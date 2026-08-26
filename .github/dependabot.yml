@@ -1,0 +1,38 @@
+# Dependabot version updates.
+#
+# The repo is docs-only today. Slice 1 lands the first Python code, and its
+# runtime footprint is numba, pyarrow, duckdb, schwab-py, and
+# exchange_calendars. Until a manifest exists, Dependabot finds nothing here
+# and reports "no dependency files found". That resolves itself when the code
+# lands. The config sits here now so updates start on day one.
+version: 2
+
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      # Minor and patch bumps ride one PR. Majors stay separate, since they
+      # are the ones that need reading.
+      python-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore(ci)
+    groups:
+      actions:
+        patterns:
+          - "*"
