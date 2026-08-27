@@ -55,11 +55,14 @@ QUOTES_SURFACE = "quotes"
 ROW_KIND_DATA = "data"
 ROW_KIND_GAP = "gap"
 
-# The durability primitive. ``F_FULLFSYNC`` forces a file's data all the way to the
-# drive, past the drive's own write cache. Plain ``fsync`` stops at that cache on
-# macOS, per Apple's ``fsync(2)`` man page, so a power loss could still drop it. The
-# constant is macOS-specific. The fallback keeps the suite runnable on other systems,
-# but only ``F_FULLFSYNC`` delivers the durability the design requires.
+# The durability primitive. A cycle is durable only once its bytes reach stable
+# storage, past the drive's own write cache. On macOS that needs
+# ``fcntl(fd, F_FULLFSYNC)``. Plain ``fsync`` stops at the drive cache there, per
+# Apple's ``fsync(2)`` man page. On Linux ``fsync`` already flushes the device cache
+# on mainstream filesystems, so ``os.fsync`` is the equivalent, not a weaker
+# stand-in. ``F_FULLFSYNC`` is macOS-specific only because Apple made ``fsync``
+# weaker than POSIX. The daemon runs on the macOS laptop today. A future Linux host
+# keeps real durability through the fallback.
 F_FULLFSYNC = getattr(fcntl, "F_FULLFSYNC", None)
 
 
@@ -422,6 +425,15 @@ class SegmentWriter:
         # A collision must never truncate durable rows or shadow-append past an EOS.
         fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         self._fd = fd
+        # Make the new segment's directory entry durable, so the file itself survives
+        # a crash right after creation. This is the standard directory fsync. It uses
+        # plain ``os.fsync`` even on macOS, where ``F_FULLFSYNC`` does not apply to a
+        # directory, matching how SQLite and Postgres persist directory entries.
+        dir_fd = os.open(self.path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
         # Unbuffered, so every write reaches the OS before the durability flush.
         self._file = open(fd, "wb", buffering=0, closefd=True)
         self._sink = pa.PythonFile(self._file, mode="w")
@@ -467,7 +479,7 @@ class SegmentWriter:
         self._sink.flush()
         if F_FULLFSYNC is not None:
             fcntl.fcntl(self._fd, F_FULLFSYNC)
-        else:  # pragma: no cover - non-macOS fallback, not the durability guarantee
+        else:  # pragma: no cover - non-macOS path, exercised on Linux CI, not the dev Mac
             os.fsync(self._fd)
         self.durable_syncs += 1
 

@@ -8,6 +8,8 @@ torn-tail tolerance, the shadow-append refusal, and per-cycle durability.
 from __future__ import annotations
 
 import fcntl
+import os
+import stat
 
 import pyarrow as pa
 import pytest
@@ -213,6 +215,23 @@ def test_each_cycle_is_flushed_durable_and_the_close_flushes_the_eos(lake_root):
     writer.close()
     # The end-of-stream marker is made durable too.
     assert writer.durable_syncs == 3
+
+
+def test_creation_fsyncs_the_parent_directory(lake_root, monkeypatch):
+    # The new segment's directory entry is made durable at creation, so the file
+    # survives a crash right after it is created. Record the fds that get fsynced and
+    # assert the parent directory is among them.
+    synced_dirs = []
+    real_fsync = os.fsync
+
+    def spy(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            synced_dirs.append(fd)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", spy)
+    journal.SegmentWriter.open(lake_root, "chains", "SPY", DAY, START, PID).close()
+    assert synced_dirs, "the parent directory was not fsynced at creation"
 
 
 def test_a_cycle_is_on_disk_before_the_segment_is_closed(lake_root):
