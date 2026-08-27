@@ -127,22 +127,35 @@ def test_happy_cycle_writes_chains_and_quotes_with_correct_stamps(cassette_vendo
     # Schwab's CUSIP, a sibling of the quote block in a reference envelope field, is
     # captured raw in its own column.
     assert spy_quote["cusip"] == "111111111"
-    # The dividend fundamentals are lifted from the envelope's fundamental block into
-    # their typed columns.
+    # The full fundamental block lands in its typed columns: dividends plus valuation and
+    # volume stats. peRatio and eps are captured now, not left behind.
     assert spy_quote["div_pay_amount"] == 1.75
     assert spy_quote["div_ex_date"] == "2026-09-18"
-    assert spy_quote["div_amount"] == 7.0
-    assert spy_quote["div_freq"] == 4
-    assert spy_quote["declaration_date"] == "2026-08-15"
-    assert spy_quote["next_div_ex_date"] == "2026-12-18"
     assert spy_quote["next_div_pay_date"] == "2026-12-31"
-    # The non-dividend fundamental fields (peRatio, eps) are left behind: they are not
-    # captured and do not pollute the normally-empty overflow.
+    assert spy_quote["div_yield"] == 1.28
+    assert spy_quote["pe_ratio"] == 24.5
+    assert spy_quote["eps"] == 22.3
+    assert spy_quote["avg_10_days_volume"] == 74000000.0
+    assert spy_quote["last_earnings_date"] == "2026-07-30"
+    # The regular-session block lands in its regular_market_* columns.
+    assert spy_quote["regular_market_last_price"] == 649.5
+    assert spy_quote["regular_market_last_size"] == 100
+    assert spy_quote["regular_market_trade_time"] == "2026-08-24T16:00:00Z"
+    # The extended-hours block lands in its extended_* columns. Its lastPrice collides
+    # with the quote block's, and the two land in separate columns without overwriting.
+    assert spy_quote["extended_last_price"] == 651.0
+    assert spy_quote["extended_bid_price"] == 650.9
+    assert spy_quote["extended_total_volume"] == 2000
+    assert (spy_quote["last"], spy_quote["extended_last_price"]) == (650.0, 651.0)
+    # Every field is recognized, so the namespaced overflow stays empty.
     assert spy_quote["extra"] is None
 
     qqq_quote = _rows(result.segment(QUOTES, "QQQ"))[0]
     assert qqq_quote["bid"] == 601.48
     assert qqq_quote["cusip"] == "222222222"
+    assert qqq_quote["regular_market_last_price"] == 601.0
+    assert qqq_quote["extended_last_price"] == 602.0
+    assert qqq_quote["extra"] is None
     assert qqq_quote["div_pay_amount"] == 0.9
     assert qqq_quote["extra"] is None
 

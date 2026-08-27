@@ -123,72 +123,31 @@ def _chain_vendor_quote_ts(body: Mapping[str, object]) -> datetime | None:
     return None
 
 
-# The dividend fields lifted out of Schwab's ``fundamental`` block. Only these are
-# captured. The rest of that block, like ``peRatio`` and ``eps``, is deliberately left
-# behind, so ``extra`` stays empty and the "populated extra flags the report" invariant
-# keeps its meaning. These vendor names must match the dividend entries in the journal's
-# ``_QUOTE_MAP``. They are confirmed against the live cassette recording; the design's
-# names are used for now.
-_QUOTE_FUNDAMENTAL_KEYS = frozenset(
-    {
-        "divPayAmount",
-        "divExDate",
-        "divAmount",
-        "divFreq",
-        "declarationDate",
-        "nextDivExDate",
-        "nextDivPayDate",
-    }
-)
+def _quote_envelope(body: Mapping[str, object], ticker: str) -> Mapping[str, object] | None:
+    """One ticker's per-symbol quote envelope from a batched quotes body, or ``None``.
 
-
-def _envelope_cusip(envelope: Mapping[str, object]) -> object | None:
-    """Schwab's CUSIP for one quote envelope, or ``None`` if absent.
-
-    The CUSIP is a sibling of the ``quote`` block on the per-symbol envelope, not inside
-    it. Schwab places it either as a top-level ``cusip`` field or inside a ``reference``
-    block, so this checks both. It is captured raw under the vendor-verbatim rule so a
-    later enrichment can resolve the instrument's FIGI from it. It is never a join key.
-    """
-    if "cusip" in envelope:
-        return envelope["cusip"]
-    reference = envelope.get("reference")
-    if isinstance(reference, Mapping):
-        return reference.get("cusip")
-    return None
-
-
-def _flatten_quote(body: Mapping[str, object], ticker: str) -> dict | None:
-    """The per-ticker flattened quote mapping from a batched quotes body, or ``None``.
-
-    The batched response maps each ticker to an envelope. The bid, ask, and last live in
-    the envelope's ``quote`` block. The real-time flag, the CUSIP, and the dividend
-    fundamentals are sibling fields on the envelope, outside that block: the flag and the
-    CUSIP at the envelope's own level, the dividends inside its ``fundamental`` block.
-    This merges the flag, the CUSIP, and only the specific dividend fields into the quote
-    mapping, so the row builder takes one flat mapping and each lands in its typed column
-    rather than ``extra``. The non-dividend fundamental fields are left behind, so
-    ``extra`` stays empty. A ticker absent from a 200 batch yields ``None``, the caller's
-    gap signal. This is the one place that split logic lives, shared by the loop and by
-    the onboarding snapshot, so both flatten a batched quote identically.
+    The batched response maps each ticker to an envelope holding the ``quote``,
+    ``fundamental``, ``regular``, and ``extended`` blocks, plus envelope-level fields like
+    ``realtime`` and the CUSIP. This returns the whole envelope unchanged, so the journal
+    row builder can project each block through its own map. The blocks are never merged
+    here, because ``quote`` and ``extended`` share field names. A ticker absent from a 200
+    batch, or one with no ``quote`` block, yields ``None``, the caller's gap signal. This
+    is the one place the split lives, shared by the loop and by the onboarding snapshot.
     """
     envelope = body.get(ticker)
-    quote_fields = envelope.get("quote") if isinstance(envelope, Mapping) else None
-    if not isinstance(quote_fields, Mapping):
+    if not isinstance(envelope, Mapping):
         return None
-    flat = dict(quote_fields)
-    if isinstance(envelope, Mapping):
-        if "realtime" in envelope:
-            flat["realtime"] = envelope["realtime"]
-        cusip = _envelope_cusip(envelope)
-        if cusip is not None:
-            flat["cusip"] = cusip
-        fundamental = envelope.get("fundamental")
-        if isinstance(fundamental, Mapping):
-            for key in _QUOTE_FUNDAMENTAL_KEYS:
-                if key in fundamental:
-                    flat[key] = fundamental[key]
-    return flat
+    if not isinstance(envelope.get("quote"), Mapping):
+        return None
+    return envelope
+
+
+def _quote_vendor_quote_ts(envelope: Mapping[str, object]) -> datetime | None:
+    """The vendor quote time from a quote envelope's ``quote`` block, or ``None``."""
+    quote = envelope.get("quote")
+    if isinstance(quote, Mapping):
+        return _epoch_ms_to_datetime(quote.get("quoteTime"))
+    return None
 
 
 def _build_snapshot_batch(
@@ -217,16 +176,16 @@ def _build_snapshot_batch(
             vendor_quote_ts=_chain_vendor_quote_ts(body),
         )
     if surface == QUOTES:
-        flat = _flatten_quote(body, ticker)
-        if flat is None:
+        envelope = _quote_envelope(body, ticker)
+        if envelope is None:
             raise VendorError(f"quotes response has no quote for {ticker!r}")
         return journal.quotes_data_batch(
-            flat,
+            envelope,
             ticker=ticker,
             snap_ts=snap_ts,
             fetch_ts=fetch_ts,
             fetch_end_ts=fetch_end_ts,
-            vendor_quote_ts=_epoch_ms_to_datetime(flat.get("quoteTime")),
+            vendor_quote_ts=_quote_vendor_quote_ts(envelope),
         )
     raise ValueError(f"unknown surface {surface!r}")
 
@@ -424,14 +383,13 @@ class _CaptureCycle:
     ) -> _Plan:
         """Split one ticker out of a batched quote body and plan its segment.
 
-        The batched response maps each ticker to an envelope. The bid, ask, and last
-        live in the envelope's ``quote`` block, and the real-time entitlement flag lives
-        on the envelope. The row builder takes one flat quote mapping, so this merges the
-        flag into the quote fields. A ticker missing from a 200 batch is its own gap. The
-        round-trip stamps are the shared batch's, since one request served every ticker.
+        The batched response maps each ticker to an envelope. The row builder projects the
+        envelope's blocks into typed columns. A ticker missing from a 200 batch, or one
+        with no quote block, is its own gap. The round-trip stamps are the shared batch's,
+        since one request served every ticker.
         """
         try:
-            if _flatten_quote(body, ticker) is None:
+            if _quote_envelope(body, ticker) is None:
                 return self._gap_plan(QUOTES, ticker, "quote_absent", fetch_ts, fetch_end_ts)
             batch = _build_snapshot_batch(
                 QUOTES,

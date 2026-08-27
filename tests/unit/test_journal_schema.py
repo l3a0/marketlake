@@ -69,20 +69,58 @@ CHAIN_BODY = {
     },
 }
 
+# A full per-symbol quote envelope, shaped like a Schwab quote response. It carries the
+# quote block, the envelope-level realtime flag and reference CUSIP, and the full
+# fundamental, regular, and extended blocks. The extended block deliberately reuses the
+# quote block's field names to exercise the collision handling.
 QUOTE = {
-    "bidPrice": 649.98,
-    "askPrice": 650.02,
-    "lastPrice": 650.0,
-    "quoteTime": 1787000100000,
+    "assetMainType": "EQUITY",
     "realtime": True,
-    "cusip": "111111111",
-    "divPayAmount": 1.75,
-    "divExDate": "2026-09-18",
-    "divAmount": 7.0,
-    "divFreq": 4,
-    "declarationDate": "2026-08-15",
-    "nextDivExDate": "2026-12-18",
-    "nextDivPayDate": "2026-12-31",
+    "reference": {"cusip": "111111111"},
+    "quote": {
+        "bidPrice": 649.98,
+        "askPrice": 650.02,
+        "lastPrice": 650.0,
+        "quoteTime": 1787000100000,
+    },
+    "fundamental": {
+        "divPayAmount": 1.75,
+        "divExDate": "2026-09-18",
+        "divAmount": 7.0,
+        "divFreq": 4,
+        "declarationDate": "2026-08-15",
+        "nextDivExDate": "2026-12-18",
+        "nextDivPayDate": "2026-12-31",
+        "divPayDate": "2026-09-30",
+        "divYield": 1.28,
+        "peRatio": 24.5,
+        "eps": 22.3,
+        "high52": 700.0,
+        "low52": 500.0,
+        "avg10DaysVolume": 74000000.0,
+        "avg1YearVolume": 80000000.0,
+        "lastEarningsDate": "2026-07-30",
+        "fundLeverageFactor": 1.0,
+    },
+    "regular": {
+        "regularMarketLastPrice": 649.5,
+        "regularMarketLastSize": 100,
+        "regularMarketNetChange": 1.2,
+        "regularMarketPercentChange": 0.18,
+        "regularMarketTradeTime": "2026-08-24T16:00:00Z",
+    },
+    "extended": {
+        "lastPrice": 651.0,
+        "bidPrice": 650.9,
+        "askPrice": 651.1,
+        "bidSize": 5,
+        "askSize": 7,
+        "lastSize": 3,
+        "mark": 651.0,
+        "quoteTime": "2026-08-24T17:00:00Z",
+        "tradeTime": "2026-08-24T17:00:01Z",
+        "totalVolume": 2000,
+    },
 }
 
 SNAP = "2026-08-24T16:15:00-04:00"
@@ -156,6 +194,7 @@ def test_quotes_schema_names_and_types():
         "last",
         "realtime",
         "cusip",
+        # fundamental block
         "div_pay_amount",
         "div_ex_date",
         "div_amount",
@@ -163,6 +202,33 @@ def test_quotes_schema_names_and_types():
         "declaration_date",
         "next_div_ex_date",
         "next_div_pay_date",
+        "div_pay_date",
+        "div_yield",
+        "pe_ratio",
+        "eps",
+        "high_52",
+        "low_52",
+        "avg_10_days_volume",
+        "avg_1_year_volume",
+        "last_earnings_date",
+        "fund_leverage_factor",
+        # regular block
+        "regular_market_last_price",
+        "regular_market_last_size",
+        "regular_market_net_change",
+        "regular_market_percent_change",
+        "regular_market_trade_time",
+        # extended block
+        "extended_last_price",
+        "extended_bid_price",
+        "extended_ask_price",
+        "extended_bid_size",
+        "extended_ask_size",
+        "extended_last_size",
+        "extended_mark",
+        "extended_quote_time",
+        "extended_trade_time",
+        "extended_total_volume",
         "row_kind",
         "schema_version",
         "extra",
@@ -179,11 +245,50 @@ def test_quotes_schema_names_and_types():
     assert schema.field("div_freq").type == pa.int64()
     for date_field in ("div_ex_date", "declaration_date", "next_div_ex_date", "next_div_pay_date"):
         assert schema.field(date_field).type == pa.string()
+    # The rest of the fundamental block: valuation floats, volume floats, string dates.
+    for float_field in (
+        "div_yield",
+        "pe_ratio",
+        "eps",
+        "high_52",
+        "low_52",
+        "fund_leverage_factor",
+    ):
+        assert schema.field(float_field).type == pa.float64()
+    assert schema.field("avg_10_days_volume").type == pa.float64()
+    assert schema.field("avg_1_year_volume").type == pa.float64()
+    assert schema.field("last_earnings_date").type == pa.string()
+    assert schema.field("div_pay_date").type == pa.string()
+    # The regular block: prices float, size int, net/percent float, trade time string.
+    assert schema.field("regular_market_last_price").type == pa.float64()
+    assert schema.field("regular_market_last_size").type == pa.int64()
+    assert schema.field("regular_market_net_change").type == pa.float64()
+    assert schema.field("regular_market_percent_change").type == pa.float64()
+    assert schema.field("regular_market_trade_time").type == pa.string()
+    # The extended block: prices/mark float, sizes and volume int, times string.
+    for float_field in (
+        "extended_last_price",
+        "extended_bid_price",
+        "extended_ask_price",
+        "extended_mark",
+    ):
+        assert schema.field(float_field).type == pa.float64()
+    for int_field in (
+        "extended_bid_size",
+        "extended_ask_size",
+        "extended_last_size",
+        "extended_total_volume",
+    ):
+        assert schema.field(int_field).type == pa.int64()
+    assert schema.field("extended_quote_time").type == pa.string()
+    assert schema.field("extended_trade_time").type == pa.string()
     # Quotes never carry a per-contract vendor column.
     assert "open_interest" not in schema.names
-    # Chains carry neither the equity CUSIP nor the dividend fundamentals.
+    # Chains carry none of the equity CUSIP, dividend, regular, or extended columns.
     assert "cusip" not in journal.CHAINS_SCHEMA.names
     assert "div_amount" not in journal.CHAINS_SCHEMA.names
+    assert "regular_market_last_price" not in journal.CHAINS_SCHEMA.names
+    assert "extended_last_price" not in journal.CHAINS_SCHEMA.names
 
 
 def test_schema_for_resolves_surfaces_and_rejects_unknown():
@@ -315,7 +420,7 @@ def test_quotes_data_batch_maps_prices_and_consumes_quote_time():
     assert row["row_kind"] == journal.ROW_KIND_DATA
     # The CUSIP lands in its typed column, kept raw for the deferred FIGI backfill.
     assert row["cusip"] == "111111111"
-    # The seven dividend fundamentals each land in their typed columns.
+    # The full fundamental block lands in its typed columns.
     assert row["div_pay_amount"] == 1.75
     assert row["div_ex_date"] == "2026-09-18"
     assert row["div_amount"] == 7.0
@@ -323,16 +428,48 @@ def test_quotes_data_batch_maps_prices_and_consumes_quote_time():
     assert row["declaration_date"] == "2026-08-15"
     assert row["next_div_ex_date"] == "2026-12-18"
     assert row["next_div_pay_date"] == "2026-12-31"
-    # quoteTime is recognized and carried in vendor_quote_ts, and realtime, cusip, and the
-    # dividend fields are typed columns, so none pollutes the normally-empty overflow.
+    assert row["div_pay_date"] == "2026-09-30"
+    assert row["div_yield"] == 1.28
+    assert row["pe_ratio"] == 24.5
+    assert row["eps"] == 22.3
+    assert row["high_52"] == 700.0
+    assert row["low_52"] == 500.0
+    assert row["avg_10_days_volume"] == 74000000.0
+    assert row["avg_1_year_volume"] == 80000000.0
+    assert row["last_earnings_date"] == "2026-07-30"
+    assert row["fund_leverage_factor"] == 1.0
+    # The regular block lands in its typed columns.
+    assert row["regular_market_last_price"] == 649.5
+    assert row["regular_market_last_size"] == 100
+    assert row["regular_market_net_change"] == 1.2
+    assert row["regular_market_percent_change"] == 0.18
+    assert row["regular_market_trade_time"] == "2026-08-24T16:00:00Z"
+    # The extended block lands in its distinctly-prefixed columns.
+    assert row["extended_last_price"] == 651.0
+    assert row["extended_bid_price"] == 650.9
+    assert row["extended_ask_price"] == 651.1
+    assert row["extended_bid_size"] == 5
+    assert row["extended_ask_size"] == 7
+    assert row["extended_last_size"] == 3
+    assert row["extended_mark"] == 651.0
+    assert row["extended_quote_time"] == "2026-08-24T17:00:00Z"
+    assert row["extended_trade_time"] == "2026-08-24T17:00:01Z"
+    assert row["extended_total_volume"] == 2000
+    # The colliding name lands in both blocks' own columns, never overwriting: the quote
+    # block's lastPrice in ``last``, the extended block's in ``extended_last_price``.
+    assert (row["last"], row["extended_last_price"]) == (650.0, 651.0)
+    # Every field is recognized, so the namespaced overflow stays empty. Envelope-level
+    # noise like assetMainType and the reference block beyond the CUSIP are not captured
+    # and do not overflow either.
     assert row["extra"] is None
 
 
 def test_quotes_realtime_lands_in_the_column_and_not_in_extra():
     # A payload whose only extra-looking field is the now-recognized realtime flag
     # keeps an empty overflow.
+    envelope = {"realtime": True, "quote": {"bidPrice": 1.0, "askPrice": 1.1, "lastPrice": 1.05}}
     batch = journal.quotes_data_batch(
-        {"bidPrice": 1.0, "askPrice": 1.1, "lastPrice": 1.05, "realtime": True},
+        envelope,
         ticker="SPY",
         snap_ts=SNAP,
         fetch_ts=FETCH,
@@ -343,13 +480,19 @@ def test_quotes_realtime_lands_in_the_column_and_not_in_extra():
     assert row["extra"] is None
 
 
-def test_quotes_unknown_field_lands_in_extra():
-    quote = dict(QUOTE, netChange=1.5)
+def test_quotes_unknown_field_overflows_namespaced_by_block():
+    # An unrecognized field in a captured block overflows into extra under that block's
+    # key, so drift in any block surfaces without colliding with another block's names.
+    import copy
+
+    envelope = copy.deepcopy(QUOTE)
+    envelope["quote"]["netChange"] = 1.5
+    envelope["extended"]["someNewField"] = 42
     batch = journal.quotes_data_batch(
-        quote, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH, vendor_quote_ts=VENDOR
+        envelope, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH, vendor_quote_ts=VENDOR
     )
-    # The unknown field overflows. The recognized realtime and quoteTime do not.
-    assert json.loads(batch.to_pylist()[0]["extra"]) == {"netChange": 1.5}
+    extra = json.loads(batch.to_pylist()[0]["extra"])
+    assert extra == {"quote": {"netChange": 1.5}, "extended": {"someNewField": 42}}
 
 
 # -- gap rows ----------------------------------------------------------------
@@ -397,15 +540,28 @@ def test_quotes_gap_row_carries_reason_and_optional_fetch():
     assert row["error_class"] == "quote_sampler_dead"
     assert row["fetch_ts"] == FETCH
     assert row["bid"] is None and row["ask"] is None and row["last"] is None
-    # The entitlement flag, the CUSIP, and the dividend fundamentals are vendor columns,
-    # so all are null on a gap.
+    # The entitlement flag, the CUSIP, and the fundamental, regular, and extended blocks
+    # are vendor columns, so all are null on a gap.
     assert row["realtime"] is None
     assert row["cusip"] is None
-    assert row["div_pay_amount"] is None
-    assert row["div_amount"] is None
-    assert row["div_freq"] is None
-    assert row["div_ex_date"] is None
-    assert row["next_div_pay_date"] is None
+    for column in (
+        "div_pay_amount",
+        "div_amount",
+        "div_freq",
+        "div_ex_date",
+        "next_div_pay_date",
+        "div_yield",
+        "pe_ratio",
+        "avg_1_year_volume",
+        "regular_market_last_price",
+        "regular_market_last_size",
+        "regular_market_trade_time",
+        "extended_last_price",
+        "extended_bid_size",
+        "extended_total_volume",
+        "extended_quote_time",
+    ):
+        assert row[column] is None, column
 
 
 def test_gap_row_can_carry_a_close_tag_for_an_absent_marker():

@@ -40,11 +40,11 @@ from lake.vendor import VendorError, VendorResponse
 # relative default the live recorder falls back to, never a committed machine path.
 DEFAULT_TOKEN_PATH = Path.home() / ".config" / "marketlake" / "token.json"
 
-# The field groups pinned on every batched quote request. ``quote`` carries bid/ask/last
-# and the quote time, ``fundamental`` the dividend fields, and ``reference`` the CUSIP.
-# Pinning them means those blocks are present regardless of Schwab's per-account default,
-# so the dividend and CUSIP columns are never silently empty.
-QUOTE_FIELD_GROUPS = "quote,fundamental,reference"
+# The field groups pinned on every batched quote request. ``all`` returns every block
+# Schwab offers: quote, fundamental, regular, extended, and reference. Pinning it means
+# those blocks are present regardless of the per-account default, so the fundamental,
+# regular, extended, and CUSIP columns are never silently empty.
+QUOTE_FIELD_GROUPS = "all"
 
 
 @runtime_checkable
@@ -144,9 +144,9 @@ class SchwabVendor:
     def get_quotes(self, symbols: Sequence[str]) -> VendorResponse:
         """Batched equity quotes for every symbol, verbatim.
 
-        The request pins the ``quote``, ``fundamental``, and ``reference`` field groups,
-        so the dividend fundamentals and the CUSIP are present regardless of the
-        account's default field set.
+        The request pins the ``all`` field group, so every block Schwab offers, the
+        quote, fundamental, regular, extended, and reference blocks, is present
+        regardless of the account's default field set.
         """
         return _response_from(self._client.get_quotes(list(symbols), fields=QUOTE_FIELD_GROUPS))
 

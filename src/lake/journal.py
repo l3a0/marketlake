@@ -136,27 +136,35 @@ CHAINS_SCHEMA = pa.schema(
     + _PROVENANCE_FIELDS
 )
 
-# The quotes capture schema. Each row is one equity quote for one ticker: bid, ask,
-# last, ``realtime``, ``cusip``, and the dividend fundamentals. ``realtime`` is the
-# vendor's real-time entitlement flag. It must be true on a real-time quote. The
-# validation battery checks it, so it is a captured vendor column, not dropped. ``cusip``
-# is Schwab's CUSIP for the equity, kept raw under the vendor-verbatim rule. It is never
-# a join key and never published, but it is captured so a later enrichment can resolve
-# the instrument's FIGI from it. The seven ``div_*`` columns are Schwab's dividend
-# fundamentals, captured as typed columns because the deferred greeks layer's dividend
-# input reads them at valuation time. ``div_pay_amount`` is the per-event amount, never
-# ``div_amount``, which is the annualized trailing figure. The ``next_div_*`` fields are
-# the vendor's undocumented projections, kept raw for the declaration-vs-projection
-# study. The vendor quote time is carried in ``vendor_quote_ts``, not repeated as a
-# vendor column.
+# The quotes capture schema. Each row is one equity quote for one ticker. Besides the
+# ``quote`` block's bid/ask/last, it captures the vendor's ``realtime`` entitlement flag,
+# the ``cusip``, and the full ``fundamental``, ``regular``, and ``extended`` blocks as
+# distinctly-named typed columns, all vendor-verbatim. ``realtime`` must be true on a
+# real-time quote; the battery checks it. ``cusip`` is Schwab's CUSIP, kept raw so a
+# later enrichment can resolve the instrument's FIGI from it; it is never a join key.
+# The ``fundamental`` block carries the dividend fields plus valuation and volume stats.
+# ``div_pay_amount`` is the per-event amount, never ``div_amount``, the annualized
+# trailing figure; the ``next_div_*`` fields are the vendor's undocumented projections.
+# The ``regular`` block is the regular-session close, prefixed ``regular_market_*`` by
+# Schwab. The ``extended`` block is the extended-hours session; its columns are prefixed
+# ``extended_*`` because that block reuses ``lastPrice``/``bidPrice``/``askPrice``/
+# ``quoteTime``, which would otherwise collide with the ``quote`` block. The vendor quote
+# time is carried in ``vendor_quote_ts``, not repeated as a column.
+#
+# The field names and types are calibrated against the live cassette recording (live
+# check 1). The per-block maps below are the single source of truth; an unrecognized
+# field in a captured block fails open into ``extra`` under that block's key.
 QUOTES_SCHEMA = pa.schema(
     _STAMP_FIELDS
     + [
+        # quote block (unchanged in this pass)
         ("bid", pa.float64()),
         ("ask", pa.float64()),
         ("last", pa.float64()),
+        # envelope-level
         ("realtime", pa.bool_()),
         ("cusip", pa.string()),
+        # fundamental block — dividends
         ("div_pay_amount", pa.float64()),
         ("div_ex_date", pa.string()),
         ("div_amount", pa.float64()),
@@ -164,6 +172,34 @@ QUOTES_SCHEMA = pa.schema(
         ("declaration_date", pa.string()),
         ("next_div_ex_date", pa.string()),
         ("next_div_pay_date", pa.string()),
+        ("div_pay_date", pa.string()),
+        ("div_yield", pa.float64()),
+        # fundamental block — valuation and volume stats
+        ("pe_ratio", pa.float64()),
+        ("eps", pa.float64()),
+        ("high_52", pa.float64()),
+        ("low_52", pa.float64()),
+        ("avg_10_days_volume", pa.float64()),
+        ("avg_1_year_volume", pa.float64()),
+        ("last_earnings_date", pa.string()),
+        ("fund_leverage_factor", pa.float64()),
+        # regular block — the regular-session close
+        ("regular_market_last_price", pa.float64()),
+        ("regular_market_last_size", pa.int64()),
+        ("regular_market_net_change", pa.float64()),
+        ("regular_market_percent_change", pa.float64()),
+        ("regular_market_trade_time", pa.string()),
+        # extended block — extended-hours session, prefixed to avoid the quote collision
+        ("extended_last_price", pa.float64()),
+        ("extended_bid_price", pa.float64()),
+        ("extended_ask_price", pa.float64()),
+        ("extended_bid_size", pa.int64()),
+        ("extended_ask_size", pa.int64()),
+        ("extended_last_size", pa.int64()),
+        ("extended_mark", pa.float64()),
+        ("extended_quote_time", pa.string()),
+        ("extended_trade_time", pa.string()),
+        ("extended_total_volume", pa.int64()),
     ]
     + _PROVENANCE_FIELDS
 )
@@ -210,20 +246,24 @@ _CHAINS_HEADER_MAP = {
     "isDelayed": "is_delayed",
 }
 
-# The quote fields that land in typed quotes columns. ``realtime`` and ``cusip`` are
-# envelope-level fields, and the seven dividend fields come from the envelope's
-# ``fundamental`` block. The sampler merges all of them into the flat quote before this
-# map runs, so each is captured in its own column and kept out of ``extra``. Only these
-# specific dividend fields are lifted from ``fundamental``. The rest of that block, like
-# ``peRatio``, is deliberately left behind so ``extra`` stays empty and the populated-
-# extra report flag keeps its meaning. The exact Schwab field names are confirmed by the
-# live cassette recording; the design's names are mapped here for now.
+# The per-block quote field maps, each vendor-field to snake_case column. Each map is
+# applied against its OWN block, never a merged dict, because the ``quote`` and
+# ``extended`` blocks reuse field names (``lastPrice``, ``bidPrice``, ``askPrice``,
+# ``quoteTime``). Applying each block's map to that block alone keeps the colliding names
+# in separate columns. These maps are the single source of truth for what lands typed;
+# an unrecognized field in any block fails open into ``extra`` under that block's key.
+# The names and types are calibrated against the live cassette recording (live check 1).
+
+# The ``quote`` block. Only bid/ask/last are typed in this pass; the rest of the block is
+# left for a later change. ``quoteTime`` is consumed into ``vendor_quote_ts`` below.
 _QUOTE_MAP = {
     "bidPrice": "bid",
     "askPrice": "ask",
     "lastPrice": "last",
-    "realtime": "realtime",
-    "cusip": "cusip",
+}
+
+# The ``fundamental`` block: the dividend fields plus valuation and volume stats.
+_FUNDAMENTAL_MAP = {
     "divPayAmount": "div_pay_amount",
     "divExDate": "div_ex_date",
     "divAmount": "div_amount",
@@ -231,12 +271,58 @@ _QUOTE_MAP = {
     "declarationDate": "declaration_date",
     "nextDivExDate": "next_div_ex_date",
     "nextDivPayDate": "next_div_pay_date",
+    "divPayDate": "div_pay_date",
+    "divYield": "div_yield",
+    "peRatio": "pe_ratio",
+    "eps": "eps",
+    "high52": "high_52",
+    "low52": "low_52",
+    "avg10DaysVolume": "avg_10_days_volume",
+    "avg1YearVolume": "avg_1_year_volume",
+    "lastEarningsDate": "last_earnings_date",
+    "fundLeverageFactor": "fund_leverage_factor",
 }
 
-# Quote fields the parser recognizes but does not overflow into ``extra``. The vendor
-# quote time is carried in ``vendor_quote_ts`` instead, so keeping it out of ``extra``
-# keeps that column normally empty.
+# The ``regular`` block: the regular-session close. Schwab already prefixes these
+# ``regularMarket*``, so they do not collide with the ``quote`` block.
+_REGULAR_MAP = {
+    "regularMarketLastPrice": "regular_market_last_price",
+    "regularMarketLastSize": "regular_market_last_size",
+    "regularMarketNetChange": "regular_market_net_change",
+    "regularMarketPercentChange": "regular_market_percent_change",
+    "regularMarketTradeTime": "regular_market_trade_time",
+}
+
+# The ``extended`` block: the extended-hours session. Its field names collide with the
+# ``quote`` block, so every column is prefixed ``extended_``.
+_EXTENDED_MAP = {
+    "lastPrice": "extended_last_price",
+    "bidPrice": "extended_bid_price",
+    "askPrice": "extended_ask_price",
+    "bidSize": "extended_bid_size",
+    "askSize": "extended_ask_size",
+    "lastSize": "extended_last_size",
+    "mark": "extended_mark",
+    "quoteTime": "extended_quote_time",
+    "tradeTime": "extended_trade_time",
+    "totalVolume": "extended_total_volume",
+}
+
+# The quote-block fields the parser recognizes but does not overflow into ``extra``. The
+# vendor quote time is carried in ``vendor_quote_ts`` instead, so keeping it out of the
+# overflow keeps that column normally empty.
 _QUOTE_CONSUMED = frozenset({"quoteTime"})
+
+# The captured blocks, each paired with its map and its consumed set. A block is
+# projected against its own sub-dict; unrecognized fields overflow into ``extra`` under
+# the block's key. Blocks not listed here (like ``reference`` beyond the CUSIP, or the
+# envelope's own ``assetMainType``) are neither captured nor overflowed.
+_QUOTE_BLOCK_SPECS = (
+    ("quote", _QUOTE_MAP, _QUOTE_CONSUMED),
+    ("fundamental", _FUNDAMENTAL_MAP, frozenset()),
+    ("regular", _REGULAR_MAP, frozenset()),
+    ("extended", _EXTENDED_MAP, frozenset()),
+)
 
 
 # -- row building ------------------------------------------------------------
@@ -336,8 +422,58 @@ def chains_data_batch(
     return _batch(CHAINS_SCHEMA, rows)
 
 
+def quote_cusip(envelope: Mapping[str, object]) -> object | None:
+    """Schwab's CUSIP for one quote envelope, or ``None`` if absent.
+
+    The CUSIP is a sibling of the ``quote`` block on the per-symbol envelope, not inside
+    it. Schwab places it either as a top-level ``cusip`` field or inside a ``reference``
+    block, so this checks both. It is captured raw under the vendor-verbatim rule so a
+    later enrichment can resolve the instrument's FIGI from it. It is never a join key.
+    """
+    if "cusip" in envelope:
+        return envelope["cusip"]
+    reference = envelope.get("reference")
+    if isinstance(reference, Mapping):
+        return reference.get("cusip")
+    return None
+
+
+def _project_quote_envelope(envelope: Mapping[str, object]) -> tuple[dict[str, object], str | None]:
+    """Project one per-symbol quote envelope into typed columns plus namespaced overflow.
+
+    Each captured block is projected against its own sub-dict through its own map, so the
+    colliding names in the ``quote`` and ``extended`` blocks (``lastPrice`` and friends)
+    land in separate columns. A field a block's map does not name, and that the block does
+    not consume, overflows into ``extra`` under that block's key, so drift in any block
+    surfaces without key collision and ``extra`` stays empty in steady state. The
+    envelope-level ``realtime`` flag and the ``cusip`` are captured too. Anything else on
+    the envelope, like ``assetMainType`` or the ``reference`` block beyond the CUSIP, is
+    neither captured nor overflowed.
+    """
+    columns: dict[str, object] = {}
+    overflow: dict[str, dict[str, object]] = {}
+    for block_key, field_map, consumed in _QUOTE_BLOCK_SPECS:
+        block = envelope.get(block_key)
+        if not isinstance(block, Mapping):
+            continue
+        for vendor, column in field_map.items():
+            if vendor in block:
+                columns[column] = block[vendor]
+        known = set(field_map) | consumed
+        rest = {key: value for key, value in block.items() if key not in known}
+        if rest:
+            overflow[block_key] = rest
+    if "realtime" in envelope:
+        columns["realtime"] = envelope["realtime"]
+    cusip = quote_cusip(envelope)
+    if cusip is not None:
+        columns["cusip"] = cusip
+    extra = json.dumps(overflow, sort_keys=True) if overflow else None
+    return columns, extra
+
+
 def quotes_data_batch(
-    quote: Mapping[str, object],
+    envelope: Mapping[str, object],
     *,
     ticker: str,
     snap_ts: str | datetime,
@@ -348,16 +484,17 @@ def quotes_data_batch(
     close_tag: str | None = None,
     session_phase: str | None = None,
 ) -> pa.RecordBatch:
-    """Build a one-row quotes batch from one ticker's quote object.
+    """Build a one-row quotes batch from one ticker's per-symbol quote envelope.
 
     The batched quote sampler splits the vendor's response per ticker and hands this
-    builder that ticker's quote fields: bid, ask, last, the vendor quote time, the
-    ``realtime`` entitlement flag, the ``cusip``, and the seven dividend fundamentals the
-    sampler lifted from the envelope's ``fundamental`` block. Every recognized field
-    lands in its typed column. The quote time is carried in ``vendor_quote_ts``. Anything
-    the map does not name lands in ``extra``, so the non-dividend fundamental fields the
-    sampler left behind never reach here and ``extra`` stays empty. ``fetch_end_ts`` is
-    the request-end stamp, the pair to ``fetch_ts`` for round-trip.
+    builder that ticker's whole envelope: the ``quote``, ``fundamental``, ``regular``,
+    and ``extended`` blocks, the ``realtime`` flag, and the CUSIP. Each block is projected
+    through its own map into distinctly-named columns, so a name shared by the ``quote``
+    and ``extended`` blocks lands in both its columns, never overwriting the other. The
+    quote time is carried in ``vendor_quote_ts``. A field a captured block's map does not
+    name overflows into ``extra`` under that block's key, so ``extra`` stays empty in
+    steady state and drift in any block still surfaces. ``fetch_end_ts`` is the
+    request-end stamp, the pair to ``fetch_ts`` for round-trip.
     """
     row: dict[str, object] = {
         "snap_ts": _iso(snap_ts),
@@ -372,10 +509,9 @@ def quotes_data_batch(
         "session_phase": session_phase,
         "schema_version": SCHEMA_VERSION,
     }
-    for vendor, column in _QUOTE_MAP.items():
-        if vendor in quote:
-            row[column] = quote[vendor]
-    row["extra"] = _extra_json(quote, set(_QUOTE_MAP) | _QUOTE_CONSUMED)
+    columns, extra = _project_quote_envelope(envelope)
+    row.update(columns)
+    row["extra"] = extra
     return _batch(QUOTES_SCHEMA, [row])
 
 
@@ -402,8 +538,8 @@ def gap_batch(
     ``vendor_quote_ts`` is always null. Every vendor column is null on a gap by
     construction: the row sets only the stamps and provenance below, and the batch
     builder fills each schema column the row omits with null. So the prices, greeks,
-    ``open_interest``, ``volume``, ``realtime``, ``cusip``, and the dividend
-    fundamentals are all null, per surface, without being enumerated here.
+    ``open_interest``, ``volume``, ``realtime``, ``cusip``, and the whole fundamental,
+    regular, and extended blocks are all null, per surface, without being enumerated here.
     """
     schema = schema_for(surface)
     row: dict[str, object] = {

@@ -159,14 +159,41 @@
             "declarationDate": "2026-08-15",
             "nextDivExDate": "2026-12-18",
             "nextDivPayDate": "2026-12-31",
+            "divPayDate": "2026-09-30",
+            "divYield": 1.28,
             "peRatio": 24.5,
-            "eps": 22.3
+            "eps": 22.3,
+            "high52": 700.0,
+            "low52": 500.0,
+            "avg10DaysVolume": 74000000.0,
+            "avg1YearVolume": 80000000.0,
+            "lastEarningsDate": "2026-07-30",
+            "fundLeverageFactor": 1.0
           },
           "quote": {
             "bidPrice": 649.98,
             "askPrice": 650.02,
             "lastPrice": 650.0,
             "quoteTime": 1787000100000
+          },
+          "regular": {
+            "regularMarketLastPrice": 649.5,
+            "regularMarketLastSize": 100,
+            "regularMarketNetChange": 1.2,
+            "regularMarketPercentChange": 0.18,
+            "regularMarketTradeTime": "2026-08-24T16:00:00Z"
+          },
+          "extended": {
+            "lastPrice": 651.0,
+            "bidPrice": 650.9,
+            "askPrice": 651.1,
+            "bidSize": 5,
+            "askSize": 7,
+            "lastSize": 3,
+            "mark": 651.0,
+            "quoteTime": "2026-08-24T17:00:00Z",
+            "tradeTime": "2026-08-24T17:00:01Z",
+            "totalVolume": 2000
           }
         },
         "QQQ": {
@@ -183,14 +210,41 @@
             "declarationDate": "2026-08-14",
             "nextDivExDate": "2026-12-18",
             "nextDivPayDate": "2026-12-31",
+            "divPayDate": "2026-09-30",
+            "divYield": 0.61,
             "peRatio": 33.1,
-            "eps": 18.2
+            "eps": 18.2,
+            "high52": 620.0,
+            "low52": 430.0,
+            "avg10DaysVolume": 42000000.0,
+            "avg1YearVolume": 45000000.0,
+            "lastEarningsDate": "2026-07-29",
+            "fundLeverageFactor": 1.0
           },
           "quote": {
             "bidPrice": 601.48,
             "askPrice": 601.52,
             "lastPrice": 601.5,
             "quoteTime": 1787000100000
+          },
+          "regular": {
+            "regularMarketLastPrice": 601.0,
+            "regularMarketLastSize": 200,
+            "regularMarketNetChange": -0.5,
+            "regularMarketPercentChange": -0.08,
+            "regularMarketTradeTime": "2026-08-24T16:00:00Z"
+          },
+          "extended": {
+            "lastPrice": 602.0,
+            "bidPrice": 601.9,
+            "askPrice": 602.1,
+            "bidSize": 4,
+            "askSize": 6,
+            "lastSize": 2,
+            "mark": 602.0,
+            "quoteTime": "2026-08-24T17:00:00Z",
+            "tradeTime": "2026-08-24T17:00:01Z",
+            "totalVolume": 1500
           }
         }
       }

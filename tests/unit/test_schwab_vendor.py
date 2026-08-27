@@ -76,12 +76,13 @@ def test_get_quotes_calls_the_batched_endpoint_with_the_symbol_list():
     assert response.body == QUOTES_BODY
 
 
-def test_get_quotes_pins_the_quote_fundamental_reference_field_groups():
-    # The dividend fundamentals and the CUSIP live in the fundamental and reference field
-    # groups. Pinning them means they are present regardless of the account default.
+def test_get_quotes_pins_the_all_field_group():
+    # The fundamental, regular, extended, and reference blocks live in their own field
+    # groups. Requesting ``all`` means every block is present regardless of the account
+    # default, so no captured column is silently empty.
     client = _client()
     SchwabVendor(client).get_quotes(["SPY", "QQQ"])
-    assert client.quote_fields == ["quote,fundamental,reference"]
+    assert client.quote_fields == ["all"]
     assert client.quote_fields == [QUOTE_FIELD_GROUPS]
 
 
