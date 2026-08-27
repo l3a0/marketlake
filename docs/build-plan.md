@@ -28,7 +28,12 @@ D0 builds the seams the whole suite leans on. A seam is an injection point where
 4. The lake root as a temporary directory, so a test writes to a throwaway lake.
 5. A fixture-lake builder, which assembles a known lake on disk for a test to read.
 
-Two enforcement tests then stay in continuous integration for the life of the project. Continuous integration is the service that runs the suite on every push. One test fails the build on any direct clock call outside the clock module. One fails on any hardcoded session time outside the calendar module. These two keep the seams from being bypassed later.
+Two enforcement tests then stay in continuous integration for the life of the project. Continuous integration is the service that runs the suite on every push.
+
+1. One fails the build on any direct clock call outside the clock module.
+2. One fails the build on any hardcoded session time outside the calendar module.
+
+These two keep the seams from being bypassed later.
 
 ### Slice 1, the capture clock
 
@@ -131,5 +136,5 @@ These need the real world. They run by hand, off CI.
 
 Two rules keep the pyramid upright. The pyramid is the shape of a healthy suite: many fast unit tests, fewer component tests, a thin layer of integration tests.
 
-- A bug's regression test goes to the lowest tier that can express it. A bug decided from values alone gets a unit test, never an integration test.
-- A new page-class path earns one unit test and at most one integration scenario. A page-class path is a code path that can raise a page-now alert. This caps the cost of each new alert.
+1. A bug's regression test goes to the lowest tier that can express it. A bug decided from values alone gets a unit test, never an integration test.
+2. A new page-class path earns one unit test and at most one integration scenario. A page-class path is a code path that can raise a page-now alert. This caps the cost of each new alert.
