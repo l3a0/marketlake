@@ -61,6 +61,7 @@ class FakeSchwabClient:
         self.chain_calls: list[str] = []
         self.chain_underlying_quote: list[bool] = []
         self.quote_calls: list[list[str]] = []
+        self.quote_fields: list[str | None] = []
 
     def get_option_chain(
         self, symbol: str, *, include_underlying_quote: bool = False
@@ -71,9 +72,10 @@ class FakeSchwabClient:
             raise KeyError(f"no canned chain for {symbol!r}")
         return self._chains[symbol]
 
-    def get_quotes(self, symbols: Sequence[str]) -> FakeResponse:
+    def get_quotes(self, symbols: Sequence[str], *, fields: str | None = None) -> FakeResponse:
         key = tuple(symbols)
         self.quote_calls.append(list(symbols))
+        self.quote_fields.append(fields)
         if key not in self._quotes:
             raise KeyError(f"no canned quotes for {key!r}")
         return self._quotes[key]

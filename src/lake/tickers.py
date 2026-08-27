@@ -20,7 +20,7 @@ on the next cycle with no restart.
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -119,6 +119,51 @@ def load_tickers(
     if not isinstance(mapping, Mapping):
         raise TickersError(f"tickers file is not a mapping: {resolved}")
     return Roster.from_mapping(mapping)
+
+
+def upsert_ticker(
+    ticker: str,
+    *,
+    options: bool,
+    chain_cadence: str | None = None,
+    bars: Sequence[str] = (),
+    path: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> Path:
+    """Add or update one ticker's entry in ``tickers.yaml`` and return the file path.
+
+    Onboarding writes the roster entry itself. This is the write half of the roster
+    module, the counterpart to ``load_tickers``. It reads any existing file, sets the
+    one ticker's settings, and writes the whole roster back. So re-onboarding a ticker
+    replaces its entry rather than duplicating it, which is what *idempotent-friendly*
+    means here: running the command twice leaves one clean entry, not two.
+
+    The written entry mirrors the schema ``TickerConfig`` reads back. ``chain_cadence``
+    is written only for an options ticker, since an equity-only ticker needs no cadence.
+    ``bars`` is written as a plain list.
+
+    The path precedence matches ``load_tickers``: an explicit ``path``, then the
+    ``MARKETLAKE_TICKERS`` environment variable, then the default. The roster lives in
+    ``~/.config/marketlake/``, outside the repo. It is portable config, never a tracked
+    file, so no machine path or secret is committed by writing it.
+    """
+    resolved = _resolve_path(path, env)
+    existing: dict[str, object] = {}
+    if resolved.exists():
+        loaded = yaml.safe_load(resolved.read_text()) or {}
+        if not isinstance(loaded, Mapping):
+            raise TickersError(f"tickers file is not a mapping: {resolved}")
+        existing = {str(key): value for key, value in loaded.items()}
+
+    entry: dict[str, object] = {"options": bool(options)}
+    if options and chain_cadence is not None:
+        entry["chain_cadence"] = chain_cadence
+    entry["bars"] = [str(freq) for freq in bars]
+    existing[ticker] = entry
+
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    resolved.write_text(yaml.safe_dump(existing, sort_keys=True))
+    return resolved
 
 
 def _resolve_path(path: str | Path | None, env: Mapping[str, str] | None) -> Path:

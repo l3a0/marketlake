@@ -61,7 +61,7 @@ from lake.lock import lake_lock
 from lake.manifest import record_partition
 from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor
 from lake.tickers import Roster, load_tickers
-from lake.vendor import Vendor
+from lake.vendor import Vendor, VendorError
 
 # The manifest ``source`` for a capture-written segment entry.
 CAPTURE_SOURCE = "capture"
@@ -121,6 +121,73 @@ def _chain_vendor_quote_ts(body: Mapping[str, object]) -> datetime | None:
     if isinstance(underlying, Mapping):
         return _epoch_ms_to_datetime(underlying.get("quoteTime"))
     return None
+
+
+def _quote_envelope(body: Mapping[str, object], ticker: str) -> Mapping[str, object] | None:
+    """One ticker's per-symbol quote envelope from a batched quotes body, or ``None``.
+
+    The batched response maps each ticker to an envelope holding the ``quote``,
+    ``fundamental``, ``regular``, and ``extended`` blocks, plus envelope-level fields like
+    ``realtime`` and the CUSIP. This returns the whole envelope unchanged, so the journal
+    row builder can project each block through its own map. The blocks are never merged
+    here, because ``quote`` and ``extended`` share field names. A ticker absent from a 200
+    batch, or one with no ``quote`` block, yields ``None``, the caller's gap signal. This
+    is the one place the split lives, shared by the loop and by the onboarding snapshot.
+    """
+    envelope = body.get(ticker)
+    if not isinstance(envelope, Mapping):
+        return None
+    if not isinstance(envelope.get("quote"), Mapping):
+        return None
+    return envelope
+
+
+def _quote_vendor_quote_ts(envelope: Mapping[str, object]) -> datetime | None:
+    """The vendor quote time from a quote envelope's ``quote`` block, or ``None``."""
+    quote = envelope.get("quote")
+    if isinstance(quote, Mapping):
+        return _epoch_ms_to_datetime(quote.get("quoteTime"))
+    return None
+
+
+def _build_snapshot_batch(
+    surface: str,
+    ticker: str,
+    body: Mapping[str, object],
+    *,
+    snap_ts: datetime,
+    fetch_ts: datetime,
+    fetch_end_ts: datetime,
+) -> object:
+    """Build one surface's data batch from a vendor response, the loop's own way.
+
+    This is the row-building step of a capture cycle, factored so another caller can
+    build a batch from a response it already fetched. A chains body maps straight
+    through the D4 chains builder. A batched quotes body is split to the one ticker
+    first. The result is byte-for-byte what the loop would build for the same response.
+    """
+    if surface == CHAINS:
+        return journal.chains_data_batch(
+            body,
+            ticker=ticker,
+            snap_ts=snap_ts,
+            fetch_ts=fetch_ts,
+            fetch_end_ts=fetch_end_ts,
+            vendor_quote_ts=_chain_vendor_quote_ts(body),
+        )
+    if surface == QUOTES:
+        envelope = _quote_envelope(body, ticker)
+        if envelope is None:
+            raise VendorError(f"quotes response has no quote for {ticker!r}")
+        return journal.quotes_data_batch(
+            envelope,
+            ticker=ticker,
+            snap_ts=snap_ts,
+            fetch_ts=fetch_ts,
+            fetch_end_ts=fetch_end_ts,
+            vendor_quote_ts=_quote_vendor_quote_ts(envelope),
+        )
+    raise ValueError(f"unknown surface {surface!r}")
 
 
 @dataclass(frozen=True)
@@ -197,6 +264,7 @@ class _Plan:
     row_kind: str
     error_class: str | None
     fetch_ts: datetime
+    fetch_end_ts: datetime
 
 
 @dataclass
@@ -224,37 +292,58 @@ class _CaptureCycle:
 
     # -- planning: the fallible, fail-open half ------------------------------
 
-    def _gap_plan(self, surface: str, ticker: str, error_class: str, fetch_ts: datetime) -> _Plan:
+    def _gap_plan(
+        self,
+        surface: str,
+        ticker: str,
+        error_class: str,
+        fetch_ts: datetime,
+        fetch_end_ts: datetime,
+    ) -> _Plan:
         batch = journal.gap_batch(
             surface,
             ticker=ticker,
             snap_ts=self.snap_ts,
             error_class=error_class,
             fetch_ts=fetch_ts,
+            fetch_end_ts=fetch_end_ts,
         )
-        return _Plan(batch, journal.ROW_KIND_GAP, error_class, fetch_ts)
+        return _Plan(batch, journal.ROW_KIND_GAP, error_class, fetch_ts, fetch_end_ts)
 
     def _plan_chain(self, ticker: str) -> _Plan:
-        """Fetch one chain and plan its segment. A failure plans a gap, never raises."""
+        """Fetch one chain and plan its segment. A failure plans a gap, never raises.
+
+        ``fetch_ts`` is stamped before the request and ``fetch_end_ts`` the instant the
+        response or the failure lands, so the request round-trip is captured even when
+        the fetch times out.
+        """
         fetch_ts = self.clock.now()
         try:
             response = self.vendor.get_chain(ticker)
+        except Exception as exc:
+            fetch_end_ts = self.clock.now()
+            return self._gap_plan(CHAINS, ticker, _error_class(exc), fetch_ts, fetch_end_ts)
+        fetch_end_ts = self.clock.now()
+        try:
             if not _ok(response.status):
-                return self._gap_plan(CHAINS, ticker, f"http_{response.status}", fetch_ts)
-            vendor_quote_ts = _chain_vendor_quote_ts(response.body)
-            batch = journal.chains_data_batch(
+                return self._gap_plan(
+                    CHAINS, ticker, f"http_{response.status}", fetch_ts, fetch_end_ts
+                )
+            batch = _build_snapshot_batch(
+                CHAINS,
+                ticker,
                 response.body,
-                ticker=ticker,
                 snap_ts=self.snap_ts,
                 fetch_ts=fetch_ts,
-                vendor_quote_ts=vendor_quote_ts,
+                fetch_end_ts=fetch_end_ts,
             )
-            return _Plan(batch, journal.ROW_KIND_DATA, None, fetch_ts)
+            return _Plan(batch, journal.ROW_KIND_DATA, None, fetch_ts, fetch_end_ts)
         except Exception as exc:
-            # Any vendor error or malformed payload fails open to a gap. Raw stays
-            # vendor-verbatim, so nothing here judges a 200 it did receive. This only
-            # catches a fetch that failed or a body the row builder could not read.
-            return self._gap_plan(CHAINS, ticker, _error_class(exc), fetch_ts)
+            # A malformed payload fails open to a gap. Raw stays vendor-verbatim, so
+            # nothing here judges a 200 it did receive. This only catches a body the row
+            # builder could not read. The round-trip is the vendor call's, already
+            # stamped above.
+            return self._gap_plan(CHAINS, ticker, _error_class(exc), fetch_ts, fetch_end_ts)
 
     def _plan_quotes(self) -> list[tuple[str, _Plan]]:
         """Fetch the one batched quote request and plan a segment per roster ticker.
@@ -267,40 +356,52 @@ class _CaptureCycle:
         try:
             response = self.vendor.get_quotes(symbols)
         except Exception as exc:
+            fetch_end_ts = self.clock.now()
             error_class = _error_class(exc)
-            return [(sym, self._gap_plan(QUOTES, sym, error_class, fetch_ts)) for sym in symbols]
+            return [
+                (sym, self._gap_plan(QUOTES, sym, error_class, fetch_ts, fetch_end_ts))
+                for sym in symbols
+            ]
+        fetch_end_ts = self.clock.now()
         if not _ok(response.status):
             error_class = f"http_{response.status}"
-            return [(sym, self._gap_plan(QUOTES, sym, error_class, fetch_ts)) for sym in symbols]
-        return [(sym, self._plan_one_quote(response.body, sym, fetch_ts)) for sym in symbols]
+            return [
+                (sym, self._gap_plan(QUOTES, sym, error_class, fetch_ts, fetch_end_ts))
+                for sym in symbols
+            ]
+        return [
+            (sym, self._plan_one_quote(response.body, sym, fetch_ts, fetch_end_ts))
+            for sym in symbols
+        ]
 
-    def _plan_one_quote(self, body: Mapping[str, object], ticker: str, fetch_ts: datetime) -> _Plan:
+    def _plan_one_quote(
+        self,
+        body: Mapping[str, object],
+        ticker: str,
+        fetch_ts: datetime,
+        fetch_end_ts: datetime,
+    ) -> _Plan:
         """Split one ticker out of a batched quote body and plan its segment.
 
-        The batched response maps each ticker to an envelope. The bid, ask, and last
-        live in the envelope's ``quote`` block, and the real-time entitlement flag lives
-        on the envelope. The row builder takes one flat quote mapping, so this merges the
-        flag into the quote fields. A ticker missing from a 200 batch is its own gap.
+        The batched response maps each ticker to an envelope. The row builder projects the
+        envelope's blocks into typed columns. A ticker missing from a 200 batch, or one
+        with no quote block, is its own gap. The round-trip stamps are the shared batch's,
+        since one request served every ticker.
         """
         try:
-            envelope = body.get(ticker)
-            quote_fields = envelope.get("quote") if isinstance(envelope, Mapping) else None
-            if not isinstance(quote_fields, Mapping):
-                return self._gap_plan(QUOTES, ticker, "quote_absent", fetch_ts)
-            flat = dict(quote_fields)
-            if isinstance(envelope, Mapping) and "realtime" in envelope:
-                flat["realtime"] = envelope["realtime"]
-            vendor_quote_ts = _epoch_ms_to_datetime(quote_fields.get("quoteTime"))
-            batch = journal.quotes_data_batch(
-                flat,
-                ticker=ticker,
+            if _quote_envelope(body, ticker) is None:
+                return self._gap_plan(QUOTES, ticker, "quote_absent", fetch_ts, fetch_end_ts)
+            batch = _build_snapshot_batch(
+                QUOTES,
+                ticker,
+                body,
                 snap_ts=self.snap_ts,
                 fetch_ts=fetch_ts,
-                vendor_quote_ts=vendor_quote_ts,
+                fetch_end_ts=fetch_end_ts,
             )
-            return _Plan(batch, journal.ROW_KIND_DATA, None, fetch_ts)
+            return _Plan(batch, journal.ROW_KIND_DATA, None, fetch_ts, fetch_end_ts)
         except Exception as exc:
-            return self._gap_plan(QUOTES, ticker, _error_class(exc), fetch_ts)
+            return self._gap_plan(QUOTES, ticker, _error_class(exc), fetch_ts, fetch_end_ts)
 
     # -- writing: the durable half -------------------------------------------
 
@@ -434,10 +535,86 @@ def run_cycle_from_config(
     )
 
 
+def journal_snapshot(
+    lake_root: Path | str,
+    surface: str,
+    ticker: str,
+    *,
+    body: Mapping[str, object],
+    cycle_start: datetime,
+    fetch_ts: datetime,
+    fetch_end_ts: datetime,
+    pid: int | None = None,
+    source: str = CAPTURE_SOURCE,
+) -> SegmentOutcome:
+    """Journal one already-fetched response as a single durable capture cycle.
+
+    This is the durable half of the capture primitive, factored so a caller that already
+    holds a response can land it exactly the way the loop lands a cycle. Onboarding uses
+    it to journal its first snapshot rather than discard a perishable sample. It reuses
+    the same primitives end to end, so the result is indistinguishable in shape from a
+    segment ``run_cycle`` writes:
+
+    1. Derive the coordinates from ``cycle_start`` the way a cycle does: ``snap_ts`` is
+       that instant floored to the minute, ``day`` is that slot's date, and ``start_ts``
+       is the writer-session stamp. The caller stamps ``cycle_start``, ``fetch_ts``, and
+       ``fetch_end_ts`` from the injected clock around its own fetch.
+    2. Build the surface's data batch with the D4 journal row builders.
+    3. Open a fresh ``SegmentWriter``, write the one cycle, and close it, which lays down
+       the end-of-stream marker.
+    4. Append one segment-keyed manifest entry under the lake-root lock, keyed by the
+       segment path, ``source`` defaulting to ``capture``, and ``fetched_at`` the
+       dispatch time, exactly as the loop records a segment.
+
+    Each call is its own writer session. A re-run stamps a different ``start_ts`` and
+    ``pid``, so the segment name differs and the ``O_CREAT | O_EXCL`` create never
+    collides. Journaling another snapshot on a re-onboard is therefore fine: each is a
+    real cycle taken at its own moment, never a discarded sample.
+    """
+    lake_root = Path(lake_root)
+    snap_ts = cycle_start.replace(second=0, microsecond=0)
+    day = snap_ts.date()
+    start_ts = cycle_start.strftime(_SEGMENT_STAMP_FORMAT)
+    writer_pid = os.getpid() if pid is None else pid
+
+    batch = _build_snapshot_batch(
+        surface,
+        ticker,
+        body,
+        snap_ts=snap_ts,
+        fetch_ts=fetch_ts,
+        fetch_end_ts=fetch_end_ts,
+    )
+    writer = journal.SegmentWriter.open(lake_root, surface, ticker, day, start_ts, writer_pid)
+    with writer:
+        writer.write_cycle(batch)
+    partition = writer.path.relative_to(lake_root).as_posix()
+    fetched_at = fetch_ts.isoformat()
+    with lake_lock(lake_root):
+        record_partition(
+            lake_root,
+            partition,
+            source=source,
+            rows=batch.num_rows,
+            fetched_at=fetched_at,
+        )
+    return SegmentOutcome(
+        surface=surface,
+        ticker=ticker,
+        path=writer.path,
+        partition=partition,
+        row_kind=journal.ROW_KIND_DATA,
+        rows=batch.num_rows,
+        error_class=None,
+        fetched_at=fetched_at,
+    )
+
+
 __all__ = [
     "CycleResult",
     "SegmentError",
     "SegmentOutcome",
+    "journal_snapshot",
     "run_cycle",
     "run_cycle_from_config",
 ]

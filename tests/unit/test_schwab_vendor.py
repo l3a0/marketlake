@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from lake.schwab import SchwabVendor
+from lake.schwab import QUOTE_FIELD_GROUPS, SchwabVendor
 from lake.vendor import Vendor, VendorError, VendorResponse
 from tests.support.schwab import FakeResponse, FakeSchwabClient
 
@@ -74,6 +74,16 @@ def test_get_quotes_calls_the_batched_endpoint_with_the_symbol_list():
     assert client.quote_calls == [["SPY", "QQQ"]]
     assert response.status == 200
     assert response.body == QUOTES_BODY
+
+
+def test_get_quotes_pins_the_all_field_group():
+    # The fundamental, regular, extended, and reference blocks live in their own field
+    # groups. Requesting ``all`` means every block is present regardless of the account
+    # default, so no captured column is silently empty.
+    client = _client()
+    SchwabVendor(client).get_quotes(["SPY", "QQQ"])
+    assert client.quote_fields == ["all"]
+    assert client.quote_fields == [QUOTE_FIELD_GROUPS]
 
 
 def test_get_quotes_passes_a_plain_list_to_the_client():

@@ -40,6 +40,12 @@ from lake.vendor import VendorError, VendorResponse
 # relative default the live recorder falls back to, never a committed machine path.
 DEFAULT_TOKEN_PATH = Path.home() / ".config" / "marketlake" / "token.json"
 
+# The field groups pinned on every batched quote request. ``all`` returns every block
+# Schwab offers: quote, fundamental, regular, extended, and reference. Pinning it means
+# those blocks are present regardless of the per-account default, so the fundamental,
+# regular, extended, and CUSIP columns are never silently empty.
+QUOTE_FIELD_GROUPS = "all"
+
 
 @runtime_checkable
 class HttpResponse(Protocol):
@@ -84,8 +90,13 @@ class SchwabClient(Protocol):
         """The full option chain for one underlying, in one request."""
         ...
 
-    def get_quotes(self, symbols: Sequence[str]) -> HttpResponse:
-        """Batched equity quotes for a list of symbols, in one request."""
+    def get_quotes(self, symbols: Sequence[str], *, fields: str | None = None) -> HttpResponse:
+        """Batched equity quotes for a list of symbols, in one request.
+
+        ``fields`` is the comma-separated field groups to include, like
+        ``quote,fundamental,reference``. The real client accepts it; a test fake records
+        it.
+        """
         ...
 
     @property
@@ -131,8 +142,13 @@ class SchwabVendor:
         return _response_from(self._client.get_option_chain(symbol, include_underlying_quote=True))
 
     def get_quotes(self, symbols: Sequence[str]) -> VendorResponse:
-        """Batched equity quotes for every symbol, verbatim."""
-        return _response_from(self._client.get_quotes(list(symbols)))
+        """Batched equity quotes for every symbol, verbatim.
+
+        The request pins the ``all`` field group, so every block Schwab offers, the
+        quote, fundamental, regular, extended, and reference blocks, is present
+        regardless of the account's default field set.
+        """
+        return _response_from(self._client.get_quotes(list(symbols), fields=QUOTE_FIELD_GROUPS))
 
     def token_mint_time(self) -> datetime:
         """When the refresh token in use was minted, timezone-aware in UTC.
