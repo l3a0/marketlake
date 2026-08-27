@@ -94,6 +94,8 @@ Every test sits in one of four tiers. The tier is set by the widest boundary the
 | Integration | Two or more subsystems wired through real boundaries. | 14 named tests, two to four minutes | every push |
 | Live | Needs the real vendor, the real OS scheduler, or real elapsed time. Deliberately not in CI. | 7 checks | by hand |
 
+Two of these tiers get a named roster below. The 14 integration tests and the 7 live checks are each small and hand-picked, so every scenario is pinned by name. Unit and component are not rostered. Their counts are targets, filled per module and per subsystem as the build proceeds.
+
 ## The placement rule
 
 One rule places every test. Apply it in order and stop at the first match.
