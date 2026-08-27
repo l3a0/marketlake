@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from typing import Protocol, runtime_checkable
+from zoneinfo import ZoneInfo
 
 import exchange_calendars as xcals
 import pandas as pd
@@ -40,6 +41,12 @@ DEFAULT_CALENDAR = "XNYS"
 
 # Times are reported in this zone, matching the doc's Eastern-time framing.
 _MARKET_TZ = "America/New_York"
+
+# The same zone as a tzinfo, for pure-Python conversions. The session clock floors
+# ``now`` to the Eastern-time minute and asks the calendar about the Eastern date,
+# so it needs the zone as an object. ``_MARKET_TZ`` stays the string the pandas
+# conversions below pass to ``tz_convert``.
+MARKET_TZ = ZoneInfo(_MARKET_TZ)
 
 
 class NotASession(Exception):
