@@ -16,8 +16,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from lake import journal
 from lake.cassette import Cassette, Interaction
-from lake.manifest import scrub
+from lake.manifest import latest_entries, scrub
 from lake.onboard import onboard
 from lake.security_master import ID_TYPE_TICKER, SecurityMaster, master_path
 from lake.tickers import load_tickers
@@ -102,6 +103,21 @@ def test_onboard_mid_session(lake_root, tmp_path):
     roster = load_tickers(tickers_path)
     assert set(roster.symbols) == {"SPY", "QQQ"}
 
-    # The two-way integrity scrub is clean: the master's manifest entry exists and
-    # matches, and no lake file is left unrecorded.
+    # Each ticker's verification snapshot was journaled as its first captured cycle. Both
+    # segments exist, round-trip through the reader, and carry a segment-keyed manifest
+    # entry, exactly as a capture cycle would leave them.
+    manifest = latest_entries(lake_root)
+    for report in (spy, qqq):
+        assert report.snapshot_surface == journal.CHAINS_SURFACE
+        segment_path = lake_root / report.snapshot_segment
+        assert segment_path.exists()
+        rows = journal.read_segment(segment_path).to_pylist()
+        assert len(rows) == 1
+        assert rows[0]["ticker"] == report.ticker
+        assert rows[0]["row_kind"] == journal.ROW_KIND_DATA
+        assert report.snapshot_segment in manifest
+
+    # The two-way integrity scrub is clean: the master's manifest entry and each snapshot
+    # segment entry exist and match, and no lake file is left unrecorded. Journal
+    # segments are manifest-tracked here yet excluded from the reverse pass by rule.
     assert scrub(lake_root).ok

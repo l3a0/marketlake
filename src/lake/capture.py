@@ -61,7 +61,7 @@ from lake.lock import lake_lock
 from lake.manifest import record_partition
 from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor
 from lake.tickers import Roster, load_tickers
-from lake.vendor import Vendor
+from lake.vendor import Vendor, VendorError
 
 # The manifest ``source`` for a capture-written segment entry.
 CAPTURE_SOURCE = "capture"
@@ -121,6 +121,66 @@ def _chain_vendor_quote_ts(body: Mapping[str, object]) -> datetime | None:
     if isinstance(underlying, Mapping):
         return _epoch_ms_to_datetime(underlying.get("quoteTime"))
     return None
+
+
+def _flatten_quote(body: Mapping[str, object], ticker: str) -> dict | None:
+    """The per-ticker flattened quote mapping from a batched quotes body, or ``None``.
+
+    The batched response maps each ticker to an envelope. The bid, ask, and last live in
+    the envelope's ``quote`` block, and the real-time entitlement flag lives on the
+    envelope. This merges the flag into the quote fields, so the row builder takes one
+    flat mapping. A ticker absent from a 200 batch yields ``None``, the caller's gap
+    signal. This is the one place that split logic lives, shared by the loop and by the
+    onboarding snapshot, so both flatten a batched quote identically.
+    """
+    envelope = body.get(ticker)
+    quote_fields = envelope.get("quote") if isinstance(envelope, Mapping) else None
+    if not isinstance(quote_fields, Mapping):
+        return None
+    flat = dict(quote_fields)
+    if isinstance(envelope, Mapping) and "realtime" in envelope:
+        flat["realtime"] = envelope["realtime"]
+    return flat
+
+
+def _build_snapshot_batch(
+    surface: str,
+    ticker: str,
+    body: Mapping[str, object],
+    *,
+    snap_ts: datetime,
+    fetch_ts: datetime,
+    fetch_end_ts: datetime,
+) -> object:
+    """Build one surface's data batch from a vendor response, the loop's own way.
+
+    This is the row-building step of a capture cycle, factored so another caller can
+    build a batch from a response it already fetched. A chains body maps straight
+    through the D4 chains builder. A batched quotes body is split to the one ticker
+    first. The result is byte-for-byte what the loop would build for the same response.
+    """
+    if surface == CHAINS:
+        return journal.chains_data_batch(
+            body,
+            ticker=ticker,
+            snap_ts=snap_ts,
+            fetch_ts=fetch_ts,
+            fetch_end_ts=fetch_end_ts,
+            vendor_quote_ts=_chain_vendor_quote_ts(body),
+        )
+    if surface == QUOTES:
+        flat = _flatten_quote(body, ticker)
+        if flat is None:
+            raise VendorError(f"quotes response has no quote for {ticker!r}")
+        return journal.quotes_data_batch(
+            flat,
+            ticker=ticker,
+            snap_ts=snap_ts,
+            fetch_ts=fetch_ts,
+            fetch_end_ts=fetch_end_ts,
+            vendor_quote_ts=_epoch_ms_to_datetime(flat.get("quoteTime")),
+        )
+    raise ValueError(f"unknown surface {surface!r}")
 
 
 @dataclass(frozen=True)
@@ -262,14 +322,13 @@ class _CaptureCycle:
                 return self._gap_plan(
                     CHAINS, ticker, f"http_{response.status}", fetch_ts, fetch_end_ts
                 )
-            vendor_quote_ts = _chain_vendor_quote_ts(response.body)
-            batch = journal.chains_data_batch(
+            batch = _build_snapshot_batch(
+                CHAINS,
+                ticker,
                 response.body,
-                ticker=ticker,
                 snap_ts=self.snap_ts,
                 fetch_ts=fetch_ts,
                 fetch_end_ts=fetch_end_ts,
-                vendor_quote_ts=vendor_quote_ts,
             )
             return _Plan(batch, journal.ROW_KIND_DATA, None, fetch_ts, fetch_end_ts)
         except Exception as exc:
@@ -324,21 +383,15 @@ class _CaptureCycle:
         round-trip stamps are the shared batch's, since one request served every ticker.
         """
         try:
-            envelope = body.get(ticker)
-            quote_fields = envelope.get("quote") if isinstance(envelope, Mapping) else None
-            if not isinstance(quote_fields, Mapping):
+            if _flatten_quote(body, ticker) is None:
                 return self._gap_plan(QUOTES, ticker, "quote_absent", fetch_ts, fetch_end_ts)
-            flat = dict(quote_fields)
-            if isinstance(envelope, Mapping) and "realtime" in envelope:
-                flat["realtime"] = envelope["realtime"]
-            vendor_quote_ts = _epoch_ms_to_datetime(quote_fields.get("quoteTime"))
-            batch = journal.quotes_data_batch(
-                flat,
-                ticker=ticker,
+            batch = _build_snapshot_batch(
+                QUOTES,
+                ticker,
+                body,
                 snap_ts=self.snap_ts,
                 fetch_ts=fetch_ts,
                 fetch_end_ts=fetch_end_ts,
-                vendor_quote_ts=vendor_quote_ts,
             )
             return _Plan(batch, journal.ROW_KIND_DATA, None, fetch_ts, fetch_end_ts)
         except Exception as exc:
@@ -476,10 +529,86 @@ def run_cycle_from_config(
     )
 
 
+def journal_snapshot(
+    lake_root: Path | str,
+    surface: str,
+    ticker: str,
+    *,
+    body: Mapping[str, object],
+    cycle_start: datetime,
+    fetch_ts: datetime,
+    fetch_end_ts: datetime,
+    pid: int | None = None,
+    source: str = CAPTURE_SOURCE,
+) -> SegmentOutcome:
+    """Journal one already-fetched response as a single durable capture cycle.
+
+    This is the durable half of the capture primitive, factored so a caller that already
+    holds a response can land it exactly the way the loop lands a cycle. Onboarding uses
+    it to journal its first snapshot rather than discard a perishable sample. It reuses
+    the same primitives end to end, so the result is indistinguishable in shape from a
+    segment ``run_cycle`` writes:
+
+    1. Derive the coordinates from ``cycle_start`` the way a cycle does: ``snap_ts`` is
+       that instant floored to the minute, ``day`` is that slot's date, and ``start_ts``
+       is the writer-session stamp. The caller stamps ``cycle_start``, ``fetch_ts``, and
+       ``fetch_end_ts`` from the injected clock around its own fetch.
+    2. Build the surface's data batch with the D4 journal row builders.
+    3. Open a fresh ``SegmentWriter``, write the one cycle, and close it, which lays down
+       the end-of-stream marker.
+    4. Append one segment-keyed manifest entry under the lake-root lock, keyed by the
+       segment path, ``source`` defaulting to ``capture``, and ``fetched_at`` the
+       dispatch time, exactly as the loop records a segment.
+
+    Each call is its own writer session. A re-run stamps a different ``start_ts`` and
+    ``pid``, so the segment name differs and the ``O_CREAT | O_EXCL`` create never
+    collides. Journaling another snapshot on a re-onboard is therefore fine: each is a
+    real cycle taken at its own moment, never a discarded sample.
+    """
+    lake_root = Path(lake_root)
+    snap_ts = cycle_start.replace(second=0, microsecond=0)
+    day = snap_ts.date()
+    start_ts = cycle_start.strftime(_SEGMENT_STAMP_FORMAT)
+    writer_pid = os.getpid() if pid is None else pid
+
+    batch = _build_snapshot_batch(
+        surface,
+        ticker,
+        body,
+        snap_ts=snap_ts,
+        fetch_ts=fetch_ts,
+        fetch_end_ts=fetch_end_ts,
+    )
+    writer = journal.SegmentWriter.open(lake_root, surface, ticker, day, start_ts, writer_pid)
+    with writer:
+        writer.write_cycle(batch)
+    partition = writer.path.relative_to(lake_root).as_posix()
+    fetched_at = fetch_ts.isoformat()
+    with lake_lock(lake_root):
+        record_partition(
+            lake_root,
+            partition,
+            source=source,
+            rows=batch.num_rows,
+            fetched_at=fetched_at,
+        )
+    return SegmentOutcome(
+        surface=surface,
+        ticker=ticker,
+        path=writer.path,
+        partition=partition,
+        row_kind=journal.ROW_KIND_DATA,
+        rows=batch.num_rows,
+        error_class=None,
+        fetched_at=fetched_at,
+    )
+
+
 __all__ = [
     "CycleResult",
     "SegmentError",
     "SegmentOutcome",
+    "journal_snapshot",
     "run_cycle",
     "run_cycle_from_config",
 ]

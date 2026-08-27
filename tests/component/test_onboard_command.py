@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from lake import journal
+from lake.capture import CAPTURE_SOURCE
 from lake.cassette import Cassette, Interaction
 from lake.manifest import latest_entries
 from lake.onboard import MASTER_PARTITION, EntitlementError, onboard
@@ -132,6 +134,27 @@ def test_onboard_registers_verifies_and_writes(lake_root, tmp_path):
     assert spy.chain_cadence == "1m"
     assert spy.bars == ("1m", "1d")
 
+    # The verification snapshot was journaled as the first captured cycle, not discarded.
+    assert report.snapshot_surface == journal.CHAINS_SURFACE
+    segment_path = lake_root / report.snapshot_segment
+    assert report.snapshot_segment.startswith("journal/")
+    assert segment_path.exists()
+
+    # It round-trips through the reader with one data row per contract, the same shape a
+    # capture cycle writes.
+    table = journal.read_segment(segment_path).to_pylist()
+    assert [row["occ_symbol"] for row in table] == [
+        "SPY   260918C00650000",
+        "SPY   260918P00650000",
+    ]
+    assert all(row["row_kind"] == journal.ROW_KIND_DATA for row in table)
+    assert all(row["fetch_ts"] is not None and row["fetch_end_ts"] is not None for row in table)
+
+    # A matching segment-keyed manifest entry was appended, sourced like a capture write.
+    entry = latest_entries(lake_root)[report.snapshot_segment]
+    assert entry["source"] == CAPTURE_SOURCE
+    assert entry["rows"] == len(table)
+
 
 def test_onboard_is_idempotent(lake_root, tmp_path):
     resolver = FakeFigiResolver(_SPY_FIGI)
@@ -167,6 +190,12 @@ def test_onboard_is_idempotent(lake_root, tmp_path):
     roster = load_tickers(tickers_path)
     assert roster.symbols == ("SPY",)
 
+    # Each run journaled its own snapshot at its own moment. The two segments differ and
+    # both survive on disk, so a re-onboard never discards or clobbers a sample.
+    assert second.snapshot_segment != first.snapshot_segment
+    assert (lake_root / first.snapshot_segment).exists()
+    assert (lake_root / second.snapshot_segment).exists()
+
 
 def test_delayed_feed_is_refused_and_writes_nothing(lake_root, tmp_path):
     tickers_path = tmp_path / "tickers.yaml"
@@ -182,9 +211,10 @@ def test_delayed_feed_is_refused_and_writes_nothing(lake_root, tmp_path):
             options=True,
         )
 
-    # Nothing was trusted: no roster entry and no persisted master.
+    # Nothing was trusted: no roster entry, no persisted master, and no journal segment.
     assert not tickers_path.exists()
     assert not master_path(lake_root).exists()
+    assert not (lake_root / "journal").exists()
 
 
 def test_equity_only_onboard_uses_a_quote(lake_root, tmp_path):
@@ -210,6 +240,16 @@ def test_equity_only_onboard_uses_a_quote(lake_root, tmp_path):
     qqq = roster.get("QQQ")
     assert qqq.options is False
     assert qqq.chain_cadence is None
+
+    # The quotes snapshot it fetched for entitlement was journaled as the first cycle.
+    assert report.snapshot_surface == journal.QUOTES_SURFACE
+    segment_path = lake_root / report.snapshot_segment
+    assert segment_path.exists()
+    row = journal.read_segment(segment_path).to_pylist()[0]
+    assert row["ticker"] == "QQQ"
+    assert row["realtime"] is True
+    assert row["row_kind"] == journal.ROW_KIND_DATA
+    assert report.snapshot_segment in latest_entries(lake_root)
 
 
 def test_equity_only_delayed_quote_is_refused(lake_root, tmp_path):

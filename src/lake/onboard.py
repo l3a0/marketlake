@@ -21,12 +21,21 @@ The slice-1 steps, in order.
    ticker this fetches the full chain and asserts the vendor's ``isDelayed`` flag is
    false. For an equity-only ticker it fetches one quote and asserts the ``realtime``
    flag is true. Real-time entitlement is a verified precondition, not an assumption. A
-   delayed feed fails onboarding before the ticker is trusted or written.
+   delayed feed fails onboarding before the ticker is trusted, written, or journaled.
+   The fetch is stamped like a capture cycle: ``snap_ts`` the onboarding minute slot,
+   ``fetch_ts`` before the request, ``fetch_end_ts`` after, all from the injected clock.
 4. *Write the roster entry.* The command writes the ``tickers.yaml`` entry itself. The
    roster lives in ``~/.config/marketlake/``, outside the repo, so no machine path or
    secret ever lands in a tracked file.
-5. *Persist the master and record it.* The master is written under the lake-root lock
-   and given a manifest entry, so the integrity scrub stays clean in both directions.
+5. *Persist the master and journal the snapshot.* The master is written under the
+   lake-root lock and given a manifest entry, so the integrity scrub stays clean in both
+   directions. Then, once the ticker is trusted, the same snapshot fetched for
+   verification is journaled as the ticker's first captured cycle rather than discarded.
+   No second fetch is made. It is written through the capture primitive's own durable
+   path, so the segment is indistinguishable in shape from one the loop writes. A
+   perishable sample is never thrown away. A re-onboard is a new writer session, so its
+   segment name differs and journaling another snapshot is fine: each is a real cycle at
+   its own moment.
 6. *Print a sign-off report.* The report pins the first snapshot's contract count as
    the day-one plausibility anchor. The median-relative battery checks have no anchor
    until history accrues, so this count is the one early sanity number.
@@ -54,7 +63,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from lake import security_master
+from lake import capture, journal, security_master
 from lake.calendar import MARKET_TZ
 from lake.clock import Clock, SystemClock
 from lake.config import load_config
@@ -139,6 +148,8 @@ class OnboardReport:
     the first chain snapshot. It is ``None`` for an equity-only ticker, which takes no
     chain snapshot. ``already_registered`` is true when the ticker was already in the
     master, so a re-run reuses its id and capture_start rather than minting new ones.
+    ``snapshot_surface`` is the surface journaled as the first cycle (``chains`` or
+    ``quotes``), and ``snapshot_segment`` is that segment's lake-relative path.
     ``deferred`` names the later-slice steps this command does not yet do.
     """
 
@@ -152,6 +163,8 @@ class OnboardReport:
     tickers_path: Path
     master_path: Path
     already_registered: bool
+    snapshot_surface: str
+    snapshot_segment: str
     deferred: tuple[str, ...] = (
         "corporate-actions history fetch (slice 3, D16)",
         "full validation battery (slice 5, D20)",
@@ -170,6 +183,7 @@ class OnboardReport:
         ]
         if self.contract_count is not None:
             lines.append(f"  day-one anchor:  {self.contract_count} contracts in first snapshot")
+        lines.append(f"  first cycle:     {self.snapshot_surface} segment {self.snapshot_segment}")
         lines.append(f"  tickers.yaml:    {self.tickers_path}")
         lines.append(f"  security master: {self.master_path}")
         lines.append("  deferred to later slices:")
@@ -248,15 +262,19 @@ def onboard(
     options: bool = True,
     chain_cadence: str | None = DEFAULT_CHAIN_CADENCE,
     bars: Sequence[str] = DEFAULT_BARS,
+    pid: int | None = None,
 ) -> OnboardReport:
     """Onboard one ticker into the lake and return its sign-off report.
 
     Every dependency is injected, so this runs offline. The steps follow the module
     docstring. The security master is read from disk if it exists, updated, and written
     back under the lake-root lock with a fresh manifest entry. The roster entry and the
-    master persist to disk; the first snapshot is fetched to verify entitlement and
-    count contracts, and is not itself journaled, since the capture loop journals going
-    forward.
+    master persist to disk. The first snapshot is fetched to verify the real-time
+    entitlement and count contracts, and then, once the ticker is trusted, that same
+    response is journaled as the ticker's first captured cycle through the capture
+    primitive's durable path. No second fetch is made. ``pid`` sets the journal segment's
+    writer-session id, defaulting to this process, and a test pins it for a deterministic
+    segment name.
     """
     lake_root = Path(lake_root)
     now = clock.now()
@@ -286,18 +304,27 @@ def onboard(
         capture_start = master.capture_start_of(instrument_id)
 
     # The first snapshot proves the real-time entitlement before the ticker is trusted.
+    # It is stamped like a capture cycle so it can be journaled as the first cycle:
+    # cycle_start floors to snap_ts, fetch_ts is stamped before the request and
+    # fetch_end_ts after, all from the injected clock.
+    cycle_start = clock.now()
+    fetch_ts = clock.now()
     contract_count: int | None = None
     if options:
         response = vendor.get_chain(ticker)
+        fetch_end_ts = clock.now()
         if not _ok(response.status):
             raise OnboardError(f"first chain snapshot for {ticker} failed: HTTP {response.status}")
         _assert_chain_realtime(response.body)
         contract_count = _count_contracts(response.body)
+        snapshot_surface = journal.CHAINS_SURFACE
     else:
         response = vendor.get_quotes([ticker])
+        fetch_end_ts = clock.now()
         if not _ok(response.status):
             raise OnboardError(f"first quote for {ticker} failed: HTTP {response.status}")
         _assert_quote_realtime(ticker, response.body)
+        snapshot_surface = journal.QUOTES_SURFACE
 
     # Only now, past the entitlement gate, write the roster entry.
     written_tickers_path = upsert_ticker(
@@ -324,6 +351,20 @@ def onboard(
             fetched_at=now.isoformat(),
         )
 
+    # Journal the same verification snapshot as the ticker's first captured cycle,
+    # through the capture primitive's own durable path. This runs after the master lock
+    # is released, since journal_snapshot takes the lock itself for its manifest append.
+    snapshot = capture.journal_snapshot(
+        lake_root,
+        snapshot_surface,
+        ticker,
+        body=response.body,
+        cycle_start=cycle_start,
+        fetch_ts=fetch_ts,
+        fetch_end_ts=fetch_end_ts,
+        pid=pid,
+    )
+
     return OnboardReport(
         ticker=ticker,
         instrument_id=instrument_id,
@@ -335,6 +376,8 @@ def onboard(
         tickers_path=written_tickers_path,
         master_path=master_path,
         already_registered=already_registered,
+        snapshot_surface=snapshot_surface,
+        snapshot_segment=snapshot.partition,
     )
 
 
