@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 from lake import capture, journal
-from lake.cassette import load_cassette
+from lake.cassette import Cassette, Interaction, load_cassette
 from lake.manifest import latest_entries, sha256_file
 from lake.tickers import Roster
 from lake.vendor import VendorError
@@ -120,11 +120,14 @@ def test_happy_cycle_writes_chains_and_quotes_with_correct_stamps(cassette_vendo
     assert spy_quote["fetch_ts"] == _CLOCK_START.isoformat()
     assert spy_quote["fetch_end_ts"] == _CLOCK_START.isoformat()
     assert spy_quote["vendor_quote_ts"] == _QUOTE_VQT
-    # The envelope's classification fields do not pollute the normally-empty overflow.
+    # Schwab's CUSIP, a sibling of the quote block in a reference envelope field, is
+    # captured raw in its own column and does not pollute the normally-empty overflow.
+    assert spy_quote["cusip"] == "111111111"
     assert spy_quote["extra"] is None
 
     qqq_quote = _rows(result.segment(QUOTES, "QQQ"))[0]
     assert qqq_quote["bid"] == 601.48
+    assert qqq_quote["cusip"] == "222222222"
 
 
 # -- 4. the manifest entry per segment ---------------------------------------
@@ -274,3 +277,35 @@ def test_round_trip_is_captured_on_success_and_on_a_slow_failure(cassette_vendor
     assert spy_gap["row_kind"] == journal.ROW_KIND_GAP
     assert spy_gap["error_class"] == "vendor_error"
     assert _round_trip(spy_gap) == pytest.approx(0.6)
+
+
+# -- 6. the CUSIP is captured wherever Schwab puts it ------------------------
+
+
+def test_top_level_envelope_cusip_lands_in_the_column(lake_root):
+    # Schwab may put the CUSIP as a top-level envelope field rather than in a reference
+    # block. Both sites are captured. Here the equity-only QQQ carries a top-level cusip.
+    cassette = Cassette(
+        interactions=(
+            Interaction(
+                endpoint="quotes",
+                params={"symbols": ["QQQ"]},
+                status=200,
+                body={
+                    "QQQ": {
+                        "assetMainType": "EQUITY",
+                        "realtime": True,
+                        "cusip": "333333333",
+                        "quote": {"bidPrice": 1.0, "askPrice": 1.1, "lastPrice": 1.05},
+                    }
+                },
+            ),
+        )
+    )
+    roster = Roster.from_mapping({"QQQ": {"options": False}})
+    result = capture.run_cycle(
+        ManualClock(start=_CLOCK_START), CassetteVendor(cassette), roster, lake_root, pid=4242
+    )
+    row = _rows(result.segment(QUOTES, "QQQ"))[0]
+    assert row["cusip"] == "333333333"
+    assert row["extra"] is None

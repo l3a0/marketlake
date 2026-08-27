@@ -1,13 +1,14 @@
 """The onboarding command across real files.
 
 These run the onboarding core against a throwaway lake and a throwaway tickers.yaml,
-with a cassette-backed vendor, a fake FIGI resolver, and a manual clock. No network, no
-token, and no wall clock are crossed. The tier is component: onboarding writes and reads
-real files, with the clock and vendor still fake.
+with a cassette-backed vendor and a manual clock. No network, no token, and no wall
+clock are crossed. The tier is component: onboarding writes and reads real files, with
+the clock and vendor still fake.
 
-They pin the slice-1 contract: register with a stamped capture_start, resolve the FIGI,
-verify the real-time entitlement before trusting the ticker, write the roster entry, and
-persist the master with a manifest entry so the scrub stays clean. A delayed feed is
+They pin the slice-1 contract: register with a stamped capture_start and a ticker
+mapping only (the FIGI is deferred to a CUSIP-keyed backfill), verify the real-time
+entitlement before trusting the ticker, write the roster entry, journal the snapshot,
+and persist the master with a manifest entry so the scrub stays clean. A delayed feed is
 refused before anything is written.
 """
 
@@ -23,7 +24,7 @@ from lake.capture import CAPTURE_SOURCE
 from lake.cassette import Cassette, Interaction
 from lake.manifest import latest_entries
 from lake.onboard import MASTER_PARTITION, EntitlementError, onboard
-from lake.security_master import ID_TYPE_TICKER, SecurityMaster, master_path
+from lake.security_master import ID_TYPE_FIGI, ID_TYPE_TICKER, SecurityMaster, master_path
 from lake.tickers import load_tickers
 from tests.support.clock import ManualClock
 from tests.support.vendor import CassetteVendor
@@ -31,19 +32,6 @@ from tests.support.vendor import CassetteVendor
 # A mid-session instant: 2026-08-27 15:00 UTC is 11:00 ET, the design's "onboarded
 # 11:00" case.
 _MID_SESSION = datetime(2026, 8, 27, 15, 0, tzinfo=UTC)
-_SPY_FIGI = "BBG000BDTBL9"
-
-
-class FakeFigiResolver:
-    """A ``FigiResolver`` that returns a canned FIGI, or ``None`` to model no match."""
-
-    def __init__(self, figi: str | None) -> None:
-        self._figi = figi
-        self.asked: list[str] = []
-
-    def resolve(self, ticker: str) -> str | None:
-        self.asked.append(ticker)
-        return self._figi
 
 
 def _chain_body(*, is_delayed: bool) -> dict:
@@ -87,7 +75,13 @@ def _quote_vendor(ticker: str, *, realtime: bool) -> CassetteVendor:
                     endpoint="quotes",
                     params={"symbols": [ticker]},
                     status=200,
-                    body={ticker: {"realtime": realtime, "quote": {"bidPrice": 1.0}}},
+                    body={
+                        ticker: {
+                            "realtime": realtime,
+                            "reference": {"cusip": "444444444"},
+                            "quote": {"bidPrice": 1.0},
+                        }
+                    },
                 ),
             )
         )
@@ -96,14 +90,12 @@ def _quote_vendor(ticker: str, *, realtime: bool) -> CassetteVendor:
 
 def test_onboard_registers_verifies_and_writes(lake_root, tmp_path):
     clock = ManualClock(start=_MID_SESSION)
-    resolver = FakeFigiResolver(_SPY_FIGI)
     tickers_path = tmp_path / "tickers.yaml"
 
     report = onboard(
         "SPY",
         clock=clock,
         vendor=_chain_vendor(is_delayed=False),
-        figi_resolver=resolver,
         lake_root=lake_root,
         tickers_path=tickers_path,
         options=True,
@@ -111,18 +103,23 @@ def test_onboard_registers_verifies_and_writes(lake_root, tmp_path):
 
     # The report pins the day-one anchor and the stamped epoch.
     assert report.instrument_id == 1
-    assert report.figi == _SPY_FIGI
     assert report.capture_start == _MID_SESSION
     assert report.contract_count == 2
     assert report.realtime_verified is True
     assert report.already_registered is False
-    assert resolver.asked == ["SPY"]
 
     # The master persisted and resolves SPY as of the onboarding day to the same id.
     master = SecurityMaster.read(master_path(lake_root))
-    instrument_id = master.resolve("SPY", report.capture_start.date(), id_type=ID_TYPE_TICKER)
+    onboard_day = report.capture_start.date()
+    instrument_id = master.resolve("SPY", onboard_day, id_type=ID_TYPE_TICKER)
     assert instrument_id == 1
     assert master.capture_start_of(1) == _MID_SESSION
+
+    # Registration created the ticker mapping only. The FIGI is deferred, so the master
+    # has no FIGI mapping for the instrument; it backfills later from the captured CUSIP.
+    assert master.symbol_at(1, onboard_day, id_type=ID_TYPE_TICKER) == "SPY"
+    assert master.symbol_at(1, onboard_day, id_type=ID_TYPE_FIGI) is None
+    assert all(m.id_type == ID_TYPE_TICKER for m in master)
 
     # The master has a manifest entry, so the reverse scrub will not flag it as orphan.
     assert MASTER_PARTITION in latest_entries(lake_root)
@@ -157,14 +154,12 @@ def test_onboard_registers_verifies_and_writes(lake_root, tmp_path):
 
 
 def test_onboard_is_idempotent(lake_root, tmp_path):
-    resolver = FakeFigiResolver(_SPY_FIGI)
     tickers_path = tmp_path / "tickers.yaml"
 
     first = onboard(
         "SPY",
         clock=ManualClock(start=_MID_SESSION),
         vendor=_chain_vendor(is_delayed=False),
-        figi_resolver=resolver,
         lake_root=lake_root,
         tickers_path=tickers_path,
         options=True,
@@ -176,7 +171,6 @@ def test_onboard_is_idempotent(lake_root, tmp_path):
         "SPY",
         clock=ManualClock(start=later),
         vendor=_chain_vendor(is_delayed=False),
-        figi_resolver=resolver,
         lake_root=lake_root,
         tickers_path=tickers_path,
         options=True,
@@ -205,7 +199,6 @@ def test_delayed_feed_is_refused_and_writes_nothing(lake_root, tmp_path):
             "SPY",
             clock=ManualClock(start=_MID_SESSION),
             vendor=_chain_vendor(is_delayed=True),
-            figi_resolver=FakeFigiResolver(_SPY_FIGI),
             lake_root=lake_root,
             tickers_path=tickers_path,
             options=True,
@@ -224,16 +217,13 @@ def test_equity_only_onboard_uses_a_quote(lake_root, tmp_path):
         "QQQ",
         clock=ManualClock(start=_MID_SESSION),
         vendor=_quote_vendor("QQQ", realtime=True),
-        figi_resolver=FakeFigiResolver(None),
         lake_root=lake_root,
         tickers_path=tickers_path,
         options=False,
     )
 
-    # No chain snapshot, so no contract anchor. The FIGI was unresolved, which does not
-    # block onboarding.
+    # No chain snapshot, so no contract anchor.
     assert report.contract_count is None
-    assert report.figi is None
     assert report.realtime_verified is True
 
     roster = load_tickers(tickers_path)
@@ -241,13 +231,15 @@ def test_equity_only_onboard_uses_a_quote(lake_root, tmp_path):
     assert qqq.options is False
     assert qqq.chain_cadence is None
 
-    # The quotes snapshot it fetched for entitlement was journaled as the first cycle.
+    # The quotes snapshot it fetched for entitlement was journaled as the first cycle,
+    # carrying the raw CUSIP for the deferred FIGI backfill.
     assert report.snapshot_surface == journal.QUOTES_SURFACE
     segment_path = lake_root / report.snapshot_segment
     assert segment_path.exists()
     row = journal.read_segment(segment_path).to_pylist()[0]
     assert row["ticker"] == "QQQ"
     assert row["realtime"] is True
+    assert row["cusip"] == "444444444"
     assert row["row_kind"] == journal.ROW_KIND_DATA
     assert report.snapshot_segment in latest_entries(lake_root)
 
@@ -258,7 +250,6 @@ def test_equity_only_delayed_quote_is_refused(lake_root, tmp_path):
             "QQQ",
             clock=ManualClock(start=_MID_SESSION),
             vendor=_quote_vendor("QQQ", realtime=False),
-            figi_resolver=FakeFigiResolver(None),
             lake_root=lake_root,
             tickers_path=Path(tmp_path / "tickers.yaml"),
             options=False,

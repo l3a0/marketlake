@@ -29,13 +29,6 @@ from tests.support.vendor import CassetteVendor
 _MID_SESSION = datetime(2026, 8, 27, 15, 0, tzinfo=UTC)
 
 
-class _NoFigi:
-    """A resolver that returns no FIGI, the offline default for this scenario."""
-
-    def resolve(self, ticker: str) -> str | None:
-        return None
-
-
 def _chain_vendor(ticker: str) -> CassetteVendor:
     """A real-time chain vendor for one ticker with a single contract."""
     return CassetteVendor(
@@ -71,7 +64,6 @@ def test_onboard_mid_session(lake_root, tmp_path):
         "SPY",
         clock=clock,
         vendor=_chain_vendor("SPY"),
-        figi_resolver=_NoFigi(),
         lake_root=lake_root,
         tickers_path=tickers_path,
         options=True,
@@ -86,7 +78,6 @@ def test_onboard_mid_session(lake_root, tmp_path):
         "QQQ",
         clock=ManualClock(start=_MID_SESSION),
         vendor=_chain_vendor("QQQ"),
-        figi_resolver=_NoFigi(),
         lake_root=lake_root,
         tickers_path=tickers_path,
         options=True,

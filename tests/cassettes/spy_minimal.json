@@ -144,6 +144,9 @@
         "SPY": {
           "assetMainType": "EQUITY",
           "realtime": true,
+          "reference": {
+            "cusip": "111111111"
+          },
           "quote": {
             "bidPrice": 649.98,
             "askPrice": 650.02,
@@ -154,6 +157,9 @@
         "QQQ": {
           "assetMainType": "EQUITY",
           "realtime": true,
+          "reference": {
+            "cusip": "222222222"
+          },
           "quote": {
             "bidPrice": 601.48,
             "askPrice": 601.52,

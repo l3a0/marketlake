@@ -123,23 +123,44 @@ def _chain_vendor_quote_ts(body: Mapping[str, object]) -> datetime | None:
     return None
 
 
+def _envelope_cusip(envelope: Mapping[str, object]) -> object | None:
+    """Schwab's CUSIP for one quote envelope, or ``None`` if absent.
+
+    The CUSIP is a sibling of the ``quote`` block on the per-symbol envelope, not inside
+    it. Schwab places it either as a top-level ``cusip`` field or inside a ``reference``
+    block, so this checks both. It is captured raw under the vendor-verbatim rule so a
+    later enrichment can resolve the instrument's FIGI from it. It is never a join key.
+    """
+    if "cusip" in envelope:
+        return envelope["cusip"]
+    reference = envelope.get("reference")
+    if isinstance(reference, Mapping):
+        return reference.get("cusip")
+    return None
+
+
 def _flatten_quote(body: Mapping[str, object], ticker: str) -> dict | None:
     """The per-ticker flattened quote mapping from a batched quotes body, or ``None``.
 
     The batched response maps each ticker to an envelope. The bid, ask, and last live in
-    the envelope's ``quote`` block, and the real-time entitlement flag lives on the
-    envelope. This merges the flag into the quote fields, so the row builder takes one
-    flat mapping. A ticker absent from a 200 batch yields ``None``, the caller's gap
-    signal. This is the one place that split logic lives, shared by the loop and by the
-    onboarding snapshot, so both flatten a batched quote identically.
+    the envelope's ``quote`` block. The real-time entitlement flag and the CUSIP are
+    sibling fields on the envelope, outside that block. This merges both into the quote
+    fields, so the row builder takes one flat mapping and neither falls into ``extra``. A
+    ticker absent from a 200 batch yields ``None``, the caller's gap signal. This is the
+    one place that split logic lives, shared by the loop and by the onboarding snapshot,
+    so both flatten a batched quote identically.
     """
     envelope = body.get(ticker)
     quote_fields = envelope.get("quote") if isinstance(envelope, Mapping) else None
     if not isinstance(quote_fields, Mapping):
         return None
     flat = dict(quote_fields)
-    if isinstance(envelope, Mapping) and "realtime" in envelope:
-        flat["realtime"] = envelope["realtime"]
+    if isinstance(envelope, Mapping):
+        if "realtime" in envelope:
+            flat["realtime"] = envelope["realtime"]
+        cusip = _envelope_cusip(envelope)
+        if cusip is not None:
+            flat["cusip"] = cusip
     return flat
 
 

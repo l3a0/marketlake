@@ -134,10 +134,12 @@ CHAINS_SCHEMA = pa.schema(
 )
 
 # The quotes capture schema. Each row is one equity quote for one ticker: bid, ask,
-# last, and ``realtime``. ``realtime`` is the vendor's real-time entitlement flag. It
-# must be true on a real-time quote. The validation battery checks it, so it is a
-# captured vendor column, not dropped. The vendor quote time is carried in
-# ``vendor_quote_ts``, not repeated as a vendor column.
+# last, ``realtime``, and ``cusip``. ``realtime`` is the vendor's real-time entitlement
+# flag. It must be true on a real-time quote. The validation battery checks it, so it is
+# a captured vendor column, not dropped. ``cusip`` is Schwab's CUSIP for the equity, kept
+# raw under the vendor-verbatim rule. It is never a join key and never published, but it
+# is captured so a later enrichment can resolve the instrument's FIGI from it. The vendor
+# quote time is carried in ``vendor_quote_ts``, not repeated as a vendor column.
 QUOTES_SCHEMA = pa.schema(
     _STAMP_FIELDS
     + [
@@ -145,6 +147,7 @@ QUOTES_SCHEMA = pa.schema(
         ("ask", pa.float64()),
         ("last", pa.float64()),
         ("realtime", pa.bool_()),
+        ("cusip", pa.string()),
     ]
     + _PROVENANCE_FIELDS
 )
@@ -190,13 +193,15 @@ _CHAINS_HEADER_MAP = {
     "isDelayed": "is_delayed",
 }
 
-# The quote fields that land in typed quotes columns. ``realtime`` is the real-time
-# entitlement flag, mapped per row so it is captured and kept out of ``extra``.
+# The quote fields that land in typed quotes columns. ``realtime`` and ``cusip`` are
+# envelope-level fields the sampler merges into the flat quote before this map runs, so
+# both are captured in their own columns and kept out of ``extra``.
 _QUOTE_MAP = {
     "bidPrice": "bid",
     "askPrice": "ask",
     "lastPrice": "last",
     "realtime": "realtime",
+    "cusip": "cusip",
 }
 
 # Quote fields the parser recognizes but does not overflow into ``extra``. The vendor
@@ -317,10 +322,11 @@ def quotes_data_batch(
     """Build a one-row quotes batch from one ticker's quote object.
 
     The batched quote sampler splits the vendor's response per ticker and hands this
-    builder that ticker's quote fields: bid, ask, last, the vendor quote time, and the
-    ``realtime`` entitlement flag. The three prices and the flag land in typed columns.
-    The quote time is carried in ``vendor_quote_ts``. Anything else lands in ``extra``.
-    ``fetch_end_ts`` is the request-end stamp, the pair to ``fetch_ts`` for round-trip.
+    builder that ticker's quote fields: bid, ask, last, the vendor quote time, the
+    ``realtime`` entitlement flag, and the ``cusip``. The three prices, the flag, and the
+    CUSIP land in typed columns. The quote time is carried in ``vendor_quote_ts``.
+    Anything else lands in ``extra``. ``fetch_end_ts`` is the request-end stamp, the pair
+    to ``fetch_ts`` for round-trip.
     """
     row: dict[str, object] = {
         "snap_ts": _iso(snap_ts),
@@ -362,7 +368,7 @@ def gap_batch(
     never inferred. ``fetch_ts`` is optional, since a gap for a dead daemon has no
     fetch at all. ``fetch_end_ts`` is optional too, and set for a failed fetch so the
     round-trip to the failure is measurable. There is no vendor quote, so
-    ``vendor_quote_ts`` is always null.
+    ``vendor_quote_ts`` is always null, and the quotes-only ``cusip`` column is null too.
     """
     schema = schema_for(surface)
     row: dict[str, object] = {
@@ -377,6 +383,9 @@ def gap_batch(
         "close_tag": close_tag,
         "session_phase": session_phase,
         "schema_version": SCHEMA_VERSION,
+        # The quotes-only CUSIP is a vendor column, null on a gap like the rest. It is
+        # ignored on a chains gap, whose schema has no such column.
+        "cusip": None,
         "extra": None,
     }
     return _batch(schema, [row])

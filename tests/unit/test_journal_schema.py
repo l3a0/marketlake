@@ -73,6 +73,7 @@ QUOTE = {
     "lastPrice": 650.0,
     "quoteTime": 1787000100000,
     "realtime": True,
+    "cusip": "111111111",
 }
 
 SNAP = "2026-08-24T16:15:00-04:00"
@@ -142,6 +143,7 @@ def test_quotes_schema_names_and_types():
         "ask",
         "last",
         "realtime",
+        "cusip",
         "row_kind",
         "schema_version",
         "extra",
@@ -150,8 +152,12 @@ def test_quotes_schema_names_and_types():
     # The entitlement flag is a per-row vendor bool, placed with the price fields.
     assert schema.field("realtime").type == pa.bool_()
     assert schema.names.index("realtime") == schema.names.index("last") + 1
+    # The CUSIP is a nullable string vendor column on quotes only.
+    assert schema.field("cusip").type == pa.string()
     # Quotes never carry a per-contract vendor column.
     assert "open_interest" not in schema.names
+    # Chains do not carry the equity CUSIP.
+    assert "cusip" not in journal.CHAINS_SCHEMA.names
 
 
 def test_schema_for_resolves_surfaces_and_rejects_unknown():
@@ -279,8 +285,10 @@ def test_quotes_data_batch_maps_prices_and_consumes_quote_time():
     assert row["ticker"] == "SPY"
     assert row["vendor_quote_ts"] == VENDOR
     assert row["row_kind"] == journal.ROW_KIND_DATA
-    # quoteTime is recognized and carried in vendor_quote_ts, and realtime is a typed
-    # column, so neither pollutes the normally-empty overflow.
+    # The CUSIP lands in its typed column, kept raw for the deferred FIGI backfill.
+    assert row["cusip"] == "111111111"
+    # quoteTime is recognized and carried in vendor_quote_ts, and realtime and cusip are
+    # typed columns, so none pollutes the normally-empty overflow.
     assert row["extra"] is None
 
 
@@ -352,8 +360,9 @@ def test_quotes_gap_row_carries_reason_and_optional_fetch():
     assert row["error_class"] == "quote_sampler_dead"
     assert row["fetch_ts"] == FETCH
     assert row["bid"] is None and row["ask"] is None and row["last"] is None
-    # The entitlement flag is a vendor column, so it is null on a gap too.
+    # The entitlement flag and the CUSIP are vendor columns, so both are null on a gap.
     assert row["realtime"] is None
+    assert row["cusip"] is None
 
 
 def test_gap_row_can_carry_a_close_tag_for_an_absent_marker():
