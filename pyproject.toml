@@ -8,6 +8,7 @@ dependencies = [
     "exchange-calendars>=4.5",
     "pyarrow>=17",
     "pyyaml>=6",
+    "schwab-py>=1.5",
 ]
 
 [dependency-groups]
