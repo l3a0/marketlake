@@ -1,0 +1,100 @@
+{
+  "cassette_version": 1,
+  "token_mint_time": "2026-08-23T20:05:00-04:00",
+  "interactions": [
+    {
+      "endpoint": "chains",
+      "params": {
+        "symbol": "SPY"
+      },
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": {
+        "symbol": "SPY",
+        "status": "SUCCESS",
+        "isDelayed": false,
+        "interestRate": 4.25,
+        "underlyingPrice": 650.01,
+        "dividendYield": 1.28,
+        "numberOfContracts": 2,
+        "callExpDateMap": {
+          "2026-09-18:25": {
+            "650.0": [
+              {
+                "putCall": "CALL",
+                "symbol": "SPY   260918C00650000",
+                "bid": 4.2,
+                "ask": 4.25,
+                "last": 4.22,
+                "openInterest": 1234,
+                "volatility": 12.5,
+                "delta": 0.51,
+                "gamma": 0.03,
+                "theta": -0.12,
+                "vega": 0.34,
+                "rho": 0.08
+              }
+            ]
+          }
+        },
+        "putExpDateMap": {
+          "2026-09-18:25": {
+            "650.0": [
+              {
+                "putCall": "PUT",
+                "symbol": "SPY   260918P00650000",
+                "bid": 3.8,
+                "ask": 3.85,
+                "last": 3.82,
+                "openInterest": 987,
+                "volatility": 12.7,
+                "delta": -0.49,
+                "gamma": 0.03,
+                "theta": -0.11,
+                "vega": 0.34,
+                "rho": -0.07
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "endpoint": "quotes",
+      "params": {
+        "symbols": [
+          "SPY",
+          "QQQ"
+        ]
+      },
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": {
+        "SPY": {
+          "assetMainType": "EQUITY",
+          "realtime": true,
+          "quote": {
+            "bidPrice": 649.98,
+            "askPrice": 650.02,
+            "lastPrice": 650.0,
+            "quoteTime": 1787000100000
+          }
+        },
+        "QQQ": {
+          "assetMainType": "EQUITY",
+          "realtime": true,
+          "quote": {
+            "bidPrice": 601.48,
+            "askPrice": 601.52,
+            "lastPrice": 601.5,
+            "quoteTime": 1787000100000
+          }
+        }
+      }
+    }
+  ]
+}
