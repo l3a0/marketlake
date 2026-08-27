@@ -49,6 +49,15 @@ def test_get_chain_calls_the_chain_endpoint_for_the_symbol():
     assert response.headers == {"content-type": "application/json"}
 
 
+def test_get_chain_requests_the_underlying_quote():
+    # The chain must carry the underlying's price and quote time beside the contracts,
+    # at the same moment. That embedded reading is the design's IV spot, and the
+    # chain's ``vendor_quote_ts`` comes from the underlying's quote time.
+    client = _client()
+    SchwabVendor(client).get_chain("SPY")
+    assert client.chain_underlying_quote == [True]
+
+
 def test_get_chain_returns_the_body_verbatim():
     vendor = SchwabVendor(_client())
     body = vendor.get_chain("SPY").body

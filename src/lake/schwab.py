@@ -78,7 +78,9 @@ class SchwabClient(Protocol):
     the last silent refresh.
     """
 
-    def get_option_chain(self, symbol: str) -> HttpResponse:
+    def get_option_chain(
+        self, symbol: str, *, include_underlying_quote: bool = False
+    ) -> HttpResponse:
         """The full option chain for one underlying, in one request."""
         ...
 
@@ -119,8 +121,14 @@ class SchwabVendor:
         self._client = client
 
     def get_chain(self, symbol: str) -> VendorResponse:
-        """The full option chain for one underlying, verbatim."""
-        return _response_from(self._client.get_option_chain(symbol))
+        """The full option chain for one underlying, verbatim.
+
+        The request asks for the underlying quote, so the response carries the
+        underlying's price and quote time beside the contracts, at the same moment.
+        The design's spot for IV inversion is that embedded underlying reading, and
+        the chain's ``vendor_quote_ts`` comes from the underlying's quote time.
+        """
+        return _response_from(self._client.get_option_chain(symbol, include_underlying_quote=True))
 
     def get_quotes(self, symbols: Sequence[str]) -> VendorResponse:
         """Batched equity quotes for every symbol, verbatim."""
