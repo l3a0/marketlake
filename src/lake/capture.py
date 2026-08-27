@@ -197,6 +197,7 @@ class _Plan:
     row_kind: str
     error_class: str | None
     fetch_ts: datetime
+    fetch_end_ts: datetime
 
 
 @dataclass
@@ -224,37 +225,59 @@ class _CaptureCycle:
 
     # -- planning: the fallible, fail-open half ------------------------------
 
-    def _gap_plan(self, surface: str, ticker: str, error_class: str, fetch_ts: datetime) -> _Plan:
+    def _gap_plan(
+        self,
+        surface: str,
+        ticker: str,
+        error_class: str,
+        fetch_ts: datetime,
+        fetch_end_ts: datetime,
+    ) -> _Plan:
         batch = journal.gap_batch(
             surface,
             ticker=ticker,
             snap_ts=self.snap_ts,
             error_class=error_class,
             fetch_ts=fetch_ts,
+            fetch_end_ts=fetch_end_ts,
         )
-        return _Plan(batch, journal.ROW_KIND_GAP, error_class, fetch_ts)
+        return _Plan(batch, journal.ROW_KIND_GAP, error_class, fetch_ts, fetch_end_ts)
 
     def _plan_chain(self, ticker: str) -> _Plan:
-        """Fetch one chain and plan its segment. A failure plans a gap, never raises."""
+        """Fetch one chain and plan its segment. A failure plans a gap, never raises.
+
+        ``fetch_ts`` is stamped before the request and ``fetch_end_ts`` the instant the
+        response or the failure lands, so the request round-trip is captured even when
+        the fetch times out.
+        """
         fetch_ts = self.clock.now()
         try:
             response = self.vendor.get_chain(ticker)
+        except Exception as exc:
+            fetch_end_ts = self.clock.now()
+            return self._gap_plan(CHAINS, ticker, _error_class(exc), fetch_ts, fetch_end_ts)
+        fetch_end_ts = self.clock.now()
+        try:
             if not _ok(response.status):
-                return self._gap_plan(CHAINS, ticker, f"http_{response.status}", fetch_ts)
+                return self._gap_plan(
+                    CHAINS, ticker, f"http_{response.status}", fetch_ts, fetch_end_ts
+                )
             vendor_quote_ts = _chain_vendor_quote_ts(response.body)
             batch = journal.chains_data_batch(
                 response.body,
                 ticker=ticker,
                 snap_ts=self.snap_ts,
                 fetch_ts=fetch_ts,
+                fetch_end_ts=fetch_end_ts,
                 vendor_quote_ts=vendor_quote_ts,
             )
-            return _Plan(batch, journal.ROW_KIND_DATA, None, fetch_ts)
+            return _Plan(batch, journal.ROW_KIND_DATA, None, fetch_ts, fetch_end_ts)
         except Exception as exc:
-            # Any vendor error or malformed payload fails open to a gap. Raw stays
-            # vendor-verbatim, so nothing here judges a 200 it did receive. This only
-            # catches a fetch that failed or a body the row builder could not read.
-            return self._gap_plan(CHAINS, ticker, _error_class(exc), fetch_ts)
+            # A malformed payload fails open to a gap. Raw stays vendor-verbatim, so
+            # nothing here judges a 200 it did receive. This only catches a body the row
+            # builder could not read. The round-trip is the vendor call's, already
+            # stamped above.
+            return self._gap_plan(CHAINS, ticker, _error_class(exc), fetch_ts, fetch_end_ts)
 
     def _plan_quotes(self) -> list[tuple[str, _Plan]]:
         """Fetch the one batched quote request and plan a segment per roster ticker.
@@ -267,26 +290,44 @@ class _CaptureCycle:
         try:
             response = self.vendor.get_quotes(symbols)
         except Exception as exc:
+            fetch_end_ts = self.clock.now()
             error_class = _error_class(exc)
-            return [(sym, self._gap_plan(QUOTES, sym, error_class, fetch_ts)) for sym in symbols]
+            return [
+                (sym, self._gap_plan(QUOTES, sym, error_class, fetch_ts, fetch_end_ts))
+                for sym in symbols
+            ]
+        fetch_end_ts = self.clock.now()
         if not _ok(response.status):
             error_class = f"http_{response.status}"
-            return [(sym, self._gap_plan(QUOTES, sym, error_class, fetch_ts)) for sym in symbols]
-        return [(sym, self._plan_one_quote(response.body, sym, fetch_ts)) for sym in symbols]
+            return [
+                (sym, self._gap_plan(QUOTES, sym, error_class, fetch_ts, fetch_end_ts))
+                for sym in symbols
+            ]
+        return [
+            (sym, self._plan_one_quote(response.body, sym, fetch_ts, fetch_end_ts))
+            for sym in symbols
+        ]
 
-    def _plan_one_quote(self, body: Mapping[str, object], ticker: str, fetch_ts: datetime) -> _Plan:
+    def _plan_one_quote(
+        self,
+        body: Mapping[str, object],
+        ticker: str,
+        fetch_ts: datetime,
+        fetch_end_ts: datetime,
+    ) -> _Plan:
         """Split one ticker out of a batched quote body and plan its segment.
 
         The batched response maps each ticker to an envelope. The bid, ask, and last
         live in the envelope's ``quote`` block, and the real-time entitlement flag lives
         on the envelope. The row builder takes one flat quote mapping, so this merges the
-        flag into the quote fields. A ticker missing from a 200 batch is its own gap.
+        flag into the quote fields. A ticker missing from a 200 batch is its own gap. The
+        round-trip stamps are the shared batch's, since one request served every ticker.
         """
         try:
             envelope = body.get(ticker)
             quote_fields = envelope.get("quote") if isinstance(envelope, Mapping) else None
             if not isinstance(quote_fields, Mapping):
-                return self._gap_plan(QUOTES, ticker, "quote_absent", fetch_ts)
+                return self._gap_plan(QUOTES, ticker, "quote_absent", fetch_ts, fetch_end_ts)
             flat = dict(quote_fields)
             if isinstance(envelope, Mapping) and "realtime" in envelope:
                 flat["realtime"] = envelope["realtime"]
@@ -296,11 +337,12 @@ class _CaptureCycle:
                 ticker=ticker,
                 snap_ts=self.snap_ts,
                 fetch_ts=fetch_ts,
+                fetch_end_ts=fetch_end_ts,
                 vendor_quote_ts=vendor_quote_ts,
             )
-            return _Plan(batch, journal.ROW_KIND_DATA, None, fetch_ts)
+            return _Plan(batch, journal.ROW_KIND_DATA, None, fetch_ts, fetch_end_ts)
         except Exception as exc:
-            return self._gap_plan(QUOTES, ticker, _error_class(exc), fetch_ts)
+            return self._gap_plan(QUOTES, ticker, _error_class(exc), fetch_ts, fetch_end_ts)
 
     # -- writing: the durable half -------------------------------------------
 

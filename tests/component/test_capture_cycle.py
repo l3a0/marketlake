@@ -20,10 +20,13 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from lake import capture, journal
 from lake.cassette import load_cassette
 from lake.manifest import latest_entries, sha256_file
 from lake.tickers import Roster
+from lake.vendor import VendorError
 from tests.support.clock import ManualClock
 from tests.support.vendor import CassetteVendor
 
@@ -97,6 +100,9 @@ def test_happy_cycle_writes_chains_and_quotes_with_correct_stamps(cassette_vendo
     for row in spy_chain:
         assert row["snap_ts"] == _EXPECTED_SNAP.isoformat()
         assert row["fetch_ts"] == _CLOCK_START.isoformat()
+        # The manual clock does not advance across the fetch, so the request-end stamp
+        # equals the dispatch stamp here. It is still stamped, not null.
+        assert row["fetch_end_ts"] == _CLOCK_START.isoformat()
         assert row["vendor_quote_ts"] == _CHAIN_VQT
         assert row["close_tag"] is None
         assert row["suspect"] is False
@@ -112,6 +118,7 @@ def test_happy_cycle_writes_chains_and_quotes_with_correct_stamps(cassette_vendo
     assert spy_quote["realtime"] is True
     assert spy_quote["snap_ts"] == _EXPECTED_SNAP.isoformat()
     assert spy_quote["fetch_ts"] == _CLOCK_START.isoformat()
+    assert spy_quote["fetch_end_ts"] == _CLOCK_START.isoformat()
     assert spy_quote["vendor_quote_ts"] == _QUOTE_VQT
     # The envelope's classification fields do not pollute the normally-empty overflow.
     assert spy_quote["extra"] is None
@@ -202,3 +209,68 @@ def test_failing_quote_batch_gaps_every_ticker(lake_root):
         (QUOTES, "SPY"),
         (QUOTES, "QQQ"),
     }
+
+
+# -- 5. the request round-trip is captured -----------------------------------
+
+
+class _AdvancingVendor:
+    """A vendor that advances the injected clock across each call.
+
+    The manual clock only moves when told to. This wrapper advances it by a fixed span
+    on each vendor call, modelling a request that takes real time. So ``fetch_end_ts``
+    lands that span past ``fetch_ts`` and the round-trip is non-zero. A ``raise_chain``
+    flag models a slow failure: the clock still advances, then the call raises, so even
+    a timeout's duration is captured.
+    """
+
+    def __init__(self, inner, clock, *, chain_seconds, quote_seconds, raise_chain=False):
+        self._inner = inner
+        self._clock = clock
+        self._chain_seconds = chain_seconds
+        self._quote_seconds = quote_seconds
+        self._raise_chain = raise_chain
+
+    def get_chain(self, symbol):
+        self._clock.advance(self._chain_seconds)
+        if self._raise_chain:
+            raise VendorError("slow timeout")
+        return self._inner.get_chain(symbol)
+
+    def get_quotes(self, symbols):
+        self._clock.advance(self._quote_seconds)
+        return self._inner.get_quotes(symbols)
+
+    def token_mint_time(self):
+        return self._inner.token_mint_time()
+
+
+def _round_trip(row: dict) -> float:
+    start = datetime.fromisoformat(row["fetch_ts"])
+    end = datetime.fromisoformat(row["fetch_end_ts"])
+    return (end - start).total_seconds()
+
+
+def test_round_trip_is_captured_on_success_and_on_a_slow_failure(cassette_vendor, lake_root):
+    clock = ManualClock(start=_CLOCK_START)
+    vendor = _AdvancingVendor(cassette_vendor, clock, chain_seconds=0.4, quote_seconds=0.25)
+    result = capture.run_cycle(clock, vendor, _both_options(), lake_root, pid=4242)
+
+    # Each chain request took 0.4s, and the shared quote batch 0.25s. fetch_ts is
+    # re-read before each call, so the round-trip is the call's own span, not a running
+    # total.
+    assert _round_trip(_rows(result.segment(CHAINS, "SPY"))[0]) == pytest.approx(0.4)
+    assert _round_trip(_rows(result.segment(CHAINS, "QQQ"))[0]) == pytest.approx(0.4)
+    assert _round_trip(_rows(result.segment(QUOTES, "SPY"))[0]) == pytest.approx(0.25)
+
+    # A slow failure still stamps fetch_end_ts, so the gap row carries the failed
+    # request's duration.
+    clock2 = ManualClock(start=_CLOCK_START)
+    failing = _AdvancingVendor(
+        cassette_vendor, clock2, chain_seconds=0.6, quote_seconds=0.25, raise_chain=True
+    )
+    result2 = capture.run_cycle(clock2, failing, _both_options(), lake_root, pid=4243)
+    spy_gap = _rows(result2.segment(CHAINS, "SPY"))[0]
+    assert spy_gap["row_kind"] == journal.ROW_KIND_GAP
+    assert spy_gap["error_class"] == "vendor_error"
+    assert _round_trip(spy_gap) == pytest.approx(0.6)

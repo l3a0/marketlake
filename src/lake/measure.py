@@ -7,14 +7,18 @@ already carry everything here, so each measurement is a query over stored cycles
 
 The four measurements, each glossed at first use.
 
-1. *Fetch latency*, with the open and the final fifteen minutes broken out. Fetch
-   latency here is how far into its minute slot a cycle's fetch was dispatched:
-   ``fetch_ts`` minus ``snap_ts``. ``snap_ts`` is the minute slot the cycle fired for,
-   floored to the minute. ``fetch_ts`` is the loop's clock when it fetched. A large
-   latency eats the one-minute budget, which is exactly what the roster-ceiling claim
-   needs measured. It is reported as p50 and p99, the 50th and 99th percentiles, across
-   the whole session, then again for the open slot and for the final fifteen minutes.
-   The open and the close are the two load spikes the design calls out.
+1. *Fetch latency*, reported as two distinct metrics, each with the open and the final
+   fifteen minutes broken out. The *dispatch delay* is how far into its minute slot a
+   cycle's fetch was dispatched: ``fetch_ts`` minus ``snap_ts``. ``snap_ts`` is the
+   minute slot the cycle fired for, floored to the minute. ``fetch_ts`` is the loop's
+   clock just before the request. The *request round-trip* is the request's true
+   duration: ``fetch_end_ts`` minus ``fetch_ts``, where ``fetch_end_ts`` is when the
+   response or the failure landed. Both matter to the one-minute budget the
+   roster-ceiling claim needs measured. Each is reported as p50 and p99, the 50th and
+   99th percentiles, across the whole session, then again for the open slot and for the
+   final fifteen minutes. The open and the close are the two load spikes the design
+   calls out. A row missing ``fetch_end_ts`` has no defined round-trip, so it is skipped
+   and the skipped count is reported, never silently dropped.
 2. *Chain contract counts and per-cycle sizing.* The contract count is the number of
    data rows in a chains cycle. Sizing is those counts distributed across cycles, plus
    the segments' bytes on disk per cycle. This is the ~10-25k-contracts-per-snapshot
@@ -141,12 +145,27 @@ class LatencyStats:
 
 
 @dataclass(frozen=True)
-class FetchLatency:
-    """Fetch latency across the session, and broken out at the two load spikes."""
+class LatencyBreakout:
+    """One latency metric across the session, broken out at the two load spikes."""
 
     overall: LatencyStats
     at_open: LatencyStats
     final_fifteen: LatencyStats
+
+
+@dataclass(frozen=True)
+class FetchLatency:
+    """Both fetch-latency metrics: the dispatch delay and the request round-trip.
+
+    ``dispatch`` is ``fetch_ts`` minus ``snap_ts``, how far into the slot the request
+    started. ``round_trip`` is ``fetch_end_ts`` minus ``fetch_ts``, the request's true
+    duration. ``round_trip_skipped`` counts cycles whose ``fetch_end_ts`` was null, so
+    the round-trip was undefined there and the cycle was left out, never silently.
+    """
+
+    dispatch: LatencyBreakout
+    round_trip: LatencyBreakout
+    round_trip_skipped: int
 
 
 @dataclass(frozen=True)
@@ -213,9 +232,13 @@ class DayOneMeasurements:
         lines = [
             f"Day-one measurements: {self.ticker} {self.day}",
             f"  cycles:            {self.cycles} ({self.data_cycles} data, {self.gap_cycles} gap)",
-            f"  fetch latency:     {_stat(lat.overall)}",
-            f"    at open:         {_stat(lat.at_open)}",
-            f"    final 15 min:    {_stat(lat.final_fifteen)}",
+            f"  dispatch delay:    {_stat(lat.dispatch.overall)}",
+            f"    at open:         {_stat(lat.dispatch.at_open)}",
+            f"    final 15 min:    {_stat(lat.dispatch.final_fifteen)}",
+            f"  round-trip:        {_stat(lat.round_trip.overall)} "
+            f"(skipped {lat.round_trip_skipped} without fetch_end_ts)",
+            f"    at open:         {_stat(lat.round_trip.at_open)}",
+            f"    final 15 min:    {_stat(lat.round_trip.final_fifteen)}",
             f"  contracts/cycle:   min={self.sizing.contracts_min} "
             f"p50={self.sizing.contracts_p50} p99={self.sizing.contracts_p99} "
             f"max={self.sizing.contracts_max}",
@@ -296,18 +319,65 @@ def measure_day(
     )
 
 
-def _cycle_latency(cycle_rows: list[dict], snap: datetime) -> float | None:
-    """One cycle's fetch latency in seconds: ``fetch_ts`` minus ``snap_ts``."""
+def _dispatch_value(cycle_rows: list[dict], snap: datetime) -> float | None:
+    """A cycle's dispatch delay in seconds: ``fetch_ts`` minus ``snap_ts``."""
     fetch_ts = cycle_rows[0]["fetch_ts"]
     if fetch_ts is None:
         return None
     return (datetime.fromisoformat(fetch_ts) - snap).total_seconds()
 
 
+def _round_trip_value(cycle_rows: list[dict], snap: datetime) -> float | None:
+    """A cycle's request round-trip in seconds: ``fetch_end_ts`` minus ``fetch_ts``.
+
+    Undefined, and so ``None``, when either stamp is missing on the cycle. ``snap`` is
+    unused here; the signature matches ``_dispatch_value`` so both feed ``_breakout``.
+    """
+    row = cycle_rows[0]
+    fetch_ts = row["fetch_ts"]
+    fetch_end_ts = row["fetch_end_ts"]
+    if fetch_ts is None or fetch_end_ts is None:
+        return None
+    start = datetime.fromisoformat(fetch_ts)
+    end = datetime.fromisoformat(fetch_end_ts)
+    return (end - start).total_seconds()
+
+
 def _stats(values: list[float]) -> LatencyStats:
     return LatencyStats(
         count=len(values), p50=_percentile(values, 0.5), p99=_percentile(values, 0.99)
     )
+
+
+def _breakout(
+    cycles: dict[str, list[dict]],
+    parsed: dict[str, datetime],
+    order: list[str],
+    open_at: datetime,
+    close_at: datetime,
+    value_fn,
+) -> tuple[LatencyBreakout, int]:
+    """One metric's overall/open/final breakout, plus the count of skipped cycles.
+
+    A cycle whose ``value_fn`` returns ``None`` is left out and counted as skipped, so
+    an undefined round-trip is reported rather than silently absorbed.
+    """
+    final_start = close_at - FINAL_WINDOW
+    overall: list[float] = []
+    at_open: list[float] = []
+    final: list[float] = []
+    skipped = 0
+    for slot in order:
+        value = value_fn(cycles[slot], parsed[slot])
+        if value is None:
+            skipped += 1
+            continue
+        overall.append(value)
+        if parsed[slot] == open_at:
+            at_open.append(value)
+        if parsed[slot] >= final_start:
+            final.append(value)
+    return LatencyBreakout(_stats(overall), _stats(at_open), _stats(final)), skipped
 
 
 def _fetch_latency(
@@ -318,25 +388,14 @@ def _fetch_latency(
     close_slot: datetime | None,
 ) -> FetchLatency:
     if not order:
-        empty = LatencyStats(0, None, None)
-        return FetchLatency(empty, empty, empty)
+        zero = LatencyStats(0, None, None)
+        empty = LatencyBreakout(zero, zero, zero)
+        return FetchLatency(dispatch=empty, round_trip=empty, round_trip_skipped=0)
     open_at = open_slot if open_slot is not None else parsed[order[0]]
     close_at = close_slot if close_slot is not None else parsed[order[-1]]
-    final_start = close_at - FINAL_WINDOW
-
-    overall: list[float] = []
-    at_open: list[float] = []
-    final: list[float] = []
-    for slot in order:
-        latency = _cycle_latency(cycles[slot], parsed[slot])
-        if latency is None:
-            continue
-        overall.append(latency)
-        if parsed[slot] == open_at:
-            at_open.append(latency)
-        if parsed[slot] >= final_start:
-            final.append(latency)
-    return FetchLatency(_stats(overall), _stats(at_open), _stats(final))
+    dispatch, _ = _breakout(cycles, parsed, order, open_at, close_at, _dispatch_value)
+    round_trip, skipped = _breakout(cycles, parsed, order, open_at, close_at, _round_trip_value)
+    return FetchLatency(dispatch=dispatch, round_trip=round_trip, round_trip_skipped=skipped)
 
 
 def _sizing(
@@ -436,6 +495,7 @@ __all__ = [
     "FINAL_WINDOW",
     "DayOneMeasurements",
     "FetchLatency",
+    "LatencyBreakout",
     "LatencyStats",
     "OiRefresh",
     "SameDayExpiry",

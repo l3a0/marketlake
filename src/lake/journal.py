@@ -85,12 +85,18 @@ _PROVENANCE_FIELDS = [
     ("extra", pa.string()),
 ]
 
-# The three timestamps plus the ticker every row carries. ``snap_ts`` is the minute
-# slot. ``fetch_ts`` is the loop's clock at fetch. ``vendor_quote_ts`` is Schwab's own
-# quote time. Staleness is ``fetch_ts`` minus ``vendor_quote_ts``, measurable per row.
+# The timestamps plus the ticker every row carries. ``snap_ts`` is the minute slot.
+# ``fetch_ts`` and ``fetch_end_ts`` are a pair around the vendor call. ``fetch_ts`` is
+# the dispatch time, the loop's clock just before the request starts. ``fetch_end_ts``
+# is when the response or the failure landed, the request end. So the request
+# round-trip is ``fetch_end_ts`` minus ``fetch_ts``, measurable per row, and even a
+# timeout's duration is captured. ``vendor_quote_ts`` is Schwab's own quote time, and
+# staleness is ``fetch_ts`` minus it. ``fetch_end_ts`` is nullable, so a row without it
+# is still valid.
 _STAMP_FIELDS = [
     ("snap_ts", pa.string()),
     ("fetch_ts", pa.string()),
+    ("fetch_end_ts", pa.string()),
     ("vendor_quote_ts", pa.string()),
     ("ticker", pa.string()),
 ]
@@ -255,6 +261,7 @@ def chains_data_batch(
     ticker: str,
     snap_ts: str | datetime,
     fetch_ts: str | datetime,
+    fetch_end_ts: str | datetime | None = None,
     vendor_quote_ts: str | datetime | None,
     suspect: bool = False,
     close_tag: str | None = None,
@@ -266,12 +273,14 @@ def chains_data_batch(
     fields repeat on every row: the three header fields and the ``is_delayed``
     entitlement flag. Any unrecognized contract field lands in ``extra`` as JSON. The
     parser fails open, so a new vendor field never drops a cycle. The timestamps are
-    the caller's, stamped from the injected clock.
+    the caller's, stamped from the injected clock. ``fetch_end_ts`` is when the response
+    landed, the request end, so the round-trip is ``fetch_end_ts`` minus ``fetch_ts``.
     """
     header = {column: body.get(vendor) for vendor, column in _CHAINS_HEADER_MAP.items()}
     stamps = {
         "snap_ts": _iso(snap_ts),
         "fetch_ts": _iso(fetch_ts),
+        "fetch_end_ts": _iso(fetch_end_ts),
         "vendor_quote_ts": _iso(vendor_quote_ts),
         "ticker": ticker,
         "row_kind": ROW_KIND_DATA,
@@ -299,6 +308,7 @@ def quotes_data_batch(
     ticker: str,
     snap_ts: str | datetime,
     fetch_ts: str | datetime,
+    fetch_end_ts: str | datetime | None = None,
     vendor_quote_ts: str | datetime | None,
     suspect: bool = False,
     close_tag: str | None = None,
@@ -310,10 +320,12 @@ def quotes_data_batch(
     builder that ticker's quote fields: bid, ask, last, the vendor quote time, and the
     ``realtime`` entitlement flag. The three prices and the flag land in typed columns.
     The quote time is carried in ``vendor_quote_ts``. Anything else lands in ``extra``.
+    ``fetch_end_ts`` is the request-end stamp, the pair to ``fetch_ts`` for round-trip.
     """
     row: dict[str, object] = {
         "snap_ts": _iso(snap_ts),
         "fetch_ts": _iso(fetch_ts),
+        "fetch_end_ts": _iso(fetch_end_ts),
         "vendor_quote_ts": _iso(vendor_quote_ts),
         "ticker": ticker,
         "row_kind": ROW_KIND_DATA,
@@ -337,6 +349,7 @@ def gap_batch(
     snap_ts: str | datetime,
     error_class: str,
     fetch_ts: str | datetime | None = None,
+    fetch_end_ts: str | datetime | None = None,
     suspect: bool = False,
     close_tag: str | None = None,
     session_phase: str | None = None,
@@ -347,12 +360,15 @@ def gap_batch(
     missed minute in ``snap_ts`` and the reason in ``error_class``. It holds no market
     data. The missed sample is gone forever. The row records the absence so a hole is
     never inferred. ``fetch_ts`` is optional, since a gap for a dead daemon has no
-    fetch at all. There is no vendor quote, so ``vendor_quote_ts`` is always null.
+    fetch at all. ``fetch_end_ts`` is optional too, and set for a failed fetch so the
+    round-trip to the failure is measurable. There is no vendor quote, so
+    ``vendor_quote_ts`` is always null.
     """
     schema = schema_for(surface)
     row: dict[str, object] = {
         "snap_ts": _iso(snap_ts),
         "fetch_ts": _iso(fetch_ts),
+        "fetch_end_ts": _iso(fetch_end_ts),
         "vendor_quote_ts": None,
         "ticker": ticker,
         "row_kind": ROW_KIND_GAP,

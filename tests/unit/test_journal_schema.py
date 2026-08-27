@@ -77,6 +77,7 @@ QUOTE = {
 
 SNAP = "2026-08-24T16:15:00-04:00"
 FETCH = "2026-08-24T16:15:00.400-04:00"
+FETCH_END = "2026-08-24T16:15:00.812-04:00"
 VENDOR = "2026-08-24T16:15:00-04:00"
 
 
@@ -91,6 +92,8 @@ def test_chains_schema_names_and_types():
     schema = journal.CHAINS_SCHEMA
     assert schema.field("snap_ts").type == pa.string()
     assert schema.field("fetch_ts").type == pa.string()
+    # The request-end stamp is the pair to fetch_ts, a nullable string like the others.
+    assert schema.field("fetch_end_ts").type == pa.string()
     assert schema.field("vendor_quote_ts").type == pa.string()
     assert schema.field("open_interest").type == pa.int64()
     assert schema.field("suspect").type == pa.bool_()
@@ -99,6 +102,7 @@ def test_chains_schema_names_and_types():
     assert schema.field("is_delayed").type == pa.bool_()
     # Vendor per-contract columns, the chain-level fields, and the provenance columns.
     for name in (
+        "fetch_end_ts",
         "occ_symbol",
         "put_call",
         "bid",
@@ -125,8 +129,23 @@ def test_chains_schema_names_and_types():
 
 def test_quotes_schema_names_and_types():
     schema = journal.QUOTES_SCHEMA
-    assert schema.names[:4] == ["snap_ts", "fetch_ts", "vendor_quote_ts", "ticker"]
-    for name in ("bid", "ask", "last", "realtime", "row_kind", "schema_version", "extra"):
+    assert schema.names[:5] == [
+        "snap_ts",
+        "fetch_ts",
+        "fetch_end_ts",
+        "vendor_quote_ts",
+        "ticker",
+    ]
+    for name in (
+        "fetch_end_ts",
+        "bid",
+        "ask",
+        "last",
+        "realtime",
+        "row_kind",
+        "schema_version",
+        "extra",
+    ):
         assert name in schema.names, name
     # The entitlement flag is a per-row vendor bool, placed with the price fields.
     assert schema.field("realtime").type == pa.bool_()
@@ -358,6 +377,36 @@ def test_datetime_timestamps_are_iso_formatted():
         QUOTE, ticker="SPY", snap_ts=fetched, fetch_ts=fetched, vendor_quote_ts=fetched
     )
     assert batch.to_pylist()[0]["fetch_ts"] == fetched.isoformat()
+
+
+def test_fetch_end_ts_is_stored_when_given_and_null_when_omitted():
+    # Supplied on a chains data row: it lands in the typed column verbatim.
+    chains = journal.chains_data_batch(
+        CHAIN_BODY,
+        ticker="SPY",
+        snap_ts=SNAP,
+        fetch_ts=FETCH,
+        fetch_end_ts=FETCH_END,
+        vendor_quote_ts=VENDOR,
+    )
+    assert chains.to_pylist()[0]["fetch_end_ts"] == FETCH_END
+
+    # Omitted on a quotes data row: the row is still valid, with a null request-end.
+    quotes = journal.quotes_data_batch(
+        QUOTE, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH, vendor_quote_ts=VENDOR
+    )
+    assert quotes.to_pylist()[0]["fetch_end_ts"] is None
+
+    # A gap row carries fetch_end_ts too, so a failed fetch's duration is measurable.
+    gap = journal.gap_batch(
+        journal.CHAINS_SURFACE,
+        ticker="SPY",
+        snap_ts=SNAP,
+        error_class="vendor_error",
+        fetch_ts=FETCH,
+        fetch_end_ts=FETCH_END,
+    )
+    assert gap.to_pylist()[0]["fetch_end_ts"] == FETCH_END
 
 
 # -- path convention ---------------------------------------------------------
