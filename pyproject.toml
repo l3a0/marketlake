@@ -1,0 +1,36 @@
+[project]
+name = "marketlake"
+version = "0.0.0"
+description = "Capture-first market data lake for Schwab option chains and equity quotes."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "exchange-calendars>=4.5",
+    "pyarrow>=17",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lake"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
