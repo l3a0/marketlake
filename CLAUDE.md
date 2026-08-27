@@ -35,3 +35,9 @@ This repo is public. Tracked files never carry secrets or machine-specific paths
 ## Committing
 
 Do not commit or push without explicit per-change review. Each commit instruction authorizes exactly the changes summarized in the immediately prior turn. Once that commit lands, the authorization is spent. The next change starts fresh. The pattern: make the change, summarize it, wait, then commit exactly what was summarized. If new changes appear between summary and commit, re-summarize and re-confirm. `main` requires a pull request. An active repository ruleset enforces it. Owners can bypass that rule, but do not: branch, push, and open a PR, even for a one-line docs change.
+
+## Pull requests
+
+PR titles use a Conventional Commits prefix. The form is `type(scope): summary`. Types in use: `docs`, `feat`, `fix`, `chore`, `ci`, `perf`. Add a scope in parens when it sharpens the title, like `docs(CLAUDE.md)`. Drop it when none does, like a plain `docs:` for a whole-doc change. This matches the sibling `trading-strategies` repo.
+
+PR bodies use Markdown section headings, not a wall of prose. Lead with `## Why`, then `## What`. Add situational sections after as the change needs them, like `## Scope`, `## Notes`, or `## Evidence`. The body's prose obeys the writing-style rules above. So short sentences and no em dashes, even though the sibling repo allows them. End every body with the footer line: `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
