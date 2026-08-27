@@ -59,10 +59,14 @@ class FakeSchwabClient:
         self._quotes = dict(quotes or {})
         self.token_metadata = _FakeTokenMetadata(creation_timestamp)
         self.chain_calls: list[str] = []
+        self.chain_underlying_quote: list[bool] = []
         self.quote_calls: list[list[str]] = []
 
-    def get_option_chain(self, symbol: str) -> FakeResponse:
+    def get_option_chain(
+        self, symbol: str, *, include_underlying_quote: bool = False
+    ) -> FakeResponse:
         self.chain_calls.append(symbol)
+        self.chain_underlying_quote.append(include_underlying_quote)
         if symbol not in self._chains:
             raise KeyError(f"no canned chain for {symbol!r}")
         return self._chains[symbol]
