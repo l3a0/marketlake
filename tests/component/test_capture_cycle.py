@@ -97,6 +97,8 @@ def test_happy_cycle_writes_chains_and_quotes_with_correct_stamps(cassette_vendo
         "SPY   260918P00650000",
     ]
     assert [r["bid"] for r in spy_chain] == [4.2, 3.8]
+    # Each contract's totalVolume lands in the typed volume column, not the overflow.
+    assert [r["volume"] for r in spy_chain] == [5555, 4444]
     for row in spy_chain:
         assert row["snap_ts"] == _EXPECTED_SNAP.isoformat()
         assert row["fetch_ts"] == _CLOCK_START.isoformat()
@@ -106,6 +108,8 @@ def test_happy_cycle_writes_chains_and_quotes_with_correct_stamps(cassette_vendo
         assert row["vendor_quote_ts"] == _CHAIN_VQT
         assert row["close_tag"] is None
         assert row["suspect"] is False
+        # totalVolume no longer overflows into per-contract extra.
+        assert row["extra"] is None
 
     # The QQQ chain captured independently.
     qqq_chain = _rows(result.segment(CHAINS, "QQQ"))
@@ -121,13 +125,26 @@ def test_happy_cycle_writes_chains_and_quotes_with_correct_stamps(cassette_vendo
     assert spy_quote["fetch_end_ts"] == _CLOCK_START.isoformat()
     assert spy_quote["vendor_quote_ts"] == _QUOTE_VQT
     # Schwab's CUSIP, a sibling of the quote block in a reference envelope field, is
-    # captured raw in its own column and does not pollute the normally-empty overflow.
+    # captured raw in its own column.
     assert spy_quote["cusip"] == "111111111"
+    # The dividend fundamentals are lifted from the envelope's fundamental block into
+    # their typed columns.
+    assert spy_quote["div_pay_amount"] == 1.75
+    assert spy_quote["div_ex_date"] == "2026-09-18"
+    assert spy_quote["div_amount"] == 7.0
+    assert spy_quote["div_freq"] == 4
+    assert spy_quote["declaration_date"] == "2026-08-15"
+    assert spy_quote["next_div_ex_date"] == "2026-12-18"
+    assert spy_quote["next_div_pay_date"] == "2026-12-31"
+    # The non-dividend fundamental fields (peRatio, eps) are left behind: they are not
+    # captured and do not pollute the normally-empty overflow.
     assert spy_quote["extra"] is None
 
     qqq_quote = _rows(result.segment(QUOTES, "QQQ"))[0]
     assert qqq_quote["bid"] == 601.48
     assert qqq_quote["cusip"] == "222222222"
+    assert qqq_quote["div_pay_amount"] == 0.9
+    assert qqq_quote["extra"] is None
 
 
 # -- 4. the manifest entry per segment ---------------------------------------

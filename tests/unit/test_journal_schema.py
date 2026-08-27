@@ -35,6 +35,7 @@ CHAIN_BODY = {
                     "ask": 4.25,
                     "last": 4.22,
                     "openInterest": 1234,
+                    "totalVolume": 5555,
                     "volatility": 12.5,
                     "delta": 0.51,
                     "gamma": 0.03,
@@ -55,6 +56,7 @@ CHAIN_BODY = {
                     "ask": 3.85,
                     "last": 3.82,
                     "openInterest": 987,
+                    "totalVolume": 4444,
                     "volatility": 12.7,
                     "delta": -0.49,
                     "gamma": 0.03,
@@ -74,6 +76,13 @@ QUOTE = {
     "quoteTime": 1787000100000,
     "realtime": True,
     "cusip": "111111111",
+    "divPayAmount": 1.75,
+    "divExDate": "2026-09-18",
+    "divAmount": 7.0,
+    "divFreq": 4,
+    "declarationDate": "2026-08-15",
+    "nextDivExDate": "2026-12-18",
+    "nextDivPayDate": "2026-12-31",
 }
 
 SNAP = "2026-08-24T16:15:00-04:00"
@@ -97,6 +106,8 @@ def test_chains_schema_names_and_types():
     assert schema.field("fetch_end_ts").type == pa.string()
     assert schema.field("vendor_quote_ts").type == pa.string()
     assert schema.field("open_interest").type == pa.int64()
+    # Traded volume is a nullable int64 per-contract column, next to open interest.
+    assert schema.field("volume").type == pa.int64()
     assert schema.field("suspect").type == pa.bool_()
     assert schema.field("schema_version").type == pa.int64()
     # The real-time entitlement flag is a chain-level bool, not the provenance suspect.
@@ -109,6 +120,7 @@ def test_chains_schema_names_and_types():
         "bid",
         "ask",
         "last",
+        "volume",
         "volatility",
         "delta",
         "gamma",
@@ -144,6 +156,13 @@ def test_quotes_schema_names_and_types():
         "last",
         "realtime",
         "cusip",
+        "div_pay_amount",
+        "div_ex_date",
+        "div_amount",
+        "div_freq",
+        "declaration_date",
+        "next_div_ex_date",
+        "next_div_pay_date",
         "row_kind",
         "schema_version",
         "extra",
@@ -154,10 +173,17 @@ def test_quotes_schema_names_and_types():
     assert schema.names.index("realtime") == schema.names.index("last") + 1
     # The CUSIP is a nullable string vendor column on quotes only.
     assert schema.field("cusip").type == pa.string()
+    # The dividend fundamentals: amounts float, frequency int, dates string. All nullable.
+    assert schema.field("div_pay_amount").type == pa.float64()
+    assert schema.field("div_amount").type == pa.float64()
+    assert schema.field("div_freq").type == pa.int64()
+    for date_field in ("div_ex_date", "declaration_date", "next_div_ex_date", "next_div_pay_date"):
+        assert schema.field(date_field).type == pa.string()
     # Quotes never carry a per-contract vendor column.
     assert "open_interest" not in schema.names
-    # Chains do not carry the equity CUSIP.
+    # Chains carry neither the equity CUSIP nor the dividend fundamentals.
     assert "cusip" not in journal.CHAINS_SCHEMA.names
+    assert "div_amount" not in journal.CHAINS_SCHEMA.names
 
 
 def test_schema_for_resolves_surfaces_and_rejects_unknown():
@@ -191,6 +217,8 @@ def test_chains_data_batch_maps_known_fields_and_header():
     assert row["ask"] == 4.25
     assert row["last"] == 4.22
     assert row["open_interest"] == 1234
+    # totalVolume lands in the typed volume column, not the overflow.
+    assert row["volume"] == 5555
     assert row["volatility"] == 12.5
     assert row["delta"] == 0.51
     assert row["rho"] == 0.08
@@ -287,8 +315,16 @@ def test_quotes_data_batch_maps_prices_and_consumes_quote_time():
     assert row["row_kind"] == journal.ROW_KIND_DATA
     # The CUSIP lands in its typed column, kept raw for the deferred FIGI backfill.
     assert row["cusip"] == "111111111"
-    # quoteTime is recognized and carried in vendor_quote_ts, and realtime and cusip are
-    # typed columns, so none pollutes the normally-empty overflow.
+    # The seven dividend fundamentals each land in their typed columns.
+    assert row["div_pay_amount"] == 1.75
+    assert row["div_ex_date"] == "2026-09-18"
+    assert row["div_amount"] == 7.0
+    assert row["div_freq"] == 4
+    assert row["declaration_date"] == "2026-08-15"
+    assert row["next_div_ex_date"] == "2026-12-18"
+    assert row["next_div_pay_date"] == "2026-12-31"
+    # quoteTime is recognized and carried in vendor_quote_ts, and realtime, cusip, and the
+    # dividend fields are typed columns, so none pollutes the normally-empty overflow.
     assert row["extra"] is None
 
 
@@ -332,13 +368,14 @@ def test_chains_gap_row_nulls_every_vendor_column():
     assert row["ticker"] == "SPY"
     assert row["vendor_quote_ts"] is None
     assert row["fetch_ts"] is None
-    # Every vendor column is null on a gap, the entitlement flag included. It is a
-    # vendor column, not the provenance suspect bool.
+    # Every vendor column is null on a gap, the entitlement flag and the new volume
+    # column included. It is a vendor column, not the provenance suspect bool.
     for column in (
         "bid",
         "ask",
         "last",
         "open_interest",
+        "volume",
         "delta",
         "underlying_price",
         "is_delayed",
@@ -360,9 +397,15 @@ def test_quotes_gap_row_carries_reason_and_optional_fetch():
     assert row["error_class"] == "quote_sampler_dead"
     assert row["fetch_ts"] == FETCH
     assert row["bid"] is None and row["ask"] is None and row["last"] is None
-    # The entitlement flag and the CUSIP are vendor columns, so both are null on a gap.
+    # The entitlement flag, the CUSIP, and the dividend fundamentals are vendor columns,
+    # so all are null on a gap.
     assert row["realtime"] is None
     assert row["cusip"] is None
+    assert row["div_pay_amount"] is None
+    assert row["div_amount"] is None
+    assert row["div_freq"] is None
+    assert row["div_ex_date"] is None
+    assert row["next_div_pay_date"] is None
 
 
 def test_gap_row_can_carry_a_close_tag_for_an_absent_marker():

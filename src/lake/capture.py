@@ -123,6 +123,25 @@ def _chain_vendor_quote_ts(body: Mapping[str, object]) -> datetime | None:
     return None
 
 
+# The dividend fields lifted out of Schwab's ``fundamental`` block. Only these are
+# captured. The rest of that block, like ``peRatio`` and ``eps``, is deliberately left
+# behind, so ``extra`` stays empty and the "populated extra flags the report" invariant
+# keeps its meaning. These vendor names must match the dividend entries in the journal's
+# ``_QUOTE_MAP``. They are confirmed against the live cassette recording; the design's
+# names are used for now.
+_QUOTE_FUNDAMENTAL_KEYS = frozenset(
+    {
+        "divPayAmount",
+        "divExDate",
+        "divAmount",
+        "divFreq",
+        "declarationDate",
+        "nextDivExDate",
+        "nextDivPayDate",
+    }
+)
+
+
 def _envelope_cusip(envelope: Mapping[str, object]) -> object | None:
     """Schwab's CUSIP for one quote envelope, or ``None`` if absent.
 
@@ -143,12 +162,15 @@ def _flatten_quote(body: Mapping[str, object], ticker: str) -> dict | None:
     """The per-ticker flattened quote mapping from a batched quotes body, or ``None``.
 
     The batched response maps each ticker to an envelope. The bid, ask, and last live in
-    the envelope's ``quote`` block. The real-time entitlement flag and the CUSIP are
-    sibling fields on the envelope, outside that block. This merges both into the quote
-    fields, so the row builder takes one flat mapping and neither falls into ``extra``. A
-    ticker absent from a 200 batch yields ``None``, the caller's gap signal. This is the
-    one place that split logic lives, shared by the loop and by the onboarding snapshot,
-    so both flatten a batched quote identically.
+    the envelope's ``quote`` block. The real-time flag, the CUSIP, and the dividend
+    fundamentals are sibling fields on the envelope, outside that block: the flag and the
+    CUSIP at the envelope's own level, the dividends inside its ``fundamental`` block.
+    This merges the flag, the CUSIP, and only the specific dividend fields into the quote
+    mapping, so the row builder takes one flat mapping and each lands in its typed column
+    rather than ``extra``. The non-dividend fundamental fields are left behind, so
+    ``extra`` stays empty. A ticker absent from a 200 batch yields ``None``, the caller's
+    gap signal. This is the one place that split logic lives, shared by the loop and by
+    the onboarding snapshot, so both flatten a batched quote identically.
     """
     envelope = body.get(ticker)
     quote_fields = envelope.get("quote") if isinstance(envelope, Mapping) else None
@@ -161,6 +183,11 @@ def _flatten_quote(body: Mapping[str, object], ticker: str) -> dict | None:
         cusip = _envelope_cusip(envelope)
         if cusip is not None:
             flat["cusip"] = cusip
+        fundamental = envelope.get("fundamental")
+        if isinstance(fundamental, Mapping):
+            for key in _QUOTE_FUNDAMENTAL_KEYS:
+                if key in fundamental:
+                    flat[key] = fundamental[key]
     return flat
 
 

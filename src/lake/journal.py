@@ -103,13 +103,15 @@ _STAMP_FIELDS = [
 
 # The chains capture schema. Besides the stamps and provenance, each row is one
 # contract. The per-contract vendor columns are fixed by the first day's payload:
-# the OCC symbol, the call/put flag, bid/ask/last, open interest, the vendor's implied
-# volatility, and the five greeks. The chain-level fields are repeated on every
-# contract row, per the raw-verbatim rule: ``interest_rate``, ``underlying_price``,
-# ``dividend_yield``, and ``is_delayed``. ``is_delayed`` is the vendor's real-time
-# entitlement flag. It must be false on a real-time chain response. The validation
-# battery checks it, so it is captured, not dropped. Raw stores what the vendor said.
-# Nothing here is reshaped or validated.
+# the OCC symbol, the call/put flag, bid/ask/last, open interest, the day's traded
+# volume, the vendor's implied volatility, and the five greeks. ``volume`` is Schwab's
+# ``totalVolume``. It is a typed column, not overflow, because the OI view's comparable
+# set ranks contracts on volume, so it must be queryable. The chain-level fields are
+# repeated on every contract row, per the raw-verbatim rule: ``interest_rate``,
+# ``underlying_price``, ``dividend_yield``, and ``is_delayed``. ``is_delayed`` is the
+# vendor's real-time entitlement flag. It must be false on a real-time chain response.
+# The validation battery checks it, so it is captured, not dropped. Raw stores what the
+# vendor said. Nothing here is reshaped or validated.
 CHAINS_SCHEMA = pa.schema(
     _STAMP_FIELDS
     + [
@@ -119,6 +121,7 @@ CHAINS_SCHEMA = pa.schema(
         ("ask", pa.float64()),
         ("last", pa.float64()),
         ("open_interest", pa.int64()),
+        ("volume", pa.int64()),
         ("volatility", pa.float64()),
         ("delta", pa.float64()),
         ("gamma", pa.float64()),
@@ -134,12 +137,18 @@ CHAINS_SCHEMA = pa.schema(
 )
 
 # The quotes capture schema. Each row is one equity quote for one ticker: bid, ask,
-# last, ``realtime``, and ``cusip``. ``realtime`` is the vendor's real-time entitlement
-# flag. It must be true on a real-time quote. The validation battery checks it, so it is
-# a captured vendor column, not dropped. ``cusip`` is Schwab's CUSIP for the equity, kept
-# raw under the vendor-verbatim rule. It is never a join key and never published, but it
-# is captured so a later enrichment can resolve the instrument's FIGI from it. The vendor
-# quote time is carried in ``vendor_quote_ts``, not repeated as a vendor column.
+# last, ``realtime``, ``cusip``, and the dividend fundamentals. ``realtime`` is the
+# vendor's real-time entitlement flag. It must be true on a real-time quote. The
+# validation battery checks it, so it is a captured vendor column, not dropped. ``cusip``
+# is Schwab's CUSIP for the equity, kept raw under the vendor-verbatim rule. It is never
+# a join key and never published, but it is captured so a later enrichment can resolve
+# the instrument's FIGI from it. The seven ``div_*`` columns are Schwab's dividend
+# fundamentals, captured as typed columns because the deferred greeks layer's dividend
+# input reads them at valuation time. ``div_pay_amount`` is the per-event amount, never
+# ``div_amount``, which is the annualized trailing figure. The ``next_div_*`` fields are
+# the vendor's undocumented projections, kept raw for the declaration-vs-projection
+# study. The vendor quote time is carried in ``vendor_quote_ts``, not repeated as a
+# vendor column.
 QUOTES_SCHEMA = pa.schema(
     _STAMP_FIELDS
     + [
@@ -148,6 +157,13 @@ QUOTES_SCHEMA = pa.schema(
         ("last", pa.float64()),
         ("realtime", pa.bool_()),
         ("cusip", pa.string()),
+        ("div_pay_amount", pa.float64()),
+        ("div_ex_date", pa.string()),
+        ("div_amount", pa.float64()),
+        ("div_freq", pa.int64()),
+        ("declaration_date", pa.string()),
+        ("next_div_ex_date", pa.string()),
+        ("next_div_pay_date", pa.string()),
     ]
     + _PROVENANCE_FIELDS
 )
@@ -175,6 +191,7 @@ _CHAINS_CONTRACT_MAP = {
     "ask": "ask",
     "last": "last",
     "openInterest": "open_interest",
+    "totalVolume": "volume",
     "volatility": "volatility",
     "delta": "delta",
     "gamma": "gamma",
@@ -194,14 +211,26 @@ _CHAINS_HEADER_MAP = {
 }
 
 # The quote fields that land in typed quotes columns. ``realtime`` and ``cusip`` are
-# envelope-level fields the sampler merges into the flat quote before this map runs, so
-# both are captured in their own columns and kept out of ``extra``.
+# envelope-level fields, and the seven dividend fields come from the envelope's
+# ``fundamental`` block. The sampler merges all of them into the flat quote before this
+# map runs, so each is captured in its own column and kept out of ``extra``. Only these
+# specific dividend fields are lifted from ``fundamental``. The rest of that block, like
+# ``peRatio``, is deliberately left behind so ``extra`` stays empty and the populated-
+# extra report flag keeps its meaning. The exact Schwab field names are confirmed by the
+# live cassette recording; the design's names are mapped here for now.
 _QUOTE_MAP = {
     "bidPrice": "bid",
     "askPrice": "ask",
     "lastPrice": "last",
     "realtime": "realtime",
     "cusip": "cusip",
+    "divPayAmount": "div_pay_amount",
+    "divExDate": "div_ex_date",
+    "divAmount": "div_amount",
+    "divFreq": "div_freq",
+    "declarationDate": "declaration_date",
+    "nextDivExDate": "next_div_ex_date",
+    "nextDivPayDate": "next_div_pay_date",
 }
 
 # Quote fields the parser recognizes but does not overflow into ``extra``. The vendor
@@ -323,10 +352,12 @@ def quotes_data_batch(
 
     The batched quote sampler splits the vendor's response per ticker and hands this
     builder that ticker's quote fields: bid, ask, last, the vendor quote time, the
-    ``realtime`` entitlement flag, and the ``cusip``. The three prices, the flag, and the
-    CUSIP land in typed columns. The quote time is carried in ``vendor_quote_ts``.
-    Anything else lands in ``extra``. ``fetch_end_ts`` is the request-end stamp, the pair
-    to ``fetch_ts`` for round-trip.
+    ``realtime`` entitlement flag, the ``cusip``, and the seven dividend fundamentals the
+    sampler lifted from the envelope's ``fundamental`` block. Every recognized field
+    lands in its typed column. The quote time is carried in ``vendor_quote_ts``. Anything
+    the map does not name lands in ``extra``, so the non-dividend fundamental fields the
+    sampler left behind never reach here and ``extra`` stays empty. ``fetch_end_ts`` is
+    the request-end stamp, the pair to ``fetch_ts`` for round-trip.
     """
     row: dict[str, object] = {
         "snap_ts": _iso(snap_ts),
@@ -368,7 +399,11 @@ def gap_batch(
     never inferred. ``fetch_ts`` is optional, since a gap for a dead daemon has no
     fetch at all. ``fetch_end_ts`` is optional too, and set for a failed fetch so the
     round-trip to the failure is measurable. There is no vendor quote, so
-    ``vendor_quote_ts`` is always null, and the quotes-only ``cusip`` column is null too.
+    ``vendor_quote_ts`` is always null. Every vendor column is null on a gap by
+    construction: the row sets only the stamps and provenance below, and the batch
+    builder fills each schema column the row omits with null. So the prices, greeks,
+    ``open_interest``, ``volume``, ``realtime``, ``cusip``, and the dividend
+    fundamentals are all null, per surface, without being enumerated here.
     """
     schema = schema_for(surface)
     row: dict[str, object] = {
@@ -383,9 +418,6 @@ def gap_batch(
         "close_tag": close_tag,
         "session_phase": session_phase,
         "schema_version": SCHEMA_VERSION,
-        # The quotes-only CUSIP is a vendor column, null on a gap like the rest. It is
-        # ignored on a chains gap, whose schema has no such column.
-        "cusip": None,
         "extra": None,
     }
     return _batch(schema, [row])

@@ -33,6 +33,7 @@
                 "ask": 4.25,
                 "last": 4.22,
                 "openInterest": 1234,
+                "totalVolume": 5555,
                 "volatility": 12.5,
                 "delta": 0.51,
                 "gamma": 0.03,
@@ -53,6 +54,7 @@
                 "ask": 3.85,
                 "last": 3.82,
                 "openInterest": 987,
+                "totalVolume": 4444,
                 "volatility": 12.7,
                 "delta": -0.49,
                 "gamma": 0.03,
@@ -96,6 +98,7 @@
                 "ask": 6.15,
                 "last": 6.12,
                 "openInterest": 2222,
+                "totalVolume": 7777,
                 "volatility": 14.1,
                 "delta": 0.55,
                 "gamma": 0.02,
@@ -116,6 +119,7 @@
                 "ask": 5.45,
                 "last": 5.42,
                 "openInterest": 1777,
+                "totalVolume": 6666,
                 "volatility": 14.3,
                 "delta": -0.45,
                 "gamma": 0.02,
@@ -147,6 +151,17 @@
           "reference": {
             "cusip": "111111111"
           },
+          "fundamental": {
+            "divPayAmount": 1.75,
+            "divExDate": "2026-09-18",
+            "divAmount": 7.0,
+            "divFreq": 4,
+            "declarationDate": "2026-08-15",
+            "nextDivExDate": "2026-12-18",
+            "nextDivPayDate": "2026-12-31",
+            "peRatio": 24.5,
+            "eps": 22.3
+          },
           "quote": {
             "bidPrice": 649.98,
             "askPrice": 650.02,
@@ -159,6 +174,17 @@
           "realtime": true,
           "reference": {
             "cusip": "222222222"
+          },
+          "fundamental": {
+            "divPayAmount": 0.9,
+            "divExDate": "2026-09-18",
+            "divAmount": 3.6,
+            "divFreq": 4,
+            "declarationDate": "2026-08-14",
+            "nextDivExDate": "2026-12-18",
+            "nextDivPayDate": "2026-12-31",
+            "peRatio": 33.1,
+            "eps": 18.2
           },
           "quote": {
             "bidPrice": 601.48,
