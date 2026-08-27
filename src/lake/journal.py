@@ -136,11 +136,13 @@ CHAINS_SCHEMA = pa.schema(
     + _PROVENANCE_FIELDS
 )
 
-# The quotes capture schema. Each row is one equity quote for one ticker. Besides the
-# ``quote`` block's bid/ask/last, it captures the vendor's ``realtime`` entitlement flag,
-# the ``cusip``, and the full ``fundamental``, ``regular``, and ``extended`` blocks as
-# distinctly-named typed columns, all vendor-verbatim. ``realtime`` must be true on a
-# real-time quote; the battery checks it. ``cusip`` is Schwab's CUSIP, kept raw so a
+# The quotes capture schema. Each row is one equity quote for one ticker. It captures the
+# full ``quote`` block, the vendor's ``realtime`` entitlement flag, the ``cusip``, and the
+# full ``fundamental``, ``regular``, and ``extended`` blocks as distinctly-named typed
+# columns, all vendor-verbatim. With every documented field of every block typed, ``extra``
+# is empty in steady state and only a genuinely new vendor field drifts into it.
+# ``realtime`` must be true on a real-time quote; the battery checks it. ``cusip`` is
+# Schwab's CUSIP, kept raw so a
 # later enrichment can resolve the instrument's FIGI from it; it is never a join key.
 # The ``fundamental`` block carries the dividend fields plus valuation and volume stats.
 # ``div_pay_amount`` is the per-event amount, never ``div_amount``, the annualized
@@ -157,10 +159,38 @@ CHAINS_SCHEMA = pa.schema(
 QUOTES_SCHEMA = pa.schema(
     _STAMP_FIELDS
     + [
-        # quote block (unchanged in this pass)
+        # quote block — the full documented field set, vendor-verbatim. ``quoteTime`` is
+        # consumed into ``vendor_quote_ts`` and is not repeated here. The 52-week fields
+        # are named ``week_52_*`` so they stay distinct from fundamental's ``high_52`` /
+        # ``low_52``.
         ("bid", pa.float64()),
         ("ask", pa.float64()),
         ("last", pa.float64()),
+        ("bid_size", pa.int64()),
+        ("ask_size", pa.int64()),
+        ("last_size", pa.int64()),
+        ("bid_mic_id", pa.string()),
+        ("ask_mic_id", pa.string()),
+        ("last_mic_id", pa.string()),
+        ("bid_time", pa.string()),
+        ("ask_time", pa.string()),
+        ("trade_time", pa.string()),
+        ("high_price", pa.float64()),
+        ("low_price", pa.float64()),
+        ("open_price", pa.float64()),
+        ("close_price", pa.float64()),
+        ("mark", pa.float64()),
+        ("mark_change", pa.float64()),
+        ("mark_percent_change", pa.float64()),
+        ("net_change", pa.float64()),
+        ("net_percent_change", pa.float64()),
+        ("post_market_change", pa.float64()),
+        ("post_market_percent_change", pa.float64()),
+        ("total_volume", pa.int64()),
+        ("volatility", pa.float64()),
+        ("week_52_high", pa.float64()),
+        ("week_52_low", pa.float64()),
+        ("security_status", pa.string()),
         # envelope-level
         ("realtime", pa.bool_()),
         ("cusip", pa.string()),
@@ -254,12 +284,40 @@ _CHAINS_HEADER_MAP = {
 # an unrecognized field in any block fails open into ``extra`` under that block's key.
 # The names and types are calibrated against the live cassette recording (live check 1).
 
-# The ``quote`` block. Only bid/ask/last are typed in this pass; the rest of the block is
-# left for a later change. ``quoteTime`` is consumed into ``vendor_quote_ts`` below.
+# The ``quote`` block, fully typed. ``quoteTime`` is consumed into ``vendor_quote_ts``
+# below, not made a column. The 52-week fields use ``week_52_*`` column names so they do
+# not collide with fundamental's ``high_52`` / ``low_52``. The time fields
+# (``bid_time``, ``ask_time``, ``trade_time``) are typed string pending confirmation
+# against the live cassette recording (live check 1); Schwab may send epoch millis.
 _QUOTE_MAP = {
     "bidPrice": "bid",
     "askPrice": "ask",
     "lastPrice": "last",
+    "bidSize": "bid_size",
+    "askSize": "ask_size",
+    "lastSize": "last_size",
+    "bidMICId": "bid_mic_id",
+    "askMICId": "ask_mic_id",
+    "lastMICId": "last_mic_id",
+    "bidTime": "bid_time",
+    "askTime": "ask_time",
+    "tradeTime": "trade_time",
+    "highPrice": "high_price",
+    "lowPrice": "low_price",
+    "openPrice": "open_price",
+    "closePrice": "close_price",
+    "mark": "mark",
+    "markChange": "mark_change",
+    "markPercentChange": "mark_percent_change",
+    "netChange": "net_change",
+    "netPercentChange": "net_percent_change",
+    "postMarketChange": "post_market_change",
+    "postMarketPercentChange": "post_market_percent_change",
+    "totalVolume": "total_volume",
+    "volatility": "volatility",
+    "52WeekHigh": "week_52_high",
+    "52WeekLow": "week_52_low",
+    "securityStatus": "security_status",
 }
 
 # The ``fundamental`` block: the dividend fields plus valuation and volume stats.

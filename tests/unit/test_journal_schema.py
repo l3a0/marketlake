@@ -82,6 +82,31 @@ QUOTE = {
         "askPrice": 650.02,
         "lastPrice": 650.0,
         "quoteTime": 1787000100000,
+        "bidSize": 5,
+        "askSize": 7,
+        "lastSize": 3,
+        "bidMICId": "XNYS",
+        "askMICId": "XNAS",
+        "lastMICId": "XNYS",
+        "bidTime": "2026-08-24T16:00:00Z",
+        "askTime": "2026-08-24T16:00:01Z",
+        "tradeTime": "2026-08-24T16:00:02Z",
+        "highPrice": 655.0,
+        "lowPrice": 645.0,
+        "openPrice": 648.0,
+        "closePrice": 649.0,
+        "mark": 650.0,
+        "markChange": 1.0,
+        "markPercentChange": 0.15,
+        "netChange": 1.2,
+        "netPercentChange": 0.18,
+        "postMarketChange": 0.3,
+        "postMarketPercentChange": 0.05,
+        "totalVolume": 90000000,
+        "volatility": 12.5,
+        "52WeekHigh": 705.0,
+        "52WeekLow": 495.0,
+        "securityStatus": "Normal",
     },
     "fundamental": {
         "divPayAmount": 1.75,
@@ -189,9 +214,35 @@ def test_quotes_schema_names_and_types():
     ]
     for name in (
         "fetch_end_ts",
+        # quote block — full field set
         "bid",
         "ask",
         "last",
+        "bid_size",
+        "ask_size",
+        "last_size",
+        "bid_mic_id",
+        "ask_mic_id",
+        "last_mic_id",
+        "bid_time",
+        "ask_time",
+        "trade_time",
+        "high_price",
+        "low_price",
+        "open_price",
+        "close_price",
+        "mark",
+        "mark_change",
+        "mark_percent_change",
+        "net_change",
+        "net_percent_change",
+        "post_market_change",
+        "post_market_percent_change",
+        "total_volume",
+        "volatility",
+        "week_52_high",
+        "week_52_low",
+        "security_status",
         "realtime",
         "cusip",
         # fundamental block
@@ -234,9 +285,39 @@ def test_quotes_schema_names_and_types():
         "extra",
     ):
         assert name in schema.names, name
-    # The entitlement flag is a per-row vendor bool, placed with the price fields.
+    # The quote block: prices/mark/changes/volatility float, sizes and volume int, MIC ids
+    # and times and status string. All nullable.
+    for float_field in (
+        "high_price",
+        "low_price",
+        "open_price",
+        "close_price",
+        "mark",
+        "mark_change",
+        "mark_percent_change",
+        "net_change",
+        "net_percent_change",
+        "post_market_change",
+        "post_market_percent_change",
+        "volatility",
+        "week_52_high",
+        "week_52_low",
+    ):
+        assert schema.field(float_field).type == pa.float64()
+    for int_field in ("bid_size", "ask_size", "last_size", "total_volume"):
+        assert schema.field(int_field).type == pa.int64()
+    for str_field in (
+        "bid_mic_id",
+        "ask_mic_id",
+        "last_mic_id",
+        "bid_time",
+        "ask_time",
+        "trade_time",
+        "security_status",
+    ):
+        assert schema.field(str_field).type == pa.string()
+    # The entitlement flag is a per-row vendor bool.
     assert schema.field("realtime").type == pa.bool_()
-    assert schema.names.index("realtime") == schema.names.index("last") + 1
     # The CUSIP is a nullable string vendor column on quotes only.
     assert schema.field("cusip").type == pa.string()
     # The dividend fundamentals: amounts float, frequency int, dates string. All nullable.
@@ -414,10 +495,40 @@ def test_quotes_data_batch_maps_prices_and_consumes_quote_time():
     assert row["bid"] == 649.98
     assert row["ask"] == 650.02
     assert row["last"] == 650.0
+    # The rest of the quote block lands in its typed columns.
+    assert row["bid_size"] == 5
+    assert row["ask_size"] == 7
+    assert row["last_size"] == 3
+    assert row["bid_mic_id"] == "XNYS"
+    assert row["ask_mic_id"] == "XNAS"
+    assert row["last_mic_id"] == "XNYS"
+    assert row["bid_time"] == "2026-08-24T16:00:00Z"
+    assert row["ask_time"] == "2026-08-24T16:00:01Z"
+    assert row["trade_time"] == "2026-08-24T16:00:02Z"
+    assert row["high_price"] == 655.0
+    assert row["low_price"] == 645.0
+    assert row["open_price"] == 648.0
+    assert row["close_price"] == 649.0
+    assert row["mark"] == 650.0
+    assert row["mark_change"] == 1.0
+    assert row["mark_percent_change"] == 0.15
+    assert row["net_change"] == 1.2
+    assert row["net_percent_change"] == 0.18
+    assert row["post_market_change"] == 0.3
+    assert row["post_market_percent_change"] == 0.05
+    assert row["total_volume"] == 90000000
+    assert row["volatility"] == 12.5
+    assert row["security_status"] == "Normal"
+    # The quote block's 52-week fields keep distinct columns from fundamental's high_52 /
+    # low_52, so both blocks' values survive the shared concept.
+    assert row["week_52_high"] == 705.0
+    assert row["week_52_low"] == 495.0
     assert row["realtime"] is True
     assert row["ticker"] == "SPY"
     assert row["vendor_quote_ts"] == VENDOR
     assert row["row_kind"] == journal.ROW_KIND_DATA
+    # quoteTime is consumed into vendor_quote_ts, not repeated as a column.
+    assert "quote_time" not in row
     # The CUSIP lands in its typed column, kept raw for the deferred FIGI backfill.
     assert row["cusip"] == "111111111"
     # The full fundamental block lands in its typed columns.
@@ -486,13 +597,13 @@ def test_quotes_unknown_field_overflows_namespaced_by_block():
     import copy
 
     envelope = copy.deepcopy(QUOTE)
-    envelope["quote"]["netChange"] = 1.5
+    envelope["quote"]["brandNewQuoteField"] = 1.5
     envelope["extended"]["someNewField"] = 42
     batch = journal.quotes_data_batch(
         envelope, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH, vendor_quote_ts=VENDOR
     )
     extra = json.loads(batch.to_pylist()[0]["extra"])
-    assert extra == {"quote": {"netChange": 1.5}, "extended": {"someNewField": 42}}
+    assert extra == {"quote": {"brandNewQuoteField": 1.5}, "extended": {"someNewField": 42}}
 
 
 # -- gap rows ----------------------------------------------------------------

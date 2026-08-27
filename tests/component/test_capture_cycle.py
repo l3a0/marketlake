@@ -124,6 +124,20 @@ def test_happy_cycle_writes_chains_and_quotes_with_correct_stamps(cassette_vendo
     assert spy_quote["fetch_ts"] == _CLOCK_START.isoformat()
     assert spy_quote["fetch_end_ts"] == _CLOCK_START.isoformat()
     assert spy_quote["vendor_quote_ts"] == _QUOTE_VQT
+    # The full quote block lands in its typed columns. quoteTime is still consumed into
+    # vendor_quote_ts, not a column.
+    assert spy_quote["bid_size"] == 5
+    assert spy_quote["ask_size"] == 7
+    assert spy_quote["high_price"] == 655.0
+    assert spy_quote["low_price"] == 645.0
+    assert spy_quote["mark"] == 650.0
+    assert spy_quote["total_volume"] == 90000000
+    assert spy_quote["volatility"] == 12.5
+    assert spy_quote["security_status"] == "Normal"
+    assert spy_quote["last_mic_id"] == "XNYS"
+    # The quote block's 52-week fields stay distinct from fundamental's high_52 / low_52.
+    assert spy_quote["week_52_high"] == 705.0
+    assert spy_quote["high_52"] == 700.0
     # Schwab's CUSIP, a sibling of the quote block in a reference envelope field, is
     # captured raw in its own column.
     assert spy_quote["cusip"] == "111111111"
