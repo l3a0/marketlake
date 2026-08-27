@@ -1,0 +1,165 @@
+"""The real Schwab-backed vendor.
+
+This is the production implementation of the ``Vendor`` seam from ``lake.vendor``.
+It talks to Schwab through ``schwab-py``, the maintained client library the design
+names as this project's auth and endpoint layer. Everything it returns is the
+vendor's payload verbatim. Nothing here parses, validates, or reshapes the body.
+Raw stays vendor-verbatim, always. The downstream capture primitive decides what a
+status code or a thin chain means. This layer only fetches and hands back.
+
+Two design rules shape this file.
+
+1. Dependency injection over the client. ``SchwabVendor`` is constructed with an
+   already-built ``schwab-py`` client object. So a test injects a fake client with
+   the same method shapes and never needs the network or a real token. The thin
+   ``from_token`` factory builds the real client from a token file. That factory is
+   the only place ``schwab-py`` is imported, and it runs only in the by-hand live
+   check, never in continuous integration.
+2. No wall-clock read. ``token_mint_time`` derives its instant from the token the
+   injected client already holds, never from ``datetime.now`` and never from a
+   separate file read. The mint time is a stored epoch second on the client's token
+   metadata. Converting a stored epoch to a datetime is not a clock read.
+
+``schwab-py`` returns an ``httpx.Response`` from each endpoint call. This module only
+needs three things off that response: its status code, its parsed JSON body, and its
+headers. The ``HttpResponse`` protocol below pins exactly that surface, so a fake in
+a test is a few lines.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Protocol, runtime_checkable
+
+from lake.vendor import VendorError, VendorResponse
+
+# The standard location of the Schwab token, per the design's Configuration section.
+# It sits outside the repo and outside the backup-synced lake tree. This is a home-
+# relative default the live recorder falls back to, never a committed machine path.
+DEFAULT_TOKEN_PATH = Path.home() / ".config" / "marketlake" / "token.json"
+
+
+@runtime_checkable
+class HttpResponse(Protocol):
+    """The slice of an ``httpx.Response`` this vendor reads.
+
+    ``schwab-py`` hands back an ``httpx.Response``. Only these three members matter
+    here. A test fake implements the same three.
+    """
+
+    @property
+    def status_code(self) -> int:
+        """The HTTP status code."""
+        ...
+
+    @property
+    def headers(self) -> Mapping[str, str]:
+        """The response headers."""
+        ...
+
+    def json(self) -> Mapping[str, object]:
+        """The parsed JSON body, exactly as the vendor sent it."""
+        ...
+
+
+@runtime_checkable
+class SchwabClient(Protocol):
+    """What ``SchwabVendor`` needs from a ``schwab-py`` client.
+
+    The real ``schwab.client.Client`` satisfies this. So does a test fake. Two
+    endpoint methods and one nested token attribute is the whole contract.
+
+    ``token_metadata`` is ``schwab-py``'s handle on the loaded token. Its
+    ``creation_timestamp`` is the epoch second the refresh token was minted. That is
+    the seven-day clock the design tracks. ``schwab-py`` preserves it across the
+    automatic access-token refresh, so it reflects the last full browser re-auth, not
+    the last silent refresh.
+    """
+
+    def get_option_chain(self, symbol: str) -> HttpResponse:
+        """The full option chain for one underlying, in one request."""
+        ...
+
+    def get_quotes(self, symbols: Sequence[str]) -> HttpResponse:
+        """Batched equity quotes for a list of symbols, in one request."""
+        ...
+
+    @property
+    def token_metadata(self) -> object:
+        """``schwab-py``'s token handle, carrying ``creation_timestamp``."""
+        ...
+
+
+def _response_from(reply: HttpResponse) -> VendorResponse:
+    """Shape one ``schwab-py`` reply into a verbatim ``VendorResponse``.
+
+    The body is taken exactly as ``json()`` parsed it. Headers are copied into a
+    plain dict so the result does not alias the client's own mutable state. Nothing
+    is inspected or reshaped.
+    """
+    return VendorResponse(
+        status=reply.status_code,
+        body=reply.json(),
+        headers=dict(reply.headers),
+    )
+
+
+class SchwabVendor:
+    """A ``Vendor`` backed by a ``schwab-py`` client.
+
+    Construct it with an already-built client. In production that client comes from
+    ``from_token``. In a test it is a fake with the same method shapes. Either way
+    this class never imports ``schwab-py`` itself and never touches the network on
+    its own.
+    """
+
+    def __init__(self, client: SchwabClient) -> None:
+        self._client = client
+
+    def get_chain(self, symbol: str) -> VendorResponse:
+        """The full option chain for one underlying, verbatim."""
+        return _response_from(self._client.get_option_chain(symbol))
+
+    def get_quotes(self, symbols: Sequence[str]) -> VendorResponse:
+        """Batched equity quotes for every symbol, verbatim."""
+        return _response_from(self._client.get_quotes(list(symbols)))
+
+    def token_mint_time(self) -> datetime:
+        """When the refresh token in use was minted, timezone-aware in UTC.
+
+        This reads ``creation_timestamp`` off the token the injected client already
+        holds. It is never a separate file read, so the value always matches the
+        token capture actually runs on. The stored value is an epoch second, so the
+        conversion is deterministic and touches no wall clock.
+        """
+        metadata = self._client.token_metadata
+        created = getattr(metadata, "creation_timestamp", None)
+        if created is None:
+            raise VendorError("client token metadata has no creation_timestamp")
+        return datetime.fromtimestamp(float(created), tz=UTC)
+
+    @classmethod
+    def from_token(
+        cls,
+        token_path: str | Path = DEFAULT_TOKEN_PATH,
+        *,
+        api_key: str,
+        app_secret: str,
+    ) -> SchwabVendor:
+        """Build the real vendor from a token file.
+
+        This is the one place ``schwab-py`` is imported, and it is imported lazily.
+        So ``import lake.schwab`` and the whole unit suite run without the library
+        installed. This factory is exercised only in the by-hand live check that
+        records cassettes from a real Schwab call. It never runs in continuous
+        integration, because it needs a real token and real credentials.
+
+        ``api_key`` and ``app_secret`` are secrets. They are passed in by the caller,
+        never read from or written to the repo.
+        """
+        from schwab.auth import client_from_token_file  # lazy: real dep, live only
+
+        client = client_from_token_file(str(token_path), api_key, app_secret)
+        return cls(client)
