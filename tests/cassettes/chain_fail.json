@@ -18,7 +18,7 @@
         "interestRate": 4.25,
         "underlyingPrice": 650.01,
         "dividendYield": 1.28,
-        "numberOfContracts": 2,
+        "numberOfContracts": 1,
         "underlying": {
           "symbol": "SPY",
           "quoteTime": 1787000099000
@@ -43,26 +43,7 @@
             ]
           }
         },
-        "putExpDateMap": {
-          "2026-09-18:25": {
-            "650.0": [
-              {
-                "putCall": "PUT",
-                "symbol": "SPY   260918P00650000",
-                "bid": 3.8,
-                "ask": 3.85,
-                "last": 3.82,
-                "openInterest": 987,
-                "volatility": 12.7,
-                "delta": -0.49,
-                "gamma": 0.03,
-                "theta": -0.11,
-                "vega": 0.34,
-                "rho": -0.07
-              }
-            ]
-          }
-        }
+        "putExpDateMap": {}
       }
     },
     {
@@ -70,62 +51,12 @@
       "params": {
         "symbol": "QQQ"
       },
-      "status": 200,
+      "status": 500,
       "headers": {
         "content-type": "application/json"
       },
       "body": {
-        "symbol": "QQQ",
-        "status": "SUCCESS",
-        "isDelayed": false,
-        "interestRate": 4.25,
-        "underlyingPrice": 601.5,
-        "dividendYield": 0.61,
-        "numberOfContracts": 2,
-        "underlying": {
-          "symbol": "QQQ",
-          "quoteTime": 1787000099000
-        },
-        "callExpDateMap": {
-          "2026-09-18:25": {
-            "600.0": [
-              {
-                "putCall": "CALL",
-                "symbol": "QQQ   260918C00600000",
-                "bid": 6.1,
-                "ask": 6.15,
-                "last": 6.12,
-                "openInterest": 2222,
-                "volatility": 14.1,
-                "delta": 0.55,
-                "gamma": 0.02,
-                "theta": -0.18,
-                "vega": 0.41,
-                "rho": 0.09
-              }
-            ]
-          }
-        },
-        "putExpDateMap": {
-          "2026-09-18:25": {
-            "600.0": [
-              {
-                "putCall": "PUT",
-                "symbol": "QQQ   260918P00600000",
-                "bid": 5.4,
-                "ask": 5.45,
-                "last": 5.42,
-                "openInterest": 1777,
-                "volatility": 14.3,
-                "delta": -0.45,
-                "gamma": 0.02,
-                "theta": -0.17,
-                "vega": 0.41,
-                "rho": -0.08
-              }
-            ]
-          }
-        }
+        "error": "internal server error"
       }
     },
     {

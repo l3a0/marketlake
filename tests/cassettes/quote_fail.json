@@ -1,0 +1,66 @@
+{
+  "cassette_version": 1,
+  "token_mint_time": "2026-08-23T20:05:00-04:00",
+  "interactions": [
+    {
+      "endpoint": "chains",
+      "params": {
+        "symbol": "SPY"
+      },
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": {
+        "symbol": "SPY",
+        "status": "SUCCESS",
+        "isDelayed": false,
+        "interestRate": 4.25,
+        "underlyingPrice": 650.01,
+        "dividendYield": 1.28,
+        "numberOfContracts": 1,
+        "underlying": {
+          "symbol": "SPY",
+          "quoteTime": 1787000099000
+        },
+        "callExpDateMap": {
+          "2026-09-18:25": {
+            "650.0": [
+              {
+                "putCall": "CALL",
+                "symbol": "SPY   260918C00650000",
+                "bid": 4.2,
+                "ask": 4.25,
+                "last": 4.22,
+                "openInterest": 1234,
+                "volatility": 12.5,
+                "delta": 0.51,
+                "gamma": 0.03,
+                "theta": -0.12,
+                "vega": 0.34,
+                "rho": 0.08
+              }
+            ]
+          }
+        },
+        "putExpDateMap": {}
+      }
+    },
+    {
+      "endpoint": "quotes",
+      "params": {
+        "symbols": [
+          "SPY",
+          "QQQ"
+        ]
+      },
+      "status": 503,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": {
+        "error": "service unavailable"
+      }
+    }
+  ]
+}
