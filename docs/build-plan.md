@@ -6,7 +6,13 @@ Status: PLAN, 2026-08-26.
 
 ## Slicing rule
 
-A slice is a deliverable that ships on its own. Three tests decide whether something qualifies. It is testable with the market closed and the network off. It stands alone as a shippable unit. It does not delay the capture clock. The capture clock is the daily job that records the market. Nothing in a later slice may push that job later or make it less reliable.
+A slice is a deliverable that ships on its own. Three tests decide whether something qualifies.
+
+1. It is testable with the market closed and the network off.
+2. It stands alone as a shippable unit.
+3. It does not delay the capture clock.
+
+The capture clock is the daily job that records the market. Nothing in a later slice may push that job later or make it less reliable.
 
 ## Deliverables
 
@@ -14,7 +20,13 @@ The build is a sequence of deliverables, D0 through D21. Each is one focused uni
 
 ### D0, the test harness
 
-D0 builds the seams the whole suite leans on. A seam is an injection point where a real dependency is swapped for a fake one in a test. There are four seams and one builder. An injected clock, so a test decides what time it is. An injected calendar, so a test decides which sessions and half-days exist. The vendor behind an interface, fed by recorded cassettes. A cassette is a saved vendor response replayed offline, so a test never touches the network. The lake root as a temporary directory, so a test writes to a throwaway lake. And a fixture-lake builder, which assembles a known lake on disk for a test to read.
+D0 builds the seams the whole suite leans on. A seam is an injection point where a real dependency is swapped for a fake one in a test. There are four seams and one builder.
+
+1. An injected clock, so a test decides what time it is.
+2. An injected calendar, so a test decides which sessions and half-days exist.
+3. The vendor behind an interface, fed by recorded cassettes. A cassette is a saved vendor response replayed offline, so a test never touches the network.
+4. The lake root as a temporary directory, so a test writes to a throwaway lake.
+5. A fixture-lake builder, which assembles a known lake on disk for a test to read.
 
 Two enforcement tests then stay in continuous integration for the life of the project. Continuous integration is the service that runs the suite on every push. One test fails the build on any direct clock call outside the clock module. One fails on any hardcoded session time outside the calendar module. These two keep the seams from being bypassed later.
 
