@@ -1,10 +1,10 @@
 """The slice-1 runner.
 
 This is the throwaway scheduler wrapper around the D7 capture primitive. It runs one
-capture cycle, and only on a successful durable cycle it pings a health check and then
-copies the lake to the backup SSD. It also generates the launchd job that fires the
+capture cycle, and only on a successful durable cycle it copies the lake to the backup
+SSD and then pings a health check. It also generates the launchd job that fires the
 cycle on a wall-clock schedule. Everything here retires when the slice-2 daemon lands.
-The one piece that survives is the run-cycle-then-ping-then-rsync orchestration, which
+The one piece that survives is the run-cycle-then-rsync-then-ping orchestration, which
 the daemon inherits, so it is kept clean and behind injected seams.
 
 Terms, glossed at first use.
@@ -18,11 +18,18 @@ Terms, glossed at first use.
   catch-up. The daily capture is pinned near the option close, after the OI-refresh
   moment, so a coalesced catch-up fires later than scheduled and the pin still holds.
 - A *health check* is an external dead-man timer at healthchecks.io. The runner pings
-  it after a successful cycle. Silence past the timer's grace pages the owner. The
-  design's rule is that a ping fires only on the job's success condition, never on mere
-  process liveness. So a cycle that captured nothing must not ping.
+  it last, after both the capture and the backup succeed. Silence past the timer's
+  grace pages the owner. Slice 1 has one such check, so its ping must attest both
+  things at once: capture happened and the backup landed. The design promises even
+  slice 1 never runs the capture dark or single-copy, so this one check has to catch
+  both failures. A missed ping therefore means capture-dark *or* single-copy. In slice
+  2 these split into separate checks, one for capture and one for compaction-plus-backup.
+  The design's rule holds throughout: a ping fires only on the job's success condition,
+  never on mere process liveness. So a cycle that captured nothing must not ping, and
+  neither must a cycle whose backup failed.
 - *rsync* is the standard file-copy tool. The backup step copies ``lake/`` to an
   external SSD so even slice 1 never leaves the un-buy-backable capture in one place.
+  It runs before the ping, so the ping attests it.
 
 Two external actions sit behind injected seams, so the whole test suite runs offline
 with no network and no subprocess.
@@ -170,8 +177,9 @@ def cycle_succeeded(result: CycleResult) -> bool:
 
     Success needs at least one durable data row and no segment that failed to journal.
     Mere gap rows are not success. A cycle that captured nothing is the crash-looping
-    zombie the design's dead-man rule must stay silent for. So this is the gate on the
-    ping: report health only when real data landed on disk.
+    zombie the design's dead-man rule must stay silent for. So this gates the backup
+    and, through it, the ping: only a cycle that landed real data is worth backing up
+    and reporting.
     """
     if result.errors:
         return False
@@ -187,17 +195,20 @@ def run_once(
     lake_root: Path,
     backup_target: Path,
 ) -> RunOutcome:
-    """Run one capture cycle, then ping and back up on success.
+    """Run one capture cycle, then back up and ping on success.
 
     The orchestration in order:
 
     1. Run one cycle through the injected ``cycle_runner``. In production this is the
        D7 primitive wired from config. A raised failure propagates, so the process
-       exits non-zero and launchd logs it, and neither the ping nor the backup runs.
+       exits non-zero and launchd logs it, and neither the backup nor the ping runs.
     2. Judge success with ``cycle_succeeded``.
-    3. On success only, ping the health check, then run the ``lake/`` to SSD backup.
-       The ping fires before the backup so the order stays the run-cycle-then-ping-then-
-       rsync shape the design pins for slice 1. A failed cycle does neither.
+    3. On success only, run the ``lake/`` to SSD backup first, then ping the health
+       check. The ping comes last so it attests both the capture and the backup. Slice
+       1 has one check, so the ping is the single evidence that the day is neither
+       capture-dark nor single-copy. If the backup raises, the ping never fires and the
+       error surfaces, so the missed ping makes the dead-man catch the single-copy
+       window, not just capture-dark. A failed or empty cycle does neither step.
 
     Every I/O boundary is injected, so this whole function runs offline in a test.
     """
@@ -206,10 +217,12 @@ def run_once(
     pinged = False
     backed_up = False
     if succeeded:
-        pinger.ping(ping_url)
-        pinged = True
+        # Backup first. A raised backup propagates before the ping, so a single-copy
+        # window pages through the missed ping rather than being reported as healthy.
         backup.sync(lake_root, backup_target)
         backed_up = True
+        pinger.ping(ping_url)
+        pinged = True
     return RunOutcome(result=result, succeeded=succeeded, pinged=pinged, backed_up=backed_up)
 
 

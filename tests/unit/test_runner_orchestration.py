@@ -1,9 +1,11 @@
 """The slice-1 runner orchestration, decided from values alone.
 
 These inject fakes for the two I/O seams and a canned cycle result, then assert the
-orchestration rule: on a successful durable cycle the runner pings the health check and
-then backs up, in that order; a cycle that captured nothing does neither. Nothing here
-touches the network, a subprocess, or the filesystem, so the tier is unit.
+orchestration rule: on a successful durable cycle the runner backs up and then pings the
+health check, in that order, so the one slice-1 ping attests both. A cycle that captured
+nothing does neither. A backup that fails blocks the ping and surfaces the error, so the
+missed ping catches the single-copy window. Nothing here touches the network, a
+subprocess, or the filesystem, so the tier is unit.
 """
 
 from __future__ import annotations
@@ -95,15 +97,15 @@ def _run(cycle_runner):
     return outcome, pinger, backup, events
 
 
-def test_successful_cycle_pings_then_backs_up():
+def test_successful_cycle_backs_up_then_pings():
     outcome, pinger, backup, events = _run(_data_result)
     assert outcome.succeeded is True
-    assert outcome.pinged is True and outcome.backed_up is True
-    # The ping fires on the configured URL, and the backup targets the SSD.
-    assert pinger.urls == [_URL]
+    assert outcome.backed_up is True and outcome.pinged is True
+    # The backup targets the SSD, and the ping fires on the configured URL.
     assert backup.calls == [(_LAKE, _TARGET)]
-    # Order matters: ping first, then rsync.
-    assert events == ["ping", "backup"]
+    assert pinger.urls == [_URL]
+    # Order matters: rsync first, then the ping, so the one ping attests both.
+    assert events == ["backup", "ping"]
 
 
 def test_cycle_that_captured_nothing_does_not_ping_or_back_up():
@@ -145,6 +147,31 @@ def test_a_raising_cycle_never_pings():
             backup_target=_TARGET,
         )
     assert events == []
+
+
+def test_a_failing_backup_blocks_the_ping_and_surfaces():
+    # A successful cycle, but the backup raises. The ping must not fire, and the error
+    # must propagate, so the missed ping makes the dead-man catch the single-copy window.
+    events: list[str] = []
+    pinger = FakePinger(events)
+
+    class RaisingBackup:
+        def sync(self, source: Path, target: Path) -> None:
+            events.append("backup-attempt")
+            raise runner.BackupTargetUnavailable("ssd unplugged")
+
+    with pytest.raises(runner.BackupTargetUnavailable):
+        runner.run_once(
+            _data_result,
+            pinger=pinger,
+            ping_url=_URL,
+            backup=RaisingBackup(),
+            lake_root=_LAKE,
+            backup_target=_TARGET,
+        )
+    # The backup was attempted; the ping never fired.
+    assert events == ["backup-attempt"]
+    assert pinger.urls == []
 
 
 def test_cycle_succeeded_predicate():
