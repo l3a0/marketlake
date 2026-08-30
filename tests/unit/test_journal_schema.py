@@ -88,9 +88,9 @@ QUOTE = {
         "bidMICId": "XNYS",
         "askMICId": "XNAS",
         "lastMICId": "XNYS",
-        "bidTime": "2026-08-24T16:00:00Z",
-        "askTime": "2026-08-24T16:00:01Z",
-        "tradeTime": "2026-08-24T16:00:02Z",
+        "bidTime": 1787000099000,
+        "askTime": 1787000099500,
+        "tradeTime": 1787000098000,
         "highPrice": 655.0,
         "lowPrice": 645.0,
         "openPrice": 648.0,
@@ -126,13 +126,14 @@ QUOTE = {
         "avg1YearVolume": 80000000.0,
         "lastEarningsDate": "2026-07-30",
         "fundLeverageFactor": 1.0,
+        "sharesOutstanding": 900000000,
     },
     "regular": {
         "regularMarketLastPrice": 649.5,
         "regularMarketLastSize": 100,
         "regularMarketNetChange": 1.2,
         "regularMarketPercentChange": 0.18,
-        "regularMarketTradeTime": "2026-08-24T16:00:00Z",
+        "regularMarketTradeTime": 1787000100000,
     },
     "extended": {
         "lastPrice": 651.0,
@@ -142,8 +143,8 @@ QUOTE = {
         "askSize": 7,
         "lastSize": 3,
         "mark": 651.0,
-        "quoteTime": "2026-08-24T17:00:00Z",
-        "tradeTime": "2026-08-24T17:00:01Z",
+        "quoteTime": 1787000200000,
+        "tradeTime": 1787000200500,
         "totalVolume": 2000,
     },
 }
@@ -304,17 +305,17 @@ def test_quotes_schema_names_and_types():
         "week_52_low",
     ):
         assert schema.field(float_field).type == pa.float64()
-    for int_field in ("bid_size", "ask_size", "last_size", "total_volume"):
-        assert schema.field(int_field).type == pa.int64()
-    for str_field in (
-        "bid_mic_id",
-        "ask_mic_id",
-        "last_mic_id",
+    for int_field in (
+        "bid_size",
+        "ask_size",
+        "last_size",
+        "total_volume",
         "bid_time",
         "ask_time",
         "trade_time",
-        "security_status",
     ):
+        assert schema.field(int_field).type == pa.int64()
+    for str_field in ("bid_mic_id", "ask_mic_id", "last_mic_id", "security_status"):
         assert schema.field(str_field).type == pa.string()
     # The entitlement flag is a per-row vendor bool.
     assert schema.field("realtime").type == pa.bool_()
@@ -338,15 +339,16 @@ def test_quotes_schema_names_and_types():
         assert schema.field(float_field).type == pa.float64()
     assert schema.field("avg_10_days_volume").type == pa.float64()
     assert schema.field("avg_1_year_volume").type == pa.float64()
+    assert schema.field("shares_outstanding").type == pa.int64()
     assert schema.field("last_earnings_date").type == pa.string()
     assert schema.field("div_pay_date").type == pa.string()
-    # The regular block: prices float, size int, net/percent float, trade time string.
+    # The regular block: prices float, size int, net/percent float, trade time int (epoch-ms).
     assert schema.field("regular_market_last_price").type == pa.float64()
     assert schema.field("regular_market_last_size").type == pa.int64()
     assert schema.field("regular_market_net_change").type == pa.float64()
     assert schema.field("regular_market_percent_change").type == pa.float64()
-    assert schema.field("regular_market_trade_time").type == pa.string()
-    # The extended block: prices/mark float, sizes and volume int, times string.
+    assert schema.field("regular_market_trade_time").type == pa.int64()
+    # The extended block: prices/mark float, sizes and volume int, times int (epoch-ms).
     for float_field in (
         "extended_last_price",
         "extended_bid_price",
@@ -361,8 +363,8 @@ def test_quotes_schema_names_and_types():
         "extended_total_volume",
     ):
         assert schema.field(int_field).type == pa.int64()
-    assert schema.field("extended_quote_time").type == pa.string()
-    assert schema.field("extended_trade_time").type == pa.string()
+    assert schema.field("extended_quote_time").type == pa.int64()
+    assert schema.field("extended_trade_time").type == pa.int64()
     # Quotes never carry a per-contract vendor column.
     assert "open_interest" not in schema.names
     # Chains carry none of the equity CUSIP, dividend, regular, or extended columns.
@@ -502,9 +504,9 @@ def test_quotes_data_batch_maps_prices_and_consumes_quote_time():
     assert row["bid_mic_id"] == "XNYS"
     assert row["ask_mic_id"] == "XNAS"
     assert row["last_mic_id"] == "XNYS"
-    assert row["bid_time"] == "2026-08-24T16:00:00Z"
-    assert row["ask_time"] == "2026-08-24T16:00:01Z"
-    assert row["trade_time"] == "2026-08-24T16:00:02Z"
+    assert row["bid_time"] == 1787000099000
+    assert row["ask_time"] == 1787000099500
+    assert row["trade_time"] == 1787000098000
     assert row["high_price"] == 655.0
     assert row["low_price"] == 645.0
     assert row["open_price"] == 648.0
@@ -549,12 +551,13 @@ def test_quotes_data_batch_maps_prices_and_consumes_quote_time():
     assert row["avg_1_year_volume"] == 80000000.0
     assert row["last_earnings_date"] == "2026-07-30"
     assert row["fund_leverage_factor"] == 1.0
+    assert row["shares_outstanding"] == 900000000
     # The regular block lands in its typed columns.
     assert row["regular_market_last_price"] == 649.5
     assert row["regular_market_last_size"] == 100
     assert row["regular_market_net_change"] == 1.2
     assert row["regular_market_percent_change"] == 0.18
-    assert row["regular_market_trade_time"] == "2026-08-24T16:00:00Z"
+    assert row["regular_market_trade_time"] == 1787000100000
     # The extended block lands in its distinctly-prefixed columns.
     assert row["extended_last_price"] == 651.0
     assert row["extended_bid_price"] == 650.9
@@ -563,8 +566,8 @@ def test_quotes_data_batch_maps_prices_and_consumes_quote_time():
     assert row["extended_ask_size"] == 7
     assert row["extended_last_size"] == 3
     assert row["extended_mark"] == 651.0
-    assert row["extended_quote_time"] == "2026-08-24T17:00:00Z"
-    assert row["extended_trade_time"] == "2026-08-24T17:00:01Z"
+    assert row["extended_quote_time"] == 1787000200000
+    assert row["extended_trade_time"] == 1787000200500
     assert row["extended_total_volume"] == 2000
     # The colliding name lands in both blocks' own columns, never overwriting: the quote
     # block's lastPrice in ``last``, the extended block's in ``extended_last_price``.

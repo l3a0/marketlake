@@ -172,9 +172,9 @@ QUOTES_SCHEMA = pa.schema(
         ("bid_mic_id", pa.string()),
         ("ask_mic_id", pa.string()),
         ("last_mic_id", pa.string()),
-        ("bid_time", pa.string()),
-        ("ask_time", pa.string()),
-        ("trade_time", pa.string()),
+        ("bid_time", pa.int64()),
+        ("ask_time", pa.int64()),
+        ("trade_time", pa.int64()),
         ("high_price", pa.float64()),
         ("low_price", pa.float64()),
         ("open_price", pa.float64()),
@@ -213,12 +213,13 @@ QUOTES_SCHEMA = pa.schema(
         ("avg_1_year_volume", pa.float64()),
         ("last_earnings_date", pa.string()),
         ("fund_leverage_factor", pa.float64()),
+        ("shares_outstanding", pa.int64()),
         # regular block — the regular-session close
         ("regular_market_last_price", pa.float64()),
         ("regular_market_last_size", pa.int64()),
         ("regular_market_net_change", pa.float64()),
         ("regular_market_percent_change", pa.float64()),
-        ("regular_market_trade_time", pa.string()),
+        ("regular_market_trade_time", pa.int64()),
         # extended block — extended-hours session, prefixed to avoid the quote collision
         ("extended_last_price", pa.float64()),
         ("extended_bid_price", pa.float64()),
@@ -227,8 +228,8 @@ QUOTES_SCHEMA = pa.schema(
         ("extended_ask_size", pa.int64()),
         ("extended_last_size", pa.int64()),
         ("extended_mark", pa.float64()),
-        ("extended_quote_time", pa.string()),
-        ("extended_trade_time", pa.string()),
+        ("extended_quote_time", pa.int64()),
+        ("extended_trade_time", pa.int64()),
         ("extended_total_volume", pa.int64()),
     ]
     + _PROVENANCE_FIELDS
@@ -287,8 +288,8 @@ _CHAINS_HEADER_MAP = {
 # The ``quote`` block, fully typed. ``quoteTime`` is consumed into ``vendor_quote_ts``
 # below, not made a column. The 52-week fields use ``week_52_*`` column names so they do
 # not collide with fundamental's ``high_52`` / ``low_52``. The time fields
-# (``bid_time``, ``ask_time``, ``trade_time``) are typed string pending confirmation
-# against the live cassette recording (live check 1); Schwab may send epoch millis.
+# (``bid_time``, ``ask_time``, ``trade_time``) are int64: the live cassette recording
+# (live check 1) confirmed Schwab returns them as epoch milliseconds, stored verbatim.
 _QUOTE_MAP = {
     "bidPrice": "bid",
     "askPrice": "ask",
@@ -339,6 +340,7 @@ _FUNDAMENTAL_MAP = {
     "avg1YearVolume": "avg_1_year_volume",
     "lastEarningsDate": "last_earnings_date",
     "fundLeverageFactor": "fund_leverage_factor",
+    "sharesOutstanding": "shares_outstanding",
 }
 
 # The ``regular`` block: the regular-session close. Schwab already prefixes these

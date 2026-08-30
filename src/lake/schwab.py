@@ -41,10 +41,13 @@ from lake.vendor import VendorError, VendorResponse
 DEFAULT_TOKEN_PATH = Path.home() / ".config" / "marketlake" / "token.json"
 
 # The field groups pinned on every batched quote request. ``all`` returns every block
-# Schwab offers: quote, fundamental, regular, extended, and reference. Pinning it means
+# Schwab offers: quote, fundamental, regular, extended, and reference. Pinning them means
 # those blocks are present regardless of the per-account default, so the fundamental,
-# regular, extended, and CUSIP columns are never silently empty.
-QUOTE_FIELD_GROUPS = "all"
+# regular, extended, and CUSIP columns are never silently empty. schwab-py expects an
+# ITERABLE of the field-group values (validated against its Fields enum), not one joined
+# string, so this is a tuple. The values are exactly the Fields enum's own values, and
+# the client is built with enforce_enums=False so the raw strings pass through.
+QUOTE_FIELD_GROUPS = ("quote", "fundamental", "regular", "extended", "reference")
 
 
 @runtime_checkable
@@ -90,7 +93,9 @@ class SchwabClient(Protocol):
         """The full option chain for one underlying, in one request."""
         ...
 
-    def get_quotes(self, symbols: Sequence[str], *, fields: str | None = None) -> HttpResponse:
+    def get_quotes(
+        self, symbols: Sequence[str], *, fields: Sequence[str] | None = None
+    ) -> HttpResponse:
         """Batched equity quotes for a list of symbols, in one request.
 
         ``fields`` is the comma-separated field groups to include, like
@@ -144,11 +149,14 @@ class SchwabVendor:
     def get_quotes(self, symbols: Sequence[str]) -> VendorResponse:
         """Batched equity quotes for every symbol, verbatim.
 
-        The request pins the ``all`` field group, so every block Schwab offers, the
-        quote, fundamental, regular, extended, and reference blocks, is present
-        regardless of the account's default field set.
+        The request pins every field group Schwab offers, the quote, fundamental,
+        regular, extended, and reference blocks, so they are present regardless of the
+        account's default field set. The groups pass as an iterable of their string
+        values, which the ``enforce_enums=False`` client accepts as-is.
         """
-        return _response_from(self._client.get_quotes(list(symbols), fields=QUOTE_FIELD_GROUPS))
+        return _response_from(
+            self._client.get_quotes(list(symbols), fields=list(QUOTE_FIELD_GROUPS))
+        )
 
     def token_mint_time(self) -> datetime:
         """When the refresh token in use was minted, timezone-aware in UTC.
@@ -185,5 +193,7 @@ class SchwabVendor:
         """
         from schwab.auth import client_from_token_file  # lazy: real dep, live only
 
-        client = client_from_token_file(str(token_path), api_key, app_secret)
+        # enforce_enums=False lets get_quotes pass the field groups as plain strings
+        # rather than schwab-py Fields enum members, keeping this layer enum-agnostic.
+        client = client_from_token_file(str(token_path), api_key, app_secret, enforce_enums=False)
         return cls(client)

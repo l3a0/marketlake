@@ -154,7 +154,7 @@ def test_happy_cycle_writes_chains_and_quotes_with_correct_stamps(cassette_vendo
     # The regular-session block lands in its regular_market_* columns.
     assert spy_quote["regular_market_last_price"] == 649.5
     assert spy_quote["regular_market_last_size"] == 100
-    assert spy_quote["regular_market_trade_time"] == "2026-08-24T16:00:00Z"
+    assert spy_quote["regular_market_trade_time"] == 1787000100000
     # The extended-hours block lands in its extended_* columns. Its lastPrice collides
     # with the quote block's, and the two land in separate columns without overwriting.
     assert spy_quote["extended_last_price"] == 651.0
