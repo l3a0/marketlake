@@ -76,14 +76,15 @@ def test_get_quotes_calls_the_batched_endpoint_with_the_symbol_list():
     assert response.body == QUOTES_BODY
 
 
-def test_get_quotes_pins_the_all_field_group():
+def test_get_quotes_pins_every_field_group():
     # The fundamental, regular, extended, and reference blocks live in their own field
-    # groups. Requesting ``all`` means every block is present regardless of the account
-    # default, so no captured column is silently empty.
+    # groups. Requesting all of them explicitly means every block is present regardless of
+    # the account default, so no captured column is silently empty. schwab-py wants an
+    # iterable of the field-group values, not a joined string, so the vendor passes a list.
     client = _client()
     SchwabVendor(client).get_quotes(["SPY", "QQQ"])
-    assert client.quote_fields == ["all"]
-    assert client.quote_fields == [QUOTE_FIELD_GROUPS]
+    assert list(QUOTE_FIELD_GROUPS) == ["quote", "fundamental", "regular", "extended", "reference"]
+    assert client.quote_fields == [list(QUOTE_FIELD_GROUPS)]
 
 
 def test_get_quotes_passes_a_plain_list_to_the_client():

@@ -1,303 +1,305 @@
 {
   "cassette_version": 1,
-  "token_mint_time": "2026-08-23T20:05:00-04:00",
   "interactions": [
     {
+      "body": {
+        "callExpDateMap": {
+          "2026-09-18:25": {
+            "650.0": [
+              {
+                "ask": 4.25,
+                "bid": 4.2,
+                "delta": 0.51,
+                "gamma": 0.03,
+                "last": 4.22,
+                "openInterest": 1234,
+                "putCall": "CALL",
+                "rho": 0.08,
+                "symbol": "SPY   260918C00650000",
+                "theta": -0.12,
+                "totalVolume": 5555,
+                "vega": 0.34,
+                "volatility": 12.5
+              }
+            ]
+          }
+        },
+        "dividendYield": 1.28,
+        "interestRate": 4.25,
+        "isDelayed": false,
+        "numberOfContracts": 2,
+        "putExpDateMap": {
+          "2026-09-18:25": {
+            "650.0": [
+              {
+                "ask": 3.85,
+                "bid": 3.8,
+                "delta": -0.49,
+                "gamma": 0.03,
+                "last": 3.82,
+                "openInterest": 987,
+                "putCall": "PUT",
+                "rho": -0.07,
+                "symbol": "SPY   260918P00650000",
+                "theta": -0.11,
+                "totalVolume": 4444,
+                "vega": 0.34,
+                "volatility": 12.7
+              }
+            ]
+          }
+        },
+        "status": "SUCCESS",
+        "symbol": "SPY",
+        "underlying": {
+          "quoteTime": 1787000099000,
+          "symbol": "SPY"
+        },
+        "underlyingPrice": 650.01
+      },
       "endpoint": "chains",
+      "headers": {
+        "content-type": "application/json"
+      },
       "params": {
         "symbol": "SPY"
       },
-      "status": 200,
+      "status": 200
+    },
+    {
+      "body": {
+        "callExpDateMap": {
+          "2026-09-18:25": {
+            "600.0": [
+              {
+                "ask": 6.15,
+                "bid": 6.1,
+                "delta": 0.55,
+                "gamma": 0.02,
+                "last": 6.12,
+                "openInterest": 2222,
+                "putCall": "CALL",
+                "rho": 0.09,
+                "symbol": "QQQ   260918C00600000",
+                "theta": -0.18,
+                "totalVolume": 7777,
+                "vega": 0.41,
+                "volatility": 14.1
+              }
+            ]
+          }
+        },
+        "dividendYield": 0.61,
+        "interestRate": 4.25,
+        "isDelayed": false,
+        "numberOfContracts": 2,
+        "putExpDateMap": {
+          "2026-09-18:25": {
+            "600.0": [
+              {
+                "ask": 5.45,
+                "bid": 5.4,
+                "delta": -0.45,
+                "gamma": 0.02,
+                "last": 5.42,
+                "openInterest": 1777,
+                "putCall": "PUT",
+                "rho": -0.08,
+                "symbol": "QQQ   260918P00600000",
+                "theta": -0.17,
+                "totalVolume": 6666,
+                "vega": 0.41,
+                "volatility": 14.3
+              }
+            ]
+          }
+        },
+        "status": "SUCCESS",
+        "symbol": "QQQ",
+        "underlying": {
+          "quoteTime": 1787000099000,
+          "symbol": "QQQ"
+        },
+        "underlyingPrice": 601.5
+      },
+      "endpoint": "chains",
       "headers": {
         "content-type": "application/json"
       },
-      "body": {
-        "symbol": "SPY",
-        "status": "SUCCESS",
-        "isDelayed": false,
-        "interestRate": 4.25,
-        "underlyingPrice": 650.01,
-        "dividendYield": 1.28,
-        "numberOfContracts": 2,
-        "underlying": {
-          "symbol": "SPY",
-          "quoteTime": 1787000099000
-        },
-        "callExpDateMap": {
-          "2026-09-18:25": {
-            "650.0": [
-              {
-                "putCall": "CALL",
-                "symbol": "SPY   260918C00650000",
-                "bid": 4.2,
-                "ask": 4.25,
-                "last": 4.22,
-                "openInterest": 1234,
-                "totalVolume": 5555,
-                "volatility": 12.5,
-                "delta": 0.51,
-                "gamma": 0.03,
-                "theta": -0.12,
-                "vega": 0.34,
-                "rho": 0.08
-              }
-            ]
-          }
-        },
-        "putExpDateMap": {
-          "2026-09-18:25": {
-            "650.0": [
-              {
-                "putCall": "PUT",
-                "symbol": "SPY   260918P00650000",
-                "bid": 3.8,
-                "ask": 3.85,
-                "last": 3.82,
-                "openInterest": 987,
-                "totalVolume": 4444,
-                "volatility": 12.7,
-                "delta": -0.49,
-                "gamma": 0.03,
-                "theta": -0.11,
-                "vega": 0.34,
-                "rho": -0.07
-              }
-            ]
-          }
-        }
-      }
-    },
-    {
-      "endpoint": "chains",
       "params": {
         "symbol": "QQQ"
       },
-      "status": 200,
-      "headers": {
-        "content-type": "application/json"
-      },
-      "body": {
-        "symbol": "QQQ",
-        "status": "SUCCESS",
-        "isDelayed": false,
-        "interestRate": 4.25,
-        "underlyingPrice": 601.5,
-        "dividendYield": 0.61,
-        "numberOfContracts": 2,
-        "underlying": {
-          "symbol": "QQQ",
-          "quoteTime": 1787000099000
-        },
-        "callExpDateMap": {
-          "2026-09-18:25": {
-            "600.0": [
-              {
-                "putCall": "CALL",
-                "symbol": "QQQ   260918C00600000",
-                "bid": 6.1,
-                "ask": 6.15,
-                "last": 6.12,
-                "openInterest": 2222,
-                "totalVolume": 7777,
-                "volatility": 14.1,
-                "delta": 0.55,
-                "gamma": 0.02,
-                "theta": -0.18,
-                "vega": 0.41,
-                "rho": 0.09
-              }
-            ]
-          }
-        },
-        "putExpDateMap": {
-          "2026-09-18:25": {
-            "600.0": [
-              {
-                "putCall": "PUT",
-                "symbol": "QQQ   260918P00600000",
-                "bid": 5.4,
-                "ask": 5.45,
-                "last": 5.42,
-                "openInterest": 1777,
-                "totalVolume": 6666,
-                "volatility": 14.3,
-                "delta": -0.45,
-                "gamma": 0.02,
-                "theta": -0.17,
-                "vega": 0.41,
-                "rho": -0.08
-              }
-            ]
-          }
-        }
-      }
+      "status": 200
     },
     {
-      "endpoint": "quotes",
-      "params": {
-        "symbols": [
-          "SPY",
-          "QQQ"
-        ]
-      },
-      "status": 200,
-      "headers": {
-        "content-type": "application/json"
-      },
       "body": {
-        "SPY": {
-          "assetMainType": "EQUITY",
-          "realtime": true,
-          "reference": {
-            "cusip": "111111111"
-          },
-          "fundamental": {
-            "divPayAmount": 1.75,
-            "divExDate": "2026-09-18",
-            "divAmount": 7.0,
-            "divFreq": 4,
-            "declarationDate": "2026-08-15",
-            "nextDivExDate": "2026-12-18",
-            "nextDivPayDate": "2026-12-31",
-            "divPayDate": "2026-09-30",
-            "divYield": 1.28,
-            "peRatio": 24.5,
-            "eps": 22.3,
-            "high52": 700.0,
-            "low52": 500.0,
-            "avg10DaysVolume": 74000000.0,
-            "avg1YearVolume": 80000000.0,
-            "lastEarningsDate": "2026-07-30",
-            "fundLeverageFactor": 1.0
-          },
-          "quote": {
-            "bidPrice": 649.98,
-            "askPrice": 650.02,
-            "lastPrice": 650.0,
-            "quoteTime": 1787000100000,
-            "bidSize": 5,
-            "askSize": 7,
-            "lastSize": 3,
-            "bidMICId": "XNYS",
-            "askMICId": "XNAS",
-            "lastMICId": "XNYS",
-            "bidTime": "2026-08-24T16:00:00Z",
-            "askTime": "2026-08-24T16:00:00Z",
-            "tradeTime": "2026-08-24T16:00:00Z",
-            "highPrice": 655.0,
-            "lowPrice": 645.0,
-            "openPrice": 648.0,
-            "closePrice": 649.0,
-            "mark": 650.0,
-            "markChange": 1.0,
-            "markPercentChange": 0.15,
-            "netChange": 1.2,
-            "netPercentChange": 0.18,
-            "postMarketChange": 0.3,
-            "postMarketPercentChange": 0.05,
-            "totalVolume": 90000000,
-            "volatility": 12.5,
-            "52WeekHigh": 705.0,
-            "52WeekLow": 495.0,
-            "securityStatus": "Normal"
-          },
-          "regular": {
-            "regularMarketLastPrice": 649.5,
-            "regularMarketLastSize": 100,
-            "regularMarketNetChange": 1.2,
-            "regularMarketPercentChange": 0.18,
-            "regularMarketTradeTime": "2026-08-24T16:00:00Z"
-          },
-          "extended": {
-            "lastPrice": 651.0,
-            "bidPrice": 650.9,
-            "askPrice": 651.1,
-            "bidSize": 5,
-            "askSize": 7,
-            "lastSize": 3,
-            "mark": 651.0,
-            "quoteTime": "2026-08-24T17:00:00Z",
-            "tradeTime": "2026-08-24T17:00:01Z",
-            "totalVolume": 2000
-          }
-        },
         "QQQ": {
           "assetMainType": "EQUITY",
-          "realtime": true,
-          "reference": {
-            "cusip": "222222222"
+          "extended": {
+            "askPrice": 602.1,
+            "askSize": 6,
+            "bidPrice": 601.9,
+            "bidSize": 4,
+            "lastPrice": 602.0,
+            "lastSize": 2,
+            "mark": 602.0,
+            "quoteTime": 1787000200000,
+            "totalVolume": 1500,
+            "tradeTime": 1787000200500
           },
           "fundamental": {
-            "divPayAmount": 0.9,
-            "divExDate": "2026-09-18",
-            "divAmount": 3.6,
-            "divFreq": 4,
-            "declarationDate": "2026-08-14",
-            "nextDivExDate": "2026-12-18",
-            "nextDivPayDate": "2026-12-31",
-            "divPayDate": "2026-09-30",
-            "divYield": 0.61,
-            "peRatio": 33.1,
-            "eps": 18.2,
-            "high52": 620.0,
-            "low52": 430.0,
             "avg10DaysVolume": 42000000.0,
             "avg1YearVolume": 45000000.0,
+            "declarationDate": "2026-08-14",
+            "divAmount": 3.6,
+            "divExDate": "2026-09-18",
+            "divFreq": 4,
+            "divPayAmount": 0.9,
+            "divPayDate": "2026-09-30",
+            "divYield": 0.61,
+            "eps": 18.2,
+            "fundLeverageFactor": 1.0,
+            "high52": 620.0,
             "lastEarningsDate": "2026-07-29",
-            "fundLeverageFactor": 1.0
+            "low52": 430.0,
+            "nextDivExDate": "2026-12-18",
+            "nextDivPayDate": "2026-12-31",
+            "peRatio": 33.1,
+            "sharesOutstanding": 900000000
           },
           "quote": {
-            "bidPrice": 601.48,
-            "askPrice": 601.52,
-            "lastPrice": 601.5,
-            "quoteTime": 1787000100000,
-            "bidSize": 4,
-            "askSize": 6,
-            "lastSize": 2,
-            "bidMICId": "XNAS",
+            "52WeekHigh": 625.0,
+            "52WeekLow": 425.0,
             "askMICId": "XNAS",
-            "lastMICId": "XNAS",
-            "bidTime": "2026-08-24T16:00:00Z",
-            "askTime": "2026-08-24T16:00:00Z",
-            "tradeTime": "2026-08-24T16:00:00Z",
-            "highPrice": 605.0,
-            "lowPrice": 598.0,
-            "openPrice": 600.0,
+            "askPrice": 601.52,
+            "askSize": 6,
+            "askTime": 1787000099500,
+            "bidMICId": "XNAS",
+            "bidPrice": 601.48,
+            "bidSize": 4,
+            "bidTime": 1787000099000,
             "closePrice": 601.0,
+            "highPrice": 605.0,
+            "lastMICId": "XNAS",
+            "lastPrice": 601.5,
+            "lastSize": 2,
+            "lowPrice": 598.0,
             "mark": 601.5,
             "markChange": 0.5,
             "markPercentChange": 0.08,
             "netChange": 0.5,
             "netPercentChange": 0.08,
+            "openPrice": 600.0,
             "postMarketChange": 0.1,
             "postMarketPercentChange": 0.02,
+            "quoteTime": 1787000100000,
+            "securityStatus": "Normal",
             "totalVolume": 45000000,
-            "volatility": 14.1,
-            "52WeekHigh": 625.0,
-            "52WeekLow": 425.0,
-            "securityStatus": "Normal"
+            "tradeTime": 1787000098000,
+            "volatility": 14.1
+          },
+          "realtime": true,
+          "reference": {
+            "cusip": "222222222"
           },
           "regular": {
             "regularMarketLastPrice": 601.0,
             "regularMarketLastSize": 200,
             "regularMarketNetChange": -0.5,
             "regularMarketPercentChange": -0.08,
-            "regularMarketTradeTime": "2026-08-24T16:00:00Z"
-          },
+            "regularMarketTradeTime": 1787000100000
+          }
+        },
+        "SPY": {
+          "assetMainType": "EQUITY",
           "extended": {
-            "lastPrice": 602.0,
-            "bidPrice": 601.9,
-            "askPrice": 602.1,
-            "bidSize": 4,
-            "askSize": 6,
-            "lastSize": 2,
-            "mark": 602.0,
-            "quoteTime": "2026-08-24T17:00:00Z",
-            "tradeTime": "2026-08-24T17:00:01Z",
-            "totalVolume": 1500
+            "askPrice": 651.1,
+            "askSize": 7,
+            "bidPrice": 650.9,
+            "bidSize": 5,
+            "lastPrice": 651.0,
+            "lastSize": 3,
+            "mark": 651.0,
+            "quoteTime": 1787000200000,
+            "totalVolume": 2000,
+            "tradeTime": 1787000200500
+          },
+          "fundamental": {
+            "avg10DaysVolume": 74000000.0,
+            "avg1YearVolume": 80000000.0,
+            "declarationDate": "2026-08-15",
+            "divAmount": 7.0,
+            "divExDate": "2026-09-18",
+            "divFreq": 4,
+            "divPayAmount": 1.75,
+            "divPayDate": "2026-09-30",
+            "divYield": 1.28,
+            "eps": 22.3,
+            "fundLeverageFactor": 1.0,
+            "high52": 700.0,
+            "lastEarningsDate": "2026-07-30",
+            "low52": 500.0,
+            "nextDivExDate": "2026-12-18",
+            "nextDivPayDate": "2026-12-31",
+            "peRatio": 24.5,
+            "sharesOutstanding": 900000000
+          },
+          "quote": {
+            "52WeekHigh": 705.0,
+            "52WeekLow": 495.0,
+            "askMICId": "XNAS",
+            "askPrice": 650.02,
+            "askSize": 7,
+            "askTime": 1787000099500,
+            "bidMICId": "XNYS",
+            "bidPrice": 649.98,
+            "bidSize": 5,
+            "bidTime": 1787000099000,
+            "closePrice": 649.0,
+            "highPrice": 655.0,
+            "lastMICId": "XNYS",
+            "lastPrice": 650.0,
+            "lastSize": 3,
+            "lowPrice": 645.0,
+            "mark": 650.0,
+            "markChange": 1.0,
+            "markPercentChange": 0.15,
+            "netChange": 1.2,
+            "netPercentChange": 0.18,
+            "openPrice": 648.0,
+            "postMarketChange": 0.3,
+            "postMarketPercentChange": 0.05,
+            "quoteTime": 1787000100000,
+            "securityStatus": "Normal",
+            "totalVolume": 90000000,
+            "tradeTime": 1787000098000,
+            "volatility": 12.5
+          },
+          "realtime": true,
+          "reference": {
+            "cusip": "111111111"
+          },
+          "regular": {
+            "regularMarketLastPrice": 649.5,
+            "regularMarketLastSize": 100,
+            "regularMarketNetChange": 1.2,
+            "regularMarketPercentChange": 0.18,
+            "regularMarketTradeTime": 1787000100000
           }
         }
-      }
+      },
+      "endpoint": "quotes",
+      "headers": {
+        "content-type": "application/json"
+      },
+      "params": {
+        "symbols": [
+          "SPY",
+          "QQQ"
+        ]
+      },
+      "status": 200
     }
-  ]
+  ],
+  "token_mint_time": "2026-08-23T20:05:00-04:00"
 }
