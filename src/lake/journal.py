@@ -35,7 +35,7 @@ import fcntl
 import json
 import os
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pyarrow as pa
@@ -102,36 +102,98 @@ _STAMP_FIELDS = [
 ]
 
 # The chains capture schema. Besides the stamps and provenance, each row is one
-# contract. The per-contract vendor columns are fixed by the first day's payload:
-# the OCC symbol, the call/put flag, bid/ask/last, open interest, the day's traded
-# volume, the vendor's implied volatility, and the five greeks. ``volume`` is Schwab's
+# contract. Every per-contract field Schwab returns lands in a typed column, the same
+# way the quotes surface fully types its blocks, so ``extra`` stays empty in steady
+# state and only a genuinely new vendor field drifts into it. ``volume`` is Schwab's
 # ``totalVolume``. It is a typed column, not overflow, because the OI view's comparable
-# set ranks contracts on volume, so it must be queryable. The chain-level fields are
-# repeated on every contract row, per the raw-verbatim rule: ``interest_rate``,
-# ``underlying_price``, ``dividend_yield``, and ``is_delayed``. ``is_delayed`` is the
-# vendor's real-time entitlement flag. It must be false on a real-time chain response.
-# The validation battery checks it, so it is captured, not dropped. Raw stores what the
-# vendor said. Nothing here is reshaped or validated.
+# set ranks contracts on volume, so it must be queryable. Two contract fields are not
+# stored verbatim in a column of their own. ``quoteTimeInLong`` is the per-contract
+# quote time, consumed into ``vendor_quote_ts`` below and not repeated as a column.
+# ``optionDeliverablesList`` is a nested list, JSON-encoded into the string column
+# ``option_deliverables_list`` so the non-standard-contract detection can read it back.
+# The ``*_in_long`` and ``last_trading_day`` and ``trade_time`` columns hold Schwab's
+# epoch-millisecond stamps verbatim, as int64. ``expiration_date`` is the vendor's ISO
+# string, kept as a string, not an epoch. The chain-level fields are repeated on every
+# contract row, per the raw-verbatim rule: ``interest_rate``, ``underlying_price``,
+# ``dividend_yield``, ``is_delayed``, ``is_chain_truncated``, and
+# ``number_of_contracts``. ``is_delayed`` is the vendor's real-time entitlement flag. It
+# must be false on a real-time chain response. The validation battery checks it, so it
+# is captured, not dropped. Raw stores what the vendor said. Nothing here is reshaped or
+# validated. The names and types are calibrated against a real Schwab chain payload
+# (live check 1 follow-up).
 CHAINS_SCHEMA = pa.schema(
     _STAMP_FIELDS
     + [
+        # identity and the call/put flag
         ("occ_symbol", pa.string()),
         ("put_call", pa.string()),
+        # top of book and its sizes
         ("bid", pa.float64()),
         ("ask", pa.float64()),
         ("last", pa.float64()),
+        ("bid_size", pa.int64()),
+        ("ask_size", pa.int64()),
+        ("last_size", pa.int64()),
+        ("bid_ask_size", pa.string()),
+        # open interest and the day's traded volume
         ("open_interest", pa.int64()),
         ("volume", pa.int64()),
+        # the session prices and the mark
+        ("open_price", pa.float64()),
+        ("high_price", pa.float64()),
+        ("low_price", pa.float64()),
+        ("close_price", pa.float64()),
+        ("mark", pa.float64()),
+        ("mark_change", pa.float64()),
+        ("mark_percent_change", pa.float64()),
+        ("net_change", pa.float64()),
+        ("percent_change", pa.float64()),
+        # implied volatility and the five greeks
         ("volatility", pa.float64()),
         ("delta", pa.float64()),
         ("gamma", pa.float64()),
         ("theta", pa.float64()),
         ("vega", pa.float64()),
         ("rho", pa.float64()),
+        # theoreticals and the value decomposition
+        ("theoretical_option_value", pa.float64()),
+        ("theoretical_volatility", pa.float64()),
+        ("intrinsic_value", pa.float64()),
+        ("extrinsic_value", pa.float64()),
+        ("time_value", pa.float64()),
+        ("break_even", pa.float64()),
+        # the contract's 52-week range
+        ("high_52_week", pa.float64()),
+        ("low_52_week", pa.float64()),
+        # contract terms
+        ("strike_price", pa.float64()),
+        ("multiplier", pa.float64()),
+        ("days_to_expiration", pa.int64()),
+        ("expiration_date", pa.string()),
+        ("expiration_type", pa.string()),
+        ("exercise_type", pa.string()),
+        ("settlement_type", pa.string()),
+        ("option_root", pa.string()),
+        ("deliverable_note", pa.string()),
+        ("description", pa.string()),
+        ("exchange_name", pa.string()),
+        ("option_deliverables_list", pa.string()),
+        # the contract's classification flags
+        ("in_the_money", pa.bool_()),
+        ("non_standard", pa.bool_()),
+        ("mini", pa.bool_()),
+        ("penny_pilot", pa.bool_()),
+        # vendor identifiers and the epoch-millisecond stamps
+        ("ssid", pa.int64()),
+        ("last_trading_day", pa.int64()),
+        ("trade_time", pa.int64()),
+        # the chain-level fields, repeated on every contract row
         ("interest_rate", pa.float64()),
         ("underlying_price", pa.float64()),
         ("dividend_yield", pa.float64()),
         ("is_delayed", pa.bool_()),
+        ("is_chain_truncated", pa.bool_()),
+        ("number_of_contracts", pa.int64()),
     ]
     + _PROVENANCE_FIELDS
 )
@@ -248,33 +310,99 @@ def schema_for(surface: str) -> pa.Schema:
 
 # -- vendor field maps -------------------------------------------------------
 
-# The per-contract vendor fields that land in typed chains columns. The vendor speaks
-# camelCase. The pinned schema names are snake_case. Only the names change. The values
-# are stored verbatim.
+# The per-contract vendor fields that land in typed chains columns, each stored
+# verbatim under a snake_case name. The vendor speaks camelCase. Only the names change,
+# never the values. Two per-contract fields are handled outside this map because their
+# value is transformed, not copied: ``quoteTimeInLong`` is consumed into
+# ``vendor_quote_ts`` (see ``_CHAINS_CONTRACT_CONSUMED``), and ``optionDeliverablesList``
+# is JSON-encoded into a string column (see ``_CHAINS_DELIVERABLES_FIELD``). Both are
+# still counted as known below, so neither overflows into ``extra``.
 _CHAINS_CONTRACT_MAP = {
     "symbol": "occ_symbol",
     "putCall": "put_call",
     "bid": "bid",
     "ask": "ask",
     "last": "last",
+    "bidSize": "bid_size",
+    "askSize": "ask_size",
+    "lastSize": "last_size",
+    "bidAskSize": "bid_ask_size",
     "openInterest": "open_interest",
     "totalVolume": "volume",
+    "openPrice": "open_price",
+    "highPrice": "high_price",
+    "lowPrice": "low_price",
+    "closePrice": "close_price",
+    "mark": "mark",
+    "markChange": "mark_change",
+    "markPercentChange": "mark_percent_change",
+    "netChange": "net_change",
+    "percentChange": "percent_change",
     "volatility": "volatility",
     "delta": "delta",
     "gamma": "gamma",
     "theta": "theta",
     "vega": "vega",
     "rho": "rho",
+    "theoreticalOptionValue": "theoretical_option_value",
+    "theoreticalVolatility": "theoretical_volatility",
+    "intrinsicValue": "intrinsic_value",
+    "extrinsicValue": "extrinsic_value",
+    "timeValue": "time_value",
+    "breakEven": "break_even",
+    "high52Week": "high_52_week",
+    "low52Week": "low_52_week",
+    "strikePrice": "strike_price",
+    "multiplier": "multiplier",
+    "daysToExpiration": "days_to_expiration",
+    "expirationDate": "expiration_date",
+    "expirationType": "expiration_type",
+    "exerciseType": "exercise_type",
+    "settlementType": "settlement_type",
+    "optionRoot": "option_root",
+    "deliverableNote": "deliverable_note",
+    "description": "description",
+    "exchangeName": "exchange_name",
+    "inTheMoney": "in_the_money",
+    "nonStandard": "non_standard",
+    "mini": "mini",
+    "pennyPilot": "penny_pilot",
+    "ssid": "ssid",
+    "lastTradingDay": "last_trading_day",
+    "tradeTimeInLong": "trade_time",
 }
 
-# The chain-level fields promoted to columns on every contract row. The last is the
-# real-time entitlement flag, recognized here so it is captured, not dropped, and
-# never mistaken for an unknown field.
+# The per-contract quote time. It is an epoch-millisecond int on each contract. It is
+# consumed into that contract's ``vendor_quote_ts`` stamp, not stored as a column, so it
+# never lands in ``extra`` either. This mirrors how the quotes surface consumes
+# ``quote.quoteTime``.
+_CHAINS_QUOTE_TS_FIELD = "quoteTimeInLong"
+_CHAINS_CONTRACT_CONSUMED = frozenset({_CHAINS_QUOTE_TS_FIELD})
+
+# The nested deliverables list. Schwab returns it as a list of dicts. It is JSON-encoded
+# into a single string column, because the design's non-standard-contract detection reads
+# it back and Arrow columns hold no free-form nested list here.
+_CHAINS_DELIVERABLES_FIELD = "optionDeliverablesList"
+_CHAINS_DELIVERABLES_COLUMN = "option_deliverables_list"
+
+# Every per-contract field the parser recognizes. A field outside this set overflows
+# into ``extra``. The mapped fields, the consumed quote time, and the JSON-encoded
+# deliverables list are all known, so a fully-populated contract leaves ``extra`` empty.
+_CHAINS_CONTRACT_KNOWN = (
+    set(_CHAINS_CONTRACT_MAP) | _CHAINS_CONTRACT_CONSUMED | {_CHAINS_DELIVERABLES_FIELD}
+)
+
+# The chain-level fields promoted to columns on every contract row. The entitlement flag
+# and the two truncation-and-count fields are recognized here so they are captured, not
+# dropped, and never mistaken for an unknown field. Every other top-level body field
+# (strategy, interval, isIndex, and the rest) is neither per-contract nor captured.
 _CHAINS_HEADER_MAP = {
     "interestRate": "interest_rate",
     "underlyingPrice": "underlying_price",
     "dividendYield": "dividend_yield",
     "isDelayed": "is_delayed",
+    "isChainTruncated": "is_chain_truncated",
+    "numberOfContracts": "number_of_contracts",
 }
 
 # The per-block quote field maps, each vendor-field to snake_case column. Each map is
@@ -399,6 +527,19 @@ def _iso(value: str | datetime | date | None) -> str | None:
     return value.isoformat()
 
 
+def _epoch_ms_to_iso(value: object) -> str | None:
+    """A vendor epoch-millisecond stamp as a UTC ISO-8601 string, or ``None``.
+
+    Schwab stamps a contract's quote time as ``quoteTimeInLong``, an epoch in
+    milliseconds. Converting a stored epoch to a datetime is deterministic and reads no
+    wall clock, the same move ``lake.capture`` makes for the quote surface's quote time.
+    A missing value returns ``None``.
+    """
+    if value is None:
+        return None
+    return datetime.fromtimestamp(float(value) / 1000.0, tz=UTC).isoformat()
+
+
 def _extra_json(fields: Mapping[str, object], known: set[str]) -> str | None:
     """JSON for the vendor fields the schema does not name, or ``None`` when empty.
 
@@ -442,17 +583,25 @@ def chains_data_batch(
     snap_ts: str | datetime,
     fetch_ts: str | datetime,
     fetch_end_ts: str | datetime | None = None,
-    vendor_quote_ts: str | datetime | None,
     suspect: bool = False,
     close_tag: str | None = None,
     session_phase: str | None = None,
 ) -> pa.RecordBatch:
     """Build a chains data batch from one chain response body.
 
-    One row per contract. Known contract fields land in typed columns. The chain-level
-    fields repeat on every row: the three header fields and the ``is_delayed``
-    entitlement flag. Any unrecognized contract field lands in ``extra`` as JSON. The
-    parser fails open, so a new vendor field never drops a cycle. The timestamps are
+    One row per contract. Known contract fields land in typed columns. Any unrecognized
+    contract field lands in ``extra`` as JSON. The parser fails open, so a new vendor
+    field never drops a cycle.
+
+    ``vendor_quote_ts`` is per contract, derived from that contract's ``quoteTimeInLong``
+    epoch-millisecond stamp. The top-level ``underlying`` block is null on a real Schwab
+    chain even when the underlying quote is requested, so there is no single chain-level
+    quote time to stamp. The underlying price for IV inversion still arrives, in the
+    top-level ``underlyingPrice`` scalar, captured through the header map. The
+    ``optionDeliverablesList`` is JSON-encoded into ``option_deliverables_list``.
+
+    The chain-level header fields repeat on every row: the rates, the underlying price,
+    the entitlement flag, and the truncation-and-count fields. The other timestamps are
     the caller's, stamped from the injected clock. ``fetch_end_ts`` is when the response
     landed, the request end, so the round-trip is ``fetch_end_ts`` minus ``fetch_ts``.
     """
@@ -461,7 +610,6 @@ def chains_data_batch(
         "snap_ts": _iso(snap_ts),
         "fetch_ts": _iso(fetch_ts),
         "fetch_end_ts": _iso(fetch_end_ts),
-        "vendor_quote_ts": _iso(vendor_quote_ts),
         "ticker": ticker,
         "row_kind": ROW_KIND_DATA,
         "error_class": None,
@@ -474,10 +622,14 @@ def chains_data_batch(
     for contract in _iter_contracts(body):
         row: dict[str, object] = dict(stamps)
         row.update(header)
+        row["vendor_quote_ts"] = _epoch_ms_to_iso(contract.get(_CHAINS_QUOTE_TS_FIELD))
         for vendor, column in _CHAINS_CONTRACT_MAP.items():
             if vendor in contract:
                 row[column] = contract[vendor]
-        row["extra"] = _extra_json(contract, set(_CHAINS_CONTRACT_MAP))
+        deliverables = contract.get(_CHAINS_DELIVERABLES_FIELD)
+        if deliverables is not None:
+            row[_CHAINS_DELIVERABLES_COLUMN] = json.dumps(deliverables, sort_keys=True)
+        row["extra"] = _extra_json(contract, _CHAINS_CONTRACT_KNOWN)
         rows.append(row)
     return _batch(CHAINS_SCHEMA, rows)
 

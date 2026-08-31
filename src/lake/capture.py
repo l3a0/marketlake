@@ -109,20 +109,6 @@ def _epoch_ms_to_datetime(value: object) -> datetime | None:
     return datetime.fromtimestamp(float(value) / 1000.0, tz=UTC)
 
 
-def _chain_vendor_quote_ts(body: Mapping[str, object]) -> datetime | None:
-    """The chain response's vendor quote time, from the underlying quote, or ``None``.
-
-    A Schwab option-chain response carries the underlying's quote in an ``underlying``
-    block when the underlying quote is requested. Its ``quoteTime`` is the chain-level
-    vendor quote time. Absent that block, the chain carries no single quote time and the
-    stamp is null.
-    """
-    underlying = body.get("underlying")
-    if isinstance(underlying, Mapping):
-        return _epoch_ms_to_datetime(underlying.get("quoteTime"))
-    return None
-
-
 def _quote_envelope(body: Mapping[str, object], ticker: str) -> Mapping[str, object] | None:
     """One ticker's per-symbol quote envelope from a batched quotes body, or ``None``.
 
@@ -163,8 +149,9 @@ def _build_snapshot_batch(
 
     This is the row-building step of a capture cycle, factored so another caller can
     build a batch from a response it already fetched. A chains body maps straight
-    through the D4 chains builder. A batched quotes body is split to the one ticker
-    first. The result is byte-for-byte what the loop would build for the same response.
+    through the D4 chains builder, which stamps each contract's ``vendor_quote_ts`` from
+    its own ``quoteTimeInLong``. A batched quotes body is split to the one ticker first.
+    The result is byte-for-byte what the loop would build for the same response.
     """
     if surface == CHAINS:
         return journal.chains_data_batch(
@@ -173,7 +160,6 @@ def _build_snapshot_batch(
             snap_ts=snap_ts,
             fetch_ts=fetch_ts,
             fetch_end_ts=fetch_end_ts,
-            vendor_quote_ts=_chain_vendor_quote_ts(body),
         )
     if surface == QUOTES:
         envelope = _quote_envelope(body, ticker)
