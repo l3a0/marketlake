@@ -586,6 +586,8 @@ def chains_data_batch(
     suspect: bool = False,
     close_tag: str | None = None,
     session_phase: str | None = None,
+    absent_expirations: Sequence[str] = (),
+    absent_error_class: str | None = None,
 ) -> pa.RecordBatch:
     """Build a chains data batch from one chain response body.
 
@@ -601,9 +603,21 @@ def chains_data_batch(
     ``optionDeliverablesList`` is JSON-encoded into ``option_deliverables_list``.
 
     The chain-level header fields repeat on every row: the rates, the underlying price,
-    the entitlement flag, and the truncation-and-count fields. The other timestamps are
+    the entitlement flag, and the truncation-and-count fields. The truncation flag and the
+    contract count are recomputed from the reassembled rows, never read from ``body``. So a
+    chunked chain reports its own captured contract count and whether any expiration was
+    given up, not the strike_count=1 discovery probe's figures. The other timestamps are
     the caller's, stamped from the injected clock. ``fetch_end_ts`` is when the response
     landed, the request end, so the round-trip is ``fetch_end_ts`` minus ``fetch_ts``.
+
+    ``absent_expirations`` supports the capture chunker's partial snapshot. When a chain
+    is fetched in expiration chunks and one chunk fails past every retry, that
+    expiration's contracts are absent from ``body``. Rather than lose the whole chain to a
+    gap, the chunker names those expirations here. Each becomes one gap-marker row in this
+    same batch: ``row_kind`` gap, ``error_class`` = ``absent_error_class``, its
+    ``expiration_date`` set so the missing expiration is queryable, and every other vendor
+    column null. So one segment carries the captured contracts and the absence markers
+    together. The default empty sequence is the ordinary whole-chain case.
     """
     header = {column: body.get(vendor) for vendor, column in _CHAINS_HEADER_MAP.items()}
     stamps = {
@@ -631,6 +645,38 @@ def chains_data_batch(
             row[_CHAINS_DELIVERABLES_COLUMN] = json.dumps(deliverables, sort_keys=True)
         row["extra"] = _extra_json(contract, _CHAINS_CONTRACT_KNOWN)
         rows.append(row)
+    # number_of_contracts and is_chain_truncated describe the whole stored chain, not any
+    # single response, so recompute them from the reassembled rows. The count is the
+    # contract rows actually captured. Truncation is the vendor's own flag on a one-shot
+    # chain, or, on a chunked chain, whether any expiration was given up and marked absent
+    # below. Both override the header value, which on a chunked chain came from the
+    # strike_count=1 discovery probe and describes only that probe.
+    contract_count = len(rows)
+    truncated = bool(header["is_chain_truncated"]) or bool(absent_expirations)
+    for row in rows:
+        row["number_of_contracts"] = contract_count
+        row["is_chain_truncated"] = truncated
+    for expiration in absent_expirations:
+        # A gap-marker for one absent expiration. Every vendor column stays null except
+        # expiration_date, which names the missing expiration. suspect and close_tag ride
+        # the same values as the data rows so the whole snapshot tags consistently.
+        rows.append(
+            {
+                "snap_ts": _iso(snap_ts),
+                "fetch_ts": _iso(fetch_ts),
+                "fetch_end_ts": _iso(fetch_end_ts),
+                "vendor_quote_ts": None,
+                "ticker": ticker,
+                "row_kind": ROW_KIND_GAP,
+                "error_class": absent_error_class,
+                "suspect": suspect,
+                "close_tag": close_tag,
+                "session_phase": session_phase,
+                "schema_version": SCHEMA_VERSION,
+                "expiration_date": expiration,
+                "extra": None,
+            }
+        )
     return _batch(CHAINS_SCHEMA, rows)
 
 

@@ -7,7 +7,7 @@ These are value-only unit tests.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -56,6 +56,53 @@ def test_get_chain_requests_the_underlying_quote():
     client = _client()
     SchwabVendor(client).get_chain("SPY")
     assert client.chain_underlying_quote == [True]
+
+
+def test_get_chain_forwards_no_narrowing_by_default():
+    # The bare chain call must leave every narrowing parameter unset, so schwab-py omits
+    # them and returns the full chain. This is the path onboarding and the recorder use.
+    client = _client()
+    SchwabVendor(client).get_chain("SPY")
+    assert client.chain_from_date == [None]
+    assert client.chain_to_date == [None]
+    assert client.chain_strike_count == [None]
+
+
+def test_get_chain_forwards_strike_count_for_discovery():
+    # The chunker discovers the expiration list with a strike_count=1 probe. The vendor
+    # must forward that to the client verbatim, with no date bounds.
+    client = _client()
+    SchwabVendor(client).get_chain("SPY", strike_count=1)
+    assert client.chain_strike_count == [1]
+    assert client.chain_from_date == [None]
+    assert client.chain_to_date == [None]
+
+
+def test_get_chain_forwards_the_expiration_range_for_a_chunk():
+    # Each chunk fetch bounds the request by a from/to date. Both must reach the client.
+    client = _client()
+    frm, to = date(2026, 9, 18), date(2026, 10, 16)
+    SchwabVendor(client).get_chain("SPY", from_date=frm, to_date=to)
+    assert client.chain_from_date == [frm]
+    assert client.chain_to_date == [to]
+    assert client.chain_strike_count == [None]
+
+
+def test_get_chain_serves_a_response_keyed_by_the_request():
+    # The fake client returns distinct canned responses for the discovery probe and each
+    # chunk, keyed by the full request tuple, so a chunker test can drive them apart.
+    discovery = FakeResponse(200, {"discovery": True})
+    chunk = FakeResponse(200, {"chunk": True})
+    frm, to = date(2026, 9, 18), date(2026, 10, 16)
+    client = FakeSchwabClient(
+        chains={
+            ("SPY", None, None, 1): discovery,
+            ("SPY", frm, to, None): chunk,
+        }
+    )
+    vendor = SchwabVendor(client)
+    assert vendor.get_chain("SPY", strike_count=1).body == {"discovery": True}
+    assert vendor.get_chain("SPY", from_date=frm, to_date=to).body == {"chunk": True}
 
 
 def test_get_chain_returns_the_body_verbatim():

@@ -29,7 +29,7 @@ a test is a few lines.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -88,9 +88,21 @@ class SchwabClient(Protocol):
     """
 
     def get_option_chain(
-        self, symbol: str, *, include_underlying_quote: bool = False
+        self,
+        symbol: str,
+        *,
+        include_underlying_quote: bool = False,
+        from_date: date | None = None,
+        to_date: date | None = None,
+        strike_count: int | None = None,
     ) -> HttpResponse:
-        """The full option chain for one underlying, in one request."""
+        """One option-chain request for an underlying.
+
+        With none of the three narrowing parameters this returns the full chain, as
+        before. ``from_date`` / ``to_date`` bound the returned expirations and
+        ``strike_count`` caps strikes per expiration. ``schwab-py`` omits any parameter
+        left ``None`` from the request, so the bare call is unchanged.
+        """
         ...
 
     def get_quotes(
@@ -136,16 +148,37 @@ class SchwabVendor:
     def __init__(self, client: SchwabClient) -> None:
         self._client = client
 
-    def get_chain(self, symbol: str) -> VendorResponse:
-        """The full option chain for one underlying, verbatim.
+    def get_chain(
+        self,
+        symbol: str,
+        *,
+        from_date: date | None = None,
+        to_date: date | None = None,
+        strike_count: int | None = None,
+    ) -> VendorResponse:
+        """One option-chain request for an underlying, verbatim.
 
         The request asks for the underlying quote, so the response carries the
         underlying's price beside the contracts, in the top-level ``underlyingPrice``
         scalar. The design's spot for IV inversion is that reading. The chain's
         ``vendor_quote_ts`` comes from each contract's own ``quoteTimeInLong``, since the
         top-level ``underlying`` block is null on a real chain even here.
+
+        The three optional parameters pass straight through to the client, which omits any
+        left ``None``. So the bare call is the full chain, exactly as before. The capture
+        chunker supplies ``strike_count=1`` to discover the expiration list, then
+        ``from_date`` / ``to_date`` to fetch each expiration range when the full chain
+        exceeds Schwab's gateway body limit.
         """
-        return _response_from(self._client.get_option_chain(symbol, include_underlying_quote=True))
+        return _response_from(
+            self._client.get_option_chain(
+                symbol,
+                include_underlying_quote=True,
+                from_date=from_date,
+                to_date=to_date,
+                strike_count=strike_count,
+            )
+        )
 
     def get_quotes(self, symbols: Sequence[str]) -> VendorResponse:
         """Batched equity quotes for every symbol, verbatim.
