@@ -37,7 +37,10 @@ CASSETTES = Path(__file__).parents[1] / "cassettes"
 _CLOCK_START = datetime(2026, 8, 24, 13, 30, 45, tzinfo=UTC)
 _EXPECTED_SNAP = datetime(2026, 8, 24, 13, 30, 0, tzinfo=UTC)
 
-# The synthetic vendor quote times the cassettes carry, as ISO strings.
+# The synthetic vendor quote times the cassettes carry, as ISO strings. The chain stamp
+# is derived per contract from ``quoteTimeInLong``; every contract in the cassette carries
+# the same value, so both rows share it. The quote stamp comes from the quote block's
+# ``quoteTime``.
 _CHAIN_VQT = datetime.fromtimestamp(1787000099000 / 1000.0, tz=UTC).isoformat()
 _QUOTE_VQT = datetime.fromtimestamp(1787000100000 / 1000.0, tz=UTC).isoformat()
 

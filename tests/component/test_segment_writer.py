@@ -53,7 +53,7 @@ VENDOR = "2026-08-24T16:15:00-04:00"
 
 
 def _chain_batch(**overrides):
-    kwargs = dict(ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH, vendor_quote_ts=VENDOR)
+    kwargs = dict(ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
     kwargs.update(overrides)
     return journal.chains_data_batch(CHAIN_BODY, **kwargs)
 

@@ -16,7 +16,91 @@ import pytest
 from lake import journal
 from tests.support.lake import FixtureLake
 
-# A minimal chain body, shaped like a Schwab chain response. One call and one put.
+# The two synthetic per-contract quote times, as epoch milliseconds. The call and the
+# put carry different stamps so the per-contract derivation is observable. Each row's
+# ``vendor_quote_ts`` is derived from its own contract's ``quoteTimeInLong``.
+CALL_QUOTE_TIME_MS = 1787000099000
+PUT_QUOTE_TIME_MS = 1787000098000
+CALL_VQT = datetime.fromtimestamp(CALL_QUOTE_TIME_MS / 1000.0, tz=UTC).isoformat()
+PUT_VQT = datetime.fromtimestamp(PUT_QUOTE_TIME_MS / 1000.0, tz=UTC).isoformat()
+
+
+def _full_contract(**overrides):
+    """A fully-populated Schwab contract: every field the real payload carries.
+
+    Starting from this template keeps ``extra`` empty, since every field is known. A
+    contract overrides only what makes it distinct. ``quoteTimeInLong`` is the per-row
+    quote time and ``optionDeliverablesList`` is the nested deliverables list.
+    """
+    contract = {
+        "putCall": "CALL",
+        "symbol": "SPY   260918C00650000",
+        "bid": 4.2,
+        "ask": 4.25,
+        "last": 4.22,
+        "bidSize": 10,
+        "askSize": 12,
+        "lastSize": 3,
+        "bidAskSize": "10X12",
+        "openInterest": 1234,
+        "totalVolume": 5555,
+        "openPrice": 4.1,
+        "highPrice": 4.3,
+        "lowPrice": 4.0,
+        "closePrice": 4.15,
+        "mark": 4.23,
+        "markChange": -0.1,
+        "markPercentChange": -2.3,
+        "netChange": -0.1,
+        "percentChange": -2.3,
+        "volatility": 12.5,
+        "delta": 0.51,
+        "gamma": 0.03,
+        "theta": -0.12,
+        "vega": 0.34,
+        "rho": 0.08,
+        "theoreticalOptionValue": 4.22,
+        "theoreticalVolatility": 12.6,
+        "intrinsicValue": 0.1,
+        "extrinsicValue": 4.12,
+        "timeValue": 4.12,
+        "breakEven": 654.2,
+        "high52Week": 21.9,
+        "low52Week": 0.24,
+        "strikePrice": 650.0,
+        "multiplier": 100.0,
+        "daysToExpiration": 25,
+        "expirationDate": "2026-09-18T20:00:00.000+00:00",
+        "expirationType": "M",
+        "exerciseType": "A",
+        "settlementType": "P",
+        "optionRoot": "SPY",
+        "deliverableNote": "100 SPY",
+        "description": "SPY 09/18/2026 650.00 C",
+        "exchangeName": "OPR",
+        "inTheMoney": True,
+        "nonStandard": False,
+        "mini": False,
+        "pennyPilot": True,
+        "ssid": 139171819,
+        "lastTradingDay": 1788220800000,
+        "tradeTimeInLong": 1787000098000,
+        "quoteTimeInLong": CALL_QUOTE_TIME_MS,
+        "optionDeliverablesList": [
+            {
+                "symbol": "SPY",
+                "assetType": "STOCK",
+                "deliverableUnits": 100.0,
+                "currencyType": None,
+            }
+        ],
+    }
+    contract.update(overrides)
+    return contract
+
+
+# A chain body shaped like a real Schwab response: the underlying block null, the price
+# in the top-level scalar, one fully-populated call and one put.
 CHAIN_BODY = {
     "symbol": "SPY",
     "status": "SUCCESS",
@@ -24,46 +108,28 @@ CHAIN_BODY = {
     "interestRate": 4.25,
     "underlyingPrice": 650.01,
     "dividendYield": 1.28,
+    "isChainTruncated": False,
     "numberOfContracts": 2,
-    "callExpDateMap": {
-        "2026-09-18:25": {
-            "650.0": [
-                {
-                    "putCall": "CALL",
-                    "symbol": "SPY   260918C00650000",
-                    "bid": 4.2,
-                    "ask": 4.25,
-                    "last": 4.22,
-                    "openInterest": 1234,
-                    "totalVolume": 5555,
-                    "volatility": 12.5,
-                    "delta": 0.51,
-                    "gamma": 0.03,
-                    "theta": -0.12,
-                    "vega": 0.34,
-                    "rho": 0.08,
-                }
-            ]
-        }
-    },
+    "underlying": None,
+    "callExpDateMap": {"2026-09-18:25": {"650.0": [_full_contract()]}},
     "putExpDateMap": {
         "2026-09-18:25": {
             "650.0": [
-                {
-                    "putCall": "PUT",
-                    "symbol": "SPY   260918P00650000",
-                    "bid": 3.8,
-                    "ask": 3.85,
-                    "last": 3.82,
-                    "openInterest": 987,
-                    "totalVolume": 4444,
-                    "volatility": 12.7,
-                    "delta": -0.49,
-                    "gamma": 0.03,
-                    "theta": -0.11,
-                    "vega": 0.34,
-                    "rho": -0.07,
-                }
+                _full_contract(
+                    putCall="PUT",
+                    symbol="SPY   260918P00650000",
+                    bid=3.8,
+                    ask=3.85,
+                    last=3.82,
+                    openInterest=987,
+                    totalVolume=4444,
+                    volatility=12.7,
+                    delta=-0.49,
+                    theta=-0.11,
+                    rho=-0.07,
+                    quoteTimeInLong=PUT_QUOTE_TIME_MS,
+                    description="SPY 09/18/2026 650.00 P",
+                )
             ]
         }
     },
@@ -176,6 +242,9 @@ def test_chains_schema_names_and_types():
     assert schema.field("schema_version").type == pa.int64()
     # The real-time entitlement flag is a chain-level bool, not the provenance suspect.
     assert schema.field("is_delayed").type == pa.bool_()
+    # The two new chain-level fields: the truncation flag is a bool, the count an int64.
+    assert schema.field("is_chain_truncated").type == pa.bool_()
+    assert schema.field("number_of_contracts").type == pa.int64()
     # Vendor per-contract columns, the chain-level fields, and the provenance columns.
     for name in (
         "fetch_end_ts",
@@ -195,6 +264,8 @@ def test_chains_schema_names_and_types():
         "underlying_price",
         "dividend_yield",
         "is_delayed",
+        "is_chain_truncated",
+        "number_of_contracts",
         "row_kind",
         "error_class",
         "close_tag",
@@ -202,6 +273,56 @@ def test_chains_schema_names_and_types():
         "extra",
     ):
         assert name in schema.names, name
+    # The full per-contract field set, calibrated to the real payload. Sizes are int64,
+    # the string fields string, the classification flags bool, and the epoch-millisecond
+    # stamps int64. ``expiration_date`` is an ISO string, not an epoch.
+    for float_field in (
+        "open_price",
+        "high_price",
+        "low_price",
+        "close_price",
+        "mark",
+        "mark_change",
+        "mark_percent_change",
+        "net_change",
+        "percent_change",
+        "theoretical_option_value",
+        "theoretical_volatility",
+        "intrinsic_value",
+        "extrinsic_value",
+        "time_value",
+        "break_even",
+        "high_52_week",
+        "low_52_week",
+        "strike_price",
+        "multiplier",
+    ):
+        assert schema.field(float_field).type == pa.float64(), float_field
+    for int_field in (
+        "bid_size",
+        "ask_size",
+        "last_size",
+        "days_to_expiration",
+        "ssid",
+        "last_trading_day",
+        "trade_time",
+    ):
+        assert schema.field(int_field).type == pa.int64(), int_field
+    for str_field in (
+        "bid_ask_size",
+        "expiration_date",
+        "expiration_type",
+        "exercise_type",
+        "settlement_type",
+        "option_root",
+        "deliverable_note",
+        "description",
+        "exchange_name",
+        "option_deliverables_list",
+    ):
+        assert schema.field(str_field).type == pa.string(), str_field
+    for bool_field in ("in_the_money", "non_standard", "mini", "penny_pilot"):
+        assert schema.field(bool_field).type == pa.bool_(), bool_field
 
 
 def test_quotes_schema_names_and_types():
@@ -385,9 +506,7 @@ def test_schema_for_resolves_surfaces_and_rejects_unknown():
 
 
 def test_chains_data_batch_one_row_per_contract():
-    batch = journal.chains_data_batch(
-        CHAIN_BODY, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH, vendor_quote_ts=VENDOR
-    )
+    batch = journal.chains_data_batch(CHAIN_BODY, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
     assert batch.schema == journal.CHAINS_SCHEMA
     assert batch.num_rows == 2
     table = pa.Table.from_batches([batch])
@@ -397,9 +516,7 @@ def test_chains_data_batch_one_row_per_contract():
 
 
 def test_chains_data_batch_maps_known_fields_and_header():
-    batch = journal.chains_data_batch(
-        CHAIN_BODY, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH, vendor_quote_ts=VENDOR
-    )
+    batch = journal.chains_data_batch(CHAIN_BODY, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
     row = batch.slice(0, 1).to_pylist()[0]
     assert row["bid"] == 4.2
     assert row["ask"] == 4.25
@@ -410,11 +527,64 @@ def test_chains_data_batch_maps_known_fields_and_header():
     assert row["volatility"] == 12.5
     assert row["delta"] == 0.51
     assert row["rho"] == 0.08
-    # The chain-level fields repeat on every row: the headers and the entitlement flag.
+    # A representative spread of the fully-typed contract fields: sizes, session prices,
+    # the mark family, the value decomposition, contract terms, and the flags.
+    assert row["bid_size"] == 10
+    assert row["ask_size"] == 12
+    assert row["bid_ask_size"] == "10X12"
+    assert row["open_price"] == 4.1
+    assert row["mark"] == 4.23
+    assert row["net_change"] == -0.1
+    assert row["intrinsic_value"] == 0.1
+    assert row["break_even"] == 654.2
+    assert row["strike_price"] == 650.0
+    assert row["multiplier"] == 100.0
+    assert row["days_to_expiration"] == 25
+    # expirationDate is stored as the vendor's ISO string, not reshaped to an epoch.
+    assert row["expiration_date"] == "2026-09-18T20:00:00.000+00:00"
+    assert row["exercise_type"] == "A"
+    assert row["option_root"] == "SPY"
+    assert row["in_the_money"] is True
+    assert row["penny_pilot"] is True
+    # The epoch-millisecond stamps land verbatim as int64.
+    assert row["ssid"] == 139171819
+    assert row["last_trading_day"] == 1788220800000
+    assert row["trade_time"] == 1787000098000
+    # The chain-level fields repeat on every row: the headers, the entitlement flag, and
+    # the truncation-and-count fields.
     assert row["interest_rate"] == 4.25
     assert row["underlying_price"] == 650.01
     assert row["dividend_yield"] == 1.28
     assert row["is_delayed"] is False
+    assert row["is_chain_truncated"] is False
+    assert row["number_of_contracts"] == 2
+
+
+def test_chains_vendor_quote_ts_is_derived_per_contract():
+    # Each row's vendor quote time comes from its own contract's quoteTimeInLong, not from
+    # a chain-level underlying block (which is null on a real payload). The call and the
+    # put carry different quote times, so the two rows carry different stamps.
+    batch = journal.chains_data_batch(CHAIN_BODY, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+    assert batch.column("vendor_quote_ts").to_pylist() == [CALL_VQT, PUT_VQT]
+    assert CALL_VQT != PUT_VQT
+    # quoteTimeInLong is consumed into the stamp, never a column and never in extra.
+    assert "quote_time_in_long" not in batch.schema.names
+    assert batch.column("extra").to_pylist() == [None, None]
+
+
+def test_chains_option_deliverables_list_round_trips_as_json():
+    # The nested deliverables list is JSON-encoded into a single string column, so the
+    # design's non-standard-contract detection can read it back.
+    batch = journal.chains_data_batch(CHAIN_BODY, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+    stored = batch.slice(0, 1).to_pylist()[0]["option_deliverables_list"]
+    assert json.loads(stored) == [
+        {
+            "symbol": "SPY",
+            "assetType": "STOCK",
+            "deliverableUnits": 100.0,
+            "currencyType": None,
+        }
+    ]
 
 
 def test_chains_data_batch_provenance_and_stamps():
@@ -423,7 +593,6 @@ def test_chains_data_batch_provenance_and_stamps():
         ticker="SPY",
         snap_ts=SNAP,
         fetch_ts=FETCH,
-        vendor_quote_ts=VENDOR,
         close_tag="canonical",
     )
     row = batch.slice(0, 1).to_pylist()[0]
@@ -435,23 +604,22 @@ def test_chains_data_batch_provenance_and_stamps():
     assert row["schema_version"] == 1
     assert row["snap_ts"] == SNAP
     assert row["fetch_ts"] == FETCH
-    assert row["vendor_quote_ts"] == VENDOR
+    # The stamp is derived from the call contract's own quoteTimeInLong.
+    assert row["vendor_quote_ts"] == CALL_VQT
     assert row["ticker"] == "SPY"
 
 
-def test_chains_extra_is_empty_for_a_known_payload():
-    batch = journal.chains_data_batch(
-        CHAIN_BODY, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH, vendor_quote_ts=VENDOR
-    )
+def test_chains_extra_is_empty_for_a_fully_populated_contract():
+    # Every field the real payload carries is typed or consumed, so a fully-populated
+    # contract leaves the overflow empty in steady state.
+    batch = journal.chains_data_batch(CHAIN_BODY, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
     assert batch.column("extra").to_pylist() == [None, None]
 
 
 def test_chains_is_delayed_lands_in_the_column_and_not_in_extra():
     # The payload's entitlement flag is now recognized. It rides the typed column on
     # every contract row, and the overflow stays empty.
-    batch = journal.chains_data_batch(
-        CHAIN_BODY, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH, vendor_quote_ts=VENDOR
-    )
+    batch = journal.chains_data_batch(CHAIN_BODY, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
     assert batch.column("is_delayed").to_pylist() == [False, False]
     assert batch.column("extra").to_pylist() == [None, None]
 
@@ -459,13 +627,11 @@ def test_chains_is_delayed_lands_in_the_column_and_not_in_extra():
 def test_chains_unknown_contract_field_lands_in_extra():
     body = json.loads(json.dumps(CHAIN_BODY))  # deep copy
     contract = body["callExpDateMap"]["2026-09-18:25"]["650.0"][0]
-    contract["mark"] = 4.23
-    contract["bidSize"] = 40
-    batch = journal.chains_data_batch(
-        body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH, vendor_quote_ts=VENDOR
-    )
+    contract["brandNewGreek"] = 1.5
+    contract["anotherNewField"] = 40
+    batch = journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
     call_extra = batch.slice(0, 1).to_pylist()[0]["extra"]
-    assert json.loads(call_extra) == {"mark": 4.23, "bidSize": 40}
+    assert json.loads(call_extra) == {"brandNewGreek": 1.5, "anotherNewField": 40}
     # Known fields still land typed, not swept into the overflow.
     assert batch.slice(0, 1).to_pylist()[0]["bid"] == 4.2
     # The put row, with no unknown field, keeps an empty overflow.
@@ -478,7 +644,6 @@ def test_chains_suspect_flag_rides_every_row():
         ticker="SPY",
         snap_ts=SNAP,
         fetch_ts=FETCH,
-        vendor_quote_ts=VENDOR,
         suspect=True,
     )
     assert batch.column("suspect").to_pylist() == [True, True]
@@ -709,7 +874,6 @@ def test_fetch_end_ts_is_stored_when_given_and_null_when_omitted():
         snap_ts=SNAP,
         fetch_ts=FETCH,
         fetch_end_ts=FETCH_END,
-        vendor_quote_ts=VENDOR,
     )
     assert chains.to_pylist()[0]["fetch_end_ts"] == FETCH_END
 
