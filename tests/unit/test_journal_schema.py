@@ -550,14 +550,43 @@ def test_chains_data_batch_maps_known_fields_and_header():
     assert row["ssid"] == 139171819
     assert row["last_trading_day"] == 1788220800000
     assert row["trade_time"] == 1787000098000
-    # The chain-level fields repeat on every row: the headers, the entitlement flag, and
-    # the truncation-and-count fields.
+    # The chain-level fields repeat on every row: the headers and the entitlement flag.
     assert row["interest_rate"] == 4.25
     assert row["underlying_price"] == 650.01
     assert row["dividend_yield"] == 1.28
     assert row["is_delayed"] is False
+    # The count and truncation flag are recomputed from the rows. Here the body's own
+    # figures happen to match: two contracts, untruncated.
     assert row["is_chain_truncated"] is False
     assert row["number_of_contracts"] == 2
+
+
+def test_chains_data_batch_recomputes_count_and_truncation_from_rows():
+    # number_of_contracts and is_chain_truncated describe the captured rows, not the body's
+    # declared header. A body claiming a bogus count still stores the two real contracts,
+    # and an absent expiration forces the truncation flag true.
+    body = dict(CHAIN_BODY)
+    body["numberOfContracts"] = 999
+    body["isChainTruncated"] = False
+    batch = journal.chains_data_batch(
+        body,
+        ticker="SPY",
+        snap_ts=SNAP,
+        fetch_ts=FETCH,
+        absent_expirations=["2026-10-16"],
+        absent_error_class="chain_chunk_failed",
+    )
+    rows = batch.to_pylist()
+    data_rows = [r for r in rows if r["row_kind"] == journal.ROW_KIND_DATA]
+    gap_rows = [r for r in rows if r["row_kind"] == journal.ROW_KIND_GAP]
+    # Two real contracts, not the bogus 999. Truncated because an expiration was given up.
+    assert all(r["number_of_contracts"] == 2 for r in data_rows)
+    assert all(r["is_chain_truncated"] is True for r in data_rows)
+    # The absent-marker gap row names its expiration and nulls the chain-level fields.
+    assert len(gap_rows) == 1
+    assert gap_rows[0]["expiration_date"] == "2026-10-16"
+    assert gap_rows[0]["number_of_contracts"] is None
+    assert gap_rows[0]["is_chain_truncated"] is None
 
 
 def test_chains_vendor_quote_ts_is_derived_per_contract():

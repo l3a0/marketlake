@@ -281,11 +281,13 @@ class _AdvancingVendor:
         self._quote_seconds = quote_seconds
         self._raise_chain = raise_chain
 
-    def get_chain(self, symbol):
+    def get_chain(self, symbol, *, from_date=None, to_date=None, strike_count=None):
         self._clock.advance(self._chain_seconds)
         if self._raise_chain:
             raise VendorError("slow timeout")
-        return self._inner.get_chain(symbol)
+        return self._inner.get_chain(
+            symbol, from_date=from_date, to_date=to_date, strike_count=strike_count
+        )
 
     def get_quotes(self, symbols):
         self._clock.advance(self._quote_seconds)
@@ -306,15 +308,18 @@ def test_round_trip_is_captured_on_success_and_on_a_slow_failure(cassette_vendor
     vendor = _AdvancingVendor(cassette_vendor, clock, chain_seconds=0.4, quote_seconds=0.25)
     result = capture.run_cycle(clock, vendor, _both_options(), lake_root, pid=4242)
 
-    # Each chain request took 0.4s, and the shared quote batch 0.25s. fetch_ts is
-    # re-read before each call, so the round-trip is the call's own span, not a running
-    # total.
-    assert _round_trip(_rows(result.segment(CHAINS, "SPY"))[0]) == pytest.approx(0.4)
-    assert _round_trip(_rows(result.segment(CHAINS, "QQQ"))[0]) == pytest.approx(0.4)
+    # A chain is now fetched in two requests, a discovery probe and one expiration chunk,
+    # each taking 0.4s. So the chain round-trip spans the whole chunked fetch, 0.8s, from
+    # the discovery dispatch to the last chunk landing. The shared quote batch is one
+    # 0.25s request. fetch_ts is re-read before each operation, so the round-trip is that
+    # operation's own span, not a running total.
+    assert _round_trip(_rows(result.segment(CHAINS, "SPY"))[0]) == pytest.approx(0.8)
+    assert _round_trip(_rows(result.segment(CHAINS, "QQQ"))[0]) == pytest.approx(0.8)
     assert _round_trip(_rows(result.segment(QUOTES, "SPY"))[0]) == pytest.approx(0.25)
 
     # A slow failure still stamps fetch_end_ts, so the gap row carries the failed
-    # request's duration.
+    # request's duration. The discovery probe is the first chain request, so it raises
+    # before any chunk fetch and the whole chain is one gap spanning the 0.6s probe.
     clock2 = ManualClock(start=_CLOCK_START)
     failing = _AdvancingVendor(
         cassette_vendor, clock2, chain_seconds=0.6, quote_seconds=0.25, raise_chain=True

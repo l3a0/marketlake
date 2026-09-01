@@ -129,6 +129,16 @@ class GuardConstants:
     oi_refresh_quorum: float = 0.50
     # The number of subsequent stored cycles a refreshed OI must hold to be selected.
     oi_plateau_cycles: int = 1
+    # The chain chunker's two constants. A full SPY chain in one request exceeds Schwab's
+    # gateway body limit (a 502 with errorcode protocol.http.TooBigBody), so the chain is
+    # fetched in expiration chunks and reassembled. Like the OI-view constants above, the
+    # design names these as guard constants but pins no number, so the values here are
+    # provisional placeholders. Slice 1's day-one chain-size measurement calibrates them.
+    # The chunker groups this many consecutive expirations into one fetch.
+    chain_chunk_expirations: int = 8
+    # A chunk still too big to fetch is split in half and re-fetched, bounded by this many
+    # recursive splits before the chunker gives up on the offending expirations.
+    chain_chunk_max_split_depth: int = 4
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object] | None) -> GuardConstants:

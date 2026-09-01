@@ -56,7 +56,7 @@ from pathlib import Path
 
 from lake import journal
 from lake.clock import Clock, SystemClock
-from lake.config import load_config
+from lake.config import GuardConstants, load_config
 from lake.lock import lake_lock
 from lake.manifest import record_partition
 from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor
@@ -80,6 +80,77 @@ _SEGMENT_STAMP_FORMAT = "%Y%m%dT%H%M%S%f"
 # reads like the design's other classes (``daemon_dead``, ``quote_sampler_dead``). A
 # ``VendorError`` becomes ``vendor_error``.
 _CAMEL_BOUNDARY = re.compile(r"(?<!^)(?=[A-Z])")
+
+# The error class stamped on a chunk that failed past every retry. On a partial snapshot
+# it tags the absent-expiration gap-marker rows and the segment outcome. When every chunk
+# fails it is the whole chain's gap class.
+CHAIN_CHUNK_FAILED = "chain_chunk_failed"
+
+# The error class for a discovery response that returned no expirations at all. A 200 with
+# empty maps has no chunk to fetch, so it fails open to a whole-chain gap rather than
+# journaling an empty snapshot.
+CHAIN_NO_EXPIRATIONS = "chain_no_expirations"
+
+# The two chain maps a discovery response and every chunk response nest contracts under.
+_CHAIN_EXP_MAPS = ("callExpDateMap", "putExpDateMap")
+
+
+def _chain_expirations(body: Mapping[str, object]) -> list[str]:
+    """The sorted, de-duplicated expiration dates in a chain body.
+
+    Schwab keys ``callExpDateMap`` and ``putExpDateMap`` by ``"YYYY-MM-DD:DTE"``, the
+    expiration date joined to its days-to-expiration by a colon. This takes the date part
+    of every key across both maps, unions them, and sorts. ISO date strings sort
+    chronologically as text, so no date parsing is needed to order them. The discovery
+    fetch (``strike_count=1``) is where this is read: it lists every expiration cheaply.
+    """
+    dates: set[str] = set()
+    for map_key in _CHAIN_EXP_MAPS:
+        exp_map = body.get(map_key) or {}
+        if isinstance(exp_map, Mapping):
+            for key in exp_map:
+                dates.add(str(key).split(":")[0])
+    return sorted(dates)
+
+
+def _group_expirations(expirations: list[str], size: int) -> list[list[str]]:
+    """Split the sorted expirations into consecutive groups of ``size``.
+
+    Each group becomes one chunk fetch bounded by the group's first and last date. A group
+    still too big for one response is split further, adaptively, by the fetch step.
+    """
+    step = max(1, size)
+    return [expirations[i : i + step] for i in range(0, len(expirations), step)]
+
+
+def _is_chain_truncated(body: Mapping[str, object]) -> bool:
+    """Whether a chain response body flags itself truncated.
+
+    Schwab sets ``isChainTruncated`` true when it clipped the response to fit its gateway
+    body limit. A truncated chunk is treated exactly like a too-big 502: split and refetch.
+    """
+    return bool(body.get("isChainTruncated"))
+
+
+def _collect_contracts(
+    body: Mapping[str, object],
+    call_map: dict[str, dict[str, list]],
+    put_map: dict[str, dict[str, list]],
+) -> None:
+    """Merge one chunk body's contracts into the reassembly maps, verbatim.
+
+    The maps nest ``expiration -> strike -> [contract]``. Chunks cover disjoint expiration
+    ranges, so a merge never overwrites, only accretes. The contract dicts are copied by
+    reference, untouched, so the calibrated row builder still sees the vendor's payload.
+    """
+    for map_key, target in ((_CHAIN_EXP_MAPS[0], call_map), (_CHAIN_EXP_MAPS[1], put_map)):
+        exp_map = body.get(map_key) or {}
+        if not isinstance(exp_map, Mapping):
+            continue
+        for exp_key, strikes in exp_map.items():
+            bucket = target.setdefault(str(exp_key), {})
+            for strike, contracts in strikes.items():
+                bucket.setdefault(str(strike), []).extend(contracts)
 
 
 def _snake_case(name: str) -> str:
@@ -262,6 +333,7 @@ class _CaptureCycle:
     roster: Roster
     lake_root: Path
     pid: int
+    guards: GuardConstants
     snap_ts: datetime = field(init=False)
     day: date = field(init=False)
     start_ts: str = field(init=False)
@@ -297,39 +369,144 @@ class _CaptureCycle:
         return _Plan(batch, journal.ROW_KIND_GAP, error_class, fetch_ts, fetch_end_ts)
 
     def _plan_chain(self, ticker: str) -> _Plan:
-        """Fetch one chain and plan its segment. A failure plans a gap, never raises.
+        """Fetch one chain in expiration chunks and plan its segment, never raising.
 
-        ``fetch_ts`` is stamped before the request and ``fetch_end_ts`` the instant the
-        response or the failure lands, so the request round-trip is captured even when
-        the fetch times out.
+        A full SPY chain in one request exceeds Schwab's gateway body limit (a 502 with
+        errorcode ``protocol.http.TooBigBody``), so the chain is discovered, grouped, and
+        fetched in pieces, then reassembled into one snapshot. The control flow:
+
+        1. **Discover.** One cheap ``strike_count=1`` fetch lists every expiration. If it
+           is non-2xx or raises, the whole chain is a gap for this ticker, as the single
+           fetch used to be.
+        2. **Group.** Sort the expirations and cut them into runs of
+           ``chain_chunk_expirations`` consecutive dates.
+        3. **Fetch each group, sequentially.** Bound each fetch by the group's first and
+           last date. A non-2xx response or a body flagged ``isChainTruncated`` means the
+           group is still too big: split it in half and refetch each half, recursively,
+           bounded by ``chain_chunk_max_split_depth``. A single expiration that still fails
+           at the bound is given up on.
+        4. **Reassemble.** Every collected contract is journaled as one snapshot, a single
+           chains segment sharing one ``snap_ts``, through the calibrated row builder.
+        5. **Partial failure.** Expirations whose chunk permanently failed become
+           gap-marker rows in that same snapshot, tagged ``chain_chunk_failed``, not a
+           whole-chain gap. Only a failed discovery or a chain where every chunk failed is
+           a whole-chain gap.
+
+        The fetches are sequential in slice 1. Firing the chunks in parallel with
+        per-chunk jitter, to cut wall-time to the slowest chunk, is the D9 daemon
+        follow-up the design pins. It is deliberately not built here.
+
+        ``fetch_ts`` is stamped before the discovery request and ``fetch_end_ts`` after
+        the last chunk lands, so the round-trip spans the whole chunked fetch and even a
+        discovery timeout's duration is captured.
         """
         fetch_ts = self.clock.now()
         try:
-            response = self.vendor.get_chain(ticker)
+            discovery = self.vendor.get_chain(ticker, strike_count=1)
         except Exception as exc:
             fetch_end_ts = self.clock.now()
             return self._gap_plan(CHAINS, ticker, _error_class(exc), fetch_ts, fetch_end_ts)
-        fetch_end_ts = self.clock.now()
+        if not _ok(discovery.status):
+            fetch_end_ts = self.clock.now()
+            return self._gap_plan(
+                CHAINS, ticker, f"http_{discovery.status}", fetch_ts, fetch_end_ts
+            )
+
         try:
-            if not _ok(response.status):
-                return self._gap_plan(
-                    CHAINS, ticker, f"http_{response.status}", fetch_ts, fetch_end_ts
-                )
-            batch = _build_snapshot_batch(
-                CHAINS,
-                ticker,
-                response.body,
+            expirations = _chain_expirations(discovery.body)
+        except Exception as exc:
+            fetch_end_ts = self.clock.now()
+            return self._gap_plan(CHAINS, ticker, _error_class(exc), fetch_ts, fetch_end_ts)
+        if not expirations:
+            fetch_end_ts = self.clock.now()
+            return self._gap_plan(CHAINS, ticker, CHAIN_NO_EXPIRATIONS, fetch_ts, fetch_end_ts)
+
+        call_map: dict[str, dict[str, list]] = {}
+        put_map: dict[str, dict[str, list]] = {}
+        failed: list[str] = []
+        for group in _group_expirations(expirations, self.guards.chain_chunk_expirations):
+            self._fetch_chunk(ticker, group, 0, call_map, put_map, failed)
+        fetch_end_ts = self.clock.now()
+
+        # Every chunk failed: no contract survived, so this is a whole-chain gap, exactly
+        # like a failed discovery, just with the chunk-failure class.
+        if not call_map and not put_map:
+            return self._gap_plan(CHAINS, ticker, CHAIN_CHUNK_FAILED, fetch_ts, fetch_end_ts)
+
+        # Reassemble one snapshot. The chain-level header fields (rates, underlying price,
+        # entitlement flag) are taken from the discovery response, the one response fetched
+        # exactly once, so the header has a single unambiguous source. The contracts come
+        # from the chunks. The contract count and truncation flag are not read from
+        # discovery. chains_data_batch recomputes them from the reassembled rows, so they
+        # describe the captured chain and not the strike_count=1 probe.
+        merged_body: dict[str, object] = {
+            key: value for key, value in discovery.body.items() if key not in _CHAIN_EXP_MAPS
+        }
+        merged_body[_CHAIN_EXP_MAPS[0]] = call_map
+        merged_body[_CHAIN_EXP_MAPS[1]] = put_map
+
+        absent = sorted(set(failed))
+        try:
+            batch = journal.chains_data_batch(
+                merged_body,
+                ticker=ticker,
                 snap_ts=self.snap_ts,
                 fetch_ts=fetch_ts,
                 fetch_end_ts=fetch_end_ts,
+                absent_expirations=absent,
+                absent_error_class=CHAIN_CHUNK_FAILED if absent else None,
             )
-            return _Plan(batch, journal.ROW_KIND_DATA, None, fetch_ts, fetch_end_ts)
         except Exception as exc:
-            # A malformed payload fails open to a gap. Raw stays vendor-verbatim, so
-            # nothing here judges a 200 it did receive. This only catches a body the row
-            # builder could not read. The round-trip is the vendor call's, already
-            # stamped above.
+            # A body the row builder could not read fails open to a whole-chain gap, the
+            # same fail-open the single-fetch path used. Raw stays vendor-verbatim.
             return self._gap_plan(CHAINS, ticker, _error_class(exc), fetch_ts, fetch_end_ts)
+
+        # A partial snapshot still journals as a data segment. Its absence markers ride
+        # inside it. error_class flags the segment as partial without demoting it to a gap.
+        error_class = CHAIN_CHUNK_FAILED if absent else None
+        return _Plan(batch, journal.ROW_KIND_DATA, error_class, fetch_ts, fetch_end_ts)
+
+    def _fetch_chunk(
+        self,
+        ticker: str,
+        expirations: list[str],
+        depth: int,
+        call_map: dict[str, dict[str, list]],
+        put_map: dict[str, dict[str, list]],
+        failed: list[str],
+    ) -> None:
+        """Fetch one expiration range, splitting in half while it is still too big.
+
+        The range is bounded by its first and last expiration. A non-2xx response or a
+        body flagged ``isChainTruncated`` means the range is too big to return in one
+        response. When it can still be split (more than one expiration, and the depth bound
+        is not yet reached) it is halved and each half refetched. When it cannot, every
+        expiration in the range is given up on and recorded in ``failed``. A successful,
+        untruncated response has its contracts merged into the reassembly maps.
+        """
+        from_date = date.fromisoformat(expirations[0])
+        to_date = date.fromisoformat(expirations[-1])
+        try:
+            response = self.vendor.get_chain(ticker, from_date=from_date, to_date=to_date)
+        except Exception:
+            response = None
+
+        too_big = response is None or not _ok(response.status) or _is_chain_truncated(response.body)
+        if not too_big:
+            try:
+                _collect_contracts(response.body, call_map, put_map)
+                return
+            except Exception:
+                # A body that would not merge is treated like a failed chunk, so the cycle
+                # still lands what the other chunks returned.
+                too_big = True
+
+        if len(expirations) == 1 or depth >= self.guards.chain_chunk_max_split_depth:
+            failed.extend(expirations)
+            return
+        mid = len(expirations) // 2
+        self._fetch_chunk(ticker, expirations[:mid], depth + 1, call_map, put_map, failed)
+        self._fetch_chunk(ticker, expirations[mid:], depth + 1, call_map, put_map, failed)
 
     def _plan_quotes(self) -> list[tuple[str, _Plan]]:
         """Fetch the one batched quote request and plan a segment per roster ticker.
@@ -461,18 +638,23 @@ def run_cycle(
     lake_root: Path | str,
     *,
     pid: int | None = None,
+    guards: GuardConstants | None = None,
 ) -> CycleResult:
     """Run one capture cycle. The primitive the daemon will later call in a loop.
 
     It performs one cycle over the injected clock, vendor, and roster, writing into
     ``lake_root``. It reads no wall clock and names no session time. ``pid`` defaults to
-    this process, and a test pins it so segment names are deterministic.
+    this process, and a test pins it so segment names are deterministic. ``guards`` carries
+    the tunable thresholds the cycle reads, chiefly the chain chunker's group size and
+    split-depth bound. It defaults to the design's pinned values.
 
     The steps, in order:
 
     1. Assign ``snap_ts`` from the clock, floored to the minute.
-    2. For each options ticker, fetch the chain and write a chains segment. A failure
-       writes a chains gap row. One ticker's failure never blocks another.
+    2. For each options ticker, fetch the chain in expiration chunks and write a chains
+       segment. A failed discovery writes a chains gap row. A chunk that fails past every
+       retry becomes an absence marker inside the snapshot. One ticker's failure never
+       blocks another.
     3. Fetch the batched quotes for every roster ticker, split per ticker, and write a
        quotes segment each. A failed batch gaps every ticker's quotes.
     4. Append one manifest entry per segment, keyed by the segment path, under the
@@ -484,6 +666,7 @@ def run_cycle(
         roster=roster,
         lake_root=Path(lake_root),
         pid=os.getpid() if pid is None else pid,
+        guards=guards if guards is not None else GuardConstants(),
     )
     return cycle.run()
 
@@ -518,6 +701,7 @@ def run_cycle_from_config(
         roster,
         config.lake_root,
         pid=pid,
+        guards=config.guards,
     )
 
 

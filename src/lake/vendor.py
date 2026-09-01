@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Protocol, runtime_checkable
 
 
@@ -45,8 +45,25 @@ class VendorResponse:
 class Vendor(Protocol):
     """What the capture primitive needs from Schwab."""
 
-    def get_chain(self, symbol: str) -> VendorResponse:
-        """The full option chain for one underlying, in one request."""
+    def get_chain(
+        self,
+        symbol: str,
+        *,
+        from_date: date | None = None,
+        to_date: date | None = None,
+        strike_count: int | None = None,
+    ) -> VendorResponse:
+        """One option-chain request for an underlying, verbatim.
+
+        With no optional argument this is the full chain in one request, as before. The
+        three optional parameters narrow the request so the capture chunker can fetch a
+        chain too big for one response. ``from_date`` and ``to_date`` bound the returned
+        expirations, and ``strike_count`` caps the strikes per expiration. A ``None``
+        parameter is omitted from the vendor request. The chunker uses ``strike_count=1``
+        to discover the expiration list cheaply, then ``from_date`` / ``to_date`` to fetch
+        each expiration range. Onboarding and the recorder still call this with the bare
+        symbol for the whole chain.
+        """
         ...
 
     def get_quotes(self, symbols: Sequence[str]) -> VendorResponse:
