@@ -131,13 +131,17 @@ class GuardConstants:
     oi_plateau_cycles: int = 1
     # The chain chunker's two constants. A full SPY chain in one request exceeds Schwab's
     # gateway body limit (a 502 with errorcode protocol.http.TooBigBody), so the chain is
-    # fetched in expiration chunks and reassembled. Like the OI-view constants above, the
-    # design names these as guard constants but pins no number, so the values here are
-    # provisional placeholders. Slice 1's day-one chain-size measurement calibrates them.
+    # fetched in expiration chunks and reassembled. The day-one chain-size measurement, run
+    # 2026-09-01, set these. SPY carries 33 expirations and QQQ 32, both out to Dec 2028.
+    # The body limit sits above 7.4 MB: 17 expirations returned at 7.4 MB, the full chain
+    # 502'd. Eight expirations is the densest near-term block at about 3 MB, a 2-3x margin
+    # under the limit, and five chunks cover SPY.
     # The chunker groups this many consecutive expirations into one fetch.
     chain_chunk_expirations: int = 8
     # A chunk still too big to fetch is split in half and re-fetched, bounded by this many
-    # recursive splits before the chunker gives up on the offending expirations.
+    # recursive splits before the chunker gives up on the offending expirations. Four is
+    # enough: 8 -> 4 -> 2 -> 1 reaches single expirations in three splits, and one
+    # expiration is 429 KB, always under the limit, so the split converges.
     chain_chunk_max_split_depth: int = 4
 
     @classmethod
