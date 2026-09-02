@@ -3,8 +3,8 @@
 A capture cycle is the smallest unit of capture. It fetches every option chain and
 one batched equity quote, journals what the vendor sent, and records each journal
 segment in the manifest. This module builds that one cycle and nothing more. The
-daemon that will call it in a loop is a later deliverable. So is any market-hours,
-calendar, or session logic. Here the cycle runs once and returns.
+daemon that calls it once a minute is ``lake.daemon``. The market-hours, calendar, and
+session logic live there and in ``lake.session``. Here the cycle runs once and returns.
 
 Three terms recur, defined at first use.
 
@@ -202,6 +202,8 @@ def _build_snapshot_batch(
     snap_ts: datetime,
     fetch_ts: datetime,
     fetch_end_ts: datetime,
+    close_tag: str | None = None,
+    session_phase: str | None = None,
 ) -> object:
     """Build one surface's data batch from a vendor response, the loop's own way.
 
@@ -210,6 +212,8 @@ def _build_snapshot_batch(
     through the D4 chains builder, which stamps each contract's ``vendor_quote_ts`` from
     its own ``quoteTimeInLong``. A batched quotes body is split to the one ticker first.
     The result is byte-for-byte what the loop would build for the same response.
+    ``close_tag`` and ``session_phase`` are the loop's two provenance tags, stamped on
+    every row. Both default to null for a caller outside the loop.
     """
     if surface == CHAINS:
         return journal.chains_data_batch(
@@ -218,6 +222,8 @@ def _build_snapshot_batch(
             snap_ts=snap_ts,
             fetch_ts=fetch_ts,
             fetch_end_ts=fetch_end_ts,
+            close_tag=close_tag,
+            session_phase=session_phase,
         )
     if surface == QUOTES:
         envelope = _quote_envelope(body, ticker)
@@ -230,6 +236,8 @@ def _build_snapshot_batch(
             fetch_ts=fetch_ts,
             fetch_end_ts=fetch_end_ts,
             vendor_quote_ts=_quote_vendor_quote_ts(envelope),
+            close_tag=close_tag,
+            session_phase=session_phase,
         )
     raise ValueError(f"unknown surface {surface!r}")
 
@@ -313,7 +321,11 @@ class _Plan:
 
 @dataclass
 class _CaptureCycle:
-    """One run of the primitive. Holds the cycle-wide coordinates the steps share."""
+    """One run of the primitive. Holds the cycle-wide coordinates the steps share.
+
+    ``close_tag`` and ``session_phase`` are the loop's two provenance tags. They are
+    cycle-wide: every batch this cycle builds, data and gap alike, carries both.
+    """
 
     clock: Clock
     vendor: Vendor
@@ -322,6 +334,8 @@ class _CaptureCycle:
     pid: int
     guards: GuardConstants
     plan: ChainPlan
+    close_tag: str | None = None
+    session_phase: str | None = None
     snap_ts: datetime = field(init=False)
     day: date = field(init=False)
     start_ts: str = field(init=False)
@@ -353,6 +367,8 @@ class _CaptureCycle:
             error_class=error_class,
             fetch_ts=fetch_ts,
             fetch_end_ts=fetch_end_ts,
+            close_tag=self.close_tag,
+            session_phase=self.session_phase,
         )
         return _Plan(batch, journal.ROW_KIND_GAP, error_class, fetch_ts, fetch_end_ts)
 
@@ -385,9 +401,9 @@ class _CaptureCycle:
            in that same snapshot, carrying that window's own error class, not a whole-chain
            gap. Only a chain where every window failed is a whole-chain gap.
 
-        The windows are fetched sequentially in slice 1. Firing them in parallel with
-        per-window jitter, to cut wall-time to the slowest window, is the D9 daemon
-        follow-up the design pins. It is deliberately not built here.
+        The windows are fetched sequentially. Firing them in parallel with per-window
+        jitter, to cut wall-time to the slowest window, is a refinement the design pins
+        for after the D9 loop. It is deliberately not built here.
 
         ``fetch_ts`` is stamped before the first window fetch and ``fetch_end_ts`` after
         the last, so the round-trip spans the whole windowed fetch and even a timeout's
@@ -458,6 +474,8 @@ class _CaptureCycle:
                 snap_ts=self.snap_ts,
                 fetch_ts=fetch_ts,
                 fetch_end_ts=fetch_end_ts,
+                close_tag=self.close_tag,
+                session_phase=self.session_phase,
                 windows=windows,
                 absent_markers=absent_markers,
             )
@@ -609,6 +627,8 @@ class _CaptureCycle:
                 snap_ts=self.snap_ts,
                 fetch_ts=fetch_ts,
                 fetch_end_ts=fetch_end_ts,
+                close_tag=self.close_tag,
+                session_phase=self.session_phase,
             )
             return _Plan(batch, journal.ROW_KIND_DATA, None, fetch_ts, fetch_end_ts)
         except Exception as exc:
@@ -644,7 +664,10 @@ class _CaptureCycle:
 
     def run(self) -> CycleResult:
         plans: list[tuple[str, str, _Plan]] = []
-        # Chains: one per options ticker, each planned on its own for skip-not-block.
+        # Chains: one per options ticker, each planned on its own for skip-not-block. The
+        # tickers are fetched sequentially, in roster order. The design's per-ticker
+        # workers, fired in parallel at the minute top with a few tens of milliseconds of
+        # stagger, are a later refinement past the D9 loop. Not built here.
         for entry in self.roster:
             if entry.options:
                 plans.append((CHAINS, entry.ticker, self._plan_chain(entry.ticker)))
@@ -688,8 +711,10 @@ def run_cycle(
     pid: int | None = None,
     guards: GuardConstants | None = None,
     plan: ChainPlan | None = None,
+    close_tag: str | None = None,
+    session_phase: str | None = None,
 ) -> CycleResult:
-    """Run one capture cycle. The primitive the daemon will later call in a loop.
+    """Run one capture cycle. The primitive the daemon calls once a minute.
 
     It performs one cycle over the injected clock, vendor, and roster, writing into
     ``lake_root``. It reads no wall clock and names no session time. ``pid`` defaults to
@@ -699,6 +724,11 @@ def run_cycle(
     set of date windows the chain is fetched by. It defaults to ``load_chain_plan()``,
     which reads the machine-owned plan file and falls back to the built-in default. A test
     injects a small plan to drive the windows exactly.
+
+    ``close_tag`` and ``session_phase`` are the loop's two provenance tags. The loop decides
+    them per minute from the session clock and its close-tag hook. The cycle stamps both on
+    every row it writes, on both surfaces, gap rows and absence markers included, so a
+    tagged cycle tags consistently. A caller outside the loop leaves both null.
 
     The steps, in order:
 
@@ -720,6 +750,8 @@ def run_cycle(
         pid=os.getpid() if pid is None else pid,
         guards=guards if guards is not None else GuardConstants(),
         plan=plan if plan is not None else load_chain_plan(),
+        close_tag=close_tag,
+        session_phase=session_phase,
     )
     return cycle.run()
 
@@ -731,15 +763,21 @@ def run_cycle_from_config(
     tickers_path: str | Path | None = None,
     token_path: str | Path | None = None,
     pid: int | None = None,
+    close_tag: str | None = None,
+    session_phase: str | None = None,
 ) -> CycleResult:
     """Run one cycle wired from the real config, roster, and Schwab-backed vendor.
 
-    This is the thin production entry the slice-1 runner (D8) calls. It loads the
-    machine-local config and the portable roster, builds the authenticated vendor from
-    the token file, and runs the same core cycle. The ``schwab-py`` client is built only
-    here, lazily inside ``SchwabVendor.from_token``, so importing this module and running
-    the offline suite need neither the library nor a real token. A test drives
-    ``run_cycle`` directly with fakes instead.
+    This is the thin production entry the slice-1 runner (D8) and the daemon loop (D9)
+    call. It loads the machine-local config and the portable roster, builds the
+    authenticated vendor from the token file, and runs the same core cycle. Every call
+    reloads all four inputs: the config, the roster, the token, and the chain plan. Nothing
+    is cached across calls. That is the per-cycle re-read the design wants, so a nightly
+    plan rewrite takes effect the next minute and a re-auth is picked up the next cycle.
+    The ``schwab-py`` client is built only here, lazily inside ``SchwabVendor.from_token``,
+    so importing this module and running the offline suite need neither the library nor a
+    real token. A test drives ``run_cycle`` directly with fakes instead. ``close_tag`` and
+    ``session_phase`` pass straight through to ``run_cycle``.
     """
     config = load_config(config_path)
     roster = load_tickers(tickers_path)
@@ -756,6 +794,8 @@ def run_cycle_from_config(
         pid=pid,
         guards=config.guards,
         plan=load_chain_plan(),
+        close_tag=close_tag,
+        session_phase=session_phase,
     )
 
 
