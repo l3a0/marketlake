@@ -275,11 +275,16 @@ class LaunchdJob:
     daily fire, or a list of such dicts for a bounded minute-by-minute schedule.
     launchd accepts both shapes under ``StartCalendarInterval``. Every value here is
     supplied by the caller, so no machine path and no session-time literal is baked in.
+
+    A resident process has no calendar interval. It sets ``keep_alive`` instead, the
+    launchd key that relaunches an exiting process within seconds. The slice-2 daemon
+    and the query service are that shape. A job with no interval, no keep-alive, and no
+    run-at-load would never start, so that combination is refused.
     """
 
     label: str
     program_arguments: tuple[str, ...]
-    calendar_interval: dict[str, int] | list[dict[str, int]]
+    calendar_interval: dict[str, int] | list[dict[str, int]] | None = None
     working_directory: str | None = None
     standard_out_path: str | None = None
     standard_error_path: str | None = None
@@ -287,15 +292,25 @@ class LaunchdJob:
     run_at_load: bool = False
     user_name: str | None = None
     group_name: str | None = None
+    keep_alive: bool = False
+
+    def __post_init__(self) -> None:
+        if self.calendar_interval is None and not (self.keep_alive or self.run_at_load):
+            raise ValueError(
+                f"{self.label}: a job needs a calendar interval, KeepAlive, or RunAtLoad"
+            )
 
     def to_dict(self) -> dict[str, object]:
         """The plist as a Python dict, with launchd's own key names."""
         plist: dict[str, object] = {
             "Label": self.label,
             "ProgramArguments": list(self.program_arguments),
-            "StartCalendarInterval": self.calendar_interval,
-            "RunAtLoad": self.run_at_load,
         }
+        if self.calendar_interval is not None:
+            plist["StartCalendarInterval"] = self.calendar_interval
+        plist["RunAtLoad"] = self.run_at_load
+        if self.keep_alive:
+            plist["KeepAlive"] = True
         if self.working_directory is not None:
             plist["WorkingDirectory"] = self.working_directory
         if self.standard_out_path is not None:
