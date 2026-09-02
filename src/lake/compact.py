@@ -28,9 +28,10 @@ The job's rules, each glossed at first use.
    seals the live day and never unlinks a segment the daemon holds open.
 3. *Verify before manifest, manifest before delete.* Each ticker-day's segments are read
    to their last complete batch, concatenated, and written as one Parquet file. The file
-   is then re-read and its row count checked against the sum across the segments. Only
-   after that does the manifest entry land, and only after the manifest append are the
-   segments unlinked. A crash at any point re-runs with nothing lost.
+   is then read back, once, and that one read serves both checks. Its row count is
+   compared to the sum across the segments, and its digest is what the manifest records.
+   Only after that does the manifest entry land, and only after the manifest append are
+   the segments unlinked. A crash at any point re-runs with nothing lost.
 4. *A torn tail is dropped, a shadow-append is refused.* A torn tail is a segment cut
    mid-batch by a power loss. Its complete batches are kept and the cut bytes dropped,
    never an error. A *shadow-append* is bytes after a segment's end-of-stream marker, the
@@ -83,7 +84,13 @@ from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants, load_config
 from lake.journal import ROW_KIND_DATA, ShadowAppendError
 from lake.lock import lake_lock
-from lake.manifest import guard_row_count, latest_entries, record_partition, sha256_file
+from lake.manifest import (
+    append_manifest,
+    guard_row_count,
+    latest_entries,
+    sha256_bytes,
+    sha256_file,
+)
 from lake.paths import CHAINS, LakePaths
 from lake.runner import BackupRunner, Pinger, RsyncBackup, UrllibPinger
 from lake.session import SessionClock
@@ -411,8 +418,9 @@ def _seal(
 
     The order is the design's compaction-failure rule. Every segment is read before
     anything is written, so a shadow-append raises with the ticker-day untouched. The
-    Parquet lands, is re-read, and its row count is checked against the sum across the
-    segments. The manifest entry is appended. Only then are the segments unlinked.
+    Parquet lands and is read back once. That read yields both the row count, checked
+    against the sum across the segments, and the digest the manifest entry carries. The
+    entry is appended. Only then are the segments unlinked.
 
     With ``guard`` on, the no-shrink invariant is checked before the partition file is
     replaced, not only at the manifest append. A refused rebuild must leave the larger
@@ -439,14 +447,18 @@ def _seal(
         guard_row_count(root, rel, expected)
 
     _write_partition(merged, partition)
-    actual = pq.read_table(partition).num_rows
+    # One read of the sealed file serves both post-write checks. The row count proves
+    # every page decodes, and the digest attests the very bytes the count came from.
+    written = partition.read_bytes()
+    actual = pq.read_table(pa.BufferReader(written)).num_rows
     if actual != expected:
         raise CompactionVerifyError(rel, expected, actual)
 
-    entry = record_partition(
+    entry = append_manifest(
         root,
-        rel,
+        partition=rel,
         source=COMPACTION_SOURCE,
+        sha256=sha256_bytes(written),
         rows=expected,
         fetched_at=clock.now().isoformat(),
         guard=guard,
