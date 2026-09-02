@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Marketlake status</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --captured: #2e8b57;
+    --suspect: #e0a800;
+    --gap: #c0392b;
+    --missing: #7f8c8d;
+    --pending: rgba(127, 127, 127, 0.18);
+    --rule: rgba(127, 127, 127, 0.35);
+  }
+  body {
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    margin: 1.5rem auto;
+    max-width: 1100px;
+    padding: 0 1rem;
+  }
+  header { display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; }
+  h1 { font-size: 1.4rem; margin: 0; }
+  h2 { font-size: 1.1rem; margin: 0 0 .5rem; }
+  section { margin-top: 1.75rem; }
+  .muted { opacity: .7; }
+  button { font: inherit; padding: .2rem .7rem; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: .3rem .5rem; border-bottom: 1px solid var(--rule); }
+  th { font-weight: 600; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .stale { color: var(--gap); font-weight: 600; }
+  .strip-label { display: flex; justify-content: space-between; margin-top: .6rem; }
+  .strip { display: flex; gap: 1px; height: 18px; margin: .2rem 0 .1rem; }
+  .strip div { flex: 1 1 0; min-width: 1px; }
+  .captured { background: var(--captured); }
+  .suspect { background: var(--suspect); }
+  .gap { background: var(--gap); }
+  .missing { background: var(--missing); }
+  .pending { background: var(--pending); }
+  .legend { margin: .4rem 0 .6rem; }
+  .legend i { display: inline-block; width: 12px; height: 12px; vertical-align: -1px; margin: 0 .3rem 0 .9rem; }
+  .legend i:first-child { margin-left: 0; }
+  #error {
+    display: none;
+    margin-top: 1rem;
+    padding: .6rem .8rem;
+    border: 1px solid var(--gap);
+    border-radius: 4px;
+    color: var(--gap);
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Marketlake</h1>
+  <span id="asof" class="muted">loading&hellip;</span>
+  <button id="refresh" type="button">Refresh</button>
+</header>
+<div id="error"></div>
+
+<section>
+  <h2>Now <span id="phase" class="muted"></span></h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Ticker</th><th>Surface</th><th>Last data cycle (ET)</th>
+        <th>Minutes since</th><th>Latest slot</th><th>Status</th><th>Reason</th>
+      </tr>
+    </thead>
+    <tbody id="now-rows"></tbody>
+  </table>
+  <p id="token" class="muted"></p>
+</section>
+
+<section>
+  <h2>Today <span id="session" class="muted"></span></h2>
+  <div class="legend">
+    <i class="captured"></i>captured
+    <i class="suspect"></i>suspect
+    <i class="gap"></i>gap
+    <i class="missing"></i>missing
+    <i class="pending"></i>pending
+  </div>
+  <div id="strips"></div>
+</section>
+
+<script>
+(function () {
+  "use strict";
+  // The lake's slots are session times, so the page renders them in Eastern time.
+  var ET = "America/New_York";
+  var timeFmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: ET, hour: "2-digit", minute: "2-digit", hour12: false
+  });
+  var stampFmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: ET, month: "short", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
+  });
+  var REFRESH_MS = 60000;
+
+  function byId(id) { return document.getElementById(id); }
+
+  function el(tag, text, className) {
+    var node = document.createElement(tag);
+    if (text !== undefined && text !== null) { node.textContent = String(text); }
+    if (className) { node.className = className; }
+    return node;
+  }
+
+  function clear(node) { while (node.firstChild) { node.removeChild(node.firstChild); } }
+
+  function fmt(iso, formatter) {
+    if (!iso) { return "—"; }
+    return formatter.format(new Date(iso));
+  }
+
+  function getJSON(url) {
+    return fetch(url, { cache: "no-store" }).then(function (r) {
+      if (!r.ok) { throw new Error(url + " returned " + r.status); }
+      return r.json();
+    });
+  }
+
+  function showError(message) {
+    var box = byId("error");
+    box.textContent = message;
+    box.style.display = "block";
+  }
+
+  function hideError() { byId("error").style.display = "none"; }
+
+  function capturing(now) {
+    return now.phase === "open" || now.phase === "post_equity_close";
+  }
+
+  function renderNow(now) {
+    byId("asof").textContent = "as of " + fmt(now.as_of, stampFmt) + " ET";
+    byId("phase").textContent = now.is_session
+      ? "(" + now.session_date + ", " + now.phase.replace(/_/g, " ") + ")"
+      : "(" + now.session_date + ", no session)";
+    var body = byId("now-rows");
+    clear(body);
+    if (now.surfaces.length === 0) {
+      var empty = el("tr");
+      var cell = el("td", "No tickers found under the lake root yet.", "muted");
+      cell.colSpan = 7;
+      empty.appendChild(cell);
+      body.appendChild(empty);
+    }
+    now.surfaces.forEach(function (row) {
+      var tr = el("tr");
+      tr.appendChild(el("td", row.ticker));
+      tr.appendChild(el("td", row.surface));
+      tr.appendChild(el("td", fmt(row.last_data_snap_ts, stampFmt)));
+      var since = el("td", row.minutes_since === null ? "—" : row.minutes_since.toFixed(1), "num");
+      if (capturing(now) && (row.minutes_since === null || row.minutes_since > now.stale_after_minutes)) {
+        since.className += " stale";
+      }
+      tr.appendChild(since);
+      tr.appendChild(el("td", fmt(row.last_snap_ts, stampFmt)));
+      tr.appendChild(el("td", row.last_status || "—"));
+      var reason = row.last_error_class || "";
+      if (row.unreadable_segments > 0) {
+        reason += (reason ? "; " : "") + row.unreadable_segments + " unreadable segment(s)";
+      }
+      tr.appendChild(el("td", reason || "—"));
+      body.appendChild(tr);
+    });
+    var token = now.token_minted_at === null
+      ? "Refresh token age: not journaled yet."
+      : "Refresh token minted " + fmt(now.token_minted_at, stampFmt) + " ET, " +
+        now.token_age_minutes + " minutes ago.";
+    var ping = now.dead_man_last_ping === null
+      ? " Last dead-man ping: not recorded yet."
+      : " Last dead-man ping: " + fmt(now.dead_man_last_ping, stampFmt) + " ET.";
+    byId("token").textContent = token + ping;
+  }
+
+  function renderToday(today) {
+    var session = byId("session");
+    var strips = byId("strips");
+    clear(strips);
+    if (!today.is_session) {
+      session.textContent = "(" + today.date + ", no session)";
+      strips.appendChild(el("p", "The calendar calls this day closed.", "muted"));
+      return;
+    }
+    session.textContent = "(" + today.date + ", " + today.slot_count + " slots, " +
+      fmt(today.session_open, timeFmt) + "–" + fmt(today.option_close, timeFmt) +
+      " ET" + (today.early_close ? ", early close" : "") + ")";
+    if (today.strips.length === 0) {
+      strips.appendChild(el("p", "No tickers found under the lake root yet.", "muted"));
+    }
+    today.strips.forEach(function (strip) {
+      var label = el("div", null, "strip-label");
+      label.appendChild(el("strong", strip.ticker + " " + strip.surface));
+      var c = strip.counts;
+      var summary = c.captured + " captured, " + c.suspect + " suspect, " + c.gap + " gap, " +
+        c.missing + " missing, " + c.pending + " pending";
+      if (strip.unreadable_segments > 0) {
+        summary += ", " + strip.unreadable_segments + " unreadable segment(s)";
+      }
+      label.appendChild(el("span", summary, "muted"));
+      strips.appendChild(label);
+      var row = el("div", null, "strip");
+      strip.slots.forEach(function (slot) {
+        var cell = el("div", null, slot.status);
+        var tip = fmt(slot.slot, timeFmt) + " " + slot.status;
+        if (slot.rows > 0) { tip += ", " + slot.rows + " rows"; }
+        if (slot.error_class) { tip += ", " + slot.error_class; }
+        cell.title = tip;
+        row.appendChild(cell);
+      });
+      strips.appendChild(row);
+    });
+  }
+
+  function refresh() {
+    getJSON("/api/now").then(function (now) {
+      renderNow(now);
+      return getJSON("/api/today?date=" + encodeURIComponent(now.session_date));
+    }).then(function (today) {
+      renderToday(today);
+      hideError();
+    }).catch(function (err) {
+      showError("Query service unreachable or failing: " + err.message);
+    });
+  }
+
+  byId("refresh").addEventListener("click", refresh);
+  refresh();
+  setInterval(refresh, REFRESH_MS);
+})();
+</script>
+</body>
+</html>
