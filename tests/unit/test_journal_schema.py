@@ -564,7 +564,7 @@ def test_chains_data_batch_maps_known_fields_and_header():
 def test_chains_data_batch_recomputes_count_and_truncation_from_rows():
     # number_of_contracts and is_chain_truncated describe the captured rows, not the body's
     # declared header. A body claiming a bogus count still stores the two real contracts,
-    # and an absent expiration forces the truncation flag true.
+    # and an absent window forces the truncation flag true.
     body = dict(CHAIN_BODY)
     body["numberOfContracts"] = 999
     body["isChainTruncated"] = False
@@ -573,20 +573,103 @@ def test_chains_data_batch_recomputes_count_and_truncation_from_rows():
         ticker="SPY",
         snap_ts=SNAP,
         fetch_ts=FETCH,
-        absent_expirations=["2026-10-16"],
-        absent_error_class="chain_chunk_failed",
+        absent_markers=[
+            journal.AbsentMarker("2026-10-16", "2026-11-15", "chain_chunk_failed", "2026-10-16")
+        ],
     )
     rows = batch.to_pylist()
     data_rows = [r for r in rows if r["row_kind"] == journal.ROW_KIND_DATA]
     gap_rows = [r for r in rows if r["row_kind"] == journal.ROW_KIND_GAP]
-    # Two real contracts, not the bogus 999. Truncated because an expiration was given up.
+    # Two real contracts, not the bogus 999. Truncated because a window was given up.
     assert all(r["number_of_contracts"] == 2 for r in data_rows)
     assert all(r["is_chain_truncated"] is True for r in data_rows)
-    # The absent-marker gap row names its expiration and nulls the chain-level fields.
+    # The absent-marker gap row carries its window's own class, names the expiration, keeps
+    # the failed range as provenance, and nulls the chain-level fields.
     assert len(gap_rows) == 1
+    assert gap_rows[0]["error_class"] == "chain_chunk_failed"
     assert gap_rows[0]["expiration_date"] == "2026-10-16"
+    assert (gap_rows[0]["window_start"], gap_rows[0]["window_end"]) == ("2026-10-16", "2026-11-15")
     assert gap_rows[0]["number_of_contracts"] is None
     assert gap_rows[0]["is_chain_truncated"] is None
+
+
+def test_chains_absent_markers_carry_their_own_per_window_class():
+    # Each marker keeps its own error class, so a partial snapshot records why each window
+    # was given up: a size give-up, a rate-limit, and a transient status side by side. The
+    # per-expiration kind names its expiration. The per-window kind leaves it null.
+    batch = journal.chains_data_batch(
+        CHAIN_BODY,
+        ticker="SPY",
+        snap_ts=SNAP,
+        fetch_ts=FETCH,
+        absent_markers=[
+            journal.AbsentMarker("2026-10-16", "2026-11-15", "chain_chunk_failed", "2026-10-30"),
+            journal.AbsentMarker("2026-11-16", None, "http_429", None),
+            journal.AbsentMarker("2026-09-19", "2026-09-30", "http_500", "2026-09-25"),
+        ],
+    )
+    gap_rows = [r for r in batch.to_pylist() if r["row_kind"] == journal.ROW_KIND_GAP]
+    assert {
+        (r["window_start"], r["window_end"], r["error_class"], r["expiration_date"])
+        for r in gap_rows
+    } == {
+        ("2026-10-16", "2026-11-15", "chain_chunk_failed", "2026-10-30"),
+        ("2026-11-16", None, "http_429", None),
+        ("2026-09-19", "2026-09-30", "http_500", "2026-09-25"),
+    }
+    # Every vendor column stays null on both marker kinds.
+    assert all(r["bid"] is None and r["open_interest"] is None for r in gap_rows)
+
+
+# -- window provenance -------------------------------------------------------
+
+
+def test_chains_schema_carries_the_two_window_provenance_columns():
+    # window_start and window_end are nullable ISO date strings on chains only. They sit
+    # with the provenance columns, and quotes never carry them.
+    schema = journal.CHAINS_SCHEMA
+    assert schema.field("window_start").type == pa.string()
+    assert schema.field("window_end").type == pa.string()
+    assert "window_start" not in journal.QUOTES_SCHEMA.names
+    assert "window_end" not in journal.QUOTES_SCHEMA.names
+
+
+def test_chains_data_rows_carry_the_plan_window_holding_their_expiration():
+    # The contract expires 2026-09-18. With a plan whose closed window runs to 2026-09-20 the
+    # row carries that closed window. Fetch provenance is not a vendor field, so extra stays
+    # empty even though the two columns are set.
+    batch = journal.chains_data_batch(
+        CHAIN_BODY,
+        ticker="SPY",
+        snap_ts=SNAP,
+        fetch_ts=FETCH,
+        windows=[("2026-09-01", "2026-09-20"), ("2026-09-21", None)],
+    )
+    rows = batch.to_pylist()
+    assert {(r["window_start"], r["window_end"]) for r in rows} == {("2026-09-01", "2026-09-20")}
+    assert batch.column("extra").to_pylist() == [None, None]
+
+
+def test_chains_data_rows_on_the_open_tail_carry_a_null_window_end():
+    # The same contract against a plan whose closed window ends before it lands on the open
+    # tail, which matches anything on or after its start and has no end.
+    batch = journal.chains_data_batch(
+        CHAIN_BODY,
+        ticker="SPY",
+        snap_ts=SNAP,
+        fetch_ts=FETCH,
+        windows=[("2026-09-01", "2026-09-10"), ("2026-09-11", None)],
+    )
+    rows = batch.to_pylist()
+    assert {(r["window_start"], r["window_end"]) for r in rows} == {("2026-09-11", None)}
+    assert batch.column("extra").to_pylist() == [None, None]
+
+
+def test_chains_data_rows_leave_the_window_null_without_a_plan():
+    # The one-shot whole-chain case passes no windows, so the provenance stays null.
+    batch = journal.chains_data_batch(CHAIN_BODY, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+    assert batch.column("window_start").to_pylist() == [None, None]
+    assert batch.column("window_end").to_pylist() == [None, None]
 
 
 def test_chains_vendor_quote_ts_is_derived_per_contract():
@@ -622,13 +705,13 @@ def test_chains_data_batch_provenance_and_stamps():
         ticker="SPY",
         snap_ts=SNAP,
         fetch_ts=FETCH,
-        close_tag="canonical",
+        close_tag="option_close",
     )
     row = batch.slice(0, 1).to_pylist()[0]
     assert row["row_kind"] == journal.ROW_KIND_DATA
     assert row["error_class"] is None
     assert row["suspect"] is False
-    assert row["close_tag"] == "canonical"
+    assert row["close_tag"] == "option_close"
     assert row["session_phase"] is None
     assert row["schema_version"] == 1
     assert row["snap_ts"] == SNAP

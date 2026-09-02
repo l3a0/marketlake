@@ -37,8 +37,11 @@ import os
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 import pyarrow as pa
+
+from lake.manifest import read_manifest
 
 # The schema version stamped on every row. The vendor columns' full list is fixed by
 # the first day's payload and recorded as version 1. A later payload change mints a
@@ -71,7 +74,7 @@ F_FULLFSYNC = getattr(fcntl, "F_FULLFSYNC", None)
 # The provenance columns every row carries, in every surface. ``row_kind`` is
 # ``data`` or ``gap``. ``error_class`` is null on data rows and names the reason on a
 # gap. ``suspect`` flags a response the validation battery should judge. ``close_tag``
-# is ``canonical``, ``spot_close``, or null, stamped on every row of a tagged cycle.
+# is ``option_close``, ``spot_close``, or null, stamped on every row of a tagged cycle.
 # ``session_phase`` tags rows observed after the equity close. ``extra`` is a
 # normally-empty JSON overflow column. Any vendor field the schema does not name lands
 # there, so vendor-verbatim stays structurally true even when a payload drifts.
@@ -83,6 +86,17 @@ _PROVENANCE_FIELDS = [
     ("session_phase", pa.string()),
     ("schema_version", pa.int64()),
     ("extra", pa.string()),
+]
+
+# Two more provenance columns the chains surface alone carries: the date window that
+# fetched the row. ``window_start`` and ``window_end`` are the plan window's ISO dates, the
+# end null on the open tail. They are fetch provenance, not vendor fields, so they never
+# count as a vendor column and never leak into ``extra``. A data row carries the plan window
+# whose range holds its expiration. An absence marker carries the failed range. The nightly
+# re-tune groups the day's rows by these two columns to re-size the plan.
+_CHAINS_WINDOW_FIELDS = [
+    ("window_start", pa.string()),
+    ("window_end", pa.string()),
 ]
 
 # The timestamps plus the ticker every row carries. ``snap_ts`` is the minute slot.
@@ -196,6 +210,7 @@ CHAINS_SCHEMA = pa.schema(
         ("number_of_contracts", pa.int64()),
     ]
     + _PROVENANCE_FIELDS
+    + _CHAINS_WINDOW_FIELDS
 )
 
 # The quotes capture schema. Each row is one equity quote for one ticker. It captures the
@@ -576,6 +591,47 @@ def _iter_contracts(body: Mapping[str, object]) -> list[Mapping[str, object]]:
     return contracts
 
 
+class AbsentMarker(NamedTuple):
+    """One absence-marker gap row for a chunk the chunker gave up on.
+
+    ``window_start`` and ``window_end`` are the failed range's ISO dates, the end ``None``
+    on the open tail. ``error_class`` is that window's own failure class. ``expiration_date``
+    names one missing expiration when the chunker could read it off the journal's latest
+    prior durable batch. It is ``None`` on the per-window marker, the fallback when no prior
+    batch exists or none of its expirations fall inside the failed range. Either way every
+    vendor column stays null, so the marker is the design's single exception to the
+    all-columns-null gap row only in ``expiration_date``.
+    """
+
+    window_start: str
+    window_end: str | None
+    error_class: str
+    expiration_date: str | None
+
+
+def _window_bounds(
+    windows: Sequence[tuple[date | str, date | str | None]],
+) -> list[tuple[str, str | None]]:
+    """The plan windows as ISO date bounds, the open tail's end left ``None``."""
+    return [(_day_str(start), None if end is None else _day_str(end)) for start, end in windows]
+
+
+def _window_holding(
+    exp_iso: str, bounds: Sequence[tuple[str, str | None]]
+) -> tuple[str | None, str | None]:
+    """The plan window whose inclusive date range holds an expiration, or nulls.
+
+    The windows tile the date line from the session date, so at most one matches, and the
+    open tail matches anything on or after its start. ISO dates compare as text, so no date
+    parsing is needed. An expiration no window holds, one dated before the session date,
+    leaves both bounds null.
+    """
+    for start, end in bounds:
+        if exp_iso >= start and (end is None or exp_iso <= end):
+            return start, end
+    return None, None
+
+
 def chains_data_batch(
     body: Mapping[str, object],
     *,
@@ -586,8 +642,8 @@ def chains_data_batch(
     suspect: bool = False,
     close_tag: str | None = None,
     session_phase: str | None = None,
-    absent_expirations: Sequence[str] = (),
-    absent_error_class: str | None = None,
+    windows: Sequence[tuple[date | str, date | str | None]] = (),
+    absent_markers: Sequence[AbsentMarker] = (),
 ) -> pa.RecordBatch:
     """Build a chains data batch from one chain response body.
 
@@ -605,21 +661,33 @@ def chains_data_batch(
     The chain-level header fields repeat on every row: the rates, the underlying price,
     the entitlement flag, and the truncation-and-count fields. The truncation flag and the
     contract count are recomputed from the reassembled rows, never read from ``body``. So a
-    chunked chain reports its own captured contract count and whether any expiration was
-    given up, not the strike_count=1 discovery probe's figures. The other timestamps are
-    the caller's, stamped from the injected clock. ``fetch_end_ts`` is when the response
-    landed, the request end, so the round-trip is ``fetch_end_ts`` minus ``fetch_ts``.
+    windowed chain reports its own captured contract count and whether any window was given
+    up, not one window response's header figures. The other timestamps are the caller's,
+    stamped from the injected clock. ``fetch_end_ts`` is when the response landed, the
+    request end, so the round-trip is ``fetch_end_ts`` minus ``fetch_ts``.
 
-    ``absent_expirations`` supports the capture chunker's partial snapshot. When a chain
-    is fetched in expiration chunks and one chunk fails past every retry, that
-    expiration's contracts are absent from ``body``. Rather than lose the whole chain to a
-    gap, the chunker names those expirations here. Each becomes one gap-marker row in this
-    same batch: ``row_kind`` gap, ``error_class`` = ``absent_error_class``, its
-    ``expiration_date`` set so the missing expiration is queryable, and every other vendor
-    column null. So one segment carries the captured contracts and the absence markers
-    together. The default empty sequence is the ordinary whole-chain case.
+    ``windows`` is the session's concrete plan, the ``(from_date, to_date | None)`` list
+    from ``ChainPlan.windows_for``. Each data row carries ``window_start`` and
+    ``window_end``, the plan window whose range holds the contract's expiration date. That
+    is the plan window, never a split sub-range, because the nightly re-tune groups rows by
+    it. The empty default leaves both null, the one-shot whole-chain case.
+
+    ``absent_markers`` supports the capture chunker's partial snapshot. When a chain is
+    fetched by date windows and one window fails, that window's contracts are absent from
+    ``body``. Rather than lose the whole chain to a gap, the chunker hands one
+    ``AbsentMarker`` per gap row here. The chunker names the missing expirations by reading
+    the ticker's latest prior durable chains batch off the journal, keeping those inside the
+    failed range and dated on or after the session date, one marker each. With no prior
+    batch, or none of its expirations inside the range, it hands one per-window marker
+    instead, its ``expiration_date`` null. Every marker becomes one gap row in this same
+    batch: ``row_kind`` gap, ``error_class`` the window's own class, ``window_start`` and
+    ``window_end`` the failed range, ``expiration_date`` as the marker says, and every other
+    vendor column null. So one segment carries the captured contracts and the absence
+    markers together, and no failed window loses its class. The default empty sequence is
+    the ordinary whole-chain case.
     """
     header = {column: body.get(vendor) for vendor, column in _CHAINS_HEADER_MAP.items()}
+    bounds = _window_bounds(windows)
     stamps = {
         "snap_ts": _iso(snap_ts),
         "fetch_ts": _iso(fetch_ts),
@@ -644,22 +712,30 @@ def chains_data_batch(
         if deliverables is not None:
             row[_CHAINS_DELIVERABLES_COLUMN] = json.dumps(deliverables, sort_keys=True)
         row["extra"] = _extra_json(contract, _CHAINS_CONTRACT_KNOWN)
+        # The fetch provenance: the plan window holding this contract's expiration date.
+        # The vendor's expiration is an ISO datetime, so its date part is the key.
+        expiration = contract.get("expirationDate")
+        if expiration is not None and bounds:
+            row["window_start"], row["window_end"] = _window_holding(
+                str(expiration).split("T")[0], bounds
+            )
         rows.append(row)
     # number_of_contracts and is_chain_truncated describe the whole stored chain, not any
     # single response, so recompute them from the reassembled rows. The count is the
     # contract rows actually captured. Truncation is the vendor's own flag on a one-shot
-    # chain, or, on a chunked chain, whether any expiration was given up and marked absent
-    # below. Both override the header value, which on a chunked chain came from the
-    # strike_count=1 discovery probe and describes only that probe.
+    # chain, or, on a windowed chain, whether any window was given up and marked absent
+    # below. Both override the header value, which on a windowed chain came from one
+    # window's response and describes only that window.
     contract_count = len(rows)
-    truncated = bool(header["is_chain_truncated"]) or bool(absent_expirations)
+    truncated = bool(header["is_chain_truncated"]) or bool(absent_markers)
     for row in rows:
         row["number_of_contracts"] = contract_count
         row["is_chain_truncated"] = truncated
-    for expiration in absent_expirations:
-        # A gap-marker for one absent expiration. Every vendor column stays null except
-        # expiration_date, which names the missing expiration. suspect and close_tag ride
-        # the same values as the data rows so the whole snapshot tags consistently.
+    for window_start, window_end, error_class, expiration_date in absent_markers:
+        # One absence-marker gap row. Every vendor column stays null except expiration_date,
+        # set only when the chunker could name the missing expiration off the journal. The
+        # failed range rides window_start and window_end. suspect and close_tag ride the same
+        # values as the data rows so the whole snapshot tags consistently.
         rows.append(
             {
                 "snap_ts": _iso(snap_ts),
@@ -668,12 +744,14 @@ def chains_data_batch(
                 "vendor_quote_ts": None,
                 "ticker": ticker,
                 "row_kind": ROW_KIND_GAP,
-                "error_class": absent_error_class,
+                "error_class": error_class,
                 "suspect": suspect,
                 "close_tag": close_tag,
                 "session_phase": session_phase,
                 "schema_version": SCHEMA_VERSION,
-                "expiration_date": expiration,
+                "expiration_date": expiration_date,
+                "window_start": window_start,
+                "window_end": window_end,
                 "extra": None,
             }
         )
@@ -974,6 +1052,24 @@ class ShadowAppendError(Exception):
         )
 
 
+def _complete_batches(reader: pa.ipc.RecordBatchStreamReader) -> tuple[list[pa.RecordBatch], bool]:
+    """Every complete record batch in a stream, and whether it ended at a clean EOS.
+
+    A torn tail, from a power loss mid-append, stops the read at the last complete batch.
+    The incomplete trailing bytes are dropped, never an error. Every durable cycle ends in a
+    full flush, so the last complete batch is exactly what the writer believed it had. The
+    flag is ``True`` only when the stream reached its end-of-stream marker.
+    """
+    batches: list[pa.RecordBatch] = []
+    while True:
+        try:
+            batches.append(reader.read_next_batch())
+        except StopIteration:
+            return batches, True
+        except (pa.ArrowInvalid, OSError):
+            return batches, False
+
+
 def read_segment(path: Path | str) -> pa.Table:
     """Read a segment to its last complete record batch.
 
@@ -990,18 +1086,80 @@ def read_segment(path: Path | str) -> pa.Table:
     with pa.memory_map(str(path), "rb") as source:
         reader = pa.ipc.open_stream(source)
         schema = reader.schema
-        batches: list[pa.RecordBatch] = []
-        clean_eos = False
-        while True:
-            try:
-                batches.append(reader.read_next_batch())
-            except StopIteration:
-                clean_eos = True
-                break
-            except (pa.ArrowInvalid, OSError):
-                # A torn tail: the next message is incomplete. Stop at the last
-                # complete batch and keep what is durable.
-                break
+        batches, clean_eos = _complete_batches(reader)
         if clean_eos and source.tell() < source.size():
             raise ShadowAppendError(path, source.tell(), source.size())
     return pa.Table.from_batches(batches, schema=schema)
+
+
+def _is_chains_segment_for(rel: str, ticker: str) -> bool:
+    """Whether a manifest partition path is one of ``ticker``'s chains journal segments.
+
+    A capture-written segment is manifested under its own path,
+    ``journal/date=D/surface=chains/ticker=T/seg-<start_ts>-<pid>.arrows``. This matches
+    that shape exactly, so a compacted Parquet partition or another surface's segment never
+    qualifies.
+    """
+    parts = rel.split("/")
+    return (
+        len(parts) == 5
+        and parts[0] == "journal"
+        and parts[2] == f"surface={CHAINS_SURFACE}"
+        and parts[3] == f"ticker={ticker}"
+        and parts[4].endswith(".arrows")
+    )
+
+
+def latest_expirations(lake_root: Path | str, ticker: str) -> list[str] | None:
+    """The distinct expiration dates in a ticker's latest prior durable chains batch.
+
+    This is the last-durable-batch read. The capture chunker makes it on its failure path
+    to name absence markers without a live lookup, since every successful fetch already
+    returned the full expiration set. D10's startup gap-marking reuses the same read to find
+    where a ticker's durable record left off. It is general on purpose: it reads from disk
+    only when called, and never reads the wall clock.
+
+    The segment is located through the manifest. Capture appends one entry per segment in
+    cycle order, keyed by the segment path, so the ticker's chains-segment entries in file
+    order are its segments oldest to newest. The read walks them newest first, opens each
+    with the Arrow IPC stream reader, and takes every complete batch, so a torn tail is
+    safe. The first segment holding a batch with data rows wins. Its last such batch's
+    ``expiration_date`` values, reduced to their date part and de-duplicated, are the
+    result, sorted. Walking back past a newer gap-only segment is what makes this the
+    latest *durable data* batch rather than merely the latest segment, so a whole-chain gap
+    last minute does not blind the marker.
+
+    ``None`` means no prior durable data batch exists: no manifest, no chains segment for
+    the ticker, or none of its segments holds a data batch. A manifested segment whose file
+    is gone is skipped, never an error.
+    """
+    root = Path(lake_root)
+    ordered: dict[str, dict] = {}
+    for entry in read_manifest(root):
+        rel = entry.get("partition")
+        if isinstance(rel, str) and _is_chains_segment_for(rel, ticker):
+            # Keep insertion at the last occurrence, so a re-recorded segment sorts by its
+            # most recent entry while every segment still appears once.
+            ordered.pop(rel, None)
+            ordered[rel] = entry
+    for rel in reversed(list(ordered)):
+        path = root / rel
+        if not path.exists():
+            continue
+        try:
+            with pa.memory_map(str(path), "rb") as source:
+                batches, _clean_eos = _complete_batches(pa.ipc.open_stream(source))
+        except (OSError, pa.ArrowInvalid):
+            continue
+        for batch in reversed(batches):
+            kinds = batch.column("row_kind").to_pylist()
+            if ROW_KIND_DATA not in kinds:
+                continue
+            expirations = batch.column("expiration_date").to_pylist()
+            dates = {
+                str(exp).split("T")[0]
+                for kind, exp in zip(kinds, expirations, strict=True)
+                if kind == ROW_KIND_DATA and exp
+            }
+            return sorted(dates)
+    return None

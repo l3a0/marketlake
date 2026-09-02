@@ -47,7 +47,7 @@ class FakeSchwabClient:
     symbol string, which matches any narrowing, or the full request tuple
     ``(symbol, from_date, to_date, strike_count)``, which matches exactly. The full-tuple
     key is tried first, then the symbol key, so a test can supply one response for the
-    bare chain or distinct responses for the discovery probe and each expiration chunk.
+    bare chain or distinct responses for each date window the chunker fetches.
     ``quotes`` maps a tuple of symbols to its ``FakeResponse``. ``creation_timestamp`` is
     the token mint epoch second the vendor converts in ``token_mint_time``. Pass ``None``
     to model a client whose token metadata carries no mint time.

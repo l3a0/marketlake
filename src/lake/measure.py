@@ -27,7 +27,7 @@ The four measurements, each glossed at first use.
    same-day expiration. The question is whether the vendor still serves those series
    late in the session. This reads the last captured cycle and counts contracts whose
    OCC symbol encodes an expiration equal to the session date. The answer calibrates
-   the canonical fill's membership guard. The OCC symbol is the Options Clearing
+   the option-close fill's membership guard. The OCC symbol is the Options Clearing
    Corporation's contract name; its characters 7 through 12 are the expiration YYMMDD.
 4. *The OI-refresh moment.* Open interest, OI, is the count of contracts outstanding.
    Schwab loads a session's settled OI at some moment early in the next session. This

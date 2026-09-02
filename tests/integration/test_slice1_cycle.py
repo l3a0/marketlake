@@ -14,11 +14,16 @@ manifest is a faithful, scrub-clean record of it.
 from __future__ import annotations
 
 from lake import capture, journal
+from lake.chain_plan import ChainPlan
 from lake.manifest import latest_entries, read_manifest, scrub, sha256_file
 from lake.tickers import Roster
 
 CHAINS = journal.CHAINS_SURFACE
 QUOTES = journal.QUOTES_SURFACE
+
+# A single open-ended window keeps each chain to one deterministic request, matching the
+# checked-in minimal cassette. The chunking tree is exercised in the component tier.
+_ONE_WINDOW = ChainPlan(((0, None),))
 
 
 def _roster() -> Roster:
@@ -31,7 +36,9 @@ def _roster() -> Roster:
 
 
 def test_slice1_cycle_end_to_end(cassette_vendor, manual_clock, lake_root):
-    result = capture.run_cycle(manual_clock, cassette_vendor, _roster(), lake_root, pid=7094)
+    result = capture.run_cycle(
+        manual_clock, cassette_vendor, _roster(), lake_root, pid=7094, plan=_ONE_WINDOW
+    )
 
     # The cycle wrote four segments and journaled every one durably.
     assert result.errors == ()

@@ -24,6 +24,7 @@ import pytest
 
 from lake import capture, journal
 from lake.cassette import Cassette, Interaction, load_cassette
+from lake.chain_plan import ChainPlan
 from lake.manifest import latest_entries, sha256_file
 from lake.tickers import Roster
 from lake.vendor import VendorError
@@ -31,6 +32,12 @@ from tests.support.clock import ManualClock
 from tests.support.vendor import CassetteVendor
 
 CASSETTES = Path(__file__).parents[1] / "cassettes"
+
+# A single open-ended window. It makes each ticker's chain one fetch, bounded by
+# ``from_date`` = the session date and ``to_date`` = None, which the checked-in cassettes
+# record. The chunking tree itself is exercised in tests/component/test_chain_chunking.py;
+# here the plan just keeps the cycle to one deterministic chain request per ticker.
+_ONE_WINDOW = ChainPlan(((0, None),))
 
 # A clock whose seconds are non-zero, so flooring to the minute is observable. 09:30:45
 # Eastern, expressed in UTC.
@@ -78,7 +85,9 @@ def _rows(segment: capture.SegmentOutcome) -> list[dict]:
 
 def test_happy_cycle_writes_chains_and_quotes_with_correct_stamps(cassette_vendor, lake_root):
     clock = ManualClock(start=_CLOCK_START)
-    result = capture.run_cycle(clock, cassette_vendor, _both_options(), lake_root, pid=4242)
+    result = capture.run_cycle(
+        clock, cassette_vendor, _both_options(), lake_root, pid=4242, plan=_ONE_WINDOW
+    )
 
     assert result.errors == ()
     assert result.snap_ts == _EXPECTED_SNAP
@@ -182,7 +191,9 @@ def test_happy_cycle_writes_chains_and_quotes_with_correct_stamps(cassette_vendo
 
 def test_manifest_gains_one_entry_per_segment_keyed_by_the_segment_path(cassette_vendor, lake_root):
     clock = ManualClock(start=_CLOCK_START)
-    result = capture.run_cycle(clock, cassette_vendor, _both_options(), lake_root, pid=4242)
+    result = capture.run_cycle(
+        clock, cassette_vendor, _both_options(), lake_root, pid=4242, plan=_ONE_WINDOW
+    )
 
     latest = latest_entries(lake_root)
     # Exactly the four segment paths, and nothing else, are keys in the manifest.
@@ -204,7 +215,9 @@ def test_manifest_gains_one_entry_per_segment_keyed_by_the_segment_path(cassette
 def test_failing_chain_gaps_only_that_ticker(lake_root):
     vendor = CassetteVendor(load_cassette(CASSETTES / "chain_fail.json"))
     clock = ManualClock(start=_CLOCK_START)
-    result = capture.run_cycle(clock, vendor, _both_options(), lake_root, pid=4242)
+    result = capture.run_cycle(
+        clock, vendor, _both_options(), lake_root, pid=4242, plan=_ONE_WINDOW
+    )
 
     assert result.errors == ()
 
@@ -213,7 +226,9 @@ def test_failing_chain_gaps_only_that_ticker(lake_root):
     assert spy_chain.row_kind == journal.ROW_KIND_DATA
     assert spy_chain.rows == 1
 
-    # QQQ's chain failed on a non-2xx status, so it is one gap row with the error class.
+    # QQQ's only window returned a non-2xx status. That is not a size signal, so the window
+    # is recorded once with its http class and never split. It is the only window, so the
+    # whole chain gaps carrying that class, http_500, not a blanket chunk-failure.
     qqq_chain = result.segment(CHAINS, "QQQ")
     assert qqq_chain.row_kind == journal.ROW_KIND_GAP
     assert qqq_chain.error_class == "http_500"
@@ -238,7 +253,9 @@ def test_failing_chain_gaps_only_that_ticker(lake_root):
 def test_failing_quote_batch_gaps_every_ticker(lake_root):
     vendor = CassetteVendor(load_cassette(CASSETTES / "quote_fail.json"))
     clock = ManualClock(start=_CLOCK_START)
-    result = capture.run_cycle(clock, vendor, _spy_options_qqq_equity(), lake_root, pid=4242)
+    result = capture.run_cycle(
+        clock, vendor, _spy_options_qqq_equity(), lake_root, pid=4242, plan=_ONE_WINDOW
+    )
 
     assert result.errors == ()
 
@@ -271,7 +288,8 @@ class _AdvancingVendor:
     on each vendor call, modelling a request that takes real time. So ``fetch_end_ts``
     lands that span past ``fetch_ts`` and the round-trip is non-zero. A ``raise_chain``
     flag models a slow failure: the clock still advances, then the call raises, so even
-    a timeout's duration is captured.
+    a timeout's duration is captured. The single-window plan makes one chain call per
+    ticker, so the chain round-trip is that one call's span.
     """
 
     def __init__(self, inner, clock, *, chain_seconds, quote_seconds, raise_chain=False):
@@ -306,25 +324,30 @@ def _round_trip(row: dict) -> float:
 def test_round_trip_is_captured_on_success_and_on_a_slow_failure(cassette_vendor, lake_root):
     clock = ManualClock(start=_CLOCK_START)
     vendor = _AdvancingVendor(cassette_vendor, clock, chain_seconds=0.4, quote_seconds=0.25)
-    result = capture.run_cycle(clock, vendor, _both_options(), lake_root, pid=4242)
+    result = capture.run_cycle(
+        clock, vendor, _both_options(), lake_root, pid=4242, plan=_ONE_WINDOW
+    )
 
-    # A chain is now fetched in two requests, a discovery probe and one expiration chunk,
-    # each taking 0.4s. So the chain round-trip spans the whole chunked fetch, 0.8s, from
-    # the discovery dispatch to the last chunk landing. The shared quote batch is one
-    # 0.25s request. fetch_ts is re-read before each operation, so the round-trip is that
-    # operation's own span, not a running total.
-    assert _round_trip(_rows(result.segment(CHAINS, "SPY"))[0]) == pytest.approx(0.8)
-    assert _round_trip(_rows(result.segment(CHAINS, "QQQ"))[0]) == pytest.approx(0.8)
+    # A chain is fetched by its plan of date windows, one window here, so one 0.4s request.
+    # The chain round-trip is that request's span, from the first window's dispatch to the
+    # last window landing. The shared quote batch is one 0.25s request. fetch_ts is re-read
+    # before each operation, so the round-trip is that operation's own span, not a running
+    # total.
+    assert _round_trip(_rows(result.segment(CHAINS, "SPY"))[0]) == pytest.approx(0.4)
+    assert _round_trip(_rows(result.segment(CHAINS, "QQQ"))[0]) == pytest.approx(0.4)
     assert _round_trip(_rows(result.segment(QUOTES, "SPY"))[0]) == pytest.approx(0.25)
 
-    # A slow failure still stamps fetch_end_ts, so the gap row carries the failed
-    # request's duration. The discovery probe is the first chain request, so it raises
-    # before any chunk fetch and the whole chain is one gap spanning the 0.6s probe.
+    # A slow failure still stamps fetch_end_ts, so the gap row carries the failed request's
+    # duration. The lone window raises after advancing 0.6s. A raised window fetch is a
+    # transport failure, recorded once with its own class and never split, so the whole
+    # chain is one gap spanning that 0.6s, tagged vendor_error rather than a chunk-failure.
     clock2 = ManualClock(start=_CLOCK_START)
     failing = _AdvancingVendor(
         cassette_vendor, clock2, chain_seconds=0.6, quote_seconds=0.25, raise_chain=True
     )
-    result2 = capture.run_cycle(clock2, failing, _both_options(), lake_root, pid=4243)
+    result2 = capture.run_cycle(
+        clock2, failing, _both_options(), lake_root, pid=4243, plan=_ONE_WINDOW
+    )
     spy_gap = _rows(result2.segment(CHAINS, "SPY"))[0]
     assert spy_gap["row_kind"] == journal.ROW_KIND_GAP
     assert spy_gap["error_class"] == "vendor_error"
@@ -356,7 +379,12 @@ def test_top_level_envelope_cusip_lands_in_the_column(lake_root):
     )
     roster = Roster.from_mapping({"QQQ": {"options": False}})
     result = capture.run_cycle(
-        ManualClock(start=_CLOCK_START), CassetteVendor(cassette), roster, lake_root, pid=4242
+        ManualClock(start=_CLOCK_START),
+        CassetteVendor(cassette),
+        roster,
+        lake_root,
+        pid=4242,
+        plan=_ONE_WINDOW,
     )
     row = _rows(result.segment(QUOTES, "QQQ"))[0]
     assert row["cusip"] == "333333333"

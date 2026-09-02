@@ -51,10 +51,11 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from lake import journal
+from lake.chain_plan import ChainPlan, load_chain_plan
 from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants, load_config
 from lake.lock import lake_lock
@@ -81,55 +82,41 @@ _SEGMENT_STAMP_FORMAT = "%Y%m%dT%H%M%S%f"
 # ``VendorError`` becomes ``vendor_error``.
 _CAMEL_BOUNDARY = re.compile(r"(?<!^)(?=[A-Z])")
 
-# The error class stamped on a chunk that failed past every retry. On a partial snapshot
-# it tags the absent-expiration gap-marker rows and the segment outcome. When every chunk
-# fails it is the whole chain's gap class.
+# The error class stamped on a too-big window that could not be split any further: a single
+# day, the open tail, or the depth bound reached. Far-term sparsity makes it unreachable in
+# practice. A window that failed for a non-size reason (auth, rate-limit, a transient status,
+# a raised exception) carries its own class instead, so the failure model keeps those apart.
 CHAIN_CHUNK_FAILED = "chain_chunk_failed"
 
-# The error class for a discovery response that returned no expirations at all. A 200 with
-# empty maps has no chunk to fetch, so it fails open to a whole-chain gap rather than
-# journaling an empty snapshot.
-CHAIN_NO_EXPIRATIONS = "chain_no_expirations"
-
-# The two chain maps a discovery response and every chunk response nest contracts under.
+# The two chain maps every window response nests contracts under.
 _CHAIN_EXP_MAPS = ("callExpDateMap", "putExpDateMap")
 
 
-def _chain_expirations(body: Mapping[str, object]) -> list[str]:
-    """The sorted, de-duplicated expiration dates in a chain body.
+def _is_too_big(body: Mapping[str, object]) -> bool:
+    """Whether a chain response signals it was too big for one request.
 
-    Schwab keys ``callExpDateMap`` and ``putExpDateMap`` by ``"YYYY-MM-DD:DTE"``, the
-    expiration date joined to its days-to-expiration by a colon. This takes the date part
-    of every key across both maps, unions them, and sorts. ISO date strings sort
-    chronologically as text, so no date parsing is needed to order them. The discovery
-    fetch (``strike_count=1``) is where this is read: it lists every expiration cheaply.
+    This is the only signal that warrants a midpoint split. Two shapes carry it. A 200 body
+    flags itself ``isChainTruncated`` when Schwab clipped it to fit the gateway body limit. A
+    502 gateway fault carries the ``TooBigBody`` errorcode, either at the top level under
+    ``errorcode`` (the shape the offline fakes use) or nested under
+    ``fault.detail.errorcode`` (the real gateway fault). Both mean split and refetch. Every
+    other non-2xx status, and a raised exception, is *not* a size signal. Splitting one would
+    be wrong, and for a 429 rate-limit it would fan out into a burst of more throttled
+    requests, so the fetcher records those with their own class instead.
     """
-    dates: set[str] = set()
-    for map_key in _CHAIN_EXP_MAPS:
-        exp_map = body.get(map_key) or {}
-        if isinstance(exp_map, Mapping):
-            for key in exp_map:
-                dates.add(str(key).split(":")[0])
-    return sorted(dates)
-
-
-def _group_expirations(expirations: list[str], size: int) -> list[list[str]]:
-    """Split the sorted expirations into consecutive groups of ``size``.
-
-    Each group becomes one chunk fetch bounded by the group's first and last date. A group
-    still too big for one response is split further, adaptively, by the fetch step.
-    """
-    step = max(1, size)
-    return [expirations[i : i + step] for i in range(0, len(expirations), step)]
-
-
-def _is_chain_truncated(body: Mapping[str, object]) -> bool:
-    """Whether a chain response body flags itself truncated.
-
-    Schwab sets ``isChainTruncated`` true when it clipped the response to fit its gateway
-    body limit. A truncated chunk is treated exactly like a too-big 502: split and refetch.
-    """
-    return bool(body.get("isChainTruncated"))
+    if body.get("isChainTruncated"):
+        return True
+    top = body.get("errorcode")
+    if isinstance(top, str) and "TooBigBody" in top:
+        return True
+    fault = body.get("fault")
+    if isinstance(fault, Mapping):
+        detail = fault.get("detail")
+        if isinstance(detail, Mapping):
+            code = detail.get("errorcode")
+            if isinstance(code, str) and "TooBigBody" in code:
+                return True
+    return False
 
 
 def _collect_contracts(
@@ -334,6 +321,7 @@ class _CaptureCycle:
     lake_root: Path
     pid: int
     guards: GuardConstants
+    plan: ChainPlan
     snap_ts: datetime = field(init=False)
     day: date = field(init=False)
     start_ts: str = field(init=False)
@@ -369,83 +357,100 @@ class _CaptureCycle:
         return _Plan(batch, journal.ROW_KIND_GAP, error_class, fetch_ts, fetch_end_ts)
 
     def _plan_chain(self, ticker: str) -> _Plan:
-        """Fetch one chain in expiration chunks and plan its segment, never raising.
+        """Fetch one chain by its date-window plan and plan its segment, never raising.
 
         A full SPY chain in one request exceeds Schwab's gateway body limit (a 502 with
-        errorcode ``protocol.http.TooBigBody``), so the chain is discovered, grouped, and
-        fetched in pieces, then reassembled into one snapshot. The control flow:
+        errorcode ``protocol.http.TooBigBody``), so the chain is fetched in date windows
+        read straight off the plan, then reassembled into one snapshot. There is no
+        discovery request on the hot path. The control flow:
 
-        1. **Discover.** One cheap ``strike_count=1`` fetch lists every expiration. If it
-           is non-2xx or raises, the whole chain is a gap for this ticker, as the single
-           fetch used to be.
-        2. **Group.** Sort the expirations and cut them into runs of
-           ``chain_chunk_expirations`` consecutive dates.
-        3. **Fetch each group, sequentially.** Bound each fetch by the group's first and
-           last date. A non-2xx response or a body flagged ``isChainTruncated`` means the
-           group is still too big: split it in half and refetch each half, recursively,
-           bounded by ``chain_chunk_max_split_depth``. A single expiration that still fails
-           at the bound is given up on.
+        1. **Read the plan.** ``self.plan.windows_for(self.day)`` turns the day-offset
+           windows into concrete ``(from_date, to_date)`` ranges against the cycle's
+           session date. The last range's ``to_date`` is ``None``, the open tail.
+        2. **Fetch each window, sequentially.** ``_fetch_window`` fetches the range and
+           merges its contracts. Only a genuine size signal, a ``TooBigBody`` 502 or a body
+           flagged ``isChainTruncated``, is split at the window's date midpoint and refetched,
+           bounded by ``chain_chunk_max_split_depth``. Any other failure, a non-2xx status or
+           a raised exception, is recorded once with its own error class and never split.
+        3. **Whole-chain gap.** If no window succeeded, nothing was captured, so the whole
+           chain is one gap for this ticker, tagged with the first failed window's class. So
+           an all-401 chain gaps as ``http_401`` and the failure model still sees auth death
+           on the chain surface.
         4. **Reassemble.** Every collected contract is journaled as one snapshot, a single
-           chains segment sharing one ``snap_ts``, through the calibrated row builder.
-        5. **Partial failure.** Expirations whose chunk permanently failed become
-           gap-marker rows in that same snapshot, tagged ``chain_chunk_failed``, not a
-           whole-chain gap. Only a failed discovery or a chain where every chunk failed is
-           a whole-chain gap.
+           chains segment sharing one ``snap_ts``, through the calibrated row builder. The
+           chain-level header fields (rates, underlying price, entitlement flag) come from
+           the first window that returned successfully. Every window response carries the
+           same top-level fields, so the first success is an unambiguous source.
+        5. **Partial failure.** A window whose range failed becomes one absent-marker gap row
+           in that same snapshot, carrying that window's own error class, not a whole-chain
+           gap. Only a chain where every window failed is a whole-chain gap.
 
-        The fetches are sequential in slice 1. Firing the chunks in parallel with
-        per-chunk jitter, to cut wall-time to the slowest chunk, is the D9 daemon
+        The windows are fetched sequentially in slice 1. Firing them in parallel with
+        per-window jitter, to cut wall-time to the slowest window, is the D9 daemon
         follow-up the design pins. It is deliberately not built here.
 
-        ``fetch_ts`` is stamped before the discovery request and ``fetch_end_ts`` after
-        the last chunk lands, so the round-trip spans the whole chunked fetch and even a
-        discovery timeout's duration is captured.
+        ``fetch_ts`` is stamped before the first window fetch and ``fetch_end_ts`` after
+        the last, so the round-trip spans the whole windowed fetch and even a timeout's
+        duration is captured.
         """
+        windows = self.plan.windows_for(self.day)
         fetch_ts = self.clock.now()
-        try:
-            discovery = self.vendor.get_chain(ticker, strike_count=1)
-        except Exception as exc:
-            fetch_end_ts = self.clock.now()
-            return self._gap_plan(CHAINS, ticker, _error_class(exc), fetch_ts, fetch_end_ts)
-        if not _ok(discovery.status):
-            fetch_end_ts = self.clock.now()
-            return self._gap_plan(
-                CHAINS, ticker, f"http_{discovery.status}", fetch_ts, fetch_end_ts
-            )
-
-        try:
-            expirations = _chain_expirations(discovery.body)
-        except Exception as exc:
-            fetch_end_ts = self.clock.now()
-            return self._gap_plan(CHAINS, ticker, _error_class(exc), fetch_ts, fetch_end_ts)
-        if not expirations:
-            fetch_end_ts = self.clock.now()
-            return self._gap_plan(CHAINS, ticker, CHAIN_NO_EXPIRATIONS, fetch_ts, fetch_end_ts)
-
         call_map: dict[str, dict[str, list]] = {}
         put_map: dict[str, dict[str, list]] = {}
-        failed: list[str] = []
-        for group in _group_expirations(expirations, self.guards.chain_chunk_expirations):
-            self._fetch_chunk(ticker, group, 0, call_map, put_map, failed)
+        failed: list[tuple[date, date | None, str]] = []
+        header_holder: list[Mapping[str, object]] = []
+        for from_date, to_date in windows:
+            self._fetch_window(
+                ticker, from_date, to_date, 0, call_map, put_map, failed, header_holder
+            )
         fetch_end_ts = self.clock.now()
 
-        # Every chunk failed: no contract survived, so this is a whole-chain gap, exactly
-        # like a failed discovery, just with the chunk-failure class.
-        if not call_map and not put_map:
-            return self._gap_plan(CHAINS, ticker, CHAIN_CHUNK_FAILED, fetch_ts, fetch_end_ts)
+        # No window returned successfully, so nothing was captured. That is a whole-chain
+        # gap for this ticker, tagged with the first failed window's class so auth death, a
+        # rate-limit, and a transient fault stay apart. A ChainPlan always has at least one
+        # window, and every window path either seeds the header or records a failure, so a
+        # failure exists here; the fallback only guards the impossible empty case.
+        if not header_holder:
+            error_class = failed[0][2] if failed else CHAIN_CHUNK_FAILED
+            return self._gap_plan(CHAINS, ticker, error_class, fetch_ts, fetch_end_ts)
 
-        # Reassemble one snapshot. The chain-level header fields (rates, underlying price,
-        # entitlement flag) are taken from the discovery response, the one response fetched
-        # exactly once, so the header has a single unambiguous source. The contracts come
-        # from the chunks. The contract count and truncation flag are not read from
-        # discovery. chains_data_batch recomputes them from the reassembled rows, so they
-        # describe the captured chain and not the strike_count=1 probe.
+        # Reassemble one snapshot. The chain-level header fields are taken from the first
+        # window that succeeded. Every window response carries the same top-level
+        # ``underlyingPrice``, rates, and entitlement flag, so the first success is a single
+        # unambiguous source. The contracts come from every window. The contract count and
+        # truncation flag are not read from the header. chains_data_batch recomputes them
+        # from the reassembled rows, so they describe the captured chain.
+        header_source = header_holder[0]
         merged_body: dict[str, object] = {
-            key: value for key, value in discovery.body.items() if key not in _CHAIN_EXP_MAPS
+            key: value for key, value in header_source.items() if key not in _CHAIN_EXP_MAPS
         }
         merged_body[_CHAIN_EXP_MAPS[0]] = call_map
         merged_body[_CHAIN_EXP_MAPS[1]] = put_map
 
-        absent = sorted(set(failed))
+        # Name the absence markers. The daemon holds no expiration state, so the missing
+        # expirations come from the journal's latest prior durable batch, read once per
+        # ticker per cycle and only on the failure path. For each failed range, keep the
+        # prior expirations inside it and dated on or after the session date, one marker
+        # each. With no prior batch, or none inside, emit one per-window marker instead. So
+        # every failed range yields at least one marker and its class is never lost.
+        absent_markers: list[journal.AbsentMarker] = []
+        if failed:
+            prior = journal.latest_expirations(self.lake_root, ticker)
+            for from_date, to_date, error_class in failed:
+                start = from_date.isoformat()
+                end = None if to_date is None else to_date.isoformat()
+                # The range bound alone excludes an expired series from yesterday's batch.
+                # Every plan window starts at offset 0 or later, so start is never before
+                # the session date.
+                inside = [
+                    exp for exp in (prior or []) if exp >= start and (end is None or exp <= end)
+                ]
+                if inside:
+                    absent_markers.extend(
+                        journal.AbsentMarker(start, end, error_class, exp) for exp in inside
+                    )
+                else:
+                    absent_markers.append(journal.AbsentMarker(start, end, error_class, None))
         try:
             batch = journal.chains_data_batch(
                 merged_body,
@@ -453,8 +458,8 @@ class _CaptureCycle:
                 snap_ts=self.snap_ts,
                 fetch_ts=fetch_ts,
                 fetch_end_ts=fetch_end_ts,
-                absent_expirations=absent,
-                absent_error_class=CHAIN_CHUNK_FAILED if absent else None,
+                windows=windows,
+                absent_markers=absent_markers,
             )
         except Exception as exc:
             # A body the row builder could not read fails open to a whole-chain gap, the
@@ -462,51 +467,94 @@ class _CaptureCycle:
             return self._gap_plan(CHAINS, ticker, _error_class(exc), fetch_ts, fetch_end_ts)
 
         # A partial snapshot still journals as a data segment. Its absence markers ride
-        # inside it. error_class flags the segment as partial without demoting it to a gap.
-        error_class = CHAIN_CHUNK_FAILED if absent else None
+        # inside it, each carrying its own window's class. The segment flag takes the first
+        # failed window's class, the representative signal, mirroring the whole-chain gap.
+        error_class = failed[0][2] if failed else None
         return _Plan(batch, journal.ROW_KIND_DATA, error_class, fetch_ts, fetch_end_ts)
 
-    def _fetch_chunk(
+    def _fetch_window(
         self,
         ticker: str,
-        expirations: list[str],
+        from_date: date,
+        to_date: date | None,
         depth: int,
         call_map: dict[str, dict[str, list]],
         put_map: dict[str, dict[str, list]],
-        failed: list[str],
+        failed: list[tuple[date, date | None, str]],
+        header_holder: list[Mapping[str, object]],
     ) -> None:
-        """Fetch one expiration range, splitting in half while it is still too big.
+        """Fetch one date window, splitting only a genuine size failure at its midpoint.
 
-        The range is bounded by its first and last expiration. A non-2xx response or a
-        body flagged ``isChainTruncated`` means the range is too big to return in one
-        response. When it can still be split (more than one expiration, and the depth bound
-        is not yet reached) it is halved and each half refetched. When it cannot, every
-        expiration in the range is given up on and recorded in ``failed``. A successful,
-        untruncated response has its contracts merged into the reassembly maps.
+        The window is fetched with ``from_date`` / ``to_date`` and no ``strike_count``. Four
+        outcomes:
+
+        1. A **raised exception** is a transport failure, not a size signal. The range is
+           recorded in ``failed`` with the exception's own class and never split. Splitting a
+           network error would only multiply it.
+        2. A **too-big** response, a ``TooBigBody`` 502 or a body flagged
+           ``isChainTruncated`` (see ``_is_too_big``), is split at the window's date
+           midpoint and each half refetched, when the window is splittable: a concrete
+           ``to_date``, spanning more than one day, and the depth bound not yet reached. When
+           it cannot be split, the range is given up with the size class
+           ``chain_chunk_failed``.
+        3. Any **other non-2xx** status, an auth 401, a rate-limit 429, a transient 500, is
+           recorded once in ``failed`` with ``http_<status>`` and never split. Splitting a
+           429 in particular would fan out into more throttled requests.
+        4. A **successful** 2xx, untruncated response has its contracts merged into the
+           reassembly maps and, on the first success, seeds the header source. A body the
+           merge cannot read is treated like a too-big window, so the cycle still lands what
+           the other windows returned.
         """
-        from_date = date.fromisoformat(expirations[0])
-        to_date = date.fromisoformat(expirations[-1])
         try:
             response = self.vendor.get_chain(ticker, from_date=from_date, to_date=to_date)
-        except Exception:
-            response = None
+        except Exception as exc:
+            # A raised fetch is a transport failure. Record it with its own class, no split.
+            failed.append((from_date, to_date, _error_class(exc)))
+            return
 
-        too_big = response is None or not _ok(response.status) or _is_chain_truncated(response.body)
-        if not too_big:
+        too_big = _is_too_big(response.body)
+        if _ok(response.status) and not too_big:
             try:
                 _collect_contracts(response.body, call_map, put_map)
+                if not header_holder:
+                    header_holder.append(response.body)
                 return
             except Exception:
-                # A body that would not merge is treated like a failed chunk, so the cycle
-                # still lands what the other chunks returned.
+                # A body that would not merge is treated like a too-big window, so the cycle
+                # still lands what the other windows returned.
                 too_big = True
-
-        if len(expirations) == 1 or depth >= self.guards.chain_chunk_max_split_depth:
-            failed.extend(expirations)
+        elif not too_big:
+            # A non-2xx status that is not the TooBigBody fault is not a size problem. Record
+            # it once with its http class and do not split.
+            failed.append((from_date, to_date, f"http_{response.status}"))
             return
-        mid = len(expirations) // 2
-        self._fetch_chunk(ticker, expirations[:mid], depth + 1, call_map, put_map, failed)
-        self._fetch_chunk(ticker, expirations[mid:], depth + 1, call_map, put_map, failed)
+
+        splittable = (
+            to_date is not None
+            and to_date > from_date
+            and depth < self.guards.chain_chunk_max_split_depth
+        )
+        if not splittable:
+            # An open-ended tail window (``to_date is None``) that comes back too big
+            # cannot be midpoint-split, so it is given up with the size class. Far-term
+            # sparsity makes this unreachable in practice: the open tail holds the fewest
+            # expirations of any window.
+            failed.append((from_date, to_date, CHAIN_CHUNK_FAILED))
+            return
+        mid = from_date + timedelta(days=(to_date - from_date).days // 2)
+        self._fetch_window(
+            ticker, from_date, mid, depth + 1, call_map, put_map, failed, header_holder
+        )
+        self._fetch_window(
+            ticker,
+            mid + timedelta(days=1),
+            to_date,
+            depth + 1,
+            call_map,
+            put_map,
+            failed,
+            header_holder,
+        )
 
     def _plan_quotes(self) -> list[tuple[str, _Plan]]:
         """Fetch the one batched quote request and plan a segment per roster ticker.
@@ -639,22 +687,26 @@ def run_cycle(
     *,
     pid: int | None = None,
     guards: GuardConstants | None = None,
+    plan: ChainPlan | None = None,
 ) -> CycleResult:
     """Run one capture cycle. The primitive the daemon will later call in a loop.
 
     It performs one cycle over the injected clock, vendor, and roster, writing into
     ``lake_root``. It reads no wall clock and names no session time. ``pid`` defaults to
     this process, and a test pins it so segment names are deterministic. ``guards`` carries
-    the tunable thresholds the cycle reads, chiefly the chain chunker's group size and
-    split-depth bound. It defaults to the design's pinned values.
+    the tunable thresholds the cycle reads, chiefly the chunker's date-based split-depth
+    bound. It defaults to the design's pinned values. ``plan`` is the chain chunk plan, the
+    set of date windows the chain is fetched by. It defaults to ``load_chain_plan()``,
+    which reads the machine-owned plan file and falls back to the built-in default. A test
+    injects a small plan to drive the windows exactly.
 
     The steps, in order:
 
     1. Assign ``snap_ts`` from the clock, floored to the minute.
-    2. For each options ticker, fetch the chain in expiration chunks and write a chains
-       segment. A failed discovery writes a chains gap row. A chunk that fails past every
-       retry becomes an absence marker inside the snapshot. One ticker's failure never
-       blocks another.
+    2. For each options ticker, fetch the chain by its date-window plan and write a chains
+       segment. A chain where every window failed writes a chains gap row. A window that
+       fails past every split becomes an absence marker inside the snapshot. One ticker's
+       failure never blocks another.
     3. Fetch the batched quotes for every roster ticker, split per ticker, and write a
        quotes segment each. A failed batch gaps every ticker's quotes.
     4. Append one manifest entry per segment, keyed by the segment path, under the
@@ -667,6 +719,7 @@ def run_cycle(
         lake_root=Path(lake_root),
         pid=os.getpid() if pid is None else pid,
         guards=guards if guards is not None else GuardConstants(),
+        plan=plan if plan is not None else load_chain_plan(),
     )
     return cycle.run()
 
@@ -702,6 +755,7 @@ def run_cycle_from_config(
         config.lake_root,
         pid=pid,
         guards=config.guards,
+        plan=load_chain_plan(),
     )
 
 
