@@ -8,6 +8,11 @@ deleted. That merge is *compaction*. This module is the close+15 job that does i
 copies the lake to the backup SSD, then re-sizes the chain chunk plan from what the day
 captured.
 
+Every ``close+N`` here counts from the *option* close, the capture stop at 16:15 ET on a
+regular day and 13:15 on an early close. It never counts from the 16:00 equity close, even
+though the option close is itself fifteen minutes past that. So close+15 is 16:30 and
+close+5 is 16:20.
+
 The job's rules, each glossed at first use.
 
 1. *One lock for the whole run.* Every lake-mutating job takes the lake-root ``flock``
@@ -16,10 +21,11 @@ The job's rules, each glossed at first use.
    the lock by design, so blocking a cycle behind compaction never drops a minute.
 2. *Sweep every date, but only past the guard.* The job walks every date directory under
    ``journal/``, so a segment orphaned by an earlier failed run is recovered. A ticker-day
-   is eligible only once its *option-close deadline* has passed. That is close+5, five
-   minutes past the option close, the last moment the option-close fill may still write a
-   journal batch. Eligibility is decided from the injected clock and calendar alone, so
-   the job never seals the live day and never unlinks a segment the daemon holds open.
+   is eligible only once its *option-close deadline* has passed. That is close+5, the last
+   moment the option-close fill may still write a journal batch. The job's own run time is
+   close+15, ten minutes past the deadline, so it starts well clear of that boundary.
+   Eligibility is decided from the injected clock and calendar alone, so the job never
+   seals the live day and never unlinks a segment the daemon holds open.
 3. *Verify before manifest, manifest before delete.* Each ticker-day's segments are read
    to their last complete batch, concatenated, and written as one Parquet file. The file
    is then re-read and its row count checked against the sum across the segments. Only
