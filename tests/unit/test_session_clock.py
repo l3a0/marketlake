@@ -15,8 +15,8 @@ import pytest
 
 from lake.calendar import MARKET_TZ, NotASession
 from lake.session import (
-    CANONICAL_GUARD,
     COMPACTION_DELAY,
+    OPTION_CLOSE_GUARD,
     SessionBounds,
     SessionClock,
     SessionPhase,
@@ -56,7 +56,7 @@ def session_clock_at(calendar: FakeCalendar, day: date, h: int, m: int, s: int =
 
 
 def test_guard_offsets_are_pinned():
-    assert CANONICAL_GUARD == timedelta(minutes=5)
+    assert OPTION_CLOSE_GUARD == timedelta(minutes=5)
     assert COMPACTION_DELAY == timedelta(minutes=15)
 
 
@@ -93,7 +93,7 @@ def test_bounds_reports_every_session_moment(calendar: FakeCalendar):
     assert b.open == et(REGULAR, 9, 30)
     assert b.equity_close == et(REGULAR, 16, 0)
     assert b.option_close == et(REGULAR, 16, 15)
-    assert b.canonical_deadline == et(REGULAR, 16, 20)  # close+5
+    assert b.option_close_deadline == et(REGULAR, 16, 20)  # close+5
     assert b.compaction == et(REGULAR, 16, 30)  # close+15
     assert b.early_close is False
 
@@ -102,7 +102,7 @@ def test_bounds_on_an_early_close_is_short(calendar: FakeCalendar):
     b = session_clock_at(calendar, EARLY_CLOSE, 12, 0).bounds(EARLY_CLOSE)
     assert b.equity_close == et(EARLY_CLOSE, 13, 0)
     assert b.option_close == et(EARLY_CLOSE, 13, 15)
-    assert b.canonical_deadline == et(EARLY_CLOSE, 13, 20)
+    assert b.option_close_deadline == et(EARLY_CLOSE, 13, 20)
     assert b.compaction == et(EARLY_CLOSE, 13, 30)
     assert b.early_close is True
 
@@ -131,7 +131,7 @@ def test_bounds_is_a_frozen_dataclass(calendar: FakeCalendar):
         (16, 0, 0, SessionPhase.OPEN),  # the spot_close slot, still synchronous
         (16, 0, 30, SessionPhase.OPEN),  # still serving the 16:00 slot
         (16, 1, 0, SessionPhase.POST_EQUITY_CLOSE),
-        (16, 15, 0, SessionPhase.POST_EQUITY_CLOSE),  # the canonical slot, still capturing
+        (16, 15, 0, SessionPhase.POST_EQUITY_CLOSE),  # the option_close slot, still capturing
         (16, 15, 30, SessionPhase.POST_EQUITY_CLOSE),  # still serving the 16:15 slot
         (16, 16, 0, SessionPhase.CLOSED),
         (23, 0, 0, SessionPhase.CLOSED),
@@ -149,7 +149,7 @@ def test_phase_transitions_on_a_regular_day(
         (9, 30, SessionPhase.OPEN),
         (13, 0, SessionPhase.OPEN),  # the early spot_close slot
         (13, 1, SessionPhase.POST_EQUITY_CLOSE),
-        (13, 15, SessionPhase.POST_EQUITY_CLOSE),  # the early canonical slot
+        (13, 15, SessionPhase.POST_EQUITY_CLOSE),  # the early option_close slot
         (13, 16, SessionPhase.CLOSED),
     ],
 )
@@ -188,7 +188,7 @@ def test_phase_follows_the_injected_clock(calendar: FakeCalendar):
         (9, 30, True),  # the open
         (12, 0, True),
         (16, 0, True),  # the spot_close slot
-        (16, 15, True),  # the canonical slot
+        (16, 15, True),  # the option_close slot
         (16, 16, False),  # past the option close
     ],
 )

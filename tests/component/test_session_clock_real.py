@@ -39,7 +39,7 @@ def test_real_regular_bounds(calendar: ExchangeCalendar):
     assert (b.open.hour, b.open.minute) == (9, 30)
     assert (b.equity_close.hour, b.equity_close.minute) == (16, 0)
     assert (b.option_close.hour, b.option_close.minute) == (16, 15)
-    assert (b.canonical_deadline.hour, b.canonical_deadline.minute) == (16, 20)
+    assert (b.option_close_deadline.hour, b.option_close_deadline.minute) == (16, 20)
     assert (b.compaction.hour, b.compaction.minute) == (16, 30)
     assert b.early_close is False
 
@@ -58,7 +58,7 @@ def test_real_early_close_bounds(calendar: ExchangeCalendar):
         (9, 30, SessionPhase.OPEN),
         (16, 0, SessionPhase.OPEN),  # the spot_close slot
         (16, 1, SessionPhase.POST_EQUITY_CLOSE),
-        (16, 15, SessionPhase.POST_EQUITY_CLOSE),  # the canonical slot
+        (16, 15, SessionPhase.POST_EQUITY_CLOSE),  # the option_close slot
         (16, 16, SessionPhase.CLOSED),
     ],
 )

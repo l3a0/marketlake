@@ -52,13 +52,18 @@ Slice 1 starts the capture clock on the real dataset. It is D0 through D8.
 
 Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop.
 
-- **D9** daemon loop.
-- **D10** startup gap-marking. Gap-marking writes an explicit marker for a missed minute, so a gap is recorded rather than silently absent.
-- **D11** close tags and the close+5 guard. Close+5 is the five-minute window after the option close, the last moment a canonical fetch may land.
-- **D12** compaction and backup. Compaction merges a day's segments into one sealed partition.
-- **D13** watchdog and alerting. One test pins the startup rule. The per-surface counters start at zero, not rebuilt from the journal's last durable batch. So a restart never pages for the downtime that preceded it. Whole-daemon death stays the job of the external dead-man switch, the health ping whose silence pages.
+- **D9** daemon loop. It fires the capture cycle at each session minute and idles otherwise. It holds no expiration state and re-reads the chain plan each cycle. It also defines three hooks the loop-coupled deliverables plug into, each with a no-op default so the loop ships on its own:
+  1. a startup hook, called once before the first cycle,
+  2. a per-slot close-tag hook, asked what tag the minute carries,
+  3. a cycle-outcome observer, handed each cycle's result.
+- **D10** startup gap-marking. Gap-marking writes an explicit marker for a missed minute, so a gap is recorded rather than silently absent. It plugs into D9's startup hook and reuses the last-durable-batch read the capture primitive's failure path already makes.
+- **D11** close tags and the close+5 guard. Close+5 is the five-minute window after the option close, the last moment an option-close fetch may land. It plugs into D9's close-tag hook.
+- **D12** compaction and backup, plus the nightly window re-tune. Compaction merges a day's segments into one sealed partition. The re-tune runs after it. The job groups the day's rows by `window_start` and `window_end`, compares each window's contract count to the body limit, and rewrites `chain_plan.json` when the profile drifts.
+- **D13** watchdog and alerting. One test pins the startup rule. The per-surface counters start at zero, not rebuilt from the journal's last durable batch. So a restart never pages for the downtime that preceded it. Whole-daemon death stays the job of the external dead-man switch, the health ping whose silence pages. It plugs into D9's cycle-outcome observer.
 - **D14** laptop control plane.
 - **D15** query service with the Now and Today panels. The query service is the read-only localhost dashboard.
+
+Slice 2 builds in two waves. D9 comes first and defines the hooks. D12, D14, and D15 do not touch the loop, so they build in parallel with D9. D10, D11, and D13 plug into D9's hooks, so they follow it, in parallel with each other.
 
 ### Slice 3, vendor fetch
 

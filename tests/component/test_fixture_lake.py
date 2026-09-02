@@ -85,7 +85,7 @@ def test_chains_partition_reads_back(fixture_lake: FixtureLake):
     table = pq.read_table(lake.partition_path("chains", "SPY", DAY))
     assert table.num_rows == 1
     assert table.column("ticker")[0].as_py() == "SPY"
-    assert table.column("close_tag")[0].as_py() == "canonical"
+    assert table.column("close_tag")[0].as_py() == "option_close"
 
 
 def test_journal_segment_reads_back_as_arrow_ipc(fixture_lake: FixtureLake):

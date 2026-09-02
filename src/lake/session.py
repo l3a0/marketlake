@@ -14,9 +14,9 @@ session-relative moments the design enumerates.
 
 1. Capture start and stop: the session open and the option close.
 2. The close tags' moments: the equity close (the ``spot_close`` cycle) and the
-   option close (the ``canonical`` cycle).
-3. The close+5 guard: five minutes past the option close, the last moment a
-   canonical fill may land.
+   option close (the ``option_close`` cycle).
+3. The close+5 guard: five minutes past the option close, the last moment an
+   option-close fill may land.
 4. The close+15 compaction: fifteen minutes past the option close.
 
 Definitions used here, following the design doc.
@@ -29,9 +29,9 @@ Definitions used here, following the design doc.
 - The *equity close* is the closing-auction moment, 16:00 on regular days. Its
   cycle is tagged ``spot_close``. It is the last regular-session-synchronous minute.
 - The *option close* is the equity close plus fifteen minutes, 16:15 on regular
-  days. Its cycle is tagged ``canonical``. It is the capture stop.
+  days. Its cycle is tagged ``option_close``. It is the capture stop.
 - *close+5* and *close+15* are durations past the option close. close+5 is pinned
-  in code, not config, because it defines canonical-close semantics.
+  in code, not config, because it defines option-close semantics.
 
 The module reads the clock only through the injected ``Clock``. It names no session
 time of its own. Every session time comes from the calendar. So both enforcement
@@ -47,10 +47,10 @@ from enum import Enum
 from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
 
-# The canonical-guard window. The last moment after the option close that a
-# canonical fill may land. Pinned in code, not config, because it defines
-# canonical-close semantics, not alerting.
-CANONICAL_GUARD = timedelta(minutes=5)
+# The option-close guard window. The last moment after the option close that an
+# option-close fill may land. Pinned in code, not config, because it defines
+# option-close semantics, not alerting.
+OPTION_CLOSE_GUARD = timedelta(minutes=5)
 
 # The compaction delay. How long after the option close the close+15 compaction
 # job runs. A structural session-relative offset, so it lives in code, not config.
@@ -79,8 +79,8 @@ class SessionBounds:
     day: date
     open: datetime  # capture start, the session open
     equity_close: datetime  # the spot_close moment
-    option_close: datetime  # the canonical moment, the capture stop
-    canonical_deadline: datetime  # close+5, the canonical-guard window end
+    option_close: datetime  # the option-close moment, the capture stop
+    option_close_deadline: datetime  # close+5, the option-close guard window end
     compaction: datetime  # close+15, when the compaction job runs
     early_close: bool
 
@@ -115,7 +115,7 @@ class SessionClock:
             open=self._calendar.session_open(day),
             equity_close=self._calendar.session_close(day),
             option_close=option_close,
-            canonical_deadline=option_close + CANONICAL_GUARD,
+            option_close_deadline=option_close + OPTION_CLOSE_GUARD,
             compaction=option_close + COMPACTION_DELAY,
             early_close=self._calendar.is_early_close(day),
         )

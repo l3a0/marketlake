@@ -7,11 +7,14 @@ never silently reach past its recording.
 The request keys mirror the real calls. ``get_chain`` keys on ``{"symbol": symbol}``
 plus whichever narrowing parameters are set: ``from_date`` and ``to_date`` as ISO date
 strings and ``strike_count`` as an int. So the bare chain still keys on
-``{"symbol": symbol}``, the discovery probe on ``{"symbol": symbol, "strike_count": 1}``,
-and each chunk on ``{"symbol": symbol, "from_date": ..., "to_date": ...}``. A parameter
-left ``None`` is omitted from the key, exactly as the real vendor omits it from the
-request. ``get_quotes`` keys on ``{"symbols": [...]}`` in the order given. A cassette
-must record the same shapes.
+``{"symbol": symbol}``, and each date window the capture chunker fetches keys on
+``{"symbol": symbol, "from_date": ...}`` plus ``"to_date"`` when the window is closed. The
+open tail leaves ``to_date`` ``None``, so it keys on ``{"symbol": symbol, "from_date":
+...}`` alone. A parameter left ``None`` is omitted from the key, exactly as the real vendor
+omits it from the request, so a window keyed on ``from_date`` and ``to_date`` matches a
+closed window and one keyed on ``from_date`` alone matches the open tail. ``strike_count``
+is only the by-hand probe's parameter now, never the hot path's. ``get_quotes`` keys on
+``{"symbols": [...]}`` in the order given. A cassette must record the same shapes.
 """
 
 from __future__ import annotations
