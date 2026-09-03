@@ -83,9 +83,14 @@ def quarantine_path(lake_root: Path) -> Path:
 # -- checksums ---------------------------------------------------------------
 
 
+def sha256_bytes(data: bytes) -> str:
+    """The sha256 hex digest of bytes already in hand."""
+    return hashlib.sha256(data).hexdigest()
+
+
 def sha256_file(path: Path) -> str:
     """The sha256 hex digest of a file's bytes."""
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    return sha256_bytes(Path(path).read_bytes())
 
 
 # -- reading -----------------------------------------------------------------
