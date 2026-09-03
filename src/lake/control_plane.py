@@ -94,6 +94,11 @@ class WallClockTime:
         """The ``pmset`` argument form, 24-hour with seconds."""
         return f"{self.hour:02d}:{self.minute:02d}:00"
 
+    @property
+    def sudoers_hms(self) -> str:
+        """The ``hms`` form as a plain sudoers argument, where a colon needs a backslash."""
+        return self.hms.replace(":", "\\:")
+
     def launchd_intervals(self, weekdays: Sequence[int]) -> list[dict[str, int]]:
         """One ``StartCalendarInterval`` entry per launchd weekday number."""
         return [{**calendar_interval(self.hour, self.minute), "Weekday": wd} for wd in weekdays]
@@ -836,22 +841,57 @@ def sunday_maintenance(
 # A sudoers user field. Anything else would be a syntax hole in a root-level file.
 _ACCOUNT = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 
+# Neither sudoers rule wildcards its argument, and the reason is the same for both.
+# ``sudo`` joins a command's arguments into one string before matching, so a ``*``
+# there spans whitespace and admits whatever follows the wake. Both writes keep
+# reading arguments past the event they set. ``pmset repeat`` takes a second
+# power-off event after the power-on event, and ``pmset schedule`` keeps parsing
+# settings after the event it schedules. A wildcard on either rule therefore grants
+# far more than the wake it is meant to allow.
+#
+# The weekday alarm's argument never changes, so its rule spells the argument out.
+# The one-shot's date changes every week, so its rule pins the argument's shape
+# instead, as a POSIX extended regular expression. ``sudoers`` reads an argument that
+# starts with ``^`` and ends with ``$`` as one, a sudo 1.9.10 feature. The whole
+# joined argument string is that one regular expression, so the two leading words sit
+# inside it and ``[[:space:]]`` stands in for each separator. Written as a single word
+# it is unambiguously a regular expression, which is the form the sudoers manual's own
+# examples take. Inside one, no sudoers character needs a backslash, so the colons
+# stay bare. The date pattern matches what ``_pmset_date`` renders and nothing wider.
+# The closing anchor is what leaves no room for a trailing setting.
+_SUDOERS_SPACE = "[[:space:]]"
+_PMSET_DATE_PATTERN = "[0-9][0-9]/[0-9][0-9]/[0-9][0-9]"
+_SCHEDULE_ARGS_REGEX = (
+    f"^schedule{_SUDOERS_SPACE}wakeorpoweron{_SUDOERS_SPACE}"
+    f"{_PMSET_DATE_PATTERN}{_SUDOERS_SPACE}{SUNDAY_WAKE.hms}$"
+)
+
 
 def sudoers_dropin(owner: str) -> str:
     """The ``/etc/sudoers.d`` drop-in granting ``owner`` exactly the two pmset writes.
 
-    The repeat rule's argument is fixed and the one-shot's date changes weekly, so
-    both rules wildcard the argument. Nothing else runs under sudo. ``pmset
-    disablesleep`` is deliberately absent: it is rejected by design and stays
+    Neither rule wildcards its argument. The weekday alarm's argument is fixed, so the
+    rule spells it out, carrying the backslash a colon needs in a plain sudoers
+    argument. The one-shot's date changes weekly, so that rule pins the argument's
+    shape with an anchored regular expression. Nothing else runs under sudo. The
+    sleep-disabling write is deliberately absent: it is rejected by design and stays
     password-gated.
     """
     if _ACCOUNT.match(owner) is None:
         raise ValueError(f"not a valid account name for sudoers: {owner!r}")
     return (
         "# Marketlake: the two pmset writes the control plane needs, and nothing else.\n"
-        "# The sleep-disabling command is rejected by design and stays password-gated.\n"
-        f"{owner} ALL=(root) NOPASSWD: /usr/bin/pmset repeat wakeorpoweron *\n"
-        f"{owner} ALL=(root) NOPASSWD: /usr/bin/pmset schedule wakeorpoweron *\n"
+        "# Neither rule wildcards its argument. sudo joins a command's arguments into one\n"
+        "# string before matching, so a wildcard there spans whitespace and admits what\n"
+        "# follows the wake. Both writes keep reading arguments past the event they set.\n"
+        "# The weekday alarm's argument is fixed, so it is spelled out. The Sunday\n"
+        "# one-shot's date changes weekly, so that rule is an anchored regular\n"
+        "# expression. It pins the date's shape and the wake time, and the closing\n"
+        "# anchor leaves no room for a trailing setting.\n"
+        "# The sleep-disabling write is rejected by design and stays password-gated.\n"
+        f"{owner} ALL=(root) NOPASSWD: /usr/bin/pmset repeat wakeorpoweron"
+        f" MTWRF {WEEKDAY_WAKE.sudoers_hms}\n"
+        f"{owner} ALL=(root) NOPASSWD: /usr/bin/pmset {_SCHEDULE_ARGS_REGEX}\n"
     )
 
 
@@ -953,6 +993,9 @@ def install_commands(out_dir: Path, host: LaunchdHost, token_path: str) -> str:
         "# 2. Install the sudoers drop-in after visudo validates it.",
         f"sudo visudo -cf {out / SUDOERS_FILE} && "
         f"sudo install -o root -g wheel -m 440 {out / SUDOERS_FILE} /etc/sudoers.d/marketlake",
+        "# visudo checks the syntax only. This prints the two rules as sudo parsed them,",
+        "# which is what shows the one-shot's regular expression survived as one.",
+        "sudo -l | grep pmset",
         "# 3. Set the weekday firmware wake, then read it back.",
         f"sudo {pmset_repeat_command()}",
         "pmset -g sched",

@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import json
 import plistlib
+import re
+import shlex
+from collections.abc import Sequence
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -85,10 +88,97 @@ def test_rendered_sudoers_grants_exactly_the_two_pmset_writes(tmp_path):
     text = (out / cp.SUDOERS_FILE).read_text()
     rules = [line for line in text.splitlines() if not line.startswith("#")]
     assert rules == [
-        "someone ALL=(root) NOPASSWD: /usr/bin/pmset repeat wakeorpoweron *",
-        "someone ALL=(root) NOPASSWD: /usr/bin/pmset schedule wakeorpoweron *",
+        "someone ALL=(root) NOPASSWD: /usr/bin/pmset repeat wakeorpoweron MTWRF 08\\:25\\:00",
+        "someone ALL=(root) NOPASSWD: /usr/bin/pmset ^schedule[[:space:]]wakeorpoweron"
+        "[[:space:]][0-9][0-9]/[0-9][0-9]/[0-9][0-9][[:space:]]19:55:00$",
     ]
     assert "disablesleep" not in text
+
+
+def test_neither_sudoers_rule_wildcards_its_argument(tmp_path):
+    """A ``*`` would span whitespace, and both pmset writes read on past their event."""
+    out = tmp_path / "out"
+    cp.main(["render", "--out", str(out), *RENDER_ARGS])
+    rules = [
+        line
+        for line in (out / cp.SUDOERS_FILE).read_text().splitlines()
+        if not line.startswith("#")
+    ]
+    assert len(rules) == 2
+    for rule in rules:
+        _, _, args = rule.partition("/usr/bin/pmset ")
+        assert "*" not in args
+
+
+# Python's ``re`` is not a POSIX engine, so the one bracket expression the drop-in
+# uses is translated before matching. Every other construct in the rule means the same
+# in both dialects.
+_POSIX_CLASSES = {"[[:space:]]": "[ ]"}
+
+
+def _sudo_args_match(spec: str, argv: Sequence[str]) -> bool:
+    """Whether sudo would let ``argv`` run under the drop-in's argument ``spec``.
+
+    ``sudo`` joins the arguments with single spaces and matches that one string. A
+    spec framed by ``^`` and ``$`` is a POSIX extended regular expression. Anything
+    else is compared literally, after the backslash a colon carries is dropped. The
+    assertion guards the translation, so a POSIX class added later fails here rather
+    than being read as a nested set.
+    """
+    joined = " ".join(argv)
+    if not (spec.startswith("^") and spec.endswith("$")):
+        return spec.replace("\\:", ":") == joined
+    pattern = spec
+    for posix, python in _POSIX_CLASSES.items():
+        pattern = pattern.replace(posix, python)
+    assert "[:" not in pattern, f"untranslated POSIX class in {spec!r}"
+    return re.fullmatch(pattern[1:-1], joined) is not None
+
+
+@pytest.mark.parametrize(
+    ("argv", "permitted"),
+    [
+        # The exact commands the design pins. Both must run without a password.
+        (["repeat", "wakeorpoweron", "MTWRF", "08:25:00"], True),
+        (["schedule", "wakeorpoweron", "09/06/26 19:55:00"], True),
+        (["schedule", "wakeorpoweron", "12/27/26 19:55:00"], True),
+        # A second power-off event riding the repeat alarm. The wildcard admitted it.
+        (
+            ["repeat", "wakeorpoweron", "MTWRF", "08:25:00", "shutdown", "MTWRFSU", "03:00:00"],
+            False,
+        ),
+        (["repeat", "wakeorpoweron", "MTWRF", "08:25:00", "sleep", "MTWRFSU", "20:00:00"], False),
+        # A wake at another hour, on other days.
+        (["repeat", "wakeorpoweron", "MTWRFSU", "03:00:00"], False),
+        # The sleep-disabling write, trailing the one-shot. The wildcard admitted it.
+        (["schedule", "wakeorpoweron", "09/06/26 19:55:00", "x", "disablesleep", "1"], False),
+        (["schedule", "wakeorpoweron", "09/06/26 19:55:00", "disablesleep", "1"], False),
+        # A one-shot at another time, of another kind, or in another date form.
+        (["schedule", "wakeorpoweron", "09/06/26 03:00:00"], False),
+        (["schedule", "sleep", "09/06/26 19:55:00"], False),
+        (["schedule", "wakeorpoweron", "09/06/2026 19:55:00"], False),
+    ],
+)
+def test_the_grant_admits_the_two_pinned_commands_and_nothing_further(argv, permitted):
+    specs = [
+        rule.partition("/usr/bin/pmset ")[2]
+        for rule in cp.sudoers_dropin("someone").splitlines()
+        if not rule.startswith("#")
+    ]
+    assert any(_sudo_args_match(spec, argv) for spec in specs) is permitted
+
+
+def test_the_rendered_rules_cover_the_commands_the_module_composes(tmp_path):
+    """The grant and the command builders must not drift apart."""
+    specs = [
+        rule.partition("/usr/bin/pmset ")[2]
+        for rule in cp.sudoers_dropin("someone").splitlines()
+        if not rule.startswith("#")
+    ]
+    repeat = shlex.split(cp.pmset_repeat_command())[1:]
+    one_shot = shlex.split(cp.pmset_schedule_command(date(2026, 9, 6)))[1:]
+    assert any(_sudo_args_match(spec, repeat) for spec in specs)
+    assert any(_sudo_args_match(spec, one_shot) for spec in specs)
 
 
 def test_rendered_tmutil_line_targets_the_token_under_home(tmp_path):
