@@ -140,17 +140,18 @@ These need the real world. They run by hand, off CI.
 6. A real restore from the SSD.
 7. The Sunday canary coverage assertion. The Sunday canary is the weekend check that proves capture still works.
 
-## When the health checks get created
+## When the alert channels get created
 
-Each healthchecks.io check is created by hand, in the session that first makes its job ping, and never earlier. A check begins its grace timer the moment it exists, so a row created ahead of its job pages for something unbuilt. The design doc's monitoring table holds the slug for each one.
+Each healthchecks.io check is created by hand, in the session that first makes its job ping, and never earlier. A check pages only after its first ping, so a row created ahead of its job is silent until then. Create it late anyway. A row with no producer reads exactly like the mistyped-slug failure the design calls silence. The design doc's monitoring table holds the slug for each one, and the ntfy table beside it holds every message shape and the integration settings. The ntfy topic itself is a D1 config key, hand-generated with the rest of `config.yaml`.
 
-1. **D8**, `slice1-capture`. The slice-1 runner's own envelope.
-2. **D12**, `compaction`. The close+15 seal, backup, and re-tune.
-3. **D13**, `capture`. The per-cycle dead-man. Delete the `slice1-capture` row in the same session, because `capture` supersedes it.
-4. **D14**, `pre-open` and `sunday`. D14 renders the launchd jobs and the wake schedules those two checks watch.
+1. **D8**, `slice1-capture`, and the channel. Subscribe the phone to the topic from the clipboard, never from a printed string. Create the healthchecks.io project, its ntfy integration and its email integration with the design's settings, and the `slice1-capture` check named `Slice-1 capture`. Confirm ntfy and email both read on for it. Prove the chain before the first unattended run. Give the check a 2-minute period and a 1-minute grace, ping once, wait for `Slice-1 capture is DOWN` on the phone, ping again for `is UP`, then set the real envelope. A new check sends no up push on its first ping, so down is the first thing the phone can show. Slice 1 shipped before this step was written, so any part of it still owed runs before D13.
+2. **D12**, `compaction`. Create the check and confirm ntfy and email both read on for it.
+3. **D13**, `capture`, and the daemon's own pages. The per-cycle dead-man. Delete the `slice1-capture` row in the same session, because `capture` supersedes it. Ship every daemon page path through one publisher: auth death, the auth-gap reminder, sustained 429s, the watchdog, the sampler collapse, and the parser's schema drift, plus the undelivered-pages counter and a `--test-push` on the onboarding command. Rehearse the topic rotation once, end to end.
+4. **D14**, `pre-open` and `sunday`, and the Sunday reminder. D14 renders the launchd jobs and the wake schedules those two checks watch. The Sunday job sends the re-auth reminder on its 20:00, 21:00, and 22:00 canary runs only, while the throwaway call or the coverage assertion still fails, reading the token's mint time from `token.json` itself.
 5. **D16**, `eod-sweep`. The vendor sweep.
+6. **D20**, the battery's pages, delayed feed and nightly schema drift.
 
-`calendar-probe` is the exception. No deliverable ships the 09:35 says-closed-but-open probe yet, so its row waits on whichever one does.
+`calendar-probe` is the exception. No deliverable ships the 09:35 says-closed-but-open probe yet, so its row and its page wait on whichever one does.
 
 ## Discipline rules
 
