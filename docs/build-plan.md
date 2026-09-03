@@ -140,6 +140,18 @@ These need the real world. They run by hand, off CI.
 6. A real restore from the SSD.
 7. The Sunday canary coverage assertion. The Sunday canary is the weekend check that proves capture still works.
 
+## When the health checks get created
+
+Each healthchecks.io check is created by hand, in the session that first makes its job ping, and never earlier. A check begins its grace timer the moment it exists, so a row created ahead of its job pages for something unbuilt. The design doc's monitoring table holds the slug for each one.
+
+1. **D8**, `slice1-capture`. The slice-1 runner's own envelope.
+2. **D12**, `compaction`. The close+15 seal, backup, and re-tune.
+3. **D13**, `capture`. The per-cycle dead-man. Delete the `slice1-capture` row in the same session, because `capture` supersedes it.
+4. **D14**, `pre-open` and `sunday`. D14 renders the launchd jobs and the wake schedules those two checks watch.
+5. **D16**, `eod-sweep`. The vendor sweep.
+
+`calendar-probe` is the exception. No deliverable ships the 09:35 says-closed-but-open probe yet, so its row waits on whichever one does.
+
 ## Discipline rules
 
 Two rules keep the pyramid upright. The pyramid is the shape of a healthy suite: many fast unit tests, fewer component tests, a thin layer of integration tests.
