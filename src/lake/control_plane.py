@@ -53,11 +53,12 @@ test.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from lake.calendar import MARKET_TZ, Calendar
@@ -236,23 +237,32 @@ def self_check_job(host: LaunchdHost) -> LaunchdJob:
     )
 
 
-def sunday_job(host: LaunchdHost) -> LaunchdJob:
+def sunday_job(host: LaunchdHost, token_path: str) -> LaunchdJob:
     """The Sunday canary and maintenance job, five minutes after the one-shot wake.
 
-    The 18:30 vendor sweep is not rendered here. That job is slice 3's, and it does
-    not exist yet.
+    ``token_path`` is the same file the Time Machine exclusion names, so the coverage
+    assertion reads the token the install step protected, and the two can never name
+    different files. The 18:30 vendor sweep is not rendered here. That job is slice
+    3's, and it does not exist yet.
     """
     return host.job(
         SUNDAY_LABEL,
         "lake.control_plane",
         "sunday",
+        "--token",
+        token_path,
         calendar=SUNDAY_MAINTENANCE.launchd_intervals([LAUNCHD_SUNDAY])[0],
     )
 
 
-def all_jobs(host: LaunchdHost) -> tuple[LaunchdJob, ...]:
+def all_jobs(host: LaunchdHost, token_path: str) -> tuple[LaunchdJob, ...]:
     """Every launchd job the control plane installs, resident processes first."""
-    return (daemon_job(host), dashboard_job(host), self_check_job(host), sunday_job(host))
+    return (
+        daemon_job(host),
+        dashboard_job(host),
+        self_check_job(host),
+        sunday_job(host, token_path),
+    )
 
 
 # -- the pre-open self-check ---------------------------------------------------
@@ -731,8 +741,13 @@ def _canary_pass_through() -> bool:
 class SundayOutcome:
     """What one Sunday maintenance run found and did.
 
-    ``covered`` is ``None`` when no mint time was supplied, so the coverage assertion
-    did not run. ``pinged`` is the success condition: every check passed.
+    ``problems`` are the findings that withhold the ping: a failed scrub, a failed
+    canary, a token that does not cover the coming week, or a mint time that could
+    not be read. ``report`` carries the report-tier findings. Today that is only
+    pmset alarm drift. The design pins drift to the nightly report, because the pre-open
+    self-check already catches a missed wake an hour before the bell, so drift never
+    withholds the ping. ``covered`` is ``None`` when the mint time could not be read.
+    That is a problem, never a skip. ``pinged`` is the success condition.
     """
 
     scrub: ScrubResult
@@ -741,6 +756,7 @@ class SundayOutcome:
     covered: bool | None
     pinged: bool
     problems: tuple[str, ...] = ()
+    report: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -760,10 +776,14 @@ def sunday_maintenance(
 ) -> SundayOutcome:
     """Scrub, verify the wake alarms, run the canary, assert coverage, then ping.
 
-    Every check runs and every problem is named, so the report sees all of them at
-    once. The ping fires only when all pass. The canary's 30-minute retry until the
-    deadline is the launchd retry loop's job, not this function's. This function
-    decides one attempt.
+    Every check runs and every finding is named, so one run reports all of them.
+    The ping fires only when the scrub, the canary, and the coverage assertion pass.
+    Alarm drift is checked and named in ``report`` but never withholds the ping. The
+    coverage assertion needs the token's mint time. ``mint`` is ``None`` when the
+    caller could not read it, and that withholds the ping. A coverage assertion that
+    never ran must not read as a pass. The canary's 30-minute
+    retry until the deadline is the launchd retry loop's job, not this function's.
+    This function decides one attempt.
     """
     problems: list[str] = []
 
@@ -782,14 +802,16 @@ def sunday_maintenance(
         parse_pmset_schedule(schedule_reader()),
         one_shot_date=expected_one_shot(now, calendar),
     )
-    problems.extend(alarms.problems)
+    report = list(alarms.problems)
 
     canary_passed = bool(canary())
     if not canary_passed:
         problems.append("canary call failed")
 
     covered: bool | None = None
-    if mint is not None:
+    if mint is None:
+        problems.append("token mint time unreadable, so the coverage assertion did not run")
+    else:
         covered = token_covers_week(mint, now, calendar)
         if not covered:
             problems.append("token mint plus seven days does not clear the coming week")
@@ -805,6 +827,7 @@ def sunday_maintenance(
         covered=covered,
         pinged=pinged,
         problems=tuple(problems),
+        report=tuple(report),
     )
 
 
@@ -842,6 +865,34 @@ def default_token_path(home: str) -> str:
     return str(Path(home) / ".config" / "marketlake" / "token.json")
 
 
+def read_token_mint(token_path: Path | str) -> datetime:
+    """When the refresh token in ``token_path`` was minted, timezone-aware in UTC.
+
+    ``schwab-py`` writes ``creation_timestamp`` beside the token, the epoch second of
+    the last full browser re-auth. This reads that one field and nothing else, so the
+    secret half of the file never leaves the parser. Any failure raises
+    ``ValueError`` and the caller treats it as a problem, never as a skip.
+    """
+    path = Path(token_path)
+    try:
+        payload = json.loads(path.read_text())
+    except OSError as exc:
+        raise ValueError(f"token file unreadable: {exc.strerror}") from exc
+    except ValueError as exc:
+        raise ValueError("token file is not JSON") from exc
+    created = payload.get("creation_timestamp") if isinstance(payload, dict) else None
+    if created is None:
+        raise ValueError("token file has no creation_timestamp")
+    # A bool is an int to Python and a numeric string is a float to float(). Neither
+    # is a stamp schwab-py writes, so both are refused before the conversion.
+    if isinstance(created, bool) or not isinstance(created, (int, float)):
+        raise ValueError("creation_timestamp is not an epoch second")
+    try:
+        return datetime.fromtimestamp(float(created), tz=UTC)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ValueError("creation_timestamp is not an epoch second") from exc
+
+
 @dataclass(frozen=True)
 class RenderedFile:
     """One file the dry-run renderer produces."""
@@ -852,7 +903,7 @@ class RenderedFile:
 
 def render_all(host: LaunchdHost, token_path: str) -> tuple[RenderedFile, ...]:
     """Every plist and setup file, as text, in install order."""
-    files = [RenderedFile(f"{job.label}.plist", job.render()) for job in all_jobs(host)]
+    files = [RenderedFile(f"{job.label}.plist", job.render()) for job in all_jobs(host, token_path)]
     files.append(RenderedFile(SUDOERS_FILE, sudoers_dropin(host.owner)))
     files.append(
         RenderedFile(
@@ -894,7 +945,7 @@ def install_commands(out_dir: Path, host: LaunchdHost, token_path: str) -> str:
         "# Marketlake control plane: the manual install. Run each line by hand.",
         "# 1. Install the four LaunchDaemons, root-owned as launchd requires.",
     ]
-    for job in all_jobs(host):
+    for job in all_jobs(host, token_path):
         lines.append(
             f"sudo install -o root -g wheel -m 644 {out / job.label}.plist /Library/LaunchDaemons/"
         )
@@ -909,7 +960,7 @@ def install_commands(out_dir: Path, host: LaunchdHost, token_path: str) -> str:
         tmutil_exclusion_command(token_path),
         "# 5. Load the jobs into the system domain, then confirm the daemon is running.",
     ]
-    for job in all_jobs(host):
+    for job in all_jobs(host, token_path):
         lines.append(
             f"sudo launchctl bootstrap {LAUNCHD_DOMAIN} /Library/LaunchDaemons/{job.label}.plist"
         )
@@ -953,7 +1004,12 @@ def _build_parser():
 
     sunday = sub.add_parser("sunday", help="Scrub, verify the wake alarms, canary, then ping.")
     sunday.add_argument("--config", help="Path to config.yaml (defaults to the standard location).")
-    sunday.add_argument("--mint", help="The token's mint time, ISO 8601 with offset.")
+    sunday.add_argument(
+        "--token", help="Path to token.json. Defaults to the standard place under HOME."
+    )
+    sunday.add_argument(
+        "--mint", help="Override the token's mint time, ISO 8601 with offset. Tests only."
+    )
 
     sub.add_parser("pmset", help="Print the two pmset commands for the coming week.")
 
@@ -1016,7 +1072,18 @@ def main(
     if args.command == "sunday":
         config = load_config(args.config)
         now = (clock if clock is not None else _system_clock()).now()
-        mint = datetime.fromisoformat(args.mint) if args.mint is not None else None
+        mint: datetime | None
+        if args.mint is not None:
+            mint = datetime.fromisoformat(args.mint)
+        else:
+            token_path = (
+                args.token if args.token is not None else default_token_path(str(Path.home()))
+            )
+            try:
+                mint = read_token_mint(token_path)
+            except ValueError as exc:
+                print(f"sunday: {exc}")
+                mint = None
         outcome = sunday_maintenance(
             lake_root=config.lake_root,
             now=now,
@@ -1029,6 +1096,8 @@ def main(
         )
         for problem in outcome.problems:
             print(f"sunday: {problem}")
+        for line in outcome.report:
+            print(f"sunday: report: {line}")
         print(f"sunday: pinged={outcome.pinged} slug={SUNDAY_SLUG}")
         return 0 if outcome.pinged else 1
 
@@ -1105,6 +1174,7 @@ __all__ = [
     "pmset_repeat_command",
     "pmset_schedule_command",
     "read_pmset_schedule",
+    "read_token_mint",
     "render_all",
     "self_check",
     "self_check_job",

@@ -1,8 +1,10 @@
 """The Sunday maintenance job across one real boundary: the filesystem.
 
 The scrub reads a lake the fixture builder put on disk. Everything else is injected:
-``now``, the calendar, the schedule reader, the canary, and the pinger. The rule under
-test is that the ping fires only when every check passes, and that every failure is
+``now``, the calendar, the schedule reader, the canary, the pinger, and the mint time.
+The rules under test: the ping fires only when the scrub, the canary, and the
+coverage assertion pass, pmset alarm drift rides the report and never withholds the
+ping, an unreadable mint time is a problem and never a skip, and every finding is
 named at once.
 """
 
@@ -35,6 +37,7 @@ def _week(monday: date) -> FakeCalendar:
 CALENDAR = _week(date(2026, 8, 31))
 SUNDAY_20 = _et(2026, 8, 30, 20, 0)
 SUNDAY_19 = _et(2026, 8, 30, 19, 0)
+FRESH_MINT = _et(2026, 8, 30, 19, 30)
 URL = "https://hc-ping.com/secret-key/sunday"
 
 REPEAT_ONLY = "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n"
@@ -55,7 +58,7 @@ def _clean_lake(fixture_lake: FixtureLake) -> Path:
     return fixture_lake.build()
 
 
-def _run(lake_root: Path, *, now=SUNDAY_20, schedule=REPEAT_ONLY, canary=None, mint=None):
+def _run(lake_root: Path, *, now=SUNDAY_20, schedule=REPEAT_ONLY, canary=None, mint=FRESH_MINT):
     pinger = FakePinger()
     kwargs = {}
     if canary is not None:
@@ -78,18 +81,23 @@ def test_clean_scrub_and_the_repeat_alarm_ping_at_the_maintenance_time(fixture_l
     # alarm is expected, per the design's read-back caveat.
     outcome, pinger = _run(_clean_lake(fixture_lake))
     assert outcome.scrub.ok and outcome.alarms.ok and outcome.canary_passed
-    assert outcome.covered is None
+    assert outcome.covered is True
     assert outcome.pinged is True
-    assert outcome.problems == ()
+    assert outcome.problems == () and outcome.report == ()
     assert pinger.urls == [URL]
 
 
-def test_before_the_wake_both_alarms_are_required(fixture_lake):
+def test_before_the_wake_a_missing_one_shot_rides_the_report(fixture_lake):
+    # Both alarms are expected before the wake. A missing one is drift, which the
+    # design pins to the nightly report, so it is named but the ping still fires.
     root = _clean_lake(fixture_lake)
     missing, pinger = _run(root, now=SUNDAY_19, schedule=REPEAT_ONLY)
-    assert missing.pinged is False and pinger.urls == []
-    assert any("one-shot" in p for p in missing.problems)
+    assert missing.alarms.ok is False
+    assert any("one-shot" in line for line in missing.report)
+    assert missing.problems == ()
+    assert missing.pinged is True and pinger.urls == [URL]
     present, pinger = _run(root, now=SUNDAY_19, schedule=BOTH)
+    assert present.report == ()
     assert present.pinged is True and pinger.urls == [URL]
 
 
@@ -111,11 +119,15 @@ def test_a_missing_lake_root_is_a_failure_not_a_clean_scrub(tmp_path):
     assert any("lake root missing" in p for p in outcome.problems)
 
 
-def test_a_missing_repeat_alarm_blocks_the_ping(fixture_lake):
+def test_a_missing_repeat_alarm_rides_the_report_and_the_ping_still_fires(fixture_lake):
+    # The pre-open self-check catches a missed wake an hour before the bell, so
+    # waiting overnight loses nothing that page does not already cover.
     outcome, pinger = _run(_clean_lake(fixture_lake), schedule="No scheduled events.\n")
     assert outcome.alarms.repeat_ok is False
-    assert outcome.pinged is False
-    assert pinger.urls == []
+    assert any("repeat" in line for line in outcome.report)
+    assert outcome.problems == ()
+    assert outcome.pinged is True
+    assert pinger.urls == [URL]
 
 
 def test_a_failing_canary_blocks_the_ping(fixture_lake):
@@ -124,6 +136,14 @@ def test_a_failing_canary_blocks_the_ping(fixture_lake):
     assert outcome.pinged is False
     assert pinger.urls == []
     assert "canary call failed" in outcome.problems
+
+
+def test_an_unreadable_mint_is_a_problem_not_a_skip(fixture_lake):
+    outcome, pinger = _run(_clean_lake(fixture_lake), mint=None)
+    assert outcome.covered is None
+    assert any("mint time unreadable" in p for p in outcome.problems)
+    assert outcome.pinged is False
+    assert pinger.urls == []
 
 
 def test_a_stale_mint_blocks_the_ping_and_a_fresh_one_passes(fixture_lake):
@@ -141,5 +161,6 @@ def test_every_failure_is_named_at_once(fixture_lake):
     fixture_lake.partition_path("quotes", "SPY", date(2026, 8, 28)).unlink()
     outcome, _ = _run(root, schedule="", canary=lambda: False, mint=_et(2026, 8, 20, 12, 0))
     kinds = [p.split(":")[0].split(" ")[0] for p in outcome.problems]
-    assert kinds == ["scrub", "weekday", "canary", "token"]
+    assert kinds == ["scrub", "canary", "token"]
+    assert [line.split(" ")[0] for line in outcome.report] == ["weekday"]
     assert outcome.pinged is False

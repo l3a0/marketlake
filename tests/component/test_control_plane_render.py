@@ -8,6 +8,7 @@ clock is read and nothing shells out.
 
 from __future__ import annotations
 
+import json
 import plistlib
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -179,8 +180,18 @@ def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys):
     lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
     config = _config(tmp_path, lake)
     pinger = FakePinger()
+    # An absent token file beside the override proves the override wins and that
+    # the test can never fall through to the real token under HOME.
     code = cp.main(
-        ["sunday", "--config", str(config), "--mint", "2026-08-30T19:30:00-04:00"],
+        [
+            "sunday",
+            "--config",
+            str(config),
+            "--token",
+            str(tmp_path / "absent.json"),
+            "--mint",
+            "2026-08-30T19:30:00-04:00",
+        ],
         clock=ManualClock(start=_et(2026, 8, 30, 20, 0)),
         calendar=_week(date(2026, 8, 31)),
         schedule_reader=lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
@@ -188,7 +199,30 @@ def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys):
     )
     assert code == 0
     assert pinger.urls == ["https://hc-ping.com/secret-key/sunday"]
-    assert "secret-key" not in capsys.readouterr().out
+    printed = capsys.readouterr().out
+    assert "secret-key" not in printed
+    assert "token file unreadable" not in printed
+
+
+def test_sunday_cli_reads_the_mint_time_from_the_token_file(tmp_path, capsys):
+    lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
+    config = _config(tmp_path, lake)
+    token = tmp_path / "token.json"
+    # 2026-08-30 19:30 ET as an epoch second, the shape schwab-py writes.
+    minted = _et(2026, 8, 30, 19, 30).timestamp()
+    token.write_text(json.dumps({"creation_timestamp": minted, "token": {"x": "never-read"}}))
+    pinger = FakePinger()
+    code = cp.main(
+        ["sunday", "--config", str(config), "--token", str(token)],
+        clock=ManualClock(start=_et(2026, 8, 30, 20, 0)),
+        calendar=_week(date(2026, 8, 31)),
+        schedule_reader=lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
+        pinger=pinger,
+    )
+    assert code == 0
+    assert pinger.urls == ["https://hc-ping.com/secret-key/sunday"]
+    printed = capsys.readouterr().out
+    assert "never-read" not in printed and "secret-key" not in printed
 
 
 def test_sunday_cli_reports_problems_and_exits_non_zero(tmp_path, capsys):
@@ -196,7 +230,7 @@ def test_sunday_cli_reports_problems_and_exits_non_zero(tmp_path, capsys):
     config = _config(tmp_path, lake)
     pinger = FakePinger()
     code = cp.main(
-        ["sunday", "--config", str(config)],
+        ["sunday", "--config", str(config), "--token", str(tmp_path / "absent.json")],
         clock=ManualClock(start=_et(2026, 8, 30, 20, 0)),
         calendar=_week(date(2026, 8, 31)),
         schedule_reader=lambda: "",
@@ -206,8 +240,12 @@ def test_sunday_cli_reports_problems_and_exits_non_zero(tmp_path, capsys):
     assert code == 1
     assert pinger.urls == []
     printed = capsys.readouterr().out
-    assert "repeat alarm missing" in printed
+    lines = printed.splitlines()
+    assert any(
+        line.startswith("sunday: report:") and "repeat alarm missing" in line for line in lines
+    )
     assert "canary call failed" in printed
+    assert "token file unreadable" in printed
 
 
 def test_pmset_cli_prints_both_commands_for_the_coming_week(capsys):
