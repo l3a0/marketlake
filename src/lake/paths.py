@@ -117,6 +117,16 @@ class LakePaths:
         """The journal root. Compaction sweeps every date present under it."""
         return self.root / JOURNAL_DIR
 
+    def segment_dir(self, surface: str, ticker: str, day: date | str) -> Path:
+        """The directory holding one surface, ticker, and day's journal segments.
+
+        Every writer session on that day lands its segment here. A reader lists this
+        directory to find the day's segments.
+        """
+        return (
+            self.journal_dir / f"date={_day_str(day)}" / f"surface={surface}" / f"ticker={ticker}"
+        )
+
     def segment_path(
         self, surface: str, ticker: str, day: date | str, start_ts: str, pid: int
     ) -> Path:
@@ -126,13 +136,7 @@ class LakePaths:
         Together they make the name unique, so a second writer never truncates a live
         segment. The segment is Arrow IPC, hence the ``.arrows`` suffix.
         """
-        return (
-            self.journal_dir
-            / f"date={_day_str(day)}"
-            / f"surface={surface}"
-            / f"ticker={ticker}"
-            / f"seg-{start_ts}-{pid}.arrows"
-        )
+        return self.segment_dir(surface, ticker, day) / f"seg-{start_ts}-{pid}.arrows"
 
     # -- ledgers -------------------------------------------------------------
 
