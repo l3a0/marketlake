@@ -227,3 +227,48 @@ def test_a_non_wake_event_does_not_satisfy_the_check():
     text = "Repeating power events:\n  shutdown at 8:25AM weekdays only\n"
     check = cp.check_alarms(cp.parse_pmset_schedule(text), one_shot_date=None)
     assert not check.repeat_ok
+
+
+# -- the print shapes pmset really emits ---------------------------------------------
+
+# pmset names a day mask only when it is every day, weekdays, weekends, or one day.
+# Anything else prints as "Some days", with no day list at all. And pmset lists every
+# owner's one-shots, which carry a leeway and a user-visible tail after the owner.
+
+
+def test_an_unnamed_day_mask_parses_as_an_unknown_set():
+    text = "Repeating power events:\n  wakepoweron at 8:25AM Some days\n"
+    alarm = cp.parse_pmset_schedule(text).repeats[0]
+    assert (alarm.hour, alarm.minute) == (8, 25)
+    assert alarm.weekdays is None
+
+
+def test_an_unnamed_day_mask_reads_as_drift_not_a_pass():
+    text = "Repeating power events:\n  wakepoweron at 8:25AM Some days\n"
+    check = cp.check_alarms(cp.parse_pmset_schedule(text), one_shot_date=None)
+    assert check.repeat_ok is False
+    assert any("drifted" in line for line in check.problems)
+
+
+def test_a_single_day_name_still_parses():
+    text = "Repeating power events:\n  wakepoweron at 8:25AM Wednesday\n"
+    assert cp.parse_pmset_schedule(text).repeats[0].weekdays == frozenset({2})
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "",
+        " by 'pmset'",
+        " by 'com.apple.alarm.user-invisible-foo' leeway secs: 300",
+        " by 'com.apple.someagent' User visible: true",
+        " by 'com.apple.someagent' leeway secs: 0 User visible: true",
+        " leeway secs: 300",
+        " User visible: true",
+    ],
+)
+def test_a_one_shot_parses_with_every_tail_pmset_appends(tail):
+    text = f"Scheduled power events:\n [0]  wakeorpoweron at 09/06/2026 19:55:00{tail}\n"
+    alarm = cp.parse_pmset_schedule(text).one_shots[0]
+    assert alarm.when == datetime(2026, 9, 6, 19, 55)
+    assert alarm.kind == "wakeorpoweron"

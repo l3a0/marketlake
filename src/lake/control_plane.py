@@ -408,9 +408,16 @@ def sunday_wake_command(now: datetime, calendar: Calendar) -> str:
 WAKE_KINDS = frozenset({"wakeorpoweron", "wakepoweron"})
 
 _REPEAT_LINE = re.compile(r"^(?P<kind>\w+)\s+at\s+(?P<time>\S+)\s+(?P<days>.+?)\s*$")
+# A one-shot line carries up to three optional tails, in this order: the owner, the
+# leeway pmset allows the firing, and whether the event is user-visible. pmset appends
+# each one only when it applies, and it prints every owner's events, not just this
+# project's. So a foreign event's tail must parse rather than fail the whole read-back.
 _ONE_SHOT_LINE = re.compile(
     r"^\[\d+\]\s+(?P<kind>\w+)\s+at\s+(?P<date>\S+)\s+(?P<time>\S+)"
-    r"(?:\s+by\s+'(?P<owner>[^']*)')?\s*$"
+    r"(?:\s+by\s+'(?P<owner>[^']*)')?"
+    r"(?:\s+leeway\s+secs:\s*-?\d+)?"
+    r"(?:\s+User\s+visible:\s*\S+)?"
+    r"\s*$"
 )
 _CLOCK = re.compile(r"^(?P<h>\d{1,2}):(?P<m>\d{2})(?::(?P<s>\d{2}))?\s*(?P<ampm>[AaPp][Mm])?$")
 _DATE = re.compile(r"^(?P<mo>\d{1,2})/(?P<d>\d{1,2})/(?P<y>\d{2}|\d{4})$")
@@ -432,12 +439,16 @@ class PmsetParseError(ValueError):
 
 @dataclass(frozen=True)
 class RepeatAlarm:
-    """One repeating power event. ``weekdays`` uses Python numbering, Monday=0."""
+    """One repeating power event. ``weekdays`` uses Python numbering, Monday=0.
+
+    ``weekdays`` is ``None`` when pmset printed a day mask it has no name for. The
+    alarm exists and its days are unknown, which is drift either way.
+    """
 
     kind: str
     hour: int
     minute: int
-    weekdays: frozenset[int]
+    weekdays: frozenset[int] | None
 
 
 @dataclass(frozen=True)
@@ -481,7 +492,14 @@ def _parse_date(text: str) -> date:
     return date(year, int(match.group("mo")), int(match.group("d")))
 
 
-def _parse_days(text: str) -> frozenset[int]:
+def _parse_days(text: str) -> frozenset[int] | None:
+    """The day set a repeat line names, or ``None`` when pmset would not name it.
+
+    pmset prints one of ``every day``, ``weekdays only``, ``weekends only``, or a
+    single day's name. Every other mask prints as ``Some days``, which carries no day
+    list at all. That is a drifted alarm rather than an unreadable line, so it parses
+    as an unknown set and the alarm check names it.
+    """
     lowered = text.lower()
     if "every day" in lowered:
         return frozenset(range(7))
@@ -489,6 +507,8 @@ def _parse_days(text: str) -> frozenset[int]:
         return _PY_WEEKDAYS
     if "weekend" in lowered:
         return frozenset({_PY_SATURDAY, _PY_SUNDAY})
+    if "some days" in lowered:
+        return None
     days: set[int] = set()
     for token in text.split():
         if token.lower() in _DAY_NAMES:
@@ -509,6 +529,12 @@ def parse_pmset_schedule(text: str) -> PmsetSchedule:
     19:55:00 by 'pmset'``. Empty output, or a ``No scheduled events`` line, parses
     as an empty schedule. Times in 12-hour or 24-hour form and two- or four-digit
     years are all accepted, because the exact print form is confirmed by live check 4.
+
+    Two shapes come from pmset printing other owners' events beside this project's. A
+    one-shot line may carry a leeway and a user-visible tail after its owner, and a
+    repeat line whose day mask pmset has no name for prints ``Some days``. Both parse.
+    A line this parser still does not know raises ``PmsetParseError``, and the Sunday
+    job turns that into a report line rather than a withheld ping.
     """
     repeats: list[RepeatAlarm] = []
     one_shots: list[OneShotAlarm] = []
@@ -571,6 +597,11 @@ def expected_one_shot(now: datetime, calendar: Calendar) -> date | None:
     return sunday if SUNDAY_WAKE.on(sunday) > now else None
 
 
+def _format_days(weekdays: frozenset[int] | None) -> str:
+    """A repeat alarm's day set for a report line, in Python numbering, Monday=0."""
+    return "a mask pmset does not name" if weekdays is None else str(sorted(weekdays))
+
+
 def check_alarms(schedule: PmsetSchedule, *, one_shot_date: date | None) -> AlarmCheck:
     """Whether the weekday repeat alarm and the pending Sunday one-shot are present.
 
@@ -591,7 +622,9 @@ def check_alarms(schedule: PmsetSchedule, *, one_shot_date: date | None) -> Alar
     )
     if not repeat_ok:
         if wakes:
-            found = ", ".join(f"{a.hour:02d}:{a.minute:02d} on {sorted(a.weekdays)}" for a in wakes)
+            found = ", ".join(
+                f"{a.hour:02d}:{a.minute:02d} on {_format_days(a.weekdays)}" for a in wakes
+            )
             problems.append(f"weekday wake repeat alarm drifted: found {found}")
         else:
             problems.append("weekday wake repeat alarm missing")
@@ -783,7 +816,10 @@ def sunday_maintenance(
 
     Every check runs and every finding is named, so one run reports all of them.
     The ping fires only when the scrub, the canary, and the coverage assertion pass.
-    Alarm drift is checked and named in ``report`` but never withholds the ping. The
+    Alarm drift is checked and named in ``report`` but never withholds the ping. A
+    read-back that cannot be run or parsed is named there too, for the same reason:
+    the design routes the whole read-back step to the nightly report, and the
+    pre-open self-check already catches a missed wake an hour before the bell. The
     coverage assertion needs the token's mint time. ``mint`` is ``None`` when the
     caller could not read it, and that withholds the ping. A coverage assertion that
     never ran must not read as a pass. The canary's 30-minute
@@ -803,10 +839,22 @@ def sunday_maintenance(
             f"orphans={len(result.orphans)}"
         )
 
-    alarms = check_alarms(
-        parse_pmset_schedule(schedule_reader()),
-        one_shot_date=expected_one_shot(now, calendar),
-    )
+    # The design routes this whole step to the nightly report, so nothing it can raise
+    # may withhold the ping. The reader is an injected seam that shells out in
+    # production, and ``pmset -g sched`` lists every owner's events, in shapes the
+    # parser does not all know yet. So the catch is deliberately broad. A read-back
+    # that cannot be read is a report line naming what failed, never a silent pass and
+    # never a page.
+    try:
+        schedule = parse_pmset_schedule(schedule_reader())
+    except Exception as exc:
+        alarms = AlarmCheck(
+            repeat_ok=False,
+            one_shot_ok=False,
+            problems=(f"pmset read-back unreadable: {type(exc).__name__}: {exc}",),
+        )
+    else:
+        alarms = check_alarms(schedule, one_shot_date=expected_one_shot(now, calendar))
     report = list(alarms.problems)
 
     canary_passed = bool(canary())

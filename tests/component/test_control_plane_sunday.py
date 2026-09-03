@@ -10,6 +10,7 @@ named at once.
 
 from __future__ import annotations
 
+import subprocess
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -164,3 +165,84 @@ def test_every_failure_is_named_at_once(fixture_lake):
     assert kinds == ["scrub", "canary", "token"]
     assert [line.split(" ")[0] for line in outcome.report] == ["weekday"]
     assert outcome.pinged is False
+
+
+# -- the read-back that cannot be read -----------------------------------------------
+
+# The design routes the whole read-back step to the nightly report. So a reader that
+# raises, and a line the parser does not know, must both ride the report and leave the
+# ping alone. Before this, each aborted the run after the scrub and before the canary,
+# the coverage assertion, and the ping, which paged at 23:00.
+
+
+def _raise(exc: Exception):
+    def reader() -> str:
+        raise exc
+
+    return reader
+
+
+def test_a_reader_that_raises_rides_the_report_and_the_ping_still_fires(fixture_lake):
+    root = _clean_lake(fixture_lake)
+    for exc in (
+        subprocess.CalledProcessError(1, ["pmset", "-g", "sched"]),
+        FileNotFoundError(2, "No such file or directory", "pmset"),
+        RuntimeError("the seam broke in a way nobody predicted"),
+    ):
+        pinger = FakePinger()
+        outcome = cp.sunday_maintenance(
+            lake_root=root,
+            now=SUNDAY_20,
+            calendar=CALENDAR,
+            schedule_reader=_raise(exc),
+            pinger=pinger,
+            ping_url=URL,
+            mint=FRESH_MINT,
+        )
+        assert outcome.alarms.repeat_ok is False
+        assert any("read-back unreadable" in line for line in outcome.report)
+        assert type(exc).__name__ in outcome.report[0]
+        assert outcome.problems == ()
+        assert outcome.pinged is True
+        assert pinger.urls == [URL]
+
+
+def test_an_unparseable_line_rides_the_report_and_the_ping_still_fires(fixture_lake):
+    outcome, pinger = _run(
+        _clean_lake(fixture_lake),
+        schedule="Repeating power events:\n  a shape nobody has seen\n",
+    )
+    assert any("read-back unreadable" in line for line in outcome.report)
+    assert "PmsetParseError" in outcome.report[0]
+    assert outcome.problems == ()
+    assert outcome.pinged is True
+    assert pinger.urls == [URL]
+
+
+def test_an_unnamed_day_mask_is_drift_not_an_unreadable_line(fixture_lake):
+    # pmset prints "Some days" for any mask it has no name for. That is a drifted
+    # alarm, so it parses and the check names it, rather than aborting the run.
+    outcome, pinger = _run(
+        _clean_lake(fixture_lake),
+        schedule="Repeating power events:\n  wakepoweron at 8:25AM Some days\n",
+    )
+    assert outcome.alarms.repeat_ok is False
+    assert any("drifted" in line for line in outcome.report)
+    assert not any("unreadable" in line for line in outcome.report)
+    assert outcome.problems == ()
+    assert outcome.pinged is True
+    assert pinger.urls == [URL]
+
+
+def test_a_foreign_one_shot_with_a_leeway_tail_does_not_break_the_read_back(fixture_lake):
+    # pmset lists every owner's events. One carrying a leeway or user-visible tail
+    # must not cost this job its ping.
+    schedule = (
+        REPEAT_ONLY + "Scheduled power events:\n"
+        " [0]  wake at 09/06/2026 03:11:52 by 'com.apple.alarm.user-invisible' leeway secs: 300\n"
+        " [1]  wake at 09/06/2026 09:00:00 by 'com.apple.someagent' User visible: true\n"
+    )
+    outcome, pinger = _run(_clean_lake(fixture_lake), schedule=schedule)
+    assert outcome.report == ()
+    assert outcome.pinged is True
+    assert pinger.urls == [URL]
