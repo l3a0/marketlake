@@ -72,6 +72,12 @@ class SessionPhase(Enum):
     CLOSED = "closed"  # a session day, past the option close
 
 
+# The two phases the loop captures on: the open through the option close. The daemon
+# reads ``phase()`` once per minute and decides capture against this set, so the loop and
+# ``in_capture_window`` share one definition of the window.
+CAPTURE_PHASES = frozenset({SessionPhase.OPEN, SessionPhase.POST_EQUITY_CLOSE})
+
+
 @dataclass(frozen=True)
 class SessionBounds:
     """Every session-relative moment for one session day, all Eastern-time aware."""
@@ -139,6 +145,6 @@ class SessionClock:
         """Whether the current snap slot is a capture slot.
 
         The capture window runs from the session open through the option close. It
-        is the two phases the loop captures on: ``OPEN`` and ``POST_EQUITY_CLOSE``.
+        is the two phases in ``CAPTURE_PHASES``: ``OPEN`` and ``POST_EQUITY_CLOSE``.
         """
-        return self.phase() in (SessionPhase.OPEN, SessionPhase.POST_EQUITY_CLOSE)
+        return self.phase() in CAPTURE_PHASES
