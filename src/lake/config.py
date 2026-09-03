@@ -142,6 +142,18 @@ class GuardConstants:
     # and four midpoint splits collapse any oversized window to a single day, which one
     # expiration's ~429 KB always fits.
     chain_chunk_max_split_depth: int = 4
+    # The nightly window re-tune's two triggers. The close+15 compaction job groups the
+    # day's chains rows by window_start and window_end, takes each plan window's peak
+    # per-cycle contract count, and compares it to these two. Both are sized from the
+    # day-one measurement, run 2026-09-01: one 7.4 MB response carried 6,278 contracts,
+    # about 1.2 KB per contract, and the gateway body limit sits somewhere above 7.4 MB.
+    # A window whose peak count is over the max splits at its midpoint offset. 2,500
+    # contracts is about 3 MB, well under the limit with room for a dense day. Two
+    # adjacent finite windows whose peak counts are both under the min merge into one.
+    # 800 contracts is about 1 MB, so a merged pair stays under 2 MB and never nears the
+    # split trigger. The open tail is never split and never merged.
+    chain_window_max_contracts: int = 2500
+    chain_window_min_contracts: int = 800
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object] | None) -> GuardConstants:
