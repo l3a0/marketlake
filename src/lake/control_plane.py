@@ -694,8 +694,13 @@ def caffeinate_args(window: AssertionWindow, now: datetime) -> tuple[str, ...] |
     design's posture is lid open on AC. The seconds run from ``now`` to the window's
     end, rounded up. A call before the window starts holds early, which costs nothing
     on AC. A call at or past the end returns ``None``: nothing is owed.
+
+    The span is measured in absolute time. Both operands carry the same Eastern
+    ``tzinfo`` object, and subtracting those compares wall clocks and ignores an offset
+    change between them. On the November Sunday that repeats an hour, that reads an
+    hour short, and the assertion would lapse before the canary deadline.
     """
-    remaining = window.end - now
+    remaining = timedelta(seconds=window.end.timestamp() - now.timestamp())
     if remaining <= timedelta(0):
         return None
     return ("caffeinate", "-i", "-t", str(math.ceil(remaining.total_seconds())))
@@ -731,17 +736,66 @@ def hold_assertion(
     return args
 
 
+class AssertionHolder:
+    """Holds one ``caffeinate`` assertion per expectation window.
+
+    ``caffeinate -i -t <seconds>`` releases itself when its timer runs out, so the
+    daemon spawns one process per window and never has to kill one. This remembers the
+    window it last held, so the minutely caller spawns nothing until the next window
+    opens. Without that memory a per-tick call would leave one caffeinate process per
+    minute, each holding its own assertion until the window ended.
+
+    The hold starts when the window does, never before. Holding early would be
+    harmless on AC, but a daemon that started at midnight would keep the machine awake
+    for the eight hours before the wake, which is not what the design asks for.
+    """
+
+    def __init__(self, *, runner: AssertionRunner | None = None) -> None:
+        self._runner = runner if runner is not None else _spawn
+        self._held: AssertionWindow | None = None
+
+    def hold(self, now: datetime) -> tuple[str, ...] | None:
+        """Hold the assertion for the window ``now`` sits in, if one is open and unheld.
+
+        Returns the arguments the runner was handed, or ``None`` when nothing was owed:
+        no window today, the window not open yet or already over, or this window
+        already held.
+        """
+        eastern = now.astimezone(MARKET_TZ)
+        window = assertion_window(eastern.date())
+        if window is None or window == self._held or not window.contains(eastern):
+            return None
+        args = caffeinate_args(window, eastern)
+        if args is None:  # pragma: no cover - contains() already excludes the end
+            return None
+        self._runner(args)
+        self._held = window
+        return args
+
+
 # -- the token coverage assertion ------------------------------------------------
 
 
 def week_option_close(now: datetime, calendar: Calendar) -> datetime:
-    """The coming week's last option close: Friday's, or the last session's before it.
+    """The last option close of the week the token must still cover.
 
-    The coming week is the Monday-to-Friday span strictly after this week. On a
-    Sunday that is tomorrow's week. A Good Friday makes Thursday the last session, so
-    the week is walked back from Friday to the first session found.
+    That week is the one holding the next session whose option close is still ahead.
+    From the Sunday job it is tomorrow's week, which is the design's coming Friday.
+    From a Monday catch-up run, after launchd coalesced a wake missed over the
+    weekend, it is this week, so the token minted the evening before clears it. That
+    is what makes the design's Monday backstop able to pass. Anchoring on the Monday
+    strictly after today instead would judge next week from every weekday, and a
+    fresh token can never cover a week it will not live to see.
+
+    Past the last session's option close the answer moves to the following week. A
+    Good Friday makes Thursday the last session, so the week is walked back from
+    Friday to the first session found.
     """
-    monday = _next_monday(now.astimezone(MARKET_TZ).date())
+    today = now.astimezone(MARKET_TZ).date()
+    first = _first_session_on_or_after(today, calendar)
+    if calendar.option_close(first) <= now:
+        first = _first_session_on_or_after(first + timedelta(days=1), calendar)
+    monday = first - timedelta(days=first.weekday())
     for offset in range(4, -1, -1):
         day = monday + timedelta(days=offset)
         if calendar.is_session(day):
@@ -822,9 +876,8 @@ def sunday_maintenance(
     pre-open self-check already catches a missed wake an hour before the bell. The
     coverage assertion needs the token's mint time. ``mint`` is ``None`` when the
     caller could not read it, and that withholds the ping. A coverage assertion that
-    never ran must not read as a pass. The canary's 30-minute
-    retry until the deadline is the launchd retry loop's job, not this function's.
-    This function decides one attempt.
+    never ran must not read as a pass. The canary's 30-minute retry until the deadline
+    belongs to ``sunday_run``, not to this function. This function decides one attempt.
     """
     problems: list[str] = []
 
@@ -882,6 +935,76 @@ def sunday_maintenance(
         problems=tuple(problems),
         report=tuple(report),
     )
+
+
+# The canary's retry cadence. The design re-runs the canary every 30 minutes until it
+# passes or the deadline, so a re-login done after the 20:00 run still clears the check.
+CANARY_RETRY = timedelta(minutes=30)
+
+# Reads the token's mint time afresh, or ``None`` when it could not be read. The retry
+# loop calls it once per attempt. That is what lets a mid-evening re-login be seen.
+MintReader = Callable[[], datetime | None]
+
+
+def sunday_run(
+    *,
+    lake_root: Path,
+    clock: Clock,
+    calendar: Calendar,
+    schedule_reader: ScheduleReader,
+    pinger: Pinger,
+    ping_url: str,
+    mint_reader: MintReader,
+    canary: CanaryCall = _canary_pass_through,
+    retry: timedelta = CANARY_RETRY,
+) -> list[SundayOutcome]:
+    """Run the Sunday job, retrying until it passes or the canary deadline.
+
+    The ritual can be done any time on Sunday evening. A 20:00 run that finds no fresh
+    token must not strand a re-login done at 20:10, so the attempt repeats on the retry
+    cadence until it passes or the deadline. The mint time and the canary are read
+    afresh every attempt, which is the whole point. A retry reusing the first attempt's
+    reading could never see the new token.
+
+    launchd has no repeat-until key, so the retry lives here rather than in the plist.
+    The loop returns on the first success, so a healthy Sunday makes one attempt and
+    scrubs once. An evening that keeps failing scrubs again on each attempt. That is
+    the price of keeping one attempt one decision, and it buys a re-check of an
+    integrity failure that may have been a disk unplugged for a moment.
+
+    Retrying is Sunday-evening behaviour alone. A run started outside that window makes
+    one attempt and returns. That covers the Monday catch-up launchd fires for a wake
+    missed over the weekend, where retrying all day would page nobody sooner. Every
+    attempt comes back, in order, so the caller can report them all.
+    """
+    start = clock.now().astimezone(MARKET_TZ)
+    in_the_window = start.weekday() == _PY_SUNDAY and SUNDAY_MAINTENANCE.on(start.date()) <= start
+    stop = CANARY_DEADLINE.on(start.date()) if in_the_window else start
+
+    outcomes: list[SundayOutcome] = []
+    while True:
+        outcomes.append(
+            sunday_maintenance(
+                lake_root=lake_root,
+                now=clock.now(),
+                calendar=calendar,
+                schedule_reader=schedule_reader,
+                pinger=pinger,
+                ping_url=ping_url,
+                canary=canary,
+                mint=mint_reader(),
+            )
+        )
+        if outcomes[-1].pinged:
+            return outcomes
+        # The cadence is measured from the first attempt, so a slow scrub shifts no
+        # later attempt off the design's half-hour grid.
+        following = start + retry * len(outcomes)
+        if following > stop:
+            return outcomes
+        waited = (following - clock.now().astimezone(MARKET_TZ)).total_seconds()
+        if waited > 0:
+            clock.sleep(waited)
 
 
 # -- the setup artifacts ------------------------------------------------------------
@@ -1162,35 +1285,38 @@ def main(
 
     if args.command == "sunday":
         config = load_config(args.config)
-        now = (clock if clock is not None else _system_clock()).now()
-        mint: datetime | None
-        if args.mint is not None:
-            mint = datetime.fromisoformat(args.mint)
-        else:
-            token_path = (
-                args.token if args.token is not None else default_token_path(str(Path.home()))
-            )
+        token_path = args.token if args.token is not None else default_token_path(str(Path.home()))
+
+        def read_mint() -> datetime | None:
+            """The token's mint time, read fresh so a retry can see a new re-login."""
+            if args.mint is not None:
+                return datetime.fromisoformat(args.mint)
             try:
-                mint = read_token_mint(token_path)
+                return read_token_mint(token_path)
             except ValueError as exc:
                 print(f"sunday: {exc}")
-                mint = None
-        outcome = sunday_maintenance(
+                return None
+
+        outcomes = sunday_run(
             lake_root=config.lake_root,
-            now=now,
+            clock=clock if clock is not None else _system_clock(),
             calendar=calendar if calendar is not None else _exchange_calendar(),
             schedule_reader=schedule_reader if schedule_reader is not None else read_pmset_schedule,
             pinger=pinger if pinger is not None else UrllibPinger(),
             ping_url=config.healthchecks_url(SUNDAY_SLUG),
             canary=canary if canary is not None else _canary_pass_through,
-            mint=mint,
+            mint_reader=read_mint,
         )
-        for problem in outcome.problems:
-            print(f"sunday: {problem}")
-        for line in outcome.report:
-            print(f"sunday: report: {line}")
-        print(f"sunday: pinged={outcome.pinged} slug={SUNDAY_SLUG}")
-        return 0 if outcome.pinged else 1
+        for number, outcome in enumerate(outcomes, start=1):
+            if len(outcomes) > 1:
+                print(f"sunday: attempt {number} of {len(outcomes)}")
+            for problem in outcome.problems:
+                print(f"sunday: {problem}")
+            for line in outcome.report:
+                print(f"sunday: report: {line}")
+        pinged = outcomes[-1].pinged
+        print(f"sunday: attempts={len(outcomes)} pinged={pinged} slug={SUNDAY_SLUG}")
+        return 0 if pinged else 1
 
     if args.command == "pmset":
         now = (clock if clock is not None else _system_clock()).now()
@@ -1216,6 +1342,7 @@ def _exchange_calendar() -> Calendar:
 
 __all__ = [
     "CANARY_DEADLINE",
+    "CANARY_RETRY",
     "DAEMON_LABEL",
     "DASHBOARD_LABEL",
     "LAUNCHD_DOMAIN",
@@ -1233,11 +1360,13 @@ __all__ = [
     "WEEKDAY_ASSERTION_END",
     "WEEKDAY_WAKE",
     "AlarmCheck",
+    "AssertionHolder",
     "AssertionRunner",
     "AssertionWindow",
     "CanaryCall",
     "DaemonProbe",
     "LaunchdHost",
+    "MintReader",
     "OneShotAlarm",
     "PmsetParseError",
     "PmsetSchedule",
@@ -1272,6 +1401,7 @@ __all__ = [
     "sudoers_dropin",
     "sunday_job",
     "sunday_maintenance",
+    "sunday_run",
     "sunday_wake_command",
     "tmutil_exclusion_command",
     "token_covers_week",

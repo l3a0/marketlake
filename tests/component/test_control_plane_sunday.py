@@ -17,6 +17,7 @@ from pathlib import Path
 from lake import control_plane as cp
 from lake.calendar import MARKET_TZ
 from tests.support.calendar import FakeCalendar, SessionTimes
+from tests.support.clock import ManualClock
 from tests.support.lake import FixtureLake
 
 
@@ -24,18 +25,24 @@ def _et(*args: int) -> datetime:
     return datetime(*args, tzinfo=MARKET_TZ)
 
 
-def _week(monday: date) -> FakeCalendar:
+def _weeks(monday: date, count: int = 2) -> FakeCalendar:
+    """Consecutive Monday-to-Friday session weeks.
+
+    Two by default, because a Monday catch-up run looks ahead to the following week's
+    Sunday wake and a one-week calendar would run out under it.
+    """
     table = {}
-    for offset in range(5):
-        day = monday + timedelta(days=offset)
-        table[day] = SessionTimes(
-            open=_et(day.year, day.month, day.day, 9, 30),
-            close=_et(day.year, day.month, day.day, 16, 0),
-        )
+    for week in range(count):
+        for offset in range(5):
+            day = monday + timedelta(days=week * 7 + offset)
+            table[day] = SessionTimes(
+                open=_et(day.year, day.month, day.day, 9, 30),
+                close=_et(day.year, day.month, day.day, 16, 0),
+            )
     return FakeCalendar(table)
 
 
-CALENDAR = _week(date(2026, 8, 31))
+CALENDAR = _weeks(date(2026, 8, 31))
 SUNDAY_20 = _et(2026, 8, 30, 20, 0)
 SUNDAY_19 = _et(2026, 8, 30, 19, 0)
 FRESH_MINT = _et(2026, 8, 30, 19, 30)
@@ -246,3 +253,108 @@ def test_a_foreign_one_shot_with_a_leeway_tail_does_not_break_the_read_back(fixt
     assert outcome.report == ()
     assert outcome.pinged is True
     assert pinger.urls == [URL]
+
+
+# -- the canary retry ----------------------------------------------------------------
+
+# The ritual can be done any time on Sunday evening. A 20:00 run that finds no fresh
+# token must not strand a re-login done at 20:10, so the attempt repeats every 30
+# minutes until it passes or 23:00. Before this the plist fired once and any later
+# ritual paged.
+
+STALE_MINT = _et(2026, 8, 27, 18, 0)  # last week's late mint: valid, not fresh
+
+
+class _Mints:
+    """Hands back one mint per attempt, repeating the last once the list runs out."""
+
+    def __init__(self, *mints):
+        self.mints = list(mints)
+        self.reads = 0
+
+    def __call__(self):
+        mint = self.mints[min(self.reads, len(self.mints) - 1)]
+        self.reads += 1
+        return mint
+
+
+def _retry_run(lake_root, *, start, mints, canary=None, schedule=REPEAT_ONLY):
+    clock = ManualClock(start=start)
+    pinger = FakePinger()
+    outcomes = cp.sunday_run(
+        lake_root=lake_root,
+        clock=clock,
+        calendar=CALENDAR,
+        schedule_reader=lambda: schedule,
+        pinger=pinger,
+        ping_url=URL,
+        mint_reader=mints,
+        canary=canary if canary is not None else (lambda: True),
+    )
+    return outcomes, pinger, clock
+
+
+def test_a_healthy_sunday_makes_one_attempt(fixture_lake):
+    outcomes, pinger, clock = _retry_run(
+        _clean_lake(fixture_lake), start=SUNDAY_20, mints=_Mints(FRESH_MINT)
+    )
+    assert len(outcomes) == 1
+    assert outcomes[-1].pinged is True
+    assert pinger.urls == [URL]
+    assert clock.now() == SUNDAY_20  # nothing slept
+
+
+def test_a_ritual_done_after_the_first_run_still_clears_the_check(fixture_lake):
+    # 20:00 finds last week's token. The re-login lands at 20:10. The 20:30 attempt
+    # reads the mint afresh, so the ping fires and nothing pages at 23:00.
+    mints = _Mints(STALE_MINT, FRESH_MINT)
+    outcomes, pinger, clock = _retry_run(_clean_lake(fixture_lake), start=SUNDAY_20, mints=mints)
+    assert len(outcomes) == 2
+    assert outcomes[0].covered is False and outcomes[0].pinged is False
+    assert outcomes[1].covered is True and outcomes[1].pinged is True
+    assert pinger.urls == [URL]
+    assert clock.now() == _et(2026, 8, 30, 20, 30)
+    assert mints.reads == 2  # the mint is read once per attempt, never cached
+
+
+def test_a_ritual_never_done_retries_to_the_deadline_and_never_pings(fixture_lake):
+    outcomes, pinger, clock = _retry_run(
+        _clean_lake(fixture_lake), start=SUNDAY_20, mints=_Mints(STALE_MINT)
+    )
+    # 20:00 through 23:00 on the half hour: the deadline is the last retry.
+    assert len(outcomes) == 7
+    assert clock.now() == _et(2026, 8, 30, 23, 0)
+    assert all(o.pinged is False for o in outcomes)
+    assert pinger.urls == []
+
+
+def test_a_failing_canary_retries_the_same_way(fixture_lake):
+    outcomes, pinger, _ = _retry_run(
+        _clean_lake(fixture_lake),
+        start=SUNDAY_20,
+        mints=_Mints(FRESH_MINT),
+        canary=lambda: False,
+    )
+    assert len(outcomes) == 7
+    assert pinger.urls == []
+
+
+def test_a_monday_catch_up_makes_one_attempt(fixture_lake):
+    # launchd coalesces a wake missed over the weekend and fires the job Monday
+    # morning. Retrying all day would page nobody sooner, so the catch-up runs once.
+    outcomes, pinger, clock = _retry_run(
+        _clean_lake(fixture_lake), start=_et(2026, 8, 31, 8, 25), mints=_Mints(STALE_MINT)
+    )
+    assert len(outcomes) == 1
+    assert pinger.urls == []
+    assert clock.now() == _et(2026, 8, 31, 8, 25)
+
+
+def test_a_sunday_run_before_the_maintenance_time_makes_one_attempt(fixture_lake):
+    # RunAtLoad fires the job whenever the operator bootstraps it. Only the evening
+    # window retries.
+    outcomes, _, clock = _retry_run(
+        _clean_lake(fixture_lake), start=_et(2026, 8, 30, 15, 0), mints=_Mints(STALE_MINT)
+    )
+    assert len(outcomes) == 1
+    assert clock.now() == _et(2026, 8, 30, 15, 0)

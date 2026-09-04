@@ -166,6 +166,50 @@ def test_naive_times_are_refused():
         cp.token_covers_week(datetime(2026, 8, 30, 19, 30), SUNDAY_NOW, WEEK)
 
 
+def _weeks(monday: date, count: int = 2) -> FakeCalendar:
+    """A calendar of consecutive Monday-to-Friday session weeks."""
+    table = {}
+    for week in range(count):
+        for offset in range(5):
+            day = monday + timedelta(days=week * 7 + offset)
+            table[day] = SessionTimes(
+                open=_et(day.year, day.month, day.day, 9, 30),
+                close=_et(day.year, day.month, day.day, 16, 0),
+            )
+    return FakeCalendar(table)
+
+
+def test_a_monday_catch_up_judges_this_week_not_the_next():
+    # launchd coalesces a wake missed over the weekend and fires the Sunday job at the
+    # Monday 08:25 wake. That backstop can only clear the check when the run judges the
+    # week it stands in. Anchoring on the Monday strictly after today judged next week,
+    # which a token minted the evening before can never cover, so the backstop could
+    # never pass and the check could never come back up.
+    catch_up = _et(2026, 8, 31, 8, 25)
+    assert cp.week_option_close(catch_up, WEEK) == _et(2026, 9, 4, 16, 15)
+    assert cp.token_covers_week(_et(2026, 8, 30, 20, 10), catch_up, WEEK) is True
+
+
+def test_every_weekday_before_the_last_close_judges_the_same_week():
+    for month, day in ((8, 31), (9, 1), (9, 2), (9, 3), (9, 4)):
+        assert cp.week_option_close(_et(2026, month, day, 12, 0), WEEK) == _et(2026, 9, 4, 16, 15)
+
+
+def test_after_a_midweek_close_the_week_still_holds():
+    # Wednesday 17:00, past that day's option close. Thursday and Friday are still
+    # ahead, so the week the token must cover has not moved.
+    assert cp.week_option_close(_et(2026, 9, 2, 17, 0), WEEK) == _et(2026, 9, 4, 16, 15)
+
+
+def test_past_the_last_close_the_week_moves_on():
+    # Friday evening, past the week's last option close. The next session is the
+    # following Monday, so the coming week is the one the token must now cover.
+    two = _weeks(date(2026, 8, 31))
+    assert cp.week_option_close(_et(2026, 9, 4, 18, 0), two) == _et(2026, 9, 11, 16, 15)
+    # The Sunday answer is unchanged by the wider calendar.
+    assert cp.week_option_close(SUNDAY_NOW, two) == _et(2026, 9, 4, 16, 15)
+
+
 def test_a_dark_week_raises():
     with pytest.raises(ValueError):
         cp.week_option_close(SUNDAY_NOW, FakeCalendar({}))
@@ -223,3 +267,77 @@ def test_launchctl_print_parser_wants_a_running_state():
     assert cp.parse_launchctl_print(running) is True
     assert cp.parse_launchctl_print(idle) is False
     assert cp.parse_launchctl_print("") is False
+
+
+# -- the assertion holder ---------------------------------------------------------
+
+# The daemon calls this every minute. One caffeinate process per window is owed, not
+# one per minute, and `caffeinate -i -t` releases itself when the window ends.
+
+
+class _Runner:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+
+    def __call__(self, args) -> None:
+        self.calls.append(tuple(args))
+
+
+def test_the_holder_spawns_once_per_window_not_once_per_tick():
+    runner = _Runner()
+    holder = cp.AssertionHolder(runner=runner)
+    # Every minute from 08:25 to 08:29 on a Monday.
+    for minute in range(25, 30):
+        holder.hold(_et(2026, 8, 31, 8, minute))
+    assert len(runner.calls) == 1
+    assert runner.calls[0][:3] == ("caffeinate", "-i", "-t")
+    # 08:25 to 18:45 is 10 hours 20 minutes.
+    assert runner.calls[0][3] == str((18 - 8) * 3600 + (45 - 25) * 60)
+
+
+def test_the_holder_takes_the_next_day_window_too():
+    runner = _Runner()
+    holder = cp.AssertionHolder(runner=runner)
+    holder.hold(_et(2026, 8, 31, 8, 25))
+    holder.hold(_et(2026, 8, 31, 12, 0))
+    assert len(runner.calls) == 1
+    holder.hold(_et(2026, 9, 1, 8, 25))
+    assert len(runner.calls) == 2
+
+
+def test_the_holder_waits_for_the_window_to_open():
+    runner = _Runner()
+    holder = cp.AssertionHolder(runner=runner)
+    holder.hold(_et(2026, 8, 31, 0, 0))  # midnight, hours before the wake
+    holder.hold(_et(2026, 8, 31, 8, 24))
+    assert runner.calls == []
+    holder.hold(_et(2026, 8, 31, 8, 25))
+    assert len(runner.calls) == 1
+
+
+def test_the_holder_owes_nothing_after_the_window_or_on_saturday():
+    runner = _Runner()
+    holder = cp.AssertionHolder(runner=runner)
+    holder.hold(_et(2026, 8, 31, 19, 0))  # past the 18:45 end
+    holder.hold(_et(2026, 9, 5, 12, 0))  # Saturday
+    assert runner.calls == []
+
+
+def test_the_holder_takes_the_sunday_evening_window():
+    runner = _Runner()
+    holder = cp.AssertionHolder(runner=runner)
+    holder.hold(_et(2026, 8, 30, 19, 55))
+    assert len(runner.calls) == 1
+    # 19:55 to 23:00 is 3 hours 5 minutes.
+    assert runner.calls[0][3] == str(3 * 3600 + 5 * 60)
+
+
+def test_a_hold_across_the_fall_back_sunday_measures_absolute_time():
+    # 2026-11-01 repeats the 01:00 hour. The Sunday window runs 19:55 to 23:00, both
+    # after the change, so the daemon's own hold is unaffected. The span is measured
+    # in absolute time, so a call from inside the repeated hour is not an hour short.
+    window = cp.assertion_window(date(2026, 11, 1))
+    early = _et(2026, 11, 1, 1, 0)
+    args = cp.caffeinate_args(window, early)
+    assert args is not None
+    assert int(args[3]) == int(window.end.timestamp() - early.timestamp())
