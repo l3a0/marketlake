@@ -4,8 +4,10 @@ The data plane is plain files any host can serve. The control plane is what keep
 laptop awake, keeps the two resident processes running, and proves both to the outside
 world. It is macOS-specific by construction and is rewritten per host. This module
 renders it and reasons about it. It executes nothing privileged. No ``sudo``, no
-``pmset`` write, no ``launchctl``, no ``tmutil`` runs from here. Those are the operator's
-install step and the by-hand live checks.
+``pmset`` write, no ``launchctl`` bootstrap, and no ``tmutil`` write runs from here.
+Installing is the operator's step, by hand. Three read-only probes do run, from the
+rendered jobs and from the by-hand live checks: ``launchctl print``, ``pmset -g sched``,
+and ``tmutil isexcluded``. None of them needs root.
 
 Terms, glossed at first use.
 
@@ -21,8 +23,9 @@ Terms, glossed at first use.
   ``sudo`` for named commands. The one here grants exactly the two ``pmset`` writes.
 - *caffeinate* is the macOS tool that holds a power assertion. ``caffeinate -i``
   prevents idle sleep while it runs. It cannot stop a closed lid from sleeping.
-- *tmutil addexclusion* keeps a file out of Time Machine backups. The token file gets it,
-  so a brokerage credential never rides onto a backup disk.
+- *tmutil addexclusion* keeps an item out of Time Machine backups. The whole config
+  directory gets it, so neither the brokerage token nor the secrets in ``config.yaml``
+  ride onto a backup disk. ``tmutil isexcluded`` reads that back.
 - A *healthchecks slug* names one dead-man check. A ping fires only on the job's
   success condition, never on mere liveness.
 
@@ -865,6 +868,8 @@ def sunday_maintenance(
     ping_url: str,
     canary: CanaryCall = _canary_pass_through,
     mint: datetime | None = None,
+    exclusion_targets: Sequence[str] = (),
+    exclusion_reader: ExclusionReader | None = None,
 ) -> SundayOutcome:
     """Scrub, verify the wake alarms, run the canary, assert coverage, then ping.
 
@@ -873,7 +878,13 @@ def sunday_maintenance(
     Alarm drift is checked and named in ``report`` but never withholds the ping. A
     read-back that cannot be run or parsed is named there too, for the same reason:
     the design routes the whole read-back step to the nightly report, and the
-    pre-open self-check already catches a missed wake an hour before the bell. The
+    pre-open self-check already catches a missed wake an hour before the bell.
+
+    The Time Machine exclusion is checked the same way and reported the same way. A
+    sticky exclusion is invisible once set and dies quietly if the item it marks is
+    replaced, so something has to look. With no ``exclusion_reader`` the check does not
+    run, which costs a report line and never a ping. The command line always passes
+    one. The
     coverage assertion needs the token's mint time. ``mint`` is ``None`` when the
     caller could not read it, and that withholds the ping. A coverage assertion that
     never ran must not read as a pass. The canary's 30-minute retry until the deadline
@@ -909,6 +920,16 @@ def sunday_maintenance(
     else:
         alarms = check_alarms(schedule, one_shot_date=expected_one_shot(now, calendar))
     report = list(alarms.problems)
+
+    if exclusion_reader is not None and exclusion_targets:
+        try:
+            states = parse_exclusions(exclusion_reader(exclusion_targets))
+        except Exception as exc:
+            report.append(f"time machine exclusion unreadable: {type(exc).__name__}: {exc}")
+        else:
+            for target in exclusion_targets:
+                if not states.get(target, False):
+                    report.append(f"not excluded from time machine: {target}")
 
     canary_passed = bool(canary())
     if not canary_passed:
@@ -957,6 +978,8 @@ def sunday_run(
     mint_reader: MintReader,
     canary: CanaryCall = _canary_pass_through,
     retry: timedelta = CANARY_RETRY,
+    exclusion_targets: Sequence[str] = (),
+    exclusion_reader: ExclusionReader | None = None,
 ) -> list[SundayOutcome]:
     """Run the Sunday job, retrying until it passes or the canary deadline.
 
@@ -993,6 +1016,8 @@ def sunday_run(
                 ping_url=ping_url,
                 canary=canary,
                 mint=mint_reader(),
+                exclusion_targets=exclusion_targets,
+                exclusion_reader=exclusion_reader,
             )
         )
         if outcomes[-1].pinged:
@@ -1066,14 +1091,88 @@ def sudoers_dropin(owner: str) -> str:
     )
 
 
-def tmutil_exclusion_command(token_path: str) -> str:
-    """The Time Machine exclusion for the token file. Runs as the user, no root."""
-    return f'tmutil addexclusion "{token_path}"'
+# Returns the ``tmutil isexcluded`` output for the given paths. The real one shells
+# out. A test injects one.
+ExclusionReader = Callable[[Sequence[str]], str]
+
+_EXCLUSION_LINE = re.compile(r"^\[(?P<state>[^\]]+)\]\s+(?P<path>.+?)\s*$")
+
+
+def read_exclusions(targets: Sequence[str]) -> str:
+    """The real reader: ``tmutil isexcluded``, read-only and no root."""
+    import subprocess  # lazy: only a real run shells out
+
+    return subprocess.run(
+        ["tmutil", "isexcluded", *targets], capture_output=True, text=True, check=True
+    ).stdout
+
+
+def parse_exclusions(text: str) -> dict[str, bool]:
+    """Parse ``tmutil isexcluded`` output into a path-to-excluded map.
+
+    Each line reads ``[Excluded]`` or ``[Included]`` and then the path. Only the first
+    means excluded. ``tmutil`` also prints ``[UNKNOWN]`` for a path it cannot resolve,
+    which is not an exclusion either.
+    """
+    states: dict[str, bool] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        match = _EXCLUSION_LINE.match(line)
+        if match is None:
+            raise ValueError(f"unrecognized tmutil isexcluded line: {line!r}")
+        states[match.group("path")] = match.group("state") == "Excluded"
+    return states
+
+
+def default_config_dir(home: str) -> str:
+    """The config directory under ``home``. Machine-derived, never tracked."""
+    return str(Path(home) / ".config" / "marketlake")
 
 
 def default_token_path(home: str) -> str:
     """The token's standard location under ``home``. Machine-derived, never tracked."""
-    return str(Path(home) / ".config" / "marketlake" / "token.json")
+    return str(Path(default_config_dir(home)) / "token.json")
+
+
+def tmutil_exclusion_targets(config_dir: str, token_path: str) -> tuple[str, ...]:
+    """What to keep out of Time Machine: the config directory, and a token outside it.
+
+    The whole directory is excluded rather than the token file alone. Three reasons.
+
+    1. ``config.yaml`` sits beside the token and holds four secrets of its own: the
+       healthchecks ping key, the ntfy topic, and the two Schwab app credentials.
+       Excluding only the token left those on a backup disk without FileVault.
+    2. A sticky exclusion is an attribute on the item, so it dies when the item is
+       deleted and re-created. ``config.yaml`` is hand-edited and most editors save by
+       writing a temporary file and renaming over the original, which replaces the
+       inode and drops the exclusion silently. A re-login re-creates ``token.json`` the
+       same way. A directory's inode survives its files being rewritten.
+    3. One line covers the files that arrive later, ``tickers.yaml`` and
+       ``chain_plan.json``, without the list having to grow.
+
+    The fixed-path form would also survive an inode change, but ``man tmutil`` requires
+    root and Full Disk Access for it, and this step runs as the owner.
+
+    Nothing here is restored from a backup anyway. The design rewrites ``config.yaml``
+    per machine, and the token and the roster are carried deliberately on migration.
+    A token pointed outside the directory is excluded on its own, because a brokerage
+    credential must be excluded wherever it is put.
+    """
+    targets = [config_dir]
+    token = Path(token_path)
+    if Path(config_dir) not in token.parents:
+        targets.append(token_path)
+    return tuple(targets)
+
+
+def tmutil_exclusion_commands(config_dir: str, token_path: str) -> tuple[str, ...]:
+    """The Time Machine exclusion lines. They run as the user, no root."""
+    return tuple(
+        f'tmutil addexclusion "{target}"'
+        for target in tmutil_exclusion_targets(config_dir, token_path)
+    )
 
 
 def read_token_mint(token_path: Path | str) -> datetime:
@@ -1116,11 +1215,14 @@ def render_all(host: LaunchdHost, token_path: str) -> tuple[RenderedFile, ...]:
     """Every plist and setup file, as text, in install order."""
     files = [RenderedFile(f"{job.label}.plist", job.render()) for job in all_jobs(host, token_path)]
     files.append(RenderedFile(SUDOERS_FILE, sudoers_dropin(host.owner)))
+    lines = tmutil_exclusion_commands(default_config_dir(host.home), token_path)
     files.append(
         RenderedFile(
             TMUTIL_FILE,
-            "#!/bin/sh\n# Keep the brokerage token out of Time Machine. Run as the owner.\n"
-            f"{tmutil_exclusion_command(token_path)}\n",
+            "#!/bin/sh\n"
+            "# Keep the brokerage token and the config secrets out of Time Machine.\n"
+            "# Run as the owner. The sticky exclusion needs no root.\n"
+            + "".join(f"{line}\n" for line in lines),
         )
     )
     return tuple(files)
@@ -1170,8 +1272,12 @@ def install_commands(out_dir: Path, host: LaunchdHost, token_path: str) -> str:
         "# 3. Set the weekday firmware wake, then read it back.",
         f"sudo {pmset_repeat_command()}",
         "pmset -g sched",
-        "# 4. Keep the token out of Time Machine. As the owner, never under sudo.",
-        tmutil_exclusion_command(token_path),
+        "# 4. Keep the token and the config secrets out of Time Machine. As the owner,",
+        "# never under sudo. The whole directory goes, so an editor that saves by rename",
+        "# cannot drop the exclusion, and config.yaml's four secrets are covered too.",
+        *tmutil_exclusion_commands(default_config_dir(host.home), token_path),
+        "tmutil isexcluded "
+        + " ".join(tmutil_exclusion_targets(default_config_dir(host.home), token_path)),
         "# 5. Load the jobs into the system domain, then confirm the daemon is running.",
     ]
     for job in all_jobs(host, token_path):
@@ -1239,6 +1345,7 @@ def main(
     pinger: Pinger | None = None,
     schedule_reader: ScheduleReader | None = None,
     canary: CanaryCall | None = None,
+    exclusion_reader: ExclusionReader | None = None,
 ) -> int:
     """The ``python -m lake.control_plane`` entry. Returns a process exit code.
 
@@ -1306,6 +1413,12 @@ def main(
             ping_url=config.healthchecks_url(SUNDAY_SLUG),
             canary=canary if canary is not None else _canary_pass_through,
             mint_reader=read_mint,
+            exclusion_targets=tmutil_exclusion_targets(
+                default_config_dir(str(Path.home())), token_path
+            ),
+            exclusion_reader=(
+                exclusion_reader if exclusion_reader is not None else read_exclusions
+            ),
         )
         for number, outcome in enumerate(outcomes, start=1):
             if len(outcomes) > 1:
@@ -1365,6 +1478,7 @@ __all__ = [
     "AssertionWindow",
     "CanaryCall",
     "DaemonProbe",
+    "ExclusionReader",
     "LaunchdHost",
     "MintReader",
     "OneShotAlarm",
@@ -1382,6 +1496,7 @@ __all__ = [
     "check_alarms",
     "daemon_job",
     "dashboard_job",
+    "default_config_dir",
     "default_token_path",
     "expected_one_shot",
     "hold_assertion",
@@ -1389,10 +1504,12 @@ __all__ = [
     "launchctl_probe",
     "main",
     "next_sunday_wake",
+    "parse_exclusions",
     "parse_launchctl_print",
     "parse_pmset_schedule",
     "pmset_repeat_command",
     "pmset_schedule_command",
+    "read_exclusions",
     "read_pmset_schedule",
     "read_token_mint",
     "render_all",
@@ -1403,7 +1520,8 @@ __all__ = [
     "sunday_maintenance",
     "sunday_run",
     "sunday_wake_command",
-    "tmutil_exclusion_command",
+    "tmutil_exclusion_commands",
+    "tmutil_exclusion_targets",
     "token_covers_week",
     "week_option_close",
     "write_rendered",

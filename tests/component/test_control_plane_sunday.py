@@ -358,3 +358,81 @@ def test_a_sunday_run_before_the_maintenance_time_makes_one_attempt(fixture_lake
     )
     assert len(outcomes) == 1
     assert clock.now() == _et(2026, 8, 30, 15, 0)
+
+
+# -- the Time Machine exclusion ------------------------------------------------------
+
+# A sticky exclusion is invisible once set and dies quietly when the item it marks is
+# replaced. config.yaml is hand-edited and most editors save by rename, so something
+# has to look. A lost exclusion rides the report, like pmset drift.
+
+CONFIG_DIR = "/Users/someone/.config/marketlake"
+
+
+def _excluded(*paths: str) -> str:
+    return "".join(f"[Excluded]\t{p}\n" for p in paths)
+
+
+def _exclusion_run(lake_root, *, reader, targets=(CONFIG_DIR,)):
+    pinger = FakePinger()
+    outcome = cp.sunday_maintenance(
+        lake_root=lake_root,
+        now=SUNDAY_20,
+        calendar=CALENDAR,
+        schedule_reader=lambda: REPEAT_ONLY,
+        pinger=pinger,
+        ping_url=URL,
+        mint=FRESH_MINT,
+        exclusion_targets=targets,
+        exclusion_reader=reader,
+    )
+    return outcome, pinger
+
+
+def test_an_excluded_config_directory_reports_nothing(fixture_lake):
+    outcome, pinger = _exclusion_run(
+        _clean_lake(fixture_lake), reader=lambda paths: _excluded(*paths)
+    )
+    assert outcome.report == ()
+    assert outcome.pinged is True and pinger.urls == [URL]
+
+
+def test_a_lost_exclusion_rides_the_report_and_the_ping_still_fires(fixture_lake):
+    outcome, pinger = _exclusion_run(
+        _clean_lake(fixture_lake),
+        reader=lambda paths: "".join(f"[Included]\t{p}\n" for p in paths),
+    )
+    assert any("not excluded from time machine" in line for line in outcome.report)
+    assert CONFIG_DIR in outcome.report[0]
+    assert outcome.problems == ()
+    assert outcome.pinged is True and pinger.urls == [URL]
+
+
+def test_a_raising_or_unreadable_exclusion_probe_rides_the_report(fixture_lake):
+    for reader in (
+        lambda paths: (_ for _ in ()).throw(FileNotFoundError(2, "no tmutil", "tmutil")),
+        lambda paths: "a shape nobody has seen\n",
+    ):
+        outcome, pinger = _exclusion_run(_clean_lake(fixture_lake), reader=reader)
+        assert any("exclusion unreadable" in line for line in outcome.report)
+        assert outcome.problems == ()
+        assert outcome.pinged is True and pinger.urls == [URL]
+
+
+def test_a_path_tmutil_cannot_resolve_is_not_an_exclusion(fixture_lake):
+    outcome, _ = _exclusion_run(
+        _clean_lake(fixture_lake), reader=lambda paths: f"[UNKNOWN]\t{paths[0]}\n"
+    )
+    assert any("not excluded from time machine" in line for line in outcome.report)
+
+
+def test_every_target_is_checked(fixture_lake):
+    # A token outside the config directory carries its own exclusion, so both are read.
+    token = "/elsewhere/token.json"
+    outcome, _ = _exclusion_run(
+        _clean_lake(fixture_lake),
+        targets=(CONFIG_DIR, token),
+        reader=lambda paths: _excluded(CONFIG_DIR) + f"[Included]\t{token}\n",
+    )
+    assert len(outcome.report) == 1
+    assert token in outcome.report[0]

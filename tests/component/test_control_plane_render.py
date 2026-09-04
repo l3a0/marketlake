@@ -181,17 +181,61 @@ def test_the_rendered_rules_cover_the_commands_the_module_composes(tmp_path):
     assert any(_sudo_args_match(spec, one_shot) for spec in specs)
 
 
-def test_rendered_tmutil_line_targets_the_token_under_home(tmp_path):
+def test_rendered_tmutil_line_excludes_the_whole_config_directory(tmp_path):
+    # The directory, not the token file alone. config.yaml sits beside the token and
+    # holds four secrets of its own, and a sticky exclusion on a hand-edited file dies
+    # the first time an editor saves by writing a temp file and renaming over it.
     out = tmp_path / "out"
     cp.main(["render", "--out", str(out), *RENDER_ARGS])
-    text = (out / cp.TMUTIL_FILE).read_text()
-    assert 'tmutil addexclusion "/Users/someone/.config/marketlake/token.json"' in text
+    lines = [
+        line
+        for line in (out / cp.TMUTIL_FILE).read_text().splitlines()
+        if line.startswith("tmutil")
+    ]
+    assert lines == ['tmutil addexclusion "/Users/someone/.config/marketlake"']
 
 
-def test_render_honours_an_explicit_token_path(tmp_path):
+def test_a_token_outside_the_config_directory_is_excluded_on_its_own(tmp_path):
     out = tmp_path / "out"
     cp.main(["render", "--out", str(out), *RENDER_ARGS, "--token", "/elsewhere/token.json"])
-    assert 'addexclusion "/elsewhere/token.json"' in (out / cp.TMUTIL_FILE).read_text()
+    lines = [
+        line
+        for line in (out / cp.TMUTIL_FILE).read_text().splitlines()
+        if line.startswith("tmutil")
+    ]
+    assert lines == [
+        'tmutil addexclusion "/Users/someone/.config/marketlake"',
+        'tmutil addexclusion "/elsewhere/token.json"',
+    ]
+
+
+def test_a_token_inside_the_config_directory_needs_no_line_of_its_own(tmp_path):
+    out = tmp_path / "out"
+    cp.main(
+        [
+            "render",
+            "--out",
+            str(out),
+            *RENDER_ARGS,
+            "--token",
+            "/Users/someone/.config/marketlake/other.json",
+        ]
+    )
+    lines = [
+        line
+        for line in (out / cp.TMUTIL_FILE).read_text().splitlines()
+        if line.startswith("tmutil")
+    ]
+    assert lines == ['tmutil addexclusion "/Users/someone/.config/marketlake"']
+
+
+def test_the_install_text_excludes_the_directory_and_reads_it_back(tmp_path, capsys):
+    out = tmp_path / "out"
+    cp.main(["render", "--out", str(out), *RENDER_ARGS])
+    printed = capsys.readouterr().out
+    assert 'tmutil addexclusion "/Users/someone/.config/marketlake"' in printed
+    # visudo has its read-back and pmset has its own. So does this.
+    assert "tmutil isexcluded /Users/someone/.config/marketlake" in printed
 
 
 def test_nothing_rendered_mentions_the_rejected_sleep_override(tmp_path):
@@ -313,6 +357,44 @@ def test_sunday_cli_reads_the_mint_time_from_the_token_file(tmp_path, capsys):
     assert pinger.urls == ["https://hc-ping.com/secret-key/sunday"]
     printed = capsys.readouterr().out
     assert "never-read" not in printed and "secret-key" not in printed
+
+
+def test_sunday_cli_checks_the_time_machine_exclusion(tmp_path, capsys):
+    # Production must always run the check, so the CLI passes the reader and the
+    # standard targets. A lost exclusion rides the report and the ping still fires.
+    lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
+    config = _config(tmp_path, lake)
+    pinger = FakePinger()
+    asked: list[tuple[str, ...]] = []
+
+    def reader(paths):
+        asked.append(tuple(paths))
+        return "".join(f"[Included]\t{p}\n" for p in paths)
+
+    code = cp.main(
+        [
+            "sunday",
+            "--config",
+            str(config),
+            "--token",
+            str(tmp_path / "absent.json"),
+            "--mint",
+            "2026-08-30T19:30:00-04:00",
+        ],
+        clock=ManualClock(start=_et(2026, 8, 30, 20, 0)),
+        calendar=_week(date(2026, 8, 31)),
+        schedule_reader=lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
+        pinger=pinger,
+        exclusion_reader=reader,
+    )
+    assert code == 0  # report tier: the ping still fires
+    assert pinger.urls == ["https://hc-ping.com/secret-key/sunday"]
+    assert len(asked) == 1
+    # The config directory under the running account, and the token beside it.
+    assert asked[0][0].endswith("/.config/marketlake")
+    printed = capsys.readouterr().out
+    assert "sunday: report: not excluded from time machine" in printed
+    assert "secret-key" not in printed
 
 
 def test_sunday_cli_reports_problems_and_exits_non_zero(tmp_path, capsys):
