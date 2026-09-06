@@ -39,16 +39,29 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from lake.paths import JOURNAL_DIR, REPORTS_DIR
+
 # The two ledgers, both at the lake root.
 MANIFEST_NAME = "manifest.jsonl"
 QUARANTINE_NAME = "quarantine.jsonl"
 
-# What the reverse scrub excludes, enumerated and not implied. The manifest cannot
-# cover itself. Journal segments are manifest-less by rule, so the whole ``journal/``
-# tree is out. An entry ending in ``/`` is a directory prefix. Any other entry is an
-# exact filename at the lake root. The lock adds no file to skip, because it locks the
-# manifest itself.
-SCRUB_EXCLUSIONS: tuple[str, ...] = (MANIFEST_NAME, "journal/")
+# What the reverse scrub excludes, enumerated and not implied. The reverse pass asks
+# every data file for a manifest entry, so the few things in the lake that never get
+# one have to be named here. Three are.
+#
+# 1. The manifest cannot cover itself.
+# 2. Journal segments are manifest-less by rule, so the whole tree is out.
+# 3. ``reports/`` holds the nightly report, one dated file per night. The design puts
+#    it inside the backup sync root and outside the manifest, and skips it here by name.
+#
+# The quarantine ledger is deliberately not on this list. The battery refreshes its
+# manifest entry after each run, and the sign-off tool appends the row and the refreshed
+# entry in one locked invocation. So the ledger is scrubbed like any sealed file, which
+# is the check that catches a verdict written without its entry.
+#
+# An entry ending in ``/`` is a directory prefix. Any other entry is an exact filename
+# at the lake root. The lock adds no file to skip, because it locks the manifest itself.
+SCRUB_EXCLUSIONS: tuple[str, ...] = (MANIFEST_NAME, f"{JOURNAL_DIR}/", f"{REPORTS_DIR}/")
 
 
 class RowCountRegression(Exception):

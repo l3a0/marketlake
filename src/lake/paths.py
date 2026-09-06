@@ -39,9 +39,13 @@ SURFACES = (CHAINS, QUOTES, BARS, ACTIONS)
 # level and ``actions`` is a single file, so both are excluded from the generic method.
 _DATE_PARTITIONED = frozenset({CHAINS, QUOTES})
 
-# The journal top-level directory, the reference directory, and the two ledgers.
+# The journal top-level directory, the reference directory, the reports directory, and
+# the two ledgers. ``reports/`` holds one dated file per night, written by the vendor
+# sweep. It sits inside the backup sync root, so a restore carries the reports with the
+# data, and outside the manifest, because a report is not a measurement.
 JOURNAL_DIR = "journal"
 REFERENCE_DIR = "reference"
+REPORTS_DIR = "reports"
 MANIFEST_FILE = "manifest.jsonl"
 QUARANTINE_FILE = "quarantine.jsonl"
 
