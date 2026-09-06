@@ -29,19 +29,20 @@ Terms, glossed at first use.
 - A *healthchecks slug* names one dead-man check. A ping fires only on the job's
   success condition, never on mere liveness.
 
-Four operational wall-clock times live here as named integer constants. They are not
-session times. The session times come from the calendar. These are the moments the
-design pins to the machine's clock, so launchd and pmset can fire them.
+Six operational wall-clock times live here as named integer constants, in order. They
+are not session times. The session times come from the calendar. These are the moments
+the design pins to the machine's clock, so launchd and pmset can fire them.
 
 1. The 08:25 weekday firmware wake.
 2. The 08:30 weekday pre-open self-check.
-3. The 19:55 Sunday one-shot wake.
-4. The 20:00 Sunday canary and maintenance job.
+3. The weekday assertion end near 18:45, when the vendor sweep's ping lands.
+4. The 19:55 Sunday one-shot wake.
+5. The 20:00 Sunday canary and maintenance job.
+6. The 23:00 Sunday canary deadline, which is also the canary's last retry.
 
-Two more bound the caffeinate windows: the weekday assertion end near 18:45, when the
-vendor sweep's ping lands, and the Sunday canary deadline at 23:00. Every one of these
-is a pair of integers, never a ``"HH:MM"`` string, so the session-time enforcement
-scanner stays green.
+The re-auth reminder's hours derive from the last two rather than adding constants of
+their own. Every one of these is a pair of integers, never a ``"HH:MM"`` string, so
+the session-time enforcement scanner stays green.
 
 One design caveat governs the Sunday read-back. A fired ``pmset`` one-shot leaves the
 schedule. By Sunday 20:00 the 19:55 wake has fired, so a fired one-shot and a never-set
@@ -60,7 +61,7 @@ import json
 import math
 import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -117,6 +118,16 @@ WEEKDAY_ASSERTION_END = WallClockTime(18, 45)  # when the vendor sweep's ping la
 SUNDAY_WAKE = WallClockTime(19, 55)  # the Friday-set one-shot wake
 SUNDAY_MAINTENANCE = WallClockTime(20, 0)  # the canary + scrub launchd job
 CANARY_DEADLINE = WallClockTime(23, 0)  # the canary's last retry, the Sunday check's deadline
+
+# The design sends the re-auth reminder on the hour, from the maintenance run through
+# the hour before the deadline. So 20:00, 21:00, and 22:00, and never on the half hours
+# the canary also retries on. The reminder is quieter than the retry.
+REMINDER_HOURS = tuple(range(SUNDAY_MAINTENANCE.hour, CANARY_DEADLINE.hour))
+
+# The reminder's wire shape, per the design's message table. Priority 3 is the
+# reminder tier: a short vibration, not a page.
+REMINDER_TITLE = "Sunday re-auth due"
+REMINDER_PRIORITY = 3
 
 # Schwab's refresh token lives this long. The coverage assertion adds it to the mint.
 TOKEN_LIFETIME = timedelta(days=7)
@@ -201,8 +212,14 @@ class LaunchdHost:
         *args: str,
         calendar: dict[str, int] | list[dict[str, int]] | None = None,
         keep_alive: bool = False,
+        run_at_load: bool = False,
     ) -> LaunchdJob:
-        """One job of this host running ``python -m <module> <args>``."""
+        """One job of this host running ``python -m <module> <args>``.
+
+        ``run_at_load`` defaults off. launchd runs a job once at load when it is on,
+        which is right for a resident process and wrong for work that belongs to a
+        moment. Each caller states which it is.
+        """
         return LaunchdJob(
             label=label,
             program_arguments=(self.python, "-m", module, *args),
@@ -211,7 +228,7 @@ class LaunchdHost:
             standard_out_path=self.log_path(label, "out"),
             standard_error_path=self.log_path(label, "err"),
             environment=self.environment(),
-            run_at_load=True,
+            run_at_load=run_at_load,
             user_name=self.owner,
             group_name=self.group,
             keep_alive=keep_alive,
@@ -223,13 +240,18 @@ def daemon_job(host: LaunchdHost) -> LaunchdJob:
 
     It runs ``python -m lake.daemon``, the slice-2 loop. It never exits on its own.
     Outside sessions it idles and heartbeats. So it has no calendar interval at all.
+    ``RunAtLoad`` starts it as soon as the plist is bootstrapped and after every boot,
+    which is what makes the 08:25 firmware wake reach a running daemon.
     """
-    return host.job(DAEMON_LABEL, "lake.daemon", keep_alive=True)
+    return host.job(DAEMON_LABEL, "lake.daemon", keep_alive=True, run_at_load=True)
 
 
 def dashboard_job(host: LaunchdHost) -> LaunchdJob:
-    """The read-only localhost query service, the second resident under ``KeepAlive``."""
-    return host.job(DASHBOARD_LABEL, "lake.dashboard", keep_alive=True)
+    """The read-only localhost query service, the second resident under ``KeepAlive``.
+
+    It starts at load for the same reason the daemon does.
+    """
+    return host.job(DASHBOARD_LABEL, "lake.dashboard", keep_alive=True, run_at_load=True)
 
 
 def self_check_job(host: LaunchdHost) -> LaunchdJob:
@@ -243,6 +265,7 @@ def self_check_job(host: LaunchdHost) -> LaunchdJob:
         "lake.control_plane",
         "self-check",
         calendar=PRE_OPEN_SELF_CHECK.launchd_intervals(LAUNCHD_WEEKDAYS),
+        run_at_load=True,
     )
 
 
@@ -255,6 +278,15 @@ def sunday_job(host: LaunchdHost) -> LaunchdJob:
     argument can point any of the three somewhere else, so they cannot split. The
     18:30 vendor sweep is not rendered here. That job is slice 3's, and it does not
     exist yet.
+
+    ``RunAtLoad`` is deliberately off, the one job of the four that leaves it off. It
+    would otherwise run at every bootstrap and every boot, on any day. That means a
+    full integrity scrub of the lake each time, and a coverage assertion on a day the
+    design never asks about. A healthy weekday reboot would pass every check and ping
+    the ``sunday`` slug midweek, which is not what that check watches. Turning it off
+    costs nothing the design asks for. launchd still fires a missed Sunday occurrence
+    on the next wake, which is the backstop the pmset table names, and that coalescing
+    has nothing to do with ``RunAtLoad``.
     """
     return host.job(
         SUNDAY_LABEL,
@@ -836,6 +868,74 @@ def _canary_pass_through() -> bool:
 
 
 @dataclass(frozen=True)
+class ReauthReminder:
+    """One Sunday re-auth reminder, in the shape the design's message table pins.
+
+    The body names which half failed and the token's mint date. That date is the one
+    fact from the config directory a message may carry, because it is already journal
+    metadata. Nothing else from that directory goes on the wire, so the message stays
+    worthless to anyone reading the topic.
+    """
+
+    title: str
+    body: str
+    priority: int
+
+
+# Sends one reminder. The real one is D13's ntfy publisher, which does not exist yet.
+# This module decides whether a reminder is owed and what it says. Delivery is the
+# publisher's. A test injects a recorder.
+ReminderSink = Callable[[ReauthReminder], None]
+
+
+def reauth_reminder(
+    *,
+    now: datetime,
+    canary_passed: bool,
+    covered: bool | None,
+    mint: datetime | None,
+) -> ReauthReminder | None:
+    """The reminder this attempt owes, or ``None``.
+
+    The design fires it on Sunday only, on the 20:00, 21:00, and 22:00 runs, while the
+    throwaway call or the coverage assertion still fails. So it never fires midweek,
+    never on the half-hour retries, and stops on its own once the ritual is done,
+    because a passing attempt owes nothing. At most three go out in an evening.
+
+    Reading it as "the ritual is not done yet" is what makes the mint date the useful
+    fact. A stale date says the ritual was skipped. An unreadable one says the token
+    file itself is the problem.
+
+    The gate is the hour, not the exact minute. launchd fires a calendar job late, and
+    a coalesced missed occurrence fires whenever the machine wakes, so the attempt grid
+    ``sunday_run`` builds from its own start almost never lands on the minute. Matching
+    the minute sent nothing at all on those evenings. Holding the count at three is
+    ``sunday_run``'s job, which sends at most one reminder an hour.
+    """
+    eastern = now.astimezone(MARKET_TZ)
+    if eastern.weekday() != _PY_SUNDAY or eastern.hour not in REMINDER_HOURS:
+        return None
+    failed = []
+    if not canary_passed:
+        failed.append("the throwaway call")
+    if covered is not True:
+        failed.append("the coverage assertion")
+    if not failed:
+        return None
+    which = " and ".join(failed)
+    minted = (
+        "The token's mint time could not be read."
+        if mint is None
+        else f"Token minted {mint.astimezone(MARKET_TZ).date().isoformat()}."
+    )
+    return ReauthReminder(
+        title=REMINDER_TITLE,
+        body=f"{which[0].upper()}{which[1:]} failed. {minted}",
+        priority=REMINDER_PRIORITY,
+    )
+
+
+@dataclass(frozen=True)
 class SundayOutcome:
     """What one Sunday maintenance run found and did.
 
@@ -853,6 +953,7 @@ class SundayOutcome:
     canary_passed: bool
     covered: bool | None
     pinged: bool
+    reminder: ReauthReminder | None = None
     problems: tuple[str, ...] = ()
     report: tuple[str, ...] = ()
 
@@ -890,8 +991,26 @@ def sunday_maintenance(
     one. The
     coverage assertion needs the token's mint time. ``mint`` is ``None`` when the
     caller could not read it, and that withholds the ping. A coverage assertion that
-    never ran must not read as a pass. The canary's 30-minute retry until the deadline
-    belongs to ``sunday_run``, not to this function. This function decides one attempt.
+    never ran must not read as a pass.
+
+    Five duties the design gives the Sunday run are not built here. Each is named so
+    the gap is a decision rather than an oversight.
+
+    1. Regenerate the weekday wake alarm when the machine's timezone has moved. That
+       is a ``pmset`` write, so it needs the operator's sudoers grant at run time.
+    2. Check ``exchange_calendars`` for a package update, per the design's provenance
+       rule that the library learns schedule changes only through releases.
+    3. Scrub the backup copy as well as the primary lake. That needs the backup target
+       mounted, which the compaction job owns.
+    4. Check the disk runway, free space over trailing growth, and flag the nightly
+       report under a few weeks of headroom.
+    5. Rotate the logs.
+
+    The re-auth reminder is built. The build plan assigns it to this deliverable, and
+    only its delivery waits on D13's publisher.
+
+    The canary's 30-minute retry until the deadline belongs to ``sunday_run``, not to
+    this function. This function decides one attempt.
     """
     problems: list[str] = []
 
@@ -946,6 +1065,8 @@ def sunday_maintenance(
         if not covered:
             problems.append("token mint plus seven days does not clear the coming week")
 
+    reminder = reauth_reminder(now=now, canary_passed=canary_passed, covered=covered, mint=mint)
+
     pinged = False
     if not problems:
         pinger.ping(ping_url)
@@ -956,6 +1077,7 @@ def sunday_maintenance(
         canary_passed=canary_passed,
         covered=covered,
         pinged=pinged,
+        reminder=reminder,
         problems=tuple(problems),
         report=tuple(report),
     )
@@ -983,6 +1105,7 @@ def sunday_run(
     retry: timedelta = CANARY_RETRY,
     exclusion_targets: Sequence[str] = (),
     exclusion_reader: ExclusionReader | None = None,
+    reminder_sink: ReminderSink | None = None,
 ) -> list[SundayOutcome]:
     """Run the Sunday job, retrying until it passes or the canary deadline.
 
@@ -1008,22 +1131,33 @@ def sunday_run(
     stop = CANARY_DEADLINE.on(start.date()) if in_the_window else start
 
     outcomes: list[SundayOutcome] = []
+    reminded: set[int] = set()
     while True:
-        outcomes.append(
-            sunday_maintenance(
-                lake_root=lake_root,
-                now=clock.now(),
-                calendar=calendar,
-                schedule_reader=schedule_reader,
-                pinger=pinger,
-                ping_url=ping_url,
-                canary=canary,
-                mint=mint_reader(),
-                exclusion_targets=exclusion_targets,
-                exclusion_reader=exclusion_reader,
-            )
+        attempt_now = clock.now()
+        outcome = sunday_maintenance(
+            lake_root=lake_root,
+            now=attempt_now,
+            calendar=calendar,
+            schedule_reader=schedule_reader,
+            pinger=pinger,
+            ping_url=ping_url,
+            canary=canary,
+            mint=mint_reader(),
+            exclusion_targets=exclusion_targets,
+            exclusion_reader=exclusion_reader,
         )
-        if outcomes[-1].pinged:
+        # One reminder an hour. Later attempts in the same hour owe nothing, so the
+        # outcome records only the one that went out.
+        hour = attempt_now.astimezone(MARKET_TZ).hour
+        if outcome.reminder is not None:
+            if hour in reminded:
+                outcome = replace(outcome, reminder=None)
+            else:
+                reminded.add(hour)
+                if reminder_sink is not None:
+                    reminder_sink(outcome.reminder)
+        outcomes.append(outcome)
+        if outcome.pinged:
             return outcomes
         # The cadence is measured from the first attempt, so a slow scrub shifts no
         # later attempt off the design's half-hour grid.
@@ -1430,6 +1564,8 @@ def main(
                 print(f"sunday: {problem}")
             for line in outcome.report:
                 print(f"sunday: report: {line}")
+            if outcome.reminder is not None:
+                print(f"sunday: reminder: {outcome.reminder.body}")
         pinged = outcomes[-1].pinged
         print(f"sunday: attempts={len(outcomes)} pinged={pinged} slug={SUNDAY_SLUG}")
         return 0 if pinged else 1
@@ -1464,6 +1600,9 @@ __all__ = [
     "LAUNCHD_DOMAIN",
     "PRE_OPEN_SELF_CHECK",
     "PRE_OPEN_SLUG",
+    "REMINDER_HOURS",
+    "REMINDER_PRIORITY",
+    "REMINDER_TITLE",
     "SELF_CHECK_LABEL",
     "SUDOERS_FILE",
     "SUNDAY_LABEL",
@@ -1487,6 +1626,8 @@ __all__ = [
     "OneShotAlarm",
     "PmsetParseError",
     "PmsetSchedule",
+    "ReauthReminder",
+    "ReminderSink",
     "RenderedFile",
     "RepeatAlarm",
     "ScheduleReader",
@@ -1515,6 +1656,7 @@ __all__ = [
     "read_exclusions",
     "read_pmset_schedule",
     "read_token_mint",
+    "reauth_reminder",
     "render_all",
     "self_check",
     "self_check_job",

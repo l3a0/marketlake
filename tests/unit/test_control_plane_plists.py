@@ -99,6 +99,25 @@ def test_sunday_job_fires_sunday_at_the_maintenance_time():
     assert "KeepAlive" not in plist
 
 
+@pytest.mark.parametrize(
+    ("build", "run_at_load"),
+    [
+        (cp.daemon_job, True),
+        (cp.dashboard_job, True),
+        (cp.self_check_job, True),
+        (cp.sunday_job, False),
+    ],
+)
+def test_run_at_load_is_pinned_per_job(build, run_at_load):
+    # The three that should start at load do. The Sunday job does not, because a
+    # bootstrap or a boot would otherwise scrub the whole lake and assert coverage on
+    # a day the design never asks about, then ping the sunday slug midweek. Its
+    # calendar interval, pinned above, is then the only thing that starts it. launchd
+    # still fires a missed occurrence on the next wake, which is the Monday backstop,
+    # and that coalescing does not depend on RunAtLoad.
+    assert _parsed(build(HOST))["RunAtLoad"] is run_at_load
+
+
 def test_all_jobs_are_the_four_and_carry_no_vendor_sweep():
     labels = [job.label for job in cp.all_jobs(HOST)]
     assert labels == [cp.DAEMON_LABEL, cp.DASHBOARD_LABEL, cp.SELF_CHECK_LABEL, cp.SUNDAY_LABEL]

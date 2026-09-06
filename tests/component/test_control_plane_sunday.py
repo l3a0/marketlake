@@ -109,6 +109,17 @@ def test_before_the_wake_a_missing_one_shot_rides_the_report(fixture_lake):
     assert present.pinged is True and pinger.urls == [URL]
 
 
+def test_a_scrub_failure_alone_owes_no_reminder(fixture_lake):
+    # The reminder keys on the canary and the coverage assertion, never on whether
+    # the run pinged. A corrupted partition withholds the ping and owes no reminder,
+    # because re-authing would fix nothing.
+    root = _clean_lake(fixture_lake)
+    next(root.glob("chains/**/*.parquet")).write_bytes(b"corrupt")
+    outcome, pinger = _run(root, now=SUNDAY_20, mint=FRESH_MINT)
+    assert outcome.pinged is False and pinger.urls == []
+    assert outcome.reminder is None
+
+
 def test_a_failed_scrub_blocks_the_ping(fixture_lake):
     root = _clean_lake(fixture_lake)
     # Corrupt a manifested partition so the forward pass sees a sha mismatch.
@@ -151,6 +162,10 @@ def test_an_unreadable_mint_is_a_problem_not_a_skip(fixture_lake):
     assert outcome.covered is None
     assert any("mint time unreadable" in p for p in outcome.problems)
     assert outcome.pinged is False
+    # The reminder says so too, because an unreadable mint means the token file itself
+    # is the problem rather than a skipped ritual.
+    assert outcome.reminder is not None
+    assert outcome.reminder.body.endswith("The token's mint time could not be read.")
     assert pinger.urls == []
 
 
@@ -278,7 +293,7 @@ class _Mints:
         return mint
 
 
-def _retry_run(lake_root, *, start, mints, canary=None, schedule=REPEAT_ONLY):
+def _retry_run(lake_root, *, start, mints, canary=None, schedule=REPEAT_ONLY, reminder_sink=None):
     clock = ManualClock(start=start)
     pinger = FakePinger()
     outcomes = cp.sunday_run(
@@ -290,6 +305,7 @@ def _retry_run(lake_root, *, start, mints, canary=None, schedule=REPEAT_ONLY):
         ping_url=URL,
         mint_reader=mints,
         canary=canary if canary is not None else (lambda: True),
+        reminder_sink=reminder_sink,
     )
     return outcomes, pinger, clock
 
@@ -351,8 +367,8 @@ def test_a_monday_catch_up_makes_one_attempt(fixture_lake):
 
 
 def test_a_sunday_run_before_the_maintenance_time_makes_one_attempt(fixture_lake):
-    # RunAtLoad fires the job whenever the operator bootstraps it. Only the evening
-    # window retries.
+    # RunAtLoad is off for the Sunday plist, so an off-window start means a hand-run
+    # or a coalesced catch-up. Either way only the evening window retries.
     outcomes, _, clock = _retry_run(
         _clean_lake(fixture_lake), start=_et(2026, 8, 30, 15, 0), mints=_Mints(STALE_MINT)
     )
@@ -436,3 +452,66 @@ def test_every_target_is_checked(fixture_lake):
     )
     assert len(outcome.report) == 1
     assert token in outcome.report[0]
+
+
+# -- the Sunday re-auth reminder -----------------------------------------------------
+
+# The build plan assigns the reminder to this deliverable. It fires on Sunday only, on
+# the 20:00, 21:00, and 22:00 runs, while the throwaway call or the coverage assertion
+# still fails. So it never fires midweek, never on the half-hour retries, and stops on
+# its own once the ritual is done. Delivery is D13's publisher. The decision is here.
+
+
+def _reminders(lake_root, *, start, mints, canary=None):
+    """Every reminder `sunday_run` sends across one evening."""
+    sent = []
+    _retry_run(lake_root, start=start, mints=mints, canary=canary, reminder_sink=sent.append)
+    return sent
+
+
+def test_three_reminders_go_out_across_a_failing_sunday_evening(fixture_lake):
+    sent = _reminders(_clean_lake(fixture_lake), start=SUNDAY_20, mints=_Mints(STALE_MINT))
+    # Seven attempts run, on the hour and the half hour. Only the three on the hour
+    # send, and 23:00 is a retry rather than a reminder.
+    assert len(sent) == 3
+    assert all(r.title == "Sunday re-auth due" and r.priority == 3 for r in sent)
+    assert all("Token minted 2026-08-27." in r.body for r in sent)
+    assert all("The coverage assertion failed." in r.body for r in sent)
+
+
+def test_the_reminder_stops_once_the_ritual_is_done(fixture_lake):
+    # The re-login lands at 20:10. The 20:00 reminder went out. The 20:30 attempt
+    # passes, so nothing further is owed.
+    sent = _reminders(
+        _clean_lake(fixture_lake), start=SUNDAY_20, mints=_Mints(STALE_MINT, FRESH_MINT)
+    )
+    assert len(sent) == 1
+
+
+def test_a_healthy_sunday_sends_no_reminder(fixture_lake):
+    assert _reminders(_clean_lake(fixture_lake), start=SUNDAY_20, mints=_Mints(FRESH_MINT)) == []
+
+
+def test_a_midweek_run_sends_no_reminder(fixture_lake):
+    # RunAtLoad is off for the Sunday plist, so this needs a hand-run to happen at
+    # all. It must still stay quiet.
+    sent = _reminders(
+        _clean_lake(fixture_lake), start=_et(2026, 8, 31, 21, 0), mints=_Mints(STALE_MINT)
+    )
+    assert sent == []
+
+
+def test_the_outcome_carries_the_reminder_even_with_no_sink(fixture_lake):
+    # D13's publisher does not exist yet, so the CLI prints the body instead. The
+    # decision must not depend on a sink being wired.
+    outcome, _ = _run(_clean_lake(fixture_lake), mint=STALE_MINT)
+    assert outcome.reminder is not None
+    assert outcome.reminder.body.startswith("The coverage assertion failed.")
+
+
+def test_a_failing_canary_names_both_halves(fixture_lake):
+    outcome, _ = _run(_clean_lake(fixture_lake), mint=STALE_MINT, canary=lambda: False)
+    assert outcome.reminder is not None
+    assert outcome.reminder.body == (
+        "The throwaway call and the coverage assertion failed. Token minted 2026-08-27."
+    )

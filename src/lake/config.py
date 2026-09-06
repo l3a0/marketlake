@@ -231,14 +231,39 @@ def load_config(
     Path precedence: an explicit ``path`` argument, then the ``MARKETLAKE_CONFIG``
     environment variable, then the default ``~/.config/marketlake/config.yaml``. A test
     passes ``path`` or an ``env`` mapping to point the loader at a throwaway file.
+
+    A parse failure names the file and nothing else. PyYAML quotes the offending line
+    back in its message, and four of this file's values are secrets, so a stray quote
+    on the ping-key line would put that key in the error. Jobs run from launchd with
+    stdout and stderr going to a log file, so an uncaught traceback writes it to disk.
+    ``_parse_yaml`` drops the parse error rather than chaining it, and the ``ConfigError``
+    is raised outside that handler, so the quoted line is on neither the traceback nor
+    the exception's ``__context__``.
     """
     resolved = _resolve_path(path, env, CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH)
     if not resolved.exists():
         raise ConfigError(f"config file not found: {resolved}")
-    mapping = yaml.safe_load(resolved.read_text()) or {}
+    mapping = _parse_yaml(resolved.read_text())
+    if mapping is None:
+        raise ConfigError(f"config file is not valid YAML: {resolved}")
     if not isinstance(mapping, Mapping):
         raise ConfigError(f"config file is not a mapping: {resolved}")
     return Config.from_mapping(mapping)
+
+
+def _parse_yaml(text: str) -> object | None:
+    """The parsed YAML, or ``None`` when ``text`` is not YAML at all.
+
+    The parse error stays inside this function and is never re-raised. Its message
+    quotes the offending source line, and this file holds four secrets, so letting it
+    out would put one of them wherever the caller's error lands. An empty file and a
+    ``null`` document both parse to an empty mapping, so ``None`` means the parse
+    failed and nothing else.
+    """
+    try:
+        return yaml.safe_load(text) or {}
+    except yaml.YAMLError:
+        return None
 
 
 def _resolve_path(

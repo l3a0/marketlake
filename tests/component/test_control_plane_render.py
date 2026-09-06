@@ -433,6 +433,9 @@ def test_sunday_cli_reports_problems_and_exits_non_zero(tmp_path, capsys):
     )
     assert "canary call failed" in printed
     assert "token file unreadable" in printed
+    # Until D13's publisher lands, this print is the only way a reminder reaches a
+    # human, so the log line is the delivery path and is pinned as one.
+    assert "sunday: reminder: The throwaway call" in printed
 
 
 def test_pmset_cli_prints_both_commands_for_the_coming_week(capsys):

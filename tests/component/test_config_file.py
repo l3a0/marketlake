@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import traceback
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,27 @@ def test_explicit_argument_beats_the_env_var(tmp_path: Path):
     ignored = _write(tmp_path / "ignored.yaml", root="/data/ignored")
     cfg = load_config(chosen, env={"MARKETLAKE_CONFIG": str(ignored)})
     assert cfg.lake_root == Path("/data/chosen")
+
+
+def test_malformed_yaml_names_the_file_and_never_the_secret(tmp_path: Path):
+    # PyYAML quotes the offending line back in its message, and four of this file's
+    # values are secrets. Jobs run from launchd with stderr going to a log file, so an
+    # uncaught traceback would write the ping key to disk.
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(
+        "lake_root: /data/lake\n"
+        "backup_target: /Volumes/ssd\n"
+        'healthchecks_ping_key: "SUPERSECRET-abc123\n'
+        "ntfy_topic: topic\n"
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(bad)
+    assert str(excinfo.value) == f"config file is not valid YAML: {bad}"
+    # `from None` drops the original, so the quoted line cannot ride the traceback.
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+    rendered = "".join(traceback.format_exception(excinfo.value))
+    assert "SUPERSECRET" not in rendered
 
 
 def test_missing_file_raises(tmp_path: Path):
