@@ -39,6 +39,18 @@ def test_env_var_points_the_loader_at_a_file(tmp_path: Path):
     assert cfg.backup_target == Path("/Volumes/ssd")
 
 
+def test_a_typed_tilde_still_expands(tmp_path: Path, monkeypatch):
+    # An argument and an environment override are whatever a person typed, so both
+    # expand. Only the default comes from lake.paths already resolved. Removing the
+    # expansion here would make the loader open a literal "~" directory.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write(tmp_path / "typed.yaml")
+    assert load_config("~/typed.yaml").backup_target == Path("/Volumes/ssd")
+    assert load_config(env={"MARKETLAKE_CONFIG": "~/typed.yaml"}).backup_target == Path(
+        "/Volumes/ssd"
+    )
+
+
 def test_explicit_argument_beats_the_env_var(tmp_path: Path):
     chosen = _write(tmp_path / "chosen.yaml", root="/data/chosen")
     ignored = _write(tmp_path / "ignored.yaml", root="/data/ignored")

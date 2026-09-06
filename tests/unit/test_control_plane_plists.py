@@ -92,7 +92,7 @@ def test_self_check_fires_weekdays_at_the_pre_open_time():
 
 def test_sunday_job_fires_sunday_at_the_maintenance_time():
     token = cp.default_token_path(HOST.home)
-    plist = _parsed(cp.sunday_job(HOST, token))
+    plist = _parsed(cp.sunday_job(HOST))
     # The job names the same token file the Time Machine exclusion protects.
     assert plist["ProgramArguments"][-4:] == ["lake.control_plane", "sunday", "--token", token]
     assert plist["StartCalendarInterval"] == {"Weekday": 0, "Hour": 20, "Minute": 0}
@@ -100,13 +100,13 @@ def test_sunday_job_fires_sunday_at_the_maintenance_time():
 
 
 def test_all_jobs_are_the_four_and_carry_no_vendor_sweep():
-    labels = [job.label for job in cp.all_jobs(HOST, cp.default_token_path(HOST.home))]
+    labels = [job.label for job in cp.all_jobs(HOST)]
     assert labels == [cp.DAEMON_LABEL, cp.DASHBOARD_LABEL, cp.SELF_CHECK_LABEL, cp.SUNDAY_LABEL]
     assert not any("sweep" in label for label in labels)
 
 
 def test_intervals_are_integers_not_strings():
-    for job in cp.all_jobs(HOST, cp.default_token_path(HOST.home)):
+    for job in cp.all_jobs(HOST):
         interval = job.to_dict().get("StartCalendarInterval")
         if interval is None:
             continue

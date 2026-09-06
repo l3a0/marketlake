@@ -33,12 +33,13 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from lake.paths import TOKEN_FILE, config_dir
 from lake.vendor import VendorError, VendorResponse
 
 # The standard location of the Schwab token, per the design's Configuration section.
 # It sits outside the repo and outside the backup-synced lake tree. This is a home-
 # relative default the live recorder falls back to, never a committed machine path.
-DEFAULT_TOKEN_PATH = Path.home() / ".config" / "marketlake" / "token.json"
+DEFAULT_TOKEN_PATH = config_dir() / TOKEN_FILE
 
 # The field groups pinned on every batched quote request. ``all`` returns every block
 # Schwab offers: quote, fundamental, regular, extended, and reference. Pinning them means

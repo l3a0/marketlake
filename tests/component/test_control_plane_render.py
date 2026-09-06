@@ -20,6 +20,7 @@ import pytest
 
 from lake import control_plane as cp
 from lake.calendar import MARKET_TZ
+from lake.schwab import DEFAULT_TOKEN_PATH
 from tests.support.calendar import FakeCalendar, SessionTimes
 from tests.support.clock import ManualClock
 from tests.support.lake import FixtureLake
@@ -195,38 +196,52 @@ def test_rendered_tmutil_line_excludes_the_whole_config_directory(tmp_path):
     assert lines == ['tmutil addexclusion "/Users/someone/.config/marketlake"']
 
 
-def test_a_token_outside_the_config_directory_is_excluded_on_its_own(tmp_path):
-    out = tmp_path / "out"
-    cp.main(["render", "--out", str(out), *RENDER_ARGS, "--token", "/elsewhere/token.json"])
-    lines = [
-        line
-        for line in (out / cp.TMUTIL_FILE).read_text().splitlines()
-        if line.startswith("tmutil")
-    ]
-    assert lines == [
-        'tmutil addexclusion "/Users/someone/.config/marketlake"',
-        'tmutil addexclusion "/elsewhere/token.json"',
-    ]
+def test_render_takes_no_token_argument():
+    # The render path derives the token from --home alone, so no override can point
+    # the daemon, the Sunday job, and the exclusion at different files.
+    with pytest.raises(SystemExit) as excinfo:
+        cp.main(["render", "--out", "/tmp/x", *RENDER_ARGS, "--token", "/elsewhere/token.json"])
+    assert excinfo.value.code == 2
 
 
-def test_a_token_inside_the_config_directory_needs_no_line_of_its_own(tmp_path):
+def test_the_three_consumers_name_one_file(tmp_path):
     out = tmp_path / "out"
-    cp.main(
-        [
-            "render",
-            "--out",
-            str(out),
-            *RENDER_ARGS,
-            "--token",
-            "/Users/someone/.config/marketlake/other.json",
-        ]
-    )
-    lines = [
-        line
-        for line in (out / cp.TMUTIL_FILE).read_text().splitlines()
-        if line.startswith("tmutil")
-    ]
-    assert lines == ['tmutil addexclusion "/Users/someone/.config/marketlake"']
+    cp.main(["render", "--out", str(out), *RENDER_ARGS])
+    token = "/Users/someone/.config/marketlake/token.json"
+    # The Sunday job reads it.
+    sunday = plistlib.loads((out / "com.marketlake.sunday.plist").read_bytes())
+    assert sunday["ProgramArguments"][-2:] == ["--token", token]
+    # The daemon writes it. It carries no --token, so it resolves the path from the
+    # HOME its plist sets, through schwab's own spelling of the same rule. Binding the
+    # two spellings is the daemon leg of the invariant. Asserting control_plane's
+    # helper against itself would pass while the daemon read another file entirely.
+    daemon = plistlib.loads((out / "com.marketlake.daemon.plist").read_bytes())
+    assert daemon["EnvironmentVariables"]["HOME"] == "/Users/someone"
+    assert "--token" not in daemon["ProgramArguments"]
+    assert str(DEFAULT_TOKEN_PATH) == cp.default_token_path(str(Path.home()))
+    assert cp.default_token_path(daemon["EnvironmentVariables"]["HOME"]) == token
+    # The exclusion protects the directory holding it.
+    excluded = (out / cp.TMUTIL_FILE).read_text()
+    assert 'tmutil addexclusion "/Users/someone/.config/marketlake"' in excluded
+    assert token.startswith(cp.default_config_dir("/Users/someone") + "/")
+
+
+@pytest.mark.parametrize(
+    ("token", "expected"),
+    [
+        # Inside the directory: the directory line covers it.
+        ("/Users/someone/.config/marketlake/token.json", ("/Users/someone/.config/marketlake",)),
+        ("/Users/someone/.config/marketlake/other.json", ("/Users/someone/.config/marketlake",)),
+        # Outside it: a brokerage credential is excluded wherever it is put. The
+        # render path cannot produce this, but `sunday --token` still can.
+        (
+            "/elsewhere/token.json",
+            ("/Users/someone/.config/marketlake", "/elsewhere/token.json"),
+        ),
+    ],
+)
+def test_exclusion_targets_cover_a_token_wherever_it_sits(token, expected):
+    assert cp.tmutil_exclusion_targets("/Users/someone/.config/marketlake", token) == expected
 
 
 def test_the_install_text_excludes_the_directory_and_reads_it_back(tmp_path, capsys):

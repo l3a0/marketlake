@@ -33,11 +33,11 @@ from pathlib import Path
 
 import yaml
 
-from lake.paths import LakePaths
+from lake.paths import CONFIG_FILE, LakePaths, config_dir
 
 # The machine-local config file. Overridable by argument or this environment variable,
 # so a test points the loader at a throwaway file.
-DEFAULT_CONFIG_PATH = Path("~/.config/marketlake/config.yaml")
+DEFAULT_CONFIG_PATH = config_dir() / CONFIG_FILE
 CONFIG_PATH_ENV = "MARKETLAKE_CONFIG"
 
 # The healthchecks host. Pings go by slug, in the form ``hc-ping.com/<ping-key>/<slug>``.
@@ -247,11 +247,17 @@ def _resolve_path(
     env_key: str,
     default: Path,
 ) -> Path:
-    """Resolve a config path: explicit argument, then env var, then the default."""
+    """Resolve a config path: explicit argument, then env var, then the default.
+
+    An argument and an environment override are whatever a person typed, so both may
+    carry a ``~`` and both are expanded. ``default`` comes from ``lake.paths`` already
+    resolved, so it is returned as it is. A caller passing an unexpanded default would
+    get it back unexpanded.
+    """
     if path is not None:
         return Path(path).expanduser()
     env = os.environ if env is None else env
     override = env.get(env_key)
     if override:
         return Path(override).expanduser()
-    return default.expanduser()
+    return default

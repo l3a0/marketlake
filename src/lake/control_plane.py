@@ -68,6 +68,7 @@ from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
 from lake.config import load_config
 from lake.manifest import ScrubResult, scrub
+from lake.paths import TOKEN_FILE, config_dir
 from lake.runner import LaunchdJob, Pinger, UrllibPinger, calendar_interval
 
 # -- the wall-clock constants ------------------------------------------------
@@ -245,31 +246,33 @@ def self_check_job(host: LaunchdHost) -> LaunchdJob:
     )
 
 
-def sunday_job(host: LaunchdHost, token_path: str) -> LaunchdJob:
+def sunday_job(host: LaunchdHost) -> LaunchdJob:
     """The Sunday canary and maintenance job, five minutes after the one-shot wake.
 
-    ``token_path`` is the same file the Time Machine exclusion names, so the coverage
-    assertion reads the token the install step protected, and the two can never name
-    different files. The 18:30 vendor sweep is not rendered here. That job is slice
-    3's, and it does not exist yet.
+    The token path is derived from the host's home, the one place every consumer
+    derives it from. The daemon reads that file, this job asserts coverage over it,
+    and the Time Machine exclusion protects the directory holding it. No render
+    argument can point any of the three somewhere else, so they cannot split. The
+    18:30 vendor sweep is not rendered here. That job is slice 3's, and it does not
+    exist yet.
     """
     return host.job(
         SUNDAY_LABEL,
         "lake.control_plane",
         "sunday",
         "--token",
-        token_path,
+        default_token_path(host.home),
         calendar=SUNDAY_MAINTENANCE.launchd_intervals([LAUNCHD_SUNDAY])[0],
     )
 
 
-def all_jobs(host: LaunchdHost, token_path: str) -> tuple[LaunchdJob, ...]:
+def all_jobs(host: LaunchdHost) -> tuple[LaunchdJob, ...]:
     """Every launchd job the control plane installs, resident processes first."""
     return (
         daemon_job(host),
         dashboard_job(host),
         self_check_job(host),
-        sunday_job(host, token_path),
+        sunday_job(host),
     )
 
 
@@ -1128,12 +1131,12 @@ def parse_exclusions(text: str) -> dict[str, bool]:
 
 def default_config_dir(home: str) -> str:
     """The config directory under ``home``. Machine-derived, never tracked."""
-    return str(Path(home) / ".config" / "marketlake")
+    return str(config_dir(home))
 
 
 def default_token_path(home: str) -> str:
     """The token's standard location under ``home``. Machine-derived, never tracked."""
-    return str(Path(default_config_dir(home)) / "token.json")
+    return str(config_dir(home) / TOKEN_FILE)
 
 
 def tmutil_exclusion_targets(config_dir: str, token_path: str) -> tuple[str, ...]:
@@ -1211,11 +1214,11 @@ class RenderedFile:
     content: str
 
 
-def render_all(host: LaunchdHost, token_path: str) -> tuple[RenderedFile, ...]:
+def render_all(host: LaunchdHost) -> tuple[RenderedFile, ...]:
     """Every plist and setup file, as text, in install order."""
-    files = [RenderedFile(f"{job.label}.plist", job.render()) for job in all_jobs(host, token_path)]
+    files = [RenderedFile(f"{job.label}.plist", job.render()) for job in all_jobs(host)]
     files.append(RenderedFile(SUDOERS_FILE, sudoers_dropin(host.owner)))
-    lines = tmutil_exclusion_commands(default_config_dir(host.home), token_path)
+    lines = tmutil_exclusion_commands(default_config_dir(host.home), default_token_path(host.home))
     files.append(
         RenderedFile(
             TMUTIL_FILE,
@@ -1251,14 +1254,14 @@ def write_rendered(files: Sequence[RenderedFile], out_dir: Path) -> list[Path]:
     return written
 
 
-def install_commands(out_dir: Path, host: LaunchdHost, token_path: str) -> str:
+def install_commands(out_dir: Path, host: LaunchdHost) -> str:
     """The operator's manual install steps, as text. Nothing here runs from code."""
     out = Path(out_dir)
     lines = [
         "# Marketlake control plane: the manual install. Run each line by hand.",
         "# 1. Install the four LaunchDaemons, root-owned as launchd requires.",
     ]
-    for job in all_jobs(host, token_path):
+    for job in all_jobs(host):
         lines.append(
             f"sudo install -o root -g wheel -m 644 {out / job.label}.plist /Library/LaunchDaemons/"
         )
@@ -1275,12 +1278,14 @@ def install_commands(out_dir: Path, host: LaunchdHost, token_path: str) -> str:
         "# 4. Keep the token and the config secrets out of Time Machine. As the owner,",
         "# never under sudo. The whole directory goes, so an editor that saves by rename",
         "# cannot drop the exclusion, and config.yaml's four secrets are covered too.",
-        *tmutil_exclusion_commands(default_config_dir(host.home), token_path),
+        *tmutil_exclusion_commands(default_config_dir(host.home), default_token_path(host.home)),
         "tmutil isexcluded "
-        + " ".join(tmutil_exclusion_targets(default_config_dir(host.home), token_path)),
+        + " ".join(
+            tmutil_exclusion_targets(default_config_dir(host.home), default_token_path(host.home))
+        ),
         "# 5. Load the jobs into the system domain, then confirm the daemon is running.",
     ]
-    for job in all_jobs(host, token_path):
+    for job in all_jobs(host):
         lines.append(
             f"sudo launchctl bootstrap {LAUNCHD_DOMAIN} /Library/LaunchDaemons/{job.label}.plist"
         )
@@ -1316,7 +1321,6 @@ def _build_parser():
         default=[],
         help="A directory to prepend to PATH, such as where uv lives. Repeatable.",
     )
-    render.add_argument("--token", help="The token.json path to exclude from Time Machine.")
 
     check = sub.add_parser("self-check", help="Verify the daemon is up, then ping pre-open.")
     check.add_argument("--config", help="Path to config.yaml (defaults to the standard location).")
@@ -1365,17 +1369,16 @@ def main(
             config_path=args.config,
             path_dirs=tuple(args.path_dir),
         )
-        token_path = args.token if args.token is not None else default_token_path(args.home)
         out = Path(args.out)
         try:
-            written = write_rendered(render_all(host, token_path), out)
+            written = write_rendered(render_all(host), out)
         except ValueError as exc:
             print(f"render: {exc}")
             return 2
         for path in written:
             print(f"wrote {path}")
         print()
-        print(install_commands(out, host, token_path), end="")
+        print(install_commands(out, host), end="")
         return 0
 
     if args.command == "self-check":
