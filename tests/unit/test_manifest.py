@@ -124,5 +124,5 @@ def test_data_files_and_the_quarantine_ledger_are_not_excluded():
     assert not _is_excluded("quarantine.jsonl", SCRUB_EXCLUSIONS)
 
 
-def test_enumerated_exclusion_set_is_exactly_the_two_documented_members():
-    assert SCRUB_EXCLUSIONS == ("manifest.jsonl", "journal/")
+def test_enumerated_exclusion_set_is_exactly_the_three_documented_members():
+    assert SCRUB_EXCLUSIONS == ("manifest.jsonl", "journal/", "reports/")
