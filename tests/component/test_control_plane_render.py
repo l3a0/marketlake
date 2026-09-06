@@ -13,7 +13,7 @@ import plistlib
 import re
 import shlex
 from collections.abc import Sequence
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
@@ -290,21 +290,28 @@ def test_self_check_cli_exits_non_zero_without_pinging_when_down(tmp_path):
     assert pinger.urls == []
 
 
+def _token(tmp_path: Path, minted: datetime | None = None) -> Path:
+    """A token.json in schwab-py's shape: an epoch second beside the secret half."""
+    path = tmp_path / "token.json"
+    when = et(2026, 8, 30, 19, 30) if minted is None else minted
+    path.write_text(
+        json.dumps({"creation_timestamp": when.timestamp(), "token": {"x": "never-read"}})
+    )
+    return path
+
+
 def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys):
     lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
     config = write_config(tmp_path, lake)
     pinger = FakePinger()
-    # An absent token file beside the override proves the override wins and that
-    # the test can never fall through to the real token under HOME.
+    # An explicit --token keeps the test off the real token under HOME.
     code = cp.main(
         [
             "sunday",
             "--config",
             str(config),
             "--token",
-            str(tmp_path / "absent.json"),
-            "--mint",
-            "2026-08-30T19:30:00-04:00",
+            str(_token(tmp_path)),
         ],
         clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
         calendar=weekday_sessions(date(2026, 8, 31)),
@@ -315,16 +322,40 @@ def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys):
     assert pinger.urls == ["https://hc-ping.com/secret-key/sunday"]
     printed = capsys.readouterr().out
     assert "secret-key" not in printed
-    assert "token file unreadable" not in printed
+
+
+def test_sunday_cli_withholds_the_ping_for_a_stale_token(tmp_path, capsys):
+    # Minted late the prior week: still valid on Sunday, dead before Friday's option
+    # close. Validity is not freshness, and the command line has to act on that, not
+    # just the decision functions that already pin it. This is the case the deleted
+    # `--mint` override could hide, by supplying a mint the token does not carry.
+    lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
+    config = write_config(tmp_path, lake)
+    pinger = FakePinger()
+    code = cp.main(
+        [
+            "sunday",
+            "--config",
+            str(config),
+            "--token",
+            str(_token(tmp_path, et(2026, 8, 27, 18, 0))),
+        ],
+        clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
+        calendar=weekday_sessions(date(2026, 8, 31), date(2026, 9, 7)),
+        schedule_reader=lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
+        pinger=pinger,
+    )
+    assert code == 1
+    assert pinger.urls == []
+    printed = capsys.readouterr().out
+    assert "does not clear the coming week" in printed
+    assert "secret-key" not in printed
 
 
 def test_sunday_cli_reads_the_mint_time_from_the_token_file(tmp_path, capsys):
     lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
     config = write_config(tmp_path, lake)
-    token = tmp_path / "token.json"
-    # 2026-08-30 19:30 ET as an epoch second, the shape schwab-py writes.
-    minted = et(2026, 8, 30, 19, 30).timestamp()
-    token.write_text(json.dumps({"creation_timestamp": minted, "token": {"x": "never-read"}}))
+    token = _token(tmp_path)
     pinger = FakePinger()
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(token)],
@@ -357,9 +388,7 @@ def test_sunday_cli_checks_the_time_machine_exclusion(tmp_path, capsys):
             "--config",
             str(config),
             "--token",
-            str(tmp_path / "absent.json"),
-            "--mint",
-            "2026-08-30T19:30:00-04:00",
+            str(_token(tmp_path)),
         ],
         clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
         calendar=weekday_sessions(date(2026, 8, 31)),

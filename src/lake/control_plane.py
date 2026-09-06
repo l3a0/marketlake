@@ -1467,9 +1467,6 @@ def _build_parser():
     sunday.add_argument(
         "--token", help="Path to token.json. Defaults to the standard place under HOME."
     )
-    sunday.add_argument(
-        "--mint", help="Override the token's mint time, ISO 8601 with offset. Tests only."
-    )
 
     sub.add_parser("pmset", help="Print the two pmset commands for the coming week.")
 
@@ -1534,9 +1531,13 @@ def main(
         token_path = args.token if args.token is not None else default_token_path(str(Path.home()))
 
         def read_mint() -> datetime | None:
-            """The token's mint time, read fresh so a retry can see a new re-login."""
-            if args.mint is not None:
-                return datetime.fromisoformat(args.mint)
+            """The token's mint time, read fresh so a retry can see a new re-login.
+
+            The token file is the only source. The coverage assertion refuses a mint
+            that does not clear the coming week, so an override supplying a mint the
+            token does not carry would hide the stale token the check exists to catch.
+            Validity is not freshness.
+            """
             try:
                 return read_token_mint(token_path)
             except ValueError as exc:
