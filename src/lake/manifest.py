@@ -42,8 +42,8 @@ from pathlib import Path
 from lake.paths import JOURNAL_DIR, MANIFEST_FILE, QUARANTINE_FILE, REPORTS_DIR
 
 # What the reverse scrub excludes, enumerated and not implied. The reverse pass asks
-# every data file for a manifest entry, so the few things in the lake that never get
-# one have to be named here. Three are.
+# every file under the lake root for a manifest entry, so the few that never get one
+# have to be named here. Three are.
 #
 # 1. The manifest cannot cover itself.
 # 2. Journal segments are manifest-less by rule, so the whole tree is out.
@@ -291,7 +291,7 @@ def _compacted_partition_for_segment(rel: str) -> str | None:
     so the scrub can tell when the segment entry has been superseded.
     """
     parts = rel.split("/")
-    if len(parts) != 5 or parts[0] != "journal":
+    if len(parts) != 5 or parts[0] != JOURNAL_DIR:
         return None
     date_part, surface_part, ticker_part, name = parts[1:]
     if not (
