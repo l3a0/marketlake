@@ -131,8 +131,9 @@ def test_a_failed_ping_never_carries_the_key():
         lake_root=_LAKE,
         backup_target=_TARGET,
     )
+    # Equality is the stronger claim. It says what the line is, so no part of the URL
+    # can be in it.
     assert outcome.problem == "ping failed: HTTPError"
-    assert "secret" not in outcome.problem and "hc-ping" not in outcome.problem
 
 
 def test_cycle_that_captured_nothing_does_not_ping_or_back_up():

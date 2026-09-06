@@ -394,9 +394,9 @@ def test_a_failed_ping_never_carries_the_key(fixture_lake):
         ping_url=URL,
         mint=FRESH_MINT,
     )
-    # Presence first. `not any(...)` over an empty tuple passes for the wrong reason.
+    # Pinned by equality rather than by scanning for the key. Equality is the stronger
+    # claim: it says what the line is, so nothing else can be in it.
     assert outcome.problems == ("ping failed: HTTPError",)
-    assert not any("secret-key" in p or "hc-ping.com" in p for p in outcome.problems)
 
 
 def test_the_retry_loop_gives_a_failed_ping_another_chance(fixture_lake):

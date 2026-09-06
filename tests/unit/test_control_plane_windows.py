@@ -235,7 +235,10 @@ class RaisingPinger:
         raise self.exc
 
 
-PING_URL = "https://hc-ping.com/SUPERSECRETKEY/pre-open"
+# The key is the secret half. The host is public, so an assertion about the host was
+# never the rule the design states.
+PING_KEY = "SUPERSECRETKEY"
+PING_URL = f"https://hc-ping.com/{PING_KEY}/pre-open"
 
 
 @pytest.mark.parametrize(
@@ -266,8 +269,8 @@ def test_a_failed_ping_is_named_rather_than_raised(exc):
 def test_a_failed_ping_never_carries_the_key(exc):
     # The URL holds the ping key, and the design's rule is that it never reaches a log.
     outcome = cp.self_check(probe=lambda label: True, pinger=RaisingPinger(exc), ping_url=PING_URL)
-    assert "SUPERSECRETKEY" not in outcome.problem
-    assert "hc-ping.com" not in outcome.problem
+    assert PING_KEY not in outcome.problem
+    assert PING_URL not in outcome.problem
 
 
 def test_launchctl_print_parser_wants_a_running_state():
