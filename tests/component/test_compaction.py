@@ -23,6 +23,7 @@ They pin the job's contract:
 
 from __future__ import annotations
 
+import urllib.error
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
@@ -653,6 +654,30 @@ def test_a_recompaction_needs_the_segments(lake_root):
 
 
 # -- 6. backup and ping ------------------------------------------------------
+
+
+def test_a_failed_ping_is_named_and_the_run_keeps_its_report(lake_root):
+    # The ping is the last step, after the seal, the retune, and the backup. A raise
+    # there used to propagate out of compact() before main printed result.render(), so
+    # a whole night's compaction report vanished behind a traceback over one lost ping.
+    _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
+
+    class Boom:
+        def ping(self, url: str) -> None:
+            raise urllib.error.URLError(OSError("connection refused"))
+
+    result, events, backup, _ = _run(lake_root, pinger=Boom())
+
+    assert result.pinged is False
+    assert result.problem == "ping failed: URLError"
+    # Everything the run did survives, which the raise used to take with it.
+    assert len(result.sealed) == 1
+    assert result.backed_up is True
+    assert events == ["backup"]
+    rendered = result.render()
+    assert "ping failed: URLError" in rendered
+    assert "sealed=1" in rendered
+    assert "secret-key" not in rendered
 
 
 def test_backup_runs_after_the_seal_then_pings_the_compaction_slug_once(lake_root):

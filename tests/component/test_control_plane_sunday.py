@@ -10,7 +10,9 @@ named at once.
 
 from __future__ import annotations
 
+import io
 import subprocess
+import urllib.error
 from datetime import date
 from pathlib import Path
 
@@ -344,6 +346,76 @@ def test_a_sunday_run_before_the_maintenance_time_makes_one_attempt(fixture_lake
     )
     assert len(outcomes) == 1
     assert clock.now() == et(2026, 8, 30, 15, 0)
+
+
+# -- a ping that fails ---------------------------------------------------------------
+
+# The ping is the last step. A raise there used to abort before the outcome printed, so
+# a wifi blip cost the report-tier lines and the verdict as well as the ping itself.
+
+
+class _RaisingPinger:
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+        self.urls: list[str] = []
+
+    def ping(self, url: str) -> None:
+        self.urls.append(url)
+        raise self.exc
+
+
+def test_a_failed_ping_is_a_named_problem_and_the_run_still_reports(fixture_lake):
+    pinger = _RaisingPinger(urllib.error.URLError(OSError("connection refused")))
+    outcome = cp.sunday_maintenance(
+        lake_root=_clean_lake(fixture_lake),
+        now=SUNDAY_20,
+        calendar=CALENDAR,
+        schedule_reader=lambda: REPEAT_ONLY,
+        pinger=pinger,
+        ping_url=URL,
+        mint=FRESH_MINT,
+    )
+    # It was attempted, it failed, and the failure is named beside the other findings.
+    assert pinger.urls == [URL]
+    assert outcome.pinged is False
+    assert outcome.problems == ("ping failed: URLError",)
+    # Everything the run learned survives, which a raise would have taken with it.
+    assert outcome.scrub.ok and outcome.canary_passed and outcome.covered is True
+
+
+def test_a_failed_ping_never_carries_the_key(fixture_lake):
+    pinger = _RaisingPinger(urllib.error.HTTPError(URL, 500, "Server Error", {}, io.BytesIO(b"")))
+    outcome = cp.sunday_maintenance(
+        lake_root=_clean_lake(fixture_lake),
+        now=SUNDAY_20,
+        calendar=CALENDAR,
+        schedule_reader=lambda: REPEAT_ONLY,
+        pinger=pinger,
+        ping_url=URL,
+        mint=FRESH_MINT,
+    )
+    # Presence first. `not any(...)` over an empty tuple passes for the wrong reason.
+    assert outcome.problems == ("ping failed: HTTPError",)
+    assert not any("secret-key" in p or "hc-ping.com" in p for p in outcome.problems)
+
+
+def test_the_retry_loop_gives_a_failed_ping_another_chance(fixture_lake):
+    # The Sunday job already retries every 30 minutes, so a blip at 20:00 is retried at
+    # 20:30 with no HTTP-level retry in the pinger.
+    clock = ManualClock(start=SUNDAY_20)
+    pinger = _RaisingPinger(TimeoutError("timed out"))
+    outcomes = cp.sunday_run(
+        lake_root=_clean_lake(fixture_lake),
+        clock=clock,
+        calendar=CALENDAR,
+        schedule_reader=lambda: REPEAT_ONLY,
+        pinger=pinger,
+        ping_url=URL,
+        mint_reader=_Mints(FRESH_MINT),
+    )
+    assert len(outcomes) == 7
+    assert len(pinger.urls) == 7
+    assert all(o.problems == ("ping failed: TimeoutError",) for o in outcomes)
 
 
 # -- the Time Machine exclusion ------------------------------------------------------

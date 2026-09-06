@@ -49,7 +49,9 @@ the design's schedule note requires.
 
 from __future__ import annotations
 
+import http.client
 import plistlib
+import urllib.error
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,6 +78,22 @@ _MINUTES_PER_DAY = 24 * 60
 
 
 # -- the injected seams ------------------------------------------------------
+
+
+# What a ping can fail with. ``urlopen`` fails two ways. Everything socket-shaped is an
+# ``OSError``, including ``urllib.error.URLError``, its ``HTTPError`` subclass, and a
+# timeout. A malformed response instead raises ``http.client.HTTPException``, which is
+# not an ``OSError``, so catching only the socket family would let it through.
+#
+# Every job pings as its last step, after the work is done, and prints its verdict after
+# that. So a raising ping used to cost the verdict as well as the ping. The ping is lost
+# either way and healthchecks pages for it after the grace. Losing the report too is
+# what these catches prevent. It lives here beside the protocol rather than in one
+# caller, because all four call sites need the same answer.
+#
+# Only the exception's type is ever reported. The URL carries the ping key, and the
+# design's rule is that it never reaches a log.
+PING_FAILURES = (urllib.error.URLError, OSError, http.client.HTTPException)
 
 
 @runtime_checkable
@@ -167,12 +185,15 @@ class RunOutcome:
 
     ``succeeded`` is the durable-capture success condition. ``pinged`` and ``backed_up``
     record whether each success-gated step ran. On a failed cycle both are false.
+    ``problem`` names a ping that failed, which leaves ``pinged`` false and the run
+    itself successful. The capture is durable either way.
     """
 
     result: CycleResult
     succeeded: bool
     pinged: bool
     backed_up: bool
+    problem: str | None = None
 
 
 def cycle_succeeded(result: CycleResult) -> bool:
@@ -219,14 +240,20 @@ def run_once(
     succeeded = cycle_succeeded(result)
     pinged = False
     backed_up = False
+    problem: str | None = None
     if succeeded:
         # Backup first. A raised backup propagates before the ping, so a single-copy
         # window pages through the missed ping rather than being reported as healthy.
         backup.sync(lake_root, backup_target)
         backed_up = True
-        pinger.ping(ping_url)
-        pinged = True
-    return RunOutcome(result=result, succeeded=succeeded, pinged=pinged, backed_up=backed_up)
+        try:
+            pinger.ping(ping_url)
+            pinged = True
+        except PING_FAILURES as exc:
+            problem = f"ping failed: {type(exc).__name__}"
+    return RunOutcome(
+        result=result, succeeded=succeeded, pinged=pinged, backed_up=backed_up, problem=problem
+    )
 
 
 def run_once_from_config(
@@ -509,8 +536,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Report by slug and counts only. The ping URL carries the secret ping key and
         # is never printed.
         status = "captured" if outcome.succeeded else "no durable data"
+        if outcome.problem is not None:
+            print(f"slice-1 run: {outcome.problem}")
         print(
-            f"slice-1 run: {status}; "
+            f"slice-1 run: {status} "
             f"segments={len(outcome.result.segments)} "
             f"pinged={outcome.pinged} backed_up={outcome.backed_up} "
             f"slug={SLICE1_RUNNER_SLUG}"

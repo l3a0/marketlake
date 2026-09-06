@@ -12,6 +12,7 @@ import json
 import plistlib
 import re
 import shlex
+import urllib.error
 from collections.abc import Sequence
 from datetime import date, datetime
 from pathlib import Path
@@ -277,6 +278,23 @@ def test_self_check_cli_pings_the_pre_open_slug_when_the_daemon_is_up(tmp_path, 
     assert pinger.urls == ["https://hc-ping.com/secret-key/pre-open"]
     printed = capsys.readouterr().out
     assert "slug=pre-open" in printed
+    assert "secret-key" not in printed
+
+
+def test_self_check_cli_names_a_failed_ping_and_still_reports(tmp_path, capsys):
+    # The ping is the last step, so a raise there used to replace the summary line with
+    # a traceback in the job's err log. The line is what the operator reads.
+    config = write_config(tmp_path, tmp_path / "lake")
+
+    class Boom:
+        def ping(self, url: str) -> None:
+            raise urllib.error.URLError(OSError("connection refused"))
+
+    code = cp.main(["self-check", "--config", str(config)], probe=lambda label: True, pinger=Boom())
+    assert code == 1
+    printed = capsys.readouterr().out
+    assert "self-check: ping failed: URLError" in printed
+    assert "daemon up pinged=False slug=pre-open" in printed
     assert "secret-key" not in printed
 
 

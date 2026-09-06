@@ -70,7 +70,7 @@ from lake.clock import Clock
 from lake.config import load_config
 from lake.manifest import ScrubResult, scrub
 from lake.paths import TOKEN_FILE, config_dir
-from lake.runner import LaunchdJob, Pinger, UrllibPinger, calendar_interval
+from lake.runner import PING_FAILURES, LaunchdJob, Pinger, UrllibPinger, calendar_interval
 
 # -- the wall-clock constants ------------------------------------------------
 
@@ -353,6 +353,7 @@ class SelfCheckOutcome:
 
     daemon_up: bool
     pinged: bool
+    problem: str | None = None
 
 
 def self_check(
@@ -368,11 +369,20 @@ def self_check(
     wake failed, paged a full hour before the bell. So the ping fires only on the
     success condition. A down daemon exits without pinging. A raising probe
     propagates, which is also a non-ping.
+
+    A ping that fails is named rather than raised. The outcome is the same missed
+    ping either way, and healthchecks pages for it after the grace. The difference is
+    that the caller still gets to say what happened, instead of the job dying with a
+    traceback where its one summary line should be.
     """
     up = probe(label)
     if not up:
         return SelfCheckOutcome(daemon_up=False, pinged=False)
-    pinger.ping(ping_url)
+    try:
+        pinger.ping(ping_url)
+    except PING_FAILURES as exc:
+        problem = f"ping failed: {type(exc).__name__}"
+        return SelfCheckOutcome(daemon_up=True, pinged=False, problem=problem)
     return SelfCheckOutcome(daemon_up=True, pinged=True)
 
 
@@ -941,13 +951,19 @@ def reauth_reminder(
 class SundayOutcome:
     """What one Sunday maintenance run found and did.
 
-    ``problems`` are the findings that withhold the ping: a failed scrub, a failed
-    canary, a token that does not cover the coming week, or a mint time that could
-    not be read. ``report`` carries the report-tier findings. Today that is only
-    pmset alarm drift. The design pins drift to the nightly report, because the pre-open
-    self-check already catches a missed wake an hour before the bell, so drift never
-    withholds the ping. ``covered`` is ``None`` when the mint time could not be read.
-    That is a problem, never a skip. ``pinged`` is the success condition.
+    ``problems`` are the findings that withhold the ping, plus the ping's own failure
+    when it is reached and fails. The withholding ones are a missing lake root, a
+    failed scrub, a failed canary, a token that does not cover the coming week, and a
+    mint time that could not be read. The ping's failure is different in kind. It is
+    recorded after the others have all passed, and it names why the ping did not land
+    rather than why it was not attempted.
+
+    ``report`` carries the report-tier findings. Today that is only pmset alarm drift.
+    The design pins drift to the nightly report, because the pre-open self-check already
+    catches a missed wake an hour before the bell, so drift never withholds the ping.
+
+    ``covered`` is ``None`` when the mint time could not be read. That is a problem,
+    never a skip. ``pinged`` is the success condition.
     """
 
     scrub: ScrubResult
@@ -992,8 +1008,10 @@ def sunday_maintenance(
     run, which costs a report line and never a ping. The command line always passes
     one. The
     coverage assertion needs the token's mint time. ``mint`` is ``None`` when the
-    caller could not read it, and that withholds the ping. A coverage assertion that
-    never ran must not read as a pass.
+    caller could not read it, and that withholds the ping. A ping that is attempted
+    and fails is named in ``problems`` rather than raised, so the run still reports
+    the scrub, the canary, and the coverage verdict it just spent its time computing.
+    A coverage assertion that never ran must not read as a pass.
 
     Five duties the design gives the Sunday run are not built here. Each is named so
     the gap is a decision rather than an oversight.
@@ -1071,8 +1089,11 @@ def sunday_maintenance(
 
     pinged = False
     if not problems:
-        pinger.ping(ping_url)
-        pinged = True
+        try:
+            pinger.ping(ping_url)
+            pinged = True
+        except PING_FAILURES as exc:
+            problems.append(f"ping failed: {type(exc).__name__}")
     return SundayOutcome(
         scrub=result,
         alarms=alarms,
@@ -1523,7 +1544,9 @@ def main(
             label=args.label,
         )
         status = "daemon up" if outcome.daemon_up else "daemon down"
-        print(f"self-check: {status}; pinged={outcome.pinged} slug={PRE_OPEN_SLUG}")
+        if outcome.problem is not None:
+            print(f"self-check: {outcome.problem}")
+        print(f"self-check: {status} pinged={outcome.pinged} slug={PRE_OPEN_SLUG}")
         return 0 if outcome.pinged else 1
 
     if args.command == "sunday":

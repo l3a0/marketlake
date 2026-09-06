@@ -12,6 +12,8 @@ so the listing comes back empty on any machine.
 
 from __future__ import annotations
 
+import io
+import urllib.error
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -86,6 +88,51 @@ def test_successful_cycle_backs_up_then_pings():
     assert pinger.urls == [_URL]
     # Order matters: rsync first, then the ping, so the one ping attests both.
     assert events == ["backup", "ping"]
+
+
+def test_a_failed_ping_is_named_and_the_run_keeps_its_verdict():
+    # The ping is the last step, after the capture is durable and the backup is done.
+    # A raise there used to propagate before main printed the run's summary, turning a
+    # successful capture into a traceback and a non-zero exit. The ping is lost either
+    # way, and healthchecks pages for it after the grace. The verdict is not.
+    events: list[str] = []
+
+    class Boom:
+        def ping(self, url: str) -> None:
+            events.append("ping")
+            raise urllib.error.URLError(OSError("connection refused"))
+
+    outcome = runner.run_once(
+        _data_result,
+        pinger=Boom(),
+        ping_url=_URL,
+        backup=FakeBackup(events),
+        lake_root=_LAKE,
+        backup_target=_TARGET,
+    )
+    assert outcome.succeeded is True
+    assert outcome.backed_up is True
+    assert outcome.pinged is False
+    assert outcome.problem == "ping failed: URLError"
+    # The backup still ran and its order is still pinned.
+    assert events == ["backup", "ping"]
+
+
+def test_a_failed_ping_never_carries_the_key():
+    class Boom:
+        def ping(self, url: str) -> None:
+            raise urllib.error.HTTPError(_URL, 500, "Server Error", {}, io.BytesIO(b""))
+
+    outcome = runner.run_once(
+        _data_result,
+        pinger=Boom(),
+        ping_url=_URL,
+        backup=FakeBackup([]),
+        lake_root=_LAKE,
+        backup_target=_TARGET,
+    )
+    assert outcome.problem == "ping failed: HTTPError"
+    assert "secret" not in outcome.problem and "hc-ping" not in outcome.problem
 
 
 def test_cycle_that_captured_nothing_does_not_ping_or_back_up():

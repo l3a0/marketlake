@@ -8,6 +8,9 @@ pings only when the injected probe reports the daemon up. Nothing crosses a boun
 
 from __future__ import annotations
 
+import http.client
+import io
+import urllib.error
 from datetime import date, datetime, timedelta
 
 import pytest
@@ -220,6 +223,51 @@ def test_a_raising_probe_never_pings():
     with pytest.raises(OSError):
         cp.self_check(probe=probe, pinger=pinger, ping_url=URL)
     assert pinger.urls == []
+
+
+class RaisingPinger:
+    """A pinger whose GET fails, the way a wifi blip makes the real one fail."""
+
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+
+    def ping(self, url: str) -> None:
+        raise self.exc
+
+
+PING_URL = "https://hc-ping.com/SUPERSECRETKEY/pre-open"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        urllib.error.HTTPError(PING_URL, 500, "Server Error", {}, io.BytesIO(b"")),
+        urllib.error.URLError(OSError("connection refused")),
+        TimeoutError("timed out"),
+        http.client.IncompleteRead(b""),
+    ],
+)
+def test_a_failed_ping_is_named_rather_than_raised(exc):
+    # The missed ping is the same either way, and healthchecks pages for it after the
+    # grace. What a raise cost was the job's own summary line, replaced by a traceback.
+    outcome = cp.self_check(probe=lambda label: True, pinger=RaisingPinger(exc), ping_url=PING_URL)
+    assert outcome.daemon_up is True
+    assert outcome.pinged is False
+    assert outcome.problem == f"ping failed: {type(exc).__name__}"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        urllib.error.HTTPError(PING_URL, 500, "Server Error", {}, io.BytesIO(b"")),
+        urllib.error.URLError(OSError("connection refused")),
+    ],
+)
+def test_a_failed_ping_never_carries_the_key(exc):
+    # The URL holds the ping key, and the design's rule is that it never reaches a log.
+    outcome = cp.self_check(probe=lambda label: True, pinger=RaisingPinger(exc), ping_url=PING_URL)
+    assert "SUPERSECRETKEY" not in outcome.problem
+    assert "hc-ping.com" not in outcome.problem
 
 
 def test_launchctl_print_parser_wants_a_running_state():
