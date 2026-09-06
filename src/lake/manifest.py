@@ -39,11 +39,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from lake.paths import JOURNAL_DIR, REPORTS_DIR
-
-# The two ledgers, both at the lake root.
-MANIFEST_NAME = "manifest.jsonl"
-QUARANTINE_NAME = "quarantine.jsonl"
+from lake.paths import JOURNAL_DIR, MANIFEST_FILE, QUARANTINE_FILE, REPORTS_DIR
 
 # What the reverse scrub excludes, enumerated and not implied. The reverse pass asks
 # every data file for a manifest entry, so the few things in the lake that never get
@@ -61,7 +57,7 @@ QUARANTINE_NAME = "quarantine.jsonl"
 #
 # An entry ending in ``/`` is a directory prefix. Any other entry is an exact filename
 # at the lake root. The lock adds no file to skip, because it locks the manifest itself.
-SCRUB_EXCLUSIONS: tuple[str, ...] = (MANIFEST_NAME, f"{JOURNAL_DIR}/", f"{REPORTS_DIR}/")
+SCRUB_EXCLUSIONS: tuple[str, ...] = (MANIFEST_FILE, f"{JOURNAL_DIR}/", f"{REPORTS_DIR}/")
 
 
 class RowCountRegression(Exception):
@@ -85,12 +81,12 @@ class RowCountRegression(Exception):
 
 def manifest_path(lake_root: Path) -> Path:
     """The manifest path for a lake, derived from its root."""
-    return Path(lake_root) / MANIFEST_NAME
+    return Path(lake_root) / MANIFEST_FILE
 
 
 def quarantine_path(lake_root: Path) -> Path:
     """The quarantine-ledger path for a lake, derived from its root."""
-    return Path(lake_root) / QUARANTINE_NAME
+    return Path(lake_root) / QUARANTINE_FILE
 
 
 # -- checksums ---------------------------------------------------------------
