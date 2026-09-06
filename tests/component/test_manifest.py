@@ -32,6 +32,7 @@ from lake.manifest import (
     sha256_file,
     would_shrink,
 )
+from lake.paths import REPORTS_DIR
 from tests.support.lake import FixtureLake, sample_chains_table
 
 DAY = date(2026, 8, 24)
@@ -237,6 +238,33 @@ def test_exclusion_set_is_honored(fixture_lake):
     assert manifest_path(lake.root).exists()
     assert lake.segment_path("chains", "SPY", DAY, "20260824T160000", 4242).exists()
     assert scrub(lake.root).ok
+
+
+def test_the_reports_directory_is_not_an_orphan(fixture_lake):
+    # The reverse pass asks every data file for a manifest entry. The nightly report is
+    # not data and never gets one. Before this the scrub called it an orphan, so the
+    # first report D16 wrote would have failed the Sunday scrub and withheld its ping.
+    lake = fixture_lake
+    lake.with_chains("SPY", DAY)
+    root = lake.build()
+    reports = root / REPORTS_DIR
+    reports.mkdir()
+    (reports / "2026-08-24.md").write_text("Nightly 2026-08-24\n")
+    result = scrub(root)
+    assert result.orphans == ()
+    assert result.ok
+
+
+def test_a_stray_file_outside_the_excluded_names_is_still_an_orphan(fixture_lake):
+    # The exclusions are named, not implied. A directory that merely looks like the
+    # reports one is still swept.
+    lake = fixture_lake
+    lake.with_chains("SPY", DAY)
+    root = lake.build()
+    stray = root / "reports-old"
+    stray.mkdir()
+    (stray / "2026-08-24.md").write_text("moved aside by hand\n")
+    assert scrub(root).orphans == ("reports-old/2026-08-24.md",)
 
 
 def test_slice1_segment_entry_is_a_failure_until_the_partition_is_compacted(fixture_lake):
