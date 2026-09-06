@@ -2,8 +2,7 @@
 
 Two resident processes render under ``KeepAlive`` with no calendar interval. Two
 calendar jobs render the weekday and Sunday intervals. Every path and account is a
-value the test supplied, never a tracked literal. And the slice-1 daily job renders
-exactly as it did before the ``LaunchdJob`` extension.
+value the test supplied, never a tracked literal.
 """
 
 from __future__ import annotations
@@ -132,30 +131,3 @@ def test_intervals_are_integers_not_strings():
         entries = interval if isinstance(interval, list) else [interval]
         for entry in entries:
             assert all(isinstance(value, int) for value in entry.values())
-
-
-# -- the LaunchdJob extension -------------------------------------------------------
-
-
-def test_daily_runner_job_renders_as_before():
-    job = runner.daily_runner_job(python="/opt/py/bin/python", hour=16, minute=10)
-    assert job.to_dict() == {
-        "Label": runner.DAILY_LABEL,
-        "ProgramArguments": ["/opt/py/bin/python", "-m", "lake.runner", "run"],
-        "StartCalendarInterval": {"Hour": 16, "Minute": 10},
-        "RunAtLoad": False,
-    }
-    assert "KeepAlive" not in job.render()
-
-
-def test_a_job_that_could_never_start_is_refused():
-    with pytest.raises(ValueError):
-        runner.LaunchdJob(label="x", program_arguments=("/py",))
-
-
-def test_run_at_load_alone_is_enough_to_omit_the_interval():
-    job = runner.LaunchdJob(label="x", program_arguments=("/py",), run_at_load=True)
-    plist = job.to_dict()
-    assert "StartCalendarInterval" not in plist
-    assert plist["RunAtLoad"] is True
-    assert "KeepAlive" not in plist

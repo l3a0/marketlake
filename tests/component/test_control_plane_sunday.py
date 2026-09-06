@@ -11,53 +11,23 @@ named at once.
 from __future__ import annotations
 
 import subprocess
-from datetime import date, datetime, timedelta
+from datetime import date
 from pathlib import Path
 
 from lake import control_plane as cp
-from lake.calendar import MARKET_TZ
-from tests.support.calendar import FakeCalendar, SessionTimes
+from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.lake import FixtureLake
+from tests.support.pinger import FakePinger
 
-
-def _et(*args: int) -> datetime:
-    return datetime(*args, tzinfo=MARKET_TZ)
-
-
-def _weeks(monday: date, count: int = 2) -> FakeCalendar:
-    """Consecutive Monday-to-Friday session weeks.
-
-    Two by default, because a Monday catch-up run looks ahead to the following week's
-    Sunday wake and a one-week calendar would run out under it.
-    """
-    table = {}
-    for week in range(count):
-        for offset in range(5):
-            day = monday + timedelta(days=week * 7 + offset)
-            table[day] = SessionTimes(
-                open=_et(day.year, day.month, day.day, 9, 30),
-                close=_et(day.year, day.month, day.day, 16, 0),
-            )
-    return FakeCalendar(table)
-
-
-CALENDAR = _weeks(date(2026, 8, 31))
-SUNDAY_20 = _et(2026, 8, 30, 20, 0)
-SUNDAY_19 = _et(2026, 8, 30, 19, 0)
-FRESH_MINT = _et(2026, 8, 30, 19, 30)
+CALENDAR = weekday_sessions(date(2026, 8, 31), date(2026, 9, 7))
+SUNDAY_20 = et(2026, 8, 30, 20, 0)
+SUNDAY_19 = et(2026, 8, 30, 19, 0)
+FRESH_MINT = et(2026, 8, 30, 19, 30)
 URL = "https://hc-ping.com/secret-key/sunday"
 
 REPEAT_ONLY = "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n"
 BOTH = REPEAT_ONLY + "Scheduled power events:\n [0]  wakepoweron at 08/30/26 19:55:00 by 'pmset'\n"
-
-
-class FakePinger:
-    def __init__(self) -> None:
-        self.urls: list[str] = []
-
-    def ping(self, url: str) -> None:
-        self.urls.append(url)
 
 
 def _clean_lake(fixture_lake: FixtureLake) -> Path:
@@ -171,10 +141,10 @@ def test_an_unreadable_mint_is_a_problem_not_a_skip(fixture_lake):
 
 def test_a_stale_mint_blocks_the_ping_and_a_fresh_one_passes(fixture_lake):
     root = _clean_lake(fixture_lake)
-    stale, pinger = _run(root, mint=_et(2026, 8, 27, 18, 0))
+    stale, pinger = _run(root, mint=et(2026, 8, 27, 18, 0))
     assert stale.covered is False
     assert stale.pinged is False and pinger.urls == []
-    fresh, pinger = _run(root, mint=_et(2026, 8, 30, 19, 30))
+    fresh, pinger = _run(root, mint=et(2026, 8, 30, 19, 30))
     assert fresh.covered is True
     assert fresh.pinged is True and pinger.urls == [URL]
 
@@ -182,7 +152,7 @@ def test_a_stale_mint_blocks_the_ping_and_a_fresh_one_passes(fixture_lake):
 def test_every_failure_is_named_at_once(fixture_lake):
     root = _clean_lake(fixture_lake)
     fixture_lake.partition_path("quotes", "SPY", date(2026, 8, 28)).unlink()
-    outcome, _ = _run(root, schedule="", canary=lambda: False, mint=_et(2026, 8, 20, 12, 0))
+    outcome, _ = _run(root, schedule="", canary=lambda: False, mint=et(2026, 8, 20, 12, 0))
     kinds = [p.split(":")[0].split(" ")[0] for p in outcome.problems]
     assert kinds == ["scrub", "canary", "token"]
     assert [line.split(" ")[0] for line in outcome.report] == ["weekday"]
@@ -277,7 +247,7 @@ def test_a_foreign_one_shot_with_a_leeway_tail_does_not_break_the_read_back(fixt
 # minutes until it passes or 23:00. Before this the plist fired once and any later
 # ritual paged.
 
-STALE_MINT = _et(2026, 8, 27, 18, 0)  # last week's late mint: valid, not fresh
+STALE_MINT = et(2026, 8, 27, 18, 0)  # last week's late mint: valid, not fresh
 
 
 class _Mints:
@@ -329,7 +299,7 @@ def test_a_ritual_done_after_the_first_run_still_clears_the_check(fixture_lake):
     assert outcomes[0].covered is False and outcomes[0].pinged is False
     assert outcomes[1].covered is True and outcomes[1].pinged is True
     assert pinger.urls == [URL]
-    assert clock.now() == _et(2026, 8, 30, 20, 30)
+    assert clock.now() == et(2026, 8, 30, 20, 30)
     assert mints.reads == 2  # the mint is read once per attempt, never cached
 
 
@@ -339,7 +309,7 @@ def test_a_ritual_never_done_retries_to_the_deadline_and_never_pings(fixture_lak
     )
     # 20:00 through 23:00 on the half hour: the deadline is the last retry.
     assert len(outcomes) == 7
-    assert clock.now() == _et(2026, 8, 30, 23, 0)
+    assert clock.now() == et(2026, 8, 30, 23, 0)
     assert all(o.pinged is False for o in outcomes)
     assert pinger.urls == []
 
@@ -359,21 +329,21 @@ def test_a_monday_catch_up_makes_one_attempt(fixture_lake):
     # launchd coalesces a wake missed over the weekend and fires the job Monday
     # morning. Retrying all day would page nobody sooner, so the catch-up runs once.
     outcomes, pinger, clock = _retry_run(
-        _clean_lake(fixture_lake), start=_et(2026, 8, 31, 8, 25), mints=_Mints(STALE_MINT)
+        _clean_lake(fixture_lake), start=et(2026, 8, 31, 8, 25), mints=_Mints(STALE_MINT)
     )
     assert len(outcomes) == 1
     assert pinger.urls == []
-    assert clock.now() == _et(2026, 8, 31, 8, 25)
+    assert clock.now() == et(2026, 8, 31, 8, 25)
 
 
 def test_a_sunday_run_before_the_maintenance_time_makes_one_attempt(fixture_lake):
     # RunAtLoad is off for the Sunday plist, so an off-window start means a hand-run
     # or a coalesced catch-up. Either way only the evening window retries.
     outcomes, _, clock = _retry_run(
-        _clean_lake(fixture_lake), start=_et(2026, 8, 30, 15, 0), mints=_Mints(STALE_MINT)
+        _clean_lake(fixture_lake), start=et(2026, 8, 30, 15, 0), mints=_Mints(STALE_MINT)
     )
     assert len(outcomes) == 1
-    assert clock.now() == _et(2026, 8, 30, 15, 0)
+    assert clock.now() == et(2026, 8, 30, 15, 0)
 
 
 # -- the Time Machine exclusion ------------------------------------------------------
@@ -496,7 +466,7 @@ def test_a_midweek_run_sends_no_reminder(fixture_lake):
     # RunAtLoad is off for the Sunday plist, so this needs a hand-run to happen at
     # all. It must still stay quiet.
     sent = _reminders(
-        _clean_lake(fixture_lake), start=_et(2026, 8, 31, 21, 0), mints=_Mints(STALE_MINT)
+        _clean_lake(fixture_lake), start=et(2026, 8, 31, 21, 0), mints=_Mints(STALE_MINT)
     )
     assert sent == []
 

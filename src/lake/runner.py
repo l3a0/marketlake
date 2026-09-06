@@ -108,8 +108,10 @@ class UrllibPinger:
     """The real pinger: a plain HTTP GET with ``urllib``.
 
     It is constructed cheaply and imports nothing network-bound at module load, so the
-    offline suite can build one without consequence. The GET itself only happens in the
-    by-hand live check. A test injects a fake instead.
+    offline suite can build one without consequence. The GET runs from every job that
+    pings, the daily runner and the compaction job here, the weekday self-check and the
+    Sunday job in the control plane, and from the by-hand live check. A test injects a
+    fake instead.
     """
 
     def __init__(self, timeout_seconds: float = 10.0) -> None:
@@ -129,7 +131,8 @@ class RsyncBackup:
     It asserts the backup target is mounted, then copies ``lake/`` into it. The design
     pins the tool as ``rsync`` or ``rclone`` with checksum verification, the lake root
     as the only sync root, and a mount check before the copy. The ``subprocess`` call
-    runs only in the by-hand live check. A test injects a fake.
+    runs from the compaction job after every session, and from the by-hand live check.
+    A test injects a fake.
     """
 
     def __init__(self, extra_args: Sequence[str] = ()) -> None:

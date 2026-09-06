@@ -13,17 +13,18 @@ import plistlib
 import re
 import shlex
 from collections.abc import Sequence
-from datetime import date, datetime, timedelta
+from datetime import date
 from pathlib import Path
 
 import pytest
 
 from lake import control_plane as cp
-from lake.calendar import MARKET_TZ
 from lake.schwab import DEFAULT_TOKEN_PATH
-from tests.support.calendar import FakeCalendar, SessionTimes
+from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
+from tests.support.config import write_config
 from tests.support.lake import FixtureLake
+from tests.support.pinger import FakePinger
 
 RENDER_ARGS = [
     "--python",
@@ -48,18 +49,6 @@ EXPECTED_FILES = {
     cp.SUDOERS_FILE,
     cp.TMUTIL_FILE,
 }
-
-
-def _et(*args: int) -> datetime:
-    return datetime(*args, tzinfo=MARKET_TZ)
-
-
-class FakePinger:
-    def __init__(self) -> None:
-        self.urls: list[str] = []
-
-    def ping(self, url: str) -> None:
-        self.urls.append(url)
 
 
 # -- render ------------------------------------------------------------------------
@@ -280,32 +269,8 @@ def test_sudoers_refuses_an_owner_that_is_not_an_account_name():
 # -- the two jobs and pmset through the command line ----------------------------------
 
 
-def _config(tmp_path: Path, lake_root: Path) -> Path:
-    path = tmp_path / "config.yaml"
-    path.write_text(
-        f"lake_root: {lake_root}\n"
-        f"backup_target: {tmp_path / 'ssd'}\n"
-        "healthchecks_ping_key: secret-key\n"
-        "ntfy_topic: secret-topic\n"
-        "schwab_api_key: key\n"
-        "schwab_app_secret: app-secret\n"
-    )
-    return path
-
-
-def _week(monday: date) -> FakeCalendar:
-    table = {}
-    for offset in range(5):
-        day = monday + timedelta(days=offset)
-        table[day] = SessionTimes(
-            open=_et(day.year, day.month, day.day, 9, 30),
-            close=_et(day.year, day.month, day.day, 16, 0),
-        )
-    return FakeCalendar(table)
-
-
 def test_self_check_cli_pings_the_pre_open_slug_when_the_daemon_is_up(tmp_path, capsys):
-    config = _config(tmp_path, tmp_path / "lake")
+    config = write_config(tmp_path, tmp_path / "lake")
     pinger = FakePinger()
     code = cp.main(["self-check", "--config", str(config)], probe=lambda label: True, pinger=pinger)
     assert code == 0
@@ -316,7 +281,7 @@ def test_self_check_cli_pings_the_pre_open_slug_when_the_daemon_is_up(tmp_path, 
 
 
 def test_self_check_cli_exits_non_zero_without_pinging_when_down(tmp_path):
-    config = _config(tmp_path, tmp_path / "lake")
+    config = write_config(tmp_path, tmp_path / "lake")
     pinger = FakePinger()
     code = cp.main(
         ["self-check", "--config", str(config)], probe=lambda label: False, pinger=pinger
@@ -327,7 +292,7 @@ def test_self_check_cli_exits_non_zero_without_pinging_when_down(tmp_path):
 
 def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys):
     lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
-    config = _config(tmp_path, lake)
+    config = write_config(tmp_path, lake)
     pinger = FakePinger()
     # An absent token file beside the override proves the override wins and that
     # the test can never fall through to the real token under HOME.
@@ -341,8 +306,8 @@ def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys):
             "--mint",
             "2026-08-30T19:30:00-04:00",
         ],
-        clock=ManualClock(start=_et(2026, 8, 30, 20, 0)),
-        calendar=_week(date(2026, 8, 31)),
+        clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
+        calendar=weekday_sessions(date(2026, 8, 31)),
         schedule_reader=lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
         pinger=pinger,
     )
@@ -355,16 +320,16 @@ def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys):
 
 def test_sunday_cli_reads_the_mint_time_from_the_token_file(tmp_path, capsys):
     lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
-    config = _config(tmp_path, lake)
+    config = write_config(tmp_path, lake)
     token = tmp_path / "token.json"
     # 2026-08-30 19:30 ET as an epoch second, the shape schwab-py writes.
-    minted = _et(2026, 8, 30, 19, 30).timestamp()
+    minted = et(2026, 8, 30, 19, 30).timestamp()
     token.write_text(json.dumps({"creation_timestamp": minted, "token": {"x": "never-read"}}))
     pinger = FakePinger()
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(token)],
-        clock=ManualClock(start=_et(2026, 8, 30, 20, 0)),
-        calendar=_week(date(2026, 8, 31)),
+        clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
+        calendar=weekday_sessions(date(2026, 8, 31)),
         schedule_reader=lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
         pinger=pinger,
     )
@@ -378,7 +343,7 @@ def test_sunday_cli_checks_the_time_machine_exclusion(tmp_path, capsys):
     # Production must always run the check, so the CLI passes the reader and the
     # standard targets. A lost exclusion rides the report and the ping still fires.
     lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
-    config = _config(tmp_path, lake)
+    config = write_config(tmp_path, lake)
     pinger = FakePinger()
     asked: list[tuple[str, ...]] = []
 
@@ -396,8 +361,8 @@ def test_sunday_cli_checks_the_time_machine_exclusion(tmp_path, capsys):
             "--mint",
             "2026-08-30T19:30:00-04:00",
         ],
-        clock=ManualClock(start=_et(2026, 8, 30, 20, 0)),
-        calendar=_week(date(2026, 8, 31)),
+        clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
+        calendar=weekday_sessions(date(2026, 8, 31)),
         schedule_reader=lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
         pinger=pinger,
         exclusion_reader=reader,
@@ -414,12 +379,12 @@ def test_sunday_cli_checks_the_time_machine_exclusion(tmp_path, capsys):
 
 def test_sunday_cli_reports_problems_and_exits_non_zero(tmp_path, capsys):
     lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
-    config = _config(tmp_path, lake)
+    config = write_config(tmp_path, lake)
     pinger = FakePinger()
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(tmp_path / "absent.json")],
-        clock=ManualClock(start=_et(2026, 8, 30, 20, 0)),
-        calendar=_week(date(2026, 8, 31)),
+        clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
+        calendar=weekday_sessions(date(2026, 8, 31)),
         schedule_reader=lambda: "",
         pinger=pinger,
         canary=lambda: False,
@@ -441,8 +406,8 @@ def test_sunday_cli_reports_problems_and_exits_non_zero(tmp_path, capsys):
 def test_pmset_cli_prints_both_commands_for_the_coming_week(capsys):
     code = cp.main(
         ["pmset"],
-        clock=ManualClock(start=_et(2026, 8, 28, 18, 30)),
-        calendar=_week(date(2026, 8, 31)),
+        clock=ManualClock(start=et(2026, 8, 28, 18, 30)),
+        calendar=weekday_sessions(date(2026, 8, 31)),
     )
     assert code == 0
     assert capsys.readouterr().out.splitlines() == [

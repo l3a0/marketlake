@@ -8,40 +8,18 @@ and the check names what is missing or drifted. All decided from values, so unit
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
 import pytest
 
 from lake import control_plane as cp
-from lake.calendar import MARKET_TZ
-from tests.support.calendar import FakeCalendar, SessionTimes
-
-
-def _sessions(mondays: list[date], holidays: set[date] = frozenset()) -> FakeCalendar:
-    """Regular sessions on every weekday of each listed week, minus the holidays."""
-    table = {}
-    for monday in mondays:
-        assert monday.weekday() == 0
-        for offset in range(5):
-            day = monday + timedelta(days=offset)
-            if day in holidays:
-                continue
-            table[day] = SessionTimes(
-                open=datetime(day.year, day.month, day.day, 9, 30, tzinfo=MARKET_TZ),
-                close=datetime(day.year, day.month, day.day, 16, 0, tzinfo=MARKET_TZ),
-            )
-    return FakeCalendar(table)
-
+from tests.support.calendar import et, weekday_sessions
 
 # Two adjacent weeks in 2026. Labor Day, Monday September 7, is the holiday.
 WEEK_AUG_31 = date(2026, 8, 31)
 WEEK_SEP_7 = date(2026, 9, 7)
 LABOR_DAY = date(2026, 9, 7)
-CALENDAR = _sessions([date(2026, 8, 24), WEEK_AUG_31, WEEK_SEP_7], holidays={LABOR_DAY})
-
-
-def _et(*args: int) -> datetime:
-    return datetime(*args, tzinfo=MARKET_TZ)
+CALENDAR = weekday_sessions(date(2026, 8, 24), WEEK_AUG_31, WEEK_SEP_7, holidays={LABOR_DAY})
 
 
 # -- the command strings -----------------------------------------------------------
@@ -68,40 +46,40 @@ def test_schedule_command_refuses_a_non_sunday():
 
 def test_regular_week_targets_the_coming_sunday():
     # A Wednesday. The next session week starts Monday August 31.
-    assert cp.next_sunday_wake(_et(2026, 8, 26, 12, 0), CALENDAR) == date(2026, 8, 30)
+    assert cp.next_sunday_wake(et(2026, 8, 26, 12, 0), CALENDAR) == date(2026, 8, 30)
 
 
 def test_friday_run_targets_the_sunday_two_days_ahead():
-    assert cp.next_sunday_wake(_et(2026, 8, 28, 18, 30), CALENDAR) == date(2026, 8, 30)
+    assert cp.next_sunday_wake(et(2026, 8, 28, 18, 30), CALENDAR) == date(2026, 8, 30)
 
 
 def test_monday_holiday_leaves_the_sunday_where_it_is():
     # Friday September 4. Monday the 7th is Labor Day. The first session is Tuesday,
     # in the same week, so the wake is still Sunday the 6th.
-    assert cp.next_sunday_wake(_et(2026, 9, 4, 18, 30), CALENDAR) == date(2026, 9, 6)
+    assert cp.next_sunday_wake(et(2026, 9, 4, 18, 30), CALENDAR) == date(2026, 9, 6)
 
 
 def test_a_fully_dark_week_pushes_the_wake_a_week_out():
-    dark = _sessions([WEEK_SEP_7], holidays={LABOR_DAY})  # nothing the week of Aug 31
-    assert cp.next_sunday_wake(_et(2026, 8, 28, 18, 30), dark) == date(2026, 9, 6)
+    dark = weekday_sessions(WEEK_SEP_7, holidays={LABOR_DAY})  # nothing the week of Aug 31
+    assert cp.next_sunday_wake(et(2026, 8, 28, 18, 30), dark) == date(2026, 9, 6)
 
 
 def test_from_sunday_the_target_is_that_same_sunday():
-    assert cp.next_sunday_wake(_et(2026, 8, 30, 20, 0), CALENDAR) == date(2026, 8, 30)
+    assert cp.next_sunday_wake(et(2026, 8, 30, 20, 0), CALENDAR) == date(2026, 8, 30)
 
 
 def test_sunday_wake_command_composes_the_date():
-    command = cp.sunday_wake_command(_et(2026, 9, 4, 18, 30), CALENDAR)
+    command = cp.sunday_wake_command(et(2026, 9, 4, 18, 30), CALENDAR)
     assert command == 'pmset schedule wakeorpoweron "09/06/26 19:55:00"'
 
 
 def test_expected_one_shot_is_pending_before_the_wake_and_gone_after():
     # Friday: the Sunday wake is ahead, so it is expected.
-    assert cp.expected_one_shot(_et(2026, 8, 28, 18, 30), CALENDAR) == date(2026, 8, 30)
+    assert cp.expected_one_shot(et(2026, 8, 28, 18, 30), CALENDAR) == date(2026, 8, 30)
     # Sunday 19:00, an early manual run: still ahead.
-    assert cp.expected_one_shot(_et(2026, 8, 30, 19, 0), CALENDAR) == date(2026, 8, 30)
+    assert cp.expected_one_shot(et(2026, 8, 30, 19, 0), CALENDAR) == date(2026, 8, 30)
     # Sunday 20:00, the maintenance job: the one-shot fired and left the schedule.
-    assert cp.expected_one_shot(_et(2026, 8, 30, 20, 0), CALENDAR) is None
+    assert cp.expected_one_shot(et(2026, 8, 30, 20, 0), CALENDAR) is None
 
 
 # -- the read-back parser ------------------------------------------------------------

@@ -4,8 +4,10 @@ These inject fakes for the two I/O seams and a canned cycle result, then assert 
 orchestration rule: on a successful durable cycle the runner backs up and then pings the
 health check, in that order, so the one slice-1 ping attests both. A cycle that captured
 nothing does neither. A backup that fails blocks the ping and surfaces the error, so the
-missed ping catches the single-copy window. Nothing here touches the network, a
-subprocess, or the filesystem, so the tier is unit.
+missed ping catches the single-copy window. Nothing here touches the network or a
+subprocess, and no outcome depends on the filesystem, so the tier is unit. The shared
+backup fake lists the source it was handed, which is a path these tests never create,
+so the listing comes back empty on any machine.
 """
 
 from __future__ import annotations
@@ -18,35 +20,13 @@ import pytest
 from lake import runner
 from lake.capture import CycleResult, SegmentError, SegmentOutcome
 from lake.journal import ROW_KIND_DATA, ROW_KIND_GAP
+from tests.support.backup import FakeBackup
+from tests.support.pinger import FakePinger
 
 _SNAP = datetime(2026, 8, 24, 20, 15, tzinfo=UTC)
 _URL = "https://hc-ping.com/secret-key/slice1-capture"
 _LAKE = Path("/lake")
 _TARGET = Path("/ssd/lake")
-
-
-class FakePinger:
-    """Records the URL it was asked to ping, appending to a shared event log."""
-
-    def __init__(self, events: list[str]) -> None:
-        self.events = events
-        self.urls: list[str] = []
-
-    def ping(self, url: str) -> None:
-        self.urls.append(url)
-        self.events.append("ping")
-
-
-class FakeBackup:
-    """Records each sync, appending to a shared event log."""
-
-    def __init__(self, events: list[str]) -> None:
-        self.events = events
-        self.calls: list[tuple[Path, Path]] = []
-
-    def sync(self, source: Path, target: Path) -> None:
-        self.calls.append((source, target))
-        self.events.append("backup")
 
 
 def _segment(surface: str, ticker: str, row_kind: str) -> SegmentOutcome:

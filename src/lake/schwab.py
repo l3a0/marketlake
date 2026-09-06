@@ -13,8 +13,8 @@ Two design rules shape this file.
    already-built ``schwab-py`` client object. So a test injects a fake client with
    the same method shapes and never needs the network or a real token. The thin
    ``from_token`` factory builds the real client from a token file. That factory is
-   the only place ``schwab-py`` is imported, and it runs only in the by-hand live
-   check, never in continuous integration.
+   the only place ``schwab-py`` is imported. It runs from the capture daemon on every
+   cycle, and in the by-hand live check. It never runs in continuous integration.
 2. No wall-clock read. ``token_mint_time`` derives its instant from the token the
    injected client already holds, never from ``datetime.now`` and never from a
    separate file read. The mint time is a stored epoch second on the client's token
@@ -219,7 +219,7 @@ class SchwabVendor:
 
         This is the one place ``schwab-py`` is imported, and it is imported lazily.
         So ``import lake.schwab`` and the whole unit suite run without the library
-        installed. This factory is exercised only in the by-hand live check that
+        installed. In tests this factory is reached only from the by-hand live check that
         records cassettes from a real Schwab call. It never runs in continuous
         integration, because it needs a real token and real credentials.
 

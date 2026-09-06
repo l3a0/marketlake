@@ -333,9 +333,10 @@ def parse_launchctl_print(output: str) -> bool:
 def launchctl_probe(label: str, domain: str = LAUNCHD_DOMAIN) -> bool:
     """The real probe: ``launchctl print <domain>/<label>``, parsed for a running state.
 
-    It runs only in the by-hand live check. A test injects a fake instead.
+    It runs from the rendered self-check job every weekday morning, and from the
+    by-hand live check. A test injects a fake instead.
     """
-    import subprocess  # lazy: only the live check shells out
+    import subprocess  # lazy: only a real run shells out
 
     result = subprocess.run(
         ["launchctl", "print", f"{domain}/{label}"],
@@ -685,9 +686,10 @@ def check_alarms(schedule: PmsetSchedule, *, one_shot_date: date | None) -> Alar
 def read_pmset_schedule() -> str:
     """The real schedule reader: ``pmset -g sched``, read-only, no root.
 
-    It runs only in the by-hand live check. A test injects a fake returning text.
+    It runs from the rendered Sunday job every week, and from the by-hand live check.
+    A test injects a fake returning text.
     """
-    import subprocess  # lazy: only the live check shells out
+    import subprocess  # lazy: only a real run shells out
 
     return subprocess.run(
         ["pmset", "-g", "sched"], capture_output=True, text=True, check=True
