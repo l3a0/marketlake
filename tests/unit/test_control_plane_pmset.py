@@ -115,9 +115,7 @@ Scheduled power events:
 def test_parser_reads_both_alarms():
     schedule = cp.parse_pmset_schedule(BOTH_PRESENT)
     assert schedule.repeats == (cp.RepeatAlarm("wakepoweron", 8, 25, frozenset({0, 1, 2, 3, 4})),)
-    assert schedule.one_shots == (
-        cp.OneShotAlarm("wakepoweron", datetime(2026, 9, 6, 19, 55), "pmset"),
-    )
+    assert schedule.one_shots == (cp.OneShotAlarm("wakepoweron", datetime(2026, 9, 6, 19, 55)),)
 
 
 def test_parser_accepts_the_alternate_spellings():
@@ -131,7 +129,7 @@ def test_parser_accepts_the_alternate_spellings():
     assert schedule.repeats[0].weekdays == frozenset({0, 1, 2, 3, 4})
     assert schedule.repeats[0].hour == 8 and schedule.repeats[0].minute == 25
     assert schedule.one_shots[0].when == datetime(2026, 9, 6, 19, 55)
-    assert schedule.one_shots[0].owner is None
+    assert schedule.one_shots[0].kind == "wakeorpoweron"
 
 
 def test_parser_reads_twelve_hour_pm_and_the_letter_day_form():
@@ -160,20 +158,19 @@ SUNDAY = date(2026, 9, 6)
 
 def test_both_alarms_present_passes():
     check = cp.check_alarms(cp.parse_pmset_schedule(BOTH_PRESENT), one_shot_date=SUNDAY)
-    assert check.ok
+    assert check.repeat_ok and check.one_shot_ok
     assert check.problems == ()
 
 
 def test_missing_one_shot_fails_when_it_is_expected():
     check = cp.check_alarms(cp.parse_pmset_schedule(REPEAT_ONLY), one_shot_date=SUNDAY)
     assert check.repeat_ok and not check.one_shot_ok
-    assert not check.ok
     assert any("one-shot" in p and "missing" in p for p in check.problems)
 
 
 def test_missing_one_shot_passes_when_none_is_pending():
     check = cp.check_alarms(cp.parse_pmset_schedule(REPEAT_ONLY), one_shot_date=None)
-    assert check.ok
+    assert check.repeat_ok and check.one_shot_ok
 
 
 def test_missing_repeat_fails():

@@ -60,7 +60,8 @@ def test_clean_scrub_and_the_repeat_alarm_ping_at_the_maintenance_time(fixture_l
     # At Sunday 20:00 the one-shot has fired and left the schedule. Only the repeat
     # alarm is expected, per the design's read-back caveat.
     outcome, pinger = _run(_clean_lake(fixture_lake))
-    assert outcome.scrub.ok and outcome.alarms.ok and outcome.canary_passed
+    assert outcome.scrub.ok and outcome.canary_passed
+    assert outcome.alarms.repeat_ok and outcome.alarms.one_shot_ok
     assert outcome.covered is True
     assert outcome.pinged is True
     assert outcome.problems == () and outcome.report == ()
@@ -72,7 +73,7 @@ def test_before_the_wake_a_missing_one_shot_rides_the_report(fixture_lake):
     # design pins to the nightly report, so it is named but the ping still fires.
     root = _clean_lake(fixture_lake)
     missing, pinger = _run(root, now=SUNDAY_19, schedule=REPEAT_ONLY)
-    assert missing.alarms.ok is False
+    assert missing.alarms.one_shot_ok is False
     assert any("one-shot" in line for line in missing.report)
     assert missing.problems == ()
     assert missing.pinged is True and pinger.urls == [URL]

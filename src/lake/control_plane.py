@@ -330,7 +330,7 @@ def parse_launchctl_print(output: str) -> bool:
     return False
 
 
-def launchctl_probe(label: str, domain: str = LAUNCHD_DOMAIN) -> bool:
+def launchctl_probe(label: str) -> bool:
     """The real probe: ``launchctl print <domain>/<label>``, parsed for a running state.
 
     It runs from the rendered self-check job every weekday morning, and from the
@@ -339,7 +339,7 @@ def launchctl_probe(label: str, domain: str = LAUNCHD_DOMAIN) -> bool:
     import subprocess  # lazy: only a real run shells out
 
     result = subprocess.run(
-        ["launchctl", "print", f"{domain}/{label}"],
+        ["launchctl", "print", f"{LAUNCHD_DOMAIN}/{label}"],
         capture_output=True,
         text=True,
         check=False,
@@ -463,7 +463,7 @@ _REPEAT_LINE = re.compile(r"^(?P<kind>\w+)\s+at\s+(?P<time>\S+)\s+(?P<days>.+?)\
 # project's. So a foreign event's tail must parse rather than fail the whole read-back.
 _ONE_SHOT_LINE = re.compile(
     r"^\[\d+\]\s+(?P<kind>\w+)\s+at\s+(?P<date>\S+)\s+(?P<time>\S+)"
-    r"(?:\s+by\s+'(?P<owner>[^']*)')?"
+    r"(?:\s+by\s+'[^']*')?"
     r"(?:\s+leeway\s+secs:\s*-?\d+)?"
     r"(?:\s+User\s+visible:\s*\S+)?"
     r"\s*$"
@@ -502,11 +502,15 @@ class RepeatAlarm:
 
 @dataclass(frozen=True)
 class OneShotAlarm:
-    """One scheduled power event. ``when`` is naive local time, as pmset prints it."""
+    """One scheduled power event. ``when`` is naive local time, as pmset prints it.
+
+    pmset also prints who set the alarm. The line is matched so it parses, and the owner
+    is not kept, because no check asks who set one. Only the time and the kind decide
+    whether the wake the design pins is present.
+    """
 
     kind: str
     when: datetime
-    owner: str | None = None
 
 
 @dataclass(frozen=True)
@@ -616,7 +620,7 @@ def parse_pmset_schedule(text: str) -> PmsetSchedule:
             day = _parse_date(match.group("date"))
             hour, minute = _parse_clock(match.group("time"))
             when = datetime(day.year, day.month, day.day, hour, minute)
-            one_shots.append(OneShotAlarm(match.group("kind"), when, match.group("owner")))
+            one_shots.append(OneShotAlarm(match.group("kind"), when))
         else:
             raise PmsetParseError(f"line outside any section: {line!r}")
     return PmsetSchedule(tuple(repeats), tuple(one_shots))
@@ -629,10 +633,6 @@ class AlarmCheck:
     repeat_ok: bool
     one_shot_ok: bool
     problems: tuple[str, ...] = ()
-
-    @property
-    def ok(self) -> bool:
-        return self.repeat_ok and self.one_shot_ok
 
 
 def expected_one_shot(now: datetime, calendar: Calendar) -> date | None:
@@ -974,10 +974,6 @@ class SundayOutcome:
     reminder: ReauthReminder | None = None
     problems: tuple[str, ...] = ()
     report: tuple[str, ...] = ()
-
-    @property
-    def ok(self) -> bool:
-        return self.pinged
 
 
 def sunday_maintenance(
