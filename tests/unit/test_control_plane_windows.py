@@ -17,7 +17,6 @@ import pytest
 
 from lake import control_plane as cp
 from tests.support.calendar import FakeCalendar, et, weekday_sessions
-from tests.support.clock import ManualClock
 from tests.support.pinger import FakePinger
 
 # -- the assertion window -------------------------------------------------------------
@@ -83,31 +82,6 @@ def test_caffeinate_is_none_once_the_window_has_ended():
     window = cp.assertion_window(date(2026, 8, 26))
     assert cp.caffeinate_args(window, et(2026, 8, 26, 18, 45)) is None
     assert cp.caffeinate_args(window, et(2026, 8, 26, 21, 0)) is None
-
-
-def test_hold_assertion_hands_the_runner_todays_line():
-    calls: list[tuple[str, ...]] = []
-    clock = ManualClock(start=et(2026, 8, 26, 12, 0))
-    args = cp.hold_assertion(clock=clock, runner=lambda a: calls.append(tuple(a)))
-    assert args == ("caffeinate", "-i", "-t", "24300")
-    assert calls == [args]
-
-
-def test_hold_assertion_does_nothing_on_saturday():
-    calls: list[tuple[str, ...]] = []
-    clock = ManualClock(start=et(2026, 9, 5, 12, 0))
-    assert cp.hold_assertion(clock=clock, runner=lambda a: calls.append(tuple(a))) is None
-    assert calls == []
-
-
-def test_hold_assertion_reads_the_eastern_date_from_a_utc_clock():
-    # 23:30 UTC on Friday is 19:30 Eastern on Friday: still inside Friday's window.
-    from datetime import UTC
-
-    calls: list[tuple[str, ...]] = []
-    clock = ManualClock(start=datetime(2026, 8, 28, 22, 0, tzinfo=UTC))  # 18:00 ET
-    args = cp.hold_assertion(clock=clock, runner=lambda a: calls.append(tuple(a)))
-    assert args is not None and args[-1] == "2700"
 
 
 # -- the coverage assertion -----------------------------------------------------------
@@ -333,6 +307,19 @@ def test_the_holder_owes_nothing_after_the_window_or_on_saturday():
     holder.hold(et(2026, 8, 31, 19, 0))  # past the 18:45 end
     holder.hold(et(2026, 9, 5, 12, 0))  # Saturday
     assert runner.calls == []
+
+
+def test_the_holder_reads_the_eastern_date_from_a_utc_clock():
+    # 22:00 UTC on Friday is 18:00 Eastern on Friday, still inside Friday's window.
+    # The daemon hands it whatever its clock returns, so the conversion is the holder's.
+    from datetime import UTC
+
+    runner = _Runner()
+    holder = cp.AssertionHolder(runner=runner)
+    holder.hold(datetime(2026, 8, 28, 22, 0, tzinfo=UTC))
+    assert len(runner.calls) == 1
+    # 18:00 to 18:45 Eastern is 45 minutes.
+    assert runner.calls[0][3] == "2700"
 
 
 def test_the_holder_takes_the_sunday_evening_window():
