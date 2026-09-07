@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -64,6 +65,34 @@ class Transport(Protocol):
     def send(self, message: Message) -> None: ...
 
 
+class NtfyTransport:
+    """The real POST, to ntfy's topic URL.
+
+    The topic is the secret half of that URL, exactly as the ping key is for
+    healthchecks, so it is held here and never put in a message. A publisher refuses any
+    page whose own text contains it.
+    """
+
+    def __init__(self, topic: str, *, host: str = "https://ntfy.sh") -> None:
+        self._url = f"{host.rstrip('/')}/{topic}"
+
+    def send(self, message: Message) -> None:
+        import urllib.request  # lazy: only a real send reaches the network
+
+        request = urllib.request.Request(
+            self._url,
+            data=message.body.encode("utf-8"),
+            headers={
+                "Title": message.title,
+                "Priority": str(message.priority),
+                "Tags": message.event,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=10):
+            pass
+
+
 class Publisher:
     """Sends pages, caps the day, and writes down every one that did not go.
 
@@ -76,11 +105,15 @@ class Publisher:
         *,
         lake_root: Path | str,
         transport: Transport | None = None,
+        secrets: Sequence[str] = (),
         daily_cap: int = DEFAULT_DAILY_CAP,
         pid: int | None = None,
     ) -> None:
         self._paths = LakePaths(Path(lake_root))
         self._transport = transport
+        # The values that must never reach a phone: the ping key and the ntfy topic.
+        # Empty means a caller that holds no secrets, which refuses nothing.
+        self._secrets = tuple(secret for secret in secrets if secret)
         self._cap = daily_cap
         self._pid = os.getpid() if pid is None else pid
         self._day: date | None = None
@@ -154,10 +187,19 @@ class Publisher:
         return Delivery(False, reason)
 
     def _leak(self, message: Message) -> str | None:
-        """The field carrying something that must never reach a phone, if any."""
+        """The field carrying a secret, if any.
+
+        The check is for the secret values themselves, not for the hostnames that
+        usually surround them. ``hc-ping.com`` and ``ntfy.sh`` are public names, and a
+        page mentioning either carries nothing. What must never reach a phone is the
+        ping key and the ntfy topic, because either one lets a stranger write to the
+        channel. Matching the host would refuse harmless text and still miss a key
+        pasted on its own.
+        """
+        if not self._secrets:
+            return None
         for field, value in (("title", message.title), ("body", message.body)):
-            lowered = value.lower()
-            if "hc-ping.com/" in lowered or "ntfy.sh/" in lowered:
+            if any(secret in value for secret in self._secrets):
                 return field
         return None
 
@@ -181,6 +223,7 @@ __all__ = [
     "REFUSED",
     "Delivery",
     "Message",
+    "NtfyTransport",
     "Publisher",
     "Transport",
     "undelivered",

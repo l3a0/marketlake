@@ -20,6 +20,8 @@ from lake.alert import (
 ET = ZoneInfo("America/New_York")
 NOW = datetime(2026, 9, 2, 10, 0, tzinfo=ET)
 PAGE = Message(event="capture_down", title="Capture down: SPY chains", body="3 minutes")
+# What must never reach a phone: the ping key and the ntfy topic.
+SECRETS = ("SECRETKEY", "secret-topic")
 
 
 class Recording:
@@ -87,11 +89,13 @@ def test_the_cap_resets_with_the_session_date_not_the_process(tmp_path):
     [
         Message(event="e", title="see https://hc-ping.com/SECRETKEY/capture", body="b"),
         Message(event="e", title="t", body="posted to https://ntfy.sh/secret-topic"),
+        # The key on its own, with no URL around it, is the same leak.
+        Message(event="e", title="t", body="key SECRETKEY rotated"),
     ],
 )
-def test_a_page_carrying_a_secret_url_is_refused_and_the_record_redacts_it(tmp_path, message):
+def test_a_page_carrying_a_secret_is_refused_and_the_record_redacts_it(tmp_path, message):
     transport = Recording()
-    publisher = Publisher(lake_root=tmp_path, transport=transport, pid=1)
+    publisher = Publisher(lake_root=tmp_path, transport=transport, secrets=SECRETS, pid=1)
     delivery = publisher.publish(message, now=NOW)
 
     assert not delivery.sent
@@ -132,3 +136,78 @@ def test_a_publisher_with_no_transport_records_rather_than_raising(tmp_path):
     delivery = publisher.publish(PAGE, now=NOW)
     assert not delivery.sent
     assert delivery.reason == POST_FAILED
+
+
+def test_a_public_hostname_alone_is_not_a_leak(tmp_path):
+    # `hc-ping.com` and `ntfy.sh` are public names. Refusing a page for mentioning one
+    # would drop a real alert and protect nothing.
+    transport = Recording()
+    publisher = Publisher(lake_root=tmp_path, transport=transport, secrets=SECRETS, pid=1)
+    message = Message(event="e", title="hc-ping.com unreachable", body="ntfy.sh down too")
+    assert publisher.publish(message, now=NOW).sent
+    assert transport.sent == [message]
+
+
+def test_a_publisher_holding_no_secrets_refuses_nothing(tmp_path):
+    transport = Recording()
+    publisher = Publisher(lake_root=tmp_path, transport=transport, pid=1)
+    assert publisher.publish(PAGE, now=NOW).sent
+
+
+# -- the production wiring -----------------------------------------------------------
+
+
+def test_the_daemon_pages_through_the_publisher_when_a_surface_goes_quiet(tmp_path):
+    """Deleting the daemon's watchdog binding must not leave the suite green."""
+    from lake import daemon
+    from lake.capture import CycleResult, SegmentOutcome
+    from tests.support.calendar import et, weekday_sessions
+    from tests.support.clock import ManualClock
+    from tests.support.config import write_config
+
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("XYZ: {options: false}\n")
+
+    def failing_cycle(*, close_tag, session_phase):
+        return CycleResult(
+            et(2026, 9, 2, 12, 0),
+            (
+                SegmentOutcome(
+                    surface="quotes",
+                    ticker="XYZ",
+                    path=tmp_path / "s.arrows",
+                    partition="p",
+                    row_kind="gap",
+                    rows=1,
+                    error_class="boom",
+                    fetched_at=None,
+                ),
+            ),
+        )
+
+    clock = ManualClock(start=et(2026, 9, 2, 11, 58))
+    ticks = [0]
+
+    def four() -> bool:
+        ticks[0] += 1
+        return ticks[0] <= 4
+
+    daemon.run_loop_from_config(
+        config_path=str(config),
+        tickers_path=str(tickers),
+        clock=clock,
+        calendar=weekday_sessions(date(2026, 8, 31)),
+        assertion_runner=lambda args: None,
+        transport=Broken(),
+        cycle_runner=failing_cycle,
+        should_continue=four,
+    )
+
+    # The ntfy POST cannot land in a test, so the page is recorded as undelivered. That
+    # it was recorded at all is the proof the watchdog reached the publisher.
+    records = _records(lake_root)
+    assert records, "the daemon ran four failing cycles and raised no page"
+    assert records[0]["event"] == "capture_down"

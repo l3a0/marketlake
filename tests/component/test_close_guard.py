@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from lake import close_guard, daemon, journal
+from lake.capture import CycleResult
 from lake.paths import LakePaths
 from lake.session import (
     OPTION_CLOSE,
@@ -129,7 +130,11 @@ def test_the_daemon_answers_the_close_tag_hook_from_the_calendar(tmp_path):
         clock=clock,
         calendar=weekday_sessions(WEEK),
         assertion_runner=lambda args: None,
-        cycle_runner=lambda *, close_tag, session_phase: tags.append(close_tag),
+        # A real cycle runner always returns a CycleResult, and the loop now hands it
+        # to observers, so a fake that returned None would be lying about the contract.
+        cycle_runner=lambda *, close_tag, session_phase: (
+            tags.append(close_tag) or CycleResult(et(2026, 9, 2, 16, 0), ())
+        ),
         should_continue=three,
     )
     # 15:59, 16:00, 16:01. A bare daemon answers None for every slot, so this pins that
@@ -406,7 +411,7 @@ def test_the_guard_writes_the_close_minutes_before_gap_marking_claims_them(tmp_p
         clock=clock,
         calendar=weekday_sessions(WEEK),
         assertion_runner=lambda args: None,
-        cycle_runner=lambda *, close_tag, session_phase: None,
+        cycle_runner=lambda *, close_tag, session_phase: CycleResult(et(2026, 9, 2, 16, 30), ()),
         should_continue=once,
     )
 
