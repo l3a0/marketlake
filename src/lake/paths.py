@@ -49,6 +49,26 @@ REPORTS_DIR = "reports"
 MANIFEST_FILE = "manifest.jsonl"
 QUARANTINE_FILE = "quarantine.jsonl"
 
+# The key prefix on a partition-date directory or filename, as in ``date=2026-01-05``.
+DATE_PREFIX = "date="
+
+# The key prefix on a journal surface directory, as in ``surface=chains``.
+SURFACE_PREFIX = "surface="
+
+# The key prefix on a ticker directory, as in ``ticker=SPY``.
+TICKER_PREFIX = "ticker="
+
+# The first part of a journal segment's filename. A writer-session start stamp and the
+# writer's pid follow it.
+SEGMENT_PREFIX = "seg-"
+
+# The last part of a journal segment's filename. The segment format is Arrow IPC.
+SEGMENT_SUFFIX = ".arrows"
+
+# The glob matching exactly the segments a writer created. It carries the prefix too, so it
+# is narrower than the suffix alone and never matches a stray ``.arrows`` file.
+SEGMENT_GLOB = f"{SEGMENT_PREFIX}*{SEGMENT_SUFFIX}"
+
 # The reference tables named in the design.
 SECURITY_MASTER = "security_master"
 CONTRACTS = "contracts"
@@ -89,7 +109,12 @@ class LakePaths:
                 f"partition_path is for {sorted(_DATE_PARTITIONED)}, not {surface!r}. "
                 "Use bars_partition_path or actions_path."
             )
-        return self.root / surface / f"ticker={ticker}" / f"date={_day_str(day)}.parquet"
+        return (
+            self.root
+            / surface
+            / f"{TICKER_PREFIX}{ticker}"
+            / f"{DATE_PREFIX}{_day_str(day)}.parquet"
+        )
 
     def chains_partition_path(self, ticker: str, day: date | str) -> Path:
         """The chains partition for a ticker-day."""
@@ -106,7 +131,11 @@ class LakePaths:
         ticker has bars at several frequencies on the same day.
         """
         return (
-            self.root / BARS / f"ticker={ticker}" / f"freq={freq}" / f"date={_day_str(day)}.parquet"
+            self.root
+            / BARS
+            / f"{TICKER_PREFIX}{ticker}"
+            / f"freq={freq}"
+            / f"{DATE_PREFIX}{_day_str(day)}.parquet"
         )
 
     @property
@@ -128,7 +157,10 @@ class LakePaths:
         directory to find the day's segments.
         """
         return (
-            self.journal_dir / f"date={_day_str(day)}" / f"surface={surface}" / f"ticker={ticker}"
+            self.journal_dir
+            / f"{DATE_PREFIX}{_day_str(day)}"
+            / f"{SURFACE_PREFIX}{surface}"
+            / f"{TICKER_PREFIX}{ticker}"
         )
 
     def segment_path(
@@ -140,7 +172,10 @@ class LakePaths:
         Together they make the name unique, so a second writer never truncates a live
         segment. The segment is Arrow IPC, hence the ``.arrows`` suffix.
         """
-        return self.segment_dir(surface, ticker, day) / f"seg-{start_ts}-{pid}.arrows"
+        return (
+            self.segment_dir(surface, ticker, day)
+            / f"{SEGMENT_PREFIX}{start_ts}-{pid}{SEGMENT_SUFFIX}"
+        )
 
     # -- ledgers -------------------------------------------------------------
 

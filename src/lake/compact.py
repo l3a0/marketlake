@@ -91,7 +91,14 @@ from lake.manifest import (
     sha256_bytes,
     sha256_file,
 )
-from lake.paths import CHAINS, LakePaths
+from lake.paths import (
+    CHAINS,
+    DATE_PREFIX,
+    SEGMENT_GLOB,
+    SURFACE_PREFIX,
+    TICKER_PREFIX,
+    LakePaths,
+)
 from lake.runner import BackupRunner, Pinger, RsyncBackup, UrllibPinger
 from lake.session import SessionClock
 
@@ -102,12 +109,6 @@ COMPACTION_SLUG = "compaction"
 
 # The manifest ``source`` for a compacted partition entry.
 COMPACTION_SOURCE = "compaction"
-
-# The three journal path levels, as their directory-name prefixes.
-_DATE_PREFIX = "date="
-_SURFACE_PREFIX = "surface="
-_TICKER_PREFIX = "ticker="
-_SEGMENT_GLOB = "seg-*.arrows"
 
 # The chains columns the re-tune profile reads. Everything else stays on disk.
 _PROFILE_COLUMNS = ("ticker", "snap_ts", "row_kind", "window_start", "window_end")
@@ -288,9 +289,9 @@ def _sweep_scope(
         return eligible, skipped
     slot = session.snap_slot()
     for entry in sorted(journal_dir.iterdir()):
-        if not entry.is_dir() or not entry.name.startswith(_DATE_PREFIX):
+        if not entry.is_dir() or not entry.name.startswith(DATE_PREFIX):
             continue
-        raw = entry.name[len(_DATE_PREFIX) :]
+        raw = entry.name[len(DATE_PREFIX) :]
         try:
             day = date.fromisoformat(raw)
         except ValueError:
@@ -310,13 +311,13 @@ def _ticker_days(date_dir: Path) -> list[tuple[str, str, Path]]:
     """Every ``(surface, ticker, directory)`` under one journal date directory."""
     found: list[tuple[str, str, Path]] = []
     for surface_dir in sorted(date_dir.iterdir()):
-        if not surface_dir.is_dir() or not surface_dir.name.startswith(_SURFACE_PREFIX):
+        if not surface_dir.is_dir() or not surface_dir.name.startswith(SURFACE_PREFIX):
             continue
-        surface = surface_dir.name[len(_SURFACE_PREFIX) :]
+        surface = surface_dir.name[len(SURFACE_PREFIX) :]
         for ticker_dir in sorted(surface_dir.iterdir()):
-            if not ticker_dir.is_dir() or not ticker_dir.name.startswith(_TICKER_PREFIX):
+            if not ticker_dir.is_dir() or not ticker_dir.name.startswith(TICKER_PREFIX):
                 continue
-            found.append((surface, ticker_dir.name[len(_TICKER_PREFIX) :], ticker_dir))
+            found.append((surface, ticker_dir.name[len(TICKER_PREFIX) :], ticker_dir))
     return found
 
 
@@ -797,7 +798,7 @@ def compact(
         chains_by_day: dict[date, list[SealedPartition]] = {}
         for day, date_dir in eligible:
             for surface, ticker, ticker_dir in _ticker_days(date_dir):
-                segments = sorted(ticker_dir.glob(_SEGMENT_GLOB))
+                segments = sorted(ticker_dir.glob(SEGMENT_GLOB))
                 if not segments:
                     continue
                 rel = paths.partition_path(surface, ticker, day).relative_to(root).as_posix()
@@ -862,8 +863,8 @@ def recompact_ticker_day(
     root = Path(lake_root)
     paths = LakePaths(root)
     with lake_lock(root):
-        ticker_dir = paths.segment_path(surface, ticker, day, "", 0).parent
-        segments = sorted(ticker_dir.glob(_SEGMENT_GLOB))
+        ticker_dir = paths.segment_dir(surface, ticker, day)
+        segments = sorted(ticker_dir.glob(SEGMENT_GLOB))
         if not segments:
             raise RecompactionRefused(
                 f"no segments remain for {surface}/{ticker}/{day.isoformat()}; "

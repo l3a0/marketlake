@@ -2,21 +2,31 @@
 
 These pin the boundary rules without a connection, a file, or a socket in the path, so
 the tier is unit. The parameter validators, the Host check, the route and registry
-shape, the slot denominator, and the command-line contract are each a pure function or
-a table.
+shape, the status vocabulary, the slot denominator, and the command-line contract are
+each a pure function or a table.
+
+The command-line cases reach ``main`` with every seam it wires replaced: the clock, the
+calendar, the service, the config reader, and the server factory. The factory raises the
+port-in-use error, so ``main`` records its choices and returns before anything binds or
+is read. So the tier holds even though the function under test is the process entry.
 """
 
 from __future__ import annotations
 
+import errno
 from datetime import date, datetime
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from lake import dashboard
 from lake.calendar import MARKET_TZ, OPTION_CLOSE_OFFSET
+from lake.config import GuardConstants
 from lake.dashboard import (
     NAMED_QUERIES,
     ROUTES,
+    STATUSES,
     QueryParameterError,
     host_allowed,
     parse_date,
@@ -100,8 +110,13 @@ def test_parameter_errors_never_echo_the_value():
         ("localhost:", False),
         ("localhost:abc", False),
         ("localhost.evil.example", False),
+        ("evil.localhost", False),
+        ("evil.localhost:8765", False),
+        ("xlocalhost", False),
+        ("xlocalhost:8765", False),
         ("evil.example", False),
         ("127.0.0.1.evil.example", False),
+        ("0127.0.0.1", False),
         ("[::1]", False),
         ("[::1]:8765", False),
         ("localhost:8765:1", False),
@@ -194,3 +209,102 @@ def test_the_status_page_ships_in_the_package_and_is_self_contained():
     # No external resource: the page must work offline and inside the same-origin policy.
     for marker in (b"http://", b"https://", b"<link", b"<img", b"src="):
         assert marker not in page
+
+
+# -- the status vocabulary ---------------------------------------------------
+
+
+def test_the_statuses_are_the_six_the_strip_reports():
+    # The strip's ``counts`` dict is keyed by exactly these, and it is the strip's
+    # denominator. A status added here without the payload following it, or the reverse,
+    # leaves a cell counted nowhere.
+    assert STATUSES == ("captured", "suspect", "gap", "missing", "pending", "out_of_scope")
+    assert len(set(STATUSES)) == len(STATUSES)
+    assert set(STATUSES) == {
+        dashboard.STATUS_CAPTURED,
+        dashboard.STATUS_SUSPECT,
+        dashboard.STATUS_GAP,
+        dashboard.STATUS_MISSING,
+        dashboard.STATUS_PENDING,
+        dashboard.STATUS_OUT_OF_SCOPE,
+    }
+
+
+# -- the entry point's lake-root branch ---------------------------------------
+
+
+class _ServiceRecorder:
+    """A stand-in for the service that records how ``main`` constructed it."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(self, lake_root, *, clock, calendar, guards):
+        self.calls.append(
+            {"lake_root": lake_root, "clock": clock, "calendar": calendar, "guards": guards}
+        )
+        return object()
+
+
+def _wire_main(monkeypatch, *, load_config) -> _ServiceRecorder:
+    """Replace every seam ``main`` wires, and make the bind fail so it returns at once."""
+    recorder = _ServiceRecorder()
+    monkeypatch.setattr(dashboard, "SystemClock", lambda: "the system clock")
+    monkeypatch.setattr(dashboard, "ExchangeCalendar", lambda: "the exchange calendar")
+    monkeypatch.setattr(dashboard, "DashboardService", recorder)
+    monkeypatch.setattr(dashboard, "load_config", load_config)
+
+    def refuse_to_bind(service, port):
+        raise OSError(errno.EADDRINUSE, "Address already in use")
+
+    monkeypatch.setattr(dashboard, "make_server", refuse_to_bind)
+    return recorder
+
+
+def _never_called(path=None):
+    raise AssertionError("load_config must not be read when --lake-root is given")
+
+
+def test_main_serves_the_lake_root_flag_and_never_reads_the_config(monkeypatch, capsys):
+    recorder = _wire_main(monkeypatch, load_config=_never_called)
+    assert dashboard.main(["--lake-root", "/fixture/lake", "--port", "9001"]) == 2
+    assert recorder.calls == [
+        {
+            "lake_root": Path("/fixture/lake"),
+            "clock": "the system clock",
+            "calendar": "the exchange calendar",
+            "guards": GuardConstants(),
+        }
+    ]
+    # Serving a lake root directly reads no config, so the guards are the pinned defaults.
+    assert "9001" in capsys.readouterr().err
+
+
+def test_main_reads_the_lake_root_and_the_guards_from_the_config(monkeypatch, capsys):
+    recalibrated = GuardConstants(watchdog_page_minutes=9)
+    seen: list[str | None] = []
+
+    def load_config(path=None):
+        seen.append(path)
+        return SimpleNamespace(lake_root=Path("/configured/lake"), guards=recalibrated)
+
+    recorder = _wire_main(monkeypatch, load_config=load_config)
+    assert dashboard.main(["--config", "machine.yaml"]) == 2
+    assert seen == ["machine.yaml"]
+    assert recorder.calls[0]["lake_root"] == Path("/configured/lake")
+    assert recorder.calls[0]["guards"] is recalibrated
+    capsys.readouterr()
+
+
+def test_main_falls_back_to_the_default_config_location(monkeypatch):
+    recalibrated = GuardConstants(watchdog_page_minutes=9)
+    seen: list[str | None] = []
+
+    def load_config(path=None):
+        seen.append(path)
+        return SimpleNamespace(lake_root=Path("/configured/lake"), guards=recalibrated)
+
+    recorder = _wire_main(monkeypatch, load_config=load_config)
+    assert dashboard.main([]) == 2
+    assert seen == [None]
+    assert recorder.calls[0]["lake_root"] == Path("/configured/lake")

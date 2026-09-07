@@ -3,11 +3,22 @@
 from __future__ import annotations
 
 from datetime import date
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 import pytest
 
-from lake.paths import ACTIONS, BARS, CHAINS, QUOTES, SURFACES, LakePaths
+from lake.paths import (
+    ACTIONS,
+    BARS,
+    CHAINS,
+    QUOTES,
+    SEGMENT_GLOB,
+    SEGMENT_PREFIX,
+    SEGMENT_SUFFIX,
+    SURFACES,
+    LakePaths,
+)
 from tests.support.lake import FixtureLake
 
 ROOT = Path("/lake")
@@ -103,3 +114,18 @@ def test_ledger_paths_match_fixture_lake(paths: LakePaths):
     fixture = FixtureLake(ROOT)
     assert paths.manifest_path == fixture.manifest_path
     assert paths.quarantine_path == fixture.quarantine_path
+
+
+def test_the_segment_glob_carries_the_prefix_as_well_as_the_suffix():
+    # Readers discover a ticker-day's segments by this glob. Matching the suffix alone
+    # would sweep in any stray ``.arrows`` file, and compaction never removes one, so the
+    # panel would show its failure forever.
+    assert SEGMENT_GLOB == f"{SEGMENT_PREFIX}*{SEGMENT_SUFFIX}"
+    assert fnmatchcase("seg-20260824T160000-4242.arrows", SEGMENT_GLOB)
+    for stray in ("notes.arrows", "chain_plan.arrows", ".arrows", "seg-1-2.arrows.tmp"):
+        assert not fnmatchcase(stray, SEGMENT_GLOB)
+
+
+def test_every_segment_path_matches_the_segment_glob(paths: LakePaths):
+    written = paths.segment_path("chains", "SPY", DAY, "20260824T160000", 4242)
+    assert fnmatchcase(written.name, SEGMENT_GLOB)

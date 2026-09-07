@@ -51,6 +51,7 @@ import pyarrow as pa
 
 from lake import journal
 from lake.journal import ROW_KIND_DATA, ROW_KIND_GAP
+from lake.paths import SEGMENT_GLOB, LakePaths
 
 # The final-fifteen-minutes window. It matches the option-close trailing span the
 # design breaks out, expressed as a duration so no session-time literal appears here.
@@ -79,16 +80,10 @@ def read_surface_cycles(
     an empty table in the surface's pinned schema.
     """
     schema = journal.schema_for(surface)
-    directory = (
-        Path(lake_root)
-        / "journal"
-        / f"date={_day_str(day)}"
-        / f"surface={surface}"
-        / f"ticker={ticker}"
-    )
+    directory = LakePaths(lake_root).segment_dir(surface, ticker, day)
     if not directory.is_dir():
         return schema.empty_table()
-    segments = sorted(directory.glob("seg-*.arrows"))
+    segments = sorted(directory.glob(SEGMENT_GLOB))
     tables = [journal.read_segment(path) for path in segments]
     if not tables:
         return schema.empty_table()
@@ -406,16 +401,10 @@ def _sizing(
     order: list[str],
 ) -> SizingStats:
     counts = [len(cycles[slot]) for slot in order]
-    directory = (
-        Path(lake_root)
-        / "journal"
-        / f"date={_day_str(day)}"
-        / f"surface={journal.CHAINS_SURFACE}"
-        / f"ticker={ticker}"
-    )
+    directory = LakePaths(lake_root).segment_dir(journal.CHAINS_SURFACE, ticker, day)
     segment_bytes = 0
     if directory.is_dir():
-        segment_bytes = sum(path.stat().st_size for path in directory.glob("seg-*.arrows"))
+        segment_bytes = sum(path.stat().st_size for path in directory.glob(SEGMENT_GLOB))
     float_counts = [float(count) for count in counts]
     return SizingStats(
         cycles=len(order),

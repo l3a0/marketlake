@@ -42,6 +42,13 @@ from typing import NamedTuple
 import pyarrow as pa
 
 from lake.manifest import read_manifest
+from lake.paths import (
+    JOURNAL_DIR,
+    SEGMENT_SUFFIX,
+    SURFACE_PREFIX,
+    TICKER_PREFIX,
+    LakePaths,
+)
 
 # The schema version stamped on every row. The vendor columns' full list is fixed by
 # the first day's payload and recorded as version 1. A later payload change mints a
@@ -917,15 +924,11 @@ def segment_path(
     ``pid`` is the writer process id. Together they make the name unique per writer
     session, so a manual re-run or a crash-loop restart cannot collide with a live
     segment by accident.
+
+    This is the ``lake_root``-argument spelling of ``LakePaths.segment_path``. It
+    delegates there, so the two can never drift apart.
     """
-    return (
-        Path(lake_root)
-        / "journal"
-        / f"date={_day_str(day)}"
-        / f"surface={surface}"
-        / f"ticker={ticker}"
-        / f"seg-{start_ts}-{pid}.arrows"
-    )
+    return LakePaths(lake_root).segment_path(surface, ticker, day, start_ts, pid)
 
 
 # -- the writer --------------------------------------------------------------
@@ -1103,10 +1106,10 @@ def _is_chains_segment_for(rel: str, ticker: str) -> bool:
     parts = rel.split("/")
     return (
         len(parts) == 5
-        and parts[0] == "journal"
-        and parts[2] == f"surface={CHAINS_SURFACE}"
-        and parts[3] == f"ticker={ticker}"
-        and parts[4].endswith(".arrows")
+        and parts[0] == JOURNAL_DIR
+        and parts[2] == f"{SURFACE_PREFIX}{CHAINS_SURFACE}"
+        and parts[3] == f"{TICKER_PREFIX}{ticker}"
+        and parts[4].endswith(SEGMENT_SUFFIX)
     )
 
 

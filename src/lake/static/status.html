@@ -12,7 +12,25 @@
     --gap: #c0392b;
     --missing: #7f8c8d;
     --pending: rgba(127, 127, 127, 0.18);
+    /* Out of scope is a slot before the ticker's capture_start epoch. It means "not
+       expected", not "lost", so it gets a hue of its own rather than a shade of the
+       greys that carry missing and pending. */
+    --out-of-scope: #4f74c8;
+    /* The shadow-append alarm. A hue no status cell uses, so it never reads as a gap. */
+    --alarm: #b5179e;
+    --note: #a35b00;
     --rule: rgba(127, 127, 127, 0.35);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --captured: #3aa870;
+      --suspect: #f0bd2f;
+      --gap: #ff6f61;
+      --missing: #9aa5a6;
+      --out-of-scope: #7fa0f2;
+      --alarm: #ff86d8;
+      --note: #ffb454;
+    }
   }
   body {
     font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -25,13 +43,23 @@
   h2 { font-size: 1.1rem; margin: 0 0 .5rem; }
   section { margin-top: 1.75rem; }
   .muted { opacity: .7; }
+  .note { color: var(--note); }
+  .alarm { color: var(--alarm); font-weight: 700; }
   button { font: inherit; padding: .2rem .7rem; }
+  /* Nine columns outgrow a narrow window. The table scrolls inside its own box, so the
+     page itself never scrolls sideways and the strips below stay where they were. */
+  .table-wrap { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; }
   th, td { text-align: left; padding: .3rem .5rem; border-bottom: 1px solid var(--rule); }
   th { font-weight: 600; }
   td.num { font-variant-numeric: tabular-nums; }
   .stale { color: var(--gap); font-weight: 600; }
-  .strip-label { display: flex; justify-content: space-between; margin-top: .6rem; }
+  .writers { margin: .6rem 0 0; padding-left: 1.1rem; }
+  .writers li { margin: .1rem 0; }
+  .strip-label {
+    display: flex; justify-content: space-between; gap: .5rem;
+    flex-wrap: wrap; margin-top: .6rem;
+  }
   .strip { display: flex; gap: 1px; height: 18px; margin: .2rem 0 .1rem; }
   .strip div { flex: 1 1 0; min-width: 1px; }
   .captured { background: var(--captured); }
@@ -39,6 +67,9 @@
   .gap { background: var(--gap); }
   .missing { background: var(--missing); }
   .pending { background: var(--pending); }
+  .out_of_scope { background: var(--out-of-scope); }
+  /* A status the page does not recognize. Drift renders as itself, never as a status. */
+  .unknown { background: repeating-linear-gradient(45deg, var(--alarm) 0 2px, transparent 2px 4px); }
   .legend { margin: .4rem 0 .6rem; }
   .legend i { display: inline-block; width: 12px; height: 12px; vertical-align: -1px; margin: 0 .3rem 0 .9rem; }
   .legend i:first-child { margin-left: 0; }
@@ -50,40 +81,72 @@
     border-radius: 4px;
     color: var(--gap);
   }
+  #error.shown { display: block; }
+  .chip {
+    border: 1px solid var(--gap);
+    border-radius: 999px;
+    color: var(--gap);
+    font-weight: 700;
+    padding: .05rem .55rem;
+  }
+  /* A failed refresh must not leave a panel asserting an old "now". Each panel says it
+     is stale where the reader is standing, and the values behind the note wash out. */
+  .stale-note {
+    display: none;
+    margin: .3rem 0 .7rem;
+    padding: .4rem .6rem;
+    border-left: 4px solid var(--gap);
+    color: var(--note);
+    font-weight: 600;
+  }
+  body.degraded .stale-note { display: block; }
+  body.degraded .panel { opacity: .55; filter: grayscale(85%); }
+  body.degraded #asof { opacity: .5; }
 </style>
 </head>
 <body>
 <header>
   <h1>Marketlake</h1>
   <span id="asof" class="muted">loading&hellip;</span>
+  <span id="freshness"></span>
   <button id="refresh" type="button">Refresh</button>
 </header>
 <div id="error"></div>
 
 <section>
   <h2>Now <span id="phase" class="muted"></span></h2>
-  <table>
-    <thead>
-      <tr>
-        <th>Ticker</th><th>Surface</th><th>Last data cycle (ET)</th>
-        <th>Minutes since</th><th>Latest slot</th><th>Status</th><th>Reason</th>
-      </tr>
-    </thead>
-    <tbody id="now-rows"></tbody>
-  </table>
-  <p id="token" class="muted"></p>
+  <p id="now-stale" class="stale-note"></p>
+  <div class="panel">
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr id="now-head">
+            <th>Ticker</th><th>Surface</th><th>Capture start (ET)</th>
+            <th>Last data cycle (ET)</th><th>Minutes since</th><th>Latest slot (ET)</th>
+            <th>Status</th><th>Reason</th><th>Segment health</th>
+          </tr>
+        </thead>
+        <tbody id="now-rows"></tbody>
+      </table>
+    </div>
+    <ul id="writers" class="muted writers"></ul>
+  </div>
 </section>
 
 <section>
   <h2>Today <span id="session" class="muted"></span></h2>
-  <div class="legend">
-    <i class="captured"></i>captured
-    <i class="suspect"></i>suspect
-    <i class="gap"></i>gap
-    <i class="missing"></i>missing
-    <i class="pending"></i>pending
+  <p id="today-stale" class="stale-note"></p>
+  <div class="panel">
+    <div class="legend">
+      <i class="captured"></i><span title="A data cycle landed.">captured</span>
+      <i class="suspect"></i><span title="A data cycle landed, flagged for the validation battery to judge.">suspect</span>
+      <i class="gap"></i><span title="A gap row records the missed minute and its reason.">gap</span>
+      <i class="missing"></i><span title="A past slot with no row at all, not even a gap marker.">missing</span>
+      <i class="pending"></i><span title="A slot still ahead of the clock.">pending</span>
+      <i class="out_of_scope"></i><span title="A slot before the ticker's capture_start epoch, the instant capture began for that ticker. Minutes before it are out of scope, never gaps.">out of scope</span>
+    </div>
+    <div id="strips"></div>
   </div>
-  <div id="strips"></div>
 </section>
 
 <script>
@@ -99,6 +162,68 @@
     hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
   });
   var REFRESH_MS = 60000;
+  var DASH = "—";
+
+  // The six slot statuses, in the order the strip summary reports them. A cell's class
+  // comes from this map and never from the payload string itself, so a status the page
+  // does not know renders as drift rather than as an unstyled cell.
+  var STATUSES = ["captured", "suspect", "gap", "missing", "pending", "out_of_scope"];
+  var STATUS_CLASS = {
+    captured: "captured", suspect: "suspect", gap: "gap",
+    missing: "missing", pending: "pending", out_of_scope: "out_of_scope"
+  };
+  var STATUS_LABEL = {
+    captured: "captured", suspect: "suspect", gap: "gap",
+    missing: "missing", pending: "pending", out_of_scope: "out of scope"
+  };
+  var UNKNOWN_CLASS = "unknown";
+  var UNKNOWN_LABEL = "unrecognized status";
+
+  // The five segment-health counters, each named for what it is. One integer cannot
+  // carry these, so the page never sums them. A shadow append leads and is loud: bytes
+  // written past a segment's end-of-stream marker are rows every standard reader stops
+  // short of, and the design pins that failure as one that must never be silent.
+  var HEALTH = [
+    {
+      key: "shadow_append_segments",
+      one: "shadow-append segment", many: "shadow-append segments",
+      className: "alarm",
+      title: "Bytes were written past a segment's end-of-stream marker. A reader stops " +
+        "at that marker, so those rows are invisible to it. The design pins this as a " +
+        "failure that must never be silent."
+    },
+    {
+      key: "unreadable_segments",
+      one: "unreadable segment", many: "unreadable segments",
+      className: "note",
+      title: "The segment's bytes could not be read: a torn header, or not an Arrow stream at all."
+    },
+    {
+      key: "vanished_segments",
+      one: "vanished segment", many: "vanished segments",
+      className: "note",
+      title: "The segment was listed and then gone. Compaction sealing the day mid-read looks like this."
+    },
+    {
+      key: "drifted_segments",
+      one: "drifted segment", many: "drifted segments",
+      className: "note",
+      title: "A required provenance column is missing, or it cannot be cast back to its pinned type."
+    },
+    {
+      key: "drifted_rows",
+      one: "drifted row", many: "drifted rows",
+      className: "note",
+      title: "Rows whose row_kind is neither data nor gap. They are counted here rather " +
+        "than mistaken for a gap."
+    }
+  ];
+
+  // The instant of the last successful load, and the as_of the panels are showing. Both
+  // are null until one load succeeds.
+  var lastGoodAt = null;
+  var lastGoodAsOf = null;
+  var inFlight = false;
 
   function byId(id) { return document.getElementById(id); }
 
@@ -112,9 +237,13 @@
   function clear(node) { while (node.firstChild) { node.removeChild(node.firstChild); } }
 
   function fmt(iso, formatter) {
-    if (!iso) { return "—"; }
+    if (!iso) { return DASH; }
     return formatter.format(new Date(iso));
   }
+
+  function stamp(when) { return stampFmt.format(when); }
+
+  function plural(count, one, many) { return count + " " + (count === 1 ? one : many); }
 
   function getJSON(url) {
     return fetch(url, { cache: "no-store" }).then(function (r) {
@@ -123,17 +252,87 @@
     });
   }
 
-  function showError(message) {
-    var box = byId("error");
-    box.textContent = message;
-    box.style.display = "block";
-  }
-
-  function hideError() { byId("error").style.display = "none"; }
-
   function capturing(now) {
     return now.phase === "open" || now.phase === "post_equity_close";
   }
+
+  // -- freshness ------------------------------------------------------------
+
+  function setStaleNotes(text) {
+    byId("now-stale").textContent = text;
+    byId("today-stale").textContent = text;
+  }
+
+  function staleText(failedAt) {
+    if (lastGoodAt === null) {
+      return "No load has succeeded yet. This panel holds no data. The attempt at " +
+        stamp(failedAt) + " ET failed.";
+    }
+    return "Stale. This panel shows the load from " + stamp(lastGoodAt) + " ET. Its data " +
+      "was as of " + fmt(lastGoodAsOf, stampFmt) + " ET. The refresh at " +
+      stamp(failedAt) + " ET failed.";
+  }
+
+  function markFresh(now) {
+    lastGoodAt = new Date();
+    lastGoodAsOf = now.as_of;
+    document.body.classList.remove("degraded");
+    var box = byId("error");
+    box.textContent = "";
+    box.className = "";
+    var chip = byId("freshness");
+    chip.textContent = "";
+    chip.className = "";
+    setStaleNotes("");
+  }
+
+  function markStale(message) {
+    var failedAt = new Date();
+    document.body.classList.add("degraded");
+    var box = byId("error");
+    box.textContent = "The query service is unreachable or failing: " + message +
+      ". Nothing below is live.";
+    box.className = "shown";
+    var chip = byId("freshness");
+    chip.textContent = lastGoodAt === null
+      ? "stale, no load has succeeded"
+      : "stale, last good load " + stamp(lastGoodAt) + " ET";
+    chip.className = "chip";
+    setStaleNotes(staleText(failedAt));
+  }
+
+  // -- shared cell parts ----------------------------------------------------
+
+  function healthSpans(source) {
+    var spans = [];
+    HEALTH.forEach(function (counter) {
+      var count = source[counter.key];
+      if (typeof count !== "number" || count <= 0) { return; }
+      var span = el("span", plural(count, counter.one, counter.many), counter.className);
+      span.title = counter.title;
+      spans.push(span);
+    });
+    return spans;
+  }
+
+  function appendJoined(node, parts) {
+    parts.forEach(function (part, index) {
+      if (index > 0) { node.appendChild(el("span", ", ", "muted")); }
+      node.appendChild(part);
+    });
+  }
+
+  // The reported class is the slot's most common reason, not its only one. A count above
+  // one says other reasons rode the same minute.
+  function appendReasonCount(node, count) {
+    if (typeof count !== "number" || count <= 1) { return; }
+    var span = el("span", " (most common of " + count + " reasons)", "muted");
+    span.title = "The slot carried " + count + " distinct error classes. The one named " +
+      "is the most common of them, not the only one.";
+    node.appendChild(span);
+  }
+
+  // -- the Now panel --------------------------------------------------------
 
   function renderNow(now) {
     byId("asof").textContent = "as of " + fmt(now.as_of, stampFmt) + " ET";
@@ -145,38 +344,126 @@
     if (now.surfaces.length === 0) {
       var empty = el("tr");
       var cell = el("td", "No tickers found under the lake root yet.", "muted");
-      cell.colSpan = 7;
+      cell.colSpan = document.querySelectorAll("#now-head th").length;
       empty.appendChild(cell);
       body.appendChild(empty);
     }
     now.surfaces.forEach(function (row) {
-      var tr = el("tr");
-      tr.appendChild(el("td", row.ticker));
-      tr.appendChild(el("td", row.surface));
-      tr.appendChild(el("td", fmt(row.last_data_snap_ts, stampFmt)));
-      var since = el("td", row.minutes_since === null ? "—" : row.minutes_since.toFixed(1), "num");
-      if (capturing(now) && (row.minutes_since === null || row.minutes_since > now.stale_after_minutes)) {
-        since.className += " stale";
-      }
-      tr.appendChild(since);
-      tr.appendChild(el("td", fmt(row.last_snap_ts, stampFmt)));
-      tr.appendChild(el("td", row.last_status || "—"));
-      var reason = row.last_error_class || "";
-      if (row.unreadable_segments > 0) {
-        reason += (reason ? "; " : "") + row.unreadable_segments + " unreadable segment(s)";
-      }
-      tr.appendChild(el("td", reason || "—"));
-      body.appendChild(tr);
+      body.appendChild(nowRow(now, row));
     });
-    var token = now.token_minted_at === null
-      ? "Refresh token age: not journaled yet."
-      : "Refresh token minted " + fmt(now.token_minted_at, stampFmt) + " ET, " +
-        now.token_age_minutes + " minutes ago.";
-    var ping = now.dead_man_last_ping === null
-      ? " Last dead-man ping: not recorded yet."
-      : " Last dead-man ping: " + fmt(now.dead_man_last_ping, stampFmt) + " ET.";
-    byId("token").textContent = token + ping;
+    renderWriters(now);
   }
+
+  function nowRow(now, row) {
+    var tr = el("tr");
+    tr.appendChild(el("td", row.ticker));
+    tr.appendChild(el("td", row.surface));
+    tr.appendChild(captureStartCell(row));
+    tr.appendChild(el("td", fmt(row.last_data_snap_ts, stampFmt)));
+    tr.appendChild(minutesSinceCell(now, row));
+    tr.appendChild(el("td", fmt(row.last_snap_ts, stampFmt)));
+    tr.appendChild(el("td", row.last_status || DASH));
+    tr.appendChild(reasonCell(row));
+    tr.appendChild(healthCell(row));
+    return tr;
+  }
+
+  function captureStartCell(row) {
+    var cell = el("td");
+    if (!row.capture_start) {
+      cell.textContent = DASH;
+      return cell;
+    }
+    cell.appendChild(el("span", fmt(row.capture_start, stampFmt)));
+    if (row.in_scope === false) {
+      var tag = el("span", " (not started)", "muted");
+      tag.title = "The clock has not reached this ticker's capture_start epoch. Capture " +
+        "has not begun for it, so an empty row is what this ticker should look like.";
+      cell.appendChild(tag);
+    }
+    return cell;
+  }
+
+  // A ticker whose capture_start is still ahead of the clock has no minutes-since to be
+  // late by. It is not onboarded yet, so it is never painted stale.
+  function minutesSinceCell(now, row) {
+    var text = row.minutes_since === null ? DASH : row.minutes_since.toFixed(1);
+    var cell = el("td", text, "num");
+    if (row.in_scope === false) {
+      cell.className = "num muted";
+    } else if (capturing(now) &&
+        (row.minutes_since === null || row.minutes_since > now.stale_after_minutes)) {
+      cell.className = "num stale";
+    }
+    return cell;
+  }
+
+  function reasonCell(row) {
+    var cell = el("td");
+    if (row.last_error_class) {
+      cell.appendChild(el("span", row.last_error_class));
+      appendReasonCount(cell, row.last_error_class_count);
+    }
+    if (row.in_scope === false) {
+      if (cell.firstChild) { cell.appendChild(el("span", ", ", "muted")); }
+      cell.appendChild(el("span", "capture has not started"));
+    }
+    if (row.lookback_exhausted) {
+      if (cell.firstChild) { cell.appendChild(el("span", ", ", "muted")); }
+      var floorNote = el("span", "no data cycle in the days walked");
+      floorNote.title = "The newest-first day walk hit its cap before it found a data " +
+        "cycle. Older days were not read. So this is a floor on the age, not proof that " +
+        "the ticker never captured.";
+      cell.appendChild(floorNote);
+    }
+    if (!cell.firstChild) { cell.textContent = DASH; }
+    return cell;
+  }
+
+  function healthCell(source) {
+    var cell = el("td");
+    appendJoined(cell, healthSpans(source));
+    if (!cell.firstChild) { cell.textContent = DASH; }
+    return cell;
+  }
+
+  // Five payload fields wait on writers that do not exist yet. They render as four lines,
+  // since token_age_minutes shares a line with token_minted_at. Each line says so in the
+  // same shape, so a null reads as an unbuilt writer and never as a zero.
+  function renderWriters(now) {
+    var list = byId("writers");
+    clear(list);
+    var items = [
+      {
+        text: now.token_minted_at === null
+          ? "Refresh token mint: not recorded yet."
+          : "Refresh token minted " + fmt(now.token_minted_at, stampFmt) + " ET, " +
+            plural(now.token_age_minutes, "minute", "minutes") + " ago."
+      },
+      {
+        text: now.token_sunday_countdown_minutes === null
+          ? "Sunday re-mint countdown: not recorded yet."
+          : "Sunday re-mint in " +
+            plural(now.token_sunday_countdown_minutes, "minute", "minutes") + "."
+      },
+      {
+        text: now.dead_man_last_ping === null
+          ? "Dead-man ping: not recorded yet."
+          : "Dead-man ping last fired " + fmt(now.dead_man_last_ping, stampFmt) + " ET."
+      },
+      {
+        text: now.pages_failed_to_send === null
+          ? "Pages that failed to send: not recorded yet."
+          : plural(now.pages_failed_to_send, "page", "pages") + " failed to send.",
+        className: now.pages_failed_to_send > 0 ? "alarm" : null
+      }
+    ];
+    items.forEach(function (item) {
+      list.appendChild(el("li", item.text, item.className));
+    });
+  }
+
+  // -- the Today panel ------------------------------------------------------
 
   function renderToday(today) {
     var session = byId("session");
@@ -194,38 +481,72 @@
       strips.appendChild(el("p", "No tickers found under the lake root yet.", "muted"));
     }
     today.strips.forEach(function (strip) {
-      var label = el("div", null, "strip-label");
-      label.appendChild(el("strong", strip.ticker + " " + strip.surface));
-      var c = strip.counts;
-      var summary = c.captured + " captured, " + c.suspect + " suspect, " + c.gap + " gap, " +
-        c.missing + " missing, " + c.pending + " pending";
-      if (strip.unreadable_segments > 0) {
-        summary += ", " + strip.unreadable_segments + " unreadable segment(s)";
-      }
-      label.appendChild(el("span", summary, "muted"));
-      strips.appendChild(label);
-      var row = el("div", null, "strip");
-      strip.slots.forEach(function (slot) {
-        var cell = el("div", null, slot.status);
-        var tip = fmt(slot.slot, timeFmt) + " " + slot.status;
-        if (slot.rows > 0) { tip += ", " + slot.rows + " rows"; }
-        if (slot.error_class) { tip += ", " + slot.error_class; }
-        cell.title = tip;
-        row.appendChild(cell);
-      });
-      strips.appendChild(row);
+      strips.appendChild(stripLabel(strip));
+      strips.appendChild(stripCells(strip));
     });
   }
 
+  function stripLabel(strip) {
+    var label = el("div", null, "strip-label");
+    var name = el("span");
+    name.appendChild(el("strong", strip.ticker + " " + strip.surface));
+    if (strip.capture_start) {
+      var began = el("span", " capture began " + fmt(strip.capture_start, stampFmt) + " ET", "muted");
+      began.title = "The ticker's capture_start epoch. Slots before it are out of scope, never gaps.";
+      name.appendChild(began);
+    }
+    label.appendChild(name);
+    var right = el("span");
+    var parts = [el("span", countsText(strip.counts), "muted")].concat(healthSpans(strip));
+    appendJoined(right, parts);
+    label.appendChild(right);
+    return label;
+  }
+
+  function countsText(counts) {
+    return STATUSES.map(function (status) {
+      return (counts[status] || 0) + " " + STATUS_LABEL[status];
+    }).join(", ");
+  }
+
+  function stripCells(strip) {
+    var row = el("div", null, "strip");
+    strip.slots.forEach(function (slot) {
+      var cell = el("div", null, STATUS_CLASS[slot.status] || UNKNOWN_CLASS);
+      var tip = fmt(slot.slot, timeFmt) + " " + (STATUS_LABEL[slot.status] || UNKNOWN_LABEL);
+      if (slot.rows > 0) { tip += ", " + plural(slot.rows, "row", "rows"); }
+      if (slot.error_class) {
+        tip += ", " + slot.error_class;
+        if (slot.error_class_count > 1) {
+          tip += " (most common of " + slot.error_class_count + " reasons)";
+        }
+      }
+      cell.title = tip;
+      row.appendChild(cell);
+    });
+    return row;
+  }
+
+  // -- the refresh cycle ----------------------------------------------------
+
+  // Both payloads are fetched before either panel is painted. A partial failure would
+  // otherwise leave a fresh Now table beside a Today strip from the previous poll, with
+  // the page mixing two instants and saying so nowhere.
   function refresh() {
+    if (inFlight) { return; }
+    inFlight = true;
+    var pending = null;
     getJSON("/api/now").then(function (now) {
-      renderNow(now);
+      pending = now;
       return getJSON("/api/today?date=" + encodeURIComponent(now.session_date));
     }).then(function (today) {
+      renderNow(pending);
       renderToday(today);
-      hideError();
+      markFresh(pending);
     }).catch(function (err) {
-      showError("Query service unreachable or failing: " + err.message);
+      markStale(err.message);
+    }).then(function () {
+      inFlight = false;
     });
   }
 

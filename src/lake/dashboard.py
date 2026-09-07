@@ -13,41 +13,45 @@ token and the alerting secrets. So client-supplied SQL never crosses the boundar
 the sandbox holds even if the query surface drifts. Five rules, each enforced in code
 here.
 
-1. The HTTP layer maps a request path to a query *name* in ``NAMED_QUERIES``. A path not
-   in the map is a 404. No endpoint takes SQL, and no request field is ever treated as
-   SQL text.
+1. The HTTP layer maps a request path to a query *name* in ``NAMED_QUERIES``. Exactly one
+   path outside that map is answered: ``/`` serves the static page, which reads no lake
+   data and runs no query. Every other unmapped path is a 404. No endpoint takes SQL, and
+   no request field is ever treated as SQL text.
 2. A request carries at most two parameters, a ticker and a date. Each is validated
    before any query runs. The ticker must be in the lake's own roster, the set of tickers
    present under ``lake_root``. The date must parse as strict ``YYYY-MM-DD``. A request
-   that fails validation is a 400 and never touches the connection.
+   that fails validation is a 400. Validation runs before the connection is touched, with
+   one exception: a date the calendar cannot judge at all is refused from inside the
+   query, after a cursor has been opened. Even there no statement runs and no lake data
+   is read, so the parameter still never reaches SQL.
 3. A validated value reaches SQL only as a DuckDB bind parameter, never interpolated
    into the statement text. Every statement text is a module constant.
 4. The connection is a sandbox. ``open_lake_connection`` sets ``allowed_directories`` to
    exactly ``lake_root``, turns ``enable_external_access`` off, then locks the
    configuration. No later SQL can widen the allow-list or flip the sandbox back on.
-5. The service binds to the loopback address only and rejects any request whose ``Host``
-   header is not localhost with a 403, before doing anything else. That is the standard
-   guard against DNS rebinding, the trick where a malicious page re-points its own domain
-   at the loopback address to reach a local service through the owner's browser.
+5. The service binds to the loopback address only. It refuses any request whose ``Host``
+   header names neither ``localhost`` nor the loopback address, with a 403, whatever the
+   verb and before any lake data is touched. That is the standard guard against DNS
+   rebinding, the trick where a malicious page re-points its own domain at the loopback
+   address to reach a local service through the owner's browser.
 
-Read-only is by construction, with one honest caveat. The sandbox blocks every path
-outside ``lake_root`` but does let DuckDB write inside it. So read-only rests on the
-named queries, which are ``SELECT`` statements only, and on the connection never being
-handed to anything else. A test asserts the lake tree is byte-identical after both
-panels run.
+Read-only is by construction, with one caveat. The sandbox blocks every path outside
+``lake_root`` but does let DuckDB write inside it. So read-only rests on the named
+queries, which are ``SELECT`` statements only, and on the connection never being handed
+to anything else. A test asserts the lake tree is byte-identical after both panels run.
 
 Three terms recur, glossed at first use.
 
-- A *surface* is one kind of measurement with its own pinned schema. The two panels read
-  the two minute-cadence surfaces, ``chains`` and ``quotes``.
-- A *slot* is one minute of the session, the ``snap_ts`` a capture cycle fires for. The
-  Today strip has one cell per slot from the session open through the option close, so
-  it is denominated by the calendar's session length. An early close renders as a short
-  full day, never as a half-missing one.
-- A *sealed partition* is the one Parquet file compaction writes for a ticker-day. Before
-  compaction the day lives in journal segments, Arrow IPC files with one record batch per
-  cycle. A query reads both, unioned by column name, so the panel is the same before and
-  after the seal.
+1. A *surface* is one kind of measurement with its own pinned schema. The two panels
+   read the two minute-cadence surfaces, ``chains`` and ``quotes``.
+2. A *slot* is one minute of the session, the ``snap_ts`` a capture cycle fires for. The
+   Today strip has one cell per slot from the session open through the option close, so
+   it is denominated by the calendar's session length. An early close renders as a short
+   full day, never as a half-missing one.
+3. A *sealed partition* is the one Parquet file compaction writes for a ticker-day.
+   Before compaction the day lives in journal segments, Arrow IPC files with one record
+   batch per cycle. A query reads both, unioned by column name, so the panel is the same
+   before and after the seal.
 
 The journal segments are read through ``lake.journal.read_segment``, the one reader that
 knows the durability rules: a torn tail reads to the last complete batch, and bytes after
@@ -67,9 +71,11 @@ import argparse
 import json
 import logging
 import re
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+import sys
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
+from fnmatch import fnmatchcase
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
@@ -83,7 +89,22 @@ from lake import journal
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
 from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants, load_config
-from lake.paths import CHAINS, QUOTES, LakePaths
+from lake.paths import (
+    CHAINS,
+    DATE_PREFIX,
+    QUOTES,
+    SEGMENT_GLOB,
+    SURFACE_PREFIX,
+    TICKER_PREFIX,
+    LakePaths,
+)
+from lake.security_master import (
+    ID_TYPE_TICKER,
+    SecurityMaster,
+    SecurityMasterError,
+    is_in_scope,
+    master_path,
+)
 from lake.session import SessionBounds, SessionClock, SessionPhase
 
 log = logging.getLogger(__name__)
@@ -103,13 +124,36 @@ PANEL_SURFACES = (CHAINS, QUOTES)
 # The capture cadence. One slot per minute, matching the design's minutely loop.
 SLOT = timedelta(minutes=1)
 
-# The five slot statuses the Today strip reports.
+# The connection's resource caps. The service shares a laptop with the minutely capture
+# daemon, and the capture loop's minute budget owns the machine. The dashboard is the
+# guest, so it takes a small fixed share rather than the machine default, which is every
+# core and most of RAM. Both must be set before ``lock_configuration``, because a locked
+# configuration refuses every later ``SET``.
+QUERY_THREADS = 2
+QUERY_MEMORY_LIMIT = "2GB"
+
+# The most sessions the Now walk looks back for a data cycle, per ticker and surface.
+# The walk stops at the first day with one, so a healthy ticker costs one day's read. A
+# ticker with no data cycle in ten sessions is catastrophically dead, and the exact age
+# stops mattering long before that. Without the cap a gap-only ticker walks the entire
+# retained history on every request, and the page refreshes every minute.
+MAX_LOOKBACK_SESSIONS = 10
+
+# The six slot statuses the Today strip reports.
 STATUS_CAPTURED = "captured"  # a data cycle landed
 STATUS_SUSPECT = "suspect"  # a data cycle landed, flagged for the battery to judge
 STATUS_GAP = "gap"  # a gap row records the missed minute and its reason
 STATUS_MISSING = "missing"  # a past slot with no row at all, not even a gap marker
 STATUS_PENDING = "pending"  # a slot still in the future as of the injected clock
-STATUSES = (STATUS_CAPTURED, STATUS_SUSPECT, STATUS_GAP, STATUS_MISSING, STATUS_PENDING)
+STATUS_OUT_OF_SCOPE = "out_of_scope"  # a slot before the ticker's capture_start epoch
+STATUSES = (
+    STATUS_CAPTURED,
+    STATUS_SUSPECT,
+    STATUS_GAP,
+    STATUS_MISSING,
+    STATUS_PENDING,
+    STATUS_OUT_OF_SCOPE,
+)
 
 # The static page, shipped inside the package so it works offline.
 STATUS_PAGE = "status.html"
@@ -122,10 +166,21 @@ _TICKER_PATTERN = re.compile(r"[A-Z][A-Z0-9.]{0,11}")
 # checked first and the parser only decides whether the digits make a real date.
 _DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 
-# The directory-name prefixes the lake layout uses.
-_DATE_PREFIX = "date="
-_TICKER_PREFIX = "ticker="
-_SEGMENT_SUFFIX = ".arrows"
+# A date the calendar cannot judge. ``exchange_calendars`` covers a rolling window, a
+# little over twenty years wide, and refuses a date outside it with a ``ValueError``
+# subclass. A year pandas cannot hold in nanoseconds raises ``OverflowError`` instead.
+# Both are caught by their standard-library base classes, so no calendar implementation
+# is imported here and the calendar stays a seam.
+_CALENDAR_RANGE_ERRORS = (ValueError, OverflowError)
+
+# What a failed security-master read raises. The master is a Parquet file, so a missing
+# or truncated one surfaces as an ``OSError`` or as ``pyarrow``'s ``ArrowInvalid``, which
+# is a ``ValueError``. A file whose columns drifted raises ``KeyError``, and the master's
+# own refusals raise ``SecurityMasterError``. This set names the failures the read is
+# expected to meet, so each can be logged for what it is. It is not the only guard:
+# ``_capture_starts`` catches everything, because a file with the pinned column names and
+# drifted value types raises from a comparison much later, not from the read.
+_MASTER_READ_ERRORS = (OSError, KeyError, ValueError, SecurityMasterError)
 
 
 class QueryParameterError(ValueError):
@@ -142,16 +197,28 @@ class QueryParameterError(ValueError):
 def open_lake_connection(lake_root: Path | str) -> duckdb.DuckDBPyConnection:
     """Open the DuckDB sandbox over one lake root and return it.
 
-    The connection is in-memory. Three settings make it a sandbox, applied in the one
-    order DuckDB accepts.
+    The connection is in-memory. Six ``SET`` statements make it a capped sandbox.
 
-    1. ``allowed_directories`` is set to exactly ``[lake_root]``. DuckDB refuses to
-       change this list once external access is off, so it goes first. DuckDB also adds
-       its own spill directory to the list by default, so ``temp_directory`` is cleared
-       beforehand to keep the list at the one entry the design names.
-    2. ``enable_external_access`` is turned off. File reads, extension loads, and
+    1. ``temp_directory`` is cleared. DuckDB adds its own spill directory to the
+       allow-list by default, so leaving it set puts a second entry on the list beside
+       the lake root. Clearing it is load-bearing, not tidiness.
+    2. ``allowed_directories`` is set to exactly ``[lake_root]``.
+    3. ``enable_external_access`` is turned off. File reads, extension loads, and
        attaches are refused everywhere except under the allowed directory.
-    3. ``lock_configuration`` is turned on. No later ``SET`` can undo either setting.
+    4. ``threads`` is capped at ``QUERY_THREADS``.
+    5. ``memory_limit`` is capped at ``QUERY_MEMORY_LIMIT``.
+    6. ``lock_configuration`` is turned on. No later ``SET`` can undo any of the five
+       settings above.
+
+    DuckDB constrains the order in three places, not one. Several orders satisfy all
+    three, and the one written below is only the clearest of them.
+
+    1. ``temp_directory`` must be cleared before external access goes off. Once it is
+       off, DuckDB refuses to modify the temp directory at all.
+    2. ``allowed_directories`` must be set before external access goes off, for the same
+       reason: DuckDB refuses to change the list once it is off.
+    3. ``lock_configuration`` must come last, because a locked configuration refuses
+       every later ``SET``. That is why the two caps come before it and not after.
 
     The root is resolved first so the Python-side listing and DuckDB's own path check
     agree. DuckDB canonicalizes every path it opens, so a symlink inside the lake that
@@ -163,6 +230,8 @@ def open_lake_connection(lake_root: Path | str) -> duckdb.DuckDBPyConnection:
     con.execute("SET temp_directory = ''")
     con.execute("SET allowed_directories = [?]", [str(root)])
     con.execute("SET enable_external_access = false")
+    con.execute("SET threads = ?", [QUERY_THREADS])
+    con.execute("SET memory_limit = ?", [QUERY_MEMORY_LIMIT])
     con.execute("SET lock_configuration = true")
     return con
 
@@ -170,14 +239,26 @@ def open_lake_connection(lake_root: Path | str) -> duckdb.DuckDBPyConnection:
 # -- the roster and the parameter validators ---------------------------------
 
 
+def _children(directory: Path) -> list[Path]:
+    """Every entry in one directory, or nothing when the listing fails.
+
+    Compaction prunes an emptied ticker, surface, and date directory while holding the
+    lake lock, so a directory the panel just saw can be gone by the time it is listed.
+    A vanished directory reads as empty. So does a path that turned out not to be a
+    directory. Neither is a server error.
+    """
+    try:
+        return list(directory.iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+
+
 def _tickers_in(directory: Path) -> set[str]:
     """The ticker names under one ``ticker=...`` parent, filtered to the ticker shape."""
-    if not directory.is_dir():
-        return set()
     found: set[str] = set()
-    for child in directory.iterdir():
-        if child.is_dir() and child.name.startswith(_TICKER_PREFIX):
-            name = child.name[len(_TICKER_PREFIX) :]
+    for child in _children(directory):
+        if child.is_dir() and child.name.startswith(TICKER_PREFIX):
+            name = child.name[len(TICKER_PREFIX) :]
             if _TICKER_PATTERN.fullmatch(name):
                 found.add(name)
     return found
@@ -185,12 +266,10 @@ def _tickers_in(directory: Path) -> set[str]:
 
 def _date_dirs(journal_dir: Path) -> list[Path]:
     """Every ``date=...`` directory under the journal root, oldest first."""
-    if not journal_dir.is_dir():
-        return []
     return sorted(
         child
-        for child in journal_dir.iterdir()
-        if child.is_dir() and child.name.startswith(_DATE_PREFIX)
+        for child in _children(journal_dir)
+        if child.is_dir() and child.name.startswith(DATE_PREFIX)
     )
 
 
@@ -203,12 +282,16 @@ def lake_roster(paths: LakePaths) -> dict[str, tuple[str, ...]]:
     partition tree and under each journal date. The result is sorted by ticker, and a
     ticker maps to the sorted surfaces it appears under. This is the allow-list a request
     ticker is validated against.
+
+    The journal's date directories are listed once, not once per surface, because the
+    listing is the same for every surface and this walk runs on every request.
     """
+    date_dirs = _date_dirs(paths.journal_dir)
     surfaces: dict[str, set[str]] = {}
     for surface in PANEL_SURFACES:
         present = _tickers_in(paths.root / surface)
-        for date_dir in _date_dirs(paths.journal_dir):
-            present |= _tickers_in(date_dir / f"surface={surface}")
+        for date_dir in date_dirs:
+            present |= _tickers_in(date_dir / f"{SURFACE_PREFIX}{surface}")
         for ticker in present:
             surfaces.setdefault(ticker, set()).add(surface)
     return {ticker: tuple(sorted(surfaces[ticker])) for ticker in sorted(surfaces)}
@@ -217,11 +300,11 @@ def lake_roster(paths: LakePaths) -> dict[str, tuple[str, ...]]:
 def parse_date(text: str) -> date:
     """A strict ``YYYY-MM-DD`` as a ``date``. Anything else raises ``QueryParameterError``."""
     if not _DATE_PATTERN.fullmatch(text):
-        raise QueryParameterError("malformed date; expected YYYY-MM-DD")
+        raise QueryParameterError("malformed date, expected YYYY-MM-DD")
     try:
         return date.fromisoformat(text)
     except ValueError:
-        raise QueryParameterError("malformed date; expected YYYY-MM-DD") from None
+        raise QueryParameterError("malformed date, expected YYYY-MM-DD") from None
 
 
 def validate_ticker(text: str, roster: Mapping[str, object]) -> str:
@@ -234,15 +317,34 @@ def validate_ticker(text: str, roster: Mapping[str, object]) -> str:
 # -- reading one ticker-day's rows -------------------------------------------
 
 # The provenance columns the panels read, with their pinned types. Every surface schema
-# carries them. A drifted segment missing one gets a null column so the union still binds.
+# carries them.
 _PROVENANCE_TYPES: dict[str, pa.DataType] = {
     "snap_ts": pa.string(),
     "row_kind": pa.string(),
     "error_class": pa.string(),
     "suspect": pa.bool_(),
 }
-_PROVENANCE_COLUMNS = tuple(_PROVENANCE_TYPES)
 _PROVENANCE_SCHEMA = pa.schema(list(_PROVENANCE_TYPES.items()))
+
+# The provenance columns a segment must carry to be read at all. ``snap_ts`` names the
+# slot and ``row_kind`` says what the row records, so a segment missing either cannot be
+# placed on the strip. Nulling them would bind the union and then read as a gap, turning
+# schema drift into invented gaps. The design pins the opposite: a missing or retyped
+# known field pages, and a gap is data, never inferred from absence. So a segment missing
+# one is counted as drifted and skipped. The other two columns are optional, because
+# ``error_class`` is null on data rows anyway and ``suspect`` defaults to false, so
+# nulling a missing one invents nothing.
+_REQUIRED_PROVENANCE = ("snap_ts", "row_kind")
+
+# What a failed cast of a provenance column raises. A retyped column that cannot be cast
+# back to its pinned type is drift, not a fatal panel.
+_CAST_ERRORS = (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError)
+
+# What a mid-request read of a sealed partition raises when the file is gone or will not
+# read. DuckDB reports a path that no longer resolves to a file as an ``IOException``,
+# and bytes that are not a readable Parquet as an ``InvalidInputException``. The pair is
+# enumerated rather than a bare ``duckdb.Error`` so a real SQL defect still surfaces.
+_PARTITION_READ_ERRORS = (duckdb.IOException, duckdb.InvalidInputException)
 
 # The name the day's journal rows are registered under for the duration of one query.
 _JOURNAL_VIEW = "journal_rows"
@@ -250,22 +352,35 @@ _JOURNAL_VIEW = "journal_rows"
 # The per-slot aggregate. ``snap_ts`` is an ISO string with an offset on every row the
 # writers produce, so casting it to a zoned timestamp and taking epoch milliseconds gives
 # one key per instant, whatever offset a row was written in. ``TRY_CAST`` turns an
-# unparseable stamp into a null slot, dropped by the filter, rather than a failed panel.
+# unparseable stamp into a null slot rather than a failed panel. The null key is kept,
+# not filtered away: it groups every row whose stamp will not cast, and the caller counts
+# that group instead of discarding it, so a garbled stamp is reported rather than silently
+# rendering the minute missing. ``NULLS LAST`` pins where that group lands whatever the
+# connection's null ordering is.
 # ``row_kind`` values are bound, not spelled, so the journal module stays their one home.
+# ``other_rows`` counts the rows that match neither bound kind, including a null one, so
+# drift is counted rather than mistaken for a gap. ``mode`` reports the slot's most
+# common reason, not the alphabetically smallest, and the distinct count beside it says
+# how many reasons the slot carried. Several reasons in one minute is normal, because a
+# partial chain carries one class per failed date window.
 _SLOT_SELECT = """
 SELECT slot_ms,
        count(*) FILTER (WHERE row_kind = $data_kind) AS data_rows,
        count(*) FILTER (WHERE row_kind = $gap_kind) AS gap_rows,
+       count(*) FILTER (
+           WHERE row_kind IS DISTINCT FROM $data_kind
+             AND row_kind IS DISTINCT FROM $gap_kind
+       ) AS other_rows,
        bool_or(coalesce(suspect, false)) AS suspect,
-       min(error_class) AS error_class
+       mode(error_class) AS error_class,
+       count(DISTINCT error_class) AS error_class_count
 FROM (
     SELECT epoch_ms(TRY_CAST(snap_ts AS TIMESTAMPTZ)) AS slot_ms,
            row_kind, error_class, suspect
     FROM ({source})
 )
-WHERE slot_ms IS NOT NULL
 GROUP BY slot_ms
-ORDER BY slot_ms
+ORDER BY slot_ms NULLS LAST
 """
 
 # The two sources: the day's journal rows alone, or those rows unioned by name with the
@@ -281,79 +396,249 @@ _SLOT_SQL_JOURNAL_AND_PARTITION = _SLOT_SELECT.format(source=_SOURCE_JOURNAL_AND
 
 
 @dataclass(frozen=True)
-class SlotAggregate:
-    """What one slot's rows add up to, for one ticker and surface on one day."""
+class SegmentHealth:
+    """How one ticker-day's stored rows read, counted by what went wrong.
 
-    slot_ms: int
+    One integer cannot carry these. A file compaction sealed away mid-read is not
+    corruption. A schema that drifted is not corruption either. And a shadow-append,
+    bytes written past a segment's end-of-stream marker, is the loud failure the design
+    pins, so it must not vanish into a generic count. Each counter is reported on its own
+    and every one reaches the payload.
+
+    Four counters count segments, one counts the day's sealed partition, and two count
+    rows. The two row counters never count the same row twice: a row with an uncastable
+    stamp is counted there and nowhere else, because it has no slot to be judged in.
+    """
+
+    corrupt: int = 0  # unreadable bytes: a torn header, or not an Arrow stream at all
+    vanished: int = 0  # the file was listed and then gone, the seal landing mid-read
+    shadow_append: int = 0  # bytes follow the end-of-stream marker
+    drifted: int = 0  # a required provenance column is missing or cannot be cast back
+    unreadable_partitions: int = 0  # the sealed file went away or would not read mid-read
+    drifted_rows: int = 0  # rows whose ``row_kind`` is neither ``data`` nor ``gap``
+    unparseable_stamp_rows: int = 0  # rows whose ``snap_ts`` will not cast to an instant
+
+    def __add__(self, other: SegmentHealth) -> SegmentHealth:
+        """Merge two counts, so a multi-day walk reports one total."""
+        return SegmentHealth(
+            corrupt=self.corrupt + other.corrupt,
+            vanished=self.vanished + other.vanished,
+            shadow_append=self.shadow_append + other.shadow_append,
+            drifted=self.drifted + other.drifted,
+            unreadable_partitions=self.unreadable_partitions + other.unreadable_partitions,
+            drifted_rows=self.drifted_rows + other.drifted_rows,
+            unparseable_stamp_rows=self.unparseable_stamp_rows + other.unparseable_stamp_rows,
+        )
+
+    def with_row_counts(self, *, drifted_rows: int, unparseable_stamp_rows: int) -> SegmentHealth:
+        """The same counts with both row totals set. Both totals come from SQL."""
+        return replace(
+            self,
+            drifted_rows=drifted_rows,
+            unparseable_stamp_rows=unparseable_stamp_rows,
+        )
+
+    def payload(self) -> dict[str, int]:
+        """The counters as the panels carry them, spliced flat into a row or a strip.
+
+        ``unreadable_segments`` is the corrupt count. It keeps both the name and the
+        top-level position the payload already used for exactly that meaning. That
+        matters beyond taste. ``status.html`` reads ``row.unreadable_segments`` and
+        ``strip.unreadable_segments`` directly. Nesting these counters under a parent
+        key would leave those reads undefined, and an undefined count is never greater
+        than zero, so the page would drop the warning silently. The six other counters
+        join as siblings instead.
+        """
+        return {
+            "unreadable_segments": self.corrupt,
+            "vanished_segments": self.vanished,
+            "shadow_append_segments": self.shadow_append,
+            "drifted_segments": self.drifted,
+            "unreadable_partitions": self.unreadable_partitions,
+            "drifted_rows": self.drifted_rows,
+            "unparseable_stamp_rows": self.unparseable_stamp_rows,
+        }
+
+
+@dataclass(frozen=True)
+class SlotAggregate:
+    """What one group of rows adds up to, for one ticker and surface on one day.
+
+    ``slot_ms`` is null for the one group whose rows carry a ``snap_ts`` that will not
+    cast to an instant. Those rows name no minute, so they can be counted but never
+    placed on the strip. Every other group is one slot.
+    """
+
+    slot_ms: int | None
     data_rows: int
     gap_rows: int
+    other_rows: int
     suspect: bool
     error_class: str | None
+    error_class_count: int
+
+    @property
+    def row_count(self) -> int:
+        """Every row in the group. The three kind counters partition it."""
+        return self.data_rows + self.gap_rows + self.other_rows
+
+    @property
+    def has_bound_rows(self) -> bool:
+        """Whether the slot carries a row of a kind the panels recognize.
+
+        A slot holding only unrecognized kinds is drift. It is dropped before the strip
+        is built, so it renders missing rather than an invented gap.
+        """
+        return self.data_rows > 0 or self.gap_rows > 0
 
     @property
     def status(self) -> str:
-        """The slot's status from its own rows. A slot with rows is never missing."""
+        """The slot's status from its own rows, decided by an explicit ladder.
+
+        Data rows win first. A gap needs a gap row, never merely the absence of data.
+        Those two are the whole ladder, because a slot with neither has no status to
+        report: it holds only drifted rows, and the design pins that a gap is data and
+        is never inferred from absence.
+
+        So this asks for a slot with bound rows and says so by raising otherwise.
+        ``_slot_aggregates`` is the only source of these, and it drops every aggregate
+        without bound rows before returning, so the raise cannot fire today. It is
+        written as a raise rather than a third status precisely because it is
+        unreachable: a returned status there would be a plausible-looking answer that
+        no test can catch, while a raise cannot be mistaken for one.
+        """
         if self.data_rows > 0:
             return STATUS_SUSPECT if self.suspect else STATUS_CAPTURED
-        return STATUS_GAP
+        if self.gap_rows > 0:
+            return STATUS_GAP
+        raise ValueError("status is defined only for a slot with data or gap rows")
 
 
-def _provenance_columns(table: pa.Table) -> pa.Table:
-    """The provenance columns of one segment, in fixed order, missing ones nulled."""
-    view = table.select([name for name in _PROVENANCE_COLUMNS if name in table.column_names])
+def _provenance_columns(table: pa.Table) -> pa.Table | None:
+    """One segment's provenance columns in the pinned schema, or ``None`` on drift.
+
+    Every returned table carries exactly ``_PROVENANCE_SCHEMA``, so the concatenation
+    that follows cannot fail on a type mismatch. A retyped column is cast back to its
+    pinned type. A missing optional column is nulled. A missing required column, or a
+    retyped one that will not cast, returns ``None`` and the caller counts the segment
+    as drifted.
+    """
+    if any(name not in table.column_names for name in _REQUIRED_PROVENANCE):
+        return None
+    columns: list[pa.ChunkedArray | pa.Array] = []
     for name, kind in _PROVENANCE_TYPES.items():
-        if name not in view.column_names:
-            view = view.append_column(name, pa.nulls(table.num_rows, kind))
-    return view.select(list(_PROVENANCE_COLUMNS))
+        if name not in table.column_names:
+            columns.append(pa.nulls(table.num_rows, kind))
+            continue
+        column = table.column(name)
+        if column.type != kind:
+            try:
+                column = column.cast(kind)
+            except _CAST_ERRORS:
+                return None
+        columns.append(column)
+    return pa.Table.from_arrays(columns, schema=_PROVENANCE_SCHEMA)
 
 
-def _load_journal_rows(segments: Sequence[Path]) -> tuple[pa.Table, int]:
-    """The provenance rows of every readable segment, and how many were unreadable.
+def _load_journal_rows(segments: Sequence[Path]) -> tuple[pa.Table, SegmentHealth]:
+    """The provenance rows of every readable segment, plus how the segments read.
 
-    A segment that cannot be read, a torn header, a shadow-append, a vanished file, is
-    counted and skipped, so one bad file never blanks the panel. The count is reported so
-    the skip is visible, never silent.
+    A segment that cannot be read is counted and skipped, so one bad file never blanks
+    the panel. Four failures are counted apart, because they mean different things and
+    call for different responses.
+
+    1. The file vanished under a landing seal.
+    2. Its bytes are unreadable, from a torn header or a file that is no Arrow stream.
+    3. It carries a shadow-append, bytes written past the end-of-stream marker.
+    4. Its schema drifted past what a cast can repair.
+
+    The counts are reported so every skip is visible, never silent.
     """
     tables: list[pa.Table] = []
-    unreadable = 0
+    health = SegmentHealth()
     for path in segments:
         try:
             table = journal.read_segment(path)
-        except (OSError, pa.ArrowInvalid, journal.ShadowAppendError):
-            unreadable += 1
+        except FileNotFoundError:
+            health += SegmentHealth(vanished=1)
             continue
-        tables.append(_provenance_columns(table))
+        except journal.ShadowAppendError:
+            health += SegmentHealth(shadow_append=1)
+            continue
+        except (OSError, pa.ArrowInvalid):
+            health += SegmentHealth(corrupt=1)
+            continue
+        view = _provenance_columns(table)
+        if view is None:
+            health += SegmentHealth(drifted=1)
+            continue
+        tables.append(view)
     if not tables:
-        return _PROVENANCE_SCHEMA.empty_table(), unreadable
-    return pa.concat_tables(tables, promote_options="permissive"), unreadable
+        return _PROVENANCE_SCHEMA.empty_table(), health
+    try:
+        return pa.concat_tables(tables), health
+    except _CAST_ERRORS:
+        # Unreachable while every table above carries the pinned schema. The fallback
+        # keeps a future surprise to one skipped segment instead of a dead panel.
+        merged = _PROVENANCE_SCHEMA.empty_table()
+        for table in tables:
+            try:
+                merged = pa.concat_tables([merged, table])
+            except _CAST_ERRORS:
+                health += SegmentHealth(drifted=1)
+        return merged, health
 
 
 def _journal_segments(paths: LakePaths, surface: str, ticker: str, day: date) -> list[Path]:
+    """One ticker-day's journal segments, exactly the set compaction seals.
+
+    The name filter is ``SEGMENT_GLOB``, the same pattern compaction and the measure
+    queries use. Matching every ``.arrows`` file instead would let a stray file that
+    compaction never sweeps show on the panel forever.
+    """
     directory = paths.segment_dir(surface, ticker, day)
-    if not directory.is_dir():
-        return []
     return sorted(
         path
-        for path in directory.iterdir()
-        if path.is_file() and path.name.endswith(_SEGMENT_SUFFIX)
+        for path in _children(directory)
+        if path.is_file() and fnmatchcase(path.name, SEGMENT_GLOB)
     )
 
 
 def _slot_aggregates(
     con: duckdb.DuckDBPyConnection, paths: LakePaths, surface: str, ticker: str, day: date
-) -> tuple[list[SlotAggregate], int]:
-    """Every slot with rows for one ticker, surface, and day, plus the unreadable count.
+) -> tuple[list[SlotAggregate], SegmentHealth]:
+    """Every slot with recognized rows for one ticker, surface, and day, plus its health.
 
     The journal rows are registered as an Arrow view for the duration of the query. The
     sealed partition, when present, is read natively by DuckDB and unioned by name. The
     partition path is built from validated parts and bound as a parameter.
+
+    Compaction seals a ticker-day under the lake lock while this reads without one, so
+    the read is lock-free and the partition can change under it in both directions. Each
+    direction is handled, because each renders a captured day wrong on its own.
+
+    1. The partition appeared. It is checked again after the segments are read, so a seal
+       that landed in between does not render a fully captured day as entirely missing.
+       Counting a row twice for the few seconds both copies exist is the price, and it
+       changes no slot's status.
+    2. The partition went away, or its bytes stopped being readable Parquet, between the
+       check and the read. That is a restore, a repair, or a torn write, and DuckDB
+       raises out of the read. The rows fall back to the journal alone and the loss is
+       counted in ``unreadable_partitions``, so the request degrades instead of dying.
+
+    A slot whose rows are all of an unrecognized kind is dropped here rather than
+    reported, so drift renders missing instead of an invented gap. The rows whose
+    ``snap_ts`` will not cast are dropped too, because they name no minute. Both are
+    counted in the returned health, so neither disappears quietly.
     """
     segments = _journal_segments(paths, surface, ticker, day)
     partition = paths.partition_path(surface, ticker, day)
     has_partition = partition.is_file()
     if not segments and not has_partition:
-        return [], 0
-    rows, unreadable = _load_journal_rows(segments)
+        return [], SegmentHealth()
+    rows, health = _load_journal_rows(segments)
+    if not has_partition:
+        has_partition = partition.is_file()
     params: dict[str, object] = {
         "data_kind": journal.ROW_KIND_DATA,
         "gap_kind": journal.ROW_KIND_GAP,
@@ -362,43 +647,151 @@ def _slot_aggregates(
     try:
         if has_partition:
             params["partitions"] = [str(partition)]
-            result = con.execute(_SLOT_SQL_JOURNAL_AND_PARTITION, params).fetchall()
+            try:
+                result = con.execute(_SLOT_SQL_JOURNAL_AND_PARTITION, params).fetchall()
+            except _PARTITION_READ_ERRORS:
+                health += SegmentHealth(unreadable_partitions=1)
+                del params["partitions"]
+                result = con.execute(_SLOT_SQL_JOURNAL, params).fetchall()
         else:
             result = con.execute(_SLOT_SQL_JOURNAL, params).fetchall()
     finally:
         con.unregister(_JOURNAL_VIEW)
-    return [SlotAggregate(*row) for row in result], unreadable
+    placed, unparseable_rows = _placed_aggregates(result)
+    health = health.with_row_counts(
+        drifted_rows=sum(agg.other_rows for agg in placed),
+        unparseable_stamp_rows=unparseable_rows,
+    )
+    return [agg for agg in placed if agg.has_bound_rows], health
+
+
+def _placed_aggregates(result: Sequence[tuple]) -> tuple[list[SlotAggregate], int]:
+    """The groups that landed on a minute, plus how many rows carried no usable stamp.
+
+    The aggregate SQL groups by the cast stamp and keeps the null key, so exactly one
+    returned group can be the unplaceable one. Splitting it out here rather than in SQL
+    is what turns a garbled stamp from a silently missing minute into a reported count.
+    """
+    placed: list[SlotAggregate] = []
+    unparseable_rows = 0
+    for row in result:
+        aggregate = SlotAggregate(*row)
+        if aggregate.slot_ms is None:
+            unparseable_rows += aggregate.row_count
+            continue
+        placed.append(aggregate)
+    return placed, unparseable_rows
 
 
 def _dates_desc(paths: LakePaths, surface: str, ticker: str) -> list[date]:
     """Every day the lake holds rows for one ticker and surface, newest first."""
     days: set[date] = set()
     for date_dir in _date_dirs(paths.journal_dir):
-        if (date_dir / f"surface={surface}" / f"{_TICKER_PREFIX}{ticker}").is_dir():
+        if (date_dir / f"{SURFACE_PREFIX}{surface}" / f"{TICKER_PREFIX}{ticker}").is_dir():
             parsed = _parse_dir_date(date_dir.name)
             if parsed is not None:
                 days.add(parsed)
-    partition_dir = paths.root / surface / f"{_TICKER_PREFIX}{ticker}"
-    if partition_dir.is_dir():
-        for child in partition_dir.iterdir():
-            if child.is_file() and child.suffix == ".parquet":
-                parsed = _parse_dir_date(child.stem)
-                if parsed is not None:
-                    days.add(parsed)
+    partition_dir = paths.root / surface / f"{TICKER_PREFIX}{ticker}"
+    for child in _children(partition_dir):
+        if child.is_file() and child.suffix == ".parquet":
+            parsed = _parse_dir_date(child.stem)
+            if parsed is not None:
+                days.add(parsed)
     return sorted(days, reverse=True)
 
 
 def _parse_dir_date(name: str) -> date | None:
     """The date in a ``date=YYYY-MM-DD`` directory or file stem, or ``None``."""
-    if not name.startswith(_DATE_PREFIX):
+    if not name.startswith(DATE_PREFIX):
         return None
-    text = name[len(_DATE_PREFIX) :]
+    text = name[len(DATE_PREFIX) :]
     if not _DATE_PATTERN.fullmatch(text):
         return None
     try:
         return date.fromisoformat(text)
     except ValueError:
         return None
+
+
+# -- the capture_start clamp -------------------------------------------------
+
+
+def _capture_starts(paths: LakePaths, tickers: Iterable[str], on: date) -> dict[str, datetime]:
+    """Each ticker's ``capture_start`` epoch, read once from the security master.
+
+    ``capture_start`` is the instant the pipeline first recorded an instrument. The
+    design clamps every session-slot denominator, coverage check, and gap accounting to
+    it: sessions and minutes before it are out of scope, never gaps. Onboarding day
+    renders "onboarded 11:00," not 40 percent missing.
+
+    The master is read once per query, not once per ticker. It is optional here. An
+    absent file, an unreadable one, an ambiguous symbol, or a ticker that does not
+    resolve leaves that ticker out of the mapping, and a ticker outside the mapping gets
+    no clamp at all. A missing reference table must never break a panel, so nothing here
+    raises out of the query.
+    """
+    try:
+        return _read_capture_starts(paths, tickers, on)
+    except Exception:
+        # The guard is broad here, and only here. The master is an optional reference
+        # file read off disk, so its contents are data that may be malformed in ways no
+        # enumerated error set anticipates: a file with the pinned column names and
+        # drifted value types raises a ``TypeError`` or an ``AttributeError`` from a
+        # comparison several frames deep, not a read error. The promise above is
+        # absolute, and the cost of keeping it is one panel served without a clamp
+        # rather than a panel not served at all. Do not narrow this back to a list of
+        # error types. The traceback is logged, so a real defect is still discoverable.
+        log.exception("security master unusable, so no capture_start clamp is applied")
+        return {}
+
+
+def _read_capture_starts(paths: LakePaths, tickers: Iterable[str], on: date) -> dict[str, datetime]:
+    """Resolve each ticker against the master on disk. The caller owns the failure path.
+
+    Every value taken from the file is validated before it is kept. A ``capture_start``
+    clamps by comparison against aware instants, so anything but a timezone-aware
+    datetime is dropped for that ticker. A dropped ticker gets no clamp, which is the
+    same answer an absent master gives, rather than a wrong one.
+    """
+    try:
+        master = SecurityMaster.read(master_path(paths.root))
+    except FileNotFoundError:
+        # The master is optional and a fresh lake has none. That is not a problem to log.
+        return {}
+    except _MASTER_READ_ERRORS:
+        log.warning("security master unreadable, so no capture_start clamp is applied")
+        return {}
+    starts: dict[str, datetime] = {}
+    unusable = 0
+    for ticker in tickers:
+        try:
+            instrument_id = master.resolve(ticker, on=on, id_type=ID_TYPE_TICKER)
+            if instrument_id is None:
+                continue
+            start = _aware_capture_start(master.capture_start_of(instrument_id))
+        except SecurityMasterError:
+            continue
+        if start is None:
+            unusable += 1
+            continue
+        starts[ticker] = start
+    if unusable:
+        # The count alone, never the ticker. A ticker can arrive as a request parameter,
+        # and nothing a client sent is written to a log line.
+        log.warning("security master: %d instrument(s) carry an unusable capture_start", unusable)
+    return starts
+
+
+def _aware_capture_start(value: object) -> datetime | None:
+    """A ``capture_start`` fit to clamp with, or ``None``.
+
+    Fit means a timezone-aware datetime. A naive one cannot be compared against the
+    aware instants the panels carry, and a value of any other type cannot be compared
+    at all. Either is drift in the reference file, so it yields no clamp.
+    """
+    if isinstance(value, datetime) and value.utcoffset() is not None:
+        return value
+    return None
 
 
 # -- time helpers ------------------------------------------------------------
@@ -426,7 +819,10 @@ def session_slots(bounds: SessionBounds) -> list[datetime]:
     """Every capture slot of a session: the open through the option close, one a minute.
 
     This is the strip's denominator, derived from the calendar's bounds for the day. A
-    regular day yields about 405 slots and an early close fewer, with no literal here.
+    regular 09:30 to 16:15 day yields exactly 406 slots, both ends inclusive, and an
+    early close 226, with no literal here. The per-ticker ``capture_start`` clamp is
+    applied on the strip, not here, because one denominator serves every ticker and each
+    ticker was onboarded on its own day.
     """
     slots: list[datetime] = []
     slot = bounds.open
@@ -445,11 +841,16 @@ class QueryContext:
 
     ``now`` is the injected clock's instant, stamped by the service per request.
     ``session`` is the session clock over that same clock and the injected calendar.
+    ``roster`` is the lake's roster, walked once per request and shared with validation,
+    because the walk lists the whole journal tree. ``guards`` are the machine's guard
+    constants, so the page colours a row stale at the threshold the watchdog pages at.
     """
 
     paths: LakePaths
     now: datetime
     session: SessionClock
+    roster: Mapping[str, tuple[str, ...]]
+    guards: GuardConstants = field(default_factory=GuardConstants)
 
 
 def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, object]:
@@ -459,50 +860,76 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
     first and stops at the first day with a data cycle. So a ticker whose latest day is
     gap-only still reports its true last success, and the latest slot's own status and
     reason ride beside it. Minutes-since is ``now`` minus that slot, computed here from
-    the injected instant.
+    the injected instant. The walk is bounded at ``MAX_LOOKBACK_SESSIONS`` days, and a
+    row that hit the bound says so rather than implying the ticker never captured.
 
-    Two fields are null until their writers exist. The refresh-token age comes from the
-    mint stamp the daemon will journal into segment metadata each cycle. Nothing writes
-    that stamp yet, and the dashboard never reads the token file, so the age is null.
-    The last dead-man ping is the watchdog deliverable's, also unbuilt, so it is null.
+    Each row also carries the ticker's ``capture_start`` epoch and whether ``now`` is at
+    or after it. A ticker onboarded later today has no in-scope slot yet, so it is not a
+    stale capture.
+
+    Five fields are null until their writers exist.
+
+    1. ``token_minted_at``, the refresh token's mint stamp. It comes from the stamp the
+       daemon will journal into segment metadata each cycle. Nothing writes that stamp
+       yet, and the dashboard never reads the token file.
+    2. ``token_age_minutes``, computed from that same stamp.
+    3. ``token_sunday_countdown_minutes``, the countdown to the Sunday re-mint ritual. It
+       needs both the mint stamp and the ritual's own moment, which the unbuilt token
+       deliverable owns. This module names no session time, so the countdown cannot be
+       reconstructed here.
+    4. ``dead_man_last_ping``, the watchdog deliverable's last dead-man ping.
+    5. ``pages_failed_to_send``, the count of alert pages that failed to send. The
+       alerting deliverable owns that counter.
     """
-    roster = lake_roster(ctx.paths)
+    starts = _capture_starts(ctx.paths, ctx.roster, ctx.session.session_date())
     surfaces: list[dict[str, object]] = []
-    for ticker, present in roster.items():
+    for ticker, present in ctx.roster.items():
         for surface in present:
-            surfaces.append(_latest_cycle(con, ctx, surface, ticker))
+            surfaces.append(_latest_cycle(con, ctx, surface, ticker, starts.get(ticker)))
     phase = ctx.session.phase()
     return {
         "as_of": _iso(ctx.now),
         "session_date": ctx.session.session_date().isoformat(),
         "is_session": phase is not SessionPhase.NON_SESSION,
         "phase": phase.value,
-        "stale_after_minutes": GuardConstants().watchdog_page_minutes,
-        "tickers": list(roster),
+        "stale_after_minutes": ctx.guards.watchdog_page_minutes,
+        "tickers": list(ctx.roster),
         "surfaces": surfaces,
         "token_minted_at": None,
         "token_age_minutes": None,
+        "token_sunday_countdown_minutes": None,
         "dead_man_last_ping": None,
+        "pages_failed_to_send": None,
     }
 
 
 def _latest_cycle(
-    con: duckdb.DuckDBPyConnection, ctx: QueryContext, surface: str, ticker: str
+    con: duckdb.DuckDBPyConnection,
+    ctx: QueryContext,
+    surface: str,
+    ticker: str,
+    capture_start: datetime | None,
 ) -> dict[str, object]:
     """One Now row: the latest slot of any kind and the latest data slot, with its age."""
     last_data_ms: int | None = None
     last_ms: int | None = None
     last_status: str | None = None
     last_error: str | None = None
-    unreadable = 0
-    for day in _dates_desc(ctx.paths, surface, ticker):
-        aggregates, skipped = _slot_aggregates(con, ctx.paths, surface, ticker, day)
-        unreadable += skipped
+    last_error_count = 0
+    health = SegmentHealth()
+    days = _dates_desc(ctx.paths, surface, ticker)
+    walked = days[:MAX_LOOKBACK_SESSIONS]
+    for day in walked:
+        aggregates, day_health = _slot_aggregates(con, ctx.paths, surface, ticker, day)
+        health += day_health
         if not aggregates:
             continue
         if last_ms is None:
             latest = aggregates[-1]
-            last_ms, last_status, last_error = latest.slot_ms, latest.status, latest.error_class
+            last_ms = latest.slot_ms
+            last_status = latest.status
+            last_error = latest.error_class
+            last_error_count = latest.error_class_count
         with_data = [agg for agg in aggregates if agg.data_rows > 0]
         if with_data:
             last_data_ms = with_data[-1].slot_ms
@@ -518,7 +945,11 @@ def _latest_cycle(
         "last_snap_ts": None if last_ms is None else _iso_et(last_ms),
         "last_status": last_status,
         "last_error_class": last_error,
-        "unreadable_segments": unreadable,
+        "last_error_class_count": last_error_count,
+        "capture_start": None if capture_start is None else _iso(capture_start),
+        "in_scope": capture_start is None or is_in_scope(ctx.now, capture_start),
+        "lookback_exhausted": last_data_ms is None and len(days) > len(walked),
+        **health.payload(),
     }
 
 
@@ -533,16 +964,21 @@ def query_today(
 
     ``day`` defaults to the clock's session date. ``ticker`` defaults to every ticker in
     the roster. A day the calendar calls closed returns ``is_session`` false and no
-    strips, so a holiday renders as *no session*, never as zero percent.
+    strips, so a holiday renders as *no session*, never as zero percent. A date the
+    calendar cannot judge at all, outside the window it loads, is a bad request.
 
     The slot list comes from the calendar through ``SessionClock.bounds``, the open
     through the option close. Each slot reports its status, its data row count, and the
-    gap reason when one is present. A slot with data rows but a gap marker beside them,
-    a partial chain snapshot, reads captured and still carries the marker's class. A slot
-    in the future as of the injected clock is pending, never missing.
+    gap reason when one is present. A slot with data rows beside a gap marker, a partial
+    chain snapshot, reads captured, or suspect when a row carries the suspect flag, and
+    still carries the marker's class. A slot with no rows at all is pending when it falls
+    after the injected clock, never missing. A slot before the ticker's ``capture_start``
+    epoch is out of scope, neither missing nor pending. Data rows win over both of those,
+    so a real cycle is never hidden. A gap row wins over pending but not over out of
+    scope, because the design pins minutes before the epoch as out of scope and never
+    gaps.
     """
     session_day = day if day is not None else ctx.session.session_date()
-    roster = lake_roster(ctx.paths)
     payload: dict[str, object] = {
         "as_of": _iso(ctx.now),
         "date": session_day.isoformat(),
@@ -558,13 +994,18 @@ def query_today(
         bounds = ctx.session.bounds(session_day)
     except NotASession:
         return payload
+    except _CALENDAR_RANGE_ERRORS:
+        raise QueryParameterError("date outside the calendar's range") from None
     slots = session_slots(bounds)
-    tickers = [ticker] if ticker is not None else list(roster)
+    tickers = [ticker] if ticker is not None else list(ctx.roster)
+    starts = _capture_starts(ctx.paths, tickers, session_day)
     strips: list[dict[str, object]] = []
     for symbol in tickers:
-        for surface in roster.get(symbol, ()):
-            aggregates, unreadable = _slot_aggregates(con, ctx.paths, surface, symbol, session_day)
-            strips.append(_strip(symbol, surface, slots, aggregates, unreadable, ctx.now))
+        for surface in ctx.roster.get(symbol, ()):
+            aggregates, health = _slot_aggregates(con, ctx.paths, surface, symbol, session_day)
+            strips.append(
+                _strip(symbol, surface, slots, aggregates, health, ctx.now, starts.get(symbol))
+            )
     payload.update(
         is_session=True,
         early_close=bounds.early_close,
@@ -582,10 +1023,22 @@ def _strip(
     surface: str,
     slots: Sequence[datetime],
     aggregates: Sequence[SlotAggregate],
-    unreadable: int,
+    health: SegmentHealth,
     now: datetime,
+    capture_start: datetime | None,
 ) -> dict[str, object]:
-    """One strip: every session slot with its status, denominated by the slot list."""
+    """One strip: every session slot with its status, denominated by the slot list.
+
+    Each cell's status comes off a five-step ladder.
+
+    1. A slot with data rows is captured, or suspect when a row carries the flag.
+    2. A slot before ``capture_start`` is out of scope. Data still wins above it, so a
+       real cycle is never hidden, but a gap marker there is out of scope, because the
+       design pins minutes before the epoch as out of scope and never gaps.
+    3. A slot with gap rows is a gap.
+    4. A slot after the injected instant is pending.
+    5. Anything else is missing.
+    """
     by_slot = {agg.slot_ms: agg for agg in aggregates}
     now_ms = _slot_ms(now)
     cells: list[dict[str, object]] = []
@@ -593,20 +1046,33 @@ def _strip(
     for slot in slots:
         key = _slot_ms(slot)
         agg = by_slot.get(key)
-        if agg is None:
-            status = STATUS_PENDING if key > now_ms else STATUS_MISSING
-            rows, error_class = 0, None
+        rows = 0 if agg is None else agg.data_rows
+        error_class = None if agg is None else agg.error_class
+        error_count = 0 if agg is None else agg.error_class_count
+        if agg is not None and agg.data_rows > 0:
+            status = agg.status
+        elif capture_start is not None and not is_in_scope(slot, capture_start):
+            status, rows, error_class, error_count = STATUS_OUT_OF_SCOPE, 0, None, 0
+        elif agg is not None:
+            status = agg.status
         else:
-            status, rows, error_class = agg.status, agg.data_rows, agg.error_class
+            status = STATUS_PENDING if key > now_ms else STATUS_MISSING
         counts[status] += 1
         cells.append(
-            {"slot": slot.isoformat(), "status": status, "rows": rows, "error_class": error_class}
+            {
+                "slot": slot.isoformat(),
+                "status": status,
+                "rows": rows,
+                "error_class": error_class,
+                "error_class_count": error_count,
+            }
         )
     return {
         "ticker": ticker,
         "surface": surface,
+        "capture_start": None if capture_start is None else _iso(capture_start),
         "counts": counts,
-        "unreadable_segments": unreadable,
+        **health.payload(),
         "slots": cells,
     }
 
@@ -669,7 +1135,9 @@ class DashboardService:
     The connection is opened once at construction and is the only one the service ever
     holds. Each request runs on a cursor over it, so requests never share statement
     state, and every cursor inherits the locked sandbox. The clock and calendar are
-    injected, so a test decides what time it is and which days are sessions.
+    injected, so a test decides what time it is and which days are sessions. The guard
+    constants are injected too, so the panel reports the machine's own staleness
+    threshold rather than the pinned default it may have been recalibrated away from.
     """
 
     def __init__(
@@ -678,12 +1146,14 @@ class DashboardService:
         *,
         clock: Clock,
         calendar: Calendar,
+        guards: GuardConstants | None = None,
         connection: duckdb.DuckDBPyConnection | None = None,
         page: bytes | None = None,
     ) -> None:
         self._paths = LakePaths(Path(lake_root).resolve())
         self._clock = clock
         self._calendar = calendar
+        self._guards = guards if guards is not None else GuardConstants()
         self._con = connection if connection is not None else open_lake_connection(self._paths.root)
         self._page = page if page is not None else load_status_page()
 
@@ -698,15 +1168,24 @@ class DashboardService:
     def run_query(self, name: str, raw: Mapping[str, str]) -> dict[str, object]:
         """Run one named query with raw request fields. Validation comes first.
 
-        Raises ``KeyError`` for a name outside the registry and
-        ``QueryParameterError`` for a bad field, both before the connection is touched.
+        The roster is walked once and then carried on the context, because validation
+        and the query itself both need it and the walk lists every journal date.
+
+        Raises ``KeyError`` for a name outside the registry and ``QueryParameterError``
+        for a bad field. Both fire before the connection is touched, with one exception:
+        ``query_today`` raises ``QueryParameterError`` for a date the calendar cannot
+        judge, which happens after the cursor below has opened. No statement runs on that
+        path, so the date still never reaches SQL and no lake data is read.
         """
         query = NAMED_QUERIES[name]
-        params = validate_parameters(query, raw, self.roster())
+        roster = self.roster()
+        params = validate_parameters(query, raw, roster)
         ctx = QueryContext(
             paths=self._paths,
             now=self._clock.now(),
             session=SessionClock(self._clock, self._calendar),
+            roster=roster,
+            guards=self._guards,
         )
         cursor = self._con.cursor()
         try:
@@ -757,7 +1236,13 @@ class _Handler(BaseHTTPRequestHandler):
     def __getattr__(self, name: str) -> object:
         # The base class dispatches on ``do_<METHOD>`` and answers 501 for a method it
         # cannot find. Routing every method name here means the Host check runs before
-        # anything else, whatever the verb, and a non-GET verb gets its 405.
+        # anything else this class does, whatever the verb, and a non-GET verb gets its
+        # 405. The stdlib still answers a few malformed requests before dispatch ever
+        # happens: 414 for an over-long request line, 431 for too many or too long
+        # headers, 400 for a bad version. Those replies quote only the client's own
+        # escaped request line and touch no lake data, so the claim is that the Host
+        # check precedes every lake read, not that it is literally the first byte
+        # written. Do not restate it as the latter.
         if name.startswith("do_"):
             return self._serve
         raise AttributeError(name)
@@ -802,13 +1287,20 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         # The page is self-contained by rule. The policy lets the browser enforce it: no
         # script, style, image, or fetch may leave the page except to this same origin.
+        # ``frame-ancestors``, ``base-uri`` and ``form-action`` are listed because none
+        # of the three falls back to ``default-src``, so omitting them leaves the page
+        # framable by any origin. ``script-src`` deliberately lists ``'unsafe-inline'``
+        # alone and not ``'self'``: that blocks every external script URL, same-origin
+        # ones included, which is tighter than adding ``'self'`` would be. Do not "fix"
+        # it by adding ``'self'``.
         self.send_header(
             "Content-Security-Policy",
             "default-src 'none'; connect-src 'self'; script-src 'unsafe-inline'; "
-            "style-src 'unsafe-inline'",
+            "style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; "
+            "form-action 'none'",
         )
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
 
     def _send_json(self, status: HTTPStatus, payload: object, *, allow: str | None = None) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -820,7 +1312,18 @@ class _Handler(BaseHTTPRequestHandler):
         if allow is not None:
             self.send_header("Allow", allow)
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
+
+    def _write_body(self, body: bytes) -> None:
+        """Write the body, except on ``HEAD``.
+
+        RFC 9110 forbids content on a HEAD response. The headers still describe the
+        response the request earned, ``Content-Length`` included, so a client learns the
+        length without being sent the bytes. That response is the 405, not the matching
+        GET's, because ``_serve`` refuses every verb but ``GET`` before it routes.
+        """
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002 - stdlib name
         log.info("%s " + format, self.address_string(), *args)
@@ -840,7 +1343,17 @@ def make_server(service: DashboardService, port: int) -> ThreadingHTTPServer:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """The command-line contract. The port is the one knob; the bind is fixed."""
+    """The command-line contract: which lake to serve, and on which port.
+
+    Three arguments.
+
+    1. ``--lake-root`` names a lake to serve directly.
+    2. ``--config`` names the machine-local config to read the lake root from instead.
+    3. ``--port`` says where to listen.
+
+    The bind address is not among them. It is a constant, so the service cannot be
+    exposed by a flag.
+    """
     parser = argparse.ArgumentParser(
         prog="python -m lake.dashboard",
         description="Serve the read-only status dashboard on localhost.",
@@ -854,7 +1367,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         help="Path to config.yaml (defaults to the standard location). Read once at "
-        "startup, for lake_root alone.",
+        "startup, for the lake root and the guard constants.",
     )
     parser.add_argument(
         "--lake-root",
@@ -868,17 +1381,34 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     The lake root comes from ``--lake-root`` or, failing that, from the machine-local
     config. The config is read once here, before the connection opens, and only its
-    ``lake_root`` is kept. The service holds no secret, and the connection it opens can
-    reach nothing outside the lake tree. The real clock and the real calendar are wired
-    here and nowhere else in this module.
+    ``lake_root`` and its guard constants are kept. Serving a lake root directly means
+    no config is read, so the guards are the design's pinned defaults. The service holds
+    no secret, and the connection it opens can reach nothing outside the lake tree. The
+    real clock and the real calendar are wired here and nowhere else in this module.
+
+    A port already in use returns 2 with a one-line message. The design puts this
+    service under launchd ``KeepAlive``, where an uncaught traceback becomes a restart
+    loop instead of a readable complaint.
     """
     args = build_parser().parse_args(argv)
     if args.lake_root is not None:
         lake_root = Path(args.lake_root)
+        guards = GuardConstants()
     else:
-        lake_root = load_config(args.config).lake_root
-    service = DashboardService(lake_root, clock=SystemClock(), calendar=ExchangeCalendar())
-    server = make_server(service, args.port)
+        config = load_config(args.config)
+        lake_root = config.lake_root
+        guards = config.guards
+    service = DashboardService(
+        lake_root, clock=SystemClock(), calendar=ExchangeCalendar(), guards=guards
+    )
+    try:
+        server = make_server(service, args.port)
+    except OSError as exc:
+        print(
+            f"marketlake dashboard: cannot bind port {args.port} ({exc.strerror})",
+            file=sys.stderr,
+        )
+        return 2
     print(f"marketlake dashboard: http://{BIND_HOST}:{server.server_address[1]}/")
     try:
         server.serve_forever()
@@ -893,14 +1423,18 @@ __all__ = [
     "ALLOWED_HOSTS",
     "BIND_HOST",
     "DEFAULT_PORT",
+    "MAX_LOOKBACK_SESSIONS",
     "NAMED_QUERIES",
     "PANEL_SURFACES",
+    "QUERY_MEMORY_LIMIT",
+    "QUERY_THREADS",
     "ROUTES",
     "STATUSES",
     "DashboardService",
     "NamedQuery",
     "QueryContext",
     "QueryParameterError",
+    "SegmentHealth",
     "SlotAggregate",
     "build_parser",
     "host_allowed",

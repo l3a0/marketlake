@@ -97,6 +97,31 @@ def test_non_segment_paths_map_to_none(rel: str):
     assert _compacted_partition_for_segment(rel) is None
 
 
+def test_a_ticker_carrying_a_dot_maps_like_any_other():
+    # The parser slices each part at its key prefix and passes the value through. A
+    # ticker with a dot in it, the shape a class-B share takes, is not a special case.
+    seg = "journal/date=2026-08-24/surface=quotes/ticker=BRK.B/seg-20260824T160000-7.arrows"
+    assert _compacted_partition_for_segment(seg) == "quotes/ticker=BRK.B/date=2026-08-24.parquet"
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        # A segment path carries three keys under the journal directory. Each key is
+        # checked, and so is the directory name, so each check gets a case: no date key,
+        # no surface key, no ticker key, and a path that is not under the journal at all.
+        "journal/2026-08-24/surface=chains/ticker=SPY/seg-1.arrows",
+        "journal/date=2026-08-24/chains/ticker=SPY/seg-1.arrows",
+        "journal/date=2026-08-24/surface=chains/SPY/seg-1.arrows",
+        "reports/date=2026-08-24/surface=chains/ticker=SPY/seg-1.arrows",
+        # The part count is exact, so a deeper path is refused as well as a shallower one.
+        "journal/date=2026-08-24/surface=chains/ticker=SPY/extra/seg-1.arrows",
+    ],
+)
+def test_a_path_that_fails_one_of_the_parser_checks_maps_to_none(rel: str):
+    assert _compacted_partition_for_segment(rel) is None
+
+
 def test_supersession_decision_is_read_from_the_latest_dict():
     seg = "journal/date=2026-08-24/surface=chains/ticker=SPY/seg-20260824T160000-4242.arrows"
     compacted = _compacted_partition_for_segment(seg)
