@@ -360,15 +360,14 @@ def test_the_install_text_pins_every_command_line_in_order(tmp_path, capsys):
     ]
 
 
-def test_the_install_text_says_the_dashboard_bootstrap_waits_for_d15(tmp_path, capsys):
-    # The dashboard plist is rendered because the build plan pins four jobs, but
-    # lake.dashboard is D15. Bootstrapping it early crash-loops under KeepAlive.
+def test_the_install_text_no_longer_defers_the_dashboard(tmp_path, capsys):
+    # D15 shipped `lake.dashboard`, so the warning to skip its bootstrap is spent. A
+    # stale caution is worse than none: it tells an operator to leave a panel unloaded.
     out = tmp_path / "out"
     cp.main(["render", "--out", str(out), *RENDER_ARGS])
     printed = capsys.readouterr().out
-    assert "lake.dashboard" in printed
-    assert "D15" in printed
-    assert "Skip its line" in printed
+    assert "D15" not in printed
+    assert "com.marketlake.dashboard.plist" in printed
 
 
 def test_the_install_text_names_the_reload_and_leaves_it_commented(tmp_path, capsys):
@@ -622,3 +621,19 @@ def test_pmset_cli_skips_a_sunday_wake_that_already_fired(capsys):
         "pmset repeat wakeorpoweron MTWRF 08:25:00",
         'pmset schedule wakeorpoweron "09/06/26 19:55:00"',
     ]
+
+
+def test_the_install_text_counts_the_jobs_it_actually_installs(tmp_path, capsys):
+    # The count sat at four for a release after the probe became the fifth. An operator
+    # reads this line to know when the step is done.
+    out = tmp_path / "out"
+    cp.main(["render", "--out", str(out), *RENDER_ARGS])
+    printed = capsys.readouterr().out
+    installs = [line for line in printed.splitlines() if line.startswith("sudo install -o root")]
+    plists = [line for line in installs if line.endswith("/Library/LaunchDaemons/")]
+    assert len(plists) == len(list(out.glob("*.plist")))
+    assert f"Install the {_spelled(len(plists))} LaunchDaemons" in printed
+
+
+def _spelled(count: int) -> str:
+    return {4: "four", 5: "five", 6: "six"}[count]
