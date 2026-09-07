@@ -139,6 +139,8 @@ def test_the_segment_glob_carries_the_prefix_as_well_as_the_suffix():
 def test_every_segment_path_matches_the_segment_glob(paths: LakePaths):
     written = paths.segment_path("chains", "SPY", DAY, "20260824T160000", 4242)
     assert fnmatchcase(written.name, SEGMENT_GLOB)
+
+
 # -- the machine's config directory -----------------------------------------------
 
 # Four files sit in ~/.config/marketlake/ and four modules name them. Each spelled the
