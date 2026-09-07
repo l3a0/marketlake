@@ -90,6 +90,11 @@ SESSION_MISSES = [
     "ts = base.replace(second=0, microsecond=0)\n",
     # Reading the clock is the clock scanner's job, not this one.
     "import time\nx = time.time()\n",
+    # An integer pair is not a time-of-day literal, so the scanner does not see it.
+    # The control plane's seven wall-clock constants take that form on purpose, and this
+    # records the miss as accepted rather than leaving it to a comment in the module.
+    "x = WallClockTime(19, 55)\n",
+    "from datetime import datetime\nx = datetime(2026, 8, 24, 16, 15)\n",
 ]
 
 

@@ -26,29 +26,43 @@ Terms, glossed at first use.
 - *tmutil addexclusion* keeps an item out of Time Machine backups. The whole config
   directory gets it, so neither the brokerage token nor the secrets in ``config.yaml``
   ride onto a backup disk. ``tmutil isexcluded`` reads that back.
-- A *healthchecks slug* names one dead-man check. A ping fires only on the job's
+- A *healthchecks slug* names one dead-man check. A *dead-man check* pages when a
+  ping does not arrive, so silence is the alarm. A ping fires only on the job's
   success condition, never on mere liveness.
+- The *vendor sweep* is the 18:30 weekday job that pulls the day's settled vendor data.
+  Slice 3 builds it. Its Friday run is what sets the Sunday one-shot wake.
+- The *canary* is the Sunday throwaway authenticated call that proves the brokerage
+  token still works. It retries every 30 minutes until it passes or its deadline.
+- The *scrub* is the weekly integrity pass over the lake. It checks every recorded file
+  against its recorded checksum, and checks that no data file went unrecorded.
+- The *mint* is the moment the brokerage refresh token was issued. The *coverage
+  assertion* adds the token's lifetime to the mint and requires the sum to clear the
+  week's last option close.
 
-Six operational wall-clock times live here as named integer constants, in order. They
+Seven operational wall-clock times live here as named integer constants, in order. They
 are not session times. The session times come from the calendar. These are the moments
 the design pins to the machine's clock, so launchd and pmset can fire them.
 
 1. The 08:25 weekday firmware wake.
 2. The 08:30 weekday pre-open self-check.
-3. The weekday assertion end near 18:45, when the vendor sweep's ping lands.
-4. The 19:55 Sunday one-shot wake.
-5. The 20:00 Sunday canary and maintenance job.
-6. The 23:00 Sunday canary deadline, which is also the canary's last retry.
+3. The 18:30 weekday vendor sweep, whose Friday run sets the Sunday one-shot.
+4. The weekday assertion end near 18:45, when the vendor sweep's ping lands.
+5. The 19:55 Sunday one-shot wake.
+6. The 20:00 Sunday canary and maintenance job.
+7. The 23:00 Sunday canary deadline, which is also the canary's last retry.
 
 The re-auth reminder's hours derive from the last two rather than adding constants of
 their own. Every one of these is a pair of integers, never a ``"HH:MM"`` string, so
-the session-time enforcement scanner stays green.
+the session-time enforcement scanner stays green. That scanner is the test that fails
+the build on a hardcoded session time anywhere under ``src/lake`` outside the calendar
+module.
 
 One design caveat governs the Sunday read-back. A fired ``pmset`` one-shot leaves the
 schedule. By Sunday 20:00 the 19:55 wake has fired, so a fired one-shot and a never-set
 one look the same. Friday's sweep is the read-back that proves the one-shot landed.
-The alarm check here therefore expects the one-shot only while its wake is still
-ahead, and always expects the weekday repeat alarm.
+The alarm check here therefore expects the one-shot only between the Friday sweep
+that sets it and its own firing. Before that Friday nothing has set it, so a Monday
+catch-up run reports nothing missing. The weekday repeat alarm is always expected.
 
 Every seam is injected: the clock, the calendar, the daemon probe, the schedule reader,
 the pinger, the canary, and the caffeinate runner. The whole module runs offline in a
@@ -60,6 +74,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import shlex
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
@@ -104,9 +119,9 @@ class WallClockTime:
         """The ``hms`` form as a plain sudoers argument, where a colon needs a backslash."""
         return self.hms.replace(":", "\\:")
 
-    def launchd_intervals(self, weekdays: Sequence[int]) -> list[dict[str, int]]:
-        """One ``StartCalendarInterval`` entry per launchd weekday number."""
-        return [{**calendar_interval(self.hour, self.minute), "Weekday": wd} for wd in weekdays]
+    def launchd_interval(self, weekday: int) -> dict[str, int]:
+        """One ``StartCalendarInterval`` entry on one launchd weekday number."""
+        return {**calendar_interval(self.hour, self.minute), "Weekday": weekday}
 
 
 # The operational wall-clock times, per the design's deployment section. These are
@@ -114,6 +129,7 @@ class WallClockTime:
 # wall clock, so the design pins them there.
 WEEKDAY_WAKE = WallClockTime(8, 25)  # pmset repeat wakeorpoweron MTWRF
 PRE_OPEN_SELF_CHECK = WallClockTime(8, 30)  # the self-check launchd job, Mon-Fri
+VENDOR_SWEEP = WallClockTime(18, 30)  # the sweep job, which sets the Sunday one-shot
 WEEKDAY_ASSERTION_END = WallClockTime(18, 45)  # when the vendor sweep's ping lands
 SUNDAY_WAKE = WallClockTime(19, 55)  # the Friday-set one-shot wake
 SUNDAY_MAINTENANCE = WallClockTime(20, 0)  # the canary + scrub launchd job
@@ -154,17 +170,19 @@ PRE_OPEN_SLUG = "pre-open"
 SUNDAY_SLUG = "sunday"
 
 # The system PATH a LaunchDaemon gets. launchd gives a job a minimal environment, so
-# the plist restores the OS tool directories and prepends the caller's own, such as
-# uv's install directory. These are OS locations, not machine-specific paths.
+# the plist restores the OS tool directories the jobs shell out to: pmset, launchctl,
+# tmutil, caffeinate, and rsync. These are OS locations, not machine-specific paths.
 _SYSTEM_PATH = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
 
 # Directories the dry-run renderer refuses to write into. Installing is the operator's
-# step, by hand, with the printed commands.
+# step, by hand, with the printed commands. Both /etc spellings are listed. On macOS
+# /etc is a symlink that resolve() folds into /private/etc, and on a host where /etc is
+# a real directory the /etc entry is the one that catches it.
 _PROTECTED_ROOTS = (Path("/Library"), Path("/System"), Path("/etc"), Path("/private/etc"))
 
-# The rendered setup files beside the four plists.
+# The one rendered setup file beside the four plists. The Time Machine exclusion is a
+# printed install step rather than a rendered script, so there is one copy of it.
 SUDOERS_FILE = "marketlake.sudoers"
-TMUTIL_FILE = "tmutil-exclusion.sh"
 
 
 # -- the host description and the plists -------------------------------------
@@ -176,8 +194,7 @@ class LaunchdHost:
 
     ``python`` is the interpreter path, ``owner`` the account the jobs run as, ``home``
     that account's home directory, ``project_dir`` the working directory, and
-    ``log_dir`` where stdout and stderr land. ``path_dirs`` are prepended to ``PATH``,
-    which is how the jobs find ``uv``. ``group`` defaults to ``staff``, macOS's
+    ``log_dir`` where stdout and stderr land. ``group`` defaults to ``staff``, macOS's
     primary group for every local account. It is a group name, not an account.
     """
 
@@ -188,13 +205,12 @@ class LaunchdHost:
     log_dir: str
     group: str = "staff"
     config_path: str | None = None
-    path_dirs: tuple[str, ...] = ()
 
     def environment(self) -> dict[str, str]:
         """The ``EnvironmentVariables`` block every job shares."""
         env = {
             "HOME": self.home,
-            "PATH": ":".join((*self.path_dirs, *_SYSTEM_PATH)),
+            "PATH": ":".join(_SYSTEM_PATH),
             "PYTHONUNBUFFERED": "1",
         }
         if self.config_path is not None:
@@ -264,7 +280,7 @@ def self_check_job(host: LaunchdHost) -> LaunchdJob:
         SELF_CHECK_LABEL,
         "lake.control_plane",
         "self-check",
-        calendar=PRE_OPEN_SELF_CHECK.launchd_intervals(LAUNCHD_WEEKDAYS),
+        calendar=[PRE_OPEN_SELF_CHECK.launchd_interval(wd) for wd in LAUNCHD_WEEKDAYS],
         run_at_load=True,
     )
 
@@ -294,7 +310,7 @@ def sunday_job(host: LaunchdHost) -> LaunchdJob:
         "sunday",
         "--token",
         default_token_path(host.home),
-        calendar=SUNDAY_MAINTENANCE.launchd_intervals([LAUNCHD_SUNDAY])[0],
+        calendar=SUNDAY_MAINTENANCE.launchd_interval(LAUNCHD_SUNDAY),
     )
 
 
@@ -447,13 +463,29 @@ def next_sunday_wake(now: datetime, calendar: Calendar) -> date:
 
 
 def sunday_wake_command(now: datetime, calendar: Calendar) -> str:
-    """The one-shot command for the next Sunday wake, given ``now``."""
-    return pmset_schedule_command(next_sunday_wake(now, calendar))
+    """The one-shot command for the next Sunday wake still ahead of ``now``.
+
+    ``next_sunday_wake`` answers with today on a Sunday, which is what the read-back
+    wants. A command is different. On a Sunday at or after 19:55 that wake has already
+    fired, and scheduling a moment in the past sets nothing, so the answer advances to
+    the following Sunday.
+
+    The ``pmset`` subcommand is the only caller. It prints this line for the operator to
+    run by hand every Friday. Nothing in this deliverable sets the one-shot, and the
+    slice-3 sweep that will set it does not exist yet. Install step 6 names the gap, and
+    the design's DST-weekend live check needs the same line.
+    """
+    sunday = next_sunday_wake(now, calendar)
+    if SUNDAY_WAKE.on(sunday) <= now:
+        sunday = next_sunday_wake(now + timedelta(days=1), calendar)
+    return pmset_schedule_command(sunday)
 
 
-# pmset spells the event type ``wakeorpoweron`` on the command line and prints it back
-# as ``wakepoweron``. The read-back parser accepts both. Live check 4 confirms the
-# printed form.
+# pmset takes the event type as ``wakeorpoweron`` on the command line, and both that
+# spelling and ``wakepoweron`` appear in the binary's own strings. Which section prints
+# which is not settled here, so the parser accepts either in either section and the
+# tests cover both. Live check 4, the by-hand read-back, is what confirms the printed
+# form on the real machine.
 WAKE_KINDS = frozenset({"wakeorpoweron", "wakepoweron"})
 
 _REPEAT_LINE = re.compile(r"^(?P<kind>\w+)\s+at\s+(?P<time>\S+)\s+(?P<days>.+?)\s*$")
@@ -528,6 +560,13 @@ def _parse_clock(text: str) -> tuple[int, int]:
     hour = int(match.group("h"))
     minute = int(match.group("m"))
     ampm = match.group("ampm")
+    # The regex shapes the digits but not their range, and the caller's contract is that
+    # an unreadable line raises PmsetParseError rather than a bare ValueError from
+    # ``datetime``. Check the printed hour, before the 12-hour fold, or ``24:00AM``
+    # folds to a valid zero and passes.
+    high = 12 if ampm is not None else 23
+    if not (0 <= hour <= high and 0 <= minute < 60):
+        raise PmsetParseError(f"time out of range: {text!r}")
     if ampm is not None:
         hour %= 12
         if ampm.upper() == "PM":
@@ -542,7 +581,10 @@ def _parse_date(text: str) -> date:
     year = int(match.group("y"))
     if year < 100:
         year += 2000
-    return date(year, int(match.group("mo")), int(match.group("d")))
+    try:
+        return date(year, int(match.group("mo")), int(match.group("d")))
+    except ValueError as exc:  # a regex-shaped but impossible calendar date
+        raise PmsetParseError(f"date out of range: {text!r}") from exc
 
 
 def _parse_days(text: str) -> frozenset[int] | None:
@@ -578,10 +620,11 @@ def parse_pmset_schedule(text: str) -> PmsetSchedule:
 
     The output has two labeled sections, ``Repeating power events:`` and
     ``Scheduled power events:``. A repeat line reads like ``wakepoweron at 8:25AM
-    weekdays only``. A one-shot line reads like ``[0]  wakepoweron at 09/06/26
-    19:55:00 by 'pmset'``. Empty output, or a ``No scheduled events`` line, parses
-    as an empty schedule. Times in 12-hour or 24-hour form and two- or four-digit
-    years are all accepted, because the exact print form is confirmed by live check 4.
+    weekdays only``. A one-shot line reads like ``[0]  wakeorpoweron at 09/06/2026
+    19:55:00 by 'pmset'``. Either wake spelling parses in either section. Empty output,
+    or a ``No scheduled events`` line, parses as an empty schedule. Times in 12-hour or
+    24-hour form and two- or four-digit years are all accepted, because the exact print
+    form is not settled until live check 4 runs on the real machine.
 
     Two shapes come from pmset printing other owners' events beside this project's. A
     one-shot line may carry a leeway and a user-visible tail after its owner, and a
@@ -638,12 +681,21 @@ class AlarmCheck:
 def expected_one_shot(now: datetime, calendar: Calendar) -> date | None:
     """The Sunday whose one-shot wake should be pending at ``now``, or ``None``.
 
-    A fired one-shot leaves the schedule, so the wake is expected only while it is
-    still ahead. From Friday's sweep the coming Sunday is ahead and expected. From the
-    Sunday job at 20:00 the wake fired five minutes earlier, so nothing is expected.
+    The wake is expected only between the two moments that bound its life. The Friday
+    18:30 sweep sets it, and its own firing takes it back out of the schedule.
+
+    Before that Friday nothing has set it, so an absent alarm is not drift. A Monday
+    catch-up run, after launchd coalesced a wake missed over the weekend, would
+    otherwise report the coming Sunday's wake as missing five days early. From the
+    Sunday job at 20:00 the wake fired five minutes earlier, so nothing is expected
+    then either.
     """
     sunday = next_sunday_wake(now, calendar)
-    return sunday if SUNDAY_WAKE.on(sunday) > now else None
+    if SUNDAY_WAKE.on(sunday) <= now:
+        return None
+    # The Friday before a Sunday is always that Sunday minus two days, and the sweep
+    # runs every weekday, holidays included, so no calendar lookup is needed.
+    return sunday if VENDOR_SWEEP.on(sunday - timedelta(days=2)) <= now else None
 
 
 def _format_days(weekdays: frozenset[int] | None) -> str:
@@ -1229,7 +1281,11 @@ def sudoers_dropin(owner: str) -> str:
     sleep-disabling write is deliberately absent: it is rejected by design and stays
     password-gated.
     """
-    if _ACCOUNT.match(owner) is None:
+    # ``ALL`` fits the account pattern and visudo accepts it, but sudoers reads it as the
+    # reserved word matching every account, so the drop-in would hand the two writes to
+    # every local user instead of the owner. The word is case-sensitive, so a real
+    # account named ``all`` still passes.
+    if _ACCOUNT.match(owner) is None or owner == "ALL":
         raise ValueError(f"not a valid account name for sudoers: {owner!r}")
     return (
         "# Marketlake: the two pmset writes the control plane needs, and nothing else.\n"
@@ -1326,7 +1382,7 @@ def tmutil_exclusion_targets(config_dir: str, token_path: str) -> tuple[str, ...
 def tmutil_exclusion_commands(config_dir: str, token_path: str) -> tuple[str, ...]:
     """The Time Machine exclusion lines. They run as the user, no root."""
     return tuple(
-        f'tmutil addexclusion "{target}"'
+        f"tmutil addexclusion {shlex.quote(target)}"
         for target in tmutil_exclusion_targets(config_dir, token_path)
     )
 
@@ -1371,22 +1427,16 @@ def render_all(host: LaunchdHost) -> tuple[RenderedFile, ...]:
     """Every plist and setup file, as text, in install order."""
     files = [RenderedFile(f"{job.label}.plist", job.render()) for job in all_jobs(host)]
     files.append(RenderedFile(SUDOERS_FILE, sudoers_dropin(host.owner)))
-    lines = tmutil_exclusion_commands(default_config_dir(host.home), default_token_path(host.home))
-    files.append(
-        RenderedFile(
-            TMUTIL_FILE,
-            "#!/bin/sh\n"
-            "# Keep the brokerage token and the config secrets out of Time Machine.\n"
-            "# Run as the owner. The sticky exclusion needs no root.\n"
-            + "".join(f"{line}\n" for line in lines),
-        )
-    )
     return tuple(files)
 
 
 def _is_protected(target: Path) -> bool:
-    resolved = target.resolve()
-    return any(resolved == root or root in resolved.parents for root in _PROTECTED_ROOTS)
+    # Fold case before comparing. The default APFS volume is case-insensitive, so
+    # /LIBRARY/LaunchDaemons names the same directory as /Library/LaunchDaemons, and
+    # ``Path.resolve`` does not fold it.
+    resolved = Path(str(target.resolve()).lower())
+    roots = tuple(Path(str(root).lower()) for root in _PROTECTED_ROOTS)
+    return any(resolved == root or root in resolved.parents for root in roots)
 
 
 def write_rendered(files: Sequence[RenderedFile], out_dir: Path) -> list[Path]:
@@ -1408,20 +1458,26 @@ def write_rendered(files: Sequence[RenderedFile], out_dir: Path) -> list[Path]:
 
 
 def install_commands(out_dir: Path, host: LaunchdHost) -> str:
-    """The operator's manual install steps, as text. Nothing here runs from code."""
+    """The operator's manual install steps, as text. Nothing here runs from code.
+
+    Every operator-supplied path is quoted, because these lines are pasted into a shell
+    and a home or an output directory may hold a space.
+    """
     out = Path(out_dir)
+    sudoers = shlex.quote(str(out / SUDOERS_FILE))
     lines = [
         "# Marketlake control plane: the manual install. Run each line by hand.",
         "# 1. Install the four LaunchDaemons, root-owned as launchd requires.",
     ]
     for job in all_jobs(host):
         lines.append(
-            f"sudo install -o root -g wheel -m 644 {out / job.label}.plist /Library/LaunchDaemons/"
+            "sudo install -o root -g wheel -m 644 "
+            f"{shlex.quote(f'{out / job.label}.plist')} /Library/LaunchDaemons/"
         )
     lines += [
         "# 2. Install the sudoers drop-in after visudo validates it.",
-        f"sudo visudo -cf {out / SUDOERS_FILE} && "
-        f"sudo install -o root -g wheel -m 440 {out / SUDOERS_FILE} /etc/sudoers.d/marketlake",
+        f"sudo visudo -cf {sudoers} && "
+        f"sudo install -o root -g wheel -m 440 {sudoers} /etc/sudoers.d/marketlake",
         "# visudo checks the syntax only. This prints the two rules as sudo parsed them,",
         "# which is what shows the one-shot's regular expression survived as one.",
         "sudo -l | grep pmset",
@@ -1434,9 +1490,15 @@ def install_commands(out_dir: Path, host: LaunchdHost) -> str:
         *tmutil_exclusion_commands(default_config_dir(host.home), default_token_path(host.home)),
         "tmutil isexcluded "
         + " ".join(
-            tmutil_exclusion_targets(default_config_dir(host.home), default_token_path(host.home))
+            shlex.quote(target)
+            for target in tmutil_exclusion_targets(
+                default_config_dir(host.home), default_token_path(host.home)
+            )
         ),
         "# 5. Load the jobs into the system domain, then confirm the daemon is running.",
+        "# The dashboard runs `python -m lake.dashboard`, which D15 ships. Skip its line",
+        "# until that module lands. launchd respawns a failing KeepAlive job every ten",
+        "# seconds, so bootstrapping it early fills the err log instead of serving panels.",
     ]
     for job in all_jobs(host):
         lines.append(
@@ -1446,11 +1508,29 @@ def install_commands(out_dir: Path, host: LaunchdHost) -> str:
     lines += [
         "# 6. Set the Sunday one-shot. The slice-3 vendor sweep will do this every Friday.",
         "# Until that sweep lands, run this line each Friday and run the second command it",
-        "# prints under sudo. Nothing else sets the one-shot, and nothing catches a missed",
-        "# one: by Sunday evening a wake that never got set and one that already fired look",
-        "# the same, so the Sunday read-back expects no one-shot and passes either way.",
-        f"cd {host.project_dir} && {host.python} -m lake.control_plane pmset",
+        "# prints under sudo. Nothing else sets the one-shot, and the Sunday read-back",
+        "# cannot catch a missed one: by Sunday evening a wake that never got set and one",
+        "# that already fired look the same. A machine left asleep still pages, because",
+        "# the Sunday check never runs and its dead-man ping never arrives.",
+        f"cd {shlex.quote(host.project_dir)} && "
+        f"{shlex.quote(host.python)} -m lake.control_plane pmset",
     ]
+    # Unnumbered, because a reinstall is conditional rather than a step of the first
+    # install. The bootout lines stay commented out: booting out a label that was never
+    # loaded fails, so a fresh install must not run them.
+    lines += [
+        "# Re-installing. Steps 1 to 5 are the first install and run once. Step 6 is the",
+        "# standing Friday task until slice 3 lands.",
+        "# launchd keeps a job's definition from the bootstrap that loaded it, so",
+        "# overwriting a plist in step 1 changes nothing by itself. After a re-render that",
+        "# changes a plist, boot out that label, then run its step 1 and step 5 lines again.",
+        "# `launchctl kickstart -k` is not the reload. It restarts the process under the",
+        "# definition already loaded. A re-render that only adds a plist needs step 1 and",
+        "# step 5 for the new label alone, with no bootout. Steps 2, 3, and 4 write files",
+        "# and settings, so they re-run as they are.",
+    ]
+    for job in all_jobs(host):
+        lines.append(f"# sudo launchctl bootout {LAUNCHD_DOMAIN}/{job.label}")
     return "\n".join(lines) + "\n"
 
 
@@ -1475,12 +1555,6 @@ def _build_parser():
     render.add_argument("--log-dir", required=True, help="Directory for stdout/stderr logs.")
     render.add_argument("--group", default="staff", help="GroupName for the jobs.")
     render.add_argument("--config", help="Config path, passed via MARKETLAKE_CONFIG.")
-    render.add_argument(
-        "--path-dir",
-        action="append",
-        default=[],
-        help="A directory to prepend to PATH, such as where uv lives. Repeatable.",
-    )
 
     check = sub.add_parser("self-check", help="Verify the daemon is up, then ping pre-open.")
     check.add_argument("--config", help="Path to config.yaml (defaults to the standard location).")
@@ -1516,6 +1590,24 @@ def main(
     args = _build_parser().parse_args(argv)
 
     if args.command == "render":
+        # Every one of these lands in a plist or in a printed install line that runs
+        # from wherever the operator pastes it, so a relative value is never right.
+        # --out is resolved rather than refused, because a directory to write into is
+        # naturally typed relative.
+        relative = {
+            name: value
+            for name, value in (
+                ("--python", args.python),
+                ("--home", args.home),
+                ("--project-dir", args.project_dir),
+                ("--log-dir", args.log_dir),
+            )
+            if not Path(value).is_absolute()
+        }
+        if relative:
+            named = ", ".join(f"{name} {value!r}" for name, value in sorted(relative.items()))
+            print(f"render: these must be absolute paths: {named}")
+            return 2
         host = LaunchdHost(
             python=args.python,
             owner=args.owner,
@@ -1524,9 +1616,10 @@ def main(
             log_dir=args.log_dir,
             group=args.group,
             config_path=args.config,
-            path_dirs=tuple(args.path_dir),
         )
-        out = Path(args.out)
+        # Resolved, so the printed install lines name an absolute path and work from
+        # any directory, not only the one the render ran in.
+        out = Path(args.out).resolve()
         try:
             written = write_rendered(render_all(host), out)
         except ValueError as exc:
@@ -1638,8 +1731,8 @@ __all__ = [
     "SUNDAY_MAINTENANCE",
     "SUNDAY_SLUG",
     "SUNDAY_WAKE",
-    "TMUTIL_FILE",
     "TOKEN_LIFETIME",
+    "VENDOR_SWEEP",
     "WAKE_KINDS",
     "WEEKDAY_ASSERTION_END",
     "WEEKDAY_WAKE",

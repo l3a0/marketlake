@@ -82,6 +82,16 @@ def test_expected_one_shot_is_pending_before_the_wake_and_gone_after():
     assert cp.expected_one_shot(et(2026, 8, 30, 20, 0), CALENDAR) is None
 
 
+def test_no_one_shot_is_expected_before_the_sweep_that_sets_it():
+    # The Friday 18:30 sweep is what sets the wake. Expecting it any earlier turns a
+    # Monday catch-up run, after launchd coalesced a wake missed over the weekend, into
+    # a page for an alarm nothing was due to set for another five days.
+    assert cp.expected_one_shot(et(2026, 8, 24, 9, 0), CALENDAR) is None
+    assert cp.expected_one_shot(et(2026, 8, 28, 18, 29), CALENDAR) is None
+    # One minute later the sweep has run, so the wake is owed.
+    assert cp.expected_one_shot(et(2026, 8, 28, 18, 30), CALENDAR) == date(2026, 8, 30)
+
+
 # -- the read-back parser ------------------------------------------------------------
 
 BOTH_PRESENT = """\
@@ -142,6 +152,23 @@ def test_parser_reads_twelve_hour_pm_and_the_letter_day_form():
 def test_parser_reads_empty_and_no_event_output():
     assert cp.parse_pmset_schedule("") == cp.PmsetSchedule()
     assert cp.parse_pmset_schedule("No scheduled events.\n") == cp.PmsetSchedule()
+
+
+def test_a_regex_shaped_but_impossible_time_or_date_is_a_parse_error():
+    # The regex shapes the digits, not their range. The caller's contract is that an
+    # unreadable line is a PmsetParseError the Sunday job turns into a report line,
+    # never a bare ValueError out of ``datetime``.
+    for text in (
+        " Repeating power events:\n  wakeorpoweron at 24:00 every day\n",
+        "Scheduled power events:\n [0]  wakeorpoweron at 09/13/26 24:00:00\n",
+        "Scheduled power events:\n [0]  wakeorpoweron at 13/45/26 19:55:00\n",
+        # The range check runs before the 12-hour fold. After it, 24:00AM would fold to
+        # a valid zero and pass.
+        " Repeating power events:\n  wakeorpoweron at 24:00AM every day\n",
+        " Repeating power events:\n  wakeorpoweron at 20:25AM every day\n",
+    ):
+        with pytest.raises(cp.PmsetParseError):
+            cp.parse_pmset_schedule(text)
 
 
 def test_parser_rejects_an_unknown_shape():

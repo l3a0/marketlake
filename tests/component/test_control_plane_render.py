@@ -38,8 +38,6 @@ RENDER_ARGS = [
     "/Users/someone/marketlake",
     "--log-dir",
     "/Users/someone/Library/Logs/marketlake",
-    "--path-dir",
-    "/Users/someone/.local/bin",
 ]
 
 EXPECTED_FILES = {
@@ -48,7 +46,6 @@ EXPECTED_FILES = {
     "com.marketlake.self-check.plist",
     "com.marketlake.sunday.plist",
     cp.SUDOERS_FILE,
-    cp.TMUTIL_FILE,
 }
 
 
@@ -172,18 +169,15 @@ def test_the_rendered_rules_cover_the_commands_the_module_composes(tmp_path):
     assert any(_sudo_args_match(spec, one_shot) for spec in specs)
 
 
-def test_rendered_tmutil_line_excludes_the_whole_config_directory(tmp_path):
+def test_rendered_tmutil_line_excludes_the_whole_config_directory(tmp_path, capsys):
     # The directory, not the token file alone. config.yaml sits beside the token and
     # holds four secrets of its own, and a sticky exclusion on a hand-edited file dies
     # the first time an editor saves by writing a temp file and renaming over it.
     out = tmp_path / "out"
     cp.main(["render", "--out", str(out), *RENDER_ARGS])
-    lines = [
-        line
-        for line in (out / cp.TMUTIL_FILE).read_text().splitlines()
-        if line.startswith("tmutil")
-    ]
-    assert lines == ['tmutil addexclusion "/Users/someone/.config/marketlake"']
+    printed = capsys.readouterr().out
+    lines = [line for line in printed.splitlines() if line.startswith("tmutil addexclusion")]
+    assert lines == ["tmutil addexclusion /Users/someone/.config/marketlake"]
 
 
 def test_render_takes_no_token_argument():
@@ -194,7 +188,7 @@ def test_render_takes_no_token_argument():
     assert excinfo.value.code == 2
 
 
-def test_the_three_consumers_name_one_file(tmp_path):
+def test_the_three_consumers_name_one_file(tmp_path, capsys):
     out = tmp_path / "out"
     cp.main(["render", "--out", str(out), *RENDER_ARGS])
     token = "/Users/someone/.config/marketlake/token.json"
@@ -211,8 +205,7 @@ def test_the_three_consumers_name_one_file(tmp_path):
     assert str(DEFAULT_TOKEN_PATH) == cp.default_token_path(str(Path.home()))
     assert cp.default_token_path(daemon["EnvironmentVariables"]["HOME"]) == token
     # The exclusion protects the directory holding it.
-    excluded = (out / cp.TMUTIL_FILE).read_text()
-    assert 'tmutil addexclusion "/Users/someone/.config/marketlake"' in excluded
+    assert "tmutil addexclusion /Users/someone/.config/marketlake" in capsys.readouterr().out
     assert token.startswith(cp.default_config_dir("/Users/someone") + "/")
 
 
@@ -238,7 +231,7 @@ def test_the_install_text_excludes_the_directory_and_reads_it_back(tmp_path, cap
     out = tmp_path / "out"
     cp.main(["render", "--out", str(out), *RENDER_ARGS])
     printed = capsys.readouterr().out
-    assert 'tmutil addexclusion "/Users/someone/.config/marketlake"' in printed
+    assert "tmutil addexclusion /Users/someone/.config/marketlake" in printed
     # visudo has its read-back and pmset has its own. So does this.
     assert "tmutil isexcluded /Users/someone/.config/marketlake" in printed
 
@@ -268,6 +261,127 @@ def test_the_install_text_numbers_its_steps_in_order(tmp_path, capsys):
     assert steps == ["1", "2", "3", "4", "5", "6"]
 
 
+def test_the_install_text_quotes_every_path_that_needs_it(tmp_path, capsys):
+    # These lines are pasted into a shell. Every operator-supplied path gets a space
+    # here, not just one of them, because a guard that only exercises --home lets the
+    # other four lose their quoting unnoticed.
+    out = tmp_path / "out dir"
+    spaced = {
+        "/Users/someone": "/Users/some one",
+        "/Users/someone/marketlake": "/Users/some one/mark et",
+        "/opt/py/bin/python": "/opt/p y/bin/python",
+        "/Users/someone/Library/Logs/marketlake": "/Users/some one/Lo gs",
+    }
+    args = [spaced.get(a, a) for a in RENDER_ARGS]
+    cp.main(["render", "--out", str(out), *args])
+    printed = capsys.readouterr().out
+    wanted = {*spaced.values(), str(out)}
+    for line in printed.splitlines():
+        if line.startswith(("#", "wrote ")) or not line.strip():
+            continue
+        # Each `&&`-joined command is its own argv. A spaced path must come back as one
+        # token in it, never split across two.
+        tokens = [t for part in line.split("&&") for t in shlex.split(part)]
+        for path in wanted:
+            if path in line:
+                assert any(token == path or token.startswith(path + "/") for token in tokens), (
+                    f"{path!r} is not one token in {line!r}"
+                )
+
+
+@pytest.mark.parametrize("flag", ["--python", "--home", "--project-dir", "--log-dir"])
+def test_render_refuses_a_relative_machine_path(flag, capsys):
+    # These land in a plist or in a printed line the operator pastes from anywhere, so
+    # a relative value is never right. --out is the exception: it is resolved instead.
+    args = list(RENDER_ARGS)
+    args[args.index(flag) + 1] = "relative/path"
+    code = cp.main(["render", "--out", "/tmp/unused-render", *args])
+    assert code == 2
+    assert "must be absolute" in capsys.readouterr().out
+
+
+def test_the_install_text_names_absolute_paths_from_a_relative_out(tmp_path, capsys, monkeypatch):
+    # An operator pastes these lines from any directory, not only the one the render
+    # ran in, so a relative --out must not survive into them.
+    monkeypatch.chdir(tmp_path)
+    cp.main(["render", "--out", "rel-out", *RENDER_ARGS])
+    printed = capsys.readouterr().out
+    for line in printed.splitlines():
+        assert "rel-out/" not in line or line.startswith(str(tmp_path)) or "/rel-out/" in line
+
+
+def test_sudoers_refuses_the_reserved_word_all_as_the_owner():
+    # ALL matches the account pattern and visudo accepts it, but sudoers reads it as the
+    # reserved word for every account, so the drop-in would grant both pmset writes to
+    # every local user.
+    with pytest.raises(ValueError):
+        cp.sudoers_dropin("ALL")
+    # Case-sensitive: a real account named "all" is still an account.
+    assert "all ALL=(root)" in cp.sudoers_dropin("all")
+
+
+def test_the_install_text_pins_every_command_line_in_order(tmp_path, capsys):
+    # Every runnable line, in order. The comments around them stay free to move. This
+    # script is pasted by hand on a machine with no other guard, so the root ownership,
+    # the 440 the sudoers drop-in needs, the visudo gate ahead of it, and all four
+    # bootstrap labels are pinned rather than sampled.
+    out = tmp_path / "out"
+    cp.main(["render", "--out", str(out), *RENDER_ARGS])
+    script = capsys.readouterr().out.split("\n\n", 1)[1]
+    commands = [line for line in script.splitlines() if line and not line.startswith("#")]
+    resolved = out.resolve()
+    labels = [
+        "com.marketlake.daemon",
+        "com.marketlake.dashboard",
+        "com.marketlake.self-check",
+        "com.marketlake.sunday",
+    ]
+    sudoers = resolved / cp.SUDOERS_FILE
+    assert commands == [
+        *(
+            f"sudo install -o root -g wheel -m 644 {resolved / label}.plist /Library/LaunchDaemons/"
+            for label in labels
+        ),
+        f"sudo visudo -cf {sudoers} && "
+        f"sudo install -o root -g wheel -m 440 {sudoers} /etc/sudoers.d/marketlake",
+        "sudo -l | grep pmset",
+        "sudo pmset repeat wakeorpoweron MTWRF 08:25:00",
+        "pmset -g sched",
+        "tmutil addexclusion /Users/someone/.config/marketlake",
+        "tmutil isexcluded /Users/someone/.config/marketlake",
+        *(
+            f"sudo launchctl bootstrap system /Library/LaunchDaemons/{label}.plist"
+            for label in labels
+        ),
+        "launchctl print system/com.marketlake.daemon",
+        "cd /Users/someone/marketlake && /opt/py/bin/python -m lake.control_plane pmset",
+    ]
+
+
+def test_the_install_text_says_the_dashboard_bootstrap_waits_for_d15(tmp_path, capsys):
+    # The dashboard plist is rendered because the build plan pins four jobs, but
+    # lake.dashboard is D15. Bootstrapping it early crash-loops under KeepAlive.
+    out = tmp_path / "out"
+    cp.main(["render", "--out", str(out), *RENDER_ARGS])
+    printed = capsys.readouterr().out
+    assert "lake.dashboard" in printed
+    assert "D15" in printed
+    assert "Skip its line" in printed
+
+
+def test_the_install_text_names_the_reload_and_leaves_it_commented(tmp_path, capsys):
+    # Overwriting a plist does not reload it, and the operator has no way to know that
+    # from a text that only covers the first install. The bootout lines stay commented,
+    # because booting out a label that was never loaded fails.
+    out = tmp_path / "out"
+    cp.main(["render", "--out", str(out), *RENDER_ARGS])
+    printed = capsys.readouterr().out
+    assert "Re-installing." in printed
+    bootouts = [line for line in printed.splitlines() if "launchctl bootout" in line]
+    assert len(bootouts) == 4
+    assert all(line.startswith("# ") for line in bootouts)
+
+
 def test_nothing_rendered_mentions_the_rejected_sleep_override(tmp_path):
     out = tmp_path / "out"
     cp.main(["render", "--out", str(out), *RENDER_ARGS])
@@ -275,7 +389,12 @@ def test_nothing_rendered_mentions_the_rejected_sleep_override(tmp_path):
         assert "disablesleep" not in path.read_text()
 
 
-@pytest.mark.parametrize("target", ["/Library/LaunchDaemons", "/etc/sudoers.d", "/private/etc"])
+# The default APFS volume is case-insensitive, so the upper-case spelling names the
+# same directory and must be refused the same way.
+@pytest.mark.parametrize(
+    "target",
+    ["/Library/LaunchDaemons", "/LIBRARY/LaunchDaemons", "/etc/sudoers.d", "/private/etc"],
+)
 def test_render_refuses_a_system_directory(target, capsys):
     code = cp.main(["render", "--out", target, *RENDER_ARGS])
     assert code == 2
@@ -485,4 +604,19 @@ def test_pmset_cli_prints_both_commands_for_the_coming_week(capsys):
     assert capsys.readouterr().out.splitlines() == [
         "pmset repeat wakeorpoweron MTWRF 08:25:00",
         'pmset schedule wakeorpoweron "08/30/26 19:55:00"',
+    ]
+
+
+def test_pmset_cli_skips_a_sunday_wake_that_already_fired(capsys):
+    # On a Sunday evening after 19:55 this week's wake has already fired. Scheduling a
+    # moment already past sets nothing, so the answer is the following Sunday.
+    code = cp.main(
+        ["pmset"],
+        clock=ManualClock(start=et(2026, 8, 30, 21, 0)),
+        calendar=weekday_sessions(date(2026, 8, 31), date(2026, 9, 7)),
+    )
+    assert code == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "pmset repeat wakeorpoweron MTWRF 08:25:00",
+        'pmset schedule wakeorpoweron "09/06/26 19:55:00"',
     ]

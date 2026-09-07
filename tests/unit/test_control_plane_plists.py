@@ -21,7 +21,6 @@ HOST = cp.LaunchdHost(
     project_dir="/Users/someone/marketlake",
     log_dir="/Users/someone/Library/Logs/marketlake",
     config_path="/Users/someone/.config/marketlake/config.yaml",
-    path_dirs=("/Users/someone/.local/bin",),
 )
 
 
@@ -58,8 +57,9 @@ def test_resident_plists_carry_the_working_dir_logs_and_environment():
     assert plist["StandardOutPath"] != plist["StandardErrorPath"]
     env = plist["EnvironmentVariables"]
     assert env["HOME"] == "/Users/someone"
-    assert env["PATH"].startswith("/Users/someone/.local/bin:")
-    assert "/usr/bin" in env["PATH"].split(":")
+    # An equality pin, not a membership one. It fails if any directory is ever
+    # prepended again, which is what the dropped --path-dir knob used to do.
+    assert env["PATH"].split(":") == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
     assert env["MARKETLAKE_CONFIG"].endswith("config.yaml")
 
 
