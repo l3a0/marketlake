@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -32,6 +33,13 @@ from lake.paths import LakePaths
 # The design's cap on pages a day. The forty-first is written down and never sent, so a
 # storm cannot empty the phone's attention for the one page that matters.
 DEFAULT_DAILY_CAP = 40
+
+# The tag every lake-composed page carries, per the design's message table.
+PAGE_TAG = "rotating_light"
+
+# How long one POST may take. Short, because a page that has not landed in five seconds
+# is competing with the next minute's cycle.
+POST_TIMEOUT = timedelta(seconds=5)
 
 # Why a message never reached the phone. These are different failures and must not read
 # alike: one is the network, one is the cap, one is this module refusing to send.
@@ -52,10 +60,15 @@ class Message:
 
 @dataclass(frozen=True)
 class Delivery:
-    """What became of one message."""
+    """What became of one message.
+
+    ``recorded`` separates a page that was written down from one that was lost twice.
+    Both leave the phone silent, and only the second leaves nothing behind.
+    """
 
     sent: bool
     reason: str | None = None
+    recorded: bool = False
 
 
 @runtime_checkable
@@ -66,38 +79,61 @@ class Transport(Protocol):
 
 
 class NtfyTransport:
-    """The real POST, to ntfy's topic URL.
+    """The real POST to ntfy.
 
-    The topic is the secret half of that URL, exactly as the ping key is for
-    healthchecks, so it is held here and never put in a message. A publisher refuses any
-    page whose own text contains it.
+    The topic is the write credential for the channel, so it goes in the JSON body and
+    never in the URL. A URL lands in a proxy log, a crash report, and anything that
+    records a request line. It is held here and never put in a message, and a publisher
+    refuses any page whose own text contains it.
+
+    A timeout or a 5xx is retried once. A 4xx is not, because the request itself is
+    wrong and sending it again changes nothing.
     """
 
     def __init__(self, topic: str, *, host: str = "https://ntfy.sh") -> None:
-        self._url = f"{host.rstrip('/')}/{topic}"
+        self._topic = topic
+        self._url = host.rstrip("/")
 
     def send(self, message: Message) -> None:
+        import json as _json
+        import urllib.error
         import urllib.request  # lazy: only a real send reaches the network
 
+        body = _json.dumps(
+            {
+                "topic": self._topic,
+                "title": message.title,
+                "message": message.body,
+                "priority": message.priority,
+                "tags": [PAGE_TAG],
+            }
+        ).encode("utf-8")
         request = urllib.request.Request(
             self._url,
-            data=message.body.encode("utf-8"),
-            headers={
-                "Title": message.title,
-                "Priority": str(message.priority),
-                "Tags": message.event,
-            },
+            data=body,
+            headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=10):
-            pass
+        try:
+            with urllib.request.urlopen(request, timeout=POST_TIMEOUT.seconds):
+                return
+        except (urllib.error.HTTPError, TimeoutError, OSError) as exc:
+            status = getattr(exc, "code", None)
+            if status is not None and 400 <= status < 500:
+                # The request itself is wrong. Sending it again changes nothing.
+                raise
+        with urllib.request.urlopen(request, timeout=POST_TIMEOUT.seconds):
+            return
 
 
 class Publisher:
     """Sends pages, caps the day, and writes down every one that did not go.
 
-    The cap is keyed by the Eastern date, so it resets with the session rather than with
-    the process. A daemon restarted at noon does not get a fresh forty.
+    The cap is keyed by the Eastern date and held in memory, so it resets when the date
+    turns and also when the process does. A daemon restarted at noon gets a fresh forty.
+    That is the wrong way round for a crash loop, and the right way round for the case
+    the cap exists to stop, which is one runaway producer inside one incarnation. Making
+    it survive a restart means a durable tally, which is a sink of its own.
     """
 
     def __init__(
@@ -118,6 +154,7 @@ class Publisher:
         self._pid = os.getpid() if pid is None else pid
         self._day: date | None = None
         self._sent = 0
+        self._written = 0
 
     def publish(self, message: Message, *, now: datetime) -> Delivery:
         """Send one page, or record why it did not go. Never raises."""
@@ -173,18 +210,26 @@ class Publisher:
             entry["title"] = message.title
         if detail is not None:
             entry["detail"] = detail
-        stamp = eastern.strftime("%H%M%S%f")
+        # One cycle raises several pages at one instant, and a slot's stamp carries no
+        # sub-minute part, so the clock alone cannot name them apart. The sequence can,
+        # and it makes the name unique without depending on the clock at all.
+        self._written += 1
+        stamp = f"{eastern.strftime('%H%M%S%f')}-{self._written:04d}"
         try:
             directory.mkdir(parents=True, exist_ok=True)
             path = directory / f"{stamp}-{message.event}-{self._pid}.json"
             with open(path, "x", encoding="utf-8") as handle:
                 json.dump(entry, handle, sort_keys=True)
                 handle.write("\n")
-        except OSError:
-            # The record is the last line of defence and it just failed. There is
-            # nowhere further to write, so the caller is told and the daemon lives.
-            return Delivery(False, reason)
-        return Delivery(False, reason)
+        except OSError as exc:
+            # The record is the last line of defence and it just failed. Nothing further
+            # can be written, so the one place left to say so is the daemon's own log.
+            print(
+                f"alert: {message.event} lost, and its record failed too: {type(exc).__name__}",
+                file=sys.stderr,
+            )
+            return Delivery(False, reason, recorded=False)
+        return Delivery(False, reason, recorded=True)
 
     def _leak(self, message: Message) -> str | None:
         """The field carrying a secret, if any.
@@ -222,6 +267,8 @@ __all__ = [
     "POST_FAILED",
     "REFUSED",
     "Delivery",
+    "PAGE_TAG",
+    "POST_TIMEOUT",
     "Message",
     "NtfyTransport",
     "Publisher",

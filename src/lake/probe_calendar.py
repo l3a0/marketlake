@@ -26,11 +26,14 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 
+from lake.alert import Message
 from lake.calendar import MARKET_TZ
+from lake.runner import PING_FAILURES
+from lake.schwab import DEFAULT_TOKEN_PATH
 
 # What the probe reports, per the design's message table. A session the daemon slept
 # through is the loudest thing here, because the samples are gone.
-PAGE_TITLE = "Calendar wrong: market open, daemon idle"
+PAGE_TITLE = "Calendar says closed, market looks open"
 
 # The tag on the ping for a day the calendar and the vendor agree about. The design
 # words it this way, and it makes a session day distinguishable from a probe that never
@@ -117,7 +120,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--token", help="Path to token.json.")
     args = parser.parse_args(argv)
 
-    from lake.alert import Message, Publisher
+    from lake.alert import NtfyTransport, Publisher
     from lake.calendar import ExchangeCalendar
     from lake.clock import SystemClock
     from lake.config import input_errors_exit, load_config
@@ -131,30 +134,60 @@ def main(argv: Sequence[str] | None = None) -> int:
         roster = load_tickers(args.tickers)
 
     clock = SystemClock()
-    vendor = SchwabVendor.from_token(config, token_path=args.token)
+    vendor = SchwabVendor.from_token(
+        args.token if args.token is not None else DEFAULT_TOKEN_PATH,
+        api_key=config.schwab_api_key.reveal(),
+        app_secret=config.schwab_app_secret.reveal(),
+    )
     result = run_probe(
         calendar=ExchangeCalendar(),
         clock=clock,
         symbols=roster.symbols,
         fetch=vendor.get_quotes,
     )
+    return report(
+        result,
+        publisher=Publisher(
+            lake_root=config.lake_root,
+            transport=NtfyTransport(config.ntfy_topic.reveal()),
+            secrets=(config.healthchecks_ping_key.reveal(), config.ntfy_topic.reveal()),
+        ),
+        pinger=UrllibPinger(),
+        ping_url=config.healthchecks_url(CALENDAR_PROBE_SLUG),
+        now=clock.now(),
+    )
+
+
+def report(result: ProbeResult, *, publisher, pinger, ping_url: str, now) -> int:
+    """Feed the check, page if the market is open, and say what happened.
+
+    The check is fed before the paging branch returns. It is fed on every answer, so
+    its silence means the probe stopped running rather than that every day was fine, and
+    a day that pages is exactly a day the probe did run.
+    """
+    try:
+        pinger.ping(ping_url)
+    except PING_FAILURES as exc:
+        # A ping that does not land is what the check exists to notice. Losing the page
+        # because of it would be the wrong trade.
+        print(f"calendar probe: ping failed: {type(exc).__name__}", file=sys.stderr)
 
     if result.pages:
-        Publisher(lake_root=config.lake_root).publish(
+        publisher.publish(
             Message(
                 event="calendar_wrong",
                 title=PAGE_TITLE,
-                body=f"{result.day.isoformat()}: {', '.join(result.trading)} quoting today",
+                body=(
+                    f"{result.day.isoformat()}: {', '.join(result.trading)} quoting today. "
+                    "The daemon is idle. Check the Now panel."
+                ),
                 priority=5,
             ),
-            now=clock.now(),
+            now=now,
         )
         print(f"calendar probe: {PAGE_TITLE} ({len(result.trading)} symbols)", file=sys.stderr)
         return 1
 
-    # The check is fed whatever the answer, so its silence means the probe stopped
-    # running rather than that every day was fine.
-    UrllibPinger().ping(config.healthchecks_url(CALENDAR_PROBE_SLUG))
     status = SESSION_DAY_TAG if not result.checked else "calendar agrees"
     if result.problem is not None:
         status = f"vendor unreachable: {result.problem}"
@@ -168,6 +201,7 @@ __all__ = [
     "ProbeResult",
     "fresh_symbols",
     "main",
+    "report",
     "run_probe",
 ]
 

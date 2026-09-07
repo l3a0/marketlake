@@ -100,7 +100,7 @@ from lake.control_plane import AssertionHolder, AssertionRunner
 from lake.deadman import CAPTURE_SLUG, DeadMan
 from lake.gap import GapMarker, MarkingReport, surfaces_for
 from lake.journal import ROW_KIND_DATA
-from lake.runner import UrllibPinger
+from lake.runner import Pinger, UrllibPinger
 from lake.security_master import SecurityMaster, SecurityMasterError, master_path
 from lake.session import (
     CAPTURE_PHASES,
@@ -342,6 +342,7 @@ def _alarm(
     tickers_path: str | Path | None,
     session_clock: SessionClock,
     transport: Transport | None,
+    pinger: Pinger | None,
 ) -> tuple[Watchdog, Publisher, DeadMan, Roster] | None:
     """The watchdog, its publisher, and the dead-man feed, or ``None``.
 
@@ -360,7 +361,7 @@ def _alarm(
         secrets=(config.healthchecks_ping_key.reveal(), config.ntfy_topic.reveal()),
     )
     deadman = DeadMan(
-        pinger=UrllibPinger(),
+        pinger=pinger if pinger is not None else UrllibPinger(),
         url=config.healthchecks_url(CAPTURE_SLUG),
         session_clock=session_clock,
     )
@@ -378,6 +379,7 @@ def run_loop_from_config(
     assertion_runner: AssertionRunner | None = None,
     cycle_runner: CycleRunner | None = None,
     transport: Transport | None = None,
+    pinger: Pinger | None = None,
     should_continue: Callable[[], bool] = _forever,
 ) -> None:
     """Run the loop wired from the real clock, calendar, and config. It never returns.
@@ -391,9 +393,9 @@ def run_loop_from_config(
     The caffeinate power assertion is held here rather than left to a caller. The
     design's chain is the wake alarm, then ``KeepAlive`` starting the daemon, then the
     assertion keeping an open laptop awake, and this is the link that holds it. An
-    ``transport`` defaults to the real ntfy POST. A test must pass its own, because the
-    default reaches a public endpoint and a page sent from a test is a page a person
-    receives.
+    ``transport`` defaults to the real ntfy POST and ``pinger`` to the real HTTP GET.
+    A test must pass its own for both, because each default reaches a public endpoint
+    and a page sent from a test is a page a person receives.
 
     ``cycle_runner`` defaults to the real capture cycle. A test passes its own, which
     is the only way to observe what this entry binds without reaching a vendor: every
@@ -474,7 +476,7 @@ def run_loop_from_config(
     # runs no cycle for a slot it slept through and those are the minutes the daemon was
     # worst off. The dead-man rides the same two plus every tick, so an idle weekday
     # keeps feeding the check that pages on silence.
-    alarm = _alarm(config_path, tickers_path, session_clock, transport)
+    alarm = _alarm(config_path, tickers_path, session_clock, transport, pinger)
     if alarm is not None:
         watchdog, publisher, deadman, roster = alarm
         alarm_on_cycle = hooks.on_cycle
@@ -499,9 +501,19 @@ def run_loop_from_config(
             alarm_on_cycle(slot, result)
 
         def on_skipped(slots: list[datetime]) -> None:
+            # The roster is re-read here rather than closed over. The cycle runner
+            # re-reads it every cycle, and the design has the watchdog counters read
+            # that same snapshot, so a ticker retired mid-session must stop being
+            # charged without a restart. A roster that will not load leaves the last
+            # good one in place, since refusing to count is worse than counting a
+            # ticker one cycle too long.
+            try:
+                current = load_tickers(tickers_path)
+            except TickersError:
+                current = roster
             watched = [
                 Surface(surface, entry.ticker)
-                for entry in roster
+                for entry in current
                 for surface in surfaces_for(entry)
             ]
             raise_pages(watchdog.missed(watched, slots), slots[-1])

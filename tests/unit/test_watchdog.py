@@ -283,7 +283,7 @@ def test_a_dead_token_pages_once_naming_auth_rather_than_the_roster():
                 at=_at(minute),
             )
         )
-    assert [p.title for p in raised] == ["Capture down: auth dead"]
+    assert [p.title for p in raised] == ["Capture down: token dead"]
     assert raised[0].cause == "http_401"
     assert len(raised[0].surfaces) == 4
 
@@ -358,7 +358,7 @@ def test_a_cause_pages_once_and_re_arms_when_capture_returns():
                 at=_at(minute),
             )
         )
-    assert [p.title for p in again] == ["Capture down: auth dead"]
+    assert [p.title for p in again] == ["Capture down: token dead"]
 
 
 def test_one_surface_failing_with_an_auth_class_is_not_a_dead_daemon():

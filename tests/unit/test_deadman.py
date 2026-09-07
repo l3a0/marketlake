@@ -53,6 +53,9 @@ def test_the_slug_is_the_one_the_design_names():
         # boundary comes from the assertion window rather than being restated here.
         (et(2026, 9, 2, 18, 45), False),
         (et(2026, 9, 5, 12, 0), False),  # Saturday owes nothing
+        # The assertion window covers Sunday evening so the Sunday job can run, but no
+        # capture is expected then and a heartbeat would read as a session running.
+        (et(2026, 9, 6, 21, 0), False),
     ],
 )
 def test_the_envelope_is_the_window_the_daemon_is_kept_awake_for(moment, inside):

@@ -74,7 +74,7 @@ def test_the_cap_stops_sending_and_still_records(tmp_path):
     assert reasons == [CAP_REACHED, CAP_REACHED]
 
 
-def test_the_cap_resets_with_the_session_date_not_the_process(tmp_path):
+def test_the_cap_resets_when_the_session_date_turns(tmp_path):
     transport = Recording()
     publisher = Publisher(lake_root=tmp_path, transport=transport, daily_cap=1, pid=1)
     publisher.publish(PAGE, now=NOW)
@@ -211,3 +211,67 @@ def test_the_daemon_pages_through_the_publisher_when_a_surface_goes_quiet(tmp_pa
     records = _records(lake_root)
     assert records, "the daemon ran four failing cycles and raised no page"
     assert records[0]["event"] == "capture_down"
+
+
+def test_every_page_of_one_burst_is_written_down(tmp_path):
+    """One cycle raises several pages at one instant.
+
+    A slot carries no sub-minute part, so a name built from the clock alone collides and
+    all but the first is lost to a swallowed FileExistsError.
+    """
+    publisher = Publisher(lake_root=tmp_path, transport=Broken(), pid=1)
+    titles = ["Capture down: quote sampler dead", "Capture down: SPY chains", "x"]
+    for title in titles:
+        delivery = publisher.publish(Message(event="capture_down", title=title, body="b"), now=NOW)
+        assert delivery.recorded
+    assert undelivered(tmp_path, date(2026, 9, 2)) == 3
+    assert sorted(r["title"] for r in _records(tmp_path)) == sorted(titles)
+
+
+def test_a_record_that_cannot_be_written_says_so(tmp_path, capsys, monkeypatch):
+    publisher = Publisher(lake_root=tmp_path, transport=Broken(), pid=1)
+
+    def refuse(*args, **kwargs):
+        raise OSError("read-only")
+
+    monkeypatch.setattr("builtins.open", refuse)
+    delivery = publisher.publish(PAGE, now=NOW)
+    assert not delivery.sent
+    assert not delivery.recorded
+    # Lost twice is not the same as lost once, and the log is the only place left.
+    assert "record failed too" in capsys.readouterr().err
+
+
+def test_the_topic_never_appears_in_the_request_url(tmp_path):
+    # A URL lands in a proxy log and anything that records a request line. The topic is
+    # the write credential for the channel.
+    from lake.alert import PAGE_TAG, NtfyTransport
+
+    sent = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def urlopen(request, timeout=None):
+        sent["url"] = request.full_url
+        sent["body"] = json.loads(request.data)
+        return FakeResponse()
+
+    import urllib.request
+
+    original = urllib.request.urlopen
+    urllib.request.urlopen = urlopen
+    try:
+        NtfyTransport("secret-topic").send(PAGE)
+    finally:
+        urllib.request.urlopen = original
+
+    assert "secret-topic" not in sent["url"]
+    assert sent["url"] == "https://ntfy.sh"
+    assert sent["body"]["topic"] == "secret-topic"
+    assert sent["body"]["title"] == PAGE.title
+    assert sent["body"]["tags"] == [PAGE_TAG]

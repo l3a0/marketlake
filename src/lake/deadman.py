@@ -52,9 +52,13 @@ def in_envelope(now: datetime) -> bool:
     keep flowing. A second definition of the same window would be one more thing to keep
     in step, and the two going out of step is how a false page gets built.
 
-    Saturday owes nothing, so nothing is expected and nothing heartbeats.
+    Only the weekday window counts. The assertion window also covers Sunday evening,
+    because the Sunday job needs the machine awake, but no capture is expected then and
+    the check would read a heartbeat as a session running.
     """
     eastern = now.astimezone(MARKET_TZ)
+    if eastern.weekday() >= 5:
+        return False
     window = assertion_window(eastern.date())
     return window is not None and window.contains(eastern)
 

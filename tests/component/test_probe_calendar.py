@@ -111,3 +111,99 @@ def test_freshness_is_same_day_in_market_time_not_a_seconds_window():
     assert fresh_symbols({"A": _quote(long_ago_but_today)}, day) == ("A",)
     yesterday = _quote(datetime(2026, 9, 5, 0, 1, tzinfo=ET) - timedelta(hours=2))
     assert fresh_symbols({"A": yesterday}, day) == ()
+
+
+# -- the entry that actually pages ---------------------------------------------------
+
+
+class Sink:
+    def __init__(self) -> None:
+        self.sent = []
+
+    def publish(self, message, *, now):
+        self.sent.append(message)
+        return None
+
+
+class Pings:
+    def __init__(self) -> None:
+        self.urls = []
+
+    def ping(self, url: str) -> None:
+        self.urls.append(url)
+
+
+def test_a_market_found_open_is_actually_sent(tmp_path):
+    """The page must reach the publisher, not just be decided on.
+
+    `main` had no test, which is how a publisher with no transport shipped: it recorded
+    the page to a file and returned, and nothing noticed.
+    """
+    from lake.probe_calendar import PAGE_TITLE, report
+
+    sink, pings = Sink(), Pings()
+    result = ProbeResult(date(2026, 9, 5), checked=True, trading=("SPY",))
+    code = report(
+        result, publisher=sink, pinger=pings, ping_url="https://x/y", now=et(2026, 9, 5, 9, 35)
+    )
+    assert code == 1
+    assert [m.title for m in sink.sent] == [PAGE_TITLE]
+    assert sink.sent[0].priority == 5
+    assert "SPY" in sink.sent[0].body
+
+
+def test_the_check_is_fed_on_the_day_it_pages_too():
+    # The check's silence must mean the probe stopped running. A day that pages is
+    # exactly a day it ran.
+    from lake.probe_calendar import report
+
+    pings = Pings()
+    report(
+        ProbeResult(date(2026, 9, 5), checked=True, trading=("SPY",)),
+        publisher=Sink(),
+        pinger=pings,
+        ping_url="https://x/y",
+        now=et(2026, 9, 5, 9, 35),
+    )
+    assert pings.urls == ["https://x/y"]
+
+
+def test_a_quiet_day_feeds_the_check_and_pages_nobody():
+    from lake.probe_calendar import report
+
+    sink, pings = Sink(), Pings()
+    code = report(
+        ProbeResult(date(2026, 9, 5), checked=True),
+        publisher=sink,
+        pinger=pings,
+        ping_url="https://x/y",
+        now=et(2026, 9, 5, 9, 35),
+    )
+    assert code == 0
+    assert sink.sent == []
+    assert pings.urls == ["https://x/y"]
+
+
+def test_a_failing_ping_never_costs_the_page():
+    from lake.probe_calendar import report
+
+    class Broken:
+        def ping(self, url: str) -> None:
+            raise OSError("no network")
+
+    sink = Sink()
+    code = report(
+        ProbeResult(date(2026, 9, 5), checked=True, trading=("SPY",)),
+        publisher=sink,
+        pinger=Broken(),
+        ping_url="https://x/y",
+        now=et(2026, 9, 5, 9, 35),
+    )
+    assert code == 1
+    assert len(sink.sent) == 1
+
+
+def test_the_page_title_is_the_one_the_design_pins():
+    from lake.probe_calendar import PAGE_TITLE
+
+    assert PAGE_TITLE == "Calendar says closed, market looks open"

@@ -41,8 +41,8 @@ DEFAULT_PAGE_MINUTES = 3
 # would page the roster and name nothing. The design puts auth death and sustained rate
 # limiting in this deliverable for exactly that reason.
 _WHOLE_DAEMON_CAUSES = {
-    "http_401": "Capture down: auth dead",
-    "http_403": "Capture down: auth dead",
+    "http_401": "Capture down: token dead",
+    "http_403": "Capture down: token dead",
     "http_429": "Capture down: rate limited",
 }
 
