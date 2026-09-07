@@ -1470,7 +1470,7 @@ def install_commands(out_dir: Path, host: LaunchdHost) -> str:
     sudoers = shlex.quote(str(out / SUDOERS_FILE))
     lines = [
         "# Marketlake control plane: the manual install. Run each line by hand.",
-        "# 1. Install the four LaunchDaemons, root-owned as launchd requires.",
+        "# 1. Install the five LaunchDaemons, root-owned as launchd requires.",
     ]
     for job in all_jobs(host):
         lines.append(
@@ -1499,9 +1499,6 @@ def install_commands(out_dir: Path, host: LaunchdHost) -> str:
             )
         ),
         "# 5. Load the jobs into the system domain, then confirm the daemon is running.",
-        "# The dashboard runs `python -m lake.dashboard`, which D15 ships. Skip its line",
-        "# until that module lands. launchd respawns a failing KeepAlive job every ten",
-        "# seconds, so bootstrapping it early fills the err log instead of serving panels.",
     ]
     for job in all_jobs(host):
         lines.append(
