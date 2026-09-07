@@ -92,6 +92,8 @@ from typing import Protocol
 from lake.calendar import Calendar, ExchangeCalendar
 from lake.capture import CycleResult, run_cycle_from_config
 from lake.clock import Clock, SystemClock
+from lake.close_guard import CloseGuard
+from lake.close_guard import GuardOutcome as CloseGuardOutcome
 from lake.config import ConfigError, load_config
 from lake.control_plane import AssertionHolder, AssertionRunner
 from lake.gap import GapMarker, MarkingReport
@@ -100,6 +102,7 @@ from lake.session import (
     CAPTURE_PHASES,
     TICK,
     SessionClock,
+    SessionDispatch,
     SessionPhase,
     missed_slots,
     skipped_slots,
@@ -289,6 +292,46 @@ def _gap_marker(
     )
 
 
+def _report_guard(outcome: CloseGuardOutcome) -> None:
+    """Print what the guard found, so a close nobody observed is not silent.
+
+    Three of the design's rules for this guard end in "flags the nightly report", and
+    no report exists yet. launchd captures the daemon's stderr, which is where these can
+    be seen until one does. A day where both closes landed prints nothing.
+    """
+    if not outcome.reportable:
+        return
+    parts = [f"close+5 {outcome.day.isoformat()}:"]
+    for name, values in (
+        ("unobserved", outcome.unobserved),
+        ("baseline-less", outcome.baseline_less),
+        ("shortfall", outcome.shortfalls),
+        ("refused", outcome.refused),
+        ("problems", outcome.problems),
+    ):
+        if values:
+            parts.append(f"{name}={','.join(values)}")
+    print(" ".join(parts), file=sys.stderr)
+
+
+def _close_guard(
+    config_path: str | Path | None,
+    tickers_path: str | Path | None,
+    session_clock: SessionClock,
+) -> CloseGuard | None:
+    """The close+5 guard for this daemon, or ``None`` when it cannot be built.
+
+    A config or roster that will not load is already fatal to the cycle runner on its
+    first tick, so nothing here is worth refusing to start over.
+    """
+    try:
+        config = load_config(config_path)
+        roster = load_tickers(tickers_path)
+    except (ConfigError, TickersError):
+        return None
+    return CloseGuard(lake_root=config.lake_root, roster=roster, session_clock=session_clock)
+
+
 def run_loop_from_config(
     *,
     config_path: str | Path | None = None,
@@ -298,6 +341,7 @@ def run_loop_from_config(
     clock: Clock | None = None,
     calendar: Calendar | None = None,
     assertion_runner: AssertionRunner | None = None,
+    cycle_runner: CycleRunner | None = None,
     should_continue: Callable[[], bool] = _forever,
 ) -> None:
     """Run the loop wired from the real clock, calendar, and config. It never returns.
@@ -311,6 +355,10 @@ def run_loop_from_config(
     The caffeinate power assertion is held here rather than left to a caller. The
     design's chain is the wake alarm, then ``KeepAlive`` starting the daemon, then the
     assertion keeping an open laptop awake, and this is the link that holds it. An
+    ``cycle_runner`` defaults to the real capture cycle. A test passes its own, which
+    is the only way to observe what this entry binds without reaching a vendor: every
+    hook the loop-coupled deliverables bind fires on a capture slot.
+
     ``AssertionHolder`` rides ``on_tick``, so the assertion is taken when a window
     opens and again for each new day the daemon lives through. Any hook the caller
     passed still runs.
@@ -351,7 +399,38 @@ def run_loop_from_config(
 
         hooks = replace(hooks, on_start=on_start, on_skipped=on_skipped)
 
-    def cycle_runner(*, close_tag: str | None, session_phase: str | None) -> CycleResult:
+    # Every session-relative job is dispatched from in here, because launchd's calendar
+    # intervals are fixed wall-clock and cannot express a close-relative time. The
+    # close+5 guard is the first of them. The close+15 compaction binds to the same
+    # dispatcher when someone builds it.
+    #
+    # This wraps the gap marker's hooks rather than the other way round, and the order is
+    # load-bearing. On a post-close restart the guard owns the two close minutes, and it
+    # must write them before startup marking walks the day, or the day's 16:00 and 16:15
+    # would carry a marker from each writer.
+    guard = _close_guard(config_path, tickers_path, session_clock)
+    if guard is not None:
+        dispatch = SessionDispatch(
+            session_clock=session_clock,
+            moment=lambda bounds: bounds.option_close_deadline,
+            job=lambda day: _report_guard(guard.run(day)),
+        )
+        guard_on_start = hooks.on_start
+        guard_on_tick = hooks.on_tick
+
+        def on_start_guarded() -> None:
+            dispatch.check(clock.now())
+            guard_on_start()
+
+        def on_tick_guarded(slot: datetime) -> None:
+            dispatch.check(slot)
+            guard_on_tick(slot)
+
+        hooks = replace(hooks, on_start=on_start_guarded, on_tick=on_tick_guarded)
+
+    hooks = replace(hooks, close_tag_for=session_clock.close_tag_at)
+
+    def run_a_cycle(*, close_tag: str | None, session_phase: str | None) -> CycleResult:
         return run_cycle_from_config(
             clock=clock,
             config_path=config_path,
@@ -361,7 +440,13 @@ def run_loop_from_config(
             session_phase=session_phase,
         )
 
-    run_loop(session_clock, cycle_runner, clock=clock, hooks=hooks, should_continue=should_continue)
+    run_loop(
+        session_clock,
+        cycle_runner if cycle_runner is not None else run_a_cycle,
+        clock=clock,
+        hooks=hooks,
+        should_continue=should_continue,
+    )
 
 
 # -- the command-line entry ----------------------------------------------------

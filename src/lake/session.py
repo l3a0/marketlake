@@ -40,6 +40,7 @@ scanners stay green.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from enum import Enum
@@ -51,6 +52,11 @@ from lake.clock import Clock
 # option-close fill may land. Pinned in code, not config, because it defines
 # option-close semantics, not alerting.
 OPTION_CLOSE_GUARD = timedelta(minutes=5)
+
+# The two close tags. A tagged row is one of the day's two close cycles, and every row
+# of that cycle carries the tag, fill-fetch segments included.
+SPOT_CLOSE = "spot_close"
+OPTION_CLOSE = "option_close"
 
 # The compaction delay. How long after the option close the close+15 compaction
 # job runs. A structural session-relative offset, so it lives in code, not config.
@@ -131,6 +137,28 @@ class SessionClock:
             compaction=option_close + COMPACTION_DELAY,
             early_close=self._calendar.is_early_close(day),
         )
+
+    def close_tag_at(self, slot: datetime) -> str | None:
+        """The ``close_tag`` a capture slot carries, or ``None`` for every other minute.
+
+        Two cycles a session day are tagged, and they are ordinary loop cycles rather
+        than extra fetches. The equity close carries ``spot_close``, the last cycle where
+        the option marks and the underlying top of book are read at the same pre-auction
+        moment. The option close carries ``option_close``, the option market's close of
+        record.
+
+        Both moments come from the calendar for that day, so an early close moves them
+        together and nothing keys on a wall-clock 16:00 or 16:15.
+        """
+        try:
+            bounds = self.bounds(slot.date())
+        except NotASession:
+            return None
+        if slot == bounds.equity_close:
+            return SPOT_CLOSE
+        if slot == bounds.option_close:
+            return OPTION_CLOSE
+        return None
 
     def phase(self) -> SessionPhase:
         """The phase of the current snap slot."""
@@ -219,3 +247,58 @@ def missed_slots(
         skipped.extend(skipped_slots(bounds, after, before))
         day += _ONE_DAY
     return skipped
+
+
+# -- session-relative dispatch ---------------------------------------------------
+
+
+class SessionDispatch:
+    """Fires one callback once per session day, at a moment the calendar decides.
+
+    The design dispatches everything session-relative from inside the daemon, because
+    ``StartCalendarInterval`` is fixed wall-clock and cannot express a close-relative
+    time. An early close moves the option close, and with it every moment derived from
+    it, which a launchd job could not follow.
+
+    The moment is named by a function of the day's bounds rather than by a time, so a
+    caller says "close plus five" and the calendar says when that is. The callback runs
+    on the first observation at or after that moment and not again that day, whether the
+    observation comes from a tick or from the daemon starting up late. A daemon that
+    starts at 16:18 therefore still serves a close+5 job for that day.
+
+    Nothing fires for a day the calendar refuses, and nothing fires twice. The day
+    already served is the only state it keeps, which is what makes a per-minute caller
+    safe.
+    """
+
+    def __init__(
+        self,
+        *,
+        session_clock: SessionClock,
+        moment: Callable[[SessionBounds], datetime],
+        job: Callable[[date], None],
+    ) -> None:
+        self._session_clock = session_clock
+        self._moment = moment
+        self._job = job
+        self._served: date | None = None
+
+    def check(self, now: datetime) -> bool:
+        """Run the job if its moment has passed today and it has not run yet.
+
+        Returns whether the job ran, so a caller can order two dispatches or report
+        what a startup pass did.
+        """
+        eastern = now.astimezone(MARKET_TZ)
+        day = eastern.date()
+        if day == self._served:
+            return False
+        try:
+            bounds = self._session_clock.bounds(day)
+        except NotASession:
+            return False
+        if eastern < self._moment(bounds):
+            return False
+        self._served = day
+        self._job(day)
+        return True
