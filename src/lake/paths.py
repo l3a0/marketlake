@@ -43,10 +43,18 @@ deliverables read paths built here. Two surfaces do not share the flat
 ticker has bars at several frequencies on the same day. ``actions`` is a single
 all-ticker file. Each gets its own method, so a caller cannot build a wrong path by
 passing its surface name to the generic partition method.
+
+This is also the single production home for reading those paths back apart. A journal
+segment path and a ``date=YYYY-MM-DD`` directory name are both parsed by more than one
+module. A second reader that re-implements the split can drift from the builder that
+made the path, and nothing would catch it. So each parser sits beside the builder it
+inverts. ``parse_segment_rel`` inverts ``segment_path``. ``parse_date_dir`` reads the
+``date=`` key that every partition path carries.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -231,6 +239,72 @@ class LakePaths:
         return self.reference_path(CONTRACTS)
 
 
+# -- reading a path back apart -----------------------------------------------
+
+# ``parse_segment_rel`` is the inverse of ``LakePaths.segment_path``. That method builds
+# the five-part segment path. This function takes one apart. The pair lives in one module
+# so the shape is spelled once. A parser that drifts from its builder is a silent bug,
+# because the caller gets a plausible answer rather than an error.
+
+
+@dataclass(frozen=True)
+class SegmentRef:
+    """One journal segment's path, parsed into its parts."""
+
+    day: str  # the raw text after "date=", not yet a date object
+    surface: str
+    ticker: str
+    filename: str
+
+
+def parse_segment_rel(rel: str) -> SegmentRef | None:
+    """Parse a lake-relative journal segment path, or return None.
+
+    The shape is journal/date=D/surface=S/ticker=T/seg-<start>-<pid>.arrows.
+    Anything else is None. The separator is always "/", because these strings are
+    manifest keys and not host paths.
+    """
+    parts = rel.split("/")
+    if len(parts) != 5 or parts[0] != JOURNAL_DIR:
+        return None
+    date_part, surface_part, ticker_part, filename = parts[1:]
+    if not (
+        date_part.startswith(DATE_PREFIX)
+        and surface_part.startswith(SURFACE_PREFIX)
+        and ticker_part.startswith(TICKER_PREFIX)
+        and filename.endswith(SEGMENT_SUFFIX)
+    ):
+        return None
+    return SegmentRef(
+        day=date_part[len(DATE_PREFIX) :],
+        surface=surface_part[len(SURFACE_PREFIX) :],
+        ticker=ticker_part[len(TICKER_PREFIX) :],
+        filename=filename,
+    )
+
+
+# A strict ``YYYY-MM-DD``: four digits, two, two, joined by hyphens and nothing else.
+_DATE_SHAPE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def parse_date_dir(name: str) -> date | None:
+    """The date in a ``date=YYYY-MM-DD`` directory name, or None.
+
+    Strict. ``date.fromisoformat`` alone accepts ``20260824`` and ``2026-W35-1``
+    on Python 3.12, so the shape is checked before the parser is asked whether the
+    digits make a real date.
+    """
+    if not name.startswith(DATE_PREFIX):
+        return None
+    text = name[len(DATE_PREFIX) :]
+    if not _DATE_SHAPE.fullmatch(text):
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
 # -- the machine's config directory ------------------------------------------
 
 # The four files that sit in the config directory. The directory plus one of these
@@ -249,3 +323,35 @@ def config_dir(home: str | Path | None = None) -> Path:
     """
     base = Path(home) if home is not None else Path.home()
     return base / ".config" / "marketlake"
+
+
+__all__ = [
+    "ACTIONS",
+    "BARS",
+    "CHAINS",
+    "CHAIN_PLAN_FILE",
+    "CONFIG_FILE",
+    "CONTRACTS",
+    "CORPORATE_ACTIONS_FILE",
+    "DATE_PREFIX",
+    "JOURNAL_DIR",
+    "MANIFEST_FILE",
+    "QUARANTINE_FILE",
+    "QUOTES",
+    "REFERENCE_DIR",
+    "REPORTS_DIR",
+    "SECURITY_MASTER",
+    "SEGMENT_GLOB",
+    "SEGMENT_PREFIX",
+    "SEGMENT_SUFFIX",
+    "SURFACES",
+    "SURFACE_PREFIX",
+    "TICKERS_FILE",
+    "TICKER_PREFIX",
+    "TOKEN_FILE",
+    "LakePaths",
+    "SegmentRef",
+    "config_dir",
+    "parse_date_dir",
+    "parse_segment_rel",
+]

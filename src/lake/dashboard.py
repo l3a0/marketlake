@@ -97,6 +97,7 @@ from lake.paths import (
     SURFACE_PREFIX,
     TICKER_PREFIX,
     LakePaths,
+    parse_date_dir,
 )
 from lake.security_master import (
     ID_TYPE_TICKER,
@@ -684,33 +685,27 @@ def _placed_aggregates(result: Sequence[tuple]) -> tuple[list[SlotAggregate], in
 
 
 def _dates_desc(paths: LakePaths, surface: str, ticker: str) -> list[date]:
-    """Every day the lake holds rows for one ticker and surface, newest first."""
+    """Every day the lake holds rows for one ticker and surface, newest first.
+
+    Both halves of the day come through ``paths.parse_date_dir``. A journal date
+    directory carries the ``date=`` key as its own name. A sealed partition carries the
+    same key as its filename stem, as in ``date=2026-08-24.parquet``. One parser reads
+    both, and compaction's sweep reads its date directories through that same parser, so
+    a directory this panel cannot name is a directory compaction will not seal.
+    """
     days: set[date] = set()
     for date_dir in _date_dirs(paths.journal_dir):
         if (date_dir / f"{SURFACE_PREFIX}{surface}" / f"{TICKER_PREFIX}{ticker}").is_dir():
-            parsed = _parse_dir_date(date_dir.name)
+            parsed = parse_date_dir(date_dir.name)
             if parsed is not None:
                 days.add(parsed)
     partition_dir = paths.root / surface / f"{TICKER_PREFIX}{ticker}"
     for child in _children(partition_dir):
         if child.is_file() and child.suffix == ".parquet":
-            parsed = _parse_dir_date(child.stem)
+            parsed = parse_date_dir(child.stem)
             if parsed is not None:
                 days.add(parsed)
     return sorted(days, reverse=True)
-
-
-def _parse_dir_date(name: str) -> date | None:
-    """The date in a ``date=YYYY-MM-DD`` directory or file stem, or ``None``."""
-    if not name.startswith(DATE_PREFIX):
-        return None
-    text = name[len(DATE_PREFIX) :]
-    if not _DATE_PATTERN.fullmatch(text):
-        return None
-    try:
-        return date.fromisoformat(text)
-    except ValueError:
-        return None
 
 
 # -- the capture_start clamp -------------------------------------------------

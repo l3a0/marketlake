@@ -42,13 +42,7 @@ from typing import NamedTuple
 import pyarrow as pa
 
 from lake.manifest import read_manifest
-from lake.paths import (
-    JOURNAL_DIR,
-    SEGMENT_SUFFIX,
-    SURFACE_PREFIX,
-    TICKER_PREFIX,
-    LakePaths,
-)
+from lake.paths import LakePaths, parse_segment_rel
 
 # The schema version stamped on every row. The vendor columns' full list is fixed by
 # the first day's payload and recorded as version 1. A later payload change mints a
@@ -1102,15 +1096,13 @@ def _is_chains_segment_for(rel: str, ticker: str) -> bool:
     ``journal/date=D/surface=chains/ticker=T/seg-<start_ts>-<pid>.arrows``. This matches
     that shape exactly, so a compacted Parquet partition or another surface's segment never
     qualifies.
+
+    Recognizing that shape is ``parse_segment_rel``'s job. It lives beside the builder that
+    made the path. What is left here is the question only this reader asks, whether the
+    parsed segment names the chains surface and the ticker in hand.
     """
-    parts = rel.split("/")
-    return (
-        len(parts) == 5
-        and parts[0] == JOURNAL_DIR
-        and parts[2] == f"{SURFACE_PREFIX}{CHAINS_SURFACE}"
-        and parts[3] == f"{TICKER_PREFIX}{ticker}"
-        and parts[4].endswith(SEGMENT_SUFFIX)
-    )
+    ref = parse_segment_rel(rel)
+    return ref is not None and ref.surface == CHAINS_SURFACE and ref.ticker == ticker
 
 
 def latest_expirations(lake_root: Path | str, ticker: str) -> list[str] | None:

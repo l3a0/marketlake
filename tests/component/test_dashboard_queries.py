@@ -634,6 +634,25 @@ def test_a_half_written_partition_file_is_not_a_day(fixture_lake: FixtureLake):
     assert row["lookback_exhausted"] is False
 
 
+def test_a_partition_spelled_outside_the_date_key_is_not_a_day(fixture_lake: FixtureLake):
+    # The same cap's worth of gap-only days, so an eleventh day would report the walk as
+    # truncated. Two Parquet files name an eleventh day in spellings this lake never
+    # writes. The first drops the ``date=`` key. The second keeps the key and spells the
+    # day the compact way, which ``date.fromisoformat`` alone still reads as 2026-08-14.
+    #
+    # Neither file was built by this pipeline, so neither is a day. The panel reads its
+    # date directories and its partition stems through the one parser compaction's sweep
+    # uses, so a name the panel refuses is a name the sweep will not seal.
+    days = [MONDAY - timedelta(days=back) for back in range(MAX_LOOKBACK_SESSIONS)]
+    root = _gap_only_days(fixture_lake, "SPY", days)
+    partitions = root / "chains" / "ticker=SPY"
+    partitions.mkdir(parents=True, exist_ok=True)
+    for name in ("2026-08-14.parquet", "date=20260814.parquet"):
+        (partitions / name).write_bytes(b"never opened, because it is never a day")
+    row = service_over(root).run_query("now", {})["surfaces"][0]
+    assert row["lookback_exhausted"] is False
+
+
 def test_a_ticker_with_no_data_cycle_ever_reports_null_freshness(fixture_lake: FixtureLake):
     # Day one for a newly onboarded ticker: a gap landed, no cycle has. Freshness is null
     # rather than zero, because there is no cycle to measure an age against.

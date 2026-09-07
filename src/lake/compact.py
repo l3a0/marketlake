@@ -98,6 +98,7 @@ from lake.paths import (
     SURFACE_PREFIX,
     TICKER_PREFIX,
     LakePaths,
+    parse_date_dir,
 )
 from lake.runner import PING_FAILURES, BackupRunner, Pinger, RsyncBackup, UrllibPinger
 from lake.session import SessionClock
@@ -296,17 +297,33 @@ def _sweep_scope(
     for entry in sorted(journal_dir.iterdir()):
         if not entry.is_dir() or not entry.name.startswith(DATE_PREFIX):
             continue
-        raw = entry.name[len(DATE_PREFIX) :]
-        try:
-            day = date.fromisoformat(raw)
-        except ValueError:
+        # ``parse_date_dir`` is the one decision about what a date directory is. The
+        # dashboard's panels ask it the same question, so both halves of the system now
+        # agree on the answer. It is stricter than the bare ``date.fromisoformat`` this
+        # used to call. On Python 3.12 that parser also reads ``date=20260824`` and
+        # ``date=2026-W35-1`` as 2026-08-24, so the sweep used to seal three differently
+        # named directories into one partition while the panels showed only the one
+        # spelled ``date=2026-08-24``.
+        #
+        # Stricter is the correct direction. Every writer hands ``_day_str`` a ``date``,
+        # which it renders as ISO, so a directory in any other spelling was never written
+        # by this pipeline. The helper passes a string through verbatim, so the guarantee
+        # rests on the writers rather than on the helper. Sealing a foreign directory is
+        # worse than declining to. Compaction would fold it into a partition the panels
+        # cannot show, and the segments would be unlinked afterward.
+        #
+        # This module has no logger. The ``SkippedDay`` below is how a foreign directory
+        # stays discoverable. It carries the full directory name, the run result holds it,
+        # and ``CompactionResult.render`` prints it.
+        day = parse_date_dir(entry.name)
+        if day is None:
             skipped.append(SkippedDay(entry.name, "unparseable"))
             continue
         if not calendar.is_session(day):
-            skipped.append(SkippedDay(raw, "not_a_session"))
+            skipped.append(SkippedDay(day.isoformat(), "not_a_session"))
             continue
         if slot <= session.bounds(day).option_close_deadline:
-            skipped.append(SkippedDay(raw, "guard_open"))
+            skipped.append(SkippedDay(day.isoformat(), "guard_open"))
             continue
         eligible.append((day, entry))
     return eligible, skipped
