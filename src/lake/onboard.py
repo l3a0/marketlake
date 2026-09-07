@@ -68,7 +68,7 @@ from pathlib import Path
 from lake import capture, journal, security_master
 from lake.calendar import MARKET_TZ
 from lake.clock import Clock, SystemClock
-from lake.config import load_config
+from lake.config import input_errors_exit, load_config
 from lake.manifest import record_partition
 from lake.security_master import ID_TYPE_TICKER, KIND_EQUITY, SecurityMaster
 from lake.tickers import upsert_ticker
@@ -409,15 +409,16 @@ def _build_parser():
 def main(argv: Sequence[str] | None = None) -> int:
     """The ``python -m lake.onboard`` entry. Returns a process exit code."""
     args = _build_parser().parse_args(argv)
-    report = onboard_from_config(
-        args.ticker,
-        config_path=args.config,
-        tickers_path=args.tickers,
-        token_path=args.token,
-        options=args.options,
-        chain_cadence=args.chain_cadence,
-        bars=args.bars,
-    )
+    with input_errors_exit("onboard"):
+        report = onboard_from_config(
+            args.ticker,
+            config_path=args.config,
+            tickers_path=args.tickers,
+            token_path=args.token,
+            options=args.options,
+            chain_cadence=args.chain_cadence,
+            bars=args.bars,
+        )
     print(report.render())
     return 0
 

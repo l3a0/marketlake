@@ -155,10 +155,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     recorded cassette is for local diagnosis. Do not commit a recording from a real
     account.
     """
-    from lake.config import load_config  # lazy: D1 dependency, live only
+    from lake.config import input_errors_exit, load_config  # lazy: D1 dependency, live only
 
     args = build_parser().parse_args(argv)
-    cfg = load_config()
+    with input_errors_exit("record"):
+        cfg = load_config()
     api_key = cfg.schwab_api_key.reveal()
     app_secret = cfg.schwab_app_secret.reveal()
 
