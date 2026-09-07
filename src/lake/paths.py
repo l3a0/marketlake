@@ -74,8 +74,10 @@ _DATE_PARTITIONED = frozenset({CHAINS, QUOTES})
 
 # The journal top-level directory, the reference directory, the reports directory, and
 # the two ledgers. ``reports/`` holds one dated file per night, written by the vendor
-# sweep. It sits inside the backup sync root, so a restore carries the reports with the
-# data, and outside the manifest, because a report is not a measurement.
+# sweep. The daemon also writes here, one file per page that never reached the phone,
+# under `reports/alerts/date=D/`. It sits inside the backup sync root, so a restore
+# carries the reports with the data, and outside the manifest, because neither a
+# report nor a record of an unsent page is a measurement.
 JOURNAL_DIR = "journal"
 REFERENCE_DIR = "reference"
 REPORTS_DIR = "reports"

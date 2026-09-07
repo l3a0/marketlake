@@ -44,6 +44,7 @@ EXPECTED_FILES = {
     "com.marketlake.daemon.plist",
     "com.marketlake.dashboard.plist",
     "com.marketlake.self-check.plist",
+    "com.marketlake.calendar-probe.plist",
     "com.marketlake.sunday.plist",
     cp.SUDOERS_FILE,
 }
@@ -334,6 +335,7 @@ def test_the_install_text_pins_every_command_line_in_order(tmp_path, capsys):
         "com.marketlake.daemon",
         "com.marketlake.dashboard",
         "com.marketlake.self-check",
+        "com.marketlake.calendar-probe",
         "com.marketlake.sunday",
     ]
     sudoers = resolved / cp.SUDOERS_FILE
@@ -378,7 +380,7 @@ def test_the_install_text_names_the_reload_and_leaves_it_commented(tmp_path, cap
     printed = capsys.readouterr().out
     assert "Re-installing." in printed
     bootouts = [line for line in printed.splitlines() if "launchctl bootout" in line]
-    assert len(bootouts) == 4
+    assert len(bootouts) == 5
     assert all(line.startswith("# ") for line in bootouts)
 
 

@@ -89,6 +89,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
+from lake.alert import Message, NtfyTransport, Publisher, Transport
 from lake.calendar import Calendar, ExchangeCalendar
 from lake.capture import CycleResult, run_cycle_from_config
 from lake.clock import Clock, SystemClock
@@ -96,7 +97,10 @@ from lake.close_guard import CloseGuard
 from lake.close_guard import GuardOutcome as CloseGuardOutcome
 from lake.config import ConfigError, load_config
 from lake.control_plane import AssertionHolder, AssertionRunner
-from lake.gap import GapMarker, MarkingReport
+from lake.deadman import CAPTURE_SLUG, DeadMan
+from lake.gap import GapMarker, MarkingReport, surfaces_for
+from lake.journal import ROW_KIND_DATA
+from lake.runner import Pinger, UrllibPinger
 from lake.security_master import SecurityMaster, SecurityMasterError, master_path
 from lake.session import (
     CAPTURE_PHASES,
@@ -107,7 +111,8 @@ from lake.session import (
     missed_slots,
     skipped_slots,
 )
-from lake.tickers import TickersError, load_tickers
+from lake.tickers import Roster, TickersError, load_tickers
+from lake.watchdog import Page, Surface, Watchdog
 
 # The loop's cadence: one tick per minute, on the minute top.
 
@@ -332,6 +337,37 @@ def _close_guard(
     return CloseGuard(lake_root=config.lake_root, roster=roster, session_clock=session_clock)
 
 
+def _alarm(
+    config_path: str | Path | None,
+    tickers_path: str | Path | None,
+    session_clock: SessionClock,
+    transport: Transport | None,
+    pinger: Pinger | None,
+) -> tuple[Watchdog, Publisher, DeadMan, Roster] | None:
+    """The watchdog, its publisher, and the dead-man feed, or ``None``.
+
+    A config or roster that will not load is already fatal to the cycle runner on its
+    first tick, so nothing here is worth refusing to start over.
+    """
+    try:
+        config = load_config(config_path)
+        roster = load_tickers(tickers_path)
+    except (ConfigError, TickersError):
+        return None
+    publisher = Publisher(
+        lake_root=config.lake_root,
+        transport=transport if transport is not None else NtfyTransport(config.ntfy_topic.reveal()),
+        # The values that must never reach a phone, checked against the page itself.
+        secrets=(config.healthchecks_ping_key.reveal(), config.ntfy_topic.reveal()),
+    )
+    deadman = DeadMan(
+        pinger=pinger if pinger is not None else UrllibPinger(),
+        url=config.healthchecks_url(CAPTURE_SLUG),
+        session_clock=session_clock,
+    )
+    return Watchdog(page_minutes=config.guards.watchdog_page_minutes), publisher, deadman, roster
+
+
 def run_loop_from_config(
     *,
     config_path: str | Path | None = None,
@@ -342,6 +378,8 @@ def run_loop_from_config(
     calendar: Calendar | None = None,
     assertion_runner: AssertionRunner | None = None,
     cycle_runner: CycleRunner | None = None,
+    transport: Transport | None = None,
+    pinger: Pinger | None = None,
     should_continue: Callable[[], bool] = _forever,
 ) -> None:
     """Run the loop wired from the real clock, calendar, and config. It never returns.
@@ -355,6 +393,10 @@ def run_loop_from_config(
     The caffeinate power assertion is held here rather than left to a caller. The
     design's chain is the wake alarm, then ``KeepAlive`` starting the daemon, then the
     assertion keeping an open laptop awake, and this is the link that holds it. An
+    ``transport`` defaults to the real ntfy POST and ``pinger`` to the real HTTP GET.
+    A test must pass its own for both, because each default reaches a public endpoint
+    and a page sent from a test is a page a person receives.
+
     ``cycle_runner`` defaults to the real capture cycle. A test passes its own, which
     is the only way to observe what this entry binds without reaching a vendor: every
     hook the loop-coupled deliverables bind fires on a capture slot.
@@ -429,6 +471,59 @@ def run_loop_from_config(
         hooks = replace(hooks, on_start=on_start_guarded, on_tick=on_tick_guarded)
 
     hooks = replace(hooks, close_tag_for=session_clock.close_tag_at)
+
+    # The watchdog rides the cycle observer and the skipped-slot hook, because the loop
+    # runs no cycle for a slot it slept through and those are the minutes the daemon was
+    # worst off. The dead-man rides the same two plus every tick, so an idle weekday
+    # keeps feeding the check that pages on silence.
+    alarm = _alarm(config_path, tickers_path, session_clock, transport, pinger)
+    if alarm is not None:
+        watchdog, publisher, deadman, roster = alarm
+        alarm_on_cycle = hooks.on_cycle
+        alarm_on_skipped = hooks.on_skipped
+        alarm_on_tick = hooks.on_tick
+
+        def raise_pages(pages: list[Page], now: datetime) -> None:
+            for page in pages:
+                publisher.publish(
+                    Message(
+                        event="capture_down",
+                        title=page.title,
+                        body=f"{page.minutes} session minutes without a durable cycle",
+                    ),
+                    now=now,
+                )
+
+        def on_cycle(slot: datetime, result: CycleResult) -> None:
+            raise_pages(watchdog.observe(result), slot)
+            if any(seg.row_kind == ROW_KIND_DATA for seg in result.segments):
+                deadman.captured(slot)
+            alarm_on_cycle(slot, result)
+
+        def on_skipped(slots: list[datetime]) -> None:
+            # The roster is re-read here rather than closed over. The cycle runner
+            # re-reads it every cycle, and the design has the watchdog counters read
+            # that same snapshot, so a ticker retired mid-session must stop being
+            # charged without a restart. A roster that will not load leaves the last
+            # good one in place, since refusing to count is worse than counting a
+            # ticker one cycle too long.
+            try:
+                current = load_tickers(tickers_path)
+            except TickersError:
+                current = roster
+            watched = [
+                Surface(surface, entry.ticker)
+                for entry in current
+                for surface in surfaces_for(entry)
+            ]
+            raise_pages(watchdog.missed(watched, slots), slots[-1])
+            alarm_on_skipped(slots)
+
+        def on_tick(slot: datetime) -> None:
+            deadman.idle(slot)
+            alarm_on_tick(slot)
+
+        hooks = replace(hooks, on_cycle=on_cycle, on_skipped=on_skipped, on_tick=on_tick)
 
     def run_a_cycle(*, close_tag: str | None, session_phase: str | None) -> CycleResult:
         return run_cycle_from_config(
