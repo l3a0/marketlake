@@ -23,8 +23,8 @@ The manifest is the lock file, and that is deliberate. A ``flock`` lock is kerne
 state on an open file descriptor, not bytes in the file. So locking ``manifest.jsonl``
 writes nothing into it and leaves no stale lock data behind. The manifest is the
 rendezvous the single-writer rule already names, so it is the natural thing to lock.
-Locking it keeps the scrub's exclusion set exactly ``{manifest.jsonl, journal/}`` as
-the doc enumerates, and adds no new file to the lake tree or the backup. The handle is
+Locking it adds nothing to the scrub's enumerated exclusion set, because the manifest
+is already on it, and no new file to the lake tree or the backup. The handle is
 opened read-only, so accidental truncation or corruption of the integrity root through
 the lock path is structurally impossible. ``flock`` works fine on a read-only handle.
 
