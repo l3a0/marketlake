@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from enum import Enum
 
-from lake.calendar import MARKET_TZ, Calendar
+from lake.calendar import MARKET_TZ, Calendar, NotASession
 from lake.clock import Clock
 
 # The option-close guard window. The last moment after the option close that an
@@ -55,6 +55,12 @@ OPTION_CLOSE_GUARD = timedelta(minutes=5)
 # The compaction delay. How long after the option close the close+15 compaction
 # job runs. A structural session-relative offset, so it lives in code, not config.
 COMPACTION_DELAY = timedelta(minutes=15)
+
+
+# One capture slot. The loop fires on the minute, so a missed span is counted in these.
+TICK = timedelta(minutes=1)
+
+_ONE_DAY = timedelta(days=1)
 
 
 class SessionPhase(Enum):
@@ -128,7 +134,16 @@ class SessionClock:
 
     def phase(self) -> SessionPhase:
         """The phase of the current snap slot."""
-        slot = self.snap_slot()
+        return self.phase_at(self.snap_slot())
+
+    def phase_at(self, slot: datetime) -> SessionPhase:
+        """The phase of any slot, past or present.
+
+        ``phase`` reads the clock. This reads the slot it is handed, so a writer
+        stamping a minute that has already gone by can ask the same question. Gap
+        marking needs it, because a marker for a post-equity-close minute carries the
+        same ``session_phase`` a captured row would have carried.
+        """
         day = slot.date()
         if not self._calendar.is_session(day):
             return SessionPhase.NON_SESSION
@@ -148,3 +163,59 @@ class SessionClock:
         is the two phases in ``CAPTURE_PHASES``: ``OPEN`` and ``POST_EQUITY_CLOSE``.
         """
         return self.phase() in CAPTURE_PHASES
+
+
+# -- missed capture slots -------------------------------------------------------
+
+
+def skipped_slots(bounds: SessionBounds, after: datetime, before: datetime) -> list[datetime]:
+    """The capture slots strictly between two slots of one session date, in order.
+
+    It steps one minute at a time from ``after`` toward ``before`` and keeps each slot
+    inside the capture window, ``bounds.open`` through ``bounds.option_close`` inclusive.
+    Adjacent slots yield nothing. So does a span that lies wholly off the window.
+    """
+    skipped: list[datetime] = []
+    candidate = after + TICK
+    while candidate < before:
+        if bounds.open <= candidate <= bounds.option_close:
+            skipped.append(candidate)
+        candidate += TICK
+    return skipped
+
+
+def missed_slots(
+    session_clock: SessionClock,
+    last_slot: datetime | None,
+    slot: datetime,
+) -> list[datetime]:
+    """The capture slots missed between the previous tick and this one, in order.
+
+    Nothing is missed before the first tick or between adjacent ticks, and only past
+    that short-circuit does the calendar get asked, so the normal-cadence path never
+    touches it. A wider span is walked one calendar day at a time, from the previous
+    tick's date through this one's. A day the calendar refuses as ``NotASession``, a
+    weekend, a holiday, or a Saturday wake, contributes nothing. Each session day is
+    clipped at its own edges: the first day runs from the previous slot through its
+    option close, the last day from its open up to this slot, a middle day end to end,
+    and a same-day span from the previous slot to this one. So a stall across days
+    reports the first day's tail and the last day's head, and a night jump that touches
+    no capture slot reports nothing.
+    """
+    if last_slot is None or slot - last_slot <= TICK:
+        return []
+    first_day = last_slot.date()
+    last_day = slot.date()
+    skipped: list[datetime] = []
+    day = first_day
+    while day <= last_day:
+        try:
+            bounds = session_clock.bounds(day)
+        except NotASession:
+            day += _ONE_DAY
+            continue
+        after = last_slot if day == first_day else bounds.open - TICK
+        before = slot if day == last_day else bounds.option_close + TICK
+        skipped.extend(skipped_slots(bounds, after, before))
+        day += _ONE_DAY
+    return skipped

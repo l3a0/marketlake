@@ -34,7 +34,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import NamedTuple
@@ -896,6 +896,47 @@ def gap_batch(
     return _batch(schema, [row])
 
 
+def gap_rows(
+    surface: str,
+    *,
+    ticker: str,
+    slots: Sequence[datetime],
+    error_class: str,
+    session_phase_at: Callable[[datetime], str | None] | None = None,
+) -> pa.RecordBatch:
+    """Build one gap batch covering many missed minutes, one row per slot.
+
+    ``gap_batch`` is the single-minute form. A dead daemon leaves whole sessions
+    missing, and a regular session is 406 capture slots, so building one batch per
+    minute would put 406 record batches and 406 message headers in a segment that holds
+    one fact per row. This builds one batch instead, with the same all-columns-null rule
+    by construction.
+
+    ``session_phase_at`` names the phase of a past slot, because a marker for a minute
+    after the equity close carries the same ``session_phase`` a captured row would have
+    carried. Passing nothing leaves every phase null.
+    """
+    schema = schema_for(surface)
+    rows = [
+        {
+            "snap_ts": _iso(slot),
+            "fetch_ts": None,
+            "fetch_end_ts": None,
+            "vendor_quote_ts": None,
+            "ticker": ticker,
+            "row_kind": ROW_KIND_GAP,
+            "error_class": error_class,
+            "suspect": False,
+            "close_tag": None,
+            "session_phase": None if session_phase_at is None else session_phase_at(slot),
+            "schema_version": SCHEMA_VERSION,
+            "extra": None,
+        }
+        for slot in slots
+    ]
+    return _batch(schema, rows)
+
+
 # -- segment paths -----------------------------------------------------------
 
 
@@ -923,6 +964,16 @@ def segment_path(
     delegates there, so the two can never drift apart.
     """
     return LakePaths(lake_root).segment_path(surface, ticker, day, start_ts, pid)
+
+
+def segment_dir(lake_root: Path | str, surface: str, ticker: str, day: date | str) -> Path:
+    """The directory holding one surface, ticker, and day's segments.
+
+    ``segment_path`` names one file inside it. A reader that wants every segment for a
+    ticker-day asks for the directory instead. Both defer to ``LakePaths``, so the
+    layout is spelled in one place.
+    """
+    return LakePaths(lake_root).segment_dir(surface, ticker, day)
 
 
 # -- the writer --------------------------------------------------------------
@@ -1089,6 +1140,62 @@ def read_segment(path: Path | str) -> pa.Table:
     return pa.Table.from_batches(batches, schema=schema)
 
 
+class RecordedSlot(NamedTuple):
+    """The newest recorded minute for a ticker-day, and what could not be read."""
+
+    slot: datetime | None
+    unreadable: tuple[Path, ...]
+
+
+def last_recorded_slot(
+    lake_root: Path | str, surface: str, ticker: str, day: date | str
+) -> RecordedSlot:
+    """The newest ``snap_ts`` already recorded for one surface, ticker, and day.
+
+    This is gap marking's anchor. It answers "where does this ticker-day's record stop",
+    which decides the first minute a marker is owed for.
+
+    It counts rows of every kind, data and gap alike, and that is the whole point. A
+    daemon under ``KeepAlive`` restarts repeatedly, and each restart marks from this
+    anchor forward. An anchor that saw only data rows would not see the previous
+    restart's markers, so the second restart would mark the same minutes again. The
+    day's partition would then seal with two rows per missed minute, and the row-count
+    guard would not object because the count grew. Counting markers makes a repeated
+    restart idempotent.
+
+    It reads the day's journal directory rather than the manifest, for the same reason.
+    Marker segments carry no manifest entry, so a manifest-ordered walk would not find
+    them.
+
+    A torn tail is safe: each segment reads to its last complete batch. A segment that
+    cannot be read at all is a different thing, and the caller is told rather than
+    misled: ``unreadable`` names those files. Treating one as absent would let a day
+    that really was captured read as fully dark, and a full session of ``daemon_dead``
+    markers would then be written over a record that exists.
+
+    ``None`` with nothing unreadable means nothing is recorded for that ticker-day,
+    which is the fully dark case.
+    """
+    directory = segment_dir(lake_root, surface, ticker, day)
+    if not directory.is_dir():
+        return RecordedSlot(None, ())
+    newest: datetime | None = None
+    unreadable: list[Path] = []
+    for path in sorted(directory.glob("*.arrows")):
+        try:
+            table = read_segment(path)
+        except (OSError, pa.ArrowInvalid, ShadowAppendError):
+            unreadable.append(path)
+            continue
+        for value in table.column("snap_ts").to_pylist():
+            if value is None:
+                continue
+            stamp = datetime.fromisoformat(value)
+            if newest is None or stamp > newest:
+                newest = stamp
+    return RecordedSlot(newest, tuple(unreadable))
+
+
 def _is_chains_segment_for(rel: str, ticker: str) -> bool:
     """Whether a manifest partition path is one of ``ticker``'s chains journal segments.
 
@@ -1110,9 +1217,12 @@ def latest_expirations(lake_root: Path | str, ticker: str) -> list[str] | None:
 
     This is the last-durable-batch read. The capture chunker makes it on its failure path
     to name absence markers without a live lookup, since every successful fetch already
-    returned the full expiration set. D10's startup gap-marking reuses the same read to find
-    where a ticker's durable record left off. It is general on purpose: it reads from disk
-    only when called, and never reads the wall clock.
+    returned the full expiration set. It is general on purpose: it reads from disk only when
+    called, and never reads the wall clock.
+
+    Gap marking does not use this. It needs the newest recorded minute, on either surface,
+    counting marker rows as well as data rows, which is three ways different from what this
+    answers. ``last_recorded_slot`` is that read.
 
     The segment is located through the manifest. Capture appends one entry per segment in
     cycle order, keyed by the segment path, so the ticker's chains-segment entries in file
