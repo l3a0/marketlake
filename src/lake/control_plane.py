@@ -39,17 +39,20 @@ Terms, glossed at first use.
   assertion* adds the token's lifetime to the mint and requires the sum to clear the
   week's last option close.
 
-Seven operational wall-clock times live here as named integer constants, in order. They
+Nine operational wall-clock times live here as named integer constants, in order. They
 are not session times. The session times come from the calendar. These are the moments
 the design pins to the machine's clock, so launchd and pmset can fire them.
 
 1. The 08:25 weekday firmware wake.
 2. The 08:30 weekday pre-open self-check.
-3. The 18:30 weekday vendor sweep, whose Friday run sets the Sunday one-shot.
-4. The weekday assertion end near 18:45, when the vendor sweep's ping lands.
-5. The 19:55 Sunday one-shot wake.
-6. The 20:00 Sunday canary and maintenance job.
-7. The 23:00 Sunday canary deadline, which is also the canary's last retry.
+3. The 09:35 weekday says-closed-but-open calendar probe.
+4. The 18:30 weekday vendor sweep, whose Friday run sets the Sunday one-shot.
+5. The weekday assertion end near 18:45, when the vendor sweep's ping lands.
+6. The 19:55 Sunday one-shot wake.
+7. The 20:00 Sunday canary and maintenance job.
+8. The 23:00 Sunday canary cutoff, the last retry the canary attempts.
+9. The 23:30 Sunday assertion end, the ``sunday`` check's deadline. It sits half an hour
+   past the cutoff so the last retry finishes inside the power assertion.
 
 The re-auth reminder's hours derive from the last two rather than adding constants of
 their own. Every one of these is a pair of integers, never a ``"HH:MM"`` string, so
