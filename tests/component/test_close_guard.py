@@ -29,7 +29,9 @@ def _clock(at: datetime) -> SessionClock:
     return SessionClock(clock=ManualClock(start=at), calendar=weekday_sessions(WEEK))
 
 
-def _row(root: Path, surface: str, ticker: str, slot: datetime, *, tag: str, kind: str) -> None:
+def _row(
+    root: Path, surface: str, ticker: str, slot: datetime, *, tag: str | None, kind: str
+) -> None:
     """One recorded row under a close tag, standing for a cycle that ran."""
     schema = journal.schema_for(surface)
     batch = journal._batch(
@@ -371,3 +373,47 @@ def test_a_journalled_snapshot_can_carry_a_slot_apart_from_its_fetch_minute(tmp_
     assert rows[0]["close_tag"] == OPTION_CLOSE
     # The fetch minute is still recorded, so the round trip stays measurable.
     assert rows[0]["fetch_ts"].startswith("2026-09-02T16:18")
+
+
+def test_the_guard_writes_the_close_minutes_before_gap_marking_claims_them(tmp_path):
+    """The two writers must not both mark 16:00 on a post-close restart.
+
+    Startup gap marking walks the day and marks every minute with no record. The guard
+    is the design's sole writer of the spot_close absent-marker. Running the guard first
+    puts a row at 16:00 before the marker looks, and the marker's anchor counts marker
+    rows, so it stops short rather than adding a second.
+    """
+    from tests.support.config import write_config
+
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("XYZ: {options: false}\n")
+    # Captured to 11:00, then the daemon died. It restarts after close+5.
+    _row(lake_root, "quotes", "XYZ", et(2026, 9, 2, 11, 0), tag=None, kind="data")
+
+    clock = ManualClock(start=et(2026, 9, 2, 16, 30))
+    ticks = [0]
+
+    def once() -> bool:
+        ticks[0] += 1
+        return ticks[0] <= 1
+
+    daemon.run_loop_from_config(
+        config_path=str(config),
+        tickers_path=str(tickers),
+        clock=clock,
+        calendar=weekday_sessions(WEEK),
+        assertion_runner=lambda args: None,
+        cycle_runner=lambda *, close_tag, session_phase: None,
+        should_continue=once,
+    )
+
+    rows = _rows(lake_root, "quotes", "XYZ", DAY)
+    at_close = [r for r in rows if r["snap_ts"].startswith("2026-09-02T16:00")]
+    assert len(at_close) == 1, "16:00 carries a marker from each writer"
+    assert at_close[0]["close_tag"] == SPOT_CLOSE
+    assert at_close[0]["error_class"] == close_guard.SPOT_CLOSE_UNOBSERVED
+    stamps = [r["snap_ts"] for r in rows]
+    assert len(stamps) == len(set(stamps)), "a minute is recorded twice"

@@ -32,8 +32,8 @@ has a no-op default, so the loop ships standalone.
   watchdog (D13), which counts consecutive session minutes without a durable data cycle,
   plugs in here.
 - ``on_skipped(slots)`` is handed the capture slots the loop missed, in order, when a
-  cycle overran its minute. The same gap-marking writer (D10) plugs in here. Until it
-  does, a skipped slot stays a hole, exactly as a loop with no such hook would leave it.
+  cycle overran its minute. The same gap-marking writer plugs in here, so a slot the
+  loop slept through is recorded rather than left a hole.
 
 Two provenance tags ride every row of a cycle. The loop is the first piece that consults
 the session clock per minute, so it is the piece that stamps them.
@@ -85,25 +85,33 @@ import argparse
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
-from lake.calendar import Calendar, ExchangeCalendar, NotASession
+from lake.calendar import Calendar, ExchangeCalendar
 from lake.capture import CycleResult, run_cycle_from_config
 from lake.clock import Clock, SystemClock
 from lake.close_guard import CloseGuard
 from lake.close_guard import GuardOutcome as CloseGuardOutcome
 from lake.config import ConfigError, load_config
 from lake.control_plane import AssertionHolder, AssertionRunner
-from lake.session import CAPTURE_PHASES, SessionBounds, SessionClock, SessionDispatch, SessionPhase
+from lake.gap import GapMarker, MarkingReport
+from lake.security_master import SecurityMaster, SecurityMasterError, master_path
+from lake.session import (
+    CAPTURE_PHASES,
+    TICK,
+    SessionClock,
+    SessionDispatch,
+    SessionPhase,
+    missed_slots,
+    skipped_slots,
+)
 from lake.tickers import TickersError, load_tickers
 
 # The loop's cadence: one tick per minute, on the minute top.
-TICK = timedelta(minutes=1)
 
 # The step of the day-walk a multi-day stall is accounted by.
-_ONE_DAY = timedelta(days=1)
 
 
 class CycleRunner(Protocol):
@@ -133,7 +141,7 @@ def _ignore_cycle(slot: datetime, result: CycleResult) -> None:
 
 
 def _ignore_skipped(slots: list[datetime]) -> None:
-    """The default skipped-slot hook. The slots stay holes until D10 plugs its writer in."""
+    """The default skipped-slot hook. Bare hooks record nothing, so the slots stay holes."""
 
 
 def _ignore_tick(slot: datetime) -> None:
@@ -172,59 +180,6 @@ def seconds_to_next_minute(now: datetime) -> float:
     return (top - now).total_seconds()
 
 
-def skipped_slots(bounds: SessionBounds, after: datetime, before: datetime) -> list[datetime]:
-    """The capture slots strictly between two slots of one session date, in order.
-
-    It steps one minute at a time from ``after`` toward ``before`` and keeps each slot
-    inside the capture window, ``bounds.open`` through ``bounds.option_close`` inclusive.
-    Adjacent slots yield nothing. So does a span that lies wholly off the window.
-    """
-    skipped: list[datetime] = []
-    candidate = after + TICK
-    while candidate < before:
-        if bounds.open <= candidate <= bounds.option_close:
-            skipped.append(candidate)
-        candidate += TICK
-    return skipped
-
-
-def _skips_since(
-    session_clock: SessionClock,
-    last_slot: datetime | None,
-    slot: datetime,
-) -> list[datetime]:
-    """The capture slots missed between the previous tick and this one, in order.
-
-    Nothing is missed before the first tick or between adjacent ticks, and only past
-    that short-circuit does the calendar get asked, so the normal-cadence path never
-    touches it. A wider span is walked one calendar day at a time, from the previous
-    tick's date through this one's. A day the calendar refuses as ``NotASession``, a
-    weekend, a holiday, or a Saturday wake, contributes nothing. Each session day is
-    clipped at its own edges: the first day runs from the previous slot through its
-    option close, the last day from its open up to this slot, a middle day end to end,
-    and a same-day span from the previous slot to this one. So a stall across days
-    reports the first day's tail and the last day's head, and a night jump that touches
-    no capture slot reports nothing.
-    """
-    if last_slot is None or slot - last_slot <= TICK:
-        return []
-    first_day = last_slot.date()
-    last_day = slot.date()
-    skipped: list[datetime] = []
-    day = first_day
-    while day <= last_day:
-        try:
-            bounds = session_clock.bounds(day)
-        except NotASession:
-            day += _ONE_DAY
-            continue
-        after = last_slot if day == first_day else bounds.open - TICK
-        before = slot if day == last_day else bounds.option_close + TICK
-        skipped.extend(skipped_slots(bounds, after, before))
-        day += _ONE_DAY
-    return skipped
-
-
 def _forever() -> bool:
     """The default ``should_continue``. The production loop never stops on its own."""
     return True
@@ -259,16 +214,21 @@ def run_loop(
     A test binds it to a manual clock to bound a simulated session.
     """
     hooks = hooks if hooks is not None else DaemonHooks()
+    # The slot of the previous tick, seeded before ``on_start`` runs so the handoff
+    # between startup marking and the loop is exact rather than a matter of timing.
+    # Startup marking bounds itself at this same minute plus one. If the pass then
+    # outlives its minute, the first tick lands later than that bound and the minutes
+    # in between belong to neither producer. Seeding here hands them to ``on_skipped``,
+    # which is true to what happened: the daemon was alive and busy. Seeding also costs
+    # nothing when the pass is quick, because adjacent slots yield no missed minutes.
+    last_slot: datetime | None = session_clock.snap_slot()
     hooks.on_start()
-    # The slot of the previous tick. None before the first tick, so a fresh incarnation
-    # leaves the minutes before it to startup gap-marking and the two never overlap.
-    last_slot: datetime | None = None
     while should_continue():
         clock.sleep(seconds_to_next_minute(clock.now()))
         phase = session_clock.phase()
         slot = session_clock.snap_slot()
         hooks.on_tick(slot)
-        skipped = _skips_since(session_clock, last_slot, slot)
+        skipped = missed_slots(session_clock, last_slot, slot)
         if skipped:
             hooks.on_skipped(skipped)
         last_slot = slot
@@ -281,6 +241,55 @@ def run_loop(
 
 
 # -- the production entry ------------------------------------------------------
+
+
+def _report(report: MarkingReport, pass_name: str) -> None:
+    """Print what a marking pass did, so a pass that failed is not silent.
+
+    launchd captures the daemon's stderr to its own log, which is the only place a
+    startup pass can be seen from. A pass that marked the right thing, one that marked
+    nothing because a segment could not be read, and one that stopped at the walk-back
+    cap all look identical on disk. Only the quiet case stays quiet: a pass with rows
+    and no findings prints nothing, so the ordinary restart adds no noise.
+    """
+    if not report.problems and not report.truncated:
+        return
+    parts = [f"gap {pass_name}: rows={report.rows}"]
+    if report.truncated:
+        parts.append(f"truncated={','.join(report.truncated)}")
+    if report.problems:
+        parts.append(f"problems={'; '.join(report.problems)}")
+    print(" ".join(parts), file=sys.stderr)
+
+
+def _gap_marker(
+    config_path: str | Path | None,
+    tickers_path: str | Path | None,
+    session_clock: SessionClock,
+) -> GapMarker | None:
+    """The gap marker for this daemon, or ``None`` when it cannot be built.
+
+    Marking is a record of what was missed, not a capture. A config or roster that will
+    not load is already fatal to the cycle runner on its first tick, and the security
+    master is optional, so nothing here is worth refusing to start over. Returning
+    ``None`` leaves the hooks bare and the loop unchanged.
+    """
+    try:
+        config = load_config(config_path)
+        roster = load_tickers(tickers_path)
+    except (ConfigError, TickersError):
+        return None
+    master = None
+    try:
+        master = SecurityMaster.read(master_path(config.lake_root))
+    except (OSError, SecurityMasterError):
+        master = None
+    return GapMarker(
+        lake_root=config.lake_root,
+        roster=roster,
+        session_clock=session_clock,
+        master=master,
+    )
 
 
 def _report_guard(outcome: CloseGuardOutcome) -> None:
@@ -353,6 +362,13 @@ def run_loop_from_config(
     ``AssertionHolder`` rides ``on_tick``, so the assertion is taken when a window
     opens and again for each new day the daemon lives through. Any hook the caller
     passed still runs.
+
+    Gap marking rides ``on_start`` and ``on_skipped`` the same way. Both hand their
+    missed slots to one ``GapMarker``, so a restart and a live overrun leave the same
+    kind of record. Marking needs the lake root, the roster, and the security master,
+    which this entry did not load before, so it loads them once here rather than per
+    cycle. A load failure leaves marking off and the loop still runs, because a daemon
+    that captures without marking is better than one that does not start.
     """
     clock = clock if clock is not None else SystemClock()
     calendar = calendar if calendar is not None else ExchangeCalendar()
@@ -368,10 +384,30 @@ def run_loop_from_config(
 
     hooks = replace(hooks, on_tick=on_tick)
 
+    marker = _gap_marker(config_path, tickers_path, session_clock)
+    if marker is not None:
+        caller_on_start = hooks.on_start
+        caller_on_skipped = hooks.on_skipped
+
+        def on_start() -> None:
+            _report(marker.on_start(), "startup")
+            caller_on_start()
+
+        def on_skipped(slots: list[datetime]) -> None:
+            _report(marker.on_skipped(slots), "skipped")
+            caller_on_skipped(slots)
+
+        hooks = replace(hooks, on_start=on_start, on_skipped=on_skipped)
+
     # Every session-relative job is dispatched from in here, because launchd's calendar
     # intervals are fixed wall-clock and cannot express a close-relative time. The
     # close+5 guard is the first of them. The close+15 compaction binds to the same
     # dispatcher when someone builds it.
+    #
+    # This wraps the gap marker's hooks rather than the other way round, and the order is
+    # load-bearing. On a post-close restart the guard owns the two close minutes, and it
+    # must write them before startup marking walks the day, or the day's 16:00 and 16:15
+    # would carry a marker from each writer.
     guard = _close_guard(config_path, tickers_path, session_clock)
     if guard is not None:
         dispatch = SessionDispatch(
@@ -383,9 +419,6 @@ def run_loop_from_config(
         guard_on_tick = hooks.on_tick
 
         def on_start_guarded() -> None:
-            # A daemon starting after close+5 still owes the day its guard, and it must
-            # run before startup gap marking, which would otherwise mark the two close
-            # minutes the guard owns.
             dispatch.check(clock.now())
             guard_on_start()
 
