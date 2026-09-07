@@ -23,6 +23,7 @@ They pin the job's contract:
 
 from __future__ import annotations
 
+import urllib.error
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
@@ -55,9 +56,12 @@ from lake.manifest import (
 )
 from lake.paths import LakePaths
 from lake.runner import BackupTargetUnavailable, RsyncBackup
+from tests.support.backup import FakeBackup
 from tests.support.calendar import FakeCalendar, SessionTimes
 from tests.support.clock import ManualClock
+from tests.support.config import write_config
 from tests.support.lake import FixtureLake
+from tests.support.pinger import FakePinger
 
 FRIDAY = date(2026, 8, 21)
 DAY = date(2026, 8, 24)
@@ -86,34 +90,6 @@ def _calendar() -> FakeCalendar:
 
 def _clock_at(day: date, hour: int, minute: int, second: int = 0) -> ManualClock:
     return ManualClock(_et(day, hour, minute, second))
-
-
-class FakePinger:
-    """Records each ping into a shared event log."""
-
-    def __init__(self, events: list[str]) -> None:
-        self.events = events
-        self.urls: list[str] = []
-
-    def ping(self, url: str) -> None:
-        self.urls.append(url)
-        self.events.append("ping")
-
-
-class FakeBackup:
-    """Records each sync, plus the lake's file listing at the moment it ran."""
-
-    def __init__(self, events: list[str]) -> None:
-        self.events = events
-        self.calls: list[tuple[Path, Path]] = []
-        self.seen: list[list[str]] = []
-
-    def sync(self, source: Path, target: Path) -> None:
-        self.calls.append((source, target))
-        self.seen.append(
-            sorted(p.relative_to(source).as_posix() for p in source.rglob("*") if p.is_file())
-        )
-        self.events.append("backup")
 
 
 def _run(
@@ -680,6 +656,30 @@ def test_a_recompaction_needs_the_segments(lake_root):
 # -- 6. backup and ping ------------------------------------------------------
 
 
+def test_a_failed_ping_is_named_and_the_run_keeps_its_report(lake_root):
+    # The ping is the last step, after the seal, the retune, and the backup. A raise
+    # there used to propagate out of compact() before main printed result.render(), so
+    # a whole night's compaction report vanished behind a traceback over one lost ping.
+    _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
+
+    class Boom:
+        def ping(self, url: str) -> None:
+            raise urllib.error.URLError(OSError("connection refused"))
+
+    result, events, backup, _ = _run(lake_root, pinger=Boom())
+
+    assert result.pinged is False
+    assert result.problem == "ping failed: URLError"
+    # Everything the run did survives, which the raise used to take with it.
+    assert len(result.sealed) == 1
+    assert result.backed_up is True
+    assert events == ["backup"]
+    rendered = result.render()
+    assert "ping failed: URLError" in rendered
+    assert "sealed=1" in rendered
+    assert "secret-key" not in rendered
+
+
 def test_backup_runs_after_the_seal_then_pings_the_compaction_slug_once(lake_root):
     segment = _segment(
         lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a"
@@ -973,28 +973,8 @@ def test_a_quotes_only_day_has_no_profile(lake_root):
 # -- the command-line entry --------------------------------------------------
 
 
-def _config_file(tmp_path: Path, lake_root: Path) -> Path:
-    target = tmp_path / "ssd"
-    target.mkdir()
-    config = tmp_path / "config.yaml"
-    config.write_text(
-        "\n".join(
-            [
-                f"lake_root: {lake_root}",
-                f"backup_target: {target}",
-                "healthchecks_ping_key: secret-key",
-                "ntfy_topic: secret-topic",
-                "schwab_api_key: secret-api-key",
-                "schwab_app_secret: secret-app-secret",
-                "",
-            ]
-        )
-    )
-    return config
-
-
 def test_main_runs_the_job_from_config_with_injected_seams(lake_root, tmp_path, capsys):
-    config = _config_file(tmp_path, lake_root)
+    config = write_config(tmp_path, lake_root)
     plan_path = tmp_path / "chain_plan.json"
     _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
     _segment(lake_root, "quotes", "SPY", DAY, _quotes(1, snap_ts=_snap(DAY, 0)), start_ts="a")
@@ -1023,7 +1003,7 @@ def test_main_runs_the_job_from_config_with_injected_seams(lake_root, tmp_path, 
 
 
 def test_main_recompact_is_the_human_repair(lake_root, tmp_path, capsys):
-    config = _config_file(tmp_path, lake_root)
+    config = write_config(tmp_path, lake_root)
     partition, rel = _manifested_day(lake_root, rows=1)
     _segment(lake_root, "chains", "SPY", DAY, _chains(3, snap_ts=_snap(DAY, 0)), start_ts="a")
 

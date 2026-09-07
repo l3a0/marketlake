@@ -570,3 +570,66 @@ def test_main_passes_the_paths_to_the_config_entry(monkeypatch):
     monkeypatch.setattr(daemon, "run_loop_from_config", fake_run_loop_from_config)
     assert daemon.main(["--config", "/c.yaml", "--token", "/tok.json"]) == 0
     assert seen == {"config_path": "/c.yaml", "tickers_path": None, "token_path": "/tok.json"}
+
+
+# -- the power assertion ----------------------------------------------------------
+
+# The design's chain is the wake alarm, then KeepAlive starting the daemon, then the
+# caffeinate assertion keeping an open laptop awake. These pin the last link. The
+# assertion is owed on a holiday too, so it rides the per-tick seam rather than the
+# per-cycle one.
+
+
+def test_on_tick_fires_every_minute_including_a_non_session_day(calendar):
+    ticks: list[datetime] = []
+    clock = ManualClock(start=datetime(2026, 8, 31, 12, 0, tzinfo=MARKET_TZ).astimezone(UTC))
+    session_clock = SessionClock(clock, FakeCalendar({}))
+    daemon.run_loop(
+        session_clock,
+        lambda **_: pytest.fail("no cycle runs on a day the calendar calls closed"),
+        clock=clock,
+        hooks=daemon.DaemonHooks(on_tick=ticks.append),
+        should_continue=_stop_after(3),
+    )
+    assert len(ticks) == 3
+
+
+def _stop_after(count: int) -> Callable[[], bool]:
+    remaining = [count]
+
+    def should_continue() -> bool:
+        if remaining[0] == 0:
+            return False
+        remaining[0] -= 1
+        return True
+
+    return should_continue
+
+
+def test_the_wired_daemon_holds_the_caffeinate_assertion_once_per_window():
+    # A holiday weekday: no cycle runs, and the assertion is still owed from the 08:25
+    # wake. Nothing here reads a config, because no capture slot is ever reached.
+    held: list[tuple[str, ...]] = []
+    clock = ManualClock(start=datetime(2026, 8, 31, 8, 25, tzinfo=MARKET_TZ).astimezone(UTC))
+    daemon.run_loop_from_config(
+        clock=clock,
+        calendar=FakeCalendar({}),
+        assertion_runner=lambda args: held.append(tuple(args)),
+        should_continue=_stop_after(4),
+    )
+    # Four ticks, one window, one caffeinate process.
+    assert len(held) == 1
+    assert held[0][:3] == ("caffeinate", "-i", "-t")
+
+
+def test_the_wired_daemon_still_runs_a_caller_tick_hook():
+    ticks: list[datetime] = []
+    clock = ManualClock(start=datetime(2026, 8, 31, 8, 25, tzinfo=MARKET_TZ).astimezone(UTC))
+    daemon.run_loop_from_config(
+        clock=clock,
+        calendar=FakeCalendar({}),
+        assertion_runner=lambda args: None,
+        hooks=daemon.DaemonHooks(on_tick=ticks.append),
+        should_continue=_stop_after(2),
+    )
+    assert len(ticks) == 2

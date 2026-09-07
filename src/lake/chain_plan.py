@@ -38,11 +38,13 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 
+from lake.paths import CHAIN_PLAN_FILE, config_dir
+
 # The machine-owned plan file, beside ``token.json`` in the config dir. It is
 # *machine-derived* rather than hand config: the nightly job writes it, so no job ever
 # rewrites the hand-owned ``config.yaml``. Absent on a fresh machine, which is fine, since
 # ``load_chain_plan`` falls back to the built-in default.
-DEFAULT_CHAIN_PLAN_PATH = Path.home() / ".config" / "marketlake" / "chain_plan.json"
+DEFAULT_CHAIN_PLAN_PATH = config_dir() / CHAIN_PLAN_FILE
 
 # One window: a start day-offset and an end day-offset, the end ``None`` on the open tail.
 Window = tuple[int, "int | None"]

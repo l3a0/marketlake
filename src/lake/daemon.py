@@ -83,7 +83,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Protocol
@@ -91,6 +91,7 @@ from typing import Protocol
 from lake.calendar import Calendar, ExchangeCalendar, NotASession
 from lake.capture import CycleResult, run_cycle_from_config
 from lake.clock import Clock, SystemClock
+from lake.control_plane import AssertionHolder, AssertionRunner
 from lake.session import CAPTURE_PHASES, SessionBounds, SessionClock, SessionPhase
 
 # The loop's cadence: one tick per minute, on the minute top.
@@ -130,9 +131,13 @@ def _ignore_skipped(slots: list[datetime]) -> None:
     """The default skipped-slot hook. The slots stay holes until D10 plugs its writer in."""
 
 
+def _ignore_tick(slot: datetime) -> None:
+    """The default tick observer. It fires every minute, session or not."""
+
+
 @dataclass(frozen=True)
 class DaemonHooks:
-    """The four seams the loop-coupled deliverables plug into.
+    """The five seams the loop-coupled deliverables plug into.
 
     Every field is a callable with a no-op default, so ``DaemonHooks()`` is a complete,
     standalone set. ``slot`` in each signature is the snap slot, the Eastern-time minute
@@ -141,6 +146,7 @@ class DaemonHooks:
     """
 
     on_start: Callable[[], None] = _no_start
+    on_tick: Callable[[datetime], None] = _ignore_tick
     close_tag_for: Callable[[datetime], str | None] = _no_close_tag
     on_cycle: Callable[[datetime, CycleResult], None] = _ignore_cycle
     on_skipped: Callable[[list[datetime]], None] = _ignore_skipped
@@ -233,7 +239,9 @@ def run_loop(
 
     1. Sleep through ``clock.sleep`` until the next minute top, computed from
        ``clock.now``.
-    2. Read ``session_clock.phase()`` and the snap slot.
+    2. Read ``session_clock.phase()`` and the snap slot, then hand the slot to
+       ``on_tick``. That fires every minute, session or not, because the power
+       assertion the control plane holds is owed on holidays too.
     3. Hand any capture slots missed since the previous tick, across days if the loop
        slept that long, to ``on_skipped``, then remember this tick's slot. This is the
        loop's only state across ticks.
@@ -254,6 +262,7 @@ def run_loop(
         clock.sleep(seconds_to_next_minute(clock.now()))
         phase = session_clock.phase()
         slot = session_clock.snap_slot()
+        hooks.on_tick(slot)
         skipped = _skips_since(session_clock, last_slot, slot)
         if skipped:
             hooks.on_skipped(skipped)
@@ -277,6 +286,8 @@ def run_loop_from_config(
     hooks: DaemonHooks | None = None,
     clock: Clock | None = None,
     calendar: Calendar | None = None,
+    assertion_runner: AssertionRunner | None = None,
+    should_continue: Callable[[], bool] = _forever,
 ) -> None:
     """Run the loop wired from the real clock, calendar, and config. It never returns.
 
@@ -285,10 +296,27 @@ def run_loop_from_config(
     runner is a closure over ``run_cycle_from_config``, which reloads the config, the
     roster, the token, and the chain plan on every call. Nothing is cached here, so the
     per-cycle re-read the design wants comes from the existing wiring.
+
+    The caffeinate power assertion is held here rather than left to a caller. The
+    design's chain is the wake alarm, then ``KeepAlive`` starting the daemon, then the
+    assertion keeping an open laptop awake, and this is the link that holds it. An
+    ``AssertionHolder`` rides ``on_tick``, so the assertion is taken when a window
+    opens and again for each new day the daemon lives through. Any hook the caller
+    passed still runs.
     """
     clock = clock if clock is not None else SystemClock()
     calendar = calendar if calendar is not None else ExchangeCalendar()
     session_clock = SessionClock(clock, calendar)
+
+    hooks = hooks if hooks is not None else DaemonHooks()
+    holder = AssertionHolder(runner=assertion_runner)
+    caller_on_tick = hooks.on_tick
+
+    def on_tick(slot: datetime) -> None:
+        holder.hold(slot)
+        caller_on_tick(slot)
+
+    hooks = replace(hooks, on_tick=on_tick)
 
     def cycle_runner(*, close_tag: str | None, session_phase: str | None) -> CycleResult:
         return run_cycle_from_config(
@@ -300,7 +328,7 @@ def run_loop_from_config(
             session_phase=session_phase,
         )
 
-    run_loop(session_clock, cycle_runner, clock=clock, hooks=hooks)
+    run_loop(session_clock, cycle_runner, clock=clock, hooks=hooks, should_continue=should_continue)
 
 
 # -- the command-line entry ----------------------------------------------------

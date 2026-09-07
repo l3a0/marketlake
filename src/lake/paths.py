@@ -1,10 +1,35 @@
-"""The lake path module.
+"""The path module.
 
-This is the single production home for lake path construction. Give it a
-``lake_root`` and it builds every path the lake uses: the surface partitions, the
-journal segments, the two append-only ledgers, and the reference tables. It reads no
-config and no clock. The root is an argument, so a test points it at a throwaway
+This is the single production home for path construction. It covers two locations.
+
+The lake is the first. Give it a ``lake_root`` and it builds every path the lake
+uses: the surface partitions, the journal segments, the two append-only ledgers, and
+the reference tables. The root is an argument, so a test points it at a throwaway
 directory and production points it at the configured ``lake_root``.
+
+The machine's config directory is the second. Four files sit in
+``~/.config/marketlake/``: the machine-local ``config.yaml``, the rotating
+``token.json``, the portable ``tickers.yaml``, and the nightly-written
+``chain_plan.json``. That directory is the one path no config can name, because it is
+where ``config.yaml`` is found. So it is a code constant, and this is where it is
+spelled. Four modules and the control plane's renderer each spelled it separately
+before.
+
+The two halves sit together because they answer one question, where a file lives, and
+because a second spelling of either is the failure both guard against. They differ in
+one way worth naming. The lake root is configured and passed in. The config directory
+is resolved from a home, the current user's unless a caller names another. So this
+module reads the environment for that one location. It reads no config file and no
+clock.
+
+One spelling matters beyond tidiness. The Time Machine exclusion the control plane
+renders covers the config directory, not the files in it. A module that spelled the
+directory its own way would put its file outside that exclusion, and the credential or
+the secret inside it would ride onto a backup disk with nothing to say so.
+
+Every path here comes back resolved, never the unexpanded ``~`` form. A path that
+looks usable but is not is a footgun, because ``open`` on ``~/x`` creates a literal
+``~`` directory rather than failing. Resolving here means no caller has to remember.
 
 A *surface* is one kind of measurement with its own pinned schema and partitioning.
 That is the design's term for each top-level directory. The surfaces are ``chains``,
@@ -165,3 +190,23 @@ class LakePaths:
     def contracts_path(self) -> Path:
         """The contracts reference: ``instrument_id`` to contract terms."""
         return self.reference_path(CONTRACTS)
+
+
+# -- the machine's config directory ------------------------------------------
+
+# The four files that sit in the config directory. The directory plus one of these
+# names a full location.
+CONFIG_FILE = "config.yaml"
+TOKEN_FILE = "token.json"
+TICKERS_FILE = "tickers.yaml"
+CHAIN_PLAN_FILE = "chain_plan.json"
+
+
+def config_dir(home: str | Path | None = None) -> Path:
+    """The config directory, resolved under ``home`` or the current user's home.
+
+    A running process omits ``home`` and gets its own. The control plane's renderer
+    passes one, because it builds a plist for another account.
+    """
+    base = Path(home) if home is not None else Path.home()
+    return base / ".config" / "marketlake"

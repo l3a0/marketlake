@@ -92,7 +92,7 @@ from lake.manifest import (
     sha256_file,
 )
 from lake.paths import CHAINS, LakePaths
-from lake.runner import BackupRunner, Pinger, RsyncBackup, UrllibPinger
+from lake.runner import PING_FAILURES, BackupRunner, Pinger, RsyncBackup, UrllibPinger
 from lake.session import SessionClock
 
 # The health-check slug the compaction job pings. It is the compaction-plus-backup check
@@ -220,7 +220,9 @@ class CompactionResult:
     that already had a manifest entry and were sha-checked, with their debris deleted.
     ``skipped`` lists the date directories left alone. ``retune`` is the window re-tune
     verdict, or ``None`` when no chains partition of an eligible day was available to
-    profile. ``backed_up`` and ``pinged`` record the two post-seal steps.
+    profile. ``backed_up`` and ``pinged`` record the two post-seal steps. ``problem``
+    names a ping that failed, which leaves ``pinged`` false. The seal and the backup
+    already happened, so the run's report is worth more than the lost ping.
     """
 
     sealed: tuple[SealedPartition, ...]
@@ -229,6 +231,7 @@ class CompactionResult:
     retune: RetuneResult | None
     backed_up: bool
     pinged: bool
+    problem: str | None = None
 
     @property
     def changed(self) -> bool:
@@ -248,6 +251,8 @@ class CompactionResult:
             f"skipped={len(self.skipped)} backed_up={self.backed_up} pinged={self.pinged} "
             f"slug={COMPACTION_SLUG}"
         ]
+        if self.problem is not None:
+            lines.append(f"  {self.problem}")
         for item in self.sealed:
             lines.append(f"  sealed   {item.partition} rows={item.rows} from {len(item.segments)}")
         for item in self.verified:
@@ -794,6 +799,7 @@ def compact(
         latest = latest_entries(root)
         sealed: list[SealedPartition] = []
         verified: list[SealedPartition] = []
+        problem: str | None = None
         chains_by_day: dict[date, list[SealedPartition]] = {}
         for day, date_dir in eligible:
             for surface, ticker, ticker_dir in _ticker_days(date_dir):
@@ -828,8 +834,11 @@ def compact(
         backed_up = True
         pinged = False
         if pinger is not None:
-            pinger.ping(str(ping_url))
-            pinged = True
+            try:
+                pinger.ping(str(ping_url))
+                pinged = True
+            except PING_FAILURES as exc:
+                problem = f"ping failed: {type(exc).__name__}"
 
     return CompactionResult(
         sealed=tuple(sealed),
@@ -838,6 +847,7 @@ def compact(
         retune=retune,
         backed_up=backed_up,
         pinged=pinged,
+        problem=problem,
     )
 
 

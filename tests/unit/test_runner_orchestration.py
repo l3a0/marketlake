@@ -4,12 +4,16 @@ These inject fakes for the two I/O seams and a canned cycle result, then assert 
 orchestration rule: on a successful durable cycle the runner backs up and then pings the
 health check, in that order, so the one slice-1 ping attests both. A cycle that captured
 nothing does neither. A backup that fails blocks the ping and surfaces the error, so the
-missed ping catches the single-copy window. Nothing here touches the network, a
-subprocess, or the filesystem, so the tier is unit.
+missed ping catches the single-copy window. Nothing here touches the network or a
+subprocess, and no outcome depends on the filesystem, so the tier is unit. The shared
+backup fake lists the source it was handed, which is a path these tests never create,
+so the listing comes back empty on any machine.
 """
 
 from __future__ import annotations
 
+import io
+import urllib.error
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -18,35 +22,13 @@ import pytest
 from lake import runner
 from lake.capture import CycleResult, SegmentError, SegmentOutcome
 from lake.journal import ROW_KIND_DATA, ROW_KIND_GAP
+from tests.support.backup import FakeBackup
+from tests.support.pinger import FakePinger
 
 _SNAP = datetime(2026, 8, 24, 20, 15, tzinfo=UTC)
 _URL = "https://hc-ping.com/secret-key/slice1-capture"
 _LAKE = Path("/lake")
 _TARGET = Path("/ssd/lake")
-
-
-class FakePinger:
-    """Records the URL it was asked to ping, appending to a shared event log."""
-
-    def __init__(self, events: list[str]) -> None:
-        self.events = events
-        self.urls: list[str] = []
-
-    def ping(self, url: str) -> None:
-        self.urls.append(url)
-        self.events.append("ping")
-
-
-class FakeBackup:
-    """Records each sync, appending to a shared event log."""
-
-    def __init__(self, events: list[str]) -> None:
-        self.events = events
-        self.calls: list[tuple[Path, Path]] = []
-
-    def sync(self, source: Path, target: Path) -> None:
-        self.calls.append((source, target))
-        self.events.append("backup")
 
 
 def _segment(surface: str, ticker: str, row_kind: str) -> SegmentOutcome:
@@ -106,6 +88,52 @@ def test_successful_cycle_backs_up_then_pings():
     assert pinger.urls == [_URL]
     # Order matters: rsync first, then the ping, so the one ping attests both.
     assert events == ["backup", "ping"]
+
+
+def test_a_failed_ping_is_named_and_the_run_keeps_its_verdict():
+    # The ping is the last step, after the capture is durable and the backup is done.
+    # A raise there used to propagate before main printed the run's summary, turning a
+    # successful capture into a traceback and a non-zero exit. The ping is lost either
+    # way, and healthchecks pages for it after the grace. The verdict is not.
+    events: list[str] = []
+
+    class Boom:
+        def ping(self, url: str) -> None:
+            events.append("ping")
+            raise urllib.error.URLError(OSError("connection refused"))
+
+    outcome = runner.run_once(
+        _data_result,
+        pinger=Boom(),
+        ping_url=_URL,
+        backup=FakeBackup(events),
+        lake_root=_LAKE,
+        backup_target=_TARGET,
+    )
+    assert outcome.succeeded is True
+    assert outcome.backed_up is True
+    assert outcome.pinged is False
+    assert outcome.problem == "ping failed: URLError"
+    # The backup still ran and its order is still pinned.
+    assert events == ["backup", "ping"]
+
+
+def test_a_failed_ping_never_carries_the_key():
+    class Boom:
+        def ping(self, url: str) -> None:
+            raise urllib.error.HTTPError(_URL, 500, "Server Error", {}, io.BytesIO(b""))
+
+    outcome = runner.run_once(
+        _data_result,
+        pinger=Boom(),
+        ping_url=_URL,
+        backup=FakeBackup([]),
+        lake_root=_LAKE,
+        backup_target=_TARGET,
+    )
+    # Equality is the stronger claim. It says what the line is, so no part of the URL
+    # can be in it.
+    assert outcome.problem == "ping failed: HTTPError"
 
 
 def test_cycle_that_captured_nothing_does_not_ping_or_back_up():

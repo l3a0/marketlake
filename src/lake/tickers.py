@@ -26,9 +26,11 @@ from pathlib import Path
 
 import yaml
 
+from lake.paths import TICKERS_FILE, config_dir
+
 # The portable roster file. Overridable by argument or this environment variable, so a
 # test points the loader at a throwaway file.
-DEFAULT_TICKERS_PATH = Path("~/.config/marketlake/tickers.yaml")
+DEFAULT_TICKERS_PATH = config_dir() / TICKERS_FILE
 TICKERS_PATH_ENV = "MARKETLAKE_TICKERS"
 
 
@@ -167,11 +169,16 @@ def upsert_ticker(
 
 
 def _resolve_path(path: str | Path | None, env: Mapping[str, str] | None) -> Path:
-    """Resolve the roster path: explicit argument, then env var, then the default."""
+    """Resolve the roster path: explicit argument, then env var, then the default.
+
+    An argument and an environment override are whatever a person typed, so both may
+    carry a ``~`` and both are expanded. The default comes from ``lake.paths`` already
+    resolved.
+    """
     if path is not None:
         return Path(path).expanduser()
     env = os.environ if env is None else env
     override = env.get(TICKERS_PATH_ENV)
     if override:
         return Path(override).expanduser()
-    return DEFAULT_TICKERS_PATH.expanduser()
+    return DEFAULT_TICKERS_PATH
