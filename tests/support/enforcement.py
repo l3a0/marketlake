@@ -13,6 +13,9 @@ project. They keep the clock seam and the calendar seam from being bypassed.
    under ``src/lake`` outside the calendar module. A hardcoded session time is a
    bare ``"HH:MM"`` string, a ``datetime.time(...)`` construction, or a
    ``.replace(hour=..., minute=...)`` that builds a time of day from literals.
+   An integer pair is not one of these. ``WallClockTime(19, 55)`` and
+   ``datetime(y, m, d, 16, 15)`` pass unseen, which is what lets the control plane
+   pin its wall-clock moments as integers.
 
 Both scanners read the source with the ``ast`` module and resolve names through the
 file's own imports, so aliased imports are caught and false positives stay rare. They

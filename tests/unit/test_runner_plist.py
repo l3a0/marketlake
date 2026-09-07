@@ -98,3 +98,36 @@ def test_plist_cli_prints_xml(capsys):
     out = capsys.readouterr().out
     parsed = plistlib.loads(out.encode("utf-8"))
     assert parsed["StartCalendarInterval"] == {"Hour": 16, "Minute": 10}
+
+
+# -- the shapes slice 2 added -------------------------------------------------------
+
+# `LaunchdJob` grew an optional calendar interval and a KeepAlive flag for the D14
+# control plane's two resident processes. These live here, beside the job they belong
+# to, rather than in the control-plane tests that prompted them.
+
+
+def test_daily_runner_job_renders_as_before():
+    """The slice-1 job's plist is unchanged by the slice-2 additions."""
+    job = runner.daily_runner_job(python="/opt/py/bin/python", hour=16, minute=10)
+    assert job.to_dict() == {
+        "Label": runner.DAILY_LABEL,
+        "ProgramArguments": ["/opt/py/bin/python", "-m", "lake.runner", "run"],
+        "StartCalendarInterval": {"Hour": 16, "Minute": 10},
+        "RunAtLoad": False,
+    }
+    assert "KeepAlive" not in job.render()
+
+
+def test_a_job_that_could_never_start_is_refused():
+    # No interval, no KeepAlive, no RunAtLoad. launchd would never start it.
+    with pytest.raises(ValueError):
+        runner.LaunchdJob(label="x", program_arguments=("/py",))
+
+
+def test_run_at_load_alone_is_enough_to_omit_the_interval():
+    job = runner.LaunchdJob(label="x", program_arguments=("/py",), run_at_load=True)
+    plist = job.to_dict()
+    assert "StartCalendarInterval" not in plist
+    assert plist["RunAtLoad"] is True
+    assert "KeepAlive" not in plist

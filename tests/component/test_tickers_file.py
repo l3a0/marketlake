@@ -32,6 +32,18 @@ def test_env_var_points_the_loader_at_a_file(tmp_path: Path):
     assert len(roster) == 2
 
 
+def test_a_typed_tilde_still_expands(tmp_path: Path, monkeypatch):
+    # An argument and an environment override are whatever a person typed, so both
+    # expand. Only the default comes from lake.paths already resolved. Removing the
+    # expansion here would make the loader open a literal "~" directory.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    path = tmp_path / ".config" / "roster.yaml"
+    path.parent.mkdir(parents=True)
+    path.write_text(YAML)
+    assert len(load_tickers("~/.config/roster.yaml")) == 2
+    assert len(load_tickers(env={"MARKETLAKE_TICKERS": "~/.config/roster.yaml"})) == 2
+
+
 def test_missing_file_raises(tmp_path: Path):
     with pytest.raises(TickersError):
         load_tickers(tmp_path / "none.yaml")

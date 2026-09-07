@@ -49,7 +49,9 @@ the design's schedule note requires.
 
 from __future__ import annotations
 
+import http.client
 import plistlib
+import urllib.error
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,6 +78,22 @@ _MINUTES_PER_DAY = 24 * 60
 
 
 # -- the injected seams ------------------------------------------------------
+
+
+# What a ping can fail with. ``urlopen`` fails two ways. Everything socket-shaped is an
+# ``OSError``, including ``urllib.error.URLError``, its ``HTTPError`` subclass, and a
+# timeout. A malformed response instead raises ``http.client.HTTPException``, which is
+# not an ``OSError``, so catching only the socket family would let it through.
+#
+# Every job pings as its last step, after the work is done, and prints its verdict after
+# that. So a raising ping used to cost the verdict as well as the ping. The ping is lost
+# either way and healthchecks pages for it after the grace. Losing the report too is
+# what these catches prevent. It lives here beside the protocol rather than in one
+# caller, because all four call sites need the same answer.
+#
+# Only the exception's type is ever reported. The URL carries the ping key, and the
+# design's rule is that it never reaches a log.
+PING_FAILURES = (urllib.error.URLError, OSError, http.client.HTTPException)
 
 
 @runtime_checkable
@@ -108,8 +126,10 @@ class UrllibPinger:
     """The real pinger: a plain HTTP GET with ``urllib``.
 
     It is constructed cheaply and imports nothing network-bound at module load, so the
-    offline suite can build one without consequence. The GET itself only happens in the
-    by-hand live check. A test injects a fake instead.
+    offline suite can build one without consequence. The GET runs from every job that
+    pings, the daily runner and the compaction job here, the weekday self-check and the
+    Sunday job in the control plane, and from the by-hand live check. A test injects a
+    fake instead.
     """
 
     def __init__(self, timeout_seconds: float = 10.0) -> None:
@@ -129,7 +149,8 @@ class RsyncBackup:
     It asserts the backup target is mounted, then copies ``lake/`` into it. The design
     pins the tool as ``rsync`` or ``rclone`` with checksum verification, the lake root
     as the only sync root, and a mount check before the copy. The ``subprocess`` call
-    runs only in the by-hand live check. A test injects a fake.
+    runs from the compaction job after every session, and from the by-hand live check.
+    A test injects a fake.
     """
 
     def __init__(self, extra_args: Sequence[str] = ()) -> None:
@@ -164,12 +185,15 @@ class RunOutcome:
 
     ``succeeded`` is the durable-capture success condition. ``pinged`` and ``backed_up``
     record whether each success-gated step ran. On a failed cycle both are false.
+    ``problem`` names a ping that failed, which leaves ``pinged`` false and the run
+    itself successful. The capture is durable either way.
     """
 
     result: CycleResult
     succeeded: bool
     pinged: bool
     backed_up: bool
+    problem: str | None = None
 
 
 def cycle_succeeded(result: CycleResult) -> bool:
@@ -216,14 +240,20 @@ def run_once(
     succeeded = cycle_succeeded(result)
     pinged = False
     backed_up = False
+    problem: str | None = None
     if succeeded:
         # Backup first. A raised backup propagates before the ping, so a single-copy
         # window pages through the missed ping rather than being reported as healthy.
         backup.sync(lake_root, backup_target)
         backed_up = True
-        pinger.ping(ping_url)
-        pinged = True
-    return RunOutcome(result=result, succeeded=succeeded, pinged=pinged, backed_up=backed_up)
+        try:
+            pinger.ping(ping_url)
+            pinged = True
+        except PING_FAILURES as exc:
+            problem = f"ping failed: {type(exc).__name__}"
+    return RunOutcome(
+        result=result, succeeded=succeeded, pinged=pinged, backed_up=backed_up, problem=problem
+    )
 
 
 def run_once_from_config(
@@ -275,11 +305,16 @@ class LaunchdJob:
     daily fire, or a list of such dicts for a bounded minute-by-minute schedule.
     launchd accepts both shapes under ``StartCalendarInterval``. Every value here is
     supplied by the caller, so no machine path and no session-time literal is baked in.
+
+    A resident process has no calendar interval. It sets ``keep_alive`` instead, the
+    launchd key that relaunches an exiting process within seconds. The slice-2 daemon
+    and the query service are that shape. A job with no interval, no keep-alive, and no
+    run-at-load would never start, so that combination is refused.
     """
 
     label: str
     program_arguments: tuple[str, ...]
-    calendar_interval: dict[str, int] | list[dict[str, int]]
+    calendar_interval: dict[str, int] | list[dict[str, int]] | None = None
     working_directory: str | None = None
     standard_out_path: str | None = None
     standard_error_path: str | None = None
@@ -287,15 +322,25 @@ class LaunchdJob:
     run_at_load: bool = False
     user_name: str | None = None
     group_name: str | None = None
+    keep_alive: bool = False
+
+    def __post_init__(self) -> None:
+        if self.calendar_interval is None and not (self.keep_alive or self.run_at_load):
+            raise ValueError(
+                f"{self.label}: a job needs a calendar interval, KeepAlive, or RunAtLoad"
+            )
 
     def to_dict(self) -> dict[str, object]:
         """The plist as a Python dict, with launchd's own key names."""
         plist: dict[str, object] = {
             "Label": self.label,
             "ProgramArguments": list(self.program_arguments),
-            "StartCalendarInterval": self.calendar_interval,
-            "RunAtLoad": self.run_at_load,
         }
+        if self.calendar_interval is not None:
+            plist["StartCalendarInterval"] = self.calendar_interval
+        plist["RunAtLoad"] = self.run_at_load
+        if self.keep_alive:
+            plist["KeepAlive"] = True
         if self.working_directory is not None:
             plist["WorkingDirectory"] = self.working_directory
         if self.standard_out_path is not None:
@@ -491,8 +536,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Report by slug and counts only. The ping URL carries the secret ping key and
         # is never printed.
         status = "captured" if outcome.succeeded else "no durable data"
+        if outcome.problem is not None:
+            print(f"slice-1 run: {outcome.problem}")
         print(
-            f"slice-1 run: {status}; "
+            f"slice-1 run: {status} "
             f"segments={len(outcome.result.segments)} "
             f"pinged={outcome.pinged} backed_up={outcome.backed_up} "
             f"slug={SLICE1_RUNNER_SLUG}"
