@@ -81,7 +81,7 @@ from lake import journal
 from lake.calendar import Calendar, ExchangeCalendar
 from lake.chain_plan import DEFAULT_CHAIN_PLAN_PATH, ChainPlan, Window, load_chain_plan
 from lake.clock import Clock, SystemClock
-from lake.config import GuardConstants, load_config
+from lake.config import GuardConstants, input_errors_exit, load_config
 from lake.journal import ROW_KIND_DATA, ShadowAppendError
 from lake.lock import lake_lock
 from lake.manifest import (
@@ -929,7 +929,8 @@ def main(
     dispatch of this job is a later wiring. This entry runs it standalone.
     """
     args = build_parser().parse_args(argv)
-    config = load_config(args.config)
+    with input_errors_exit("compact"):
+        config = load_config(args.config)
     clock = clock if clock is not None else SystemClock()
 
     if args.command == "recompact":

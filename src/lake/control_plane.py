@@ -82,7 +82,7 @@ from pathlib import Path
 
 from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
-from lake.config import load_config
+from lake.config import input_errors_exit, load_config
 from lake.manifest import ScrubResult, scrub
 from lake.paths import TOKEN_FILE, config_dir
 from lake.runner import PING_FAILURES, LaunchdJob, Pinger, UrllibPinger, calendar_interval
@@ -1613,7 +1613,8 @@ def main(
         return 0
 
     if args.command == "self-check":
-        config = load_config(args.config)
+        with input_errors_exit("self-check"):
+            config = load_config(args.config)
         outcome = self_check(
             probe=probe if probe is not None else launchctl_probe,
             pinger=pinger if pinger is not None else UrllibPinger(),
@@ -1627,7 +1628,8 @@ def main(
         return 0 if outcome.pinged else 1
 
     if args.command == "sunday":
-        config = load_config(args.config)
+        with input_errors_exit("sunday"):
+            config = load_config(args.config)
         token_path = args.token if args.token is not None else default_token_path(str(Path.home()))
 
         def read_mint() -> datetime | None:
