@@ -27,13 +27,17 @@ values the design pins. Slice 1 measures the real distributions and recalibrates
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+import sys
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
 import yaml
 
+from lake.chain_plan import ChainPlanError
 from lake.paths import CONFIG_FILE, LakePaths, config_dir
+from lake.tickers import TickersError
 
 # The machine-local config file. Overridable by argument or this environment variable,
 # so a test points the loader at a throwaway file.
@@ -243,7 +247,7 @@ def load_config(
     resolved = _resolve_path(path, env, CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH)
     if not resolved.exists():
         raise ConfigError(f"config file not found: {resolved}")
-    mapping = _parse_yaml(resolved.read_text())
+    mapping = _parse_yaml(_read_text(resolved, "config"))
     if mapping is None:
         raise ConfigError(f"config file is not valid YAML: {resolved}")
     if not isinstance(mapping, Mapping):
@@ -264,6 +268,43 @@ def _parse_yaml(text: str) -> object | None:
         return yaml.safe_load(text) or {}
     except yaml.YAMLError:
         return None
+
+
+@contextmanager
+def input_errors_exit(command: str) -> Iterator[None]:
+    """Turn a bad operator input file into one named line and exit 2.
+
+    Three machine-local files are the operator's to edit, and all three sit in the
+    config directory: ``config.yaml``, ``tickers.yaml``, and ``chain_plan.json``. A
+    malformed one is an operator mistake, not a bug, so a traceback names the wrong
+    thing. The loader is the last frame printed and the line that matters sits under a
+    stack to read past. This prints that line and exits 2, the code and the shape
+    ``argparse`` already uses for a bad argument in these same entries.
+
+    It wraps the call rather than the load, because two entries load their files inside
+    a library helper. Those helpers keep raising, and only a ``main`` turns an
+    exception into an exit code.
+    """
+    try:
+        yield
+    except (ChainPlanError, ConfigError, TickersError) as exc:
+        print(f"{command}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+
+
+def _read_text(resolved: Path, kind: str) -> str:
+    """The file's text, or a ``ConfigError`` naming what could not be read.
+
+    ``exists()`` passing does not mean the file can be read. A path one character
+    short of the file names its directory, a restrictive mode makes it unreadable, and
+    a binary file is not text. Each of those raised a bare ``OSError`` before, which is
+    the traceback this module exists to avoid. Only the path is named, never the
+    exception's own message, so nothing from inside the file can reach the error.
+    """
+    try:
+        return resolved.read_text()
+    except (OSError, UnicodeDecodeError):
+        raise ConfigError(f"{kind} file cannot be read: {resolved}") from None
 
 
 def _resolve_path(

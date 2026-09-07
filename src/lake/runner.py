@@ -58,7 +58,7 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from lake.capture import CycleResult, run_cycle_from_config
-from lake.config import load_config
+from lake.config import input_errors_exit, load_config
 from lake.journal import ROW_KIND_DATA
 
 # The health-check slug the slice-1 runner pings. It is its own check, deliberately
@@ -528,11 +528,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
 
     if args.command == "run":
-        outcome = run_once_from_config(
-            config_path=args.config,
-            tickers_path=args.tickers,
-            token_path=args.token,
-        )
+        with input_errors_exit("runner"):
+            outcome = run_once_from_config(
+                config_path=args.config,
+                tickers_path=args.tickers,
+                token_path=args.token,
+            )
         # Report by slug and counts only. The ping URL carries the secret ping key and
         # is never printed.
         status = "captured" if outcome.succeeded else "no durable data"
