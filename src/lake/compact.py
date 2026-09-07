@@ -81,7 +81,7 @@ from lake import journal
 from lake.calendar import Calendar, ExchangeCalendar
 from lake.chain_plan import DEFAULT_CHAIN_PLAN_PATH, ChainPlan, Window, load_chain_plan
 from lake.clock import Clock, SystemClock
-from lake.config import GuardConstants, load_config
+from lake.config import GuardConstants, input_errors_exit, load_config
 from lake.journal import ROW_KIND_DATA, ShadowAppendError
 from lake.lock import lake_lock
 from lake.manifest import (
@@ -99,7 +99,7 @@ from lake.paths import (
     TICKER_PREFIX,
     LakePaths,
 )
-from lake.runner import BackupRunner, Pinger, RsyncBackup, UrllibPinger
+from lake.runner import PING_FAILURES, BackupRunner, Pinger, RsyncBackup, UrllibPinger
 from lake.session import SessionClock
 
 # The health-check slug the compaction job pings. It is the compaction-plus-backup check
@@ -221,7 +221,9 @@ class CompactionResult:
     that already had a manifest entry and were sha-checked, with their debris deleted.
     ``skipped`` lists the date directories left alone. ``retune`` is the window re-tune
     verdict, or ``None`` when no chains partition of an eligible day was available to
-    profile. ``backed_up`` and ``pinged`` record the two post-seal steps.
+    profile. ``backed_up`` and ``pinged`` record the two post-seal steps. ``problem``
+    names a ping that failed, which leaves ``pinged`` false. The seal and the backup
+    already happened, so the run's report is worth more than the lost ping.
     """
 
     sealed: tuple[SealedPartition, ...]
@@ -230,6 +232,7 @@ class CompactionResult:
     retune: RetuneResult | None
     backed_up: bool
     pinged: bool
+    problem: str | None = None
 
     @property
     def changed(self) -> bool:
@@ -249,6 +252,8 @@ class CompactionResult:
             f"skipped={len(self.skipped)} backed_up={self.backed_up} pinged={self.pinged} "
             f"slug={COMPACTION_SLUG}"
         ]
+        if self.problem is not None:
+            lines.append(f"  {self.problem}")
         for item in self.sealed:
             lines.append(f"  sealed   {item.partition} rows={item.rows} from {len(item.segments)}")
         for item in self.verified:
@@ -530,11 +535,6 @@ class WindowProfile:
     peaks: Mapping[Window, int]
     failed: frozenset[Window]
 
-    @property
-    def unknown(self) -> frozenset[Window]:
-        """The windows that failed all day and so have no measured size."""
-        return self.failed - frozenset(self.peaks)
-
 
 def _offsets(row: Mapping[str, object], session_date: date) -> Window:
     """A row's ISO window bounds as day offsets, the reverse of ``windows_for``."""
@@ -795,6 +795,7 @@ def compact(
         latest = latest_entries(root)
         sealed: list[SealedPartition] = []
         verified: list[SealedPartition] = []
+        problem: str | None = None
         chains_by_day: dict[date, list[SealedPartition]] = {}
         for day, date_dir in eligible:
             for surface, ticker, ticker_dir in _ticker_days(date_dir):
@@ -829,8 +830,11 @@ def compact(
         backed_up = True
         pinged = False
         if pinger is not None:
-            pinger.ping(str(ping_url))
-            pinged = True
+            try:
+                pinger.ping(str(ping_url))
+                pinged = True
+            except PING_FAILURES as exc:
+                problem = f"ping failed: {type(exc).__name__}"
 
     return CompactionResult(
         sealed=tuple(sealed),
@@ -839,6 +843,7 @@ def compact(
         retune=retune,
         backed_up=backed_up,
         pinged=pinged,
+        problem=problem,
     )
 
 
@@ -925,7 +930,8 @@ def main(
     dispatch of this job is a later wiring. This entry runs it standalone.
     """
     args = build_parser().parse_args(argv)
-    config = load_config(args.config)
+    with input_errors_exit("compact"):
+        config = load_config(args.config)
     clock = clock if clock is not None else SystemClock()
 
     if args.command == "recompact":

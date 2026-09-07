@@ -472,9 +472,10 @@ def main(argv=None) -> int:
     if args.lake_root is not None:
         lake_root = Path(args.lake_root)
     else:
-        from lake.config import load_config
+        from lake.config import input_errors_exit, load_config
 
-        lake_root = load_config(args.config).lake_root
+        with input_errors_exit("measure"):
+            lake_root = load_config(args.config).lake_root
     measurements = measure_day(lake_root, args.ticker, date.fromisoformat(args.day))
     print(measurements.render())
     return 0

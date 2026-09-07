@@ -27,17 +27,21 @@ values the design pins. Slice 1 measures the real distributions and recalibrates
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+import sys
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
 import yaml
 
-from lake.paths import LakePaths
+from lake.chain_plan import ChainPlanError
+from lake.paths import CONFIG_FILE, LakePaths, config_dir
+from lake.tickers import TickersError
 
 # The machine-local config file. Overridable by argument or this environment variable,
 # so a test points the loader at a throwaway file.
-DEFAULT_CONFIG_PATH = Path("~/.config/marketlake/config.yaml")
+DEFAULT_CONFIG_PATH = config_dir() / CONFIG_FILE
 CONFIG_PATH_ENV = "MARKETLAKE_CONFIG"
 
 # The healthchecks host. Pings go by slug, in the form ``hc-ping.com/<ping-key>/<slug>``.
@@ -231,14 +235,76 @@ def load_config(
     Path precedence: an explicit ``path`` argument, then the ``MARKETLAKE_CONFIG``
     environment variable, then the default ``~/.config/marketlake/config.yaml``. A test
     passes ``path`` or an ``env`` mapping to point the loader at a throwaway file.
+
+    A parse failure names the file and nothing else. PyYAML quotes the offending line
+    back in its message, and four of this file's values are secrets, so a stray quote
+    on the ping-key line would put that key in the error. Jobs run from launchd with
+    stdout and stderr going to a log file, so an uncaught traceback writes it to disk.
+    ``_parse_yaml`` drops the parse error rather than chaining it, and the ``ConfigError``
+    is raised outside that handler, so the quoted line is on neither the traceback nor
+    the exception's ``__context__``.
     """
     resolved = _resolve_path(path, env, CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH)
     if not resolved.exists():
         raise ConfigError(f"config file not found: {resolved}")
-    mapping = yaml.safe_load(resolved.read_text()) or {}
+    mapping = _parse_yaml(_read_text(resolved, "config"))
+    if mapping is None:
+        raise ConfigError(f"config file is not valid YAML: {resolved}")
     if not isinstance(mapping, Mapping):
         raise ConfigError(f"config file is not a mapping: {resolved}")
     return Config.from_mapping(mapping)
+
+
+def _parse_yaml(text: str) -> object | None:
+    """The parsed YAML, or ``None`` when ``text`` is not YAML at all.
+
+    The parse error stays inside this function and is never re-raised. Its message
+    quotes the offending source line, and this file holds four secrets, so letting it
+    out would put one of them wherever the caller's error lands. An empty file and a
+    ``null`` document both parse to an empty mapping, so ``None`` means the parse
+    failed and nothing else.
+    """
+    try:
+        return yaml.safe_load(text) or {}
+    except yaml.YAMLError:
+        return None
+
+
+@contextmanager
+def input_errors_exit(command: str) -> Iterator[None]:
+    """Turn a bad operator input file into one named line and exit 2.
+
+    Three machine-local files are the operator's to edit, and all three sit in the
+    config directory: ``config.yaml``, ``tickers.yaml``, and ``chain_plan.json``. A
+    malformed one is an operator mistake, not a bug, so a traceback names the wrong
+    thing. The loader is the last frame printed and the line that matters sits under a
+    stack to read past. This prints that line and exits 2, the code and the shape
+    ``argparse`` already uses for a bad argument in these same entries.
+
+    It wraps the call rather than the load, because two entries load their files inside
+    a library helper. Those helpers keep raising, and only a ``main`` turns an
+    exception into an exit code.
+    """
+    try:
+        yield
+    except (ChainPlanError, ConfigError, TickersError) as exc:
+        print(f"{command}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+
+
+def _read_text(resolved: Path, kind: str) -> str:
+    """The file's text, or a ``ConfigError`` naming what could not be read.
+
+    ``exists()`` passing does not mean the file can be read. A path one character
+    short of the file names its directory, a restrictive mode makes it unreadable, and
+    a binary file is not text. Each of those raised a bare ``OSError`` before, which is
+    the traceback this module exists to avoid. Only the path is named, never the
+    exception's own message, so nothing from inside the file can reach the error.
+    """
+    try:
+        return resolved.read_text()
+    except (OSError, UnicodeDecodeError):
+        raise ConfigError(f"{kind} file cannot be read: {resolved}") from None
 
 
 def _resolve_path(
@@ -247,11 +313,17 @@ def _resolve_path(
     env_key: str,
     default: Path,
 ) -> Path:
-    """Resolve a config path: explicit argument, then env var, then the default."""
+    """Resolve a config path: explicit argument, then env var, then the default.
+
+    An argument and an environment override are whatever a person typed, so both may
+    carry a ``~`` and both are expanded. ``default`` comes from ``lake.paths`` already
+    resolved, so it is returned as it is. A caller passing an unexpanded default would
+    get it back unexpanded.
+    """
     if path is not None:
         return Path(path).expanduser()
     env = os.environ if env is None else env
     override = env.get(env_key)
     if override:
         return Path(override).expanduser()
-    return default.expanduser()
+    return default

@@ -8,17 +8,27 @@ from pathlib import Path
 
 import pytest
 
+from lake import control_plane as cp
+from lake.chain_plan import DEFAULT_CHAIN_PLAN_PATH
+from lake.config import DEFAULT_CONFIG_PATH
 from lake.paths import (
     ACTIONS,
     BARS,
+    CHAIN_PLAN_FILE,
     CHAINS,
+    CONFIG_FILE,
     QUOTES,
     SEGMENT_GLOB,
     SEGMENT_PREFIX,
     SEGMENT_SUFFIX,
     SURFACES,
+    TICKERS_FILE,
+    TOKEN_FILE,
     LakePaths,
+    config_dir,
 )
+from lake.schwab import DEFAULT_TOKEN_PATH
+from lake.tickers import DEFAULT_TICKERS_PATH
 from tests.support.lake import FixtureLake
 
 ROOT = Path("/lake")
@@ -129,3 +139,48 @@ def test_the_segment_glob_carries_the_prefix_as_well_as_the_suffix():
 def test_every_segment_path_matches_the_segment_glob(paths: LakePaths):
     written = paths.segment_path("chains", "SPY", DAY, "20260824T160000", 4242)
     assert fnmatchcase(written.name, SEGMENT_GLOB)
+# -- the machine's config directory -----------------------------------------------
+
+# Four files sit in ~/.config/marketlake/ and four modules name them. Each spelled the
+# directory itself before, five spellings counting the control plane's renderer. The
+# Time Machine exclusion covers the directory rather than the files, so a module that
+# drifted would put its file outside the exclusion and the secret in it would ride
+# onto a backup disk with nothing to say so.
+
+
+def test_the_config_directory_is_the_location_the_design_pins():
+    assert config_dir("/Users/alice") == Path("/Users/alice/.config/marketlake")
+    assert config_dir() == Path.home() / ".config" / "marketlake"
+
+
+@pytest.mark.parametrize(
+    ("default", "name"),
+    [
+        (DEFAULT_CONFIG_PATH, CONFIG_FILE),
+        (DEFAULT_TICKERS_PATH, TICKERS_FILE),
+        (DEFAULT_TOKEN_PATH, TOKEN_FILE),
+        (DEFAULT_CHAIN_PLAN_PATH, CHAIN_PLAN_FILE),
+    ],
+)
+def test_every_machine_file_sits_in_the_excluded_directory(default, name):
+    assert default.parent == config_dir()
+    assert default.name == name
+
+
+@pytest.mark.parametrize(
+    "default",
+    [DEFAULT_CONFIG_PATH, DEFAULT_TICKERS_PATH, DEFAULT_TOKEN_PATH, DEFAULT_CHAIN_PLAN_PATH],
+)
+def test_every_default_comes_back_resolved(default):
+    # One convention. An unexpanded "~" path looks usable and is not, because open()
+    # would create a literal "~" directory rather than failing.
+    assert default.is_absolute()
+    assert "~" not in str(default)
+
+
+def test_the_control_plane_renderer_agrees_with_the_shared_rule():
+    # The renderer builds paths for another account's home. It must spell the
+    # directory the same way a running process does.
+    assert cp.default_config_dir("/Users/alice") == str(config_dir("/Users/alice"))
+    assert cp.default_token_path("/Users/alice") == str(config_dir("/Users/alice") / TOKEN_FILE)
+    assert cp.default_token_path(str(Path.home())) == str(DEFAULT_TOKEN_PATH)
