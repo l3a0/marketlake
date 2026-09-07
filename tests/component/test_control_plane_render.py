@@ -250,10 +250,22 @@ def test_the_install_text_says_who_sets_the_sunday_one_shot_until_slice_3(tmp_pa
     # Nothing in this deliverable sets the one-shot, and the Sunday read-back cannot
     # catch a week that missed it. So the install text has to hand the operator the
     # by-hand step rather than leave the gap to be discovered on a Monday.
-    assert "python -m lake.control_plane pmset" in printed
+    # The interpreter and the working directory come from the render, like every other
+    # line. A bare `python` is not on a stock Mac, and this is the one step whose whole
+    # job is to be pasted and run.
+    assert (
+        "cd /Users/someone/marketlake && /opt/py/bin/python -m lake.control_plane pmset" in printed
+    )
     assert "each Friday" in printed
-    step = printed[printed.index("# 6.") :]
-    assert "sudo" in step
+    assert "# prints under sudo." in printed
+
+
+def test_the_install_text_numbers_its_steps_in_order(tmp_path, capsys):
+    out = tmp_path / "out"
+    cp.main(["render", "--out", str(out), *RENDER_ARGS])
+    printed = capsys.readouterr().out
+    steps = re.findall(r"^# (\d+)\.", printed, flags=re.MULTILINE)
+    assert steps == ["1", "2", "3", "4", "5", "6"]
 
 
 def test_nothing_rendered_mentions_the_rejected_sleep_override(tmp_path):

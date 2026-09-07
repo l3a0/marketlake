@@ -1449,7 +1449,7 @@ def install_commands(out_dir: Path, host: LaunchdHost) -> str:
         "# prints under sudo. Nothing else sets the one-shot, and nothing catches a missed",
         "# one: by Sunday evening a wake that never got set and one that already fired look",
         "# the same, so the Sunday read-back expects no one-shot and passes either way.",
-        "python -m lake.control_plane pmset",
+        f"cd {host.project_dir} && {host.python} -m lake.control_plane pmset",
     ]
     return "\n".join(lines) + "\n"
 
