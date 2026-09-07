@@ -42,6 +42,7 @@ from typing import NamedTuple
 import pyarrow as pa
 
 from lake.manifest import read_manifest
+from lake.paths import LakePaths, parse_segment_rel
 
 # The schema version stamped on every row. The vendor columns' full list is fixed by
 # the first day's payload and recorded as version 1. A later payload change mints a
@@ -917,15 +918,11 @@ def segment_path(
     ``pid`` is the writer process id. Together they make the name unique per writer
     session, so a manual re-run or a crash-loop restart cannot collide with a live
     segment by accident.
+
+    This is the ``lake_root``-argument spelling of ``LakePaths.segment_path``. It
+    delegates there, so the two can never drift apart.
     """
-    return (
-        Path(lake_root)
-        / "journal"
-        / f"date={_day_str(day)}"
-        / f"surface={surface}"
-        / f"ticker={ticker}"
-        / f"seg-{start_ts}-{pid}.arrows"
-    )
+    return LakePaths(lake_root).segment_path(surface, ticker, day, start_ts, pid)
 
 
 # -- the writer --------------------------------------------------------------
@@ -1099,15 +1096,13 @@ def _is_chains_segment_for(rel: str, ticker: str) -> bool:
     ``journal/date=D/surface=chains/ticker=T/seg-<start_ts>-<pid>.arrows``. This matches
     that shape exactly, so a compacted Parquet partition or another surface's segment never
     qualifies.
+
+    Recognizing that shape is ``parse_segment_rel``'s job. It lives beside the builder that
+    made the path. What is left here is the question only this reader asks, whether the
+    parsed segment names the chains surface and the ticker in hand.
     """
-    parts = rel.split("/")
-    return (
-        len(parts) == 5
-        and parts[0] == "journal"
-        and parts[2] == f"surface={CHAINS_SURFACE}"
-        and parts[3] == f"ticker={ticker}"
-        and parts[4].endswith(".arrows")
-    )
+    ref = parse_segment_rel(rel)
+    return ref is not None and ref.surface == CHAINS_SURFACE and ref.ticker == ticker
 
 
 def latest_expirations(lake_root: Path | str, ticker: str) -> list[str] | None:

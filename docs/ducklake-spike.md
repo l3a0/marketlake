@@ -62,7 +62,7 @@ DuckLake is the only one being spiked. The rest are pinned here with reasons.
 
 Budget roughly ninety minutes. Point everything at a scratch lake. Never point a spike at the capture lake.
 
-**Build the fixture at real scale.** The sizing section puts a SPY chain at 10 to 25k contracts per snapshot across \~405 snapshots. Use the low end and generate a \~4M-row ticker-day. This matters more than it looks. A thousand-row fixture commits too fast to land inside a crash window, and the spike then concludes that everything passes.
+**Build the fixture at real scale.** The sizing section puts a SPY chain at 10 to 25k contracts per snapshot across 406 snapshots. Use the low end and generate a \~4M-row ticker-day. This matters more than it looks. A thousand-row fixture commits too fast to land inside a crash window, and the spike then concludes that everything passes.
 
 **Do not race a `kill -9`.** Use deterministic crash points driven by an environment variable. At each point the code calls `os.abort()`. That raises SIGABRT and skips Python's exit handlers, buffer flushes, and destructors, so it has genuine process-death fidelity. Three points are needed: `mid_data_file_write`, `post_data_file_pre_commit`, and `post_commit_pre_unlink`.
 

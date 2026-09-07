@@ -518,6 +518,29 @@ def test_an_unparseable_date_directory_is_reported_and_left_alone(lake_root):
     assert (odd / "seg-a-1.arrows").exists()
 
 
+@pytest.mark.parametrize("spelling", ["20260824", "2026-W35-1"])
+def test_a_foreign_spelling_of_a_real_date_is_skipped_rather_than_swept(lake_root, spelling):
+    # The sweep reads a date directory through ``parse_date_dir``, which is stricter than
+    # the bare ``date.fromisoformat`` it replaced. On Python 3.12 that parser reads the
+    # compact form and the ISO week date as 2026-08-24, the day this run is eligible to
+    # seal. Every writer builds the directory through one spelling, so a directory named
+    # any other way was never written by this pipeline.
+    #
+    # Stricter is the correct direction. Sealing a foreign directory would fold its rows
+    # into a partition the dashboard's panels cannot name, and the segments would be
+    # unlinked afterward. So it is reported and left alone, the same as any other name the
+    # sweep cannot read.
+    stray = _segment(
+        lake_root, "chains", "SPY", spelling, _chains(1, snap_ts=_snap(DAY, 0)), start_ts="a"
+    )
+    result, _, _, _ = _run(lake_root)
+    assert result.skipped == (SkippedDay(f"date={spelling}", "unparseable"),)
+    assert result.sealed == ()
+    assert stray.exists()
+    assert not LakePaths(lake_root).chains_partition_path("SPY", DAY).exists()
+    assert read_manifest(lake_root) == []
+
+
 # -- 5. manifest-aware recovery and the no-shrink guard -----------------------
 
 

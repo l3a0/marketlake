@@ -5,6 +5,7 @@ description = "Capture-first market data lake for Schwab option chains and equit
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "duckdb>=1.5.5",
     "exchange-calendars>=4.5",
     "pyarrow>=17",
     "pyyaml>=6",

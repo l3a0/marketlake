@@ -91,7 +91,15 @@ from lake.manifest import (
     sha256_bytes,
     sha256_file,
 )
-from lake.paths import CHAINS, LakePaths
+from lake.paths import (
+    CHAINS,
+    DATE_PREFIX,
+    SEGMENT_GLOB,
+    SURFACE_PREFIX,
+    TICKER_PREFIX,
+    LakePaths,
+    parse_date_dir,
+)
 from lake.runner import PING_FAILURES, BackupRunner, Pinger, RsyncBackup, UrllibPinger
 from lake.session import SessionClock
 
@@ -102,12 +110,6 @@ COMPACTION_SLUG = "compaction"
 
 # The manifest ``source`` for a compacted partition entry.
 COMPACTION_SOURCE = "compaction"
-
-# The three journal path levels, as their directory-name prefixes.
-_DATE_PREFIX = "date="
-_SURFACE_PREFIX = "surface="
-_TICKER_PREFIX = "ticker="
-_SEGMENT_GLOB = "seg-*.arrows"
 
 # The chains columns the re-tune profile reads. Everything else stays on disk.
 _PROFILE_COLUMNS = ("ticker", "snap_ts", "row_kind", "window_start", "window_end")
@@ -293,19 +295,35 @@ def _sweep_scope(
         return eligible, skipped
     slot = session.snap_slot()
     for entry in sorted(journal_dir.iterdir()):
-        if not entry.is_dir() or not entry.name.startswith(_DATE_PREFIX):
+        if not entry.is_dir() or not entry.name.startswith(DATE_PREFIX):
             continue
-        raw = entry.name[len(_DATE_PREFIX) :]
-        try:
-            day = date.fromisoformat(raw)
-        except ValueError:
+        # ``parse_date_dir`` is the one decision about what a date directory is. The
+        # dashboard's panels ask it the same question, so both halves of the system now
+        # agree on the answer. It is stricter than the bare ``date.fromisoformat`` this
+        # used to call. On Python 3.12 that parser also reads ``date=20260824`` and
+        # ``date=2026-W35-1`` as 2026-08-24, so the sweep used to seal three differently
+        # named directories into one partition while the panels showed only the one
+        # spelled ``date=2026-08-24``.
+        #
+        # Stricter is the correct direction. Every writer hands ``_day_str`` a ``date``,
+        # which it renders as ISO, so a directory in any other spelling was never written
+        # by this pipeline. The helper passes a string through verbatim, so the guarantee
+        # rests on the writers rather than on the helper. Sealing a foreign directory is
+        # worse than declining to. Compaction would fold it into a partition the panels
+        # cannot show, and the segments would be unlinked afterward.
+        #
+        # This module has no logger. The ``SkippedDay`` below is how a foreign directory
+        # stays discoverable. It carries the full directory name, the run result holds it,
+        # and ``CompactionResult.render`` prints it.
+        day = parse_date_dir(entry.name)
+        if day is None:
             skipped.append(SkippedDay(entry.name, "unparseable"))
             continue
         if not calendar.is_session(day):
-            skipped.append(SkippedDay(raw, "not_a_session"))
+            skipped.append(SkippedDay(day.isoformat(), "not_a_session"))
             continue
         if slot <= session.bounds(day).option_close_deadline:
-            skipped.append(SkippedDay(raw, "guard_open"))
+            skipped.append(SkippedDay(day.isoformat(), "guard_open"))
             continue
         eligible.append((day, entry))
     return eligible, skipped
@@ -315,13 +333,13 @@ def _ticker_days(date_dir: Path) -> list[tuple[str, str, Path]]:
     """Every ``(surface, ticker, directory)`` under one journal date directory."""
     found: list[tuple[str, str, Path]] = []
     for surface_dir in sorted(date_dir.iterdir()):
-        if not surface_dir.is_dir() or not surface_dir.name.startswith(_SURFACE_PREFIX):
+        if not surface_dir.is_dir() or not surface_dir.name.startswith(SURFACE_PREFIX):
             continue
-        surface = surface_dir.name[len(_SURFACE_PREFIX) :]
+        surface = surface_dir.name[len(SURFACE_PREFIX) :]
         for ticker_dir in sorted(surface_dir.iterdir()):
-            if not ticker_dir.is_dir() or not ticker_dir.name.startswith(_TICKER_PREFIX):
+            if not ticker_dir.is_dir() or not ticker_dir.name.startswith(TICKER_PREFIX):
                 continue
-            found.append((surface, ticker_dir.name[len(_TICKER_PREFIX) :], ticker_dir))
+            found.append((surface, ticker_dir.name[len(TICKER_PREFIX) :], ticker_dir))
     return found
 
 
@@ -798,7 +816,7 @@ def compact(
         chains_by_day: dict[date, list[SealedPartition]] = {}
         for day, date_dir in eligible:
             for surface, ticker, ticker_dir in _ticker_days(date_dir):
-                segments = sorted(ticker_dir.glob(_SEGMENT_GLOB))
+                segments = sorted(ticker_dir.glob(SEGMENT_GLOB))
                 if not segments:
                     continue
                 rel = paths.partition_path(surface, ticker, day).relative_to(root).as_posix()
@@ -867,8 +885,8 @@ def recompact_ticker_day(
     root = Path(lake_root)
     paths = LakePaths(root)
     with lake_lock(root):
-        ticker_dir = paths.segment_path(surface, ticker, day, "", 0).parent
-        segments = sorted(ticker_dir.glob(_SEGMENT_GLOB))
+        ticker_dir = paths.segment_dir(surface, ticker, day)
+        segments = sorted(ticker_dir.glob(SEGMENT_GLOB))
         if not segments:
             raise RecompactionRefused(
                 f"no segments remain for {surface}/{ticker}/{day.isoformat()}; "

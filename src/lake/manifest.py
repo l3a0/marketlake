@@ -39,7 +39,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from lake.paths import JOURNAL_DIR, MANIFEST_FILE, QUARANTINE_FILE, REPORTS_DIR
+from lake.paths import (
+    DATE_PREFIX,
+    JOURNAL_DIR,
+    MANIFEST_FILE,
+    QUARANTINE_FILE,
+    REPORTS_DIR,
+    TICKER_PREFIX,
+    parse_segment_rel,
+)
 
 # What the reverse scrub excludes, enumerated and not implied. The reverse pass asks
 # every file under the lake root for a manifest entry, so the few that never get one
@@ -289,22 +297,15 @@ def _compacted_partition_for_segment(rel: str) -> str | None:
     ``journal/date=D/surface=S/ticker=T/seg-<...>.arrows``. That segment merges into
     the compacted partition ``S/ticker=T/date=D.parquet``. This maps one to the other
     so the scrub can tell when the segment entry has been superseded.
+
+    Deciding whether ``rel`` is a segment at all, and splitting it into its parts, is
+    ``parse_segment_rel``'s job. It lives beside the builder that made the path. What is
+    left here is the one thing only the scrub needs, the mapping onto the compacted path.
     """
-    parts = rel.split("/")
-    if len(parts) != 5 or parts[0] != JOURNAL_DIR:
+    ref = parse_segment_rel(rel)
+    if ref is None:
         return None
-    date_part, surface_part, ticker_part, name = parts[1:]
-    if not (
-        date_part.startswith("date=")
-        and surface_part.startswith("surface=")
-        and ticker_part.startswith("ticker=")
-        and name.endswith(".arrows")
-    ):
-        return None
-    day = date_part[len("date=") :]
-    surface = surface_part[len("surface=") :]
-    ticker = ticker_part[len("ticker=") :]
-    return f"{surface}/ticker={ticker}/date={day}.parquet"
+    return f"{ref.surface}/{TICKER_PREFIX}{ref.ticker}/{DATE_PREFIX}{ref.day}.parquet"
 
 
 def _is_excluded(rel: str, exclusions: Sequence[str]) -> bool:

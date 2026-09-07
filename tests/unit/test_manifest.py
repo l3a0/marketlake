@@ -90,10 +90,50 @@ def test_segment_mapping_handles_the_quotes_surface():
         "chains/ticker=SPY/date=2026-08-24.parquet",  # already a compacted partition
         "reference/security_master.parquet",  # not a segment at all
         "journal/date=2026-08-24/surface=chains/ticker=SPY/seg.parquet",  # wrong suffix
+        # A Parquet file named like a segment. The filename is matched on its suffix, so
+        # carrying the segment prefix is not enough.
+        "journal/date=2026-08-24/surface=chains/ticker=SPY/seg-1.parquet",
         "journal/date=2026-08-24/ticker=SPY/seg-1.arrows",  # too few path parts
     ],
 )
 def test_non_segment_paths_map_to_none(rel: str):
+    assert _compacted_partition_for_segment(rel) is None
+
+
+def test_a_ticker_carrying_a_dot_maps_like_any_other():
+    # The parser slices each part at its key prefix and passes the value through. A
+    # ticker with a dot in it, the shape a class-B share takes, is not a special case.
+    seg = "journal/date=2026-08-24/surface=quotes/ticker=BRK.B/seg-20260824T160000-7.arrows"
+    assert _compacted_partition_for_segment(seg) == "quotes/ticker=BRK.B/date=2026-08-24.parquet"
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        # A segment path carries three keys under the journal directory, and the parser
+        # matches each one as a literal prefix.
+        #
+        # 1. The date key.
+        # 2. The surface key.
+        # 3. The ticker key.
+        #
+        # Each key gets two cases. The first drops it. The second spells its separator
+        # wrong, which is the harder one, because the key is still the right length. A
+        # parser that sliced by length rather than matching the prefix would map such a
+        # path onto a real-looking partition instead of refusing it. The journal
+        # directory name is checked as well, so a path outside the journal gets a case.
+        "journal/2026-08-24/surface=chains/ticker=SPY/seg-1.arrows",
+        "journal/date:2026-08-24/surface=chains/ticker=SPY/seg-1.arrows",
+        "journal/date=2026-08-24/chains/ticker=SPY/seg-1.arrows",
+        "journal/date=2026-08-24/surface:chains/ticker=SPY/seg-1.arrows",
+        "journal/date=2026-08-24/surface=chains/SPY/seg-1.arrows",
+        "journal/date=2026-08-24/surface=chains/ticker:SPY/seg-1.arrows",
+        "reports/date=2026-08-24/surface=chains/ticker=SPY/seg-1.arrows",
+        # The part count is exact, so a deeper path is refused as well as a shallower one.
+        "journal/date=2026-08-24/surface=chains/ticker=SPY/extra/seg-1.arrows",
+    ],
+)
+def test_a_path_that_fails_one_of_the_parser_checks_maps_to_none(rel: str):
     assert _compacted_partition_for_segment(rel) is None
 
 
