@@ -243,6 +243,19 @@ def test_the_install_text_excludes_the_directory_and_reads_it_back(tmp_path, cap
     assert "tmutil isexcluded /Users/someone/.config/marketlake" in printed
 
 
+def test_the_install_text_says_who_sets_the_sunday_one_shot_until_slice_3(tmp_path, capsys):
+    out = tmp_path / "out"
+    cp.main(["render", "--out", str(out), *RENDER_ARGS])
+    printed = capsys.readouterr().out
+    # Nothing in this deliverable sets the one-shot, and the Sunday read-back cannot
+    # catch a week that missed it. So the install text has to hand the operator the
+    # by-hand step rather than leave the gap to be discovered on a Monday.
+    assert "python -m lake.control_plane pmset" in printed
+    assert "each Friday" in printed
+    step = printed[printed.index("# 6.") :]
+    assert "sudo" in step
+
+
 def test_nothing_rendered_mentions_the_rejected_sleep_override(tmp_path):
     out = tmp_path / "out"
     cp.main(["render", "--out", str(out), *RENDER_ARGS])

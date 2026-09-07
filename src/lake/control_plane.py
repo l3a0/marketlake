@@ -1443,7 +1443,14 @@ def install_commands(out_dir: Path, host: LaunchdHost) -> str:
             f"sudo launchctl bootstrap {LAUNCHD_DOMAIN} /Library/LaunchDaemons/{job.label}.plist"
         )
     lines.append(f"launchctl print {LAUNCHD_DOMAIN}/{DAEMON_LABEL}")
-    lines.append("# The Sunday one-shot is set by the Friday vendor sweep, not here.")
+    lines += [
+        "# 6. Set the Sunday one-shot. The slice-3 vendor sweep will do this every Friday.",
+        "# Until that sweep lands, run this line each Friday and run the second command it",
+        "# prints under sudo. Nothing else sets the one-shot, and nothing catches a missed",
+        "# one: by Sunday evening a wake that never got set and one that already fired look",
+        "# the same, so the Sunday read-back expects no one-shot and passes either way.",
+        "python -m lake.control_plane pmset",
+    ]
     return "\n".join(lines) + "\n"
 
 
