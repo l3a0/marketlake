@@ -534,11 +534,6 @@ class WindowProfile:
     peaks: Mapping[Window, int]
     failed: frozenset[Window]
 
-    @property
-    def unknown(self) -> frozenset[Window]:
-        """The windows that failed all day and so have no measured size."""
-        return self.failed - frozenset(self.peaks)
-
 
 def _offsets(row: Mapping[str, object], session_date: date) -> Window:
     """A row's ISO window bounds as day offsets, the reverse of ``windows_for``."""

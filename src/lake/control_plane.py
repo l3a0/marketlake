@@ -819,25 +819,6 @@ def _spawn(args: Sequence[str]) -> object:
     return subprocess.Popen(list(args))
 
 
-def hold_assertion(
-    *, clock: Clock, runner: AssertionRunner | None = None
-) -> tuple[str, ...] | None:
-    """Hold the assertion for today's window via the injected runner.
-
-    Today is the Eastern date of the injected clock. Returns the arguments the runner
-    was handed, or ``None`` when no window is open now.
-    """
-    now = clock.now().astimezone(MARKET_TZ)
-    window = assertion_window(now.date())
-    if window is None:
-        return None
-    args = caffeinate_args(window, now)
-    if args is None:
-        return None
-    (runner if runner is not None else _spawn)(args)
-    return args
-
-
 class AssertionHolder:
     """Holds one ``caffeinate`` assertion per expectation window.
 
@@ -1765,7 +1746,6 @@ __all__ = [
     "default_config_dir",
     "default_token_path",
     "expected_one_shot",
-    "hold_assertion",
     "install_commands",
     "launchctl_probe",
     "main",
