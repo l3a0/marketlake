@@ -38,9 +38,12 @@ def test_saturday_owes_nothing():
     assert cp.assertion_window(date(2026, 9, 5)) is None
 
 
-def test_sunday_window_runs_from_the_one_shot_wake_to_the_canary_deadline():
+def test_sunday_window_runs_from_the_one_shot_wake_to_the_check_deadline():
+    # It ends at 23:30, not at CANARY_DEADLINE. The last retry starts at 23:00, and a
+    # hold that stopped there would free the machine to sleep mid-attempt.
     window = cp.assertion_window(date(2026, 9, 6))
-    assert window == cp.AssertionWindow(et(2026, 9, 6, 19, 55), et(2026, 9, 6, 23, 0))
+    assert window == cp.AssertionWindow(et(2026, 9, 6, 19, 55), et(2026, 9, 6, 23, 30))
+    assert window.end > cp.CANARY_DEADLINE.on(date(2026, 9, 6))
 
 
 def test_window_contains_is_half_open():
@@ -320,9 +323,9 @@ def test_the_holder_reads_the_eastern_date_from_a_utc_clock():
     holder = cp.AssertionHolder(runner=runner)
     holder.hold(datetime(2026, 8, 31, 2, 0, tzinfo=UTC))
     assert len(runner.calls) == 1
-    # 22:00 to the 23:00 deadline is one hour. Read as Monday 02:00 there is no window
-    # at all, so a holder that skipped the conversion would spawn nothing.
-    assert runner.calls[0][3] == "3600"
+    # 22:00 to the 23:30 window end is ninety minutes. Read as Monday 02:00 there is no
+    # window at all, so a holder that skipped the conversion would spawn nothing.
+    assert runner.calls[0][3] == "5400"
 
 
 def test_the_holder_returns_the_arguments_it_handed_the_runner():
@@ -341,12 +344,12 @@ def test_the_holder_takes_the_sunday_evening_window():
     holder = cp.AssertionHolder(runner=runner)
     holder.hold(et(2026, 8, 30, 19, 55))
     assert len(runner.calls) == 1
-    # 19:55 to 23:00 is 3 hours 5 minutes.
-    assert runner.calls[0][3] == str(3 * 3600 + 5 * 60)
+    # 19:55 to 23:30 is 3 hours 35 minutes.
+    assert runner.calls[0][3] == str(3 * 3600 + 35 * 60)
 
 
 def test_a_hold_across_the_fall_back_sunday_measures_absolute_time():
-    # 2026-11-01 repeats the 01:00 hour. The Sunday window runs 19:55 to 23:00, both
+    # 2026-11-01 repeats the 01:00 hour. The Sunday window runs 19:55 to 23:30, both
     # after the change, so the daemon's own hold is unaffected. The span is measured
     # in absolute time, so a call from inside the repeated hour is not an hour short.
     window = cp.assertion_window(date(2026, 11, 1))
