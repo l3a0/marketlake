@@ -389,6 +389,9 @@ def test_the_daemon_wires_gap_marking_into_both_hooks(tmp_path, monkeypatch, cap
         tickers_path=str(tickers),
         clock=clock,
         calendar=weekday_sessions(WEEK),
+        # The power assertion is a seam for a reason. Left to its default it spawns the
+        # real `caffeinate`, which exists on macOS and not on a Linux CI runner.
+        assertion_runner=lambda args: None,
         should_continue=once,
     )
     marked = _slots(lake_root, "quotes", "XYZ", date(2026, 9, 2))
