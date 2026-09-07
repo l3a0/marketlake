@@ -129,6 +129,7 @@ class WallClockTime:
 # wall clock, so the design pins them there.
 WEEKDAY_WAKE = WallClockTime(8, 25)  # pmset repeat wakeorpoweron MTWRF
 PRE_OPEN_SELF_CHECK = WallClockTime(8, 30)  # the self-check launchd job, Mon-Fri
+CALENDAR_PROBE = WallClockTime(9, 35)  # the says-closed-but-open probe, Mon-Fri
 VENDOR_SWEEP = WallClockTime(18, 30)  # the sweep job, which sets the Sunday one-shot
 WEEKDAY_ASSERTION_END = WallClockTime(18, 45)  # when the vendor sweep's ping lands
 SUNDAY_WAKE = WallClockTime(19, 55)  # the Friday-set one-shot wake
@@ -163,9 +164,11 @@ LAUNCHD_DOMAIN = "system"
 DAEMON_LABEL = "com.marketlake.daemon"
 DASHBOARD_LABEL = "com.marketlake.dashboard"
 SELF_CHECK_LABEL = "com.marketlake.self-check"
+CALENDAR_PROBE_LABEL = "com.marketlake.calendar-probe"
 SUNDAY_LABEL = "com.marketlake.sunday"
 
 # The healthchecks slugs the two calendar jobs ping. Log the slug, never the URL.
+CALENDAR_PROBE_SLUG = "calendar-probe"
 PRE_OPEN_SLUG = "pre-open"
 SUNDAY_SLUG = "sunday"
 
@@ -285,6 +288,24 @@ def self_check_job(host: LaunchdHost) -> LaunchdJob:
     )
 
 
+def calendar_probe_job(host: LaunchdHost) -> LaunchdJob:
+    """The 09:35 says-closed-but-open probe, five minutes after the open.
+
+    The calendar is the daemon's only authority on whether a session exists, so a day
+    the calendar calls closed is a day nothing captures. If the market is in fact open,
+    that is a whole session lost and nothing else notices, because every other check
+    agrees with the calendar.
+
+    ``RunAtLoad`` is off. A load at any other hour would make one vendor call for a
+    question only 09:35 can answer.
+    """
+    return host.job(
+        CALENDAR_PROBE_LABEL,
+        "lake.probe_calendar",
+        calendar=[CALENDAR_PROBE.launchd_interval(wd) for wd in LAUNCHD_WEEKDAYS],
+    )
+
+
 def sunday_job(host: LaunchdHost) -> LaunchdJob:
     """The Sunday canary and maintenance job, five minutes after the one-shot wake.
 
@@ -320,6 +341,7 @@ def all_jobs(host: LaunchdHost) -> tuple[LaunchdJob, ...]:
         daemon_job(host),
         dashboard_job(host),
         self_check_job(host),
+        calendar_probe_job(host),
         sunday_job(host),
     )
 

@@ -117,10 +117,27 @@ def test_run_at_load_is_pinned_per_job(build, run_at_load):
     assert _parsed(build(HOST))["RunAtLoad"] is run_at_load
 
 
-def test_all_jobs_are_the_four_and_carry_no_vendor_sweep():
+def test_all_jobs_are_the_five_and_carry_no_vendor_sweep():
     labels = [job.label for job in cp.all_jobs(HOST)]
-    assert labels == [cp.DAEMON_LABEL, cp.DASHBOARD_LABEL, cp.SELF_CHECK_LABEL, cp.SUNDAY_LABEL]
+    assert labels == [
+        cp.DAEMON_LABEL,
+        cp.DASHBOARD_LABEL,
+        cp.SELF_CHECK_LABEL,
+        cp.CALENDAR_PROBE_LABEL,
+        cp.SUNDAY_LABEL,
+    ]
+    # The 18:30 sweep is slice 3 and is not rendered here.
     assert not any("sweep" in label for label in labels)
+
+
+def test_the_calendar_probe_runs_on_weekday_mornings_and_not_at_load():
+    (probe,) = [j for j in cp.all_jobs(HOST) if j.label == cp.CALENDAR_PROBE_LABEL]
+    entries = probe.to_dict()["StartCalendarInterval"]
+    assert [e["Weekday"] for e in entries] == [1, 2, 3, 4, 5]
+    assert {(e["Hour"], e["Minute"]) for e in entries} == {(9, 35)}
+    # A load at any other hour would make one vendor call for a question only 09:35
+    # can answer.
+    assert probe.to_dict()["RunAtLoad"] is False
 
 
 def test_intervals_are_integers_not_strings():
