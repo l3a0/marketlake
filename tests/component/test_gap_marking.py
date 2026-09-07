@@ -375,9 +375,12 @@ def test_the_daemon_wires_gap_marking_into_both_hooks(tmp_path, monkeypatch, cap
     config = write_config(tmp_path, lake_root)
     tickers = tmp_path / "tickers.yaml"
     tickers.write_text("XYZ: {options: false}\n")
-    _record(lake_root, "quotes", "XYZ", et(2026, 9, 2, 9, 59))
+    _record(lake_root, "quotes", "XYZ", et(2026, 9, 1, 11, 0))
 
-    clock = ManualClock(start=et(2026, 9, 2, 10, 0))
+    # Start before the open. The tick is pre-open, so the loop runs no capture cycle and
+    # nothing reaches for a vendor token. `on_start` fires before the loop either way,
+    # which is the wiring this pins.
+    clock = ManualClock(start=et(2026, 9, 2, 8, 0))
     ticks = [0]
 
     def once() -> bool:
@@ -394,9 +397,10 @@ def test_the_daemon_wires_gap_marking_into_both_hooks(tmp_path, monkeypatch, cap
         assertion_runner=lambda args: None,
         should_continue=once,
     )
-    marked = _slots(lake_root, "quotes", "XYZ", date(2026, 9, 2))
+    marked = _slots(lake_root, "quotes", "XYZ", date(2026, 9, 1))
     assert marked, "the daemon ran a whole tick and marked nothing"
-    assert any(s.startswith("2026-09-02T10:00") for s in marked)
+    # Tuesday went dark after 11:00, so its tail is marked to the option close.
+    assert marked[-1].startswith("2026-09-01T16:15")
 
 
 def test_a_marking_pass_that_hits_a_problem_says_so_on_stderr(tmp_path, capsys):
