@@ -810,6 +810,9 @@ def journal_snapshot(
     fetch_end_ts: datetime,
     pid: int | None = None,
     source: str = CAPTURE_SOURCE,
+    slot: datetime | None = None,
+    close_tag: str | None = None,
+    session_phase: str | None = None,
 ) -> SegmentOutcome:
     """Journal one already-fetched response as a single durable capture cycle.
 
@@ -836,7 +839,10 @@ def journal_snapshot(
     real cycle taken at its own moment, never a discarded sample.
     """
     lake_root = Path(lake_root)
-    snap_ts = cycle_start.replace(second=0, microsecond=0)
+    # The slot a row stands for is not always the minute it was fetched in. The close+5
+    # fill observes the option close from several minutes after it, and the row must
+    # carry the close, so the caller may name the slot outright.
+    snap_ts = slot if slot is not None else cycle_start.replace(second=0, microsecond=0)
     day = snap_ts.date()
     start_ts = cycle_start.strftime(_SEGMENT_STAMP_FORMAT)
     writer_pid = os.getpid() if pid is None else pid
@@ -848,6 +854,8 @@ def journal_snapshot(
         snap_ts=snap_ts,
         fetch_ts=fetch_ts,
         fetch_end_ts=fetch_end_ts,
+        close_tag=close_tag,
+        session_phase=session_phase,
     )
     writer = journal.SegmentWriter.open(lake_root, surface, ticker, day, start_ts, writer_pid)
     with writer:

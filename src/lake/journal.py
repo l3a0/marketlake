@@ -1105,6 +1105,42 @@ def _is_chains_segment_for(rel: str, ticker: str) -> bool:
     return ref is not None and ref.surface == CHAINS_SURFACE and ref.ticker == ticker
 
 
+def close_tag_rows(
+    lake_root: Path | str, surface: str, ticker: str, day: date | str, close_tag: str
+) -> tuple[int, int]:
+    """How many data rows and gap rows a ticker-day holds under one ``close_tag``.
+
+    The close+5 guard asks this to decide whether the day's close of record was ever
+    observed. Data rows are what it wants: a cycle that ran at the option close and
+    failed leaves a tagged gap row, which records the attempt but holds no marks. The
+    two counts are returned apart so the caller can tell "never ran" from "ran and
+    failed", which read the same to a caller that only asked whether any row exists.
+
+    Segments are read newest first and every complete batch counts, so a torn tail is
+    safe. A segment that cannot be read at all is skipped, because a guard that cannot
+    read one file must still write the markers it can.
+    """
+    directory = LakePaths(lake_root).segment_dir(surface, ticker, day)
+    if not directory.is_dir():
+        return 0, 0
+    data = gaps = 0
+    for path in sorted(directory.glob("*.arrows"), reverse=True):
+        try:
+            table = read_segment(path)
+        except (OSError, pa.ArrowInvalid, ShadowAppendError):
+            continue
+        tags = table.column("close_tag").to_pylist()
+        kinds = table.column("row_kind").to_pylist()
+        for tag, kind in zip(tags, kinds, strict=True):
+            if tag != close_tag:
+                continue
+            if kind == ROW_KIND_DATA:
+                data += 1
+            else:
+                gaps += 1
+    return data, gaps
+
+
 def latest_expirations(lake_root: Path | str, ticker: str) -> list[str] | None:
     """The distinct expiration dates in a ticker's latest prior durable chains batch.
 
