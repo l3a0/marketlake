@@ -23,6 +23,7 @@ from __future__ import annotations
 import errno
 import re
 import struct
+import zlib
 from datetime import date, datetime
 from importlib import resources
 from pathlib import Path
@@ -266,11 +267,16 @@ def test_the_favicon_ships_in_the_package_as_a_three_size_ico():
         sizes.append(width)
     assert tuple(sizes) == favicon.SIZES
     # Every sub-image is a PNG. The directory entry never says so, because a bit count of
-    # 32 describes a BMP sub-image just as well, so the form is read off the payload.
-    for index in range(count):
+    # 32 describes a BMP sub-image just as well, so the form is read off the payload. The
+    # payload's own dimensions are read too. Without that the entry is an unchecked
+    # promise, and a container holding three 16-pixel frames under 16, 32 and 48 entries
+    # would pass.
+    for index, side in enumerate(sizes):
         length, offset = struct.unpack_from("<II", icon, 6 + 16 * index + 8)
         assert icon[offset : offset + 8] == b"\x89PNG\r\n\x1a\n"
         assert offset + length <= len(icon)
+        declared = struct.unpack_from(">II", icon, offset + 16)
+        assert declared == (side, side), "the payload is the size its entry claims"
 
 
 def test_the_shipped_favicon_is_exactly_what_the_renderer_produces():
@@ -288,6 +294,9 @@ def test_every_icon_size_is_a_whole_multiple_of_the_grid():
     # Integer scaling is what keeps the larger sizes crisp. A size off the grid would
     # land an edge on a fraction of a pixel, so the constraint is load-bearing, not tidy.
     assert favicon.GRID == len(favicon.MARK) == 16
+    # Pinned as literals. Every other size assertion compares against ``SIZES``, so
+    # without this the whole set could drift and the suite would still agree with it.
+    assert favicon.SIZES == (16, 32, 48)
     assert all(len(row) == favicon.GRID for row in favicon.MARK)
     for side in favicon.SIZES:
         assert side % favicon.GRID == 0
@@ -318,18 +327,86 @@ def test_the_cli_defaults_to_the_shipped_file():
     # the shipped bytes drift apart without anyone running a second command.
     loaded = resources.files("lake").joinpath("static").joinpath(dashboard.FAVICON)
     assert favicon.packaged_path() == Path(str(loaded))
+    # With no ``--out`` the parser leaves the choice to ``main``, which is what makes the
+    # packaged path the default rather than a value argparse happens to hold.
+    assert favicon.build_parser().parse_args([]).out is None
+
+
+def test_the_cli_writes_its_default_path_when_given_no_out(tmp_path, monkeypatch):
+    # Drives the branch the test above only reasons about. The default is redirected, so
+    # the run proves ``main`` writes wherever ``packaged_path`` points without touching
+    # the file the package ships.
+    target = tmp_path / "favicon.ico"
+    monkeypatch.setattr(favicon, "packaged_path", lambda: target)
+    assert favicon.main([]) == 0
+    assert target.read_bytes() == favicon.render()
 
 
 def test_the_ink_is_the_pages_captured_colour():
     # The module docstring claims the ink is ``--captured``'s light-scheme value. That is
     # a claim about another file, so it is pinned the way the ``sizes`` attribute is. The
-    # light value is the one on bare ``:root``, so the search is scoped to that block
-    # rather than counting how many schemes the page happens to define.
+    # light value is the one on bare ``:root``. That rule is indented two spaces, and the
+    # dark-scheme override nests four deep inside its media query, so the block is
+    # anchored on the indentation. Matching the first ``:root`` instead would silently
+    # compare against the dark value if the two ever swapped order.
     page = dashboard.load_status_page().decode("utf-8")
-    root_block = page.split(":root {", 1)[1].split("}", 1)[0]
-    match = re.search(r"--captured:\s*(#[0-9a-fA-F]{6})\s*;", root_block)
+    block = re.search(r"(?m)^  :root \{(.*?)^  \}", page, re.S)
+    assert block is not None, "the page declares a top-level :root rule"
+    match = re.search(r"--captured:\s*(#[0-9a-fA-F]{6})\s*;", block.group(1))
     assert match is not None
     assert match.group(1).lower() == "#" + bytes(favicon.INK).hex()
+
+
+def _decode_png(png: bytes) -> list[list[bytes]]:
+    """Rows of RGBA pixels from one of the icon's sub-images.
+
+    This reads only what ``lake.favicon`` writes: 8-bit RGBA, filter type 0 on every
+    scanline, one ``IDAT``. It is not a general PNG reader, and the filter assertion is
+    what keeps it honest if the encoder ever starts writing something else.
+    """
+    width, height = struct.unpack_from(">II", png, 16)
+    data = b""
+    offset = 8
+    while offset < len(png):
+        length, tag = struct.unpack_from(">I4s", png, offset)
+        if tag == b"IDAT":
+            data += png[offset + 8 : offset + 8 + length]
+        offset += 12 + length
+    raw = zlib.decompress(data)
+    stride = width * 4
+    rows = []
+    for y in range(height):
+        start = y * (stride + 1)
+        assert raw[start] == 0, "the encoder writes filter type 0 only"
+        line = raw[start + 1 : start + 1 + stride]
+        rows.append([line[x * 4 : x * 4 + 4] for x in range(width)])
+    return rows
+
+
+def test_every_rendered_pixel_matches_the_mark_including_its_transparency():
+    # The waterline argument rests on rendered alpha, not on the grid. A renderer that
+    # painted the empty cells opaque would still satisfy ``MARK``, the golden pin and the
+    # container test, and the icon would quietly stop reading on one tab strip or the
+    # other. This is the assertion that makes the hole real.
+    icon = dashboard.load_favicon()
+    count = struct.unpack_from("<H", icon, 4)[0]
+    ink = bytes(favicon.INK) + b"\xff"
+    clear = b"\x00\x00\x00\x00"
+    for index in range(count):
+        side = struct.unpack_from("<B", icon, 6 + 16 * index)[0]
+        length, offset = struct.unpack_from("<II", icon, 6 + 16 * index + 8)
+        pixels = _decode_png(icon[offset : offset + length])
+        scale = side // favicon.GRID
+        assert len(pixels) == side
+        for y, row in enumerate(favicon.MARK):
+            for x, cell in enumerate(row):
+                expected = ink if cell == "#" else clear
+                # Every pixel of the cell, so a scaled render cannot be right only at its
+                # corner. This is the check the transparency claim actually needs.
+                for dy in range(scale):
+                    for dx in range(scale):
+                        got = pixels[y * scale + dy][x * scale + dx]
+                        assert got == expected, f"{side}px cell ({x},{y}) offset ({dx},{dy})"
 
 
 def test_the_waterline_row_is_empty():

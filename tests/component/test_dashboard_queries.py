@@ -255,6 +255,24 @@ def service(root: Path) -> DashboardService:
 # -- now ---------------------------------------------------------------------
 
 
+def test_the_page_and_icon_seams_return_what_was_injected(root: Path):
+    # The class docstring says the page and the icon are injected on the same terms, and
+    # that each falls back to the bytes shipped in the package. Both halves are asserted
+    # here. Without this the constructor could ignore either argument and every caller
+    # that passes one would still pass, because nothing else reads them back.
+    injected = DashboardService(
+        root,
+        clock=ManualClock(NOW.astimezone(UTC)),
+        calendar=CALENDAR,
+        page=b"PAGE",
+        icon=b"ICON",
+    )
+    assert (injected.page, injected.icon) == (b"PAGE", b"ICON")
+    default = DashboardService(root, clock=ManualClock(NOW.astimezone(UTC)), calendar=CALENDAR)
+    assert default.page == dashboard.load_status_page()
+    assert default.icon == dashboard.load_favicon()
+
+
 def test_now_reports_the_last_data_cycle_and_minutes_since(service: DashboardService):
     now = service.run_query("now", {})
     assert now["tickers"] == ["QQQ", "SPY"]

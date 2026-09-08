@@ -174,6 +174,7 @@ def test_the_favicon_path_serves_the_packaged_icon(served):
     status, headers, body = _request(server, "/favicon.ico", host="localhost")
     assert status == 200
     assert headers["content-type"] == "image/x-icon"
+    assert headers["content-length"] == str(len(body))
     assert body == load_favicon()
     # The page names this path, and the policy permits exactly this origin's images. This
     # test asserts both halves, because the icon needs them to agree and this is the
@@ -242,7 +243,21 @@ def test_a_bad_parameter_is_a_400(served, query: str):
     assert "error" in json.loads(body)
 
 
-@pytest.mark.parametrize("path", ["/nope", "/api/now/", "/api/history", "/api", "/status.html"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/nope",
+        "/api/now/",
+        "/api/history",
+        "/api",
+        "/status.html",
+        # The icon path is matched whole. A prefix, a trailing slash or a different
+        # case must not reach it, and nothing pinned that until these three.
+        "/favicon.ico/",
+        "/FAVICON.ICO",
+        "/favicon.icox",
+    ],
+)
 def test_an_unknown_path_is_a_404(served, path: str):
     server, _root = served
     status, _headers, body = _request(server, path, host="localhost")
