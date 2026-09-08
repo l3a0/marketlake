@@ -1011,53 +1011,141 @@ def _commands(script: str) -> list[str]:
     ]
 
 
-def test_the_uninstall_never_touches_the_lake_or_the_config_directory(tmp_path):
-    """The two things an uninstall must not take, stated as a test rather than a comment.
+def _install_targets(out: Path) -> set[str]:
+    """Every absolute path install.sh writes to, derived from the script itself."""
+    targets = set()
+    for line in _commands((out / cp.INSTALL_SCRIPT_FILE).read_text()):
+        if not line.startswith("sudo install "):
+            continue
+        dest, src = line.split()[-1], line.split()[-2].strip('"')
+        name = src.rsplit("/", 1)[-1]
+        targets.add(dest.rstrip("/") + "/" + name if dest.endswith("/") else dest)
+    return targets
 
-    Removing the token turns an uninstall into a re-auth. Removing the lake turns it into
-    data loss. Only the Time Machine exclusion on the config directory is lifted.
+
+def _rm_targets(out: Path) -> set[str]:
+    """Every path uninstall.sh deletes. Runnable lines only, so a comment cannot count."""
+    return {
+        line.split()[-1]
+        for line in _commands((out / cp.UNINSTALL_SCRIPT_FILE).read_text())
+        if " rm " in f" {line} "
+    }
+
+
+def test_the_uninstall_deletes_exactly_what_the_install_writes(tmp_path):
+    """Set equality, derived from install.sh, so neither direction can drift.
+
+    A subset check in one direction misses a forgotten removal. A subset in the other
+    misses a removal of something the install never placed, which is the sharper of the
+    two: it takes a file belonging to somebody else.
+    """
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    installed = _install_targets(out)
+    assert len(installed) == 6, installed  # five plists plus the sudoers drop-in
+    assert _rm_targets(out) == installed
+
+
+def test_the_uninstall_deletes_every_label_by_its_own_name(tmp_path):
+    """Each plist is named once. Five deletions of one path would satisfy a count."""
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    deleted = _rm_targets(out)
+    for job in cp.all_jobs(_host()):
+        assert f"/Library/LaunchDaemons/{job.label}.plist" in deleted, job.label
+
+
+def test_every_privileged_uninstall_command_runs_under_sudo(tmp_path):
+    """Stripping sudo would leave a script that fails on its first step.
+
+    The fake sudo execs what it is given, so a runtime log alone cannot tell the two
+    spellings apart. This reads the text instead.
+    """
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    commands = _commands((out / cp.UNINSTALL_SCRIPT_FILE).read_text())
+    privileged = ("launchctl bootout", "rm -f", "pmset repeat cancel")
+    for line in commands:
+        body = line[2:].lstrip() if line.startswith("  ") else line
+        if any(word in body for word in privileged):
+            assert body.startswith("sudo "), body
+    # And the read-only commands do not, because they need no root.
+    assert "pmset -g sched" in commands
+    assert not [line for line in commands if line.startswith("sudo pmset -g")]
+
+
+def test_the_uninstall_deletes_nothing_but_those_six_paths(tmp_path):
+    """No recursive delete, no path outside the install's own, however it is spelled.
+
+    Banning the literal ``rm -rf`` catches one spelling. Comparing every delete against
+    the derived install set catches the class, including ``-fr``, a variable, or a path
+    this test never thought to name.
     """
     out = tmp_path / "out"
     assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
     script = (out / cp.UNINSTALL_SCRIPT_FILE).read_text()
-    config_dir = cp.default_config_dir("/Users/someone")
-
-    assert "rm -rf" not in script
-    # The config directory appears exactly once, and only to lift the exclusion.
-    mentions = [line for line in _commands(script) if config_dir in line]
-    assert len(mentions) == 1, mentions
-    assert mentions[0].startswith("tmutil removeexclusion"), mentions[0]
-    # Nothing removes it, and nothing names a lake path.
-    assert not [line for line in _commands(script) if line.startswith("rm") and config_dir in line]
-    for word in ("lake_root", "journal", "manifest.jsonl", "reports/"):
-        assert word not in script, word
+    installed = _install_targets(out)
+    for line in _commands(script):
+        if " rm " not in f" {line} ":
+            continue
+        assert line.split()[-1] in installed, line
+        assert set(line.split()[-2]) <= {"-", "f"}, line  # -f only, never -r
+    assert "$" not in "".join(_commands(script)), "no variable reaches a command"
 
 
-def test_the_uninstall_removes_everything_the_install_places(tmp_path):
-    """Symmetry, derived rather than listed, so a new install step cannot be forgotten.
+def test_the_uninstall_leaves_the_config_directory_and_its_exclusion(tmp_path):
+    """The token outlives the install, so the guard over it outlives the install too.
 
-    Every absolute path the install writes to must be removed by the uninstall. Adding a
-    sixth job or another drop-in without extending the uninstall fails here.
+    Lifting the exclusion would put token.json and config.yaml's secrets on the next
+    hourly backup, and a backup that already ran cannot be un-run.
     """
     out = tmp_path / "out"
     assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
-    installed = (out / cp.INSTALL_SCRIPT_FILE).read_text()
-    removed = (out / cp.UNINSTALL_SCRIPT_FILE).read_text()
-
-    targets = set()
-    for line in _commands(installed):
-        if line.startswith("sudo install "):
-            dest = line.split()[-1]
-            src = line.split()[-2].strip('"')
-            name = src.rsplit("/", 1)[-1]
-            targets.add(dest.rstrip("/") + "/" + name if dest.endswith("/") else dest)
-    assert len(targets) == 6, targets  # five plists plus the sudoers drop-in
-
-    for target in targets:
-        assert f"rm -f {target}" in removed, target
+    commands = _commands((out / cp.UNINSTALL_SCRIPT_FILE).read_text())
+    config_dir = cp.default_config_dir("/Users/someone")
+    assert not [line for line in commands if config_dir in line], commands
+    assert not [line for line in commands if line.startswith("tmutil")], commands
+    # The install does place it, so this is a deliberate asymmetry rather than an
+    # omission that nobody noticed.
+    installed = _commands((out / cp.INSTALL_SCRIPT_FILE).read_text())
+    assert [line for line in installed if line.startswith("tmutil addexclusion")]
 
 
-def _run_uninstall(tmp_path: Path, *, loaded: bool):
+def test_the_uninstall_never_cancels_every_scheduled_event(tmp_path):
+    """``pmset schedule cancelall`` takes events nothing here created. It stays cut."""
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    script = (out / cp.UNINSTALL_SCRIPT_FILE).read_text()
+    assert "cancelall" not in script
+    assert not [line for line in _commands(script) if "pmset schedule" in line]
+
+
+def test_the_uninstall_prints_the_schedule_before_it_cancels_the_pair(tmp_path):
+    """``pmset repeat cancel`` clears the power-off half too, so the before-shot matters.
+
+    macOS holds one pair of repeating events and offers no way to cancel half of it. A
+    repeating sleep the operator set elsewhere goes with the marketlake wake. The only
+    thing standing between that and a silent loss is a read-back taken first.
+    """
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    commands = _commands((out / cp.UNINSTALL_SCRIPT_FILE).read_text())
+    cancel = commands.index("sudo pmset repeat cancel")
+    reads = [i for i, line in enumerate(commands) if line == "pmset -g sched"]
+    assert [i for i in reads if i < cancel], commands
+    assert [i for i in reads if i > cancel], commands
+
+
+# pmset carries its own return code, so a failure can be injected partway down the
+# uninstall rather than only at the first bootout.
+_FAKE_PMSET = """#!/bin/bash
+printf 'pmset %s\\n' "$*" >> "$LOG"
+[[ "$1" == "repeat" ]] && exit "$PMSET_RC"
+exit 0
+"""
+
+
+def _run_uninstall(tmp_path: Path, *, loaded: bool, pmset_rc: int = 0):
     out = tmp_path / "out"
     assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
     bin_dir = tmp_path / "bin"
@@ -1069,9 +1157,10 @@ def _run_uninstall(tmp_path: Path, *, loaded: bool):
             (loaded_dir / job.label).touch()
     log = tmp_path / "log"
     log.write_text("")
-    for name in ("rm", "tmutil", "pmset"):
-        (bin_dir / name).write_text(_FAKE.format(body="exit 0"))
-        (bin_dir / name).chmod(0o755)
+    (bin_dir / "rm").write_text(_FAKE.format(body="exit 0"))
+    (bin_dir / "rm").chmod(0o755)
+    (bin_dir / "pmset").write_text(_FAKE_PMSET)
+    (bin_dir / "pmset").chmod(0o755)
     (bin_dir / "sudo").write_text(_FAKE_SUDO)
     (bin_dir / "sudo").chmod(0o755)
     (bin_dir / "launchctl").write_text(_FAKE_LAUNCHCTL)
@@ -1083,6 +1172,7 @@ def _run_uninstall(tmp_path: Path, *, loaded: bool):
             "LOG": str(log),
             "LOADED": str(loaded_dir),
             "BOOTOUT_RC": "0",
+            "PMSET_RC": str(pmset_rc),
         },
         capture_output=True,
         text=True,
@@ -1090,14 +1180,22 @@ def _run_uninstall(tmp_path: Path, *, loaded: bool):
     return proc, [line for line in log.read_text().splitlines() if line]
 
 
-def test_the_uninstall_boots_out_before_deleting_each_plist(tmp_path):
-    """A plist deleted under a loaded label leaves launchd holding a definition."""
+def test_the_uninstall_runs_the_install_backwards(tmp_path):
+    """Reverse order, asserted by running it, because the header claims it in those words.
+
+    The install writes plists, then the drop-in, then the wake, then the exclusion, then
+    bootstraps. Undoing it in reverse puts the bootout first and the plists last. The
+    bootout leading is the load-bearing half: a plist deleted under a loaded label leaves
+    launchd holding a definition whose file is gone.
+    """
     proc, log = _run_uninstall(tmp_path, loaded=True)
     assert proc.returncode == 0, proc.stderr
     boots = [i for i, line in enumerate(log) if line.startswith("launchctl bootout")]
-    deletes = [i for i, line in enumerate(log) if line.startswith("rm -f /Library/LaunchDaemons")]
-    assert len(boots) == 5 and len(deletes) == 5, log
-    assert max(boots) < min(deletes), log
+    wake = [i for i, line in enumerate(log) if line == "pmset repeat cancel"]
+    dropin = [i for i, line in enumerate(log) if line == "rm -f /etc/sudoers.d/marketlake"]
+    plists = [i for i, line in enumerate(log) if line.startswith("rm -f /Library/LaunchDaemons")]
+    assert len(boots) == 5 and len(wake) == 1 and len(dropin) == 1 and len(plists) == 5, log
+    assert max(boots) < wake[0] < dropin[0] < min(plists), log
 
 
 def test_the_uninstall_converges_from_a_partial_install(tmp_path):
@@ -1106,9 +1204,21 @@ def test_the_uninstall_converges_from_a_partial_install(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert not [line for line in log if line.startswith("launchctl bootout")], log
     assert len([line for line in log if line.startswith("rm -f /Library/LaunchDaemons")]) == 5
-    assert any(line.startswith("pmset repeat cancel") for line in log), log
-    assert any(line.startswith("tmutil removeexclusion") for line in log), log
-    assert any("rm -f /etc/sudoers.d/marketlake" in line for line in log), log
+    assert any(line == "pmset repeat cancel" for line in log), log
+    assert any(line == "rm -f /etc/sudoers.d/marketlake" for line in log), log
+
+
+def test_the_uninstall_stops_at_a_failure_partway_down(tmp_path):
+    """``set -e`` has to hold for every step, not only the guarded bootout.
+
+    A failing wake cancel means the machine still wakes at 08:25. Carrying on would
+    delete the plists anyway, leaving a machine that wakes every weekday for a daemon
+    that is no longer there and no longer says so.
+    """
+    proc, log = _run_uninstall(tmp_path, loaded=True, pmset_rc=1)
+    assert proc.returncode != 0
+    assert any(line == "pmset repeat cancel" for line in log), log
+    assert not [line for line in log if line.startswith("rm -f")], log
 
 
 def test_the_reinstall_is_an_uninstall_then_an_install(tmp_path):

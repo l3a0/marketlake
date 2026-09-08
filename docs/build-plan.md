@@ -110,31 +110,52 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   root-owned copy remains the operator's own act.
 
   `render` writes two more scripts beside it, `uninstall.sh` and `reinstall.sh`. The
-  uninstall takes off exactly what the install placed, in reverse order, so a label is
-  booted out before its plist is deleted. A label that is not loaded is skipped rather
-  than treated as a failure, so the uninstall converges from a half-finished install as
-  well as a whole one. Two things it deliberately leaves:
+  uninstall runs the install backwards. The install writes the plists (step 1), the
+  sudoers drop-in (step 2), the weekday wake (step 3), the Time Machine exclusion
+  (step 4), then bootstraps the labels (step 5). The uninstall runs 5, 3, 2, 1. Putting
+  the bootout first is the load-bearing half, because a plist deleted under a loaded
+  label leaves launchd holding a definition whose file is gone. A label that is not
+  loaded is skipped rather than treated as a failure, so the uninstall converges from a
+  half-finished install as well as a whole one.
+
+  Three things it leaves:
 
   1. The lake. Deleting captured data is not part of undoing an install.
-  2. `~/.config/marketlake`, which holds the token, `config.yaml`, and `tickers.yaml`.
-     Removing the token would turn an uninstall into a re-auth. Only the Time Machine
-     exclusion on that directory is lifted, and the directory itself stays.
+  2. The config directory and, with it, install step 4's Time Machine exclusion. The
+     directory holds the token, `config.yaml`, and `tickers.yaml`, all of which survive
+     an uninstall, so the guard over them survives too. Symmetry with the install is the
+     wrong principle for a protection over data that outlives the install. Lifting the
+     exclusion would put the token and `config.yaml`'s four secrets on the next hourly
+     backup, and a backup that already ran cannot be un-run by re-adding the exclusion.
+  3. The Sunday one-shot wake. `pmset schedule cancel` can take a single event, but only
+     by naming the exact date and time it was set for. Nothing here knows which Sunday
+     is pending without parsing `pmset -g sched`, which is more machinery than one wake
+     is worth. The one-shot fires once and is then gone.
 
-  It leaves the Sunday one-shot too. Cancelling a one-shot needs `pmset schedule
-  cancelall`, which takes every scheduled event on the machine, including ones nothing
-  here created. `pmset repeat cancel` is safe by contrast, because the repeating alarm is
-  a single slot and the install owns it. The one-shot fires once and is then gone, so
-  leaving it costs one wake.
+  Cancelling the weekday wake is the one place the uninstall reaches past what the
+  install placed, and the cost is named rather than denied. macOS holds one *pair* of
+  repeating power events, a power-on and a power-off, and `pmset repeat cancel` clears
+  the pair. No command cancels half of it. The design doc's `pmset` table already
+  records that second slot: it is why the sudoers rule spells its argument out instead
+  of wildcarding it, since the wildcard would have granted a password-free repeating
+  shutdown. So a repeating sleep the operator set elsewhere goes with the 08:25 wake.
+  The script prints `pmset -g sched` before the cancel as well as after, so the
+  transcript carries what to re-set by hand. Leaving the wake instead was rejected: an
+  uninstalled machine that still wakes at 08:25 every weekday is the install's most
+  visible residue, and the operator ran an uninstall to be rid of it.
 
-  `reinstall.sh` is the uninstall followed by the install, and it carries no steps of its
-  own. The **in-place plist swap is considered and rejected.** That version overwrote the
-  plists, booted the labels out and back in, and skipped steps 2, 3, and 4 on the grounds
-  that those do not change. They do. The sudoers drop-in carries the owner and both wake
-  constants, so re-tuning a wake rewrites the drop-in while leaving every plist
-  byte-identical. On that re-render the swap reinstalled nothing that had changed and
-  skipped the only thing that had. Composing the two scripts removes the class, because a
-  reinstall then holds no third description of what an install is that could fall out of
-  step with the other two.
+  `reinstall.sh` is the uninstall followed by the install, and it carries no steps of
+  its own. The **in-place plist swap is considered and rejected.** That version
+  overwrote the plists and booted the labels out and back in, and it left install steps
+  2, 3 and 4 to the operator. It named that as a limit rather than a property, and its
+  header handed over a `sudo diff` of the drop-in to run after any re-render. The gap
+  was documented, not denied. What makes documenting it insufficient is the shape of
+  the case that bites. Re-tuning either wake constant rewrites the drop-in while leaving
+  every plist byte-identical, so the operator who checks the plists sees nothing to do
+  and skips the diff that mattered. Composing the two scripts closes the gap instead of
+  describing it, and leaves no third description of an install to fall out of step with
+  the other two. The pasteable `INSTALL.txt` keeps the by-hand procedure for operators
+  who want it, now pointing at `reinstall.sh` first and carrying the `sudo diff` line.
 - **D15** query service with the Now and Today panels. The query service is the read-only localhost dashboard.
 
 Slice 2 builds in two waves. D9 comes first and defines the hooks. D12, D14, and D15 do not touch the loop, so they build in parallel with D9. D10, D11, and D13 plug into D9's hooks, so they follow it, in parallel with each other.
