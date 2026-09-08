@@ -11,7 +11,8 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
-from lake.schwab import QUOTE_FIELD_GROUPS, SchwabVendor
+from lake.capture import _error_class
+from lake.schwab import QUOTE_FIELD_GROUPS, SchwabVendor, VendorAuthError
 from lake.vendor import Vendor, VendorError, VendorResponse
 from tests.support.schwab import FakeResponse, FakeSchwabClient
 
@@ -167,3 +168,80 @@ def test_headers_are_copied_not_aliased():
 
 def test_schwab_vendor_satisfies_the_vendor_protocol():
     assert isinstance(SchwabVendor(_client()), Vendor)
+
+
+# -- credential failures -------------------------------------------------------
+
+
+class AuthlibBaseError(Exception):
+    """Stands in for authlib's base error, matched by name rather than by import."""
+
+
+class OAuthError(AuthlibBaseError):
+    """The one authlib actually raises when a refresh token is dead."""
+
+
+class _RaisingClient:
+    """A client whose every call raises, so the wrapper is what is under test."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    def get_option_chain(self, *args, **kwargs):
+        raise self._exc
+
+    def get_quotes(self, *args, **kwargs):
+        raise self._exc
+
+
+@pytest.mark.parametrize("method", ["chain", "quotes"])
+def test_a_credential_failure_is_named_by_the_lake_not_by_the_library(method):
+    """Both fetch paths classify a dead token the same way.
+
+    A refresh that fails sends no request, so there is no status to record and the
+    library raises instead. Left alone that lands under whatever the library named its
+    exception, which is not what the watchdog watches for.
+    """
+    vendor = SchwabVendor(_RaisingClient(OAuthError("refresh token expired")))
+    with pytest.raises(VendorAuthError) as caught:
+        if method == "chain":
+            vendor.get_chain("SPY")
+        else:
+            vendor.get_quotes(["SPY"])
+    # The original is kept, so a traceback still says what the library said.
+    assert isinstance(caught.value.__cause__, OAuthError)
+
+
+def test_an_unknown_authlib_subclass_still_classifies_as_auth():
+    """This is the difference between fixing the class and fixing one instance.
+
+    authlib ships several credential errors and may add more. Matching the base rather
+    than each leaf means one this code has never seen still reads as auth death.
+    """
+
+    class SomeFutureTokenError(AuthlibBaseError):
+        pass
+
+    vendor = SchwabVendor(_RaisingClient(SomeFutureTokenError("new in some release")))
+    with pytest.raises(VendorAuthError):
+        vendor.get_quotes(["SPY"])
+
+
+def test_a_failure_that_is_not_about_credentials_passes_through():
+    """Only the classification changes, and only for credential failures."""
+    vendor = SchwabVendor(_RaisingClient(TimeoutError("read timed out")))
+    with pytest.raises(TimeoutError):
+        vendor.get_quotes(["SPY"])
+
+
+def test_the_lake_owned_class_is_what_the_watchdog_watches_for():
+    """The gap's error_class must be the string the whole-daemon map carries.
+
+    This is the join between the two modules. Renaming the exception without updating
+    the map would leave a dead token gapping under a class nothing pages on, which is
+    the defect this pair of changes exists to close.
+    """
+    from lake.watchdog import _WHOLE_DAEMON_CAUSES
+
+    assert _error_class(VendorAuthError("dead")) == "vendor_auth_error"
+    assert _WHOLE_DAEMON_CAUSES["vendor_auth_error"] == "Capture down: token dead"

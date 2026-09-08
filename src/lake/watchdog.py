@@ -43,6 +43,11 @@ DEFAULT_PAGE_MINUTES = 3
 _WHOLE_DAEMON_CAUSES = {
     "http_401": "Capture down: token dead",
     "http_403": "Capture down: token dead",
+    # The other shape of a dead token. When the refresh fails no request goes out, so
+    # there is no status to record and the vendor raises instead. ``schwab`` collapses
+    # every such raise onto one class the lake owns, so this maps one string rather
+    # than a list of the library's exception names.
+    "vendor_auth_error": "Capture down: token dead",
     "http_429": "Capture down: rate limited",
 }
 
