@@ -42,6 +42,17 @@ Do not commit or push without explicit per-change review. Each commit instructio
 
 ## Pull requests
 
+**Review every PR before the owner does (owner directive, 2026-09-06).** A PR the owner has not seen reviewed is not finished work. This holds whether the PR is yours or someone else's, whether it is one line or a thousand, and whether or not a review was asked for. The review runs before the PR is handed over, not after.
+
+The gate is mechanical, because the rule is easy to hold in principle and easy to miss in practice. Opening a PR is not finishing it. A PR link and the result of its review go to the owner in the same message, or neither goes. Reporting the link first puts the review after the handover by construction, which is the failure this rule exists to stop.
+
+Review by fanning out independent lenses, then verifying each finding adversarially. Several reviewers in parallel, each with one lens and no sight of the others, produce the findings. Verifiers then try to refute each one, and only what survives is acted on. Point one lens at completeness and one at over-reach, which catch the two failures that recur:
+
+1. Fixing the instance rather than the class, such as a false claim corrected in one file while it still stands in three more.
+2. Fixing past the class, such as generalising a change into places it does not belong.
+
+Verify by executing, not by reading. Mutate the code and confirm a test fails. A test that still passes under mutation is not holding what it claims to hold. Say plainly what the review found and what it refuted, including when it found nothing.
+
 PR titles use a Conventional Commits prefix. The form is `type(scope): summary`. Types in use: `docs`, `feat`, `fix`, `refactor`, `chore`, `ci`, `perf`. Add a scope in parens when it sharpens the title, like `docs(CLAUDE.md)`. Drop it when none does, like a plain `docs:` for a whole-doc change. The form and the scope rule match the sibling `trading-strategies` repo. Its list carries every type but `refactor`, which this repo uses and that one does not.
 
 PR bodies use Markdown section headings, not a wall of prose. Lead with `## Why`, then `## What`. Add situational sections after as the change needs them, like `## Scope`, `## Notes`, or `## Evidence`. The body's prose obeys the writing-style rules above. So short sentences and no em dashes, even though the sibling repo allows them. End every body with the footer line: `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
