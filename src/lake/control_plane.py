@@ -78,6 +78,7 @@ import json
 import math
 import re
 import shlex
+import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
@@ -1612,7 +1613,7 @@ def main(
         }
         if relative:
             named = ", ".join(f"{name} {value!r}" for name, value in sorted(relative.items()))
-            print(f"render: these must be absolute paths: {named}")
+            print(f"render: these must be absolute paths: {named}", file=sys.stderr)
             return 2
         host = LaunchdHost(
             python=args.python,
@@ -1629,11 +1630,14 @@ def main(
         try:
             written = write_rendered(render_all(host), out)
         except ValueError as exc:
-            print(f"render: {exc}")
+            print(f"render: {exc}", file=sys.stderr)
             return 2
+        # Progress and errors go to stderr, the install text to stdout. The text is
+        # meant to be read and pasted, so ``render ... > install.txt`` has to yield a
+        # file of nothing but comments and commands. A ``wrote ...`` line welded to the
+        # top of it is not a command, and a shell fed the file reports it as one.
         for path in written:
-            print(f"wrote {path}")
-        print()
+            print(f"wrote {path}", file=sys.stderr)
         print(install_commands(out, host), end="")
         return 0
 
