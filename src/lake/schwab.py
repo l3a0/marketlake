@@ -28,7 +28,8 @@ a test is a few lines.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -137,6 +138,47 @@ def _response_from(reply: HttpResponse) -> VendorResponse:
     )
 
 
+# The base classes every authlib credential failure inherits from. Matching on the
+# name rather than the type keeps this module's promise that it never imports the
+# vendor library, and matching the BASE rather than each leaf means a subclass this
+# code has never heard of still classifies as auth.
+_AUTH_BASE_NAMES = frozenset({"AuthlibBaseError", "OAuthError"})
+
+
+class VendorAuthError(Exception):
+    """The vendor refused the credentials rather than answering the request.
+
+    A dead refresh token has two shapes. Sometimes the request goes out and comes back
+    401, which capture records as ``http_401``. Sometimes the refresh fails first and no
+    request is made at all, which raises out of the client. Left alone the second shape
+    is recorded under whatever the library happened to name its exception, so the two
+    shapes of one failure land under two unrelated classes and only one of them is
+    recognised as auth death.
+
+    Raising this collapses the second shape onto one class the lake owns.
+    """
+
+
+def _is_auth_failure(exc: BaseException) -> bool:
+    """Whether a raised vendor failure is about credentials, not about the request."""
+    return any(base.__name__ in _AUTH_BASE_NAMES for base in type(exc).__mro__)
+
+
+@contextmanager
+def _auth_failures_named() -> Iterator[None]:
+    """Re-raise a credential failure as ``VendorAuthError``, and pass everything else.
+
+    Only the classification changes. The original is kept as the cause, so nothing about
+    what went wrong is lost from a traceback.
+    """
+    try:
+        yield
+    except Exception as exc:
+        if _is_auth_failure(exc):
+            raise VendorAuthError(str(exc) or type(exc).__name__) from exc
+        raise
+
+
 class SchwabVendor:
     """A ``Vendor`` backed by a ``schwab-py`` client.
 
@@ -171,15 +213,16 @@ class SchwabVendor:
         ``from_date`` / ``to_date`` to fetch each expiration range when the full chain
         exceeds Schwab's gateway body limit.
         """
-        return _response_from(
-            self._client.get_option_chain(
-                symbol,
-                include_underlying_quote=True,
-                from_date=from_date,
-                to_date=to_date,
-                strike_count=strike_count,
+        with _auth_failures_named():
+            return _response_from(
+                self._client.get_option_chain(
+                    symbol,
+                    include_underlying_quote=True,
+                    from_date=from_date,
+                    to_date=to_date,
+                    strike_count=strike_count,
+                )
             )
-        )
 
     def get_quotes(self, symbols: Sequence[str]) -> VendorResponse:
         """Batched equity quotes for every symbol, verbatim.
@@ -189,9 +232,10 @@ class SchwabVendor:
         account's default field set. The groups pass as an iterable of their string
         values, which the ``enforce_enums=False`` client accepts as-is.
         """
-        return _response_from(
-            self._client.get_quotes(list(symbols), fields=list(QUOTE_FIELD_GROUPS))
-        )
+        with _auth_failures_named():
+            return _response_from(
+                self._client.get_quotes(list(symbols), fields=list(QUOTE_FIELD_GROUPS))
+            )
 
     def token_mint_time(self) -> datetime:
         """When the refresh token in use was minted, timezone-aware in UTC.
