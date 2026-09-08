@@ -74,12 +74,34 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   3. A page that never reached the phone is written to a dated directory under `reports/`, one write-once file each, so the count on the Now panel has a source.
   It also ships the 09:35 says-closed-but-open probe, its page, its plist through D14's renderer, and the `capture` dead-man feed with its idle heartbeats.
 - **Unowned.** Four of D13's page paths. The auth-gap reminder, because the watchdog's cause page is once-on-transition, so a token dying at 09:31 pages once and is then silent for the session. The parser's schema-drift page. The undelivered-pages count on the Now panel, which has a source now but no reader. And `--test-push` on the onboarding command. The publisher exists, so each is a producer and a schedule rather than new machinery.
-- **D14** laptop control plane. `render --out DIR` writes every plist and setup file to a directory and prints the install commands. It refuses a system directory, so installing stays the operator's by-hand step. Nothing here runs `sudo`, a `pmset` write, `launchctl bootstrap`, or a `tmutil` write. What does run is read-only and needs no root: `launchctl print` from the self-check, `pmset -g sched` and `tmutil isexcluded` from the Sunday job. The token path comes from one rule, so the daemon that rewrites it, the Sunday job that asserts coverage over it, and the exclusion that protects it cannot name different files. `RunAtLoad` is on for the two residents and the self-check. It is off for the Sunday job, which would otherwise scrub the whole lake at every boot. Beside the sudoers drop-in it renders five LaunchDaemons, and it prints the Time Machine exclusion as an install step rather than rendering it:
+- **D14** laptop control plane. `render --out DIR` writes every plist and setup file to a directory and prints the install commands. It refuses a system directory, and nothing here runs `sudo`, a `pmset` write, `launchctl bootstrap`, or a `tmutil` write. What does run is read-only and needs no root: `launchctl print` from the self-check, `pmset -g sched` and `tmutil isexcluded` from the Sunday job. The token path comes from one rule, so the daemon that rewrites it, the Sunday job that asserts coverage over it, and the exclusion that protects it cannot name different files. `RunAtLoad` is on for the two residents and the self-check. It is off for the Sunday job, which would otherwise scrub the whole lake at every boot. Beside the sudoers drop-in it renders five LaunchDaemons, and it prints the Time Machine exclusion as an install step rather than rendering it:
   1. the capture daemon, resident under `KeepAlive`,
   2. the query service, resident the same way,
   3. the weekday pre-open self-check, on a calendar interval,
   4. the 09:35 calendar probe, the says-closed-but-open guard,
   5. the Sunday maintenance job, on its own.
+
+  `render` also writes an executable `install.sh`, so the privileged half is one command
+  the operator runs rather than seventeen lines pasted by hand. The **by-hand paste is
+  considered and rejected** as the only path. It was chosen so the operator saw each root
+  command before running it, and so the `visudo` gate was a natural place to stop. The
+  paste is itself a failure mode. A partial paste installs a partial control plane, and a
+  partial one is worse than none. launchd runs the jobs that landed, the `capture` check
+  goes live against a daemon whose sudoers grant never arrived, and the result reads on
+  the phone as a dead machine rather than a botched install.
+
+  The script owes three things, which are the price of dropping the paste:
+
+  1. It stops at the first failure, so a `visudo` that rejects the drop-in never reaches
+     the `install` that would place it.
+  2. It echoes each privileged command before running it, so the transcript shows what
+     ran as root.
+  3. It ends on `launchctl print`, so the operator reads whether the daemon came up.
+
+  The cost is named. One `sudo` timestamp covers the whole run, where seventeen pasted
+  lines each faced their own prompt. The renderer still executes nothing. It writes
+  `install.sh` and never runs it, and `--out` still refuses a system directory, so the
+  root-owned copy remains the operator's own act.
 - **D15** query service with the Now and Today panels. The query service is the read-only localhost dashboard.
 
 Slice 2 builds in two waves. D9 comes first and defines the hooks. D12, D14, and D15 do not touch the loop, so they build in parallel with D9. D10, D11, and D13 plug into D9's hooks, so they follow it, in parallel with each other.
