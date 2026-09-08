@@ -1480,7 +1480,7 @@ def write_rendered(files: Sequence[RenderedFile], out_dir: Path) -> list[Path]:
 
 def _first_install_lines(
     host: LaunchdHost, *, plist_path: Callable[[str], str], sudoers_path: str
-) -> list[str]:
+) -> list[str | tuple[str, str]]:
     """Steps 1 to 5, as comment and command lines, in order.
 
     One source for two renderings. ``install_commands`` prints these for pasting and
@@ -1499,7 +1499,9 @@ def _first_install_lines(
     location instead, so moving the rendered directory does not break it. Both
     ``plist_path`` and ``sudoers_path`` arrive already shell-quoted.
     """
-    lines = ["# 1. Install the five LaunchDaemons, root-owned as launchd requires."]
+    lines: list[str | tuple[str, str]] = [
+        "# 1. Install the five LaunchDaemons, root-owned as launchd requires."
+    ]
     for job in all_jobs(host):
         lines.append(
             f"sudo install -o root -g wheel -m 644 {plist_path(job.label)} /Library/LaunchDaemons/"
@@ -1544,9 +1546,10 @@ def install_script(host: LaunchdHost) -> str:
     The build plan's D14 permits this and names the three things it owes, because the
     by-hand paste it replaces bought them for free:
 
-    1. It stops at the first failure. ``set -e`` does that, and step 2's ``&&`` means a
-       ``visudo`` that rejects the drop-in never reaches the ``install`` that would
-       place it.
+    1. It stops at the first failure. ``set -e`` does that, and step 2's gate is emitted
+       as two statements rather than one ``&&`` line so that it holds. ``set -e`` does
+       not stop on a failing left side of ``&&``, so the joined form would let a
+       rejected drop-in skip its own install and the rest of the install continue.
     2. It echoes each command before running it, so the transcript shows what ran as
        root.
     3. It ends on ``launchctl print``, so the operator reads whether the daemon came up

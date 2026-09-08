@@ -789,8 +789,10 @@ def _run_script(tmp_path: Path, *, visudo_fails: bool):
     log = tmp_path / "log"
     log.write_text("")
     _fake_tools(bin_dir, visudo_fails=visudo_fails)
+    # Invoked directly rather than through ``bash <path>``, so the executable bit is
+    # part of what this exercises.
     proc = subprocess.run(
-        ["/bin/bash", str(out / cp.INSTALL_SCRIPT_FILE)],
+        [str(out / cp.INSTALL_SCRIPT_FILE)],
         env={"PATH": f"{bin_dir}:/usr/bin:/bin", "LOG": str(log)},
         capture_output=True,
         text=True,
@@ -798,9 +800,20 @@ def _run_script(tmp_path: Path, *, visudo_fails: bool):
     return proc, [line for line in log.read_text().splitlines() if line]
 
 
-def test_the_install_script_is_executable_and_parses():
-    out_files = {f.name: f for f in cp.render_all(_host())}
-    assert out_files[cp.INSTALL_SCRIPT_FILE].mode == 0o755
+def test_the_written_install_script_is_executable(tmp_path):
+    """The bit is read off disk, because that is where it has to be.
+
+    Asserting ``RenderedFile.mode`` instead would pass with the ``chmod`` deleted, and
+    the golden cannot cover it either: git stores that fixture at 0o644. Being one
+    command the operator runs is the whole point of the script, so ``./install.sh``
+    has to work.
+    """
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    script = out / cp.INSTALL_SCRIPT_FILE
+    assert script.stat().st_mode & 0o777 == 0o755
+    # The plists are not executable. A blanket chmod would pass the line above.
+    assert (out / cp.SUDOERS_FILE).stat().st_mode & 0o777 == 0o644
 
 
 def test_the_install_script_runs_every_step_in_order(tmp_path):
@@ -834,7 +847,11 @@ def test_the_install_script_echoes_every_command_before_running_it(tmp_path):
     body = [line for line in lines if line and not line.startswith("#")]
     commands = [line for line in body if not line.startswith(("echo ", "set ", "HERE="))]
     for command in commands:
-        assert f"echo {shlex.quote('+ ' + command)}" in lines, command
+        echo = f"echo {shlex.quote('+ ' + command)}"
+        assert echo in lines, command
+        # Immediately before, not merely present. An echo that trails its command
+        # describes what already ran as root, which is not what the obligation buys.
+        assert lines[lines.index(echo) + 1] == command, command
 
 
 def test_the_install_script_omits_the_standing_friday_step(tmp_path):
