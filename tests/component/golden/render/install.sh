@@ -4,6 +4,15 @@
 # Written by `python -m lake.control_plane render`, which never runs it. Run it
 # yourself, as the owner. It calls sudo for the privileged steps and will prompt.
 #
+# Usage. It installs the files sitting beside it, so it runs from anywhere and the
+# rendered directory can be moved or renamed:
+#
+#     ./install.sh                     # from the directory it was rendered into
+#     ~/marketlake-install/install.sh  # or by path, from anywhere
+#
+# Read it first. Of the 18 commands below, 14 run under sudo. The rest need no root,
+# and step 4 must not have any.
+#
 # It stops at the first failure, so a visudo that rejects the drop-in never
 # reaches the install that would place it. Every command is echoed before it runs.
 # The last command reads back whether the daemon came up.

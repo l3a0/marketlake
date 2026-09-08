@@ -1559,12 +1559,40 @@ def install_script(host: LaunchdHost) -> str:
     path, so moving the rendered directory does not break it. Step 6 is deliberately
     absent. It is the standing Friday task, not part of the first install.
     """
-    lines = [
+    body: list[str] = []
+    for item in _first_install_lines(
+        host,
+        plist_path=lambda label: f'"$HERE/{label}.plist"',
+        sudoers_path='"$HERE/' + SUDOERS_FILE + '"',
+    ):
+        for command in (item,) if isinstance(item, str) else item:
+            if command.startswith("#"):
+                body.append(command)
+            else:
+                body.append(f"echo {shlex.quote('+ ' + command)}")
+                body.append(command)
+
+    # Counted from the body rather than written down, so the header cannot drift from
+    # what the script actually runs.
+    commands = [line for line in body if not line.startswith(("#", "echo "))]
+    under_sudo = [line for line in commands if line.startswith("sudo ")]
+    name = INSTALL_SCRIPT_FILE
+    header = [
         "#!/bin/bash",
         "# Marketlake control plane: the first install, steps 1 to 5.",
         "#",
         "# Written by `python -m lake.control_plane render`, which never runs it. Run it",
         "# yourself, as the owner. It calls sudo for the privileged steps and will prompt.",
+        "#",
+        "# Usage. It installs the files sitting beside it, so it runs from anywhere and the",
+        "# rendered directory can be moved or renamed:",
+        "#",
+        f"#     ./{name}                     # from the directory it was rendered into",
+        f"#     ~/marketlake-install/{name}  # or by path, from anywhere",
+        "#",
+        f"# Read it first. Of the {len(commands)} commands below, {len(under_sudo)} run under"
+        " sudo. The rest need no root,",
+        "# and step 4 must not have any.",
         "#",
         "# It stops at the first failure, so a visudo that rejects the drop-in never",
         "# reaches the install that would place it. Every command is echoed before it runs.",
@@ -1577,18 +1605,7 @@ def install_script(host: LaunchdHost) -> str:
         'HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
         "",
     ]
-    for item in _first_install_lines(
-        host,
-        plist_path=lambda label: f'"$HERE/{label}.plist"',
-        sudoers_path='"$HERE/' + SUDOERS_FILE + '"',
-    ):
-        for command in (item,) if isinstance(item, str) else item:
-            if command.startswith("#"):
-                lines.append(command)
-            else:
-                lines.append(f"echo {shlex.quote('+ ' + command)}")
-                lines.append(command)
-    return "\n".join(lines) + "\n"
+    return "\n".join(header + body) + "\n"
 
 
 def install_commands(out_dir: Path, host: LaunchdHost) -> str:

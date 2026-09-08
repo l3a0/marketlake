@@ -861,3 +861,31 @@ def test_the_install_script_omits_the_standing_friday_step(tmp_path):
     script = (out / cp.INSTALL_SCRIPT_FILE).read_text()
     assert "lake.control_plane pmset" not in script
     assert "# 6." not in script
+
+
+def test_the_install_script_header_counts_match_its_body(tmp_path):
+    """The header's usage note counts what the script runs, rather than saying a number.
+
+    A written-down count goes stale the first time a step is added. These are derived
+    from the body, so adding a command moves them.
+    """
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    lines = (out / cp.INSTALL_SCRIPT_FILE).read_text().splitlines()
+
+    commands = [
+        line for line in lines if line and not line.startswith(("#", "echo ", "set ", "HERE="))
+    ]
+    claimed = re.search(r"Of the (\d+) commands below, (\d+) run under sudo", "\n".join(lines))
+    assert claimed, "the header states no counts"
+    assert int(claimed.group(1)) == len(commands)
+    assert int(claimed.group(2)) == sum(1 for line in commands if line.startswith("sudo "))
+
+
+def test_the_install_script_header_shows_how_to_run_it(tmp_path):
+    """The file says how to invoke itself, since that is the first thing a reader needs."""
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    header = (out / cp.INSTALL_SCRIPT_FILE).read_text().split("set -euo pipefail")[0]
+    assert f"./{cp.INSTALL_SCRIPT_FILE}" in header
+    assert "Usage" in header
