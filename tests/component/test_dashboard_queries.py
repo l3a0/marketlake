@@ -208,6 +208,7 @@ def service_over(
         calendar=CALENDAR,
         guards=guards,
         page=b"<!doctype html>",
+        icon=b"",
     )
 
 
@@ -434,7 +435,12 @@ class SpyConnection:
 def test_bad_parameters_are_rejected_before_any_sql_runs(root: Path, raw: dict[str, str]):
     spy = SpyConnection()
     service = DashboardService(
-        root, clock=ManualClock(NOW.astimezone(UTC)), calendar=CALENDAR, connection=spy, page=b""
+        root,
+        clock=ManualClock(NOW.astimezone(UTC)),
+        calendar=CALENDAR,
+        connection=spy,
+        page=b"",
+        icon=b"",
     )
     with pytest.raises(QueryParameterError):
         service.run_query("today", raw)
@@ -444,7 +450,12 @@ def test_bad_parameters_are_rejected_before_any_sql_runs(root: Path, raw: dict[s
 def test_an_unknown_query_name_never_reaches_the_connection(root: Path):
     spy = SpyConnection()
     service = DashboardService(
-        root, clock=ManualClock(NOW.astimezone(UTC)), calendar=CALENDAR, connection=spy, page=b""
+        root,
+        clock=ManualClock(NOW.astimezone(UTC)),
+        calendar=CALENDAR,
+        connection=spy,
+        page=b"",
+        icon=b"",
     )
     with pytest.raises(KeyError):
         service.run_query("history", {})

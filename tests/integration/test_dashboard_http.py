@@ -34,7 +34,7 @@ import pytest
 
 from lake import journal
 from lake.calendar import MARKET_TZ, ExchangeCalendar
-from lake.dashboard import DashboardService, make_server
+from lake.dashboard import DashboardService, load_favicon, make_server
 from tests.support.calendar import FakeCalendar, SessionTimes
 from tests.support.clock import ManualClock
 from tests.support.lake import FixtureLake
@@ -130,7 +130,9 @@ def test_the_server_binds_the_loopback_address(served):
     assert server.server_address[1] != 0
 
 
-@pytest.mark.parametrize("path", ["/", "/api/now", "/api/today?date=2026-08-24", "/nope"])
+@pytest.mark.parametrize(
+    "path", ["/", "/favicon.ico", "/api/now", "/api/today?date=2026-08-24", "/nope"]
+)
 def test_a_foreign_host_is_refused_first(served, path: str):
     server, _root = served
     status, headers, body = _request(server, path, host="dashboard.evil.example")
@@ -165,6 +167,36 @@ def test_the_root_serves_the_status_page(served):
     assert "default-src 'none'" in headers["content-security-policy"]
     assert b"<title>" in body
     assert b"/api/now" in body
+
+
+def test_the_favicon_path_serves_the_packaged_icon(served):
+    server, _root = served
+    status, headers, body = _request(server, "/favicon.ico", host="localhost")
+    assert status == 200
+    assert headers["content-type"] == "image/x-icon"
+    assert body == load_favicon()
+    # The page names this path, and the policy permits exactly this origin's images.
+    # Both halves are asserted here so a change to either is caught at the boundary that
+    # actually has to agree with the other.
+    _page_status, page_headers, page_body = _request(server, "/", host="localhost")
+    assert b'<link rel="icon" href="/favicon.ico"' in page_body
+    assert "img-src 'self'" in page_headers["content-security-policy"]
+
+
+def test_a_non_get_method_on_the_icon_is_still_a_405(served):
+    # The icon path is matched inside ``_serve``, after the method check. A branch added
+    # ahead of that check would turn this route into the one verb-agnostic hole.
+    server, _root = served
+    status, headers, _body = _request(server, "/favicon.ico", method="POST", host="localhost")
+    assert status == 405
+    assert headers["allow"] == "GET"
+
+
+def test_a_head_request_for_the_icon_sends_no_body(served):
+    server, _root = served
+    head, body = _raw_request(server, b"HEAD /favicon.ico HTTP/1.1\r\nHost: localhost\r\n")
+    assert head.split(b"\r\n")[0].endswith(b"405 Method Not Allowed")
+    assert body == b""
 
 
 def test_api_now_returns_json(served):
@@ -240,11 +272,13 @@ def test_a_head_request_gets_a_405_with_no_body(served):
 
 def test_no_response_carries_the_lake_path(served):
     server, root = served
-    for path in ("/api/now", "/api/today", "/api/today?ticker=NOPE", "/nope", "/"):
+    # The icon is swept here too. It is the one binary body, so the comparison runs over
+    # raw bytes rather than decoded text, which is the same check for every other path.
+    paths = ("/api/now", "/api/today", "/api/today?ticker=NOPE", "/nope", "/", "/favicon.ico")
+    for path in paths:
         _status, headers, body = _request(server, path, host="localhost")
-        text = body.decode("utf-8")
-        assert str(root) not in text
-        assert str(root.parent) not in text
+        assert str(root).encode() not in body
+        assert str(root.parent).encode() not in body
         assert "Python" not in headers.get("server", "")
 
 
@@ -256,6 +290,7 @@ EXPECTED_CSP = frozenset(
     {
         "default-src 'none'",
         "connect-src 'self'",
+        "img-src 'self'",
         "script-src 'unsafe-inline'",
         "style-src 'unsafe-inline'",
         "frame-ancestors 'none'",
@@ -281,6 +316,7 @@ def test_the_page_carries_the_whole_content_security_policy(served):
     ("path", "host", "status"),
     [
         ("/", "localhost", 200),
+        ("/favicon.ico", "localhost", 200),
         ("/api/now", "localhost", 200),
         ("/api/today?date=2026-08-24", "localhost", 200),
         ("/api/today?ticker=NOPE", "localhost", 400),

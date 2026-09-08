@@ -1,9 +1,13 @@
 """The dashboard's fixed-query contract, decided from values alone.
 
-These pin the boundary rules without a connection, a file, or a socket in the path, so
-the tier is unit. The parameter validators, the Host check, the route and registry
-shape, the status vocabulary, the slot denominator, and the command-line contract are
-each a pure function or a table.
+These pin the boundary rules without a connection or a socket in the path, so the tier is
+unit. The parameter validators, the Host check, the route and registry shape, the status
+vocabulary, the slot denominator, the tab icon, and the command-line contract are each a
+pure function, a table, or bytes shipped inside the package.
+
+The filesystem is touched twice, and neither crossing leaves the package. The page and
+icon cases read bytes out of it. The icon renderer's command-line case writes one file to
+a temporary directory. No subsystem boundary is crossed either way, so the tier holds.
 
 The command-line cases reach ``main`` with every seam it wires replaced: the clock, the
 calendar, the service, the config reader, and the server factory. The factory raises the
@@ -14,13 +18,15 @@ is read. So the tier holds even though the function under test is the process en
 from __future__ import annotations
 
 import errno
+import re
+import struct
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from lake import dashboard
+from lake import dashboard, favicon
 from lake.calendar import MARKET_TZ, OPTION_CLOSE_OFFSET
 from lake.config import GuardConstants
 from lake.dashboard import (
@@ -201,14 +207,130 @@ def test_build_parser_takes_a_port_and_a_lake_root():
     assert (args.port, args.lake_root, args.config) == (9001, "/lake", "c.yaml")
 
 
+# The one line the page is allowed to carry that names a resource. It is pinned whole,
+# so a link that changed its target, grew an attribute, or gained a sibling fails to
+# match and is left for the marker sweep below to catch.
+ICON_LINK = re.compile(
+    rb'^<link rel="icon" href="/favicon\.ico" sizes="(?P<sizes>[^"]*)">\n', re.MULTILINE
+)
+
+
 def test_the_status_page_ships_in_the_package_and_is_self_contained():
     page = dashboard.load_status_page()
     assert b"<title>" in page
     assert b"/api/now" in page
     assert b"/api/today" in page
+    # The page declares exactly one resource: its own tab icon, on its own origin.
+    rest, found = ICON_LINK.subn(b"", page)
+    assert found == 1, "the page declares the tab icon exactly once"
     # No external resource: the page must work offline and inside the same-origin policy.
+    # Every marker still runs, over everything except that one pinned line. Removing the
+    # line rather than relaxing the markers is what keeps this guard from going slack: a
+    # second ``<link``, an ``<img``, or any absolute URL still fails.
     for marker in (b"http://", b"https://", b"<link", b"<img", b"src="):
-        assert marker not in page
+        assert marker not in rest
+
+
+def test_the_declared_icon_sizes_match_the_sizes_the_icon_carries():
+    # The ``sizes`` attribute is a claim about a binary the HTML cannot see. Pinning it
+    # here means a size added to the renderer without updating the page fails a test
+    # rather than shipping a page that misdescribes its own icon.
+    match = ICON_LINK.search(dashboard.load_status_page())
+    assert match is not None
+    declared = match.group("sizes").decode().split()
+    assert declared == [f"{side}x{side}" for side in favicon.SIZES]
+
+
+# -- the tab icon ------------------------------------------------------------
+
+
+def test_the_favicon_ships_in_the_package_as_a_three_size_ico():
+    icon = dashboard.load_favicon()
+    # The ICO directory header: two reserved zero bytes, type 1 for an icon, then the
+    # image count. Reading it here is what makes this a test of the container and not
+    # just of the file's length.
+    reserved, kind, count = struct.unpack_from("<HHH", icon, 0)
+    assert (reserved, kind) == (0, 1)
+    assert count == len(favicon.SIZES)
+    sizes = []
+    for index in range(count):
+        width, height, colours, pad = struct.unpack_from("<BBBB", icon, 6 + 16 * index)
+        assert (colours, pad) == (0, 0), "a true-colour entry counts no palette"
+        assert width == height, "the mark is square at every size"
+        sizes.append(width)
+    assert tuple(sizes) == favicon.SIZES
+    # Every sub-image is a PNG. The directory entry never says so, because a bit count of
+    # 32 describes a BMP sub-image just as well, so the form is read off the payload.
+    for index in range(count):
+        length, offset = struct.unpack_from("<II", icon, 6 + 16 * index + 8)
+        assert icon[offset : offset + 8] == b"\x89PNG\r\n\x1a\n"
+        assert offset + length <= len(icon)
+
+
+def test_the_shipped_favicon_is_exactly_what_the_renderer_produces():
+    # The golden pin. The checked-in binary is not the only record of the icon: a reader
+    # who cannot diff 411 bytes can read ``MARK`` instead and trust that it is the same
+    # thing. A mark edited without regenerating the file fails here.
+    assert dashboard.load_favicon() == favicon.render()
+
+
+def test_the_renderer_is_deterministic():
+    assert favicon.render() == favicon.render()
+
+
+def test_every_icon_size_is_a_whole_multiple_of_the_grid():
+    # Integer scaling is what keeps the larger sizes crisp. A size off the grid would
+    # land an edge on a fraction of a pixel, so the constraint is load-bearing, not tidy.
+    assert favicon.GRID == len(favicon.MARK) == 16
+    assert all(len(row) == favicon.GRID for row in favicon.MARK)
+    for side in favicon.SIZES:
+        assert side % favicon.GRID == 0
+
+
+def test_render_refuses_a_size_the_container_cannot_carry(monkeypatch):
+    # ``render`` refuses two shapes of size.
+    # 1. A size off the grid, which would put an edge part-way through a pixel.
+    # 2. A size past 256, which would wrap in the entry's single width byte and ship a
+    #    container describing a smaller image than it holds.
+    monkeypatch.setattr(favicon, "SIZES", (24,))
+    with pytest.raises(ValueError, match="whole multiple"):
+        favicon.render()
+    monkeypatch.setattr(favicon, "SIZES", (512,))
+    with pytest.raises(ValueError, match="range an ICO entry"):
+        favicon.render()
+
+
+def test_the_renderer_cli_writes_the_same_bytes_it_ships(tmp_path):
+    out = tmp_path / "favicon.ico"
+    assert favicon.main(["--out", str(out)]) == 0
+    assert out.read_bytes() == dashboard.load_favicon()
+
+
+def test_the_cli_defaults_to_the_shipped_file():
+    # The default output path is what makes ``python -m lake.favicon`` a regeneration
+    # rather than a scratch render. A default pointing elsewhere would let the mark and
+    # the shipped bytes drift apart without anyone running a second command.
+    assert favicon.packaged_path().name == dashboard.FAVICON
+    assert favicon.packaged_path().read_bytes() == dashboard.load_favicon()
+
+
+def test_the_ink_is_the_pages_captured_colour():
+    # The module docstring claims the ink is ``--captured``'s light-scheme value. That is
+    # a claim about another file, so it is pinned the way the ``sizes`` attribute is. The
+    # light value is the one on bare ``:root``, which status.html declares before the
+    # dark-scheme override, so the first match is the one to compare.
+    page = dashboard.load_status_page().decode("utf-8")
+    declared = re.findall(r"--captured:\s*(#[0-9a-fA-F]{6})\s*;", page)
+    assert len(declared) == 2, "one value per colour scheme"
+    assert declared[0].lower() == "#" + bytes(favicon.INK).hex()
+
+
+def test_the_waterline_row_is_empty():
+    # The row between the columns and the lake is transparent on purpose. It shows the
+    # tab strip through, which is how the separation survives a light strip and a dark
+    # one alike. Filling it would silently cost the icon that.
+    assert favicon.MARK[11] == "." * favicon.GRID
+    assert set("".join(favicon.MARK)) == {"#", "."}
 
 
 # -- the status vocabulary ---------------------------------------------------
