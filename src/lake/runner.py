@@ -144,10 +144,10 @@ class UrllibPinger:
 
 
 class RsyncBackup:
-    """The real backup runner: ``rsync`` with checksum verification.
+    """The real backup runner: ``rsync``, under the compaction job's lake-root flock.
 
     It asserts the backup target is mounted, then copies ``lake/`` into it. The design
-    pins the tool as ``rsync`` or ``rclone`` with checksum verification, the lake root
+    pins the tool as ``rsync`` or ``rclone``, the lake root
     as the only sync root, and a mount check before the copy. The ``subprocess`` call
     runs from the compaction job after every session, and from the by-hand live check.
     A test injects a fake.
@@ -164,7 +164,10 @@ class RsyncBackup:
         if not target.exists() or not target.is_dir():
             raise BackupTargetUnavailable(f"backup target not mounted: {target}")
         # A trailing slash on the source copies its contents into the target. ``-a``
-        # preserves metadata; ``--checksum`` matches the scrub's partial-sync detection.
+        # preserves metadata. ``--checksum`` is pinned as cut in the design: it cannot
+        # see a half-written target, only bit rot, and it costs an O(lake) MD4 pass a
+        # day. It stays until the backup-copy scrub lands, because until then nothing
+        # else would notice the backup rotting.
         args = [
             "rsync",
             "-a",
