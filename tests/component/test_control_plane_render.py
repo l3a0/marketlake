@@ -50,6 +50,7 @@ EXPECTED_FILES = {
     "com.marketlake.sunday.plist",
     cp.SUDOERS_FILE,
     cp.INSTALL_SCRIPT_FILE,
+    cp.REINSTALL_SCRIPT_FILE,
 }
 
 
@@ -889,3 +890,127 @@ def test_the_install_script_header_shows_how_to_run_it(tmp_path):
     header = (out / cp.INSTALL_SCRIPT_FILE).read_text().split("set -euo pipefail")[0]
     assert f"./{cp.INSTALL_SCRIPT_FILE}" in header
     assert "Usage" in header
+
+
+# -- the reinstall script ------------------------------------------------------
+
+# sudo must run what it is given, or the command under it is never exercised.
+_FAKE_SUDO = """#!/bin/bash
+printf 'sudo %s\\n' "$*" >> "$LOG"
+exec "$@"
+"""
+
+# launchctl tracks which labels are loaded in a directory, so `print` answers truthfully
+# before and after a bootstrap rather than returning a fixed code.
+_FAKE_LAUNCHCTL = """#!/bin/bash
+printf 'launchctl %s\\n' "$*" >> "$LOG"
+# print and bootout name the label in $2, bootstrap names a plist path in $3.
+case "$1" in
+  print|bootout) label="${2##*/}" ;;
+  bootstrap)     label="${3##*/}"; label="${label%.plist}" ;;
+esac
+case "$1" in
+  print)     [[ -e "$LOADED/$label" ]] && exit 0 || exit 1 ;;
+  bootout)   [[ "$BOOTOUT_RC" != "0" ]] && exit "$BOOTOUT_RC"; rm -f "$LOADED/$label"; exit 0 ;;
+  bootstrap) touch "$LOADED/$label"; exit 0 ;;
+  *)         exit 0 ;;
+esac
+"""
+
+
+def _run_reinstall(tmp_path: Path, *, loaded: bool, bootout_rc: int = 0):
+    """Render, then run reinstall.sh against fakes. Returns (proc, log lines)."""
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    log = tmp_path / "log"
+    log.write_text("")
+    loaded_dir = tmp_path / "loaded"
+    loaded_dir.mkdir(exist_ok=True)
+    if loaded:
+        for job in cp.all_jobs(_host()):
+            (loaded_dir / job.label).touch()
+    (bin_dir / "install").write_text(_FAKE.format(body="exit 0"))
+    (bin_dir / "install").chmod(0o755)
+    (bin_dir / "sudo").write_text(_FAKE_SUDO)
+    (bin_dir / "sudo").chmod(0o755)
+    (bin_dir / "launchctl").write_text(_FAKE_LAUNCHCTL)
+    (bin_dir / "launchctl").chmod(0o755)
+    proc = subprocess.run(
+        [str(out / cp.REINSTALL_SCRIPT_FILE)],
+        env={
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "LOG": str(log),
+            "LOADED": str(loaded_dir),
+            "BOOTOUT_RC": str(bootout_rc),
+        },
+        capture_output=True,
+        text=True,
+    )
+    return proc, [line for line in log.read_text().splitlines() if line]
+
+
+def test_reinstall_boots_each_label_out_before_replacing_it(tmp_path):
+    """Overwriting a plist alone changes nothing, so the bootout is the load-bearing step."""
+    proc, log = _run_reinstall(tmp_path, loaded=True)
+    assert proc.returncode == 0, proc.stderr
+    boots = [line for line in log if line.startswith("launchctl bootout")]
+    assert len(boots) == 5, log
+    # For each label the order is bootout, then install, then bootstrap.
+    for label in (job.label for job in cp.all_jobs(_host())):
+        acts = [
+            line.split("launchctl ")[1].split()[0]
+            for line in log
+            if line.startswith("launchctl ") and label in line
+        ]
+        assert acts == ["print", "bootout", "bootstrap"] or acts[:3] == [
+            "print",
+            "bootout",
+            "bootstrap",
+        ], (label, acts)
+
+
+def test_reinstall_skips_the_bootout_when_nothing_is_loaded(tmp_path):
+    """A fresh machine must converge too, so a missing label is skipped, not fatal.
+
+    The install text keeps its bootout lines commented for exactly this reason. Guarding
+    on ``launchctl print`` is what lets the script carry them uncommented.
+    """
+    proc, log = _run_reinstall(tmp_path, loaded=False)
+    assert proc.returncode == 0, proc.stderr
+    assert not [line for line in log if line.startswith("launchctl bootout")], log
+    assert sum(1 for line in log if line.startswith("launchctl bootstrap")) == 5, log
+
+
+def test_a_bootout_that_refuses_stops_the_reinstall(tmp_path):
+    """The guard must not swallow a real refusal, which is why it is not ``|| true``.
+
+    A job that will not stop is the one bootout failure worth halting for. Replacing its
+    plist underneath a running definition is how the two drift apart.
+    """
+    proc, log = _run_reinstall(tmp_path, loaded=True, bootout_rc=1)
+    assert proc.returncode != 0
+    assert not [line for line in log if line.startswith("launchctl bootstrap")], log
+
+
+def test_reinstall_does_not_repeat_the_write_once_steps(tmp_path):
+    """The sudoers file, the wake alarm, and the exclusion do not change on a re-render."""
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    script = (out / cp.REINSTALL_SCRIPT_FILE).read_text()
+    for absent in ("visudo", "pmset", "tmutil", "/etc/sudoers.d"):
+        assert absent not in script, absent
+
+
+def test_reinstall_ends_on_the_read_back(tmp_path):
+    """Same last obligation as the install: the operator reads whether the daemon is up."""
+    proc, log = _run_reinstall(tmp_path, loaded=True)
+    assert proc.returncode == 0
+    assert log[-1] == f"launchctl print {cp.LAUNCHD_DOMAIN}/{cp.DAEMON_LABEL}", log[-1]
+
+
+def test_the_written_reinstall_script_is_executable(tmp_path):
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    assert (out / cp.REINSTALL_SCRIPT_FILE).stat().st_mode & 0o777 == 0o755
