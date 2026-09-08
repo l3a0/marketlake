@@ -196,6 +196,12 @@ SUDOERS_FILE = "marketlake.sudoers"
 # runs it, per the build plan's D14.
 INSTALL_SCRIPT_FILE = "install.sh"
 
+# The script for re-installing after a re-render. Separate from install.sh because
+# the two are not the same steps: launchd keeps a job's definition from the
+# bootstrap that loaded it, so a reinstall has to boot a label out before its new
+# plist means anything.
+REINSTALL_SCRIPT_FILE = "reinstall.sh"
+
 
 # -- the host description and the plists -------------------------------------
 
@@ -1434,7 +1440,7 @@ class RenderedFile:
     """One file the dry-run renderer produces.
 
     ``mode`` is the permission bits to write it with. Everything is 0o644 except the
-    install script, which the operator runs.
+    two scripts the operator runs, which are 0o755.
     """
 
     name: str
@@ -1447,6 +1453,7 @@ def render_all(host: LaunchdHost) -> tuple[RenderedFile, ...]:
     files = [RenderedFile(f"{job.label}.plist", job.render()) for job in all_jobs(host)]
     files.append(RenderedFile(SUDOERS_FILE, sudoers_dropin(host.owner)))
     files.append(RenderedFile(INSTALL_SCRIPT_FILE, install_script(host), mode=0o755))
+    files.append(RenderedFile(REINSTALL_SCRIPT_FILE, reinstall_script(host), mode=0o755))
     return tuple(files)
 
 
@@ -1606,6 +1613,98 @@ def install_script(host: LaunchdHost) -> str:
         "",
     ]
     return "\n".join(header + body) + "\n"
+
+
+def reinstall_script(host: LaunchdHost) -> str:
+    """Re-install every job after a re-render. The renderer never runs it.
+
+    ``install.sh`` cannot do this job twice. Overwriting a plist changes nothing on its
+    own, because launchd holds the definition from the bootstrap that loaded it. So a
+    second run of the first install would copy new files over old ones, bootstrap
+    nothing, and leave the old definition running while reporting success.
+    ``launchctl kickstart -k`` is not the reload either. It restarts the process under
+    the definition already loaded.
+
+    So each label is booted out, re-installed, and bootstrapped again. That converges
+    from any starting state, whether the label was loaded, stale, or never there, so the
+    operator does not have to know which case they are in.
+
+    Booting out a label that is not loaded fails, which is why the install text keeps
+    those lines commented. Here the bootout is guarded by a ``launchctl print`` instead.
+    A bare ``|| true`` would have swallowed a real refusal too, such as a job that will
+    not stop, and that is the one bootout failure worth stopping for.
+
+    Steps 2, 3 and 4 of the install are not repeated, and that is a limit rather than
+    a property. All three can change on a re-render. The sudoers drop-in carries the
+    owner and both wake constants, the wake command carries ``WEEKDAY_WAKE``, and the
+    exclusion carries the home. A wake re-tune is the sharp case: it rewrites the
+    sudoers rule while leaving every plist byte-identical, so this script reinstalls
+    nothing that changed and skips the only thing that did. The header says so and
+    gives the operator the diff to run.
+    """
+    labels = [job.label for job in all_jobs(host)]
+    lines = [
+        "#!/bin/bash",
+        "# Marketlake control plane: re-install after a re-render.",
+        "#",
+        "# Written by `python -m lake.control_plane render`, which never runs it. Run it",
+        "# yourself, as the owner. It calls sudo for the privileged steps and will prompt.",
+        "#",
+        "# Usage. It installs the files sitting beside it, so it runs from anywhere:",
+        "#",
+        f"#     ./{REINSTALL_SCRIPT_FILE}",
+        "#",
+        "# It boots each label out before re-installing it. Overwriting a plist alone does",
+        "# nothing, because launchd keeps the definition from the bootstrap that loaded it.",
+        "# A bootout of a label that is not loaded is skipped rather than treated as a",
+        "# failure, so this converges whether or not the jobs are currently running.",
+        "#",
+        "# It re-installs the launchd jobs and nothing else. The sudoers drop-in, the",
+        "# firmware wake and the Time Machine exclusion are steps 2, 3 and 4 of the",
+        "# install, and this does not repeat them. They usually survive a re-render, but",
+        "# not always. The owner, the home and both wake constants all feed them. A wake",
+        "# re-tune is the sharp case: it rewrites the sudoers rule while leaving every",
+        "# plist identical, so this script would reinstall nothing that changed. After a",
+        "# re-render that moved any of those, compare and re-run steps 2 to 4 by hand:",
+        "#",
+        '#     sudo diff /etc/sudoers.d/marketlake "$HERE/' + SUDOERS_FILE + '"',
+        "#",
+        "# The `capture` check stays armed across this, because a check leaves its `new`",
+        "# state once and never returns. So the daemon going down here pages after the",
+        "# grace, the same as any other outage. That is correct rather than a nuisance, and",
+        "# it is the reason to keep this run short.",
+        "set -euo pipefail",
+        "",
+        'HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
+        "",
+    ]
+    for label in labels:
+        plist = f'"$HERE/{label}.plist"'
+        target = f"/Library/LaunchDaemons/{label}.plist"
+        domain = f"{LAUNCHD_DOMAIN}/{label}"
+        lines += [
+            f"# {label}",
+            f"if launchctl print {domain} >/dev/null 2>&1; then",
+            f"  echo {shlex.quote(f'+ sudo launchctl bootout {domain}')}",
+            f"  sudo launchctl bootout {domain}",
+            "else",
+            f"  echo {shlex.quote(f'  {domain} is not loaded, nothing to boot out')}",
+            "fi",
+        ]
+        for command in (
+            f"sudo install -o root -g wheel -m 644 {plist} /Library/LaunchDaemons/",
+            f"sudo launchctl bootstrap {LAUNCHD_DOMAIN} {target}",
+        ):
+            lines.append(f"echo {shlex.quote('+ ' + command)}")
+            lines.append(command)
+    read_back = f"launchctl print {LAUNCHD_DOMAIN}/{DAEMON_LABEL}"
+    lines += [
+        "",
+        "# Read back whether the daemon came up under the new definition.",
+        f"echo {shlex.quote('+ ' + read_back)}",
+        read_back,
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def install_commands(out_dir: Path, host: LaunchdHost) -> str:
@@ -1889,8 +1988,10 @@ __all__ = [
     "default_token_path",
     "expected_one_shot",
     "INSTALL_SCRIPT_FILE",
+    "REINSTALL_SCRIPT_FILE",
     "install_commands",
     "install_script",
+    "reinstall_script",
     "launchctl_probe",
     "main",
     "next_sunday_wake",
