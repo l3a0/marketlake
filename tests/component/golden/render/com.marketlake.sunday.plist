@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/someone</string>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>PYTHONUNBUFFERED</key>
+		<string>1</string>
+	</dict>
+	<key>GroupName</key>
+	<string>staff</string>
+	<key>Label</key>
+	<string>com.marketlake.sunday</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/py/bin/python</string>
+		<string>-m</string>
+		<string>lake.control_plane</string>
+		<string>sunday</string>
+		<string>--token</string>
+		<string>/Users/someone/.config/marketlake/token.json</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/someone/Library/Logs/marketlake/com.marketlake.sunday.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/someone/Library/Logs/marketlake/com.marketlake.sunday.out.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>20</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+		<key>Weekday</key>
+		<integer>0</integer>
+	</dict>
+	<key>UserName</key>
+	<string>someone</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/someone/marketlake</string>
+</dict>
+</plist>
