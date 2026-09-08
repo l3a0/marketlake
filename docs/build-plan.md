@@ -85,10 +85,12 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   the operator runs rather than seventeen lines pasted by hand. The **by-hand paste is
   considered and rejected** as the only path. It was chosen so the operator saw each root
   command before running it, and so the `visudo` gate was a natural place to stop. The
-  paste is itself a failure mode. A partial paste installs a partial control plane, and a
-  partial one is worse than none. launchd runs the jobs that landed, the `capture` check
-  goes live against a daemon whose sudoers grant never arrived, and the result reads on
-  the phone as a dead machine rather than a botched install.
+  paste is itself a failure mode, and the way it fails is the argument. A skipped line
+  surfaces on a different check, at a different time, naming a different cause. Skip
+  step 2 and nothing breaks that day. The drop-in grants only the two `pmset` writes,
+  which no job needs until the Friday sweep tries to set the Sunday one-shot. The
+  `sunday` check then pages the following Sunday at 23:30, up to a week after the
+  mistake, naming the canary rather than the install.
 
   The script owes three things, which are the price of dropping the paste:
 
@@ -98,8 +100,11 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
      ran as root.
   3. It ends on `launchctl print`, so the operator reads whether the daemon came up.
 
-  The cost is named. One `sudo` timestamp covers the whole run, where seventeen pasted
-  lines each faced their own prompt. The renderer still executes nothing. It writes
+  The cost is named, and it is smaller than it looks. Of the seventeen lines in steps 1
+  to 5, thirteen call `sudo` and four never do. `sudo` also keeps its timestamp per
+  terminal for `timestamp_timeout` minutes, so a paste already answers one prompt for
+  a run of them. What the script actually costs is the reading. The operator no longer
+  sees each root command before it runs. The renderer still executes nothing. It writes
   `install.sh` and never runs it, and `--out` still refuses a system directory, so the
   root-owned copy remains the operator's own act.
 - **D15** query service with the Now and Today panels. The query service is the read-only localhost dashboard.
