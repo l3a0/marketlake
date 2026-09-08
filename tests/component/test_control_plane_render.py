@@ -278,7 +278,7 @@ def test_the_install_text_quotes_every_path_that_needs_it(tmp_path, capsys):
     printed = capsys.readouterr().out
     wanted = {*spaced.values(), str(out)}
     for line in printed.splitlines():
-        if line.startswith(("#", "wrote ")) or not line.strip():
+        if line.startswith("#") or not line.strip():
             continue
         # Each `&&`-joined command is its own argv. A spaced path must come back as one
         # token in it, never split across two.
@@ -298,7 +298,7 @@ def test_render_refuses_a_relative_machine_path(flag, capsys):
     args[args.index(flag) + 1] = "relative/path"
     code = cp.main(["render", "--out", "/tmp/unused-render", *args])
     assert code == 2
-    assert "must be absolute" in capsys.readouterr().out
+    assert "must be absolute" in capsys.readouterr().err
 
 
 def test_the_install_text_names_absolute_paths_from_a_relative_out(tmp_path, capsys, monkeypatch):
@@ -328,7 +328,7 @@ def test_the_install_text_pins_every_command_line_in_order(tmp_path, capsys):
     # bootstrap labels are pinned rather than sampled.
     out = tmp_path / "out"
     cp.main(["render", "--out", str(out), *RENDER_ARGS])
-    script = capsys.readouterr().out.split("\n\n", 1)[1]
+    script = capsys.readouterr().out
     commands = [line for line in script.splitlines() if line and not line.startswith("#")]
     resolved = out.resolve()
     labels = [
@@ -399,7 +399,7 @@ def test_nothing_rendered_mentions_the_rejected_sleep_override(tmp_path):
 def test_render_refuses_a_system_directory(target, capsys):
     code = cp.main(["render", "--out", target, *RENDER_ARGS])
     assert code == 2
-    assert "refusing" in capsys.readouterr().out
+    assert "refusing" in capsys.readouterr().err
 
 
 def test_write_rendered_refuses_a_system_directory_directly():
@@ -637,3 +637,33 @@ def test_the_install_text_counts_the_jobs_it_actually_installs(tmp_path, capsys)
 
 def _spelled(count: int) -> str:
     return {4: "four", 5: "five", 6: "six"}[count]
+
+
+def test_render_puts_progress_on_stderr_so_stdout_is_pasteable(tmp_path, capsys):
+    # The install text is read and pasted line by line, so stdout must carry nothing
+    # but comments and commands. A ``wrote ...`` progress line on stdout lands at the
+    # top of ``render ... > install.txt`` and a shell fed that file reports it as a
+    # command not found.
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    captured = capsys.readouterr()
+
+    assert "wrote " not in captured.out
+    lines = [line for line in captured.out.splitlines() if line.strip()]
+    assert lines, "stdout carried no install text"
+    assert lines[0].startswith("#"), f"stdout opens with {lines[0]!r}, not a comment"
+
+    # Every written file is still reported, just on the other stream.
+    for name in EXPECTED_FILES:
+        assert f"wrote {out / name}" in captured.err
+
+
+def test_render_reports_a_bad_path_on_stderr_and_prints_no_install_text(capsys):
+    # The failure path shares the defect. A caller redirecting stdout to a file would
+    # otherwise get an empty file and no visible reason for it.
+    args = list(RENDER_ARGS)
+    args[args.index("--home") + 1] = "relative/path"
+    assert cp.main(["render", "--out", "/tmp/unused-render-stderr", *args]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "render: these must be absolute paths" in captured.err
