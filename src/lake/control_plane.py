@@ -39,17 +39,20 @@ Terms, glossed at first use.
   assertion* adds the token's lifetime to the mint and requires the sum to clear the
   week's last option close.
 
-Seven operational wall-clock times live here as named integer constants, in order. They
+Nine operational wall-clock times live here as named integer constants, in order. They
 are not session times. The session times come from the calendar. These are the moments
 the design pins to the machine's clock, so launchd and pmset can fire them.
 
 1. The 08:25 weekday firmware wake.
 2. The 08:30 weekday pre-open self-check.
-3. The 18:30 weekday vendor sweep, whose Friday run sets the Sunday one-shot.
-4. The weekday assertion end near 18:45, when the vendor sweep's ping lands.
-5. The 19:55 Sunday one-shot wake.
-6. The 20:00 Sunday canary and maintenance job.
-7. The 23:00 Sunday canary deadline, which is also the canary's last retry.
+3. The 09:35 weekday says-closed-but-open calendar probe.
+4. The 18:30 weekday vendor sweep, whose Friday run sets the Sunday one-shot.
+5. The weekday assertion end near 18:45, when the vendor sweep's ping lands.
+6. The 19:55 Sunday one-shot wake.
+7. The 20:00 Sunday canary and maintenance job.
+8. The 23:00 Sunday canary cutoff, the last retry the canary attempts.
+9. The 23:30 Sunday assertion end, the ``sunday`` check's deadline. It sits half an hour
+   past the cutoff so the last retry finishes inside the power assertion.
 
 The re-auth reminder's hours derive from the last two rather than adding constants of
 their own. Every one of these is a pair of integers, never a ``"HH:MM"`` string, so
@@ -134,7 +137,8 @@ VENDOR_SWEEP = WallClockTime(18, 30)  # the sweep job, which sets the Sunday one
 WEEKDAY_ASSERTION_END = WallClockTime(18, 45)  # when the vendor sweep's ping lands
 SUNDAY_WAKE = WallClockTime(19, 55)  # the Friday-set one-shot wake
 SUNDAY_MAINTENANCE = WallClockTime(20, 0)  # the canary + scrub launchd job
-CANARY_DEADLINE = WallClockTime(23, 0)  # the canary's last retry, the Sunday check's deadline
+CANARY_DEADLINE = WallClockTime(23, 0)  # the canary's last retry, not the check's deadline
+SUNDAY_ASSERTION_END = WallClockTime(23, 30)  # when that last retry's ping must have landed
 
 # The design sends the re-auth reminder on the hour, from the maintenance run through
 # the hour before the deadline. So 20:00, 21:00, and 22:00, and never on the half hours
@@ -801,13 +805,15 @@ def assertion_window(day: date) -> AssertionWindow | None:
     weekday that runs from the firmware wake until the vendor sweep's ping lands,
     session or not. A holiday is exactly when the idle heartbeats must keep flowing,
     so the calendar deliberately does not enter here. On Sunday it runs from the
-    one-shot wake until the canary's deadline. Saturday owes nothing.
+    one-shot wake until the sunday check's deadline. That is half an hour past the canary's
+    last retry, so the retry finishes inside the hold rather than racing it. Saturday
+    owes nothing.
     """
     weekday = day.weekday()
     if weekday in _PY_WEEKDAYS:
         return AssertionWindow(WEEKDAY_WAKE.on(day), WEEKDAY_ASSERTION_END.on(day))
     if weekday == _PY_SUNDAY:
-        return AssertionWindow(SUNDAY_WAKE.on(day), CANARY_DEADLINE.on(day))
+        return AssertionWindow(SUNDAY_WAKE.on(day), SUNDAY_ASSERTION_END.on(day))
     return None
 
 
@@ -1732,6 +1738,7 @@ __all__ = [
     "SUNDAY_LABEL",
     "SUNDAY_MAINTENANCE",
     "SUNDAY_SLUG",
+    "SUNDAY_ASSERTION_END",
     "SUNDAY_WAKE",
     "TOKEN_LIFETIME",
     "VENDOR_SWEEP",
