@@ -279,7 +279,7 @@ def test_the_install_text_quotes_every_path_that_needs_it(tmp_path, capsys):
     printed = capsys.readouterr().out
     wanted = {*spaced.values(), str(out)}
     for line in printed.splitlines():
-        if line.startswith(("#", "wrote ")) or not line.strip():
+        if line.startswith("#") or not line.strip():
             continue
         # Each `&&`-joined command is its own argv. A spaced path must come back as one
         # token in it, never split across two.
@@ -299,7 +299,7 @@ def test_render_refuses_a_relative_machine_path(flag, capsys):
     args[args.index(flag) + 1] = "relative/path"
     code = cp.main(["render", "--out", "/tmp/unused-render", *args])
     assert code == 2
-    assert "must be absolute" in capsys.readouterr().out
+    assert "must be absolute" in capsys.readouterr().err
 
 
 def test_the_install_text_names_absolute_paths_from_a_relative_out(tmp_path, capsys, monkeypatch):
@@ -329,7 +329,7 @@ def test_the_install_text_pins_every_command_line_in_order(tmp_path, capsys):
     # bootstrap labels are pinned rather than sampled.
     out = tmp_path / "out"
     cp.main(["render", "--out", str(out), *RENDER_ARGS])
-    script = capsys.readouterr().out.split("\n\n", 1)[1]
+    script = capsys.readouterr().out
     commands = [line for line in script.splitlines() if line and not line.startswith("#")]
     resolved = out.resolve()
     labels = [
@@ -400,7 +400,7 @@ def test_nothing_rendered_mentions_the_rejected_sleep_override(tmp_path):
 def test_render_refuses_a_system_directory(target, capsys):
     code = cp.main(["render", "--out", target, *RENDER_ARGS])
     assert code == 2
-    assert "refusing" in capsys.readouterr().out
+    assert "refusing" in capsys.readouterr().err
 
 
 def test_write_rendered_refuses_a_system_directory_directly():
@@ -640,6 +640,38 @@ def _spelled(count: int) -> str:
     return {4: "four", 5: "five", 6: "six"}[count]
 
 
+def test_render_puts_progress_on_stderr_so_stdout_is_pasteable(tmp_path, capsys):
+    # The install text is read and pasted line by line, so stdout must carry nothing
+    # but comments and commands. A ``wrote ...`` progress line on stdout lands at the
+    # top of ``render ... > install.txt`` and a shell fed that file reports it as a
+    # command not found.
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    captured = capsys.readouterr()
+
+    assert "wrote " not in captured.out
+    # Assert against the stream itself. Filtering blank lines out first would let a
+    # leading blank through, and that separator is the other half of what moved.
+    assert captured.out.strip(), "stdout carried no install text"
+    assert captured.out.startswith("#"), f"stdout opens with {captured.out[:60]!r}"
+
+    # Every written file is still reported, just on the other stream.
+    for name in EXPECTED_FILES:
+        assert f"wrote {out / name}" in captured.err
+
+
+def test_render_reports_a_bad_path_on_stderr_and_prints_no_install_text(capsys):
+    # The failure path shares the defect. A caller redirecting stdout to a file used to
+    # get the reason written into the file rather than onto the terminal, so the screen
+    # stayed silent and the file held one line that is not a command.
+    args = list(RENDER_ARGS)
+    args[args.index("--home") + 1] = "relative/path"
+    assert cp.main(["render", "--out", "/tmp/unused-render-stderr", *args]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "render: these must be absolute paths" in captured.err
+
+
 # -- the golden rendering ------------------------------------------------------
 
 GOLDEN_DIR = Path(__file__).parent / "golden" / "render"
@@ -655,8 +687,14 @@ def _normalise(text: str, out: Path) -> str:
     return text.replace(str(out.resolve()), OUT_PLACEHOLDER).replace(str(out), OUT_PLACEHOLDER)
 
 
-def _check_golden(name: str, actual: str) -> None:
+def _check_golden(name: str, actual: bytes) -> None:
     """Compare one rendering to its golden file, or rewrite it when asked.
+
+    The comparison is on bytes. ``read_text`` would open with universal newlines and
+    fold a ``\\r\\n`` or a lone ``\\r`` to ``\\n`` on both sides, so a change to the line
+    terminators would pass. That is not academic for these files. A lone-CR
+    ``marketlake.sudoers`` holds no newline at all, so the whole drop-in reads as one
+    comment, grants nothing, and still leaves ``visudo -cf`` saying parsed OK.
 
     Set ``MARKETLAKE_UPDATE_GOLDEN=1`` to rewrite. That is the only way these files
     change, so a diff in a pull request is the reviewable record of a rendering change.
@@ -664,12 +702,12 @@ def _check_golden(name: str, actual: str) -> None:
     path = GOLDEN_DIR / name
     if os.environ.get("MARKETLAKE_UPDATE_GOLDEN") == "1":
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(actual)
+        path.write_bytes(actual)
         return
     assert path.exists(), (
         f"no golden for {name}. Run MARKETLAKE_UPDATE_GOLDEN=1 pytest {__file__} to write it."
     )
-    assert actual == path.read_text(), (
+    assert actual == path.read_bytes(), (
         f"{name} no longer renders as its golden file. If the change is intended, run "
         f"MARKETLAKE_UPDATE_GOLDEN=1 pytest {__file__} and review the diff."
     )
@@ -686,11 +724,21 @@ def test_each_rendered_file_matches_its_golden(name, tmp_path):
     """
     out = tmp_path / "out"
     assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
-    _check_golden(name, (out / name).read_text())
+    _check_golden(name, (out / name).read_bytes())
 
 
 def test_the_install_text_matches_its_golden(tmp_path, capsys):
     """The pasted script is pinned whole, with only the output directory normalised."""
     out = tmp_path / "out"
     assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
-    _check_golden("INSTALL.txt", _normalise(capsys.readouterr().out, out))
+    _check_golden("INSTALL.txt", _normalise(capsys.readouterr().out, out).encode())
+
+
+def test_the_golden_directory_holds_exactly_what_is_pinned():
+    """A golden for a file the renderer no longer writes would sit unread forever.
+
+    The per-file test is parametrised over ``EXPECTED_FILES``, so it only ever asks
+    about files the renderer still produces. Nothing looks the other way, and a stale
+    golden reads in review as coverage that is not there.
+    """
+    assert {p.name for p in GOLDEN_DIR.iterdir()} == EXPECTED_FILES | {"INSTALL.txt"}

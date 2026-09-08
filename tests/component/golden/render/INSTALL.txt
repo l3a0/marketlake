@@ -1,10 +1,3 @@
-wrote <OUT>/com.marketlake.daemon.plist
-wrote <OUT>/com.marketlake.dashboard.plist
-wrote <OUT>/com.marketlake.self-check.plist
-wrote <OUT>/com.marketlake.calendar-probe.plist
-wrote <OUT>/com.marketlake.sunday.plist
-wrote <OUT>/marketlake.sudoers
-
 # Marketlake control plane: the manual install. Run each line by hand.
 # 1. Install the five LaunchDaemons, root-owned as launchd requires.
 sudo install -o root -g wheel -m 644 <OUT>/com.marketlake.daemon.plist /Library/LaunchDaemons/
