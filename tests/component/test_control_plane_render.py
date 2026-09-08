@@ -760,6 +760,7 @@ def _host() -> cp.LaunchdHost:
         log_dir=pairs["--log-dir"],
     )
 
+
 # Every privileged command the script runs is shadowed by a fake on PATH, so a test
 # exercises the script's control flow without touching the machine.
 _FAKE = """#!/bin/bash
