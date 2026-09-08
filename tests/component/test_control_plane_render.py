@@ -9,6 +9,7 @@ clock is read and nothing shells out.
 from __future__ import annotations
 
 import json
+import os
 import plistlib
 import re
 import shlex
@@ -637,3 +638,59 @@ def test_the_install_text_counts_the_jobs_it_actually_installs(tmp_path, capsys)
 
 def _spelled(count: int) -> str:
     return {4: "four", 5: "five", 6: "six"}[count]
+
+
+# -- the golden rendering ------------------------------------------------------
+
+GOLDEN_DIR = Path(__file__).parent / "golden" / "render"
+
+# The install text names the output directory, which is a fresh tmp_path on every run.
+# Nothing else in the rendering varies, so that one path is normalised and every other
+# byte is compared exactly.
+OUT_PLACEHOLDER = "<OUT>"
+
+
+def _normalise(text: str, out: Path) -> str:
+    """The rendered text with the run's output directory replaced by a fixed token."""
+    return text.replace(str(out.resolve()), OUT_PLACEHOLDER).replace(str(out), OUT_PLACEHOLDER)
+
+
+def _check_golden(name: str, actual: str) -> None:
+    """Compare one rendering to its golden file, or rewrite it when asked.
+
+    Set ``MARKETLAKE_UPDATE_GOLDEN=1`` to rewrite. That is the only way these files
+    change, so a diff in a pull request is the reviewable record of a rendering change.
+    """
+    path = GOLDEN_DIR / name
+    if os.environ.get("MARKETLAKE_UPDATE_GOLDEN") == "1":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(actual)
+        return
+    assert path.exists(), (
+        f"no golden for {name}. Run MARKETLAKE_UPDATE_GOLDEN=1 pytest {__file__} to write it."
+    )
+    assert actual == path.read_text(), (
+        f"{name} no longer renders as its golden file. If the change is intended, run "
+        f"MARKETLAKE_UPDATE_GOLDEN=1 pytest {__file__} and review the diff."
+    )
+
+
+@pytest.mark.parametrize("name", sorted(EXPECTED_FILES))
+def test_each_rendered_file_matches_its_golden(name, tmp_path):
+    """Every rendered byte is pinned, not only the fields other tests sample.
+
+    The tests above assert on chosen lines: the sudoers rules, two jobs' program
+    arguments, the install commands in order. A change to a plist key none of them
+    names, such as a log path or a throttle, would land unreviewed. This compares the
+    whole file, so any change to the rendering shows up as a diff.
+    """
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    _check_golden(name, (out / name).read_text())
+
+
+def test_the_install_text_matches_its_golden(tmp_path, capsys):
+    """The pasted script is pinned whole, with only the output directory normalised."""
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    _check_golden("INSTALL.txt", _normalise(capsys.readouterr().out, out))
