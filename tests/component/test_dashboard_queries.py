@@ -208,6 +208,7 @@ def service_over(
         calendar=CALENDAR,
         guards=guards,
         page=b"<!doctype html>",
+        icon=b"",
     )
 
 
@@ -252,6 +253,24 @@ def service(root: Path) -> DashboardService:
 
 
 # -- now ---------------------------------------------------------------------
+
+
+def test_the_page_and_icon_seams_return_what_was_injected(root: Path):
+    # The class docstring says the page and the icon are injected on the same terms, and
+    # that each falls back to the bytes shipped in the package. Both halves are asserted
+    # here. Without this the constructor could ignore either argument and every caller
+    # that passes one would still pass, because nothing else reads them back.
+    injected = DashboardService(
+        root,
+        clock=ManualClock(NOW.astimezone(UTC)),
+        calendar=CALENDAR,
+        page=b"PAGE",
+        icon=b"ICON",
+    )
+    assert (injected.page, injected.icon) == (b"PAGE", b"ICON")
+    default = DashboardService(root, clock=ManualClock(NOW.astimezone(UTC)), calendar=CALENDAR)
+    assert default.page == dashboard.load_status_page()
+    assert default.icon == dashboard.load_favicon()
 
 
 def test_now_reports_the_last_data_cycle_and_minutes_since(service: DashboardService):
@@ -434,7 +453,12 @@ class SpyConnection:
 def test_bad_parameters_are_rejected_before_any_sql_runs(root: Path, raw: dict[str, str]):
     spy = SpyConnection()
     service = DashboardService(
-        root, clock=ManualClock(NOW.astimezone(UTC)), calendar=CALENDAR, connection=spy, page=b""
+        root,
+        clock=ManualClock(NOW.astimezone(UTC)),
+        calendar=CALENDAR,
+        connection=spy,
+        page=b"",
+        icon=b"",
     )
     with pytest.raises(QueryParameterError):
         service.run_query("today", raw)
@@ -444,7 +468,12 @@ def test_bad_parameters_are_rejected_before_any_sql_runs(root: Path, raw: dict[s
 def test_an_unknown_query_name_never_reaches_the_connection(root: Path):
     spy = SpyConnection()
     service = DashboardService(
-        root, clock=ManualClock(NOW.astimezone(UTC)), calendar=CALENDAR, connection=spy, page=b""
+        root,
+        clock=ManualClock(NOW.astimezone(UTC)),
+        calendar=CALENDAR,
+        connection=spy,
+        page=b"",
+        icon=b"",
     )
     with pytest.raises(KeyError):
         service.run_query("history", {})
