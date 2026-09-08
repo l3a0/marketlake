@@ -994,13 +994,51 @@ def test_a_bootout_that_refuses_stops_the_reinstall(tmp_path):
     assert not [line for line in log if line.startswith("launchctl bootstrap")], log
 
 
-def test_reinstall_does_not_repeat_the_write_once_steps(tmp_path):
-    """The sudoers file, the wake alarm, and the exclusion do not change on a re-render."""
+def test_reinstall_runs_none_of_the_write_once_steps(tmp_path):
+    """It re-installs the launchd jobs and runs nothing from steps 2, 3 or 4.
+
+    Scoped to command lines rather than the whole file. The header has to name those
+    steps, because skipping them is a limit the operator needs told about, and a check
+    that banned the words would forbid saying so.
+    """
     out = tmp_path / "out"
     assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
-    script = (out / cp.REINSTALL_SCRIPT_FILE).read_text()
-    for absent in ("visudo", "pmset", "tmutil", "/etc/sudoers.d"):
-        assert absent not in script, absent
+    lines = (out / cp.REINSTALL_SCRIPT_FILE).read_text().splitlines()
+    commands = [
+        line.strip()
+        for line in lines
+        if line.strip() and not line.strip().startswith(("#", "echo ", "set ", "HERE="))
+    ]
+    for absent in ("visudo", "pmset", "tmutil"):
+        assert not [c for c in commands if c.startswith(absent) or f" {absent} " in c], absent
+    assert not [c for c in commands if "/etc/sudoers.d" in c]
+
+
+def test_reinstall_copies_each_plist_between_the_bootout_and_the_bootstrap(tmp_path):
+    """The copy is the step this script exists to perform, so it is asserted by running it.
+
+    Without this, deleting the copy, reordering it after the bootstrap, or retargeting it
+    to another directory all pass every behavioural test, leaving only the byte golden to
+    object. A golden whose failure message says to regenerate it is a weak last line.
+    """
+    proc, log = _run_reinstall(tmp_path, loaded=True)
+    assert proc.returncode == 0, proc.stderr
+    copies = [line for line in log if line.startswith("install -o root -g wheel -m 644")]
+    assert len(copies) == 5, log
+    assert all("/Library/LaunchDaemons/" in line for line in copies), copies
+    for label in (job.label for job in cp.all_jobs(_host())):
+        acts = [line for line in log if label in line and not line.startswith("sudo ")]
+        kinds = [
+            "bootout"
+            if "bootout" in a
+            else "copy"
+            if a.startswith("install ")
+            else "bootstrap"
+            if "bootstrap" in a
+            else "print"
+            for a in acts
+        ]
+        assert kinds[:4] == ["print", "bootout", "copy", "bootstrap"], (label, kinds)
 
 
 def test_reinstall_ends_on_the_read_back(tmp_path):

@@ -1440,7 +1440,7 @@ class RenderedFile:
     """One file the dry-run renderer produces.
 
     ``mode`` is the permission bits to write it with. Everything is 0o644 except the
-    install script, which the operator runs.
+    two scripts the operator runs, which are 0o755.
     """
 
     name: str
@@ -1634,8 +1634,13 @@ def reinstall_script(host: LaunchdHost) -> str:
     A bare ``|| true`` would have swallowed a real refusal too, such as a job that will
     not stop, and that is the one bootout failure worth stopping for.
 
-    Steps 2, 3 and 4 of the install are not repeated. The sudoers drop-in, the wake
-    alarm and the Time Machine exclusion do not change on a re-render.
+    Steps 2, 3 and 4 of the install are not repeated, and that is a limit rather than
+    a property. All three can change on a re-render. The sudoers drop-in carries the
+    owner and both wake constants, the wake command carries ``WEEKDAY_WAKE``, and the
+    exclusion carries the home. A wake re-tune is the sharp case: it rewrites the
+    sudoers rule while leaving every plist byte-identical, so this script reinstalls
+    nothing that changed and skips the only thing that did. The header says so and
+    gives the operator the diff to run.
     """
     labels = [job.label for job in all_jobs(host)]
     lines = [
@@ -1643,7 +1648,7 @@ def reinstall_script(host: LaunchdHost) -> str:
         "# Marketlake control plane: re-install after a re-render.",
         "#",
         "# Written by `python -m lake.control_plane render`, which never runs it. Run it",
-        "# yourself, as the owner, from the directory holding the freshly rendered plists.",
+        "# yourself, as the owner. It calls sudo for the privileged steps and will prompt.",
         "#",
         "# Usage. It installs the files sitting beside it, so it runs from anywhere:",
         "#",
@@ -1654,8 +1659,15 @@ def reinstall_script(host: LaunchdHost) -> str:
         "# A bootout of a label that is not loaded is skipped rather than treated as a",
         "# failure, so this converges whether or not the jobs are currently running.",
         "#",
-        "# It does not repeat the sudoers drop-in, the firmware wake, or the Time Machine",
-        "# exclusion. Those do not change on a re-render.",
+        "# It re-installs the launchd jobs and nothing else. The sudoers drop-in, the",
+        "# firmware wake and the Time Machine exclusion are steps 2, 3 and 4 of the",
+        "# install, and this does not repeat them. They usually survive a re-render, but",
+        "# not always. The owner, the home and both wake constants all feed them. A wake",
+        "# re-tune is the sharp case: it rewrites the sudoers rule while leaving every",
+        "# plist identical, so this script would reinstall nothing that changed. After a",
+        "# re-render that moved any of those, compare and re-run steps 2 to 4 by hand:",
+        "#",
+        '#     sudo diff /etc/sudoers.d/marketlake "$HERE/' + SUDOERS_FILE + '"',
         "#",
         "# The `capture` check stays armed across this, because a check leaves its `new`",
         "# state once and never returns. So the daemon going down here pages after the",

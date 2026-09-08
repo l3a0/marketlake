@@ -2,7 +2,7 @@
 # Marketlake control plane: re-install after a re-render.
 #
 # Written by `python -m lake.control_plane render`, which never runs it. Run it
-# yourself, as the owner, from the directory holding the freshly rendered plists.
+# yourself, as the owner. It calls sudo for the privileged steps and will prompt.
 #
 # Usage. It installs the files sitting beside it, so it runs from anywhere:
 #
@@ -13,8 +13,15 @@
 # A bootout of a label that is not loaded is skipped rather than treated as a
 # failure, so this converges whether or not the jobs are currently running.
 #
-# It does not repeat the sudoers drop-in, the firmware wake, or the Time Machine
-# exclusion. Those do not change on a re-render.
+# It re-installs the launchd jobs and nothing else. The sudoers drop-in, the
+# firmware wake and the Time Machine exclusion are steps 2, 3 and 4 of the
+# install, and this does not repeat them. They usually survive a re-render, but
+# not always. The owner, the home and both wake constants all feed them. A wake
+# re-tune is the sharp case: it rewrites the sudoers rule while leaving every
+# plist identical, so this script would reinstall nothing that changed. After a
+# re-render that moved any of those, compare and re-run steps 2 to 4 by hand:
+#
+#     sudo diff /etc/sudoers.d/marketlake "$HERE/marketlake.sudoers"
 #
 # The `capture` check stays armed across this, because a check leaves its `new`
 # state once and never returns. So the daemon going down here pages after the
