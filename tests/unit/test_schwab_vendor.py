@@ -245,3 +245,23 @@ def test_the_lake_owned_class_is_what_the_watchdog_watches_for():
 
     assert _error_class(VendorAuthError("dead")) == "vendor_auth_error"
     assert _WHOLE_DAEMON_CAUSES["vendor_auth_error"] == "Capture down: token dead"
+
+
+def test_the_matched_names_are_the_ones_authlib_actually_raises():
+    """The one fact the whole classification rests on, checked against the real library.
+
+    Every other test here hands the matcher a locally defined stand-in, so it proves the
+    matcher matches what the test invented. It does not prove those are the names authlib
+    uses. A rename in a dependency bump would revert capture to the 2026-09-08 incident
+    with the suite still green, and this is the test that would go red instead.
+    """
+    pytest.importorskip("authlib")
+    from authlib.common.errors import AuthlibBaseError
+    from authlib.integrations.base_client.errors import OAuthError
+
+    from lake.schwab import _AUTH_BASE_NAMES
+
+    assert AuthlibBaseError.__name__ in _AUTH_BASE_NAMES
+    assert OAuthError.__name__ in _AUTH_BASE_NAMES
+    # The leaf really does inherit the base, which is why matching the base is enough.
+    assert issubclass(OAuthError, AuthlibBaseError)
