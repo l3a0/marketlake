@@ -192,6 +192,10 @@ _PROTECTED_ROOTS = (Path("/Library"), Path("/System"), Path("/etc"), Path("/priv
 # printed install step rather than a rendered script, so there is one copy of it.
 SUDOERS_FILE = "marketlake.sudoers"
 
+# The script the operator runs for steps 1 to 5. The renderer writes it and never
+# runs it, per the build plan's D14.
+INSTALL_SCRIPT_FILE = "install.sh"
+
 
 # -- the host description and the plists -------------------------------------
 
@@ -1427,16 +1431,22 @@ def read_token_mint(token_path: Path | str) -> datetime:
 
 @dataclass(frozen=True)
 class RenderedFile:
-    """One file the dry-run renderer produces."""
+    """One file the dry-run renderer produces.
+
+    ``mode`` is the permission bits to write it with. Everything is 0o644 except the
+    install script, which the operator runs.
+    """
 
     name: str
     content: str
+    mode: int = 0o644
 
 
 def render_all(host: LaunchdHost) -> tuple[RenderedFile, ...]:
     """Every plist and setup file, as text, in install order."""
     files = [RenderedFile(f"{job.label}.plist", job.render()) for job in all_jobs(host)]
     files.append(RenderedFile(SUDOERS_FILE, sudoers_dropin(host.owner)))
+    files.append(RenderedFile(INSTALL_SCRIPT_FILE, install_script(host), mode=0o755))
     return tuple(files)
 
 
@@ -1463,31 +1473,44 @@ def write_rendered(files: Sequence[RenderedFile], out_dir: Path) -> list[Path]:
     for item in files:
         path = out / item.name
         path.write_text(item.content)
+        path.chmod(item.mode)
         written.append(path)
     return written
 
 
-def install_commands(out_dir: Path, host: LaunchdHost) -> str:
-    """The operator's manual install steps, as text. Nothing here runs from code.
+def _first_install_lines(
+    host: LaunchdHost, *, plist_path: Callable[[str], str], sudoers_path: str
+) -> list[str]:
+    """Steps 1 to 5, as comment and command lines, in order.
 
-    Every operator-supplied path is quoted, because these lines are pasted into a shell
-    and a home or an output directory may hold a space.
+    One source for two renderings. ``install_commands`` prints these for pasting and
+    ``install_script`` wraps them in a script, so the two cannot drift into disagreeing
+    about what installing means.
+
+    An item is a comment, a command, or a pair of commands where the second runs only
+    if the first succeeds. The pair exists because ``visudo`` gates the sudoers install,
+    and the two renderings must express that gate differently. A pasted line uses
+    ``&&``, which self-gates. A script must not, because ``set -e`` does not stop on a
+    failing left side of ``&&``, so a rejected drop-in would skip its install and let
+    the rest of the install continue.
+
+    The two callers also name the rendered files differently. The pasted text carries
+    absolute paths, so a line works from any directory. The script resolves its own
+    location instead, so moving the rendered directory does not break it. Both
+    ``plist_path`` and ``sudoers_path`` arrive already shell-quoted.
     """
-    out = Path(out_dir)
-    sudoers = shlex.quote(str(out / SUDOERS_FILE))
-    lines = [
-        "# Marketlake control plane: the manual install. Run each line by hand.",
-        "# 1. Install the five LaunchDaemons, root-owned as launchd requires.",
-    ]
+    lines = ["# 1. Install the five LaunchDaemons, root-owned as launchd requires."]
     for job in all_jobs(host):
         lines.append(
-            "sudo install -o root -g wheel -m 644 "
-            f"{shlex.quote(f'{out / job.label}.plist')} /Library/LaunchDaemons/"
+            f"sudo install -o root -g wheel -m 644 {plist_path(job.label)} /Library/LaunchDaemons/"
         )
+    sudoers = sudoers_path
     lines += [
         "# 2. Install the sudoers drop-in after visudo validates it.",
-        f"sudo visudo -cf {sudoers} && "
-        f"sudo install -o root -g wheel -m 440 {sudoers} /etc/sudoers.d/marketlake",
+        (
+            f"sudo visudo -cf {sudoers}",
+            f"sudo install -o root -g wheel -m 440 {sudoers} /etc/sudoers.d/marketlake",
+        ),
         "# visudo checks the syntax only. This prints the two rules as sudo parsed them,",
         "# which is what shows the one-shot's regular expression survived as one.",
         "sudo -l | grep pmset",
@@ -1512,6 +1535,73 @@ def install_commands(out_dir: Path, host: LaunchdHost) -> str:
             f"sudo launchctl bootstrap {LAUNCHD_DOMAIN} /Library/LaunchDaemons/{job.label}.plist"
         )
     lines.append(f"launchctl print {LAUNCHD_DOMAIN}/{DAEMON_LABEL}")
+    return lines
+
+
+def install_script(host: LaunchdHost) -> str:
+    """Steps 1 to 5 as a script the operator runs. The renderer never runs it.
+
+    The build plan's D14 permits this and names the three things it owes, because the
+    by-hand paste it replaces bought them for free:
+
+    1. It stops at the first failure. ``set -e`` does that, and step 2's ``&&`` means a
+       ``visudo`` that rejects the drop-in never reaches the ``install`` that would
+       place it.
+    2. It echoes each command before running it, so the transcript shows what ran as
+       root.
+    3. It ends on ``launchctl print``, so the operator reads whether the daemon came up
+       rather than assuming it.
+
+    Paths resolve from the script's own directory rather than from a baked absolute
+    path, so moving the rendered directory does not break it. Step 6 is deliberately
+    absent. It is the standing Friday task, not part of the first install.
+    """
+    lines = [
+        "#!/bin/bash",
+        "# Marketlake control plane: the first install, steps 1 to 5.",
+        "#",
+        "# Written by `python -m lake.control_plane render`, which never runs it. Run it",
+        "# yourself, as the owner. It calls sudo for the privileged steps and will prompt.",
+        "#",
+        "# It stops at the first failure, so a visudo that rejects the drop-in never",
+        "# reaches the install that would place it. Every command is echoed before it runs.",
+        "# The last command reads back whether the daemon came up.",
+        "#",
+        "# Step 6, the standing Friday one-shot, is not here. It is not part of the first",
+        "# install. Run it from the install text.",
+        "set -euo pipefail",
+        "",
+        'HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
+        "",
+    ]
+    for item in _first_install_lines(
+        host,
+        plist_path=lambda label: f'"$HERE/{label}.plist"',
+        sudoers_path='"$HERE/' + SUDOERS_FILE + '"',
+    ):
+        for command in (item,) if isinstance(item, str) else item:
+            if command.startswith("#"):
+                lines.append(command)
+            else:
+                lines.append(f"echo {shlex.quote('+ ' + command)}")
+                lines.append(command)
+    return "\n".join(lines) + "\n"
+
+
+def install_commands(out_dir: Path, host: LaunchdHost) -> str:
+    """The operator's manual install steps, as text. Nothing here runs from code.
+
+    Every operator-supplied path is quoted, because these lines are pasted into a shell
+    and a home or an output directory may hold a space.
+    """
+    out = Path(out_dir)
+    lines = ["# Marketlake control plane: the manual install. Run each line by hand."]
+    for item in _first_install_lines(
+        host,
+        plist_path=lambda label: shlex.quote(f"{out / label}.plist"),
+        sudoers_path=shlex.quote(str(out / SUDOERS_FILE)),
+    ):
+        lines.append(f"{item[0]} && {item[1]}" if isinstance(item, tuple) else item)
     lines += [
         "# 6. Set the Sunday one-shot. The slice-3 vendor sweep will do this every Friday.",
         "# Until that sweep lands, run this line each Friday and run the second command it",
@@ -1778,7 +1868,9 @@ __all__ = [
     "default_config_dir",
     "default_token_path",
     "expected_one_shot",
+    "INSTALL_SCRIPT_FILE",
     "install_commands",
+    "install_script",
     "launchctl_probe",
     "main",
     "next_sunday_wake",

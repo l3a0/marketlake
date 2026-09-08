@@ -13,6 +13,7 @@ import os
 import plistlib
 import re
 import shlex
+import subprocess
 import urllib.error
 from collections.abc import Sequence
 from datetime import date, datetime
@@ -48,6 +49,7 @@ EXPECTED_FILES = {
     "com.marketlake.calendar-probe.plist",
     "com.marketlake.sunday.plist",
     cp.SUDOERS_FILE,
+    cp.INSTALL_SCRIPT_FILE,
 }
 
 
@@ -742,3 +744,102 @@ def test_the_golden_directory_holds_exactly_what_is_pinned():
     golden reads in review as coverage that is not there.
     """
     assert {p.name for p in GOLDEN_DIR.iterdir()} == EXPECTED_FILES | {"INSTALL.txt"}
+
+
+# -- the install script --------------------------------------------------------
+
+
+def _host() -> cp.LaunchdHost:
+    """A host carrying the same placeholder identity as ``RENDER_ARGS``."""
+    pairs = dict(zip(RENDER_ARGS[::2], RENDER_ARGS[1::2], strict=True))
+    return cp.LaunchdHost(
+        python=pairs["--python"],
+        owner=pairs["--owner"],
+        home=pairs["--home"],
+        project_dir=pairs["--project-dir"],
+        log_dir=pairs["--log-dir"],
+    )
+
+# Every privileged command the script runs is shadowed by a fake on PATH, so a test
+# exercises the script's control flow without touching the machine.
+_FAKE = """#!/bin/bash
+printf '%s %s\\n' "$(basename "$0")" "$*" >> "$LOG"
+{body}
+"""
+
+
+def _fake_tools(bin_dir: Path, *, visudo_fails: bool) -> None:
+    """Put stand-ins for every command the script calls on PATH."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    fail = 'if [[ "$*" == *"visudo -cf"* ]]; then exit 1; fi\nexit 0'
+    for name in ("sudo", "pmset", "tmutil", "launchctl", "grep"):
+        body = "exit 0"
+        if name == "sudo":
+            body = fail if visudo_fails else "exit 0"
+        (bin_dir / name).write_text(_FAKE.format(body=body))
+        (bin_dir / name).chmod(0o755)
+
+
+def _run_script(tmp_path: Path, *, visudo_fails: bool):
+    """Render, then run install.sh against the fakes. Returns (returncode, log lines)."""
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    bin_dir = tmp_path / "bin"
+    log = tmp_path / "log"
+    log.write_text("")
+    _fake_tools(bin_dir, visudo_fails=visudo_fails)
+    proc = subprocess.run(
+        ["/bin/bash", str(out / cp.INSTALL_SCRIPT_FILE)],
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin", "LOG": str(log)},
+        capture_output=True,
+        text=True,
+    )
+    return proc, [line for line in log.read_text().splitlines() if line]
+
+
+def test_the_install_script_is_executable_and_parses():
+    out_files = {f.name: f for f in cp.render_all(_host())}
+    assert out_files[cp.INSTALL_SCRIPT_FILE].mode == 0o755
+
+
+def test_the_install_script_runs_every_step_in_order(tmp_path):
+    """The happy path reaches the read-back, which is the third obligation D14 names."""
+    proc, log = _run_script(tmp_path, visudo_fails=False)
+    assert proc.returncode == 0, proc.stderr
+    installs = [line for line in log if line.startswith("sudo install")]
+    assert len(installs) == 6, log  # five plists plus the sudoers drop-in
+    assert sum(1 for line in log if "launchctl bootstrap" in line) == 5, log
+    assert log[-1].startswith("launchctl print system/com.marketlake.daemon"), log[-1]
+
+
+def test_a_rejected_sudoers_file_stops_before_it_is_installed(tmp_path):
+    """The first obligation D14 names, exercised rather than asserted from the text.
+
+    A paste keeps going after a failed line. This script must not, because installing a
+    drop-in that visudo just rejected is how sudo stops parsing the file at all.
+    """
+    proc, log = _run_script(tmp_path, visudo_fails=True)
+    assert proc.returncode != 0
+    assert any("visudo -cf" in line for line in log), log
+    assert not any("/etc/sudoers.d/marketlake" in line for line in log), log
+    assert not any("launchctl bootstrap" in line for line in log), log
+
+
+def test_the_install_script_echoes_every_command_before_running_it(tmp_path):
+    """The second obligation D14 names: the transcript shows what ran as root."""
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    lines = (out / cp.INSTALL_SCRIPT_FILE).read_text().splitlines()
+    body = [line for line in lines if line and not line.startswith("#")]
+    commands = [line for line in body if not line.startswith(("echo ", "set ", "HERE="))]
+    for command in commands:
+        assert f"echo {shlex.quote('+ ' + command)}" in lines, command
+
+
+def test_the_install_script_omits_the_standing_friday_step(tmp_path):
+    """Step 6 is not part of the first install, so it must not run with it."""
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    script = (out / cp.INSTALL_SCRIPT_FILE).read_text()
+    assert "lake.control_plane pmset" not in script
+    assert "# 6." not in script
