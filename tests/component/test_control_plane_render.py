@@ -9,6 +9,7 @@ clock is read and nothing shells out.
 from __future__ import annotations
 
 import json
+import os
 import plistlib
 import re
 import shlex
@@ -669,3 +670,75 @@ def test_render_reports_a_bad_path_on_stderr_and_prints_no_install_text(capsys):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "render: these must be absolute paths" in captured.err
+
+
+# -- the golden rendering ------------------------------------------------------
+
+GOLDEN_DIR = Path(__file__).parent / "golden" / "render"
+
+# The install text names the output directory, which is a fresh tmp_path on every run.
+# Nothing else in the rendering varies, so that one path is normalised and every other
+# byte is compared exactly.
+OUT_PLACEHOLDER = "<OUT>"
+
+
+def _normalise(text: str, out: Path) -> str:
+    """The rendered text with the run's output directory replaced by a fixed token."""
+    return text.replace(str(out.resolve()), OUT_PLACEHOLDER).replace(str(out), OUT_PLACEHOLDER)
+
+
+def _check_golden(name: str, actual: bytes) -> None:
+    """Compare one rendering to its golden file, or rewrite it when asked.
+
+    The comparison is on bytes. ``read_text`` would open with universal newlines and
+    fold a ``\\r\\n`` or a lone ``\\r`` to ``\\n`` on both sides, so a change to the line
+    terminators would pass. That is not academic for these files. A lone-CR
+    ``marketlake.sudoers`` holds no newline at all, so the whole drop-in reads as one
+    comment, grants nothing, and still leaves ``visudo -cf`` saying parsed OK.
+
+    Set ``MARKETLAKE_UPDATE_GOLDEN=1`` to rewrite. That is the only way these files
+    change, so a diff in a pull request is the reviewable record of a rendering change.
+    """
+    path = GOLDEN_DIR / name
+    if os.environ.get("MARKETLAKE_UPDATE_GOLDEN") == "1":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(actual)
+        return
+    assert path.exists(), (
+        f"no golden for {name}. Run MARKETLAKE_UPDATE_GOLDEN=1 pytest {__file__} to write it."
+    )
+    assert actual == path.read_bytes(), (
+        f"{name} no longer renders as its golden file. If the change is intended, run "
+        f"MARKETLAKE_UPDATE_GOLDEN=1 pytest {__file__} and review the diff."
+    )
+
+
+@pytest.mark.parametrize("name", sorted(EXPECTED_FILES))
+def test_each_rendered_file_matches_its_golden(name, tmp_path):
+    """Every rendered byte is pinned, not only the fields other tests sample.
+
+    The tests above assert on chosen lines: the sudoers rules, two jobs' program
+    arguments, the install commands in order. A change to a plist key none of them
+    names, such as a log path or a throttle, would land unreviewed. This compares the
+    whole file, so any change to the rendering shows up as a diff.
+    """
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    _check_golden(name, (out / name).read_bytes())
+
+
+def test_the_install_text_matches_its_golden(tmp_path, capsys):
+    """The pasted script is pinned whole, with only the output directory normalised."""
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    _check_golden("INSTALL.txt", _normalise(capsys.readouterr().out, out).encode())
+
+
+def test_the_golden_directory_holds_exactly_what_is_pinned():
+    """A golden for a file the renderer no longer writes would sit unread forever.
+
+    The per-file test is parametrised over ``EXPECTED_FILES``, so it only ever asks
+    about files the renderer still produces. Nothing looks the other way, and a stale
+    golden reads in review as coverage that is not there.
+    """
+    assert {p.name for p in GOLDEN_DIR.iterdir()} == EXPECTED_FILES | {"INSTALL.txt"}

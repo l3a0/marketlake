@@ -1,0 +1,11 @@
+# Marketlake: the two pmset writes the control plane needs, and nothing else.
+# Neither rule wildcards its argument. sudo joins a command's arguments into one
+# string before matching, so a wildcard there spans whitespace and admits what
+# follows the wake. Both writes keep reading arguments past the event they set.
+# The weekday alarm's argument is fixed, so it is spelled out. The Sunday
+# one-shot's date changes weekly, so that rule is an anchored regular
+# expression. It pins the date's shape and the wake time, and the closing
+# anchor leaves no room for a trailing setting.
+# The sleep-disabling write is rejected by design and stays password-gated.
+someone ALL=(root) NOPASSWD: /usr/bin/pmset repeat wakeorpoweron MTWRF 08\:25\:00
+someone ALL=(root) NOPASSWD: /usr/bin/pmset ^schedule[[:space:]]wakeorpoweron[[:space:]][0-9][0-9]/[0-9][0-9]/[0-9][0-9][[:space:]]19:55:00$
