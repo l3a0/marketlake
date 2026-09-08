@@ -1,0 +1,48 @@
+# Marketlake control plane: the manual install. Run each line by hand.
+# 1. Install the five LaunchDaemons, root-owned as launchd requires.
+sudo install -o root -g wheel -m 644 <OUT>/com.marketlake.daemon.plist /Library/LaunchDaemons/
+sudo install -o root -g wheel -m 644 <OUT>/com.marketlake.dashboard.plist /Library/LaunchDaemons/
+sudo install -o root -g wheel -m 644 <OUT>/com.marketlake.self-check.plist /Library/LaunchDaemons/
+sudo install -o root -g wheel -m 644 <OUT>/com.marketlake.calendar-probe.plist /Library/LaunchDaemons/
+sudo install -o root -g wheel -m 644 <OUT>/com.marketlake.sunday.plist /Library/LaunchDaemons/
+# 2. Install the sudoers drop-in after visudo validates it.
+sudo visudo -cf <OUT>/marketlake.sudoers && sudo install -o root -g wheel -m 440 <OUT>/marketlake.sudoers /etc/sudoers.d/marketlake
+# visudo checks the syntax only. This prints the two rules as sudo parsed them,
+# which is what shows the one-shot's regular expression survived as one.
+sudo -l | grep pmset
+# 3. Set the weekday firmware wake, then read it back.
+sudo pmset repeat wakeorpoweron MTWRF 08:25:00
+pmset -g sched
+# 4. Keep the token and the config secrets out of Time Machine. As the owner,
+# never under sudo. The whole directory goes, so an editor that saves by rename
+# cannot drop the exclusion, and config.yaml's four secrets are covered too.
+tmutil addexclusion /Users/someone/.config/marketlake
+tmutil isexcluded /Users/someone/.config/marketlake
+# 5. Load the jobs into the system domain, then confirm the daemon is running.
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.marketlake.daemon.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.marketlake.dashboard.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.marketlake.self-check.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.marketlake.calendar-probe.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.marketlake.sunday.plist
+launchctl print system/com.marketlake.daemon
+# 6. Set the Sunday one-shot. The slice-3 vendor sweep will do this every Friday.
+# Until that sweep lands, run this line each Friday and run the second command it
+# prints under sudo. Nothing else sets the one-shot, and the Sunday read-back
+# cannot catch a missed one: by Sunday evening a wake that never got set and one
+# that already fired look the same. A machine left asleep still pages, because
+# the Sunday check never runs and its dead-man ping never arrives.
+cd /Users/someone/marketlake && /opt/py/bin/python -m lake.control_plane pmset
+# Re-installing. Steps 1 to 5 are the first install and run once. Step 6 is the
+# standing Friday task until slice 3 lands.
+# launchd keeps a job's definition from the bootstrap that loaded it, so
+# overwriting a plist in step 1 changes nothing by itself. After a re-render that
+# changes a plist, boot out that label, then run its step 1 and step 5 lines again.
+# `launchctl kickstart -k` is not the reload. It restarts the process under the
+# definition already loaded. A re-render that only adds a plist needs step 1 and
+# step 5 for the new label alone, with no bootout. Steps 2, 3, and 4 write files
+# and settings, so they re-run as they are.
+# sudo launchctl bootout system/com.marketlake.daemon
+# sudo launchctl bootout system/com.marketlake.dashboard
+# sudo launchctl bootout system/com.marketlake.self-check
+# sudo launchctl bootout system/com.marketlake.calendar-probe
+# sudo launchctl bootout system/com.marketlake.sunday
