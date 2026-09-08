@@ -175,9 +175,9 @@ def test_the_favicon_path_serves_the_packaged_icon(served):
     assert status == 200
     assert headers["content-type"] == "image/x-icon"
     assert body == load_favicon()
-    # The page names this path, and the policy permits exactly this origin's images.
-    # Both halves are asserted here so a change to either is caught at the boundary that
-    # actually has to agree with the other.
+    # The page names this path, and the policy permits exactly this origin's images. This
+    # test asserts both halves, because the icon needs them to agree and this is the
+    # boundary where they meet.
     _page_status, page_headers, page_body = _request(server, "/", host="localhost")
     assert b'<link rel="icon" href="/favicon.ico"' in page_body
     assert "img-src 'self'" in page_headers["content-security-policy"]
@@ -325,8 +325,8 @@ def test_the_page_carries_the_whole_content_security_policy(served):
     ],
 )
 def test_every_response_refuses_sniffing_and_caching(served, path: str, host: str, status: int):
-    # Both response paths harden alike. A JSON panel is as cacheable and as sniffable as
-    # the page, and the JSON path answers the 403, 400 and 404 replies too.
+    # All three response paths harden alike. A JSON panel is as cacheable and as sniffable
+    # as the page or the icon, and the JSON path answers the 403, 400 and 404 replies too.
     server, _root = served
     got, headers, _body = _request(server, path, host=host)
     assert got == status

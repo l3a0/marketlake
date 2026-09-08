@@ -5,9 +5,12 @@ unit. The parameter validators, the Host check, the route and registry shape, th
 vocabulary, the slot denominator, the tab icon, and the command-line contract are each a
 pure function, a table, or bytes shipped inside the package.
 
-The filesystem is touched twice, and neither crossing leaves the package. The page and
-icon cases read bytes out of it. The icon renderer's command-line case writes one file to
-a temporary directory. No subsystem boundary is crossed either way, so the tier holds.
+Two cases touch the filesystem, and neither leaves the package.
+
+1. The page and icon cases read bytes shipped inside it.
+2. The icon renderer's command-line case writes one file to a temporary directory.
+
+Neither crosses a subsystem boundary, so the tier holds.
 
 The command-line cases reach ``main`` with every seam it wires replaced: the clock, the
 calendar, the service, the config reader, and the server factory. The factory raises the
@@ -21,6 +24,7 @@ import errno
 import re
 import struct
 from datetime import date, datetime
+from importlib import resources
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -209,9 +213,11 @@ def test_build_parser_takes_a_port_and_a_lake_root():
 
 # The one line the page is allowed to carry that names a resource. It is pinned whole,
 # so a link that changed its target, grew an attribute, or gained a sibling fails to
-# match and is left for the marker sweep below to catch.
+# match and is left for the marker sweep below to catch. The ``sizes`` value is pinned
+# to the shape a size list takes, because ``[^"]*`` there would let a URL ride inside
+# the one line the sweep never sees.
 ICON_LINK = re.compile(
-    rb'^<link rel="icon" href="/favicon\.ico" sizes="(?P<sizes>[^"]*)">\n', re.MULTILINE
+    rb'^<link rel="icon" href="/favicon\.ico" sizes="(?P<sizes>[0-9x ]*)">\n', re.MULTILINE
 )
 
 
@@ -310,19 +316,20 @@ def test_the_cli_defaults_to_the_shipped_file():
     # The default output path is what makes ``python -m lake.favicon`` a regeneration
     # rather than a scratch render. A default pointing elsewhere would let the mark and
     # the shipped bytes drift apart without anyone running a second command.
-    assert favicon.packaged_path().name == dashboard.FAVICON
-    assert favicon.packaged_path().read_bytes() == dashboard.load_favicon()
+    loaded = resources.files("lake").joinpath("static").joinpath(dashboard.FAVICON)
+    assert favicon.packaged_path() == Path(str(loaded))
 
 
 def test_the_ink_is_the_pages_captured_colour():
     # The module docstring claims the ink is ``--captured``'s light-scheme value. That is
     # a claim about another file, so it is pinned the way the ``sizes`` attribute is. The
-    # light value is the one on bare ``:root``, which status.html declares before the
-    # dark-scheme override, so the first match is the one to compare.
+    # light value is the one on bare ``:root``, so the search is scoped to that block
+    # rather than counting how many schemes the page happens to define.
     page = dashboard.load_status_page().decode("utf-8")
-    declared = re.findall(r"--captured:\s*(#[0-9a-fA-F]{6})\s*;", page)
-    assert len(declared) == 2, "one value per colour scheme"
-    assert declared[0].lower() == "#" + bytes(favicon.INK).hex()
+    root_block = page.split(":root {", 1)[1].split("}", 1)[0]
+    match = re.search(r"--captured:\s*(#[0-9a-fA-F]{6})\s*;", root_block)
+    assert match is not None
+    assert match.group(1).lower() == "#" + bytes(favicon.INK).hex()
 
 
 def test_the_waterline_row_is_empty():

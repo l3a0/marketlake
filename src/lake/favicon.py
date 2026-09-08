@@ -6,8 +6,7 @@ and the encoder that turns it into an ``.ico``, the multi-image container a brow
 the origin for at ``/favicon.ico``.
 
 **The mark.** Three capture columns of different heights stand in a band of water. The
-columns are the minute cadence and the band is the lake those minutes land in. It is the
-story the status page tells, drawn small enough to survive a tab.
+columns are the minute cadence. The band is the lake those minutes land in.
 
 **One ink, and why.** The icon is a single colour, ``#2e8b57``. That is the value the
 page's ``--captured`` token takes in its light scheme. It is the colour a completeness
@@ -24,12 +23,13 @@ ink     white  #202124  #35363a
 7f8c8d  3.48   4.63     3.47
 ======  =====  =======  =======
 
-No colour in the palette is comfortable everywhere. Only ``--missing`` at ``#7f8c8d``
-clears 3:1 on all three. That is the grey meaning no data, so a mark built from it reads
+No colour in the palette is comfortable everywhere. The bar below is 3:1, which is what
+WCAG 2.2 asks of a graphic that carries meaning without text. Only ``--missing`` at
+``#7f8c8d`` clears it on all three. That is the grey meaning no data, so a mark built from it reads
 as the product failing. ``--captured`` also has a dark-scheme value, ``#3aa870``, and it
 holds a better worst case, 2.99 against 2.84. It gives up the white strip to get there,
 and a white strip is where most tabs sit. So ``#2e8b57`` ships. Its weakest reading is 2.84
-against an active dark tab, under the 3:1 floor for non-text graphics. The mark survives
+against an active dark tab, under that bar. The mark survives
 there because the silhouette is large blocks and not thin strokes.
 
 A second ink would have to come from the rest of the palette, and the rest scores worse.

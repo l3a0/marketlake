@@ -2,7 +2,8 @@
 
 Failures push alerts. Progress needs a pull surface. This module is that surface. It is
 a small read-only query service on localhost that answers a fixed set of named queries
-over the lake, plus the one static page that renders them. ``status.html`` runs the
+over the lake. Two constant files ride along: ``status.html``, which renders the
+panels, and ``favicon.ico``, which the browser puts on the tab. The page runs the
 queries at view time. Nothing is pre-rendered and no summary state is kept. Freshness
 reads off the data's own timestamps, so a dead capture shows as an old last cycle and a
 dead service shows as a page that cannot load. Neither can be mistaken for the other.
@@ -1143,7 +1144,9 @@ class DashboardService:
     state, and every cursor inherits the locked sandbox. The clock and calendar are
     injected, so a test decides what time it is and which days are sessions. The guard
     constants are injected too, so the panel reports the machine's own staleness
-    threshold rather than the pinned default it may have been recalibrated away from.
+    threshold rather than the pinned default it may have been recalibrated away from. The
+    page and the tab icon are injected on the same terms. Each defaults to the bytes
+    shipped in the package, and a test that wants neither passes its own.
     """
 
     def __init__(
