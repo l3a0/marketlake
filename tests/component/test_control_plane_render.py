@@ -649,9 +649,10 @@ def test_render_puts_progress_on_stderr_so_stdout_is_pasteable(tmp_path, capsys)
     captured = capsys.readouterr()
 
     assert "wrote " not in captured.out
-    lines = [line for line in captured.out.splitlines() if line.strip()]
-    assert lines, "stdout carried no install text"
-    assert lines[0].startswith("#"), f"stdout opens with {lines[0]!r}, not a comment"
+    # Assert against the stream itself. Filtering blank lines out first would let a
+    # leading blank through, and that separator is the other half of what moved.
+    assert captured.out.strip(), "stdout carried no install text"
+    assert captured.out.startswith("#"), f"stdout opens with {captured.out[:60]!r}"
 
     # Every written file is still reported, just on the other stream.
     for name in EXPECTED_FILES:
@@ -659,8 +660,9 @@ def test_render_puts_progress_on_stderr_so_stdout_is_pasteable(tmp_path, capsys)
 
 
 def test_render_reports_a_bad_path_on_stderr_and_prints_no_install_text(capsys):
-    # The failure path shares the defect. A caller redirecting stdout to a file would
-    # otherwise get an empty file and no visible reason for it.
+    # The failure path shares the defect. A caller redirecting stdout to a file used to
+    # get the reason written into the file rather than onto the terminal, so the screen
+    # stayed silent and the file held one line that is not a command.
     args = list(RENDER_ARGS)
     args[args.index("--home") + 1] = "relative/path"
     assert cp.main(["render", "--out", "/tmp/unused-render-stderr", *args]) == 2
