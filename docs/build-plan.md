@@ -108,6 +108,33 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   sees each root command before it runs. The renderer still executes nothing. It writes
   `install.sh` and never runs it, and `--out` still refuses a system directory, so the
   root-owned copy remains the operator's own act.
+
+  `render` writes two more scripts beside it, `uninstall.sh` and `reinstall.sh`. The
+  uninstall takes off exactly what the install placed, in reverse order, so a label is
+  booted out before its plist is deleted. A label that is not loaded is skipped rather
+  than treated as a failure, so the uninstall converges from a half-finished install as
+  well as a whole one. Two things it deliberately leaves:
+
+  1. The lake. Deleting captured data is not part of undoing an install.
+  2. `~/.config/marketlake`, which holds the token, `config.yaml`, and `tickers.yaml`.
+     Removing the token would turn an uninstall into a re-auth. Only the Time Machine
+     exclusion on that directory is lifted, and the directory itself stays.
+
+  It leaves the Sunday one-shot too. Cancelling a one-shot needs `pmset schedule
+  cancelall`, which takes every scheduled event on the machine, including ones nothing
+  here created. `pmset repeat cancel` is safe by contrast, because the repeating alarm is
+  a single slot and the install owns it. The one-shot fires once and is then gone, so
+  leaving it costs one wake.
+
+  `reinstall.sh` is the uninstall followed by the install, and it carries no steps of its
+  own. The **in-place plist swap is considered and rejected.** That version overwrote the
+  plists, booted the labels out and back in, and skipped steps 2, 3, and 4 on the grounds
+  that those do not change. They do. The sudoers drop-in carries the owner and both wake
+  constants, so re-tuning a wake rewrites the drop-in while leaving every plist
+  byte-identical. On that re-render the swap reinstalled nothing that had changed and
+  skipped the only thing that had. Composing the two scripts removes the class, because a
+  reinstall then holds no third description of what an install is that could fall out of
+  step with the other two.
 - **D15** query service with the Now and Today panels. The query service is the read-only localhost dashboard.
 
 Slice 2 builds in two waves. D9 comes first and defines the hooks. D12, D14, and D15 do not touch the loop, so they build in parallel with D9. D10, D11, and D13 plug into D9's hooks, so they follow it, in parallel with each other.
