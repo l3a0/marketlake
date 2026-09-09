@@ -164,6 +164,7 @@ def test_the_daemon_pages_through_the_publisher_when_a_surface_goes_quiet(tmp_pa
     from tests.support.calendar import et, weekday_sessions
     from tests.support.clock import ManualClock
     from tests.support.config import write_config
+    from tests.support.pinger import FakePinger
 
     lake_root = tmp_path / "lake"
     lake_root.mkdir()
@@ -202,6 +203,7 @@ def test_the_daemon_pages_through_the_publisher_when_a_surface_goes_quiet(tmp_pa
         calendar=weekday_sessions(date(2026, 8, 31)),
         assertion_runner=lambda args: None,
         transport=Broken(),
+        pinger=FakePinger(),
         cycle_runner=failing_cycle,
         should_continue=four,
     )

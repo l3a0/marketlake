@@ -127,6 +127,7 @@ def test_input_errors_exit_lets_every_other_exception_through():
         ("lake.onboard", ["SPY", "--config", "MISSING"]),
         ("lake.runner", ["run", "--config", "MISSING"]),
         ("lake.control_plane", ["self-check", "--config", "MISSING"]),
+        ("lake.daemon", ["--config", "MISSING"]),
         ("lake.control_plane", ["sunday", "--config", "MISSING"]),
     ],
 )
