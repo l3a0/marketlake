@@ -41,6 +41,7 @@ from lake.capture import CycleResult
 from lake.session import SessionClock, SessionPhase
 from tests.support.calendar import FakeCalendar, SessionTimes
 from tests.support.clock import ManualClock
+from tests.support.pinger import FakePinger
 
 ET = MARKET_TZ
 FRIDAY = date(2026, 8, 21)  # the Friday before the regular Monday
@@ -616,6 +617,7 @@ def test_the_wired_daemon_holds_the_caffeinate_assertion_once_per_window():
         clock=clock,
         calendar=FakeCalendar({}),
         assertion_runner=lambda args: held.append(tuple(args)),
+        pinger=FakePinger(),
         should_continue=_stop_after(4),
     )
     # Four ticks, one window, one caffeinate process.
@@ -631,6 +633,7 @@ def test_the_wired_daemon_still_runs_a_caller_tick_hook():
         calendar=FakeCalendar({}),
         assertion_runner=lambda args: None,
         hooks=daemon.DaemonHooks(on_tick=ticks.append),
+        pinger=FakePinger(),
         should_continue=_stop_after(2),
     )
     assert len(ticks) == 2

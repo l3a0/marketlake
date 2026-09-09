@@ -19,6 +19,7 @@ from lake.session import (
 from lake.tickers import Roster, TickerConfig
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
+from tests.support.pinger import FakePinger
 
 WEEK = date(2026, 8, 31)
 DAY = date(2026, 9, 2)
@@ -135,6 +136,7 @@ def test_the_daemon_answers_the_close_tag_hook_from_the_calendar(tmp_path):
         cycle_runner=lambda *, close_tag, session_phase: (
             tags.append(close_tag) or CycleResult(et(2026, 9, 2, 16, 0), ())
         ),
+        pinger=FakePinger(),
         should_continue=three,
     )
     # 15:59, 16:00, 16:01. A bare daemon answers None for every slot, so this pins that
@@ -412,6 +414,7 @@ def test_the_guard_writes_the_close_minutes_before_gap_marking_claims_them(tmp_p
         calendar=weekday_sessions(WEEK),
         assertion_runner=lambda args: None,
         cycle_runner=lambda *, close_tag, session_phase: CycleResult(et(2026, 9, 2, 16, 30), ()),
+        pinger=FakePinger(),
         should_continue=once,
     )
 
