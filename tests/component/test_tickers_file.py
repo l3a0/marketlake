@@ -47,3 +47,37 @@ def test_a_typed_tilde_still_expands(tmp_path: Path, monkeypatch):
 def test_missing_file_raises(tmp_path: Path):
     with pytest.raises(TickersError):
         load_tickers(tmp_path / "none.yaml")
+
+
+def test_a_file_that_will_not_parse_is_a_tickers_error(tmp_path):
+    """The loader's contract is total, so no caller has to catch a parser's exception.
+
+    Three daemon helpers build at construction and catch ``(ConfigError, TickersError)``.
+    A ``yaml.YAMLError`` escaping past them exits the process before any hook runs, and
+    ``KeepAlive`` relaunches straight into the same failure. One typo in a hand-edited
+    roster would crash-loop the daemon.
+    """
+    path = tmp_path / "tickers.yaml"
+    path.write_text("SPY: {options: true\n  bad indent and no close\n")
+
+    with pytest.raises(TickersError) as caught:
+        load_tickers(path)
+
+    # The parser echoes the offending line back. This file holds no secrets today, and
+    # quoting file content is still a habit worth not forming beside one that does.
+    assert "will not parse" in str(caught.value)
+    assert "bad indent" not in str(caught.value)
+
+
+def test_a_file_that_cannot_be_read_is_a_tickers_error(tmp_path):
+    """An unreadable roster raises ``OSError`` from ``read_text``, which is the same class."""
+    path = tmp_path / "tickers.yaml"
+    path.write_text("SPY: {options: false}\n")
+    path.chmod(0o000)
+    try:
+        with pytest.raises(TickersError) as caught:
+            load_tickers(path)
+    finally:
+        path.chmod(0o644)
+
+    assert "unreadable" in str(caught.value)

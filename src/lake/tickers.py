@@ -117,7 +117,25 @@ def load_tickers(
     resolved = _resolve_path(path, env)
     if not resolved.exists():
         raise TickersError(f"tickers file not found: {resolved}")
-    mapping = yaml.safe_load(resolved.read_text()) or {}
+    # The loader's contract is total: every failure to produce a roster is a
+    # `TickersError`. Before this, a hand-edited file raised `yaml.YAMLError` and an
+    # unreadable one raised `OSError`, and both escaped every caller's catch. Three
+    # daemon helpers build at construction and catch `(ConfigError, TickersError)`, so a
+    # single typo exited the process before any hook ran, and `KeepAlive` relaunched it
+    # into the same failure. `load_config` already wraps its own parse failure, for the
+    # same reason and additionally because its file holds secrets.
+    #
+    # The message never quotes the parser. PyYAML echoes the offending line back, and
+    # while this file holds no secrets today, a message that quotes file content is a
+    # habit worth not forming beside one that does.
+    try:
+        text = resolved.read_text()
+    except OSError as exc:
+        raise TickersError(f"tickers file unreadable: {resolved}") from exc
+    try:
+        mapping = yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        raise TickersError(f"tickers file will not parse: {resolved}") from exc
     if not isinstance(mapping, Mapping):
         raise TickersError(f"tickers file is not a mapping: {resolved}")
     return Roster.from_mapping(mapping)
