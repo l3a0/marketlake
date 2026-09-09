@@ -50,6 +50,64 @@ def test_a_typed_tilde_still_expands(tmp_path: Path, monkeypatch):
     assert len(load_tickers(env={"MARKETLAKE_TICKERS": "~/.config/roster.yaml"})) == 2
 
 
+# Every way a roster file can fail, and the one word that must appear in each message.
+# The point of the set is that one exception type covers all of them, so a caller can
+# guard for a bad roster with one `except` and `main` can print one line and exit 2.
+BROKEN = {
+    "half saved mid-line": ("XYZ: {options: fal", "not valid YAML"),
+    "hand-edited with a tab": ("XYZ:\n\toptions: false\n", "not valid YAML"),
+    "a bare scalar": ("XYZ", "not a mapping"),
+    "an entry of the wrong shape": ("XYZ: retired\n", "settings must be a mapping"),
+}
+
+
+@pytest.mark.parametrize("text,expected", list(BROKEN.values()), ids=list(BROKEN))
+def test_every_broken_roster_raises_one_error_type(tmp_path: Path, text, expected):
+    """A `yaml` error used to escape, which every caller guarding for a bad roster missed.
+
+    `load_tickers` parses YAML and reads a file, so a half-saved roster raised
+    `yaml.YAMLError` and an unreadable one raised `OSError`. Neither is a `TickersError`,
+    so both went straight past `_alarm`, `_gap_marker`, `_close_guard`, and
+    `input_errors_exit`, and the daemon died on a traceback naming the parser. `lake.config`
+    had already solved this for `config.yaml`.
+    """
+    path = tmp_path / "tickers.yaml"
+    path.write_text(text)
+
+    with pytest.raises(TickersError) as caught:
+        load_tickers(path)
+
+    message = str(caught.value)
+    assert expected in message
+    # The message names the file. Three operator-editable files share the config
+    # directory, and this line is printed on its own.
+    assert str(path) in message
+    # And never a line of the file itself, which is the rule `lake.config` sets.
+    assert text.strip() not in message
+
+
+def test_a_file_that_cannot_be_read_raises_the_same_error(tmp_path: Path):
+    """Existing is not the same as readable, and the difference used to be an `OSError`."""
+    path = tmp_path / "tickers.yaml"
+    path.write_bytes(b"\xff\xfe\x00\x01")
+
+    with pytest.raises(TickersError, match="cannot be read"):
+        load_tickers(path)
+
+
+def test_a_broken_roster_stops_the_write_too(tmp_path: Path):
+    """`upsert_ticker` reads the file back before writing, so it has the same holes."""
+    path = tmp_path / "tickers.yaml"
+    path.write_text("XYZ:\n\toptions: false\n")
+
+    with pytest.raises(TickersError, match="not valid YAML"):
+        upsert_ticker("ABC", options=False, path=path)
+
+    # The refusal left the operator's file exactly as it was, and no temp file beside it.
+    assert path.read_text() == "XYZ:\n\toptions: false\n"
+    assert [p.name for p in sorted(tmp_path.iterdir())] == ["tickers.yaml"]
+
+
 def test_missing_file_raises(tmp_path: Path):
     with pytest.raises(TickersError):
         load_tickers(tmp_path / "none.yaml")
@@ -65,8 +123,8 @@ def test_a_reader_during_the_write_still_sees_a_whole_roster(tmp_path: Path, mon
     file as a roster of no tickers, a longer prefix as the tickers it kept with any cut
     key defaulted, so an options ticker comes back equity-only. A cycle handed one of
     those captures nothing for what it lost and writes no gap row for it either. The rest
-    raise a ``yaml`` error, which is not a ``TickersError``, so it escapes the callers
-    that guard for one.
+    raise, and ``load_tickers`` turns that into a ``TickersError`` a caller can act on.
+    The silent half is what this case is about.
     """
     path = tmp_path / "tickers.yaml"
     upsert_ticker("XYZ", options=False, path=path)

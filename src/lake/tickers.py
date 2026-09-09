@@ -117,10 +117,53 @@ def load_tickers(
     resolved = _resolve_path(path, env)
     if not resolved.exists():
         raise TickersError(f"tickers file not found: {resolved}")
-    mapping = yaml.safe_load(resolved.read_text()) or {}
+    mapping = _parse(_read_text(resolved), resolved)
     if not isinstance(mapping, Mapping):
         raise TickersError(f"tickers file is not a mapping: {resolved}")
-    return Roster.from_mapping(mapping)
+    try:
+        return Roster.from_mapping(mapping)
+    except TickersError as exc:
+        # ``from_mapping`` takes a mapping and no path, so its message names the entry it
+        # rejected and nothing else. Three operator-editable files sit in the config
+        # directory, and ``input_errors_exit`` prints this line on its own. It has to say
+        # which file.
+        raise TickersError(f"{exc} in tickers file: {resolved}") from None
+
+
+def _read_text(resolved: Path) -> str:
+    """The file's text, or a ``TickersError`` naming what could not be read.
+
+    ``exists()`` passing does not mean the file can be read. A restrictive mode makes it
+    unreadable and a binary file is not text. Both raised a bare ``OSError`` before,
+    which every caller that guards for a bad roster then missed. ``lake.config`` solved
+    the same class for ``config.yaml``. Only the path is named, so nothing from inside
+    the file reaches the error.
+    """
+    try:
+        return resolved.read_text()
+    except (OSError, UnicodeDecodeError):
+        raise TickersError(f"tickers file cannot be read: {resolved}") from None
+
+
+def _parse(text: str, resolved: Path) -> object:
+    """The parsed document, or a ``TickersError`` naming where the YAML broke.
+
+    A half-saved file is the ordinary way this fails, and where the cut lands decides
+    what happens. Some prefixes parse. The rest raise a ``yaml`` error, which is not a
+    ``TickersError``, so before this every caller guarding for a bad roster missed them
+    and the daemon died on a traceback instead.
+
+    The line number is named because it is the one thing an operator needs and this file
+    holds no secrets. ``lake.config`` suppresses the same detail for ``config.yaml``,
+    which holds four. Nothing else from the parse error is repeated, so no line of the
+    file itself can reach the error.
+    """
+    try:
+        return yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        where = "" if mark is None else f" at line {mark.line + 1}"
+        raise TickersError(f"tickers file is not valid YAML{where}: {resolved}") from None
 
 
 def upsert_ticker(
@@ -152,7 +195,7 @@ def upsert_ticker(
     resolved = _resolve_path(path, env)
     existing: dict[str, object] = {}
     if resolved.exists():
-        loaded = yaml.safe_load(resolved.read_text()) or {}
+        loaded = _parse(_read_text(resolved), resolved)
         if not isinstance(loaded, Mapping):
             raise TickersError(f"tickers file is not a mapping: {resolved}")
         existing = {str(key): value for key, value in loaded.items()}
@@ -178,8 +221,8 @@ def _write_atomically(target: Path, text: str) -> None:
     prefix as the tickers it kept, with any key it cut taking its default, so an options
     ticker comes back equity-only. A cycle handed one of those captures less than the
     roster names and writes no gap row for the rest, so the minute leaves no trace. The
-    rest raise a ``yaml`` error, which is not a ``TickersError`` and so escapes every
-    caller that guards for one.
+    rest raise, which ``_parse`` turns into a ``TickersError``, so a caller sees a refusal
+    rather than a wrong roster. The silent half is the half this rename removes.
     A rename replaces the file in one step, so every reader sees the whole old roster or
     the whole new one. The chain plan is written this way for the same reason. A crash
     mid-write leaves the prior file intact, and the temp file is removed on any failure.
