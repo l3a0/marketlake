@@ -287,20 +287,25 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   The pasteable `INSTALL.txt` keeps the step-by-step procedure for operators who want it.
   It now leads with the composed command and carries the `sudo diff` line, and it points
   at `uninstall.sh`'s header for what an uninstall leaves rather than restating the list.
-- **Unowned.** The Sunday re-auth reminder's delivery. `sunday_run` takes a
-  `reminder_sink` and only fires it when one is passed. The `python -m lake.control_plane
-  sunday` entry that the launchd job runs passes none, so the reminder is printed to the
-  job's log file and never pushed. That is the same shape as D11's missing fill: the seam
-  is built and the producer is not. It carries no blame for the September 2026 expiry,
-  because the Sunday job was not installed until three days after it, but it is what would
-  have to work for the next one to be announced.
-- **Unowned.** The Sunday canary's producer. `sunday_run` takes an injected `canary`, the
-  throwaway authenticated call that proves capture still works over a weekend, and the
-  `sunday` CLI passes none. The fallback is `_canary_pass_through`, which returns `True`
-  without calling anything. So the canary passes every Sunday whatever the token's state.
-  This is the third seam in slice 2 built and never supplied, after D11's fill and the
-  reminder above, and it is the costliest of the three. The other two fail to act. This one
-  reports success.
+
+  The Sunday job's two outward seams are supplied, so the `sunday` command line no longer
+  falls back on a canary that passes without calling anything or a reminder that reaches
+  a log file and never a phone. `token_canary` is the throwaway authenticated call. It
+  rebuilds the vendor from `token.json` inside every attempt and quotes one symbol, which
+  is what lets the 21:00 retry see a re-login done at 20:40. Any failure answers `False`,
+  because a call that did not come back has proved nothing, and the half-hour retry to
+  23:00 is what absorbs a transient outage rather than paging on it. The seam keeps no
+  default at all now. `sunday_maintenance` and `sunday_run` require a canary, so no later
+  caller can leave one out and be told the weekend passed.
+
+  `reminder_publisher` is the re-auth reminder's delivery. It pushes through the alert
+  publisher, so an unreachable ntfy costs a log line and a dated file under `reports/`
+  instead of taking the scrub, the alarm read-back and the check's own ping with it.
+
+  One alert rule moved with them. Only a page carries the `rotating_light` tag now,
+  because the design gives the emoji to a page alone and the reminder is the first
+  message at the reminder tier to go through the transport. The tag follows the priority
+  rather than becoming a second field a producer could set wrong.
 - **D15** query service with the Now and Today panels. The query service is the read-only localhost dashboard.
 - **Unowned.** Five Now-panel fields that are hardcoded `None`, and the writers each one
   waits on:
