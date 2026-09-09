@@ -129,7 +129,7 @@ class CycleRunner(Protocol):
     def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult: ...
 
 
-# -- the four hooks -----------------------------------------------------------
+# -- the five hooks ----------------------------------------------------------
 
 
 def _no_start() -> None:
