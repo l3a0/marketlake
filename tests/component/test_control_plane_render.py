@@ -51,6 +51,7 @@ EXPECTED_FILES = {
     cp.SUDOERS_FILE,
     cp.INSTALL_SCRIPT_FILE,
     cp.UNINSTALL_SCRIPT_FILE,
+    cp.RESTART_SCRIPT_FILE,
 }
 
 
@@ -1043,6 +1044,196 @@ def test_render_writes_no_reinstall_script(tmp_path):
     assert not [path for path in out.iterdir() if "reinstall" in path.name], list(out.iterdir())
     assert not hasattr(cp, "reinstall_script")
     assert not hasattr(cp, "REINSTALL_SCRIPT_FILE")
+
+
+# -- the restart script --------------------------------------------------------
+
+# launchctl holds each label's pid in a file, so `print` answers truthfully before and
+# after a kickstart. That is what lets a test tell a real restart from a no-op.
+_FAKE_LAUNCHCTL_PIDS = """#!/bin/bash
+printf 'launchctl %s\\n' "$*" >> "$LOG"
+case "$1" in
+  print)
+    label="${2##*/}"
+    if [[ ! -e "$PIDS/$label" ]]; then exit 1; fi
+    printf '\\tpid = %s\\n' "$(cat "$PIDS/$label")"
+    exit 0 ;;
+  kickstart)
+    label="${3##*/}"
+    if [[ "$KICKSTART_RC" != "0" ]]; then exit "$KICKSTART_RC"; fi
+    if [[ "$PID_CHANGES" == "1" ]]; then
+      printf '%s' "$(( $(cat "$PIDS/$label") + 1 ))" > "$PIDS/$label"
+    fi
+    exit 0 ;;
+esac
+exit 0
+"""
+
+_FAKE_GIT = """#!/bin/bash
+printf 'git %s\\n' "$*" >> "$LOG"
+case "$*" in
+  *rev-parse*--git-dir*)      [[ "$IS_REPO" == "1" ]] && exit 0 || exit 128 ;;
+  *rev-parse*--abbrev-ref*)   echo "$BRANCH"; exit 0 ;;
+  *status*--porcelain*)       [[ "$DIRTY" == "1" ]] && echo " M src/lake/x.py"; exit 0 ;;
+esac
+exit 0
+"""
+
+
+def _run_restart(
+    tmp_path: Path,
+    *,
+    argv=(),
+    loaded=("daemon", "dashboard"),
+    pid_changes=True,
+    kickstart_rc=0,
+    branch="main",
+    dirty=False,
+    is_repo=True,
+):
+    """Render, then run restart.sh against fakes. Returns (proc, log lines)."""
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    log = tmp_path / "log"
+    log.write_text("")
+    pids = tmp_path / "pids"
+    pids.mkdir(exist_ok=True)
+    for i, name in enumerate(loaded):
+        (pids / f"com.marketlake.{name}").write_text(str(1000 + i))
+    (bin_dir / "sudo").write_text(_FAKE_SUDO)
+    (bin_dir / "sudo").chmod(0o755)
+    (bin_dir / "launchctl").write_text(_FAKE_LAUNCHCTL_PIDS)
+    (bin_dir / "launchctl").chmod(0o755)
+    (bin_dir / "git").write_text(_FAKE_GIT)
+    (bin_dir / "git").chmod(0o755)
+    proc = subprocess.run(
+        [str(out / cp.RESTART_SCRIPT_FILE), *argv],
+        env={
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "LOG": str(log),
+            "PIDS": str(pids),
+            "PID_CHANGES": "1" if pid_changes else "0",
+            "KICKSTART_RC": str(kickstart_rc),
+            "BRANCH": branch,
+            "DIRTY": "1" if dirty else "0",
+            "IS_REPO": "1" if is_repo else "0",
+        },
+        capture_output=True,
+        text=True,
+    )
+    return proc, [line for line in log.read_text().splitlines() if line]
+
+
+def test_the_restart_offers_exactly_the_jobs_that_can_go_stale(tmp_path):
+    """Derived from ``keep_alive``, because that is what makes a job able to go stale.
+
+    A resident job holds the Python it imported at start. The three calendar jobs exec
+    fresh on every fire, so restarting one would be meaningless. Listing the two by hand
+    would let a sixth resident job be added without this script learning about it.
+    """
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    script = (out / cp.RESTART_SCRIPT_FILE).read_text()
+    resident = [job.label for job in cp.all_jobs(_host()) if job.keep_alive]
+    transient = [job.label for job in cp.all_jobs(_host()) if not job.keep_alive]
+    assert len(resident) == 2 and len(transient) == 3, (resident, transient)
+    for label in resident:
+        assert f"LABELS=({label})" in script, label
+    for label in transient:
+        assert label not in script, label
+
+
+def test_the_restart_defaults_to_the_dashboard(tmp_path):
+    """Restarting the daemon costs the in-flight cycle, so it has to be asked for.
+
+    The dashboard only drops open connections. A bare ``./restart.sh`` must not be the
+    command that takes capture down.
+    """
+    proc, log = _run_restart(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    # The fake sudo execs what it is given, so each kickstart logs twice. Counting the
+    # sudo-prefixed line alone also pins that the restart runs as root.
+    kicks = [line for line in log if line.startswith("sudo launchctl kickstart")]
+    assert len(kicks) == 1, log
+    assert cp.DASHBOARD_LABEL in kicks[0], kicks[0]
+    assert cp.DAEMON_LABEL not in kicks[0], kicks[0]
+
+
+def test_the_restart_proves_the_process_changed(tmp_path):
+    """A kickstart that silently did nothing is the failure this script exists to catch."""
+    proc, _ = _run_restart(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "restarted: pid 1001 -> 1002" in proc.stdout, proc.stdout
+
+
+def test_a_kickstart_that_leaves_the_pid_alone_fails(tmp_path):
+    """Same pid means the process never came down, so reporting success would be a lie."""
+    proc, log = _run_restart(tmp_path, pid_changes=False)
+    assert proc.returncode != 0
+    assert "did not restart" in proc.stderr, proc.stderr
+
+
+def test_the_restart_refuses_a_job_that_is_not_loaded(tmp_path):
+    """Nothing to restart is not a restart. It must not report success."""
+    proc, log = _run_restart(tmp_path, loaded=("daemon",))
+    assert proc.returncode != 0
+    assert "is not loaded" in proc.stderr, proc.stderr
+    assert not [line for line in log if "kickstart" in line], log
+
+
+def test_an_unknown_job_name_is_refused_before_anything_runs(tmp_path):
+    """A typo must not silently restart the default."""
+    proc, log = _run_restart(tmp_path, argv=("dashbaord",))
+    assert proc.returncode == 2, proc.stdout
+    assert "usage:" in proc.stderr, proc.stderr
+    assert not [line for line in log if "kickstart" in line], log
+
+
+def test_the_restart_warns_when_the_tree_is_not_what_will_ship(tmp_path):
+    """The services import from the working tree, so a restart adopts whatever is there.
+
+    This is the hazard that motivated the script. A restart taken while the checkout sits
+    on a feature branch silently promotes that branch into the running service.
+    """
+    on_branch, _ = _run_restart(tmp_path, branch="claude/some-work")
+    assert "not on main" in on_branch.stdout, on_branch.stdout
+    dirty, _ = _run_restart(tmp_path, dirty=True)
+    assert "uncommitted changes" in dirty.stdout, dirty.stdout
+    clean, _ = _run_restart(tmp_path)
+    assert "not on main" not in clean.stdout and "uncommitted" not in clean.stdout, clean.stdout
+
+
+def test_the_restart_survives_a_project_dir_that_is_not_a_checkout(tmp_path):
+    """The design never promises the project directory is a git repo, so this cannot die."""
+    proc, _ = _run_restart(tmp_path, is_repo=False)
+    assert proc.returncode == 0, proc.stderr
+    assert "not a git checkout" in proc.stdout, proc.stdout
+
+
+def test_the_restart_never_boots_a_label_out(tmp_path):
+    """The bootout-and-bootstrap restart is considered and rejected. It stays cut.
+
+    It would also pick up a changed plist, which makes it look like the general tool. It
+    is the more dangerous one: a failure between the bootout and the bootstrap leaves the
+    service down, where a kickstart cannot, because launchd holds the definition
+    throughout. A changed plist is the install's job.
+    """
+    proc, log = _run_restart(tmp_path, argv=("all",))
+    assert proc.returncode == 0, proc.stderr
+    kicks = [line for line in log if line.startswith("sudo launchctl kickstart")]
+    assert len(kicks) == 2, log
+    for word in ("bootout", "bootstrap", "rm ", "pmset"):
+        assert not [line for line in log if word in line], (word, log)
+    script = (tmp_path / "out" / cp.RESTART_SCRIPT_FILE).read_text()
+    assert "bootout" not in script and "bootstrap" not in script
+
+
+def test_the_written_restart_script_is_executable(tmp_path):
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    assert (out / cp.RESTART_SCRIPT_FILE).stat().st_mode & 0o777 == 0o755
 
 
 # -- the uninstall script ------------------------------------------------------

@@ -178,6 +178,39 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
      event the uninstall's step 2 took. Re-adding the file is a constant, one `render_all`
      line and a golden, if a reinstall ever earns a step of its own.
 
+  `render` also writes `restart.sh`, which restarts a resident job so it picks up new
+  code. Two of the five jobs can go stale, and the reason is the shape of the job rather
+  than anything about the code. The daemon and the dashboard are resident: launchd starts
+  each once and `KeepAlive` relaunches it if it exits, so each holds the Python it
+  imported at start. Editing the working tree does not reach a process already running.
+  The self-check, the calendar probe and the Sunday job exec fresh on every fire, so they
+  always run current code. The script derives that pair from `keep_alive` rather than
+  listing it.
+
+  `launchctl kickstart -k` restarts the process under the definition launchd already
+  holds. That is right when the code changed and the plist did not, and wrong after a
+  re-render that changed a plist, because the old definition is what gets restarted. The
+  install text already warned about the second case. This is the first case, which had no
+  tool at all until now.
+
+  Two things are pinned as **considered and rejected** for the restart.
+
+  1. **A bootout-and-bootstrap restart.** It would also pick up a changed plist, which
+     makes it look like the more general tool. It is the more dangerous one. Booting a
+     label out drops it from the domain, so a failure between the bootout and the
+     bootstrap leaves the service down rather than merely unrestarted. A `kickstart -k`
+     cannot reach that state, because launchd holds the definition throughout. Picking up
+     a changed plist is the install's job.
+  2. **Defaulting to both residents.** Restarting the dashboard costs its open
+     connections. Restarting the daemon costs the in-flight cycle and its `caffeinate`
+     assertion until it is back. A bare `./restart.sh` must not be the command that takes
+     capture down, so it restarts the dashboard alone and the daemon has to be named.
+
+  Unlike the cut `reinstall.sh`, this one is not a wrapper around a single command. It
+  reports the working tree the services will adopt, refuses a job that is not loaded, and
+  reads the pid back to prove the process actually changed. A kickstart that silently did
+  nothing is the failure worth catching, and a bare command cannot catch it.
+
   The pasteable `INSTALL.txt` keeps the step-by-step procedure for operators who want it.
   It now leads with the composed command and carries the `sudo diff` line, and it points
   at `uninstall.sh`'s header for what an uninstall leaves rather than restating the list.

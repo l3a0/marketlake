@@ -202,6 +202,11 @@ INSTALL_SCRIPT_FILE = "install.sh"
 # nor a re-auth, and it does not expose the token to the next backup.
 UNINSTALL_SCRIPT_FILE = "uninstall.sh"
 
+# Restarts a resident job so it picks up new code. Only the two KeepAlive jobs can go
+# stale: each holds the Python it imported at start, and the working tree can move under
+# it. The calendar jobs exec fresh on every fire, so they never need this.
+RESTART_SCRIPT_FILE = "restart.sh"
+
 
 # -- the host description and the plists -------------------------------------
 
@@ -1454,6 +1459,7 @@ def render_all(host: LaunchdHost) -> tuple[RenderedFile, ...]:
     files.append(RenderedFile(SUDOERS_FILE, sudoers_dropin(host.owner)))
     files.append(RenderedFile(INSTALL_SCRIPT_FILE, install_script(host), mode=0o755))
     files.append(RenderedFile(UNINSTALL_SCRIPT_FILE, uninstall_script(host), mode=0o755))
+    files.append(RenderedFile(RESTART_SCRIPT_FILE, restart_script(host), mode=0o755))
     return tuple(files)
 
 
@@ -1756,6 +1762,158 @@ def uninstall_script(host: LaunchdHost) -> str:
     return "\n".join(lines) + "\n"
 
 
+def restart_script(host: LaunchdHost) -> str:
+    """Restart a resident job so it picks up new code. The renderer never runs it.
+
+    Only two of the five jobs can go stale, and the reason is the shape of the job
+    rather than anything about the code. The daemon and the dashboard are resident:
+    launchd starts each once and ``KeepAlive`` relaunches it if it exits, so each holds
+    the Python it imported at start. Editing the working tree does not reach a process
+    already running. The self-check, the calendar probe and the Sunday job exec fresh on
+    every fire, so they always run current code and never need this. The set is derived
+    from ``keep_alive`` rather than listed, so a sixth resident job is covered by adding
+    the job and nothing else.
+
+    ``launchctl kickstart -k`` restarts the process under the definition launchd already
+    holds. That is exactly right when the code changed and the plist did not, and exactly
+    wrong when a re-render changed the plist, because the stale definition is what gets
+    restarted. The install text already warns about the second case. This script is the
+    first case, which had no tool at all.
+
+    The **bootout-and-bootstrap restart is considered and rejected** for this job. It
+    would also pick up a changed plist, so it looks like the more general tool. It is
+    the more dangerous one: booting a label out drops it from the domain, and a failure
+    between the bootout and the bootstrap leaves the service down rather than merely
+    unrestarted. ``kickstart -k`` cannot leave that state, because launchd holds the
+    definition throughout. Picking up a changed plist is the install's job.
+
+    A restart is not free. The dashboard drops its connections, and the daemon loses the
+    in-flight cycle and its ``caffeinate`` assertion for as long as it takes to come
+    back. That is why the default is the dashboard alone, and why the daemon has to be
+    named.
+    """
+    residents = [job.label for job in all_jobs(host) if job.keep_alive]
+    short = {label.rsplit(".", 1)[-1]: label for label in residents}
+    # The default is the dashboard, because restarting it costs open connections while
+    # restarting the daemon costs the in-flight cycle. Derived from the label rather than
+    # written out, so a dashboard that stopped being resident fails here loudly.
+    default = DASHBOARD_LABEL.rsplit(".", 1)[-1]
+    if default not in short:
+        raise ValueError(f"{DASHBOARD_LABEL} is not resident, so it cannot be the default")
+    lines = [
+        "#!/bin/bash",
+        "# Marketlake control plane: restart a resident job so it picks up new code.",
+        "#",
+        "# Written by `python -m lake.control_plane render`, which never runs it. Run it",
+        "# yourself, as the owner. The restart needs root and will prompt.",
+        "#",
+        "# Usage:",
+        "#",
+        f"#     ./{RESTART_SCRIPT_FILE}            # the dashboard, the usual case",
+    ]
+    for name in short:
+        lines.append(f"#     ./{RESTART_SCRIPT_FILE} {name}".ljust(30) + f"# just {name}")
+    lines += [
+        f"#     ./{RESTART_SCRIPT_FILE} all".ljust(30) + "# every resident job",
+        "#",
+        "# Only these jobs can go stale, and the reason is their shape. They are resident:",
+        "# launchd starts each once and KeepAlive relaunches it if it exits, so each holds",
+        "# the Python it imported at start. Editing the working tree does not reach a",
+        "# process already running. The other three jobs exec fresh on every fire, so they",
+        "# always run current code and never need this.",
+        "#",
+        "# `launchctl kickstart -k` restarts the process under the definition launchd",
+        "# already holds. That is the right tool when the code changed and the plist did",
+        "# not. It is the WRONG tool after a re-render that changed a plist, because the",
+        "# old definition is what gets restarted. For a changed plist, reinstall instead:",
+        "#",
+        f"#     ./{UNINSTALL_SCRIPT_FILE} && ./{INSTALL_SCRIPT_FILE}",
+        "#",
+        "# A restart is not free. The dashboard drops its open connections, and the daemon",
+        "# loses the in-flight cycle and its caffeinate assertion until it is back. So the",
+        "# default is the dashboard on its own, and the daemon has to be named.",
+        "#",
+        "# The services import from the working tree, so what they pick up is that tree as",
+        "# it stands right now, branch and uncommitted edits included. Step 1 prints it.",
+        "set -euo pipefail",
+        "",
+        f"PROJECT_DIR={shlex.quote(host.project_dir)}",
+        f"DOMAIN={LAUNCHD_DOMAIN}",
+        "",
+        'case "${1:-' + default + '}" in',
+    ]
+    for name, label in short.items():
+        lines.append(f"  {name}) LABELS=({label}) ;;")
+    lines += [
+        "  all) LABELS=(" + " ".join(residents) + ") ;;",
+        "  *)",
+        "    echo "
+        + shlex.quote(f"usage: ./{RESTART_SCRIPT_FILE} [" + "|".join([*short, "all"]) + "]")
+        + " >&2",
+        "    exit 2 ;;",
+        "esac",
+        "",
+        "# launchctl print needs no root, and it is the only place a job's pid is stated.",
+        "pid_of() {",
+        '  launchctl print "$DOMAIN/$1" 2>/dev/null |',
+        r"    sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*/\1/p' | head -1 || true",
+        "}",
+        "",
+        "# 1. What the restart will pick up. The services import from this tree, so this is",
+        "# the code they will be running afterwards, not whatever was current at boot.",
+        "echo " + shlex.quote("+ working tree at " + host.project_dir),
+        'if git -C "$PROJECT_DIR" rev-parse --git-dir >/dev/null 2>&1; then',
+        '  branch="$(git -C "$PROJECT_DIR" rev-parse --abbrev-ref HEAD)"',
+        '  echo "  branch: $branch"',
+        '  if [[ -n "$(git -C "$PROJECT_DIR" status --porcelain)" ]]; then',
+        "    echo "
+        + shlex.quote("  WARNING: uncommitted changes, so the restart picks those up too"),
+        "  fi",
+        '  if [[ "$branch" != "main" ]]; then',
+        "    echo " + shlex.quote("  WARNING: not on main, so the restart runs branch code"),
+        "  fi",
+        "else",
+        "  echo " + shlex.quote("  not a git checkout, so no branch to report"),
+        "fi",
+        "",
+        "# 2. Restart each named job, and prove it restarted. A pid that did not change is",
+        "# a kickstart that did nothing, which is the failure worth catching.",
+        'for label in "${LABELS[@]}"; do',
+        '  before="$(pid_of "$label")"',
+        '  if [[ -z "$before" ]]; then',
+        '    echo "  $label is not loaded. Run the install first." >&2',
+        "    exit 1",
+        "  fi",
+        "  # If the pid is already gone, ps fails, and under `set -e` an unguarded",
+        "  # command substitution would end the run here having printed nothing.",
+        '  running_since="$(ps -o lstart= -p "$before" 2>/dev/null | sed \'s/^ *//\' || true)"',
+        '  : "${running_since:=unknown}"',
+        '  echo "  $label is pid $before, running since $running_since"',
+        '  echo "+ sudo launchctl kickstart -k $DOMAIN/$label"',
+        '  sudo launchctl kickstart -k "$DOMAIN/$label"',
+        "  # KeepAlive relaunches within seconds rather than instantly, so give it a few.",
+        '  after=""',
+        "  for _ in 1 2 3 4 5; do",
+        '    after="$(pid_of "$label")"',
+        '    if [[ -n "$after" && "$after" != "$before" ]]; then',
+        "      break",
+        "    fi",
+        "    sleep 1",
+        "  done",
+        '  if [[ -z "$after" ]]; then',
+        '    echo "  WARNING: $label has no pid after the restart" >&2',
+        "    exit 1",
+        "  fi",
+        '  if [[ "$after" == "$before" ]]; then',
+        '    echo "  WARNING: $label is still pid $before, so it did not restart" >&2',
+        "    exit 1",
+        "  fi",
+        '  echo "  $label restarted: pid $before -> $after"',
+        "done",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def install_commands(out_dir: Path, host: LaunchdHost) -> str:
     """The operator's manual install steps, as text. Nothing here runs from code.
 
@@ -1807,6 +1965,11 @@ def install_commands(out_dir: Path, host: LaunchdHost) -> str:
     for job in all_jobs(host):
         lines.append(f"# sudo launchctl bootout {LAUNCHD_DOMAIN}/{job.label}")
     lines += [
+        "# Restarting. New code does not reach a running job. The daemon and the",
+        "# dashboard are resident, so each holds the Python it imported at start. After",
+        f"# pulling code with no plist change, run ./{RESTART_SCRIPT_FILE} beside this file.",
+        "# The other three jobs exec fresh every fire and never need it. A re-render that",
+        "# changed a plist is the other case, and it needs the reinstall above.",
         f"# Uninstalling. Run ./{UNINSTALL_SCRIPT_FILE} beside this file. It undoes steps",
         "# 5, 3, 2 and 1, in that order. Read its header before running it. It lists what",
         "# it leaves, and it warns that the wake cancel takes the whole repeating power",
@@ -2054,9 +2217,11 @@ __all__ = [
     "default_token_path",
     "expected_one_shot",
     "INSTALL_SCRIPT_FILE",
+    "RESTART_SCRIPT_FILE",
     "UNINSTALL_SCRIPT_FILE",
     "install_commands",
     "install_script",
+    "restart_script",
     "uninstall_script",
     "launchctl_probe",
     "main",
