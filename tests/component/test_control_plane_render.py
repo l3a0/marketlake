@@ -50,7 +50,6 @@ EXPECTED_FILES = {
     "com.marketlake.sunday.plist",
     cp.SUDOERS_FILE,
     cp.INSTALL_SCRIPT_FILE,
-    cp.REINSTALL_SCRIPT_FILE,
     cp.UNINSTALL_SCRIPT_FILE,
 }
 
@@ -893,7 +892,7 @@ def test_the_install_script_header_shows_how_to_run_it(tmp_path):
     assert "Usage" in header
 
 
-# -- the reinstall script ------------------------------------------------------
+# -- reinstalling, which is the two scripts composed --------------------------
 
 # sudo must run what it is given, or the command under it is never exercised.
 _FAKE_SUDO = """#!/bin/bash
@@ -919,13 +918,15 @@ case "$1" in
 esac
 """
 
+REINSTALL_COMMAND = f"./{cp.UNINSTALL_SCRIPT_FILE} && ./{cp.INSTALL_SCRIPT_FILE}"
+
 
 def _run_reinstall(tmp_path: Path, *, bootout_rc: int = 0):
-    """Render, then run reinstall.sh end to end against fakes.
+    """Render, then reinstall by composing the two scripts, exactly as an operator would.
 
-    Both halves run for real. Nothing is stubbed except the commands that would touch
-    the machine, so this exercises the composition rather than the text of the script.
-    Returns (proc, log lines).
+    There is no third script to run. This is the composed command from both headers,
+    executed end to end against fakes on ``PATH``. Both halves run for real, so what it
+    exercises is the composition rather than the text of any file.
     """
     out = tmp_path / "out"
     assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
@@ -946,7 +947,8 @@ def _run_reinstall(tmp_path: Path, *, bootout_rc: int = 0):
     (bin_dir / "launchctl").write_text(_FAKE_LAUNCHCTL)
     (bin_dir / "launchctl").chmod(0o755)
     proc = subprocess.run(
-        [str(out / cp.REINSTALL_SCRIPT_FILE)],
+        ["/bin/bash", "-c", REINSTALL_COMMAND],
+        cwd=out,
         env={
             "PATH": f"{bin_dir}:/usr/bin:/bin",
             "LOG": str(log),
@@ -959,8 +961,8 @@ def _run_reinstall(tmp_path: Path, *, bootout_rc: int = 0):
     return proc, [line for line in log.read_text().splitlines() if line]
 
 
-def test_the_reinstall_runs_the_whole_uninstall_before_the_whole_install(tmp_path):
-    """Running it end to end, because composing two scripts is the only thing it does.
+def test_reinstalling_runs_the_whole_uninstall_before_the_whole_install(tmp_path):
+    """Running the composed command end to end, because that is what a reinstall is.
 
     The order is the property worth holding. Every removal has to land before the first
     installation, or a bootout races a bootstrap for the same label.
@@ -976,16 +978,23 @@ def test_the_reinstall_runs_the_whole_uninstall_before_the_whole_install(tmp_pat
     assert max(deletes) < min(installs), log
     assert max(boots_out) < min(boots_in), log
     # The sudoers drop-in is removed and written again. The re-tune case that the
-    # earlier in-place swap skipped.
+    # earlier in-place plist swap skipped.
     assert any(line == "rm -f /etc/sudoers.d/marketlake" for line in log), log
     assert any(line.startswith("install ") and "sudoers.d" in line for line in log), log
 
 
 def test_a_failing_uninstall_leaves_the_install_half_unrun(tmp_path):
-    """It stops at the first failure rather than layering an install over a broken one.
+    """The ``&&`` is load-bearing, so it is asserted by running it rather than described.
 
     A job that will not stop is the bootout failure worth halting for. Carrying on would
-    write a fresh plist under a definition launchd is still holding.
+    write a fresh plist under a definition launchd is still holding. This is the whole
+    reason both headers spell the separator ``&&`` and not ``;``.
+
+    Two things make the uninstall exit non-zero here, which is deliberate. ``set -e``
+    catches the failing bootout, and the step 5 read-back exits 1 on its own because the
+    daemon is still loaded. Removing ``set -e`` alone does not reach this test, and the
+    survival is the point rather than a gap: ``test_the_uninstall_stops_at_a_failure``
+    ``_partway_down`` holds that half.
     """
     proc, log = _run_reinstall(tmp_path, bootout_rc=1)
     assert proc.returncode != 0
@@ -993,10 +1002,33 @@ def test_a_failing_uninstall_leaves_the_install_half_unrun(tmp_path):
     assert not [line for line in log if line.startswith("launchctl bootstrap")], log
 
 
-def test_the_written_reinstall_script_is_executable(tmp_path):
+def test_both_headers_give_the_reinstall_command_and_say_why_the_separator_matters(tmp_path):
+    """The composed command has no file of its own, so it lives in the two that remain.
+
+    ``render`` writes the scripts and prints the install text to stdout. An operator who
+    comes back to the rendered directory has only these files to read, so the third verb
+    has to be named in them or it is named nowhere they will look.
+    """
     out = tmp_path / "out"
     assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
-    assert (out / cp.REINSTALL_SCRIPT_FILE).stat().st_mode & 0o777 == 0o755
+    for name in (cp.INSTALL_SCRIPT_FILE, cp.UNINSTALL_SCRIPT_FILE):
+        header = (out / name).read_text().split("set -euo pipefail")[0]
+        assert REINSTALL_COMMAND in header, name
+        assert "`&&` is load-bearing" in header, name
+
+
+def test_render_writes_no_reinstall_script(tmp_path):
+    """A reinstall is the two scripts composed, so a third file would be a third answer.
+
+    The one it had drifted inside a single commit: its header restated the uninstall's
+    counted set of three survivals as two, dropping the Sunday one-shot. That is the
+    cost of a second description, and the cut removes the class rather than the typo.
+    """
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    assert not [path for path in out.iterdir() if "reinstall" in path.name], list(out.iterdir())
+    assert not hasattr(cp, "reinstall_script")
+    assert not hasattr(cp, "REINSTALL_SCRIPT_FILE")
 
 
 # -- the uninstall script ------------------------------------------------------
@@ -1219,17 +1251,6 @@ def test_the_uninstall_stops_at_a_failure_partway_down(tmp_path):
     assert proc.returncode != 0
     assert any(line == "pmset repeat cancel" for line in log), log
     assert not [line for line in log if line.startswith("rm -f")], log
-
-
-def test_the_reinstall_is_an_uninstall_then_an_install(tmp_path):
-    """It carries no steps of its own, which is what keeps it from drifting."""
-    out = tmp_path / "out"
-    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
-    commands = _commands((out / cp.REINSTALL_SCRIPT_FILE).read_text())
-    assert commands == [
-        f'"$HERE/{cp.UNINSTALL_SCRIPT_FILE}"',
-        f'"$HERE/{cp.INSTALL_SCRIPT_FILE}"',
-    ], commands
 
 
 def test_the_written_uninstall_script_is_executable(tmp_path):

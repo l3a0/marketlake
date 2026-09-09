@@ -28,6 +28,17 @@
 # cancels half of it. So a repeating sleep or shutdown you set elsewhere goes with
 # the 08:25 wake. Step 2 prints the schedule before and after for that reason.
 # Anything in the first print that is not the marketlake wake is yours to re-set.
+# That holds on the reinstall path too: install.sh re-sets the 08:25 wake and
+# nothing else, so it does not put back what step 2 took from you.
+#
+# Reinstalling after a re-render is this script and then the install, in one go:
+#
+#     ./uninstall.sh && ./install.sh
+#
+# The `&&` is load-bearing. If this half cannot finish, the install half must not
+# run, rather than layering a new install over a broken one. A `;` would run it.
+# There is no third script. A reinstall is these two, in that order, and nothing
+# else, so it cannot drift from what an install and an uninstall mean.
 #
 # Four dead-man checks go silent when these jobs stop: capture, pre-open,
 # calendar-probe and sunday. Each pages once its own deadline passes, which for

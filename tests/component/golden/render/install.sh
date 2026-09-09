@@ -19,6 +19,14 @@
 #
 # Step 6, the standing Friday one-shot, is not here. It is not part of the first
 # install. Run it from the install text.
+#
+# To reinstall after a re-render, run the uninstall first and this second:
+#
+#     ./uninstall.sh && ./install.sh
+#
+# The `&&` is load-bearing, not punctuation. An uninstall that cannot finish has
+# to leave this half unrun, rather than layering a new install over a broken one.
+# A `;` would run it anyway. Read uninstall.sh's header before you do.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

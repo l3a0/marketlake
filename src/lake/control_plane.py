@@ -202,10 +202,6 @@ INSTALL_SCRIPT_FILE = "install.sh"
 # nor a re-auth, and it does not expose the token to the next backup.
 UNINSTALL_SCRIPT_FILE = "uninstall.sh"
 
-# Reinstalling is the uninstall followed by the install, with no steps of its own, so
-# a third description of an install cannot fall out of step with the other two.
-REINSTALL_SCRIPT_FILE = "reinstall.sh"
-
 
 # -- the host description and the plists -------------------------------------
 
@@ -1444,7 +1440,7 @@ class RenderedFile:
     """One file the dry-run renderer produces.
 
     ``mode`` is the permission bits to write it with. Everything is 0o644 except the
-    three scripts the operator runs, which are 0o755.
+    two scripts the operator runs, which are 0o755.
     """
 
     name: str
@@ -1458,7 +1454,6 @@ def render_all(host: LaunchdHost) -> tuple[RenderedFile, ...]:
     files.append(RenderedFile(SUDOERS_FILE, sudoers_dropin(host.owner)))
     files.append(RenderedFile(INSTALL_SCRIPT_FILE, install_script(host), mode=0o755))
     files.append(RenderedFile(UNINSTALL_SCRIPT_FILE, uninstall_script(host), mode=0o755))
-    files.append(RenderedFile(REINSTALL_SCRIPT_FILE, reinstall_script(host), mode=0o755))
     return tuple(files)
 
 
@@ -1612,6 +1607,14 @@ def install_script(host: LaunchdHost) -> str:
         "#",
         "# Step 6, the standing Friday one-shot, is not here. It is not part of the first",
         "# install. Run it from the install text.",
+        "#",
+        "# To reinstall after a re-render, run the uninstall first and this second:",
+        "#",
+        f"#     ./{UNINSTALL_SCRIPT_FILE} && ./{INSTALL_SCRIPT_FILE}",
+        "#",
+        "# The `&&` is load-bearing, not punctuation. An uninstall that cannot finish has",
+        "# to leave this half unrun, rather than layering a new install over a broken one.",
+        "# A `;` would run it anyway. Read uninstall.sh's header before you do.",
         "set -euo pipefail",
         "",
         'HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
@@ -1682,6 +1685,17 @@ def uninstall_script(host: LaunchdHost) -> str:
         "# cancels half of it. So a repeating sleep or shutdown you set elsewhere goes with",
         "# the 08:25 wake. Step 2 prints the schedule before and after for that reason.",
         "# Anything in the first print that is not the marketlake wake is yours to re-set.",
+        "# That holds on the reinstall path too: install.sh re-sets the 08:25 wake and",
+        "# nothing else, so it does not put back what step 2 took from you.",
+        "#",
+        "# Reinstalling after a re-render is this script and then the install, in one go:",
+        "#",
+        f"#     ./{UNINSTALL_SCRIPT_FILE} && ./{INSTALL_SCRIPT_FILE}",
+        "#",
+        "# The `&&` is load-bearing. If this half cannot finish, the install half must not",
+        "# run, rather than layering a new install over a broken one. A `;` would run it.",
+        "# There is no third script. A reinstall is these two, in that order, and nothing",
+        "# else, so it cannot drift from what an install and an uninstall mean.",
         "#",
         "# Four dead-man checks go silent when these jobs stop: capture, pre-open,",
         "# calendar-probe and sunday. Each pages once its own deadline passes, which for",
@@ -1742,60 +1756,6 @@ def uninstall_script(host: LaunchdHost) -> str:
     return "\n".join(lines) + "\n"
 
 
-def reinstall_script(host: LaunchdHost) -> str:
-    """Uninstall, then install. It has no steps of its own.
-
-    ``host`` is unused. Everything a reinstall does comes from the two scripts written
-    beside it, so nothing about the machine reaches this text.
-
-    The earlier version replaced the plists in place and left install steps 2, 3 and 4
-    to the operator. It named that as a limit rather than a property, and its header
-    handed over a ``sudo diff`` of the drop-in to run by hand after any re-render. The
-    gap was real and documented, not denied. A wake re-tune is the case that bites: it
-    rewrites the drop-in while leaving every plist byte-identical, so the operator who
-    skips the diff reinstalls nothing that changed and misses the only thing that did.
-
-    Running the two halves end to end closes it rather than documenting it. There is no
-    third description of what an install is, so nothing can fall out of step with one.
-    """
-    lines = [
-        "#!/bin/bash",
-        "# Marketlake control plane: reinstall, which is uninstall then install.",
-        "#",
-        "# Written by `python -m lake.control_plane render`, which never runs it. Run it",
-        "# yourself, as the owner. Both halves call sudo and will prompt.",
-        "#",
-        "# Usage:",
-        "#",
-        f"#     ./{REINSTALL_SCRIPT_FILE}",
-        "#",
-        "# It has no steps of its own. Everything it does comes from the two scripts beside",
-        "# it, so a reinstall cannot drift from what an install and an uninstall mean. In",
-        "# particular it re-runs the sudoers drop-in and the firmware wake, which the",
-        "# earlier in-place plist swap left to a hand-run `sudo diff`.",
-        "#",
-        "# It stops at the first failure. An uninstall that cannot finish leaves the install",
-        "# half unrun rather than layering a new install over a broken one.",
-        "#",
-        "# Read uninstall.sh's header first. Its step 2 cancels the whole repeating power",
-        "# pair, so a repeating sleep or shutdown set outside marketlake is cancelled here",
-        "# and not re-set by the install half.",
-        "#",
-        "# The lake, the config directory and that directory's Time Machine exclusion all",
-        "# survive, because the uninstall half does not touch them.",
-        "set -euo pipefail",
-        "",
-        'HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
-        "",
-        f"echo {shlex.quote('== uninstalling')}",
-        f'"$HERE/{UNINSTALL_SCRIPT_FILE}"',
-        "",
-        f"echo {shlex.quote('== installing')}",
-        f'"$HERE/{INSTALL_SCRIPT_FILE}"',
-    ]
-    return "\n".join(lines) + "\n"
-
-
 def install_commands(out_dir: Path, host: LaunchdHost) -> str:
     """The operator's manual install steps, as text. Nothing here runs from code.
 
@@ -1826,11 +1786,12 @@ def install_commands(out_dir: Path, host: LaunchdHost) -> str:
     lines += [
         "# Re-installing. Steps 1 to 5 are the first install and run once. Step 6 is the",
         "# standing Friday task until slice 3 lands.",
-        f"# By hand is not the recommended path. Run ./{REINSTALL_SCRIPT_FILE} beside this",
-        "# file instead. It is the uninstall followed by the install, so it re-runs every",
-        "# step and cannot skip one that changed.",
-        "# If you do it by hand, the trap is that a re-render can change steps 2, 3 and 4",
-        "# while every plist stays byte-identical. Re-tuning either wake constant rewrites",
+        "# Step by step is not the recommended path. Run the two scripts beside this file",
+        f"#     ./{UNINSTALL_SCRIPT_FILE} && ./{INSTALL_SCRIPT_FILE}",
+        "# which re-runs every step and so cannot skip one that changed. The `&&` is",
+        "# load-bearing: an uninstall that cannot finish must leave the install unrun.",
+        "# If you do it step by step, the trap is that a re-render can change steps 2, 3",
+        "# and 4 while every plist stays byte-identical. Re-tuning either wake rewrites",
         "# the sudoers drop-in and nothing else, so a plist diff shows nothing to do and",
         "# the drop-in keeps granting the old command. Check it directly:",
         f"#     sudo diff /etc/sudoers.d/marketlake {shlex.quote(str(out / SUDOERS_FILE))}",
@@ -1846,9 +1807,10 @@ def install_commands(out_dir: Path, host: LaunchdHost) -> str:
         lines.append(f"# sudo launchctl bootout {LAUNCHD_DOMAIN}/{job.label}")
     lines += [
         f"# Uninstalling. Run ./{UNINSTALL_SCRIPT_FILE} beside this file. It undoes steps",
-        "# 5, 3, 2 and 1 in that order and leaves the lake, the config directory and that",
-        "# directory's Time Machine exclusion. Read its header before running it: its wake",
-        "# cancel takes the whole repeating power pair, not just the marketlake half.",
+        "# 5, 3, 2 and 1, in that order. Read its header before running it. It lists what",
+        "# it leaves, and it warns that the wake cancel takes the whole repeating power",
+        "# pair rather than only the marketlake half. That list lives in one place, so it",
+        "# is not restated here.",
     ]
     return "\n".join(lines) + "\n"
 
@@ -2091,11 +2053,9 @@ __all__ = [
     "default_token_path",
     "expected_one_shot",
     "INSTALL_SCRIPT_FILE",
-    "REINSTALL_SCRIPT_FILE",
     "UNINSTALL_SCRIPT_FILE",
     "install_commands",
     "install_script",
-    "reinstall_script",
     "uninstall_script",
     "launchctl_probe",
     "main",

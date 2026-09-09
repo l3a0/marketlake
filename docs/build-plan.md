@@ -109,7 +109,7 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   `install.sh` and never runs it, and `--out` still refuses a system directory, so the
   root-owned copy remains the operator's own act.
 
-  `render` writes two more scripts beside it, `uninstall.sh` and `reinstall.sh`. The
+  `render` writes one more script beside it, `uninstall.sh`. The
   uninstall runs the install backwards. The install writes the plists (step 1), the
   sudoers drop-in (step 2), the weekday wake (step 3), the Time Machine exclusion
   (step 4), then bootstraps the labels (step 5). The uninstall runs 5, 3, 2, 1. Putting
@@ -144,18 +144,43 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   uninstalled machine that still wakes at 08:25 every weekday is the install's most
   visible residue, and the operator ran an uninstall to be rid of it.
 
-  `reinstall.sh` is the uninstall followed by the install, and it carries no steps of
-  its own. The **in-place plist swap is considered and rejected.** That version
-  overwrote the plists and booted the labels out and back in, and it left install steps
-  2, 3 and 4 to the operator. It named that as a limit rather than a property, and its
-  header handed over a `sudo diff` of the drop-in to run after any re-render. The gap
-  was documented, not denied. What makes documenting it insufficient is the shape of
-  the case that bites. Re-tuning either wake constant rewrites the drop-in while leaving
-  every plist byte-identical, so the operator who checks the plists sees nothing to do
-  and skips the diff that mattered. Composing the two scripts closes the gap instead of
-  describing it, and leaves no third description of an install to fall out of step with
-  the other two. The pasteable `INSTALL.txt` keeps the by-hand procedure for operators
-  who want it, now pointing at `reinstall.sh` first and carrying the `sudo diff` line.
+  Reinstalling after a re-render is those two scripts, in order, and nothing else:
+
+  ```bash
+  ./uninstall.sh && ./install.sh
+  ```
+
+  Both headers carry that line, because `render` writes the scripts to a directory and
+  prints the install text to stdout. The directory is the only surface an operator comes
+  back to. The `&&` is load-bearing rather than punctuation. An uninstall that cannot
+  finish has to leave the install unrun, instead of layering a new install over a broken
+  one, and a `;` would run it anyway.
+
+  Two things are pinned as **considered and rejected** here.
+
+  1. **The in-place plist swap.** An earlier reinstall overwrote the plists, booted the
+     labels out and back in, and left install steps 2, 3 and 4 to the operator. It named
+     that as a limit rather than a property, and its header handed over a `sudo diff` of
+     the drop-in to run after any re-render. The gap was documented, not denied. What
+     makes documenting it insufficient is the shape of the case that bites. Re-tuning
+     either wake constant rewrites the drop-in while leaving every plist byte-identical,
+     so the operator who checks the plists sees nothing to do and skips the diff that
+     mattered. Running both halves closes the gap instead of describing it.
+  2. **A rendered `reinstall.sh`.** Once the swap was cut, the file held six lines that
+     called the other two scripts, and `./uninstall.sh && ./install.sh` is behaviourally
+     identical: same command log, same exit codes, same short-circuit. What decided it
+     was drift, not tidiness. Within one commit of being reduced to a composition, its
+     header restated the uninstall's counted set of three survivals as two and dropped
+     the Sunday one-shot. A file whose stated purpose was to remove a second description
+     of an install had produced one. The three facts that lived only in it moved into the
+     two headers that remain: the composed command, why the separator is `&&`, and that
+     the install half re-sets only the 08:25 wake, so it does not put back the power-off
+     event the uninstall's step 2 took. Re-adding the file is a constant, one `render_all`
+     line and a golden, if a reinstall ever earns a step of its own.
+
+  The pasteable `INSTALL.txt` keeps the step-by-step procedure for operators who want it.
+  It now leads with the composed command and carries the `sudo diff` line, and it points
+  at `uninstall.sh`'s header for what an uninstall leaves rather than restating the list.
 - **D15** query service with the Now and Today panels. The query service is the read-only localhost dashboard.
 
 Slice 2 builds in two waves. D9 comes first and defines the hooks. D12, D14, and D15 do not touch the loop, so they build in parallel with D9. D10, D11, and D13 plug into D9's hooks, so they follow it, in parallel with each other.
