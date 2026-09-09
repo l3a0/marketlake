@@ -1555,6 +1555,27 @@ def read_token_mint(token_path: Path | str) -> datetime:
         raise ValueError("creation_timestamp is not an epoch second") from exc
 
 
+def sunday_canary_due(minted_at: datetime) -> datetime:
+    """The Sunday canary a token minted at ``minted_at`` must be replaced by.
+
+    The re-auth ritual is weekly and its moment is the 20:00 Eastern Sunday canary. A
+    token minted on any other day is due at the coming Sunday's canary, whatever the
+    seven-day expiry says, because the ritual is what replaces it. A token minted on a
+    Sunday has already cleared that Sunday's ritual, at 19:00 as much as at 20:30, so
+    its own deadline is the following week's canary.
+
+    So the answer always lands within seven days and a few hours of the mint, and the
+    Now panel's countdown is the wait until the ritual rather than until the expiry.
+    The panel is the only caller. The canary itself asserts coverage against Friday's
+    option close, which is a stricter and differently shaped question.
+    """
+    eastern = minted_at.astimezone(MARKET_TZ)
+    day = eastern.date()
+    if day.weekday() == _PY_SUNDAY:
+        return SUNDAY_MAINTENANCE.on(day + timedelta(days=7))
+    return SUNDAY_MAINTENANCE.on(day + timedelta(days=_PY_SUNDAY - day.weekday()))
+
+
 @dataclass(frozen=True)
 class RenderedFile:
     """One file the dry-run renderer produces.
@@ -2435,6 +2456,7 @@ __all__ = [
     "self_check",
     "self_check_job",
     "sudoers_dropin",
+    "sunday_canary_due",
     "sunday_job",
     "sunday_maintenance",
     "sunday_run",

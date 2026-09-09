@@ -3,9 +3,10 @@
 This is the single production home for path construction. It covers two locations.
 
 The lake is the first. Give it a ``lake_root`` and it builds every path the lake
-uses: the surface partitions, the journal segments, the two append-only ledgers, and
-the reference tables. The root is an argument, so a test points it at a throwaway
-directory and production points it at the configured ``lake_root``.
+uses: the surface partitions, the journal segments, the daemon's journal metadata
+stamp, the two append-only ledgers, and the reference tables. The root is an argument,
+so a test points it at a throwaway directory and production points it at the configured
+``lake_root``.
 
 The machine's config directory is the second. Four files sit in
 ``~/.config/marketlake/``: the machine-local ``config.yaml``, the rotating
@@ -89,6 +90,12 @@ REFERENCE_DIR = "reference"
 REPORTS_DIR = "reports"
 MANIFEST_FILE = "manifest.jsonl"
 QUARANTINE_FILE = "quarantine.jsonl"
+
+# The daemon's journal metadata stamp, written by ``lake.metadata``. It sits at the
+# journal root rather than inside a ``date=`` directory, because compaction prunes a
+# sealed day's directories once they are empty and a file inside one would keep that
+# shell alive forever.
+JOURNAL_METADATA_FILE = "metadata.json"
 
 # The key prefix on a partition-date directory or filename, as in ``date=2026-01-05``.
 DATE_PREFIX = "date="
@@ -201,6 +208,11 @@ class LakePaths:
     def journal_dir(self) -> Path:
         """The journal root. Compaction sweeps every date present under it."""
         return self.root / JOURNAL_DIR
+
+    @property
+    def journal_metadata_path(self) -> Path:
+        """The journal metadata stamp: the token mint time, the roster, and the last ping."""
+        return self.journal_dir / JOURNAL_METADATA_FILE
 
     def segment_dir(self, surface: str, ticker: str, day: date | str) -> Path:
         """The directory holding one surface, ticker, and day's journal segments.
@@ -374,6 +386,7 @@ __all__ = [
     "CORPORATE_ACTIONS_FILE",
     "DATE_PREFIX",
     "JOURNAL_DIR",
+    "JOURNAL_METADATA_FILE",
     "MANIFEST_FILE",
     "QUARANTINE_FILE",
     "QUOTES",

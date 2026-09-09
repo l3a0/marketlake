@@ -99,11 +99,13 @@ from lake.clock import Clock, SystemClock
 from lake.close_guard import CloseGuard
 from lake.close_guard import GuardOutcome as CloseGuardOutcome
 from lake.config import ConfigError, input_errors_exit, load_config
-from lake.control_plane import AssertionHolder, AssertionRunner
+from lake.control_plane import AssertionHolder, AssertionRunner, read_token_mint
 from lake.deadman import CAPTURE_SLUG, DeadMan
 from lake.gap import GapMarker, MarkingReport, surfaces_for
 from lake.journal import ROW_KIND_DATA
+from lake.metadata import stamp_cycle, stamp_ping
 from lake.runner import Pinger, UrllibPinger
+from lake.schwab import DEFAULT_TOKEN_PATH
 from lake.security_master import SecurityMaster, SecurityMasterError, master_path
 from lake.session import (
     CAPTURE_PHASES,
@@ -344,6 +346,57 @@ def _close_guard(
     return CloseGuard(lake_root=config.lake_root, roster=roster, session_clock=session_clock)
 
 
+def _idle_stamp(
+    config_path: str | Path | None,
+    tickers_path: str | Path | None,
+    token_path: str | Path | None,
+    session_clock: SessionClock,
+) -> Callable[[datetime], None] | None:
+    """The idle minute's journal metadata stamp, or ``None`` when it cannot be built.
+
+    A capture cycle stamps its own mint time off the vendor it fetched with. Off the
+    capture window no cycle runs and no client exists, so the mint comes from the token
+    file instead. That file is what the next cycle builds its client from, so the two
+    agree. The dashboard still never reads it. One timestamp crosses, never a secret.
+
+    Sunday evening is the minute this exists for. The re-auth ritual mints a fresh token
+    on a day that captures nothing, and the design wants the panel showing that mint the
+    same night rather than on Monday.
+
+    A minute the loop captures in is left to the cycle's own stamp, which is the split
+    the idle heartbeat already makes for the same reason. A roster or a token file that
+    will not read costs the minute's stamp and nothing else, so a machine mid-re-auth
+    never takes the daemon down.
+    """
+    try:
+        config = load_config(config_path)
+    except ConfigError:
+        return None
+    token = Path(token_path) if token_path is not None else DEFAULT_TOKEN_PATH
+
+    def stamp(slot: datetime) -> None:
+        if session_clock.in_capture_window():
+            return
+        try:
+            roster = load_tickers(tickers_path)
+            minted = read_token_mint(token)
+        except Exception:  # noqa: BLE001 - the stamp is the least important thing here
+            # Deliberately broad. `load_tickers` parses YAML and reads a file, so a
+            # hand-edited roster raises `yaml.YAMLError` and an unreadable one raises
+            # `OSError`, neither of which is a `TickersError`. No hook is wrapped in a
+            # try, so anything escaping here exits the process, and KeepAlive relaunches
+            # straight into the same tick. A typo in tickers.yaml would crash-loop the
+            # daemon. The stamp is informational, so losing a minute of it is the
+            # correct price and the docstring above promises exactly that.
+            return
+        try:
+            stamp_cycle(config.lake_root, at=slot, token_minted_at=minted, roster=roster)
+        except OSError:
+            return
+
+    return stamp
+
+
 def _alarm(
     config_path: str | Path | None,
     tickers_path: str | Path | None,
@@ -371,10 +424,13 @@ def _alarm(
         # The values that must never reach a phone, checked against the page itself.
         secrets=(config.healthchecks_ping_key.reveal(), config.ntfy_topic.reveal()),
     )
+    lake_root = config.lake_root
     deadman = DeadMan(
         pinger=pinger,
         url=config.healthchecks_url(CAPTURE_SLUG),
         session_clock=session_clock,
+        # The panel's dead-man line reads the lake, so a landed ping is written there.
+        recorder=lambda at: stamp_ping(lake_root, at=at),
     )
     return Watchdog(page_minutes=config.guards.watchdog_page_minutes), publisher, deadman, roster
 
@@ -419,6 +475,11 @@ def run_loop_from_config(
     opens and again for each new day the daemon lives through. Any hook the caller
     passed still runs.
 
+    The journal metadata stamp rides ``on_tick`` as well, for the minutes off the
+    capture window. On a capture minute the cycle stamps itself, off it there is no
+    vendor to ask, and the two together are what keep the Now panel's token age and
+    ticker list current on every day the daemon is awake.
+
     Gap marking rides ``on_start`` and ``on_skipped`` the same way. Both hand their
     missed slots to one ``GapMarker``, so a restart and a live overrun leave the same
     kind of record. Marking needs the lake root, the roster, and the security master,
@@ -441,6 +502,19 @@ def run_loop_from_config(
         caller_on_tick(slot)
 
     hooks = replace(hooks, on_tick=on_tick)
+
+    # The idle stamp rides ``on_tick`` too, and it skips the capture window because the
+    # cycle stamps there off its own vendor. So the panel's token line stays current on
+    # a Sunday evening, when the ritual mints a token and no cycle runs to carry it.
+    stamper = _idle_stamp(config_path, tickers_path, token_path, session_clock)
+    if stamper is not None:
+        stamp_on_tick = hooks.on_tick
+
+        def on_tick_stamped(slot: datetime) -> None:
+            stamper(slot)
+            stamp_on_tick(slot)
+
+        hooks = replace(hooks, on_tick=on_tick_stamped)
 
     marker = _gap_marker(config_path, tickers_path, session_clock)
     if marker is not None:
