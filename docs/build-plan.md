@@ -182,16 +182,37 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   code. Two of the five jobs can go stale, and the reason is the shape of the job rather
   than anything about the code. The daemon and the dashboard are resident: launchd starts
   each once and `KeepAlive` relaunches it if it exits, so each holds the Python it
-  imported at start. Editing the working tree does not reach a process already running.
-  The self-check, the calendar probe and the Sunday job exec fresh on every fire, so they
-  always run current code. The script derives that pair from `keep_alive` rather than
-  listing it.
+  imported at start. The venv is an editable install whose path entry is the absolute
+  `src` directory, so editing that tree changes what a *new* process imports and nothing
+  about one already running. The self-check, the calendar probe and the Sunday job exec
+  fresh on every fire, so they always run current code. The script derives that pair from
+  `keep_alive` rather than listing it.
 
-  `launchctl kickstart -k` restarts the process under the definition launchd already
-  holds. That is right when the code changed and the plist did not, and wrong after a
-  re-render that changed a plist, because the old definition is what gets restarted. The
-  install text already warned about the second case. This is the first case, which had no
-  tool at all until now.
+  `launchctl kickstart -k` runs the service immediately whatever its launch conditions
+  say, killing the running instance first if there is one. That is right when the code
+  changed and the plist did not, and wrong after a re-render that changed a plist, because
+  the old definition is what gets run. The install text already covered the second case.
+
+  The first case was not untooled. `./uninstall.sh && ./install.sh` boots every label out
+  and back in, so it does restart both residents. It is the wrong shape for the job: it
+  takes the whole control plane off the machine and puts it back, cancelling the firmware
+  wake and re-validating the sudoers drop-in on the way, to achieve a process restart.
+
+  Two launchd states read the same through a pid and must not be confused. `launchctl
+  print` exits 0 for any label in the domain and 113 for one that is not, while the `pid`
+  line appears only while a process is actually running. A label loaded but between
+  processes therefore prints no pid, exactly like one never installed. Telling the
+  operator to run the install there would be wrong twice over: the diagnosis is false, and
+  `install.sh` bootstraps every label under `set -e`, which fails on a label already in
+  the domain. So loadedness comes from the exit code and running-ness from the pid line,
+  asked separately. That state is not exotic. It is where a resident crash-looping on bad
+  code sits, which is the case a restart tool most needs to handle.
+
+  A new pid is not yet a working service either. A resident that dies on import gets a
+  fresh pid within seconds, so "the pid changed" is satisfied by precisely the failure a
+  restart after a code change is most likely to cause. The script waits and requires the
+  new pid to still be there, and points at the job's error log when it is not. Reporting
+  success on a crash-looping job would make the read-back worse than no read-back.
 
   Two things are pinned as **considered and rejected** for the restart.
 
