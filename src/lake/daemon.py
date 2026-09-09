@@ -506,17 +506,23 @@ def run_loop_from_config(
         def on_skipped(slots: list[datetime]) -> None:
             # The roster is re-read here rather than closed over. The cycle runner
             # re-reads it every cycle, and the design has the watchdog counters read
-            # that same snapshot, so a ticker retired mid-session must stop being
-            # charged without a restart. A roster that will not load leaves the last
-            # good one in place, since refusing to count is worse than counting a
-            # ticker one cycle too long.
+            # that same snapshot, so a ticker onboarded mid-session must start being
+            # charged and one retired mid-session must stop, both without a restart.
+            # Each successful read replaces what the fallback holds, so a roster that
+            # will not load leaves the last good one in place rather than the one the
+            # daemon started with. Refusing to count is worse than counting a ticker
+            # one cycle too long. The price is a roster that outlives the file: while
+            # the file cannot be read, charging is frozen at the last successful read,
+            # so a ticker retired then is charged one cycle too long and one re-added
+            # then is not charged until a read succeeds.
+            nonlocal roster
             try:
-                current = load_tickers(tickers_path)
+                roster = load_tickers(tickers_path)
             except TickersError:
-                current = roster
+                pass
             watched = [
                 Surface(surface, entry.ticker)
-                for entry in current
+                for entry in roster
                 for surface in surfaces_for(entry)
             ]
             raise_pages(watchdog.missed(watched, slots), slots[-1])

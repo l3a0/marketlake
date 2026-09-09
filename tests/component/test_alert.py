@@ -213,6 +213,87 @@ def test_the_daemon_pages_through_the_publisher_when_a_surface_goes_quiet(tmp_pa
     assert records[0]["event"] == "capture_down"
 
 
+def test_a_ticker_onboarded_mid_session_keeps_charging_when_the_roster_stops_loading(
+    tmp_path,
+):
+    """The fallback roster is the last one that loaded, not the startup one.
+
+    The watchdog's skipped-slot hook re-reads ``tickers.yaml`` because the design has
+    the counters read the same snapshot the cycle runner does. A ticker onboarded
+    mid-session therefore starts being charged with no restart. The re-read can fail,
+    since ``tickers.yaml`` is rewritten in place and a reader can catch it half
+    written, so the hook falls back rather than refusing to count. Falling back to the
+    startup roster would drop every ticker onboarded since, and the one most likely to
+    be quiet is the one that just arrived.
+    """
+    from lake import daemon
+    from lake.capture import CycleResult
+    from tests.support.calendar import et, weekday_sessions
+    from tests.support.clock import ManualClock
+    from tests.support.config import write_config
+    from tests.support.pinger import FakePinger
+
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("XYZ: {options: false}\nABC: {options: false}\n")
+
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    cycles = [0]
+
+    def overrunning_cycle(*, close_tag, session_phase):
+        """Two cycles that each outlive their minute, so two runs of slots are missed.
+
+        The loop realigns to the next minute top, so a cycle longer than a minute is
+        how a live daemon sleeps through a capture slot. Each run here misses two.
+        """
+        slot = clock.now().replace(second=0, microsecond=0)
+        cycles[0] += 1
+        if cycles[0] == 1:
+            # DEF is onboarded between the two runs, the way the command writes it.
+            tickers.write_text(
+                "XYZ: {options: false}\nABC: {options: false}\nDEF: {options: false}\n"
+            )
+            clock.advance(140)
+        elif cycles[0] == 2:
+            # A top-level scalar is one shape a roster caught half written takes.
+            tickers.write_text("XYZ")
+            clock.advance(140)
+        return CycleResult(snap_ts=slot, segments=())
+
+    transport = Recording()
+    ticks = [0]
+
+    def four() -> bool:
+        ticks[0] += 1
+        return ticks[0] <= 4
+
+    daemon.run_loop_from_config(
+        config_path=str(config),
+        tickers_path=str(tickers),
+        token_path=str(tmp_path / "token.json"),
+        clock=clock,
+        calendar=weekday_sessions(date(2026, 8, 31)),
+        assertion_runner=lambda args: None,
+        transport=transport,
+        pinger=FakePinger(),
+        cycle_runner=overrunning_cycle,
+        should_continue=four,
+    )
+
+    # Two runs of two missed slots take every counter past the three-minute page
+    # threshold. No cycle produced a segment, so nothing but those minutes charged a
+    # counter. DEF stood at two when the file went bad. It pages only if the fallback
+    # carried it.
+    assert sorted(page.title for page in transport.sent) == [
+        "Capture down: ABC quotes",
+        "Capture down: DEF quotes",
+        "Capture down: XYZ quotes",
+    ]
+    assert {page.body for page in transport.sent} == {"3 session minutes without a durable cycle"}
+
+
 def test_every_page_of_one_burst_is_written_down(tmp_path):
     """One cycle raises several pages at one instant.
 
