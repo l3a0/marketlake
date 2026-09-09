@@ -51,6 +51,7 @@ EXPECTED_FILES = {
     cp.SUDOERS_FILE,
     cp.INSTALL_SCRIPT_FILE,
     cp.UNINSTALL_SCRIPT_FILE,
+    cp.RESTART_SCRIPT_FILE,
 }
 
 
@@ -1043,6 +1044,294 @@ def test_render_writes_no_reinstall_script(tmp_path):
     assert not [path for path in out.iterdir() if "reinstall" in path.name], list(out.iterdir())
     assert not hasattr(cp, "reinstall_script")
     assert not hasattr(cp, "REINSTALL_SCRIPT_FILE")
+
+
+# -- the restart script --------------------------------------------------------
+
+# launchd has three states this must reproduce, not two. A label absent from the
+# domain exits 113. A label present but with no process exits 0 and prints no pid
+# line. A running label exits 0 with one pid line. Relaunch is asynchronous, so a
+# kickstart clears the pid and a later poll brings it back.
+_FAKE_LAUNCHCTL_STATES = """#!/bin/bash
+printf 'launchctl %s\\n' "$*" >> "$LOG"
+label_of() { printf '%s' "${1##*/}"; }
+
+case "$1" in
+  print)
+    label="$(label_of "$2")"
+    if [[ ! -e "$STATE/$label.loaded" ]]; then exit 113; fi
+    printf 'system/%s = {\\n' "$label"
+    if [[ -e "$STATE/$label.pid" ]]; then st=running; else st='not running'; fi
+    printf '\\tstate = %s\\n' "$st"
+    if [[ -e "$STATE/$label.pending" ]]; then
+      n="$(cat "$STATE/$label.pending")"
+      if [[ "$n" -le 0 ]]; then
+        /bin/rm -f "$STATE/$label.pending"
+        printf '%s' "$(( $(cat "$STATE/$label.base") + 1 ))" > "$STATE/$label.pid"
+      else
+        printf '%s' "$(( n - 1 ))" > "$STATE/$label.pending"
+      fi
+    elif [[ "$MODE" == "crash_loop" && -e "$STATE/$label.pid" ]]; then
+      printf '%s' "$(( $(cat "$STATE/$label.pid") + 1 ))" > "$STATE/$label.pid"
+    fi
+    if [[ -e "$STATE/$label.pid" ]]; then
+      printf '\\tpid = %s\\n' "$(cat "$STATE/$label.pid")"
+    fi
+    printf '}\\n'
+    exit 0 ;;
+  kickstart)
+    label="$(label_of "$3")"
+    if [[ "$KICKSTART_RC" != "0" ]]; then exit "$KICKSTART_RC"; fi
+    case "$MODE" in
+      no_change) ;;
+      never) /bin/rm -f "$STATE/$label.pid" ;;
+      *)
+        if [[ -e "$STATE/$label.pid" ]]; then cp "$STATE/$label.pid" "$STATE/$label.base"; fi
+        /bin/rm -f "$STATE/$label.pid"
+        printf '%s' "$DELAY" > "$STATE/$label.pending" ;;
+    esac
+    exit 0 ;;
+esac
+exit 0
+"""
+
+_FAKE_GIT = """#!/bin/bash
+printf 'git %s\\n' "$*" >> "$LOG"
+case "$*" in
+  *rev-parse*--git-dir*)      [[ "$IS_REPO" == "1" ]] && exit 0 || exit 128 ;;
+  *rev-parse*--abbrev-ref*)   echo "$BRANCH"; exit 0 ;;
+  *status*--porcelain*)       [[ "$DIRTY" == "1" ]] && echo " M src/lake/x.py"; exit 0 ;;
+esac
+exit 0
+"""
+
+
+def _run_restart(
+    tmp_path: Path,
+    *,
+    argv=(),
+    running=("daemon", "dashboard"),
+    loaded=None,
+    mode="restart",
+    delay=0,
+    kickstart_rc=0,
+    branch="main",
+    dirty=False,
+    is_repo=True,
+):
+    """Render, then run restart.sh against fakes. Returns (proc, log lines).
+
+    ``loaded`` is every label in the domain and defaults to ``running``. A label in
+    ``loaded`` but not ``running`` is the state real launchd reports as present with no
+    pid, which is the one the first harness could not express.
+
+    ``mode`` picks what the kickstart does: ``restart`` brings a new pid back after
+    ``delay`` polls, ``no_change`` leaves the pid alone, ``never`` never brings one back,
+    and ``crash_loop`` returns a fresh pid on every poll.
+    """
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    log = tmp_path / "log"
+    log.write_text("")
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    for name in running if loaded is None else loaded:
+        (state / f"com.marketlake.{name}.loaded").write_text("")
+    for i, name in enumerate(running):
+        (state / f"com.marketlake.{name}.pid").write_text(str(1000 + i))
+        (state / f"com.marketlake.{name}.base").write_text(str(1000 + i))
+    (bin_dir / "sudo").write_text(_FAKE_SUDO)
+    (bin_dir / "sudo").chmod(0o755)
+    (bin_dir / "launchctl").write_text(_FAKE_LAUNCHCTL_STATES)
+    (bin_dir / "launchctl").chmod(0o755)
+    (bin_dir / "git").write_text(_FAKE_GIT)
+    (bin_dir / "git").chmod(0o755)
+    # rm and pmset are faked so the "never boots a label out" exclusions are live rather
+    # than unfalsifiable. Nothing in the script should reach them.
+    for name in ("rm", "pmset", "tmutil"):
+        (bin_dir / name).write_text(_FAKE.format(body="exit 0"))
+        (bin_dir / name).chmod(0o755)
+    # sleep is faked so the settle wait and the retry loop cost no wall clock.
+    (bin_dir / "sleep").write_text("#!/bin/bash\nexit 0\n")
+    (bin_dir / "sleep").chmod(0o755)
+    proc = subprocess.run(
+        [str(out / cp.RESTART_SCRIPT_FILE), *argv],
+        env={
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "LOG": str(log),
+            "STATE": str(state),
+            "MODE": mode,
+            "DELAY": str(delay),
+            "KICKSTART_RC": str(kickstart_rc),
+            "BRANCH": branch,
+            "DIRTY": "1" if dirty else "0",
+            "IS_REPO": "1" if is_repo else "0",
+        },
+        capture_output=True,
+        text=True,
+    )
+    return proc, [line for line in log.read_text().splitlines() if line]
+
+
+def test_the_restart_offers_exactly_the_jobs_that_can_go_stale(tmp_path):
+    """Derived from ``keep_alive``, because that is what makes a job able to go stale.
+
+    A resident job holds the Python it imported at start. The three calendar jobs exec
+    fresh on every fire, so restarting one would be meaningless. Listing the two by hand
+    would let a sixth resident job be added without this script learning about it.
+    """
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    script = (out / cp.RESTART_SCRIPT_FILE).read_text()
+    resident = [job.label for job in cp.all_jobs(_host()) if job.keep_alive]
+    transient = [job.label for job in cp.all_jobs(_host()) if not job.keep_alive]
+    assert len(resident) == 2 and len(transient) == 3, (resident, transient)
+    for label in resident:
+        assert f"LABELS=({label})" in script, label
+    for label in transient:
+        assert label not in script, label
+
+
+def test_the_restart_defaults_to_the_dashboard(tmp_path):
+    """Restarting the daemon costs the in-flight cycle, so it has to be asked for.
+
+    The dashboard only drops open connections. A bare ``./restart.sh`` must not be the
+    command that takes capture down.
+    """
+    proc, log = _run_restart(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    # The fake sudo execs what it is given, so each kickstart logs twice. Counting the
+    # sudo-prefixed line alone also pins that the restart runs as root.
+    kicks = [line for line in log if line.startswith("sudo launchctl kickstart")]
+    assert len(kicks) == 1, log
+    assert cp.DASHBOARD_LABEL in kicks[0], kicks[0]
+    assert cp.DAEMON_LABEL not in kicks[0], kicks[0]
+
+
+def test_the_restart_proves_the_process_changed(tmp_path):
+    """A kickstart that silently did nothing is the failure this script exists to catch."""
+    proc, _ = _run_restart(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "restarted: pid 1001 -> 1002" in proc.stdout, proc.stdout
+
+
+def test_a_kickstart_that_leaves_the_pid_alone_fails(tmp_path):
+    """Same pid means the process never came down, so reporting success would be a lie."""
+    proc, log = _run_restart(tmp_path, mode="no_change")
+    assert proc.returncode != 0
+    assert "did not restart" in proc.stderr, proc.stderr
+
+
+def test_an_unknown_job_name_is_refused_before_anything_runs(tmp_path):
+    """A typo must not silently restart the default."""
+    proc, log = _run_restart(tmp_path, argv=("dashbaord",))
+    assert proc.returncode == 2, proc.stdout
+    assert "usage:" in proc.stderr, proc.stderr
+    assert not [line for line in log if "kickstart" in line], log
+
+
+def test_the_restart_warns_when_the_tree_is_not_what_will_ship(tmp_path):
+    """The services import from the working tree, so a restart adopts whatever is there.
+
+    This is the hazard that motivated the script. A restart taken while the checkout sits
+    on a feature branch silently promotes that branch into the running service.
+    """
+    on_branch, _ = _run_restart(tmp_path, branch="claude/some-work")
+    assert "not on main" in on_branch.stdout, on_branch.stdout
+    dirty, _ = _run_restart(tmp_path, dirty=True)
+    assert "uncommitted changes" in dirty.stdout, dirty.stdout
+    clean, _ = _run_restart(tmp_path)
+    assert "not on main" not in clean.stdout and "uncommitted" not in clean.stdout, clean.stdout
+
+
+def test_the_restart_survives_a_project_dir_that_is_not_a_checkout(tmp_path):
+    """The design never promises the project directory is a git repo, so this cannot die."""
+    proc, _ = _run_restart(tmp_path, is_repo=False)
+    assert proc.returncode == 0, proc.stderr
+    assert "not a git checkout" in proc.stdout, proc.stdout
+
+
+def test_the_restart_never_boots_a_label_out(tmp_path):
+    """The bootout-and-bootstrap restart is considered and rejected. It stays cut.
+
+    It would also pick up a changed plist, which makes it look like the general tool. It
+    is the more dangerous one: a failure between the bootout and the bootstrap leaves the
+    service down, where a kickstart cannot, because launchd holds the definition
+    throughout. A changed plist is the install's job.
+    """
+    proc, log = _run_restart(tmp_path, argv=("all",))
+    assert proc.returncode == 0, proc.stderr
+    kicks = [line for line in log if line.startswith("sudo launchctl kickstart")]
+    assert len(kicks) == 2, log
+    for word in ("bootout", "bootstrap", "rm ", "pmset"):
+        assert not [line for line in log if word in line], (word, log)
+    script = (tmp_path / "out" / cp.RESTART_SCRIPT_FILE).read_text()
+    assert "bootout" not in script and "bootstrap" not in script
+
+
+def test_a_loaded_job_between_processes_is_started_not_refused(tmp_path):
+    """The state real launchd reports as present with no pid, which is not "not loaded".
+
+    ``launchctl print`` exits 0 for any label in the domain and 113 for one that is not,
+    while the pid line appears only while a process runs. A resident crash-looping on bad
+    code sits in the first state. Refusing there would be wrong twice: the diagnosis is
+    false, and the remedy it offers, the install, bootstraps labels already in the domain
+    and fails under ``set -e``. ``kickstart`` runs a service whatever its launch
+    conditions say, so it is exactly the right thing to do here.
+    """
+    proc, log = _run_restart(tmp_path, running=("daemon",), loaded=("daemon", "dashboard"))
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "loaded but not running, so this starts it" in proc.stdout, proc.stdout
+    assert [line for line in log if line.startswith("sudo launchctl kickstart")], log
+
+
+def test_a_label_absent_from_the_domain_is_refused(tmp_path):
+    """Not installed is the other empty-pid reading, and this one really is fatal."""
+    proc, log = _run_restart(tmp_path, running=("daemon",), loaded=("daemon",))
+    assert proc.returncode != 0
+    assert "is not in the system domain" in proc.stderr, proc.stderr
+    assert not [line for line in log if "kickstart" in line], log
+
+
+def test_a_job_that_will_not_stay_up_is_reported_as_a_failure(tmp_path):
+    """A new pid is not a working service, which is the failure a restart most often causes.
+
+    A resident that dies on import gets a fresh pid within seconds, so "the pid changed"
+    is satisfied by exactly the case an operator most needs told about. The new pid has to
+    still be there after the settle wait.
+    """
+    proc, _ = _run_restart(tmp_path, mode="crash_loop")
+    assert proc.returncode != 0
+    assert "will not stay up" in proc.stderr, proc.stderr
+    assert "crash-looping on the new code" in proc.stderr, proc.stderr
+    assert ".err.log" in proc.stderr, proc.stderr
+
+
+def test_a_job_that_never_comes_back_is_reported_as_a_failure(tmp_path):
+    """The other half of the read-back: a kickstart that killed it and got nothing back."""
+    proc, _ = _run_restart(tmp_path, mode="never")
+    assert proc.returncode != 0
+    assert "has no pid after the restart" in proc.stderr, proc.stderr
+    assert ".err.log" in proc.stderr, proc.stderr
+
+
+def test_the_restart_waits_for_a_relaunch_that_is_not_instant(tmp_path):
+    """KeepAlive relaunches within seconds, so reading the pid once would race it.
+
+    The first harness bumped the pid inside the kickstart call, so the retry loop was
+    never exercised and could be deleted with every test still green.
+    """
+    proc, _ = _run_restart(tmp_path, delay=3)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "restarted: pid 1001 -> 1002" in proc.stdout, proc.stdout
+
+
+def test_the_written_restart_script_is_executable(tmp_path):
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    assert (out / cp.RESTART_SCRIPT_FILE).stat().st_mode & 0o777 == 0o755
 
 
 # -- the uninstall script ------------------------------------------------------

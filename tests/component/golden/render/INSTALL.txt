@@ -56,6 +56,11 @@ cd /Users/someone/marketlake && /opt/py/bin/python -m lake.control_plane pmset
 # sudo launchctl bootout system/com.marketlake.self-check
 # sudo launchctl bootout system/com.marketlake.calendar-probe
 # sudo launchctl bootout system/com.marketlake.sunday
+# Restarting. New code does not reach a running job. The daemon and the
+# dashboard are resident, so each holds the Python it imported at start. After
+# pulling code with no plist change, run ./restart.sh beside this file.
+# The other three jobs exec fresh every fire and never need it. A re-render that
+# changed a plist is the other case, and it needs the reinstall above.
 # Uninstalling. Run ./uninstall.sh beside this file. It undoes steps
 # 5, 3, 2 and 1, in that order. Read its header before running it. It lists what
 # it leaves, and it warns that the wake cancel takes the whole repeating power
