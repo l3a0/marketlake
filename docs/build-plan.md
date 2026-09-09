@@ -110,11 +110,16 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   log file is a worse home than a page or a panel, and that is a separate question from this
   entry.
 - **D12** compaction and backup, plus the nightly window re-tune. Compaction merges a day's segments into one sealed partition. The re-tune runs after it. The job groups the day's rows by `window_start` and `window_end`, compares each window's contract count to the body limit, and rewrites `chain_plan.json` when the profile drifts.
-- **Unowned.** The backup's exclusion list. The design's *Backup, defined* names the sync
-  root as `lake/` only, "with an explicit exclusion list". Nothing in `compact` carries
-  one. The token file is out of the sync root today by construction rather than by
-  exclusion, so the rule holds by accident and would stop holding the first time the sync
-  root widens.
+- **D12's exclusion list.** The design's *Backup, defined* names the sync root as `lake/`
+  only, "with an explicit exclusion list". `runner.BACKUP_EXCLUSIONS` is now that list,
+  and it holds two entries. `*.tmp-*` is the temp file an atomic write leaves behind,
+  which carries no manifest entry and would plant an orphan for the backup-copy scrub
+  above. `.config/marketlake/` is the directory holding the token and `config.yaml`'s four
+  secrets. That directory is outside the sync root today, so the pattern matches nothing
+  and costs nothing. It exists so the rule holds by exclusion rather than by luck, and
+  keeps holding the first time the sync root widens. Both are derived from constants in
+  `paths`, because `compact` spelled the temp name twice before and a second spelling
+  would put a temp file outside the exclusion with nothing to say so.
 - **D13** watchdog and alerting. One counter per ticker and surface. A durable data cycle resets it, a gap row does not, and three consecutive session minutes page once. Counters start at zero on every restart, never rebuilt from the journal, so a restart never pages for the downtime that preceded it. It observes both D9's cycle-outcome hook and its skipped-slot hook, because the loop runs no cycle for a slot it slept through and those are the minutes the daemon was worst off. Three collapses keep a page storm from replacing a diagnosis:
   1. Every quotes ticker rides one batched request, so all of them failing together is one page naming the sampler.
   2. A cycle where every surface failed with the same known class pages that cause instead. A dead refresh token gaps chains and quotes for every ticker at once, and the design expects one every seven days.
@@ -285,20 +290,25 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   The pasteable `INSTALL.txt` keeps the step-by-step procedure for operators who want it.
   It now leads with the composed command and carries the `sudo diff` line, and it points
   at `uninstall.sh`'s header for what an uninstall leaves rather than restating the list.
-- **Unowned.** The Sunday re-auth reminder's delivery. `sunday_run` takes a
-  `reminder_sink` and only fires it when one is passed. The `python -m lake.control_plane
-  sunday` entry that the launchd job runs passes none, so the reminder is printed to the
-  job's log file and never pushed. That is the same shape as D11's missing fill: the seam
-  is built and the producer is not. It carries no blame for the September 2026 expiry,
-  because the Sunday job was not installed until three days after it, but it is what would
-  have to work for the next one to be announced.
-- **Unowned.** The Sunday canary's producer. `sunday_run` takes an injected `canary`, the
-  throwaway authenticated call that proves capture still works over a weekend, and the
-  `sunday` CLI passes none. The fallback is `_canary_pass_through`, which returns `True`
-  without calling anything. So the canary passes every Sunday whatever the token's state.
-  This is the third seam in slice 2 built and never supplied, after D11's fill and the
-  reminder above, and it is the costliest of the three. The other two fail to act. This one
-  reports success.
+
+  The Sunday job's two outward seams are supplied, so the `sunday` command line no longer
+  falls back on a canary that passes without calling anything or a reminder that reaches
+  a log file and never a phone. `token_canary` is the throwaway authenticated call. It
+  rebuilds the vendor from `token.json` inside every attempt and quotes one symbol, which
+  is what lets the 21:00 retry see a re-login done at 20:40. Any failure answers `False`,
+  because a call that did not come back has proved nothing, and the half-hour retry to
+  23:00 is what absorbs a transient outage rather than paging on it. The seam keeps no
+  default at all now. `sunday_maintenance` and `sunday_run` require a canary, so no later
+  caller can leave one out and be told the weekend passed.
+
+  `reminder_publisher` is the re-auth reminder's delivery. It pushes through the alert
+  publisher, so an unreachable ntfy costs a log line and a dated file under `reports/`
+  instead of taking the scrub, the alarm read-back and the check's own ping with it.
+
+  One alert rule moved with them. Only a page carries the `rotating_light` tag now,
+  because the design gives the emoji to a page alone and the reminder is the first
+  message at the reminder tier to go through the transport. The tag follows the priority
+  rather than becoming a second field a producer could set wrong.
 - **D15** query service with the Now and Today panels. The query service is the read-only localhost dashboard.
 - **D15's writers.** The Now panel reads five fields no captured row can carry: the token's mint stamp, its age, the countdown to the Sunday ritual, the last dead-man ping, and the count of pages that failed to send. Every one of them is now filled from under `lake_root`, because the dashboard never opens `~/.config`. `lake.metadata` owns the stamp at `journal/metadata.json`, which sits inside the reverse scrub's journal exclusion and outside the date directories compaction prunes. Three writers fill it:
   1. The capture cycle stamps the token's mint time, off the vendor it fetched with, and the cycle's roster as the surfaces each ticker is captured on. That roster stamp is what lets the panel show a ticker that journaled nothing as failing rather than dropping it.

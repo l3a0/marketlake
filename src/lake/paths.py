@@ -45,6 +45,12 @@ ticker has bars at several frequencies on the same day. ``actions`` is a single
 all-ticker file. Each gets its own method, so a caller cannot build a wrong path by
 passing its surface name to the generic partition method.
 
+One more path shape lives here, the temp file an atomic write uses. It is not a lake
+location, so it takes its target as an argument rather than hanging off ``LakePaths``.
+It sits here because it has the same one-spelling rule as the config directory. The
+backup's exclusion list names the temp marker, so a second spelling of it would put a
+temp file inside the backup with nothing to say so.
+
 This is also the single production home for reading those paths back apart. A journal
 segment path and a ``date=YYYY-MM-DD`` directory name are both parsed by more than one
 module. A second reader that re-implements the split can drift from the builder that
@@ -99,6 +105,17 @@ SURFACE_PREFIX = "surface="
 
 # The key prefix on a ticker directory, as in ``ticker=SPY``.
 TICKER_PREFIX = "ticker="
+
+# The marker an atomic write hangs on its target while the write is in flight. An
+# atomic write puts the bytes in a temp file beside the target, flushes, then renames
+# over the target in one step. So a crash leaves the temp rather than a torn target.
+# The writer's pid follows the marker, which keeps two writers from sharing one temp.
+#
+# The spelling lives here for the same reason the config directory does. A temp file is
+# working state, never durable data, so the backup's exclusion list names it. A second
+# spelling of the marker would put a temp file outside that exclusion with nothing to
+# say so.
+TEMP_MARKER = ".tmp-"
 
 # The first part of a journal segment's filename. A writer-session start stamp and the
 # writer's pid follow it.
@@ -253,6 +270,20 @@ class LakePaths:
         return self.reference_path(CONTRACTS)
 
 
+# -- the temp file an atomic write uses --------------------------------------
+
+
+def temp_write_path(target: Path | str, pid: int) -> Path:
+    """The temp file an atomic write to ``target`` writes into first.
+
+    It sits beside the target, so the rename that finishes the write stays on one
+    filesystem. ``pid`` is the writing process's id. Two writers therefore never share
+    a temp file, and a leftover names the process that died holding it.
+    """
+    target = Path(target)
+    return target.with_name(f"{target.name}{TEMP_MARKER}{pid}")
+
+
 # -- reading a path back apart -----------------------------------------------
 
 # ``parse_segment_rel`` is the inverse of ``LakePaths.segment_path``. That method builds
@@ -328,6 +359,11 @@ TOKEN_FILE = "token.json"
 TICKERS_FILE = "tickers.yaml"
 CHAIN_PLAN_FILE = "chain_plan.json"
 
+# The config directory's location under a home, split into its parts. The one spelling
+# of the directory, which ``config_dir`` joins onto a home and the backup's exclusion
+# list joins with "/" into an rsync pattern.
+CONFIG_DIR_PARTS = (".config", "marketlake")
+
 
 def config_dir(home: str | Path | None = None) -> Path:
     """The config directory, resolved under ``home`` or the current user's home.
@@ -336,7 +372,7 @@ def config_dir(home: str | Path | None = None) -> Path:
     passes one, because it builds a plist for another account.
     """
     base = Path(home) if home is not None else Path.home()
-    return base / ".config" / "marketlake"
+    return base.joinpath(*CONFIG_DIR_PARTS)
 
 
 __all__ = [
@@ -344,6 +380,7 @@ __all__ = [
     "BARS",
     "CHAINS",
     "CHAIN_PLAN_FILE",
+    "CONFIG_DIR_PARTS",
     "CONFIG_FILE",
     "CONTRACTS",
     "CORPORATE_ACTIONS_FILE",
@@ -361,6 +398,7 @@ __all__ = [
     "SEGMENT_SUFFIX",
     "SURFACES",
     "SURFACE_PREFIX",
+    "TEMP_MARKER",
     "TICKERS_FILE",
     "TICKER_PREFIX",
     "TOKEN_FILE",
@@ -369,4 +407,5 @@ __all__ = [
     "config_dir",
     "parse_date_dir",
     "parse_segment_rel",
+    "temp_write_path",
 ]
