@@ -29,7 +29,9 @@ Terms, glossed at first use.
   neither must a cycle whose backup failed.
 - *rsync* is the standard file-copy tool. The backup step copies ``lake/`` to an
   external SSD so even slice 1 never leaves the un-buy-backable capture in one place.
-  It runs before the ping, so the ping attests it.
+  It runs before the ping, so the ping attests it. It copies the lake root minus an
+  explicit exclusion list, ``BACKUP_EXCLUSIONS``, whose entries are justified one by
+  one where the list is defined.
 
 Two external actions sit behind injected seams, so the whole test suite runs offline
 with no network and no subprocess.
@@ -37,7 +39,9 @@ with no network and no subprocess.
 1. The *pinger* performs the health-check GET. The real one uses ``urllib``. A test
    injects a fake that records the URL.
 2. The *backup runner* copies the lake to the SSD. The real one shells out to
-   ``rsync`` after asserting the backup target is mounted. A test injects a fake.
+   ``rsync`` after asserting the backup target is mounted. A test injects a fake. The
+   real one holds a seam of its own for the command it runs, so a test can read the
+   ``rsync`` argument list, exclusions included, without a copy ever happening.
 
 The launchd schedule is a wall-clock time by necessity, because ``StartCalendarInterval``
 cannot express a session-relative time. The generator takes the hour and minute as
@@ -60,6 +64,7 @@ from typing import Protocol, runtime_checkable
 from lake.capture import CycleResult, run_cycle_from_config
 from lake.config import input_errors_exit, load_config
 from lake.journal import ROW_KIND_DATA
+from lake.paths import CONFIG_DIR_PARTS, TEMP_MARKER
 
 # The health-check slug the slice-1 runner pings. It is its own check, deliberately
 # separate from the steady-state six, because it retires with this launchd entry when
@@ -94,6 +99,49 @@ _MINUTES_PER_DAY = 24 * 60
 # Only the exception's type is ever reported. The URL carries the ping key, and the
 # design's rule is that it never reaches a log.
 PING_FAILURES = (urllib.error.URLError, OSError, http.client.HTTPException)
+
+
+# The backup's exclusion list. The design pins the sync root as ``lake/`` only, with an
+# explicit exclusion list, and this is that list.
+#
+# How rsync reads a pattern, because the shape of each entry below turns on it. A
+# pattern holding no "/" is matched against a path's last component, so it drops that
+# name wherever in the tree it appears. A pattern holding a "/" is matched against the
+# end of the whole path. A trailing "/" narrows the match to directories, and an
+# excluded directory is never descended into.
+#
+# The bar for an entry is high. An over-broad pattern drops real data and the sync
+# still exits clean, so the loss surfaces only at a restore. Two entries clear it.
+#
+# 1. The temp file an atomic write leaves behind. Every one is built by
+#    ``paths.temp_write_path``, which is why the marker is a constant there rather than
+#    a literal here. A temp file is working state, never durable data. It exists only
+#    when a writer died between its write and its rename, and the re-run that finishes
+#    the interrupted job rebuilds the partition from the journal. So dropping it loses
+#    nothing. It also carries no manifest entry and never will, so copying one plants
+#    an orphan on the backup. And a temp holds a whole partition's bytes, so the copy
+#    costs real space and real sync time.
+# 2. The config directory, holding ``token.json`` and ``config.yaml``. The token is a
+#    full brokerage credential and ``config.yaml`` holds four secrets. The design's
+#    rule is that neither may ride onto a backup disk that lacks FileVault. That
+#    directory sits outside the sync root today by construction, so this pattern
+#    matches nothing and costs nothing. It is here so the rule holds by exclusion
+#    rather than by luck. The first widening of the sync root would otherwise put the
+#    credential on the SSD, and a backup that already ran cannot be un-run. The entry
+#    names the directory rather than the two files for the reason the Time Machine
+#    exclusion does: excluding the token alone leaves ``config.yaml``'s secrets behind.
+#
+# Considered and rejected, pinned here so none is re-proposed. ``journal/`` holds the
+# only copy of the day's capture until close+15 seals it, which is the single-copy
+# window the backup exists to close. ``manifest.jsonl`` is the integrity root, and a
+# restore without it can verify nothing. ``quarantine.jsonl`` and ``reports/`` are
+# pinned by the design as inside the sync root. ``.DS_Store`` is Finder state rather
+# than anything this system writes, the primary's own reverse scrub already names it as
+# an orphan, and it costs a few kilobytes against a temp file's whole partition.
+BACKUP_EXCLUSIONS: tuple[str, ...] = (
+    f"*{TEMP_MARKER}*",
+    "/".join(CONFIG_DIR_PARTS) + "/",
+)
 
 
 @runtime_checkable
@@ -146,19 +194,33 @@ class UrllibPinger:
 class RsyncBackup:
     """The real backup runner: ``rsync``, under the compaction job's lake-root flock.
 
-    It asserts the backup target is mounted, then copies ``lake/`` into it. The design
-    pins the tool as ``rsync`` or ``rclone``, the lake root
-    as the only sync root, and a mount check before the copy. The ``subprocess`` call
-    runs from the compaction job after every session, and from the by-hand live check.
-    A test injects a fake.
+    It asserts the backup target is mounted, then copies ``lake/`` into it, minus
+    ``BACKUP_EXCLUSIONS``. The design pins the tool as ``rsync`` or ``rclone``, the lake
+    root as the only sync root, an explicit exclusion list, and a mount check before the
+    copy. The ``subprocess`` call runs from the compaction job after every session, and
+    from the by-hand live check.
+
+    The command runner is a seam of its own, so a test can read the argument list this
+    builds without a real ``rsync`` ever running. ``run`` defaults to ``subprocess``,
+    imported lazily, so the offline suite never loads it. A caller that wants the fake
+    one layer up injects a whole ``BackupRunner`` instead.
     """
 
-    def __init__(self, extra_args: Sequence[str] = ()) -> None:
+    def __init__(
+        self,
+        extra_args: Sequence[str] = (),
+        run: Callable[[list[str]], object] | None = None,
+    ) -> None:
         self._extra_args = tuple(extra_args)
+        self._run = run
 
-    def sync(self, source: Path, target: Path) -> None:
+    @staticmethod
+    def _subprocess_run(args: list[str]) -> None:
         import subprocess  # lazy: only the live check shells out
 
+        subprocess.run(args, check=True)
+
+    def sync(self, source: Path, target: Path) -> None:
         source = Path(source)
         target = Path(target)
         if not target.exists() or not target.is_dir():
@@ -168,15 +230,21 @@ class RsyncBackup:
         # see a half-written target, only bit rot, and it costs an O(lake) MD4 pass a
         # day. It stays until the backup-copy scrub lands, because until then nothing
         # else would notice the backup rotting.
+        #
+        # The exclusions come before ``extra_args``, so a caller's extra flags can never
+        # land between them. The list is policy rather than a parameter, and a caller
+        # that could interpose within it could break a pattern into an operand.
         args = [
             "rsync",
             "-a",
             "--checksum",
+            *(f"--exclude={pattern}" for pattern in BACKUP_EXCLUSIONS),
             *self._extra_args,
             f"{source}/",
             f"{target}/",
         ]
-        subprocess.run(args, check=True)
+        run = self._run if self._run is not None else self._subprocess_run
+        run(args)
 
 
 # -- the orchestration -------------------------------------------------------
@@ -568,6 +636,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "BACKUP_EXCLUSIONS",
     "DAILY_LABEL",
     "MEASUREMENT_LABEL",
     "SLICE1_RUNNER_SLUG",
