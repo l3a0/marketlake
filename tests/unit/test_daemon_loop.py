@@ -12,9 +12,10 @@ They pin the loop's observable contract:
 2. A non-session day fires nothing. An early close's last cycle is its 13:15 slot.
 3. Every sleep lands on a minute top, and the loop keeps ticking off the window rather
    than returning.
-4. The four hooks fire as specified: ``on_start`` once before any cycle, ``close_tag_for``
-   once per capture slot with its answer passed through, ``on_cycle`` with every result
-   in order, ``on_skipped`` with the capture slots an overrun missed.
+4. The five hooks fire as specified: ``on_start`` once before any cycle, ``on_tick`` on
+   every minute the loop sees, ``close_tag_for`` once per capture slot with its answer
+   passed through, ``on_cycle`` with every result in order, and ``on_skipped`` with the
+   capture slots an overrun missed.
 5. ``session_phase`` is ``post_equity_close`` on the slots past the equity close and
    through the option close, and null elsewhere.
 6. A cycle that overruns its minute skips the overrun slot and realigns. It is never
@@ -255,7 +256,7 @@ def test_seconds_to_next_minute(now: datetime, expected: float):
     assert daemon.seconds_to_next_minute(now) == pytest.approx(expected)
 
 
-# -- 3. the three hooks ----------------------------------------------------------
+# -- 3. the hooks -----------------------------------------------------------------
 
 
 def test_on_start_is_called_once_before_any_cycle(calendar):
