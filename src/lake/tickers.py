@@ -26,7 +26,7 @@ from pathlib import Path
 
 import yaml
 
-from lake.paths import TICKERS_FILE, config_dir
+from lake.paths import TICKERS_FILE, config_dir, temp_write_path
 
 # The portable roster file. Overridable by argument or this environment variable, so a
 # test points the loader at a throwaway file.
@@ -172,17 +172,21 @@ def _write_atomically(target: Path, text: str) -> None:
     """Write the roster through a temp file beside it, a flush, then one rename.
 
     The daemon re-reads this file while the command writes it. A plain write truncates
-    the file first, so a reader can catch it empty or half written. Some of those shapes
-    load without complaint, which is worse than an error. An empty file loads as a roster
-    of no tickers. A prefix that ends on a line boundary loads as the tickers it kept,
-    and any key it cut takes its default, so an options ticker can come back equity-only.
-    A cycle handed either one captures less than the roster names, and writes no gap row
-    for the rest, so the minute leaves no trace.
+    the file first, so a reader can catch it empty or half written. Where the cut lands
+    decides what happens next, and both outcomes are bad. Roughly a third of the prefixes
+    of a two-ticker roster parse: an empty file as a roster of no tickers, and a longer
+    prefix as the tickers it kept, with any key it cut taking its default, so an options
+    ticker comes back equity-only. A cycle handed one of those captures less than the
+    roster names and writes no gap row for the rest, so the minute leaves no trace. The
+    rest raise a ``yaml`` error, which is not a ``TickersError`` and so escapes every
+    caller that guards for one.
     A rename replaces the file in one step, so every reader sees the whole old roster or
     the whole new one. The chain plan is written this way for the same reason. A crash
     mid-write leaves the prior file intact, and the temp file is removed on any failure.
+    The temp path comes from ``paths.temp_write_path``, which owns the one spelling of
+    the marker the backup exclusion matches.
     """
-    tmp = target.with_name(f"{target.name}.tmp-{os.getpid()}")
+    tmp = temp_write_path(target, os.getpid())
     try:
         with open(tmp, "w", encoding="utf-8") as handle:
             handle.write(text)

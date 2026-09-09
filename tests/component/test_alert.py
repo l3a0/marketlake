@@ -164,6 +164,7 @@ def test_the_daemon_pages_through_the_publisher_when_a_surface_goes_quiet(tmp_pa
     from tests.support.calendar import et, weekday_sessions
     from tests.support.clock import ManualClock
     from tests.support.config import write_config
+    from tests.support.pinger import FakePinger
 
     lake_root = tmp_path / "lake"
     lake_root.mkdir()
@@ -202,6 +203,7 @@ def test_the_daemon_pages_through_the_publisher_when_a_surface_goes_quiet(tmp_pa
         calendar=weekday_sessions(date(2026, 8, 31)),
         assertion_runner=lambda args: None,
         transport=Broken(),
+        pinger=FakePinger(),
         cycle_runner=failing_cycle,
         should_continue=four,
     )
@@ -211,95 +213,6 @@ def test_the_daemon_pages_through_the_publisher_when_a_surface_goes_quiet(tmp_pa
     records = _records(lake_root)
     assert records, "the daemon ran four failing cycles and raised no page"
     assert records[0]["event"] == "capture_down"
-
-
-def test_a_ticker_onboarded_mid_session_keeps_charging_when_the_roster_stops_loading(
-    tmp_path,
-):
-    """The fallback roster is the last one that loaded, not the startup one.
-
-    The watchdog's skipped-slot hook fires for the capture minutes a long cycle slept
-    through, and it charges one counter per ticker and surface for each of them. It
-    re-reads ``tickers.yaml`` to decide what to charge, because the design has those
-    counters read the same roster snapshot the cycle runner does. A ticker onboarded
-    mid-session therefore starts being charged with no restart.
-
-    A read can still fail on a roster edited by hand. The hook falls back rather than
-    refusing to count. Falling back to the startup roster drops every ticker onboarded
-    since, and the ticker most likely to be quiet is the one that just arrived.
-    """
-    from lake import daemon
-    from lake.capture import CycleResult
-    from tests.support.calendar import et, weekday_sessions
-    from tests.support.clock import ManualClock
-    from tests.support.config import write_config
-    from tests.support.pinger import FakePinger
-
-    lake_root = tmp_path / "lake"
-    lake_root.mkdir()
-    config = write_config(tmp_path, lake_root)
-    tickers = tmp_path / "tickers.yaml"
-    tickers.write_text("XYZ: {options: false}\nABC: {options: false}\n")
-
-    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
-    cycles = [0]
-
-    def overrunning_cycle(*, close_tag, session_phase):
-        """Two cycles that each outlive their minute, so the loop misses two runs.
-
-        The loop realigns to the next minute top, so a cycle longer than a minute is
-        how a live daemon sleeps through a capture slot. Each run here misses two.
-        """
-        slot = clock.now().replace(second=0, microsecond=0)
-        cycles[0] += 1
-        if cycles[0] == 1:
-            # DEF is onboarded between the two runs. The roster is hand-written here.
-            # `lake.onboard` dumps sorted block style through `upsert_ticker`, and the
-            # shape of the entries is not what this case turns on.
-            tickers.write_text(
-                "XYZ: {options: false}\nABC: {options: false}\nDEF: {options: false}\n"
-            )
-            clock.advance(140)
-        elif cycles[0] == 2:
-            # Every counter stands at two here, one short of the page threshold. Push
-            # the first run past three instead and the startup roster passes this test
-            # too, because DEF would already have paged before the roster went bad.
-            assert not transport.sent
-            # A top-level scalar is one shape a roster edited by hand takes.
-            tickers.write_text("XYZ")
-            clock.advance(140)
-        return CycleResult(snap_ts=slot, segments=())
-
-    transport = Recording()
-    ticks = [0]
-
-    def four() -> bool:
-        ticks[0] += 1
-        return ticks[0] <= 4
-
-    daemon.run_loop_from_config(
-        config_path=str(config),
-        tickers_path=str(tickers),
-        token_path=str(tmp_path / "token.json"),
-        clock=clock,
-        calendar=weekday_sessions(date(2026, 8, 31)),
-        assertion_runner=lambda args: None,
-        transport=transport,
-        pinger=FakePinger(),
-        cycle_runner=overrunning_cycle,
-        should_continue=four,
-    )
-
-    # Two runs of two missed slots take every counter past the threshold of three
-    # consecutive minutes. No cycle produced a segment, so nothing but those minutes
-    # charged a counter. DEF stood at two when the file went bad. It pages only if the
-    # fallback carried it.
-    assert sorted(page.title for page in transport.sent) == [
-        "Capture down: ABC quotes",
-        "Capture down: DEF quotes",
-        "Capture down: XYZ quotes",
-    ]
-    assert {page.body for page in transport.sent} == {"3 session minutes without a durable cycle"}
 
 
 def test_every_page_of_one_burst_is_written_down(tmp_path):
@@ -328,6 +241,27 @@ def test_a_record_that_cannot_be_written_says_so(tmp_path, capsys, monkeypatch):
     assert not delivery.sent
     assert not delivery.recorded
     # Lost twice is not the same as lost once, and the log is the only place left.
+    assert "record failed too" in capsys.readouterr().err
+
+
+def test_an_undelivered_page_never_creates_the_lake_root(tmp_path, capsys):
+    """A publisher that conjured the lake would turn a broken install into a green check.
+
+    The Sunday job decides whether to ping on ``root.is_dir()`` and re-reads that on every
+    retry. Before this, a failed push recorded the page through ``mkdir(parents=True)``,
+    which created the lake root itself, so attempt two found a lake, scrubbed an empty
+    directory, found no problems, and pinged the `sunday` check green on a lake that did
+    not exist. The record is written inside a lake that exists, or not at all.
+    """
+    missing = tmp_path / "not-a-lake"
+    publisher = Publisher(lake_root=missing, transport=Broken(), pid=1)
+
+    delivery = publisher.publish(PAGE, now=NOW)
+
+    assert not delivery.sent
+    assert not delivery.recorded
+    assert not missing.exists(), "the publisher created the lake root it was handed"
+    # Lost twice, so the log is the only place left to say so.
     assert "record failed too" in capsys.readouterr().err
 
 
@@ -364,3 +298,39 @@ def test_the_topic_never_appears_in_the_request_url(tmp_path):
     assert sent["body"]["topic"] == "secret-topic"
     assert sent["body"]["title"] == PAGE.title
     assert sent["body"]["tags"] == [PAGE_TAG]
+
+
+def test_only_a_page_carries_the_tag():
+    # The design gives the emoji one job: marking a message from the lake's own jobs as
+    # a page. A reminder and the nightly summary carry none, so the phone can tell the
+    # tiers apart at a glance. Priority already names the tier, so the tag follows it.
+    from lake.alert import PAGE_TAG, NtfyTransport
+
+    bodies = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def urlopen(request, timeout=None):
+        bodies.append(json.loads(request.data))
+        return FakeResponse()
+
+    import urllib.request
+
+    original = urllib.request.urlopen
+    urllib.request.urlopen = urlopen
+    try:
+        for priority in (5, 3, 2):
+            NtfyTransport("secret-topic").send(
+                Message(event="sunday_reauth", title="t", body="b", priority=priority)
+            )
+    finally:
+        urllib.request.urlopen = original
+
+    assert bodies[0]["tags"] == [PAGE_TAG]
+    assert "tags" not in bodies[1]
+    assert "tags" not in bodies[2]

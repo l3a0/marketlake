@@ -98,12 +98,14 @@ from lake.capture import CycleResult, run_cycle_from_config
 from lake.clock import Clock, SystemClock
 from lake.close_guard import CloseGuard
 from lake.close_guard import GuardOutcome as CloseGuardOutcome
-from lake.config import ConfigError, load_config
-from lake.control_plane import AssertionHolder, AssertionRunner
+from lake.config import ConfigError, input_errors_exit, load_config
+from lake.control_plane import AssertionHolder, AssertionRunner, read_token_mint
 from lake.deadman import CAPTURE_SLUG, DeadMan
 from lake.gap import GapMarker, MarkingReport, surfaces_for
 from lake.journal import ROW_KIND_DATA
+from lake.metadata import stamp_cycle, stamp_ping
 from lake.runner import Pinger, UrllibPinger
+from lake.schwab import DEFAULT_TOKEN_PATH
 from lake.security_master import SecurityMaster, SecurityMasterError, master_path
 from lake.session import (
     CAPTURE_PHASES,
@@ -277,10 +279,13 @@ def _gap_marker(
 ) -> GapMarker | None:
     """The gap marker for this daemon, or ``None`` when it cannot be built.
 
-    Marking is a record of what was missed, not a capture. A config or roster that will
-    not load is already fatal to the cycle runner on its first tick, and the security
-    master is optional, so nothing here is worth refusing to start over. Returning
-    ``None`` leaves the hooks bare and the loop unchanged.
+    Marking is a record of what was missed, not a capture, and the security master is
+    optional, so a missing one is not worth refusing to start over. Returning ``None``
+    leaves the hooks bare and the loop unchanged.
+
+    A config or roster that will not load returns ``None`` here too. Through
+    ``run_loop_from_config`` that shape is never reached, because ``_alarm`` reads the
+    same two files and refuses. The branch is kept for a direct caller.
     """
     try:
         config = load_config(config_path)
@@ -329,8 +334,9 @@ def _close_guard(
 ) -> CloseGuard | None:
     """The close+5 guard for this daemon, or ``None`` when it cannot be built.
 
-    A config or roster that will not load is already fatal to the cycle runner on its
-    first tick, so nothing here is worth refusing to start over.
+    A config or roster that will not load returns ``None``. Through
+    ``run_loop_from_config`` that shape is never reached, because ``_alarm`` reads the
+    same two files and refuses. The branch is kept for a direct caller.
     """
     try:
         config = load_config(config_path)
@@ -340,33 +346,91 @@ def _close_guard(
     return CloseGuard(lake_root=config.lake_root, roster=roster, session_clock=session_clock)
 
 
+def _idle_stamp(
+    config_path: str | Path | None,
+    tickers_path: str | Path | None,
+    token_path: str | Path | None,
+    session_clock: SessionClock,
+) -> Callable[[datetime], None] | None:
+    """The idle minute's journal metadata stamp, or ``None`` when it cannot be built.
+
+    A capture cycle stamps its own mint time off the vendor it fetched with. Off the
+    capture window no cycle runs and no client exists, so the mint comes from the token
+    file instead. That file is what the next cycle builds its client from, so the two
+    agree. The dashboard still never reads it. One timestamp crosses, never a secret.
+
+    Sunday evening is the minute this exists for. The re-auth ritual mints a fresh token
+    on a day that captures nothing, and the design wants the panel showing that mint the
+    same night rather than on Monday.
+
+    A minute the loop captures in is left to the cycle's own stamp, which is the split
+    the idle heartbeat already makes for the same reason. A roster or a token file that
+    will not read costs the minute's stamp and nothing else, so a machine mid-re-auth
+    never takes the daemon down.
+    """
+    try:
+        config = load_config(config_path)
+    except ConfigError:
+        return None
+    token = Path(token_path) if token_path is not None else DEFAULT_TOKEN_PATH
+
+    def stamp(slot: datetime) -> None:
+        if session_clock.in_capture_window():
+            return
+        try:
+            roster = load_tickers(tickers_path)
+            minted = read_token_mint(token)
+        except Exception:  # noqa: BLE001 - the stamp is the least important thing here
+            # Deliberately broad. `load_tickers` parses YAML and reads a file, so a
+            # hand-edited roster raises `yaml.YAMLError` and an unreadable one raises
+            # `OSError`, neither of which is a `TickersError`. No hook is wrapped in a
+            # try, so anything escaping here exits the process, and KeepAlive relaunches
+            # straight into the same tick. A typo in tickers.yaml would crash-loop the
+            # daemon. The stamp is informational, so losing a minute of it is the
+            # correct price and the docstring above promises exactly that.
+            return
+        try:
+            stamp_cycle(config.lake_root, at=slot, token_minted_at=minted, roster=roster)
+        except OSError:
+            return
+
+    return stamp
+
+
 def _alarm(
     config_path: str | Path | None,
     tickers_path: str | Path | None,
     session_clock: SessionClock,
-    transport: Transport | None,
-    pinger: Pinger | None,
-) -> tuple[Watchdog, Publisher, DeadMan, Roster] | None:
-    """The watchdog, its publisher, and the dead-man feed, or ``None``.
+    transport: Transport,
+    pinger: Pinger,
+) -> tuple[Watchdog, Publisher, DeadMan, Roster]:
+    """The watchdog, its publisher, and the dead-man feed.
 
-    A config or roster that will not load is already fatal to the cycle runner on its
-    first tick, so nothing here is worth refusing to start over.
+    Both seams are handed in. Neither is defaulted here, because a default reaching a
+    public endpoint is one a caller gets without asking, and the caller that most needs
+    to be asked is a test. ``main`` is the only caller in this module that builds them.
+
+    A config or roster that will not load raises. Standing the alarm down instead was
+    the older behaviour, and it hid the failure twice over: the daemon ran on with no
+    dead-man and no watchdog, and the same test took one path on a machine that had a
+    config and another on a machine that did not. A loader that fails is fatal to the
+    cycle runner on its first tick anyway, so raising here loses nothing and says why.
     """
-    try:
-        config = load_config(config_path)
-        roster = load_tickers(tickers_path)
-    except (ConfigError, TickersError):
-        return None
+    config = load_config(config_path)
+    roster = load_tickers(tickers_path)
     publisher = Publisher(
         lake_root=config.lake_root,
-        transport=transport if transport is not None else NtfyTransport(config.ntfy_topic.reveal()),
+        transport=transport,
         # The values that must never reach a phone, checked against the page itself.
         secrets=(config.healthchecks_ping_key.reveal(), config.ntfy_topic.reveal()),
     )
+    lake_root = config.lake_root
     deadman = DeadMan(
-        pinger=pinger if pinger is not None else UrllibPinger(),
+        pinger=pinger,
         url=config.healthchecks_url(CAPTURE_SLUG),
         session_clock=session_clock,
+        # The panel's dead-man line reads the lake, so a landed ping is written there.
+        recorder=lambda at: stamp_ping(lake_root, at=at),
     )
     return Watchdog(page_minutes=config.guards.watchdog_page_minutes), publisher, deadman, roster
 
@@ -381,8 +445,8 @@ def run_loop_from_config(
     calendar: Calendar | None = None,
     assertion_runner: AssertionRunner | None = None,
     cycle_runner: CycleRunner | None = None,
-    transport: Transport | None = None,
-    pinger: Pinger | None = None,
+    transport: Transport,
+    pinger: Pinger,
     should_continue: Callable[[], bool] = _forever,
 ) -> None:
     """Run the loop wired from the real clock, calendar, and config. It never returns.
@@ -397,10 +461,13 @@ def run_loop_from_config(
 
     The caffeinate power assertion is held here rather than left to a caller. The
     design's chain is the wake alarm, then ``KeepAlive`` starting the daemon, then the
-    assertion keeping an open laptop awake, and this is the link that holds it. An
-    ``transport`` defaults to the real ntfy POST and ``pinger`` to the real HTTP GET.
-    A test must pass its own for both, because each default reaches a public endpoint
-    and a page sent from a test is a page a person receives.
+    assertion keeping an open laptop awake, and this is the link that holds it.
+
+    ``transport`` and ``pinger`` are required, and neither has a live default. Each one
+    reaches a public endpoint, so a default would hand every caller a real ntfy POST and
+    a real healthchecks GET without being asked. A test that forgot to pass its own used
+    to get exactly that, and a page sent from a test is a page a person receives.
+    ``main`` builds the live pair; everything else supplies its own.
 
     ``cycle_runner`` defaults to the real capture cycle. A test passes its own, which
     is the only way to observe what this entry binds without reaching a vendor: every
@@ -410,12 +477,19 @@ def run_loop_from_config(
     opens and again for each new day the daemon lives through. Any hook the caller
     passed still runs.
 
+    The journal metadata stamp rides ``on_tick`` as well, for the minutes off the
+    capture window. On a capture minute the cycle stamps itself, off it there is no
+    vendor to ask, and the two together are what keep the Now panel's token age and
+    ticker list current on every day the daemon is awake.
+
     Gap marking rides ``on_start`` and ``on_skipped`` the same way. Both hand their
     missed slots to one ``GapMarker``, so a restart and a live overrun leave the same
     kind of record. Marking needs the lake root, the roster, and the security master,
     which this entry did not load before, so it loads them once here rather than per
-    cycle. A load failure leaves marking off and the loop still runs, because a daemon
-    that captures without marking is better than one that does not start.
+    cycle. A missing security master leaves marking off and the loop still runs, because
+    a daemon that captures without marking is better than one that does not start. A
+    config or roster that will not load is fatal instead, because the alarm needs both
+    and a daemon with no dead-man cannot report its own death.
     """
     clock = clock if clock is not None else SystemClock()
     calendar = calendar if calendar is not None else ExchangeCalendar()
@@ -430,6 +504,19 @@ def run_loop_from_config(
         caller_on_tick(slot)
 
     hooks = replace(hooks, on_tick=on_tick)
+
+    # The idle stamp rides ``on_tick`` too, and it skips the capture window because the
+    # cycle stamps there off its own vendor. So the panel's token line stays current on
+    # a Sunday evening, when the ritual mints a token and no cycle runs to carry it.
+    stamper = _idle_stamp(config_path, tickers_path, token_path, session_clock)
+    if stamper is not None:
+        stamp_on_tick = hooks.on_tick
+
+        def on_tick_stamped(slot: datetime) -> None:
+            stamper(slot)
+            stamp_on_tick(slot)
+
+        hooks = replace(hooks, on_tick=on_tick_stamped)
 
     marker = _gap_marker(config_path, tickers_path, session_clock)
     if marker is not None:
@@ -481,67 +568,70 @@ def run_loop_from_config(
     # runs no cycle for a slot it slept through and those are the minutes the daemon was
     # worst off. The dead-man rides the same two plus every tick, so an idle weekday
     # keeps feeding the check that pages on silence.
-    alarm = _alarm(config_path, tickers_path, session_clock, transport, pinger)
-    if alarm is not None:
-        watchdog, publisher, deadman, roster = alarm
-        alarm_on_cycle = hooks.on_cycle
-        alarm_on_skipped = hooks.on_skipped
-        alarm_on_tick = hooks.on_tick
+    watchdog, publisher, deadman, roster = _alarm(
+        config_path, tickers_path, session_clock, transport, pinger
+    )
+    alarm_on_cycle = hooks.on_cycle
+    alarm_on_skipped = hooks.on_skipped
+    alarm_on_tick = hooks.on_tick
 
-        def raise_pages(pages: list[Page], now: datetime) -> None:
-            for page in pages:
-                publisher.publish(
-                    Message(
-                        event="capture_down",
-                        title=page.title,
-                        body=f"{page.minutes} session minutes without a durable cycle",
-                    ),
-                    now=now,
-                )
+    def raise_pages(pages: list[Page], now: datetime) -> None:
+        for page in pages:
+            publisher.publish(
+                Message(
+                    event="capture_down",
+                    title=page.title,
+                    body=f"{page.minutes} session minutes without a durable cycle",
+                ),
+                now=now,
+            )
 
-        def on_cycle(slot: datetime, result: CycleResult) -> None:
-            raise_pages(watchdog.observe(result), slot)
-            if any(seg.row_kind == ROW_KIND_DATA for seg in result.segments):
-                deadman.captured(slot)
-            alarm_on_cycle(slot, result)
+    def on_cycle(slot: datetime, result: CycleResult) -> None:
+        raise_pages(watchdog.observe(result), slot)
+        if any(seg.row_kind == ROW_KIND_DATA for seg in result.segments):
+            deadman.captured(slot)
+        alarm_on_cycle(slot, result)
 
-        def on_skipped(slots: list[datetime]) -> None:
-            # The roster is re-read here rather than closed over. The cycle runner
-            # re-reads it every cycle, and the design has the watchdog counters read
-            # that same snapshot. So a ticker onboarded mid-session starts being
-            # charged with no restart, and one retired mid-session stops.
-            # Each successful read replaces what the fallback holds. A read the loader
-            # refuses therefore leaves the last good roster in place, not the one the
-            # daemon started with. Refusing to count is worse than counting a ticker
-            # one cycle too long.
-            # Carrying a read across calls is only safe because ``upsert_ticker``
-            # renames the roster into place. A torn read can parse as a roster with
-            # tickers missing, and carrying one would silence their counters.
-            # The fallback covers one tick, not a window. A roster the loader refuses
-            # is already fatal to the cycle runner, which reads it again on this same
-            # tick. So the fallback only outlives the tick when the tick runs no
-            # cycle, which is a slot off the capture window. What it buys is charging
-            # the right counters on that tick rather than a stale set.
-            # ``load_tickers`` refuses less than it should. It lets a ``yaml`` error
-            # through, so a roster torn mid-line reaches neither branch here.
-            nonlocal roster
-            try:
-                roster = load_tickers(tickers_path)
-            except TickersError:
-                pass
-            watched = [
-                Surface(surface, entry.ticker)
-                for entry in roster
-                for surface in surfaces_for(entry)
-            ]
-            raise_pages(watchdog.missed(watched, slots), slots[-1])
-            alarm_on_skipped(slots)
+    def on_skipped(slots: list[datetime]) -> None:
+        # The roster is re-read here rather than closed over. The cycle runner re-reads
+        # it every cycle, and the design has the watchdog counters read that same
+        # snapshot. So a ticker onboarded mid-session starts being charged with no
+        # restart, and one retired mid-session stops.
+        # Each successful read replaces what the fallback holds. A read the loader
+        # refuses therefore leaves the last roster this hook read in place, not the one
+        # the daemon started with. It is this hook's own last read and no one else's:
+        # the cycle runner and the stamp hook each load the file too, and neither feeds
+        # this. Refusing to count is worse than counting a ticker one cycle too long.
+        # Carrying a read across calls is only safe because ``upsert_ticker`` renames
+        # the roster into place. A torn read can parse as a roster with tickers missing,
+        # and carrying one would silence their counters.
+        # The fallback covers one tick, not a window. A roster the loader refuses is
+        # already fatal to the cycle runner, which reads it again on this same tick, and
+        # ``_alarm`` refuses to build on one at startup. So the fallback only outlives
+        # its tick when that tick runs no cycle, which is a slot off the capture window.
+        # What it buys is charging the right counters on that tick rather than a stale
+        # set.
+        # ``load_tickers`` refuses less than it should, and where a tear lands decides
+        # which way it fails. Roughly a third of the prefixes of a roster parse, so a
+        # torn read can be carried as a roster with tickers missing. The rest raise a
+        # ``yaml`` error, which is not a ``TickersError``, so it escapes this hook and
+        # takes the process down. That is the hole the stamp hook above documents.
+        nonlocal roster
+        try:
+            roster = load_tickers(tickers_path)
+        except TickersError:
+            pass
+        watched = [
+            Surface(surface, entry.ticker) for entry in roster for surface in surfaces_for(entry)
+        ]
+        raise_pages(watchdog.missed(watched, slots), slots[-1])
+        alarm_on_skipped(slots)
 
-        def on_tick(slot: datetime) -> None:
-            deadman.idle(slot)
-            alarm_on_tick(slot)
+    def on_tick(slot: datetime) -> None:
+        deadman.idle(slot)
+        alarm_on_tick(slot)
 
-        hooks = replace(hooks, on_cycle=on_cycle, on_skipped=on_skipped, on_tick=on_tick)
+    hooks = replace(hooks, on_cycle=on_cycle, on_skipped=on_skipped, on_tick=on_tick)
 
     def run_a_cycle(*, close_tag: str | None, session_phase: str | None) -> CycleResult:
         return run_cycle_from_config(
@@ -581,11 +671,24 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """The ``python -m lake.daemon`` entry. Loops forever, so it returns only when stopped."""
     args = build_parser().parse_args(argv)
-    run_loop_from_config(
-        config_path=args.config,
-        tickers_path=args.tickers,
-        token_path=args.token,
-    )
+    # The only construction site in this module. The config is read here as well as
+    # inside the loop, because the ntfy topic names the transport and the transport is
+    # wired from out here now.
+    #
+    # The wrapper puts this entry in the same class as every other one that reads an
+    # operator file. A missing config or roster is an operator mistake, so it earns one
+    # named line and exit 2 rather than a traceback. That matters more here than
+    # elsewhere: launchd restarts the daemon under ``KeepAlive``, so a traceback would
+    # repeat every few seconds in the log the operator is told to read.
+    with input_errors_exit("daemon"):
+        config = load_config(args.config)
+        run_loop_from_config(
+            config_path=args.config,
+            tickers_path=args.tickers,
+            token_path=args.token,
+            transport=NtfyTransport(config.ntfy_topic.reveal()),
+            pinger=UrllibPinger(),
+        )
     return 0
 
 

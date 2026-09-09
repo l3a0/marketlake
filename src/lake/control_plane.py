@@ -68,8 +68,11 @@ that sets it and its own firing. Before that Friday nothing has set it, so a Mon
 catch-up run reports nothing missing. The weekday repeat alarm is always expected.
 
 Every seam is injected: the clock, the calendar, the daemon probe, the schedule reader,
-the pinger, the canary, and the caffeinate runner. The whole module runs offline in a
-test.
+the pinger, the canary, the alert transport, and the caffeinate runner. The whole module
+runs offline in a test. Two of those seams reach the outside world when they fall back
+to their production default. The canary quotes one symbol through the vendor, and the
+transport POSTs the re-auth reminder to ntfy. Both are built by the ``sunday`` command
+line alone, so a test that drives it passes its own for each.
 """
 
 from __future__ import annotations
@@ -84,12 +87,14 @@ from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+from lake.alert import Message, NtfyTransport, Publisher, Transport
 from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
 from lake.config import input_errors_exit, load_config
 from lake.manifest import ScrubResult, scrub
 from lake.paths import TOKEN_FILE, config_dir
 from lake.runner import PING_FAILURES, LaunchdJob, Pinger, UrllibPinger, calendar_interval
+from lake.vendor import Vendor
 
 # -- the wall-clock constants ------------------------------------------------
 
@@ -944,16 +949,86 @@ def token_covers_week(mint: datetime, now: datetime, calendar: Calendar) -> bool
 
 # -- the Sunday maintenance job ----------------------------------------------------
 
-# The canary's authenticated call. It returns whether the call succeeded. The auth
-# work plugs in here later. The default passes through.
+# The canary's authenticated call. It returns whether the call succeeded. The production
+# one is ``token_canary``, which quotes one symbol through the real vendor. A test
+# injects its own. There is deliberately no default: a seam whose default answers True
+# without calling anything turns the weekend's only auth check into a rubber stamp.
 CanaryCall = Callable[[], bool]
 
 # Returns the ``pmset -g sched`` text. The real one shells out. A test injects one.
 ScheduleReader = Callable[[], str]
 
+# The symbol the canary quotes. One batched quote is the cheapest authenticated call the
+# vendor offers, and the body is thrown away. SPY is the standing exemplar across this
+# repo, including the by-hand probe's own default. The roster is deliberately not read:
+# the canary proves the credentials still work, and a roster that will not load is a
+# different failure that must not reach the phone as a dead token.
+CANARY_SYMBOL = "SPY"
 
-def _canary_pass_through() -> bool:
-    return True
+# Builds the vendor the canary calls. The production one is ``_schwab_vendor``. A test
+# passes its own, so no test builds a real client and none reaches the network.
+VendorFactory = Callable[..., Vendor]
+
+
+def _schwab_vendor(token_path: str | Path, *, api_key: str, app_secret: str) -> Vendor:
+    """The real Schwab vendor, built from the token file.
+
+    The import is lazy, so importing the control plane never costs the vendor library.
+    This is the only line in this module that can reach the network, and it runs from
+    the installed Sunday job alone.
+    """
+    from lake.schwab import SchwabVendor  # lazy: the real client, production only
+
+    return SchwabVendor.from_token(token_path, api_key=api_key, app_secret=app_secret)
+
+
+def token_canary(
+    *,
+    token_path: str | Path,
+    api_key: str,
+    app_secret: str,
+    symbol: str = CANARY_SYMBOL,
+    vendor_factory: VendorFactory = _schwab_vendor,
+) -> CanaryCall:
+    """The Sunday canary: one throwaway authenticated call, answered as a bool.
+
+    The vendor is rebuilt inside every call rather than once here. That is the rule the
+    mint reader already follows, and it is what lets the 21:00 attempt see a re-login
+    done at 20:40. A client built once would keep calling on the token the evening
+    started with, and every retry would fail for a reason the ritual had already fixed.
+
+    Any failure answers False. A dead refresh token raises ``VendorAuthError``, an
+    unreachable vendor raises something else, and a call that did not come back has
+    proved nothing either way. The canary exists to prove the brokerage credentials
+    still work over a weekend, so True has to mean a call was made and answered.
+    Reporting success without calling anything is the failure this producer removes, and
+    a pass on a network error would put it straight back.
+
+    A False costs no page on its own. The attempt repeats every thirty minutes until
+    23:00, so a transient outage clears itself, and the reminder that does go out names
+    the throwaway call as the half that failed rather than claiming the token is dead.
+
+    The failure's class goes to the job's log, because it is what tells a dead token from
+    a dead network and it is diagnosis rather than alert. Only the class is printed. The
+    text of a vendor exception is the library's, and nothing built from a credential goes
+    anywhere a person reads.
+    """
+
+    def call() -> bool:
+        try:
+            vendor = vendor_factory(token_path, api_key=api_key, app_secret=app_secret)
+            reply = vendor.get_quotes([symbol])
+        except Exception as exc:  # noqa: BLE001 - a failed call answers False, never raises
+            print(f"sunday: canary call failed: {type(exc).__name__}")
+            return False
+        # A non-2xx is a fetch failure, the same rule the capture primitive holds. A 401
+        # is the dead-token shape that arrives as a status rather than as a raise.
+        if not 200 <= reply.status < 300:
+            print(f"sunday: canary call returned http {reply.status}")
+            return False
+        return True
+
+    return call
 
 
 @dataclass(frozen=True)
@@ -971,10 +1046,45 @@ class ReauthReminder:
     priority: int
 
 
-# Sends one reminder. The real one is D13's ntfy publisher, which does not exist yet.
-# This module decides whether a reminder is owed and what it says. Delivery is the
-# publisher's. A test injects a recorder.
+# Sends one reminder. The production one is ``reminder_publisher``, which pushes through
+# the alert publisher. This module decides whether a reminder is owed and what it says.
+# Delivery is the publisher's. A test injects a recorder.
 ReminderSink = Callable[[ReauthReminder], None]
+
+# The reminder's event name. It names the design's message-table row, and it is what the
+# publisher writes down when a reminder never leaves the laptop.
+REMINDER_EVENT = "sunday_reauth"
+
+
+def reminder_publisher(*, publisher: Publisher, clock: Clock) -> ReminderSink:
+    """Push each Sunday re-auth reminder to the phone, and log the ones that did not go.
+
+    The publisher is total. It never raises, it caps the day, and it writes every
+    undelivered message to a dated file under ``reports/``. So an unreachable ntfy costs
+    a line in the job's log and a file on disk, and the evening's retries carry on. That
+    is the right trade. A Sunday job that died on a failed push would lose the scrub, the
+    alarm read-back, and the check's own ping with it, and the missed ping would page at
+    23:30 naming the wrong cause.
+
+    Priority 3 is the reminder tier, so the push carries no tag. The design gives the
+    emoji to a page alone.
+    """
+
+    def send(reminder: ReauthReminder) -> None:
+        delivery = publisher.publish(
+            Message(
+                event=REMINDER_EVENT,
+                title=reminder.title,
+                body=reminder.body,
+                priority=reminder.priority,
+            ),
+            now=clock.now(),
+        )
+        if not delivery.sent:
+            kept = "written down" if delivery.recorded else "lost"
+            print(f"sunday: reminder not sent: {delivery.reason}, {kept}")
+
+    return send
 
 
 def reauth_reminder(
@@ -1061,7 +1171,7 @@ def sunday_maintenance(
     schedule_reader: ScheduleReader,
     pinger: Pinger,
     ping_url: str,
-    canary: CanaryCall = _canary_pass_through,
+    canary: CanaryCall,
     mint: datetime | None = None,
     exclusion_targets: Sequence[str] = (),
     exclusion_reader: ExclusionReader | None = None,
@@ -1099,8 +1209,8 @@ def sunday_maintenance(
        report under a few weeks of headroom.
     5. Rotate the logs.
 
-    The re-auth reminder is built. The build plan assigns it to this deliverable, and
-    only its delivery waits on D13's publisher.
+    ``canary`` has no default, so a caller cannot leave it out and be told the weekend's
+    auth check passed. The production one is ``token_canary``.
 
     The canary's 30-minute retry until the deadline belongs to ``sunday_run``, not to
     this function. This function decides one attempt.
@@ -1197,7 +1307,7 @@ def sunday_run(
     pinger: Pinger,
     ping_url: str,
     mint_reader: MintReader,
-    canary: CanaryCall = _canary_pass_through,
+    canary: CanaryCall,
     retry: timedelta = CANARY_RETRY,
     exclusion_targets: Sequence[str] = (),
     exclusion_reader: ExclusionReader | None = None,
@@ -1221,6 +1331,11 @@ def sunday_run(
     one attempt and returns. That covers the Monday catch-up launchd fires for a wake
     missed over the weekend, where retrying all day would page nobody sooner. Every
     attempt comes back, in order, so the caller can report them all.
+
+    ``reminder_sink`` is called unguarded, because surviving a failed delivery is the
+    publisher's contract rather than every caller's. ``reminder_publisher`` is the
+    production sink and holds that promise for this one. With no sink the reminder is
+    still decided and still returned on the outcome, and nothing pushes it.
     """
     start = clock.now().astimezone(MARKET_TZ)
     in_the_window = start.weekday() == _PY_SUNDAY and SUNDAY_MAINTENANCE.on(start.date()) <= start
@@ -1438,6 +1553,27 @@ def read_token_mint(token_path: Path | str) -> datetime:
         return datetime.fromtimestamp(float(created), tz=UTC)
     except (OverflowError, OSError, ValueError) as exc:
         raise ValueError("creation_timestamp is not an epoch second") from exc
+
+
+def sunday_canary_due(minted_at: datetime) -> datetime:
+    """The Sunday canary a token minted at ``minted_at`` must be replaced by.
+
+    The re-auth ritual is weekly and its moment is the 20:00 Eastern Sunday canary. A
+    token minted on any other day is due at the coming Sunday's canary, whatever the
+    seven-day expiry says, because the ritual is what replaces it. A token minted on a
+    Sunday has already cleared that Sunday's ritual, at 19:00 as much as at 20:30, so
+    its own deadline is the following week's canary.
+
+    So the answer always lands within seven days and a few hours of the mint, and the
+    Now panel's countdown is the wait until the ritual rather than until the expiry.
+    The panel is the only caller. The canary itself asserts coverage against Friday's
+    option close, which is a stricter and differently shaped question.
+    """
+    eastern = minted_at.astimezone(MARKET_TZ)
+    day = eastern.date()
+    if day.weekday() == _PY_SUNDAY:
+        return SUNDAY_MAINTENANCE.on(day + timedelta(days=7))
+    return SUNDAY_MAINTENANCE.on(day + timedelta(days=_PY_SUNDAY - day.weekday()))
 
 
 @dataclass(frozen=True)
@@ -2076,11 +2212,17 @@ def main(
     schedule_reader: ScheduleReader | None = None,
     canary: CanaryCall | None = None,
     exclusion_reader: ExclusionReader | None = None,
+    transport: Transport | None = None,
 ) -> int:
     """The ``python -m lake.control_plane`` entry. Returns a process exit code.
 
     The seams default to the real ones and are built lazily, so a test injects fakes
     and nothing here reads the wall clock or shells out.
+
+    Two of those defaults reach the outside world, and a test that wants the Sunday job
+    must pass its own for both. ``canary`` defaults to one real quote through the
+    vendor, and ``transport`` defaults to the real ntfy POST. A push sent from a test is
+    a push a person receives.
     """
     args = _build_parser().parse_args(argv)
 
@@ -2163,15 +2305,36 @@ def main(
                 print(f"sunday: {exc}")
                 return None
 
+        # The job's own clock, shared by the retry loop and the reminder's timestamp, so
+        # a push is stamped with the attempt that raised it.
+        run_clock = clock if clock is not None else _system_clock()
+        # The reminder's delivery. The secrets are the two values that must never reach a
+        # phone, checked against the message itself.
+        publisher = Publisher(
+            lake_root=config.lake_root,
+            transport=(
+                transport if transport is not None else NtfyTransport(config.ntfy_topic.reveal())
+            ),
+            secrets=(config.healthchecks_ping_key.reveal(), config.ntfy_topic.reveal()),
+        )
         outcomes = sunday_run(
             lake_root=config.lake_root,
-            clock=clock if clock is not None else _system_clock(),
+            clock=run_clock,
             calendar=calendar if calendar is not None else _exchange_calendar(),
             schedule_reader=schedule_reader if schedule_reader is not None else read_pmset_schedule,
             pinger=pinger if pinger is not None else UrllibPinger(),
             ping_url=config.healthchecks_url(SUNDAY_SLUG),
-            canary=canary if canary is not None else _canary_pass_through,
+            canary=(
+                canary
+                if canary is not None
+                else token_canary(
+                    token_path=token_path,
+                    api_key=config.schwab_api_key.reveal(),
+                    app_secret=config.schwab_app_secret.reveal(),
+                )
+            ),
             mint_reader=read_mint,
+            reminder_sink=reminder_publisher(publisher=publisher, clock=run_clock),
             exclusion_targets=tmutil_exclusion_targets(
                 default_config_dir(str(Path.home())), token_path
             ),
@@ -2217,11 +2380,13 @@ def _exchange_calendar() -> Calendar:
 __all__ = [
     "CANARY_DEADLINE",
     "CANARY_RETRY",
+    "CANARY_SYMBOL",
     "DAEMON_LABEL",
     "DASHBOARD_LABEL",
     "LAUNCHD_DOMAIN",
     "PRE_OPEN_SELF_CHECK",
     "PRE_OPEN_SLUG",
+    "REMINDER_EVENT",
     "REMINDER_HOURS",
     "REMINDER_PRIORITY",
     "REMINDER_TITLE",
@@ -2256,6 +2421,7 @@ __all__ = [
     "ScheduleReader",
     "SelfCheckOutcome",
     "SundayOutcome",
+    "VendorFactory",
     "WallClockTime",
     "all_jobs",
     "assertion_window",
@@ -2285,16 +2451,19 @@ __all__ = [
     "read_pmset_schedule",
     "read_token_mint",
     "reauth_reminder",
+    "reminder_publisher",
     "render_all",
     "self_check",
     "self_check_job",
     "sudoers_dropin",
+    "sunday_canary_due",
     "sunday_job",
     "sunday_maintenance",
     "sunday_run",
     "sunday_wake_command",
     "tmutil_exclusion_commands",
     "tmutil_exclusion_targets",
+    "token_canary",
     "token_covers_week",
     "week_option_close",
     "write_rendered",
