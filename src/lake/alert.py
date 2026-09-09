@@ -37,11 +37,11 @@ DEFAULT_DAILY_CAP = 40
 # The tag every lake-composed page carries, per the design's message table.
 PAGE_TAG = "rotating_light"
 
-# The page tier. The design's ladder is 5 for a page, 3 for a reminder, and 2 for
-# information that waits. The tag marks a page and nothing else, so it follows the
-# priority rather than becoming a second field a producer could set wrong. A reminder
-# and the nightly summary reach the phone carrying no tag, which is what lets the emoji
-# name the producer at a glance.
+# The page tier. The design pins two tiers, a page now at 5 and the report's digest at 2,
+# and the reminder sits at 3 between them. The tag marks a page and nothing else, so it
+# follows the priority rather than becoming a second field a producer could set wrong. A
+# reminder and the nightly summary reach the phone carrying no tag, which is what lets the
+# emoji name the producer at a glance.
 PAGE_PRIORITY = 5
 
 # How long one POST may take. Short, because a page that has not landed in five seconds
