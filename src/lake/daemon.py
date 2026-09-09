@@ -270,6 +270,34 @@ def _report(report: MarkingReport, pass_name: str) -> None:
     print(" ".join(parts), file=sys.stderr)
 
 
+def _roster_reader(
+    tickers_path: str | Path | None,
+    seed: Roster,
+) -> Callable[[], Roster]:
+    """A reader that returns the roster as it stands, never one frozen at start.
+
+    ``tickers.yaml`` is the only statement of what is in scope right now, and the cycle
+    runner re-reads it every cycle. The consumers that fire on a *skipped* slot have no
+    cycle snapshot to share, because no cycle ran. Each holds a reader of its own and
+    reads the file itself, so the two see one file rather than one object.
+
+    A roster that will not load leaves the last one that did in place. Refusing to count
+    or to mark is worse than working from a snapshot one cycle stale, and the reader
+    never raising is what lets ``on_start`` stay unguarded under ``KeepAlive``.
+    """
+    last = seed
+
+    def read() -> Roster:
+        nonlocal last
+        try:
+            last = load_tickers(tickers_path)
+        except TickersError:
+            pass
+        return last
+
+    return read
+
+
 def _gap_marker(
     config_path: str | Path | None,
     tickers_path: str | Path | None,
@@ -281,6 +309,10 @@ def _gap_marker(
     not load is already fatal to the cycle runner on its first tick, and the security
     master is optional, so nothing here is worth refusing to start over. Returning
     ``None`` leaves the hooks bare and the loop unchanged.
+
+    The marker gets a reader rather than the roster loaded here, so a pass marks the
+    tickers that are in scope when it runs. The load above still happens, because it
+    decides whether marking is wired at all and seeds the reader's fallback.
     """
     try:
         config = load_config(config_path)
@@ -294,7 +326,7 @@ def _gap_marker(
         master = None
     return GapMarker(
         lake_root=config.lake_root,
-        roster=roster,
+        roster=_roster_reader(tickers_path, roster),
         session_clock=session_clock,
         master=master,
     )
@@ -346,8 +378,8 @@ def _alarm(
     session_clock: SessionClock,
     transport: Transport | None,
     pinger: Pinger | None,
-) -> tuple[Watchdog, Publisher, DeadMan, Roster] | None:
-    """The watchdog, its publisher, and the dead-man feed, or ``None``.
+) -> tuple[Watchdog, Publisher, DeadMan, Callable[[], Roster]] | None:
+    """The watchdog, its publisher, the dead-man feed, and a roster reader, or ``None``.
 
     A config or roster that will not load is already fatal to the cycle runner on its
     first tick, so nothing here is worth refusing to start over.
@@ -368,7 +400,12 @@ def _alarm(
         url=config.healthchecks_url(CAPTURE_SLUG),
         session_clock=session_clock,
     )
-    return Watchdog(page_minutes=config.guards.watchdog_page_minutes), publisher, deadman, roster
+    return (
+        Watchdog(page_minutes=config.guards.watchdog_page_minutes),
+        publisher,
+        deadman,
+        _roster_reader(tickers_path, roster),
+    )
 
 
 def run_loop_from_config(
@@ -410,10 +447,12 @@ def run_loop_from_config(
 
     Gap marking rides ``on_start`` and ``on_skipped`` the same way. Both hand their
     missed slots to one ``GapMarker``, so a restart and a live overrun leave the same
-    kind of record. Marking needs the lake root, the roster, and the security master,
-    which this entry did not load before, so it loads them once here rather than per
-    cycle. A load failure leaves marking off and the loop still runs, because a daemon
-    that captures without marking is better than one that does not start.
+    kind of record. Marking needs the lake root, the security master, and the roster.
+    The first two are loaded once here rather than per cycle. The roster is read per
+    marking pass, the same way the watchdog counters read it, so the two agree on which
+    tickers are in scope on the one hook where no cycle ran to say. A load failure
+    leaves marking off and the loop still runs, because a daemon that captures without
+    marking is better than one that does not start.
     """
     clock = clock if clock is not None else SystemClock()
     calendar = calendar if calendar is not None else ExchangeCalendar()
@@ -481,7 +520,7 @@ def run_loop_from_config(
     # keeps feeding the check that pages on silence.
     alarm = _alarm(config_path, tickers_path, session_clock, transport, pinger)
     if alarm is not None:
-        watchdog, publisher, deadman, roster = alarm
+        watchdog, publisher, deadman, read_roster = alarm
         alarm_on_cycle = hooks.on_cycle
         alarm_on_skipped = hooks.on_skipped
         alarm_on_tick = hooks.on_tick
@@ -507,16 +546,11 @@ def run_loop_from_config(
             # The roster is re-read here rather than closed over. The cycle runner
             # re-reads it every cycle, and the design has the watchdog counters read
             # that same snapshot, so a ticker retired mid-session must stop being
-            # charged without a restart. A roster that will not load leaves the last
-            # good one in place, since refusing to count is worse than counting a
-            # ticker one cycle too long.
-            try:
-                current = load_tickers(tickers_path)
-            except TickersError:
-                current = roster
+            # charged without a restart. Gap marking reads the same way on this hook,
+            # so the two agree on scope where no cycle ran to set it.
             watched = [
                 Surface(surface, entry.ticker)
-                for entry in current
+                for entry in read_roster()
                 for surface in surfaces_for(entry)
             ]
             raise_pages(watchdog.missed(watched, slots), slots[-1])

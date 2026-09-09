@@ -69,24 +69,26 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   4. `session.missed_slots`, D9's own day-by-day walk moved beside `skipped_slots` so both hooks share one enumerator and `lake.gap` needs no import of `lake.daemon`.
 - **Unowned.** The backup-copy scrub, and the `--checksum` drop that waits on it. `manifest.scrub` reads under `lake_root` only, so nothing verifies the backup target today. `control_plane`'s Sunday gap list already names it as gap 3 of 5. The two land together or in that order, because until the scrub exists `--checksum` in `RsyncBackup.sync` is the only thing that would notice the backup rotting. Dropping it first trades a deadline that fails in a few years for a verification hole that starts now. **Both stay in slice 2.** The scrub is a Sunday-job activity, the Sunday job is D14's, and `manifest.scrub` already exists and already runs there over `lake_root`. Reaching the backup target is a target and a parameter rather than new machinery, so slice 5's validation battery is the wrong home for it. The pairing is a sequencing rule inside slice 2, not a reason to defer either half out of it.
 - **Unowned.** The daemon's in-loop close+15 compaction dispatch. `compact.compact` is reachable only from `python -m lake.compact`, and no job renders it. The design's rule that a catch-up compaction of an unsealed day is ordered after startup gap-marking is satisfied in-process today, because `run_loop` calls `on_start` before its first tick. Whoever builds the dispatch owns keeping it so. D11 built the seam it binds to, `session.SessionDispatch`, so what remains is the compaction job itself. **It stays in slice 2.** Every part it needs is already here: the dispatcher from D11, `compact.compact` from D12, and the loop from D9. It fetches nothing, so slice 3 would not help it, and it blocks the `compaction` check, which cannot be created before a producer exists.
-- **Unowned.** Tests for six of the daemon's production hook bindings. The hooks
+- **Unowned.** Tests for four of the daemon's production hook bindings. The hooks
   themselves are held, and so is each observer in isolation. What is unheld is the wiring
-  `run_loop_from_config` builds, which is the wiring the launchd job actually runs. Six are
-  in that state:
+  `run_loop_from_config` builds, which is the wiring the launchd job actually runs. Four
+  are in that state:
 
-  1. the skipped-slot hook reaching `GapMarker`, so a live overrun would record no gap,
-  2. the skipped-slot hook reaching the watchdog, so the minutes the daemon was worst off
-     would charge no counter,
-  3. the per-tick hook feeding the `capture` dead-man's idle heartbeat,
-  4. the cycle hook feeding the same dead-man's `captured` signal, which is what arms the
+  1. the per-tick hook feeding the `capture` dead-man's idle heartbeat,
+  2. the cycle hook feeding the same dead-man's `captured` signal, which is what arms the
      check on the first durable cycle and holds the whole-daemon guarantee,
-  5. the per-tick hook reaching the close+5 guard's `SessionDispatch.check`,
-  6. the per-cycle chain-plan re-read, which is what makes a nightly plan rewrite take
+  3. the per-tick hook reaching the close+5 guard's `SessionDispatch.check`,
+  4. the per-cycle chain-plan re-read, which is what makes a nightly plan rewrite take
      effect the next minute.
 
   Each was confirmed by deleting the binding and running the suite, which stays green at
-  1124. The point is not that the bindings are wrong. It is that nothing would notice if
-  they became wrong, and four of the six are the paths that carry a failure to the phone.
+  1127. The point is not that the bindings are wrong. It is that nothing would notice if
+  they became wrong, and two of the four are the paths that carry a failure to the phone.
+
+  Two more were on this list and are now held. The skipped-slot hook reaching `GapMarker`
+  and the same hook reaching the watchdog both fall out of the roster tests in
+  `tests/component/test_gap_marking.py`, which drive `run_loop_from_config` through a real
+  overrun. Deleting either binding fails them.
 - **D11** close tags and the close+5 guard. Close+5 is the five-minute window after the option close, the last moment an option-close fetch may land. It plugs into D9's close-tag hook, and it builds the session-relative dispatcher the design calls for. Everything session-relative runs from inside the daemon, because launchd's calendar intervals are fixed wall-clock and cannot express a close-relative time. `SessionDispatch` fires one job once per session day at a moment the calendar decides, including on a daemon that starts after that moment has passed. The close+15 compaction dispatch binds to the same seam when someone builds it. Two rules are worth stating where both writers can see them:
   1. The guard's fill triggers on missing marks, not a missing cycle. A chain that failed at the option close leaves a tagged gap row holding nothing a reader can price against, and a close+5 refetch is exactly what rescues it.
   2. On a post-close restart the guard runs before startup gap-marking, so the two close minutes it owns are already recorded when D10's marker walks the day.

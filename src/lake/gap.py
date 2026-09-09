@@ -18,6 +18,16 @@ startup marker says ``daemon_dead``, which is true: some other incarnation ended
 skipped-slot marker says ``slot_overrun``, because the daemon is alive on those minutes
 and recording it as dead would make the marker lie about its own reason.
 
+Both passes read the roster when they run, never a roster frozen at daemon start. The
+roster is the only statement of what is in scope right now, and the capture cycle reads
+it fresh every minute. A pass that read a stale one would disagree with capture in both
+directions. A ticker onboarded mid-session would be captured and left unmarked, which is
+the hole this exists to close. A ticker retired mid-session would keep collecting markers
+on a surface nothing captures, manufacturing holes that were never owed. Scope already
+has a boundary of this kind at its front edge. The anchor clamps to the instrument's
+``capture_start``, so minutes before it are out of scope rather than gaps. Leaving the
+roster is the back edge, and it reads from the file capture reads.
+
 Marking is calendar-driven, not segment-driven. It asks the calendar which sessions
 existed and which minutes those sessions held, then subtracts what is already recorded.
 A date with no segments at all is exactly the case a segment-driven walk would miss, and
@@ -132,15 +142,20 @@ class GapMarker:
 
     Every seam is injected. There is no wall clock here at all: the minutes come from
     the calendar, and each segment is stamped with the first minute it marks. So a
-    marking pass is a pure function of the calendar, the roster, and what is already on
-    disk.
+    marking pass is a pure function of the calendar, the roster it reads, and what is
+    already on disk.
+
+    ``roster`` is a reader, not a roster, because scope changes while the daemon runs.
+    Each pass calls it once and marks whatever it returns. The reader must not raise:
+    ``on_start`` runs unguarded under ``KeepAlive``, so a raise there is a crash loop
+    that marks nothing. The daemon's reader falls back to the last roster that loaded.
     """
 
     def __init__(
         self,
         *,
         lake_root: Path | str,
-        roster: Roster,
+        roster: Callable[[], Roster],
         session_clock: SessionClock,
         master: SecurityMaster | None = None,
         pid: int | None = None,
@@ -209,15 +224,20 @@ class GapMarker:
         Capture stays outside this lock, because a blocked cycle drops perishable
         minutes. A marker stands for a minute already gone, so nothing perishes while it
         waits.
+
+        The roster is read once here, for the pass rather than for each ticker, and
+        outside the lock because it is not lake state. One read per pass keeps every
+        surface in the pass judged against one snapshot of what is in scope.
         """
         spans: list[MarkedSpan] = []
         sealed: list[str] = []
         problems: list[str] = []
         notes = MarkingReport()
         try:
+            roster = self._roster()
             with lake_lock(self._root):
                 recorded = latest_entries(self._root)
-                for entry in self._roster:
+                for entry in roster:
                     for surface in surfaces_for(entry):
                         slots, pair_notes = plan(surface, entry.ticker)
                         notes = _merge(notes, pair_notes)
@@ -250,9 +270,9 @@ class GapMarker:
                                 )
                                 break
         except (OSError, ValueError) as exc:
-            # The lock or the ledger itself. ``on_start`` is unguarded and the daemon
-            # runs under ``KeepAlive``, so raising here is a crash loop that marks
-            # nothing. Record it and let the loop run.
+            # The roster read, the lock, or the ledger itself. ``on_start`` is unguarded
+            # and the daemon runs under ``KeepAlive``, so raising here is a crash loop
+            # that marks nothing. Record it and let the loop run.
             problems.append(f"marking pass: {type(exc).__name__}")
         return _merge(notes, MarkingReport(tuple(spans), tuple(sealed), (), tuple(problems)))
 

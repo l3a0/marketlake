@@ -34,7 +34,7 @@ def _marker(
     clock = ManualClock(start=at)
     return gap.GapMarker(
         lake_root=root,
-        roster=roster,
+        roster=lambda: roster,
         session_clock=SessionClock(clock=clock, calendar=calendar),
         pid=pid,
     )
@@ -309,7 +309,7 @@ def test_a_walk_that_reaches_the_cap_is_reported_rather_than_silent(tmp_path, mo
     clock = ManualClock(start=et(2026, 9, 2, 10, 0))
     marker = gap.GapMarker(
         lake_root=tmp_path,
-        roster=Roster((EQUITY_ONLY,)),
+        roster=lambda: Roster((EQUITY_ONLY,)),
         session_clock=SessionClock(clock=clock, calendar=calendar),
         master=Master(),
         pid=7,
@@ -334,7 +334,7 @@ def test_an_unresolvable_ticker_never_stops_the_daemon_from_starting(tmp_path):
     clock = ManualClock(start=et(2026, 9, 2, 10, 0))
     marker = gap.GapMarker(
         lake_root=tmp_path,
-        roster=Roster((EQUITY_ONLY,)),
+        roster=lambda: Roster((EQUITY_ONLY,)),
         session_clock=SessionClock(clock=clock, calendar=calendar),
         master=Master(),
         pid=7,
@@ -447,7 +447,7 @@ def test_the_walk_back_cap_counts_sessions_not_calendar_days(tmp_path, monkeypat
     clock = ManualClock(start=et(2026, 9, 8, 10, 0))
     marker = gap.GapMarker(
         lake_root=tmp_path,
-        roster=Roster((EQUITY_ONLY,)),
+        roster=lambda: Roster((EQUITY_ONLY,)),
         session_clock=SessionClock(clock=clock, calendar=weekday_sessions(WEEK, date(2026, 9, 7))),
         master=Master(),
         pid=7,
@@ -485,7 +485,7 @@ def test_no_minute_falls_between_the_startup_pass_and_the_first_cycle(
     session_clock = SessionClock(clock=clock, calendar=weekday_sessions(WEEK))
     marker = gap.GapMarker(
         lake_root=tmp_path,
-        roster=Roster((EQUITY_ONLY,)),
+        roster=lambda: Roster((EQUITY_ONLY,)),
         session_clock=session_clock,
         pid=11,
     )
@@ -524,3 +524,144 @@ def test_no_minute_falls_between_the_startup_pass_and_the_first_cycle(
     ]
     assert holes == [], f"minutes in no row at all: {holes}"
     assert covered[-1] == captured[-1]
+
+
+class _Recording:
+    """A transport that keeps the pages, and a pinger that reaches nothing.
+
+    Both seams default to a public endpoint, and a page sent from a test is a page a
+    person receives.
+    """
+
+    def __init__(self) -> None:
+        self.pages: list[str] = []
+
+    def send(self, message) -> None:
+        self.pages.append(message.title)
+
+    def ping(self, url: str) -> None:
+        pass
+
+
+def _overrun_after_a_roster_change(
+    tmp_path: Path, *, before: str, after: str
+) -> tuple[Path, list[str]]:
+    """Run a loop whose first cycle rewrites ``tickers.yaml`` and then overruns.
+
+    Returns the lake root and the titles of the pages the watchdog raised. Both
+    skipped-slot consumers read the roster, so both are observable from one run.
+
+    The rewrite lands at 10:00 and that cycle returns at 10:03, so the next tick reports
+    10:01 through 10:03 as skipped. A skipped slot is the one hook where no cycle ran, so
+    nothing but the roster each consumer reads decides which surfaces it acts on. Three
+    skipped minutes is also the watchdog's page threshold, so a charged surface pages
+    inside this run and an uncharged one stays silent.
+
+    The cycle carries no segments, so it is never a durable data cycle and the dead-man
+    never pings.
+    """
+    from lake import daemon
+    from lake.capture import CycleResult
+    from tests.support.config import write_config
+
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir(parents=True)
+    config = write_config(tmp_path, lake_root)
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text(before)
+
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    alerts = _Recording()
+    cycles = [0]
+
+    def cycle(*, close_tag, session_phase) -> CycleResult:
+        cycles[0] += 1
+        if cycles[0] == 1:
+            tickers.write_text(after)
+            clock.advance(seconds=180)
+        return CycleResult(clock.now(), ())
+
+    ticks = [0]
+
+    def twice() -> bool:
+        ticks[0] += 1
+        return ticks[0] <= 2
+
+    daemon.run_loop_from_config(
+        config_path=str(config),
+        tickers_path=str(tickers),
+        clock=clock,
+        calendar=weekday_sessions(WEEK),
+        assertion_runner=lambda args: None,
+        transport=alerts,
+        pinger=alerts,
+        cycle_runner=cycle,
+        should_continue=twice,
+    )
+    return lake_root, alerts.pages
+
+
+# The three minutes the overrun swallows.
+SKIPPED = ["2026-09-02T10:01", "2026-09-02T10:02", "2026-09-02T10:03"]
+
+
+def _marked(root: Path, ticker: str) -> list[str]:
+    return [slot[:16] for slot in _slots(root, "quotes", ticker, date(2026, 9, 2))]
+
+
+def test_a_ticker_onboarded_mid_session_has_its_skipped_minutes_marked(tmp_path):
+    """The roster gains NEW at 10:00, so NEW owes 10:01 through 10:03 like ABC does.
+
+    Capture re-reads the roster every cycle, so NEW is already being captured by the
+    time the loop oversleeps. A marking pass working from the roster the daemon loaded
+    at start would leave those three minutes as holes on a surface that is in scope,
+    which is the failure gap marking exists to close.
+    """
+    lake_root, _ = _overrun_after_a_roster_change(
+        tmp_path,
+        before="ABC: {options: false}\n",
+        after="ABC: {options: false}\nNEW: {options: false}\n",
+    )
+    assert _marked(lake_root, "NEW") == SKIPPED
+
+
+def test_a_ticker_retired_mid_session_stops_collecting_markers(tmp_path):
+    """The roster loses XYZ at 10:00, so nothing captures it and nothing owes it.
+
+    Scope's front edge already works this way: the anchor clamps to ``capture_start``,
+    so minutes before it are out of scope rather than gaps. Leaving the roster is the
+    same boundary. Marking XYZ's 10:01 would manufacture a hole on a surface no cycle
+    will write to again. ABC is the control: without it a marker that stopped writing
+    entirely would pass.
+    """
+    lake_root, _ = _overrun_after_a_roster_change(
+        tmp_path,
+        before="ABC: {options: false}\nXYZ: {options: false}\n",
+        after="ABC: {options: false}\n",
+    )
+    assert _marked(lake_root, "ABC") == SKIPPED
+    assert _marked(lake_root, "XYZ") == []
+
+
+def test_the_watchdog_charges_the_roster_as_it_stands_on_a_skipped_slot(tmp_path):
+    """The other consumer of the same read, pinned on the same run.
+
+    Gap marking and the watchdog counters both fire from ``on_skipped``, where no cycle
+    ran to fix a roster snapshot, so both read ``tickers.yaml`` themselves. Deleting
+    either read must not leave the suite green. XYZ is retired at 10:00 and must stop
+    being charged without a restart. NEW is onboarded at 10:00, is captured from the
+    next cycle, and must start.
+    """
+    _, retired = _overrun_after_a_roster_change(
+        tmp_path / "retired",
+        before="ABC: {options: false}\nXYZ: {options: false}\n",
+        after="ABC: {options: false}\n",
+    )
+    assert retired == ["Capture down: ABC quotes"]
+
+    _, onboarded = _overrun_after_a_roster_change(
+        tmp_path / "onboarded",
+        before="ABC: {options: false}\n",
+        after="ABC: {options: false}\nNEW: {options: false}\n",
+    )
+    assert sorted(onboarded) == ["Capture down: ABC quotes", "Capture down: NEW quotes"]
