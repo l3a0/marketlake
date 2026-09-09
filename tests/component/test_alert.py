@@ -218,13 +218,15 @@ def test_a_ticker_onboarded_mid_session_keeps_charging_when_the_roster_stops_loa
 ):
     """The fallback roster is the last one that loaded, not the startup one.
 
-    The watchdog's skipped-slot hook re-reads ``tickers.yaml`` because the design has
-    the counters read the same snapshot the cycle runner does. A ticker onboarded
-    mid-session therefore starts being charged with no restart. The re-read can fail,
-    since ``tickers.yaml`` is rewritten in place and a reader can catch it half
-    written, so the hook falls back rather than refusing to count. Falling back to the
-    startup roster would drop every ticker onboarded since, and the one most likely to
-    be quiet is the one that just arrived.
+    The watchdog's skipped-slot hook fires for the capture minutes a long cycle slept
+    through, and it charges one counter per ticker and surface for each of them. It
+    re-reads ``tickers.yaml`` to decide what to charge, because the design has those
+    counters read the same roster snapshot the cycle runner does. A ticker onboarded
+    mid-session therefore starts being charged with no restart.
+
+    A read can still fail on a roster edited by hand. The hook falls back rather than
+    refusing to count. Falling back to the startup roster drops every ticker onboarded
+    since, and the ticker most likely to be quiet is the one that just arrived.
     """
     from lake import daemon
     from lake.capture import CycleResult
@@ -243,7 +245,7 @@ def test_a_ticker_onboarded_mid_session_keeps_charging_when_the_roster_stops_loa
     cycles = [0]
 
     def overrunning_cycle(*, close_tag, session_phase):
-        """Two cycles that each outlive their minute, so two runs of slots are missed.
+        """Two cycles that each outlive their minute, so the loop misses two runs.
 
         The loop realigns to the next minute top, so a cycle longer than a minute is
         how a live daemon sleeps through a capture slot. Each run here misses two.
@@ -251,13 +253,17 @@ def test_a_ticker_onboarded_mid_session_keeps_charging_when_the_roster_stops_loa
         slot = clock.now().replace(second=0, microsecond=0)
         cycles[0] += 1
         if cycles[0] == 1:
-            # DEF is onboarded between the two runs, the way the command writes it.
+            # DEF is onboarded between the two runs, the way `lake.onboard` writes it.
             tickers.write_text(
                 "XYZ: {options: false}\nABC: {options: false}\nDEF: {options: false}\n"
             )
             clock.advance(140)
         elif cycles[0] == 2:
-            # A top-level scalar is one shape a roster caught half written takes.
+            # Every counter stands at two here, one short of the page threshold. Push
+            # the first run past three instead and the startup roster passes this test
+            # too, because DEF would already have paged before the roster went bad.
+            assert not transport.sent
+            # A top-level scalar is one shape a roster edited by hand takes.
             tickers.write_text("XYZ")
             clock.advance(140)
         return CycleResult(snap_ts=slot, segments=())
@@ -282,10 +288,10 @@ def test_a_ticker_onboarded_mid_session_keeps_charging_when_the_roster_stops_loa
         should_continue=four,
     )
 
-    # Two runs of two missed slots take every counter past the three-minute page
-    # threshold. No cycle produced a segment, so nothing but those minutes charged a
-    # counter. DEF stood at two when the file went bad. It pages only if the fallback
-    # carried it.
+    # Two runs of two missed slots take every counter past the threshold of three
+    # consecutive minutes. No cycle produced a segment, so nothing but those minutes
+    # charged a counter. DEF stood at two when the file went bad. It pages only if the
+    # fallback carried it.
     assert sorted(page.title for page in transport.sent) == [
         "Capture down: ABC quotes",
         "Capture down: DEF quotes",

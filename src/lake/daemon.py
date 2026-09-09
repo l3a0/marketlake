@@ -390,8 +390,10 @@ def run_loop_from_config(
     This is the entry ``python -m lake.daemon`` calls. The clock defaults to the system
     clock and the calendar to the NYSE calendar from ``exchange_calendars``. The cycle
     runner is a closure over ``run_cycle_from_config``, which reloads the config, the
-    roster, the token, and the chain plan on every call. Nothing is cached here, so the
-    per-cycle re-read the design wants comes from the existing wiring.
+    roster, the token, and the chain plan on every call. The per-cycle re-read the
+    design wants comes from that wiring rather than from anything this entry caches for
+    the cycle. The observers built below do hold state of their own, and each says what
+    it holds where it is built.
 
     The caffeinate power assertion is held here rather than left to a caller. The
     design's chain is the wake alarm, then ``KeepAlive`` starting the daemon, then the
@@ -506,15 +508,19 @@ def run_loop_from_config(
         def on_skipped(slots: list[datetime]) -> None:
             # The roster is re-read here rather than closed over. The cycle runner
             # re-reads it every cycle, and the design has the watchdog counters read
-            # that same snapshot, so a ticker onboarded mid-session must start being
-            # charged and one retired mid-session must stop, both without a restart.
-            # Each successful read replaces what the fallback holds, so a roster that
-            # will not load leaves the last good one in place rather than the one the
-            # daemon started with. Refusing to count is worse than counting a ticker
-            # one cycle too long. The price is a roster that outlives the file: while
-            # the file cannot be read, charging is frozen at the last successful read,
-            # so a ticker retired then is charged one cycle too long and one re-added
-            # then is not charged until a read succeeds.
+            # that same snapshot. So a ticker onboarded mid-session starts being
+            # charged with no restart, and one retired mid-session stops.
+            # Each successful read replaces what the fallback holds. A roster that
+            # will not load therefore leaves the last good one in place, not the one
+            # the daemon started with. Refusing to count is worse than counting a
+            # ticker one cycle too long.
+            # Carrying a read across calls is only safe because ``upsert_ticker``
+            # renames the roster into place. A torn read parses as a roster with
+            # tickers missing, and carrying one would silence their counters.
+            # The price is a roster that outlives the file. While the file will not
+            # load, the counters stay frozen at the last successful read. A ticker
+            # retired in that window is charged one cycle too long. One added in that
+            # window waits for a read to succeed.
             nonlocal roster
             try:
                 roster = load_tickers(tickers_path)

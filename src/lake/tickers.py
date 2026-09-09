@@ -164,8 +164,32 @@ def upsert_ticker(
     existing[ticker] = entry
 
     resolved.parent.mkdir(parents=True, exist_ok=True)
-    resolved.write_text(yaml.safe_dump(existing, sort_keys=True))
+    _write_atomically(resolved, yaml.safe_dump(existing, sort_keys=True))
     return resolved
+
+
+def _write_atomically(target: Path, text: str) -> None:
+    """Write the roster through a temp file beside it, a flush, then one rename.
+
+    The daemon re-reads this file while the command writes it. A plain write truncates
+    the file first, so a reader can catch it empty or half written. Neither shape is an
+    error the loader refuses. An empty file loads as a roster of no tickers, and a
+    prefix that ends on a line boundary loads as a roster missing everything after it.
+    A caller that keeps what it last read would then keep a roster that was never true.
+    A rename replaces the file in one step, so every reader sees the whole old roster or
+    the whole new one. The chain plan is written this way for the same reason. A crash
+    mid-write leaves the prior file intact, and the temp file goes on any failure.
+    """
+    tmp = target.with_name(f"{target.name}.tmp-{os.getpid()}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _resolve_path(path: str | Path | None, env: Mapping[str, str] | None) -> Path:

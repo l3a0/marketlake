@@ -1,12 +1,18 @@
-"""The roster loaded from a real tickers.yaml, with env-var and argument overrides."""
+"""The roster over a real tickers.yaml: the loader, its overrides, and the write.
+
+The daemon re-reads this file while the onboarding command writes it, so the write has
+to be atomic. The last case here holds that half.
+"""
 
 from __future__ import annotations
 
+import builtins
+import io
 from pathlib import Path
 
 import pytest
 
-from lake.tickers import TickersError, load_tickers
+from lake.tickers import TickersError, load_tickers, upsert_ticker
 
 YAML = """\
 SPY: {options: true, chain_cadence: 1m, bars: [1m, 1d]}
@@ -47,3 +53,44 @@ def test_a_typed_tilde_still_expands(tmp_path: Path, monkeypatch):
 def test_missing_file_raises(tmp_path: Path):
     with pytest.raises(TickersError):
         load_tickers(tmp_path / "none.yaml")
+
+
+def test_a_reader_during_the_write_still_sees_a_whole_roster(tmp_path: Path, monkeypatch):
+    """The write must not expose the file in a torn state.
+
+    The daemon re-reads ``tickers.yaml`` on its own schedule, so it can read while the
+    command writes. Truncating the file in place opens a window where a reader gets
+    zero bytes or a prefix. The loader refuses neither. An empty file loads as a roster
+    of no tickers, and a prefix ending on a line boundary loads as a roster missing
+    everything after it, so a torn read is silently wrong rather than an error. The
+    watchdog's counters keep what they last read, which makes a torn read outlive its
+    instant.
+    """
+    path = tmp_path / "tickers.yaml"
+    upsert_ticker("XYZ", options=False, path=path)
+    before = path.read_text()
+
+    seen: list[str | None] = []
+    real_open = builtins.open
+
+    def watching_open(file, mode="r", *args, **kwargs):
+        """Record what the roster holds just after a file is opened for writing.
+
+        Opening for writing is the truncating step, so the read has to happen after it.
+        Reading before would see the untouched file whichever way the write is done.
+        """
+        handle = real_open(file, mode, *args, **kwargs)
+        if "w" in mode:
+            seen.append(path.read_text() if path.exists() else None)
+        return handle
+
+    monkeypatch.setattr(builtins, "open", watching_open)
+    monkeypatch.setattr(io, "open", watching_open)
+    upsert_ticker("ABC", options=False, path=path)
+
+    # One file was opened for writing, and it was not the roster: the roster still held
+    # every byte of the previous version at that instant.
+    assert seen == [before]
+    assert load_tickers(path).symbols == ("ABC", "XYZ")
+    # The temp file the write goes through is gone, not left beside the roster.
+    assert [p.name for p in sorted(tmp_path.iterdir())] == ["tickers.yaml"]
