@@ -35,6 +35,7 @@ shared root without disturbing any other test.
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
@@ -46,6 +47,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from lake import dashboard, journal
+from lake.alert import Message, Publisher
 from lake.calendar import MARKET_TZ
 from lake.config import GuardConstants
 from lake.dashboard import (
@@ -53,6 +55,7 @@ from lake.dashboard import (
     DashboardService,
     QueryParameterError,
 )
+from lake.metadata import stamp_cycle, stamp_ping
 from lake.paths import DATE_PREFIX, JOURNAL_DIR, SEGMENT_GLOB
 from lake.security_master import (
     KIND_EQUITY,
@@ -60,6 +63,7 @@ from lake.security_master import (
     SecurityMaster,
     master_path,
 )
+from lake.tickers import Roster
 from tests.support.calendar import FakeCalendar, SessionTimes
 from tests.support.clock import ManualClock
 from tests.support.lake import FixtureLake, sample_chains_table, sample_quotes_table
@@ -77,6 +81,27 @@ def et(day: date, h: int, m: int, s: int = 0) -> datetime:
 
 
 NOW = et(MONDAY, 9, 40, 30)
+
+# The Sunday evening re-auth before the fixture's Monday, the mint a stamp carries.
+MINTED = et(date(2026, 8, 23), 20, 5)
+
+
+def _roster() -> Roster:
+    """The fixture lake's two tickers, as the daemon would stamp them."""
+    return Roster.from_mapping(
+        {
+            "SPY": {"options": True, "chain_cadence": "1m"},
+            "QQQ": {"options": True, "chain_cadence": "1m"},
+        }
+    )
+
+
+class _Undeliverable:
+    """A transport that cannot deliver, so the publisher writes the page down instead."""
+
+    def send(self, message: object) -> None:
+        raise OSError("no network")
+
 
 CALENDAR = FakeCalendar(
     {
@@ -311,13 +336,72 @@ def test_now_walks_back_past_a_gap_only_day(service: DashboardService):
     assert qqq["minutes_since"] == 3925.5
 
 
-def test_now_reports_null_for_the_unbuilt_writers(service: DashboardService):
+def test_now_reports_null_where_the_daemon_has_stamped_nothing(service: DashboardService):
     now = service.run_query("now", {})
-    # The daemon does not journal the token mint stamp yet, and the watchdog's dead-man
-    # ping is not built. Both read as null rather than being read from ~/.config.
+    # A lake no daemon has run against carries no stamp. The panel says so rather than
+    # showing a zero, and it never reaches into ~/.config for the answer.
     assert now["token_minted_at"] is None
     assert now["token_age_minutes"] is None
+    assert now["token_sunday_countdown_minutes"] is None
     assert now["dead_man_last_ping"] is None
+    # The page count is the exception. An ordinary day writes no file at all, so its
+    # absence is a true zero rather than an unknown.
+    assert now["pages_failed_to_send"] == 0
+
+
+def test_now_reports_the_token_stamp_the_daemon_journalled(root: Path):
+    # The mint is the Sunday evening re-auth before this Monday. The age is the wait
+    # since then and the countdown is the wait until the next Sunday canary, so the
+    # panel answers both from one stamp and never from the token file.
+    stamp_cycle(
+        root,
+        at=NOW,
+        token_minted_at=MINTED,
+        roster=_roster(),
+    )
+
+    now = service_over(root).run_query("now", {})
+    assert now["token_minted_at"] == MINTED.isoformat()
+    assert now["token_age_minutes"] == 815.5  # 13h35m30s since Sunday 20:05
+    assert now["token_sunday_countdown_minutes"] == 9259.5  # to Sunday the 30th at 20:00
+
+
+def test_an_overdue_token_counts_down_past_zero(root: Path):
+    # A token minted two Sundays back is past the ritual that should have replaced it.
+    # The countdown goes negative rather than being clamped, because a clamped zero
+    # reads the same as a ritual due this minute.
+    stamp_cycle(root, at=NOW, token_minted_at=MINTED - timedelta(days=7), roster=_roster())
+
+    now = service_over(root).run_query("now", {})
+    assert now["token_sunday_countdown_minutes"] == -820.5
+    assert now["token_age_minutes"] == 815.5 + 7 * 24 * 60
+
+
+def test_now_reports_the_dead_man_ping_the_daemon_recorded(root: Path):
+    stamp_ping(root, at=et(MONDAY, 9, 40))
+
+    now = service_over(root).run_query("now", {})
+    assert now["dead_man_last_ping"] == et(MONDAY, 9, 40).isoformat()
+
+
+def test_now_counts_the_pages_that_never_reached_the_phone(root: Path):
+    # The publisher writes one file per undelivered page. Raising them through the real
+    # publisher is what proves the reader and the writer agree on where they land.
+    publisher = Publisher(lake_root=root, transport=_Undeliverable(), pid=7)
+    for title in ("Capture down: SPY chains", "Capture down: quote sampler dead"):
+        assert publisher.publish(
+            Message(event="capture_down", title=title, body="b"), now=NOW
+        ).recorded
+
+    assert service_over(root).run_query("now", {})["pages_failed_to_send"] == 2
+
+
+def test_a_page_lost_on_another_day_is_not_todays_count(root: Path):
+    publisher = Publisher(lake_root=root, transport=_Undeliverable(), pid=7)
+    publisher.publish(Message(event="capture_down", title="t", body="b"), now=et(FRIDAY, 16, 0))
+
+    # The panel is about now, and the day is the Eastern one the publisher files under.
+    assert service_over(root).run_query("now", {})["pages_failed_to_send"] == 0
 
 
 # -- today -------------------------------------------------------------------
@@ -733,6 +817,86 @@ def test_a_ticker_whose_only_data_is_a_sealed_partition_is_in_the_roster(
     assert now["surfaces"][0]["surface"] == "quotes"
     assert now["surfaces"][0]["last_data_snap_ts"] == et(MONDAY, 9, 30).isoformat()
     assert now["surfaces"][0]["minutes_since"] == 10.5
+
+
+def test_a_stamped_ticker_that_journalled_nothing_shows_as_failing(root: Path):
+    # The design's reason for the roster stamp. Read off the lake's layout alone, a
+    # ticker whose every cycle failed has no directory and no row, so the panel shows
+    # nothing at all where it should show a capture that is down.
+    stamp_cycle(
+        root,
+        at=NOW,
+        token_minted_at=MINTED,
+        roster=Roster.from_mapping({"IWM": {"options": False}}),
+    )
+    assert not (root / "quotes" / "ticker=IWM").exists()
+
+    now = service_over(root).run_query("now", {})
+    assert now["tickers"] == ["IWM", "QQQ", "SPY"]
+    iwm = [row for row in now["surfaces"] if row["ticker"] == "IWM"]
+    # An equity-only ticker is expected on quotes alone, so it gets that one row.
+    assert [row["surface"] for row in iwm] == ["quotes"]
+    assert iwm[0]["last_data_snap_ts"] is None
+    assert iwm[0]["minutes_since"] is None
+    assert iwm[0]["lookback_exhausted"] is False
+
+
+def test_a_stamped_ticker_is_queryable_and_renders_a_dark_strip(root: Path):
+    # The roster is the request allow-list, so a stamped ticker has to pass validation
+    # too. Its Today strip is every slot missing, which is the failing capture drawn out.
+    stamp_cycle(
+        root,
+        at=NOW,
+        token_minted_at=MINTED,
+        roster=Roster.from_mapping({"IWM": {"options": False}}),
+    )
+
+    today = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "IWM"})
+    strip = today["strips"][0]
+    assert strip["ticker"] == "IWM"
+    assert strip["counts"]["captured"] == 0
+    assert strip["counts"]["missing"] > 0
+
+
+def test_a_ticker_dropped_from_the_stamp_keeps_the_days_it_captured(root: Path):
+    # The stamp is the daemon's current roster, not the lake's history. A ticker retired
+    # from tickers.yaml still has sealed partitions, and the panel must still reach them.
+    stamp_cycle(
+        root,
+        at=NOW,
+        token_minted_at=MINTED,
+        roster=Roster.from_mapping({"SPY": {"options": True, "chain_cadence": "1m"}}),
+    )
+
+    now = service_over(root).run_query("now", {})
+    assert "QQQ" in now["tickers"]
+    qqq = next(row for row in now["surfaces"] if row["ticker"] == "QQQ")
+    assert qqq["last_data_snap_ts"] == et(FRIDAY, 16, 15).isoformat()
+
+
+def test_a_malformed_stamped_ticker_never_enters_the_roster(root: Path):
+    # The stamp is a file under lake_root, and the roster it feeds is the allow-list a
+    # request ticker is checked against. So a stamped name passes the same shape gate a
+    # directory name does, and a stamped surface the panels do not read is dropped.
+    path = root / JOURNAL_DIR / "metadata.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "tickers": {
+                    "DROP TABLE": ["quotes"],
+                    "spy": ["quotes"],
+                    "IWM": ["quotes", "bars"],
+                }
+            }
+        )
+    )
+
+    now = service_over(root).run_query("now", {})
+    assert now["tickers"] == ["IWM", "QQQ", "SPY"]
+    assert [row["surface"] for row in now["surfaces"] if row["ticker"] == "IWM"] == ["quotes"]
+    with pytest.raises(QueryParameterError):
+        service_over(root).run_query("today", {"ticker": "DROP TABLE"})
 
 
 def test_a_malformed_ticker_directory_never_enters_the_roster(root: Path):

@@ -20,8 +20,9 @@ here.
    and neither runs a query. Every other unmapped path is a 404. No endpoint takes SQL,
    and no request field is ever treated as SQL text.
 2. A request carries at most two parameters, a ticker and a date. Each is validated
-   before any query runs. The ticker must be in the lake's own roster, the set of tickers
-   present under ``lake_root``. The date must parse as strict ``YYYY-MM-DD``. A request
+   before any query runs. The ticker must be in the lake's own roster, which is the
+   daemon's roster stamp and the tickers present under ``lake_root``, never
+   ``tickers.yaml``. The date must parse as strict ``YYYY-MM-DD``. A request
    that fails validation is a 400. Validation runs before the connection is touched, with
    one exception: a date the calendar cannot judge at all is refused from inside the
    query, after a cursor has been opened. Even there no statement runs and no lake data
@@ -88,9 +89,12 @@ import duckdb
 import pyarrow as pa
 
 from lake import journal
+from lake.alert import undelivered
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
 from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants, load_config
+from lake.control_plane import sunday_canary_due
+from lake.metadata import read_metadata
 from lake.paths import (
     CHAINS,
     DATE_PREFIX,
@@ -282,20 +286,35 @@ def _date_dirs(journal_dir: Path) -> list[Path]:
 
 
 def lake_roster(paths: LakePaths) -> dict[str, tuple[str, ...]]:
-    """The tickers present in the lake, each with the panel surfaces it has data for.
+    """The tickers the lake knows, each with the panel surfaces it is expected on.
 
     The design pins that the dashboard's ticker list comes from under ``lake_root`` and
-    never from ``tickers.yaml``. Until the daemon journals the roster stamp, the list is
-    read off the lake's own layout: the ``ticker=`` directories under each surface's
-    partition tree and under each journal date. The result is sorted by ticker, and a
-    ticker maps to the sorted surfaces it appears under. This is the allow-list a request
-    ticker is validated against.
+    never from ``tickers.yaml``. Two sources under the root answer that, and the roster
+    is their union.
+
+    1. The daemon's roster stamp, in the journal metadata. It names every ticker the
+       daemon is capturing and the surfaces each one is captured on. So a ticker that
+       journaled nothing at all still gets a row, showing its capture failing rather
+       than vanishing from the panel.
+    2. The lake's own layout, the ``ticker=`` directories under each surface's partition
+       tree and under each journal date. That covers a lake stamped by no daemon yet,
+       and it keeps a ticker retired from the roster reachable for the days it did
+       capture.
+
+    A stamped name is filtered by the same ticker shape a directory name is, and to the
+    two panel surfaces, because this mapping is the allow-list a request ticker is
+    validated against. The result is sorted by ticker, and each ticker's surfaces are
+    sorted too.
 
     The journal's date directories are listed once, not once per surface, because the
     listing is the same for every surface and this walk runs on every request.
     """
-    date_dirs = _date_dirs(paths.journal_dir)
     surfaces: dict[str, set[str]] = {}
+    for ticker, expected in read_metadata(paths.root).tickers.items():
+        if not _TICKER_PATTERN.fullmatch(ticker):
+            continue
+        surfaces[ticker] = {name for name in expected if name in PANEL_SURFACES}
+    date_dirs = _date_dirs(paths.journal_dir)
     for surface in PANEL_SURFACES:
         present = _tickers_in(paths.root / surface)
         for date_dir in date_dirs:
@@ -817,6 +836,15 @@ def _iso(instant: datetime) -> str:
     return instant.astimezone(MARKET_TZ).isoformat()
 
 
+def _minutes(span: timedelta) -> float:
+    """A span in minutes, at the tenth every other age on the panel carries.
+
+    A negative span is a deadline already passed, and it renders as one rather than
+    being clamped to zero.
+    """
+    return round(span.total_seconds() / 60, 1)
+
+
 def session_slots(bounds: SessionBounds) -> list[datetime]:
     """Every capture slot of a session: the open through the option close, one a minute.
 
@@ -869,19 +897,26 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
     or after it. A ticker onboarded later today has no in-scope slot yet, so it is not a
     stale capture.
 
-    Five fields are null until their writers exist.
+    Five more fields sit beside the rows, and each reads what another component wrote
+    under ``lake_root``. The dashboard never reads ``~/.config``.
 
-    1. ``token_minted_at``, the refresh token's mint stamp. It comes from the stamp the
-       daemon will journal into segment metadata each cycle. Nothing writes that stamp
-       yet, and the dashboard never reads the token file.
-    2. ``token_age_minutes``, computed from that same stamp.
-    3. ``token_sunday_countdown_minutes``, the countdown to the Sunday re-mint ritual. It
-       needs both the mint stamp and the ritual's own moment, which the unbuilt token
-       deliverable owns. This module names no session time, so the countdown cannot be
-       reconstructed here.
-    4. ``dead_man_last_ping``, the watchdog deliverable's last dead-man ping.
-    5. ``pages_failed_to_send``, the count of alert pages that failed to send. The
-       alerting deliverable owns that counter.
+    1. ``token_minted_at``, the refresh token's mint stamp, from the journal metadata
+       the daemon stamps every cycle and every idle minute.
+    2. ``token_age_minutes``, ``now`` minus that same stamp.
+    3. ``token_sunday_countdown_minutes``, the wait until the Sunday canary that must
+       replace the token in use. ``sunday_canary_due`` owns that moment, because the
+       control plane owns the ritual. It goes negative once the ritual is overdue, which
+       is the honest reading of a token past its Sunday.
+    4. ``dead_man_last_ping``, the instant the dead-man ping last landed, written by the
+       daemon's own feed.
+    5. ``pages_failed_to_send``, today's count of pages that never reached the phone,
+       counted from the files the publisher writes under ``reports/``. The day is the
+       Eastern one, the same key the publisher files them under.
+
+    Each of the five is null when nothing has been written. A daemon that has never run
+    leaves the token and ping stamps absent, and the panel says so rather than showing a
+    zero. The page count is the exception: an ordinary day writes no file at all, so its
+    absence is a true zero and reads as one.
     """
     starts = _capture_starts(ctx.paths, ctx.roster, ctx.session.session_date())
     surfaces: list[dict[str, object]] = []
@@ -889,6 +924,8 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
         for surface in present:
             surfaces.append(_latest_cycle(con, ctx, surface, ticker, starts.get(ticker)))
     phase = ctx.session.phase()
+    stamp = read_metadata(ctx.paths.root)
+    minted = stamp.token_minted_at
     return {
         "as_of": _iso(ctx.now),
         "session_date": ctx.session.session_date().isoformat(),
@@ -897,11 +934,15 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
         "stale_after_minutes": ctx.guards.watchdog_page_minutes,
         "tickers": list(ctx.roster),
         "surfaces": surfaces,
-        "token_minted_at": None,
-        "token_age_minutes": None,
-        "token_sunday_countdown_minutes": None,
-        "dead_man_last_ping": None,
-        "pages_failed_to_send": None,
+        "token_minted_at": None if minted is None else _iso(minted),
+        "token_age_minutes": None if minted is None else _minutes(ctx.now - minted),
+        "token_sunday_countdown_minutes": (
+            None if minted is None else _minutes(sunday_canary_due(minted) - ctx.now)
+        ),
+        "dead_man_last_ping": (
+            None if stamp.dead_man_last_ping is None else _iso(stamp.dead_man_last_ping)
+        ),
+        "pages_failed_to_send": undelivered(ctx.paths.root, ctx.session.session_date()),
     }
 
 

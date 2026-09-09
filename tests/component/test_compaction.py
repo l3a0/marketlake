@@ -54,8 +54,10 @@ from lake.manifest import (
     read_manifest,
     sha256_file,
 )
+from lake.metadata import read_metadata, stamp_cycle
 from lake.paths import LakePaths
 from lake.runner import BackupTargetUnavailable, RsyncBackup
+from lake.tickers import Roster
 from tests.support.backup import FakeBackup
 from tests.support.calendar import FakeCalendar, SessionTimes
 from tests.support.clock import ManualClock
@@ -232,6 +234,31 @@ def _rel(lake_root: Path, path: Path) -> str:
 
 
 # -- 1. a day of segments ----------------------------------------------------
+
+
+def test_the_journal_metadata_stamp_survives_a_seal_and_blocks_no_pruning(lake_root):
+    # The daemon's stamp sits at the journal root, beside the date directories rather
+    # than inside one. A file inside a date directory would keep that shell alive after
+    # its seal, because pruning removes an empty directory and never a populated one.
+    # The stamp is not a measurement, so the sweep must pass over it either way.
+    paths = LakePaths(lake_root)
+    segment = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a"
+    )
+    stamp_cycle(
+        lake_root,
+        at=_et(DAY, 9, 30),
+        token_minted_at=_et(DAY, 0, 5),
+        roster=Roster.from_mapping({"SPY": {"options": True, "chain_cadence": "1m"}}),
+    )
+
+    result, _, _, _ = _run(lake_root, clock=_clock_at(DAY, 16, 30))
+
+    assert not segment.exists()
+    assert [item.day for item in result.sealed] == [DAY]
+    # The date directory pruned, and the stamp is still readable beside where it was.
+    assert [child.name for child in paths.journal_dir.iterdir()] == ["metadata.json"]
+    assert read_metadata(lake_root).tickers == {"SPY": ("chains", "quotes")}
 
 
 def test_a_day_of_segments_compacts_to_one_partition_per_surface_and_ticker(lake_root):

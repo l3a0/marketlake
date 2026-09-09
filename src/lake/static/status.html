@@ -55,8 +55,8 @@
   th { font-weight: 600; }
   td.num { font-variant-numeric: tabular-nums; }
   .stale { color: var(--gap); font-weight: 600; }
-  .writers { margin: .6rem 0 0; padding-left: 1.1rem; }
-  .writers li { margin: .1rem 0; }
+  .daemon { margin: .6rem 0 0; padding-left: 1.1rem; }
+  .daemon li { margin: .1rem 0; }
   .strip-label {
     display: flex; justify-content: space-between; gap: .5rem;
     flex-wrap: wrap; margin-top: .6rem;
@@ -130,7 +130,7 @@
         <tbody id="now-rows"></tbody>
       </table>
     </div>
-    <ul id="writers" class="muted writers"></ul>
+    <ul id="daemon" class="muted daemon"></ul>
   </div>
 </section>
 
@@ -352,7 +352,7 @@
     now.surfaces.forEach(function (row) {
       body.appendChild(nowRow(now, row));
     });
-    renderWriters(now);
+    renderDaemon(now);
   }
 
   function nowRow(now, row) {
@@ -428,11 +428,22 @@
     return cell;
   }
 
-  // Five payload fields wait on writers that do not exist yet. They render as four lines,
-  // since token_age_minutes shares a line with token_minted_at. Each line says so in the
-  // same shape, so a null reads as an unbuilt writer and never as a zero.
-  function renderWriters(now) {
-    var list = byId("writers");
+  // The countdown runs past zero once the ritual is overdue, because a clamped zero
+  // reads the same as a ritual due this minute. A negative wait is said as one.
+  function countdownText(minutes) {
+    if (minutes < 0) {
+      return "Sunday re-mint overdue by " + plural(-minutes, "minute", "minutes") + ".";
+    }
+    return "Sunday re-mint in " + plural(minutes, "minute", "minutes") + ".";
+  }
+
+  // Five payload fields describe the daemon rather than a ticker. They render as four
+  // lines, since token_age_minutes shares a line with token_minted_at. A null means
+  // nothing has been stamped yet, so the line says that rather than showing a zero. The
+  // page count is the one that is never null, because a day with no file written is a
+  // true zero. Its null branch is a guard, not an expected state.
+  function renderDaemon(now) {
+    var list = byId("daemon");
     clear(list);
     var items = [
       {
@@ -444,8 +455,8 @@
       {
         text: now.token_sunday_countdown_minutes === null
           ? "Sunday re-mint countdown: not recorded yet."
-          : "Sunday re-mint in " +
-            plural(now.token_sunday_countdown_minutes, "minute", "minutes") + "."
+          : countdownText(now.token_sunday_countdown_minutes),
+        className: now.token_sunday_countdown_minutes < 0 ? "alarm" : null
       },
       {
         text: now.dead_man_last_ping === null

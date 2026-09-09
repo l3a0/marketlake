@@ -13,6 +13,8 @@ They pin the cycle's observable contract:
 3. A failing quote batch gaps every ticker's quotes, because the sampler is one shared
    failure unit.
 4. The manifest gains one entry per segment, keyed by the segment path.
+5. The journal metadata gains the cycle's token mint time and roster, and a vendor that
+   cannot name its mint time costs the stamp rather than the cycle.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from lake import capture, journal
 from lake.cassette import Cassette, Interaction, load_cassette
 from lake.chain_plan import ChainPlan
 from lake.manifest import latest_entries, sha256_file
+from lake.metadata import JournalMetadata, read_metadata
 from lake.tickers import Roster
 from lake.vendor import VendorError
 from tests.support.clock import ManualClock
@@ -389,3 +392,47 @@ def test_top_level_envelope_cusip_lands_in_the_column(lake_root):
     row = _rows(result.segment(QUOTES, "QQQ"))[0]
     assert row["cusip"] == "333333333"
     assert row["extra"] is None
+
+
+# -- 7. the journal metadata stamp -------------------------------------------
+
+
+def test_a_cycle_stamps_the_token_mint_time_and_the_roster(cassette_vendor, lake_root):
+    # The Now panel's token age comes from the lake, never from ``~/.config``. The stamp
+    # is what carries it there, and the mint comes off the vendor the cycle fetched with.
+    capture.run_cycle(
+        ManualClock(start=_CLOCK_START),
+        cassette_vendor,
+        _spy_options_qqq_equity(),
+        lake_root,
+        pid=4242,
+        plan=_ONE_WINDOW,
+    )
+
+    stamp = read_metadata(lake_root)
+    assert stamp.token_minted_at == cassette_vendor.token_mint_time()
+    assert stamp.stamped_at == _EXPECTED_SNAP
+    # The equity-only ticker is stamped on quotes alone, matching what the cycle wrote.
+    assert stamp.tickers == {"SPY": ("chains", "quotes"), "QQQ": ("quotes",)}
+
+
+def test_a_vendor_that_cannot_name_its_mint_time_still_captures(lake_root):
+    # A stamp is a report about the cycle, not part of it. This cassette carries no mint
+    # time, so ``token_mint_time`` raises and the rows must land regardless.
+    recorded = load_cassette(CASSETTES / "spy_minimal.json")
+    vendor = CassetteVendor(Cassette(interactions=recorded.interactions))
+    with pytest.raises(VendorError):
+        vendor.token_mint_time()
+
+    result = capture.run_cycle(
+        ManualClock(start=_CLOCK_START),
+        vendor,
+        _both_options(),
+        lake_root,
+        pid=4242,
+        plan=_ONE_WINDOW,
+    )
+
+    assert result.errors == ()
+    assert len(_rows(result.segment(CHAINS, "SPY"))) == 2
+    assert read_metadata(lake_root) == JournalMetadata()
