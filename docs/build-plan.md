@@ -90,10 +90,24 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
 - **D11** close tags and the close+5 guard. Close+5 is the five-minute window after the option close, the last moment an option-close fetch may land. It plugs into D9's close-tag hook, and it builds the session-relative dispatcher the design calls for. Everything session-relative runs from inside the daemon, because launchd's calendar intervals are fixed wall-clock and cannot express a close-relative time. `SessionDispatch` fires one job once per session day at a moment the calendar decides, including on a daemon that starts after that moment has passed. The close+15 compaction dispatch binds to the same seam when someone builds it. Two rules are worth stating where both writers can see them:
   1. The guard's fill triggers on missing marks, not a missing cycle. A chain that failed at the option close leaves a tagged gap row holding nothing a reader can price against, and a close+5 refetch is exactly what rescues it.
   2. On a post-close restart the guard runs before startup gap-marking, so the two close minutes it owns are already recorded when D10's marker walks the day.
-- **Moved to slice 3.** D11's repair half. The guard detects a missing `option_close` and
-  cannot fix it, because the design's remedy is one direct fetch and no vendor path exists
-  in slice 2. The fill's producer and the membership guard's absent-marker rows are booked
-  under slice 3. What ships here is the detector, the close tags, and the dispatcher.
+- **Unowned.** The close+5 fill's producer. `CloseGuard` takes an injected `fill` and
+  `daemon._close_guard` never passes one, so `self._fill` is `None` in production. The guard
+  detects a missing `option_close`, appends a `no fill fetcher` line to its own outcome, and
+  returns. Nothing is refetched and nothing is written. The reason constant
+  `OPTION_CLOSE_SERIES_ABSENT` is defined and exported and never written by any code path, and
+  `_marker` is called once in the file, on the `spot_close` side. So the close minute leaves
+  no trace from this writer at all. The whole point of close+5 is that option quotes freeze at
+  the option close, so a fetch inside that window still observes the closing marks. Until the
+  producer exists, the window is observed and never used. It needs no vendor work that slice 2
+  lacks: `SchwabVendor.get_chain` already ships and capture calls it every minute. What is
+  missing is a caller at close+5 and a decision about what a failed fill records.
+- **Unowned.** The membership guard's absent-marker rows. The guard counts missing expirations
+  and writes no marker for them, so a series that was never offered and one that was missed
+  read the same downstream. This one is ordered behind the fill above, because the comparison
+  it marks against only exists once a fill has landed. The findings the guard does produce
+  reach the daemon's stderr through `_report_guard`, so launchd captures them to a log file. A
+  log file is a worse home than a page or a panel, and that is a separate question from this
+  entry.
 - **D12** compaction and backup, plus the nightly window re-tune. Compaction merges a day's segments into one sealed partition. The re-tune runs after it. The job groups the day's rows by `window_start` and `window_end`, compares each window's contract count to the body limit, and rewrites `chain_plan.json` when the profile drifts.
 - **Unowned.** The backup's exclusion list. The design's *Backup, defined* names the sync
   root as `lake/` only, "with an explicit exclusion list". Nothing in `compact` carries
@@ -303,31 +317,22 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   cannot distinguish a ticker that was never expected from one that was expected and
   produced nothing.
 
+Every unowned entry above belongs to slice 2, and none is deferred. The test is whether an
+entry needs something a later slice introduces. None does. Slice 3 adds vendor-fetch surfaces,
+which is D16's bars and actions. The entries above that touch the vendor reuse `SchwabVendor`,
+which already ships. Slice 4 is pure derivation over sealed partitions and fetches nothing.
+Slice 5 adds the validation battery and the History and Lake panels, so it owns neither the
+Now panel's fields nor a scrub that already runs in the Sunday job. Two items in the
+integration roster below are the only slice-2-era work that genuinely waits on slice 3, and
+they are tests rather than deliverables.
+
 Slice 2 builds in two waves. D9 comes first and defines the hooks. D12, D14, and D15 do not touch the loop, so they build in parallel with D9. D10, D11, and D13 plug into D9's hooks, so they follow it, in parallel with each other.
 
 ### Slice 3, vendor fetch
 
-Slice 3 adds the vendor-fetch surfaces. Its test surface is recorded vendor payloads. It
-also owns two entries inherited from slice 2's D11, because both need a vendor fetch and
-slice 2 has no path to one.
+Slice 3 adds the vendor-fetch surfaces. Its test surface is recorded vendor payloads.
 
 - **D16** bars, actions, and the cross-check.
-- **Unowned.** The close+5 fill's producer, inherited from D11. `CloseGuard` takes an injected `fill` and
-  `daemon._close_guard` never passes one, so `self._fill` is `None` in production. The
-  guard detects a missing `option_close`, appends a `no fill fetcher` line to its own
-  outcome, and returns. Nothing is refetched and nothing is written. The reason constant
-  `OPTION_CLOSE_SERIES_ABSENT` is defined and exported and never written by any code path,
-  and `_marker` is called once in the file, on the `spot_close` side. So the close minute
-  leaves no trace from this writer at all. The whole point of close+5 is that option quotes
-  freeze at the option close, so a fetch inside that window still observes the closing
-  marks. Until the producer exists, the window is observed and never used.
-- **Unowned.** The membership guard's absent-marker rows. The guard counts missing expirations
-  and writes no marker for them, so a series that was never offered and one that was missed
-  read the same downstream. This one is ordered behind the fill above, and both are ordered
-  behind D16's vendor path, because the comparison it marks against only exists once a fill
-  has landed. The findings the guard does produce reach the daemon's stderr through
-  `_report_guard`, so launchd captures them to a log file. A log file is a worse home than a
-  page or a panel, and that is a separate question from this entry.
 
 ### Slice 4, the read layer
 
