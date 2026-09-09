@@ -279,11 +279,14 @@ def _roster_reader(
     ``tickers.yaml`` is the only statement of what is in scope right now, and the cycle
     runner re-reads it every cycle. The consumers that fire on a *skipped* slot have no
     cycle snapshot to share, because no cycle ran. Each holds a reader of its own and
-    reads the file itself, so the two see one file rather than one object.
+    reads the file itself, so each judges scope from the file rather than from a roster
+    the daemon happened to load hours earlier.
 
-    A roster that will not load leaves the last one that did in place. Refusing to count
-    or to mark is worse than working from a snapshot one cycle stale, and the reader
-    never raising is what lets ``on_start`` stay unguarded under ``KeepAlive``.
+    A roster that will not load leaves the last one that did in place, and it stays in
+    place for as long as the file stays broken. Refusing to count or to mark is worse
+    than working from a stale snapshot. ``load_tickers`` raises ``TickersError`` for
+    every way the file can fail, which is what lets this reader promise not to raise,
+    and that promise is what lets ``on_start`` stay unguarded under ``KeepAlive``.
     """
     last = seed
 
@@ -449,10 +452,10 @@ def run_loop_from_config(
     missed slots to one ``GapMarker``, so a restart and a live overrun leave the same
     kind of record. Marking needs the lake root, the security master, and the roster.
     The first two are loaded once here rather than per cycle. The roster is read per
-    marking pass, the same way the watchdog counters read it, so the two agree on which
-    tickers are in scope on the one hook where no cycle ran to say. A load failure
-    leaves marking off and the loop still runs, because a daemon that captures without
-    marking is better than one that does not start.
+    marking pass, the same way the watchdog counters read it, so on the one hook where
+    no cycle ran to say, both judge scope from the file. A load failure leaves marking
+    off and the loop still runs, because a daemon that captures without marking is
+    better than one that does not start.
     """
     clock = clock if clock is not None else SystemClock()
     calendar = calendar if calendar is not None else ExchangeCalendar()
@@ -547,7 +550,7 @@ def run_loop_from_config(
             # re-reads it every cycle, and the design has the watchdog counters read
             # that same snapshot, so a ticker retired mid-session must stop being
             # charged without a restart. Gap marking reads the same way on this hook,
-            # so the two agree on scope where no cycle ran to set it.
+            # so both judge scope from the file where no cycle ran to set it.
             watched = [
                 Surface(surface, entry.ticker)
                 for entry in read_roster()

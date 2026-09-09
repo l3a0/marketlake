@@ -14,7 +14,9 @@ The file is a mapping from ticker to its capture settings::
 like ``1m`` for one minute. ``bars`` lists the bar frequencies to fetch, like ``1m``
 and ``1d``. An equity-only ticker sets ``options: false`` and needs no cadence. The
 daemon re-reads this file at the top of every capture cycle, so a new ticker goes live
-on the next cycle with no restart.
+on the next cycle with no restart. It reads the file again on a slot the loop slept
+through, once for the watchdog counters and once for gap marking, because no cycle ran
+on that slot to take a snapshot for them to share.
 """
 
 from __future__ import annotations
@@ -117,7 +119,7 @@ def load_tickers(
     resolved = _resolve_path(path, env)
     if not resolved.exists():
         raise TickersError(f"tickers file not found: {resolved}")
-    mapping = yaml.safe_load(resolved.read_text()) or {}
+    mapping = _parse_yaml(_read_text(resolved), resolved)
     if not isinstance(mapping, Mapping):
         raise TickersError(f"tickers file is not a mapping: {resolved}")
     return Roster.from_mapping(mapping)
@@ -152,7 +154,7 @@ def upsert_ticker(
     resolved = _resolve_path(path, env)
     existing: dict[str, object] = {}
     if resolved.exists():
-        loaded = yaml.safe_load(resolved.read_text()) or {}
+        loaded = _parse_yaml(_read_text(resolved), resolved)
         if not isinstance(loaded, Mapping):
             raise TickersError(f"tickers file is not a mapping: {resolved}")
         existing = {str(key): value for key, value in loaded.items()}
@@ -166,6 +168,53 @@ def upsert_ticker(
     resolved.parent.mkdir(parents=True, exist_ok=True)
     resolved.write_text(yaml.safe_dump(existing, sort_keys=True))
     return resolved
+
+
+def _read_text(resolved: Path) -> str:
+    """The file's text, or a ``TickersError`` naming what could not be read.
+
+    ``exists()`` passing does not mean the file can be read. A path one character short
+    of the file names its directory, a restrictive mode makes it unreadable, and a
+    binary file is not text. Each raised a bare ``OSError`` or ``UnicodeDecodeError``
+    before, which no caller of this module catches.
+
+    ``lake.config`` does this for ``config.yaml`` already, and the direction of the
+    import is why it is written twice: ``config`` imports ``TickersError`` from here,
+    so this module cannot import back.
+    """
+    try:
+        return resolved.read_text()
+    except (OSError, UnicodeDecodeError):
+        raise TickersError(f"tickers file cannot be read: {resolved}") from None
+
+
+def _parse_yaml(text: str, resolved: Path) -> object:
+    """The parsed YAML, or a ``TickersError`` naming the file and where it broke.
+
+    A tab for indentation or an unclosed flow mapping raises a ``yaml.YAMLError``, not
+    a ``TickersError``. Two callers depend on that not happening. ``input_errors_exit``
+    turns an operator's malformed file into one line and exit 2, and it catches
+    ``TickersError`` only, so the traceback it exists to prevent is exactly what a
+    mangled roster printed. The daemon re-reads this file while it runs, under
+    ``KeepAlive`` and from hooks that are not guarded, so a parse error there is a
+    crash loop rather than a message.
+
+    The parse error's line and column are carried through, which is where this parts
+    company with ``lake.config``. That module drops them on purpose, because
+    ``config.yaml`` holds four secrets and the parser quotes the offending source line.
+    The roster holds ticker symbols and booleans. It is also the file an operator
+    hand-edits most, so the mark is the useful half of the message. The parser's quoted
+    line is still left out, since only the position is needed to find the mistake.
+
+    An empty file and a ``null`` document both parse to an empty mapping, matching
+    ``lake.config``.
+    """
+    try:
+        return yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        where = "" if mark is None else f" at line {mark.line + 1}, column {mark.column + 1}"
+        raise TickersError(f"tickers file is not YAML{where}: {resolved}") from None
 
 
 def _resolve_path(path: str | Path | None, env: Mapping[str, str] | None) -> Path:

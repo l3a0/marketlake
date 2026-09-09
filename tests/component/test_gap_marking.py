@@ -13,10 +13,12 @@ from pathlib import Path
 import pytest
 
 from lake import gap, journal
+from lake.config import GuardConstants
 from lake.session import SessionClock
 from lake.tickers import Roster, TickerConfig
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
+from tests.support.pinger import FakePinger
 
 # Monday of the week these tests live in. Its sessions run Monday through Friday.
 WEEK = date(2026, 8, 31)
@@ -358,14 +360,97 @@ def test_the_anchor_counts_rows_of_every_kind(tmp_path, kind):
     assert journal.last_recorded_slot(tmp_path, "quotes", "XYZ", slot.date()).slot == slot
 
 
+def test_a_stall_that_outlives_an_onboarding_marks_nothing_before_capture_start(tmp_path):
+    """A skipped-slot pass clamps to ``capture_start``, the way the startup walk does.
+
+    The loop sleeps from 10:00 to 10:10 and NEW joins the roster at 10:05, so this pass
+    is the first to see it. Its 10:01 was never owed. The design renders that ticker as
+    "onboarded 10:05", never as minutes missing, and the roster read is what makes the
+    case reachable at all: a roster frozen at daemon start could not name a ticker
+    onboarded after it.
+    """
+
+    class Master:
+        def resolve(self, symbol, on, id_type=None):
+            return 1
+
+        def capture_start_of(self, instrument_id):
+            return et(2026, 9, 2, 10, 5)
+
+    clock = ManualClock(start=et(2026, 9, 2, 10, 10))
+    marker = gap.GapMarker(
+        lake_root=tmp_path,
+        roster=lambda: Roster((TickerConfig(ticker="NEW", options=False),)),
+        session_clock=SessionClock(clock=clock, calendar=weekday_sessions(WEEK)),
+        master=Master(),
+        pid=3,
+    )
+    marker.on_skipped([et(2026, 9, 2, 10, m) for m in range(1, 10)])
+    marked = [slot[11:16] for slot in _slots(tmp_path, "quotes", "NEW", date(2026, 9, 2))]
+    assert marked == ["10:05", "10:06", "10:07", "10:08", "10:09"]
+
+
+def test_a_pass_reads_the_roster_once_however_many_surfaces_it_marks(tmp_path):
+    """One read per pass, not one per ticker or per surface.
+
+    ``_pass`` says so, and the reason is that every surface in a pass has to be judged
+    against one statement of what is in scope. A read per pair would let one pass mark
+    SPY against a roster QQQ was never checked against.
+    """
+    calls = [0]
+    roster = Roster((SPY, EQUITY_ONLY))
+
+    def read() -> Roster:
+        calls[0] += 1
+        return roster
+
+    clock = ManualClock(start=et(2026, 9, 2, 10, 4))
+    marker = gap.GapMarker(
+        lake_root=tmp_path,
+        roster=read,
+        session_clock=SessionClock(clock=clock, calendar=weekday_sessions(WEEK)),
+        pid=5,
+    )
+    report = marker.on_skipped([et(2026, 9, 2, 10, m) for m in (1, 2, 3)])
+    # SPY carries chains and quotes, XYZ quotes alone, so the pass covered three pairs.
+    assert len({(span.surface, span.ticker) for span in report.spans}) == 3
+    assert calls[0] == 1
+
+
+def test_the_startup_pass_reads_the_roster_too(tmp_path):
+    """``on_start`` reads when it runs, rather than marking a roster handed in earlier.
+
+    The daemon loads the roster to decide whether marking is wired at all, and the
+    close+5 guard's dispatch runs between that load and this pass. A ticker onboarded
+    inside that window is captured from the first cycle, so the pass has to see it.
+    """
+    _record(tmp_path, "quotes", "XYZ", et(2026, 9, 1, 16, 15))
+    _record(tmp_path, "quotes", "LATE", et(2026, 9, 1, 16, 15))
+    live = [Roster((EQUITY_ONLY,))]
+
+    clock = ManualClock(start=et(2026, 9, 2, 10, 0))
+    marker = gap.GapMarker(
+        lake_root=tmp_path,
+        roster=lambda: live[0],
+        session_clock=SessionClock(clock=clock, calendar=weekday_sessions(WEEK)),
+        pid=6,
+    )
+    # LATE joins after the marker was built but before the pass runs.
+    live[0] = Roster((EQUITY_ONLY, TickerConfig(ticker="LATE", options=False)))
+    marked = {span.ticker for span in marker.on_start().spans}
+    assert marked == {"XYZ", "LATE"}
+
+
 # -- the production wiring -----------------------------------------------------------
 
 
-def test_the_daemon_wires_gap_marking_into_both_hooks(tmp_path, monkeypatch, capsys):
+def test_the_daemon_wires_gap_marking_into_the_startup_hook(tmp_path, monkeypatch, capsys):
     """The loop really marks, rather than the marker merely working in isolation.
 
-    Without this the whole binding in ``run_loop_from_config`` can be deleted and the
-    suite stays green, which is what a review found.
+    Without this the ``on_start`` binding in ``run_loop_from_config`` can be deleted and
+    the suite stays green, which is what a review found. This run is a single pre-open
+    tick with no overrun, so it drives that hook alone. The skipped-slot binding is held
+    by the roster tests below, which a later review found this one never reached.
     """
     from lake import daemon
     from tests.support.config import write_config
@@ -526,21 +611,18 @@ def test_no_minute_falls_between_the_startup_pass_and_the_first_cycle(
     assert covered[-1] == captured[-1]
 
 
-class _Recording:
-    """A transport that keeps the pages, and a pinger that reaches nothing.
+class _Pages:
+    """A transport that keeps the pages instead of posting them.
 
-    Both seams default to a public endpoint, and a page sent from a test is a page a
-    person receives.
+    The transport and pinger seams both default to a public endpoint, so a test that
+    left either alone would send a real person a real page.
     """
 
     def __init__(self) -> None:
-        self.pages: list[str] = []
+        self.titles: list[str] = []
 
     def send(self, message) -> None:
-        self.pages.append(message.title)
-
-    def ping(self, url: str) -> None:
-        pass
+        self.titles.append(message.title)
 
 
 def _overrun_after_a_roster_change(
@@ -548,8 +630,8 @@ def _overrun_after_a_roster_change(
 ) -> tuple[Path, list[str]]:
     """Run a loop whose first cycle rewrites ``tickers.yaml`` and then overruns.
 
-    Returns the lake root and the titles of the pages the watchdog raised. Both
-    skipped-slot consumers read the roster, so both are observable from one run.
+    Returns the lake root and the tickers the watchdog raised a page for. Both
+    skipped-slot consumers read the roster, so one run shows what each of them did.
 
     The rewrite lands at 10:00 and that cycle returns at 10:03, so the next tick reports
     10:01 through 10:03 as skipped. A skipped slot is the one hook where no cycle ran, so
@@ -571,14 +653,14 @@ def _overrun_after_a_roster_change(
     tickers.write_text(before)
 
     clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
-    alerts = _Recording()
+    alerts = _Pages()
     cycles = [0]
 
     def cycle(*, close_tag, session_phase) -> CycleResult:
         cycles[0] += 1
         if cycles[0] == 1:
             tickers.write_text(after)
-            clock.advance(seconds=180)
+            clock.advance(seconds=60 * OVERRUN)
         return CycleResult(clock.now(), ())
 
     ticks = [0]
@@ -594,15 +676,30 @@ def _overrun_after_a_roster_change(
         calendar=weekday_sessions(WEEK),
         assertion_runner=lambda args: None,
         transport=alerts,
-        pinger=alerts,
+        pinger=FakePinger(),
         cycle_runner=cycle,
         should_continue=twice,
     )
-    return lake_root, alerts.pages
+    return lake_root, _charged(alerts.titles)
 
 
-# The three minutes the overrun swallows.
-SKIPPED = ["2026-09-02T10:01", "2026-09-02T10:02", "2026-09-02T10:03"]
+# The minutes the overrun swallows. The length is the watchdog's own page threshold, so
+# a surface that stays charged for all of them pages exactly once inside one run. Taking
+# it from the guard constants keeps a changed threshold from reading as "the watchdog
+# stopped charging the roster", which is the wrong diagnosis for that failure. The
+# fixture config sets no guards, so this is the value the daemon will read.
+OVERRUN = GuardConstants().watchdog_page_minutes
+SKIPPED = [f"2026-09-02T10:{m:02d}" for m in range(1, OVERRUN + 1)]
+
+# Every ticker these tests put on a roster. A page names the ticker it is about, so the
+# set of names appearing across the pages is which surfaces were charged. Reading it
+# that way keeps the watchdog's title format pinned in one place, its own unit tests.
+_TICKERS = ("ABC", "NEW", "XYZ")
+
+
+def _charged(titles: list[str]) -> list[str]:
+    """Which tickers the run raised a page for."""
+    return sorted({t for t in _TICKERS for title in titles if t in title})
 
 
 def _marked(root: Path, ticker: str) -> list[str]:
@@ -643,8 +740,52 @@ def test_a_ticker_retired_mid_session_stops_collecting_markers(tmp_path):
     assert _marked(lake_root, "XYZ") == []
 
 
+def test_a_roster_that_will_not_load_leaves_the_last_one_that_did_in_place(tmp_path):
+    """The fallback the design doc states, driven through the real loop.
+
+    ``tickers.yaml`` goes malformed at 10:00 and the loop then oversleeps. Both
+    skipped-slot consumers read it and both fail. Refusing to mark is worse than marking
+    from a stale snapshot, so the pass marks the roster that last loaded.
+
+    What the fallback buys is narrow, and the injected cycle runner hides the rest. In
+    production the next cycle calls ``load_tickers`` itself, unguarded, so the same file
+    ends the process moments later. The fallback is what gets the skipped-slot markers
+    written down before that happens. It does not keep the daemon alive, and neither
+    hook is guarded, so an exception raised here would lose those minutes as well.
+    """
+    lake_root, pages = _overrun_after_a_roster_change(
+        tmp_path,
+        before="ABC: {options: false}\n",
+        after="ABC: {options: false\n",
+    )
+    assert _marked(lake_root, "ABC") == SKIPPED
+    assert pages == ["ABC"]
+
+
+def test_the_fallback_is_the_last_roster_that_loaded_not_the_one_at_start(tmp_path):
+    """Which snapshot survives a broken file, pinned apart from the daemon-start one.
+
+    The loop-driven fallback test cannot separate these, because its roster breaks on
+    its first change, which makes the seed and the last loaded roster the same object.
+    Here the roster changes successfully first. The reader must then hold that change,
+    not fall back past it to what the daemon loaded at start.
+    """
+    from lake import daemon
+    from lake.tickers import load_tickers
+
+    path = tmp_path / "tickers.yaml"
+    path.write_text("ABC: {options: false}\n")
+    read = daemon._roster_reader(path, load_tickers(path))
+
+    path.write_text("ABC: {options: false}\nNEW: {options: false}\n")
+    assert [entry.ticker for entry in read()] == ["ABC", "NEW"]
+
+    path.write_text("ABC: {options: false\n")
+    assert [entry.ticker for entry in read()] == ["ABC", "NEW"]
+
+
 def test_the_watchdog_charges_the_roster_as_it_stands_on_a_skipped_slot(tmp_path):
-    """The other consumer of the same read, pinned on the same run.
+    """The other consumer of the same read, driven the same way.
 
     Gap marking and the watchdog counters both fire from ``on_skipped``, where no cycle
     ran to fix a roster snapshot, so both read ``tickers.yaml`` themselves. Deleting
@@ -657,11 +798,11 @@ def test_the_watchdog_charges_the_roster_as_it_stands_on_a_skipped_slot(tmp_path
         before="ABC: {options: false}\nXYZ: {options: false}\n",
         after="ABC: {options: false}\n",
     )
-    assert retired == ["Capture down: ABC quotes"]
+    assert retired == ["ABC"]
 
     _, onboarded = _overrun_after_a_roster_change(
         tmp_path / "onboarded",
         before="ABC: {options: false}\n",
         after="ABC: {options: false}\nNEW: {options: false}\n",
     )
-    assert sorted(onboarded) == ["Capture down: ABC quotes", "Capture down: NEW quotes"]
+    assert onboarded == ["ABC", "NEW"]
