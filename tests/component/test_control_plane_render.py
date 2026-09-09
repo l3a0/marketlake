@@ -884,12 +884,26 @@ def test_the_install_script_header_counts_match_its_body(tmp_path):
 
 
 def test_the_install_script_header_shows_how_to_run_it(tmp_path):
-    """The file says how to invoke itself, since that is the first thing a reader needs."""
+    """The file says how to invoke itself on its own, which is what a reader needs first.
+
+    A substring check for ``./install.sh`` no longer discriminates. The header also carries
+    the reinstall line ``./uninstall.sh && ./install.sh``, which contains that substring, so
+    the whole Usage block could be deleted and a substring check would stay green. This
+    reads the commands out of the block instead, and requires one that is install.sh alone.
+    """
     out = tmp_path / "out"
     assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
     header = (out / cp.INSTALL_SCRIPT_FILE).read_text().split("set -euo pipefail")[0]
-    assert f"./{cp.INSTALL_SCRIPT_FILE}" in header
     assert "Usage" in header
+    # Indented comment lines are the header's worked examples. Strip the marker and the
+    # trailing explanatory comment to get the command each one shows.
+    shown = [
+        line.lstrip("# ").split("#")[0].strip()
+        for line in header.splitlines()
+        if line.startswith("#     ")
+    ]
+    assert f"./{cp.INSTALL_SCRIPT_FILE}" in shown, shown
+    assert [line for line in shown if line.endswith(f"/{cp.INSTALL_SCRIPT_FILE}")], shown
 
 
 # -- reinstalling, which is the two scripts composed --------------------------
