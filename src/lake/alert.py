@@ -157,6 +157,7 @@ class Publisher:
         pid: int | None = None,
     ) -> None:
         self._paths = LakePaths(Path(lake_root))
+        self._root = Path(lake_root)
         self._transport = transport
         # The values that must never reach a phone: the ping key and the ntfy topic.
         # Empty means a caller that holds no secrets, which refuses nothing.
@@ -227,6 +228,13 @@ class Publisher:
         self._written += 1
         stamp = f"{eastern.strftime('%H%M%S%f')}-{self._written:04d}"
         try:
+            # `parents=True` from a missing lake root would create the lake itself. The
+            # Sunday job decides whether to ping on `root.is_dir()`, and it re-reads that
+            # on every retry, so a publisher that conjured the root would turn "lake root
+            # missing" into a green check on the following attempt. A record is written
+            # inside a lake that exists, or not at all.
+            if not self._root.is_dir():
+                raise FileNotFoundError(f"lake root missing: {self._root}")
             directory.mkdir(parents=True, exist_ok=True)
             path = directory / f"{stamp}-{message.event}-{self._pid}.json"
             with open(path, "x", encoding="utf-8") as handle:
