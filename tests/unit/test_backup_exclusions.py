@@ -149,7 +149,7 @@ def test_nothing_the_design_keeps_in_the_sync_root_is_named():
 # -- 3. the patterns drop those two things and nothing else ------------------
 
 
-def _excluded(rel: str) -> bool:
+def _excluded(rel: str, patterns: tuple[str, ...] = BACKUP_EXCLUSIONS) -> bool:
     """Whether ``rsync`` would exclude the file at lake-relative path ``rel``.
 
     This models the two pattern shapes ``BACKUP_EXCLUSIONS`` uses and no others.
@@ -168,12 +168,18 @@ def _excluded(rel: str) -> bool:
     no matcher, because the over-breadth check below would go quietly green.
     """
     components = rel.split("/")
-    for pattern in BACKUP_EXCLUSIONS:
+    for pattern in patterns:
         if "/" not in pattern:
             if any(fnmatch.fnmatchcase(part, pattern) for part in components):
                 return True
             continue
-        if not pattern.endswith("/") or "*" in pattern or "?" in pattern:
+        if not pattern.endswith("/") or pattern.startswith("/") or "*" in pattern or "?" in pattern:
+            # A leading "/" anchors the pattern to the transfer root, which this matcher
+            # does not model. Without this arm it passes the shape check and then
+            # `rstrip("/").split("/")` yields a leading empty component that no relative
+            # path can ever equal, so the matcher answers "not excluded" for a pattern
+            # rsync applies to the whole subtree. That is the silent pass the docstring
+            # above promises never to give.
             raise AssertionError(f"exclusion shape this matcher does not model: {pattern!r}")
         wanted = pattern.rstrip("/").split("/")
         for end in range(len(wanted), len(components)):
@@ -255,3 +261,22 @@ def test_the_journal_survives_the_exclusions(tmp_path):
     lake = _full_lake(tmp_path / "lake")
     segments = [rel for rel in _relative_files(lake) if rel.startswith("journal/")]
     assert segments and not any(_excluded(rel) for rel in segments)
+
+
+def test_the_matcher_refuses_a_shape_it_does_not_model():
+    """The over-breadth guard is only worth having if it cannot go quietly green.
+
+    A leading "/" anchors a pattern to the transfer root. This matcher does not model
+    that, and before the guard rejected it the pattern passed the shape check and then
+    produced a leading empty component no relative path can equal. The matcher answered
+    "not excluded" for a pattern rsync applies to the whole subtree, so the over-breadth
+    tests below would have gone green while a real sync dropped the journal.
+    """
+    segment = "journal/date=2026-08-24/surface=chains/ticker=SPY/seg-1.arrows"
+
+    # The unanchored form is modelled, and it does exclude the segment.
+    assert _excluded(segment, ("journal/",))
+
+    # The anchored form is refused rather than mismatched.
+    with pytest.raises(AssertionError, match="does not model"):
+        _excluded(segment, ("/journal/",))

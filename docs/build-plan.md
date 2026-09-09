@@ -110,11 +110,16 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   log file is a worse home than a page or a panel, and that is a separate question from this
   entry.
 - **D12** compaction and backup, plus the nightly window re-tune. Compaction merges a day's segments into one sealed partition. The re-tune runs after it. The job groups the day's rows by `window_start` and `window_end`, compares each window's contract count to the body limit, and rewrites `chain_plan.json` when the profile drifts.
-- **Unowned.** The backup's exclusion list. The design's *Backup, defined* names the sync
-  root as `lake/` only, "with an explicit exclusion list". Nothing in `compact` carries
-  one. The token file is out of the sync root today by construction rather than by
-  exclusion, so the rule holds by accident and would stop holding the first time the sync
-  root widens.
+- **D12's exclusion list.** The design's *Backup, defined* names the sync root as `lake/`
+  only, "with an explicit exclusion list". `runner.BACKUP_EXCLUSIONS` is now that list,
+  and it holds two entries. `*.tmp-*` is the temp file an atomic write leaves behind,
+  which carries no manifest entry and would plant an orphan for the backup-copy scrub
+  above. `.config/marketlake/` is the directory holding the token and `config.yaml`'s four
+  secrets. That directory is outside the sync root today, so the pattern matches nothing
+  and costs nothing. It exists so the rule holds by exclusion rather than by luck, and
+  keeps holding the first time the sync root widens. Both are derived from constants in
+  `paths`, because `compact` spelled the temp name twice before and a second spelling
+  would put a temp file outside the exclusion with nothing to say so.
 - **D13** watchdog and alerting. One counter per ticker and surface. A durable data cycle resets it, a gap row does not, and three consecutive session minutes page once. Counters start at zero on every restart, never rebuilt from the journal, so a restart never pages for the downtime that preceded it. It observes both D9's cycle-outcome hook and its skipped-slot hook, because the loop runs no cycle for a slot it slept through and those are the minutes the daemon was worst off. Three collapses keep a page storm from replacing a diagnosis:
   1. Every quotes ticker rides one batched request, so all of them failing together is one page naming the sampler.
   2. A cycle where every surface failed with the same known class pages that cause instead. A dead refresh token gaps chains and quotes for every ticker at once, and the design expects one every seven days.
