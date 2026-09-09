@@ -265,17 +265,18 @@ def run_once_from_config(
     tickers_path: str | Path | None = None,
     token_path: str | Path | None = None,
     slug: str = SLICE1_RUNNER_SLUG,
-    pinger: Pinger | None = None,
-    backup: BackupRunner | None = None,
+    pinger: Pinger,
+    backup: BackupRunner,
 ) -> RunOutcome:
     """Run one slice-1 cycle wired from the real config and seams.
 
     This is the entry ``python -m lake.runner run`` calls. It loads the machine-local
-    config, builds the health-check URL from the config's ping key, and defaults the
-    seams to the real ``urllib`` pinger and ``rsync`` backup. The Schwab client, the
-    network GET, and the subprocess are all built lazily, so importing this module and
-    running the offline suite touches none of them. A test drives ``run_once`` directly
-    with fakes instead.
+    config and builds the health-check URL from the config's ping key.
+
+    ``pinger`` and ``backup`` are required and have no live defaults. Both reach past
+    this process, one to healthchecks and one to the backup target over ``rsync``, and a
+    default would hand them to a caller that never asked. ``main`` builds the live pair.
+    A test drives ``run_once`` directly with fakes instead.
     """
     config = load_config(config_path)
     ping_url = config.healthchecks_url(slug)
@@ -289,9 +290,9 @@ def run_once_from_config(
 
     return run_once(
         cycle_runner,
-        pinger=pinger if pinger is not None else UrllibPinger(),
+        pinger=pinger,
         ping_url=ping_url,
-        backup=backup if backup is not None else RsyncBackup(),
+        backup=backup,
         lake_root=config.lake_root,
         backup_target=config.backup_target,
     )
@@ -536,6 +537,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 config_path=args.config,
                 tickers_path=args.tickers,
                 token_path=args.token,
+                # The one place the live seams are built.
+                pinger=UrllibPinger(),
+                backup=RsyncBackup(),
             )
         # Report by slug and counts only. The ping URL carries the secret ping key and
         # is never printed.

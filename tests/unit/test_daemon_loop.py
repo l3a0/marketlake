@@ -36,12 +36,18 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 
 from lake import daemon
+from lake.alert import NtfyTransport
 from lake.calendar import MARKET_TZ
 from lake.capture import CycleResult
+from lake.config import ConfigError
+from lake.runner import UrllibPinger
 from lake.session import SessionClock, SessionPhase
+from lake.tickers import TickersError
 from tests.support.calendar import FakeCalendar, SessionTimes
 from tests.support.clock import ManualClock
+from tests.support.config import write_config
 from tests.support.pinger import FakePinger
+from tests.support.transport import FakeTransport
 
 ET = MARKET_TZ
 FRIDAY = date(2026, 8, 21)  # the Friday before the regular Monday
@@ -563,15 +569,25 @@ def test_build_parser_reads_the_three_paths():
     assert (defaults.config, defaults.tickers, defaults.token) == (None, None, None)
 
 
-def test_main_passes_the_paths_to_the_config_entry(monkeypatch):
+def test_main_passes_the_paths_to_the_config_entry(tmp_path, monkeypatch):
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
     seen: dict[str, object] = {}
 
     def fake_run_loop_from_config(**kwargs) -> None:
         seen.update(kwargs)
 
     monkeypatch.setattr(daemon, "run_loop_from_config", fake_run_loop_from_config)
-    assert daemon.main(["--config", "/c.yaml", "--token", "/tok.json"]) == 0
-    assert seen == {"config_path": "/c.yaml", "tickers_path": None, "token_path": "/tok.json"}
+    assert daemon.main(["--config", str(config), "--token", "/tok.json"]) == 0
+    assert seen["config_path"] == str(config)
+    assert seen["tickers_path"] is None
+    assert seen["token_path"] == "/tok.json"
+    # ``main`` is the only place the live pair is built. If either of these stops being
+    # the real thing, some library entry has started defaulting a seam again, which is
+    # how the suite came to feed the owner's live capture check.
+    assert isinstance(seen["transport"], NtfyTransport)
+    assert isinstance(seen["pinger"], UrllibPinger)
 
 
 # -- the power assertion ----------------------------------------------------------
@@ -608,15 +624,26 @@ def _stop_after(count: int) -> Callable[[], bool]:
     return should_continue
 
 
-def test_the_wired_daemon_holds_the_caffeinate_assertion_once_per_window():
+def test_the_wired_daemon_holds_the_caffeinate_assertion_once_per_window(tmp_path):
     # A holiday weekday: no cycle runs, and the assertion is still owed from the 08:25
-    # wake. Nothing here reads a config, because no capture slot is ever reached.
+    # wake. The config and roster are fixtures rather than whatever the machine happens
+    # to hold, because the alarm reads both on every path, capture slot or not. Reading
+    # the machine's own is what pointed this test at the owner's live check.
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("XYZ: {options: false}\n")
+
     held: list[tuple[str, ...]] = []
     clock = ManualClock(start=datetime(2026, 8, 31, 8, 25, tzinfo=MARKET_TZ).astimezone(UTC))
     daemon.run_loop_from_config(
+        config_path=str(config),
+        tickers_path=str(tickers),
         clock=clock,
         calendar=FakeCalendar({}),
         assertion_runner=lambda args: held.append(tuple(args)),
+        transport=FakeTransport(),
         pinger=FakePinger(),
         should_continue=_stop_after(4),
     )
@@ -625,14 +652,62 @@ def test_the_wired_daemon_holds_the_caffeinate_assertion_once_per_window():
     assert held[0][:3] == ("caffeinate", "-i", "-t")
 
 
-def test_the_wired_daemon_still_runs_a_caller_tick_hook():
+def test_the_wired_daemon_refuses_to_start_without_a_config(tmp_path):
+    # Standing the alarm down on a load failure was the older behaviour, and it hid two
+    # things at once: the daemon ran on with no watchdog and no dead-man, and this very
+    # test took one path on a machine that had a config and another on a machine that
+    # did not. A loader that fails is fatal to the first cycle anyway, so it is fatal
+    # here, and says which file it wanted.
+    clock = ManualClock(start=datetime(2026, 8, 31, 8, 25, tzinfo=MARKET_TZ).astimezone(UTC))
+    with pytest.raises(ConfigError):
+        daemon.run_loop_from_config(
+            config_path=str(tmp_path / "absent.yaml"),
+            tickers_path=str(tmp_path / "absent-tickers.yaml"),
+            clock=clock,
+            calendar=FakeCalendar({}),
+            assertion_runner=lambda args: None,
+            transport=FakeTransport(),
+            pinger=FakePinger(),
+            should_continue=_stop_after(1),
+        )
+
+
+def test_the_wired_daemon_refuses_to_start_without_a_roster(tmp_path):
+    # The roster half of the same rule. The alarm reads both, so both are fatal.
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
+    clock = ManualClock(start=datetime(2026, 8, 31, 8, 25, tzinfo=MARKET_TZ).astimezone(UTC))
+    with pytest.raises(TickersError):
+        daemon.run_loop_from_config(
+            config_path=str(config),
+            tickers_path=str(tmp_path / "absent-tickers.yaml"),
+            clock=clock,
+            calendar=FakeCalendar({}),
+            assertion_runner=lambda args: None,
+            transport=FakeTransport(),
+            pinger=FakePinger(),
+            should_continue=_stop_after(1),
+        )
+
+
+def test_the_wired_daemon_still_runs_a_caller_tick_hook(tmp_path):
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("XYZ: {options: false}\n")
+
     ticks: list[datetime] = []
     clock = ManualClock(start=datetime(2026, 8, 31, 8, 25, tzinfo=MARKET_TZ).astimezone(UTC))
     daemon.run_loop_from_config(
+        config_path=str(config),
+        tickers_path=str(tickers),
         clock=clock,
         calendar=FakeCalendar({}),
         assertion_runner=lambda args: None,
         hooks=daemon.DaemonHooks(on_tick=ticks.append),
+        transport=FakeTransport(),
         pinger=FakePinger(),
         should_continue=_stop_after(2),
     )

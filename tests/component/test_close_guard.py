@@ -20,6 +20,7 @@ from lake.tickers import Roster, TickerConfig
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.pinger import FakePinger
+from tests.support.transport import FakeTransport
 
 WEEK = date(2026, 8, 31)
 DAY = date(2026, 9, 2)
@@ -136,6 +137,7 @@ def test_the_daemon_answers_the_close_tag_hook_from_the_calendar(tmp_path):
         cycle_runner=lambda *, close_tag, session_phase: (
             tags.append(close_tag) or CycleResult(et(2026, 9, 2, 16, 0), ())
         ),
+        transport=FakeTransport(),
         pinger=FakePinger(),
         should_continue=three,
     )
@@ -414,6 +416,7 @@ def test_the_guard_writes_the_close_minutes_before_gap_marking_claims_them(tmp_p
         calendar=weekday_sessions(WEEK),
         assertion_runner=lambda args: None,
         cycle_runner=lambda *, close_tag, session_phase: CycleResult(et(2026, 9, 2, 16, 30), ()),
+        transport=FakeTransport(),
         pinger=FakePinger(),
         should_continue=once,
     )
