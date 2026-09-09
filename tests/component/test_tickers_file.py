@@ -60,11 +60,11 @@ def test_a_reader_during_the_write_still_sees_a_whole_roster(tmp_path: Path, mon
 
     The daemon re-reads ``tickers.yaml`` on its own schedule, so it can read while the
     command writes. Truncating the file in place opens a window where a reader gets
-    zero bytes or a prefix. Some of those shapes the loader accepts. An empty file
-    loads as a roster of no tickers, and a prefix ending on an entry boundary loads as
-    a roster missing everything after it. A torn read is then silently wrong rather
-    than an error, and a cycle handed one captures nothing for the tickers it lost and
-    writes no gap row for them either.
+    zero bytes or a prefix. Some of those shapes the loader accepts. An empty file loads
+    as a roster of no tickers. A prefix ending on a line boundary loads as the tickers it
+    kept, with any cut key defaulted, so an options ticker can come back equity-only. A
+    torn read is then silently wrong rather than an error, and a cycle handed one captures
+    nothing for what it lost and writes no gap row for it either.
     """
     path = tmp_path / "tickers.yaml"
     upsert_ticker("XYZ", options=False, path=path)

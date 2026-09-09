@@ -173,10 +173,11 @@ def _write_atomically(target: Path, text: str) -> None:
 
     The daemon re-reads this file while the command writes it. A plain write truncates
     the file first, so a reader can catch it empty or half written. Some of those shapes
-    load without complaint, which is worse than an error. An empty file loads as a
-    roster of no tickers, and a prefix that ends on an entry boundary loads as a roster
-    missing everything after it. A cycle handed either one captures fewer tickers than
-    the roster names, and writes no gap row for the rest, so the minute leaves no trace.
+    load without complaint, which is worse than an error. An empty file loads as a roster
+    of no tickers. A prefix that ends on a line boundary loads as the tickers it kept,
+    and any key it cut takes its default, so an options ticker can come back equity-only.
+    A cycle handed either one captures less than the roster names, and writes no gap row
+    for the rest, so the minute leaves no trace.
     A rename replaces the file in one step, so every reader sees the whole old roster or
     the whole new one. The chain plan is written this way for the same reason. A crash
     mid-write leaves the prior file intact, and the temp file is removed on any failure.
