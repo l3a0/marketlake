@@ -253,7 +253,9 @@ def test_a_ticker_onboarded_mid_session_keeps_charging_when_the_roster_stops_loa
         slot = clock.now().replace(second=0, microsecond=0)
         cycles[0] += 1
         if cycles[0] == 1:
-            # DEF is onboarded between the two runs, the way `lake.onboard` writes it.
+            # DEF is onboarded between the two runs. The roster is hand-written here.
+            # `lake.onboard` dumps sorted block style through `upsert_ticker`, and the
+            # shape of the entries is not what this case turns on.
             tickers.write_text(
                 "XYZ: {options: false}\nABC: {options: false}\nDEF: {options: false}\n"
             )

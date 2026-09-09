@@ -172,13 +172,14 @@ def _write_atomically(target: Path, text: str) -> None:
     """Write the roster through a temp file beside it, a flush, then one rename.
 
     The daemon re-reads this file while the command writes it. A plain write truncates
-    the file first, so a reader can catch it empty or half written. Neither shape is an
-    error the loader refuses. An empty file loads as a roster of no tickers, and a
-    prefix that ends on a line boundary loads as a roster missing everything after it.
-    A caller that keeps what it last read would then keep a roster that was never true.
+    the file first, so a reader can catch it empty or half written. Some of those shapes
+    load without complaint, which is worse than an error. An empty file loads as a
+    roster of no tickers, and a prefix that ends on an entry boundary loads as a roster
+    missing everything after it. A cycle handed either one captures fewer tickers than
+    the roster names, and writes no gap row for the rest, so the minute leaves no trace.
     A rename replaces the file in one step, so every reader sees the whole old roster or
     the whole new one. The chain plan is written this way for the same reason. A crash
-    mid-write leaves the prior file intact, and the temp file goes on any failure.
+    mid-write leaves the prior file intact, and the temp file is removed on any failure.
     """
     tmp = target.with_name(f"{target.name}.tmp-{os.getpid()}")
     try:
