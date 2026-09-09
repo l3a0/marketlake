@@ -45,7 +45,7 @@ from lake.session import SessionClock, SessionPhase
 from lake.tickers import TickersError
 from tests.support.calendar import FakeCalendar, SessionTimes
 from tests.support.clock import ManualClock
-from tests.support.config import write_config
+from tests.support.config import NTFY_TOPIC, write_config
 from tests.support.pinger import FakePinger
 from tests.support.transport import FakeTransport
 
@@ -580,14 +580,21 @@ def test_main_passes_the_paths_to_the_config_entry(tmp_path, monkeypatch):
 
     monkeypatch.setattr(daemon, "run_loop_from_config", fake_run_loop_from_config)
     assert daemon.main(["--config", str(config), "--token", "/tok.json"]) == 0
+    # Exhaustive, so an argument added to the call is seen here rather than silently.
+    assert set(seen) == {"config_path", "tickers_path", "token_path", "transport", "pinger"}
     assert seen["config_path"] == str(config)
     assert seen["tickers_path"] is None
     assert seen["token_path"] == "/tok.json"
-    # ``main`` is the only place the live pair is built. If either of these stops being
-    # the real thing, some library entry has started defaulting a seam again, which is
-    # how the suite came to feed the owner's live capture check.
+    # ``daemon.main`` is the only caller in its module that builds the live pair. If
+    # either stops being the real thing, some entry has started defaulting a seam again,
+    # which is how the suite came to feed the owner's live capture check.
     assert isinstance(seen["transport"], NtfyTransport)
     assert isinstance(seen["pinger"], UrllibPinger)
+    # The topic, not just the class. It is the write credential for the ntfy channel, so
+    # the wiring worth holding is which topic reached the transport. Asserting the class
+    # alone passes a `main` that ignored --config and read the machine's own config,
+    # which is the very asymmetry this PR exists to remove.
+    assert seen["transport"]._topic == NTFY_TOPIC
 
 
 # -- the power assertion ----------------------------------------------------------
@@ -636,6 +643,7 @@ def test_the_wired_daemon_holds_the_caffeinate_assertion_once_per_window(tmp_pat
     tickers.write_text("XYZ: {options: false}\n")
 
     held: list[tuple[str, ...]] = []
+    pinger = FakePinger()
     clock = ManualClock(start=datetime(2026, 8, 31, 8, 25, tzinfo=MARKET_TZ).astimezone(UTC))
     daemon.run_loop_from_config(
         config_path=str(config),
@@ -644,12 +652,16 @@ def test_the_wired_daemon_holds_the_caffeinate_assertion_once_per_window(tmp_pat
         calendar=FakeCalendar({}),
         assertion_runner=lambda args: held.append(tuple(args)),
         transport=FakeTransport(),
-        pinger=FakePinger(),
+        pinger=pinger,
         should_continue=_stop_after(4),
     )
     # Four ticks, one window, one caffeinate process.
     assert len(held) == 1
     assert held[0][:3] == ("caffeinate", "-i", "-t")
+    # The holiday heartbeat, one per tick, and the regression test for the leak. These
+    # four pings went to the owner's live check until the seams were made required, so
+    # naming the fixture URL here is what proves they now go nowhere real.
+    assert pinger.urls == ["https://hc-ping.com/secret-key/capture"] * 4
 
 
 def test_the_wired_daemon_refuses_to_start_without_a_config(tmp_path):

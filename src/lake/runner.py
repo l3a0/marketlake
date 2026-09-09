@@ -537,7 +537,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 config_path=args.config,
                 tickers_path=args.tickers,
                 token_path=args.token,
-                # The one place the live seams are built.
+                # The only construction site in this module.
                 pinger=UrllibPinger(),
                 backup=RsyncBackup(),
             )

@@ -84,8 +84,8 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   6. the per-cycle chain-plan re-read, which is what makes a nightly plan rewrite take
      effect the next minute.
 
-  Each was confirmed by deleting the binding and running the suite, which stays green at
-  1124. The point is not that the bindings are wrong. It is that nothing would notice if
+  Each was confirmed by deleting the binding and running the suite, which stays green.
+  The point is not that the bindings are wrong. It is that nothing would notice if
   they became wrong, and four of the six are the paths that carry a failure to the phone.
 - **D11** close tags and the close+5 guard. Close+5 is the five-minute window after the option close, the last moment an option-close fetch may land. It plugs into D9's close-tag hook, and it builds the session-relative dispatcher the design calls for. Everything session-relative runs from inside the daemon, because launchd's calendar intervals are fixed wall-clock and cannot express a close-relative time. `SessionDispatch` fires one job once per session day at a moment the calendar decides, including on a daemon that starts after that moment has passed. The close+15 compaction dispatch binds to the same seam when someone builds it. Two rules are worth stating where both writers can see them:
   1. The guard's fill triggers on missing marks, not a missing cycle. A chain that failed at the option close leaves a tagged gap row holding nothing a reader can price against, and a close+5 refetch is exactly what rescues it.

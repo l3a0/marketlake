@@ -98,7 +98,7 @@ from lake.capture import CycleResult, run_cycle_from_config
 from lake.clock import Clock, SystemClock
 from lake.close_guard import CloseGuard
 from lake.close_guard import GuardOutcome as CloseGuardOutcome
-from lake.config import ConfigError, load_config
+from lake.config import ConfigError, input_errors_exit, load_config
 from lake.control_plane import AssertionHolder, AssertionRunner
 from lake.deadman import CAPTURE_SLUG, DeadMan
 from lake.gap import GapMarker, MarkingReport, surfaces_for
@@ -277,10 +277,13 @@ def _gap_marker(
 ) -> GapMarker | None:
     """The gap marker for this daemon, or ``None`` when it cannot be built.
 
-    Marking is a record of what was missed, not a capture. A config or roster that will
-    not load is already fatal to the cycle runner on its first tick, and the security
-    master is optional, so nothing here is worth refusing to start over. Returning
-    ``None`` leaves the hooks bare and the loop unchanged.
+    Marking is a record of what was missed, not a capture, and the security master is
+    optional, so a missing one is not worth refusing to start over. Returning ``None``
+    leaves the hooks bare and the loop unchanged.
+
+    A config or roster that will not load returns ``None`` here too. Through
+    ``run_loop_from_config`` that shape is never reached, because ``_alarm`` reads the
+    same two files and refuses. The branch is kept for a direct caller.
     """
     try:
         config = load_config(config_path)
@@ -329,8 +332,9 @@ def _close_guard(
 ) -> CloseGuard | None:
     """The close+5 guard for this daemon, or ``None`` when it cannot be built.
 
-    A config or roster that will not load is already fatal to the cycle runner on its
-    first tick, so nothing here is worth refusing to start over.
+    A config or roster that will not load returns ``None``. Through
+    ``run_loop_from_config`` that shape is never reached, because ``_alarm`` reads the
+    same two files and refuses. The branch is kept for a direct caller.
     """
     try:
         config = load_config(config_path)
@@ -351,7 +355,7 @@ def _alarm(
 
     Both seams are handed in. Neither is defaulted here, because a default reaching a
     public endpoint is one a caller gets without asking, and the caller that most needs
-    to be asked is a test. ``main`` is the only place that builds the live pair.
+    to be asked is a test. ``main`` is the only caller in this module that builds them.
 
     A config or roster that will not load raises. Standing the alarm down instead was
     the older behaviour, and it hid the failure twice over: the daemon ran on with no
@@ -419,8 +423,10 @@ def run_loop_from_config(
     missed slots to one ``GapMarker``, so a restart and a live overrun leave the same
     kind of record. Marking needs the lake root, the roster, and the security master,
     which this entry did not load before, so it loads them once here rather than per
-    cycle. A load failure leaves marking off and the loop still runs, because a daemon
-    that captures without marking is better than one that does not start.
+    cycle. A missing security master leaves marking off and the loop still runs, because
+    a daemon that captures without marking is better than one that does not start. A
+    config or roster that will not load is fatal instead, because the alarm needs both
+    and a daemon with no dead-man cannot report its own death.
     """
     clock = clock if clock is not None else SystemClock()
     calendar = calendar if calendar is not None else ExchangeCalendar()
@@ -571,18 +577,24 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """The ``python -m lake.daemon`` entry. Loops forever, so it returns only when stopped."""
     args = build_parser().parse_args(argv)
-    # The one place the live seams are built. The config is read here as well as inside
-    # the loop, because the ntfy topic names the transport and the transport is wired
-    # from out here now. A config that will not load fails the process rather than
-    # starting a daemon that cannot page.
-    config = load_config(args.config)
-    run_loop_from_config(
-        config_path=args.config,
-        tickers_path=args.tickers,
-        token_path=args.token,
-        transport=NtfyTransport(config.ntfy_topic.reveal()),
-        pinger=UrllibPinger(),
-    )
+    # The only construction site in this module. The config is read here as well as
+    # inside the loop, because the ntfy topic names the transport and the transport is
+    # wired from out here now.
+    #
+    # The wrapper puts this entry in the same class as every other one that reads an
+    # operator file. A missing config or roster is an operator mistake, so it earns one
+    # named line and exit 2 rather than a traceback. That matters more here than
+    # elsewhere: launchd restarts the daemon under ``KeepAlive``, so a traceback would
+    # repeat every few seconds in the log the operator is told to read.
+    with input_errors_exit("daemon"):
+        config = load_config(args.config)
+        run_loop_from_config(
+            config_path=args.config,
+            tickers_path=args.tickers,
+            token_path=args.token,
+            transport=NtfyTransport(config.ntfy_topic.reveal()),
+            pinger=UrllibPinger(),
+        )
     return 0
 
 
