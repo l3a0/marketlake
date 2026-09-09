@@ -12,7 +12,7 @@ transport and the health-check pinger, are faked, because a page sent from a tes
 page a person receives. So the tier is component: the daemon over real files, with the
 clock, the calendar, and the network still fake.
 
-Six bindings are pinned here.
+Seven bindings are pinned here.
 
 1. The skipped-slot hook reaches the gap marker, so a live overrun records the minutes
    it slept through.
@@ -24,6 +24,12 @@ Six bindings are pinned here.
    close+5 runs the guard on that minute.
 6. The cycle runner is the production entry that re-reads the chain plan, so a nightly
    plan rewrite takes effect the next minute.
+7. The skipped-slot hook charges the counters the current roster names. It re-reads the
+   file rather than closing over the startup roster, so a ticker retired mid-session
+   stops paging without a restart. A file the roster loader refuses leaves the startup
+   roster in place, so the refusal silences no counter. Each entry expands into the
+   surfaces its ticker is captured on, so an options ticker's chains counter is charged
+   beside its quotes.
 """
 
 from __future__ import annotations
@@ -59,6 +65,18 @@ CAPTURE_URL = f"https://hc-ping.com/{PING_KEY}/{CAPTURE_SLUG}"
 
 EQUITY_ONLY = "XYZ: {options: false}\n"
 WITH_OPTIONS = "SPY: {options: true, chain_cadence: 1m}\n"
+
+# Two equity-only tickers, and the same roster after one is retired. Neither carries
+# options, so each ticker owns exactly one counter. A slept-through slot attempts no
+# request, so the two quotes counters page one by one rather than collapsing into the
+# single sampler page a failed live cycle would raise.
+TWO_TICKERS = "XYZ: {options: false}\nABC: {options: false}\n"
+ONE_RETIRED = "ABC: {options: false}\n"
+
+# The same edit gone wrong: valid YAML the roster loader still refuses, because XYZ's
+# settings are a bare string rather than a mapping. Had it loaded, XYZ would be gone.
+# So a run that charges XYZ anyway fell back rather than read this file.
+UNLOADABLE = "XYZ: retired\nABC: {options: false}\n"
 
 # One open-ended window, the smallest plan that tiles the offset line. The rewrite
 # splits its head off, so the two plans ask for different date ranges.
@@ -428,3 +446,113 @@ def test_a_rewritten_chain_plan_takes_effect_on_the_next_cycle(tmp_path, monkeyp
     # The 10:01 cycle fetched the pair the rewrite left behind, which is a set of ranges
     # no plan read before the rewrite could have produced.
     assert vendor.windows[1:] == [(DAY, DAY), (NEXT_DAY, None)]
+
+
+# -- 7. the skipped-slot hook charges what the roster names --------------------------
+
+
+def _rewrite_after_first_cycle(path: Path, roster: str) -> daemon.DaemonHooks:
+    """Hooks that replace the roster file once, after the first cycle.
+
+    This stands for a person editing ``tickers.yaml`` while the daemon runs. The first
+    cycle is the session up to that edit. The overrun after it is what hands the fresh
+    file to the skipped-slot hook.
+    """
+    cycles: list[datetime] = []
+
+    def on_cycle(slot: datetime, result: CycleResult) -> None:
+        cycles.append(slot)
+        if len(cycles) == 1:
+            path.write_text(roster)
+
+    return daemon.DaemonHooks(on_cycle=on_cycle)
+
+
+def _run_across_an_edit(rig: _Rig, roster: str) -> None:
+    """Run one cycle, rewrite the roster to ``roster``, then overrun three slots.
+
+    The 10:00 cycle takes 200 seconds, so the loop next wakes at 10:04 and hands 10:01,
+    10:02, and 10:03 to the skipped-slot hook. Three slept-through slots is the design's
+    page threshold. So the hook pages every surface it charges across that stretch, and
+    every surface it does not charge stays silent. The cycles produce no segment of
+    their own, so nothing but the missed minutes charges a counter.
+    """
+    for ticker in ("XYZ", "ABC"):
+        # Neither assertion reads these rows. They stop startup marking walking back to
+        # its cap, which prints a truncation line to stderr on every run that lets it.
+        _record(rig.lake_root, journal.QUOTES_SURFACE, ticker, et(2026, 9, 2, 9, 58))
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(
+        rig,
+        clock,
+        ticks=2,
+        cycle_runner=_Overrunning(clock, 200),
+        hooks=_rewrite_after_first_cycle(rig.tickers, roster),
+    )
+
+
+def test_a_ticker_retired_mid_session_stops_charging_the_watchdog(tmp_path):
+    """A ticker taken off the roster has to stop paging without a restart.
+
+    The design has the daemon re-read ``tickers.yaml`` every capture cycle, and it names
+    the per-ticker watchdog counters among the consumers reading that same snapshot.
+    Closing the skipped-slot hook over the startup roster breaks the rule in the one
+    place the cycle runner cannot cover, because the loop runs no cycle for a slot it
+    slept through. A retired ticker would then page from a surface nobody is capturing,
+    and only a restart would stop it.
+    """
+    rig = _rig(tmp_path, roster=TWO_TICKERS)
+    _run_across_an_edit(rig, ONE_RETIRED)
+
+    # Sorted, because the page order is the watchdog's own rule and not this one's.
+    assert sorted(page.title for page in rig.transport.sent) == ["Capture down: ABC quotes"]
+
+
+def test_a_roster_that_will_not_load_leaves_the_startup_roster_charging(tmp_path):
+    """A roster the loader refuses must not silence the counters that were running.
+
+    The re-read reaches a hand-owned file, so it can land on a save that is not yet a
+    roster. Refusing to count is the worse failure of the two. It turns a daemon whose
+    surfaces are down into a quiet one for as long as the file stays broken. Charging a
+    ticker one overrun too long only costs an early page.
+
+    What the fallback holds is the roster loaded at startup, not the last one that
+    loaded successfully. ``_alarm`` binds that roster once and nothing reassigns it. The
+    two are the same roster here, because the only load this run completes is the
+    startup one.
+
+    The file here is valid YAML that the loader refuses on shape. ``load_tickers`` does
+    not convert a YAML parse error into a ``TickersError``, so a file broken mid-token
+    raises straight past this fallback instead of taking it. That case is not held here.
+    """
+    rig = _rig(tmp_path, roster=TWO_TICKERS)
+    _run_across_an_edit(rig, UNLOADABLE)
+
+    # Both still charge. The refusal silenced no counter, and the unloadable file
+    # retired nobody.
+    assert sorted(page.title for page in rig.transport.sent) == [
+        "Capture down: ABC quotes",
+        "Capture down: XYZ quotes",
+    ]
+
+
+def test_the_hook_charges_every_surface_its_ticker_is_captured_on(tmp_path):
+    """An options ticker's chains counter has to be charged beside its quotes.
+
+    The counters are per surface, so a dead chain worker pages while that ticker's
+    quotes still flow. The hook expands each roster entry through ``surfaces_for``, the
+    same rule capture plans a cycle with. Charging quotes alone would leave a chain
+    worker that died across an overrun invisible, on the one path where no cycle runs
+    to notice it.
+    """
+    rig = _rig(tmp_path, roster=WITH_OPTIONS)
+    for surface in (journal.CHAINS_SURFACE, journal.QUOTES_SURFACE):
+        _record(rig.lake_root, surface, "SPY", et(2026, 9, 2, 9, 58))
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=2, cycle_runner=_Overrunning(clock, 200))
+
+    # One quotes ticker, so the sampler collapse cannot fire whatever the fan-out does.
+    assert sorted(page.title for page in rig.transport.sent) == [
+        "Capture down: SPY chains",
+        "Capture down: SPY quotes",
+    ]
