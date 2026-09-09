@@ -88,6 +88,11 @@ THREE_TICKERS = "XYZ: {options: false}\nABC: {options: false}\nDEF: {options: fa
 # where it accepted UNLOADABLE, so the two together cover both ways the file can fail.
 MID_LINE_TEAR = "XYZ: {options: fal"
 
+# A stall long enough to cross the option close. The waking tick reports the window's
+# tail and then runs no cycle, which is the one tick where the hook's read is the only
+# read of the roster that minute.
+ACROSS_THE_CLOSE = 3600
+
 # One open-ended window, the smallest plan that tiles the offset line. The rewrite
 # splits its head off, so the two plans ask for different date ranges.
 ONE_WINDOW = ChainPlan(((0, None),))
@@ -557,8 +562,8 @@ def test_a_roster_that_will_not_load_takes_the_daemon_down(tmp_path, roster):
 
     Both shapes must arrive as `TickersError`, because that is what `main` turns into
     one named line and exit 2. `UNLOADABLE` is valid YAML the loader refuses on shape.
-    `MID_LINE_TEAR` is a half-saved file `yaml` itself refuses, and it used to escape as
-    a `yaml.ScannerError` past every caller guarding for a bad roster.
+    `MID_LINE_TEAR` is a half-saved file `yaml` itself refuses with a `ParserError`, and
+    it used to escape past every caller guarding for a bad roster.
     """
     rig = _rig(tmp_path, roster=TWO_TICKERS)
 
@@ -567,6 +572,40 @@ def test_a_roster_that_will_not_load_takes_the_daemon_down(tmp_path, roster):
 
     assert str(rig.tickers) in str(caught.value)
     # Nothing paged. The counters never got a roster to charge against.
+    assert rig.transport.sent == []
+
+
+def test_a_broken_roster_off_the_capture_window_is_fatal_too(tmp_path):
+    """The one tick the deleted fallback used to carry, held so the cost stays visible.
+
+    `run_loop` hands missed slots to the skipped-slot hook and only then checks the
+    phase, so a tick off the capture window fires the hook and runs no cycle. That is
+    the only tick where this hook's read is the roster's only read of the minute, and it
+    is reachable: a stall spanning the option close wakes past it with the window's tail
+    still to report.
+
+    The fallback that used to sit here carried the daemon from that tick to the next
+    capture minute, which across a Friday close is the whole weekend. Deleting it moves
+    the exit forward to here. That is the price, and it is paid deliberately: a stale
+    roster charges counters the file no longer names, and the dead-man switch is what
+    reports a daemon that stopped.
+    """
+    rig = _rig(tmp_path, roster=TWO_TICKERS)
+    _seed_two(rig)
+    clock = ManualClock(start=et(2026, 9, 2, 15, 58, 30))
+
+    def stall_across_the_close(*, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        slot = clock.now().replace(second=0, microsecond=0)
+        rig.tickers.write_text(UNLOADABLE)
+        clock.advance(ACROSS_THE_CLOSE)
+        return CycleResult(snap_ts=slot, segments=())
+
+    with pytest.raises(TickersError):
+        _run(rig, clock, ticks=2, cycle_runner=stall_across_the_close)
+
+    # The waking tick is past the option close, so no cycle ran to raise first. The hook
+    # is what took the daemon down.
+    assert clock.now() > et(2026, 9, 2, 16, 15)
     assert rig.transport.sent == []
 
 

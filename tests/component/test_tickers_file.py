@@ -53,9 +53,11 @@ def test_a_typed_tilde_still_expands(tmp_path: Path, monkeypatch):
 # Every way a roster file can fail, and the one word that must appear in each message.
 # The point of the set is that one exception type covers all of them, so a caller can
 # guard for a bad roster with one `except` and `main` can print one line and exit 2.
+# The two YAML shapes raise different `yaml` classes, `ParserError` and `ScannerError`,
+# so the pair holds that the fold catches the base class rather than one subclass.
 BROKEN = {
-    "half saved mid-line": ("XYZ: {options: fal", "not valid YAML"),
-    "hand-edited with a tab": ("XYZ:\n\toptions: false\n", "not valid YAML"),
+    "half saved mid-line": ("XYZ: {options: fal", "not valid YAML at line 1"),
+    "hand-edited with a tab": ("XYZ:\n\toptions: false\n", "not valid YAML at line 2"),
     "a bare scalar": ("XYZ", "not a mapping"),
     "an entry of the wrong shape": ("XYZ: retired\n", "settings must be a mapping"),
 }
@@ -78,21 +80,38 @@ def test_every_broken_roster_raises_one_error_type(tmp_path: Path, text, expecte
         load_tickers(path)
 
     message = str(caught.value)
+    # The fragment carries the line number for the two YAML shapes, so a fold that
+    # dropped it fails here rather than passing on the word "YAML" alone.
     assert expected in message
     # The message names the file. Three operator-editable files share the config
     # directory, and this line is printed on its own.
     assert str(path) in message
-    # And never a line of the file itself, which is the rule `lake.config` sets.
-    assert text.strip() not in message
+    # And never a line of the file itself, which is the rule `lake.config` sets. `yaml`
+    # renders the offending source line into its own message, so a fold that passed that
+    # rendering through would leak it.
+    assert "options" not in message
+    assert "\n" not in message
 
 
-def test_a_file_that_cannot_be_read_raises_the_same_error(tmp_path: Path):
-    """Existing is not the same as readable, and the difference used to be an `OSError`."""
+@pytest.mark.parametrize("kind", ["binary", "unreadable"])
+def test_a_file_that_cannot_be_read_raises_the_same_error(tmp_path: Path, kind):
+    """Existing is not the same as readable, and the two ways raise different classes.
+
+    A binary file raises `UnicodeDecodeError`, which is a `ValueError`. A file the
+    process may not open raises `OSError`. Catching one and not the other leaves half
+    the class escaping, so both are held.
+    """
     path = tmp_path / "tickers.yaml"
-    path.write_bytes(b"\xff\xfe\x00\x01")
-
-    with pytest.raises(TickersError, match="cannot be read"):
-        load_tickers(path)
+    if kind == "binary":
+        path.write_bytes(b"\xff\xfe\x00\x01")
+    else:
+        path.write_text("XYZ: {options: false}\n")
+        path.chmod(0o000)
+    try:
+        with pytest.raises(TickersError, match="cannot be read"):
+            load_tickers(path)
+    finally:
+        path.chmod(0o644)
 
 
 def test_a_broken_roster_stops_the_write_too(tmp_path: Path):

@@ -461,9 +461,9 @@ def run_loop_from_config(
     runner is a closure over ``run_cycle_from_config``, which reloads the config, the
     roster, the token, and the chain plan on every call. The per-cycle re-read the
     design wants comes from that wiring rather than from anything this entry caches for
-    the cycle. The gap marker below is the one observer this entry loads for and holds,
-    and the paragraph on it says so. The watchdog's skipped-slot hook holds no roster of
-    its own: it reads the file on every call, and a read that fails is fatal.
+    the cycle. The gap marker and the close guard below each load a roster once and hold
+    it for the daemon's life. The watchdog's skipped-slot hook holds none. It reads the
+    file on every call, and a read that fails is fatal.
 
     The caffeinate power assertion is held here rather than left to a caller. The
     design's chain is the wake alarm, then ``KeepAlive`` starting the daemon, then the
@@ -604,12 +604,19 @@ def run_loop_from_config(
         # snapshot. So a ticker onboarded mid-session starts being charged with no
         # restart, and one retired mid-session stops.
         # A read that fails takes the daemon down, and nothing here softens that. The
-        # cycle runner reads the same file on this same tick and raises on it too, and
-        # ``_alarm`` refuses to build on a roster that will not load, so a fallback
-        # would only ever cover the one tick before the process exited anyway. It also
-        # has to be a roster, and the only honest source of one is the file. Carrying a
-        # stale read forward means charging counters the roster no longer names, which
-        # is the failure the re-read exists to prevent.
+        # price is real and worth naming. On a capture slot it costs nothing, because
+        # the cycle runner reads the same file later on the same tick and raises on it
+        # too. Off the capture window it costs the rest of the daemon's life: the loop
+        # runs no cycle there, so a fallback would have carried it to the next capture
+        # minute, which across a Friday close is the whole weekend. A stall spanning a
+        # close reaches exactly that tick, since the waking tick reports the window's
+        # tail and then continues past the phase check.
+        # The price is the one the design already pays on either side of this hook.
+        # ``_alarm`` refuses to build on a roster that will not load, and the cycle
+        # runner raises on one every minute of the session. What a fallback bought back
+        # was a stale roster charging counters the file no longer names, which is the
+        # failure the per-cycle re-read exists to prevent. A dead daemon is the external
+        # dead-man's to report, and it does.
         watched = [
             Surface(surface, entry.ticker)
             for entry in load_tickers(tickers_path)

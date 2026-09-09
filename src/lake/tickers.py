@@ -133,11 +133,11 @@ def load_tickers(
 def _read_text(resolved: Path) -> str:
     """The file's text, or a ``TickersError`` naming what could not be read.
 
-    ``exists()`` passing does not mean the file can be read. A restrictive mode makes it
-    unreadable and a binary file is not text. Both raised a bare ``OSError`` before,
-    which every caller that guards for a bad roster then missed. ``lake.config`` solved
-    the same class for ``config.yaml``. Only the path is named, so nothing from inside
-    the file reaches the error.
+    ``exists()`` passing does not mean the file can be read. A restrictive mode raises
+    ``OSError`` and a binary file raises ``UnicodeDecodeError``, which is a ``ValueError``
+    rather than an ``OSError``. Both went bare before, and every caller that guards for a
+    bad roster then missed them. ``lake.config`` solved the same class for ``config.yaml``.
+    Only the path is named, so nothing from inside the file reaches the error.
     """
     try:
         return resolved.read_text()
@@ -155,8 +155,10 @@ def _parse(text: str, resolved: Path) -> object:
 
     The line number is named because it is the one thing an operator needs and this file
     holds no secrets. ``lake.config`` suppresses the same detail for ``config.yaml``,
-    which holds four. Nothing else from the parse error is repeated, so no line of the
-    file itself can reach the error.
+    which holds four. Nothing else from the parse error reaches the message, so no line
+    of the file itself is printed. ``from None`` suppresses the original in a traceback
+    too. It stays reachable as ``__context__``, which is where a debugger should find it
+    and where nothing that prints an operator error looks.
     """
     try:
         return yaml.safe_load(text) or {}
