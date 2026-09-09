@@ -67,8 +67,8 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   2. `journal.gap_rows`, one batch covering many missed minutes. A dark session is 406 slots, and `gap_batch` builds one row per call.
   3. `SessionClock.phase_at`, the phase of any slot rather than the current one, so a marker for a post-equity-close minute carries the phase a captured row would have.
   4. `session.missed_slots`, D9's own day-by-day walk moved beside `skipped_slots` so both hooks share one enumerator and `lake.gap` needs no import of `lake.daemon`.
-- **Unowned.** The backup-copy scrub, and the `--checksum` drop that waits on it. `manifest.scrub` reads under `lake_root` only, so nothing verifies the backup target today. `control_plane`'s Sunday gap list already names it as gap 3 of 5. The two land together or in that order, because until the scrub exists `--checksum` in `RsyncBackup.sync` is the only thing that would notice the backup rotting. Dropping it first trades a deadline that fails in a few years for a verification hole that starts now.
-- **Unowned.** The daemon's in-loop close+15 compaction dispatch. `compact.compact` is reachable only from `python -m lake.compact`, and no job renders it. The design's rule that a catch-up compaction of an unsealed day is ordered after startup gap-marking is satisfied in-process today, because `run_loop` calls `on_start` before its first tick. Whoever builds the dispatch owns keeping it so. D11 built the seam it binds to, `session.SessionDispatch`, so what remains is the compaction job itself.
+- **Unowned.** The backup-copy scrub, and the `--checksum` drop that waits on it. `manifest.scrub` reads under `lake_root` only, so nothing verifies the backup target today. `control_plane`'s Sunday gap list already names it as gap 3 of 5. The two land together or in that order, because until the scrub exists `--checksum` in `RsyncBackup.sync` is the only thing that would notice the backup rotting. Dropping it first trades a deadline that fails in a few years for a verification hole that starts now. **Both stay in slice 2.** The scrub is a Sunday-job activity, the Sunday job is D14's, and `manifest.scrub` already exists and already runs there over `lake_root`. Reaching the backup target is a target and a parameter rather than new machinery, so slice 5's validation battery is the wrong home for it. The pairing is a sequencing rule inside slice 2, not a reason to defer either half out of it.
+- **Unowned.** The daemon's in-loop close+15 compaction dispatch. `compact.compact` is reachable only from `python -m lake.compact`, and no job renders it. The design's rule that a catch-up compaction of an unsealed day is ordered after startup gap-marking is satisfied in-process today, because `run_loop` calls `on_start` before its first tick. Whoever builds the dispatch owns keeping it so. D11 built the seam it binds to, `session.SessionDispatch`, so what remains is the compaction job itself. **It stays in slice 2.** Every part it needs is already here: the dispatcher from D11, `compact.compact` from D12, and the loop from D9. It fetches nothing, so slice 3 would not help it, and it blocks the `compaction` check, which cannot be created before a producer exists.
 - **Unowned.** Tests for six of the daemon's production hook bindings. The hooks
   themselves are held, and so is each observer in isolation. What is unheld is the wiring
   `run_loop_from_config` builds, which is the wiring the launchd job actually runs. Six are
@@ -90,22 +90,10 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
 - **D11** close tags and the close+5 guard. Close+5 is the five-minute window after the option close, the last moment an option-close fetch may land. It plugs into D9's close-tag hook, and it builds the session-relative dispatcher the design calls for. Everything session-relative runs from inside the daemon, because launchd's calendar intervals are fixed wall-clock and cannot express a close-relative time. `SessionDispatch` fires one job once per session day at a moment the calendar decides, including on a daemon that starts after that moment has passed. The close+15 compaction dispatch binds to the same seam when someone builds it. Two rules are worth stating where both writers can see them:
   1. The guard's fill triggers on missing marks, not a missing cycle. A chain that failed at the option close leaves a tagged gap row holding nothing a reader can price against, and a close+5 refetch is exactly what rescues it.
   2. On a post-close restart the guard runs before startup gap-marking, so the two close minutes it owns are already recorded when D10's marker walks the day.
-- **Unowned.** The close+5 fill's producer. `CloseGuard` takes an injected `fill` and
-  `daemon._close_guard` never passes one, so `self._fill` is `None` in production. The
-  guard detects a missing `option_close`, appends a `no fill fetcher` line to its own
-  outcome, and returns. Nothing is refetched and nothing is written. The reason constant
-  `OPTION_CLOSE_SERIES_ABSENT` is defined and exported and never written by any code path,
-  and `_marker` is called once in the file, on the `spot_close` side. So the close minute
-  leaves no trace from this writer at all. The whole point of close+5 is that option quotes
-  freeze at the option close, so a fetch inside that window still observes the closing
-  marks. Until the producer exists, the window is observed and never used.
-- **Unowned.** The membership guard's absent-marker rows. The guard counts missing
-  expirations and writes no marker for them, so a series that was never offered and one
-  that was missed read the same downstream. This one is ordered behind the fill above,
-  because the comparison it marks against only exists once a fill has landed. The findings
-  the guard does produce reach the daemon's stderr through `_report_guard`, so launchd
-  captures them to a log file. A log file is a worse home than a page or a panel, and that
-  is a separate question from this entry.
+- **Moved to slice 3.** D11's repair half. The guard detects a missing `option_close` and
+  cannot fix it, because the design's remedy is one direct fetch and no vendor path exists
+  in slice 2. The fill's producer and the membership guard's absent-marker rows are booked
+  under slice 3. What ships here is the detector, the close tags, and the dispatcher.
 - **D12** compaction and backup, plus the nightly window re-tune. Compaction merges a day's segments into one sealed partition. The re-tune runs after it. The job groups the day's rows by `window_start` and `window_end`, compares each window's contract count to the body limit, and rewrites `chain_plan.json` when the profile drifts.
 - **Unowned.** The backup's exclusion list. The design's *Backup, defined* names the sync
   root as `lake/` only, "with an explicit exclusion list". Nothing in `compact` carries
@@ -319,9 +307,27 @@ Slice 2 builds in two waves. D9 comes first and defines the hooks. D12, D14, and
 
 ### Slice 3, vendor fetch
 
-Slice 3 adds the vendor-fetch surfaces. Its test surface is recorded vendor payloads.
+Slice 3 adds the vendor-fetch surfaces. Its test surface is recorded vendor payloads. It
+also owns two entries inherited from slice 2's D11, because both need a vendor fetch and
+slice 2 has no path to one.
 
 - **D16** bars, actions, and the cross-check.
+- **Unowned.** The close+5 fill's producer, inherited from D11. `CloseGuard` takes an injected `fill` and
+  `daemon._close_guard` never passes one, so `self._fill` is `None` in production. The
+  guard detects a missing `option_close`, appends a `no fill fetcher` line to its own
+  outcome, and returns. Nothing is refetched and nothing is written. The reason constant
+  `OPTION_CLOSE_SERIES_ABSENT` is defined and exported and never written by any code path,
+  and `_marker` is called once in the file, on the `spot_close` side. So the close minute
+  leaves no trace from this writer at all. The whole point of close+5 is that option quotes
+  freeze at the option close, so a fetch inside that window still observes the closing
+  marks. Until the producer exists, the window is observed and never used.
+- **Unowned.** The membership guard's absent-marker rows. The guard counts missing expirations
+  and writes no marker for them, so a series that was never offered and one that was missed
+  read the same downstream. This one is ordered behind the fill above, and both are ordered
+  behind D16's vendor path, because the comparison it marks against only exists once a fill
+  has landed. The findings the guard does produce reach the daemon's stderr through
+  `_report_guard`, so launchd captures them to a log file. A log file is a worse home than a
+  page or a panel, and that is a separate question from this entry.
 
 ### Slice 4, the read layer
 
