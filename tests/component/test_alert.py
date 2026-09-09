@@ -275,3 +275,166 @@ def test_the_topic_never_appears_in_the_request_url(tmp_path):
     assert sent["body"]["topic"] == "secret-topic"
     assert sent["body"]["title"] == PAGE.title
     assert sent["body"]["tags"] == [PAGE_TAG]
+
+
+def test_a_roster_saved_mid_keystroke_leaves_the_daemon_running(tmp_path):
+    """The roster fallback in ``on_skipped`` must cover a parse error, not only a bad shape.
+
+    The hook re-reads the roster and catches ``TickersError``, so the last good one
+    stays in place rather than the daemon refusing to count. A hand edit caught
+    mid-save is the likeliest way the file goes bad, and it is a parse error. While the
+    loader let ``yaml.YAMLError`` out, that walked past the hook, out of ``run_loop``,
+    and took the process with it.
+    """
+    from lake import daemon
+    from lake.capture import CycleResult
+    from tests.support.calendar import et, weekday_sessions
+    from tests.support.clock import ManualClock
+    from tests.support.config import write_config
+    from tests.support.pinger import FakePinger
+
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("XYZ: {options: false}\n")
+
+    clock = ManualClock(start=et(2026, 9, 2, 11, 58))
+
+    def overrunning_cycle(*, close_tag, session_phase):
+        # Three minutes for a one-minute cycle. The next tick lands past them, so the
+        # loop hands the minutes it slept through to on_skipped, which is the one hook
+        # that re-reads the roster. Halfway through, the operator's editor saves.
+        clock.advance(180)
+        tickers.write_text("XYZ: {options: fal")
+        return CycleResult(et(2026, 9, 2, 12, 0), ())
+
+    ticks = [0]
+
+    def three() -> bool:
+        ticks[0] += 1
+        return ticks[0] <= 3
+
+    daemon.run_loop_from_config(
+        config_path=str(config),
+        tickers_path=str(tickers),
+        clock=clock,
+        calendar=weekday_sessions(date(2026, 8, 31)),
+        assertion_runner=lambda args: None,
+        transport=Broken(),
+        pinger=FakePinger(),
+        cycle_runner=overrunning_cycle,
+        should_continue=three,
+    )
+
+    # Four calls means should_continue stopped the loop, rather than an exception doing
+    # it. Three of them ran a tick and the fourth said stop.
+    assert ticks[0] == 4
+    # The hook must also still charge the roster it kept, so three slept minutes trip
+    # XYZ's counter and raise its page. An empty roster would survive just as quietly
+    # and page nothing, which is the failure this guards.
+    records = _records(lake_root)
+    assert records, "the daemon slept through three capture minutes and raised no page"
+    assert "XYZ" in records[0]["title"]
+
+
+def test_a_ticker_retired_mid_session_stops_being_charged(tmp_path):
+    """The other half of the ``on_skipped`` promise: the hook re-reads, it does not close over.
+
+    The comment on the hook gives two rules. A roster that will not load keeps the last
+    good one, and a ticker retired mid-session stops being charged without a restart.
+    A refactor that closed over the startup roster would keep every other test green
+    and go on charging a ticker the operator retired.
+    """
+    from lake import daemon
+    from lake.capture import CycleResult
+    from tests.support.calendar import et, weekday_sessions
+    from tests.support.clock import ManualClock
+    from tests.support.config import write_config
+    from tests.support.pinger import FakePinger
+
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("XYZ: {options: false}\nZZZ: {options: false}\n")
+
+    clock = ManualClock(start=et(2026, 9, 2, 11, 58))
+
+    def overrunning_cycle(*, close_tag, session_phase):
+        clock.advance(180)
+        # The operator retires ZZZ. The roster still loads, so no fallback is involved.
+        tickers.write_text("XYZ: {options: false}\n")
+        return CycleResult(et(2026, 9, 2, 12, 0), ())
+
+    ticks = [0]
+
+    def three() -> bool:
+        ticks[0] += 1
+        return ticks[0] <= 3
+
+    daemon.run_loop_from_config(
+        config_path=str(config),
+        tickers_path=str(tickers),
+        clock=clock,
+        calendar=weekday_sessions(date(2026, 8, 31)),
+        assertion_runner=lambda args: None,
+        transport=Broken(),
+        pinger=FakePinger(),
+        cycle_runner=overrunning_cycle,
+        should_continue=three,
+    )
+
+    titles = [r["title"] for r in _records(lake_root)]
+    assert any("XYZ" in title for title in titles), "the kept ticker stopped being charged"
+    assert not any("ZZZ" in title for title in titles), "the retired ticker was still charged"
+
+
+def test_a_roster_that_will_not_load_at_start_says_which_guards_it_left_off(tmp_path, capsys):
+    """A guard that fails to build is off for the life of the process, so it must say so.
+
+    The three builders run once, before the loop, and are never rebuilt. The cycle
+    runner re-reads the roster every minute, so an operator who fixes the file before
+    the open leaves the daemon capturing all session with gap marking, the close guard,
+    the watchdog, and the dead-man all off. The dead-man going unfed does page, but it
+    pages capture-down while data is landing. Only this line names the real cause.
+    """
+    from lake import daemon
+    from lake.capture import CycleResult
+    from tests.support.calendar import et, weekday_sessions
+    from tests.support.clock import ManualClock
+    from tests.support.config import write_config
+    from tests.support.pinger import FakePinger
+
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("XYZ: {options: fal")
+
+    clock = ManualClock(start=et(2026, 9, 2, 9, 28))
+    ticks = [0]
+
+    def two() -> bool:
+        ticks[0] += 1
+        # The operator's editor finishes the save before the first capture slot.
+        tickers.write_text("XYZ: {options: false}\n")
+        return ticks[0] <= 2
+
+    daemon.run_loop_from_config(
+        config_path=str(config),
+        tickers_path=str(tickers),
+        clock=clock,
+        calendar=weekday_sessions(date(2026, 8, 31)),
+        assertion_runner=lambda args: None,
+        transport=Broken(),
+        pinger=FakePinger(),
+        cycle_runner=lambda *, close_tag, session_phase: CycleResult(et(2026, 9, 2, 9, 30), ()),
+        should_continue=two,
+    )
+
+    err = capsys.readouterr().err
+    # Every guard that failed to build names itself and the file that stopped it.
+    for guard in ("gap marking off", "close guard off", "the alarm off"):
+        assert guard in err, f"a session ran with {guard.removesuffix(' off')} off and said nothing"
+    assert "tickers file is not valid YAML" in err

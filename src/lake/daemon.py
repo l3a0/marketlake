@@ -270,6 +270,21 @@ def _report(report: MarkingReport, pass_name: str) -> None:
     print(" ".join(parts), file=sys.stderr)
 
 
+def _report_off(guard: str, exc: Exception) -> None:
+    """Say on stderr which guard a bad input file left off, and why.
+
+    launchd captures the daemon's stderr to its own log. The three builders below run
+    once at start and are never rebuilt, so a guard that fails to build is off for the
+    life of the process. The daemon can still come up and capture: the cycle runner
+    re-reads the roster every minute, so a file fixed before the open makes the cycle
+    succeed while the guards stay off. That session runs with no gap marking, no close
+    guard, no watchdog, and no dead-man. The dead-man going unfed does page, but it
+    pages capture-down while data is landing, which names the wrong thing. This line is
+    what the log has to say instead.
+    """
+    print(f"{guard} off: {exc}", file=sys.stderr)
+
+
 def _gap_marker(
     config_path: str | Path | None,
     tickers_path: str | Path | None,
@@ -277,15 +292,20 @@ def _gap_marker(
 ) -> GapMarker | None:
     """The gap marker for this daemon, or ``None`` when it cannot be built.
 
-    Marking is a record of what was missed, not a capture. A config or roster that will
-    not load is already fatal to the cycle runner on its first tick, and the security
-    master is optional, so nothing here is worth refusing to start over. Returning
-    ``None`` leaves the hooks bare and the loop unchanged.
+    Marking is a record of what was missed, not a capture, and the security master is
+    optional, so nothing here is worth refusing to start over. Returning ``None`` leaves
+    the hooks bare and the loop unchanged.
+
+    A bad input file is not always fatal to the cycle runner that follows. The runner
+    re-reads the roster every minute, so an operator who fixes the file before the open
+    leaves the daemon capturing with this guard off for the session. ``_report_off``
+    puts the reason in the log, which is the only trace that remains.
     """
     try:
         config = load_config(config_path)
         roster = load_tickers(tickers_path)
-    except (ConfigError, TickersError):
+    except (ConfigError, TickersError) as exc:
+        _report_off("gap marking", exc)
         return None
     master = None
     try:
@@ -329,13 +349,15 @@ def _close_guard(
 ) -> CloseGuard | None:
     """The close+5 guard for this daemon, or ``None`` when it cannot be built.
 
-    A config or roster that will not load is already fatal to the cycle runner on its
-    first tick, so nothing here is worth refusing to start over.
+    Nothing here is worth refusing to start over. The cycle runner re-reads the roster
+    every minute, so a file fixed before the open leaves the daemon up with this guard
+    off, and ``_report_off`` is what says so.
     """
     try:
         config = load_config(config_path)
         roster = load_tickers(tickers_path)
-    except (ConfigError, TickersError):
+    except (ConfigError, TickersError) as exc:
+        _report_off("close guard", exc)
         return None
     return CloseGuard(lake_root=config.lake_root, roster=roster, session_clock=session_clock)
 
@@ -349,13 +371,15 @@ def _alarm(
 ) -> tuple[Watchdog, Publisher, DeadMan, Roster] | None:
     """The watchdog, its publisher, and the dead-man feed, or ``None``.
 
-    A config or roster that will not load is already fatal to the cycle runner on its
-    first tick, so nothing here is worth refusing to start over.
+    Nothing here is worth refusing to start over. The cycle runner re-reads the roster
+    every minute, so a file fixed before the open leaves the daemon up with the watchdog
+    and the dead-man off, and ``_report_off`` is what says so.
     """
     try:
         config = load_config(config_path)
         roster = load_tickers(tickers_path)
-    except (ConfigError, TickersError):
+    except (ConfigError, TickersError) as exc:
+        _report_off("the alarm", exc)
         return None
     publisher = Publisher(
         lake_root=config.lake_root,
