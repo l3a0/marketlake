@@ -19,12 +19,15 @@ Each minute the loop does three things, in order.
 3. **Run one cycle** through the injected cycle runner, stamped with the two provenance
    tags the loop owns, then hand the result to the observer hook.
 
-Four hooks let the loop-coupled deliverables plug in without touching the loop. Each
+Five hooks let the loop-coupled deliverables plug in without touching the loop. Each
 has a no-op default, so the loop ships standalone.
 
 - ``on_start()`` is called exactly once, before the first tick. Startup gap-marking
   (D10) plugs in here. Gap-marking writes an explicit marker row for each minute a dead
   daemon missed, so the gap is recorded rather than silently absent.
+- ``on_tick(slot)`` is handed every minute the loop sees, session or not. D14's power
+  assertion and D13's idle heartbeat plug in here, because each needs a minute the loop is
+  awake for rather than a minute it captures on.
 - ``close_tag_for(slot)`` is asked, once per capture slot, what ``close_tag`` the minute
   carries. The close-tag decision (D11) plugs in here: ``spot_close`` at the equity close
   and ``option_close`` at the option close. The default answers ``None``.
@@ -131,7 +134,7 @@ class CycleRunner(Protocol):
     def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult: ...
 
 
-# -- the four hooks -----------------------------------------------------------
+# -- the five hooks ----------------------------------------------------------
 
 
 def _no_start() -> None:
