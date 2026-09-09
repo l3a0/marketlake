@@ -2,7 +2,8 @@
 
 Failures push alerts. Progress needs a pull surface. This module is that surface. It is
 a small read-only query service on localhost that answers a fixed set of named queries
-over the lake, plus the one static page that renders them. ``status.html`` runs the
+over the lake. Two constant files ride along: ``status.html``, which renders the
+panels, and ``favicon.ico``, which the browser puts on the tab. The page runs the
 queries at view time. Nothing is pre-rendered and no summary state is kept. Freshness
 reads off the data's own timestamps, so a dead capture shows as an old last cycle and a
 dead service shows as a page that cannot load. Neither can be mistaken for the other.
@@ -13,10 +14,11 @@ token and the alerting secrets. So client-supplied SQL never crosses the boundar
 the sandbox holds even if the query surface drifts. Five rules, each enforced in code
 here.
 
-1. The HTTP layer maps a request path to a query *name* in ``NAMED_QUERIES``. Exactly one
-   path outside that map is answered: ``/`` serves the static page, which reads no lake
-   data and runs no query. Every other unmapped path is a 404. No endpoint takes SQL, and
-   no request field is ever treated as SQL text.
+1. The HTTP layer maps a request path to a query *name* in ``NAMED_QUERIES``. Outside
+   that map, ``/`` serves the static page and ``/favicon.ico`` serves the browser-tab
+   icon. Both answer with constant bytes shipped in the package. Neither reads lake data
+   and neither runs a query. Every other unmapped path is a 404. No endpoint takes SQL,
+   and no request field is ever treated as SQL text.
 2. A request carries at most two parameters, a ticker and a date. Each is validated
    before any query runs. The ticker must be in the lake's own roster, the set of tickers
    present under ``lake_root``. The date must parse as strict ``YYYY-MM-DD``. A request
@@ -158,6 +160,11 @@ STATUSES = (
 
 # The static page, shipped inside the package so it works offline.
 STATUS_PAGE = "status.html"
+
+# The browser-tab icon, shipped beside the page. ``lake.favicon`` renders it, and the
+# path is the one a browser asks the origin for without being told to.
+FAVICON = "favicon.ico"
+FAVICON_PATH = "/favicon.ico"
 
 # A ticker as the lake's directory names carry it. The roster is read off directory
 # names under ``lake_root``, and a name outside this shape is not a ticker.
@@ -1124,6 +1131,11 @@ def load_status_page() -> bytes:
     return resources.files("lake").joinpath("static").joinpath(STATUS_PAGE).read_bytes()
 
 
+def load_favicon() -> bytes:
+    """The tab icon's bytes, read from the package beside the page."""
+    return resources.files("lake").joinpath("static").joinpath(FAVICON).read_bytes()
+
+
 class DashboardService:
     """The query service: one sandboxed connection, the injected seams, and the page.
 
@@ -1132,7 +1144,9 @@ class DashboardService:
     state, and every cursor inherits the locked sandbox. The clock and calendar are
     injected, so a test decides what time it is and which days are sessions. The guard
     constants are injected too, so the panel reports the machine's own staleness
-    threshold rather than the pinned default it may have been recalibrated away from.
+    threshold rather than the pinned default it may have been recalibrated away from. The
+    page and the tab icon are injected on the same terms. Each defaults to the bytes
+    shipped in the package, and a test that wants neither passes its own.
     """
 
     def __init__(
@@ -1144,6 +1158,7 @@ class DashboardService:
         guards: GuardConstants | None = None,
         connection: duckdb.DuckDBPyConnection | None = None,
         page: bytes | None = None,
+        icon: bytes | None = None,
     ) -> None:
         self._paths = LakePaths(Path(lake_root).resolve())
         self._clock = clock
@@ -1151,10 +1166,15 @@ class DashboardService:
         self._guards = guards if guards is not None else GuardConstants()
         self._con = connection if connection is not None else open_lake_connection(self._paths.root)
         self._page = page if page is not None else load_status_page()
+        self._icon = icon if icon is not None else load_favicon()
 
     @property
     def page(self) -> bytes:
         return self._page
+
+    @property
+    def icon(self) -> bytes:
+        return self._icon
 
     def roster(self) -> dict[str, tuple[str, ...]]:
         """The lake's current roster, re-read per call so a new ticker appears at once."""
@@ -1258,6 +1278,9 @@ class _Handler(BaseHTTPRequestHandler):
         if parts.path == "/":
             self._send_page()
             return
+        if parts.path == FAVICON_PATH:
+            self._send_icon()
+            return
         name = ROUTES.get(parts.path)
         if name is None:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -1288,12 +1311,40 @@ class _Handler(BaseHTTPRequestHandler):
         # alone and not ``'self'``: that blocks every external script URL, same-origin
         # ones included, which is tighter than adding ``'self'`` would be. Do not "fix"
         # it by adding ``'self'``.
+        # ``img-src 'self'`` is the tab icon's whole cost. It buys one image, the icon
+        # served at ``/favicon.ico``, which the page declares in its head. A favicon
+        # fetch is an image fetch, so the page's own policy governs it. Without this
+        # directive the fetch is refused and the tab stays blank. Safari 26.6.2 and
+        # Chrome 152.0.7977.82 on macOS 26.6.2 were both tested, and both behave that
+        # way. The page's declaration is what makes the directive checkable. It is not
+        # what makes the fetch happen: with the directive in place a browser asks the
+        # origin for ``/favicon.ico`` whether or not anything declares it. What the
+        # declaration buys is a reason in the markup for the directive to be here. Drop
+        # the declaration and a later tidy-up drops the directive with it, and the icon
+        # goes with both. Do not widen it past ``'self'``.
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'none'; connect-src 'self'; script-src 'unsafe-inline'; "
-            "style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; "
-            "form-action 'none'",
+            "default-src 'none'; connect-src 'self'; img-src 'self'; "
+            "script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+            "frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
         )
+        self.end_headers()
+        self._write_body(body)
+
+    def _send_icon(self) -> None:
+        """The tab icon. Constant bytes, read once at construction, with no lake access.
+
+        ``image/x-icon`` is the conventional type for this container. Safari 26.6.2 and
+        Chrome 152.0.7977.82 both accept it. ``nosniff`` sits safely beside it. That
+        header stops a browser guessing a type the response never declared, and this
+        response declares the type it is.
+        """
+        body = self.service.icon
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "image/x-icon")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self._write_body(body)
 
@@ -1434,6 +1485,7 @@ __all__ = [
     "build_parser",
     "host_allowed",
     "lake_roster",
+    "load_favicon",
     "load_status_page",
     "main",
     "make_server",
