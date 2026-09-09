@@ -163,7 +163,7 @@ _PY_WEEKDAYS = frozenset({0, 1, 2, 3, 4})
 _PY_SATURDAY = 5
 _PY_SUNDAY = 6
 
-# The launchd labels. A label is the job's unique identity to launchd. All four sit in
+# The launchd labels. A label is the job's unique identity to launchd. All five sit in
 # the system domain because they are LaunchDaemons.
 LAUNCHD_DOMAIN = "system"
 DAEMON_LABEL = "com.marketlake.daemon"
@@ -188,7 +188,7 @@ _SYSTEM_PATH = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
 # a real directory the /etc entry is the one that catches it.
 _PROTECTED_ROOTS = (Path("/Library"), Path("/System"), Path("/etc"), Path("/private/etc"))
 
-# The one rendered setup file beside the four plists. The Time Machine exclusion is a
+# The one rendered setup file beside the five plists. The Time Machine exclusion is a
 # printed install step rather than a rendered script, so there is one copy of it.
 SUDOERS_FILE = "marketlake.sudoers"
 
@@ -196,11 +196,11 @@ SUDOERS_FILE = "marketlake.sudoers"
 # runs it, per the build plan's D14.
 INSTALL_SCRIPT_FILE = "install.sh"
 
-# The script for re-installing after a re-render. Separate from install.sh because
-# the two are not the same steps: launchd keeps a job's definition from the
-# bootstrap that loaded it, so a reinstall has to boot a label out before its new
-# plist means anything.
-REINSTALL_SCRIPT_FILE = "reinstall.sh"
+# The reverse of install.sh. It takes off the five jobs, the weekday wake, the sudoers
+# drop-in and the five plists, in that order. It leaves the lake, the config directory
+# and that directory's Time Machine exclusion, so an uninstall is neither a data loss
+# nor a re-auth, and it does not expose the token to the next backup.
+UNINSTALL_SCRIPT_FILE = "uninstall.sh"
 
 
 # -- the host description and the plists -------------------------------------
@@ -331,8 +331,8 @@ def sunday_job(host: LaunchdHost) -> LaunchdJob:
     18:30 vendor sweep is not rendered here. That job is slice 3's, and it does not
     exist yet.
 
-    ``RunAtLoad`` is deliberately off, the one job of the four that leaves it off. It
-    would otherwise run at every bootstrap and every boot, on any day. That means a
+    ``RunAtLoad`` is deliberately off, as it is for the calendar probe. It would
+    otherwise run at every bootstrap and every boot, on any day. That means a
     full integrity scrub of the lake each time, and a coverage assertion on a day the
     design never asks about. A healthy weekday reboot would pass every check and ping
     the ``sunday`` slug midweek, which is not what that check watches. Turning it off
@@ -1453,7 +1453,7 @@ def render_all(host: LaunchdHost) -> tuple[RenderedFile, ...]:
     files = [RenderedFile(f"{job.label}.plist", job.render()) for job in all_jobs(host)]
     files.append(RenderedFile(SUDOERS_FILE, sudoers_dropin(host.owner)))
     files.append(RenderedFile(INSTALL_SCRIPT_FILE, install_script(host), mode=0o755))
-    files.append(RenderedFile(REINSTALL_SCRIPT_FILE, reinstall_script(host), mode=0o755))
+    files.append(RenderedFile(UNINSTALL_SCRIPT_FILE, uninstall_script(host), mode=0o755))
     return tuple(files)
 
 
@@ -1607,6 +1607,14 @@ def install_script(host: LaunchdHost) -> str:
         "#",
         "# Step 6, the standing Friday one-shot, is not here. It is not part of the first",
         "# install. Run it from the install text.",
+        "#",
+        "# To reinstall after a re-render, run the uninstall first and this second:",
+        "#",
+        f"#     ./{UNINSTALL_SCRIPT_FILE} && ./{INSTALL_SCRIPT_FILE}",
+        "#",
+        "# The `&&` is load-bearing, not punctuation. An uninstall that cannot finish has",
+        "# to leave this half unrun, rather than layering a new install over a broken one.",
+        "# A `;` would run it anyway. Read uninstall.sh's header before you do.",
         "set -euo pipefail",
         "",
         'HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
@@ -1615,75 +1623,100 @@ def install_script(host: LaunchdHost) -> str:
     return "\n".join(header + body) + "\n"
 
 
-def reinstall_script(host: LaunchdHost) -> str:
-    """Re-install every job after a re-render. The renderer never runs it.
+def uninstall_script(host: LaunchdHost) -> str:
+    """Take the control plane off a machine, in the reverse of the install's order.
 
-    ``install.sh`` cannot do this job twice. Overwriting a plist changes nothing on its
-    own, because launchd holds the definition from the bootstrap that loaded it. So a
-    second run of the first install would copy new files over old ones, bootstrap
-    nothing, and leave the old definition running while reporting success.
-    ``launchctl kickstart -k`` is not the reload either. It restarts the process under
-    the definition already loaded.
+    The install writes five plists (step 1), the sudoers drop-in (step 2), the weekday
+    firmware wake (step 3), the Time Machine exclusion (step 4), and bootstraps five
+    labels (step 5). This runs 5, 3, 2, 1. Step 4 is deliberately skipped, and the
+    bootout leading is what keeps launchd from ever holding a definition whose file is
+    gone. Booting out a label that is not loaded is skipped rather than treated as a
+    failure, so this converges from a partial install as well as a whole one.
 
-    So each label is booted out, re-installed, and bootstrapped again. That converges
-    from any starting state, whether the label was loaded, stale, or never there, so the
-    operator does not have to know which case they are in.
+    Three things it leaves, and leaving them is the point:
 
-    Booting out a label that is not loaded fails, which is why the install text keeps
-    those lines commented. Here the bootout is guarded by a ``launchctl print`` instead.
-    A bare ``|| true`` would have swallowed a real refusal too, such as a job that will
-    not stop, and that is the one bootout failure worth stopping for.
+    1. The lake. Deleting captured data is not part of undoing an install.
+    2. The config directory and its Time Machine exclusion. The directory holds the
+       token, ``config.yaml`` and ``tickers.yaml``, all of which survive an uninstall,
+       so the protection on them survives too. Symmetry with the install is the wrong
+       principle for a guard over data that outlives the install. Lifting it would put
+       the token and ``config.yaml``'s secrets on the next hourly backup, and a backup
+       that already ran cannot be un-run by re-adding the exclusion later.
+    3. The Sunday one-shot wake. ``pmset schedule cancel`` can take a single event, but
+       only by naming the exact date and time it was set for, and nothing here knows
+       which Sunday is pending without parsing ``pmset -g sched``. That is more
+       machinery than one wake is worth. The one-shot fires once and is then gone.
 
-    Steps 2, 3 and 4 of the install are not repeated, and that is a limit rather than
-    a property. All three can change on a re-render. The sudoers drop-in carries the
-    owner and both wake constants, the wake command carries ``WEEKDAY_WAKE``, and the
-    exclusion carries the home. A wake re-tune is the sharp case: it rewrites the
-    sudoers rule while leaving every plist byte-identical, so this script reinstalls
-    nothing that changed and skips the only thing that did. The header says so and
-    gives the operator the diff to run.
+    The weekday wake is different, and its removal is the one place this reaches past
+    what the install placed. macOS holds one *pair* of repeating events, a power-on and
+    a power-off, and ``pmset repeat cancel`` clears the pair. There is no command that
+    cancels half of it. So a repeating sleep or shutdown the operator set elsewhere goes
+    with the 08:25 wake. The script reads the schedule back before the cancel as well as
+    after, so the transcript carries what to re-set by hand.
     """
-    labels = [job.label for job in all_jobs(host)]
     lines = [
         "#!/bin/bash",
-        "# Marketlake control plane: re-install after a re-render.",
+        "# Marketlake control plane: take the install back off, in reverse order.",
         "#",
         "# Written by `python -m lake.control_plane render`, which never runs it. Run it",
         "# yourself, as the owner. It calls sudo for the privileged steps and will prompt.",
         "#",
-        "# Usage. It installs the files sitting beside it, so it runs from anywhere:",
+        "# Usage:",
         "#",
-        f"#     ./{REINSTALL_SCRIPT_FILE}",
+        f"#     ./{UNINSTALL_SCRIPT_FILE}",
         "#",
-        "# It boots each label out before re-installing it. Overwriting a plist alone does",
-        "# nothing, because launchd keeps the definition from the bootstrap that loaded it.",
-        "# A bootout of a label that is not loaded is skipped rather than treated as a",
-        "# failure, so this converges whether or not the jobs are currently running.",
+        "# It boots out the five launchd jobs, cancels the weekday firmware wake, removes",
+        "# the sudoers drop-in, and deletes the five plists. That is install steps 5, 3, 2",
+        "# and 1, undone in that order.",
         "#",
-        "# It re-installs the launchd jobs and nothing else. The sudoers drop-in, the",
-        "# firmware wake and the Time Machine exclusion are steps 2, 3 and 4 of the",
-        "# install, and this does not repeat them. They usually survive a re-render, but",
-        "# not always. The owner, the home and both wake constants all feed them. A wake",
-        "# re-tune is the sharp case: it rewrites the sudoers rule while leaving every",
-        "# plist identical, so this script would reinstall nothing that changed. After a",
-        "# re-render that moved any of those, compare and re-run steps 2 to 4 by hand:",
+        "# Three things it leaves:",
         "#",
-        '#     sudo diff /etc/sudoers.d/marketlake "$HERE/' + SUDOERS_FILE + '"',
+        "#   - The lake. Deleting captured data is not part of undoing an install.",
+        "#   - The config directory AND its Time Machine exclusion. The token,",
+        "#     config.yaml and tickers.yaml all survive, so the protection on them",
+        "#     survives too. Lifting the exclusion would put the token and config.yaml's",
+        "#     secrets on the next hourly backup.",
+        "#   - The Sunday one-shot wake. Cancelling one event by name needs the exact",
+        "#     date it was set for, which nothing here knows without parsing `pmset -g",
+        "#     sched`. It fires once and is then gone.",
         "#",
-        "# The `capture` check stays armed across this, because a check leaves its `new`",
-        "# state once and never returns. So the daemon going down here pages after the",
-        "# grace, the same as any other outage. That is correct rather than a nuisance, and",
-        "# it is the reason to keep this run short.",
+        "# READ THIS BEFORE STEP 2. macOS holds one PAIR of repeating power events, a",
+        "# power-on and a power-off, and `pmset repeat cancel` clears the pair. No command",
+        "# cancels half of it. So a repeating sleep or shutdown you set elsewhere goes with",
+        "# the 08:25 wake. Step 2 prints the schedule before and after for that reason.",
+        "# Anything in the first print that is not the marketlake wake is yours to re-set.",
+        "# That holds on the reinstall path too: install.sh re-sets the 08:25 wake and",
+        "# nothing else, so it does not put back what step 2 took from you.",
+        "#",
+        "# Reinstalling after a re-render is this script and then the install, in one go:",
+        "#",
+        f"#     ./{UNINSTALL_SCRIPT_FILE} && ./{INSTALL_SCRIPT_FILE}",
+        "#",
+        "# The `&&` is load-bearing. If this half cannot finish, the install half must not",
+        "# run, rather than layering a new install over a broken one. A `;` would run it.",
+        "# There is no third script. A reinstall is these two, in that order, and nothing",
+        "# else, so it cannot drift from what an install and an uninstall mean.",
+        "#",
+        "# Four dead-man checks go silent when these jobs stop: capture, pre-open,",
+        "# calendar-probe and sunday. Each pages once its own deadline passes, which for",
+        "# capture is inside the weekday capture window and for sunday is Sunday 23:30.",
+        "# Pause all four from healthchecks first if the machine is meant to stay",
+        "# uninstalled. A check that has been pinged once does not go back to `new` on its",
+        "# own, so simply stopping the jobs is not enough to keep them quiet.",
         "set -euo pipefail",
         "",
-        'HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
-        "",
     ]
+
+    def emit(command: str) -> None:
+        lines.append(f"echo {shlex.quote('+ ' + command)}")
+        lines.append(command)
+
+    labels = [job.label for job in all_jobs(host)]
+    lines.append("# 1. Boot the five jobs out. This undoes install step 5, and it leads so that")
+    lines.append("# no plist below is deleted while launchd still holds its definition.")
     for label in labels:
-        plist = f'"$HERE/{label}.plist"'
-        target = f"/Library/LaunchDaemons/{label}.plist"
         domain = f"{LAUNCHD_DOMAIN}/{label}"
         lines += [
-            f"# {label}",
             f"if launchctl print {domain} >/dev/null 2>&1; then",
             f"  echo {shlex.quote(f'+ sudo launchctl bootout {domain}')}",
             f"  sudo launchctl bootout {domain}",
@@ -1691,18 +1724,34 @@ def reinstall_script(host: LaunchdHost) -> str:
             f"  echo {shlex.quote(f'  {domain} is not loaded, nothing to boot out')}",
             "fi",
         ]
-        for command in (
-            f"sudo install -o root -g wheel -m 644 {plist} /Library/LaunchDaemons/",
-            f"sudo launchctl bootstrap {LAUNCHD_DOMAIN} {target}",
-        ):
-            lines.append(f"echo {shlex.quote('+ ' + command)}")
-            lines.append(command)
+
+    lines.append("# 2. Cancel the weekday firmware wake. This undoes install step 3. The read-back")
+    lines.append("# runs first as well as last, because the cancel takes the whole repeating pair")
+    lines.append("# and the first print is the only record of what else was in it.")
+    emit("pmset -g sched")
+    emit("sudo pmset repeat cancel")
+    emit("pmset -g sched")
+
+    lines.append("# 3. Remove the sudoers drop-in. This undoes install step 2. It grants two")
+    lines.append("# pmset writes and nothing this script runs, so nothing above depended on it.")
+    emit("sudo rm -f /etc/sudoers.d/marketlake")
+
+    lines.append("# 4. Delete the five plists. This undoes install step 1, the first thing the")
+    lines.append("# install placed and so the last thing to come off.")
+    for label in labels:
+        emit(f"sudo rm -f /Library/LaunchDaemons/{label}.plist")
+
+    lines.append("# 5. Confirm the daemon is gone. Here the read-back is expected to fail, and")
+    lines.append("# that failure is the success condition, so it is handled rather than fatal.")
     read_back = f"launchctl print {LAUNCHD_DOMAIN}/{DAEMON_LABEL}"
     lines += [
-        "",
-        "# Read back whether the daemon came up under the new definition.",
         f"echo {shlex.quote('+ ' + read_back)}",
-        read_back,
+        f"if {read_back} >/dev/null 2>&1; then",
+        f"  echo {shlex.quote(f'  WARNING: {DAEMON_LABEL} is still loaded')}",
+        "  exit 1",
+        "else",
+        f"  echo {shlex.quote(f'  {DAEMON_LABEL} is gone')}",
+        "fi",
     ]
     return "\n".join(lines) + "\n"
 
@@ -1737,6 +1786,16 @@ def install_commands(out_dir: Path, host: LaunchdHost) -> str:
     lines += [
         "# Re-installing. Steps 1 to 5 are the first install and run once. Step 6 is the",
         "# standing Friday task until slice 3 lands.",
+        "# Step by step is not the recommended path. Run the two scripts beside this file",
+        f"#     ./{UNINSTALL_SCRIPT_FILE} && ./{INSTALL_SCRIPT_FILE}",
+        "# which re-runs every step and so cannot skip one that changed. The `&&` is",
+        "# load-bearing: an uninstall that cannot finish must leave the install unrun.",
+        "# If you do it step by step, the trap is that a re-render can change steps 2, 3",
+        "# and 4 while every plist stays byte-identical. Re-tuning either wake rewrites",
+        "# the sudoers drop-in, and every plist is left untouched, so a plist diff shows",
+        "# nothing to do while the drop-in keeps granting the old command. Check it",
+        "# directly:",
+        f"#     sudo diff /etc/sudoers.d/marketlake {shlex.quote(str(out / SUDOERS_FILE))}",
         "# launchd keeps a job's definition from the bootstrap that loaded it, so",
         "# overwriting a plist in step 1 changes nothing by itself. After a re-render that",
         "# changes a plist, boot out that label, then run its step 1 and step 5 lines again.",
@@ -1747,6 +1806,13 @@ def install_commands(out_dir: Path, host: LaunchdHost) -> str:
     ]
     for job in all_jobs(host):
         lines.append(f"# sudo launchctl bootout {LAUNCHD_DOMAIN}/{job.label}")
+    lines += [
+        f"# Uninstalling. Run ./{UNINSTALL_SCRIPT_FILE} beside this file. It undoes steps",
+        "# 5, 3, 2 and 1, in that order. Read its header before running it. It lists what",
+        "# it leaves, and it warns that the wake cancel takes the whole repeating power",
+        "# pair rather than only the marketlake half. That list lives in one place, so it",
+        "# is not restated here.",
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -1988,10 +2054,10 @@ __all__ = [
     "default_token_path",
     "expected_one_shot",
     "INSTALL_SCRIPT_FILE",
-    "REINSTALL_SCRIPT_FILE",
+    "UNINSTALL_SCRIPT_FILE",
     "install_commands",
     "install_script",
-    "reinstall_script",
+    "uninstall_script",
     "launchctl_probe",
     "main",
     "next_sunday_wake",

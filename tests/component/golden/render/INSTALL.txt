@@ -34,6 +34,16 @@ launchctl print system/com.marketlake.daemon
 cd /Users/someone/marketlake && /opt/py/bin/python -m lake.control_plane pmset
 # Re-installing. Steps 1 to 5 are the first install and run once. Step 6 is the
 # standing Friday task until slice 3 lands.
+# Step by step is not the recommended path. Run the two scripts beside this file
+#     ./uninstall.sh && ./install.sh
+# which re-runs every step and so cannot skip one that changed. The `&&` is
+# load-bearing: an uninstall that cannot finish must leave the install unrun.
+# If you do it step by step, the trap is that a re-render can change steps 2, 3
+# and 4 while every plist stays byte-identical. Re-tuning either wake rewrites
+# the sudoers drop-in, and every plist is left untouched, so a plist diff shows
+# nothing to do while the drop-in keeps granting the old command. Check it
+# directly:
+#     sudo diff /etc/sudoers.d/marketlake <OUT>/marketlake.sudoers
 # launchd keeps a job's definition from the bootstrap that loaded it, so
 # overwriting a plist in step 1 changes nothing by itself. After a re-render that
 # changes a plist, boot out that label, then run its step 1 and step 5 lines again.
@@ -46,3 +56,8 @@ cd /Users/someone/marketlake && /opt/py/bin/python -m lake.control_plane pmset
 # sudo launchctl bootout system/com.marketlake.self-check
 # sudo launchctl bootout system/com.marketlake.calendar-probe
 # sudo launchctl bootout system/com.marketlake.sunday
+# Uninstalling. Run ./uninstall.sh beside this file. It undoes steps
+# 5, 3, 2 and 1, in that order. Read its header before running it. It lists what
+# it leaves, and it warns that the wake cancel takes the whole repeating power
+# pair rather than only the marketlake half. That list lives in one place, so it
+# is not restated here.

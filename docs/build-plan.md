@@ -108,6 +108,79 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   sees each root command before it runs. The renderer still executes nothing. It writes
   `install.sh` and never runs it, and `--out` still refuses a system directory, so the
   root-owned copy remains the operator's own act.
+
+  `render` writes one more script beside it, `uninstall.sh`. The
+  uninstall runs the install backwards. The install writes the plists (step 1), the
+  sudoers drop-in (step 2), the weekday wake (step 3), the Time Machine exclusion
+  (step 4), then bootstraps the labels (step 5). The uninstall runs 5, 3, 2, 1. Putting
+  the bootout first is the load-bearing half, because a plist deleted under a loaded
+  label leaves launchd holding a definition whose file is gone. A label that is not
+  loaded is skipped rather than treated as a failure, so the uninstall converges from a
+  half-finished install as well as a whole one.
+
+  Three things it leaves:
+
+  1. The lake. Deleting captured data is not part of undoing an install.
+  2. The config directory and, with it, install step 4's Time Machine exclusion. The
+     directory holds the token, `config.yaml`, and `tickers.yaml`, all of which survive
+     an uninstall, so the guard over them survives too. Symmetry with the install is the
+     wrong principle for a protection over data that outlives the install. Lifting the
+     exclusion would put the token and `config.yaml`'s four secrets on the next hourly
+     backup, and a backup that already ran cannot be un-run by re-adding the exclusion.
+  3. The Sunday one-shot wake. `pmset schedule cancel` can take a single event, but only
+     by naming the exact date and time it was set for. Nothing here knows which Sunday
+     is pending without parsing `pmset -g sched`, which is more machinery than one wake
+     is worth. The one-shot fires once and is then gone.
+
+  Cancelling the weekday wake is the one place the uninstall reaches past what the
+  install placed, and the cost is named rather than denied. macOS holds one *pair* of
+  repeating power events, a power-on and a power-off, and `pmset repeat cancel` clears
+  the pair. No command cancels half of it. The design doc's `pmset` table already
+  records that second slot: it is why the sudoers rule spells its argument out instead
+  of wildcarding it, since the wildcard would have granted a password-free repeating
+  shutdown. So a repeating sleep the operator set elsewhere goes with the 08:25 wake.
+  The script prints `pmset -g sched` before the cancel as well as after, so the
+  transcript carries what to re-set by hand. Leaving the wake instead was rejected: an
+  uninstalled machine that still wakes at 08:25 every weekday is the install's most
+  visible residue, and the operator ran an uninstall to be rid of it.
+
+  Reinstalling after a re-render is those two scripts, in order, and nothing else:
+
+  ```bash
+  ./uninstall.sh && ./install.sh
+  ```
+
+  Both headers carry that line, because `render` writes the scripts to a directory and
+  prints the install text to stdout. The directory is the only surface an operator comes
+  back to. The `&&` is load-bearing rather than punctuation. An uninstall that cannot
+  finish has to leave the install unrun, instead of layering a new install over a broken
+  one, and a `;` would run it anyway.
+
+  Two things are pinned as **considered and rejected** here.
+
+  1. **The in-place plist swap.** An earlier reinstall overwrote the plists, booted the
+     labels out and back in, and left install steps 2, 3 and 4 to the operator. It named
+     that as a limit rather than a property, and its header handed over a `sudo diff` of
+     the drop-in to run after any re-render. The gap was documented, not denied. What
+     makes documenting it insufficient is the shape of the case that bites. Re-tuning
+     either wake constant rewrites the drop-in while leaving every plist byte-identical,
+     so the operator who checks the plists sees nothing to do and skips the diff that
+     mattered. Running both halves closes the gap instead of describing it.
+  2. **A rendered `reinstall.sh`.** Once the swap was cut, the file held six lines that
+     called the other two scripts, and `./uninstall.sh && ./install.sh` is behaviourally
+     identical: same command log, same exit codes, same short-circuit. What decided it
+     was drift, not tidiness. Within one commit of being reduced to a composition, its
+     header restated the uninstall's counted set of three survivals as two and dropped
+     the Sunday one-shot. A file whose stated purpose was to remove a second description
+     of an install had produced one. The three facts that lived only in it moved into the
+     two headers that remain: the composed command, why the separator is `&&`, and that
+     the install half re-sets only the 08:25 wake, so it does not put back the power-off
+     event the uninstall's step 2 took. Re-adding the file is a constant, one `render_all`
+     line and a golden, if a reinstall ever earns a step of its own.
+
+  The pasteable `INSTALL.txt` keeps the step-by-step procedure for operators who want it.
+  It now leads with the composed command and carries the `sudo diff` line, and it points
+  at `uninstall.sh`'s header for what an uninstall leaves rather than restating the list.
 - **D15** query service with the Now and Today panels. The query service is the read-only localhost dashboard.
 
 Slice 2 builds in two waves. D9 comes first and defines the hooks. D12, D14, and D15 do not touch the loop, so they build in parallel with D9. D10, D11, and D13 plug into D9's hooks, so they follow it, in parallel with each other.
