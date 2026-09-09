@@ -69,34 +69,43 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   4. `session.missed_slots`, D9's own day-by-day walk moved beside `skipped_slots` so both hooks share one enumerator and `lake.gap` needs no import of `lake.daemon`.
 - **Unowned.** The backup-copy scrub, and the `--checksum` drop that waits on it. `manifest.scrub` reads under `lake_root` only, so nothing verifies the backup target today. `control_plane`'s Sunday gap list already names it as gap 3 of 5. The two land together or in that order, because until the scrub exists `--checksum` in `RsyncBackup.sync` is the only thing that would notice the backup rotting. Dropping it first trades a deadline that fails in a few years for a verification hole that starts now.
 - **Unowned.** The daemon's in-loop close+15 compaction dispatch. `compact.compact` is reachable only from `python -m lake.compact`, and no job renders it. The design's rule that a catch-up compaction of an unsealed day is ordered after startup gap-marking is satisfied in-process today, because `run_loop` calls `on_start` before its first tick. Whoever builds the dispatch owns keeping it so. D11 built the seam it binds to, `session.SessionDispatch`, so what remains is the compaction job itself.
-- **Unowned.** Tests for four of the daemon's production hook bindings. The hooks
+- **Unowned.** Tests for six of the daemon's production hook bindings. The hooks
   themselves are held, and so is each observer in isolation. What is unheld is the wiring
-  the launchd job actually runs, so deleting a binding leaves the whole suite green. Four
-  are in that state:
+  `run_loop_from_config` builds, which is the wiring the launchd job actually runs. Six are
+  in that state:
 
   1. the skipped-slot hook reaching `GapMarker`, so a live overrun would record no gap,
   2. the skipped-slot hook reaching the watchdog, so the minutes the daemon was worst off
      would charge no counter,
   3. the per-tick hook feeding the `capture` dead-man's idle heartbeat,
-  4. the per-cycle chain-plan re-read, which is what makes a nightly plan rewrite take
+  4. the cycle hook feeding the same dead-man's `captured` signal, which is what arms the
+     check on the first durable cycle and holds the whole-daemon guarantee,
+  5. the per-tick hook reaching the close+5 guard's `SessionDispatch.check`,
+  6. the per-cycle chain-plan re-read, which is what makes a nightly plan rewrite take
      effect the next minute.
 
-  Each was confirmed by deleting the binding and running the suite. The point is not that
-  the bindings are wrong. It is that nothing would notice if they became wrong, and the
-  first three are exactly the paths that carry a failure to the phone.
+  Each was confirmed by deleting the binding and running the suite, which stays green at
+  1124. The point is not that the bindings are wrong. It is that nothing would notice if
+  they became wrong, and four of the six are the paths that carry a failure to the phone.
 - **D11** close tags and the close+5 guard. Close+5 is the five-minute window after the option close, the last moment an option-close fetch may land. It plugs into D9's close-tag hook, and it builds the session-relative dispatcher the design calls for. Everything session-relative runs from inside the daemon, because launchd's calendar intervals are fixed wall-clock and cannot express a close-relative time. `SessionDispatch` fires one job once per session day at a moment the calendar decides, including on a daemon that starts after that moment has passed. The close+15 compaction dispatch binds to the same seam when someone builds it. Two rules are worth stating where both writers can see them:
   1. The guard's fill triggers on missing marks, not a missing cycle. A chain that failed at the option close leaves a tagged gap row holding nothing a reader can price against, and a close+5 refetch is exactly what rescues it.
   2. On a post-close restart the guard runs before startup gap-marking, so the two close minutes it owns are already recorded when D10's marker walks the day.
 - **Unowned.** The close+5 fill's producer. `CloseGuard` takes an injected `fill` and
   `daemon._close_guard` never passes one, so `self._fill` is `None` in production. The
-  guard detects a missing `option_close` and marks it, and nothing refetches it. The whole
-  point of close+5 is that option quotes freeze at the option close, so a fetch inside that
-  window still observes the closing marks. Until the producer exists, the window is
-  observed and never used.
-- **Unowned.** The membership guard's absent-marker rows, and a reader for the guard's
-  report findings. The guard counts missing expirations and writes no marker for them, so a
-  series that was never offered and one that was missed read the same downstream. The
-  findings it does produce go nowhere.
+  guard detects a missing `option_close`, appends a `no fill fetcher` line to its own
+  outcome, and returns. Nothing is refetched and nothing is written. The reason constant
+  `OPTION_CLOSE_SERIES_ABSENT` is defined and exported and never written by any code path,
+  and `_marker` is called once in the file, on the `spot_close` side. So the close minute
+  leaves no trace from this writer at all. The whole point of close+5 is that option quotes
+  freeze at the option close, so a fetch inside that window still observes the closing
+  marks. Until the producer exists, the window is observed and never used.
+- **Unowned.** The membership guard's absent-marker rows. The guard counts missing
+  expirations and writes no marker for them, so a series that was never offered and one
+  that was missed read the same downstream. This one is ordered behind the fill above,
+  because the comparison it marks against only exists once a fill has landed. The findings
+  the guard does produce reach the daemon's stderr through `_report_guard`, so launchd
+  captures them to a log file. A log file is a worse home than a page or a panel, and that
+  is a separate question from this entry.
 - **D12** compaction and backup, plus the nightly window re-tune. Compaction merges a day's segments into one sealed partition. The re-tune runs after it. The job groups the day's rows by `window_start` and `window_end`, compares each window's contract count to the body limit, and rewrites `chain_plan.json` when the profile drifts.
 - **Unowned.** The backup's exclusion list. The design's *Backup, defined* names the sync
   root as `lake/` only, "with an explicit exclusion list". Nothing in `compact` carries
@@ -274,22 +283,39 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   `reminder_sink` and only fires it when one is passed. The `python -m lake.control_plane
   sunday` entry that the launchd job runs passes none, so the reminder is printed to the
   job's log file and never pushed. That is the same shape as D11's missing fill: the seam
-  is built and the producer is not. It is also the reminder whose absence let a refresh
-  token reach expiry unannounced, so it is worth more than its size suggests.
+  is built and the producer is not. It carries no blame for the September 2026 expiry,
+  because the Sunday job was not installed until three days after it, but it is what would
+  have to work for the next one to be announced.
+- **Unowned.** The Sunday canary's producer. `sunday_run` takes an injected `canary`, the
+  throwaway authenticated call that proves capture still works over a weekend, and the
+  `sunday` CLI passes none. The fallback is `_canary_pass_through`, which returns `True`
+  without calling anything. So the canary passes every Sunday whatever the token's state.
+  This is the third seam in slice 2 built and never supplied, after D11's fill and the
+  reminder above, and it is the costliest of the three. The other two fail to act. This one
+  reports success.
 - **D15** query service with the Now and Today panels. The query service is the read-only localhost dashboard.
+- **Unowned.** Five Now-panel fields that are hardcoded `None`, and the writers each one
+  waits on:
+
+  1. `token_minted_at`, which needs the refresh token's mint stamp journaled,
+  2. `token_age_minutes`, computed from that same stamp,
+  3. `token_sunday_countdown_minutes`, computed from it too,
+  4. `dead_man_last_ping`, which needs the watchdog's last ping recorded where the
+     dashboard can read it,
+  5. `pages_failed_to_send`, which has a source and no reader, and is already booked above
+     as one of D13's four page paths.
+
+  One writer clears the first three. The panel itself renders. It answers none of the
+  questions an operator opens it to ask.
+- **Unowned.** The roster stamp the design puts in journal metadata. `lake_roster` says
+  so itself: until the stamp exists it reads the ticker list off the lake's own directory
+  layout. So a ticker that journaled nothing has no directory and is missing from the panel
+  entirely, rather than shown as failing. A surface that journaled once and then died does
+  appear, with a growing `minutes_since`. The gap is the first case, where the dashboard
+  cannot distinguish a ticker that was never expected from one that was expected and
+  produced nothing.
 
 Slice 2 builds in two waves. D9 comes first and defines the hooks. D12, D14, and D15 do not touch the loop, so they build in parallel with D9. D10, D11, and D13 plug into D9's hooks, so they follow it, in parallel with each other.
-
-- **Unowned.** Five Now-panel fields that are hardcoded `None`, and the writers each one
-  waits on. `token_minted_at` and `token_age_minutes` need the refresh token's mint stamp
-  journaled, which nothing writes, so the panel cannot show token age or the Sunday
-  countdown. `dead_man_last_ping` needs the watchdog's last ping recorded where the
-  dashboard can read it. `pages_failed_to_send` has a source and no reader, and is already
-  booked above as one of D13's four page paths. The panel renders, and on the questions an
-  operator opens it to answer it renders nothing.
-- **Unowned.** The roster stamp the design puts in journal metadata. Without it the
-  dashboard cannot tell an expected ticker that journaled nothing from a ticker that was
-  never expected, so a silently dead surface reads as a healthy one.
 
 ### Slice 3, vendor fetch
 
@@ -353,11 +379,22 @@ One rule places every test. Apply it in order and stop at the first match.
 13. Synthetic split replay.
 14. Restore from backup.
 
-Four of those have no test today, and each covers a failure the unit and component suites
-cannot reach: 4, kill compaction mid-seal; 6, overnight death; 7, fully dark session; and
-14, restore from backup. `tests/integration/` holds three files. The rest of the roster is
-served at the component level, which is fine for the ones that need no real process to die
-partway.
+Six of those have no test today. `tests/integration/` holds three files, and the rest of
+the roster is served at the component level, which is fine for the ones that need no real
+process to die partway. The six split into two kinds.
+
+Four are buildable now, and each covers a failure the unit and component suites cannot
+reach:
+
+1. 4, kill compaction mid-seal,
+2. 6, overnight death,
+3. 7, fully dark session,
+4. 14, restore from backup.
+
+Two are blocked on work that does not exist yet, because their subject is slice 3's:
+
+1. 12, nightly sweep chain,
+2. 13, synthetic split replay.
 
 ## The 7 live checks
 
