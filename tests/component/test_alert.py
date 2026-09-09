@@ -275,3 +275,39 @@ def test_the_topic_never_appears_in_the_request_url(tmp_path):
     assert sent["body"]["topic"] == "secret-topic"
     assert sent["body"]["title"] == PAGE.title
     assert sent["body"]["tags"] == [PAGE_TAG]
+
+
+def test_only_a_page_carries_the_tag():
+    # The design gives the emoji one job: marking a message from the lake's own jobs as
+    # a page. A reminder and the nightly summary carry none, so the phone can tell the
+    # tiers apart at a glance. Priority already names the tier, so the tag follows it.
+    from lake.alert import PAGE_TAG, NtfyTransport
+
+    bodies = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def urlopen(request, timeout=None):
+        bodies.append(json.loads(request.data))
+        return FakeResponse()
+
+    import urllib.request
+
+    original = urllib.request.urlopen
+    urllib.request.urlopen = urlopen
+    try:
+        for priority in (5, 3, 2):
+            NtfyTransport("secret-topic").send(
+                Message(event="sunday_reauth", title="t", body="b", priority=priority)
+            )
+    finally:
+        urllib.request.urlopen = original
+
+    assert bodies[0]["tags"] == [PAGE_TAG]
+    assert "tags" not in bodies[1]
+    assert "tags" not in bodies[2]

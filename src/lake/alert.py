@@ -37,6 +37,13 @@ DEFAULT_DAILY_CAP = 40
 # The tag every lake-composed page carries, per the design's message table.
 PAGE_TAG = "rotating_light"
 
+# The page tier. The design's ladder is 5 for a page, 3 for a reminder, and 2 for
+# information that waits. The tag marks a page and nothing else, so it follows the
+# priority rather than becoming a second field a producer could set wrong. A reminder
+# and the nightly summary reach the phone carrying no tag, which is what lets the emoji
+# name the producer at a glance.
+PAGE_PRIORITY = 5
+
 # How long one POST may take. Short, because a page that has not landed in five seconds
 # is competing with the next minute's cycle.
 POST_TIMEOUT = timedelta(seconds=5)
@@ -55,7 +62,7 @@ class Message:
     event: str
     title: str
     body: str
-    priority: int = 5
+    priority: int = PAGE_PRIORITY
 
 
 @dataclass(frozen=True)
@@ -88,6 +95,10 @@ class NtfyTransport:
 
     A timeout or a 5xx is retried once. A 4xx is not, because the request itself is
     wrong and sending it again changes nothing.
+
+    Only a page carries the tag. The design gives the emoji one job, marking a message
+    from the lake's own jobs as a page, so a reminder and the summary go out with no
+    ``tags`` field at all.
     """
 
     def __init__(self, topic: str, *, host: str = "https://ntfy.sh") -> None:
@@ -99,15 +110,15 @@ class NtfyTransport:
         import urllib.error
         import urllib.request  # lazy: only a real send reaches the network
 
-        body = _json.dumps(
-            {
-                "topic": self._topic,
-                "title": message.title,
-                "message": message.body,
-                "priority": message.priority,
-                "tags": [PAGE_TAG],
-            }
-        ).encode("utf-8")
+        payload: dict[str, object] = {
+            "topic": self._topic,
+            "title": message.title,
+            "message": message.body,
+            "priority": message.priority,
+        }
+        if message.priority == PAGE_PRIORITY:
+            payload["tags"] = [PAGE_TAG]
+        body = _json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             self._url,
             data=body,
@@ -264,6 +275,7 @@ def undelivered(lake_root: Path | str, day: date) -> int:
 __all__ = [
     "CAP_REACHED",
     "DEFAULT_DAILY_CAP",
+    "PAGE_PRIORITY",
     "POST_FAILED",
     "REFUSED",
     "Delivery",
