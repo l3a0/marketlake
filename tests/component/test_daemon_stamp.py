@@ -64,13 +64,18 @@ def _run(
     ticks: int = 1,
     token: Path | None = None,
     pinger: FakePinger | None = None,
+    roster: str | None = None,
 ) -> Path:
     """Run the loop for a few ticks over a throwaway lake, and return the lake root."""
     lake_root = tmp_path / "lake"
     lake_root.mkdir(exist_ok=True)
     config = write_config(tmp_path, lake_root)
     tickers = tmp_path / "tickers.yaml"
-    tickers.write_text("SPY: {options: true, chain_cadence: 1m}\nXYZ: {options: false}\n")
+    tickers.write_text(
+        roster
+        if roster is not None
+        else "SPY: {options: true, chain_cadence: 1m}\nXYZ: {options: false}\n"
+    )
     counted = [0]
 
     def more() -> bool:

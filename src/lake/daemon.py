@@ -376,7 +376,14 @@ def _idle_stamp(
         try:
             roster = load_tickers(tickers_path)
             minted = read_token_mint(token)
-        except (TickersError, ValueError):
+        except Exception:  # noqa: BLE001 - the stamp is the least important thing here
+            # Deliberately broad. `load_tickers` parses YAML and reads a file, so a
+            # hand-edited roster raises `yaml.YAMLError` and an unreadable one raises
+            # `OSError`, neither of which is a `TickersError`. No hook is wrapped in a
+            # try, so anything escaping here exits the process, and KeepAlive relaunches
+            # straight into the same tick. A typo in tickers.yaml would crash-loop the
+            # daemon. The stamp is informational, so losing a minute of it is the
+            # correct price and the docstring above promises exactly that.
             return
         try:
             stamp_cycle(config.lake_root, at=slot, token_minted_at=minted, roster=roster)
