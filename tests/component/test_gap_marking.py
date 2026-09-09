@@ -17,6 +17,8 @@ from lake.session import SessionClock
 from lake.tickers import Roster, TickerConfig
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
+from tests.support.pinger import FakePinger
+from tests.support.transport import FakeTransport
 
 # Monday of the week these tests live in. Its sessions run Monday through Friday.
 WEEK = date(2026, 8, 31)
@@ -395,6 +397,8 @@ def test_the_daemon_wires_gap_marking_into_both_hooks(tmp_path, monkeypatch, cap
         # The power assertion is a seam for a reason. Left to its default it spawns the
         # real `caffeinate`, which exists on macOS and not on a Linux CI runner.
         assertion_runner=lambda args: None,
+        transport=FakeTransport(),
+        pinger=FakePinger(),
         should_continue=once,
     )
     marked = _slots(lake_root, "quotes", "XYZ", date(2026, 9, 1))
