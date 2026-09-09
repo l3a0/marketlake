@@ -171,3 +171,35 @@ def test_the_mint_time_keeps_its_own_offset_through_the_round_trip(lake_root):
     # the way out, so the stored instant is the same moment either way.
     assert json.loads(metadata_path(lake_root).read_text())["token_minted_at"].endswith("+00:00")
     assert read_metadata(lake_root).token_minted_at == MINTED
+
+
+def test_the_publish_is_the_rename_and_nothing_writes_the_target_in_place(lake_root, monkeypatch):
+    """The dashboard reads this file while the daemon rewrites it every minute.
+
+    The module's own docstring makes the rename load-bearing: a reader meets the old
+    stamp or the new one, never half of either. A copy into the target would satisfy
+    every other test in this file while giving a reader a window onto a half-written
+    document.
+
+    Failing the rename is how that is pinned. If the publish is the rename, the target
+    still holds the old stamp afterwards. If anything writes the target directly, the
+    new stamp is already there and this fails.
+    """
+    stamp_cycle(lake_root, at=SLOT, token_minted_at=MINTED, roster=_roster())
+    before = metadata_path(lake_root).read_text()
+
+    def refuse(src, dst):
+        raise OSError("rename refused")
+
+    monkeypatch.setattr("lake.metadata.os.replace", refuse)
+    later = SLOT.replace(hour=SLOT.hour + 1)
+    try:
+        stamp_cycle(lake_root, at=later, token_minted_at=MINTED, roster=_roster())
+    except OSError:
+        pass
+
+    assert metadata_path(lake_root).read_text() == before
+    # The temp file is cleaned up on the way out, so a refused publish leaves no litter.
+    assert [p.name for p in metadata_path(lake_root).parent.iterdir()] == [
+        metadata_path(lake_root).name
+    ]

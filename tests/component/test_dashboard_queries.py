@@ -396,12 +396,54 @@ def test_now_counts_the_pages_that_never_reached_the_phone(root: Path):
     assert service_over(root).run_query("now", {})["pages_failed_to_send"] == 2
 
 
+def test_now_reports_how_old_the_stamp_is(root: Path):
+    """Every daemon field is only as fresh as the write that produced it.
+
+    The daemon stamps every minute it is awake, so the age is what separates a reading of
+    now from the last thing a dead daemon said. Without it the panel shows a mint time, a
+    countdown and a ping with no way to tell whether any of them still holds.
+    """
+    # The capture side owns this instant, and the daemon writes it every minute it is
+    # awake, on a capture minute and an idle one alike. The dead-man's own record is a
+    # separate key, so a ping alone leaves the age unwritten.
+    stamp_cycle(root, at=et(MONDAY, 9, 35), token_minted_at=MINTED, roster=_roster())
+
+    now = service_over(root).run_query("now", {})
+
+    # NOW is 09:40:30, so the stamp is five and a half minutes old.
+    assert now["stamp_age_minutes"] == 5.5
+
+
+def test_an_unwritten_stamp_has_no_age_rather_than_a_zero(root: Path):
+    """A zero would read as "written this instant", which is the opposite of the truth."""
+    assert service_over(root).run_query("now", {})["stamp_age_minutes"] is None
+
+
 def test_a_page_lost_on_another_day_is_not_todays_count(root: Path):
     publisher = Publisher(lake_root=root, transport=_Undeliverable(), pid=7)
     publisher.publish(Message(event="capture_down", title="t", body="b"), now=et(FRIDAY, 16, 0))
 
     # The panel is about now, and the day is the Eastern one the publisher files under.
     assert service_over(root).run_query("now", {})["pages_failed_to_send"] == 0
+
+
+def test_the_page_count_is_keyed_to_the_eastern_day_not_the_utc_one(root: Path):
+    """After 20:00 Eastern the two dates differ, and the publisher files under Eastern.
+
+    A count keyed to `ctx.now.date()` reads an empty next-day directory all evening and
+    reports zero undelivered pages, during exactly the window when a page most likely
+    failed. The sibling test above cannot see this: at 09:40 Eastern the two dates agree.
+    """
+    publisher = Publisher(lake_root=root, transport=_Undeliverable(), pid=7)
+    publisher.publish(Message(event="capture_down", title="t", body="b"), now=et(MONDAY, 16, 0))
+
+    evening = et(MONDAY, 21, 30)
+    # The premise: this instant is Monday in Eastern and Tuesday in UTC.
+    assert evening.astimezone(UTC).date() != evening.date()
+
+    now = service_over(root, now=evening).run_query("now", {})
+    assert now["session_date"] == MONDAY.isoformat()
+    assert now["pages_failed_to_send"] == 1
 
 
 # -- today -------------------------------------------------------------------

@@ -897,7 +897,7 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
     or after it. A ticker onboarded later today has no in-scope slot yet, so it is not a
     stale capture.
 
-    Five more fields sit beside the rows, and each reads what another component wrote
+    Six more fields sit beside the rows, and each reads what another component wrote
     under ``lake_root``. The dashboard never reads ``~/.config``.
 
     1. ``token_minted_at``, the refresh token's mint stamp, from the journal metadata
@@ -912,6 +912,11 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
     5. ``pages_failed_to_send``, today's count of pages that never reached the phone,
        counted from the files the publisher writes under ``reports/``. The day is the
        Eastern one, the same key the publisher files them under.
+    6. ``stamp_age_minutes``, ``now`` minus the stamp's own instant. Every field above
+       it is only as fresh as the write that produced it, and the daemon stamps every
+       minute it is awake. So a stamp older than a few minutes means the writer stopped,
+       and each of the four values beside it is the last thing a dead daemon said rather
+       than a reading of now. Without this the panel cannot tell those apart.
 
     Each of the five is null when nothing has been written. A daemon that has never run
     leaves the token and ping stamps absent, and the panel says so rather than showing a
@@ -941,6 +946,9 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
         ),
         "dead_man_last_ping": (
             None if stamp.dead_man_last_ping is None else _iso(stamp.dead_man_last_ping)
+        ),
+        "stamp_age_minutes": (
+            None if stamp.stamped_at is None else _minutes(ctx.now - stamp.stamped_at)
         ),
         "pages_failed_to_send": undelivered(ctx.paths.root, ctx.session.session_date()),
     }

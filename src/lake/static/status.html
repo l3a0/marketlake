@@ -163,6 +163,10 @@
     hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
   });
   var REFRESH_MS = 60000;
+  // The daemon stamps every minute it is awake. Two minutes allows for a slow write and
+  // the page's own refresh landing between stamps, and still calls a stopped writer
+  // stale well inside the dead-man's own grace.
+  var STALE_STAMP_MINUTES = 2;
   var DASH = "—";
 
   // The six slot statuses, in the order the strip summary reports them. A cell's class
@@ -437,11 +441,16 @@
     return "Sunday re-mint in " + plural(minutes, "minute", "minutes") + ".";
   }
 
-  // Five payload fields describe the daemon rather than a ticker. They render as four
+  // Six payload fields describe the daemon rather than a ticker. They render as five
   // lines, since token_age_minutes shares a line with token_minted_at. A null means
   // nothing has been stamped yet, so the line says that rather than showing a zero. The
   // page count is the one that is never null, because a day with no file written is a
   // true zero. Its null branch is a guard, not an expected state.
+  //
+  // The stamp age comes last and reads on every other line above it. The daemon stamps
+  // every minute it is awake, so a stamp older than STALE_STAMP_MINUTES means the writer
+  // stopped and the four values above are what a dead daemon last said. It alarms at
+  // that point for the same reason.
   function renderDaemon(now) {
     var list = byId("daemon");
     clear(list);
@@ -468,6 +477,16 @@
           ? "Pages that failed to send: not recorded yet."
           : plural(now.pages_failed_to_send, "page", "pages") + " failed to send.",
         className: now.pages_failed_to_send > 0 ? "alarm" : null
+      },
+      {
+        text: now.stamp_age_minutes === null
+          ? "Stamp: nothing written yet, so the four lines above are unread."
+          : now.stamp_age_minutes > STALE_STAMP_MINUTES
+            ? "Stamp is " + plural(now.stamp_age_minutes, "minute", "minutes") +
+              " old, so the lines above are what the daemon last said, not now."
+            : "Stamp written " + plural(now.stamp_age_minutes, "minute", "minutes") + " ago.",
+        className: now.stamp_age_minutes === null ||
+          now.stamp_age_minutes > STALE_STAMP_MINUTES ? "alarm" : null
       }
     ];
     items.forEach(function (item) {
