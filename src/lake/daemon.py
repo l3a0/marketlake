@@ -67,9 +67,9 @@ no capture slot reports nothing. A restart resets the memory to none, since the 
 tick after ``on_start`` has no previous slot. From there the successor's startup
 gap-marking takes over. So the two writers never overlap: the loop reports what it slept
 through while alive, and startup marking reports what happened while it was dead. That
-one datetime is the loop's only state. The expiration set and the chain plan stay
-unheld, because the cycle reads the plan fresh from its file and the expiration set off
-the journal on its failure path.
+one datetime is the loop's only state. The loop keeps neither the expiration set nor the
+chain plan, because the cycle reads the plan fresh from its file and the expiration set
+off the journal on its failure path.
 
 A cycle that raises propagates out of the loop. The production entry reloads config and
 the token per cycle, so a raise there means a broken machine, not a vendor hiccup, and the

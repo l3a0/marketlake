@@ -10,6 +10,8 @@ Use short, complete sentences. One idea per sentence. Avoid em dashes and semico
 
 **Explain every concept on first use.** This covers coined vocabulary (surface, segment, gap-marking), borrowed tools (`flock`, `pmset`, Arrow IPC), and behaviors (sleep-missed jobs, dead-man checks). The test: if a reader must ask "what is X," the doc failed at X's first appearance. Add the gloss there, not in a glossary. The design doc's existing glosses are the pattern to follow.
 
+**Drop the jargon (owner directive, 2026-09-10).** Given the choice between glossing an in-group term and deleting it, delete it. The test: when a sentence names a concept where it could say what happens, say what happens. "No test covers it" beats "it is unheld." "Nothing fails when the daemon's hook wiring breaks" beats "that wiring is held by nothing." A gloss works once, at first use, while the term keeps reappearing and costs the reader attention every time. Being native to this repo does not save a term, and *unheld* was native here before it was cut. One exemption: the design doc's pinned vocabulary, named under the review-hardened section below, carries exact definitions and is reused on purpose. Keep any word where it is ordinary English, as in "`config.yaml` holds four secrets" or "the daemon holds no expiration state."
+
 **List a counted set. Do not inline it.** When a sentence names a count of items, like "four seams" or "three tests," the items follow as a list, not a run-on of sentences. Number the list when the prose states the count. Use a bulleted list for an unordered set with no count.
 
 ## The design doc is review-hardened
@@ -51,7 +53,7 @@ Review by fanning out independent lenses, then verifying each finding adversaria
 1. Fixing the instance rather than the class, such as a false claim corrected in one file while it still stands in three more.
 2. Fixing past the class, such as generalising a change into places it does not belong.
 
-Verify by executing, not by reading. Mutate the code and confirm a test fails. A test that still passes under mutation is not holding what it claims to hold. Say plainly what the review found and what it refuted, including when it found nothing.
+Verify by executing, not by reading. Mutate the code and confirm a test fails. A test that still passes under mutation does not cover what it claims to cover. Say plainly what the review found and what it refuted, including when it found nothing.
 
 PR titles use a Conventional Commits prefix. The form is `type(scope): summary`. Types in use: `docs`, `feat`, `fix`, `refactor`, `chore`, `ci`, `perf`. Add a scope in parens when it sharpens the title, like `docs(CLAUDE.md)`. Drop it when none does, like a plain `docs:` for a whole-doc change. The form and the scope rule match the sibling `trading-strategies` repo. Its list carries every type but `refactor`, which this repo uses and that one does not.
 

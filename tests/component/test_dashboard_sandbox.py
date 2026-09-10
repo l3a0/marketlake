@@ -37,7 +37,7 @@ from lake.dashboard import QUERY_MEMORY_LIMIT, QUERY_THREADS, open_lake_connecti
 
 # The read that proves a path is reachable. ``content`` is projected on purpose. The
 # star projection would raise on any connection, sandboxed or not, so an assertion built
-# on it holds nothing. See the module docstring.
+# on it proves nothing about the sandbox. See the module docstring.
 _READ_TEXT = "SELECT content FROM read_text(?)"
 
 # The fragment DuckDB puts in every refusal that comes from ``lock_configuration``. An

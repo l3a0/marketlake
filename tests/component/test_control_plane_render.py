@@ -979,7 +979,7 @@ def _run_reinstall(tmp_path: Path, *, bootout_rc: int = 0):
 def test_reinstalling_runs_the_whole_uninstall_before_the_whole_install(tmp_path):
     """Running the composed command end to end, because that is what a reinstall is.
 
-    The order is the property worth holding. Every removal has to land before the first
+    The order is the property worth covering. Every removal has to land before the first
     installation, or a bootout races a bootstrap for the same label.
     """
     proc, log = _run_reinstall(tmp_path)
@@ -1009,7 +1009,7 @@ def test_a_failing_uninstall_leaves_the_install_half_unrun(tmp_path):
     catches the failing bootout, and the step 5 read-back exits 1 on its own because the
     daemon is still loaded. Removing ``set -e`` alone does not reach this test, and the
     survival is the point rather than a gap: ``test_the_uninstall_stops_at_a_failure``
-    ``_partway_down`` holds that half.
+    ``_partway_down`` covers that half.
     """
     proc, log = _run_reinstall(tmp_path, bootout_rc=1)
     assert proc.returncode != 0

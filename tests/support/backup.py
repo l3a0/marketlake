@@ -17,8 +17,8 @@ source that does not exist yields an empty list rather than raising, so a test w
 with a path it never created pays nothing for the extra fact.
 
 A backup that fails is a different thing and stays where it is used. One test defines
-a runner that raises ``BackupTargetUnavailable`` in place, to hold the design's rule
-that an unplugged drive fails the run loudly rather than skipping the sync.
+a runner that raises ``BackupTargetUnavailable`` in place. That test covers the design's
+rule that an unplugged drive fails the run loudly rather than skipping the sync.
 """
 
 from __future__ import annotations
