@@ -52,7 +52,7 @@ Safari 26.6.2 and Chrome 152.0.7977.82 both decode the shipped file. That is the
 this dashboard needs, because it is opened by hand on one Mac over the loopback address.
 
 ``render`` is deterministic and depends on nothing outside the standard library. A golden
-test pins its output against the shipped file, so the checked-in binary is never the only
+test compares its output against the shipped file, so the checked-in binary is never the only
 record of what the icon is. Regenerate the file with ``python -m lake.favicon``.
 """
 

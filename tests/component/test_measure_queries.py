@@ -206,7 +206,7 @@ def test_oi_refresh_moment_is_the_first_changed_cycle(fixture_lake):
 
 def test_explicit_window_bounds_override_inference(fixture_lake):
     root = _build_lake(fixture_lake)
-    # Pin the final window to start at 13:30, so every cycle counts as "final".
+    # Force the final window to start at 13:30, so every cycle counts as "final".
     m = measure.measure_day(
         root, "SPY", DAY, open_slot=_OPEN, close_slot=_OPEN + timedelta(minutes=14)
     )

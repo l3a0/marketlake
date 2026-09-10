@@ -156,7 +156,7 @@ def test_every_segment_path_matches_the_segment_glob(paths: LakePaths):
 # last-durable-batch read both take a segment path apart. Compaction's sweep and the
 # dashboard's day walk both read a ``date=`` key. A parser that drifted from the builder
 # it inverts would answer plausibly and wrongly, and nothing downstream would notice. So
-# each parser is pinned here, beside the builder it inverts.
+# this module covers each parser, beside the builder it inverts.
 
 SEGMENT_REL = "journal/date=2026-08-24/surface=chains/ticker=SPY/seg-20260824T160000-4242.arrows"
 
@@ -171,7 +171,7 @@ def test_a_well_formed_segment_path_splits_into_its_four_parts():
 
 
 def test_a_built_segment_path_parses_back_to_the_parts_it_was_built_from(paths: LakePaths):
-    # The property worth pinning. The parser is the builder's inverse, so a path this
+    # The property worth checking. The parser is the builder's inverse, so a path this
     # module builds must come apart into the arguments that built it, and those parts
     # must build the same path again. Each half stays self-consistent on its own, so
     # only the round trip catches the two drifting apart.

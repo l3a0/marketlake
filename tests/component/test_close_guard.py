@@ -122,7 +122,7 @@ def test_the_daemon_answers_the_close_tag_hook_from_the_calendar(tmp_path):
         ticks[0] += 1
         return ticks[0] <= 3
 
-    # A bare daemon answers None for every slot. This pins that the production entry
+    # A bare daemon answers None for every slot. This checks that the production entry
     # binds the calendar's answer instead.
     daemon.run_loop_from_config(
         config_path=str(config),
@@ -137,7 +137,7 @@ def test_the_daemon_answers_the_close_tag_hook_from_the_calendar(tmp_path):
         ),
         should_continue=three,
     )
-    # 15:59, 16:00, 16:01. A bare daemon answers None for every slot, so this pins that
+    # 15:59, 16:00, 16:01. A bare daemon answers None for every slot, so this checks that
     # the production entry binds the calendar's answer instead.
     assert tags == [None, SPOT_CLOSE, None]
 

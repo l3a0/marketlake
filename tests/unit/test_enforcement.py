@@ -1,8 +1,8 @@
 """The enforcement scanners must catch real bypasses and must not cry wolf.
 
 These tests exercise the two scanners on inline snippets. A guard that never fires,
-or one that fires on innocent code, is worse than none. So both the positive and the
-negative cases are pinned here.
+or one that fires on innocent code, is worse than none. So these tests cover both the
+positive and the negative cases.
 """
 
 from __future__ import annotations

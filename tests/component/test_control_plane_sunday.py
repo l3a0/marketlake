@@ -395,7 +395,7 @@ def test_a_failed_ping_never_carries_the_key(fixture_lake):
         ping_url=URL,
         mint=FRESH_MINT,
     )
-    # Pinned by equality rather than by scanning for the key. Equality is the stronger
+    # The assertion uses equality rather than scanning for the key. Equality is stronger
     # claim: it says what the line is, so nothing else can be in it.
     assert outcome.problems == ("ping failed: HTTPError",)
 

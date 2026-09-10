@@ -1,7 +1,7 @@
 """The pinned schemas and the row builders, decided from values alone.
 
 These tests build record batches in memory. No file, process, or query engine is
-crossed, so they sit in the unit tier. They pin the capture schema's shape, the
+crossed, so they sit in the unit tier. They cover the capture schema's shape, the
 vendor-field mapping, the fail-open overflow, and the gap-row nulling.
 """
 

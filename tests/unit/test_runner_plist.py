@@ -1,6 +1,6 @@
 """The launchd plist generator, decided from values alone.
 
-These pin the two traps the design's enforcement note calls out. The schedule must be
+These cover the two traps the design's enforcement note calls out. The schedule must be
 emitted as launchd's integer ``Hour``/``Minute``, never a ``"HH:MM"`` string, and no
 machine path may be baked in: every path is a value the caller supplied. So the tier is
 unit. The generator builds a plist string from arguments and nothing crosses a boundary.

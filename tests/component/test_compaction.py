@@ -5,7 +5,7 @@ declared calendar, and fake backup and ping seams, then read the lake back. No n
 no subprocess, and no wall clock are crossed. So the tier is component: one subsystem,
 compaction, over the real filesystem.
 
-They pin the job's contract:
+They cover the job's contract:
 
 1. A day of segments compacts to one Parquet per surface and ticker, rows equal to the
    sum, a manifest entry carrying the sha, the segments deleted. A second run no-ops.

@@ -5,7 +5,7 @@ cassette-backed fake vendor and a manual clock. No network and no wall clock are
 crossed, and every write lands on a throwaway lake. So the tier is component: one
 subsystem, capture, over real files, with the vendor and clock still fake.
 
-They pin the cycle's observable contract:
+They cover the cycle's observable contract:
 
 1. A happy cycle writes chains and quotes segments with the right rows and the right
    ``snap_ts`` / ``fetch_ts`` / ``vendor_quote_ts`` stamps.

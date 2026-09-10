@@ -231,7 +231,7 @@ def onboard(
     entitlement and count contracts, and then, once the ticker is trusted, that same
     response is journaled as the ticker's first captured cycle through the capture
     primitive's durable path. No second fetch is made. ``pid`` sets the journal segment's
-    writer-session id, defaulting to this process, and a test pins it for a deterministic
+    writer-session id, defaulting to this process, so a caller can force a deterministic
     segment name.
     """
     lake_root = Path(lake_root)

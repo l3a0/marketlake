@@ -114,7 +114,7 @@ def test_a_failed_ping_is_named_and_the_run_keeps_its_verdict():
     assert outcome.backed_up is True
     assert outcome.pinged is False
     assert outcome.problem == "ping failed: URLError"
-    # The backup still ran and its order is still pinned.
+    # The backup still ran, and it still ran before the ping.
     assert events == ["backup", "ping"]
 
 
