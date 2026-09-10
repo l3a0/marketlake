@@ -19,7 +19,6 @@ on the next cycle with no restart.
 
 from __future__ import annotations
 
-import io
 import os
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -27,7 +26,7 @@ from pathlib import Path
 
 import yaml
 
-from lake.paths import TICKERS_FILE, config_dir
+from lake.paths import TICKERS_FILE, config_dir, temp_write_path
 
 # The portable roster file. Overridable by argument or this environment variable, so a
 # test points the loader at a throwaway file.
@@ -115,34 +114,75 @@ def load_tickers(
     ``MARKETLAKE_TICKERS`` environment variable, then the default
     ``~/.config/marketlake/tickers.yaml``.
 
-    A parse failure and a read failure both raise ``TickersError``. That is the type
-    ``input_errors_exit`` turns into one named line, and the type the daemon's three
-    startup builders and its ``on_skipped`` hook catch. A ``yaml.YAMLError`` or an
-    ``OSError`` would walk past all of them.
-
-    The only writer of this file is ``upsert_ticker``, and it writes valid YAML. So a
-    file that will not parse came from a hand edit, and a save caught partway through
-    is the mechanical way that happens.
-
-    A file that names no tickers is an error, not an empty roster. Nothing writes one.
-    A fresh machine has no file at all, which is already an error, and ``upsert_ticker``
-    always writes at least one entry. So an empty file means a truncated one, the same
-    half-finished save as a parse error, and it now reads the same way. Before this it
-    read as a roster of no tickers, and a cycle over no tickers journals nothing, so the
-    watchdog charged no ticker and the dead-man went unfed. The operator still got
-    paged, but by a dead-man timeout five minutes later rather than by a line naming
-    the file.
+    A file that names no tickers is an error, not an empty roster. The rename in
+    ``_write_atomically`` closed the way a torn *write* produced one. A hand edit caught
+    partway through a save still does, and so does an operator who empties the file. The
+    harm is the one the rename removed on the other side: a cycle over no tickers
+    captures nothing and writes no gap row, so the minute leaves no trace, and the design
+    counts completeness from rows and never from holes. Nothing writes an empty file. A
+    fresh machine has no file at all, which is already an error, and ``upsert_ticker``
+    always writes at least one entry.
     """
     resolved = _resolve_path(path, env)
     if not resolved.exists():
         raise TickersError(f"tickers file not found: {resolved}")
-    parsed = _parse_yaml(_read_text(resolved), resolved)
+    parsed = _parse(_read_text(resolved), resolved)
     mapping = {} if parsed is None else parsed
     if not isinstance(mapping, Mapping):
         raise TickersError(f"tickers file is not a mapping: {resolved}")
     if not mapping:
         raise TickersError(f"tickers file names no tickers: {resolved}")
-    return Roster.from_mapping(mapping)
+    try:
+        return Roster.from_mapping(mapping)
+    except TickersError as exc:
+        # ``from_mapping`` takes a mapping and no path, so its message names the entry it
+        # rejected and nothing else. Three operator-editable files sit in the config
+        # directory, and ``input_errors_exit`` prints this line on its own. It has to say
+        # which file.
+        raise TickersError(f"{exc} in tickers file: {resolved}") from None
+
+
+def _read_text(resolved: Path) -> str:
+    """The file's text, or a ``TickersError`` naming what could not be read.
+
+    ``exists()`` passing does not mean the file can be read. A restrictive mode raises
+    ``OSError`` and a binary file raises ``UnicodeDecodeError``, which is a ``ValueError``
+    rather than an ``OSError``. Both went bare before, and every caller that guards for a
+    bad roster then missed them. ``lake.config`` solved the same class for ``config.yaml``.
+    Only the path is named, so nothing from inside the file reaches the error.
+    """
+    try:
+        return resolved.read_text()
+    except (OSError, UnicodeDecodeError):
+        raise TickersError(f"tickers file cannot be read: {resolved}") from None
+
+
+def _parse(text: str, resolved: Path) -> object:
+    """The parsed document, or a ``TickersError`` naming where the YAML broke.
+
+    A half-saved file is the ordinary way this fails, and where the cut lands decides
+    what happens. Some prefixes parse. The rest raise a ``yaml`` error, which is not a
+    ``TickersError``, so before this every caller guarding for a bad roster missed them
+    and the daemon died on a traceback instead.
+
+    The line number is named because it is the one thing an operator needs and this file
+    holds no secrets. ``lake.config`` suppresses the same detail for ``config.yaml``,
+    which holds four. Nothing else from the parse error reaches the message, so no line
+    of the file itself is printed. ``from None`` suppresses the original in a traceback
+    too. It stays reachable as ``__context__``, which is where a debugger should find it
+    and where nothing that prints an operator error looks.
+
+    An absent document comes back as ``None`` and every other value comes back as it is.
+    Folding the falsy ones into an empty mapping here would hide four of them. A file
+    holding ``0``, ``false``, ``''``, or ``[]`` is not a roster, and each caller turns
+    only ``None`` into no entries.
+    """
+    try:
+        return yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        where = "" if mark is None else f" at line {mark.line + 1}"
+        raise TickersError(f"tickers file is not valid YAML{where}: {resolved}") from None
 
 
 def upsert_ticker(
@@ -170,25 +210,15 @@ def upsert_ticker(
     ``MARKETLAKE_TICKERS`` environment variable, then the default. The roster lives in
     ``~/.config/marketlake/``, outside the repo. It is portable config, never a tracked
     file, so no machine path or secret is committed by writing it.
-
-    Reading and writing both go through the guards ``load_tickers`` uses, so a file
-    that will not parse stops the write with a ``TickersError`` rather than a raw
-    ``yaml.YAMLError``, and a file that cannot be written says so the same way.
-    Onboarding runs under ``input_errors_exit``. A write that clobbered a roster it
-    could not read would lose every other ticker in it.
-
-    The reader and the writer part on the empty file. The reader refuses one, because
-    nothing writes it and a truncation looks exactly like it. The writer accepts one,
-    treating it the same as no file at all. Both mean no entries yet. Onboarding is how
-    an operator puts an entry back, so refusing here would block the repair.
     """
     resolved = _resolve_path(path, env)
     existing: dict[str, object] = {}
     if resolved.exists():
-        parsed = _parse_yaml(_read_text(resolved), resolved)
-        # An absent document reads as no entries. Every other shape the reader refuses
-        # is refused here too, so the writer never overwrites a file the reader would
-        # not open.
+        parsed = _parse(_read_text(resolved), resolved)
+        # An absent document means no entries yet, the same as no file. Every other shape
+        # the reader refuses is refused here too, so the write never overwrites a file
+        # the reader would not open. An empty one it does accept: onboarding is how an
+        # operator puts an entry back, so refusing here would block the repair.
         loaded = {} if parsed is None else parsed
         if not isinstance(loaded, Mapping):
             raise TickersError(f"tickers file is not a mapping: {resolved}")
@@ -200,118 +230,48 @@ def upsert_ticker(
     entry["bars"] = [str(freq) for freq in bars]
     existing[ticker] = entry
 
-    _write_text(resolved, yaml.safe_dump(existing, sort_keys=True))
+    # The read half folds every failure into a ``TickersError``, and the write half is
+    # the operator's to trip the same ways: a parent that is a file rather than a
+    # directory, a mode that forbids the write, a symlink pointing at itself. Onboarding
+    # runs under ``input_errors_exit``, so leaving these bare printed a traceback for the
+    # write where the read printed one line. ``_write_atomically`` still removes its temp
+    # file first, and its name never reaches the message.
+    try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        _write_atomically(resolved, yaml.safe_dump(existing, sort_keys=True))
+    except OSError:
+        raise TickersError(f"tickers file cannot be written: {resolved}") from None
     return resolved
 
 
-def _read_text(resolved: Path) -> str:
-    """The file's text, or a ``TickersError`` naming the path.
+def _write_atomically(target: Path, text: str) -> None:
+    """Write the roster through a temp file beside it, a flush, then one rename.
 
-    ``exists()`` passing does not mean the file can be read. A path one character short
-    of the file names its directory, a restrictive mode makes it unreadable, and a
-    binary file is not text. Each of those raises a bare ``OSError`` or
-    ``UnicodeDecodeError``, which is the traceback the operator-file guards exist to
-    avoid. The line matches ``config._read_text`` word for word past the file's name,
-    because ``input_errors_exit`` prints every operator file the same way and one bad
-    file must not read differently from another.
+    The daemon re-reads this file while the command writes it. A plain write truncates
+    the file first, so a reader can catch it empty or half written. Where the cut lands
+    decides what happens next, and both outcomes are bad. Roughly a third of the prefixes
+    of a two-ticker roster parse: an empty file as a roster of no tickers, and a longer
+    prefix as the tickers it kept, with any key it cut taking its default, so an options
+    ticker comes back equity-only. A cycle handed one of those captures less than the
+    roster names and writes no gap row for the rest, so the minute leaves no trace. The
+    rest raise, which ``_parse`` turns into a ``TickersError``, so a caller sees a refusal
+    rather than a wrong roster. The silent half is the half this rename removes.
+    A rename replaces the file in one step, so every reader sees the whole old roster or
+    the whole new one. The chain plan is written this way for the same reason. A crash
+    mid-write leaves the prior file intact, and the temp file is removed on any failure.
+    The temp path comes from ``paths.temp_write_path``, which owns the one spelling of
+    the marker the backup exclusion matches.
     """
+    tmp = temp_write_path(target, os.getpid())
     try:
-        return resolved.read_text()
-    except (OSError, UnicodeDecodeError):
-        raise TickersError(f"tickers file cannot be read: {resolved}") from None
-
-
-class _NamedText(io.StringIO):
-    """A text stream that answers to the file's path.
-
-    PyYAML labels every position it reports with the name of the stream it read. Handed
-    a plain string it invents ``<unicode string>``, a file the operator never typed and
-    cannot go look at. Reading through a named stream puts the real path there instead.
-    That matters for the one load error PyYAML raises with no line and column, a stray
-    control byte, which is one way a half-written file ends.
-    """
-
-    def __init__(self, text: str, name: str) -> None:
-        super().__init__(text)
-        self.name = name
-
-
-def _write_text(resolved: Path, text: str) -> None:
-    """Write the roster back, or a ``TickersError`` naming the path.
-
-    A roster that cannot be written fails for the operator reasons one that cannot be
-    read fails: a parent that is a file rather than a directory, a mode that forbids
-    the write, a symlink that points at itself. Onboarding turns a ``TickersError``
-    into one named line, so leaving these raw would print a traceback for the write
-    where the read prints a line.
-    """
-    try:
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_text(text)
-    except OSError:
-        raise TickersError(f"tickers file cannot be written: {resolved}") from None
-
-
-def _parse_yaml(text: str, resolved: Path) -> object:
-    """The parsed YAML, or a ``TickersError`` naming the path and the mistake.
-
-    This quotes PyYAML's own complaint, where ``config._parse_yaml`` drops it. That
-    loader's file holds secrets, and a parse error echoes the offending source line
-    back verbatim, so letting one out could put a secret wherever the error lands.
-    ``tickers.yaml`` holds ticker symbols and capture settings. Nothing in it is a
-    secret, so the operator is told where the mistake is.
-
-    A file deep enough in brackets still raises ``RecursionError`` from inside
-    ``safe_load``, which is not a ``YAMLError`` and is not caught here. Catching it
-    would run cleanup on an exhausted stack, and no hand edit reaches the depth it
-    takes.
-    """
-    name = str(resolved)
-    try:
-        return yaml.safe_load(_NamedText(text, name))
-    except yaml.YAMLError as exc:
-        message = f"tickers file is not valid YAML: {name}: {_complaint(exc, name)}"
-        raise TickersError(message) from None
-
-
-def _complaint(exc: yaml.YAMLError, name: str) -> str:
-    """PyYAML's complaint, squeezed onto one line.
-
-    ``input_errors_exit`` prints one line per bad file, and PyYAML's own ``str`` runs
-    to eight lines for the ordinary syntax error. It echoes the offending source line
-    under each position it reports, with a caret beneath the column. That echo is the
-    reason ``config._parse_yaml`` drops its message whole, and dropping it here is what
-    lets this loader quote the rest.
-
-    A *marked* error, which is the kind a syntax mistake raises, carries the facts as
-    fields instead. It says what it was reading and where that began, then what it
-    tripped on and where. This keeps both. A truncated file trips at the end of the
-    file, so the position that finds the typo is the one the first field carries.
-
-    Anything unmarked has no fields to read, so its whole message is squeezed instead.
-    PyYAML names the file inside that message and the caller's line already does, so
-    the naming is rewritten into the position it introduces.
-    """
-    if isinstance(exc, yaml.MarkedYAMLError):
-        marked = [
-            _located(text, mark)
-            for text, mark in ((exc.context, exc.context_mark), (exc.problem, exc.problem_mark))
-            if text
-        ]
-        if marked:
-            return ", ".join(marked)
-    return " ".join(str(exc).split()).replace(f'in "{name}", ', "at ")
-
-
-def _located(text: str, mark: yaml.Mark | None) -> str:
-    """Half a parse complaint, with its position when it carries one.
-
-    PyYAML counts lines and columns from zero. Every editor counts from one, so this
-    shifts both. An operator reads the line and goes straight to that spot in the file.
-    """
-    if mark is None:
-        return text
-    return f"{text} at line {mark.line + 1}, column {mark.column + 1}"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _resolve_path(path: str | Path | None, env: Mapping[str, str] | None) -> Path:

@@ -127,6 +127,7 @@ def test_input_errors_exit_lets_every_other_exception_through():
         ("lake.onboard", ["SPY", "--config", "MISSING"]),
         ("lake.runner", ["run", "--config", "MISSING"]),
         ("lake.control_plane", ["self-check", "--config", "MISSING"]),
+        ("lake.daemon", ["--config", "MISSING"]),
         ("lake.control_plane", ["sunday", "--config", "MISSING"]),
     ],
 )
@@ -230,7 +231,7 @@ def test_a_roster_caught_mid_save_names_itself_the_same_way(tmp_path, capsys):
     err = capsys.readouterr().err
     # One line, as the guard promises for every operator file.
     assert err.count("\n") == 1
-    assert err.startswith(f"runner: tickers file is not valid YAML: {tickers}: ")
+    assert err == f"runner: tickers file is not valid YAML at line 1: {tickers}\n"
 
 
 def test_the_guard_names_the_three_operator_files_and_nothing_else():

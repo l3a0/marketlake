@@ -99,6 +99,7 @@ from lake.paths import (
     TICKER_PREFIX,
     LakePaths,
     parse_date_dir,
+    temp_write_path,
 )
 from lake.runner import PING_FAILURES, BackupRunner, Pinger, RsyncBackup, UrllibPinger
 from lake.session import SessionClock
@@ -415,7 +416,7 @@ def _write_partition(table: pa.Table, partition: Path) -> None:
     not at all. The temp file is cleaned up on any failure.
     """
     partition.parent.mkdir(parents=True, exist_ok=True)
-    tmp = partition.with_name(f"{partition.name}.tmp-{os.getpid()}")
+    tmp = temp_write_path(partition, os.getpid())
     try:
         pq.write_table(table, tmp)
         _durable(tmp)
@@ -682,7 +683,7 @@ def write_chain_plan(plan: ChainPlan, path: Path | str) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = {"windows": [{"start": start, "end": end} for start, end in plan.windows]}
     text = json.dumps(payload, indent=2) + "\n"
-    tmp = target.with_name(f"{target.name}.tmp-{os.getpid()}")
+    tmp = temp_write_path(target, os.getpid())
     try:
         with open(tmp, "w", encoding="utf-8") as handle:
             handle.write(text)
