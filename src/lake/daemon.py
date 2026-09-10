@@ -116,7 +116,7 @@ from lake.session import (
     missed_slots,
     skipped_slots,
 )
-from lake.tickers import Roster, TickersError, load_tickers
+from lake.tickers import TickersError, load_tickers
 from lake.watchdog import Page, Surface, Watchdog
 
 # The loop's cadence: one tick per minute, on the minute top.
@@ -381,13 +381,15 @@ def _idle_stamp(
             roster = load_tickers(tickers_path)
             minted = read_token_mint(token)
         except Exception:  # noqa: BLE001 - the stamp is the least important thing here
-            # Deliberately broad. `load_tickers` parses YAML and reads a file, so a
-            # hand-edited roster raises `yaml.YAMLError` and an unreadable one raises
-            # `OSError`, neither of which is a `TickersError`. No hook is wrapped in a
-            # try, so anything escaping here exits the process, and KeepAlive relaunches
-            # straight into the same tick. A typo in tickers.yaml would crash-loop the
-            # daemon. The stamp is informational, so losing a minute of it is the
-            # correct price and the docstring above promises exactly that.
+            # Deliberately broad. `load_tickers` now folds every way its file can fail
+            # into `TickersError`, but `read_token_mint` raises `ValueError` and this
+            # runs on the Sunday evening when the token is being replaced. No hook is
+            # wrapped in a try, so anything escaping here exits the process, and
+            # KeepAlive relaunches straight into the same tick. The stamp is
+            # informational, so losing a minute of it is the correct price and the
+            # docstring above promises exactly that. The skipped-slot hook makes the
+            # opposite call on the same file, deliberately: a roster it cannot read
+            # would have it charge the wrong counters, so there it is fatal.
             return
         try:
             stamp_cycle(config.lake_root, at=slot, token_minted_at=minted, roster=roster)
@@ -403,7 +405,7 @@ def _alarm(
     session_clock: SessionClock,
     transport: Transport,
     pinger: Pinger,
-) -> tuple[Watchdog, Publisher, DeadMan, Roster]:
+) -> tuple[Watchdog, Publisher, DeadMan]:
     """The watchdog, its publisher, and the dead-man feed.
 
     Both seams are handed in. Neither is defaulted here, because a default reaching a
@@ -417,7 +419,10 @@ def _alarm(
     cycle runner on its first tick anyway, so raising here loses nothing and says why.
     """
     config = load_config(config_path)
-    roster = load_tickers(tickers_path)
+    # The roster is loaded and thrown away. Nothing here needs it, and every consumer
+    # re-reads the file for itself. What the call buys is the refusal below, at startup,
+    # where a broken roster is one named line rather than a traceback three hooks deep.
+    load_tickers(tickers_path)
     publisher = Publisher(
         lake_root=config.lake_root,
         transport=transport,
@@ -432,7 +437,7 @@ def _alarm(
         # The panel's dead-man line reads the lake, so a landed ping is written there.
         recorder=lambda at: stamp_ping(lake_root, at=at),
     )
-    return Watchdog(page_minutes=config.guards.watchdog_page_minutes), publisher, deadman, roster
+    return Watchdog(page_minutes=config.guards.watchdog_page_minutes), publisher, deadman
 
 
 def run_loop_from_config(
@@ -454,8 +459,11 @@ def run_loop_from_config(
     This is the entry ``python -m lake.daemon`` calls. The clock defaults to the system
     clock and the calendar to the NYSE calendar from ``exchange_calendars``. The cycle
     runner is a closure over ``run_cycle_from_config``, which reloads the config, the
-    roster, the token, and the chain plan on every call. Nothing is cached here, so the
-    per-cycle re-read the design wants comes from the existing wiring.
+    roster, the token, and the chain plan on every call. The per-cycle re-read the
+    design wants comes from that wiring rather than from anything this entry caches for
+    the cycle. The gap marker and the close guard below each load a roster once and hold
+    it for the daemon's life. The watchdog's skipped-slot hook holds none. It reads the
+    file on every call, and a read that fails is fatal.
 
     The caffeinate power assertion is held here rather than left to a caller. The
     design's chain is the wake alarm, then ``KeepAlive`` starting the daemon, then the
@@ -566,7 +574,7 @@ def run_loop_from_config(
     # runs no cycle for a slot it slept through and those are the minutes the daemon was
     # worst off. The dead-man rides the same two plus every tick, so an idle weekday
     # keeps feeding the check that pages on silence.
-    watchdog, publisher, deadman, roster = _alarm(
+    watchdog, publisher, deadman = _alarm(
         config_path, tickers_path, session_clock, transport, pinger
     )
     alarm_on_cycle = hooks.on_cycle
@@ -591,18 +599,28 @@ def run_loop_from_config(
         alarm_on_cycle(slot, result)
 
     def on_skipped(slots: list[datetime]) -> None:
-        # The roster is re-read here rather than closed over. The cycle runner
-        # re-reads it every cycle, and the design has the watchdog counters read
-        # that same snapshot, so a ticker retired mid-session must stop being
-        # charged without a restart. A roster that will not load leaves the last
-        # good one in place, since refusing to count is worse than counting a
-        # ticker one cycle too long.
-        try:
-            current = load_tickers(tickers_path)
-        except TickersError:
-            current = roster
+        # The roster is re-read here rather than closed over. The cycle runner re-reads
+        # it every cycle, and the design has the watchdog counters read that same
+        # snapshot. So a ticker onboarded mid-session starts being charged with no
+        # restart, and one retired mid-session stops.
+        # A read that fails takes the daemon down, and nothing here softens that. The
+        # price is real and worth naming. On a capture slot it costs nothing, because
+        # the cycle runner reads the same file later on the same tick and raises on it
+        # too. Off the capture window it costs the rest of the daemon's life: the loop
+        # runs no cycle there, so a fallback would have carried it to the next capture
+        # minute, which across a Friday close is the whole weekend. A stall spanning a
+        # close reaches exactly that tick, since the waking tick reports the window's
+        # tail and then continues past the phase check.
+        # The price is the one the design already pays on either side of this hook.
+        # ``_alarm`` refuses to build on a roster that will not load, and the cycle
+        # runner raises on one every minute of the session. What a fallback bought back
+        # was a stale roster charging counters the file no longer names, which is the
+        # failure the per-cycle re-read exists to prevent. A dead daemon is the external
+        # dead-man's to report, and it does.
         watched = [
-            Surface(surface, entry.ticker) for entry in current for surface in surfaces_for(entry)
+            Surface(surface, entry.ticker)
+            for entry in load_tickers(tickers_path)
+            for surface in surfaces_for(entry)
         ]
         raise_pages(watchdog.missed(watched, slots), slots[-1])
         alarm_on_skipped(slots)

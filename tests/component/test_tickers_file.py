@@ -1,12 +1,18 @@
-"""The roster loaded from a real tickers.yaml, with env-var and argument overrides."""
+"""The roster over a real tickers.yaml: the loader, its overrides, and the write.
+
+The daemon re-reads this file while the onboarding command writes it, so the write has
+to be atomic. The last case here holds that half.
+"""
 
 from __future__ import annotations
 
+import builtins
+import io
 from pathlib import Path
 
 import pytest
 
-from lake.tickers import TickersError, load_tickers
+from lake.tickers import TickersError, load_tickers, upsert_ticker
 
 YAML = """\
 SPY: {options: true, chain_cadence: 1m, bars: [1m, 1d]}
@@ -44,6 +50,126 @@ def test_a_typed_tilde_still_expands(tmp_path: Path, monkeypatch):
     assert len(load_tickers(env={"MARKETLAKE_TICKERS": "~/.config/roster.yaml"})) == 2
 
 
+# Every way a roster file can fail, and the one word that must appear in each message.
+# The point of the set is that one exception type covers all of them, so a caller can
+# guard for a bad roster with one `except` and `main` can print one line and exit 2.
+# The two YAML shapes raise different `yaml` classes, `ParserError` and `ScannerError`,
+# so the pair holds that the fold catches the base class rather than one subclass.
+BROKEN = {
+    "half saved mid-line": ("XYZ: {options: fal", "not valid YAML at line 1"),
+    "hand-edited with a tab": ("XYZ:\n\toptions: false\n", "not valid YAML at line 2"),
+    "a bare scalar": ("XYZ", "not a mapping"),
+    "an entry of the wrong shape": ("XYZ: retired\n", "settings must be a mapping"),
+}
+
+
+@pytest.mark.parametrize("text,expected", list(BROKEN.values()), ids=list(BROKEN))
+def test_every_broken_roster_raises_one_error_type(tmp_path: Path, text, expected):
+    """A `yaml` error used to escape, which every caller guarding for a bad roster missed.
+
+    `load_tickers` parses YAML and reads a file, so a half-saved roster raised
+    `yaml.YAMLError` and an unreadable one raised `OSError`. Neither is a `TickersError`,
+    so both went straight past `_alarm`, `_gap_marker`, `_close_guard`, and
+    `input_errors_exit`, and the daemon died on a traceback naming the parser. `lake.config`
+    had already solved this for `config.yaml`.
+    """
+    path = tmp_path / "tickers.yaml"
+    path.write_text(text)
+
+    with pytest.raises(TickersError) as caught:
+        load_tickers(path)
+
+    message = str(caught.value)
+    # The fragment carries the line number for the two YAML shapes, so a fold that
+    # dropped it fails here rather than passing on the word "YAML" alone.
+    assert expected in message
+    # The message names the file. Three operator-editable files share the config
+    # directory, and this line is printed on its own.
+    assert str(path) in message
+    # And never a line of the file itself, which is the rule `lake.config` sets. `yaml`
+    # renders the offending source line into its own message, so a fold that passed that
+    # rendering through would leak it.
+    assert "options" not in message
+    assert "\n" not in message
+
+
+@pytest.mark.parametrize("kind", ["binary", "unreadable"])
+def test_a_file_that_cannot_be_read_raises_the_same_error(tmp_path: Path, kind):
+    """Existing is not the same as readable, and the two ways raise different classes.
+
+    A binary file raises `UnicodeDecodeError`, which is a `ValueError`. A file the
+    process may not open raises `OSError`. Catching one and not the other leaves half
+    the class escaping, so both are held.
+    """
+    path = tmp_path / "tickers.yaml"
+    if kind == "binary":
+        path.write_bytes(b"\xff\xfe\x00\x01")
+    else:
+        path.write_text("XYZ: {options: false}\n")
+        path.chmod(0o000)
+    try:
+        with pytest.raises(TickersError, match="cannot be read"):
+            load_tickers(path)
+    finally:
+        path.chmod(0o644)
+
+
+def test_a_broken_roster_stops_the_write_too(tmp_path: Path):
+    """`upsert_ticker` reads the file back before writing, so it has the same holes."""
+    path = tmp_path / "tickers.yaml"
+    path.write_text("XYZ:\n\toptions: false\n")
+
+    with pytest.raises(TickersError, match="not valid YAML"):
+        upsert_ticker("ABC", options=False, path=path)
+
+    # The refusal left the operator's file exactly as it was, and no temp file beside it.
+    assert path.read_text() == "XYZ:\n\toptions: false\n"
+    assert [p.name for p in sorted(tmp_path.iterdir())] == ["tickers.yaml"]
+
+
 def test_missing_file_raises(tmp_path: Path):
     with pytest.raises(TickersError):
         load_tickers(tmp_path / "none.yaml")
+
+
+def test_a_reader_during_the_write_still_sees_a_whole_roster(tmp_path: Path, monkeypatch):
+    """The write must not expose the file in a torn state.
+
+    The daemon re-reads ``tickers.yaml`` on its own schedule, so it can read while the
+    command writes. Truncating the file in place opens a window where a reader gets
+    zero bytes or a prefix. Where the cut lands decides what the loader does, and both
+    outcomes are bad. Roughly a third of a two-ticker roster's prefixes parse: an empty
+    file as a roster of no tickers, a longer prefix as the tickers it kept with any cut
+    key defaulted, so an options ticker comes back equity-only. A cycle handed one of
+    those captures nothing for what it lost and writes no gap row for it either. The rest
+    raise, and ``load_tickers`` turns that into a ``TickersError`` a caller can act on.
+    The silent half is what this case is about.
+    """
+    path = tmp_path / "tickers.yaml"
+    upsert_ticker("XYZ", options=False, path=path)
+    before = path.read_text()
+
+    seen: list[str | None] = []
+    real_open = builtins.open
+
+    def watching_open(file, mode="r", *args, **kwargs):
+        """Record what the roster holds just after a file is opened for writing.
+
+        Opening for writing is the truncating step, so the read has to happen after it.
+        Reading before would see the untouched file whichever way the write is done.
+        """
+        handle = real_open(file, mode, *args, **kwargs)
+        if "w" in mode:
+            seen.append(path.read_text() if path.exists() else None)
+        return handle
+
+    monkeypatch.setattr(builtins, "open", watching_open)
+    monkeypatch.setattr(io, "open", watching_open)
+    upsert_ticker("ABC", options=False, path=path)
+
+    # One file was opened for writing, and it was not the roster: the roster still held
+    # every byte of the previous version at that instant.
+    assert seen == [before]
+    assert load_tickers(path).symbols == ("ABC", "XYZ")
+    # The temp file the write goes through is gone, not left beside the roster.
+    assert [p.name for p in sorted(tmp_path.iterdir())] == ["tickers.yaml"]

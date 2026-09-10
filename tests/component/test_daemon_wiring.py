@@ -26,10 +26,11 @@ Seven bindings are pinned here.
    plan rewrite takes effect the next minute.
 7. The skipped-slot hook charges the counters the current roster names. It re-reads the
    file rather than closing over the startup roster, so a ticker retired mid-session
-   stops paging without a restart. A file the roster loader refuses leaves the startup
-   roster in place, so the refusal silences no counter. Each entry expands into the
-   surfaces its ticker is captured on, so an options ticker's chains counter is charged
-   beside its quotes.
+   stops paging without a restart and one onboarded mid-session starts. A file the roster
+   loader refuses is fatal rather than fallen back on, and every way that file can fail
+   now reaches the caller as one `TickersError`. Each entry expands into the surfaces its
+   ticker is captured on, so an options ticker's chains counter is charged beside its
+   quotes.
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ from lake.chain_plan import ChainPlan, load_chain_plan
 from lake.compact import write_chain_plan
 from lake.deadman import CAPTURE_SLUG
 from lake.session import SPOT_CLOSE
+from lake.tickers import TickersError
 from lake.vendor import VendorResponse
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
@@ -77,6 +79,19 @@ ONE_RETIRED = "ABC: {options: false}\n"
 # settings are a bare string rather than a mapping. Had it loaded, XYZ would be gone.
 # So a run that charges XYZ anyway fell back rather than read this file.
 UNLOADABLE = "XYZ: retired\nABC: {options: false}\n"
+
+# The two tickers after a third is onboarded. Only a hook that re-reads charges DEF,
+# because DEF was never in the roster the daemon started with.
+THREE_TICKERS = "XYZ: {options: false}\nABC: {options: false}\nDEF: {options: false}\n"
+
+# The same edit caught half saved, cut in the middle of a line. `yaml` refuses this one
+# where it accepted UNLOADABLE, so the two together cover both ways the file can fail.
+MID_LINE_TEAR = "XYZ: {options: fal"
+
+# A stall long enough to cross the option close. The waking tick reports the window's
+# tail and then runs no cycle, which is the one tick where the hook's read is the only
+# read of the roster that minute.
+ACROSS_THE_CLOSE = 3600
 
 # One open-ended window, the smallest plan that tiles the offset line. The rewrite
 # splits its head off, so the two plans ask for different date ranges.
@@ -468,6 +483,16 @@ def _rewrite_after_first_cycle(path: Path, roster: str) -> daemon.DaemonHooks:
     return daemon.DaemonHooks(on_cycle=on_cycle)
 
 
+def _seed_two(rig: _Rig) -> None:
+    """Put one recorded row on each ticker, so startup marking stops at the start minute.
+
+    No assertion reads these rows. Without them the walk-back reaches its cap and prints
+    a truncation line to stderr on every run.
+    """
+    for ticker in ("XYZ", "ABC"):
+        _record(rig.lake_root, journal.QUOTES_SURFACE, ticker, et(2026, 9, 2, 9, 58))
+
+
 def _run_across_an_edit(rig: _Rig, roster: str) -> None:
     """Run one cycle, rewrite the roster to ``roster``, then overrun three slots.
 
@@ -477,10 +502,7 @@ def _run_across_an_edit(rig: _Rig, roster: str) -> None:
     every surface it does not charge stays silent. The cycles produce no segment of
     their own, so nothing but the missed minutes charges a counter.
     """
-    for ticker in ("XYZ", "ABC"):
-        # Neither assertion reads these rows. They stop startup marking walking back to
-        # its cap, which prints a truncation line to stderr on every run that lets it.
-        _record(rig.lake_root, journal.QUOTES_SURFACE, ticker, et(2026, 9, 2, 9, 58))
+    _seed_two(rig)
     clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
     _run(
         rig,
@@ -508,32 +530,83 @@ def test_a_ticker_retired_mid_session_stops_charging_the_watchdog(tmp_path):
     assert sorted(page.title for page in rig.transport.sent) == ["Capture down: ABC quotes"]
 
 
-def test_a_roster_that_will_not_load_leaves_the_startup_roster_charging(tmp_path):
-    """A roster the loader refuses must not silence the counters that were running.
+def test_a_ticker_onboarded_mid_session_starts_charging_the_watchdog(tmp_path):
+    """A ticker added to the roster has to start paging without a restart.
 
-    The re-read reaches a hand-owned file, so it can land on a save that is not yet a
-    roster. Refusing to count is the worse failure of the two. It turns a daemon whose
-    surfaces are down into a quiet one for as long as the file stays broken. Charging a
-    ticker one overrun too long only costs an early page.
-
-    What the fallback holds is the roster loaded at startup, not the last one that
-    loaded successfully. ``_alarm`` binds that roster once and nothing reassigns it. The
-    two are the same roster here, because the only load this run completes is the
-    startup one.
-
-    The file here is valid YAML that the loader refuses on shape. ``load_tickers`` does
-    not convert a YAML parse error into a ``TickersError``, so a file broken mid-token
-    raises straight past this fallback instead of taking it. That case is not held here.
+    This is the retirement rule above run the other way, and the design states it as one:
+    onboarding writes the `tickers.yaml` entry itself, and a new ticker goes live
+    everywhere on the next cycle. The counters are named among the consumers of that
+    snapshot. A hook closed over the startup roster charges DEF never, so a chain worker
+    that dies the hour after an onboarding is invisible until someone restarts the
+    daemon.
     """
     rig = _rig(tmp_path, roster=TWO_TICKERS)
-    _run_across_an_edit(rig, UNLOADABLE)
+    _run_across_an_edit(rig, THREE_TICKERS)
 
-    # Both still charge. The refusal silenced no counter, and the unloadable file
-    # retired nobody.
     assert sorted(page.title for page in rig.transport.sent) == [
         "Capture down: ABC quotes",
+        "Capture down: DEF quotes",
         "Capture down: XYZ quotes",
     ]
+
+
+@pytest.mark.parametrize("roster", [UNLOADABLE, MID_LINE_TEAR], ids=["refused", "torn"])
+def test_a_roster_that_will_not_load_takes_the_daemon_down(tmp_path, roster):
+    """A roster the loader refuses is fatal here, and it arrives as one error type.
+
+    The hook has no fallback to reach for. A roster is the only thing it can charge
+    against, and the only honest source of one is the file, so carrying a stale read
+    forward would charge counters the roster no longer names. The alternative failure is
+    silent and the design would rather be loud: `_alarm` refuses the same file at
+    startup, and the cycle runner reads it again on this same tick and raises too.
+
+    Both shapes must arrive as `TickersError`, because that is what `main` turns into
+    one named line and exit 2. `UNLOADABLE` is valid YAML the loader refuses on shape.
+    `MID_LINE_TEAR` is a half-saved file `yaml` itself refuses with a `ParserError`, and
+    it used to escape past every caller guarding for a bad roster.
+    """
+    rig = _rig(tmp_path, roster=TWO_TICKERS)
+
+    with pytest.raises(TickersError) as caught:
+        _run_across_an_edit(rig, roster)
+
+    assert str(rig.tickers) in str(caught.value)
+    # Nothing paged. The counters never got a roster to charge against.
+    assert rig.transport.sent == []
+
+
+def test_a_broken_roster_off_the_capture_window_is_fatal_too(tmp_path):
+    """The one tick the deleted fallback used to carry, held so the cost stays visible.
+
+    `run_loop` hands missed slots to the skipped-slot hook and only then checks the
+    phase, so a tick off the capture window fires the hook and runs no cycle. That is
+    the only tick where this hook's read is the roster's only read of the minute, and it
+    is reachable: a stall spanning the option close wakes past it with the window's tail
+    still to report.
+
+    The fallback that used to sit here carried the daemon from that tick to the next
+    capture minute, which across a Friday close is the whole weekend. Deleting it moves
+    the exit forward to here. That is the price, and it is paid deliberately: a stale
+    roster charges counters the file no longer names, and the dead-man switch is what
+    reports a daemon that stopped.
+    """
+    rig = _rig(tmp_path, roster=TWO_TICKERS)
+    _seed_two(rig)
+    clock = ManualClock(start=et(2026, 9, 2, 15, 58, 30))
+
+    def stall_across_the_close(*, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        slot = clock.now().replace(second=0, microsecond=0)
+        rig.tickers.write_text(UNLOADABLE)
+        clock.advance(ACROSS_THE_CLOSE)
+        return CycleResult(snap_ts=slot, segments=())
+
+    with pytest.raises(TickersError):
+        _run(rig, clock, ticks=2, cycle_runner=stall_across_the_close)
+
+    # The waking tick is past the option close, so no cycle ran to raise first. The hook
+    # is what took the daemon down.
+    assert clock.now() > et(2026, 9, 2, 16, 15)
+    assert rig.transport.sent == []
 
 
 def test_the_hook_charges_every_surface_its_ticker_is_captured_on(tmp_path):
