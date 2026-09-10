@@ -38,11 +38,19 @@ def _clean_lake(fixture_lake: FixtureLake) -> Path:
     return fixture_lake.build()
 
 
-def _run(lake_root: Path, *, now=SUNDAY_20, schedule=REPEAT_ONLY, canary=None, mint=FRESH_MINT):
+def _passing_canary() -> bool:
+    """A canary that answers True.
+
+    The seam carries no default, so every call site names one. A default that answered
+    True without calling anything is the thing production must not have.
+    """
+    return True
+
+
+def _run(
+    lake_root: Path, *, now=SUNDAY_20, schedule=REPEAT_ONLY, canary=_passing_canary, mint=FRESH_MINT
+):
     pinger = FakePinger()
-    kwargs = {}
-    if canary is not None:
-        kwargs["canary"] = canary
     outcome = cp.sunday_maintenance(
         lake_root=lake_root,
         now=now,
@@ -51,7 +59,7 @@ def _run(lake_root: Path, *, now=SUNDAY_20, schedule=REPEAT_ONLY, canary=None, m
         pinger=pinger,
         ping_url=URL,
         mint=mint,
-        **kwargs,
+        canary=canary,
     )
     return outcome, pinger
 
@@ -192,6 +200,7 @@ def test_a_reader_that_raises_rides_the_report_and_the_ping_still_fires(fixture_
             schedule_reader=_raise(exc),
             pinger=pinger,
             ping_url=URL,
+            canary=_passing_canary,
             mint=FRESH_MINT,
         )
         assert outcome.alarms.repeat_ok is False
@@ -277,7 +286,7 @@ def _retry_run(lake_root, *, start, mints, canary=None, schedule=REPEAT_ONLY, re
         pinger=pinger,
         ping_url=URL,
         mint_reader=mints,
-        canary=canary if canary is not None else (lambda: True),
+        canary=canary if canary is not None else _passing_canary,
         reminder_sink=reminder_sink,
     )
     return outcomes, pinger, clock
@@ -374,6 +383,7 @@ def test_a_failed_ping_is_a_named_problem_and_the_run_still_reports(fixture_lake
         schedule_reader=lambda: REPEAT_ONLY,
         pinger=pinger,
         ping_url=URL,
+        canary=_passing_canary,
         mint=FRESH_MINT,
     )
     # It was attempted, it failed, and the failure is named beside the other findings.
@@ -393,6 +403,7 @@ def test_a_failed_ping_never_carries_the_key(fixture_lake):
         schedule_reader=lambda: REPEAT_ONLY,
         pinger=pinger,
         ping_url=URL,
+        canary=_passing_canary,
         mint=FRESH_MINT,
     )
     # Pinned by equality rather than by scanning for the key. Equality is the stronger
@@ -413,6 +424,7 @@ def test_the_retry_loop_gives_a_failed_ping_another_chance(fixture_lake):
         pinger=pinger,
         ping_url=URL,
         mint_reader=_Mints(FRESH_MINT),
+        canary=_passing_canary,
     )
     assert len(outcomes) == 7
     assert len(pinger.urls) == 7
@@ -441,6 +453,7 @@ def _exclusion_run(lake_root, *, reader, targets=(CONFIG_DIR,)):
         schedule_reader=lambda: REPEAT_ONLY,
         pinger=pinger,
         ping_url=URL,
+        canary=_passing_canary,
         mint=FRESH_MINT,
         exclusion_targets=targets,
         exclusion_reader=reader,
@@ -502,7 +515,8 @@ def test_every_target_is_checked(fixture_lake):
 # The build plan assigns the reminder to this deliverable. It fires on Sunday only, on
 # the 20:00, 21:00, and 22:00 runs, while the throwaway call or the coverage assertion
 # still fails. So it never fires midweek, never on the half-hour retries, and stops on
-# its own once the ritual is done. Delivery is D13's publisher. The decision is here.
+# its own once the ritual is done. Delivery is the publisher's, through
+# `reminder_publisher`. The decision is here, and the sink is a recorder.
 
 
 def _reminders(lake_root, *, start, mints, canary=None):
@@ -545,8 +559,8 @@ def test_a_midweek_run_sends_no_reminder(fixture_lake):
 
 
 def test_the_outcome_carries_the_reminder_even_with_no_sink(fixture_lake):
-    # D13's publisher does not exist yet, so the CLI prints the body instead. The
-    # decision must not depend on a sink being wired.
+    # The decision must not depend on a sink being wired. A caller with no sink still
+    # gets the reminder on the outcome, and the command line still logs the body.
     outcome, _ = _run(_clean_lake(fixture_lake), mint=STALE_MINT)
     assert outcome.reminder is not None
     assert outcome.reminder.body.startswith("The coverage assertion failed.")

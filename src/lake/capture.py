@@ -60,6 +60,7 @@ from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants, load_config
 from lake.lock import lake_lock
 from lake.manifest import record_partition
+from lake.metadata import stamp_cycle
 from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor
 from lake.tickers import Roster, load_tickers
 from lake.vendor import Vendor, VendorError
@@ -699,7 +700,29 @@ class _CaptureCycle:
                     fetched_at=outcome.fetched_at,
                 )
 
+        # Last, stamp what the rows cannot carry: the token's mint time and the roster.
+        self._stamp()
         return CycleResult(snap_ts=self.snap_ts, segments=tuple(outcomes), errors=tuple(errors))
+
+    def _stamp(self) -> None:
+        """Stamp the cycle's token mint time and roster into the journal metadata.
+
+        The mint time comes off the vendor this cycle actually fetched with, never from
+        a separate read of the token file. So the panel shows the token capture actually
+        runs on. The stamp is a timestamp. No token material reaches the lake.
+
+        A stamp is a report about the cycle, not part of it. So a vendor that cannot say
+        when its token was minted, and a write that fails, each cost the stamp and never
+        the captured rows. The next cycle stamps again a minute later.
+        """
+        try:
+            minted = self.vendor.token_mint_time()
+        except Exception:  # noqa: BLE001 - any vendor failure here costs a stamp, not a cycle
+            return
+        try:
+            stamp_cycle(self.lake_root, at=self.snap_ts, token_minted_at=minted, roster=self.roster)
+        except OSError:
+            return
 
 
 def run_cycle(
@@ -741,6 +764,8 @@ def run_cycle(
        quotes segment each. A failed batch gaps every ticker's quotes.
     4. Append one manifest entry per segment, keyed by the segment path, under the
        lake-root lock.
+    5. Stamp the token's mint time and the roster into the journal metadata, so the
+       dashboard reads both from the lake rather than from ``~/.config``.
     """
     cycle = _CaptureCycle(
         clock=clock,

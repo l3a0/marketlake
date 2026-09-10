@@ -26,6 +26,7 @@ with it.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timedelta
 
 from lake.calendar import MARKET_TZ
@@ -69,12 +70,25 @@ class DeadMan:
     The pinger is injected and its failures are swallowed. A ping that does not land is
     what the check is for, and a daemon that crashed while reporting itself alive would
     turn a missing minute into a missing session.
+
+    The recorder is injected on the same terms. healthchecks knows when the last ping
+    landed, and the Now panel is meant to show it too. The panel reads the lake, so a
+    landed ping is written down there. Only a landed one, because the panel's line says
+    the check is being fed and a ping that never left the laptop is not feeding it.
     """
 
-    def __init__(self, *, pinger, url: str, session_clock: SessionClock) -> None:
+    def __init__(
+        self,
+        *,
+        pinger,
+        url: str,
+        session_clock: SessionClock,
+        recorder: Callable[[datetime], None] | None = None,
+    ) -> None:
         self._pinger = pinger
         self._url = url
         self._session_clock = session_clock
+        self._recorder = recorder
         self._last: datetime | None = None
 
     def captured(self, now: datetime) -> bool:
@@ -103,7 +117,22 @@ class DeadMan:
             self._pinger.ping(self._url)
         except Exception:  # noqa: BLE001 - a missed ping is what the check is for
             return False
+        self._record(now)
         return True
+
+    def _record(self, now: datetime) -> None:
+        """Write the landed ping down for the panel, and never fail the ping over it.
+
+        The ping is the guarantee. The record is a courtesy to the page. A recorder that
+        raises would turn a fed check into a crashed daemon, which is the failure the
+        whole check exists to catch.
+        """
+        if self._recorder is None:
+            return
+        try:
+            self._recorder(now)
+        except Exception:  # noqa: BLE001 - a lost record must never cost the ping
+            return
 
 
 __all__ = [
