@@ -137,13 +137,14 @@ def test_a_reader_during_the_write_still_sees_a_whole_roster(tmp_path: Path, mon
 
     The daemon re-reads ``tickers.yaml`` on its own schedule, so it can read while the
     command writes. Truncating the file in place opens a window where a reader gets
-    zero bytes or a prefix. Where the cut lands decides what the loader does, and both
-    outcomes are bad. Roughly a third of a two-ticker roster's prefixes parse: an empty
-    file as a roster of no tickers, a longer prefix as the tickers it kept with any cut
-    key defaulted, so an options ticker comes back equity-only. A cycle handed one of
-    those captures nothing for what it lost and writes no gap row for it either. The rest
-    raise, and ``load_tickers`` turns that into a ``TickersError`` a caller can act on.
-    The silent half is what this case is about.
+    zero bytes or a prefix. Where the cut lands decides what the loader does. Of a
+    two-ticker roster's 67 prefixes, 43 raise, and ``load_tickers`` turns that into a
+    ``TickersError`` a caller can act on. Twelve parse to the whole roster and cost
+    nothing. The remaining twelve parse to the tickers the cut kept, with any cut key
+    defaulted, so an options ticker comes back equity-only. A cycle handed one of those
+    captures nothing for what it lost and writes no gap row for it either. Those twelve
+    are the silent ones, and they are what this case is about. The empty prefix was a
+    thirteenth until ``load_tickers`` began refusing a file that names no tickers.
     """
     path = tmp_path / "tickers.yaml"
     upsert_ticker("XYZ", options=False, path=path)
@@ -188,11 +189,13 @@ NAMES_NOTHING = {
 
 @pytest.mark.parametrize("text", NAMES_NOTHING.values(), ids=list(NAMES_NOTHING))
 def test_a_file_that_names_no_tickers_raises(tmp_path: Path, text: str):
-    """A roster of no tickers is the silent half the atomic write removed on its own side.
+    """A roster of no tickers is the one silent prefix the rename does not cover.
 
-    A cycle handed one captures nothing and writes no gap row, so the minute leaves no
-    trace, and the design counts completeness from rows and never from holes. That is
-    the same harm `_write_atomically` names, reached through the read instead.
+    The rename keeps a torn write from ever exposing one. It cannot reach a hand edit,
+    which is the other way an empty file appears. A cycle handed one captures nothing and
+    writes no gap row, so the minute leaves no trace, and the design counts completeness
+    from rows and never from holes. That is the harm `_write_atomically` names, reached
+    through the read instead of the write.
     """
     path = tmp_path / "tickers.yaml"
     path.write_text(text)
@@ -253,3 +256,45 @@ def test_a_roster_that_cannot_be_written_says_so(tmp_path: Path):
     assert str(caught.value) == f"tickers file cannot be written: {target}"
     # The temp file's name is an implementation detail and never rides out in the line.
     assert "tmp-" not in str(caught.value)
+
+
+# Each of these is a single malformed entry in an otherwise fine document. The document
+# parses as a mapping, so a shape check alone lets it through, and only the roster build
+# refuses it.
+BROKEN_ENTRY = {
+    "an entry cut after the colon": "SPY:\n",
+    "an entry that is a scalar": "SPY: 5\n",
+    "an entry that is a list": "SPY: [options]\n",
+    "bars that are not a list": "SPY: {options: true, bars: '1m'}\n",
+}
+
+
+@pytest.mark.parametrize("text", BROKEN_ENTRY.values(), ids=list(BROKEN_ENTRY))
+def test_the_write_refuses_an_entry_the_read_refuses(tmp_path: Path, text: str):
+    """Onboarding must not reflow a file the daemon will still not start on.
+
+    Checking the document's shape catches a roster that is a list or a number. It does
+    not catch one malformed entry, which is what a save cut partway through leaves. The
+    write used to reflow the operator's file around it and report success, and the daemon
+    still refused to start on the entry that was already broken.
+    """
+    path = tmp_path / "tickers.yaml"
+    path.write_text(text)
+    with pytest.raises(TickersError):
+        load_tickers(path)
+    with pytest.raises(TickersError):
+        upsert_ticker("QQQ", options=False, path=path)
+    assert path.read_text() == text
+    assert [p.name for p in sorted(tmp_path.iterdir())] == ["tickers.yaml"]
+
+
+def test_re_onboarding_the_broken_ticker_is_the_repair(tmp_path: Path):
+    # The merged roster is what gets validated, so the entry being replaced is the new
+    # one by the time the check runs. Onboarding SPY fixes SPY. That is the repair path,
+    # and validating before the merge would have blocked it.
+    path = tmp_path / "tickers.yaml"
+    path.write_text("SPY:\n")
+    with pytest.raises(TickersError):
+        load_tickers(path)
+    upsert_ticker("SPY", options=False, path=path)
+    assert load_tickers(path).symbols == ("SPY",)
