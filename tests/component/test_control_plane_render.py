@@ -4,6 +4,10 @@
 outside it. It refuses a system directory. The ``self-check``, ``sunday``, and
 ``pmset`` subcommands run against a throwaway config with every seam injected, so no
 clock is read and nothing shells out.
+
+Two of the ``sunday`` seams reach the outside world in production. The canary quotes a
+symbol through the real vendor, and the transport POSTs to ntfy. Every test here passes
+its own for both, so nothing reaches the network and no push lands on a phone.
 """
 
 from __future__ import annotations
@@ -468,10 +472,37 @@ def _token(tmp_path: Path, minted: datetime | None = None) -> Path:
     return path
 
 
+def _passing_canary() -> bool:
+    """A canary that answers True without calling anything.
+
+    Every ``sunday`` test states one. The command line's own default builds a real
+    client and quotes a symbol, so a test that left it out would reach the network.
+    """
+    return True
+
+
+class _Pushes:
+    """A transport recording each push. The real one POSTs to ntfy."""
+
+    def __init__(self) -> None:
+        self.sent = []
+
+    def send(self, message) -> None:
+        self.sent.append(message)
+
+
+class _BrokenTransport:
+    """A transport that cannot deliver, which is an unreachable ntfy."""
+
+    def send(self, message) -> None:
+        raise OSError("network down")
+
+
 def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys):
     lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
     config = write_config(tmp_path, lake)
     pinger = FakePinger()
+    pushes = _Pushes()
     # An explicit --token keeps the test off the real token under HOME.
     code = cp.main(
         [
@@ -485,9 +516,13 @@ def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys):
         calendar=weekday_sessions(date(2026, 8, 31)),
         schedule_reader=lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
         pinger=pinger,
+        canary=_passing_canary,
+        transport=pushes,
     )
     assert code == 0
     assert pinger.urls == ["https://hc-ping.com/secret-key/sunday"]
+    # A Sunday where the ritual was done owes no reminder, so the phone stays quiet.
+    assert pushes.sent == []
     printed = capsys.readouterr().out
     assert "secret-key" not in printed
 
@@ -512,6 +547,8 @@ def test_sunday_cli_withholds_the_ping_for_a_stale_token(tmp_path, capsys):
         calendar=weekday_sessions(date(2026, 8, 31), date(2026, 9, 7)),
         schedule_reader=lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
         pinger=pinger,
+        canary=_passing_canary,
+        transport=_Pushes(),
     )
     assert code == 1
     assert pinger.urls == []
@@ -531,6 +568,8 @@ def test_sunday_cli_reads_the_mint_time_from_the_token_file(tmp_path, capsys):
         calendar=weekday_sessions(date(2026, 8, 31)),
         schedule_reader=lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
         pinger=pinger,
+        canary=_passing_canary,
+        transport=_Pushes(),
     )
     assert code == 0
     assert pinger.urls == ["https://hc-ping.com/secret-key/sunday"]
@@ -562,6 +601,8 @@ def test_sunday_cli_checks_the_time_machine_exclusion(tmp_path, capsys):
         calendar=weekday_sessions(date(2026, 8, 31)),
         schedule_reader=lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
         pinger=pinger,
+        canary=_passing_canary,
+        transport=_Pushes(),
         exclusion_reader=reader,
     )
     assert code == 0  # report tier: the ping still fires
@@ -585,6 +626,7 @@ def test_sunday_cli_reports_problems_and_exits_non_zero(tmp_path, capsys):
         schedule_reader=lambda: "",
         pinger=pinger,
         canary=lambda: False,
+        transport=_Pushes(),
     )
     assert code == 1
     assert pinger.urls == []
@@ -595,9 +637,112 @@ def test_sunday_cli_reports_problems_and_exits_non_zero(tmp_path, capsys):
     )
     assert "canary call failed" in printed
     assert "token file unreadable" in printed
-    # Until D13's publisher lands, this print is the only way a reminder reaches a
-    # human, so the log line is the delivery path and is checked as one.
+    # The job's log carries the reminder too. The phone is the channel that matters and
+    # the push is checked below, but the log is what an operator reads after the fact.
     assert "sunday: reminder: The throwaway call" in printed
+
+
+# -- the two producers the launchd job runs on ---------------------------------------
+
+# Both seams were built and never supplied. The canary fell back to a pass-through that
+# returned True without calling anything, and the reminder had no sink, so it reached a
+# log file and never a phone. These tests hold the wiring the installed job runs.
+
+SUNDAY_20 = et(2026, 8, 30, 20, 0)
+LATE_LAST_WEEK = et(2026, 8, 23, 18, 0)
+REPEAT_ONLY = "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n"
+WEEK_AHEAD = weekday_sessions(date(2026, 8, 31), date(2026, 9, 7))
+
+
+def test_the_sunday_cli_builds_a_real_canary_rather_than_passing_through(tmp_path, monkeypatch):
+    # The seam's producer is built from the token path and the config's credentials. A
+    # command line that passed none would report a healthy weekend on a dead token.
+    lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
+    config = write_config(tmp_path, lake)
+    token = _token(tmp_path)
+    asked: list[dict] = []
+
+    def fake_token_canary(*, token_path, api_key, app_secret):
+        asked.append({"token_path": token_path, "api_key": api_key, "app_secret": app_secret})
+        return lambda: False
+
+    monkeypatch.setattr(cp, "token_canary", fake_token_canary)
+    pinger = FakePinger()
+    code = cp.main(
+        ["sunday", "--config", str(config), "--token", str(token)],
+        clock=ManualClock(start=SUNDAY_20),
+        calendar=WEEK_AHEAD,
+        schedule_reader=lambda: REPEAT_ONLY,
+        pinger=pinger,
+        transport=_Pushes(),
+    )
+    assert asked == [{"token_path": str(token), "api_key": "api-key", "app_secret": "app-secret"}]
+    # The producer's answer drives the run, so a failing call withholds the ping.
+    assert code == 1
+    assert pinger.urls == []
+
+
+def test_the_sunday_cli_pushes_the_reminder_to_the_phone(tmp_path):
+    # A token minted late last week is still valid on Sunday and dead before Friday's
+    # option close, so the ritual was skipped and the reminder is owed. The design sends
+    # it on the 20:00, 21:00 and 22:00 runs while the check still fails.
+    lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
+    config = write_config(tmp_path, lake)
+    pushes = _Pushes()
+    code = cp.main(
+        ["sunday", "--config", str(config), "--token", str(_token(tmp_path, LATE_LAST_WEEK))],
+        clock=ManualClock(start=SUNDAY_20),
+        calendar=WEEK_AHEAD,
+        schedule_reader=lambda: REPEAT_ONLY,
+        pinger=FakePinger(),
+        canary=_passing_canary,
+        transport=pushes,
+    )
+    assert code == 1
+    assert len(pushes.sent) == 3
+    first = pushes.sent[0]
+    assert first.title == cp.REMINDER_TITLE
+    assert first.event == cp.REMINDER_EVENT
+    assert first.priority == cp.REMINDER_PRIORITY
+    assert first.body.startswith("The coverage assertion failed.")
+    # The mint date is the one fact from the config directory a message may carry.
+    assert LATE_LAST_WEEK.date().isoformat() in first.body
+    assert "app-secret" not in first.body and "secret-key" not in first.body
+
+
+def test_a_reminder_that_cannot_be_pushed_is_written_down_and_the_evening_carries_on(
+    tmp_path, capsys
+):
+    # ntfy is unreachable. A Sunday job that died here would lose the scrub, the alarm
+    # read-back and the check's ping with it, and the missed ping would page at 23:30
+    # naming the wrong cause. So the push is recorded under reports/ and the run ends
+    # on its own summary line.
+    lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
+    config = write_config(tmp_path, lake)
+    code = cp.main(
+        ["sunday", "--config", str(config), "--token", str(_token(tmp_path, LATE_LAST_WEEK))],
+        clock=ManualClock(start=SUNDAY_20),
+        calendar=WEEK_AHEAD,
+        schedule_reader=lambda: REPEAT_ONLY,
+        pinger=FakePinger(),
+        canary=_passing_canary,
+        transport=_BrokenTransport(),
+    )
+    assert code == 1
+    printed = capsys.readouterr().out
+    assert printed.strip().endswith("slug=sunday")
+    assert "sunday: reminder not sent: post_failed, written down" in printed
+    # This job writes into the lake it also scrubs, and it scrubs again on every retry.
+    # `reports/` is on the scrub's enumerated exclusions, so the record the 20:00 attempt
+    # wrote is not an orphan to the 20:30 one.
+    assert "scrub failed" not in printed
+    # One write-once file per undelivered message, under the day it was owed.
+    records = sorted((lake / "reports" / "alerts" / "date=2026-08-30").glob("*.json"))
+    assert len(records) == 3
+    entry = json.loads(records[0].read_text())
+    assert entry["event"] == cp.REMINDER_EVENT
+    assert entry["reason"] == "post_failed"
+    assert entry["detail"] == "OSError"
 
 
 def test_pmset_cli_prints_both_commands_for_the_coming_week(capsys):

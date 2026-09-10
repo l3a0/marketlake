@@ -205,3 +205,37 @@ def test_a_failing_backup_blocks_the_ping_and_surfaces():
 def test_cycle_succeeded_predicate():
     assert runner.cycle_succeeded(_data_result()) is True
     assert runner.cycle_succeeded(_all_gap_result()) is False
+
+
+def test_main_wires_the_live_seams(tmp_path, monkeypatch, capsys):
+    # The runner half of the rule the daemon's `main` test covers. `run_once_from_config`
+    # no longer defaults its seams, so `main` is the caller that must supply the real
+    # pair. Nothing exercised this entry before, so neither half of the rule was covered.
+    from types import SimpleNamespace
+
+    from lake.runner import RsyncBackup, UrllibPinger
+    from tests.support.config import write_config
+
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
+
+    seen: dict = {}
+
+    def stub(**kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(
+            result=CycleResult(datetime(2026, 9, 2, 16, 0, tzinfo=UTC), ()),
+            succeeded=True,
+            pinged=True,
+            backed_up=True,
+            problem=None,
+        )
+
+    monkeypatch.setattr(runner, "run_once_from_config", stub)
+    assert runner.main(["run", "--config", str(config)]) == 0
+
+    assert isinstance(seen["pinger"], UrllibPinger)
+    assert isinstance(seen["backup"], RsyncBackup)
+    # The ping key never reaches stdout, only the slug.
+    assert "secret-key" not in capsys.readouterr().out

@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 import threading
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -32,7 +32,9 @@ from lake.manifest import (
     sha256_file,
     would_shrink,
 )
+from lake.metadata import metadata_path, stamp_cycle
 from lake.paths import REPORTS_DIR
+from lake.tickers import Roster
 from tests.support.lake import FixtureLake, sample_chains_table
 
 DAY = date(2026, 8, 24)
@@ -250,6 +252,26 @@ def test_the_reports_directory_is_not_an_orphan(fixture_lake):
     reports = root / REPORTS_DIR
     reports.mkdir()
     (reports / "2026-08-24.md").write_text("Nightly 2026-08-24\n")
+    result = scrub(root)
+    assert result.orphans == ()
+    assert result.ok
+
+
+def test_the_journal_metadata_stamp_is_not_an_orphan(fixture_lake):
+    # The daemon rewrites the stamp every minute, so it can carry no manifest entry. It
+    # is placed under ``journal/`` for exactly that reason, inside the exclusion the
+    # segments already have. Anywhere else and the Sunday scrub would call it an orphan
+    # and withhold its ping every week.
+    lake = fixture_lake
+    lake.with_chains("SPY", DAY)
+    root = lake.build()
+    stamp_cycle(
+        root,
+        at=datetime(2026, 8, 24, 16, 0, tzinfo=UTC),
+        token_minted_at=datetime(2026, 8, 23, 20, 5, tzinfo=UTC),
+        roster=Roster.from_mapping({"SPY": {"options": True, "chain_cadence": "1m"}}),
+    )
+    assert metadata_path(root).exists()
     result = scrub(root)
     assert result.orphans == ()
     assert result.ok

@@ -69,24 +69,25 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   4. `session.missed_slots`, D9's own day-by-day walk moved beside `skipped_slots` so both hooks share one enumerator and `lake.gap` needs no import of `lake.daemon`.
 - **Unowned.** The backup-copy scrub, and the `--checksum` drop that waits on it. `manifest.scrub` reads under `lake_root` only, so nothing verifies the backup target today. `control_plane`'s Sunday gap list already names it as gap 3 of 5. The two land together or in that order, because until the scrub exists `--checksum` in `RsyncBackup.sync` is the only thing that would notice the backup rotting. Dropping it first trades a deadline that fails in a few years for a verification hole that starts now. **Both stay in slice 2.** The scrub is a Sunday-job activity, the Sunday job is D14's, and `manifest.scrub` already exists and already runs there over `lake_root`. Reaching the backup target is a target and a parameter rather than new machinery, so slice 5's validation battery is the wrong home for it. The pairing is a sequencing rule inside slice 2, not a reason to defer either half out of it.
 - **Unowned.** The daemon's in-loop close+15 compaction dispatch. `compact.compact` is reachable only from `python -m lake.compact`, and no job renders it. The design's rule that a catch-up compaction of an unsealed day is ordered after startup gap-marking is satisfied in-process today, because `run_loop` calls `on_start` before its first tick. Whoever builds the dispatch owns keeping it so. D11 built the seam it binds to, `session.SessionDispatch`, so what remains is the compaction job itself. **It stays in slice 2.** Every part it needs is already here: the dispatcher from D11, `compact.compact` from D12, and the loop from D9. It fetches nothing, so slice 3 would not help it, and it blocks the `compaction` check, which cannot be created before a producer exists.
-- **Unowned.** Tests for six of the daemon's production hook bindings. The hooks
-  themselves are covered by tests, and so is each observer in isolation. What no test
-  covers is the wiring `run_loop_from_config` builds, which is the wiring the launchd job
-  actually runs. Six are in that state:
+- **Unowned.** Seven residual gaps in the daemon's production wiring. `test_daemon_wiring.py`
+  now covers the seven hook bindings `run_loop_from_config` builds, and deleting any one of
+  them fails a test. What no test covers is narrower than a binding, and two of the seven
+  reach production behaviour rather than test strength. Each was confirmed by mutating
+  `src/lake/daemon.py` and running the whole suite, which stays green:
 
-  1. the skipped-slot hook reaching `GapMarker`, so a live overrun would record no gap,
-  2. the skipped-slot hook reaching the watchdog, so the minutes the daemon was worst off
-     would charge no counter,
-  3. the per-tick hook feeding the `capture` dead-man's idle heartbeat,
-  4. the cycle hook feeding the same dead-man's `captured` signal, which is what arms the
-     check on the first durable cycle and makes the whole-daemon guarantee true,
-  5. the per-tick hook reaching the close+5 guard's `SessionDispatch.check`,
-  6. the per-cycle chain-plan re-read, which is what makes a nightly plan rewrite take
-     effect the next minute.
-
-  Each was confirmed by deleting the binding and running the suite, which stays green at
-  1124. The point is not that the bindings are wrong. It is that nothing would notice if
-  they became wrong, and four of the six are the paths that carry a failure to the phone.
+  1. the caller's `on_tick` pass-through in the close-guard layer, whose deletion silences
+     the caffeinate power assertion in every production run,
+  2. the `close_tag` and `session_phase` the loop forwards into the production cycle
+     runner, so an unstamped option-close cycle would cost the close-tag read path,
+  3. the caller's `on_start` and `on_skipped` pass-throughs in the gap-marker layer, whose
+     loss also makes the first assertion of the close+5 test vacuous,
+  4. the dead-man's `any` over a cycle's segments, which single-segment fixtures cannot
+     tell from `all`,
+  5. the guard's dispatch moment, which can move one minute off close+5 unnoticed,
+  6. the watchdog instance the skipped-slot hook charges, which no test ties to the one
+     the cycle observer feeds,
+  7. the security master the wiring loads for the gap marker, whose absence loses a freshly
+     onboarded ticker's marked minutes.
 - **D11** close tags and the close+5 guard. Close+5 is the five-minute window after the option close, the last moment an option-close fetch may land. It plugs into D9's close-tag hook, and it builds the session-relative dispatcher the design calls for. Everything session-relative runs from inside the daemon, because launchd's calendar intervals are fixed wall-clock and cannot express a close-relative time. `SessionDispatch` fires one job once per session day at a moment the calendar decides, including on a daemon that starts after that moment has passed. The close+15 compaction dispatch binds to the same seam when someone builds it. Two rules are worth stating where both writers can see them:
   1. The guard's fill triggers on missing marks, not a missing cycle. A chain that failed at the option close leaves a tagged gap row holding nothing a reader can price against, and a close+5 refetch is exactly what rescues it.
   2. On a post-close restart the guard runs before startup gap-marking, so the two close minutes it owns are already recorded when D10's marker walks the day.
@@ -109,17 +110,25 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   log file is a worse home than a page or a panel, and that is a separate question from this
   entry.
 - **D12** compaction and backup, plus the nightly window re-tune. Compaction merges a day's segments into one sealed partition. The re-tune runs after it. The job groups the day's rows by `window_start` and `window_end`, compares each window's contract count to the body limit, and rewrites `chain_plan.json` when the profile drifts.
-- **Unowned.** The backup's exclusion list. The design's *Backup, defined* names the sync
-  root as `lake/` only, "with an explicit exclusion list". Nothing in `compact` carries
-  one. The token file is out of the sync root today by construction rather than by
-  exclusion, so the rule holds by accident and would stop holding the first time the sync
-  root widens.
+- **D12's exclusion list.** The design's *Backup, defined* names the sync root as `lake/`
+  only, "with an explicit exclusion list". `runner.BACKUP_EXCLUSIONS` is now that list,
+  and it holds two entries. `*.tmp-*` is the temp file an atomic write leaves behind,
+  which carries no manifest entry and would plant an orphan for the backup-copy scrub
+  above. `.config/marketlake/` is the directory holding the token and `config.yaml`'s four
+  secrets. That directory is outside the sync root today, so the pattern matches nothing
+  and costs nothing. It exists so the rule holds by exclusion rather than by luck, and
+  keeps holding the first time the sync root widens. Both are derived from constants in
+  `paths`, because `compact` spelled the temp name twice before and a second spelling
+  would put a temp file outside the exclusion with nothing to say so.
 - **D13** watchdog and alerting. One counter per ticker and surface. A durable data cycle resets it, a gap row does not, and three consecutive session minutes page once. Counters start at zero on every restart, never rebuilt from the journal, so a restart never pages for the downtime that preceded it. It observes both D9's cycle-outcome hook and its skipped-slot hook, because the loop runs no cycle for a slot it slept through and those are the minutes the daemon was worst off. Three collapses keep a page storm from replacing a diagnosis:
   1. Every quotes ticker rides one batched request, so all of them failing together is one page naming the sampler.
   2. A cycle where every surface failed with the same known class pages that cause instead. A dead refresh token gaps chains and quotes for every ticker at once, and the design expects one every seven days.
   3. A page that never reached the phone is written to a dated directory under `reports/`, one write-once file each, so the count on the Now panel has a source.
   It also ships the 09:35 says-closed-but-open probe, its page, its plist through D14's renderer, and the `capture` dead-man feed with its idle heartbeats.
-- **Unowned.** Four of D13's page paths. The auth-gap reminder, because the watchdog's cause page is once-on-transition, so a token dying at 09:31 pages once and is then silent for the session. The parser's schema-drift page. The undelivered-pages count on the Now panel, which has a source now but no reader. And `--test-push` on the onboarding command. The publisher exists, so each is a producer and a schedule rather than new machinery.
+- **Unowned.** Three of D13's page paths. The publisher exists, so each is a producer and a schedule rather than new machinery.
+  1. The auth-gap reminder, because the watchdog's cause page is once-on-transition, so a token dying at 09:31 pages once and is then silent for the session.
+  2. The parser's schema-drift page.
+  3. `--test-push` on the onboarding command.
 - **Unowned.** The install's arming step. `capture` arms only when it has been pinged once. Outside the capture window an idle heartbeat does that on its own, so the exposure is an install made inside the capture window whose cycles all fail. That leaves the whole-daemon guarantee inert while every job reports healthy. `pre-open` does not cover it, because it asserts the daemon is up rather than that capture works. The install text ends on `launchctl print`, which answers whether the daemon started rather than whether it is being watched. It should end by arming the row from healthchecks' `Ping Now`, after the bootstrap and never before. That is one press, it works when capture is broken, and it is what converts a silent failed install into a page inside the grace.
 - **D14** laptop control plane. `render --out DIR` writes every plist and setup file to a directory and prints the install commands. It refuses a system directory, and nothing here runs `sudo`, a `pmset` write, `launchctl bootstrap`, or a `tmutil` write. What does run is read-only and needs no root: `launchctl print` from the self-check, `pmset -g sched` and `tmutil isexcluded` from the Sunday job. The token path comes from one rule, so the daemon that rewrites it, the Sunday job that asserts coverage over it, and the exclusion that protects it cannot name different files. `RunAtLoad` is on for the two residents and the self-check. It is off for the Sunday job, which would otherwise scrub the whole lake at every boot. Beside the sudoers drop-in it renders five LaunchDaemons, and it prints the Time Machine exclusion as an install step rather than rendering it:
   1. the capture daemon, resident under `KeepAlive`,
@@ -281,41 +290,32 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   The pasteable `INSTALL.txt` keeps the step-by-step procedure for operators who want it.
   It now leads with the composed command and carries the `sudo diff` line, and it points
   at `uninstall.sh`'s header for what an uninstall leaves rather than restating the list.
-- **Unowned.** The Sunday re-auth reminder's delivery. `sunday_run` takes a
-  `reminder_sink` and only fires it when one is passed. The `python -m lake.control_plane
-  sunday` entry that the launchd job runs passes none, so the reminder is printed to the
-  job's log file and never pushed. That is the same shape as D11's missing fill: the seam
-  is built and the producer is not. It carries no blame for the September 2026 expiry,
-  because the Sunday job was not installed until three days after it, but it is what would
-  have to work for the next one to be announced.
-- **Unowned.** The Sunday canary's producer. `sunday_run` takes an injected `canary`, the
-  throwaway authenticated call that proves capture still works over a weekend, and the
-  `sunday` CLI passes none. The fallback is `_canary_pass_through`, which returns `True`
-  without calling anything. So the canary passes every Sunday whatever the token's state.
-  This is the third seam in slice 2 built and never supplied, after D11's fill and the
-  reminder above, and it is the costliest of the three. The other two fail to act. This one
-  reports success.
+
+  The Sunday job's two outward seams are supplied, so the `sunday` command line no longer
+  falls back on a canary that passes without calling anything or a reminder that reaches
+  a log file and never a phone. `token_canary` is the throwaway authenticated call. It
+  rebuilds the vendor from `token.json` inside every attempt and quotes one symbol, which
+  is what lets the 21:00 retry see a re-login done at 20:40. Any failure answers `False`,
+  because a call that did not come back has proved nothing, and the half-hour retry to
+  23:00 is what absorbs a transient outage rather than paging on it. The seam keeps no
+  default at all now. `sunday_maintenance` and `sunday_run` require a canary, so no later
+  caller can leave one out and be told the weekend passed.
+
+  `reminder_publisher` is the re-auth reminder's delivery. It pushes through the alert
+  publisher, so an unreachable ntfy costs a log line and a dated file under `reports/`
+  instead of taking the scrub, the alarm read-back and the check's own ping with it.
+
+  One alert rule moved with them. Only a page carries the `rotating_light` tag now,
+  because the design gives the emoji to a page alone and the reminder is the first
+  message at the reminder tier to go through the transport. The tag follows the priority
+  rather than becoming a second field a producer could set wrong.
 - **D15** query service with the Now and Today panels. The query service is the read-only localhost dashboard.
-- **Unowned.** Five Now-panel fields that are hardcoded `None`, and the writers each one
-  waits on:
+- **D15's writers.** The Now panel reads five fields no captured row can carry: the token's mint stamp, its age, the countdown to the Sunday ritual, the last dead-man ping, and the count of pages that failed to send. Every one of them is now filled from under `lake_root`, because the dashboard never opens `~/.config`. `lake.metadata` owns the stamp at `journal/metadata.json`, which sits inside the reverse scrub's journal exclusion and outside the date directories compaction prunes. Three writers fill it:
+  1. The capture cycle stamps the token's mint time, off the vendor it fetched with, and the cycle's roster as the surfaces each ticker is captured on. That roster stamp is what lets the panel show a ticker that journaled nothing as failing rather than dropping it.
+  2. The daemon stamps the same two facts on every minute off the capture window, reading the mint from `token.json` because no client exists there. That is the path the Sunday re-auth reaches the panel by on the night it happens.
+  3. The dead-man records each landed ping, and only a landed one.
 
-  1. `token_minted_at`, which needs the refresh token's mint stamp journaled,
-  2. `token_age_minutes`, computed from that same stamp,
-  3. `token_sunday_countdown_minutes`, computed from it too,
-  4. `dead_man_last_ping`, which needs the watchdog's last ping recorded where the
-     dashboard can read it,
-  5. `pages_failed_to_send`, which has a source and no reader, and is already booked above
-     as one of D13's four page paths.
-
-  One writer clears the first three. The panel itself renders. It answers none of the
-  questions an operator opens it to ask.
-- **Unowned.** The roster stamp the design puts in journal metadata. `lake_roster` says
-  so itself: until the stamp exists it reads the ticker list off the lake's own directory
-  layout. So a ticker that journaled nothing has no directory and is missing from the panel
-  entirely, rather than shown as failing. A surface that journaled once and then died does
-  appear, with a growing `minutes_since`. The gap is the first case, where the dashboard
-  cannot distinguish a ticker that was never expected from one that was expected and
-  produced nothing.
+  The page count needed no writer. `alert.undelivered` already counted the pages that never reached the phone, and the panel now reads it for the Eastern day the publisher files them under. The age and the countdown are arithmetic over the mint stamp, the countdown against `control_plane.sunday_canary_due`, which keeps the ritual's moment beside the ritual.
 
 Every unowned entry above belongs to slice 2, and none is deferred. The test is whether an
 entry needs something a later slice introduces. None does. Slice 3 adds vendor-fetch surfaces,
@@ -425,7 +425,7 @@ Each healthchecks.io check is created by hand, in the session that first makes i
 
 1. **D8**, `slice1-capture`, and the channel. Subscribe the phone to the topic from the clipboard, never from a printed string. Create the healthchecks.io project, its ntfy integration and its email integration with the design's settings, and the `slice1-capture` check named `Slice-1 capture`. Confirm ntfy and email both read on for it. Prove the chain before the first unattended run. Give the check a 2-minute period and a 1-minute grace, ping once, wait for `Slice-1 capture is DOWN` on the phone, ping again for `is UP`, then set the real envelope. A new check sends no up push on its first ping, so down is the first thing the phone can show. The phone is an iPhone, and ntfy documents priority behavior for Android only. So the same session confirms that the priority-5 push interrupts the locked screen. It also sets the ntfy app's pass through Focus, the iPhone's do-not-disturb modes, by hand in each Focus, and confirms it with the same push. Slice 1 shipped before this step was written, so any part of it still owed runs before D13.
 2. **D12**, `compaction`. Create the check and confirm ntfy and email both read on for it.
-3. **D13**, `capture`, and the daemon's own pages. The per-cycle dead-man. Delete the `slice1-capture` row in the same session, because `capture` supersedes it. Ship every daemon page path through one publisher: auth death, sustained 429s, the watchdog, and the sampler collapse. The auth-gap reminder, the parser's schema-drift page, the undelivered-pages counter on the Now panel, and a `--test-push` on the onboarding command are not built yet and are pinned as unowned above. Rehearse the topic rotation once, end to end. The 09:35 calendar probe ships here too, with its page and its `calendar-probe` check.
+3. **D13**, `capture`, and the daemon's own pages. The per-cycle dead-man. Delete the `slice1-capture` row in the same session, because `capture` supersedes it. Ship every daemon page path through one publisher: auth death, sustained 429s, the watchdog, and the sampler collapse. The auth-gap reminder, the parser's schema-drift page, and a `--test-push` on the onboarding command are not built yet and are pinned as unowned above. Rehearse the topic rotation once, end to end. The 09:35 calendar probe ships here too, with its page and its `calendar-probe` check.
 4. **D14**, `pre-open` and `sunday`, and the Sunday reminder. D14 renders the launchd jobs and the wake schedules those two checks watch. The Sunday job sends the re-auth reminder on its 20:00, 21:00, and 22:00 canary runs only, while the throwaway call or the coverage assertion still fails, reading the token's mint time from `token.json` itself.
 5. **D16**, `eod-sweep`, and the nightly summary. The vendor sweep writes the dated report file under `reports/` and sends its one-screen digest at priority 2 after its own ping lands, holiday no-ops included. Until D20 the quarantine count is zero and the History panel that renders the file does not exist yet, so the file is read by hand.
 6. **D20**, the battery's pages, delayed feed and nightly schema drift.
