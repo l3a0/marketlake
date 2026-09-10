@@ -164,6 +164,7 @@ def test_the_daemon_pages_through_the_publisher_when_a_surface_goes_quiet(tmp_pa
     from tests.support.calendar import et, weekday_sessions
     from tests.support.clock import ManualClock
     from tests.support.config import write_config
+    from tests.support.pinger import FakePinger
 
     lake_root = tmp_path / "lake"
     lake_root.mkdir()
@@ -202,6 +203,7 @@ def test_the_daemon_pages_through_the_publisher_when_a_surface_goes_quiet(tmp_pa
         calendar=weekday_sessions(date(2026, 8, 31)),
         assertion_runner=lambda args: None,
         transport=Broken(),
+        pinger=FakePinger(),
         cycle_runner=failing_cycle,
         should_continue=four,
     )
@@ -242,6 +244,27 @@ def test_a_record_that_cannot_be_written_says_so(tmp_path, capsys, monkeypatch):
     assert "record failed too" in capsys.readouterr().err
 
 
+def test_an_undelivered_page_never_creates_the_lake_root(tmp_path, capsys):
+    """A publisher that conjured the lake would turn a broken install into a green check.
+
+    The Sunday job decides whether to ping on ``root.is_dir()`` and re-reads that on every
+    retry. Before this, a failed push recorded the page through ``mkdir(parents=True)``,
+    which created the lake root itself, so attempt two found a lake, scrubbed an empty
+    directory, found no problems, and pinged the `sunday` check green on a lake that did
+    not exist. The record is written inside a lake that exists, or not at all.
+    """
+    missing = tmp_path / "not-a-lake"
+    publisher = Publisher(lake_root=missing, transport=Broken(), pid=1)
+
+    delivery = publisher.publish(PAGE, now=NOW)
+
+    assert not delivery.sent
+    assert not delivery.recorded
+    assert not missing.exists(), "the publisher created the lake root it was handed"
+    # Lost twice, so the log is the only place left to say so.
+    assert "record failed too" in capsys.readouterr().err
+
+
 def test_the_topic_never_appears_in_the_request_url(tmp_path):
     # A URL lands in a proxy log and anything that records a request line. The topic is
     # the write credential for the channel.
@@ -275,3 +298,39 @@ def test_the_topic_never_appears_in_the_request_url(tmp_path):
     assert sent["body"]["topic"] == "secret-topic"
     assert sent["body"]["title"] == PAGE.title
     assert sent["body"]["tags"] == [PAGE_TAG]
+
+
+def test_only_a_page_carries_the_tag():
+    # The design gives the emoji one job: marking a message from the lake's own jobs as
+    # a page. A reminder and the nightly summary carry none, so the phone can tell the
+    # tiers apart at a glance. Priority already names the tier, so the tag follows it.
+    from lake.alert import PAGE_TAG, NtfyTransport
+
+    bodies = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def urlopen(request, timeout=None):
+        bodies.append(json.loads(request.data))
+        return FakeResponse()
+
+    import urllib.request
+
+    original = urllib.request.urlopen
+    urllib.request.urlopen = urlopen
+    try:
+        for priority in (5, 3, 2):
+            NtfyTransport("secret-topic").send(
+                Message(event="sunday_reauth", title="t", body="b", priority=priority)
+            )
+    finally:
+        urllib.request.urlopen = original
+
+    assert bodies[0]["tags"] == [PAGE_TAG]
+    assert "tags" not in bodies[1]
+    assert "tags" not in bodies[2]

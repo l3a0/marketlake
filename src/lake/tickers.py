@@ -14,9 +14,7 @@ The file is a mapping from ticker to its capture settings::
 like ``1m`` for one minute. ``bars`` lists the bar frequencies to fetch, like ``1m``
 and ``1d``. An equity-only ticker sets ``options: false`` and needs no cadence. The
 daemon re-reads this file at the top of every capture cycle, so a new ticker goes live
-on the next cycle with no restart. It reads the file again on a slot the loop slept
-through, once for the watchdog counters and once for gap marking, because no cycle ran
-on that slot to take a snapshot for them to share.
+on the next cycle with no restart.
 """
 
 from __future__ import annotations
@@ -28,7 +26,7 @@ from pathlib import Path
 
 import yaml
 
-from lake.paths import TICKERS_FILE, config_dir
+from lake.paths import TICKERS_FILE, config_dir, temp_write_path
 
 # The portable roster file. Overridable by argument or this environment variable, so a
 # test points the loader at a throwaway file.
@@ -115,14 +113,84 @@ def load_tickers(
     Path precedence mirrors ``load_config``: an explicit ``path``, then the
     ``MARKETLAKE_TICKERS`` environment variable, then the default
     ``~/.config/marketlake/tickers.yaml``.
+
+    A file that names no tickers is an error, not an empty roster. The rename in
+    ``_write_atomically`` closed the way a torn *write* produced one. A hand edit caught
+    partway through a save still does, and so does an operator who empties the file. The
+    harm is the one the rename removed on the other side: a cycle over no tickers
+    captures nothing and writes no gap row, so the minute leaves no trace, and the design
+    counts completeness from rows and never from holes. Nothing writes an empty file. A
+    fresh machine has no file at all, which is already an error, and ``upsert_ticker``
+    always writes at least one entry.
     """
     resolved = _resolve_path(path, env)
     if not resolved.exists():
         raise TickersError(f"tickers file not found: {resolved}")
-    mapping = _parse_yaml(_read_text(resolved), resolved)
+    parsed = _parse(_read_text(resolved), resolved)
+    mapping = {} if parsed is None else parsed
     if not isinstance(mapping, Mapping):
         raise TickersError(f"tickers file is not a mapping: {resolved}")
-    return Roster.from_mapping(mapping)
+    if not mapping:
+        raise TickersError(f"tickers file names no tickers: {resolved}")
+    return _roster_from(mapping, resolved)
+
+
+def _roster_from(mapping: Mapping[str, object], resolved: Path) -> Roster:
+    """The roster for an already-parsed mapping, with the file named on any refusal.
+
+    ``Roster.from_mapping`` takes a mapping and no path, so its message names the entry
+    it rejected and nothing else. Three operator-editable files sit in the config
+    directory, and ``input_errors_exit`` prints this line on its own. It has to say
+    which file. Both halves of this module validate through here, so the read and the
+    write refuse the same entries and say so the same way.
+    """
+    try:
+        return Roster.from_mapping(mapping)
+    except TickersError as exc:
+        raise TickersError(f"{exc} in tickers file: {resolved}") from None
+
+
+def _read_text(resolved: Path) -> str:
+    """The file's text, or a ``TickersError`` naming what could not be read.
+
+    ``exists()`` passing does not mean the file can be read. A restrictive mode raises
+    ``OSError`` and a binary file raises ``UnicodeDecodeError``, which is a ``ValueError``
+    rather than an ``OSError``. Both went bare before, and every caller that guards for a
+    bad roster then missed them. ``lake.config`` solved the same class for ``config.yaml``.
+    Only the path is named, so nothing from inside the file reaches the error.
+    """
+    try:
+        return resolved.read_text()
+    except (OSError, UnicodeDecodeError):
+        raise TickersError(f"tickers file cannot be read: {resolved}") from None
+
+
+def _parse(text: str, resolved: Path) -> object:
+    """The parsed document, or a ``TickersError`` naming where the YAML broke.
+
+    A half-saved file is the ordinary way this fails, and where the cut lands decides
+    what happens. Some prefixes parse. The rest raise a ``yaml`` error, which is not a
+    ``TickersError``, so before this every caller guarding for a bad roster missed them
+    and the daemon died on a traceback instead.
+
+    The line number is named because it is the one thing an operator needs and this file
+    holds no secrets. ``lake.config`` suppresses the same detail for ``config.yaml``,
+    which holds four. Nothing else from the parse error reaches the message, so no line
+    of the file itself is printed. ``from None`` suppresses the original in a traceback
+    too. It stays reachable as ``__context__``, which is where a debugger should find it
+    and where nothing that prints an operator error looks.
+
+    An absent document comes back as ``None`` and every other value comes back as it is.
+    Folding the falsy ones into an empty mapping here would hide four of them. A file
+    holding ``0``, ``false``, ``''``, or ``[]`` is not a roster, and each caller turns
+    only ``None`` into no entries.
+    """
+    try:
+        return yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        where = "" if mark is None else f" at line {mark.line + 1}"
+        raise TickersError(f"tickers file is not valid YAML{where}: {resolved}") from None
 
 
 def upsert_ticker(
@@ -154,7 +222,11 @@ def upsert_ticker(
     resolved = _resolve_path(path, env)
     existing: dict[str, object] = {}
     if resolved.exists():
-        loaded = _parse_yaml(_read_text(resolved), resolved)
+        parsed = _parse(_read_text(resolved), resolved)
+        # An absent document means no entries yet, the same as no file. An empty one is
+        # accepted for the same reason: onboarding is how an operator puts an entry back,
+        # so refusing it would block the repair.
+        loaded = {} if parsed is None else parsed
         if not isinstance(loaded, Mapping):
             raise TickersError(f"tickers file is not a mapping: {resolved}")
         existing = {str(key): value for key, value in loaded.items()}
@@ -164,57 +236,60 @@ def upsert_ticker(
         entry["chain_cadence"] = chain_cadence
     entry["bars"] = [str(freq) for freq in bars]
     existing[ticker] = entry
+    # The merged roster is validated before any of it is written, so the write never
+    # leaves behind a file the read refuses. The document's shape alone was not enough.
+    # An entry cut to ``SPY:`` parses as a mapping and fails only inside
+    # ``Roster.from_mapping``, so the write reflowed the operator's file, reported
+    # success, and left a daemon that still would not start. Validating after the merge
+    # is what makes re-onboarding the broken ticker the repair, because its own entry is
+    # replaced before the check runs.
+    _roster_from(existing, resolved)
 
-    resolved.parent.mkdir(parents=True, exist_ok=True)
-    resolved.write_text(yaml.safe_dump(existing, sort_keys=True))
+    # The read half folds every failure into a ``TickersError``, and the write half is
+    # the operator's to trip the same ways: a parent that is a file rather than a
+    # directory, a mode that forbids the write, a symlink pointing at itself. Onboarding
+    # runs under ``input_errors_exit``, so leaving these bare printed a traceback for the
+    # write where the read printed one line. ``_write_atomically`` still removes its temp
+    # file first, and its name never reaches the message.
+    try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        _write_atomically(resolved, yaml.safe_dump(existing, sort_keys=True))
+    except OSError:
+        raise TickersError(f"tickers file cannot be written: {resolved}") from None
     return resolved
 
 
-def _read_text(resolved: Path) -> str:
-    """The file's text, or a ``TickersError`` naming what could not be read.
+def _write_atomically(target: Path, text: str) -> None:
+    """Write the roster through a temp file beside it, a flush, then one rename.
 
-    ``exists()`` passing does not mean the file can be read. A path one character short
-    of the file names its directory, a restrictive mode makes it unreadable, and a
-    binary file is not text. Each raised a bare ``OSError`` or ``UnicodeDecodeError``
-    before, which no caller of this module catches.
-
-    ``lake.config`` does this for ``config.yaml`` already, and the direction of the
-    import is why it is written twice: ``config`` imports ``TickersError`` from here,
-    so this module cannot import back.
+    The daemon re-reads this file while the command writes it. A plain write truncates
+    the file first, so a reader can catch it empty or half written. Where the cut lands
+    decides what happens next. A two-ticker roster dumps to 66 bytes. Of its 67 prefixes,
+    43 raise, which ``_parse`` turns into a ``TickersError``, so the caller sees a refusal
+    rather than a wrong roster. Twelve parse to the whole roster and cost nothing. The
+    remaining twelve parse to fewer tickers than the file names, with any key the cut
+    removed taking its default, so an options ticker comes back equity-only. A cycle
+    handed one of those captures less than the roster names and writes no gap row for the
+    rest, so the minute leaves no trace. Those twelve are the silent ones this rename
+    removes. The empty prefix was a thirteenth until ``load_tickers`` began refusing a
+    file that names no tickers, so the loader covers that one and the rename covers the
+    rest.
+    A rename replaces the file in one step, so every reader sees the whole old roster or
+    the whole new one. The chain plan is written this way for the same reason. A crash
+    mid-write leaves the prior file intact, and the temp file is removed on any failure.
+    The temp path comes from ``paths.temp_write_path``, which owns the one spelling of
+    the marker the backup exclusion matches.
     """
+    tmp = temp_write_path(target, os.getpid())
     try:
-        return resolved.read_text()
-    except (OSError, UnicodeDecodeError):
-        raise TickersError(f"tickers file cannot be read: {resolved}") from None
-
-
-def _parse_yaml(text: str, resolved: Path) -> object:
-    """The parsed YAML, or a ``TickersError`` naming the file and where it broke.
-
-    A tab for indentation or an unclosed flow mapping raises a ``yaml.YAMLError``, not
-    a ``TickersError``. Two callers depend on that not happening. ``input_errors_exit``
-    turns an operator's malformed file into one line and exit 2, and it catches
-    ``TickersError`` only, so the traceback it exists to prevent is exactly what a
-    mangled roster printed. The daemon re-reads this file while it runs, under
-    ``KeepAlive`` and from hooks that are not guarded, so a parse error there is a
-    crash loop rather than a message.
-
-    The parse error's line and column are carried through, which is where this parts
-    company with ``lake.config``. That module drops them on purpose, because
-    ``config.yaml`` holds four secrets and the parser quotes the offending source line.
-    The roster holds ticker symbols and booleans. It is also the file an operator
-    hand-edits most, so the mark is the useful half of the message. The parser's quoted
-    line is still left out, since only the position is needed to find the mistake.
-
-    An empty file and a ``null`` document both parse to an empty mapping, matching
-    ``lake.config``.
-    """
-    try:
-        return yaml.safe_load(text) or {}
-    except yaml.YAMLError as exc:
-        mark = getattr(exc, "problem_mark", None)
-        where = "" if mark is None else f" at line {mark.line + 1}, column {mark.column + 1}"
-        raise TickersError(f"tickers file is not YAML{where}: {resolved}") from None
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _resolve_path(path: str | Path | None, env: Mapping[str, str] | None) -> Path:

@@ -127,6 +127,7 @@ def test_input_errors_exit_lets_every_other_exception_through():
         ("lake.onboard", ["SPY", "--config", "MISSING"]),
         ("lake.runner", ["run", "--config", "MISSING"]),
         ("lake.control_plane", ["self-check", "--config", "MISSING"]),
+        ("lake.daemon", ["--config", "MISSING"]),
         ("lake.control_plane", ["sunday", "--config", "MISSING"]),
     ],
 )
@@ -213,6 +214,24 @@ def test_a_bad_tickers_file_names_itself_at_the_same_entries(tmp_path, capsys):
         runner.main(["run", "--config", str(config), "--tickers", str(tickers)])
     assert excinfo.value.code == 2
     assert capsys.readouterr().err == f"runner: tickers file is not a mapping: {tickers}\n"
+
+
+def test_a_roster_caught_mid_save_names_itself_the_same_way(tmp_path, capsys):
+    # The same sibling class, for the way the file actually goes bad. A hand edit caught
+    # part way through a save is a parse error. Unguarded that prints a raw
+    # yaml.ParserError traceback, where a bad config exits 2 on one line.
+    import lake.runner as runner
+
+    config = _write(tmp_path / "config.yaml")
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("SPY: {options: fal")
+    with pytest.raises(SystemExit) as excinfo:
+        runner.main(["run", "--config", str(config), "--tickers", str(tickers)])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    # One line, as the guard promises for every operator file.
+    assert err.count("\n") == 1
+    assert err == f"runner: tickers file is not valid YAML at line 1: {tickers}\n"
 
 
 def test_the_guard_names_the_three_operator_files_and_nothing_else():

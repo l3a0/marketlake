@@ -19,6 +19,7 @@ from lake.tickers import Roster, TickerConfig
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.pinger import FakePinger
+from tests.support.transport import FakeTransport
 
 # Monday of the week these tests live in. Its sessions run Monday through Friday.
 WEEK = date(2026, 8, 31)
@@ -480,6 +481,8 @@ def test_the_daemon_wires_gap_marking_into_the_startup_hook(tmp_path, monkeypatc
         # The power assertion is a seam for a reason. Left to its default it spawns the
         # real `caffeinate`, which exists on macOS and not on a Linux CI runner.
         assertion_runner=lambda args: None,
+        transport=FakeTransport(),
+        pinger=FakePinger(),
         should_continue=once,
     )
     marked = _slots(lake_root, "quotes", "XYZ", date(2026, 9, 1))
@@ -611,20 +614,6 @@ def test_no_minute_falls_between_the_startup_pass_and_the_first_cycle(
     assert covered[-1] == captured[-1]
 
 
-class _Pages:
-    """A transport that keeps the pages instead of posting them.
-
-    The transport and pinger seams both default to a public endpoint, so a test that
-    left either alone would send a real person a real page.
-    """
-
-    def __init__(self) -> None:
-        self.titles: list[str] = []
-
-    def send(self, message) -> None:
-        self.titles.append(message.title)
-
-
 def _overrun_after_a_roster_change(
     tmp_path: Path, *, before: str, after: str
 ) -> tuple[Path, list[str]]:
@@ -653,7 +642,7 @@ def _overrun_after_a_roster_change(
     tickers.write_text(before)
 
     clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
-    alerts = _Pages()
+    alerts = FakeTransport()
     cycles = [0]
 
     def cycle(*, close_tag, session_phase) -> CycleResult:
@@ -680,7 +669,7 @@ def _overrun_after_a_roster_change(
         cycle_runner=cycle,
         should_continue=twice,
     )
-    return lake_root, _charged(alerts.titles)
+    return lake_root, _charged([m.title for m in alerts.messages])
 
 
 # The minutes the overrun swallows. The length is the watchdog's own page threshold, so
@@ -738,50 +727,6 @@ def test_a_ticker_retired_mid_session_stops_collecting_markers(tmp_path):
     )
     assert _marked(lake_root, "ABC") == SKIPPED
     assert _marked(lake_root, "XYZ") == []
-
-
-def test_a_roster_that_will_not_load_leaves_the_last_one_that_did_in_place(tmp_path):
-    """The fallback the design doc states, driven through the real loop.
-
-    ``tickers.yaml`` goes malformed at 10:00 and the loop then oversleeps. Both
-    skipped-slot consumers read it and both fail. Refusing to mark is worse than marking
-    from a stale snapshot, so the pass marks the roster that last loaded.
-
-    What the fallback buys is narrow, and the injected cycle runner hides the rest. In
-    production the next cycle calls ``load_tickers`` itself, unguarded, so the same file
-    ends the process moments later. The fallback is what gets the skipped-slot markers
-    written down before that happens. It does not keep the daemon alive, and neither
-    hook is guarded, so an exception raised here would lose those minutes as well.
-    """
-    lake_root, pages = _overrun_after_a_roster_change(
-        tmp_path,
-        before="ABC: {options: false}\n",
-        after="ABC: {options: false\n",
-    )
-    assert _marked(lake_root, "ABC") == SKIPPED
-    assert pages == ["ABC"]
-
-
-def test_the_fallback_is_the_last_roster_that_loaded_not_the_one_at_start(tmp_path):
-    """Which snapshot survives a broken file, pinned apart from the daemon-start one.
-
-    The loop-driven fallback test cannot separate these, because its roster breaks on
-    its first change, which makes the seed and the last loaded roster the same object.
-    Here the roster changes successfully first. The reader must then hold that change,
-    not fall back past it to what the daemon loaded at start.
-    """
-    from lake import daemon
-    from lake.tickers import load_tickers
-
-    path = tmp_path / "tickers.yaml"
-    path.write_text("ABC: {options: false}\n")
-    read = daemon._roster_reader(path, load_tickers(path))
-
-    path.write_text("ABC: {options: false}\nNEW: {options: false}\n")
-    assert [entry.ticker for entry in read()] == ["ABC", "NEW"]
-
-    path.write_text("ABC: {options: false\n")
-    assert [entry.ticker for entry in read()] == ["ABC", "NEW"]
 
 
 def test_the_watchdog_charges_the_roster_as_it_stands_on_a_skipped_slot(tmp_path):

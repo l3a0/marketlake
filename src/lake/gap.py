@@ -152,9 +152,13 @@ class GapMarker:
     already on disk.
 
     ``roster`` is a reader, not a roster, because scope changes while the daemon runs.
-    Each pass calls it once and marks whatever it returns. The reader must not raise:
-    ``on_start`` runs unguarded under ``KeepAlive``, so a raise there is a crash loop
-    that marks nothing. The daemon's reader falls back to the last roster that loaded.
+    Each pass calls it once and marks whatever it returns.
+
+    A reader that raises takes the daemon down, and the daemon's reader carries no
+    fallback to stop that. The price is the one the skipped-slot hook already pays for
+    its own read, and it is smaller here: a marker stands for a minute already gone, so
+    the successor's startup pass walks back and marks whatever this one missed. A stale
+    roster marking minutes the file no longer names is what has no later repair.
     """
 
     def __init__(
@@ -289,10 +293,11 @@ class GapMarker:
                                 )
                                 break
         except (OSError, ValueError) as exc:
-            # The lock or the ledger itself. The reader is contracted not to raise, so
-            # it is not what this catches. ``on_start`` is unguarded and the daemon runs
-            # under ``KeepAlive``, so raising here is a crash loop that marks nothing.
-            # Record it and let the loop run.
+            # The lock or the ledger itself. A roster that will not load raises
+            # ``TickersError`` and is deliberately not caught here, the same way the
+            # skipped-slot hook does not catch it. ``on_start`` is unguarded and the
+            # daemon runs under ``KeepAlive``, so raising for the lock or the ledger
+            # would be a crash loop that marks nothing. Record those and let the loop run.
             problems.append(f"marking pass: {type(exc).__name__}")
         return _merge(notes, MarkingReport(tuple(spans), tuple(sealed), (), tuple(problems)))
 
