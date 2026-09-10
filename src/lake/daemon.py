@@ -346,13 +346,39 @@ def _close_guard(
     A config or roster that will not load returns ``None``. Through
     ``run_loop_from_config`` that shape is never reached, because ``_alarm`` reads the
     same two files and refuses. The branch is kept for a direct caller.
+
+    The guard gets a reader rather than the roster loaded here, and the security master
+    it needs to place each ticker's capture start. Both answer at the moment the guard
+    runs rather than at daemon start. A missing master leaves the guard unclamped, which
+    only ever widens what it checks.
+
+    The reader carries no fallback, like the marker's, and the price is larger here.
+    Close+5 falls outside the capture window, so no cycle reads the roster on that tick
+    to raise first. A roster that breaks between the last cycle and close+5 therefore
+    ends the daemon at a moment nothing else would have, and that day's close check goes
+    with it: ``SessionDispatch`` marks a day served before running the job and never
+    serves a past day, so nothing retries it. Against that, a stale roster writes a
+    marker naming a ticker the file no longer captures, and no later pass removes a
+    marker.
     """
     try:
         config = load_config(config_path)
-        roster = load_tickers(tickers_path)
+        # Called for the refusal, not for the value. The guard reads the roster itself,
+        # once per run, so what this load decides is whether the guard is wired at all.
+        load_tickers(tickers_path)
     except (ConfigError, TickersError):
         return None
-    return CloseGuard(lake_root=config.lake_root, roster=roster, session_clock=session_clock)
+    master = None
+    try:
+        master = SecurityMaster.read(master_path(config.lake_root))
+    except (OSError, SecurityMasterError):
+        master = None
+    return CloseGuard(
+        lake_root=config.lake_root,
+        roster=lambda: load_tickers(tickers_path),
+        session_clock=session_clock,
+        master=master,
+    )
 
 
 def _idle_stamp(

@@ -195,7 +195,7 @@ def test_an_unobserved_equity_close_is_marked_and_never_fetched(tmp_path):
     fetches: list[str] = []
     guard = close_guard.CloseGuard(
         lake_root=tmp_path,
-        roster=Roster((EQUITY_ONLY,)),
+        roster=lambda: Roster((EQUITY_ONLY,)),
         session_clock=_clock(et(2026, 9, 2, 16, 18)),
         fill=lambda ticker, slot: fetches.append(ticker),
         pid=9,
@@ -216,7 +216,7 @@ def test_an_equity_close_that_landed_is_left_alone(tmp_path):
     _row(tmp_path, "quotes", "XYZ", et(2026, 9, 2, 16, 0), tag=SPOT_CLOSE, kind="data")
     outcome = close_guard.CloseGuard(
         lake_root=tmp_path,
-        roster=Roster((EQUITY_ONLY,)),
+        roster=lambda: Roster((EQUITY_ONLY,)),
         session_clock=_clock(et(2026, 9, 2, 16, 18)),
         pid=9,
     ).run(DAY)
@@ -230,7 +230,7 @@ def test_an_equity_close_that_ran_and_failed_is_already_recorded(tmp_path):
     _row(tmp_path, "quotes", "XYZ", et(2026, 9, 2, 16, 0), tag=SPOT_CLOSE, kind="gap")
     outcome = close_guard.CloseGuard(
         lake_root=tmp_path,
-        roster=Roster((EQUITY_ONLY,)),
+        roster=lambda: Roster((EQUITY_ONLY,)),
         session_clock=_clock(et(2026, 9, 2, 16, 18)),
         pid=9,
     ).run(DAY)
@@ -250,7 +250,7 @@ def test_a_missing_option_close_is_filled_at_the_close_slot(tmp_path):
 
     outcome = close_guard.CloseGuard(
         lake_root=tmp_path,
-        roster=Roster((SPY,)),
+        roster=lambda: Roster((SPY,)),
         session_clock=_clock(et(2026, 9, 2, 16, 18)),
         fill=fill,
         pid=9,
@@ -270,7 +270,7 @@ def test_an_option_close_that_ran_and_failed_is_still_filled(tmp_path):
     filled: list[str] = []
     outcome = close_guard.CloseGuard(
         lake_root=tmp_path,
-        roster=Roster((SPY,)),
+        roster=lambda: Roster((SPY,)),
         session_clock=_clock(et(2026, 9, 2, 16, 18)),
         fill=lambda ticker, slot: filled.append(ticker) or ["2026-09-04"],
         pid=9,
@@ -284,7 +284,7 @@ def test_an_option_close_that_landed_is_not_refetched(tmp_path):
     filled: list[str] = []
     outcome = close_guard.CloseGuard(
         lake_root=tmp_path,
-        roster=Roster((SPY,)),
+        roster=lambda: Roster((SPY,)),
         session_clock=_clock(et(2026, 9, 2, 16, 18)),
         fill=lambda ticker, slot: filled.append(ticker),
         pid=9,
@@ -297,7 +297,7 @@ def test_the_fill_is_refused_outright_past_close_plus_five(tmp_path):
     filled: list[str] = []
     outcome = close_guard.CloseGuard(
         lake_root=tmp_path,
-        roster=Roster((SPY,)),
+        roster=lambda: Roster((SPY,)),
         session_clock=_clock(et(2026, 9, 2, 16, 21)),
         fill=lambda ticker, slot: filled.append(ticker),
         pid=9,
@@ -311,7 +311,7 @@ def test_the_fill_is_refused_outright_past_close_plus_five(tmp_path):
 def test_a_fill_with_no_same_day_baseline_is_flagged_for_the_battery(tmp_path):
     outcome = close_guard.CloseGuard(
         lake_root=tmp_path,
-        roster=Roster((SPY,)),
+        roster=lambda: Roster((SPY,)),
         session_clock=_clock(et(2026, 9, 2, 16, 18)),
         fill=lambda ticker, slot: ["2026-09-04"],
         pid=9,
@@ -326,7 +326,7 @@ def test_a_vendor_failure_during_the_fill_never_stops_the_guard(tmp_path):
 
     outcome = close_guard.CloseGuard(
         lake_root=tmp_path,
-        roster=Roster((SPY, EQUITY_ONLY)),
+        roster=lambda: Roster((SPY, EQUITY_ONLY)),
         session_clock=_clock(et(2026, 9, 2, 16, 18)),
         fill=boom,
         pid=9,
@@ -343,7 +343,7 @@ def test_a_day_where_both_closes_landed_reports_nothing(tmp_path, capsys):
     _row(tmp_path, "quotes", "XYZ", et(2026, 9, 2, 16, 0), tag=SPOT_CLOSE, kind="data")
     outcome = close_guard.CloseGuard(
         lake_root=tmp_path,
-        roster=Roster((EQUITY_ONLY,)),
+        roster=lambda: Roster((EQUITY_ONLY,)),
         session_clock=_clock(et(2026, 9, 2, 16, 18)),
         pid=9,
     ).run(DAY)
@@ -428,3 +428,188 @@ def test_the_guard_writes_the_close_minutes_before_gap_marking_claims_them(tmp_p
     assert at_close[0]["error_class"] == close_guard.SPOT_CLOSE_UNOBSERVED
     stamps = [r["snap_ts"] for r in rows]
     assert len(stamps) == len(set(stamps)), "a minute is recorded twice"
+
+
+# -- who owed a close ----------------------------------------------------------------
+
+
+class _Master:
+    """A security master placing one ticker's capture start, refusing every other."""
+
+    def __init__(self, ticker: str, started: datetime) -> None:
+        self._ticker = ticker
+        self._started = started
+
+    def resolve(self, symbol, on, id_type=None):
+        return 1 if symbol == self._ticker else None
+
+    def capture_start_of(self, instrument_id):
+        return self._started
+
+
+def test_a_ticker_retired_before_the_close_is_not_marked_for_one(tmp_path):
+    """The guard reads the roster when it runs, so a retired ticker owes nothing.
+
+    A marker naming a surface no cycle writes to again is a write, not an omission, and
+    nothing later removes one. XYZ stays on the roster as the control: without it a
+    guard that stopped checking everything would pass.
+    """
+    live = [Roster((EQUITY_ONLY, TickerConfig(ticker="GONE", options=False)))]
+    guard = close_guard.CloseGuard(
+        lake_root=tmp_path,
+        roster=lambda: live[0],
+        session_clock=_clock(et(2026, 9, 2, 16, 18)),
+        pid=9,
+    )
+    live[0] = Roster((EQUITY_ONLY,))
+    outcome = guard.run(DAY)
+
+    assert outcome.unobserved == ("XYZ",)
+    assert _rows(tmp_path, "quotes", "GONE", DAY) == []
+
+
+def test_a_ticker_onboarded_before_the_close_is_checked_that_same_session(tmp_path):
+    """The other direction. The design has a new ticker live on the next cycle.
+
+    A frozen roster gives it no close check at all that day, and the check never comes
+    back: SessionDispatch serves a day once and never serves a past one.
+    """
+    live = [Roster((EQUITY_ONLY,))]
+    guard = close_guard.CloseGuard(
+        lake_root=tmp_path,
+        roster=lambda: live[0],
+        session_clock=_clock(et(2026, 9, 2, 16, 18)),
+        pid=9,
+    )
+    live[0] = Roster((EQUITY_ONLY, TickerConfig(ticker="NEW", options=False)))
+    outcome = guard.run(DAY)
+
+    assert outcome.unobserved == ("XYZ", "NEW")
+
+
+def test_a_close_before_a_ticker_came_into_scope_is_not_marked_missing(tmp_path):
+    """The front edge of scope, which the roster alone cannot answer.
+
+    A daemon restarting at 18:00 serves that day's close+5 job, and a ticker onboarded
+    at 17:00 is on the roster it reads. Its 16:00 was never owed. The design renders
+    that ticker as onboarded at 17:00, never as a close that went missing.
+    """
+    guard = close_guard.CloseGuard(
+        lake_root=tmp_path,
+        roster=lambda: Roster((TickerConfig(ticker="LATE", options=False),)),
+        session_clock=_clock(et(2026, 9, 2, 18, 0)),
+        master=_Master("LATE", et(2026, 9, 2, 17, 0)),
+        pid=9,
+    )
+    outcome = guard.run(DAY)
+
+    assert outcome.unobserved == ()
+    assert _rows(tmp_path, "quotes", "LATE", DAY) == []
+
+
+def test_each_close_is_clamped_to_its_own_moment(tmp_path):
+    """A ticker onboarded between the two closes owes the later one and not the earlier.
+
+    One clamp for both moments would be wrong whichever moment it took. The equity close
+    is 16:00 and the option close 16:15, so a 16:05 capture start splits them.
+    """
+    fetches: list[str] = []
+    guard = close_guard.CloseGuard(
+        lake_root=tmp_path,
+        roster=lambda: Roster((SPY,)),
+        session_clock=_clock(et(2026, 9, 2, 16, 18)),
+        master=_Master("SPY", et(2026, 9, 2, 16, 5)),
+        fill=lambda ticker, slot: fetches.append(ticker) or ["2026-09-18"],
+        pid=9,
+    )
+    outcome = guard.run(DAY)
+
+    assert outcome.unobserved == (), "16:00 was before SPY came into scope"
+    assert fetches == ["SPY"], "16:15 was after it, so the option close is still owed"
+
+
+def test_a_ticker_the_master_cannot_place_is_still_checked(tmp_path):
+    """Losing the clamp only ever widens what the guard checks.
+
+    A daemon with no master, or one whose master does not carry the ticker, still writes
+    the marker. Refusing to check would turn a missing master into a missing close.
+    """
+    guard = close_guard.CloseGuard(
+        lake_root=tmp_path,
+        roster=lambda: Roster((EQUITY_ONLY,)),
+        session_clock=_clock(et(2026, 9, 2, 16, 18)),
+        master=_Master("SOMETHING-ELSE", et(2026, 9, 2, 17, 0)),
+        pid=9,
+    )
+    assert guard.run(DAY).unobserved == ("XYZ",)
+
+
+def test_the_daemon_gives_the_guard_a_live_roster_and_the_master(tmp_path):
+    """The wiring, not the guard in isolation.
+
+    Freezing the roster in ``_close_guard`` or dropping the master it loads leaves the
+    whole suite green without this, which is what a review found. The loop runs from
+    16:14:30, so the roster changes on the option-close cycle and the guard fires four
+    ticks later at close+5.
+
+    GONE leaves the roster on that cycle and must collect no marker. LATE came into
+    scope at 17:00 the day before this session's close, so it owes nothing either, and
+    only the master can say so. XYZ is the control: it owes a close and gets one.
+    """
+    from lake.security_master import SecurityMaster, master_path
+    from tests.support.config import write_config
+
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("XYZ: {options: false}\nGONE: {options: false}\nLATE: {options: false}\n")
+
+    master = SecurityMaster()
+    for ticker, started in (
+        ("XYZ", et(2026, 8, 31, 9, 30)),
+        ("GONE", et(2026, 8, 31, 9, 30)),
+        ("LATE", et(2026, 9, 2, 17, 0)),
+    ):
+        master.register(
+            kind="equity", capture_start=started, valid_from=date(2026, 8, 31), ticker=ticker
+        )
+    master.write(master_path(lake_root))
+
+    clock = ManualClock(start=et(2026, 9, 2, 16, 14, 30))
+    cycles = [0]
+
+    def cycle(*, close_tag, session_phase):
+        cycles[0] += 1
+        if cycles[0] == 1:
+            tickers.write_text("XYZ: {options: false}\nLATE: {options: false}\n")
+        return CycleResult(clock.now(), ())
+
+    ticks = [0]
+
+    def six() -> bool:
+        ticks[0] += 1
+        return ticks[0] <= 6
+
+    daemon.run_loop_from_config(
+        config_path=str(config),
+        tickers_path=str(tickers),
+        clock=clock,
+        calendar=weekday_sessions(WEEK),
+        assertion_runner=lambda args: None,
+        cycle_runner=cycle,
+        transport=FakeTransport(),
+        pinger=FakePinger(),
+        should_continue=six,
+    )
+
+    def marked(ticker: str) -> list[str]:
+        return [
+            r["snap_ts"]
+            for r in _rows(lake_root, "quotes", ticker, DAY)
+            if r["error_class"] == close_guard.SPOT_CLOSE_UNOBSERVED
+        ]
+
+    assert marked("XYZ"), "the guard never ran, so the rest proves nothing"
+    assert marked("GONE") == [], "retired on the close cycle, so it owed no close"
+    assert marked("LATE") == [], "its capture start is after this session's close"

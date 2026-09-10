@@ -60,11 +60,15 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from lake import journal
-from lake.calendar import MARKET_TZ, NotASession
+from lake.calendar import NotASession
 from lake.lock import lake_lock
 from lake.manifest import latest_entries
 from lake.paths import LakePaths
-from lake.security_master import SecurityMaster, SecurityMasterError, is_in_scope
+from lake.security_master import (
+    SecurityMaster,
+    capture_start_in_market_time,
+    is_in_scope,
+)
 from lake.session import TICK, SessionClock, SessionPhase, missed_slots
 from lake.tickers import Roster
 
@@ -412,28 +416,13 @@ class GapMarker:
     def _capture_start(self, ticker: str) -> datetime | None:
         """The instrument's capture start, or ``None`` when the master cannot say.
 
-        This never raises. It runs from ``on_start``, which ``run_loop`` does not guard,
-        and the daemon runs under ``KeepAlive``. A raise here would relaunch within
-        seconds and repeat, marking nothing and paging nobody, so a missing master or an
-        unresolvable ticker degrades to no clamp rather than to a crash loop.
-
-        Losing the clamp is the safe direction. It can only widen the walk, and a marker
-        for a minute before the instrument was in scope is bounded by the anchor and by
-        ``MAX_LOOKBACK_SESSIONS``. Raising instead would stop the daemon from starting at
-        all.
+        Losing the clamp is the safe direction here. It can only widen the walk, and a
+        marker for a minute before the instrument was in scope is bounded by the anchor
+        and by ``MAX_LOOKBACK_SESSIONS``.
         """
-        if self._master is None:
-            return None
-        try:
-            instrument = self._master.resolve(ticker, self._session_clock.session_date())
-            if instrument is None:
-                return None
-            # The master stores this in UTC. Every other moment gap marking handles is
-            # market time, and a marker's ``snap_ts`` and its segment stamp both come
-            # from one, so convert here rather than letting one offset differ.
-            return self._master.capture_start_of(instrument).astimezone(MARKET_TZ)
-        except SecurityMasterError:
-            return None
+        return capture_start_in_market_time(
+            self._master, ticker, self._session_clock.session_date()
+        )
 
 
 def _merge(left: MarkingReport, right: MarkingReport) -> MarkingReport:

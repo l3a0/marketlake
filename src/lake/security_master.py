@@ -51,6 +51,8 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from lake.calendar import MARKET_TZ
+
 # The pinned schema version for this reference table. A file stamps it on every row.
 MASTER_SCHEMA_VERSION = 1
 
@@ -152,6 +154,34 @@ def is_in_scope(instant: datetime, capture_start: datetime) -> bool:
     out of scope, never a gap. Both arguments must be timezone-aware.
     """
     return instant >= capture_start
+
+
+def capture_start_in_market_time(master, ticker: str, on: date):
+    """The ticker's capture start as a market-time moment, or ``None``.
+
+    ``None`` means the master cannot say: there is no master, the ticker is not in it, or
+    it refused. Every caller treats that as no clamp, which only ever widens what gets
+    marked or checked.
+
+    This never raises, and the callers are why. Gap marking runs it from ``on_start``,
+    which ``run_loop`` does not guard, and the close+5 guard runs it from a
+    ``SessionDispatch`` on the same unguarded hooks. The daemon runs under ``KeepAlive``,
+    so a raise here relaunches within seconds and repeats, recording nothing and paging
+    nobody.
+
+    The master stores the epoch in UTC. Every moment its callers compare it against is
+    market time, so the conversion happens here rather than at each call site, where one
+    of them would eventually compare across offsets.
+    """
+    if master is None:
+        return None
+    try:
+        instrument = master.resolve(ticker, on)
+        if instrument is None:
+            return None
+        return master.capture_start_of(instrument).astimezone(MARKET_TZ)
+    except SecurityMasterError:
+        return None
 
 
 def master_path(lake_root: Path | str) -> Path:
