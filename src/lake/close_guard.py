@@ -21,6 +21,11 @@ outright.
 The guard is the sole writer of the ``spot_close`` absent-marker. On a post-close
 restart it runs before startup gap marking, so the minutes it owns are already recorded
 when the marker walks the day and are not marked a second time.
+
+Which tickers it checks is a rule of its own, because every row it writes names one. A
+ticker is checked for a close when the roster still carries it and its ``capture_start``
+is at or before that close. Both facts are read when the guard runs, never held from
+daemon start. ``run`` says why.
 """
 
 from __future__ import annotations
@@ -99,9 +104,10 @@ class CloseGuard:
     makes the guard marker-only, which is what a test wants and what a daemon with no
     vendor client falls back to.
 
-    ``roster`` is a reader, not a roster, and ``master`` says when each ticker came into
-    scope. Between them they answer the only question the guard asks before it writes:
-    did this ticker owe a close at this moment. See ``run``.
+    ``roster`` and ``master`` are both readers, not values. Between them they answer the
+    only question the guard asks before it writes: did this ticker owe a close at this
+    moment. Both are read when the guard runs, because onboarding writes both files while
+    the daemon runs and a copy from daemon start answers for the wrong moment. See ``run``.
     """
 
     def __init__(
@@ -110,7 +116,7 @@ class CloseGuard:
         lake_root: Path | str,
         roster: Callable[[], Roster],
         session_clock: SessionClock,
-        master: SecurityMaster | None = None,
+        master: Callable[[], SecurityMaster | None] | None = None,
         fill=None,
         pid: int | None = None,
     ) -> None:
@@ -139,6 +145,10 @@ class CloseGuard:
         ``capture_start`` says when the ticker came into scope, and each close is checked
         against its own moment. A ticker onboarded between the two closes owes the option
         close and not the equity close, so one clamp for both would be wrong either way.
+        The master is read here for the same reason the roster is. Onboarding writes it
+        while the daemon runs, so a copy from daemon start cannot place the one ticker the
+        clamp exists for, and the clamp would do nothing for exactly that case. One read
+        per run, so every ticker in a run is judged against one master.
 
         One end has no source. There is no ``capture_end`` epoch, so a ticker retired
         between the equity close and this run loses a marker it did owe. That window is
@@ -147,8 +157,9 @@ class CloseGuard:
         """
         bounds = self._session_clock.bounds(day)
         found = _Findings()
+        master = self._master() if self._master is not None else None
         for entry in self._roster():
-            epoch = capture_start_in_market_time(self._master, entry.ticker, day)
+            epoch = capture_start_in_market_time(master, entry.ticker, day)
             if epoch is None or is_in_scope(bounds.equity_close, epoch):
                 self._check_spot_close(entry.ticker, bounds.equity_close, found)
             if entry.options and (epoch is None or is_in_scope(bounds.option_close, epoch)):

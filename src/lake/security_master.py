@@ -156,7 +156,9 @@ def is_in_scope(instant: datetime, capture_start: datetime) -> bool:
     return instant >= capture_start
 
 
-def capture_start_in_market_time(master, ticker: str, on: date):
+def capture_start_in_market_time(
+    master: SecurityMaster | None, ticker: str, on: date
+) -> datetime | None:
     """The ticker's capture start as a market-time moment, or ``None``.
 
     ``None`` means the master cannot say: there is no master, the ticker is not in it, or

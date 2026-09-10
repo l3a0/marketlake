@@ -171,7 +171,7 @@ class GapMarker:
         lake_root: Path | str,
         roster: Callable[[], Roster],
         session_clock: SessionClock,
-        master: SecurityMaster | None = None,
+        master: Callable[[], SecurityMaster | None] | None = None,
         pid: int | None = None,
     ) -> None:
         self._root = Path(lake_root)
@@ -181,6 +181,11 @@ class GapMarker:
         self._master = master
         self._pid = os.getpid() if pid is None else pid
         self._unreadable: list[str] = []
+        # The master this pass is judging against, read once at the top of ``_pass``.
+        # A pass reads it rather than holding one from daemon start, because onboarding
+        # writes it while the daemon runs and the clamp exists for a mid-session
+        # onboarding. Per pass rather than per ticker, so one pass sees one master.
+        self._master_now: SecurityMaster | None = None
 
     # -- the two hooks ---------------------------------------------------------
 
@@ -262,6 +267,7 @@ class GapMarker:
         notes = MarkingReport()
         try:
             roster = self._roster()
+            self._master_now = self._master() if self._master is not None else None
             with lake_lock(self._root):
                 recorded = latest_entries(self._root)
                 for entry in roster:
@@ -421,7 +427,7 @@ class GapMarker:
         and by ``MAX_LOOKBACK_SESSIONS``.
         """
         return capture_start_in_market_time(
-            self._master, ticker, self._session_clock.session_date()
+            self._master_now, ticker, self._session_clock.session_date()
         )
 
 

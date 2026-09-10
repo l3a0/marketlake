@@ -18,7 +18,9 @@ from lake.security_master import (
     MASTER_SCHEMA,
     MASTER_SCHEMA_VERSION,
     SecurityMaster,
+    UnknownInstrument,
     UnsupportedSchemaVersion,
+    capture_start_in_market_time,
     master_path,
 )
 
@@ -102,3 +104,56 @@ def test_read_rejects_an_unsupported_schema_version(lake_root: Path):
 
     with pytest.raises(UnsupportedSchemaVersion):
         SecurityMaster.read(path)
+
+
+# -- the shared capture-start lookup ---------------------------------------------------
+
+
+def test_the_lookup_answers_in_market_time_not_utc():
+    """The epoch is stored in UTC and every caller compares it against market time.
+
+    The conversion lives here so one call site cannot compare across offsets. 14:30 UTC
+    is 09:30 in New York on that date, and the difference is five hours, which is enough
+    to move a clamp across a session open.
+    """
+    master = SecurityMaster()
+    master.register(kind="equity", capture_start=EPOCH, valid_from=date(2019, 1, 2), ticker="SPY")
+
+    found = capture_start_in_market_time(master, "SPY", date(2019, 1, 2))
+
+    assert found is not None
+    assert found == EPOCH, "the same instant"
+    assert (found.hour, found.minute) == (9, 30), "read in market time, not 14:30 UTC"
+    assert found.utcoffset() != EPOCH.utcoffset()
+
+
+@pytest.mark.parametrize(
+    ("master", "ticker"),
+    [(None, "SPY"), (SecurityMaster(), "SPY")],
+    ids=["no master at all", "a master that does not carry the ticker"],
+)
+def test_a_lookup_the_master_cannot_answer_returns_none(master, ticker):
+    """``None`` is the no-clamp answer, and it never raises.
+
+    Both callers run from hooks the loop does not guard, under ``KeepAlive``. A raise
+    here would relaunch within seconds and repeat, recording nothing.
+    """
+    assert capture_start_in_market_time(master, ticker, date(2019, 1, 2)) is None
+
+
+def test_a_master_that_refuses_mid_lookup_returns_none_rather_than_raising():
+    """A mapping can name an instrument the master cannot then place.
+
+    A partially written master is the way that happens. The callers run from hooks the
+    loop does not guard, so this has to degrade to no clamp rather than to a crash loop
+    that records nothing.
+    """
+
+    class Refusing:
+        def resolve(self, symbol, on, id_type=None):
+            return 1
+
+        def capture_start_of(self, instrument_id):
+            raise UnknownInstrument(instrument_id)
+
+    assert capture_start_in_market_time(Refusing(), "SPY", date(2019, 1, 2)) is None

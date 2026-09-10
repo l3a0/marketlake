@@ -498,7 +498,7 @@ def test_a_close_before_a_ticker_came_into_scope_is_not_marked_missing(tmp_path)
         lake_root=tmp_path,
         roster=lambda: Roster((TickerConfig(ticker="LATE", options=False),)),
         session_clock=_clock(et(2026, 9, 2, 18, 0)),
-        master=_Master("LATE", et(2026, 9, 2, 17, 0)),
+        master=lambda: _Master("LATE", et(2026, 9, 2, 17, 0)),
         pid=9,
     )
     outcome = guard.run(DAY)
@@ -518,7 +518,7 @@ def test_each_close_is_clamped_to_its_own_moment(tmp_path):
         lake_root=tmp_path,
         roster=lambda: Roster((SPY,)),
         session_clock=_clock(et(2026, 9, 2, 16, 18)),
-        master=_Master("SPY", et(2026, 9, 2, 16, 5)),
+        master=lambda: _Master("SPY", et(2026, 9, 2, 16, 5)),
         fill=lambda ticker, slot: fetches.append(ticker) or ["2026-09-18"],
         pid=9,
     )
@@ -538,23 +538,74 @@ def test_a_ticker_the_master_cannot_place_is_still_checked(tmp_path):
         lake_root=tmp_path,
         roster=lambda: Roster((EQUITY_ONLY,)),
         session_clock=_clock(et(2026, 9, 2, 16, 18)),
-        master=_Master("SOMETHING-ELSE", et(2026, 9, 2, 17, 0)),
+        master=lambda: _Master("SOMETHING-ELSE", et(2026, 9, 2, 17, 0)),
         pid=9,
     )
     assert guard.run(DAY).unobserved == ("XYZ",)
 
 
+def test_a_ticker_onboarded_after_the_daemon_started_is_still_placed(tmp_path):
+    """The master is read when the guard runs, not held from daemon start.
+
+    Onboarding writes the master while the daemon runs, so a copy from startup cannot
+    place the one ticker the clamp exists for. A frozen master leaves that ticker
+    unplaced, the clamp finds no epoch, and the guard marks a close from before the
+    ticker existed. The clamp would then do nothing in exactly the case it was added for.
+    """
+    from lake.security_master import SecurityMaster, master_path
+
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+
+    master = SecurityMaster()
+    master.register(
+        kind="equity",
+        capture_start=et(2026, 8, 31, 9, 30),
+        valid_from=date(2026, 8, 31),
+        ticker="XYZ",
+    )
+    master.write(master_path(lake_root))
+
+    guard = close_guard.CloseGuard(
+        lake_root=lake_root,
+        roster=lambda: Roster((EQUITY_ONLY, TickerConfig(ticker="LATE", options=False))),
+        session_clock=_clock(et(2026, 9, 2, 18, 0)),
+        master=daemon._master_reader(lake_root),
+        pid=9,
+    )
+
+    # LATE is onboarded at 17:00, after the guard was built.
+    later = SecurityMaster.read(master_path(lake_root))
+    later.register(
+        kind="equity",
+        capture_start=et(2026, 9, 2, 17, 0),
+        valid_from=DAY,
+        ticker="LATE",
+    )
+    later.write(master_path(lake_root))
+
+    outcome = guard.run(DAY)
+
+    assert outcome.unobserved == ("XYZ",), "XYZ owed a close and LATE did not"
+    assert _rows(lake_root, "quotes", "LATE", DAY) == []
+
+
 def test_the_daemon_gives_the_guard_a_live_roster_and_the_master(tmp_path):
     """The wiring, not the guard in isolation.
 
-    Freezing the roster in ``_close_guard`` or dropping the master it loads leaves the
-    whole suite green without this, which is what a review found. The loop runs from
-    16:14:30, so the roster changes on the option-close cycle and the guard fires four
-    ticks later at close+5.
+    Freezing the roster or dropping the master in ``_close_guard`` leaves the whole suite
+    green without this, which is what a review found. The clock starts at 16:14:30, so the
+    first tick is the 16:15 option close and the sixth is 16:20, which is close+5 and the
+    moment the dispatch fires. The roster changes on that first cycle, five ticks before
+    the guard reads it.
 
-    GONE leaves the roster on that cycle and must collect no marker. LATE came into
-    scope at 17:00 the day before this session's close, so it owes nothing either, and
-    only the master can say so. XYZ is the control: it owes a close and gets one.
+    Three tickers, one for each outcome:
+
+    1. XYZ owes the close and gets a marker. It is the control, since a guard that
+       checked nothing at all would pass the other two assertions.
+    2. GONE leaves the roster on the option-close cycle, so it owes nothing.
+    3. LATE has a capture start of 17:00 that same day, an hour after this session's
+       equity close, so it owes nothing either. Only the master can say so.
     """
     from lake.security_master import SecurityMaster, master_path
     from tests.support.config import write_config
