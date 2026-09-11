@@ -92,7 +92,7 @@ from lake import journal
 from lake.alert import undelivered
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
 from lake.clock import Clock, SystemClock
-from lake.config import GuardConstants, load_config
+from lake.config import GuardConstants, input_errors_exit, load_config
 from lake.control_plane import sunday_canary_due
 from lake.metadata import read_metadata
 from lake.paths import (
@@ -185,11 +185,14 @@ _DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 # is imported here and the calendar stays a seam.
 _CALENDAR_RANGE_ERRORS = (ValueError, OverflowError)
 
-# What a failed security-master read raises. The master is a Parquet file, so a missing
-# or truncated one surfaces as an ``OSError`` or as ``pyarrow``'s ``ArrowInvalid``, which
-# is a ``ValueError``. A file whose columns drifted raises ``KeyError``, and the master's
-# own refusals raise ``SecurityMasterError``. This set names the failures the read is
-# expected to meet, so each can be logged for what it is. It is not the only guard:
+# What a failed security-master read raises, named so each can be logged for what it is.
+# The master is a Parquet file. An absent one raises ``OSError``, caught just above as
+# ``FileNotFoundError``. A torn or corrupt one is folded by ``SecurityMaster.read`` into
+# ``MasterUnreadable``, a ``SecurityMasterError``, so this guard no longer depends on a
+# ``pyarrow`` type leaking out of the read. A file whose columns drifted raises
+# ``KeyError``, and the master's own refusals raise ``SecurityMasterError``. ``ValueError``
+# stays as a defensive classifier: ``ArrowInvalid`` is one, so a read that skipped the
+# fold would still be logged here rather than escape. This set is not the only guard.
 # ``_capture_starts`` catches everything, because a file with the pinned column names and
 # drifted value types raises from a comparison much later, not from the read.
 _MASTER_READ_ERRORS = (OSError, KeyError, ValueError, SecurityMasterError)
@@ -1481,16 +1484,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     no secret, and the connection it opens can reach nothing outside the lake tree. The
     real clock and the real calendar are wired here and nowhere else in this module.
 
-    A port already in use returns 2 with a one-line message. The design puts this
-    service under launchd ``KeepAlive``, where an uncaught traceback becomes a restart
-    loop instead of a readable complaint.
+    A malformed config exits with code 2 and a one-line message. A port already in
+    use does the same. The design puts this service under launchd ``KeepAlive``, where
+    an uncaught traceback becomes a restart loop instead of a readable complaint.
     """
     args = build_parser().parse_args(argv)
     if args.lake_root is not None:
         lake_root = Path(args.lake_root)
         guards = GuardConstants()
     else:
-        config = load_config(args.config)
+        with input_errors_exit("dashboard"):
+            config = load_config(args.config)
         lake_root = config.lake_root
         guards = config.guards
     service = DashboardService(
