@@ -887,7 +887,7 @@ class AssertionHolder:
         self._held: AssertionWindow | None = None
 
     def hold(self, now: datetime) -> tuple[str, ...] | None:
-        """Hold the assertion for the window ``now`` sits in, if one is open and unheld.
+        """Hold the assertion for the window ``now`` sits in, if one is open and not held yet.
 
         Returns the arguments the runner was handed, or ``None`` when nothing was owed:
         no window today, the window not open yet or already over, or this window

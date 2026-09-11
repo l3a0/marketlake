@@ -1,4 +1,4 @@
-"""The network guard itself, which nothing else holds.
+"""The network guard itself, which nothing else covers.
 
 The guard in ``tests/conftest.py`` is the reason a forgotten seam fails loudly instead of
 pinging the owner's live dead-man check. It is autouse, so every test depends on it and no

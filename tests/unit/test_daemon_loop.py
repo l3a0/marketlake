@@ -591,7 +591,7 @@ def test_main_passes_the_paths_to_the_config_entry(tmp_path, monkeypatch):
     assert isinstance(seen["transport"], NtfyTransport)
     assert isinstance(seen["pinger"], UrllibPinger)
     # The topic, not just the class. It is the write credential for the ntfy channel, so
-    # the wiring worth holding is which topic reached the transport. Asserting the class
+    # the wiring worth covering is which topic reached the transport. Asserting the class
     # alone passes a `main` that ignored --config and read the machine's own config,
     # which is the very asymmetry this PR exists to remove.
     assert seen["transport"]._topic == NTFY_TOPIC

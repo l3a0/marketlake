@@ -1,7 +1,7 @@
 """The daemon's production hook bindings, over real files.
 
 ``run_loop`` owns the loop and ``DaemonHooks`` owns the five seams it fires. Every
-observer that plugs into a seam is held on its own elsewhere. What these hold is the
+observer that plugs into a seam is covered on its own elsewhere. What these cover is the
 wiring ``run_loop_from_config`` builds between the two, which is the wiring the launchd
 job runs. A binding can be deleted with every isolated test still green, so each case
 here drives the production entry and watches the far end of one binding.
@@ -576,7 +576,7 @@ def test_a_roster_that_will_not_load_takes_the_daemon_down(tmp_path, roster):
 
 
 def test_a_broken_roster_off_the_capture_window_is_fatal_too(tmp_path):
-    """The one tick the deleted fallback used to carry, held so the cost stays visible.
+    """The one tick the deleted fallback used to carry, kept so the cost stays visible.
 
     `run_loop` hands missed slots to the skipped-slot hook and only then checks the
     phase, so a tick off the capture window fires the hook and runs no cycle. That is
