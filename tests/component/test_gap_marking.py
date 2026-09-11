@@ -314,7 +314,7 @@ def test_a_walk_that_reaches_the_cap_is_reported_rather_than_silent(tmp_path, mo
         lake_root=tmp_path,
         roster=lambda: Roster((EQUITY_ONLY,)),
         session_clock=SessionClock(clock=clock, calendar=calendar),
-        master=Master(),
+        master=lambda: Master(),
         pid=7,
     )
     report = marker.on_start()
@@ -339,7 +339,7 @@ def test_an_unresolvable_ticker_never_stops_the_daemon_from_starting(tmp_path):
         lake_root=tmp_path,
         roster=lambda: Roster((EQUITY_ONLY,)),
         session_clock=SessionClock(clock=clock, calendar=calendar),
-        master=Master(),
+        master=lambda: Master(),
         pid=7,
     )
     # The daemon runs under KeepAlive and run_loop does not guard on_start, so a raise
@@ -383,7 +383,7 @@ def test_a_stall_that_outlives_an_onboarding_marks_nothing_before_capture_start(
         lake_root=tmp_path,
         roster=lambda: Roster((TickerConfig(ticker="NEW", options=False),)),
         session_clock=SessionClock(clock=clock, calendar=weekday_sessions(WEEK)),
-        master=Master(),
+        master=lambda: Master(),
         pid=3,
     )
     marker.on_skipped([et(2026, 9, 2, 10, m) for m in range(1, 10)])
@@ -440,6 +440,50 @@ def test_the_startup_pass_reads_the_roster_too(tmp_path):
     live[0] = Roster((EQUITY_ONLY, TickerConfig(ticker="LATE", options=False)))
     marked = {span.ticker for span in marker.on_start().spans}
     assert marked == {"XYZ", "LATE"}
+
+
+def test_the_master_is_read_when_a_pass_runs_not_held_from_daemon_start(tmp_path):
+    """The clamp exists for a mid-session onboarding, so it has to be able to see one.
+
+    Onboarding writes the security master while the daemon runs. A copy held from daemon
+    start cannot place a ticker registered after it, so the clamp finds no epoch and does
+    nothing for exactly the case ``on_skipped`` describes: a stall that outlives an
+    onboarding.
+    """
+    from lake import daemon
+    from lake.security_master import SecurityMaster, master_path
+
+    master = SecurityMaster()
+    master.register(
+        kind="equity",
+        capture_start=et(2026, 8, 31, 9, 30),
+        valid_from=date(2026, 8, 31),
+        ticker="XYZ",
+    )
+    master.write(master_path(tmp_path))
+
+    clock = ManualClock(start=et(2026, 9, 2, 10, 10))
+    marker = gap.GapMarker(
+        lake_root=tmp_path,
+        roster=lambda: Roster((EQUITY_ONLY, TickerConfig(ticker="NEW", options=False))),
+        session_clock=SessionClock(clock=clock, calendar=weekday_sessions(WEEK)),
+        master=daemon._master_reader(tmp_path),
+        pid=4,
+    )
+
+    # NEW is onboarded at 10:05, after the marker was built and mid-stall.
+    later = SecurityMaster.read(master_path(tmp_path))
+    later.register(
+        kind="equity",
+        capture_start=et(2026, 9, 2, 10, 5),
+        valid_from=date(2026, 9, 2),
+        ticker="NEW",
+    )
+    later.write(master_path(tmp_path))
+
+    marker.on_skipped([et(2026, 9, 2, 10, m) for m in range(1, 10)])
+    marked = [slot[11:16] for slot in _slots(tmp_path, "quotes", "NEW", date(2026, 9, 2))]
+    assert marked == ["10:05", "10:06", "10:07", "10:08", "10:09"]
 
 
 # -- the production wiring -----------------------------------------------------------
@@ -537,7 +581,7 @@ def test_the_walk_back_cap_counts_sessions_not_calendar_days(tmp_path, monkeypat
         lake_root=tmp_path,
         roster=lambda: Roster((EQUITY_ONLY,)),
         session_clock=SessionClock(clock=clock, calendar=weekday_sessions(WEEK, date(2026, 9, 7))),
-        master=Master(),
+        master=lambda: Master(),
         pid=7,
     )
     report = marker.on_start()

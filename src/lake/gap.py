@@ -60,11 +60,15 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from lake import journal
-from lake.calendar import MARKET_TZ, NotASession
+from lake.calendar import NotASession
 from lake.lock import lake_lock
 from lake.manifest import latest_entries
 from lake.paths import LakePaths
-from lake.security_master import SecurityMaster, SecurityMasterError, is_in_scope
+from lake.security_master import (
+    SecurityMaster,
+    capture_start_in_market_time,
+    is_in_scope,
+)
 from lake.session import TICK, SessionClock, SessionPhase, missed_slots
 from lake.tickers import Roster
 
@@ -167,7 +171,7 @@ class GapMarker:
         lake_root: Path | str,
         roster: Callable[[], Roster],
         session_clock: SessionClock,
-        master: SecurityMaster | None = None,
+        master: Callable[[], SecurityMaster | None] | None = None,
         pid: int | None = None,
     ) -> None:
         self._root = Path(lake_root)
@@ -177,6 +181,11 @@ class GapMarker:
         self._master = master
         self._pid = os.getpid() if pid is None else pid
         self._unreadable: list[str] = []
+        # The master this pass is judging against, read once at the top of ``_pass``.
+        # A pass reads it rather than holding one from daemon start, because onboarding
+        # writes it while the daemon runs and the clamp exists for a mid-session
+        # onboarding. Per pass rather than per ticker, so one pass sees one master.
+        self._master_now: SecurityMaster | None = None
 
     # -- the two hooks ---------------------------------------------------------
 
@@ -258,6 +267,7 @@ class GapMarker:
         notes = MarkingReport()
         try:
             roster = self._roster()
+            self._master_now = self._master() if self._master is not None else None
             with lake_lock(self._root):
                 recorded = latest_entries(self._root)
                 for entry in roster:
@@ -412,28 +422,13 @@ class GapMarker:
     def _capture_start(self, ticker: str) -> datetime | None:
         """The instrument's capture start, or ``None`` when the master cannot say.
 
-        This never raises. It runs from ``on_start``, which ``run_loop`` does not guard,
-        and the daemon runs under ``KeepAlive``. A raise here would relaunch within
-        seconds and repeat, marking nothing and paging nobody, so a missing master or an
-        unresolvable ticker degrades to no clamp rather than to a crash loop.
-
-        Losing the clamp is the safe direction. It can only widen the walk, and a marker
-        for a minute before the instrument was in scope is bounded by the anchor and by
-        ``MAX_LOOKBACK_SESSIONS``. Raising instead would stop the daemon from starting at
-        all.
+        Losing the clamp is the safe direction here. It can only widen the walk, and a
+        marker for a minute before the instrument was in scope is bounded by the anchor
+        and by ``MAX_LOOKBACK_SESSIONS``.
         """
-        if self._master is None:
-            return None
-        try:
-            instrument = self._master.resolve(ticker, self._session_clock.session_date())
-            if instrument is None:
-                return None
-            # The master stores this in UTC. Every other moment gap marking handles is
-            # market time, and a marker's ``snap_ts`` and its segment stamp both come
-            # from one, so convert here rather than letting one offset differ.
-            return self._master.capture_start_of(instrument).astimezone(MARKET_TZ)
-        except SecurityMasterError:
-            return None
+        return capture_start_in_market_time(
+            self._master_now, ticker, self._session_clock.session_date()
+        )
 
 
 def _merge(left: MarkingReport, right: MarkingReport) -> MarkingReport:

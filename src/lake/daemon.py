@@ -272,6 +272,33 @@ def _report(report: MarkingReport, pass_name: str) -> None:
     print(" ".join(parts), file=sys.stderr)
 
 
+def _master_reader(lake_root: Path | str) -> Callable[[], SecurityMaster | None]:
+    """A reader that returns the security master as it stands, or ``None``.
+
+    The master answers when a ticker came into scope, and onboarding writes it while the
+    daemon runs. A copy loaded at daemon start therefore cannot place the one ticker the
+    scope clamp exists for, the one onboarded mid-session, so the clamp silently does
+    nothing for exactly that case.
+
+    ``None`` means the file is absent or unreadable. Every caller treats that as no
+    clamp, which only ever widens what gets marked or checked, so a missing master never
+    turns into a missing record. The reader never raises, because both callers run from
+    hooks ``run_loop`` does not guard.
+
+    Read per pass rather than per ticker. The callers each read once and hand the result
+    down, so one pass judges every ticker against one master.
+    """
+    path = master_path(lake_root)
+
+    def read() -> SecurityMaster | None:
+        try:
+            return SecurityMaster.read(path)
+        except (OSError, SecurityMasterError, ValueError):
+            return None
+
+    return read
+
+
 def _gap_marker(
     config_path: str | Path | None,
     tickers_path: str | Path | None,
@@ -301,16 +328,11 @@ def _gap_marker(
         load_tickers(tickers_path)
     except (ConfigError, TickersError):
         return None
-    master = None
-    try:
-        master = SecurityMaster.read(master_path(config.lake_root))
-    except (OSError, SecurityMasterError):
-        master = None
     return GapMarker(
         lake_root=config.lake_root,
         roster=lambda: load_tickers(tickers_path),
         session_clock=session_clock,
-        master=master,
+        master=_master_reader(config.lake_root),
     )
 
 
@@ -346,13 +368,34 @@ def _close_guard(
     A config or roster that will not load returns ``None``. Through
     ``run_loop_from_config`` that shape is never reached, because ``_alarm`` reads the
     same two files and refuses. The branch is kept for a direct caller.
+
+    The guard gets a reader rather than the roster loaded here, and the security master
+    it needs to place each ticker's capture start. Both answer at the moment the guard
+    runs rather than at daemon start. A missing master leaves the guard unclamped, which
+    only ever widens what it checks.
+
+    The reader carries no fallback, like the marker's, and the price is larger here.
+    Close+5 falls outside the capture window, so no cycle reads the roster on that tick
+    to raise first. A roster that breaks between the last cycle and close+5 therefore
+    ends the daemon at a moment nothing else would have, and it can cost that day's close
+    check. ``SessionDispatch`` marks a day served before running the job, so the pass that
+    raised does not repeat, and a restart re-serves the day only until Eastern midnight.
+    Against that, a stale roster writes a marker naming a ticker the file no longer
+    captures, and no later pass removes a marker.
     """
     try:
         config = load_config(config_path)
-        roster = load_tickers(tickers_path)
+        # Called for the refusal, not for the value. The guard reads the roster itself,
+        # once per run, so what this load decides is whether the guard is wired at all.
+        load_tickers(tickers_path)
     except (ConfigError, TickersError):
         return None
-    return CloseGuard(lake_root=config.lake_root, roster=roster, session_clock=session_clock)
+    return CloseGuard(
+        lake_root=config.lake_root,
+        roster=lambda: load_tickers(tickers_path),
+        session_clock=session_clock,
+        master=_master_reader(config.lake_root),
+    )
 
 
 def _idle_stamp(
@@ -470,9 +513,11 @@ def run_loop_from_config(
     runner is a closure over ``run_cycle_from_config``, which reloads the config, the
     roster, the token, and the chain plan on every call. The per-cycle re-read the
     design wants comes from that wiring rather than from anything this entry caches for
-    the cycle. The gap marker and the close guard below each load a roster once and hold
-    it for the daemon's life. The watchdog's skipped-slot hook holds none. It reads the
-    file on every call, and a read that fails is fatal.
+    the cycle. Nothing below holds a roster for the daemon's life. The gap marker and the
+    close guard each take a reader and call it when a pass or a run starts, and both also
+    read the security master there, because onboarding writes both files while the daemon
+    runs. The watchdog's skipped-slot hook reads the roster file on every call. None of
+    the three has a fallback, so a read that fails is fatal to the daemon.
 
     The caffeinate power assertion is held here rather than left to a caller. The
     design's chain is the wake alarm, then ``KeepAlive`` starting the daemon, then the
@@ -499,14 +544,13 @@ def run_loop_from_config(
 
     Gap marking rides ``on_start`` and ``on_skipped`` the same way. Both hand their
     missed slots to one ``GapMarker``, so a restart and a live overrun leave the same
-    kind of record. Marking needs the lake root, the security master, and the roster.
-    The first two are loaded once here rather than per cycle. The roster is read per
-    marking pass, the same way the skipped-slot hook reads it, so both judge scope from
-    the file on the one hook where no cycle ran to say. A missing security master leaves
-    marking off and the loop still runs, because a daemon that captures without marking
-    is better than one that does not start. A config or roster that will not load is
-    fatal instead, because the alarm needs both and a daemon with no dead-man cannot
-    report its own death.
+    kind of record. Marking needs the lake root, the roster, and the security master.
+    Only the lake root is fixed here. The roster and the master are both read per pass,
+    because onboarding writes both while the daemon runs and a copy from startup answers
+    for the wrong moment. A master that cannot be read leaves marking unclamped rather
+    than off, which only ever widens what gets marked. A config or roster that will not
+    load is fatal instead, because the alarm needs both and a daemon with no dead-man
+    cannot report its own death.
     """
     clock = clock if clock is not None else SystemClock()
     calendar = calendar if calendar is not None else ExchangeCalendar()
