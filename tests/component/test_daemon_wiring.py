@@ -12,7 +12,7 @@ transport and the health-check pinger, are faked, because a page sent from a tes
 page a person receives. So the tier is component: the daemon over real files, with the
 clock, the calendar, and the network still fake.
 
-Seven bindings are covered here.
+Eight bindings are covered here.
 
 1. The skipped-slot hook reaches the gap marker, so a live overrun records the minutes
    it slept through.
@@ -31,11 +31,16 @@ Seven bindings are covered here.
    now reaches the caller as one `TickersError`. Each entry expands into the surfaces its
    ticker is captured on, so an options ticker's chains counter is charged beside its
    quotes.
+8. The configured page threshold reaches the watchdog, and a mid-session recalibration
+   of ``watchdog_page_minutes`` takes effect on the next cycle without a restart. The
+   value is read off the config each time the watchdog decides to page. Baking it in at
+   loop start, which is what the daemon did before, would hold the old number and no
+   other case here drives a config edit to catch it.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -47,6 +52,7 @@ from lake.alert import Message
 from lake.capture import CycleResult, SegmentOutcome
 from lake.chain_plan import ChainPlan, load_chain_plan
 from lake.compact import write_chain_plan
+from lake.config import GuardConstants
 from lake.deadman import CAPTURE_SLUG
 from lake.session import SPOT_CLOSE
 from lake.tickers import TickersError
@@ -136,15 +142,24 @@ class _Rig:
     pinger: FakePinger
 
 
-def _rig(tmp_path: Path, roster: str = EQUITY_ONLY) -> _Rig:
-    """A complete config, roster, and lake under ``tmp_path``."""
+def _rig(
+    tmp_path: Path,
+    roster: str = EQUITY_ONLY,
+    *,
+    guards: Mapping[str, object] | None = None,
+) -> _Rig:
+    """A complete config, roster, and lake under ``tmp_path``.
+
+    ``guards`` renders a recalibrated guard section into the config, the way a hand edit
+    sets one, so a test can drive a non-default constant through the production entry.
+    """
     lake_root = tmp_path / "lake"
     lake_root.mkdir()
     tickers = tmp_path / "tickers.yaml"
     tickers.write_text(roster)
     return _Rig(
         lake_root=lake_root,
-        config=write_config(tmp_path, lake_root),
+        config=write_config(tmp_path, lake_root, guards=guards),
         tickers=tickers,
         token=tmp_path / "token.json",
         transport=_Recording(),
@@ -629,3 +644,77 @@ def test_the_hook_charges_every_surface_its_ticker_is_captured_on(tmp_path):
         "Capture down: SPY chains",
         "Capture down: SPY quotes",
     ]
+
+
+# -- 8. a mid-session recalibration reaches the watchdog ----------------------------
+
+
+# The threshold starts high, above anything this run reaches, then drops mid-session.
+# Both the start value and the value the counter trips at are non-default, so neither is
+# the pinned default a frozen threshold would fall back to.
+START_PAGE_MINUTES = 8
+RECALIBRATED_PAGE_MINUTES = 4
+
+
+class _FailingCycles:
+    """A cycle runner whose every cycle fails one surface, and which rewrites the config
+    once, at a chosen call.
+
+    Each call returns a gap for XYZ quotes, so the watchdog charges that counter every
+    minute. On the ``recalibrate_at`` call it rewrites ``config.yaml`` first, so the edit
+    is on disk before the watchdog reads the threshold for that minute.
+    """
+
+    def __init__(
+        self, rig: _Rig, clock: ManualClock, *, recalibrate_at: int, new_page_minutes: int
+    ):
+        self._rig = rig
+        self._clock = clock
+        self._recalibrate_at = recalibrate_at
+        self._new_page_minutes = new_page_minutes
+        self.calls = 0
+
+    def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        self.calls += 1
+        if self.calls == self._recalibrate_at:
+            write_config(
+                self._rig.config.parent,
+                self._rig.lake_root,
+                guards={"watchdog_page_minutes": self._new_page_minutes},
+            )
+        slot = self._clock.now().replace(second=0, microsecond=0)
+        return CycleResult(
+            snap_ts=slot, segments=(_segment(journal.ROW_KIND_GAP, self._rig.lake_root),)
+        )
+
+
+def test_a_mid_session_recalibration_reaches_the_watchdog(tmp_path):
+    """A recalibrated ``watchdog_page_minutes`` has to take effect without a restart.
+
+    The daemon reads the threshold off the config each time the watchdog decides to page,
+    so a hand edit mid-session moves the minute a surface pages on. Baking the value in at
+    loop start, which is what the daemon did before, would hold the old number until a
+    restart, and no other case here drives a config edit to catch it.
+
+    The threshold starts at eight and a surface fails every minute. Two failing minutes
+    raise nothing. The config is then rewritten to four. The counter keeps climbing from
+    where it stood, so the fourth failing minute is the one that trips it, at the new
+    number.
+    """
+    assert START_PAGE_MINUTES != RECALIBRATED_PAGE_MINUTES
+    assert RECALIBRATED_PAGE_MINUTES != GuardConstants().watchdog_page_minutes
+    rig = _rig(tmp_path, guards={"watchdog_page_minutes": START_PAGE_MINUTES})
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(
+        rig,
+        clock,
+        ticks=4,
+        cycle_runner=_FailingCycles(
+            rig, clock, recalibrate_at=3, new_page_minutes=RECALIBRATED_PAGE_MINUTES
+        ),
+    )
+
+    (page,) = rig.transport.sent
+    assert page.event == "capture_down"
+    assert page.title == "Capture down: XYZ quotes"
+    assert page.body == f"{RECALIBRATED_PAGE_MINUTES} session minutes without a durable cycle"

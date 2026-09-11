@@ -293,7 +293,7 @@ def _master_reader(lake_root: Path | str) -> Callable[[], SecurityMaster | None]
     def read() -> SecurityMaster | None:
         try:
             return SecurityMaster.read(path)
-        except (OSError, SecurityMasterError):
+        except (OSError, SecurityMasterError, ValueError):
             return None
 
     return read
@@ -489,7 +489,17 @@ def _alarm(
         # The panel's dead-man line reads the lake, so a landed ping is written there.
         recorder=lambda at: stamp_ping(lake_root, at=at),
     )
-    return Watchdog(page_minutes=config.guards.watchdog_page_minutes), publisher, deadman
+    # The page threshold is read live rather than baked in. The watchdog calls this each
+    # time it decides whether to page, so an operator who recalibrates
+    # ``watchdog_page_minutes`` mid-session sees it on the next cycle, not the next
+    # restart. That matches the chain chunker's split-depth bound, which the cycle already
+    # reads off the config every minute. The price is a config read on the alerting path,
+    # the same one the skipped-slot hook pays for the roster.
+    return (
+        Watchdog(page_minutes=lambda: load_config(config_path).guards.watchdog_page_minutes),
+        publisher,
+        deadman,
+    )
 
 
 def run_loop_from_config(
