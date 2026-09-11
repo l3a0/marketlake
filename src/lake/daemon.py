@@ -293,7 +293,7 @@ def _master_reader(lake_root: Path | str) -> Callable[[], SecurityMaster | None]
     def read() -> SecurityMaster | None:
         try:
             return SecurityMaster.read(path)
-        except (OSError, SecurityMasterError, ValueError):
+        except (OSError, SecurityMasterError):
             return None
 
     return read

@@ -43,6 +43,7 @@ would owe fees to redistribute.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
@@ -52,6 +53,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from lake.calendar import MARKET_TZ
+from lake.paths import temp_write_path
 
 # The pinned schema version for this reference table. A file stamps it on every row.
 MASTER_SCHEMA_VERSION = 1
@@ -121,6 +123,23 @@ class UnsupportedSchemaVersion(SecurityMasterError):
     def __init__(self, found: int) -> None:
         super().__init__(f"master schema version {found}, this code reads {MASTER_SCHEMA_VERSION}")
         self.found = found
+
+
+class MasterUnreadable(SecurityMasterError):
+    """Raised when the master file is present but truncated or otherwise not valid parquet.
+
+    A torn write, or a write interrupted partway, leaves fewer bytes than a whole master.
+    ``pyarrow`` refuses those with ``ArrowInvalid``, whose class tree is ``ArrowInvalid ->
+    ValueError``, not a ``SecurityMasterError``. A caller guarding the master's own errors
+    alone would let it escape, so ``read`` folds it into this class. Two other unreadable
+    cases raise ``OSError`` instead, and callers guard that beside this class: an absent
+    master, and an on-disk read error such as a bad sector, which ``pyarrow`` reports as
+    ``ArrowIOError``.
+    """
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(f"security master at {path} is not readable parquet")
+        self.path = path
 
 
 @dataclass(frozen=True)
@@ -429,13 +448,48 @@ class SecurityMaster:
         )
 
     def write(self, path: Path | str) -> Path:
-        """Write the master to a parquet file at ``path``, creating parent dirs."""
+        """Write the master to a parquet file at ``path``, through a temp file and a rename.
+
+        Onboarding writes the master while the daemon and the dashboard read it. A write
+        straight onto the target truncates it first, so a reader can catch the file empty
+        or half done. The write instead goes to a temp file beside the target, flushes,
+        then renames over the target in one step. A reader sees the whole old master or
+        the whole new one, never a torn one. The roster's write takes this shape for the
+        same reason, added for the same bug. A crash mid-write leaves the prior master
+        intact, and the temp file is removed on any failure.
+
+        The temp path comes from ``paths.temp_write_path``, which owns the one spelling of
+        the marker the backup exclusion matches. Parent dirs are created if absent.
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(self.to_table(), path)
+        tmp = temp_write_path(path, os.getpid())
+        try:
+            pq.write_table(self.to_table(), tmp)
+            fd = os.open(tmp, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
         return path
 
     @classmethod
     def read(cls, path: Path | str) -> SecurityMaster:
-        """Read a master from a parquet file at ``path``."""
-        return cls.from_table(pq.read_table(Path(path)))
+        """Read a master from a parquet file at ``path``.
+
+        A truncated or torn file raises ``pyarrow``'s ``ArrowInvalid``. It is folded into
+        ``MasterUnreadable`` so a caller guarding ``SecurityMasterError`` catches it rather
+        than a stray ``ValueError``. An absent file raises ``OSError``, and so does an
+        on-disk read error such as a bad sector. The fold stays narrow on purpose: an
+        absent master is not a corrupt one, and callers treat the two apart.
+        """
+        path = Path(path)
+        try:
+            table = pq.read_table(path)
+        except pa.ArrowInvalid as exc:
+            raise MasterUnreadable(path) from exc
+        return cls.from_table(table)

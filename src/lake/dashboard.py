@@ -185,11 +185,14 @@ _DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 # is imported here and the calendar stays a seam.
 _CALENDAR_RANGE_ERRORS = (ValueError, OverflowError)
 
-# What a failed security-master read raises. The master is a Parquet file, so a missing
-# or truncated one surfaces as an ``OSError`` or as ``pyarrow``'s ``ArrowInvalid``, which
-# is a ``ValueError``. A file whose columns drifted raises ``KeyError``, and the master's
-# own refusals raise ``SecurityMasterError``. This set names the failures the read is
-# expected to meet, so each can be logged for what it is. It is not the only guard:
+# What a failed security-master read raises, named so each can be logged for what it is.
+# The master is a Parquet file. An absent one raises ``OSError``, caught just above as
+# ``FileNotFoundError``. A torn or corrupt one is folded by ``SecurityMaster.read`` into
+# ``MasterUnreadable``, a ``SecurityMasterError``, so this guard no longer depends on a
+# ``pyarrow`` type leaking out of the read. A file whose columns drifted raises
+# ``KeyError``, and the master's own refusals raise ``SecurityMasterError``. ``ValueError``
+# stays as a defensive classifier: ``ArrowInvalid`` is one, so a read that skipped the
+# fold would still be logged here rather than escape. This set is not the only guard.
 # ``_capture_starts`` catches everything, because a file with the pinned column names and
 # drifted value types raises from a comparison much later, not from the read.
 _MASTER_READ_ERRORS = (OSError, KeyError, ValueError, SecurityMasterError)
