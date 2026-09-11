@@ -18,6 +18,22 @@ startup marker says ``daemon_dead``, which is true: some other incarnation ended
 skipped-slot marker says ``slot_overrun``, because the daemon is alive on those minutes
 and recording it as dead would make the marker lie about its own reason.
 
+Both passes read the roster when they run, never a roster frozen at daemon start. The
+roster is the only statement of what is in scope right now, and the capture cycle reads
+it fresh every minute. A pass that read a stale one would disagree with capture in both
+directions. A ticker onboarded mid-session would be captured and left unmarked, which is
+the hole this exists to close. A ticker retired mid-session would keep collecting markers
+on a surface nothing captures, manufacturing holes that were never owed.
+
+A ticker's scope has two ends, and reading is what keeps marking on the right side of
+both. ``capture_start`` opens it, and the anchor clamps there, so minutes before it are
+out of scope rather than gaps. Leaving ``tickers.yaml`` closes it, and marking reads
+that same file, so both ends move with capture. One limit on the closing end is worth
+naming. There is no ``capture_end`` epoch, so a ticker that leaves the roster and later
+returns has its whole absence walked back as ``daemon_dead`` gaps by the next startup
+pass. Reading the roster does not change that, because the anchor knows only the newest
+recorded minute.
+
 Marking is calendar-driven, not segment-driven. It asks the calendar which sessions
 existed and which minutes those sessions held, then subtracts what is already recorded.
 A date with no segments at all is exactly the case a segment-driven walk would miss, and
@@ -48,7 +64,7 @@ from lake.calendar import MARKET_TZ, NotASession
 from lake.lock import lake_lock
 from lake.manifest import latest_entries
 from lake.paths import LakePaths
-from lake.security_master import SecurityMaster, SecurityMasterError
+from lake.security_master import SecurityMaster, SecurityMasterError, is_in_scope
 from lake.session import TICK, SessionClock, SessionPhase, missed_slots
 from lake.tickers import Roster
 
@@ -132,15 +148,24 @@ class GapMarker:
 
     Every seam is injected. There is no wall clock here at all: the minutes come from
     the calendar, and each segment is stamped with the first minute it marks. So a
-    marking pass is a pure function of the calendar, the roster, and what is already on
-    disk.
+    marking pass is decided entirely by the calendar, the roster it reads, and what is
+    already on disk.
+
+    ``roster`` is a reader, not a roster, because scope changes while the daemon runs.
+    Each pass calls it once and marks whatever it returns.
+
+    A reader that raises takes the daemon down, and the daemon's reader carries no
+    fallback to stop that. The price is the one the skipped-slot hook already pays for
+    its own read, and it is smaller here: a marker stands for a minute already gone, so
+    the successor's startup pass walks back and marks whatever this one missed. A stale
+    roster marking minutes the file no longer names is what has no later repair.
     """
 
     def __init__(
         self,
         *,
         lake_root: Path | str,
-        roster: Roster,
+        roster: Callable[[], Roster],
         session_clock: SessionClock,
         master: SecurityMaster | None = None,
         pid: int | None = None,
@@ -183,9 +208,22 @@ class GapMarker:
         """Mark the capture slots a live loop slept through.
 
         The loop hands the same slots for every ticker, because it missed the whole
-        cycle rather than one ticker's fetch.
+        cycle rather than one ticker's fetch. Each ticker's own scope still applies, so
+        the slots are clamped to its ``capture_start`` the way the startup walk's anchor
+        is. A stall can outlive an onboarding: the loop sleeps from 10:00 to 10:10 and a
+        ticker joins the roster at 10:05, so this pass is the first to see it. Its 10:01
+        was never owed, and marking it would render "40% missing" on a ticker the design
+        renders as "onboarded 10:05". A ticker the master cannot place is not clamped,
+        which only ever widens the marking, and ``_capture_start`` never raises.
         """
-        return self._pass(SLOT_OVERRUN, lambda surface, ticker: (list(slots), MarkingReport()))
+
+        def plan(surface: str, ticker: str) -> tuple[list[datetime], MarkingReport]:
+            epoch = self._capture_start(ticker)
+            if epoch is None:
+                return list(slots), MarkingReport()
+            return [slot for slot in slots if is_in_scope(slot, epoch)], MarkingReport()
+
+        return self._pass(SLOT_OVERRUN, plan)
 
     # -- the pass --------------------------------------------------------------
 
@@ -209,15 +247,20 @@ class GapMarker:
         Capture stays outside this lock, because a blocked cycle drops perishable
         minutes. A marker stands for a minute already gone, so nothing perishes while it
         waits.
+
+        The roster is read once here, for the pass rather than for each ticker, and
+        outside the lock because it is not lake state. One read per pass keeps every
+        surface in the pass judged against one snapshot of what is in scope.
         """
         spans: list[MarkedSpan] = []
         sealed: list[str] = []
         problems: list[str] = []
         notes = MarkingReport()
         try:
+            roster = self._roster()
             with lake_lock(self._root):
                 recorded = latest_entries(self._root)
-                for entry in self._roster:
+                for entry in roster:
                     for surface in surfaces_for(entry):
                         slots, pair_notes = plan(surface, entry.ticker)
                         notes = _merge(notes, pair_notes)
@@ -250,9 +293,11 @@ class GapMarker:
                                 )
                                 break
         except (OSError, ValueError) as exc:
-            # The lock or the ledger itself. ``on_start`` is unguarded and the daemon
-            # runs under ``KeepAlive``, so raising here is a crash loop that marks
-            # nothing. Record it and let the loop run.
+            # The lock or the ledger itself. A roster that will not load raises
+            # ``TickersError`` and is deliberately not caught here, the same way the
+            # skipped-slot hook does not catch it. ``on_start`` is unguarded and the
+            # daemon runs under ``KeepAlive``, so raising for the lock or the ledger
+            # would be a crash loop that marks nothing. Record those and let the loop run.
             problems.append(f"marking pass: {type(exc).__name__}")
         return _merge(notes, MarkingReport(tuple(spans), tuple(sealed), (), tuple(problems)))
 
