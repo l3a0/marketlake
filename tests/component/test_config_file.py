@@ -128,6 +128,8 @@ def test_input_errors_exit_lets_every_other_exception_through():
         ("lake.runner", ["run", "--config", "MISSING"]),
         ("lake.control_plane", ["self-check", "--config", "MISSING"]),
         ("lake.daemon", ["--config", "MISSING"]),
+        ("lake.dashboard", ["--config", "MISSING"]),
+        ("lake.probe_calendar", ["--config", "MISSING"]),
         ("lake.control_plane", ["sunday", "--config", "MISSING"]),
     ],
 )
@@ -143,9 +145,16 @@ def test_a_missing_config_names_itself_at_every_cli_entry(module, argv, tmp_path
     assert excinfo.value.code == 2
     err = capsys.readouterr().err
     assert err.count("\n") == 1
-    # The control plane names its subcommand rather than its module, because one
-    # module carries four of them and "control_plane:" would not say which failed.
-    expected = argv[0] if module == "lake.control_plane" else module.removeprefix("lake.")
+    # Two entries print a label that is not their bare module suffix. The control
+    # plane names its subcommand, because one module carries four of them and
+    # "control_plane:" would not say which failed. probe_calendar spells its label
+    # with a hyphen.
+    if module == "lake.control_plane":
+        expected = argv[0]
+    elif module == "lake.probe_calendar":
+        expected = "probe-calendar"
+    else:
+        expected = module.removeprefix("lake.")
     assert err.startswith(f"{expected}: config file not found:")
 
 
