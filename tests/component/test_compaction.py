@@ -1023,7 +1023,9 @@ def test_a_quotes_only_day_has_no_profile(lake_root):
 # -- the command-line entry --------------------------------------------------
 
 
-def test_main_runs_the_job_from_config_with_injected_seams(lake_root, tmp_path, capsys):
+def test_main_runs_the_job_from_config_with_injected_seams(
+    lake_root, tmp_path, capsys, monkeypatch
+):
     config = write_config(tmp_path, lake_root)
     plan_path = tmp_path / "chain_plan.json"
     _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
@@ -1031,13 +1033,15 @@ def test_main_runs_the_job_from_config_with_injected_seams(lake_root, tmp_path, 
     events: list[str] = []
     backup = FakeBackup(events)
     pinger = FakePinger(events)
+    # main builds rsync and the healthchecks pinger itself. A fake reaches them by
+    # replacing the producer main names, not by a seam this entry no longer accepts.
+    monkeypatch.setattr("lake.compact.RsyncBackup", lambda: backup)
+    monkeypatch.setattr("lake.compact.UrllibPinger", lambda: pinger)
 
     code = main(
         ["--config", str(config), "--plan", str(plan_path)],
         clock=_clock_at(DAY, 16, 30),
         calendar=_calendar(),
-        backup=backup,
-        pinger=pinger,
     )
 
     assert code == 0
