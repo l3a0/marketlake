@@ -88,6 +88,18 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
      the cycle observer feeds,
   7. the security master the wiring loads for the gap marker, whose absence loses a freshly
      onboarded ticker's marked minutes.
+- **Unowned.** The close+5 guard's roster snapshot. `daemon._close_guard` loads the roster
+  once and hands the object to `CloseGuard`, which keeps it for the daemon's life. The
+  guard does not ride a capture cycle, so it is in the position gap-marking and the
+  watchdog counters were in before they were made to read `tickers.yaml` themselves. The
+  same two directions apply. A ticker onboarded mid-session owes a `spot_close` and an
+  `option_close` the frozen roster never checks, and a ticker retired mid-session can
+  collect a `spot_close_unobserved` marker it no longer owes. The gap marker now takes a
+  reader and calls it per pass, which is the shape that would fit. **It stays in slice 2**, beside the guard it belongs to.
+  What it needs first is not code but a decision: the guard is a per-day check rather than
+  a per-minute record of an owed minute, so "why does it read the roster at that moment"
+  has to be answered before "is the frozen one wrong". The design doc names it as open in
+  the Onboarding section rather than settling it.
 - **D11** close tags and the close+5 guard. Close+5 is the five-minute window after the option close, the last moment an option-close fetch may land. It plugs into D9's close-tag hook, and it builds the session-relative dispatcher the design calls for. Everything session-relative runs from inside the daemon, because launchd's calendar intervals are fixed wall-clock and cannot express a close-relative time. `SessionDispatch` fires one job once per session day at a moment the calendar decides, including on a daemon that starts after that moment has passed. The close+15 compaction dispatch binds to the same seam when someone builds it. Two rules are worth stating where both writers can see them:
   1. The guard's fill triggers on missing marks, not a missing cycle. A chain that failed at the option close leaves a tagged gap row holding nothing a reader can price against, and a close+5 refetch is exactly what rescues it.
   2. On a post-close restart the guard runs before startup gap-marking, so the two close minutes it owns are already recorded when D10's marker walks the day.

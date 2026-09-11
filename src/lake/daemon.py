@@ -286,10 +286,19 @@ def _gap_marker(
     A config or roster that will not load returns ``None`` here too. Through
     ``run_loop_from_config`` that shape is never reached, because ``_alarm`` reads the
     same two files and refuses. The branch is kept for a direct caller.
+
+    The marker gets a reader rather than the roster loaded here, so a pass marks the
+    tickers in scope when it runs rather than the ones configured at daemon start. The
+    load above still happens, because it decides whether marking is wired at all. The
+    reader carries no fallback, for the reason the skipped-slot hook's own read carries
+    none: a stale roster marking minutes the file no longer names is the failure the
+    re-read exists to prevent.
     """
     try:
         config = load_config(config_path)
-        roster = load_tickers(tickers_path)
+        # Called for the refusal, not for the value. The marker reads the roster itself,
+        # per pass, so what this load decides is whether marking is wired at all.
+        load_tickers(tickers_path)
     except (ConfigError, TickersError):
         return None
     master = None
@@ -299,7 +308,7 @@ def _gap_marker(
         master = None
     return GapMarker(
         lake_root=config.lake_root,
-        roster=roster,
+        roster=lambda: load_tickers(tickers_path),
         session_clock=session_clock,
         master=master,
     )
@@ -490,12 +499,14 @@ def run_loop_from_config(
 
     Gap marking rides ``on_start`` and ``on_skipped`` the same way. Both hand their
     missed slots to one ``GapMarker``, so a restart and a live overrun leave the same
-    kind of record. Marking needs the lake root, the roster, and the security master,
-    which this entry did not load before, so it loads them once here rather than per
-    cycle. A missing security master leaves marking off and the loop still runs, because
-    a daemon that captures without marking is better than one that does not start. A
-    config or roster that will not load is fatal instead, because the alarm needs both
-    and a daemon with no dead-man cannot report its own death.
+    kind of record. Marking needs the lake root, the security master, and the roster.
+    The first two are loaded once here rather than per cycle. The roster is read per
+    marking pass, the same way the skipped-slot hook reads it, so both judge scope from
+    the file on the one hook where no cycle ran to say. A missing security master leaves
+    marking off and the loop still runs, because a daemon that captures without marking
+    is better than one that does not start. A config or roster that will not load is
+    fatal instead, because the alarm needs both and a daemon with no dead-man cannot
+    report its own death.
     """
     clock = clock if clock is not None else SystemClock()
     calendar = calendar if calendar is not None else ExchangeCalendar()

@@ -18,6 +18,7 @@ loud failure on an unplugged drive passes a target it did not create.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 
 CONFIG_NAME = "config.yaml"
@@ -25,13 +26,28 @@ PING_KEY = "secret-key"
 NTFY_TOPIC = "secret-topic"
 
 
-def write_config(tmp_path: Path, lake_root: Path, *, backup_target: Path | None = None) -> Path:
+def write_config(
+    tmp_path: Path,
+    lake_root: Path,
+    *,
+    backup_target: Path | None = None,
+    guards: Mapping[str, object] | None = None,
+) -> Path:
     """Write a config naming ``lake_root``, and return its path.
 
     ``backup_target`` defaults to an ``ssd`` directory beside the config, created here.
+
+    ``guards`` renders a ``guards`` section over the pinned defaults, so a test can drive
+    a recalibrated guard constant the way a hand edit sets one. Left unset, no section is
+    written and every guard keeps its default.
     """
     target = tmp_path / "ssd" if backup_target is None else backup_target
     target.mkdir(parents=True, exist_ok=True)
+    section = (
+        ""
+        if not guards
+        else "guards:\n" + "".join(f"  {key}: {value}\n" for key, value in guards.items())
+    )
     path = tmp_path / CONFIG_NAME
     path.write_text(
         f"lake_root: {lake_root}\n"
@@ -40,5 +56,6 @@ def write_config(tmp_path: Path, lake_root: Path, *, backup_target: Path | None 
         f"ntfy_topic: {NTFY_TOPIC}\n"
         "schwab_api_key: api-key\n"
         "schwab_app_secret: app-secret\n"
+        f"{section}"
     )
     return path
