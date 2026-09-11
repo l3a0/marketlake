@@ -7,7 +7,7 @@ with a programmable fake vendor, a manual clock, and a small injected plan. No n
 no wall clock are crossed. So the tier is component: one subsystem, capture, over real
 files, with the vendor and clock still fake.
 
-They pin the chunker's contract:
+They cover the chunker's contract:
 
 1. The plan's windows are each fetched by their date range, with no ``strike_count``
    discovery call, and reassembled into one chains segment. The header comes from the
@@ -133,7 +133,7 @@ class _WindowVendor:
     returned, to model a fetch that raises. A requested range with no mapping raises, so a
     test never silently reaches past its setup. The chunker records a raise with its own
     class rather than splitting, so the deterministic tests assert ``chain_calls`` (and the
-    ``_calls_for`` helper) to pin the exact ranges fetched. Any ``strike_count`` call raises,
+    ``_calls_for`` helper) to check the exact ranges fetched. Any ``strike_count`` call raises,
     proving the hot path makes no discovery request.
     """
 

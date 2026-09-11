@@ -741,7 +741,7 @@ def run_cycle(
 
     It performs one cycle over the injected clock, vendor, and roster, writing into
     ``lake_root``. It reads no wall clock and names no session time. ``pid`` defaults to
-    this process, and a test pins it so segment names are deterministic. ``guards`` carries
+    this process, and a test fixes it so segment names are deterministic. ``guards`` carries
     the tunable thresholds the cycle reads, chiefly the chunker's date-based split-depth
     bound. It defaults to the design's pinned values. ``plan`` is the chain chunk plan, the
     set of date windows the chain is fetched by. It defaults to ``load_chain_plan()``,

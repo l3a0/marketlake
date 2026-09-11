@@ -70,9 +70,9 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
 - **Unowned.** The backup-copy scrub, and the `--checksum` drop that waits on it. `manifest.scrub` reads under `lake_root` only, so nothing verifies the backup target today. `control_plane`'s Sunday gap list already names it as gap 3 of 5. The two land together or in that order, because until the scrub exists `--checksum` in `RsyncBackup.sync` is the only thing that would notice the backup rotting. Dropping it first trades a deadline that fails in a few years for a verification hole that starts now. **Both stay in slice 2.** The scrub is a Sunday-job activity, the Sunday job is D14's, and `manifest.scrub` already exists and already runs there over `lake_root`. Reaching the backup target is a target and a parameter rather than new machinery, so slice 5's validation battery is the wrong home for it. The pairing is a sequencing rule inside slice 2, not a reason to defer either half out of it.
 - **Unowned.** The daemon's in-loop close+15 compaction dispatch. `compact.compact` is reachable only from `python -m lake.compact`, and no job renders it. The design's rule that a catch-up compaction of an unsealed day is ordered after startup gap-marking is satisfied in-process today, because `run_loop` calls `on_start` before its first tick. Whoever builds the dispatch owns keeping it so. D11 built the seam it binds to, `session.SessionDispatch`, so what remains is the compaction job itself. **It stays in slice 2.** Every part it needs is already here: the dispatcher from D11, `compact.compact` from D12, and the loop from D9. It fetches nothing, so slice 3 would not help it, and it blocks the `compaction` check, which cannot be created before a producer exists.
 - **Unowned.** Seven residual gaps in the daemon's production wiring. `test_daemon_wiring.py`
-  now pins the seven hook bindings `run_loop_from_config` builds, and deleting any one of
-  them fails a test. What is unheld is narrower than a binding, and two of the seven reach
-  production behaviour rather than test strength. Each was confirmed by mutating
+  now covers the seven hook bindings `run_loop_from_config` builds, and deleting any one of
+  them fails a test. What no test covers is narrower than a binding, and two of the seven
+  reach production behaviour rather than test strength. Each was confirmed by mutating
   `src/lake/daemon.py` and running the whole suite, which stays green:
 
   1. the caller's `on_tick` pass-through in the close-guard layer, whose deletion silences
@@ -84,7 +84,7 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   4. the dead-man's `any` over a cycle's segments, which single-segment fixtures cannot
      tell from `all`,
   5. the guard's dispatch moment, which can move one minute off close+5 unnoticed,
-  6. the watchdog instance the skipped-slot hook charges, which is not held to be the one
+  6. the watchdog instance the skipped-slot hook charges, which no test ties to the one
      the cycle observer feeds,
   7. the security master the wiring loads for the gap marker, whose absence loses a freshly
      onboarded ticker's marked minutes.

@@ -57,7 +57,7 @@ def test_resident_plists_carry_the_working_dir_logs_and_environment():
     assert plist["StandardOutPath"] != plist["StandardErrorPath"]
     env = plist["EnvironmentVariables"]
     assert env["HOME"] == "/Users/someone"
-    # An equality pin, not a membership one. It fails if any directory is ever
+    # An equality check, not a membership one. It fails if any directory is ever
     # prepended again, which is what the dropped --path-dir knob used to do.
     assert env["PATH"].split(":") == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
     assert env["MARKETLAKE_CONFIG"].endswith("config.yaml")
@@ -111,7 +111,7 @@ def test_run_at_load_is_pinned_per_job(build, run_at_load):
     # The three that should start at load do. The Sunday job does not, because a
     # bootstrap or a boot would otherwise scrub the whole lake and assert coverage on
     # a day the design never asks about, then ping the sunday slug midweek. Its
-    # calendar interval, pinned above, is then the only thing that starts it. launchd
+    # calendar interval, checked above, is then the only thing that starts it. launchd
     # still fires a missed occurrence on the next wake, which is the Monday backstop,
     # and that coalescing does not depend on RunAtLoad.
     assert _parsed(build(HOST))["RunAtLoad"] is run_at_load

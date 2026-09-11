@@ -330,11 +330,11 @@ def test_sudoers_refuses_the_reserved_word_all_as_the_owner():
     assert "all ALL=(root)" in cp.sudoers_dropin("all")
 
 
-def test_the_install_text_pins_every_command_line_in_order(tmp_path, capsys):
+def test_the_install_text_carries_every_command_line_in_order(tmp_path, capsys):
     # Every runnable line, in order. The comments around them stay free to move. This
     # script is pasted by hand on a machine with no other guard, so the root ownership,
-    # the 440 the sudoers drop-in needs, the visudo gate ahead of it, and all four
-    # bootstrap labels are pinned rather than sampled.
+    # the 440 the sudoers drop-in needs, the visudo gate ahead of it, and all five
+    # bootstrap labels are checked exactly rather than sampled.
     out = tmp_path / "out"
     cp.main(["render", "--out", str(out), *RENDER_ARGS])
     script = capsys.readouterr().out
@@ -530,7 +530,7 @@ def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys):
 def test_sunday_cli_withholds_the_ping_for_a_stale_token(tmp_path, capsys):
     # Minted late the prior week: still valid on Sunday, dead before Friday's option
     # close. Validity is not freshness, and the command line has to act on that, not
-    # just the decision functions that already pin it. This is the case the deleted
+    # just the decision functions that already enforce it. This is the case the deleted
     # `--mint` override could hide, by supplying a mint the token does not carry.
     lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
     config = write_config(tmp_path, lake)
@@ -638,7 +638,7 @@ def test_sunday_cli_reports_problems_and_exits_non_zero(tmp_path, capsys):
     assert "canary call failed" in printed
     assert "token file unreadable" in printed
     # The job's log carries the reminder too. The phone is the channel that matters and
-    # the push is pinned below, but the log is what an operator reads after the fact.
+    # the push is checked below, but the log is what an operator reads after the fact.
     assert "sunday: reminder: The throwaway call" in printed
 
 
@@ -864,7 +864,7 @@ def _check_golden(name: str, actual: bytes) -> None:
 
 @pytest.mark.parametrize("name", sorted(EXPECTED_FILES))
 def test_each_rendered_file_matches_its_golden(name, tmp_path):
-    """Every rendered byte is pinned, not only the fields other tests sample.
+    """Every rendered byte is checked, not only the fields other tests sample.
 
     The tests above assert on chosen lines: the sudoers rules, two jobs' program
     arguments, the install commands in order. A change to a plist key none of them
@@ -877,13 +877,13 @@ def test_each_rendered_file_matches_its_golden(name, tmp_path):
 
 
 def test_the_install_text_matches_its_golden(tmp_path, capsys):
-    """The pasted script is pinned whole, with only the output directory normalised."""
+    """The pasted script is checked whole, with only the output directory normalised."""
     out = tmp_path / "out"
     assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
     _check_golden("INSTALL.txt", _normalise(capsys.readouterr().out, out).encode())
 
 
-def test_the_golden_directory_holds_exactly_what_is_pinned():
+def test_the_golden_directory_holds_exactly_what_is_covered():
     """A golden for a file the renderer no longer writes would sit unread forever.
 
     The per-file test is parametrised over ``EXPECTED_FILES``, so it only ever asks
@@ -1124,7 +1124,7 @@ def _run_reinstall(tmp_path: Path, *, bootout_rc: int = 0):
 def test_reinstalling_runs_the_whole_uninstall_before_the_whole_install(tmp_path):
     """Running the composed command end to end, because that is what a reinstall is.
 
-    The order is the property worth holding. Every removal has to land before the first
+    The order is the property worth covering. Every removal has to land before the first
     installation, or a bootout races a bootstrap for the same label.
     """
     proc, log = _run_reinstall(tmp_path)
@@ -1154,7 +1154,7 @@ def test_a_failing_uninstall_leaves_the_install_half_unrun(tmp_path):
     catches the failing bootout, and the step 5 read-back exits 1 on its own because the
     daemon is still loaded. Removing ``set -e`` alone does not reach this test, and the
     survival is the point rather than a gap: ``test_the_uninstall_stops_at_a_failure``
-    ``_partway_down`` holds that half.
+    ``_partway_down`` covers that half.
     """
     proc, log = _run_reinstall(tmp_path, bootout_rc=1)
     assert proc.returncode != 0
@@ -1348,7 +1348,7 @@ def test_the_restart_defaults_to_the_dashboard(tmp_path):
     proc, log = _run_restart(tmp_path)
     assert proc.returncode == 0, proc.stderr
     # The fake sudo execs what it is given, so each kickstart logs twice. Counting the
-    # sudo-prefixed line alone also pins that the restart runs as root.
+    # sudo-prefixed line alone also checks that the restart runs as root.
     kicks = [line for line in log if line.startswith("sudo launchctl kickstart")]
     assert len(kicks) == 1, log
     assert cp.DASHBOARD_LABEL in kicks[0], kicks[0]

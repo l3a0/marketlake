@@ -1,5 +1,5 @@
 """The calendar seam, real side. The ExchangeCalendar adapter over the real
-``exchange_calendars`` library. The expected times are pinned against known 2026 NYSE
+``exchange_calendars`` library. The expected times come from known 2026 NYSE
 sessions. These assertions name times in the test, which is exactly where naming a
 time is allowed."""
 

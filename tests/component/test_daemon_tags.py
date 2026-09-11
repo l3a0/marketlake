@@ -6,7 +6,7 @@ real segments with the cassette-backed fake vendor and a manual clock. No networ
 wall clock are crossed, and every write lands on a throwaway lake. So the tier is
 component: one subsystem, capture, over real files, with the vendor and clock still fake.
 
-Two layers are pinned.
+The tests cover two layers.
 
 1. ``run_cycle`` with the two tags stamps every row on both surfaces: data rows,
    whole-chain and quote gap rows, and the absence markers inside a partial snapshot.

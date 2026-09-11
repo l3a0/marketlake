@@ -4,7 +4,7 @@ The stamp carries the three facts the Now panel cannot read off a captured row: 
 refresh token's mint time, the roster, and the last dead-man ping. It decides nothing
 and touches no clock, so the tier is unit.
 
-Four properties are pinned here, because each one is what a panel field rests on.
+Four properties are covered here, because each one is what a panel field rests on.
 
 1. The two writers share the file without clobbering each other. The cycle stamps the
    mint time and the roster, the dead-man stamps its ping, and each carries the other's
@@ -181,7 +181,7 @@ def test_the_publish_is_the_rename_and_nothing_writes_the_target_in_place(lake_r
     every other test in this file while giving a reader a window onto a half-written
     document.
 
-    Failing the rename is how that is pinned. If the publish is the rename, the target
+    Failing the rename is how that is checked. If the publish is the rename, the target
     still holds the old stamp afterwards. If anything writes the target directly, the
     new stamp is already there and this fails.
     """

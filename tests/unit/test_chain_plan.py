@@ -2,7 +2,7 @@
 
 These tests build and validate plans in memory and read throwaway plan files under the
 test's temp directory. No process, network, or wall clock is crossed, so they sit in the
-unit tier. They pin the tiling invariant, the date arithmetic, and the fail-safe load.
+unit tier. They cover the tiling invariant, the date arithmetic, and the fail-safe load.
 """
 
 from __future__ import annotations

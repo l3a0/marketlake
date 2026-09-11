@@ -6,8 +6,8 @@ real healthchecks GET, a real ntfy POST, and a real ``rsync``. The caller that m
 to be asked was a test, and two of them fed the owner's live ``capture`` dead-man six times
 per suite run.
 
-Requiring the seams fixed that, but a required argument is held only by the signature. A
-later edit re-adding ``= None`` and the ``x if x is not None else Live()`` fallback would
+Requiring the seams fixed that, but a required argument is enforced only by the signature.
+A later edit re-adding ``= None`` and the ``x if x is not None else Live()`` fallback would
 restore the bug with every test still green. These assertions are what goes red instead.
 
 The rule is scoped to the entries below on purpose. A ``main`` builds live objects because

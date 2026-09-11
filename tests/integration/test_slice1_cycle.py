@@ -7,7 +7,7 @@ boundaries: the vendor seam, the journal segment writer, the manifest ledger, an
 lake-root lock. That is more than one subsystem over one real boundary, so it belongs
 in the integration tier, not component.
 
-The claim it pins: what the cycle captured survives a round-trip off disk, and the
+The claim it checks: what the cycle captured survives a round-trip off disk, and the
 manifest is a faithful, scrub-clean record of it.
 """
 

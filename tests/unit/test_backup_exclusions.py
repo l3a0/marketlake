@@ -1,7 +1,7 @@
 """The backup's exclusion list.
 
 The design pins the sync root as ``lake/`` only, with an explicit exclusion list.
-``runner.BACKUP_EXCLUSIONS`` is that list. These tests hold three things about it.
+``runner.BACKUP_EXCLUSIONS`` is that list. These tests cover three things about it.
 
 1. Every pattern reaches ``rsync``, ahead of the source and target operands.
 2. The list is exactly the two justified entries, each derived from the constant that
@@ -100,7 +100,7 @@ def test_the_list_is_exactly_the_temp_marker_and_the_config_directory():
 
 def test_the_temp_pattern_matches_what_the_shared_helper_builds(tmp_path):
     # The pattern is derived from the same constant ``temp_write_path`` uses. This
-    # holds that the derivation lands on the real name, not merely on the constant.
+    # checks that the derivation lands on the real name, not merely on the constant.
     tmp = temp_write_path(tmp_path / "date=2026-08-24.parquet", 4242)
     assert _excluded(tmp.name)
 

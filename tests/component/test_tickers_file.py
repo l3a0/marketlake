@@ -1,7 +1,7 @@
 """The roster over a real tickers.yaml: the loader, its overrides, and the write.
 
 The daemon re-reads this file while the onboarding command writes it, so the write has
-to be atomic. The last case here holds that half.
+to be atomic. The last case here covers that half.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ def test_a_typed_tilde_still_expands(tmp_path: Path, monkeypatch):
 # The point of the set is that one exception type covers all of them, so a caller can
 # guard for a bad roster with one `except` and `main` can print one line and exit 2.
 # The two YAML shapes raise different `yaml` classes, `ParserError` and `ScannerError`,
-# so the pair holds that the fold catches the base class rather than one subclass.
+# so the pair checks that the fold catches the base class rather than one subclass.
 BROKEN = {
     "half saved mid-line": ("XYZ: {options: fal", "not valid YAML at line 1"),
     "hand-edited with a tab": ("XYZ:\n\toptions: false\n", "not valid YAML at line 2"),
@@ -99,7 +99,7 @@ def test_a_file_that_cannot_be_read_raises_the_same_error(tmp_path: Path, kind):
 
     A binary file raises `UnicodeDecodeError`, which is a `ValueError`. A file the
     process may not open raises `OSError`. Catching one and not the other leaves half
-    the class escaping, so both are held.
+    the class escaping, so both are covered.
     """
     path = tmp_path / "tickers.yaml"
     if kind == "binary":

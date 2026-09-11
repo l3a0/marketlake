@@ -3,7 +3,7 @@
 ``SessionClock`` composed with the real ``ExchangeCalendar`` and a manual clock.
 That crosses one real boundary, the ``exchange_calendars`` library, so it sits in
 the component tier. The clock stays fake, per the tier rule. The times named here
-are pinned against known 2026 NYSE sessions, which is where naming a time is allowed.
+come from known 2026 NYSE sessions, which is where naming a time is allowed.
 """
 
 from __future__ import annotations

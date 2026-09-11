@@ -3,7 +3,7 @@
 ``latest_expirations`` locates a ticker's most recent chains segment through the manifest
 and returns the expirations in its last data batch. The capture chunker's failure path
 reads it to name absence markers, and D10's startup gap-marking reuses the same read.
-These cross the filesystem, so they sit in the component tier. They pin the empty-lake
+These cross the filesystem, so they sit in the component tier. They cover the empty-lake
 case, the manifest lookup, the torn-tail read, and the walk back past a gap-only segment.
 """
 

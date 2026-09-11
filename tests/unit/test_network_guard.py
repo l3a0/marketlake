@@ -1,10 +1,10 @@
-"""The network guard itself, which nothing else holds.
+"""The network guard itself, which nothing else covers.
 
 The guard in ``tests/conftest.py`` is the reason a forgotten seam fails loudly instead of
 pinging the owner's live dead-man check. It is autouse, so every test depends on it and no
 test asserts it. These do.
 
-Three properties carry the whole guard, and each is pinned below.
+Three properties carry the whole guard, and each is covered below.
 
 1. A connection leaving this machine fails, whether it goes through ``urlopen``,
    ``socket.create_connection``, or a raw ``socket.socket``.

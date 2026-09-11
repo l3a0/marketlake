@@ -3,7 +3,7 @@
 The lock is a blocking advisory ``flock`` on the manifest. The whole point is that a
 second asker waits. So these prove the block directly, once with two threads and once
 with two real processes contending. The process case is the true target, since the
-lock coordinates separate jobs. Two more tests pin that locking the manifest never
+lock coordinates separate jobs. Two more tests check that locking the manifest never
 alters it: a fresh lake gets a valid empty manifest, and an existing manifest comes
 back byte-identical.
 """

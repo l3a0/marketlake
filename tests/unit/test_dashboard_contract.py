@@ -1,6 +1,6 @@
 """The dashboard's fixed-query contract, decided from values alone.
 
-These pin the boundary rules without a connection or a socket in the path, so the tier is
+These cover the boundary rules without a connection or a socket in the path, so the tier is
 unit. The parameter validators, the Host check, the route and registry shape, the status
 vocabulary, the slot denominator, the tab icon, and the command-line contract are each a
 pure function, a table, or bytes shipped inside the package.
@@ -212,11 +212,11 @@ def test_build_parser_takes_a_port_and_a_lake_root():
     assert (args.port, args.lake_root, args.config) == (9001, "/lake", "c.yaml")
 
 
-# The one line the page is allowed to carry that names a resource. It is pinned whole,
-# so a link that changed its target, grew an attribute, or gained a sibling fails to
-# match and is left for the marker sweep below to catch. The ``sizes`` value is pinned
-# to the shape a size list takes, because ``[^"]*`` there would let a URL ride inside
-# the one line the sweep never sees.
+# The one line the page is allowed to carry that names a resource. The pattern covers
+# the whole line, so a link that changed its target, grew an attribute, or gained a
+# sibling fails to match and is left for the marker sweep below to catch. The ``sizes``
+# value must match the shape a size list takes, because ``[^"]*`` there would let a URL
+# ride inside the one line the sweep never sees.
 ICON_LINK = re.compile(
     rb'^<link rel="icon" href="/favicon\.ico" sizes="(?P<sizes>[0-9x ]*)">\n', re.MULTILINE
 )
@@ -231,7 +231,7 @@ def test_the_status_page_ships_in_the_package_and_is_self_contained():
     rest, found = ICON_LINK.subn(b"", page)
     assert found == 1, "the page declares the tab icon exactly once"
     # No external resource: the page must work offline and inside the same-origin policy.
-    # Every marker still runs, over everything except that one pinned line. Removing the
+    # Every marker still runs, over everything except that one matched line. Removing the
     # line rather than relaxing the markers is what keeps this guard from going slack: a
     # second ``<link``, an ``<img``, or any absolute URL still fails.
     for marker in (b"http://", b"https://", b"<link", b"<img", b"src="):
@@ -239,7 +239,7 @@ def test_the_status_page_ships_in_the_package_and_is_self_contained():
 
 
 def test_the_declared_icon_sizes_match_the_sizes_the_icon_carries():
-    # The ``sizes`` attribute is a claim about a binary the HTML cannot see. Pinning it
+    # The ``sizes`` attribute is a claim about a binary the HTML cannot see. Checking it
     # here means a size added to the renderer without updating the page fails a test
     # rather than shipping a page that misdescribes its own icon.
     match = ICON_LINK.search(dashboard.load_status_page())
@@ -280,7 +280,7 @@ def test_the_favicon_ships_in_the_package_as_a_three_size_ico():
 
 
 def test_the_shipped_favicon_is_exactly_what_the_renderer_produces():
-    # The golden pin. The checked-in binary is not the only record of the icon: a reader
+    # The golden test. The checked-in binary is not the only record of the icon: a reader
     # who cannot diff 411 bytes can read ``MARK`` instead and trust that it is the same
     # thing. A mark edited without regenerating the file fails here.
     assert dashboard.load_favicon() == favicon.render()
@@ -294,7 +294,7 @@ def test_every_icon_size_is_a_whole_multiple_of_the_grid():
     # Integer scaling is what keeps the larger sizes crisp. A size off the grid would
     # land an edge on a fraction of a pixel, so the constraint is load-bearing, not tidy.
     assert favicon.GRID == len(favicon.MARK) == 16
-    # Pinned as literals. Every other size assertion compares against ``SIZES``, so
+    # Written out as literals. Every other size assertion compares against ``SIZES``, so
     # without this the whole set could drift and the suite would still agree with it.
     assert favicon.SIZES == (16, 32, 48)
     assert all(len(row) == favicon.GRID for row in favicon.MARK)
@@ -344,7 +344,7 @@ def test_the_cli_writes_its_default_path_when_given_no_out(tmp_path, monkeypatch
 
 def test_the_ink_is_the_pages_captured_colour():
     # The module docstring claims the ink is ``--captured``'s light-scheme value. That is
-    # a claim about another file, so it is pinned the way the ``sizes`` attribute is. The
+    # a claim about another file, so it is checked the way the ``sizes`` attribute is. The
     # light value is the one on bare ``:root``. That rule is indented two spaces, and the
     # dark-scheme override nests four deep inside its media query, so the block is
     # anchored on the indentation. Matching the first ``:root`` instead would silently
@@ -385,7 +385,7 @@ def _decode_png(png: bytes) -> list[list[bytes]]:
 
 def test_every_rendered_pixel_matches_the_mark_including_its_transparency():
     # The waterline argument rests on rendered alpha, not on the grid. A renderer that
-    # painted the empty cells opaque would still satisfy ``MARK``, the golden pin and the
+    # painted the empty cells opaque would still satisfy ``MARK``, the golden test and the
     # container test, and the icon would quietly stop reading on one tab strip or the
     # other. This is the assertion that makes the hole real.
     icon = dashboard.load_favicon()

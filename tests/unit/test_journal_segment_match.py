@@ -10,7 +10,7 @@ These pass strings and read booleans. No file is opened and no clock is read, so
 tier is unit. The disk-backed read that uses the predicate sits in the component tier,
 in ``tests/component/test_latest_expirations.py``.
 
-The malformed cases mirror the ones pinned in ``tests/unit/test_paths.py``. That is
+The malformed cases mirror the ones covered in ``tests/unit/test_paths.py``. That is
 deliberate. Both this reader and the manifest scrub go through the one shared parser, so
 a weakened check has to be refused on both sides or one caller silently accepts a path
 the other refuses.

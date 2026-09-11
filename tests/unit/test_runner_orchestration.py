@@ -114,7 +114,7 @@ def test_a_failed_ping_is_named_and_the_run_keeps_its_verdict():
     assert outcome.backed_up is True
     assert outcome.pinged is False
     assert outcome.problem == "ping failed: URLError"
-    # The backup still ran and its order is still pinned.
+    # The backup still ran, and it still ran before the ping.
     assert events == ["backup", "ping"]
 
 
@@ -208,9 +208,9 @@ def test_cycle_succeeded_predicate():
 
 
 def test_main_wires_the_live_seams(tmp_path, monkeypatch, capsys):
-    # The runner half of the rule the daemon's `main` test holds. `run_once_from_config`
+    # The runner half of the rule the daemon's `main` test covers. `run_once_from_config`
     # no longer defaults its seams, so `main` is the caller that must supply the real
-    # pair. Nothing exercised this entry before, so neither half of the rule was held.
+    # pair. Nothing exercised this entry before, so neither half of the rule was covered.
     from types import SimpleNamespace
 
     from lake.runner import RsyncBackup, UrllibPinger

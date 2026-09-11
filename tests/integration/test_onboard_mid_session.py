@@ -5,7 +5,7 @@ against a real throwaway lake and a real tickers.yaml, wired through the securit
 the roster writer, and the manifest ledger. That is three subsystems talking through
 real boundaries, so it belongs in the integration tier.
 
-The claim it pins: onboarding a ticker in the middle of a session leaves the lake
+The claim it checks: onboarding a ticker in the middle of a session leaves the lake
 consistent. The instrument registers with its capture_start stamped at the mid-session
 instant, so coverage clamps to "onboarded now," never counts the morning as missing.
 The master persists with a manifest entry, so the two-way integrity scrub stays clean.

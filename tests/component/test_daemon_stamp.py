@@ -3,7 +3,7 @@
 The Now panel reads the token's mint time, the roster, and the last dead-man ping from
 under ``lake_root``, because the dashboard never opens ``~/.config``. Two writers put
 them there. A capture cycle stamps the mint off the vendor it fetched with, which
-``tests/component/test_capture_cycle.py`` pins. Everything else is here: the minutes off
+``tests/component/test_capture_cycle.py`` covers. Everything else is here: the minutes off
 the capture window, where no cycle runs and no client exists.
 
 These drive ``run_loop_from_config`` over a real lake, a real token file, and a real

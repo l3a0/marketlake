@@ -2,7 +2,7 @@
 
 These open the dashboard's connection over a throwaway lake and try to break out of it.
 The one real boundary is the filesystem DuckDB reads, so the tier is component. Every
-case pins one clause of the design's sandbox: reads outside ``lake_root`` fail, reads
+case checks one clause of the design's sandbox: reads outside ``lake_root`` fail, reads
 inside work, the two resource caps are applied, and once the configuration is locked
 nothing can widen any of it.
 
@@ -37,7 +37,7 @@ from lake.dashboard import QUERY_MEMORY_LIMIT, QUERY_THREADS, open_lake_connecti
 
 # The read that proves a path is reachable. ``content`` is projected on purpose. The
 # star projection would raise on any connection, sandboxed or not, so an assertion built
-# on it holds nothing. See the module docstring.
+# on it proves nothing about the sandbox. See the module docstring.
 _READ_TEXT = "SELECT content FROM read_text(?)"
 
 # The fragment DuckDB puts in every refusal that comes from ``lock_configuration``. An
@@ -161,7 +161,7 @@ def test_extension_install_and_attach_are_refused(lake_root: Path, tmp_path: Pat
     with pytest.raises(duckdb.PermissionException):
         con.execute("INSTALL httpfs")
     # DuckDB accepts no bind parameter for ``ATTACH``, so a parameterized one is a parser
-    # error on any connection and pins nothing. The path is spliced instead. It is the
+    # error on any connection and proves nothing. The path is spliced instead. It is the
     # test's own temp path, never a client value.
     outside_db = tmp_path / "other.duckdb"
     with pytest.raises(duckdb.PermissionException):
