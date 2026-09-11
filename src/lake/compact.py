@@ -938,14 +938,17 @@ def main(
     *,
     clock: Clock | None = None,
     calendar: Calendar | None = None,
-    backup: BackupRunner | None = None,
-    pinger: Pinger | None = None,
 ) -> int:
     """The ``python -m lake.compact`` entry. Returns a process exit code.
 
-    The four seams default to the real ones: the system clock, the exchange calendar,
-    ``rsync``, and ``urllib``. A test passes fakes. The daemon's internal close+15
-    dispatch of this job is a later wiring. This entry runs it standalone.
+    ``backup`` and ``pinger`` are built here, not accepted. Each reaches past this
+    process. ``rsync`` shells out to copy the lake, and the healthchecks GET goes to the
+    network. A ``main`` that accepted them let a test omit one and reach the real effect,
+    so ``main`` builds them and a test drives the ``compact`` helper directly instead.
+
+    ``clock`` and ``calendar`` stay injectable. A system clock and an exchange calendar
+    never reach past this process, so a test injects them with no live effect. The daemon's
+    internal close+15 dispatch of this job is a later wiring. This entry runs it standalone.
     """
     args = build_parser().parse_args(argv)
     with input_errors_exit("compact"):
@@ -971,9 +974,9 @@ def main(
         config.lake_root,
         clock=clock,
         calendar=calendar if calendar is not None else ExchangeCalendar(),
-        backup=backup if backup is not None else RsyncBackup(),
+        backup=RsyncBackup(),
         backup_target=config.backup_target,
-        pinger=pinger if pinger is not None else UrllibPinger(),
+        pinger=UrllibPinger(),
         ping_url=config.healthchecks_url(COMPACTION_SLUG),
         guards=config.guards,
         plan_path=args.plan if args.plan is not None else DEFAULT_CHAIN_PLAN_PATH,
