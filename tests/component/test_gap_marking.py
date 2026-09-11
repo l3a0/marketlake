@@ -486,6 +486,26 @@ def test_the_master_is_read_when_a_pass_runs_not_held_from_daemon_start(tmp_path
     assert marked == ["10:05", "10:06", "10:07", "10:08", "10:09"]
 
 
+def test_a_corrupt_master_leaves_the_daemon_reader_unclamped_rather_than_crashing(tmp_path):
+    """A master the reader cannot parse must drop the clamp, not end the daemon.
+
+    The write is atomic now, so onboarding no longer exposes a half-written master. A
+    master can still go bad at rest, from a disk error or bit rot. A corrupt parquet raises
+    ``pyarrow``'s ``ArrowInvalid``. The reader runs from a hook the loop does not guard, so
+    an escape ends the loop on a pyarrow traceback. ``SecurityMaster.read`` folds that into
+    ``SecurityMasterError``, which the reader catches, returning ``None``. That is the same
+    no-clamp answer an absent master gives.
+    """
+    from lake import daemon
+    from lake.security_master import master_path
+
+    path = master_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"not parquet at all")
+
+    assert daemon._master_reader(tmp_path)() is None
+
+
 # -- the production wiring -----------------------------------------------------------
 
 
