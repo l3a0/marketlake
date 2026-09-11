@@ -92,7 +92,7 @@ from lake import journal
 from lake.alert import undelivered
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
 from lake.clock import Clock, SystemClock
-from lake.config import GuardConstants, load_config
+from lake.config import GuardConstants, input_errors_exit, load_config
 from lake.control_plane import sunday_canary_due
 from lake.metadata import read_metadata
 from lake.paths import (
@@ -1484,16 +1484,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     no secret, and the connection it opens can reach nothing outside the lake tree. The
     real clock and the real calendar are wired here and nowhere else in this module.
 
-    A port already in use returns 2 with a one-line message. The design puts this
-    service under launchd ``KeepAlive``, where an uncaught traceback becomes a restart
-    loop instead of a readable complaint.
+    A malformed config exits with code 2 and a one-line message. A port already in
+    use does the same. The design puts this service under launchd ``KeepAlive``, where
+    an uncaught traceback becomes a restart loop instead of a readable complaint.
     """
     args = build_parser().parse_args(argv)
     if args.lake_root is not None:
         lake_root = Path(args.lake_root)
         guards = GuardConstants()
     else:
-        config = load_config(args.config)
+        with input_errors_exit("dashboard"):
+            config = load_config(args.config)
         lake_root = config.lake_root
         guards = config.guards
     service = DashboardService(
