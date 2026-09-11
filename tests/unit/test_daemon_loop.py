@@ -5,7 +5,7 @@ cycle runner that records each call and returns a canned result. No file, networ
 wall clock is in the path, so these are unit tests. The times named here are declared
 through the fakes, which is exactly where naming a time is allowed.
 
-They pin the loop's observable contract:
+They cover the loop's observable contract:
 
 1. A regular session fires one cycle at every capture slot, the open through the option
    close, and at no other minute. The loop idles before the open and after the close.
@@ -600,7 +600,7 @@ def test_main_passes_the_paths_to_the_config_entry(tmp_path, monkeypatch):
 # -- the power assertion ----------------------------------------------------------
 
 # The design's chain is the wake alarm, then KeepAlive starting the daemon, then the
-# caffeinate assertion keeping an open laptop awake. These pin the last link. The
+# caffeinate assertion keeping an open laptop awake. These cover the last link. The
 # assertion is owed on a holiday too, so it rides the per-tick seam rather than the
 # per-cycle one.
 

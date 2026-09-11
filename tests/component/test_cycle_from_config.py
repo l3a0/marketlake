@@ -12,7 +12,7 @@ single cycle, so a single call could never catch any of it. The vendor is a fake
 is manual, so no network and no wall clock are crossed. The tier is component: the
 capture entry over real files, with the vendor and the clock still fake.
 
-Four claims are pinned.
+Four claims are covered.
 
 1. The roster reaches the chain workers, so a ticker onboarded mid-session has its chain
    captured on the next cycle.
@@ -28,7 +28,7 @@ Two boundaries are worth naming, because the design's claim is wider than this f
 - The design names a third consumer of the roster snapshot, the per-ticker watchdog
   counters. It reads the roster in the daemon's skipped-slot hook, not in this entry, so
   it is out of this file's reach.
-- The entry reloads one more input, the chain plan. Every case here pins it to a
+- The entry reloads one more input, the chain plan. Every case here points it at a
   test-owned path so the date windows are deterministic. No case here fails if that
   re-read breaks.
 """
@@ -141,7 +141,7 @@ def _token_text(refresh: str, minted: int) -> str:
     expired one's. The design's rule is a mint-time comparison: rebuild the client when
     the file's stamp is newer than the in-memory token's. The entry rebuilds
     unconditionally today, which satisfies that rule. Moving the stamp keeps these cases
-    true under either reading, rather than pinning the unconditional rebuild by accident.
+    true under either reading, rather than locking in the unconditional rebuild by accident.
     """
     return json.dumps({"refresh_token": refresh, "creation_timestamp": minted})
 
@@ -215,7 +215,7 @@ def _rig(tmp_path: Path, roster: str, *, plan: ChainPlan = ONE_WINDOW) -> _Rig:
 def _wire(monkeypatch, rig: _Rig, build) -> None:
     """Point the entry's two module-level names at the rig, with no real client in path.
 
-    1. ``load_chain_plan`` is pinned to a test-owned path. The plan file is machine-local,
+    1. ``load_chain_plan`` is pointed at a test-owned path. The plan file is machine-local,
        so the test owns its path rather than the home directory's. The loader itself stays
        the real one, called once per cycle.
     2. ``SchwabVendor`` is replaced by a stub. The production factory builds a live
@@ -282,7 +282,7 @@ def test_a_ticker_onboarded_mid_session_is_chained_on_the_next_cycle(tmp_path, m
 
     # The next cycle chained both. The two are compared order-free on purpose. Tickers are
     # fetched sequentially in roster order today, and the design fires them as parallel
-    # per-ticker workers later, so their relative order is not this claim's to pin.
+    # per-ticker workers later, so their relative order is not this claim's to assert.
     assert sorted(second) == ["QQQ", "SPY"]
 
     # The next cycle fetched the new ticker's chain and journaled its contracts as data.

@@ -1,7 +1,7 @@
 """Startup gap marking, driven the way the daemon drives it.
 
 The design's rules for D10 are stated in whole sessions and whole minutes, so these
-tests are too. Each one names the rule it pins.
+tests are too. Each one names the rule it checks.
 """
 
 from __future__ import annotations
@@ -465,7 +465,7 @@ def test_the_daemon_wires_gap_marking_into_the_startup_hook(tmp_path, monkeypatc
 
     # Start before the open. The tick is pre-open, so the loop runs no capture cycle and
     # nothing reaches for a vendor token. `on_start` fires before the loop either way,
-    # which is the wiring this pins.
+    # which is the wiring this checks.
     clock = ManualClock(start=et(2026, 9, 2, 8, 0))
     ticks = [0]
 
@@ -682,7 +682,7 @@ SKIPPED = [f"2026-09-02T10:{m:02d}" for m in range(1, OVERRUN + 1)]
 
 # Every ticker these tests put on a roster. A page names the ticker it is about, so the
 # set of names appearing across the pages is which surfaces were charged. Reading it
-# that way keeps the watchdog's title format pinned in one place, its own unit tests.
+# that way keeps the watchdog's title format asserted in one place, its own unit tests.
 _TICKERS = ("ABC", "NEW", "XYZ")
 
 

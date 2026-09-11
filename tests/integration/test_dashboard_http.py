@@ -4,7 +4,7 @@ These bind the server on an ephemeral port over a real fixture lake and drive it
 real HTTP requests. The HTTP layer, the sandboxed connection, and the filesystem are all
 crossed, so the tier is integration. The clock and calendar stay fake.
 
-Every case pins one line of the design's residual-surface argument: the bind is loopback,
+Every case covers one line of the design's residual-surface argument: the bind is loopback,
 a foreign ``Host`` is refused before anything else, only the enumerated routes answer,
 only ``GET`` is served, every response carries the same hardening headers, and no
 response carries a path or a secret.
@@ -252,7 +252,7 @@ def test_a_bad_parameter_is_a_400(served, query: str):
         "/api",
         "/status.html",
         # The icon path is matched whole. A prefix, a trailing slash or a different
-        # case must not reach it, and nothing pinned that until these three.
+        # case must not reach it, and nothing covered that until these three.
         "/favicon.ico/",
         "/FAVICON.ICO",
         "/favicon.icox",

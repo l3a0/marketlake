@@ -5,7 +5,7 @@ with a cassette-backed vendor and a manual clock. No network, no token, and no w
 clock are crossed. The tier is component: onboarding writes and reads real files, with
 the clock and vendor still fake.
 
-They pin the slice-1 contract: register with a stamped capture_start and a ticker
+They cover the slice-1 contract: register with a stamped capture_start and a ticker
 mapping only (the FIGI is deferred to a CUSIP-keyed backfill), verify the real-time
 entitlement before trusting the ticker, write the roster entry, journal the snapshot,
 and persist the master with a manifest entry so the scrub stays clean. A delayed feed is

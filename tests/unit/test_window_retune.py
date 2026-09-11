@@ -1,7 +1,7 @@
 """The nightly window re-tune rule, decided from values alone.
 
 ``retune_plan`` takes a plan and each window's peak per-cycle contract count and rebuilds
-the plan. These pin the rule: a window over the max splits at its midpoint offset, two
+the plan. These cover the rule: a window over the max splits at its midpoint offset, two
 adjacent finite windows both under the min merge, the open tail is never split and never
 merged, and the rebuilt plan still tiles. ``write_chain_plan`` crosses the filesystem, so
 its atomicity check sits here with a temp directory rather than a lake. Nothing reads a

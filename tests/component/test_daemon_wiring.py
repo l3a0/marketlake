@@ -12,7 +12,7 @@ transport and the health-check pinger, are faked, because a page sent from a tes
 page a person receives. So the tier is component: the daemon over real files, with the
 clock, the calendar, and the network still fake.
 
-Seven bindings are pinned here.
+Seven bindings are covered here.
 
 1. The skipped-slot hook reaches the gap marker, so a live overrun records the minutes
    it slept through.

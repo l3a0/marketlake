@@ -1,6 +1,6 @@
 """The segment writer and reader, across one real boundary: files on disk.
 
-These cross the filesystem, so they sit in the component tier. They pin exclusive
+These cross the filesystem, so they sit in the component tier. They cover exclusive
 creation, the data-row and gap-row round trips, one schema per file by surface,
 torn-tail tolerance, the shadow-append refusal, and per-cycle durability.
 """
@@ -199,7 +199,7 @@ def test_a_second_stream_appended_after_eos_fails_loudly(lake_root, tmp_path):
 def test_uses_f_fullfsync_on_this_platform():
     # The design's durability point is macOS F_FULLFSYNC, not plain fsync. Where the
     # platform lacks it, such as Linux CI, the writer falls back to os.fsync and the
-    # constant resolves to None. The test pins that same platform contract.
+    # constant resolves to None. The test checks that same platform contract.
     if hasattr(fcntl, "F_FULLFSYNC"):
         assert journal.F_FULLFSYNC == fcntl.F_FULLFSYNC
     else:
