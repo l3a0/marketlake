@@ -30,10 +30,11 @@ Three rules hold for everything written here, and each has a failure behind it.
    phone. The Now panel shows that count as ``pages_failed_to_send``. A guard finding
    filed there would inflate a page-failure count with things that are not pages, so the
    guard files beside it rather than in it.
-3. **Write-once, named by stamp and pid.** One instant can produce several files and a
-   slot's stamp carries no sub-minute part, so the name carries microseconds and the
-   writing process's id. ``alert._record`` names its files the same way for the same
-   reason.
+3. **Write-once, named by stamp and pid.** A slot's stamp carries no sub-minute part, so
+   the name carries microseconds and the writing process's id instead. That is enough for
+   a producer the dispatcher serves once per day, and a restart that serves the day again
+   writes under a new pid. ``alert._record`` needs more and adds a per-message sequence,
+   because one cycle can raise several pages at one instant.
 """
 
 from __future__ import annotations

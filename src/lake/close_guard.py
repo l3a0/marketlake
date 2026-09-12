@@ -90,9 +90,11 @@ class GuardOutcome:
     guessing where to write. Until D16 writes that report, ``report.write_close_guard``
     files each run under ``reports/close_guard/`` and the daemon prints it beside.
 
-    The strings here carry the fuller exception message, and the file drops it. A reader
-    with the launchd log gets what an exception said, and the tree the dashboard may read
-    gets the class alone. ``report._redacted`` owns that split and says why.
+    ``problems`` is the one field that interpolates an exception, and its strings keep the
+    fuller message. The file drops it, so a reader with the launchd log gets what the
+    exception said and the tree the dashboard may read gets the class alone. The other
+    five fields are composed from tickers, counts, and error classes, so they go down
+    whole. ``report._redacted`` owns that split and says why.
     """
 
     day: date
