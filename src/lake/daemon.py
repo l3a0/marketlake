@@ -879,6 +879,16 @@ def run_loop_from_config(
         Once per window rather than once per minute, because the holder retries every
         minute and a page that repeats six hundred times is a page nobody reads.
         """
+        if holder.took_over_dead_child():
+            # Reported, not paged. The machine was unheld for at most the minute between
+            # two ticks, and it is held again now. A page for a lapse that healed itself
+            # before anyone could read it is the cry-wolf shape the page-now tier cannot
+            # afford. A chronic one shows as a line every window, in the log the restart
+            # script already sends the operator to.
+            print(
+                f"assertion: {now.isoformat()}: re-took a caffeinate that had gone",
+                file=sys.stderr,
+            )
         failure = holder.pending_failure()
         if failure is None:
             return
