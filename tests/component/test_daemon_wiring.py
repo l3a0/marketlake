@@ -1376,3 +1376,51 @@ def test_a_page_the_transport_refuses_is_not_retried_every_minute(tmp_path, caps
 
     assert refusing.attempts == 1, f"the page was retried every minute, {refusing.attempts} times"
     assert "page not sent" in capsys.readouterr().err, "a refused page left no trace"
+
+
+class _DyingAssertions:
+    """A runner whose child dies after ``alive_for`` ticks, the way a killed one would."""
+
+    def __init__(self, alive_for: int) -> None:
+        self.spawns = 0
+        self._alive_for = alive_for
+        self._children: list[list[int | None]] = []
+
+    def __call__(self, args) -> object:
+        self.spawns += 1
+        state: list[int | None] = [None]
+        self._children.append(state)
+        countdown = [self._alive_for]
+
+        class _Child:
+            def poll(self_inner) -> int | None:
+                if state[0] is None:
+                    countdown[0] -= 1
+                    if countdown[0] < 0:
+                        state[0] = 0
+                return state[0]
+
+        return _Child()
+
+
+def test_the_daemon_re_takes_an_assertion_whose_child_died(tmp_path, capsys):
+    """The loop is awake while the machine goes unheld, so it is what should notice.
+
+    A ``caffeinate`` killed at 11:00 used to leave the window marked held for the rest of
+    the day. The daemon kept ticking, kept capturing, and the machine idled to sleep
+    underneath it, which costs the session rather than a marker.
+
+    Reported rather than paged: the lapse lasted at most the minute between two ticks and
+    is over by the time anyone could read a page.
+    """
+    rig = _rig(tmp_path)
+    runner = _DyingAssertions(alive_for=1)
+
+    _assertion_run(rig, ManualClock(start=et(2026, 9, 2, 17, 0, 30)), ticks=3, runner=runner)
+
+    assert runner.spawns >= 2, "the dead child was left dead for the rest of the window"
+    reported = capsys.readouterr().err
+    assert "re-took a caffeinate that had gone" in reported, "the re-take went unrecorded"
+    assert [m for m in rig.transport.sent if m.event == "assertion_lost"] == [], (
+        "a lapse that healed itself in a minute raised a page"
+    )

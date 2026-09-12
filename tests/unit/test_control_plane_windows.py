@@ -440,3 +440,275 @@ def test_a_failed_spawn_answers_none_rather_than_the_arguments():
     holder = cp.AssertionHolder(runner=_Failing())
 
     assert holder.hold(et(2026, 9, 2, 8, 30)) is None
+
+
+# -- a child that dies inside its window -----------------------------------------------
+
+
+class _Child:
+    """A stand-in for the spawned ``caffeinate``, alive until it is told otherwise."""
+
+    def __init__(self) -> None:
+        self._status: int | None = None
+
+    def die(self, status: int = 0) -> None:
+        self._status = status
+
+    def poll(self) -> int | None:
+        return self._status
+
+
+class _SpawningRunner:
+    """A runner that hands back a child the test can kill, the way ``Popen`` does."""
+
+    def __init__(self) -> None:
+        self.children: list[_Child] = []
+
+    def __call__(self, args) -> object:
+        child = _Child()
+        self.children.append(child)
+        return child
+
+
+def test_a_child_that_dies_inside_its_window_is_re_taken():
+    """The capture-loss path this closes, and the daemon is awake for all of it.
+
+    ``caffeinate`` carries a timer to the window's end, so an exit before then means it
+    was killed or died. Nothing releases one early on purpose. Before this, the holder
+    believed the window was held for the rest of the day and the machine idled to sleep
+    underneath a daemon that was running and ticking the whole time.
+    """
+    runner = _SpawningRunner()
+    holder = cp.AssertionHolder(runner=runner)
+
+    assert holder.hold(et(2026, 9, 2, 8, 30)) is not None, "the first hold never spawned"
+    assert holder.hold(et(2026, 9, 2, 8, 31)) is None, "it re-spawned over a living child"
+
+    runner.children[0].die()
+    retaken = holder.hold(et(2026, 9, 2, 8, 32))
+
+    assert retaken is not None, "a dead child was left dead for the rest of the window"
+    assert holder.took_over_dead_child() is True
+    assert holder.took_over_dead_child() is False, "the re-take was offered twice"
+
+    # And it sticks. A re-take that left the window unheld would spawn again every minute,
+    # piling up live caffeinates rather than replacing the one that went.
+    assert holder.hold(et(2026, 9, 2, 8, 33)) is None
+    assert len(runner.children) == 2, "the re-take did not take"
+
+
+def test_a_living_child_is_left_alone_for_the_whole_window():
+    """The other half. A re-spawn a minute would pile up assertions all day."""
+    runner = _SpawningRunner()
+    holder = cp.AssertionHolder(runner=runner)
+    holder.hold(et(2026, 9, 2, 8, 30))
+
+    for minute in range(31, 45):
+        assert holder.hold(et(2026, 9, 2, 8, minute)) is None
+
+    assert len(runner.children) == 1
+    assert holder.took_over_dead_child() is False
+
+
+def test_a_runner_that_hands_back_nothing_is_taken_at_its_word():
+    """Unable to tell is not the same as gone, and the two want opposite behaviour.
+
+    Every test double in this suite returns ``None``, and so may a future caller that has
+    no process to hand back. Reading that as a dead child would re-spawn a ``caffeinate``
+    every minute of a ten-hour window on the strength of knowing nothing.
+    """
+    runner = _Runner()
+    holder = cp.AssertionHolder(runner=runner)
+    holder.hold(et(2026, 9, 2, 8, 30))
+
+    for minute in range(31, 40):
+        holder.hold(et(2026, 9, 2, 8, minute))
+
+    assert len(runner.calls) == 1, "a runner returning nothing was read as a dead child"
+    assert holder.took_over_dead_child() is False
+
+
+def test_a_dead_child_from_an_earlier_window_does_not_count_as_a_re_take():
+    """A new window spawns because it is new, not because the old child is gone."""
+    runner = _SpawningRunner()
+    holder = cp.AssertionHolder(runner=runner)
+    holder.hold(et(2026, 9, 2, 8, 30))
+    runner.children[0].die()
+
+    holder.hold(et(2026, 9, 3, 8, 30))
+    # The second tick of the new window is the one that matters. A holder that kept the
+    # first window's dead child reads "gone" on every tick from here and re-spawns a
+    # caffeinate a minute for the whole ten-hour window.
+    holder.hold(et(2026, 9, 3, 8, 31))
+
+    assert len(runner.children) == 2, "the new window did not adopt its own child"
+    assert holder.took_over_dead_child() is False, "a new window was reported as a re-take"
+
+
+class _ScriptedRunner:
+    """A runner that fails or succeeds on command, handing back a killable child."""
+
+    def __init__(self) -> None:
+        self.fail = False
+        self.children: list[_Child] = []
+
+    def __call__(self, args) -> object:
+        if self.fail:
+            raise BlockingIOError(35, "no slots")
+        child = _Child()
+        self.children.append(child)
+        return child
+
+
+def test_a_re_take_that_fails_is_not_reported_as_a_re_take():
+    """Saying it was re-taken when the spawn raised is worse than saying nothing.
+
+    The flag used to be set before the spawn was attempted, so the daemon's log line
+    claimed the machine was being held again on a tick where nothing had been taken.
+    """
+    runner = _ScriptedRunner()
+    holder = cp.AssertionHolder(runner=runner)
+    holder.hold(et(2026, 9, 2, 8, 30))
+    runner.children[0].die()
+    runner.fail = True
+
+    assert holder.hold(et(2026, 9, 2, 8, 31)) is None
+    assert holder.took_over_dead_child() is False, "a failed spawn claimed a re-take"
+
+
+def test_a_second_loss_in_a_window_that_already_paged_can_still_page():
+    """The once-per-window rule is about one unresolved failure, not the window's quota.
+
+    A window that paged for an early failure and then recovered had spent its only page.
+    A different loss hours later was suppressed on the window it had already reported,
+    so the machine stayed unheld for the session with nothing saying so. That hole opened
+    the moment a window could hold more than one spawn.
+    """
+    runner = _ScriptedRunner()
+    holder = cp.AssertionHolder(runner=runner)
+
+    runner.fail = True
+    holder.hold(et(2026, 9, 2, 8, 30))
+    first = holder.pending_failure()
+    assert first is not None
+    holder.mark_reported(first[0])
+
+    runner.fail = False
+    holder.hold(et(2026, 9, 2, 8, 31))
+    assert holder.pending_failure() is None, "a held window still owed a page"
+
+    runner.children[0].die()
+    runner.fail = True
+    holder.hold(et(2026, 9, 2, 11, 1))
+
+    assert holder.pending_failure() is not None, "the second loss went unpageable"
+
+
+def test_a_continuous_re_take_is_reported_once_for_the_window():
+    """A caffeinate that exits on every spawn must not write a line a minute.
+
+    That is the same argument the page's collapse rests on, applied to the log the
+    restart script sends the operator to. Once a window still shows a chronic one, every
+    window, which is the signal worth having.
+    """
+    runner = _SpawningRunner()
+    holder = cp.AssertionHolder(runner=runner)
+    holder.hold(et(2026, 9, 2, 8, 30))
+
+    reports = 0
+    for minute in range(31, 45):
+        runner.children[-1].die()
+        holder.hold(et(2026, 9, 2, 8, minute))
+        reports += 1 if holder.took_over_dead_child() else 0
+
+    assert len(runner.children) == 15, "the re-take stopped happening"
+    assert reports == 1, f"one line per window, got {reports}"
+
+
+def test_a_child_whose_poll_raises_neither_crashes_nor_re_spawns():
+    """This runs from a hook nothing wraps, so the read has the same rule as the spawn.
+
+    ``Popen.poll`` does not raise in CPython, but the protocol promises only that the
+    attribute exists. Unable to tell answers held, because the other answer re-spawns a
+    caffeinate every minute of the window on the strength of an error.
+    """
+
+    class _Hostile:
+        def poll(self) -> int | None:
+            raise OSError("no such process")
+
+    holder = cp.AssertionHolder(runner=lambda args: _Hostile())
+    holder.hold(et(2026, 9, 2, 8, 30))
+
+    assert holder.hold(et(2026, 9, 2, 8, 31)) is None, "a raising poll forced a re-spawn"
+    assert holder.took_over_dead_child() is False
+
+
+def test_a_child_killed_by_a_signal_is_re_taken():
+    """``kill -9`` is the likeliest way one of these dies, and it never exits zero.
+
+    ``Popen.poll`` answers the negative signal number, so a liveness read written as
+    "exited cleanly" rather than "exited at all" would call a killed child alive and leave
+    the window unheld for the day. Every other double here dies with status 0, which is
+    the one status a hand-killed process does not have.
+    """
+    runner = _SpawningRunner()
+    holder = cp.AssertionHolder(runner=runner)
+    holder.hold(et(2026, 9, 2, 8, 30))
+
+    runner.children[0].die(-9)
+    retaken = holder.hold(et(2026, 9, 2, 8, 31))
+
+    assert retaken is not None, "a SIGKILLed caffeinate was read as still holding"
+    assert len(runner.children) == 2
+
+
+def test_a_handle_with_no_poll_is_tolerated_rather_than_fatal():
+    """Unable to ask is a supported answer. Raising here would exit the daemon.
+
+    The guard is an ``isinstance`` against the protocol rather than a ``None`` check, and
+    the difference only shows for a runner that hands back something real without a
+    ``poll``. A ``None`` check would reach for the attribute and raise, from a hook
+    ``run_loop`` does not wrap, which is the crash loop this whole area exists to prevent.
+    """
+    runner = _CountingRunner(lambda args: 4242)
+    holder = cp.AssertionHolder(runner=runner)
+
+    assert holder.hold(et(2026, 9, 2, 8, 30)) is not None
+    assert holder.hold(et(2026, 9, 2, 8, 31)) is None, "an unaskable handle forced a re-spawn"
+    assert runner.calls == 1
+
+
+class _CountingRunner:
+    def __init__(self, answer) -> None:
+        self.calls = 0
+        self._answer = answer
+
+    def __call__(self, args) -> object:
+        self.calls += 1
+        return self._answer(args)
+
+
+def test_the_holder_spawns_through_the_real_runner_by_default():
+    """The default is the production spawn, which nothing else in the suite reaches.
+
+    Every test hands in a double, so the default was free to be anything, a no-op
+    included, with the whole suite green. That is the shape where the feature ships
+    disabled.
+    """
+    assert cp.AssertionHolder()._runner is cp._spawn
+
+
+def test_the_real_spawn_hands_back_something_the_holder_can_ask():
+    """``_spawn``'s contract is that its return can be polled, and only this runs it.
+
+    The protocol's docstring claims ``subprocess.Popen`` satisfies it. Returning a pid, or
+    nothing, would make every liveness read answer "held" forever and silently disable the
+    re-take, with no test red. ``true`` is used rather than ``caffeinate`` so the test
+    spawns nothing that touches power state.
+    """
+    child = cp._spawn(["true"])
+
+    assert isinstance(child, cp.AssertionHandle), "the spawn returned something unaskable"
+    child.wait()
+    assert child.poll() is not None, "a finished child still read as running"
