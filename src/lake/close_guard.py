@@ -7,7 +7,13 @@ closes are not equally recoverable.
 An ``option_close`` that never landed can be refetched. Option quotes freeze at the
 option close, so a fetch at close+5 still observes the closing marks. The fill is
 written as its own segment and carries the close slot in ``snap_ts``, never its fetch
-minute, so a reader asking for the close gets the close.
+minute, so a reader asking for the close gets the close. A fill that captured nothing
+writes no segment at all. The day already holds the gap row from the cycle that failed
+at the close, and a second row for that one minute would double-count it in every
+per-slot completeness read, so the attempt is recorded in the outcome instead. A fill
+that landed but gave up a date window is named too, because the window that fails at
+close+5 is usually the one that failed intraday, so the membership comparison is blind
+in the same place and nothing else would say the close is a window short.
 
 A ``spot_close`` that never landed is unrecoverable by construction. The 16:00 moment
 cannot be re-observed at 16:20. A post-close fetch would carry frozen option marks
@@ -102,9 +108,11 @@ class CloseGuard:
     """Checks both close tags landed, fills the recoverable one, marks the other.
 
     ``fill`` is the injected fetch. It is handed a ticker and the close slot and returns
-    the expirations it captured, or ``None`` when it could not fetch. Leaving it unset
-    makes the guard marker-only, which is what a test wants and what a daemon with no
-    vendor client falls back to.
+    the expirations it captured, or ``None`` when it could not fetch. It both fetches and
+    journals, because the row it lands carries the close slot rather than its own fetch
+    minute and only the writer can stamp that. ``capture.fill_option_close`` is the one
+    the daemon passes. Leaving it unset makes the guard marker-only, which is what a
+    marker-side test wants.
 
     ``spans`` and ``master`` are both readers, not values. Between them they answer the
     only question the guard asks before it writes: did this ticker owe a close at this
@@ -333,17 +341,51 @@ class CloseGuard:
             # option close means.
             found.refused.append(f"{ticker}: past close+5")
             return
+        # The baseline is the day's own last loop-captured cycle, and both halves of that
+        # phrase are load-bearing.
+        #
+        # Read before the fill, never after. ``latest_expirations`` answers with the
+        # newest durable batch, and the fill lands one, so reading after would hand back
+        # the fill's own expirations and the comparison below would compare the fill
+        # against itself and never find a shortfall.
+        #
+        # Scoped to the day, never across days. A dark session leaves no same-day batch,
+        # and an unscoped read reaches back to an earlier one whose same-day series have
+        # since expired. Every one of them would read as missing from today's fill, which
+        # is a shortfall that cannot be true. With no same-day cycle the design's answer
+        # is baseline-less, which is what a ``None`` here becomes below.
+        baseline = journal.latest_expirations(self._root, ticker, on=day)
         try:
             captured = self._fill(ticker, bounds.option_close)
         except Exception as exc:  # noqa: BLE001 - a vendor failure must not stop the guard
             found.problems.append(f"chains/{ticker} option_close: {type(exc).__name__}")
             return
         if captured is None:
+            # Nothing landed, so nothing is written. The day already carries the gap row
+            # from the cycle that failed at the close, and a second row for that minute
+            # would double-count it in every per-slot completeness read. The refusal is
+            # the record of the attempt, and it reaches the report like the others.
             found.refused.append(f"{ticker}: fill fetch returned nothing")
             return
         found.filled.append(ticker)
 
-        baseline = journal.latest_expirations(self._root, ticker)
+        # A fill can land and still have given up on a date window. Those windows ride the
+        # snapshot as absence-marker gap rows carrying their own class, so the lake's own
+        # record stands, but nothing in the outcome named them and the report went silent
+        # on a close of record missing a whole window. Worse, the membership comparison
+        # below cannot see it either: the window that failed at close+5 is usually the one
+        # that failed intraday, so the baseline is blind in exactly the same place and the
+        # difference comes out empty.
+        #
+        # The count is the gap rows the fill added, read against the same tag this method
+        # opened with. Only the fill wrote between the two reads, so the difference is
+        # the fill's own.
+        landed = journal.close_tag_rows(
+            self._root, journal.CHAINS_SURFACE, ticker, day, OPTION_CLOSE
+        )
+        if landed.gaps > rows.gaps:
+            found.shortfalls.append(f"{ticker}: {landed.gaps - rows.gaps} windows absent")
+
         if baseline is None:
             # No same-day cycle to compare against. The fill still stands, and the
             # battery is told to judge it rather than the guard voiding it.

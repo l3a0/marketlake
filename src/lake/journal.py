@@ -1218,7 +1218,7 @@ def recorded_slots(
     return RecordedSet(frozenset(snaps), tuple(unreadable))
 
 
-def _is_chains_segment_for(rel: str, ticker: str) -> bool:
+def _is_chains_segment_for(rel: str, ticker: str, on: date | str | None = None) -> bool:
     """Whether a manifest partition path is one of ``ticker``'s chains journal segments.
 
     A capture-written segment is manifested under its own path,
@@ -1228,10 +1228,13 @@ def _is_chains_segment_for(rel: str, ticker: str) -> bool:
 
     Recognizing that shape is ``parse_segment_rel``'s job. It lives beside the builder that
     made the path. What is left here is the question only this reader asks, whether the
-    parsed segment names the chains surface and the ticker in hand.
+    parsed segment names the chains surface and the ticker in hand, and, when ``on`` is
+    given, the session date too.
     """
     ref = parse_segment_rel(rel)
-    return ref is not None and ref.surface == CHAINS_SURFACE and ref.ticker == ticker
+    if ref is None or ref.surface != CHAINS_SURFACE or ref.ticker != ticker:
+        return False
+    return on is None or ref.day == _day_str(on)
 
 
 class CloseTagRows(NamedTuple):
@@ -1319,7 +1322,9 @@ def _expirations_of(batches: list) -> list[str] | None:
     return None
 
 
-def latest_expirations(lake_root: Path | str, ticker: str) -> list[str] | None:
+def latest_expirations(
+    lake_root: Path | str, ticker: str, *, on: date | str | None = None
+) -> list[str] | None:
     """The distinct expiration dates in a ticker's latest prior durable chains batch.
 
     This is the last-durable-batch read. The capture chunker makes it on its failure path
@@ -1341,15 +1346,22 @@ def latest_expirations(lake_root: Path | str, ticker: str) -> list[str] | None:
     latest *durable data* batch rather than merely the latest segment, so a whole-chain gap
     last minute does not blind the marker.
 
-    ``None`` means no prior durable data batch exists: no manifest, no chains segment for
-    the ticker, or none of its segments holds a data batch. A manifested segment whose file
-    is gone is skipped, never an error.
+    ``on`` narrows the walk to one session date. The capture chunker leaves it unset,
+    because the expirations it names absent come from whatever batch is latest and a
+    chain listed yesterday is still listed today. The close+5 guard sets it, because the
+    baseline it compares a fill against is the day's own last loop-captured cycle. A
+    cross-day baseline would call a series that expired yesterday missing from today's
+    fill, which is a shortfall that cannot be true.
+
+    ``None`` means no prior durable data batch exists in scope: no manifest, no chains
+    segment for the ticker, none on the named date, or none of its segments holds a data
+    batch. A manifested segment whose file is gone is skipped, never an error.
     """
     root = Path(lake_root)
     ordered: dict[str, dict] = {}
     for entry in read_manifest(root):
         rel = entry.get("partition")
-        if isinstance(rel, str) and _is_chains_segment_for(rel, ticker):
+        if isinstance(rel, str) and _is_chains_segment_for(rel, ticker, on):
             # Keep insertion at the last occurrence, so a re-recorded segment sorts by its
             # most recent entry while every segment still appears once.
             ordered.pop(rel, None)
