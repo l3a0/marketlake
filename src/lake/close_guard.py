@@ -124,11 +124,16 @@ class CloseGuard:
     """Checks both close tags landed, fills the recoverable one, marks the other.
 
     ``fill`` is the injected fetch. It is handed a ticker and the close slot and returns
-    the expirations it captured, or ``None`` when it could not fetch. It both fetches and
-    journals, because the row it lands carries the close slot rather than its own fetch
-    minute and only the writer can stamp that. ``capture.fill_option_close`` is the one
-    the daemon passes. Leaving it unset makes the guard marker-only, which is what a
-    marker-side test wants.
+    a ``capture.FillResult``, which is what the daemon passes and what a fake here has to
+    return too. Three things ride it, and the guard reads every one: the expirations the
+    fill captured, the date windows its fetch gave up on, and the representative error
+    class. A bare expiration list carried only the first, which left a partially failed
+    fill unable to say so and made a series the fetch missed indistinguishable from one
+    the vendor withdrew.
+
+    The fill both fetches and journals, because the row it lands carries the close slot
+    rather than its own fetch minute and only the writer can stamp that. Leaving it unset
+    makes the guard marker-only, which is what a marker-side test wants.
 
     ``spans`` and ``master`` are both readers, not values. Between them they answer the
     only question the guard asks before it writes: did this ticker owe a close at this

@@ -1116,3 +1116,132 @@ def test_an_absent_series_marker_refuses_a_surface_with_no_expirations():
             expirations=[NEAR_EXP],
             error_class=close_guard.OPTION_CLOSE_SERIES_ABSENT,
         )
+
+
+# -- what the mutation lens found: the marker row's own columns ------------------------
+
+# Every column a membership marker is allowed to fill. Everything else on the chains
+# schema stays null, which is the all-columns-null rule a gap row is built on, and the
+# one exception is the expiration the row exists to name.
+_MARKER_FILLED = frozenset(
+    {
+        "snap_ts",
+        "ticker",
+        "row_kind",
+        "error_class",
+        "suspect",
+        "close_tag",
+        "session_phase",
+        "schema_version",
+        "expiration_date",
+    }
+)
+
+
+def test_the_membership_markers_reason_is_the_literal_downstream_readers_key_on():
+    """The wire value, not the symbol. A rename is a silent break for every reader.
+
+    A test that filters rows by ``close_guard.OPTION_CLOSE_SERIES_ABSENT`` follows the
+    constant wherever it goes, so it cannot notice the string changing. The string is the
+    contract: ``docs/design.md`` and ``docs/build-plan.md`` both name this literal, and a
+    reader in a later slice matches on it rather than importing the module.
+    """
+    assert close_guard.OPTION_CLOSE_SERIES_ABSENT == "option_close_series_absent"
+
+
+def test_the_row_builder_stamps_the_reason_it_was_handed(lake_root):
+    """``absent_series_rows`` is a general builder, not a hardcoded one.
+
+    Hardcoding the close guard's own class here would mislabel every row a later caller
+    writes, and the mislabel would be invisible because the guard passes that same class.
+    """
+    batch = journal.absent_series_rows(
+        CHAINS,
+        ticker="SPY",
+        slot=CLOSE,
+        expirations=[NEAR_EXP, "2026-09-11"],
+        error_class="some_other_reason",
+    )
+
+    rows = batch.to_pylist()
+    assert [r["error_class"] for r in rows] == ["some_other_reason", "some_other_reason"]
+    assert [r["ticker"] for r in rows] == ["SPY", "SPY"]
+
+
+def test_the_membership_marker_fills_only_the_columns_it_is_entitled_to(lake_root):
+    """A gap row holds no market data, and this one holds exactly one extra field.
+
+    A filled ``fetch_ts`` would make a row that observed nothing look like it observed
+    something, and a ``suspect`` flag would change what a downstream quality filter
+    drops. Asserting the whole row rather than the two window bounds is what keeps a
+    later edit from quietly filling one of them.
+    """
+    _intraday(lake_root, [NEAR_EXP, "2026-09-11"])
+    short = _WindowVendor(windows={NEAR: _chain([NEAR_EXP]), TAIL: _chain([])})
+
+    _guard(lake_root, at=FILL_MINUTE, fill=lambda t, s: _fill(lake_root, short, ticker=t)).run(DAY)
+
+    marker = _markers(lake_root)[0]
+    assert marker["error_class"] == "option_close_series_absent"
+    assert marker["ticker"] == "SPY"
+    assert marker["suspect"] is False
+    assert marker["schema_version"] == 1
+    filled = {name for name, value in marker.items() if value is not None}
+    assert filled == _MARKER_FILLED, f"unexpected columns on a gap row: {filled - _MARKER_FILLED}"
+
+
+def test_the_shortfall_line_counts_every_missing_series(lake_root):
+    """The report is what an operator reads, so an understated count is a silent loss."""
+    _intraday(lake_root, [NEAR_EXP, "2026-09-11", "2026-09-14"])
+    short = _WindowVendor(windows={NEAR: _chain([NEAR_EXP]), TAIL: _chain([])})
+
+    outcome = _guard(
+        lake_root, at=FILL_MINUTE, fill=lambda t, s: _fill(lake_root, short, ticker=t)
+    ).run(DAY)
+
+    assert outcome.shortfalls == ("SPY: 2 expirations",)
+
+
+def test_a_marker_write_that_fails_is_a_problem_and_never_a_shortfall(lake_root):
+    """Claiming a shortfall no row records is the one lie this writer must not tell.
+
+    The shortfall line says the absence is on record. If the write failed, it is not, and
+    reporting it anyway turns a hole into something an operator reads as handled.
+    """
+    _intraday(lake_root, [NEAR_EXP, "2026-09-11"])
+    short = _WindowVendor(windows={NEAR: _chain([NEAR_EXP]), TAIL: _chain([])})
+    guard = _guard(lake_root, at=FILL_MINUTE, fill=lambda t, s: _fill(lake_root, short, ticker=t))
+
+    def refuse(*args, **kwargs):
+        raise OSError("read-only file system")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(guard, "_series_marker", refuse)
+        outcome = guard.run(DAY)
+
+    assert outcome.shortfalls == (), "a shortfall was claimed for a row that never landed"
+    assert outcome.problems == ("chains/SPY option_close: OSError",)
+
+
+def test_a_calendar_that_cannot_place_the_minute_costs_the_stamp_and_not_the_marker(lake_root):
+    """The phase is provenance riding a marker. The marker is the record itself.
+
+    Losing the stamp leaves a row whose phase is null, which is recoverable from the
+    slot. Losing the marker leaves a hole, which is not. The guard's own docstring
+    promises that order, so something has to hold it.
+    """
+    _intraday(lake_root, [NEAR_EXP, "2026-09-11"])
+    short = _WindowVendor(windows={NEAR: _chain([NEAR_EXP]), TAIL: _chain([])})
+    guard = _guard(lake_root, at=FILL_MINUTE, fill=lambda t, s: _fill(lake_root, short, ticker=t))
+
+    def broken(slot):
+        raise RuntimeError("calendar unavailable")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(guard._session_clock, "phase_at", broken)
+        outcome = guard.run(DAY)
+
+    markers = _markers(lake_root)
+    assert [m["expiration_date"] for m in markers] == ["2026-09-11"], "the marker was lost"
+    assert markers[0]["session_phase"] is None
+    assert outcome.shortfalls == ("SPY: 1 expirations",)
