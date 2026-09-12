@@ -302,8 +302,12 @@ def dashboard_job(host: LaunchdHost) -> LaunchdJob:
 def self_check_job(host: LaunchdHost) -> LaunchdJob:
     """The weekday pre-open self-check, five minutes after the firmware wake.
 
-    ``RunAtLoad`` is deliberately on. A load during the day runs the check once at
-    load, which is harmless and pings only if the daemon is up.
+    ``RunAtLoad`` is deliberately on. A load during the day runs the check once at load,
+    which is harmless: it pings only if the daemon is up, and it asks for the assertion
+    only when a window is open. An install outside every window, on a Saturday or a
+    weekday evening, is the case that would otherwise fail on a healthy machine and
+    withhold the first ping, the one that takes this check out of the never-pinged state
+    where it cannot page at all.
     """
     return host.job(
         SELF_CHECK_LABEL,
@@ -411,6 +415,57 @@ def launchctl_probe(label: str) -> bool:
     return result.returncode == 0 and parse_launchctl_print(result.stdout)
 
 
+# Whether a ``caffeinate`` assertion is currently held. The real one shells out to
+# ``pmset -g assertions``, which is read-only and needs no root, the same shape the
+# Sunday job's ``pmset -g sched`` read already has. A test injects a callable.
+AssertionProbe = Callable[[], bool]
+
+
+def parse_pmset_assertions(output: str) -> bool:
+    """Whether ``caffeinate`` holds an idle-sleep assertion in a ``pmset -g`` dump.
+
+    The dump lists assertions twice: a system-wide tally, then one line per owning
+    process. This reads the second, because the tally answers a different question. On an
+    ordinary machine ``powerd``, ``coreaudiod``, ``runningboardd`` and others hold
+    ``PreventUserIdleSystemSleep`` routinely, ``powerd`` for as long as the display is on.
+    The tally therefore reads safe on a machine with no daemon running at all, which is
+    the exact state this check exists to find.
+
+    What it confirms is narrower than "the daemon's assertion", and the difference is
+    worth stating rather than glossing. A line carries its owner as ``pid 123(caffeinate)``
+    and its kind further along, so both must appear on one line to count, which excludes
+    every holder that is not a ``caffeinate``. It does not identify *which* ``caffeinate``:
+    the owning pid is not matched against the daemon's child, and the assertion's timer
+    sits on a continuation line the match never reaches. So a hand-run ``caffeinate -i``
+    left over from the night before satisfies this. Closing that needs the daemon to
+    record its child's pid somewhere this separate process can read, which is #107.
+
+    The kind has to be on the line too, because ``caffeinate -d`` holds the display up and
+    lets the system idle to sleep underneath it.
+    """
+    for line in output.splitlines():
+        if "(caffeinate)" in line and "PreventUserIdleSystemSleep" in line:
+            return True
+    return False
+
+
+def pmset_assertions_probe() -> bool:
+    """The real probe: ``pmset -g assertions``, parsed for a caffeinate-held assertion.
+
+    Read-only, so it needs no sudoers entry. The design's ``pmset`` table already lists
+    this invocation, and the two writes the drop-in grants stay the wake schedule's.
+    """
+    import subprocess  # lazy: only a real run shells out
+
+    result = subprocess.run(
+        ["pmset", "-g", "assertions"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0 and parse_pmset_assertions(result.stdout)
+
+
 @dataclass(frozen=True)
 class SelfCheckOutcome:
     """What one pre-open self-check found and did."""
@@ -418,6 +473,25 @@ class SelfCheckOutcome:
     daemon_up: bool
     pinged: bool
     problem: str | None = None
+    # ``None`` means the question was not asked: no probe was handed in, or no assertion
+    # was owed at the moment of the check. Distinct from ``True``, which is a probe that
+    # answered. A field that read ``True`` for a check that never looked would be the
+    # first false line any panel reading it printed.
+    assertion_held: bool | None = None
+
+
+def _assertion_owed(now: datetime | None) -> bool:
+    """Whether an assertion is owed at ``now``, so that its absence means something.
+
+    Without a moment there is no window to judge against, so nothing is owed. That is
+    the honest answer rather than a convenient one: a check with no clock cannot tell a
+    machine that should be held awake from a Saturday afternoon.
+    """
+    if now is None:
+        return False
+    eastern = now.astimezone(MARKET_TZ)
+    window = assertion_window(eastern.date())
+    return window is not None and window.contains(eastern)
 
 
 def self_check(
@@ -426,13 +500,41 @@ def self_check(
     pinger: Pinger,
     ping_url: str,
     label: str = DAEMON_LABEL,
+    assertion_probe: AssertionProbe | None = None,
+    now: datetime | None = None,
 ) -> SelfCheckOutcome:
-    """Verify the daemon is up, and ping the pre-open check only then.
+    """Verify the daemon is up and holding its assertion, and ping only then.
 
-    The self-check's ping means awake-and-daemon-up. A missed ping means the 08:25
-    wake failed, paged a full hour before the bell. So the ping fires only on the
-    success condition. A down daemon exits without pinging. A raising probe
+    The ping means awake, daemon up, and the machine held awake. A missed ping means
+    one of those failed, paged a full hour before the bell. So the ping fires only on
+    the success condition. A down daemon exits without pinging. A raising probe
     propagates, which is also a non-ping.
+
+    The assertion is checked because a daemon that is up is not the same as a machine
+    that will stay awake. The design rejected ``pmset disablesleep`` in favour of this
+    assertion, so on a machine whose AC profile idles to sleep, nothing else holds it up
+    once the display's own grace has passed.
+
+    What this catches, stated exactly, because the obvious phrasings do not survive
+    contact with the timings. It is the case where the machine is still awake at 08:30
+    and the daemon's own ``caffeinate`` is not what is keeping it that way. Something
+    else is holding idle sleep off: an operator at the keyboard that morning, a hand-run
+    ``caffeinate -d``, a video call. The machine looks fine and will sleep the moment
+    that other holder goes away, which is usually before the bell. That is the one
+    scenario the parser's by-owning-process read exists for, and nothing else notices it.
+
+    The neighbouring phrasings are wrong and worth naming so they do not come back. A
+    daemon that was down when the window opened is caught by the probe above, before
+    this runs. An assertion "lost overnight" cannot happen, because nothing is owed
+    between 18:45 and 08:25. And a spawn that keeps failing puts the machine to sleep
+    within about a minute, so the 08:30 job never runs at all and the missed ping is what
+    pages.
+
+    The assertion is demanded only when one is owed. Outside any window, on a Saturday,
+    or before the wake, nothing is holding anything and nothing should be: a check that
+    asked anyway would fail every out-of-window run, including the one at install time
+    that arms the check in the first place. ``now`` is what decides that, so a caller
+    that passes a probe and no ``now`` gets no assertion check.
 
     A ping that fails is named rather than raised. The outcome is the same missed
     ping either way, and healthchecks pages for it after the grace. The difference is
@@ -442,12 +544,22 @@ def self_check(
     up = probe(label)
     if not up:
         return SelfCheckOutcome(daemon_up=False, pinged=False)
+    held: bool | None = None
+    if _assertion_owed(now) and assertion_probe is not None:
+        held = assertion_probe()
+        if not held:
+            return SelfCheckOutcome(
+                daemon_up=True,
+                pinged=False,
+                problem="no caffeinate assertion held",
+                assertion_held=False,
+            )
     try:
         pinger.ping(ping_url)
     except PING_FAILURES as exc:
         problem = f"ping failed: {type(exc).__name__}"
-        return SelfCheckOutcome(daemon_up=True, pinged=False, problem=problem)
-    return SelfCheckOutcome(daemon_up=True, pinged=True)
+        return SelfCheckOutcome(daemon_up=True, pinged=False, problem=problem, assertion_held=held)
+    return SelfCheckOutcome(daemon_up=True, pinged=True, assertion_held=held)
 
 
 # -- the pmset schedule: rendering and read-back ------------------------------
@@ -2249,7 +2361,9 @@ def _build_parser():
     render.add_argument("--group", default="staff", help="GroupName for the jobs.")
     render.add_argument("--config", help="Config path, passed via MARKETLAKE_CONFIG.")
 
-    check = sub.add_parser("self-check", help="Verify the daemon is up, then ping pre-open.")
+    check = sub.add_parser(
+        "self-check", help="Verify the daemon is up and holding its assertion, then ping."
+    )
     check.add_argument("--config", help="Path to config.yaml (defaults to the standard location).")
     check.add_argument("--label", default=DAEMON_LABEL, help="The daemon's launchd label.")
 
@@ -2338,6 +2452,8 @@ def main(
             pinger=UrllibPinger(),
             ping_url=config.healthchecks_url(PRE_OPEN_SLUG),
             label=args.label,
+            assertion_probe=pmset_assertions_probe,
+            now=_system_clock().now(),
         )
         status = "daemon up" if outcome.daemon_up else "daemon down"
         if outcome.problem is not None:

@@ -13,7 +13,7 @@ Four properties carry the whole guard, and each is covered below.
    be swallowed and the test would pass.
 3. Every other program still runs for real, which is what lets the four render tests
    in ``tests/component/test_control_plane_render.py`` spawn a rendered script.
-4. The four production seams that forget to fake a guarded program are themselves
+4. The five production seams that forget to fake a guarded program are themselves
    caught, not just a synthetic call naming the program directly.
 """
 
@@ -24,7 +24,12 @@ import sys
 
 import pytest
 
-from lake.control_plane import launchctl_probe, read_exclusions, read_pmset_schedule
+from lake.control_plane import (
+    launchctl_probe,
+    pmset_assertions_probe,
+    read_exclusions,
+    read_pmset_schedule,
+)
 from lake.runner import RsyncBackup
 from tests.conftest import SubprocessAccessInTest
 
@@ -98,6 +103,18 @@ def test_a_forgotten_launchctl_probe_fake_is_caught():
 def test_a_forgotten_pmset_schedule_fake_is_caught():
     with pytest.raises(SubprocessAccessInTest):
         read_pmset_schedule()
+
+
+def test_a_forgotten_pmset_assertions_fake_is_caught():
+    """The fifth seam, and the reason this set is a set rather than four separate tests.
+
+    The pre-open self-check reads ``pmset -g assertions`` to confirm the machine is being
+    held awake. A test that forgets the fake would ask the machine running the suite,
+    whose answer has nothing to do with the case under test and changes depending on
+    whether someone is at the keyboard.
+    """
+    with pytest.raises(SubprocessAccessInTest):
+        pmset_assertions_probe()
 
 
 def test_a_forgotten_exclusion_reader_fake_is_caught():

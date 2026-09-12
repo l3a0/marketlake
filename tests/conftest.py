@@ -153,19 +153,19 @@ def _no_network() -> Iterator[None]:
 
 # -- the subprocess guard --------------------------------------------------------------
 
-# Four production call sites shell out to a named external tool through
+# Five production call sites shell out to a named external tool through
 # ``subprocess.run``: ``RsyncBackup.sync`` runs ``rsync``, ``launchctl_probe`` runs
-# ``launchctl``, ``read_pmset_schedule`` runs ``pmset``, and ``read_exclusions`` runs
-# ``tmutil``. Each is a seam, so a test injects a fake in place of the function that
-# calls it. A test that forgets runs the real tool instead, which the network guard
-# above cannot catch: none of the four touch a socket in this process. This fixture
-# closes that gap the same way, on those four names only.
+# ``launchctl``, ``read_pmset_schedule`` and ``pmset_assertions_probe`` run ``pmset``,
+# and ``read_exclusions`` runs ``tmutil``. Each is a seam, so a test injects a fake in
+# place of the function that calls it. A test that forgets runs the real tool instead,
+# which the network guard above cannot catch: none of the five touch a socket in this
+# process. This fixture closes that gap the same way, on those program names only.
 #
 # The refusal has to name the program rather than block every subprocess. Four tests in
 # ``tests/component/test_control_plane_render.py`` run the rendered install, reinstall,
 # restart, and uninstall scripts for real, each sandboxed by a fake ``PATH`` that points
 # at stand-ins for the tools the script calls. Those calls name a script path or
-# ``bash``, never one of the four guarded names directly, so refusing only the four
+# ``bash``, never one of the guarded names directly, so refusing only those names
 # leaves them untouched.
 
 _GUARDED_PROGRAMS = frozenset({"rsync", "launchctl", "pmset", "tmutil"})
