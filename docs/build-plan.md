@@ -18,6 +18,8 @@ The capture clock is the daily job that records the market. Nothing in a later s
 
 The build is a sequence of deliverables, D0 through D21. Each is one focused unit of work. They group into the five slices from the design doc, plus the test harness that comes first.
 
+An entry that leads with an issue number rather than a D number is work a deliverable did not finish. The issue is the source of truth for its status, and the entry is the scope and the reasoning behind it. Neither repeats the other: an entry describes the gap and why it belongs to this slice, and never records whether the work has since been done, which is the issue's to say. Where an entry's description of a gap and its issue disagree, the issue is right. An entry that claimed both would go stale the moment the work landed, which is what happened while the entries were marked unowned.
+
 ### D0, the test harness
 
 D0 builds the seams the whole suite leans on. A seam is an injection point where a real dependency is swapped for a fake one in a test. There are four seams and one builder.
@@ -67,7 +69,7 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   2. `journal.gap_rows`, one batch covering many missed minutes. A dark session is 406 slots, and `gap_batch` builds one row per call.
   3. `SessionClock.phase_at`, the phase of any slot rather than the current one, so a marker for a post-equity-close minute carries the phase a captured row would have.
   4. `session.missed_slots`, D9's own day-by-day walk moved beside `skipped_slots` so both hooks share one enumerator and `lake.gap` needs no import of `lake.daemon`.
-- **Unowned.** The backup-copy scrub, and the `--checksum` drop that waits on it. `manifest.scrub` reads under `lake_root` only, so nothing verifies the backup target today. `control_plane`'s Sunday gap list already names it as gap 3 of 5. The two land together or in that order, because until the scrub exists `--checksum` in `RsyncBackup.sync` is the only thing that would notice the backup rotting. Dropping it first trades a deadline that fails in a few years for a verification hole that starts now. **Both stay in slice 2.** The scrub is a Sunday-job activity, the Sunday job is D14's, and `manifest.scrub` already exists and already runs there over `lake_root`. Reaching the backup target is a target and a parameter rather than new machinery, so slice 5's validation battery is the wrong home for it. The pairing is a sequencing rule inside slice 2, not a reason to defer either half out of it.
+- **[#88](https://github.com/l3a0/marketlake/issues/88).** The backup-copy scrub, and the `--checksum` drop that waits on it. `manifest.scrub` reads under `lake_root` only, so nothing verifies the backup target today. `control_plane`'s Sunday gap list already names it as gap 3 of 5. The two land together or in that order, because until the scrub exists `--checksum` in `RsyncBackup.sync` is the only thing that would notice the backup rotting. Dropping it first trades a deadline that fails in a few years for a verification hole that starts now. **Both stay in slice 2.** The scrub is a Sunday-job activity, the Sunday job is D14's, and `manifest.scrub` already exists and already runs there over `lake_root`. Reaching the backup target is a target and a parameter rather than new machinery, so slice 5's validation battery is the wrong home for it. The pairing is a sequencing rule inside slice 2, not a reason to defer either half out of it.
 - **The close+15 compaction dispatch.** Built. The daemon dispatches the close+15 job
   through D11's `session.SessionDispatch`, on the same tick hook the close+5 guard rides,
   so the machine seals and backs up its own day instead of waiting for a hand-run
@@ -130,29 +132,30 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   debris. Gap-marking already skipped a sealed date for this exact reason. The guard now
   does too.
 
-- **Unowned.** Seven residual gaps in the daemon's production wiring. `test_daemon_wiring.py`
-  now covers the ten hook bindings `run_loop_from_config` builds, and deleting any one of
-  them fails a test. What no test covers is narrower than a binding, and two of the seven
-  reach production behaviour rather than test strength. Each was confirmed by mutating
-  `src/lake/daemon.py` and running the whole suite, which stays green:
+- **[#94](https://github.com/l3a0/marketlake/issues/94), [#95](https://github.com/l3a0/marketlake/issues/95), [#113](https://github.com/l3a0/marketlake/issues/113) and [#114](https://github.com/l3a0/marketlake/issues/114).** Four residual gaps in
+  the daemon's production wiring. `test_daemon_wiring.py` covers the hook bindings
+  `run_loop_from_config` builds, and deleting any one of them fails a test. What no test
+  covers is narrower than a binding. This entry listed seven. Three have closed since, each
+  to a different change rather than to one: the close-guard layer's `on_tick` pass-through
+  to D15's idle stamp, the guard's dispatch moment to the wiring tests themselves, and the
+  gap marker's security master to the close+15 dispatch. Each of the four below was
+  re-confirmed by mutating `src/lake/daemon.py` and running the whole suite, which stays
+  green:
 
-  1. the caller's `on_tick` pass-through in the close-guard layer, whose deletion silences
-     the caffeinate power assertion in every production run,
-  2. the `close_tag` and `session_phase` the loop forwards into the production cycle
-     runner, so an unstamped option-close cycle would cost the close-tag read path,
-  3. the caller's `on_start` and `on_skipped` pass-throughs in the gap-marker layer, whose
-     loss also makes the first assertion of the close+5 test vacuous,
-  4. the dead-man's `any` over a cycle's segments, which single-segment fixtures cannot
-     tell from `all`,
-  5. the guard's dispatch moment, which can move one minute off close+5 unnoticed,
-  6. the watchdog instance the skipped-slot hook charges, which no test ties to the one
-     the cycle observer feeds,
-  7. the security master the wiring loads for the gap marker, whose absence loses a freshly
-     onboarded ticker's marked minutes.
+  1. the dead-man's `any` over a cycle's segments, which single-segment fixtures cannot
+     tell from `all`, which is [#94](https://github.com/l3a0/marketlake/issues/94),
+  2. the `session_phase` the loop forwards into the production cycle runner, and the fact
+     that no test carries either it or the close tag into a journaled row through the
+     production entry, which is [#95](https://github.com/l3a0/marketlake/issues/95). The `close_tag` half of the forward is
+     covered, by `test_the_daemon_answers_the_close_tag_hook_from_the_calendar`,
+  3. the caller's `on_start` and `on_skipped` pass-throughs in the gap-marker layer, which
+     is [#113](https://github.com/l3a0/marketlake/issues/113),
+  4. the watchdog instance the skipped-slot hook charges, which no test ties to the one the
+     cycle observer feeds, which is [#114](https://github.com/l3a0/marketlake/issues/114).
 - **D11** close tags and the close+5 guard. Close+5 is the five-minute window after the option close, the last moment an option-close fetch may land. It plugs into D9's close-tag hook, and it builds the session-relative dispatcher the design calls for. Everything session-relative runs from inside the daemon, because launchd's calendar intervals are fixed wall-clock and cannot express a close-relative time. `SessionDispatch` fires one job once per session day at a moment the calendar decides, including on a daemon that starts after that moment has passed. The close+15 compaction dispatch binds to the same seam, one tick later than its own moment, for the reason the entry above gives. Two rules are worth stating where both writers can see them:
   1. The guard's fill triggers on missing marks, not a missing cycle. A chain that failed at the option close leaves a tagged gap row holding nothing a reader can price against, and a close+5 refetch is exactly what rescues it.
   2. On a post-close restart the guard runs before startup gap-marking, so the two close minutes it owns are already recorded when D10's marker walks the day.
-- **Unowned.** The close+5 fill's producer. `CloseGuard` takes an injected `fill` and
+- **[#90](https://github.com/l3a0/marketlake/issues/90).** The close+5 fill's producer. `CloseGuard` takes an injected `fill` and
   `daemon._close_guard` never passes one, so `self._fill` is `None` in production. The guard
   detects a missing `option_close`, appends a `no fill fetcher` line to its own outcome, and
   returns. Nothing is refetched and nothing is written. The reason constant
@@ -163,7 +166,7 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   producer exists, the window is observed and never used. It needs no vendor work that slice 2
   lacks: `SchwabVendor.get_chain` already ships and capture calls it every minute. What is
   missing is a caller at close+5 and a decision about what a failed fill records.
-- **Unowned.** The membership guard's absent-marker rows. The guard counts missing expirations
+- **[#91](https://github.com/l3a0/marketlake/issues/91).** The membership guard's absent-marker rows. The guard counts missing expirations
   and writes no marker for them, so a series that was never offered and one that was missed
   read the same downstream. This one is ordered behind the fill above, because the comparison
   it marks against only exists once a fill has landed. The findings the guard does produce
@@ -186,11 +189,11 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   2. A cycle where every surface failed with the same known class pages that cause instead. A dead refresh token gaps chains and quotes for every ticker at once, and the design expects one every seven days.
   3. A page that never reached the phone is written to a dated directory under `reports/`, one write-once file each, so the count on the Now panel has a source.
   It also ships the 09:35 says-closed-but-open probe, its page, its plist through D14's renderer, and the `capture` dead-man feed with its idle heartbeats.
-- **Unowned.** Three of D13's page paths. The publisher exists, so each is a producer and a schedule rather than new machinery.
+- **[#92](https://github.com/l3a0/marketlake/issues/92).** Three of D13's page paths. The publisher exists, so each is a producer and a schedule rather than new machinery.
   1. The auth-gap reminder, because the watchdog's cause page is once-on-transition, so a token dying at 09:31 pages once and is then silent for the session.
   2. The parser's schema-drift page.
   3. `--test-push` on the onboarding command.
-- **Unowned.** The install's arming step. `capture` arms only when it has been pinged once. Outside the capture window an idle heartbeat does that on its own, so the exposure is an install made inside the capture window whose cycles all fail. That leaves the whole-daemon guarantee inert while every job reports healthy. `pre-open` does not cover it, because it asserts the daemon is up rather than that capture works. The install text ends on `launchctl print`, which answers whether the daemon started rather than whether it is being watched. It should end by arming the row from healthchecks' `Ping Now`, after the bootstrap and never before. That is one press, it works when capture is broken, and it is what converts a silent failed install into a page inside the grace.
+- **[#93](https://github.com/l3a0/marketlake/issues/93).** The install's arming step. `capture` arms only when it has been pinged once. Outside the capture window an idle heartbeat does that on its own, so the exposure is an install made inside the capture window whose cycles all fail. That leaves the whole-daemon guarantee inert while every job reports healthy. `pre-open` does not cover it, because it asserts the daemon is up rather than that capture works. The install text ends on `launchctl print`, which answers whether the daemon started rather than whether it is being watched. It should end by arming the row from healthchecks' `Ping Now`, after the bootstrap and never before. That is one press, it works when capture is broken, and it is what converts a silent failed install into a page inside the grace.
 - **D14** laptop control plane. `render --out DIR` writes every plist and setup file to a directory and prints the install commands. It refuses a system directory, and nothing here runs `sudo`, a `pmset` write, `launchctl bootstrap`, or a `tmutil` write. What does run is read-only and needs no root: `launchctl print` and `pmset -g assertions` from the self-check, `pmset -g sched` and `tmutil isexcluded` from the Sunday job. The token path comes from one rule, so the daemon that rewrites it, the Sunday job that asserts coverage over it, and the exclusion that protects it cannot name different files. `RunAtLoad` is on for the two residents and the self-check. It is off for the Sunday job, which would otherwise scrub the whole lake at every boot. Beside the sudoers drop-in it renders five LaunchDaemons, and it prints the Time Machine exclusion as an install step rather than rendering it:
   1. the capture daemon, resident under `KeepAlive`,
   2. the query service, resident the same way,
@@ -378,7 +381,7 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
 
   The page count needed no writer. `alert.undelivered` already counted the pages that never reached the phone, and the panel now reads it for the Eastern day the publisher files them under. The age and the countdown are arithmetic over the mint stamp, the countdown against `control_plane.sunday_canary_due`, which keeps the ritual's moment beside the ritual.
 
-Every unowned entry above belongs to slice 2, and none is deferred. The test is whether an
+Every issue-linked entry above belongs to slice 2, and none is deferred. The test is whether an
 entry needs something a later slice introduces. None does. Slice 3 adds vendor-fetch surfaces,
 which is D16's bars and actions. The entries above that touch the vendor reuse `SchwabVendor`,
 which already ships. Slice 4 is pure derivation over sealed partitions and fetches nothing.
@@ -458,7 +461,7 @@ process to die partway. The six split into two kinds.
 Four are buildable now, and each covers a failure the unit and component suites cannot
 reach:
 
-1. 4, kill compaction mid-seal,
+1. 4, kill compaction mid-seal, which is [#98](https://github.com/l3a0/marketlake/issues/98),
 2. 6, overnight death,
 3. 7, fully dark session,
 4. 14, restore from backup.
@@ -493,7 +496,7 @@ Each healthchecks.io check is created by hand, in the session that first makes i
    it. Until the row is created the ping goes to a slug healthchecks does not know, which
    is the mistyped-slug silence the design names, with the difference that here the job is
    working and only the report is missing.
-3. **D13**, `capture`, and the daemon's own pages. The per-cycle dead-man. Delete the `slice1-capture` row in the same session, because `capture` supersedes it. Ship every daemon page path through one publisher: auth death, sustained 429s, the watchdog, and the sampler collapse. The auth-gap reminder, the parser's schema-drift page, and a `--test-push` on the onboarding command are not built yet and are pinned as unowned above. Rehearse the topic rotation once, end to end. The 09:35 calendar probe ships here too, with its page and its `calendar-probe` check.
+3. **D13**, `capture`, and the daemon's own pages. The per-cycle dead-man. Delete the `slice1-capture` row in the same session, because `capture` supersedes it. Ship every daemon page path through one publisher: auth death, sustained 429s, the watchdog, and the sampler collapse. The auth-gap reminder, the parser's schema-drift page, and a `--test-push` on the onboarding command are tracked in [#92](https://github.com/l3a0/marketlake/issues/92) above. Rehearse the topic rotation once, end to end. The 09:35 calendar probe ships here too, with its page and its `calendar-probe` check.
 4. **D14**, `pre-open` and `sunday`, and the Sunday reminder. D14 renders the launchd jobs and the wake schedules those two checks watch. The Sunday job sends the re-auth reminder on its 20:00, 21:00, and 22:00 canary runs only, while the throwaway call or the coverage assertion still fails, reading the token's mint time from `token.json` itself.
 5. **D16**, `eod-sweep`, and the nightly summary. The vendor sweep writes the dated report file under `reports/` and sends its one-screen digest at priority 2 after its own ping lands, holiday no-ops included. Until D20 the quarantine count is zero and the History panel that renders the file does not exist yet, so the file is read by hand.
 6. **D20**, the battery's pages, delayed feed and nightly schema drift.
