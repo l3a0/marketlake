@@ -860,6 +860,54 @@ def run_loop_from_config(
     alarm_on_skipped = hooks.on_skipped
     alarm_on_tick = hooks.on_tick
 
+    def report_lost_assertion(now: datetime) -> None:
+        """Page when the power assertion could not be taken, once per window.
+
+        This is the one failure in the loop where the daemon must speak before it can no
+        longer speak at all. AC idle sleep on the capture machine is one minute, and the
+        design rejected ``pmset disablesleep`` in favour of this assertion, so nothing
+        else keeps the machine awake. A minute after the spawn fails the machine can be
+        asleep, and a sleeping machine sends nothing: not this page, not the dead-man's
+        ping, not a cycle.
+
+        So this page is not a second copy of the dead-man's. The ``capture`` check does
+        page on the silence that follows, but only once the loss is already running. This
+        one can leave the machine while it is still awake to send it, and the design's
+        tier test asks whether waiting compounds the loss. Here every minute asleep is a
+        minute that cannot be bought back.
+
+        Once per window rather than once per minute, because the holder retries every
+        minute and a page that repeats six hundred times is a page nobody reads.
+        """
+        failure = holder.pending_failure()
+        if failure is None:
+            return
+        window, exc = failure
+        detail = f"{type(exc).__name__}: {exc}"
+        # On stderr as well as on the phone, the bargain ``_dispatched`` already makes.
+        # After this the holder retries every minute in silence, so without this line a
+        # permanent failure leaves the launchd log, the one the restart script tells the
+        # operator to read, with nothing in it.
+        print(f"assertion: {now.isoformat()}: {detail}", file=sys.stderr)
+        delivery = publisher.publish(
+            Message(
+                event="assertion_lost",
+                title="Capture at risk: power assertion not held",
+                body=(
+                    f"caffeinate would not start at {now.isoformat()}, in the window "
+                    f"opening {window.start.isoformat()}: {detail}. The machine may "
+                    "idle-sleep and stop capturing."
+                ),
+            ),
+            now=now,
+        )
+        # Told either way, so a publisher that refuses does not turn one lost assertion
+        # into a page every minute for the rest of the window. What it refused is on
+        # stderr and journalled under ``reports/``, which the Now panel counts.
+        holder.mark_reported(window)
+        if not delivery.sent:
+            print(f"assertion: page not sent: {delivery.reason}", file=sys.stderr)
+
     def raise_pages(pages: list[Page], now: datetime) -> None:
         for page in pages:
             publisher.publish(
@@ -918,6 +966,13 @@ def run_loop_from_config(
     def on_tick(slot: datetime) -> None:
         deadman.idle(slot)
         alarm_on_tick(slot)
+        # After the chain, not before it. Each wrapper does its own work and then calls
+        # inward, so the innermost runs last, and ``holder.hold`` is the innermost. Asking
+        # before this point asks about a minute the spawn has not been attempted in yet,
+        # which sent the page a tick late. One tick is the whole margin: AC idle sleep on
+        # the capture machine is one minute, so the minute this page is late by is the
+        # minute the machine can spend asleep.
+        report_lost_assertion(slot)
 
     hooks = replace(hooks, on_cycle=on_cycle, on_skipped=on_skipped, on_tick=on_tick)
 

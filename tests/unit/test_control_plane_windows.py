@@ -357,3 +357,86 @@ def test_a_hold_across_the_fall_back_sunday_measures_absolute_time():
     args = cp.caffeinate_args(window, early)
     assert args is not None
     assert int(args[3]) == int(window.end.timestamp() - early.timestamp())
+
+
+# -- a spawn that will not start -------------------------------------------------------
+
+
+class _Failing:
+    """A runner that refuses the first ``fail`` spawns, then works."""
+
+    def __init__(self, fail: int = 10_000, error: Exception | None = None) -> None:
+        self.calls: list[tuple[str, ...]] = []
+        self._left = fail
+        self._error = error if error is not None else BlockingIOError(35, "no slots")
+
+    def __call__(self, args) -> None:
+        self.calls.append(tuple(args))
+        if self._left > 0:
+            self._left -= 1
+            raise self._error
+
+
+def test_each_window_owes_its_own_page(tmp_path):
+    """Once per window is the rule, and one window can never prove it.
+
+    A holder that reports once in its whole life satisfies a single-window test exactly
+    as a correct one does, and so does a holder that records only its first failure ever.
+    Both leave a daemon that pages on Monday's lapse and stays silent through every day
+    after, which is the failure this rule exists to prevent rather than the one it is
+    named for.
+    """
+    runner = _Failing()
+    holder = cp.AssertionHolder(runner=runner)
+
+    # Wednesday, failing from the window's open to its close.
+    for minute in (30, 31, 32):
+        holder.hold(et(2026, 9, 2, 8, minute))
+    first = holder.pending_failure()
+    assert first is not None, "the first window's failure was never offered"
+    holder.mark_reported(first[0])
+    assert holder.pending_failure() is None, "the same window was offered twice"
+
+    # Thursday. A new window, a new failure, and a page of its own.
+    holder.hold(et(2026, 9, 3, 8, 30))
+    second = holder.pending_failure()
+
+    assert second is not None, "the next window's failure was never offered"
+    assert second[0] != first[0], "the second page named the first window"
+
+
+def test_a_spawn_that_recovers_in_its_window_owes_no_page():
+    """A held assertion owes no report, which is what clearing the failure states."""
+    runner = _Failing(fail=1)
+    holder = cp.AssertionHolder(runner=runner)
+
+    holder.hold(et(2026, 9, 2, 8, 30))
+    assert holder.pending_failure() is not None, "the failure was not recorded at all"
+    holder.hold(et(2026, 9, 2, 8, 31))
+
+    assert holder.pending_failure() is None, "a page was owed for an assertion now held"
+    assert len(runner.calls) == 2
+
+
+def test_a_failure_that_is_not_an_oserror_is_caught_too():
+    """The claim is categorical, so the test cannot rest on one exception class.
+
+    ``BlockingIOError`` is the realistic failure and it is an ``OSError``, so a catch
+    narrowed to that class passes every test built on the realistic case. ``Popen`` can
+    also raise ``ValueError`` on a bad argument, and a raise of any class from this hook
+    exits the process just the same.
+    """
+    runner = _Failing(error=ValueError("embedded null byte"))
+    holder = cp.AssertionHolder(runner=runner)
+
+    assert holder.hold(et(2026, 9, 2, 8, 30)) is None, "a failed spawn answered as if held"
+
+    failure = holder.pending_failure()
+    assert failure is not None and isinstance(failure[1], ValueError)
+
+
+def test_a_failed_spawn_answers_none_rather_than_the_arguments():
+    """The docstring promises ``None`` on the failure path, so the path is checked."""
+    holder = cp.AssertionHolder(runner=_Failing())
+
+    assert holder.hold(et(2026, 9, 2, 8, 30)) is None

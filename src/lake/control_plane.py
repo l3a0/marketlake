@@ -902,13 +902,30 @@ class AssertionHolder:
     def __init__(self, *, runner: AssertionRunner | None = None) -> None:
         self._runner = runner if runner is not None else _spawn
         self._held: AssertionWindow | None = None
+        self._failure: tuple[AssertionWindow, Exception] | None = None
+        self._reported: AssertionWindow | None = None
 
     def hold(self, now: datetime) -> tuple[str, ...] | None:
         """Hold the assertion for the window ``now`` sits in, if one is open and not held yet.
 
         Returns the arguments the runner was handed, or ``None`` when nothing was owed:
-        no window today, the window not open yet or already over, or this window
-        already held.
+        no window today, the window not open yet or already over, this window already
+        held, or the spawn failed.
+
+        A spawn that will not start is caught here rather than left to the caller. This
+        runs from the daemon's tick hook, which ``run_loop`` does not wrap, so a raise
+        would exit the process. ``_held`` is then still unset, so the successor lands in
+        the same window and spawns again, and the weekday window runs 08:25 to 18:45,
+        bracketing the whole session. That is a crash loop across the trading day, paid
+        for an assertion whose worst case is a machine that sleeps.
+
+        Leaving ``_held`` unset on failure is deliberate, and it is the opposite choice
+        from the daemon's once-a-day dispatched jobs. Those fail at a moment that has
+        passed, so a retry cannot help. This one is owed every minute the window is open,
+        so the next minute is exactly the retry, and a transient cause such as a full
+        process table clears on its own. What must not repeat is the telling: the failure
+        is kept for ``take_failure`` to report once per window rather than six hundred
+        times.
         """
         eastern = now.astimezone(MARKET_TZ)
         window = assertion_window(eastern.date())
@@ -917,9 +934,37 @@ class AssertionHolder:
         args = caffeinate_args(window, eastern)
         if args is None:  # pragma: no cover - contains() already excludes the end
             return None
-        self._runner(args)
+        try:
+            self._runner(args)
+        except Exception as exc:  # noqa: BLE001 - a raise here would crash-loop the daemon
+            self._failure = (window, exc)
+            return None
         self._held = window
+        self._failure = None
         return args
+
+    def pending_failure(self) -> tuple[AssertionWindow, Exception] | None:
+        """The spawn failure owed a report, or ``None`` when none is owed.
+
+        Kept apart from ``hold`` because the two answer to different callers. ``hold``
+        runs on every tick and retries. The report goes out once, and the caller that
+        sends it holds the publisher, which is built later than this object is.
+
+        Reading does not mark it told. An earlier version did, which made asking the
+        question spend the answer: a page the publisher then refused, for a leaked
+        secret or the daily cap, was gone with nothing left to send. The caller says when
+        it counts, through ``mark_reported``.
+        """
+        if self._failure is None:
+            return None
+        window, exc = self._failure
+        if window == self._reported:
+            return None
+        return window, exc
+
+    def mark_reported(self, window: AssertionWindow) -> None:
+        """Record that this window's failure has been reported, so it is not sent again."""
+        self._reported = window
 
 
 # -- the token coverage assertion ------------------------------------------------
