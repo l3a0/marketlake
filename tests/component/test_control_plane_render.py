@@ -490,6 +490,16 @@ def _passing_canary() -> bool:
     return True
 
 
+def _excluded(paths: Sequence[str]) -> str:
+    """A reader reporting every path already excluded, the healthy Time Machine state.
+
+    Every ``sunday`` test replaces ``read_exclusions`` with one. main builds the real
+    reader, which shells out to ``tmutil``, so a test that left the producer live would
+    reach a real subprocess.
+    """
+    return "".join(f"[Excluded]\t{p}\n" for p in paths)
+
+
 class _Pushes:
     """A transport recording each push. The real one POSTs to ntfy."""
 
@@ -522,6 +532,7 @@ def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys, monke
     monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
     monkeypatch.setattr(cp, "NtfyTransport", lambda topic: pushes)
+    monkeypatch.setattr(cp, "read_exclusions", _excluded)
     # An explicit --token keeps the test off the real token under HOME.
     code = cp.main(
         [
@@ -558,6 +569,7 @@ def test_sunday_cli_withholds_the_ping_for_a_stale_token(tmp_path, capsys, monke
     monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
     monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr(cp, "read_exclusions", _excluded)
     code = cp.main(
         [
             "sunday",
@@ -589,6 +601,7 @@ def test_sunday_cli_reads_the_mint_time_from_the_token_file(tmp_path, capsys, mo
     monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
     monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr(cp, "read_exclusions", _excluded)
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(token)],
         clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
@@ -650,6 +663,7 @@ def test_sunday_cli_reports_problems_and_exits_non_zero(tmp_path, capsys, monkey
     monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: lambda: False)
     monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr(cp, "read_exclusions", _excluded)
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(tmp_path / "absent.json")],
         clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
@@ -698,6 +712,7 @@ def test_the_sunday_cli_builds_a_real_canary_rather_than_passing_through(tmp_pat
     monkeypatch.setattr(cp, "read_pmset_schedule", lambda: REPEAT_ONLY)
     monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
     monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr(cp, "read_exclusions", _excluded)
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(token)],
         clock=ManualClock(start=SUNDAY_20),
@@ -720,6 +735,7 @@ def test_the_sunday_cli_pushes_the_reminder_to_the_phone(tmp_path, monkeypatch):
     monkeypatch.setattr(cp, "UrllibPinger", FakePinger)
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
     monkeypatch.setattr(cp, "NtfyTransport", lambda topic: pushes)
+    monkeypatch.setattr(cp, "read_exclusions", _excluded)
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(_token(tmp_path, LATE_LAST_WEEK))],
         clock=ManualClock(start=SUNDAY_20),
@@ -750,6 +766,7 @@ def test_a_reminder_that_cannot_be_pushed_is_written_down_and_the_evening_carrie
     monkeypatch.setattr(cp, "UrllibPinger", FakePinger)
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
     monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _BrokenTransport())
+    monkeypatch.setattr(cp, "read_exclusions", _excluded)
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(_token(tmp_path, LATE_LAST_WEEK))],
         clock=ManualClock(start=SUNDAY_20),
