@@ -10,7 +10,7 @@ import pytest
 from lake import close_guard, daemon, journal
 from lake.capture import CycleResult
 from lake.capture_spans import CaptureSpans, spans_path
-from lake.manifest import append_manifest, sha256_file
+from lake.manifest import append_manifest, manifest_path, sha256_file
 from lake.paths import LakePaths
 from lake.security_master import SecurityMaster, master_path
 from lake.session import (
@@ -23,6 +23,8 @@ from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.pinger import FakePinger
 from tests.support.transport import FakeTransport
+
+_STAMP_FORMAT = "%Y%m%dT%H%M%S%f"
 
 WEEK = date(2026, 8, 31)
 DAY = date(2026, 9, 2)
@@ -369,6 +371,22 @@ def test_an_unobserved_close_says_so_on_stderr(tmp_path, capsys):
     outcome = close_guard.GuardOutcome(DAY, unobserved=("XYZ",))
     daemon._report_guard(outcome)
     assert "unobserved=XYZ" in capsys.readouterr().err
+
+
+def test_a_run_that_only_had_problems_still_says_so_on_stderr(capsys):
+    """Problems are the whole operator-visible output of a run that wrote nothing.
+
+    A prologue failure and a per-ticker failure both resolve into ``problems`` and into
+    nothing else. stderr is where they land, so a day whose guard could not read the
+    ledger would otherwise pass in silence while the day reads short. Both halves are
+    asserted, because either one alone leaves the other free to drop the field: the
+    outcome has to count as reportable, and the report has to carry the field.
+    """
+    outcome = close_guard.GuardOutcome(DAY, problems=("prologue: KeyError: 'partition'",))
+
+    assert outcome.reportable, "a run that failed outright judged itself not worth reporting"
+    daemon._report_guard(outcome)
+    assert "problems=prologue: KeyError" in capsys.readouterr().err
 
 
 # -- the fill's own slot -------------------------------------------------------------
@@ -733,3 +751,126 @@ def test_a_sealed_day_is_left_alone_rather_than_marked_unobserved(tmp_path):
 
     assert outcome.unobserved == (), "the guard called a sealed day's close unobserved"
     assert not _rows(tmp_path, "quotes", "XYZ", DAY), "a marker landed beside a sealed day"
+
+
+# -- a failure that must not take the daemon down ---------------------------------------
+
+
+def _drifted_segment(root: Path, surface: str, ticker: str, day: date) -> None:
+    """A segment that reads cleanly and holds none of the columns the guard asks for.
+
+    This is the shape a schema change leaves behind: the file is valid Arrow IPC, so
+    ``read_segment`` returns a table and the guard's own read catches nothing, and then
+    asking for ``close_tag`` raises ``KeyError``. Writing it by hand rather than through
+    ``SegmentWriter`` is the point, because the writer can only produce the current
+    schema.
+    """
+    import pyarrow as pa
+
+    directory = LakePaths(root).segment_dir(surface, ticker, day)
+    directory.mkdir(parents=True, exist_ok=True)
+    slot = datetime.combine(day, datetime.min.time()).replace(hour=16)
+    schema = pa.schema([("snap_ts", pa.string())])
+    name = f"{slot.strftime(_STAMP_FORMAT)}-1.arrows"
+    with pa.ipc.new_stream(directory / name, schema) as writer:
+        writer.write_batch(pa.record_batch([pa.array([slot.isoformat()])], schema=schema))
+
+
+def test_an_unreadable_manifest_stops_the_run_and_writes_nothing(tmp_path):
+    """The ledger decides which days are sealed, so losing it must not widen the run.
+
+    ``latest_entries`` raises ``KeyError`` on a manifest line that is valid JSON and
+    carries no ``partition`` key, and ``OSError`` on a read that fails. Either way the
+    guard can no longer tell a sealed ticker-day from an unsealed one.
+
+    Treating that as "nothing is sealed" is the tempting repair and the wrong one. It
+    would let this writer mark a close as unobserved on a day compaction already sealed,
+    which is a false claim the next run deletes as debris, dropping a row a live writer
+    wrote. So the run stops, says what broke, and leaves the day alone.
+    """
+    # Nothing captured the close, so a guard with a readable ledger would mark it. The
+    # unreadable ledger is the only reason this run writes nothing.
+    manifest_path(tmp_path).write_text('{"source": "compaction", "rows": 406}\n')
+
+    guard = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 20)), [("XYZ", False)])
+    outcome = guard.run(DAY)
+
+    assert len(outcome.problems) == 1, outcome.problems
+    assert outcome.problems[0].startswith("prologue: KeyError"), "the run did not say what broke"
+    assert "partition" in outcome.problems[0], "the report named no key, so it diagnoses nothing"
+    assert outcome.unobserved == (), "the guard claimed a close went unseen without the ledger"
+    assert _rows(tmp_path, "quotes", "XYZ", DAY) == [], "a marker landed on an unreadable ledger"
+
+
+class _DriftedSpans:
+    """A spans file that loaded and answers nothing the guard can use.
+
+    The readers in ``daemon`` catch ``(OSError, CaptureSpansError, ValueError)`` around
+    the load, so a file that parses and then misbehaves reaches the guard intact.
+    """
+
+    def spans_covering(self, instant):
+        raise RuntimeError("drifted spans")
+
+
+def test_a_scope_read_that_fails_is_a_prologue_failure_too(tmp_path):
+    """The prologue answers two questions, so both of its reads need covering.
+
+    Leaving only the ledger read inside the try is the natural refactor for anyone who
+    reads the handler as "the ledger failed", and it passes every other test here. The
+    scope read is the half that says who owed a close at all, and losing it the same way
+    has to resolve the same way.
+    """
+    guard = close_guard.CloseGuard(
+        lake_root=tmp_path,
+        spans=_DriftedSpans,
+        session_clock=_clock(et(2026, 9, 2, 16, 20)),
+        master=SecurityMaster,
+    )
+    outcome = guard.run(DAY)
+
+    assert len(outcome.problems) == 1, outcome.problems
+    assert outcome.problems[0].startswith("prologue: RuntimeError"), outcome.problems
+    assert outcome.unobserved == (), "a guard that cannot read scope still claimed a close"
+
+
+def test_one_tickers_unreadable_segment_does_not_cost_the_others_their_markers(tmp_path):
+    """A drifted file under one ticker is one ticker's loss, not the run's.
+
+    Completeness is counted from rows and never inferred from holes, so a marker the
+    guard fails to write is a minute that reads as missing with nothing saying why. That
+    makes the blast radius of a single bad file the thing to bound: DRIFT is read first
+    and raises, and OK must still get the marker it is owed.
+    """
+    _drifted_segment(tmp_path, "quotes", "DRIFT", DAY)
+
+    guard = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 20)), [("DRIFT", False), ("OK", False)])
+    outcome = guard.run(DAY)
+
+    assert len(outcome.problems) == 1, outcome.problems
+    assert outcome.problems[0].startswith("quotes/DRIFT: KeyError"), "the bad ticker was not named"
+    assert "close_tag" in outcome.problems[0], "the report named no column, so it diagnoses nothing"
+    assert outcome.unobserved == ("OK",), "the run stopped at the first unreadable file"
+    marked = [row for row in _rows(tmp_path, "quotes", "OK", DAY) if row["close_tag"]]
+    assert marked, "the healthy ticker lost its marker to another ticker's bad file"
+
+
+def test_the_option_close_loop_survives_a_bad_file_the_same_way(tmp_path):
+    """The chains half owes the same guarantee as the quotes half, and symmetry is not proof.
+
+    The two loops are written alike and fail alike, which is exactly why each needs its
+    own case. Deleting the catch on this loop alone leaves the whole suite green when only
+    the quotes side is covered, so the chains side would ship its crash path intact.
+
+    With no fill fetcher wired, a healthy ticker's option close records a refusal. That
+    refusal is what shows the run reached OK at all after DRIFT raised.
+    """
+    _drifted_segment(tmp_path, "chains", "DRIFT", DAY)
+
+    guard = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 20)), [("DRIFT", True), ("OK", True)])
+    outcome = guard.run(DAY)
+
+    assert len(outcome.problems) == 1, outcome.problems
+    assert outcome.problems[0].startswith("chains/DRIFT: KeyError"), "the bad ticker was not named"
+    assert outcome.refused == ("OK: no fill fetcher",), "the run stopped at the bad chains file"
+    assert set(outcome.unobserved) == {"DRIFT", "OK"}, "the quotes half was collateral damage"

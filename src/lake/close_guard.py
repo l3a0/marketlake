@@ -152,21 +152,62 @@ class CloseGuard:
         would answer for the wrong moment: it would miss a ticker onboarded mid-session
         and mark one retired mid-session. One read per run, so every ticker in a run is
         judged against one snapshot.
+
+        Nothing here raises. The guard runs from a hook ``run_loop`` does not wrap, so a
+        raise would exit the process, and under ``KeepAlive`` the successor would reach
+        the same minute and raise again. Failures resolve into ``problems`` at one of two
+        grains. A prologue failure stops the run, because those reads decide who is owed a
+        marker and which days are already sealed. A per-ticker failure costs that ticker
+        alone and the run carries on, because the rest still owe their markers. The
+        dispatcher wraps this call too, for whatever a later edit adds that neither grain
+        foresees.
         """
         bounds = self._session_clock.bounds(day)
         found = _Findings()
         master = self._master() if self._master is not None else None
         spans = self._spans() if self._spans is not None else None
-        # Read once for the run, like the spans and the master above, so every ticker is
-        # judged against one snapshot of what compaction has already sealed.
-        sealed = latest_entries(self._root)
-        for ticker, _ in self._covering(spans, master, bounds.equity_close, day):
-            if self._is_sealed(sealed, journal.QUOTES_SURFACE, ticker, day):
+        try:
+            # Read once for the run, like the spans and the master above, so every ticker
+            # is judged against one snapshot of what compaction has already sealed, and
+            # against one snapshot of who was in scope at each close.
+            sealed = latest_entries(self._root)
+            spot_owed = self._covering(spans, master, bounds.equity_close, day)
+            option_owed = self._covering(spans, master, bounds.option_close, day)
+        except Exception as exc:  # noqa: BLE001 - the run stops, the daemon does not
+            # The prologue answers two questions the run cannot proceed without: which
+            # ticker-days are already sealed, and who owed each close. A failure here is
+            # answered by writing nothing, never by widening. An empty ledger would call
+            # every partition unsealed, which is how this writer makes a false claim
+            # about a day compaction already sealed and the next run deletes as debris.
+            # An empty scope would write no marker anyway, so both failures resolve the
+            # same way: say what broke and write nothing.
+            #
+            # What that costs is named in #102 rather than hidden here. The startup walk
+            # does not pick the day up afterwards, because compaction seals it ten minutes
+            # later and the walk skips a sealed date. So the minute this run owed stays a
+            # hole with no row naming it. That is a smaller loss than the session's
+            # capture, which is what the alternative costs, and it is still a loss.
+            found.problems.append(f"prologue: {type(exc).__name__}: {exc}")
+            return GuardOutcome(day, problems=tuple(found.problems))
+        for ticker, _ in spot_owed:
+            # Per ticker, because one unreadable file is one ticker's loss and not the
+            # run's. Marking is the record completeness is counted from, so a drifted
+            # segment under the third ticker must not cost the fourth its marker.
+            try:
+                if self._is_sealed(sealed, journal.QUOTES_SURFACE, ticker, day):
+                    continue
+                self._check_spot_close(ticker, bounds.equity_close, found)
+            except Exception as exc:  # noqa: BLE001 - one ticker, not the run
+                found.problems.append(f"quotes/{ticker}: {type(exc).__name__}: {exc}")
+        for ticker, options in option_owed:
+            if not options:
                 continue
-            self._check_spot_close(ticker, bounds.equity_close, found)
-        for ticker, options in self._covering(spans, master, bounds.option_close, day):
-            if options and not self._is_sealed(sealed, journal.CHAINS_SURFACE, ticker, day):
+            try:
+                if self._is_sealed(sealed, journal.CHAINS_SURFACE, ticker, day):
+                    continue
                 self._check_option_close(ticker, bounds, found)
+            except Exception as exc:  # noqa: BLE001 - one ticker, not the run
+                found.problems.append(f"chains/{ticker}: {type(exc).__name__}: {exc}")
         return GuardOutcome(
             day,
             tuple(found.filled),

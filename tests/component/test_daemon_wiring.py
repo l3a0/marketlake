@@ -1081,3 +1081,83 @@ def test_a_spawn_that_fails_is_reported_and_never_takes_capture_down(tmp_path):
     assert rig.pinger.urls == [CAPTURE_URL] * 4
     # Once, not once a minute: the dispatcher marks the day served before it runs.
     assert rig.compaction.calls == 1
+
+
+# -- a dispatched job that raises must not take the loop down --------------------------
+
+
+def _boom(*args, **kwargs):
+    """A job that fails the same way every time it is asked, which is the dangerous way."""
+    raise RuntimeError("dispatched job blew up")
+
+
+def test_a_guard_that_raises_costs_its_markers_and_not_the_session(tmp_path, capsys):
+    """A crash loop here would trade two markers for every remaining capture minute.
+
+    Both session-relative jobs ride the tick hook, and ``run_loop`` wraps no hook in a
+    try. So a guard that raises exits the process, and under ``KeepAlive`` the successor
+    reaches the same minute, runs the same guard against the same lake, and raises again.
+    Capture is the un-buy-backable thing and every other job is arranged not to block it,
+    so that trade is backwards.
+
+    ``CloseGuard.run`` handles the failures it can foresee at a finer grain, recording
+    them in ``problems`` and carrying on, which is what ``test_close_guard.py`` covers.
+    The raise is injected here because after that work no reachable path escapes ``run``.
+    This is the backstop for what a later edit adds, and #90's fill producer will add a
+    vendor call inside ``run`` shortly.
+    """
+    rig = _rig(tmp_path)
+    master = SecurityMaster()
+    xyz = master.register(
+        kind="equity", capture_start=et(2026, 9, 2, 9, 30), valid_from=DAY, ticker="XYZ"
+    )
+    master.write(master_path(rig.lake_root))
+    spans = CaptureSpans()
+    spans.open_span(xyz, et(2026, 9, 2, 9, 30), False)
+    spans.write(spans_path(rig.lake_root))
+
+    seen: list[str] = []
+    hooks = daemon.DaemonHooks(on_tick=lambda slot: seen.append(slot.strftime("%H:%M")))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(close_guard.CloseGuard, "run", _boom)
+        # Close+5 is 16:20, the second of the three ticks.
+        clock = ManualClock(start=et(2026, 9, 2, 16, 18, 30))
+        _run(rig, clock, ticks=3, cycle_runner=_no_cycle, hooks=hooks)
+
+    assert seen == ["16:19", "16:20", "16:21"], "the loop died on the minute the guard failed"
+    reported = capsys.readouterr().err
+    assert "close+5: 2026-09-02: RuntimeError" in reported, "the failure was swallowed silently"
+
+
+def test_a_compaction_spawn_that_raises_costs_the_seal_and_not_the_session(tmp_path, capsys):
+    """The same rule for the other job on the same hook, which had its own catch before.
+
+    ``_start_compaction`` carried a try of its own until this change routed both jobs
+    through one wrapper, and nothing exercised it. A spawn failure is the realistic case:
+    the interpreter path is wrong after an upgrade, or the machine is out of process
+    slots. Sealing is missed for that day, the ``compaction`` check pages on its own
+    silence, and the next run sweeps the date it skipped.
+    """
+    rig = _rig(tmp_path)
+    seen: list[str] = []
+    hooks = daemon.DaemonHooks(on_tick=lambda slot: seen.append(slot.strftime("%H:%M")))
+    # Close+15 is 16:30 and the dispatch waits one tick, so 16:32 is the failing minute.
+    clock = ManualClock(start=et(2026, 9, 2, 16, 30, 30))
+    daemon.run_loop_from_config(
+        config_path=str(rig.config),
+        tickers_path=str(rig.tickers),
+        token_path=str(rig.token),
+        clock=clock,
+        calendar=weekday_sessions(WEEK),
+        assertion_runner=lambda args: None,
+        transport=rig.transport,
+        pinger=rig.pinger,
+        compaction_runner=_boom,
+        cycle_runner=_no_cycle,
+        hooks=hooks,
+        should_continue=_stop_after(4),
+    )
+
+    assert seen == ["16:31", "16:32", "16:33", "16:34"], "the loop died on the failed spawn"
+    reported = capsys.readouterr().err
+    assert "compaction: 2026-09-02: RuntimeError" in reported, "the failure was swallowed"
