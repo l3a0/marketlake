@@ -168,6 +168,12 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   rather than in the status. A fill that landed but gave up a window is named in the
   guard's outcome, since the membership comparison cannot see a window that failed both
   intraday and at close+5.
+- **[#116](https://github.com/l3a0/marketlake/issues/116).** The chain fetch's two fail-open branches are reached by no test. A
+  chains body the row builder rejects is meant to fail open to a gap row, and a body that
+  will not merge is meant to be treated like a too-big window. Replacing either branch
+  with a raise leaves the whole suite green, so the first could exit the process on a
+  minute `KeepAlive` will retry forever, and the second drops a window with no marker and
+  no class. Both predate the close+5 fill, which carried them across unchanged.
 - **[#91](https://github.com/l3a0/marketlake/issues/91).** The membership guard's absent-marker rows. The guard counts missing expirations
   and writes no marker for them, so a series that was never offered and one that was missed
   read the same downstream. The reason constant `OPTION_CLOSE_SERIES_ABSENT` is defined and
