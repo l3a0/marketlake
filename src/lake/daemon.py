@@ -119,6 +119,7 @@ from lake.deadman import CAPTURE_SLUG, DeadMan
 from lake.gap import GapMarker, MarkingReport, surfaces_for
 from lake.journal import ROW_KIND_DATA
 from lake.metadata import stamp_cycle, stamp_ping
+from lake.report import write_close_guard
 from lake.runner import Pinger, UrllibPinger
 from lake.schwab import DEFAULT_TOKEN_PATH
 from lake.security_master import SecurityMaster, SecurityMasterError, master_path
@@ -386,8 +387,11 @@ def _report_guard(outcome: CloseGuardOutcome) -> None:
     """Print what the guard found, so a close nobody observed is not silent.
 
     Three of the design's rules for this guard end in "flags the nightly report", and
-    no report exists yet. launchd captures the daemon's stderr, which is where these can
-    be seen until one does. A day where both closes landed prints nothing.
+    no report exists yet. launchd captures the daemon's stderr, which is one of the two
+    places these land until one does. The other is the file ``_guard_reporter`` writes,
+    and the two differ on purpose: stderr keeps an exception's own message and the file
+    keeps its class. A day where both closes landed prints nothing here and still writes
+    its file, because an absent file has to mean the guard never ran.
     """
     if not outcome.reportable:
         return
@@ -402,6 +406,37 @@ def _report_guard(outcome: CloseGuardOutcome) -> None:
         if values:
             parts.append(f"{name}={','.join(values)}")
     print(" ".join(parts), file=sys.stderr)
+
+
+def _guard_reporter(
+    config_path: str | Path | None,
+    clock: Clock,
+) -> Callable[[CloseGuardOutcome], None]:
+    """Where one close+5 run's outcome goes: stderr, and a file the nightly report reads.
+
+    A factory rather than a plain function, because the write needs the lake root and
+    ``_report_guard`` never had one. The dispatch site builds its job from a lambda over
+    a day and holds no config, so the root is resolved here once, the way ``_close_fill``
+    and ``_gap_marker`` resolve theirs.
+
+    A config that will not load leaves the stderr print alone. Through
+    ``run_loop_from_config`` that shape is never reached, because ``_alarm`` reads the
+    same file and refuses, and the guard beside this one returns ``None`` on it. The
+    branch is kept for a direct caller, and it costs the file rather than the report.
+
+    Printing runs first. The write is the half that can fail, and a failure there must
+    not take the findings off stderr with it.
+    """
+    try:
+        lake_root = load_config(config_path).lake_root
+    except ConfigError:
+        return _report_guard
+
+    def report(outcome: CloseGuardOutcome) -> None:
+        _report_guard(outcome)
+        write_close_guard(lake_root, outcome, now=clock.now())
+
+    return report
 
 
 def _close_fill(
@@ -819,10 +854,11 @@ def run_loop_from_config(
     # would carry a marker from each writer.
     guard = _close_guard(config_path, tickers_path, session_clock, clock, token_path)
     if guard is not None:
+        report_guard = _guard_reporter(config_path, clock)
         dispatch = SessionDispatch(
             session_clock=session_clock,
             moment=lambda bounds: bounds.option_close_deadline,
-            job=_dispatched("close+5", lambda day: _report_guard(guard.run(day))),
+            job=_dispatched("close+5", lambda day: report_guard(guard.run(day))),
         )
         guard_on_start = hooks.on_start
         guard_on_tick = hooks.on_tick

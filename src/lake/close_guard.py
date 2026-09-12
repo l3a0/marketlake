@@ -87,7 +87,12 @@ class GuardOutcome:
 
     Three of the design's rules end in "flags the nightly report", and no report exists
     yet. Everything it would say is here, so the report reads it rather than the guard
-    guessing where to write. Until then the daemon prints it.
+    guessing where to write. Until D16 writes that report, ``report.write_close_guard``
+    files each run under ``reports/close_guard/`` and the daemon prints it beside.
+
+    The strings here carry the fuller exception message, and the file drops it. A reader
+    with the launchd log gets what an exception said, and the tree the dashboard may read
+    gets the class alone. ``report._redacted`` owns that split and says why.
     """
 
     day: date
