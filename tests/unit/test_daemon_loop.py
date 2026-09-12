@@ -581,15 +581,24 @@ def test_main_passes_the_paths_to_the_config_entry(tmp_path, monkeypatch):
     monkeypatch.setattr(daemon, "run_loop_from_config", fake_run_loop_from_config)
     assert daemon.main(["--config", str(config), "--token", "/tok.json"]) == 0
     # Exhaustive, so an argument added to the call is seen here rather than silently.
-    assert set(seen) == {"config_path", "tickers_path", "token_path", "transport", "pinger"}
+    assert set(seen) == {
+        "config_path",
+        "tickers_path",
+        "token_path",
+        "transport",
+        "pinger",
+        "compaction_runner",
+    }
     assert seen["config_path"] == str(config)
     assert seen["tickers_path"] is None
     assert seen["token_path"] == "/tok.json"
-    # ``daemon.main`` is the only caller in its module that builds the live pair. If
-    # either stops being the real thing, some entry has started defaulting a seam again,
-    # which is how the suite came to feed the owner's live capture check.
+    # ``daemon.main`` is the only caller in its module that builds the live three. If any
+    # stops being the real thing, some entry has started defaulting a seam again, which
+    # is how the suite came to feed the owner's live capture check.
     assert isinstance(seen["transport"], NtfyTransport)
     assert isinstance(seen["pinger"], UrllibPinger)
+    # The live runner is the one that actually spawns a child process.
+    assert seen["compaction_runner"] is daemon._spawn_compaction
     # The topic, not just the class. It is the write credential for the ntfy channel, so
     # the wiring worth covering is which topic reached the transport. Asserting the class
     # alone passes a `main` that ignored --config and read the machine's own config,
@@ -653,6 +662,7 @@ def test_the_wired_daemon_holds_the_caffeinate_assertion_once_per_window(tmp_pat
         assertion_runner=lambda args: held.append(tuple(args)),
         transport=FakeTransport(),
         pinger=pinger,
+        compaction_runner=lambda args: None,
         should_continue=_stop_after(4),
     )
     # Four ticks, one window, one caffeinate process.
@@ -680,6 +690,7 @@ def test_the_wired_daemon_refuses_to_start_without_a_config(tmp_path):
             assertion_runner=lambda args: None,
             transport=FakeTransport(),
             pinger=FakePinger(),
+            compaction_runner=lambda args: None,
             should_continue=_stop_after(1),
         )
 
@@ -699,6 +710,7 @@ def test_the_wired_daemon_refuses_to_start_without_a_roster(tmp_path):
             assertion_runner=lambda args: None,
             transport=FakeTransport(),
             pinger=FakePinger(),
+            compaction_runner=lambda args: None,
             should_continue=_stop_after(1),
         )
 
@@ -721,6 +733,7 @@ def test_the_wired_daemon_still_runs_a_caller_tick_hook(tmp_path):
         hooks=daemon.DaemonHooks(on_tick=ticks.append),
         transport=FakeTransport(),
         pinger=FakePinger(),
+        compaction_runner=lambda args: None,
         should_continue=_stop_after(2),
     )
     assert len(ticks) == 2

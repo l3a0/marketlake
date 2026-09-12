@@ -42,6 +42,8 @@ from pathlib import Path
 
 from lake import journal
 from lake.capture_spans import CaptureSpans
+from lake.manifest import latest_entries
+from lake.paths import LakePaths
 from lake.security_master import SecurityMaster
 from lake.session import OPTION_CLOSE, SPOT_CLOSE, SessionClock
 
@@ -155,10 +157,15 @@ class CloseGuard:
         found = _Findings()
         master = self._master() if self._master is not None else None
         spans = self._spans() if self._spans is not None else None
+        # Read once for the run, like the spans and the master above, so every ticker is
+        # judged against one snapshot of what compaction has already sealed.
+        sealed = latest_entries(self._root)
         for ticker, _ in self._covering(spans, master, bounds.equity_close, day):
+            if self._is_sealed(sealed, journal.QUOTES_SURFACE, ticker, day):
+                continue
             self._check_spot_close(ticker, bounds.equity_close, found)
         for ticker, options in self._covering(spans, master, bounds.option_close, day):
-            if options:
+            if options and not self._is_sealed(sealed, journal.CHAINS_SURFACE, ticker, day):
                 self._check_option_close(ticker, bounds, found)
         return GuardOutcome(
             day,
@@ -169,6 +176,23 @@ class CloseGuard:
             tuple(found.refused),
             tuple(found.problems),
         )
+
+    def _is_sealed(self, sealed: dict, surface: str, ticker: str, day: date) -> bool:
+        """Whether compaction has already sealed this ticker-day's partition.
+
+        A sealed day is one this guard must say nothing about. Compaction unlinks a day's
+        segments once its partition is manifested, so ``close_tag_rows`` reads the empty
+        directory and reports a close nobody observed, for a close that was captured and
+        is sitting in the partition. The marker that follows is a false claim, and the
+        next run deletes it as debris, so a row a live writer wrote is silently dropped.
+
+        Gap-marking learned this first and skips a sealed date for the same reason. The
+        guard's own window closes before compaction's opens, so a sealed day is always a
+        day this guard's work is finished with. Only a restart after the seal reaches
+        here at all.
+        """
+        partition = LakePaths(self._root).partition_path(surface, ticker, day)
+        return partition.relative_to(self._root).as_posix() in sealed
 
     def _covering(
         self,

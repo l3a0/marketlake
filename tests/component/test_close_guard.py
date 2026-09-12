@@ -10,6 +10,7 @@ import pytest
 from lake import close_guard, daemon, journal
 from lake.capture import CycleResult
 from lake.capture_spans import CaptureSpans, spans_path
+from lake.manifest import append_manifest, sha256_file
 from lake.paths import LakePaths
 from lake.security_master import SecurityMaster, master_path
 from lake.session import (
@@ -177,6 +178,7 @@ def test_the_daemon_answers_the_close_tag_hook_from_the_calendar(tmp_path):
         ),
         transport=FakeTransport(),
         pinger=FakePinger(),
+        compaction_runner=lambda args: None,
         should_continue=three,
     )
     # 15:59, 16:00, 16:01. A bare daemon answers None for every slot, so this checks that
@@ -438,6 +440,7 @@ def test_the_guard_writes_the_close_minutes_before_gap_marking_claims_them(tmp_p
         cycle_runner=lambda *, close_tag, session_phase: CycleResult(et(2026, 9, 2, 16, 30), ()),
         transport=FakeTransport(),
         pinger=FakePinger(),
+        compaction_runner=lambda args: None,
         should_continue=once,
     )
 
@@ -663,6 +666,7 @@ def test_the_daemon_gives_the_guard_live_spans_and_the_master(tmp_path):
         cycle_runner=cycle,
         transport=FakeTransport(),
         pinger=FakePinger(),
+        compaction_runner=lambda args: None,
         should_continue=six,
     )
 
@@ -676,3 +680,56 @@ def test_the_daemon_gives_the_guard_live_spans_and_the_master(tmp_path):
     assert marked("XYZ"), "the guard never ran, so the rest proves nothing"
     assert marked("GONE") == [], "its span closed before the close, so it owed nothing"
     assert marked("LATE") == [], "its span opens after this session's close"
+
+
+# -- a day compaction has already sealed -----------------------------------------------
+
+
+def _seal(root: Path, ticker: str, day: date) -> None:
+    """Stand in for compaction: manifest the ticker-day's partition, drop its segments.
+
+    Only the two facts the guard can see are reproduced, because those are the two that
+    decide it: the manifest holds an entry for the partition, and the segment directory
+    is empty. How compaction gets there is its own module's contract.
+    """
+    paths = LakePaths(root)
+    partition = paths.quotes_partition_path(ticker, day)
+    partition.parent.mkdir(parents=True, exist_ok=True)
+    partition.write_bytes(b"sealed")
+    append_manifest(
+        root,
+        partition=partition.relative_to(root).as_posix(),
+        source="compaction",
+        sha256=sha256_file(partition),
+        rows=406,
+        fetched_at=None,
+    )
+    directory = paths.segment_dir(journal.QUOTES_SURFACE, ticker, day)
+    for segment in directory.glob("*.arrows"):
+        segment.unlink()
+
+
+def test_a_sealed_day_is_left_alone_rather_than_marked_unobserved(tmp_path):
+    """A restart after the daemon sealed its own day must not claim the close went unseen.
+
+    Compaction unlinks a ticker-day's segments once its partition is manifested, and
+    ``close_tag_rows`` reads only that directory. So a guard run after the seal reads an
+    empty directory and concludes nobody observed the close, for a close that was captured
+    and is sitting in the partition.
+
+    Nothing stopped that before the daemon dispatched its own compaction, because the
+    seal and the daemon's life never overlapped. Now they do: seal at 16:31, die at 16:33,
+    restart at 16:34, and the guard's dispatcher has forgotten it already ran. The marker
+    it writes is a false claim, and the next run deletes it as debris, so a row a live
+    writer wrote is silently dropped. Gap-marking skips a sealed date for this reason and
+    the guard now does too.
+    """
+    # Captured at the equity close, the way a healthy session ends.
+    _row(tmp_path, "quotes", "XYZ", et(2026, 9, 2, 16, 0), tag=SPOT_CLOSE, kind="data")
+    _seal(tmp_path, "XYZ", DAY)
+
+    guard = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 34)), [("XYZ", False)])
+    outcome = guard.run(DAY)
+
+    assert outcome.unobserved == (), "the guard called a sealed day's close unobserved"
+    assert not _rows(tmp_path, "quotes", "XYZ", DAY), "a marker landed beside a sealed day"

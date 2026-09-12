@@ -77,9 +77,13 @@ loop has no channel of its own to report it. The process exits non-zero, launchd
 and relaunches, and the successor's startup gap-marking records the minutes lost. A vendor
 failure never reaches here: the cycle resolves it into gap rows and returns normally.
 
-Two things are deliberately not here. The launchd plist that runs the daemon is D14's.
-Health pings and the backup sync belong to D12 and D13, so unlike the slice-1 runner this
-loop pings and backs up nothing per minute.
+The launchd plist that runs the daemon is deliberately not here. It is D14's.
+
+Nothing is pinged or backed up per minute, unlike the slice-1 runner. The two session-
+relative jobs the loop dispatches own both. The close+15 compaction seals the day, syncs
+the lake to the backup drive, and pings the ``compaction`` check, once a day. The
+dead-man ping is the per-minute exception, and it reports that the daemon is running
+rather than that anything landed.
 """
 
 from __future__ import annotations
@@ -100,7 +104,12 @@ from lake.clock import Clock, SystemClock
 from lake.close_guard import CloseGuard
 from lake.close_guard import GuardOutcome as CloseGuardOutcome
 from lake.config import ConfigError, input_errors_exit, load_config
-from lake.control_plane import AssertionHolder, AssertionRunner, read_token_mint
+from lake.control_plane import (
+    AssertionHolder,
+    AssertionRunner,
+    holiday_compaction_moment,
+    read_token_mint,
+)
 from lake.deadman import CAPTURE_SLUG, DeadMan
 from lake.gap import GapMarker, MarkingReport, surfaces_for
 from lake.journal import ROW_KIND_DATA
@@ -123,6 +132,14 @@ from lake.watchdog import Page, Surface, Watchdog
 # The loop's cadence: one tick per minute, on the minute top.
 
 # The step of the day-walk a multi-day stall is accounted by.
+
+
+# Starts the close+15 compaction. The real one spawns ``python -m lake.compact``. A test
+# injects a callable that records the arguments. It mirrors ``AssertionRunner``, which is
+# how this loop already spawns ``caffeinate``, but unlike that one it is required rather
+# than defaulted: a caller who forgot it would run a real compaction over whatever config
+# the daemon was pointed at.
+CompactionRunner = Callable[[Sequence[str]], object]
 
 
 class CycleRunner(Protocol):
@@ -414,6 +431,62 @@ def _close_guard(
     )
 
 
+def compaction_command(config_path: str | Path | None) -> list[str]:
+    """The argv that runs the close+15 job in its own process.
+
+    ``sys.executable`` rather than a bare ``python``, so the child runs the same
+    interpreter the daemon does. The daemon is started by launchd from the venv, and a
+    bare name would resolve against whatever ``PATH`` launchd happens to hand it.
+
+    The config path is forwarded when the daemon was given one, and omitted otherwise so
+    the child falls back to the same standard location the daemon did. Nothing else is
+    passed. The child reads the config itself, which is what keeps the lake root, the
+    backup target, the guard constants and the check URL current without the daemon
+    holding a copy of any of them.
+    """
+    args = [sys.executable, "-m", "lake.compact"]
+    if config_path is not None:
+        args += ["--config", str(config_path)]
+    return args
+
+
+def _spawn_compaction(args: Sequence[str]) -> object:
+    """Start the close+15 job and return without waiting. The live ``CompactionRunner``."""
+    import subprocess  # lazy: only the live daemon spawns
+
+    return subprocess.Popen(list(args))
+
+
+def _start_compaction(runner: CompactionRunner, args: Sequence[str]) -> None:
+    """Start the close+15 job in its own process, and never take the daemon down.
+
+    The job runs beside the daemon rather than inside it. The design gives compaction
+    and its backup roughly 25 minutes, and the dead-man's idle heartbeat rides the same
+    per-minute hook a job running here would block. Those two cannot both hold on one
+    thread: a compaction outrunning the 5-minute grace would page "capture down" about a
+    healthy daemon, which is the one page reserved for a daemon that is actually gone.
+    A separate process keeps the loop ticking through it.
+
+    Serialisation is already the lake-root lock's job, and that lock was written for
+    exactly this shape. The design's manifest protocol has it covering the scheduled run,
+    a launchd sleep-missed catch-up, and a hand-invoked one, which are three processes
+    contending for one lake. This adds a fourth caller, not a new mechanism.
+
+    Nothing is waited on, so a failing run is not reported from here. It cannot be: the
+    child outlives this call by design. The child pings the ``compaction`` check itself,
+    after its backup, so a run that died sends nothing and healthchecks pages on the
+    silence. Its own stderr lands in the launchd log beside the daemon's.
+
+    What is caught is a spawn that never started, which is the one failure this call can
+    still see. A raise here would exit the process, because no hook is wrapped in a try,
+    and under ``KeepAlive`` the successor would reach the same minute and raise again.
+    """
+    try:
+        runner(args)
+    except Exception as exc:  # noqa: BLE001 - a raise here would crash-loop the daemon
+        print(f"compaction: spawn failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+
 def _idle_stamp(
     config_path: str | Path | None,
     tickers_path: str | Path | None,
@@ -539,6 +612,7 @@ def run_loop_from_config(
     cycle_runner: CycleRunner | None = None,
     transport: Transport,
     pinger: Pinger,
+    compaction_runner: CompactionRunner,
     should_continue: Callable[[], bool] = _forever,
 ) -> None:
     """Run the loop wired from the real clock, calendar, and config. It never returns.
@@ -558,11 +632,17 @@ def run_loop_from_config(
     design's chain is the wake alarm, then ``KeepAlive`` starting the daemon, then the
     assertion keeping an open laptop awake, and this is the link that holds it.
 
-    ``transport`` and ``pinger`` are required, and neither has a live default. Each one
-    reaches a public endpoint, so a default would hand every caller a real ntfy POST and
-    a real healthchecks GET without being asked. A test that forgot to pass its own used
-    to get exactly that, and a page sent from a test is a page a person receives.
-    ``main`` builds the live pair; everything else supplies its own.
+    ``transport``, ``pinger`` and ``backup`` are required, and none has a live default.
+    Each one reaches past this process: a real ntfy POST, a real healthchecks GET, and an
+    ``rsync`` of the whole lake. A default would hand every caller the live object without
+    being asked. A test that forgot to pass one used to get exactly that, and a page sent
+    from a test is a page a person receives. ``main`` builds the live three; everything
+    else supplies its own.
+
+    ``plan_path`` names the machine-derived chunk plan the close+15 re-tune rewrites. It
+    defaults to the same file the capture cycle reads, so the two never disagree about
+    which plan is in force. A test points it at its own, because this one is written
+    rather than only read.
 
     ``cycle_runner`` defaults to the real capture cycle. A test passes its own, which
     is the only way to observe what this entry binds without reaching a vendor: every
@@ -586,6 +666,11 @@ def run_loop_from_config(
     than off, which only ever widens what gets marked. A config or roster that will not
     load is fatal instead, because the alarm needs both and a daemon with no dead-man
     cannot report its own death.
+
+    The close+15 compaction is dispatched from the tick hook as well, one tick past its
+    moment, so the day seals after every writer that can still add a row to it. A run
+    that raises is reported and swallowed rather than allowed to exit the process, since
+    the missed ``compaction`` ping already pages and a crash loop would cost capture.
     """
     clock = clock if clock is not None else SystemClock()
     calendar = calendar if calendar is not None else ExchangeCalendar()
@@ -631,8 +716,8 @@ def run_loop_from_config(
 
     # Every session-relative job is dispatched from in here, because launchd's calendar
     # intervals are fixed wall-clock and cannot express a close-relative time. The
-    # close+5 guard is the first of them. The close+15 compaction binds to the same
-    # dispatcher when someone builds it.
+    # close+5 guard is the first of them, and the close+15 compaction below is the
+    # second.
     #
     # This wraps the gap marker's hooks rather than the other way round, and the order is
     # load-bearing. On a post-close restart the guard owns the two close minutes, and it
@@ -657,6 +742,66 @@ def run_loop_from_config(
             guard_on_tick(slot)
 
         hooks = replace(hooks, on_start=on_start_guarded, on_tick=on_tick_guarded)
+
+    # Close+15 compaction, dispatched one tick after its moment. Sealing a day is the one
+    # act here that cannot be taken back, so it runs after every writer that can still
+    # add a row to that day, and the one-tick wait is what puts it there.
+    #
+    # Three writers come before it, and the tick alone does not order all three. Startup
+    # marking runs from ``on_start``, before the first tick. The close+5 guard runs from
+    # the tick hook above, so it is already wrapped inside this one. The third is the
+    # loop's own skipped-slot marking, and it is the one that decides this: ``run_loop``
+    # calls ``on_skipped`` *after* ``on_tick``, so a compaction dispatched from the tick
+    # it woke on would seal the day a minute before those markers were written.
+    #
+    # A lid closed at 16:10 and opened at 17:00 is that case, and it is an ordinary
+    # laptop day rather than an exotic one. The waking tick owes markers for 16:11
+    # through 16:15. Sealing first would strand them beside a manifested partition,
+    # where the next run deletes them as debris, and the day would then read five
+    # minutes short with no row saying why. Completeness is counted from rows and never
+    # inferred from holes, so that is a silent loss of exactly what marking exists to
+    # record.
+    #
+    # Waiting a tick costs one minute against a job the design schedules fifteen minutes
+    # past the close, and it buys the same ordering for all three writers at once.
+    compaction_args = compaction_command(config_path)
+    compaction = SessionDispatch(
+        session_clock=session_clock,
+        moment=lambda bounds: bounds.compaction,
+        # A day with no session still owes this job. The design has compaction and the
+        # sweep run and no-op-ping at their regular wall-clock times on a non-session
+        # weekday, because a job that correctly no-ops still pings and silence always
+        # means broken rather than idle. Without the fallback the ``compaction`` check
+        # would go down every holiday on a daemon doing exactly the right thing.
+        fallback=holiday_compaction_moment,
+        # The day is the dispatcher's, not the job's. ``compact`` sweeps every date under
+        # ``journal/`` whose close+5 has passed, so a day left unsealed by an earlier
+        # death is recovered by the next run rather than needing a dispatch of its own.
+        job=lambda day: _start_compaction(compaction_runner, compaction_args),
+    )
+    compaction_on_tick = hooks.on_tick
+    # The previous tick's slot, and the only state this holds across ticks. It is ``None``
+    # until the second tick, so a daemon started past close+15 compacts on its second
+    # minute rather than its first. That start is also the one moment startup marking has
+    # just walked the day, which is the ordering above again.
+    previous_slot: datetime | None = None
+
+    def on_tick_compacting(slot: datetime) -> None:
+        nonlocal previous_slot
+        compaction_on_tick(slot)
+        last, previous_slot = previous_slot, slot
+        if last is None:
+            return
+        # Never inside a capture window. A stall that starts just past one day's close+15
+        # and ends inside the next session leaves the dispatch owed on a minute the loop
+        # is capturing, and the seal would then run in front of a live fetch. The day it
+        # skips is swept by the next run outside the window, which is the catch-up the
+        # job already does for every date under ``journal/``.
+        if session_clock.phase_at(slot) in CAPTURE_PHASES:
+            return
+        compaction.check(last)
+
+    hooks = replace(hooks, on_tick=on_tick_compacting)
 
     hooks = replace(hooks, close_tag_for=session_clock.close_tag_at)
 
@@ -787,6 +932,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             token_path=args.token,
             transport=NtfyTransport(config.ntfy_topic.reveal()),
             pinger=UrllibPinger(),
+            compaction_runner=_spawn_compaction,
         )
     return 0
 

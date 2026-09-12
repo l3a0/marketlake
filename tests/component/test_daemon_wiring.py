@@ -7,12 +7,13 @@ job runs. A binding can be deleted with every isolated test still green, so each
 here drives the production entry and watches the far end of one binding.
 
 Each runs that entry with a manual clock, a fake calendar, and a throwaway config,
-roster, and lake on disk. The two seams that reach the public internet, the ntfy
-transport and the health-check pinger, are faked, because a page sent from a test is a
-page a person receives. So the tier is component: the daemon over real files, with the
-clock, the calendar, and the network still fake.
+roster, and lake on disk. The three seams that reach past the process are faked: the
+ntfy transport, the health-check pinger, and the backup's ``rsync``. A page sent from a
+test is a page a person receives, and a sync from one copies a throwaway lake onto the
+machine running the suite. So the tier is component: the daemon over real files, with the
+clock, the calendar, the network, and the backup still fake.
 
-Eight bindings are covered here.
+Ten bindings are covered here.
 
 1. The skipped-slot hook reaches the gap marker, so a live overrun records the minutes
    it slept through.
@@ -36,15 +37,26 @@ Eight bindings are covered here.
    value is read off the config each time the watchdog decides to page. Baking it in at
    loop start, which is what the daemon did before, would hold the old number and no
    other case here drives a config edit to catch it.
+9. An empty roster keeps the loop, the dead-man, and the watchdog running, because those
+   report on the daemon's own health rather than on any ticker's.
+10. The per-tick hook reaches the close+15 compaction, so the daemon seals and backs up
+    its own day rather than waiting for a hand-run command. The job is spawned as its own
+    process, because the design gives it roughly 25 minutes and the dead-man's heartbeat
+    rides this same hook under a 5-minute grace. The dispatch fires one tick past its
+    moment, which puts the seal after both gap-marking writers, and never inside a capture
+    window. A day with no session falls back to the regular wall-clock time, so the
+    ``compaction`` check is fed on a holiday rather than paging about an idle daemon.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+import sys
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
 
+import pyarrow.parquet as pq
 import pytest
 
 from lake import capture, close_guard, daemon, gap, journal
@@ -52,13 +64,15 @@ from lake.alert import Message
 from lake.capture import CycleResult, SegmentOutcome
 from lake.capture_spans import CaptureSpans, spans_path
 from lake.chain_plan import ChainPlan, load_chain_plan
-from lake.compact import write_chain_plan
+from lake.compact import COMPACTION_SLUG, compact, write_chain_plan
 from lake.config import GuardConstants
 from lake.deadman import CAPTURE_SLUG
+from lake.paths import LakePaths
 from lake.security_master import SecurityMaster, master_path
-from lake.session import SPOT_CLOSE
+from lake.session import SPOT_CLOSE, TICK
 from lake.tickers import TickersError
 from lake.vendor import VendorResponse
+from tests.support.backup import FakeBackup
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import PING_KEY, write_config
@@ -70,8 +84,10 @@ WEEK = date(2026, 8, 31)
 DAY = date(2026, 9, 2)
 NEXT_DAY = date(2026, 9, 3)
 
-# The check the daemon feeds, as the throwaway config addresses it.
+# The checks the daemon feeds, as the throwaway config addresses them. The dead-man
+# takes the first every minute it is awake, and the close+15 job the second once a day.
 CAPTURE_URL = f"https://hc-ping.com/{PING_KEY}/{CAPTURE_SLUG}"
+COMPACTION_URL = f"https://hc-ping.com/{PING_KEY}/{COMPACTION_SLUG}"
 
 EQUITY_ONLY = "XYZ: {options: false}\n"
 WITH_OPTIONS = "SPY: {options: true, chain_cadence: 1m}\n"
@@ -132,16 +148,46 @@ class _Recording:
         self.sent.append(message)
 
 
+class _Compactions:
+    """A ``CompactionRunner`` that records each spawn instead of starting a child.
+
+    The daemon's job is to issue the right command at the right minute. What that
+    command then does is ``compact``'s own contract, covered over real files in
+    ``test_compaction.py``. So this records the argv and the moment, and a test that
+    wants the seal itself asks for ``run_here``.
+
+    ``run_here`` makes the recorder perform the compaction in-process instead, with the
+    test's own seams. That is how a case about *ordering* reads what is on disk at the
+    moment the daemon dispatched, which is the one thing a recorded argv cannot show.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self._run_here: Callable[[], None] | None = None
+
+    def run_here(self, run: Callable[[], None]) -> None:
+        """Perform the compaction in-process on every dispatch, instead of recording only."""
+        self._run_here = run
+
+    def __call__(self, args: Sequence[str]) -> object:
+        self.calls.append(list(args))
+        if self._run_here is not None:
+            self._run_here()
+        return None
+
+
 @dataclass(frozen=True)
 class _Rig:
-    """The throwaway machine one daemon run reads, and the fakes for its two endpoints."""
+    """The throwaway machine one daemon run reads, and the fakes for its three endpoints."""
 
     lake_root: Path
     config: Path
     tickers: Path
     token: Path
+    plan: Path
     transport: _Recording
     pinger: FakePinger
+    compaction: _Compactions
 
 
 def _rig(
@@ -164,8 +210,10 @@ def _rig(
         config=write_config(tmp_path, lake_root, guards=guards),
         tickers=tickers,
         token=tmp_path / "token.json",
+        plan=tmp_path / "chain_plan.json",
         transport=_Recording(),
         pinger=FakePinger(),
+        compaction=_Compactions(),
     )
 
 
@@ -194,7 +242,12 @@ def _run(
 
     ``cycle_runner`` left unset is the real one, the closure over the capture entry.
     The power assertion is a seam for a reason: left to its default it spawns the real
-    ``caffeinate``, which exists on macOS and not on a Linux CI runner.
+    ``caffeinate``, which exists on macOS and not on a Linux CI runner. The backup is a
+    seam for the same reason, one step further: left to its default it would ``rsync``
+    the throwaway lake onto the machine running the suite.
+
+    The compaction runner is a seam for the same reason once more: left to its default it
+    spawns a real ``python -m lake.compact`` child against whatever config it is handed.
     """
     daemon.run_loop_from_config(
         config_path=str(rig.config),
@@ -205,6 +258,7 @@ def _run(
         assertion_runner=lambda args: None,
         transport=rig.transport,
         pinger=rig.pinger,
+        compaction_runner=rig.compaction,
         cycle_runner=cycle_runner,
         hooks=hooks,
         should_continue=_stop_after(ticks),
@@ -217,6 +271,18 @@ def _record(root: Path, surface: str, ticker: str, slot: datetime, *, kind: str 
     stamp = slot.strftime(gap.SEGMENT_STAMP_FORMAT)
     with journal.SegmentWriter.open(root, surface, ticker, slot.date(), stamp, 1) as writer:
         writer.write_cycle(batch)
+
+
+def _segments(root: Path, ticker: str, day: date = DAY) -> list[Path]:
+    """The journal segments still on disk for one ticker-day's quotes.
+
+    Compaction deletes a ticker-day's segments only after its partition is manifested,
+    so an empty list beside a sealed partition says the seal finished. A segment left
+    here after a run is either one the job refused or one a later writer added, and the
+    two cases are told apart by which rows the partition carries.
+    """
+    directory = journal.segment_dir(root, journal.QUOTES_SURFACE, ticker, day)
+    return sorted(directory.glob("*.arrows")) if directory.is_dir() else []
 
 
 def _rows(root: Path, surface: str, ticker: str, day: date) -> list[dict]:
@@ -760,3 +826,258 @@ def test_an_empty_roster_still_runs_the_loop_and_reports(tmp_path):
     assert rig.pinger.urls == [CAPTURE_URL] * 3
     # No page fired, since there is nothing to charge or watch.
     assert rig.transport.sent == []
+
+
+# -- 10. the tick hook reaches the close+15 compaction ---------------------------------
+
+
+def _compaction_argv(rig: _Rig) -> list[str]:
+    """The command the daemon must issue to run the close+15 job in its own process."""
+    return [sys.executable, "-m", "lake.compact", "--config", str(rig.config)]
+
+
+def test_a_daemon_alive_across_close_plus_fifteen_starts_the_compaction(tmp_path):
+    """The daemon has to run its own close+15 job, or nothing does.
+
+    ``compact.compact`` was reachable only from ``python -m lake.compact``, so an unbound
+    tick hook leaves every session's segments unmerged, the lake unsynced to the backup
+    drive, and the ``compaction`` check unfed until someone runs that command by hand.
+
+    The job goes in its own process. The design gives it roughly 25 minutes and gives the
+    dead-man a 5-minute grace on a heartbeat riding this same hook, so a job run inline
+    would page "capture down" about a healthy daemon. The child also keeps an ``rsync``
+    and a whole ticker-day of Parquet out of the resident daemon's heap.
+    """
+    rig = _rig(tmp_path)
+    seen: list[tuple[str, int]] = []
+    hooks = daemon.DaemonHooks(
+        on_tick=lambda slot: seen.append((slot.strftime("%H:%M"), len(rig.compaction.calls)))
+    )
+    # Close+15 is 16:30, so the run ticks 16:30, 16:31 and 16:32.
+    clock = ManualClock(start=et(2026, 9, 2, 16, 29, 30))
+    _run(rig, clock, ticks=3, cycle_runner=_no_cycle, hooks=hooks)
+
+    # The dispatch waits one tick past its moment, and the caller's hook runs before it
+    # on its own tick, so 16:32 is the first minute that sees the count go up.
+    assert seen == [("16:30", 0), ("16:31", 0), ("16:32", 1)]
+    assert rig.compaction.calls == [_compaction_argv(rig)]
+
+
+def test_the_job_is_not_started_before_close_plus_fifteen(tmp_path):
+    """Close+15 is the number this feature is named for, so it is worth pinning.
+
+    Close+5 has passed by 16:20 and the option close by 16:16, and a dispatch bound to
+    either would look right on every case that starts after the close. This one starts
+    between them, where the three moments disagree.
+    """
+    rig = _rig(tmp_path)
+    # 16:20 is close+5 exactly. The run ticks 16:20, 16:21 and 16:22, all short of 16:30.
+    clock = ManualClock(start=et(2026, 9, 2, 16, 19, 30))
+    _run(rig, clock, ticks=3, cycle_runner=_no_cycle)
+
+    assert rig.compaction.calls == []
+
+
+def test_a_holiday_still_runs_the_job_so_its_check_is_fed(tmp_path):
+    """A job that correctly no-ops still pings, because silence means broken, not idle.
+
+    Close+15 does not exist without a session, so the dispatcher has no bounds to derive
+    from and would skip the day outright. The design has compaction run at its regular
+    wall-clock time instead, and the ``compaction`` check expects a ping every weekday.
+    Skipping would take that check down on every holiday while the daemon did exactly the
+    right thing, which is the false page the design's rule exists to prevent.
+    """
+    rig = _rig(tmp_path)
+    # Thursday is declared a holiday: the week's calendar names every session but it.
+    holiday = date(2026, 9, 3)
+    clock = ManualClock(start=et(2026, 9, 3, 16, 30, 30))
+    daemon.run_loop_from_config(
+        config_path=str(rig.config),
+        tickers_path=str(rig.tickers),
+        token_path=str(rig.token),
+        clock=clock,
+        calendar=weekday_sessions(WEEK, holidays=(holiday,)),
+        assertion_runner=lambda args: None,
+        transport=rig.transport,
+        pinger=rig.pinger,
+        compaction_runner=rig.compaction,
+        cycle_runner=_no_cycle,
+        should_continue=_stop_after(2),
+    )
+
+    assert rig.compaction.calls == [_compaction_argv(rig)]
+
+
+def test_a_weekend_owes_the_job_nothing(tmp_path):
+    """The check expects a ping on weekdays only, so Saturday must not start a run.
+
+    The holiday fallback is a weekday rule, not an every-day rule. Firing here would run
+    a scrub-and-sync the schedule never asked for, and it would do it on the two days the
+    design leaves deliberately silent.
+    """
+    rig = _rig(tmp_path)
+    saturday = date(2026, 9, 5)
+    clock = ManualClock(start=et(2026, 9, 5, 16, 30, 30))
+    daemon.run_loop_from_config(
+        config_path=str(rig.config),
+        tickers_path=str(rig.tickers),
+        token_path=str(rig.token),
+        clock=clock,
+        calendar=weekday_sessions(WEEK),
+        assertion_runner=lambda args: None,
+        transport=rig.transport,
+        pinger=rig.pinger,
+        compaction_runner=rig.compaction,
+        cycle_runner=_no_cycle,
+        should_continue=_stop_after(2),
+    )
+
+    assert saturday.weekday() == 5
+    assert rig.compaction.calls == []
+
+
+def test_a_stall_into_the_next_session_does_not_seal_in_front_of_a_live_minute(tmp_path):
+    """Compaction must never run inside a capture window.
+
+    A stall that begins just past one day's close+15 and ends inside the next session
+    leaves the dispatch owed on a minute the loop is capturing. Starting it there puts a
+    lake lock, a seal and a full-lake ``rsync`` in front of a live fetch, which is the one
+    thing every other job here is arranged not to do. The day it skips is swept by the
+    next run outside the window, because the job walks every date under ``journal/``.
+    """
+    rig = _rig(tmp_path)
+    clock = ManualClock(start=et(2026, 9, 2, 16, 29, 30))
+    stalled: list[int] = []
+
+    def close_the_lid(slot: datetime) -> None:
+        # One stall, on the first tick: Wednesday 16:30 to Thursday 09:30. Wednesday's
+        # close+15 has passed and no later tick lands that day, so the dispatch is owed
+        # on the first tick of Thursday's session.
+        if not stalled:
+            stalled.append(1)
+            clock.advance(61200)
+
+    _run(
+        rig,
+        clock,
+        ticks=3,
+        cycle_runner=lambda *, close_tag, session_phase: CycleResult(clock.now(), ()),
+        hooks=daemon.DaemonHooks(on_tick=close_the_lid),
+    )
+
+    assert rig.compaction.calls == [], "the seal ran in front of a live capture minute"
+
+
+def _compacts_here(rig: _Rig, clock: ManualClock) -> Callable[[], None]:
+    """Perform the compaction in-process, with the test's own seams.
+
+    The daemon spawns a child in production, and a child cannot be started from the
+    offline suite. A case about *ordering* still needs the seal to actually happen, so
+    this stands in for the child and does the same work the child would: the same
+    ``compact`` entry, over the same lake, with a fake backup and no ping.
+    """
+
+    def run() -> None:
+        compact(
+            rig.lake_root,
+            clock=clock,
+            calendar=weekday_sessions(WEEK),
+            backup=FakeBackup(),
+            backup_target=rig.lake_root.parent / "ssd",
+            plan_path=rig.plan,
+        )
+
+    return run
+
+
+def test_a_stall_across_the_close_marks_its_minutes_before_the_day_is_sealed(tmp_path):
+    """Sealing is the one act here that cannot be taken back, so it goes last.
+
+    ``run_loop`` calls ``on_skipped`` after ``on_tick``. A compaction dispatched from the
+    tick the daemon woke on would seal the day a minute before the loop wrote the markers
+    it owed for it. The next run would find the partition manifested and delete those
+    markers as debris, and the day would read short with no row saying why.
+
+    A lid closed at 16:10 and opened at 17:00 is that case, and it is an ordinary laptop
+    day rather than an exotic one.
+    """
+    rig = _rig(tmp_path)
+    clock = ManualClock(start=et(2026, 9, 2, 16, 9, 30))
+    rig.compaction.run_here(_compacts_here(rig, clock))
+    _record(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", et(2026, 9, 2, 16, 9))
+    # The 16:10 cycle runs fifty minutes, so the loop next wakes past close+15.
+    _run(rig, clock, ticks=3, cycle_runner=_Overrunning(clock, 3000))
+
+    partition = LakePaths(rig.lake_root).quotes_partition_path("XYZ", DAY)
+    sealed = sorted(snap[:16] for snap in pq.read_table(partition).column("snap_ts").to_pylist())
+    assert sealed == [
+        "2026-09-02T16:09",
+        "2026-09-02T16:11",
+        "2026-09-02T16:12",
+        "2026-09-02T16:13",
+        "2026-09-02T16:14",
+        "2026-09-02T16:15",
+    ]
+    assert _segments(rig.lake_root, "XYZ") == [], "a marker landed after the seal"
+
+
+def test_a_restart_past_close_plus_fifteen_marks_the_day_before_sealing_it(tmp_path):
+    """Startup marking is the other writer the seal has to follow.
+
+    It runs from ``on_start``, so a dispatch added there too would seal the day before
+    the walk wrote a single marker, and those minutes would be deleted as debris by the
+    next run. The one-tick wait is what keeps the dispatch on the far side of it: the
+    first tick after a restart has no previous slot, so nothing is dispatched until the
+    walk is already done.
+    """
+    rig = _rig(tmp_path)
+    master = SecurityMaster()
+    xyz = master.register(
+        kind="equity", capture_start=et(2026, 9, 2, 9, 30), valid_from=DAY, ticker="XYZ"
+    )
+    master.write(master_path(rig.lake_root))
+    spans = CaptureSpans()
+    spans.open_span(xyz, et(2026, 9, 2, 9, 30), False)
+    spans.write(spans_path(rig.lake_root))
+    # Captured through 16:09, so 16:10 to 16:15 are the minutes the day still owes.
+    for minute in range(40):
+        _record(
+            rig.lake_root, journal.QUOTES_SURFACE, "XYZ", et(2026, 9, 2, 15, 30) + TICK * minute
+        )
+    clock = ManualClock(start=et(2026, 9, 2, 16, 59, 30))
+    rig.compaction.run_here(_compacts_here(rig, clock))
+    _run(rig, clock, ticks=3, cycle_runner=_no_cycle)
+
+    partition = LakePaths(rig.lake_root).quotes_partition_path("XYZ", DAY)
+    sealed = {snap[11:16] for snap in pq.read_table(partition).column("snap_ts").to_pylist()}
+    owed = {"16:10", "16:11", "16:12", "16:13", "16:14", "16:15"}
+    assert owed <= sealed, "startup marking's minutes were sealed away or never written"
+
+
+class _Unspawnable:
+    """A ``CompactionRunner`` standing for a spawn that cannot start."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, args):
+        self.calls += 1
+        raise OSError("no such interpreter")
+
+
+def test_a_spawn_that_fails_is_reported_and_never_takes_capture_down(tmp_path):
+    """A compaction that will not start must not cost tomorrow's session.
+
+    No hook is wrapped in a try, so a raise here exits the process, and under
+    ``KeepAlive`` the successor reaches the same minute and raises again. One broken
+    spawn would become a crash loop with capture dead inside it, which inverts the
+    design's order of precedence. The missed ``compaction`` ping pages instead.
+    """
+    rig = replace(_rig(tmp_path), compaction=_Unspawnable())
+    clock = ManualClock(start=et(2026, 9, 2, 16, 29, 30))
+    _run(rig, clock, ticks=4, cycle_runner=_no_cycle)
+
+    # The loop ran every tick it was given, so the raise never reached it.
+    assert rig.pinger.urls == [CAPTURE_URL] * 4
+    # Once, not once a minute: the dispatcher marks the day served before it runs.
+    assert rig.compaction.calls == 1
