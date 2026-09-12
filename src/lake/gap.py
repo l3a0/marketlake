@@ -25,25 +25,32 @@ directions. A ticker onboarded mid-session would be captured and left unmarked, 
 the hole this exists to close. A ticker retired mid-session would keep collecting markers
 on a surface nothing captures, manufacturing holes that were never owed.
 
-A ticker's scope has two ends, and reading is what keeps marking on the right side of
-both. ``capture_start`` opens it, and the anchor clamps there, so minutes before it are
-out of scope rather than gaps. Leaving ``tickers.yaml`` closes it, and marking reads
-that same file, so both ends move with capture. One limit on the closing end is worth
-naming. There is no ``capture_end`` epoch, so a ticker that leaves the roster and later
-returns has its whole absence walked back as ``daemon_dead`` gaps by the next startup
-pass. Reading the roster does not change that, because the anchor knows only the newest
-recorded minute.
+A ticker's scope is a set of capture spans, and the startup walk reads them to stay on
+the right side of both ends. A minute is owed only when a span covers it, so minutes
+before the first span, after a closed span, and between two spans are out of scope rather
+than gaps. This closes the rejoin hole. A ticker retired and later brought back opens a
+second span, and the away period falls in no span, so the walk owes nothing there and
+marks nothing, rather than walking the whole absence back as ``daemon_dead`` gaps.
+
+The startup walk is hole-aware. For each session day it owes the capture window minutes
+in scope, and marks the ones no row records. So a single stray row cannot pose as a
+frontier and hide the rest of the day. That is the fix for the collapse where a dark
+session showed 16 of its 406 minutes recorded, a stray row near the close posing as a
+frontier, so the old walk left the other 390 owed minutes unmarked. They are marked now,
+because they are owed and no row records them.
 
 Marking is calendar-driven, not segment-driven. It asks the calendar which sessions
 existed and which minutes those sessions held, then subtracts what is already recorded.
 A date with no segments at all is exactly the case a segment-driven walk would miss, and
-it is the case that matters most: a laptop closed for a week leaves no trace to walk.
+it is the case that matters most: a laptop closed for a week leaves no trace to walk. The
+walk stops at the first day with nothing missing, a fully captured or out-of-scope day,
+and everything below it was made complete by the incarnation that reached it.
 
 Two rules keep repeated marking safe, which matters because the daemon runs under
 ``KeepAlive`` and a crash loop restarts it within seconds.
 
-1. The anchor counts marker rows as well as data rows, so a second restart resumes
-   after the first restart's markers rather than writing them again.
+1. The present set counts marker rows as well as data rows, so a minute a previous
+   restart already marked is not owed a second time.
 2. A date the manifest has already sealed is skipped, so markers never land under a
    partition whose row count is fixed.
 
@@ -61,6 +68,7 @@ from pathlib import Path
 
 from lake import journal
 from lake.calendar import NotASession
+from lake.capture_spans import CaptureSpan, CaptureSpans, spans_of_ticker
 from lake.lock import lake_lock
 from lake.manifest import latest_entries
 from lake.paths import LakePaths
@@ -69,7 +77,7 @@ from lake.security_master import (
     capture_start_in_market_time,
     is_in_scope,
 )
-from lake.session import TICK, SessionClock, SessionPhase, missed_slots
+from lake.session import TICK, SessionClock, SessionPhase, session_slots
 from lake.tickers import Roster
 
 # The reason stamped on a startup marker. The previous incarnation ended without
@@ -172,6 +180,7 @@ class GapMarker:
         roster: Callable[[], Roster],
         session_clock: SessionClock,
         master: Callable[[], SecurityMaster | None] | None = None,
+        spans: Callable[[], CaptureSpans | None] | None = None,
         pid: int | None = None,
     ) -> None:
         self._root = Path(lake_root)
@@ -179,13 +188,15 @@ class GapMarker:
         self._roster = roster
         self._session_clock = session_clock
         self._master = master
+        self._spans = spans
         self._pid = os.getpid() if pid is None else pid
         self._unreadable: list[str] = []
-        # The master this pass is judging against, read once at the top of ``_pass``.
-        # A pass reads it rather than holding one from daemon start, because onboarding
-        # writes it while the daemon runs and the clamp exists for a mid-session
-        # onboarding. Per pass rather than per ticker, so one pass sees one master.
+        # The master and spans this pass is judging against, read once at the top of
+        # ``_pass``. A pass reads them rather than holding a copy from daemon start,
+        # because onboarding and retiring write them while the daemon runs. Per pass
+        # rather than per ticker, so one pass judges every ticker against one snapshot.
         self._master_now: SecurityMaster | None = None
+        self._spans_now: CaptureSpans | None = None
 
     # -- the two hooks ---------------------------------------------------------
 
@@ -200,16 +211,19 @@ class GapMarker:
         """
         first_live_slot = self._session_clock.snap_slot() + TICK
 
-        def plan(surface: str, ticker: str) -> tuple[list[datetime], MarkingReport]:
+        def plan(
+            surface: str, ticker: str, recorded: dict[str, dict]
+        ) -> tuple[list[datetime], MarkingReport]:
             self._unreadable = []
-            anchor, truncated = self._anchor(surface, ticker, first_live_slot)
+            missing, truncated, sealed = self._startup_missing(
+                surface, ticker, first_live_slot, recorded
+            )
             notes = MarkingReport(
+                sealed=tuple(sealed),
                 truncated=(f"{surface}/{ticker}",) if truncated else (),
                 problems=tuple(self._unreadable),
             )
-            if anchor is None:
-                return [], notes
-            return missed_slots(self._session_clock, anchor, first_live_slot), notes
+            return missing, notes
 
         return self._pass(DAEMON_DEAD, plan)
 
@@ -218,15 +232,17 @@ class GapMarker:
 
         The loop hands the same slots for every ticker, because it missed the whole
         cycle rather than one ticker's fetch. Each ticker's own scope still applies, so
-        the slots are clamped to its ``capture_start`` the way the startup walk's anchor
-        is. A stall can outlive an onboarding: the loop sleeps from 10:00 to 10:10 and a
+        the slots are clamped to its ``capture_start``, the epoch before which nothing is
+        owed. A stall can outlive an onboarding: the loop sleeps from 10:00 to 10:10 and a
         ticker joins the roster at 10:05, so this pass is the first to see it. Its 10:01
         was never owed, and marking it would render "40% missing" on a ticker the design
         renders as "onboarded 10:05". A ticker the master cannot place is not clamped,
         which only ever widens the marking, and ``_capture_start`` never raises.
         """
 
-        def plan(surface: str, ticker: str) -> tuple[list[datetime], MarkingReport]:
+        def plan(
+            surface: str, ticker: str, recorded: dict[str, dict]
+        ) -> tuple[list[datetime], MarkingReport]:
             epoch = self._capture_start(ticker)
             if epoch is None:
                 return list(slots), MarkingReport()
@@ -239,7 +255,7 @@ class GapMarker:
     def _pass(
         self,
         error_class: str,
-        plan: Callable[[str, str], tuple[list[datetime], MarkingReport]],
+        plan: Callable[[str, str, dict[str, dict]], tuple[list[datetime], MarkingReport]],
     ) -> MarkingReport:
         """Run one marking pass over the whole roster under a single lock.
 
@@ -247,8 +263,8 @@ class GapMarker:
         each ticker. ``on_skipped`` runs on the loop thread, so a lock per surface per
         ticker would put a growing stall in front of the next capture cycle.
 
-        Deciding and writing sit inside the same hold. The anchor is read there too, so
-        a second incarnation cannot read the same anchor and mark the same minutes into
+        Deciding and writing sit inside the same hold. The recorded set is read there too,
+        so a second incarnation cannot read the same state and mark the same minutes into
         a differently named segment. Compaction fixes a date's row count when it seals,
         so a marker landing between the seal check and the write would make that count
         wrong.
@@ -276,11 +292,12 @@ class GapMarker:
         try:
             roster = self._roster().enabled
             self._master_now = self._master() if self._master is not None else None
+            self._spans_now = self._spans() if self._spans is not None else None
             with lake_lock(self._root):
                 recorded = latest_entries(self._root)
                 for entry in roster:
                     for surface in surfaces_for(entry):
-                        slots, pair_notes = plan(surface, entry.ticker)
+                        slots, pair_notes = plan(surface, entry.ticker, recorded)
                         notes = _merge(notes, pair_notes)
                         by_day: dict[date, list[datetime]] = {}
                         for slot in slots:
@@ -301,10 +318,11 @@ class GapMarker:
                                     )
                                 )
                             except OSError as exc:
-                                # Stop this pair here. Marking its later days would move
-                                # the anchor past the failure, so the next restart would
-                                # never retry it. Leaving the anchor behind makes the
-                                # failure temporary rather than permanent.
+                                # Stop this pair here. An OSError like a full disk is
+                                # likely to hit the next day too. The unwritten days stay
+                                # owed, so the next restart re-derives what is missing and
+                                # marks them then. Stopping now defers the work, never
+                                # drops it.
                                 problems.append(
                                     f"{surface}/{entry.ticker} {day.isoformat()}: "
                                     f"{type(exc).__name__}"
@@ -334,8 +352,8 @@ class GapMarker:
         ``SegmentWriter`` opens with ``O_CREAT|O_EXCL``, so the second would fail. A
         startup pass and a skipped-slot pass in the same minute is the ordinary case,
         not a rare one. Stamping from the span also makes the name say what it covers,
-        and two passes cannot cover the same first minute, because the anchor moves past
-        whatever the previous pass wrote.
+        and two passes cannot cover the same first minute, because the recorded set counts
+        the previous pass's marker rows, so those minutes are no longer owed.
         """
         stamp = slots[0].strftime(SEGMENT_STAMP_FORMAT)
         path = journal.segment_path(self._root, surface, ticker, day, stamp, self._pid)
@@ -357,82 +375,123 @@ class GapMarker:
         phase = self._session_clock.phase_at(slot)
         return phase.value if phase is SessionPhase.POST_EQUITY_CLOSE else None
 
-    # -- the anchor ------------------------------------------------------------
+    # -- the hole-aware startup walk -------------------------------------------
 
-    def _anchor(self, surface: str, ticker: str, before: datetime) -> tuple[datetime | None, bool]:
-        """Where this ticker-surface's record stops, as an exclusive lower bound.
+    def _startup_missing(
+        self,
+        surface: str,
+        ticker: str,
+        first_live_slot: datetime,
+        recorded: dict[str, dict],
+    ) -> tuple[list[datetime], bool, list[str]]:
+        """The owed-but-unrecorded minutes for one ticker-surface, walking back from today.
 
-        The walk starts at ``before``'s own date and steps back one calendar day at a
-        time, skipping the days the calendar refuses. The first session holding any row
-        wins, and marking resumes after that row's minute. Marker rows count, so a
-        restart that already marked a span resumes after it rather than repeating it.
+        For each session day, the owed minutes are the capture window intersected with the
+        ticker's capture spans, and the missing ones are the owed minutes no row records. A
+        single stray row, such as the close guard's 16:00 marker on an otherwise dark day,
+        is one present minute among the owed set rather than a frontier that hides the
+        morning. That is the fix for the collapse where a dark session recorded 16 of its
+        406 minutes.
 
-        Two floors stop the walk. The instrument's capture start is the real one, since
-        no minute before it was ever in scope. ``MAX_LOOKBACK_SESSIONS`` is the backstop
-        for a lake with no record at all, counted in sessions because a session is what
-        carries capture slots. Hitting either is reported rather than passed over.
+        The walk stops at the first prior day with nothing missing: a fully captured day,
+        or a day out of scope. Stopping at a fully captured day is safe, because the
+        incarnation that completed it also handled every day below it. Stopping at an
+        out-of-scope day bounds a normal restart to the recent past. The price is a rejoin
+        edge: a dark, in-scope day in an earlier closed span, below the away gap between two
+        spans, is not caught here, but only after a compound failure where the daemon was
+        dead for that whole earlier span. A day with any missing minute keeps the walk
+        going, because a dark day can sit below it.
+
+        A date the manifest has sealed is skipped, and the walk continues past it rather
+        than stopping. Compaction unlinks a sealed day's segments, so it reads as dark and
+        would be re-marked, and stopping at it is the rejected last-manifested-partition
+        anchor that leaves a dark date below it unmarked.
+
+        An unreadable segment aborts the pair, so a full session of markers is never
+        written over a record that exists. The 90-session cap is the backstop for a lake
+        with no record; hitting it marks down to the oldest examined day and claims nothing
+        below it.
+
+        Scope comes from the capture spans. When they cannot be read, the ticker cannot be
+        placed in scope, so nothing is owed and nothing is marked. That defers the pass to
+        the next readable restart rather than inventing a full session of gaps against a
+        ticker whose scope is unknown.
         """
-        epoch = self._capture_start(ticker)
-        day = before.date()
+        spanlist = spans_of_ticker(
+            self._spans_now, self._master_now, ticker, self._session_clock.session_date()
+        )
+        missing: list[datetime] = []
+        sealed: list[str] = []
+        day = first_live_slot.date()
         sessions = 0
         calendar_days = 0
-        oldest: datetime | None = None
         while sessions < MAX_LOOKBACK_SESSIONS and calendar_days < _CALENDAR_DAY_GUARD:
             calendar_days += 1
             try:
                 bounds = self._session_clock.bounds(day)
             except NotASession:
-                # A weekend or a holiday costs no budget. The cap counts sessions,
-                # because a session is what carries capture slots.
+                # A weekend or a holiday carries no capture slots and costs no session
+                # budget. The cap counts sessions, because a session is what carries slots.
                 day -= _ONE_DAY
                 continue
             sessions += 1
-            oldest = bounds.open
-            recorded = journal.last_recorded_slot(self._root, surface, ticker, day)
-            if recorded.unreadable:
+            key = (
+                self._paths.partition_path(surface, ticker, day).relative_to(self._root).as_posix()
+            )
+            if key in recorded:
+                # Sealed after it was marked, so it is accounted. Name it and keep walking.
+                # The check is a dict lookup, so a long sealed history costs almost nothing
+                # and the owed-versus-present read runs only on the unsealed recent days.
+                sealed.append(key)
+                day -= _ONE_DAY
+                continue
+            present = journal.recorded_slots(self._root, surface, ticker, day)
+            if present.unreadable:
                 # A segment that cannot be read is not the same as no segment. Marking
-                # this day would write a full session of markers over a record that
-                # exists. Refuse the pair and say so, so the next restart tries again.
+                # this day would write a full session over a record that exists. Refuse
+                # the pair and say so, so the next restart tries again.
                 self._unreadable.append(
-                    f"{surface}/{ticker} {day.isoformat()}: {len(recorded.unreadable)} unreadable"
+                    f"{surface}/{ticker} {day.isoformat()}: {len(present.unreadable)} unreadable"
                 )
-                return None, False
-            if recorded.slot is not None:
-                return self._clamp(recorded.slot, epoch), False
-            if epoch is not None and bounds.open <= epoch:
-                # The walk reached the instrument's first in-scope session. Nothing
-                # before it was ever owed, so this is the floor rather than the cap.
-                return self._clamp(epoch - TICK, None), False
+                return [], False, sealed
+            owed = [
+                slot
+                for slot in session_slots(bounds)
+                if slot < first_live_slot and self._in_scope(surface, spanlist, slot)
+            ]
+            day_missing = [slot for slot in owed if slot not in present.slots]
+            missing.extend(day_missing)
+            if not day_missing and day < first_live_slot.date():
+                # A prior day with nothing missing: fully captured, or out of scope.
+                # Everything below it is accounted, so stop. The restart date itself never
+                # stops the walk, because a pre-open or mid-session restart owes little or
+                # nothing there while the day before may hold a whole dark session.
+                return missing, False, sealed
             day -= _ONE_DAY
-        if oldest is None or epoch is None:
-            # Either the calendar held no session inside the guard, or the walk found
-            # no row and no capture start. Nothing has ever claimed this instrument was
-            # in scope for these sessions, so marking them would invent an absence
-            # rather than record one. The pass is still reported, because "marked
-            # nothing on purpose" and "marked nothing by mistake" must not look alike.
-            return None, True
-        # The cap stopped the walk. Anchor at the open of the oldest session actually
-        # examined, so that day is marked in full and nothing below it is claimed. An
-        # anchor inside an unexamined day would mark a partial session and leave the
-        # rest for a later pass, which would double-count the overlap.
-        return self._clamp(oldest - TICK, epoch), True
+        # The cap stopped the walk. Everything down to the oldest examined day is already
+        # in ``missing``, and nothing below it is claimed.
+        return missing, True, sealed
 
-    def _clamp(self, anchor: datetime, epoch: datetime | None) -> datetime:
-        """The later of a recorded anchor and the instrument's capture start.
+    def _in_scope(
+        self, surface: str, spanlist: tuple[CaptureSpan, ...] | None, slot: datetime
+    ) -> bool:
+        """Whether ``slot`` is owed on ``surface`` by the ticker's capture spans.
 
-        ``missed_slots`` is exclusive at its lower bound, so the epoch is offset by one
-        slot to keep the capture-start minute itself markable.
+        A slot is owed when a span covers it. On the chains surface it is owed only when
+        the covering span captured options, because a span with options off owed no chain.
+        ``None`` means scope could not be read, so nothing is owed.
         """
-        if epoch is None:
-            return anchor
-        return max(anchor, epoch - TICK)
+        if spanlist is None:
+            return False
+        wants_options = surface == journal.CHAINS_SURFACE
+        return any(span.contains(slot) and (not wants_options or span.options) for span in spanlist)
 
     def _capture_start(self, ticker: str) -> datetime | None:
         """The instrument's capture start, or ``None`` when the master cannot say.
 
-        Losing the clamp is the safe direction here. It can only widen the walk, and a
-        marker for a minute before the instrument was in scope is bounded by the anchor
-        and by ``MAX_LOOKBACK_SESSIONS``.
+        Losing the clamp is the safe direction here. Only the skipped-slot pass reads it,
+        and that pass marks just the slots the loop slept through, so a lost clamp widens
+        the marking by at most that short list.
         """
         return capture_start_in_market_time(
             self._master_now, ticker, self._session_clock.session_date()

@@ -356,6 +356,7 @@ def _gap_marker(
         roster=lambda: load_tickers(tickers_path),
         session_clock=session_clock,
         master=_master_reader(config.lake_root),
+        spans=_spans_reader(config.lake_root),
     )
 
 
