@@ -174,13 +174,27 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   with a raise leaves the whole suite green, so the first could exit the process on a
   minute `KeepAlive` will retry forever, and the second drops a window with no marker and
   no class. Both predate the close+5 fill, which carried them across unchanged.
-- **[#91](https://github.com/l3a0/marketlake/issues/91).** The membership guard's absent-marker rows. The guard counts missing expirations
-  and writes no marker for them, so a series that was never offered and one that was missed
-  read the same downstream. The reason constant `OPTION_CLOSE_SERIES_ABSENT` is defined and
-  exported and written by no code path, and this entry is what writes it. The findings the
-  guard does produce reach the daemon's stderr through `_report_guard`, so launchd captures
-  them to a log file. A log file is a worse home than a page or a panel, and that is a separate
+- **D11's membership marker.** Every expiration the intraday chain carried and the close+5
+  fill did not becomes one row under `option_close_series_absent`, written by the guard
+  into its own segment beside the fill's. Only series whose date window was fetched
+  successfully get that reason. One inside a window the fetch gave up was missed rather
+  than withdrawn, and the fill already marked it with that window's own class, so the
+  guard subtracts those before it writes. That subtraction is what the fill's widened
+  return exists for: it hands back what it captured, the windows it lost, and the
+  representative error class, because a bare expiration list cannot tell the two
+  populations apart. The marker's `session_phase` is read off the calendar rather than
+  hardcoded, which is why the equity-close marker carries null (16:00 is the last minute
+  of `open`) and this one carries `post_equity_close`. The findings the guard produces
+  still reach the daemon's stderr through `_report_guard`, so launchd captures them to a
+  log file. A log file is a worse home than a page or a panel, and that is a separate
   question from this entry.
+- **[#118](https://github.com/l3a0/marketlake/issues/118).** The Today strip and the Now panel pick a slot's reason with
+  `mode(error_class)`, the most common one among its rows. Absence markers are per series
+  rather than per cycle, so they outnumber the row recording why the cycle failed and the
+  vote goes to the benign reason. A 16:15 that failed `http_500` reports
+  `chain_chunk_failed` once the fill gives up a window naming five series, which is
+  reachable without the membership marker at all. The marker widens the count rather than
+  creating the hole. No figure is wrong; the one reason string an operator reads is.
 - **D12** compaction and backup, plus the nightly window re-tune. Compaction merges a day's segments into one sealed partition. The re-tune runs after it. The job groups the day's rows by `window_start` and `window_end`, compares each window's contract count to the body limit, and rewrites `chain_plan.json` when the profile drifts.
 - **D12's exclusion list.** The design's *Backup, defined* names the sync root as `lake/`
   only, "with an explicit exclusion list". `runner.BACKUP_EXCLUSIONS` is now that list,

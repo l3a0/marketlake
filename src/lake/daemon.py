@@ -98,7 +98,12 @@ from typing import Protocol
 
 from lake.alert import Message, NtfyTransport, Publisher, Transport
 from lake.calendar import Calendar, ExchangeCalendar
-from lake.capture import CycleResult, fill_option_close_from_config, run_cycle_from_config
+from lake.capture import (
+    CycleResult,
+    FillResult,
+    fill_option_close_from_config,
+    run_cycle_from_config,
+)
 from lake.capture_spans import CaptureSpans, CaptureSpansError, spans_path
 from lake.clock import Clock, SystemClock
 from lake.close_guard import CloseGuard
@@ -404,13 +409,15 @@ def _close_fill(
     token_path: str | Path | None,
     session_clock: SessionClock,
     clock: Clock,
-) -> Callable[[str, datetime], list[str] | None]:
+) -> Callable[[str, datetime], FillResult]:
     """The close+5 guard's fill: refetch one ticker's option close and journal it.
 
     The guard decides who is owed a fill and refuses past close+5. This is what it calls
-    once it has decided. It hands back the expirations the fill captured, or ``None``
-    when nothing could be fetched, which is the shape the guard's membership comparison
-    reads.
+    once it has decided. It hands back a ``FillResult``: the expirations the fill
+    captured, the date windows its fetch gave up on, and the representative error class.
+    The guard needs all three. The windows are what separate a series the fetch missed
+    from one the vendor no longer offers, and marking those the same way would call a
+    collection failure a delisting.
 
     Nothing is built until a fill is actually owed. The vendor is constructed inside
     ``fill_option_close_from_config``, on the call, which is how a daemon whose token
@@ -423,7 +430,7 @@ def _close_fill(
     the filled row and the cycle it replaces agree.
     """
 
-    def fill(ticker: str, slot: datetime) -> list[str] | None:
+    def fill(ticker: str, slot: datetime) -> FillResult:
         phase = session_clock.phase_at(slot)
         return fill_option_close_from_config(
             ticker,

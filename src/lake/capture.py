@@ -394,6 +394,46 @@ class ChainFetch:
     error_class: str | None
 
 
+@dataclass(frozen=True)
+class FillResult:
+    """What one close+5 fill captured, and what it could not.
+
+    The guard needs all three of these and a bare expiration list carries only the first.
+
+    ``expirations`` are the series the landed segment holds, empty when nothing landed.
+    ``absent`` are the date windows the fetch gave up on, the same markers that rode the
+    snapshot, so the guard can tell a series the fetch missed from one the vendor no
+    longer offers. Those two populations look identical in a plain expiration
+    difference, and marking them the same way would label a fetch failure a delisting.
+    ``error_class`` is the first failed window's class, the representative signal, so a
+    fill that captured nothing can say ``http_401`` rather than only that it came back
+    empty.
+
+    ``landed`` is whether a segment was written. A fill that captured nothing writes no
+    row, because the day already holds the gap row from the cycle that failed at the
+    close.
+    """
+
+    expirations: tuple[str, ...] = ()
+    absent: tuple[journal.AbsentMarker, ...] = ()
+    error_class: str | None = None
+
+    @property
+    def landed(self) -> bool:
+        """Whether this fill journaled a segment."""
+        return bool(self.expirations)
+
+    @property
+    def absent_expirations(self) -> frozenset[str]:
+        """The series the fetch's own failed windows already marked absent.
+
+        Named off the markers rather than recomputed, so the set the guard subtracts is
+        exactly the set already on disk. A marker for a window with no prior batch to
+        read names no expiration, and contributes nothing here.
+        """
+        return frozenset(m.expiration_date for m in self.absent if m.expiration_date)
+
+
 def fetch_chain(
     clock: Clock,
     vendor: Vendor,
@@ -1143,7 +1183,7 @@ def fill_option_close(
     plan: ChainPlan | None = None,
     pid: int | None = None,
     session_phase: str | None = None,
-) -> list[str] | None:
+) -> FillResult:
     """Refetch one ticker's option close inside the close+5 window and journal it.
 
     This is the close+5 guard's fill. Option quotes freeze at the option close, so a fetch
@@ -1162,12 +1202,13 @@ def fill_option_close(
     measurable. ``close_tag`` is ``option_close`` on every row, so a second guard run
     counts the fill as the close already observed rather than fetching it again.
 
-    Returns the expirations the fill captured, which the guard compares against the day's
-    intraday baseline, or ``None`` when every window failed and nothing was captured. A
-    failed fill writes no row. The day already carries the gap row from the cycle that
+    Returns a ``FillResult``, never a bare list. The guard needs what the fill captured,
+    what its failed windows gave up, and why, and only the first of those three fits in a
+    list of expirations. A result whose ``expirations`` are empty is a fill that captured
+    nothing, and it wrote no row. The day already carries the gap row from the cycle that
     triggered the fill, and a second row for that one minute would double-count it in
     every per-slot completeness read. The guard records the refusal in its own outcome
-    instead.
+    instead, naming the error class this result carries.
 
     ``guards`` and ``plan`` default the way ``run_cycle`` defaults them, so a caller with
     no config still fetches by the machine's own plan.
@@ -1190,8 +1231,9 @@ def fill_option_close(
         # for a fault it reports in the body rather than the status. Writing either one
         # would leave a zero-row segment and a ``rows=0`` manifest entry standing for a
         # close nobody captured, and would report the close as filled. The check runs
-        # before the write, so no segment is created to clean up.
-        return None
+        # before the write, so no segment is created to clean up. The class still rides
+        # the result, so the guard can say which failure it was.
+        return FillResult(error_class=fetched.error_class)
     outcome = journal_snapshot(
         lake_root,
         CHAINS,
@@ -1207,7 +1249,11 @@ def fill_option_close(
         windows=fetched.windows,
         absent_markers=fetched.absent_markers,
     )
-    return _landed_expirations(outcome.path)
+    return FillResult(
+        tuple(_landed_expirations(outcome.path)),
+        fetched.absent_markers,
+        fetched.error_class,
+    )
 
 
 def fill_option_close_from_config(
@@ -1219,7 +1265,7 @@ def fill_option_close_from_config(
     token_path: str | Path | None = None,
     session_phase: str | None = None,
     pid: int | None = None,
-) -> list[str] | None:
+) -> FillResult:
     """Run one close+5 fill wired from the real config and a Schwab-backed vendor.
 
     This is the production entry the daemon's close+5 guard reaches through. It mirrors
@@ -1255,6 +1301,7 @@ def fill_option_close_from_config(
 
 __all__ = [
     "ChainFetch",
+    "FillResult",
     "CycleResult",
     "SegmentError",
     "SegmentOutcome",
