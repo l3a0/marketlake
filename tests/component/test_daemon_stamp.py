@@ -108,6 +108,20 @@ def test_an_idle_minute_stamps_the_mint_time_and_the_roster(tmp_path):
     assert stamp.tickers == {"SPY": ("chains", "quotes"), "XYZ": ("quotes",)}
 
 
+def test_an_idle_stamp_omits_a_ticker_disabled_in_place(tmp_path):
+    # A disabled ticker still names an entry in tickers.yaml, but an idle stamp must not
+    # carry it into the dashboard's ticker list, or the panel would show a ticker not
+    # actually being captured until the next live cycle overwrites the stamp.
+    lake_root = _run(
+        tmp_path,
+        start=et(2026, 8, 31, 8, 40),
+        roster="SPY: {options: true, chain_cadence: 1m}\nXYZ: {options: false, enabled: false}\n",
+    )
+
+    stamp = read_metadata(lake_root)
+    assert stamp.tickers == {"SPY": ("chains", "quotes")}
+
+
 def test_the_sunday_re_auth_reaches_the_panel_the_same_night(tmp_path):
     # The design's own case. The machine is awake for the canary window, the ritual mints
     # a token, and the panel is meant to show that mint on Sunday rather than on Monday.

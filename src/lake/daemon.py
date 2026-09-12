@@ -95,6 +95,7 @@ from typing import Protocol
 from lake.alert import Message, NtfyTransport, Publisher, Transport
 from lake.calendar import Calendar, ExchangeCalendar
 from lake.capture import CycleResult, run_cycle_from_config
+from lake.capture_spans import CaptureSpans, CaptureSpansError, spans_path
 from lake.clock import Clock, SystemClock
 from lake.close_guard import CloseGuard
 from lake.close_guard import GuardOutcome as CloseGuardOutcome
@@ -116,7 +117,7 @@ from lake.session import (
     missed_slots,
     skipped_slots,
 )
-from lake.tickers import TickersError, load_tickers
+from lake.tickers import Roster, TickersError, load_tickers
 from lake.watchdog import Page, Surface, Watchdog
 
 # The loop's cadence: one tick per minute, on the minute top.
@@ -299,6 +300,28 @@ def _master_reader(lake_root: Path | str) -> Callable[[], SecurityMaster | None]
     return read
 
 
+def _spans_reader(lake_root: Path | str) -> Callable[[], CaptureSpans | None]:
+    """A reader that returns the capture spans as they stand, or ``None``.
+
+    The spans file says which instruments were in scope at a given minute, and onboarding
+    and retiring write it while the daemon runs. Reading it per pass, not at daemon start,
+    is what lets the guard see a ticker onboarded or retired mid-session.
+
+    ``None`` means the file is absent or unreadable. The guard treats that as no ticker in
+    scope, so a missing file writes no false marker. The reader never raises, because it
+    runs from hooks ``run_loop`` does not guard.
+    """
+    path = spans_path(lake_root)
+
+    def read() -> CaptureSpans | None:
+        try:
+            return CaptureSpans.read(path)
+        except (OSError, CaptureSpansError, ValueError):
+            return None
+
+    return read
+
+
 def _gap_marker(
     config_path: str | Path | None,
     tickers_path: str | Path | None,
@@ -369,30 +392,22 @@ def _close_guard(
     ``run_loop_from_config`` that shape is never reached, because ``_alarm`` reads the
     same two files and refuses. The branch is kept for a direct caller.
 
-    The guard gets a reader rather than the roster loaded here, and the security master
-    it needs to place each ticker's capture start. Both answer at the moment the guard
-    runs rather than at daemon start. A missing master leaves the guard unclamped, which
-    only ever widens what it checks.
-
-    The reader carries no fallback, like the marker's, and the price is larger here.
-    Close+5 falls outside the capture window, so no cycle reads the roster on that tick
-    to raise first. A roster that breaks between the last cycle and close+5 therefore
-    ends the daemon at a moment nothing else would have, and it can cost that day's close
-    check. ``SessionDispatch`` marks a day served before running the job, so the pass that
-    raised does not repeat, and a restart re-serves the day only until Eastern midnight.
-    Against that, a stale roster writes a marker naming a ticker the file no longer
-    captures, and no later pass removes a marker.
+    The guard gets a spans reader and a master reader rather than values. The spans say
+    which instruments were in scope at each close's minute, and the master turns a span's
+    id back into a ticker. Both answer at the moment the guard runs rather than at daemon
+    start, so a ticker onboarded or retired mid-session is judged against the moment. A
+    missing spans file leaves the guard checking nothing, which writes no false marker.
     """
     try:
         config = load_config(config_path)
-        # Called for the refusal, not for the value. The guard reads the roster itself,
+        # Called for the refusal, not for the value. The guard reads the spans itself,
         # once per run, so what this load decides is whether the guard is wired at all.
         load_tickers(tickers_path)
     except (ConfigError, TickersError):
         return None
     return CloseGuard(
         lake_root=config.lake_root,
-        roster=lambda: load_tickers(tickers_path),
+        spans=_spans_reader(config.lake_root),
         session_clock=session_clock,
         master=_master_reader(config.lake_root),
     )
@@ -444,7 +459,16 @@ def _idle_stamp(
             # would have it charge the wrong counters, so there it is fatal.
             return
         try:
-            stamp_cycle(config.lake_root, at=slot, token_minted_at=minted, roster=roster)
+            # Only the enabled entries, matching what a live cycle would actually cover.
+            # A disabled ticker still names an entry, and stamping it here would leave
+            # it in the dashboard's ticker list through every idle minute until the next
+            # live cycle overwrites the stamp with the filtered roster.
+            stamp_cycle(
+                config.lake_root,
+                at=slot,
+                token_minted_at=minted,
+                roster=Roster(roster.enabled),
+            )
         except OSError:
             return
 
@@ -659,7 +683,14 @@ def run_loop_from_config(
 
     def on_cycle(slot: datetime, result: CycleResult) -> None:
         raise_pages(watchdog.observe(result), slot)
-        if any(seg.row_kind == ROW_KIND_DATA for seg in result.segments):
+        # A cycle that landed real data is the strongest evidence of life. A cycle over
+        # an empty roster is different: every ticker retired, so there was nothing to
+        # fetch, and that is the daemon idle by design rather than broken. Both feed the
+        # check. A non-empty roster where every fetch failed writes gap segments and
+        # neither condition holds, so it stays unfed, which is what lets the dead-man
+        # ping go silent for capture that is truly stuck.
+        landed_data = any(seg.row_kind == ROW_KIND_DATA for seg in result.segments)
+        if landed_data or result.nothing_to_capture:
             deadman.captured(slot)
         alarm_on_cycle(slot, result)
 
@@ -682,9 +713,13 @@ def run_loop_from_config(
         # was a stale roster charging counters the file no longer names, which is the
         # failure the per-cycle re-read exists to prevent. A dead daemon is the external
         # dead-man's to report, and it does.
+        # Only the enabled entries are charged. A ticker disabled in place still names
+        # an entry here, but its capture span is already closed, so charging it would
+        # page for a surface nothing owes any more, the same reasoning gap-marking's
+        # roster read applies.
         watched = [
             Surface(surface, entry.ticker)
-            for entry in load_tickers(tickers_path)
+            for entry in load_tickers(tickers_path).enabled
             for surface in surfaces_for(entry)
         ]
         raise_pages(watchdog.missed(watched, slots), slots[-1])

@@ -23,7 +23,7 @@ from lake import journal
 from lake.capture import CAPTURE_SOURCE
 from lake.cassette import Cassette, Interaction
 from lake.manifest import latest_entries
-from lake.onboard import MASTER_PARTITION, EntitlementError, onboard
+from lake.onboard import MASTER_PARTITION, EntitlementError, OnboardError, onboard
 from lake.security_master import ID_TYPE_FIGI, ID_TYPE_TICKER, SecurityMaster, master_path
 from lake.tickers import load_tickers
 from tests.support.clock import ManualClock
@@ -86,6 +86,35 @@ def _quote_vendor(ticker: str, *, realtime: bool) -> CassetteVendor:
             )
         )
     )
+
+
+def test_onboarding_an_existing_ticker_before_the_seed_run_has_happened_refuses(
+    lake_root, tmp_path
+):
+    """A master with instruments and no spans file must refuse, not silently lose history.
+
+    Onboarding a ticker the master already knows would open a fresh, empty spans file
+    and read the instrument as never having had a capture span at all, discarding its
+    whole recorded history. The fix is a run of the seed command, named in the error.
+    """
+    from lake.security_master import KIND_EQUITY
+
+    master = SecurityMaster()
+    master.register(
+        kind=KIND_EQUITY, capture_start=_MID_SESSION, valid_from=_MID_SESSION.date(), ticker="SPY"
+    )
+    master.write(master_path(lake_root))
+    tickers_path = tmp_path / "tickers.yaml"
+
+    with pytest.raises(OnboardError, match="seed_spans"):
+        onboard(
+            "SPY",
+            clock=ManualClock(start=_MID_SESSION),
+            vendor=_chain_vendor(is_delayed=False),
+            lake_root=lake_root,
+            tickers_path=tickers_path,
+            options=True,
+        )
 
 
 def test_onboard_registers_verifies_and_writes(lake_root, tmp_path):

@@ -793,6 +793,22 @@ def test_a_ticker_retired_mid_session_stops_collecting_markers(tmp_path):
     assert _marked(lake_root, "XYZ") == []
 
 
+def test_a_ticker_disabled_in_place_stops_collecting_markers_too(tmp_path):
+    """The on/off switch is the other way a ticker leaves capture, and marking must
+    honor it the same as removal.
+
+    XYZ stays in ``tickers.yaml``, only turned off, so a reader that iterates the raw
+    roster would still mark it. The one that matters here reads only enabled entries.
+    """
+    lake_root, _ = _overrun_after_a_roster_change(
+        tmp_path,
+        before="ABC: {options: false}\nXYZ: {options: false}\n",
+        after="ABC: {options: false}\nXYZ: {options: false, enabled: false}\n",
+    )
+    assert _marked(lake_root, "ABC") == SKIPPED
+    assert _marked(lake_root, "XYZ") == []
+
+
 def test_the_watchdog_charges_the_roster_as_it_stands_on_a_skipped_slot(tmp_path):
     """The other consumer of the same read, driven the same way.
 
@@ -815,3 +831,18 @@ def test_the_watchdog_charges_the_roster_as_it_stands_on_a_skipped_slot(tmp_path
         after="ABC: {options: false}\nNEW: {options: false}\n",
     )
     assert onboarded == ["ABC", "NEW"]
+
+
+def test_the_watchdog_does_not_charge_a_ticker_disabled_in_place(tmp_path):
+    """The on/off switch is the same boundary here as it is for gap marking.
+
+    XYZ stays in ``tickers.yaml``, only turned off, rather than being removed. A reader
+    that iterates the raw roster would still charge it and eventually page for a surface
+    nothing owes any more.
+    """
+    _, disabled = _overrun_after_a_roster_change(
+        tmp_path,
+        before="ABC: {options: false}\nXYZ: {options: false}\n",
+        after="ABC: {options: false}\nXYZ: {options: false, enabled: false}\n",
+    )
+    assert disabled == ["ABC"]

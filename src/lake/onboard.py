@@ -65,7 +65,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
-from lake import capture, journal, security_master
+from lake import capture, capture_spans, journal, security_master
 from lake.calendar import MARKET_TZ
 from lake.clock import Clock, SystemClock
 from lake.config import input_errors_exit, load_config
@@ -240,6 +240,24 @@ def onboard(
 
     master_path = security_master.master_path(lake_root)
     master = SecurityMaster.read(master_path) if master_path.exists() else SecurityMaster()
+    spans_file = capture_spans.spans_path(lake_root)
+    if not spans_file.exists() and master.instrument_ids():
+        # The master already has instruments, registered under the old capture_start-only
+        # scheme, and the seed run that gives them their spans has not happened. Opening
+        # a fresh, empty spans file here would silently discard every one of their
+        # capture histories: an already-registered ticker would look never-captured to
+        # every span reader. Refuse instead of guessing, and name the fix. A brand-new
+        # lake, with no instruments yet, never trips this, so a fresh onboarding needs no
+        # seed run first.
+        raise OnboardError(
+            "capture spans are missing but the security master already has instruments; "
+            "run `python -m lake.seed_spans` before onboarding"
+        )
+    spans = (
+        capture_spans.CaptureSpans.read(spans_file)
+        if spans_file.exists()
+        else capture_spans.CaptureSpans()
+    )
 
     # Idempotent-friendly: reuse the existing instrument if the ticker is already known.
     existing_id = master.resolve(ticker, valid_from, id_type=ID_TYPE_TICKER)
@@ -247,7 +265,6 @@ def onboard(
 
     if already_registered:
         instrument_id = existing_id
-        capture_start = master.capture_start_of(instrument_id)
     else:
         # Register with the ticker mapping only. The FIGI is left unset here and
         # backfills later from the captured CUSIP. The two facts that cannot be redone,
@@ -258,7 +275,18 @@ def onboard(
             valid_from=valid_from,
             ticker=ticker,
         )
-        capture_start = master.capture_start_of(instrument_id)
+
+    # Open a capture span. A new instrument opens its first. A ticker brought back after
+    # retirement, its spans all closed, opens a fresh one at ``now``. A ticker already
+    # capturing keeps its open span, so re-onboarding is idempotent for scope too.
+    if spans.has_open_span(instrument_id):
+        opened_span = False
+    else:
+        spans.open_span(instrument_id, now, options)
+        opened_span = True
+    # The report's capture_start is the current span's start: ``now`` for a new or
+    # rejoined ticker, and the existing open span's start for one already capturing.
+    capture_start = next(s.start for s in spans.spans_of(instrument_id) if s.end is None)
 
     # The first snapshot proves the real-time entitlement before the ticker is trusted.
     # It is stamped like a capture cycle so it can be journaled as the first cycle:
@@ -307,6 +335,18 @@ def onboard(
             rows=len(master),
             fetched_at=now.isoformat(),
         )
+        # Write the spans file only when a span was opened, so an idempotent re-onboard
+        # of a live ticker adds no manifest entry. The write is atomic, the same as the
+        # master's, and both live under this one lock.
+        if opened_span:
+            spans.write(spans_file)
+            record_partition(
+                lake_root,
+                capture_spans.SPANS_PARTITION,
+                source=REFERENCE_SOURCE,
+                rows=len(spans),
+                fetched_at=now.isoformat(),
+            )
 
     # Journal the same verification snapshot as the ticker's first captured cycle,
     # through the capture primitive's own durable path. This runs after the master lock

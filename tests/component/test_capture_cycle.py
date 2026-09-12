@@ -83,6 +83,31 @@ def _rows(segment: capture.SegmentOutcome) -> list[dict]:
     return journal.read_segment(segment.path).to_pylist()
 
 
+def test_an_empty_roster_writes_no_segments_and_stamps_nothing_to_capture(lake_root):
+    """A fully retired roster is idle by design, and the cycle result says so.
+
+    ``run_cycle`` never touches the vendor here, which the fake would fail on if it
+    tried: an empty roster has no options entries to chain and no symbols to batch, so
+    ``get_quotes`` is never called either.
+    """
+    clock = ManualClock(start=_CLOCK_START)
+
+    class _NoCallsVendor:
+        def get_chain(self, *args, **kwargs):
+            raise AssertionError("no chain fetch should run for an empty roster")
+
+        def get_quotes(self, *args, **kwargs):
+            raise AssertionError("no quote fetch should run for an empty roster")
+
+    result = capture.run_cycle(
+        clock, _NoCallsVendor(), Roster(()), lake_root, pid=4242, plan=_ONE_WINDOW
+    )
+
+    assert result.segments == ()
+    assert result.errors == ()
+    assert result.nothing_to_capture is True
+
+
 # -- 1. the happy cycle ------------------------------------------------------
 
 
@@ -94,6 +119,7 @@ def test_happy_cycle_writes_chains_and_quotes_with_correct_stamps(cassette_vendo
 
     assert result.errors == ()
     assert result.snap_ts == _EXPECTED_SNAP
+    assert result.nothing_to_capture is False
 
     # One data segment per option ticker on chains, one per roster ticker on quotes.
     assert {(s.surface, s.ticker) for s in result.segments} == {

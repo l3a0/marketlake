@@ -50,10 +50,12 @@ import pytest
 from lake import capture, close_guard, daemon, gap, journal
 from lake.alert import Message
 from lake.capture import CycleResult, SegmentOutcome
+from lake.capture_spans import CaptureSpans, spans_path
 from lake.chain_plan import ChainPlan, load_chain_plan
 from lake.compact import write_chain_plan
 from lake.config import GuardConstants
 from lake.deadman import CAPTURE_SLUG
+from lake.security_master import SecurityMaster, master_path
 from lake.session import SPOT_CLOSE
 from lake.tickers import TickersError
 from lake.vendor import VendorResponse
@@ -377,6 +379,15 @@ def test_a_daemon_alive_across_close_plus_five_runs_the_guard_that_minute(tmp_pa
     on every day the daemon does not happen to restart after it.
     """
     rig = _rig(tmp_path)
+    # XYZ is in scope for the session, so the guard finds it owes the close.
+    master = SecurityMaster()
+    xyz = master.register(
+        kind="equity", capture_start=et(2026, 9, 2, 9, 30), valid_from=DAY, ticker="XYZ"
+    )
+    master.write(master_path(rig.lake_root))
+    spans = CaptureSpans()
+    spans.open_span(xyz, et(2026, 9, 2, 9, 30), False)
+    spans.write(spans_path(rig.lake_root))
     # The option close is already recorded, so startup marking has nothing to write for
     # the day and every later row came from the guard.
     _record(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", et(2026, 9, 2, 16, 15))
@@ -718,3 +729,34 @@ def test_a_mid_session_recalibration_reaches_the_watchdog(tmp_path):
     assert page.event == "capture_down"
     assert page.title == "Capture down: XYZ quotes"
     assert page.body == f"{RECALIBRATED_PAGE_MINUTES} session minutes without a durable cycle"
+
+
+# -- 9. an empty roster keeps the daemon running ---------------------------------------
+
+
+def test_an_empty_roster_still_runs_the_loop_and_reports(tmp_path):
+    """Retiring every ticker must not stop the daemon, only its capturing.
+
+    An empty ``tickers.yaml`` used to be refused outright. Now the capture-spans file is
+    the record of scope, and a fully retired roster is a real, supported state: nothing
+    is captured, but the healthcheck ping, the dead-man feed, and the watchdog keep
+    running, because those report on the daemon's own health, not on any ticker's.
+    """
+    rig = _rig(tmp_path, roster="")
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    calls = [0]
+
+    def cycle(*, close_tag, session_phase):
+        calls[0] += 1
+        # The real cycle runner stamps this when the roster it read was empty; the fake
+        # here reproduces that, since ``capture.py``'s own tests cover the stamping.
+        return CycleResult(clock.now(), (), nothing_to_capture=True)
+
+    _run(rig, clock, ticks=3, cycle_runner=cycle)
+
+    # The cycle runner still fires on every capture tick, over zero tickers.
+    assert calls[0] == 3
+    # The healthcheck ping still reaches the transport.
+    assert rig.pinger.urls == [CAPTURE_URL] * 3
+    # No page fired, since there is nothing to charge or watch.
+    assert rig.transport.sent == []
