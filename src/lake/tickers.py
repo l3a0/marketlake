@@ -43,13 +43,17 @@ class TickerConfig:
     """One ticker's capture settings.
 
     ``chain_cadence`` is ``None`` for an equity-only ticker. ``bars`` is a tuple of bar
-    frequencies, empty when none are configured.
+    frequencies, empty when none are configured. ``enabled`` is the on/off switch: a
+    disabled entry stays in the roster but is not captured. It defaults to true, so a
+    file with no ``enabled`` key reads as enabled, and turning a ticker off is the only
+    time the key is written.
     """
 
     ticker: str
     options: bool = False
     chain_cadence: str | None = None
     bars: tuple[str, ...] = ()
+    enabled: bool = True
 
     @classmethod
     def from_mapping(cls, ticker: str, settings: Mapping[str, object]) -> TickerConfig:
@@ -62,6 +66,7 @@ class TickerConfig:
             options=bool(settings.get("options", False)),
             chain_cadence=None if cadence is None else str(cadence),
             bars=tuple(str(freq) for freq in bars),
+            enabled=bool(settings.get("enabled", True)),
         )
 
 
@@ -81,6 +86,16 @@ class Roster:
     def symbols(self) -> tuple[str, ...]:
         """Every ticker symbol, in file order."""
         return tuple(entry.ticker for entry in self.tickers)
+
+    @property
+    def enabled(self) -> tuple[TickerConfig, ...]:
+        """The entries that are enabled, in file order.
+
+        The live-capture path captures these. A disabled entry stays in the roster for
+        the record but is skipped when fetching. Scope readers do not use this; they read
+        the capture-spans file instead.
+        """
+        return tuple(entry for entry in self.tickers if entry.enabled)
 
     def get(self, ticker: str) -> TickerConfig:
         """The settings for one ticker. Raises ``TickersError`` if it is not present."""
@@ -114,14 +129,14 @@ def load_tickers(
     ``MARKETLAKE_TICKERS`` environment variable, then the default
     ``~/.config/marketlake/tickers.yaml``.
 
-    A file that names no tickers is an error, not an empty roster. The rename in
-    ``_write_atomically`` closed the way a torn *write* produced one. A hand edit caught
-    partway through a save still does, and so does an operator who empties the file. The
-    harm is the one the rename removed on the other side: a cycle over no tickers
-    captures nothing and writes no gap row, so the minute leaves no trace, and the design
-    counts completeness from rows and never from holes. Nothing writes an empty file. A
-    fresh machine has no file at all, which is already an error, and ``upsert_ticker``
-    always writes at least one entry.
+    An empty roster is allowed. It used to be an error, because the roster was the only
+    record of scope, so a cycle over no tickers captured nothing and left no trace. Now
+    the capture-spans file records scope, and retiring the last ticker is a real thing to
+    do, so the file may name no tickers. The daemon still runs its health and watchdog
+    reporting over an empty roster, it just captures nothing. An absent file is still an
+    error, since a fresh machine has no roster and that should be noticed. A missing file
+    differs from an empty one: the first is a setup that never happened, the second is a
+    roster with everything retired.
     """
     resolved = _resolve_path(path, env)
     if not resolved.exists():
@@ -130,8 +145,6 @@ def load_tickers(
     mapping = {} if parsed is None else parsed
     if not isinstance(mapping, Mapping):
         raise TickersError(f"tickers file is not a mapping: {resolved}")
-    if not mapping:
-        raise TickersError(f"tickers file names no tickers: {resolved}")
     return _roster_from(mapping, resolved)
 
 
@@ -199,6 +212,7 @@ def upsert_ticker(
     options: bool,
     chain_cadence: str | None = None,
     bars: Sequence[str] = (),
+    enabled: bool = True,
     path: str | Path | None = None,
     env: Mapping[str, str] | None = None,
 ) -> Path:
@@ -235,6 +249,10 @@ def upsert_ticker(
     if options and chain_cadence is not None:
         entry["chain_cadence"] = chain_cadence
     entry["bars"] = [str(freq) for freq in bars]
+    # ``enabled`` is written only when off. An enabled entry omits the key, so existing
+    # files stay unchanged and ``TickerConfig`` reads a missing key as enabled.
+    if not enabled:
+        entry["enabled"] = False
     existing[ticker] = entry
     # The merged roster is validated before any of it is written, so the write never
     # leaves behind a file the read refuses. The document's shape alone was not enough.
@@ -257,6 +275,85 @@ def upsert_ticker(
     except OSError:
         raise TickersError(f"tickers file cannot be written: {resolved}") from None
     return resolved
+
+
+def set_enabled(
+    ticker: str,
+    enabled: bool,
+    *,
+    path: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> Path:
+    """Turn one ticker's capture on or off in place, keeping its other settings.
+
+    This is how retirement disables a ticker without removing its entry. The entry stays
+    in the file so it is easy to turn back on. It preserves ``options``, ``chain_cadence``,
+    and ``bars`` and only flips ``enabled``. Enabling drops the key, since a missing key
+    reads as enabled. Raises ``TickersError`` if the file or the ticker is absent.
+    """
+    resolved = _resolve_path(path, env)
+    if not resolved.exists():
+        raise TickersError(f"tickers file not found: {resolved}")
+    existing = _read_mapping(resolved)
+    if ticker not in existing:
+        raise TickersError(f"ticker not in roster: {ticker!r} in tickers file: {resolved}")
+    settings = existing[ticker]
+    entry = dict(settings) if isinstance(settings, Mapping) else {}
+    if enabled:
+        entry.pop("enabled", None)
+    else:
+        entry["enabled"] = False
+    existing[ticker] = entry
+    _roster_from(existing, resolved)
+    try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        _write_atomically(resolved, yaml.safe_dump(existing, sort_keys=True))
+    except OSError:
+        raise TickersError(f"tickers file cannot be written: {resolved}") from None
+    return resolved
+
+
+def remove_ticker(
+    ticker: str,
+    *,
+    path: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> Path:
+    """Remove one ticker's entry from ``tickers.yaml`` and return the file path.
+
+    This is the write-half counterpart to ``upsert_ticker``, used when retirement removes
+    a ticker outright rather than disabling it in place. The remainder is validated before
+    the write, the same as ``upsert_ticker``. Removing the last entry is allowed and leaves
+    an empty roster, which ``load_tickers`` now accepts. Raises ``TickersError`` if the file
+    or the ticker is absent.
+    """
+    resolved = _resolve_path(path, env)
+    if not resolved.exists():
+        raise TickersError(f"tickers file not found: {resolved}")
+    existing = _read_mapping(resolved)
+    if ticker not in existing:
+        raise TickersError(f"ticker not in roster: {ticker!r} in tickers file: {resolved}")
+    del existing[ticker]
+    _roster_from(existing, resolved)
+    try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        _write_atomically(resolved, yaml.safe_dump(existing, sort_keys=True))
+    except OSError:
+        raise TickersError(f"tickers file cannot be written: {resolved}") from None
+    return resolved
+
+
+def _read_mapping(resolved: Path) -> dict[str, object]:
+    """The roster file's raw mapping, or a ``TickersError`` if it is not a mapping.
+
+    An absent document reads as no entries. This is the shared read the write-half
+    functions use before they change one entry.
+    """
+    parsed = _parse(_read_text(resolved), resolved)
+    loaded = {} if parsed is None else parsed
+    if not isinstance(loaded, Mapping):
+        raise TickersError(f"tickers file is not a mapping: {resolved}")
+    return {str(key): value for key, value in loaded.items()}
 
 
 def _write_atomically(target: Path, text: str) -> None:
@@ -290,6 +387,15 @@ def _write_atomically(target: Path, text: str) -> None:
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def tickers_file_path(path: str | Path | None = None, env: Mapping[str, str] | None = None) -> Path:
+    """The resolved roster path, by the same precedence ``load_tickers`` uses.
+
+    A command that needs to name the roster file, without reading it, uses this. The
+    resolution is the same one every read and write here shares.
+    """
+    return _resolve_path(path, env)
 
 
 def _resolve_path(path: str | Path | None, env: Mapping[str, str] | None) -> Path:

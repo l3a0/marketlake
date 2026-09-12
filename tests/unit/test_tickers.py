@@ -16,6 +16,28 @@ def test_full_entry_parses_every_field():
     )
 
 
+def test_enabled_defaults_to_true_when_absent():
+    roster = Roster.from_mapping({"SPY": {"options": False}})
+    assert roster.get("SPY").enabled is True
+
+
+def test_enabled_false_parses_to_a_disabled_entry():
+    roster = Roster.from_mapping({"SPY": {"options": False, "enabled": False}})
+    assert roster.get("SPY").enabled is False
+
+
+def test_roster_enabled_filters_out_disabled_entries():
+    roster = Roster.from_mapping(
+        {
+            "SPY": {"options": False},
+            "OFF": {"options": False, "enabled": False},
+            "QQQ": {"options": False},
+        }
+    )
+    assert tuple(e.ticker for e in roster.enabled) == ("SPY", "QQQ")
+    assert roster.symbols == ("SPY", "OFF", "QQQ")
+
+
 def test_equity_only_entry_has_no_cadence():
     roster = Roster.from_mapping({"XYZ": {"options": False, "bars": ["1d"]}})
     xyz = roster.get("XYZ")

@@ -259,14 +259,22 @@ class GapMarker:
 
         The roster is read once here, for the pass rather than for each ticker, and
         outside the lock because it is not lake state. One read per pass keeps every
-        surface in the pass judged against one snapshot of what is in scope.
+        surface in the pass judged against one snapshot of what is in scope. Only
+        enabled entries are marked. A ticker disabled in place, rather than removed,
+        still names an entry in the file. Marking it anyway would manufacture gaps on a
+        surface nothing owes any more, the same holes freezing the roster used to
+        manufacture, so this reads only the enabled entries the same way capture does.
+        The command that disables a ticker closes its capture span first, so the two
+        stay in step. The rule binds the command; a hand edit that flips the switch
+        without closing the span is outside it, the same as every other roster rule
+        here.
         """
         spans: list[MarkedSpan] = []
         sealed: list[str] = []
         problems: list[str] = []
         notes = MarkingReport()
         try:
-            roster = self._roster()
+            roster = self._roster().enabled
             self._master_now = self._master() if self._master is not None else None
             with lake_lock(self._root):
                 recorded = latest_entries(self._root)

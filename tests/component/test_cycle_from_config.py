@@ -409,3 +409,112 @@ def test_a_recalibrated_split_depth_takes_effect_on_the_next_cycle(tmp_path, mon
     # a set no cycle reading the first bound could produce. The open tail is refused the
     # same way under both bounds, because it can never be split.
     assert vendor.windows == [WHOLE, TAIL, WHOLE, FIRST_HALF, SECOND_HALF, TAIL]
+
+
+# -- 5. capture never records outside a capture span ----------------------------------
+
+
+def test_a_ticker_with_a_closed_span_is_not_captured_even_if_still_enabled(tmp_path, monkeypatch):
+    """The invariant retiring exists to guarantee: no row lands outside a span.
+
+    Retiring closes a ticker's capture span before it disables the roster entry, so a
+    crash between the two writes can leave a ticker enabled with a closed span. This is
+    that exact state, built directly. The cycle must not capture it, or a row would be
+    recorded for a minute the ticker's span no longer covers.
+    """
+    from lake.capture_spans import CaptureSpans, spans_path
+    from lake.security_master import SecurityMaster, master_path
+
+    rig = _rig(tmp_path, WITH_XYZ)
+    master = SecurityMaster()
+    spy = master.register(
+        kind="equity", capture_start=et(2026, 9, 1, 9, 30), valid_from=DAY, ticker="SPY"
+    )
+    xyz = master.register(
+        kind="equity", capture_start=et(2026, 9, 1, 9, 30), valid_from=DAY, ticker="XYZ"
+    )
+    master.write(master_path(rig.lake_root))
+    spans = CaptureSpans()
+    spans.open_span(spy, et(2026, 9, 1, 9, 30), True)  # SPY still capturing
+    spans.open_span(xyz, et(2026, 9, 1, 9, 30), False)
+    spans.close_span(xyz, et(2026, 9, 2, 9, 45))  # XYZ retired, span closed before the cycle
+    spans.write(spans_path(rig.lake_root))
+
+    vendor = _Vendor()
+    _wire(monkeypatch, rig, lambda path: vendor)
+    clock = ManualClock(start=FIRST_MINUTE)
+    result = _cycle(rig, clock)
+
+    tickers_captured = {seg.ticker for seg in result.segments}
+    assert tickers_captured == {"SPY"}
+    assert "XYZ" not in vendor.quotes[0]
+
+
+def test_a_ticker_disabled_in_place_is_not_captured(tmp_path, monkeypatch):
+    """The on/off switch alone, with no span in play, still stops capture."""
+    rig = _rig(tmp_path, SPY_ONLY + "XYZ: {options: false, enabled: false}\n")
+    vendor = _Vendor()
+    _wire(monkeypatch, rig, lambda path: vendor)
+    clock = ManualClock(start=FIRST_MINUTE)
+    result = _cycle(rig, clock)
+
+    tickers_captured = {seg.ticker for seg in result.segments}
+    assert tickers_captured == {"SPY"}
+    assert "XYZ" not in vendor.quotes[0]
+
+
+def test_with_no_master_or_spans_file_every_enabled_ticker_is_captured(tmp_path, monkeypatch):
+    """The degrade-open rule: a missing reference file widens, never narrows.
+
+    A fresh lake has neither file yet, and capture must not stop for that. This is
+    also every existing test in this file, none of which write a master or spans file.
+    """
+    rig = _rig(tmp_path, WITH_QQQ)
+    vendor = _Vendor()
+    _wire(monkeypatch, rig, lambda path: vendor)
+    clock = ManualClock(start=FIRST_MINUTE)
+    result = _cycle(rig, clock)
+
+    tickers_captured = {seg.ticker for seg in result.segments}
+    assert tickers_captured == {"SPY", "QQQ"}
+
+
+def test_a_drifted_spans_file_widens_rather_than_crashing_the_cycle(tmp_path, monkeypatch):
+    """A comparison inside the span check must not be allowed to crash a live cycle.
+
+    A retyped ``span_start`` column reads back as a naive or non-comparable value, which
+    raises out of ``CaptureSpan.contains`` rather than out of the file read that opened
+    it. The live capture path treats that the same as a missing spans file: it keeps the
+    ticker rather than let the cycle crash.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from lake.capture_spans import CaptureSpans, spans_path
+    from lake.security_master import KIND_EQUITY, SecurityMaster, master_path
+
+    rig = _rig(tmp_path, SPY_ONLY)
+    master = SecurityMaster()
+    iid = master.register(
+        kind=KIND_EQUITY, capture_start=FIRST_MINUTE, valid_from=DAY, ticker="SPY"
+    )
+    master.write(master_path(rig.lake_root))
+    spans = CaptureSpans()
+    spans.open_span(iid, FIRST_MINUTE, True)
+    table = spans.to_table()
+    drifted = pa.schema(
+        [
+            pa.field("span_start", pa.timestamp("us")) if f.name == "span_start" else f
+            for f in table.schema
+        ]
+    )
+    path = spans_path(rig.lake_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table.cast(drifted), path)
+
+    vendor = _Vendor()
+    _wire(monkeypatch, rig, lambda path: vendor)
+    clock = ManualClock(start=FIRST_MINUTE)
+    result = _cycle(rig, clock)
+
+    assert {seg.ticker for seg in result.segments} == {"SPY"}

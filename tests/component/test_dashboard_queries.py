@@ -49,6 +49,7 @@ import pytest
 from lake import dashboard, journal
 from lake.alert import Message, Publisher
 from lake.calendar import MARKET_TZ
+from lake.capture_spans import SPANS_SCHEMA, CaptureSpans, spans_path
 from lake.config import GuardConstants
 from lake.dashboard import (
     MAX_LOOKBACK_SESSIONS,
@@ -1262,15 +1263,41 @@ def test_a_partition_read_in_full_counts_no_loss(fixture_lake: FixtureLake):
 
 
 def write_master(root: Path, ticker: str, capture_start: datetime) -> Path:
-    """A security master under ``root`` holding one equity and its capture epoch."""
+    """A security master and a matching open capture span under ``root``.
+
+    The span starts at ``capture_start`` and stays open, reproducing the exact clamp
+    an old-style single-epoch registration gave: every instant at or after it is in
+    scope, nothing before it is.
+    """
     master = SecurityMaster()
-    master.register(
+    instrument_id = master.register(
         kind=KIND_EQUITY,
         capture_start=capture_start,
         valid_from=date(2026, 1, 2),
         ticker=ticker,
     )
-    return master.write(master_path(root))
+    path = master.write(master_path(root))
+    spans = CaptureSpans()
+    spans.open_span(instrument_id, capture_start, False)
+    spans.write(spans_path(root))
+    return path
+
+
+def write_closed_span(root: Path, ticker: str, capture_start: datetime, end: datetime) -> Path:
+    """A security master and one CLOSED capture span, standing for a retired ticker."""
+    master = SecurityMaster()
+    instrument_id = master.register(
+        kind=KIND_EQUITY,
+        capture_start=capture_start,
+        valid_from=date(2026, 1, 2),
+        ticker=ticker,
+    )
+    path = master.write(master_path(root))
+    spans = CaptureSpans()
+    spans.open_span(instrument_id, capture_start, False)
+    spans.close_span(instrument_id, end)
+    spans.write(spans_path(root))
+    return path
 
 
 def test_slots_before_capture_start_read_out_of_scope(root: Path):
@@ -1336,7 +1363,21 @@ def test_a_ticker_the_master_does_not_resolve_is_unclamped(root: Path):
     assert chains["counts"]["gap"] == 1
 
 
-# -- a security master whose types drifted -----------------------------------
+# -- a security master or a spans file whose types drifted -------------------
+
+# What each drift test below shares: a well-formed file rewritten with some columns'
+# types swapped. The names still line up, so the read itself succeeds and the wrong
+# types surface later, from a comparison several frames deep rather than from the read.
+# ``casts`` names the columns to swap and leaves the rest pinned. An empty ``casts``
+# writes a well-formed file, which is what makes the control test possible: it stops the
+# whole set from being satisfied by a panel that never clamps at all.
+
+
+def _retype(table: pa.Table, casts: dict[str, pa.DataType]) -> pa.Table:
+    drifted = pa.schema(
+        [pa.field(field.name, casts.get(field.name, field.type)) for field in table.schema]
+    )
+    return table.cast(drifted)
 
 
 def write_retyped_master(
@@ -1344,23 +1385,42 @@ def write_retyped_master(
 ) -> Path:
     """A master carrying the pinned column names with some of their types swapped.
 
-    This is the drift a reference file takes when a writer changes: the names still
-    line up, so the read succeeds and the wrong types surface later, from a comparison
-    several frames deep rather than from the read. ``casts`` names the columns to swap
-    and leaves the rest pinned. An empty ``casts`` writes a well-formed master, which is
-    what makes this helper usable as its own control.
+    Scope now clamps off the spans file, so a valid one is written alongside, isolating
+    the drift to the master. This exercises the master's own two live failure surfaces:
+    ``resolve`` (walked by ``valid_from``) and the schema-version guard.
     """
     master = SecurityMaster()
-    master.register(
+    instrument_id = master.register(
         kind=KIND_EQUITY, capture_start=capture_start, valid_from=date(2026, 1, 2), ticker=ticker
-    )
-    table = master.to_table()
-    drifted = pa.schema(
-        [pa.field(field.name, casts.get(field.name, field.type)) for field in table.schema]
     )
     path = master_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(table.cast(drifted), path)
+    pq.write_table(_retype(master.to_table(), casts), path)
+    spans = CaptureSpans()
+    spans.open_span(instrument_id, capture_start, False)
+    spans.write(spans_path(root))
+    return path
+
+
+def write_retyped_spans(
+    root: Path, ticker: str, capture_start: datetime, casts: dict[str, pa.DataType]
+) -> Path:
+    """A spans file carrying the pinned column names with some of their types swapped.
+
+    A valid master is written alongside, isolating the drift to the spans file. This
+    exercises the spans reader's own failure surfaces: ``_valid_span`` (walked by
+    ``span_start``) and the schema-version guard.
+    """
+    master = SecurityMaster()
+    instrument_id = master.register(
+        kind=KIND_EQUITY, capture_start=capture_start, valid_from=date(2026, 1, 2), ticker=ticker
+    )
+    master.write(master_path(root))
+    spans = CaptureSpans()
+    spans.open_span(instrument_id, capture_start, False)
+    path = spans_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(_retype(spans.to_table(), casts), path)
     return path
 
 
@@ -1368,19 +1428,16 @@ def write_retyped_master(
     "casts",
     [
         pytest.param(dict.fromkeys(MASTER_SCHEMA.names, pa.string()), id="all"),
-        pytest.param({"capture_start": pa.string()}, id="capture_start_string"),
-        pytest.param({"capture_start": pa.timestamp("us")}, id="capture_start_naive"),
         pytest.param({"valid_from": pa.string()}, id="valid_from_string"),
     ],
 )
 def test_a_drifted_master_costs_the_clamp_and_nothing_else(root: Path, casts: dict):
     # A reference table must never break a panel. Each of these files is valid Parquet
     # carrying the pinned column names, so the read itself succeeds and the drift lands
-    # later. Three mechanisms carry it there.
+    # later. Two mechanisms carry it there.
     #
     # 1. A retyped ``schema_version`` is refused by the master's own reader.
-    # 2. A retyped ``capture_start`` is unfit to compare instants against.
-    # 3. A retyped ``valid_from`` raises out of a date comparison inside resolution.
+    # 2. A retyped ``valid_from`` raises out of a date comparison inside resolution.
     #
     # Every one costs that ticker its clamp and nothing more, so both panels still serve.
     write_retyped_master(root, "SPY", et(MONDAY, 9, 36), casts)
@@ -1404,9 +1461,9 @@ def test_a_drifted_master_costs_the_clamp_and_nothing_else(root: Path, casts: di
 
 
 def test_the_same_helper_with_nothing_retyped_still_clamps(root: Path):
-    # The control for the drifted cases above. The helper writes a master the panel can
-    # use, so their verdict of no clamp is the drift talking and not a broken fixture. It
-    # also stops the whole set from being satisfied by a panel that never clamps at all.
+    # The control for the drifted master cases above. The helper writes a master the
+    # panel can use, so their verdict of no clamp is the drift talking and not a broken
+    # fixture.
     write_retyped_master(root, "SPY", et(MONDAY, 9, 36), {})
     chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
         "strips"
@@ -1414,6 +1471,100 @@ def test_the_same_helper_with_nothing_retyped_still_clamps(root: Path):
     assert chains["capture_start"] == et(MONDAY, 9, 36).isoformat()
     assert chains["counts"]["out_of_scope"] == 3
     assert chains["counts"]["gap"] == 0
+
+
+@pytest.mark.parametrize(
+    "casts",
+    [
+        pytest.param(dict.fromkeys(SPANS_SCHEMA.names, pa.string()), id="all"),
+        pytest.param({"span_start": pa.string()}, id="span_start_string"),
+        pytest.param({"span_start": pa.timestamp("us")}, id="span_start_naive"),
+    ],
+)
+def test_a_drifted_spans_file_costs_the_clamp_and_nothing_else(root: Path, casts: dict):
+    # The spans-file mirror of the master drift test above. Two mechanisms carry it.
+    #
+    # 1. A retyped ``schema_version`` is refused by the spans reader itself, the same
+    #    way the master's is.
+    # 2. A retyped ``span_start`` is unfit to compare instants against, dropped by
+    #    ``_valid_span``.
+    #
+    # Either costs the ticker its clamp and nothing more.
+    write_retyped_spans(root, "SPY", et(MONDAY, 9, 36), casts)
+    chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
+        "strips"
+    ][0]
+    assert chains["capture_start"] is None
+    assert chains["counts"]["out_of_scope"] == 0
+    assert chains["counts"]["gap"] == 1
+    assert chains["counts"]["captured"] == 2
+
+
+def test_the_spans_helper_with_nothing_retyped_still_clamps(root: Path):
+    # The control for the drifted spans cases above.
+    write_retyped_spans(root, "SPY", et(MONDAY, 9, 36), {})
+    chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
+        "strips"
+    ][0]
+    assert chains["capture_start"] == et(MONDAY, 9, 36).isoformat()
+    assert chains["counts"]["out_of_scope"] == 3
+    assert chains["counts"]["gap"] == 0
+
+
+# -- retirement and rejoin: the back edge of scope ----------------------------
+
+
+def test_a_slot_after_retirement_reads_out_of_scope(root: Path):
+    # The dashboard's half of #77 case 1: a retired ticker's minutes after its close
+    # render out of scope, not missing, and its earlier data still renders captured.
+    write_closed_span(root, "SPY", et(MONDAY, 9, 36), et(MONDAY, 16, 2))
+    chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
+        "strips"
+    ][0]
+    assert chains["capture_start"] == et(MONDAY, 9, 36).isoformat()
+    # Every slot from 16:02 on is out of scope, not missing.
+    after = [c for c in chains["slots"] if c["slot"] > et(MONDAY, 16, 2).isoformat()]
+    assert after and all(c["status"] == "out_of_scope" for c in after)
+
+
+def test_the_now_panel_reads_in_scope_false_once_the_span_closed(root: Path):
+    # The Now panel's half of the same case, checked at an instant after retirement
+    # rather than the fixture's fixed morning clock.
+    write_closed_span(root, "SPY", et(MONDAY, 9, 36), et(MONDAY, 9, 40))
+    row = next(
+        row
+        for row in service_over(root).run_query("now", {})["surfaces"]
+        if (row["ticker"], row["surface"]) == ("SPY", "chains")
+    )
+    # NOW is 09:40:30, four minutes after the 09:36 start and past the 09:40 retirement.
+    assert row["in_scope"] is False
+
+
+def test_a_rejoined_ticker_renders_out_of_scope_only_for_the_time_away(root: Path):
+    # The #77 case-2 rejoin case, from the dashboard's side: a returning ticker's away
+    # days render out of scope, not missing, and both live periods render normally.
+    master = SecurityMaster()
+    instrument_id = master.register(
+        kind=KIND_EQUITY, capture_start=et(MONDAY, 9, 36), valid_from=date(2026, 1, 2), ticker="SPY"
+    )
+    master.write(master_path(root))
+    spans = CaptureSpans()
+    spans.open_span(instrument_id, et(MONDAY, 9, 36), False)
+    spans.close_span(instrument_id, et(MONDAY, 12, 0))
+    spans.open_span(instrument_id, et(MONDAY, 15, 0), False)
+    spans.write(spans_path(root))
+
+    chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
+        "strips"
+    ][0]
+    away = [
+        c
+        for c in chains["slots"]
+        if et(MONDAY, 12, 0).isoformat() <= c["slot"] < et(MONDAY, 15, 0).isoformat()
+    ]
+    assert away and all(c["status"] == "out_of_scope" for c in away)
+    back = [c for c in chains["slots"] if c["slot"] >= et(MONDAY, 15, 0).isoformat()]
+    assert back and all(c["status"] != "out_of_scope" for c in back)
 
 
 # -- the injected guard constants --------------------------------------------

@@ -55,6 +55,8 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from lake import journal
+from lake.calendar import MARKET_TZ
+from lake.capture_spans import CaptureSpans, CaptureSpansError, spans_path
 from lake.chain_plan import ChainPlan, load_chain_plan
 from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants, load_config
@@ -62,6 +64,7 @@ from lake.lock import lake_lock
 from lake.manifest import record_partition
 from lake.metadata import stamp_cycle
 from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor
+from lake.security_master import ID_TYPE_TICKER, SecurityMaster, SecurityMasterError, master_path
 from lake.tickers import Roster, load_tickers
 from lake.vendor import Vendor, VendorError
 
@@ -283,12 +286,17 @@ class CycleResult:
 
     ``segments`` is every durable segment written, data and gap alike. ``errors`` is the
     normally-empty set of tickers that could not be journaled. ``snap_ts`` is the minute
-    slot the whole cycle fired for.
+    slot the whole cycle fired for. ``nothing_to_capture`` is true when the cycle ran over
+    an empty roster: every ticker retired, so there was nothing to fetch and no segment to
+    write. That is a different shape from a non-empty roster where every fetch failed,
+    which still writes gap segments. The dead-man feed tells the two apart, because a
+    fully retired daemon is alive and idle, not broken.
     """
 
     snap_ts: datetime
     segments: tuple[SegmentOutcome, ...]
     errors: tuple[SegmentError, ...] = ()
+    nothing_to_capture: bool = False
 
     @property
     def partitions(self) -> tuple[str, ...]:
@@ -580,8 +588,13 @@ class _CaptureCycle:
 
         The sampler is one shared failure unit. A failed batch plans a gap for every
         ticker. A success is split per ticker, each ticker planned on its own.
+
+        An empty roster, every ticker retired, skips the request outright. Nothing is
+        owed, so nothing is fetched, and no cycle wastes a batched call on zero symbols.
         """
         symbols = self.roster.symbols
+        if not symbols:
+            return []
         fetch_ts = self.clock.now()
         try:
             response = self.vendor.get_quotes(symbols)
@@ -702,7 +715,12 @@ class _CaptureCycle:
 
         # Last, stamp what the rows cannot carry: the token's mint time and the roster.
         self._stamp()
-        return CycleResult(snap_ts=self.snap_ts, segments=tuple(outcomes), errors=tuple(errors))
+        return CycleResult(
+            snap_ts=self.snap_ts,
+            segments=tuple(outcomes),
+            errors=tuple(errors),
+            nothing_to_capture=not self.roster,
+        )
 
     def _stamp(self) -> None:
         """Stamp the cycle's token mint time and roster into the journal metadata.
@@ -806,15 +824,17 @@ def run_cycle_from_config(
     """
     config = load_config(config_path)
     roster = load_tickers(tickers_path)
+    resolved_clock = clock if clock is not None else SystemClock()
+    live_roster = _live_roster(roster, config.lake_root, resolved_clock.now())
     vendor = SchwabVendor.from_token(
         token_path if token_path is not None else DEFAULT_TOKEN_PATH,
         api_key=config.schwab_api_key.reveal(),
         app_secret=config.schwab_app_secret.reveal(),
     )
     return run_cycle(
-        clock if clock is not None else SystemClock(),
+        resolved_clock,
         vendor,
-        roster,
+        live_roster,
         config.lake_root,
         pid=pid,
         guards=config.guards,
@@ -822,6 +842,50 @@ def run_cycle_from_config(
         close_tag=close_tag,
         session_phase=session_phase,
     )
+
+
+def _live_roster(roster: Roster, lake_root: Path | str, now: datetime) -> Roster:
+    """The entries this cycle actually captures: enabled, and inside an open span.
+
+    Retiring closes a ticker's capture span before it turns off the roster entry, so a
+    crash between the two writes leaves a stale enabled entry with a closed span. Filtering
+    on the span too, not only on ``enabled``, means that stale entry is never captured, so
+    no row is ever recorded outside a span.
+
+    A missing master or spans file widens rather than narrows: every enabled entry is
+    captured, the same as before capture spans existed. A missing reference file must
+    never stop capture, the same rule every other reader of these two files follows. A
+    ticker the master cannot resolve is kept for the same reason: losing the clamp only
+    ever widens what gets captured.
+    """
+    enabled = roster.enabled
+    try:
+        master = SecurityMaster.read(master_path(lake_root))
+    except (OSError, SecurityMasterError, ValueError):
+        return Roster(enabled)
+    try:
+        spans = CaptureSpans.read(spans_path(lake_root))
+    except (OSError, CaptureSpansError, ValueError):
+        return Roster(enabled)
+    on = now.astimezone(MARKET_TZ).date()
+    kept = []
+    for entry in enabled:
+        try:
+            instrument_id = master.resolve(entry.ticker, on, id_type=ID_TYPE_TICKER)
+            in_scope = instrument_id is None or spans.in_scope(instrument_id, now)
+        except Exception:  # noqa: BLE001 - a per-ticker scope check must never crash a cycle
+            # Deliberately broad. A master or a spans file that loaded but carries a
+            # drifted value (a naive or retyped timestamp) raises from a comparison
+            # inside resolution or the span check, not from the read that opened the
+            # file. This is the live capture path, so the price of missing an
+            # unenumerated error here is a crashed cycle, worse than the dashboard's
+            # unclamped panel. Widen instead: keep the ticker, the same answer a
+            # missing master or spans file already gives.
+            kept.append(entry)
+            continue
+        if in_scope:
+            kept.append(entry)
+    return Roster(tuple(kept))
 
 
 def journal_snapshot(

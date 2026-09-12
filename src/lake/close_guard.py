@@ -23,9 +23,13 @@ restart it runs before startup gap marking, so the minutes it owns are already r
 when the marker walks the day and are not marked a second time.
 
 Which tickers it checks is a rule of its own, because every row it writes names one. A
-ticker is checked for a close when the roster still carries it and its ``capture_start``
-is at or before that close. Both facts are read when the guard runs, never held from
-daemon start. ``run`` says why.
+ticker is checked for a close when a capture span covers that close's minute. The guard
+reads the capture-spans file, not the roster, so a ticker retired between the equity
+close and this run still gets its owed marker: its span still covers 16:00 even though it
+has left the roster. The span also carries whether options were captured, so the guard
+knows whether the option close was owed. The master turns each span's ``instrument_id``
+back into the ticker symbol that names the row. Both are read when the guard runs, never
+held from daemon start. ``run`` says why.
 """
 
 from __future__ import annotations
@@ -37,13 +41,9 @@ from datetime import date, datetime
 from pathlib import Path
 
 from lake import journal
-from lake.security_master import (
-    SecurityMaster,
-    capture_start_in_market_time,
-    is_in_scope,
-)
+from lake.capture_spans import CaptureSpans
+from lake.security_master import SecurityMaster
 from lake.session import OPTION_CLOSE, SPOT_CLOSE, SessionClock
-from lake.tickers import Roster
 
 # The reason on a marker for a close that was never observed. The equity close is one
 # moment and it passed unwitnessed, so nothing names a failure to retry.
@@ -104,24 +104,26 @@ class CloseGuard:
     makes the guard marker-only, which is what a test wants and what a daemon with no
     vendor client falls back to.
 
-    ``roster`` and ``master`` are both readers, not values. Between them they answer the
+    ``spans`` and ``master`` are both readers, not values. Between them they answer the
     only question the guard asks before it writes: did this ticker owe a close at this
-    moment. Both are read when the guard runs, because onboarding writes both files while
-    the daemon runs and a copy from daemon start answers for the wrong moment. See ``run``.
+    moment. The spans file says which instruments were in scope at a close's minute, and
+    the master turns an ``instrument_id`` into the ticker symbol. Both are read when the
+    guard runs, because onboarding and retiring write these files while the daemon runs
+    and a copy from daemon start answers for the wrong moment. See ``run``.
     """
 
     def __init__(
         self,
         *,
         lake_root: Path | str,
-        roster: Callable[[], Roster],
+        spans: Callable[[], CaptureSpans | None],
         session_clock: SessionClock,
-        master: Callable[[], SecurityMaster | None] | None = None,
+        master: Callable[[], SecurityMaster | None],
         fill=None,
         pid: int | None = None,
     ) -> None:
         self._root = Path(lake_root)
-        self._roster = roster
+        self._spans = spans
         self._session_clock = session_clock
         self._master = master
         self._fill = fill
@@ -132,38 +134,32 @@ class CloseGuard:
 
         What the guard writes is a claim that a named ticker owed a close and nothing
         observed it. Absence cannot be read off the lake, because a ticker that captured
-        nothing looks the same as one that was never owed anything. So the guard asks
-        two sources outside the data, one for each end of a ticker's scope.
+        nothing looks the same as one that was never owed anything. So the guard reads a
+        source outside the data: the capture spans.
 
-        ``tickers.yaml`` says whether the ticker is still captured, and it is read here
-        rather than held from daemon start. The roster is the only statement of that,
-        and a copy hours old answers for the wrong moment. A ticker onboarded mid-session
-        owes both of that day's closes and a frozen copy never checks it. A retired one
-        owes neither and a frozen copy marks it anyway, on a surface no cycle writes to
-        again.
+        Each close is checked against its own minute. A ticker owes the equity close when
+        a span covers 16:00, and the option close when a span covers 16:15 and captured
+        options. The two are separate because a ticker onboarded between the closes owes
+        only the later one, and a ticker retired between them owes only the earlier one.
+        A span covering 16:00 but ending before 16:15 is exactly the retired-at-16:02
+        case, and it still gets its spot-close marker because the guard reads spans rather
+        than the live roster.
 
-        ``capture_start`` says when the ticker came into scope, and each close is checked
-        against its own moment. A ticker onboarded between the two closes owes the option
-        close and not the equity close, so one clamp for both would be wrong either way.
-        The master is read here for the same reason the roster is. Onboarding writes it
-        while the daemon runs, so a copy from daemon start cannot place the one ticker the
-        clamp exists for, and the clamp would do nothing for exactly that case. One read
-        per run, so every ticker in a run is judged against one master.
-
-        One end has no source. There is no ``capture_end`` epoch, so a ticker retired
-        between the equity close and this run loses a marker it did owe. That window is
-        twenty minutes on a live daemon and longer on a late restart. The doc names the
-        same limit for gap marking, and closing it needs an epoch neither has.
+        The spans and the master are read here, not held from daemon start, because
+        onboarding and retiring write them while the daemon runs. A copy from daemon start
+        would answer for the wrong moment: it would miss a ticker onboarded mid-session
+        and mark one retired mid-session. One read per run, so every ticker in a run is
+        judged against one snapshot.
         """
         bounds = self._session_clock.bounds(day)
         found = _Findings()
         master = self._master() if self._master is not None else None
-        for entry in self._roster():
-            epoch = capture_start_in_market_time(master, entry.ticker, day)
-            if epoch is None or is_in_scope(bounds.equity_close, epoch):
-                self._check_spot_close(entry.ticker, bounds.equity_close, found)
-            if entry.options and (epoch is None or is_in_scope(bounds.option_close, epoch)):
-                self._check_option_close(entry.ticker, bounds, found)
+        spans = self._spans() if self._spans is not None else None
+        for ticker, _ in self._covering(spans, master, bounds.equity_close, day):
+            self._check_spot_close(ticker, bounds.equity_close, found)
+        for ticker, options in self._covering(spans, master, bounds.option_close, day):
+            if options:
+                self._check_option_close(ticker, bounds, found)
         return GuardOutcome(
             day,
             tuple(found.filled),
@@ -173,6 +169,28 @@ class CloseGuard:
             tuple(found.refused),
             tuple(found.problems),
         )
+
+    def _covering(
+        self,
+        spans: CaptureSpans | None,
+        master: SecurityMaster | None,
+        instant: datetime,
+        day: date,
+    ) -> list[tuple[str, bool]]:
+        """The (ticker, options) pairs whose capture span covers ``instant``.
+
+        Returns nothing when the spans file or the master is missing, which widens to
+        checking no ticker rather than raising. That is the safe direction on the daemon's
+        unguarded hooks: a missing source records nothing rather than a false marker.
+        """
+        if spans is None or master is None:
+            return []
+        out: list[tuple[str, bool]] = []
+        for span in spans.spans_covering(instant):
+            ticker = master.symbol_at(span.instrument_id, day)
+            if ticker is not None:
+                out.append((ticker, span.options))
+        return out
 
     # -- the unrecoverable half ------------------------------------------------
 

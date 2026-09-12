@@ -91,6 +91,7 @@ import pyarrow as pa
 from lake import journal
 from lake.alert import undelivered
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
+from lake.capture_spans import CaptureSpan, CaptureSpans, CaptureSpansError, spans_path
 from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants, input_errors_exit, load_config
 from lake.control_plane import sunday_canary_due
@@ -109,7 +110,6 @@ from lake.security_master import (
     ID_TYPE_TICKER,
     SecurityMaster,
     SecurityMasterError,
-    is_in_scope,
     master_path,
 )
 from lake.session import SessionBounds, SessionClock, SessionPhase
@@ -193,9 +193,12 @@ _CALENDAR_RANGE_ERRORS = (ValueError, OverflowError)
 # ``KeyError``, and the master's own refusals raise ``SecurityMasterError``. ``ValueError``
 # stays as a defensive classifier: ``ArrowInvalid`` is one, so a read that skipped the
 # fold would still be logged here rather than escape. This set is not the only guard.
-# ``_capture_starts`` catches everything, because a file with the pinned column names and
+# ``_capture_spans`` catches everything, because a file with the pinned column names and
 # drifted value types raises from a comparison much later, not from the read.
 _MASTER_READ_ERRORS = (OSError, KeyError, ValueError, SecurityMasterError)
+
+# The spans-file counterpart to ``_MASTER_READ_ERRORS``, same reasoning.
+_SPANS_READ_ERRORS = (OSError, KeyError, ValueError, CaptureSpansError)
 
 
 class QueryParameterError(ValueError):
@@ -740,42 +743,51 @@ def _dates_desc(paths: LakePaths, surface: str, ticker: str) -> list[date]:
 # -- the capture_start clamp -------------------------------------------------
 
 
-def _capture_starts(paths: LakePaths, tickers: Iterable[str], on: date) -> dict[str, datetime]:
-    """Each ticker's ``capture_start`` epoch, read once from the security master.
+def _capture_spans(
+    paths: LakePaths, tickers: Iterable[str], on: date
+) -> dict[str, tuple[CaptureSpan, ...]]:
+    """Each ticker's capture spans, read once from the master and the spans file.
 
-    ``capture_start`` is the instant the pipeline first recorded an instrument. The
-    design clamps every session-slot denominator, coverage check, and gap accounting to
-    it: sessions and minutes before it are out of scope, never gaps. Onboarding day
-    renders "onboarded 11:00," not 40 percent missing.
+    A *capture span* is a window ``[start, end)`` during which the ticker was captured.
+    A minute outside every one of a ticker's spans is out of scope, whether it falls
+    before the first span, after a closed one, or between two spans following a
+    retirement and a rejoin. The design clamps every session-slot denominator, coverage
+    check, and gap accounting the same way: out-of-scope minutes are never gaps.
+    Onboarding day renders "onboarded 11:00," not 40 percent missing. A retirement day
+    renders the same way from its own end, and the days away between a retirement and a
+    rejoin render out of scope rather than as gaps.
 
-    The master is read once per query, not once per ticker. It is optional here. An
+    Both files are read once per query, not once per ticker. Either is optional here. An
     absent file, an unreadable one, an ambiguous symbol, or a ticker that does not
     resolve leaves that ticker out of the mapping, and a ticker outside the mapping gets
     no clamp at all. A missing reference table must never break a panel, so nothing here
     raises out of the query.
     """
     try:
-        return _read_capture_starts(paths, tickers, on)
+        return _read_capture_spans(paths, tickers, on)
     except Exception:
-        # The guard is broad here, and only here. The master is an optional reference
-        # file read off disk, so its contents are data that may be malformed in ways no
-        # enumerated error set anticipates: a file with the pinned column names and
-        # drifted value types raises a ``TypeError`` or an ``AttributeError`` from a
-        # comparison several frames deep, not a read error. The promise above is
-        # absolute, and the cost of keeping it is one panel served without a clamp
-        # rather than a panel not served at all. Do not narrow this back to a list of
-        # error types. The traceback is logged, so a real defect is still discoverable.
-        log.exception("security master unusable, so no capture_start clamp is applied")
+        # The guard is broad here, and only here. The master and the spans file are
+        # optional reference files read off disk, so their contents are data that may be
+        # malformed in ways no enumerated error set anticipates: a file with the pinned
+        # column names and drifted value types raises a ``TypeError`` or an
+        # ``AttributeError`` from a comparison several frames deep, not a read error.
+        # The promise above is absolute, and the cost of keeping it is one panel served
+        # without a clamp rather than a panel not served at all. Do not narrow this back
+        # to a list of error types. The traceback is logged, so a real defect is still
+        # discoverable.
+        log.exception("capture spans unusable, so no scope clamp is applied")
         return {}
 
 
-def _read_capture_starts(paths: LakePaths, tickers: Iterable[str], on: date) -> dict[str, datetime]:
-    """Resolve each ticker against the master on disk. The caller owns the failure path.
+def _read_capture_spans(
+    paths: LakePaths, tickers: Iterable[str], on: date
+) -> dict[str, tuple[CaptureSpan, ...]]:
+    """Resolve each ticker against the master and its spans. The caller owns the failure path.
 
-    Every value taken from the file is validated before it is kept. A ``capture_start``
-    clamps by comparison against aware instants, so anything but a timezone-aware
-    datetime is dropped for that ticker. A dropped ticker gets no clamp, which is the
-    same answer an absent master gives, rather than a wrong one.
+    Every span taken from the file is validated before it is kept. A span clamps by
+    comparison against aware instants, so one whose ends are not both timezone-aware
+    datetimes is dropped. A dropped span costs a ticker its clamp, the same answer an
+    absent spans file gives, rather than a wrong one.
     """
     try:
         master = SecurityMaster.read(master_path(paths.root))
@@ -783,39 +795,54 @@ def _read_capture_starts(paths: LakePaths, tickers: Iterable[str], on: date) -> 
         # The master is optional and a fresh lake has none. That is not a problem to log.
         return {}
     except _MASTER_READ_ERRORS:
-        log.warning("security master unreadable, so no capture_start clamp is applied")
+        log.warning("security master unreadable, so no scope clamp is applied")
         return {}
-    starts: dict[str, datetime] = {}
+    try:
+        spans = CaptureSpans.read(spans_path(paths.root))
+    except FileNotFoundError:
+        # The spans file is optional too, for the same reason the master is.
+        return {}
+    except _SPANS_READ_ERRORS:
+        log.warning("capture spans unreadable, so no scope clamp is applied")
+        return {}
+    result: dict[str, tuple[CaptureSpan, ...]] = {}
     unusable = 0
     for ticker in tickers:
         try:
             instrument_id = master.resolve(ticker, on=on, id_type=ID_TYPE_TICKER)
-            if instrument_id is None:
-                continue
-            start = _aware_capture_start(master.capture_start_of(instrument_id))
         except SecurityMasterError:
             continue
-        if start is None:
-            unusable += 1
+        if instrument_id is None:
             continue
-        starts[ticker] = start
+        ticker_spans = tuple(s for s in spans.spans_of(instrument_id) if _valid_span(s))
+        dropped = len(spans.spans_of(instrument_id)) - len(ticker_spans)
+        unusable += dropped
+        if ticker_spans:
+            result[ticker] = ticker_spans
     if unusable:
         # The count alone, never the ticker. A ticker can arrive as a request parameter,
         # and nothing a client sent is written to a log line.
-        log.warning("security master: %d instrument(s) carry an unusable capture_start", unusable)
-    return starts
+        log.warning("capture spans: %d span(s) carry an unusable end", unusable)
+    return result
 
 
-def _aware_capture_start(value: object) -> datetime | None:
-    """A ``capture_start`` fit to clamp with, or ``None``.
+def _valid_span(span: CaptureSpan) -> bool:
+    """Whether a span's ends are fit to clamp with: aware datetimes throughout.
 
-    Fit means a timezone-aware datetime. A naive one cannot be compared against the
-    aware instants the panels carry, and a value of any other type cannot be compared
-    at all. Either is drift in the reference file, so it yields no clamp.
+    A retyped file drifts the same way the master's ``capture_start`` column can, and a
+    span unfit to compare is dropped rather than raising, which costs that span its
+    clamp and nothing else.
     """
-    if isinstance(value, datetime) and value.utcoffset() is not None:
-        return value
-    return None
+    if not isinstance(span.start, datetime) or span.start.utcoffset() is None:
+        return False
+    if span.end is None:
+        return True
+    return isinstance(span.end, datetime) and span.end.utcoffset() is not None
+
+
+def _in_scope(instant: datetime, spans: tuple[CaptureSpan, ...]) -> bool:
+    """Whether ``instant`` falls inside any of a ticker's capture spans."""
+    return any(span.contains(instant) for span in spans)
 
 
 # -- time helpers ------------------------------------------------------------
@@ -926,11 +953,13 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
     zero. The page count is the exception: an ordinary day writes no file at all, so its
     absence is a true zero and reads as one.
     """
-    starts = _capture_starts(ctx.paths, ctx.roster, ctx.session.session_date())
+    spans_by_ticker = _capture_spans(ctx.paths, ctx.roster, ctx.session.session_date())
     surfaces: list[dict[str, object]] = []
     for ticker, present in ctx.roster.items():
         for surface in present:
-            surfaces.append(_latest_cycle(con, ctx, surface, ticker, starts.get(ticker)))
+            surfaces.append(
+                _latest_cycle(con, ctx, surface, ticker, spans_by_ticker.get(ticker, ()))
+            )
     phase = ctx.session.phase()
     stamp = read_metadata(ctx.paths.root)
     minted = stamp.token_minted_at
@@ -962,9 +991,14 @@ def _latest_cycle(
     ctx: QueryContext,
     surface: str,
     ticker: str,
-    capture_start: datetime | None,
+    spans: tuple[CaptureSpan, ...],
 ) -> dict[str, object]:
-    """One Now row: the latest slot of any kind and the latest data slot, with its age."""
+    """One Now row: the latest slot of any kind and the latest data slot, with its age.
+
+    ``spans`` empty means no scope clamp: the ticker is always in scope. Otherwise the
+    reported ``capture_start`` is the most recently opened span's start, so a currently
+    live ticker shows when it started and a retired one still shows its last known start.
+    """
     last_data_ms: int | None = None
     last_ms: int | None = None
     last_status: str | None = None
@@ -991,6 +1025,7 @@ def _latest_cycle(
     minutes_since: float | None = None
     if last_data_ms is not None:
         minutes_since = round((_slot_ms(ctx.now) - last_data_ms) / 60_000, 1)
+    capture_start = spans[-1].start if spans else None
     return {
         "ticker": ticker,
         "surface": surface,
@@ -1001,7 +1036,7 @@ def _latest_cycle(
         "last_error_class": last_error,
         "last_error_class_count": last_error_count,
         "capture_start": None if capture_start is None else _iso(capture_start),
-        "in_scope": capture_start is None or is_in_scope(ctx.now, capture_start),
+        "in_scope": not spans or _in_scope(ctx.now, spans),
         "lookback_exhausted": last_data_ms is None and len(days) > len(walked),
         **health.payload(),
     }
@@ -1052,13 +1087,21 @@ def query_today(
         raise QueryParameterError("date outside the calendar's range") from None
     slots = session_slots(bounds)
     tickers = [ticker] if ticker is not None else list(ctx.roster)
-    starts = _capture_starts(ctx.paths, tickers, session_day)
+    spans_by_ticker = _capture_spans(ctx.paths, tickers, session_day)
     strips: list[dict[str, object]] = []
     for symbol in tickers:
         for surface in ctx.roster.get(symbol, ()):
             aggregates, health = _slot_aggregates(con, ctx.paths, surface, symbol, session_day)
             strips.append(
-                _strip(symbol, surface, slots, aggregates, health, ctx.now, starts.get(symbol))
+                _strip(
+                    symbol,
+                    surface,
+                    slots,
+                    aggregates,
+                    health,
+                    ctx.now,
+                    spans_by_ticker.get(symbol, ()),
+                )
             )
     payload.update(
         is_session=True,
@@ -1079,19 +1122,23 @@ def _strip(
     aggregates: Sequence[SlotAggregate],
     health: SegmentHealth,
     now: datetime,
-    capture_start: datetime | None,
+    spans: tuple[CaptureSpan, ...],
 ) -> dict[str, object]:
     """One strip: every session slot with its status, denominated by the slot list.
 
     Each cell's status comes off a five-step ladder.
 
     1. A slot with data rows is captured, or suspect when a row carries the flag.
-    2. A slot before ``capture_start`` is out of scope. Data still wins above it, so a
-       real cycle is never hidden, but a gap marker there is out of scope, because the
-       design pins minutes before the epoch as out of scope and never gaps.
+    2. A slot outside every one of the ticker's capture spans is out of scope. Data
+       still wins above it, so a real cycle is never hidden, but a gap marker there is
+       out of scope, because the design pins an out-of-scope minute as never a gap. This
+       covers a slot before the first span, after a closed one, and between two spans
+       following a retirement and a rejoin.
     3. A slot with gap rows is a gap.
     4. A slot after the injected instant is pending.
     5. Anything else is missing.
+
+    ``spans`` empty means no scope clamp: every slot is in scope.
     """
     by_slot = {agg.slot_ms: agg for agg in aggregates}
     now_ms = _slot_ms(now)
@@ -1105,7 +1152,7 @@ def _strip(
         error_count = 0 if agg is None else agg.error_class_count
         if agg is not None and agg.data_rows > 0:
             status = agg.status
-        elif capture_start is not None and not is_in_scope(slot, capture_start):
+        elif spans and not _in_scope(slot, spans):
             status, rows, error_class, error_count = STATUS_OUT_OF_SCOPE, 0, None, 0
         elif agg is not None:
             status = agg.status
@@ -1121,6 +1168,7 @@ def _strip(
                 "error_class_count": error_count,
             }
         )
+    capture_start = spans[-1].start if spans else None
     return {
         "ticker": ticker,
         "surface": surface,

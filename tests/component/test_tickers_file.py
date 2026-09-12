@@ -12,7 +12,13 @@ from pathlib import Path
 
 import pytest
 
-from lake.tickers import TickersError, load_tickers, upsert_ticker
+from lake.tickers import (
+    TickersError,
+    load_tickers,
+    remove_ticker,
+    set_enabled,
+    upsert_ticker,
+)
 
 YAML = """\
 SPY: {options: true, chain_cadence: 1m, bars: [1m, 1d]}
@@ -176,9 +182,8 @@ def test_a_reader_during_the_write_still_sees_a_whole_roster(tmp_path: Path, mon
     assert [p.name for p in sorted(tmp_path.iterdir())] == ["tickers.yaml"]
 
 
-# Every one of these parses cleanly and names no ticker. The rename in the write half
-# closed the way a torn write produced one. A hand edit caught partway through a save
-# still does, and so does an operator who empties the file.
+# Every one of these parses cleanly and names no ticker. An empty roster is allowed now
+# that the capture-spans file records scope, so all four load as a roster of no tickers.
 NAMES_NOTHING = {
     "an empty file": "",
     "comments only": "# XYZ: {options: false}\n",
@@ -188,20 +193,19 @@ NAMES_NOTHING = {
 
 
 @pytest.mark.parametrize("text", NAMES_NOTHING.values(), ids=list(NAMES_NOTHING))
-def test_a_file_that_names_no_tickers_raises(tmp_path: Path, text: str):
-    """A roster of no tickers is the one silent prefix the rename does not cover.
+def test_a_file_that_names_no_tickers_loads_as_an_empty_roster(tmp_path: Path, text: str):
+    """An empty roster is valid now that the capture-spans file records scope.
 
-    The rename keeps a torn write from ever exposing one. It cannot reach a hand edit,
-    which is the other way an empty file appears. A cycle handed one captures nothing and
-    writes no gap row, so the minute leaves no trace, and the design counts completeness
-    from rows and never from holes. That is the harm `_write_atomically` names, reached
-    through the read instead of the write.
+    Before, the roster was the only record of scope, so a file naming no tickers was
+    refused: a cycle over it captured nothing and left no trace. Now scope lives in the
+    spans file, retiring the last ticker is a real action, and the daemon still runs its
+    health and watchdog reporting over an empty roster.
     """
     path = tmp_path / "tickers.yaml"
     path.write_text(text)
-    with pytest.raises(TickersError) as caught:
-        load_tickers(path)
-    assert str(caught.value) == f"tickers file names no tickers: {path}"
+    roster = load_tickers(path)
+    assert roster.symbols == ()
+    assert len(roster) == 0
 
 
 # Each of these parses to a value that is neither absent nor a mapping. Folding the
@@ -235,13 +239,63 @@ def test_the_write_refuses_a_document_the_read_refuses(tmp_path: Path, text: str
 
 
 def test_onboarding_into_an_empty_file_still_works(tmp_path: Path):
-    # Where the two halves part. The reader refuses a file naming no tickers. The writer
-    # takes one as no entries yet, the same as no file, because onboarding is how an
-    # operator puts an entry back and refusing would block the repair.
+    # An empty file loads as an empty roster, and onboarding into it adds the first entry.
     path = tmp_path / "tickers.yaml"
     path.write_text("")
     upsert_ticker("SPY", options=False, path=path)
     assert load_tickers(path).symbols == ("SPY",)
+
+
+def test_upsert_writes_enabled_only_when_off(tmp_path: Path):
+    path = tmp_path / "tickers.yaml"
+    upsert_ticker("SPY", options=False, path=path)
+    assert "enabled" not in path.read_text()  # enabled is the default, so the key is omitted
+    upsert_ticker("OFF", options=False, enabled=False, path=path)
+    assert load_tickers(path).get("OFF").enabled is False
+
+
+def test_set_enabled_flips_in_place_and_preserves_settings(tmp_path: Path):
+    path = tmp_path / "tickers.yaml"
+    upsert_ticker("SPY", options=True, chain_cadence="1m", bars=["1m", "1d"], path=path)
+
+    set_enabled("SPY", False, path=path)
+    entry = load_tickers(path).get("SPY")
+    assert entry.enabled is False
+    # The other settings survive the flip.
+    assert entry.options is True and entry.chain_cadence == "1m" and entry.bars == ("1m", "1d")
+
+    set_enabled("SPY", True, path=path)
+    assert load_tickers(path).get("SPY").enabled is True
+    assert "enabled" not in path.read_text()  # enabling drops the key
+
+
+def test_set_enabled_on_an_absent_ticker_raises(tmp_path: Path):
+    path = tmp_path / "tickers.yaml"
+    upsert_ticker("SPY", options=False, path=path)
+    with pytest.raises(TickersError):
+        set_enabled("NOPE", False, path=path)
+
+
+def test_remove_ticker_removes_one_entry(tmp_path: Path):
+    path = tmp_path / "tickers.yaml"
+    upsert_ticker("SPY", options=False, path=path)
+    upsert_ticker("QQQ", options=False, path=path)
+    remove_ticker("SPY", path=path)
+    assert load_tickers(path).symbols == ("QQQ",)
+
+
+def test_remove_the_last_ticker_leaves_an_empty_roster(tmp_path: Path):
+    path = tmp_path / "tickers.yaml"
+    upsert_ticker("SPY", options=False, path=path)
+    remove_ticker("SPY", path=path)
+    assert load_tickers(path).symbols == ()  # the daemon accepts this now
+
+
+def test_remove_an_absent_ticker_raises(tmp_path: Path):
+    path = tmp_path / "tickers.yaml"
+    upsert_ticker("SPY", options=False, path=path)
+    with pytest.raises(TickersError):
+        remove_ticker("NOPE", path=path)
 
 
 def test_a_roster_that_cannot_be_written_says_so(tmp_path: Path):
