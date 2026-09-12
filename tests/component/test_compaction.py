@@ -48,6 +48,7 @@ from lake.compact import (
 from lake.compact import write_chain_plan as _write_plan
 from lake.journal import CHAINS_SCHEMA, QUOTES_SCHEMA, ShadowAppendError
 from lake.manifest import (
+    ManifestError,
     RowCountRegression,
     latest_entries,
     manifest_path,
@@ -1079,3 +1080,23 @@ def test_build_parser_accepts_the_run_and_the_repair():
     assert (repair.surface, repair.ticker, repair.day) == ("chains", "SPY", "2026-08-24")
     assert repair.allow_shrink is True
     assert parser.parse_args(["recompact", "quotes", "QQQ", "2026-08-24"]).allow_shrink is False
+
+
+# -- the ledger's damage stays loud where stopping is the right answer -------------------
+
+
+def test_a_manifest_line_naming_no_partition_stops_the_seal(tmp_path):
+    """The catches that keep the daemon alive must not follow the manifest everywhere.
+
+    #100 widened two readers so a damaged ledger cannot kill the capture loop. Compaction
+    is the opposite case and the distinction is the whole point. It decides which segments
+    to delete and whether a partition would shrink, so a ledger it cannot read is a reason
+    to stop rather than to continue carefully. The child exits, sends no ping, and the
+    ``compaction`` check pages on that silence, which is how a stopped seal gets noticed.
+    """
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    (lake_root / "manifest.jsonl").write_text('{"source": "compaction", "rows": 406}\n')
+
+    with pytest.raises(ManifestError):
+        _run(lake_root)

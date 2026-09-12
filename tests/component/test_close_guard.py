@@ -756,7 +756,9 @@ def test_a_sealed_day_is_left_alone_rather_than_marked_unobserved(tmp_path):
 # -- a failure that must not take the daemon down ---------------------------------------
 
 
-def _drifted_segment(root: Path, surface: str, ticker: str, day: date) -> None:
+def _drifted_segment(
+    root: Path, surface: str, ticker: str, day: date, *, at: datetime | None = None
+) -> None:
     """A segment that reads cleanly and holds none of the columns the guard asks for.
 
     This is the shape a schema change leaves behind: the file is valid Arrow IPC, so
@@ -769,7 +771,7 @@ def _drifted_segment(root: Path, surface: str, ticker: str, day: date) -> None:
 
     directory = LakePaths(root).segment_dir(surface, ticker, day)
     directory.mkdir(parents=True, exist_ok=True)
-    slot = datetime.combine(day, datetime.min.time()).replace(hour=16)
+    slot = at if at is not None else datetime.combine(day, datetime.min.time()).replace(hour=16)
     schema = pa.schema([("snap_ts", pa.string())])
     name = f"{slot.strftime(_STAMP_FORMAT)}-1.arrows"
     with pa.ipc.new_stream(directory / name, schema) as writer:
@@ -796,8 +798,10 @@ def test_an_unreadable_manifest_stops_the_run_and_writes_nothing(tmp_path):
     outcome = guard.run(DAY)
 
     assert len(outcome.problems) == 1, outcome.problems
-    assert outcome.problems[0].startswith("prologue: KeyError"), "the run did not say what broke"
-    assert "partition" in outcome.problems[0], "the report named no key, so it diagnoses nothing"
+    assert outcome.problems[0].startswith("prologue: ManifestError"), (
+        "the run did not say what broke"
+    )
+    assert "entry 1" in outcome.problems[0], "the report located no line, so it diagnoses nothing"
     assert outcome.unobserved == (), "the guard claimed a close went unseen without the ledger"
     assert _rows(tmp_path, "quotes", "XYZ", DAY) == [], "a marker landed on an unreadable ledger"
 
@@ -834,25 +838,61 @@ def test_a_scope_read_that_fails_is_a_prologue_failure_too(tmp_path):
     assert outcome.unobserved == (), "a guard that cannot read scope still claimed a close"
 
 
-def test_one_tickers_unreadable_segment_does_not_cost_the_others_their_markers(tmp_path):
-    """A drifted file under one ticker is one ticker's loss, not the run's.
+def test_a_drifted_segment_is_reported_rather_than_marked_over(tmp_path):
+    """A file that will not read is not an absent close, and the marker is a claim.
 
-    Completeness is counted from rows and never inferred from holes, so a marker the
-    guard fails to write is a minute that reads as missing with nothing saying why. That
-    makes the blast radius of a single bad file the thing to bound: DRIFT is read first
-    and raises, and OK must still get the marker it is owed.
+    The marker says a named ticker owed a close and nothing observed it. A drifted
+    segment may hold the very row that refutes that, so counting it as zero rows would
+    have the guard make a false claim, which the next run then deletes as debris and
+    takes a live writer's row with it. Declining and saying so is the honest answer.
+
+    The blast radius still has to stop at the one ticker: DRIFT is read first, and OK must
+    still get the marker it is owed.
     """
     _drifted_segment(tmp_path, "quotes", "DRIFT", DAY)
+    # Two, so the count in the message is a count rather than a constant that happens to
+    # read right when every fixture plants exactly one bad file.
+    _drifted_segment(tmp_path, "quotes", "DRIFT", DAY, at=et(2026, 9, 2, 16, 1))
 
     guard = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 20)), [("DRIFT", False), ("OK", False)])
     outcome = guard.run(DAY)
 
-    assert len(outcome.problems) == 1, outcome.problems
-    assert outcome.problems[0].startswith("quotes/DRIFT: KeyError"), "the bad ticker was not named"
-    assert "close_tag" in outcome.problems[0], "the report named no column, so it diagnoses nothing"
-    assert outcome.unobserved == ("OK",), "the run stopped at the first unreadable file"
+    assert outcome.problems == ("quotes/DRIFT: 2 unreadable",), "the bad ticker was not named"
+    assert outcome.unobserved == ("OK",), "the guard claimed a close it could not see"
+    # The drifted segment itself is one row in that directory, so what must be absent is a
+    # marker, not a row. A marker carries the close tag; the drifted schema has no such
+    # column at all, which is why this reads with ``get``.
+    planted = [row for row in _rows(tmp_path, "quotes", "DRIFT", DAY) if row.get("close_tag")]
+    assert not planted, "a false marker landed beside a bad file"
     marked = [row for row in _rows(tmp_path, "quotes", "OK", DAY) if row["close_tag"]]
     assert marked, "the healthy ticker lost its marker to another ticker's bad file"
+
+
+def test_a_raise_inside_one_tickers_check_does_not_cost_the_others_their_markers(tmp_path):
+    """The per-ticker catch still holds, now that no ordinary file reaches it.
+
+    #103 added this catch when a drifted segment was the way to reach it. The readers now
+    resolve that case into ``unreadable`` instead, which is better and leaves this catch
+    with no reachable trigger of its own. It stays, because the next reader to grow a new
+    raise path would otherwise cost every later ticker its marker, so the raise is
+    injected rather than provoked.
+    """
+    real = journal.close_tag_rows
+
+    def boom(root, surface, ticker, day, close_tag):
+        if ticker == "BOOM":
+            raise RuntimeError("a reader grew a new raise path")
+        return real(root, surface, ticker, day, close_tag)
+
+    guard = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 20)), [("BOOM", False), ("OK", False)])
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(journal, "close_tag_rows", boom)
+        outcome = guard.run(DAY)
+
+    assert outcome.problems == ("quotes/BOOM: RuntimeError: a reader grew a new raise path",)
+    assert outcome.unobserved == ("OK",), "the run stopped at the first raise"
+    marked = [row for row in _rows(tmp_path, "quotes", "OK", DAY) if row["close_tag"]]
+    assert marked, "the healthy ticker lost its marker to another ticker's raise"
 
 
 def test_the_option_close_loop_survives_a_bad_file_the_same_way(tmp_path):
@@ -870,7 +910,40 @@ def test_the_option_close_loop_survives_a_bad_file_the_same_way(tmp_path):
     guard = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 20)), [("DRIFT", True), ("OK", True)])
     outcome = guard.run(DAY)
 
-    assert len(outcome.problems) == 1, outcome.problems
-    assert outcome.problems[0].startswith("chains/DRIFT: KeyError"), "the bad ticker was not named"
-    assert outcome.refused == ("OK: no fill fetcher",), "the run stopped at the bad chains file"
+    assert outcome.problems == ("chains/DRIFT: 1 unreadable",), "the bad ticker was not named"
+    # Both are refused for want of a fetcher, DRIFT included. That it reaches the fill
+    # path at all is the point: an unreadable segment names a problem here and does not
+    # call the close off, because the fill is the only thing that can still rescue it.
+    assert outcome.refused == ("DRIFT: no fill fetcher", "OK: no fill fetcher"), outcome.refused
     assert set(outcome.unobserved) == {"DRIFT", "OK"}, "the quotes half was collateral damage"
+
+
+def test_an_empty_segment_reads_as_absent_rather_than_unreadable(tmp_path):
+    """A file created and never written to holds nothing, so it hides nothing.
+
+    ``SegmentWriter`` opens with ``O_CREAT|O_EXCL`` and fsyncs the directory entry before
+    any schema bytes land, so a process killed in between leaves a durably zero-byte
+    segment, and a ``KeepAlive`` crash loop makes them in quantity. That makes this the
+    likeliest bad file in the lake rather than an exotic one.
+
+    Counting it unreadable would have withheld the option close's refetch, and the window
+    shuts at close+5 with compaction sealing the day ten minutes later. Absent is not a
+    softer reading of the same thing, it is the accurate one: the file holds no batches,
+    so nothing in it can contradict what the fill writes.
+    """
+    directory = LakePaths(tmp_path).segment_dir(journal.CHAINS_SURFACE, "SPY", DAY)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "20260902T161500000000-1.arrows").write_bytes(b"")
+
+    asked: list[str] = []
+
+    def fill(ticker: str, slot: datetime) -> list[str]:
+        asked.append(ticker)
+        return ["2026-09-18"]
+
+    guard = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 20)), [("SPY", True)], fill=fill)
+    outcome = guard.run(DAY)
+
+    assert asked == ["SPY"], "an empty file called off the only thing that could rescue the close"
+    assert outcome.filled == ("SPY",), outcome
+    assert outcome.problems == (), "an empty file was reported as damage rather than absence"

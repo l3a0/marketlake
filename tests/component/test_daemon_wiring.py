@@ -56,6 +56,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
@@ -1161,3 +1162,50 @@ def test_a_compaction_spawn_that_raises_costs_the_seal_and_not_the_session(tmp_p
     assert seen == ["16:31", "16:32", "16:33", "16:34"], "the loop died on the failed spawn"
     reported = capsys.readouterr().err
     assert "compaction: 2026-09-02: RuntimeError" in reported, "the failure was swallowed"
+
+
+# -- a lake the startup walk cannot read ------------------------------------------------
+
+
+def test_a_manifest_line_naming_no_partition_does_not_stop_the_daemon(tmp_path):
+    """#100's reproduction, driven through the production entry.
+
+    ``on_start`` runs before the first tick, so this crash cost the whole session rather
+    than one pass's markers, and the bad line stays on disk so every ``KeepAlive``
+    successor hit it again. Zero capture minutes, repeating until someone noticed.
+
+    The daemon ticking at all is the assertion. Everything else here is setup.
+    """
+    rig = _rig(tmp_path)
+    (rig.lake_root / "manifest.jsonl").write_text('{"source": "compaction", "rows": 406}\n')
+
+    seen: list[str] = []
+    hooks = daemon.DaemonHooks(on_tick=lambda slot: seen.append(slot.strftime("%H:%M")))
+    # Past the option close, so no cycle is owed and the startup walk is what this
+    # exercises. ``on_start`` runs before the first tick either way.
+    clock = ManualClock(start=et(2026, 9, 2, 17, 0, 30))
+    _run(rig, clock, ticks=3, cycle_runner=_no_cycle, hooks=hooks)
+
+    assert seen == ["17:01", "17:02", "17:03"], "the daemon died before its first tick"
+
+
+def test_a_drifted_segment_does_not_stop_the_daemon_either(tmp_path):
+    """The second trigger, the one that needs no bad ledger at all.
+
+    A segment written before a schema change reads back cleanly and then refuses the
+    column asked of it. That reaches the same unguarded hook by a different route, so it
+    needs its own case rather than riding the manifest's.
+    """
+    rig = _rig(tmp_path)
+    directory = journal.segment_dir(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", DAY)
+    directory.mkdir(parents=True, exist_ok=True)
+    schema = pa.schema([("nothing_useful", pa.string())])
+    with pa.ipc.new_stream(directory / "20260902T100000000000-1.arrows", schema) as writer:
+        writer.write_batch(pa.record_batch([pa.array(["x"])], schema=schema))
+
+    seen: list[str] = []
+    hooks = daemon.DaemonHooks(on_tick=lambda slot: seen.append(slot.strftime("%H:%M")))
+    clock = ManualClock(start=et(2026, 9, 2, 17, 0, 30))
+    _run(rig, clock, ticks=2, cycle_runner=_no_cycle, hooks=hooks)
+
+    assert seen == ["17:01", "17:02"], "the daemon died on a segment it could not read"

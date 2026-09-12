@@ -9,15 +9,21 @@ the component tier.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
 from lake.manifest import (
     SCRUB_EXCLUSIONS,
+    ManifestError,
     _compacted_partition_for_segment,
     _is_excluded,
     _latest_by_partition,
     _parse_jsonl,
+    latest_entries,
+    latest_quarantine,
+    manifest_path,
+    quarantine_path,
 )
 
 
@@ -61,14 +67,14 @@ def test_last_entry_wins_per_partition():
         _entry("q", rows=5),
         _entry("p", rows=405, sha256="new"),
     ]
-    latest = _latest_by_partition(entries)
+    latest = _latest_by_partition(entries, Path("manifest.jsonl"))
     assert latest["p"]["rows"] == 405
     assert latest["p"]["sha256"] == "new"
     assert latest["q"]["rows"] == 5
 
 
 def test_latest_by_partition_of_nothing_is_empty():
-    assert _latest_by_partition([]) == {}
+    assert _latest_by_partition([], Path("manifest.jsonl")) == {}
 
 
 # -- the segment to compacted-partition mapping ------------------------------
@@ -141,9 +147,9 @@ def test_supersession_decision_is_read_from_the_latest_dict():
     seg = "journal/date=2026-08-24/surface=chains/ticker=SPY/seg-20260824T160000-4242.arrows"
     compacted = _compacted_partition_for_segment(seg)
     # Without the compacted entry the segment stands on its own.
-    assert compacted not in _latest_by_partition([_entry(seg)])
+    assert compacted not in _latest_by_partition([_entry(seg)], Path("m.jsonl"))
     # With it present the segment is superseded.
-    latest = _latest_by_partition([_entry(seg), _entry(compacted)])
+    latest = _latest_by_partition([_entry(seg), _entry(compacted)], Path("m.jsonl"))
     assert compacted in latest
 
 
@@ -166,3 +172,48 @@ def test_data_files_and_the_quarantine_ledger_are_not_excluded():
 
 def test_enumerated_exclusion_set_is_exactly_the_three_documented_members():
     assert SCRUB_EXCLUSIONS == ("manifest.jsonl", "journal/", "reports/")
+
+
+# -- a ledger line nobody can interpret ------------------------------------------------
+
+
+def test_a_line_naming_no_partition_raises_and_locates_itself(tmp_path):
+    """The integrity root refuses to be read past, and says which line to look at.
+
+    Skipping the line was considered and rejected. A torn trailing line is a write that
+    did not finish, which ``_read_jsonl`` already discards. A line in the body that parses
+    and names nothing is a record no reader can interpret, and stepping over damage in the
+    file every other check is measured against would make all of them weaker than they
+    read.
+    """
+    manifest_path(tmp_path).write_text(
+        '{"partition": "a.parquet", "rows": 1}\n{"source": "compaction", "rows": 406}\n'
+    )
+
+    with pytest.raises(ManifestError) as raised:
+        latest_entries(tmp_path)
+
+    assert "entry 2" in str(raised.value), "the error did not locate the bad line"
+    assert str(manifest_path(tmp_path)) in str(raised.value), "the error did not name the ledger"
+
+
+def test_a_line_that_is_not_an_object_raises_the_same_way(tmp_path):
+    """Damage that indexes differently is damage the same, so it answers the same."""
+    manifest_path(tmp_path).write_text("[1, 2, 3]\n")
+
+    with pytest.raises(ManifestError):
+        latest_entries(tmp_path)
+
+
+def test_the_quarantine_ledger_names_itself_rather_than_the_manifest(tmp_path):
+    """Two ledgers share the reader, so the message has to say which one broke."""
+    quarantine_path(tmp_path).write_text('{"verdict": "keep"}\n')
+
+    with pytest.raises(ManifestError) as raised:
+        latest_quarantine(tmp_path)
+
+    # Compared against the path itself. An earlier version asserted the word
+    # "quarantine" appeared anywhere in the message, which pytest satisfies for free:
+    # tmp_path is derived from the test's own name. It passed with the manifest's path
+    # substituted, which is the mutation it existed to catch.
+    assert str(quarantine_path(tmp_path)) in str(raised.value), str(raised.value)

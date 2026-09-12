@@ -17,7 +17,7 @@ from lake.capture_spans import CaptureSpans
 from lake.config import GuardConstants
 from lake.security_master import SecurityMaster
 from lake.session import SessionClock, session_slots
-from lake.tickers import Roster, TickerConfig
+from lake.tickers import Roster, TickerConfig, TickersError
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.pinger import FakePinger
@@ -1034,3 +1034,126 @@ def test_the_watchdog_does_not_charge_a_ticker_disabled_in_place(tmp_path):
         after="ABC: {options: false}\nXYZ: {options: false, enabled: false}\n",
     )
     assert disabled == ["ABC"]
+
+
+# -- the marking pass survives a lake it cannot read -----------------------------------
+
+
+def _roster_of(*tickers: str) -> Roster:
+    return Roster([TickerConfig(ticker=t, options=False) for t in tickers])
+
+
+def _drifted_segment(root: Path, surface: str, ticker: str, day: date) -> None:
+    """A segment that reads cleanly and holds none of the columns a reader asks for.
+
+    The shape a schema rotation leaves behind: valid Arrow IPC, so ``read_segment``
+    returns a table and the existing catch sees nothing, and then the column read raises.
+    Written by hand rather than through ``SegmentWriter``, which can only make the
+    current schema.
+    """
+    import pyarrow as pa
+
+    directory = journal.segment_dir(root, surface, ticker, day)
+    directory.mkdir(parents=True, exist_ok=True)
+    schema = pa.schema([("nothing_useful", pa.string())])
+    name = f"{et(2026, 9, 2, 16, 0).strftime(gap.SEGMENT_STAMP_FORMAT)}-1.arrows"
+    with pa.ipc.new_stream(directory / name, schema) as writer:
+        writer.write_batch(pa.record_batch([pa.array(["x"])], schema=schema))
+
+
+def test_a_manifest_line_naming_no_partition_is_recorded_rather_than_raised(tmp_path):
+    """The crash this closes. A ledger line nobody can interpret must not end the daemon.
+
+    ``on_start`` runs before the first tick, so a raise here costs the whole session's
+    capture rather than one pass's markers, and the bad line sits on disk so every
+    ``KeepAlive`` restart hits it again. The pass reports and the loop lives.
+    """
+    (tmp_path / "manifest.jsonl").write_text('{"source": "compaction", "rows": 406}\n')
+    marker = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=_roster_of("XYZ"))
+
+    report = marker.on_start()
+
+    assert len(report.problems) == 1, report.problems
+    assert report.problems[0].startswith("marking pass: ManifestError"), report.problems
+    assert "entry 1" in report.problems[0], "the report located no line"
+
+
+def test_a_drifted_segment_is_recorded_rather_than_raised(tmp_path):
+    """The second way in. A readable segment that lost its columns took the daemon down too.
+
+    ``recorded_slots`` catches the read and then asks for ``snap_ts``, so a segment
+    written before a schema change reads back cleanly and raises on the column. The
+    reader now counts it unreadable, which is the same answer it already gives a file it
+    could not open at all.
+    """
+    _drifted_segment(tmp_path, "quotes", "XYZ", date(2026, 9, 2))
+    marker = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=_roster_of("XYZ"))
+
+    report = marker.on_start()
+
+    # The pair is refused and named, which is what the reader's ``unreadable`` channel is
+    # for. Marking the day would write a full session of holes over a record that may
+    # exist inside the file nobody can read.
+    assert report.problems == ("quotes/XYZ 2026-09-02: 1 unreadable",), report.problems
+    # Counted as segments rather than read as rows, because the planted file has no
+    # columns to read. One segment means only the planted one is there and the walk added
+    # no marker beside it.
+    written = sorted(
+        journal.segment_dir(tmp_path, "quotes", "XYZ", date(2026, 9, 2)).glob("*.arrows")
+    )
+    assert len(written) == 1, "the walk marked a day whose record it could not read"
+
+
+def test_a_roster_that_will_not_load_is_still_fatal(tmp_path):
+    """The one failure the widened catch must not swallow, and the reason it is named.
+
+    Marking against a roster nobody could read would invent gaps for tickers that left it
+    and miss the ones that joined. `TickersError` derives from `Exception` directly, so a
+    blanket catch takes it silently. The explicit re-raise is what keeps it fatal, and
+    deleting that clause turns this test from a raise into a recorded problem.
+    """
+
+    def unreadable() -> Roster:
+        raise TickersError("tickers.yaml is not readable")
+
+    marker = gap.GapMarker(
+        lake_root=tmp_path,
+        roster=unreadable,
+        session_clock=SessionClock(
+            clock=ManualClock(start=et(2026, 9, 2, 10, 0)),
+            calendar=weekday_sessions(WEEK),
+        ),
+        master=lambda: None,
+        spans=lambda: None,
+    )
+
+    with pytest.raises(TickersError):
+        marker.on_start()
+
+
+def test_one_pairs_failure_does_not_cost_the_rest_of_the_roster_their_markers(tmp_path):
+    """The pass-level catch keeps the daemon alive. It must not end the pass.
+
+    Widening that catch so #100's crash became a recorded problem also widened what can
+    end marking for every ticker after the one that raised. The close+5 guard bounds its
+    own checks per ticker for exactly this reason, and marking is the record completeness
+    is counted from, so it owes the same bound.
+    """
+    real = journal.recorded_slots
+
+    def boom(root, surface, ticker, day):
+        if ticker == "BOOM":
+            raise RuntimeError("a reader grew a new raise path")
+        return real(root, surface, ticker, day)
+
+    roster = _roster_of("BOOM", "ZZZ")
+    marker = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=roster)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(journal, "recorded_slots", boom)
+        report = marker.on_start()
+
+    assert len(report.problems) == 1, report.problems
+    assert report.problems[0].startswith("quotes/BOOM: RuntimeError"), report.problems
+    assert _gap_snaps(tmp_path, "quotes", "ZZZ", date(2026, 9, 2)), (
+        "the ticker after the failing one lost its markers"
+    )

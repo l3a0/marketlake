@@ -78,7 +78,7 @@ from lake.security_master import (
     is_in_scope,
 )
 from lake.session import TICK, SessionClock, SessionPhase, session_slots
-from lake.tickers import Roster
+from lake.tickers import Roster, TickersError
 
 # The reason stamped on a startup marker. The previous incarnation ended without
 # reaching these minutes, so from the new one's side the writer that owed them is gone.
@@ -297,44 +297,72 @@ class GapMarker:
                 recorded = latest_entries(self._root)
                 for entry in roster:
                     for surface in surfaces_for(entry):
-                        slots, pair_notes = plan(surface, entry.ticker, recorded)
-                        notes = _merge(notes, pair_notes)
-                        by_day: dict[date, list[datetime]] = {}
-                        for slot in slots:
-                            by_day.setdefault(slot.date(), []).append(slot)
-                        for day, day_slots in sorted(by_day.items()):
-                            key = (
-                                self._paths.partition_path(surface, entry.ticker, day)
-                                .relative_to(self._root)
-                                .as_posix()
-                            )
-                            if key in recorded:
-                                sealed.append(key)
-                                continue
-                            try:
-                                spans.append(
-                                    self._segment(
-                                        surface, entry.ticker, day, day_slots, error_class
+                        try:
+                            slots, pair_notes = plan(surface, entry.ticker, recorded)
+                            notes = _merge(notes, pair_notes)
+                            by_day: dict[date, list[datetime]] = {}
+                            for slot in slots:
+                                by_day.setdefault(slot.date(), []).append(slot)
+                            for day, day_slots in sorted(by_day.items()):
+                                key = (
+                                    self._paths.partition_path(surface, entry.ticker, day)
+                                    .relative_to(self._root)
+                                    .as_posix()
+                                )
+                                if key in recorded:
+                                    sealed.append(key)
+                                    continue
+                                try:
+                                    spans.append(
+                                        self._segment(
+                                            surface, entry.ticker, day, day_slots, error_class
+                                        )
                                     )
-                                )
-                            except OSError as exc:
-                                # Stop this pair here. An OSError like a full disk is
-                                # likely to hit the next day too. The unwritten days stay
-                                # owed, so the next restart re-derives what is missing and
-                                # marks them then. Stopping now defers the work, never
-                                # drops it.
-                                problems.append(
-                                    f"{surface}/{entry.ticker} {day.isoformat()}: "
-                                    f"{type(exc).__name__}"
-                                )
-                                break
-        except (OSError, ValueError) as exc:
-            # The lock or the ledger itself. A roster that will not load raises
-            # ``TickersError`` and is deliberately not caught here, the same way the
-            # skipped-slot hook does not catch it. ``on_start`` is unguarded and the
-            # daemon runs under ``KeepAlive``, so raising for the lock or the ledger
-            # would be a crash loop that marks nothing. Record those and let the loop run.
-            problems.append(f"marking pass: {type(exc).__name__}")
+                                except OSError as exc:
+                                    # Stop this pair here. An OSError like a full disk is
+                                    # likely to hit the next day too. The unwritten days stay
+                                    # owed, so the next restart re-derives what is missing and
+                                    # marks them then. Stopping now defers the work, never
+                                    # drops it.
+                                    problems.append(
+                                        f"{surface}/{entry.ticker} {day.isoformat()}: "
+                                        f"{type(exc).__name__}"
+                                    )
+                                    break
+                        except Exception as exc:  # noqa: BLE001 - one pair, not the pass
+                            # Bounded to this surface and ticker, the way the close+5
+                            # guard bounds its own per-ticker checks. The pass-level
+                            # catch below keeps the daemon alive, which is what #100
+                            # was about, and on its own it would end marking for every
+                            # ticker after the one that raised. Marking is the record
+                            # completeness is counted from, so the third ticker
+                            # failing must not cost the fourth its markers.
+                            problems.append(
+                                f"{surface}/{entry.ticker}: {type(exc).__name__}: {exc}"
+                            )
+                            continue
+        except TickersError:
+            # The one failure that stays fatal, named rather than left to a class list.
+            # A roster that will not load means nobody knows what is in scope, and a
+            # daemon marking against a roster it could not read would invent gaps for
+            # tickers or miss them entirely. The skipped-slot hook refuses it the same
+            # way. Naming it here is what lets the catch below widen safely.
+            raise
+        except Exception as exc:  # noqa: BLE001 - see the crash-loop rule below
+            # The lock, the ledger, or a segment read. ``on_start`` is unguarded and the
+            # daemon runs under ``KeepAlive``, so raising here would be a crash loop that
+            # marks nothing, before the loop reaches a single capture minute. Record and
+            # let the loop run.
+            #
+            # This catches broadly rather than naming classes, because naming them is what
+            # failed. The old list was ``(OSError, ValueError)``, written when the ledger
+            # read could only fail those ways. ``latest_entries`` later grew a ``KeyError``
+            # on a malformed line and the segment readers grew their own, so the list went
+            # stale without anyone editing it, and #100 was the daemon dying before its
+            # first tick on a file it had no business dying for. A catch whose whole job
+            # is to keep the loop alive cannot depend on a list that a change elsewhere
+            # silently invalidates.
+            problems.append(f"marking pass: {type(exc).__name__}: {exc}")
         return _merge(notes, MarkingReport(tuple(spans), tuple(sealed), (), tuple(problems)))
 
     def _segment(

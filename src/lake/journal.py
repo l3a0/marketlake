@@ -1140,6 +1140,25 @@ def read_segment(path: Path | str) -> pa.Table:
     return pa.Table.from_batches(batches, schema=schema)
 
 
+# What makes a segment unusable rather than absent, for a reader asking what it holds.
+# Four things go wrong and they all mean one thing to the caller. The file will not open,
+# which is an ``OSError``. The stream is malformed, which pyarrow raises as
+# ``ArrowInvalid``, itself a ``ValueError``. Bytes sit past the end-of-stream marker, which
+# is a ``ShadowAppendError``. Or the segment opens cleanly and its schema has drifted, so
+# the column asked of it is gone, a ``KeyError``, or holds a value the parse refuses, a
+# ``TypeError`` or a ``ValueError``.
+#
+# Drift is the case worth spelling out, because it does not look like a read failure. A
+# segment written before a schema change reads back perfectly and then answers the wrong
+# question. A reader that let that raise would take the daemon down from inside a hook
+# nothing guards, which is what #100 was.
+#
+# Every case here means the same thing: the file exists and cannot be trusted to say what
+# it holds. That is never the same as the file not being there, which is why these land in
+# ``unreadable`` rather than reading as an absent minute.
+UNUSABLE_SEGMENT = (OSError, ShadowAppendError, KeyError, TypeError, ValueError)
+
+
 class RecordedSet(NamedTuple):
     """The distinct recorded minutes for a ticker-day, and what could not be read."""
 
@@ -1175,13 +1194,27 @@ def recorded_slots(
     unreadable: list[Path] = []
     for path in sorted(directory.glob("*.arrows")):
         try:
+            if path.stat().st_size == 0:
+                # Created and never written to, which is absent rather than unreadable.
+                # ``SegmentWriter`` opens with ``O_CREAT|O_EXCL`` and fsyncs the directory
+                # entry before the first schema bytes, so a process killed in between
+                # leaves one of these durably behind, and a ``KeepAlive`` crash loop makes
+                # them in quantity. It holds no batches at all, so there is nothing in it
+                # to be wrong about and nothing a later writer would duplicate.
+                continue
             table = read_segment(path)
-        except (OSError, pa.ArrowInvalid, ShadowAppendError):
+            # Parsed inside the try, and into a list of its own before anything is kept,
+            # so a segment that fails partway contributes none of its minutes rather than
+            # the prefix that happened to parse.
+            parsed = [
+                datetime.fromisoformat(value)
+                for value in table.column("snap_ts").to_pylist()
+                if value is not None
+            ]
+        except UNUSABLE_SEGMENT:
             unreadable.append(path)
             continue
-        for value in table.column("snap_ts").to_pylist():
-            if value is not None:
-                snaps.append(datetime.fromisoformat(value))
+        snaps.extend(parsed)
     return RecordedSet(frozenset(snaps), tuple(unreadable))
 
 
@@ -1201,9 +1234,23 @@ def _is_chains_segment_for(rel: str, ticker: str) -> bool:
     return ref is not None and ref.surface == CHAINS_SURFACE and ref.ticker == ticker
 
 
+class CloseTagRows(NamedTuple):
+    """Rows found under one close tag, and the segments that could not be read.
+
+    ``unreadable`` exists for the same reason ``RecordedSet``'s does. A segment that
+    cannot be read is not an absent one, and the close+5 guard's output is a claim that
+    nothing observed a close. Counting a drifted file as zero rows would let the guard
+    make that claim about a close sitting in the file it could not read.
+    """
+
+    data: int
+    gaps: int
+    unreadable: tuple[Path, ...]
+
+
 def close_tag_rows(
     lake_root: Path | str, surface: str, ticker: str, day: date | str, close_tag: str
-) -> tuple[int, int]:
+) -> CloseTagRows:
     """How many data rows and gap rows a ticker-day holds under one ``close_tag``.
 
     The close+5 guard asks this to decide whether the day's close of record was ever
@@ -1212,21 +1259,35 @@ def close_tag_rows(
     two counts are returned apart so the caller can tell "never ran" from "ran and
     failed", which read the same to a caller that only asked whether any row exists.
 
-    Segments are read newest first and every complete batch counts, so a torn tail is
-    safe. A segment that cannot be read at all is skipped, because a guard that cannot
-    read one file must still write the markers it can.
+    Every complete batch in every segment counts, so a torn tail is safe. Order does not
+    matter here, because the answer is a sum over the whole ticker-day rather than a
+    newest-wins lookup. A segment that cannot be read is counted in ``unreadable`` rather
+    than as zero
+    rows, so the caller can tell "this close was never recorded" from "one of these files
+    will not say". The guard treats the second as a reason to stay quiet, because its
+    output is a claim about what did not happen.
     """
     directory = LakePaths(lake_root).segment_dir(surface, ticker, day)
     if not directory.is_dir():
-        return 0, 0
+        return CloseTagRows(0, 0, ())
+    unreadable: list[Path] = []
     data = gaps = 0
     for path in sorted(directory.glob("*.arrows"), reverse=True):
         try:
+            if path.stat().st_size == 0:
+                # Created and never written to, which is absent rather than unreadable.
+                # ``SegmentWriter`` opens with ``O_CREAT|O_EXCL`` and fsyncs the directory
+                # entry before the first schema bytes, so a process killed in between
+                # leaves one of these durably behind, and a ``KeepAlive`` crash loop makes
+                # them in quantity. It holds no batches at all, so there is nothing in it
+                # to be wrong about and nothing a later writer would duplicate.
+                continue
             table = read_segment(path)
-        except (OSError, pa.ArrowInvalid, ShadowAppendError):
+            tags = table.column("close_tag").to_pylist()
+            kinds = table.column("row_kind").to_pylist()
+        except UNUSABLE_SEGMENT:
+            unreadable.append(path)
             continue
-        tags = table.column("close_tag").to_pylist()
-        kinds = table.column("row_kind").to_pylist()
         for tag, kind in zip(tags, kinds, strict=True):
             if tag != close_tag:
                 continue
@@ -1234,7 +1295,28 @@ def close_tag_rows(
                 data += 1
             else:
                 gaps += 1
-    return data, gaps
+    return CloseTagRows(data, gaps, tuple(unreadable))
+
+
+def _expirations_of(batches: list) -> list[str] | None:
+    """The expirations of the newest batch holding data rows, or ``None`` for none.
+
+    Split out so the column reads sit inside the caller's ``UNUSABLE_SEGMENT`` handler. A
+    segment whose schema drifted opens cleanly and raises here, on the column, which is
+    the shape that took the daemon down in #100.
+    """
+    for batch in reversed(batches):
+        kinds = batch.column("row_kind").to_pylist()
+        if ROW_KIND_DATA not in kinds:
+            continue
+        expirations = batch.column("expiration_date").to_pylist()
+        dates = {
+            str(exp).split("T")[0]
+            for kind, exp in zip(kinds, expirations, strict=True)
+            if kind == ROW_KIND_DATA and exp
+        }
+        return sorted(dates)
+    return None
 
 
 def latest_expirations(lake_root: Path | str, ticker: str) -> list[str] | None:
@@ -1279,17 +1361,9 @@ def latest_expirations(lake_root: Path | str, ticker: str) -> list[str] | None:
         try:
             with pa.memory_map(str(path), "rb") as source:
                 batches, _clean_eos = _complete_batches(pa.ipc.open_stream(source))
-        except (OSError, pa.ArrowInvalid):
+            found = _expirations_of(batches)
+        except UNUSABLE_SEGMENT:
             continue
-        for batch in reversed(batches):
-            kinds = batch.column("row_kind").to_pylist()
-            if ROW_KIND_DATA not in kinds:
-                continue
-            expirations = batch.column("expiration_date").to_pylist()
-            dates = {
-                str(exp).split("T")[0]
-                for kind, exp in zip(kinds, expirations, strict=True)
-                if kind == ROW_KIND_DATA and exp
-            }
-            return sorted(dates)
+        if found is not None:
+            return found
     return None
