@@ -216,7 +216,7 @@ class CloseGuard:
             # An empty scope would write no marker anyway, so both failures resolve the
             # same way: say what broke and write nothing.
             #
-            # What that costs is named in #102 rather than hidden here. The startup walk
+            # What that costs is named in #120 rather than hidden here. The startup walk
             # does not pick the day up afterwards, because compaction seals it ten minutes
             # later and the walk skips a sealed date. So the minute this run owed stays a
             # hole with no row naming it. That is a smaller loss than the session's
@@ -313,7 +313,7 @@ class CloseGuard:
             #
             # This withholds a marker for a minute nothing else records either, because
             # the startup walk refuses the same pair. The day then reads short with no row
-            # naming why, which is the loss #102 tracks. It is the right side to err on
+            # naming why, which is the loss #120 tracks. It is the right side to err on
             # only because the alternative is a false claim sealed into the record.
             found.problems.append(f"quotes/{ticker}: {len(rows.unreadable)} unreadable")
             return
