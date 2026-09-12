@@ -937,6 +937,58 @@ def gap_rows(
     return _batch(schema, rows)
 
 
+def absent_series_rows(
+    surface: str,
+    *,
+    ticker: str,
+    slot: datetime,
+    expirations: Sequence[str],
+    error_class: str,
+    close_tag: str | None = None,
+    session_phase: str | None = None,
+) -> pa.RecordBatch:
+    """Build one gap batch naming several absent expirations, one row per series.
+
+    ``gap_rows`` is the many-minutes form, one row per missed slot. This is the
+    many-series form: one slot, one row per expiration that slot should have carried and
+    did not. The close+5 guard writes it when the fill came back short of the day's
+    intraday chain, so a series the vendor stopped offering is a row rather than a hole.
+
+    Every vendor column stays null except ``expiration_date``, which is the same single
+    exception the capture chunker's own absence markers make. ``window_start`` and
+    ``window_end`` stay null on purpose. Those name the date range a *fetch* gave up on,
+    and these rows exist for series whose window was fetched successfully. A reader can
+    tell the two apart by that alone, and by the error class each carries.
+
+    Chains only. An expiration is a chains-schema column, so naming one on another
+    surface is a programming error rather than a field to drop quietly.
+    """
+    if surface != CHAINS_SURFACE:
+        raise ValueError(f"an absent-series marker names an expiration, so not {surface!r}")
+    schema = schema_for(surface)
+    rows = [
+        {
+            "snap_ts": _iso(slot),
+            "fetch_ts": None,
+            "fetch_end_ts": None,
+            "vendor_quote_ts": None,
+            "ticker": ticker,
+            "row_kind": ROW_KIND_GAP,
+            "error_class": error_class,
+            "suspect": False,
+            "close_tag": close_tag,
+            "session_phase": session_phase,
+            "schema_version": SCHEMA_VERSION,
+            "expiration_date": expiration,
+            "window_start": None,
+            "window_end": None,
+            "extra": None,
+        }
+        for expiration in expirations
+    ]
+    return _batch(schema, rows)
+
+
 # -- segment paths -----------------------------------------------------------
 
 

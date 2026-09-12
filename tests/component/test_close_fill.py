@@ -194,9 +194,10 @@ def test_the_fill_lands_the_close_slot_and_keeps_its_own_fetch_minute(lake_root)
     ``snap_ts``. The round trip must stay measurable, so the minute the fetch really ran
     in is the row's ``fetch_ts``. Stamping either one over the other loses the other.
     """
-    captured = _fill(lake_root, _both_windows())
+    result = _fill(lake_root, _both_windows())
 
-    assert captured == [NEAR_EXP, TAIL_EXP]
+    assert result.expirations == (NEAR_EXP, TAIL_EXP)
+    assert result.landed
     rows = _rows(lake_root)
     assert rows, "the fill journaled nothing"
     assert {r["snap_ts"][:16] for r in rows} == {"2026-09-02T16:15"}
@@ -278,7 +279,7 @@ def test_a_window_that_failed_rides_the_fill_as_an_absence_marker(lake_root):
         plan=TWO_WINDOWS,
     )
     vendor = _WindowVendor(windows={NEAR: TOO_BIG, TAIL: _chain([TAIL_EXP])})
-    captured = capture.fill_option_close(
+    result = capture.fill_option_close(
         ManualClock(start=FILL_MINUTE),
         vendor,
         "SPY",
@@ -292,7 +293,10 @@ def test_a_window_that_failed_rides_the_fill_as_an_absence_marker(lake_root):
     # The marker's expiration is not a captured one, so the returned set holds the tail
     # alone. The guard compares that against the day's baseline, so counting a series the
     # fill failed to fetch would hide the very shortfall the comparison exists to find.
-    assert captured == [TAIL_EXP]
+    assert result.expirations == (TAIL_EXP,)
+    # The fetch also hands back the window it gave up, which is what lets the guard tell a
+    # series it missed from one the vendor no longer offers.
+    assert result.absent_expirations == frozenset({NEAR_EXP})
     rows = [r for r in _rows(lake_root) if r["snap_ts"].startswith("2026-09-02T16:15")]
     markers = [r for r in rows if r["row_kind"] == journal.ROW_KIND_GAP]
     assert len(markers) == 1
@@ -359,9 +363,12 @@ def test_a_fill_whose_every_window_failed_writes_no_row(lake_root):
             TAIL: VendorResponse(status=401, body={}),
         }
     )
-    captured = _fill(lake_root, vendor)
+    result = _fill(lake_root, vendor)
 
-    assert captured is None
+    assert not result.landed
+    assert result.expirations == ()
+    # The class rides back, so the refusal can say which failure it was.
+    assert result.error_class == "http_401"
     assert _rows(lake_root) == []
     assert latest_entries(lake_root) == {}
 
@@ -382,7 +389,7 @@ def test_a_failed_fill_leaves_the_days_existing_gap_row_standing_alone(lake_root
     ).run(DAY)
 
     assert outcome.filled == ()
-    assert outcome.refused == ("SPY: fill fetch returned nothing",)
+    assert outcome.refused == ("SPY: captured nothing (http_500)",)
     assert len(_rows(lake_root)) == before == 1
 
 
@@ -659,9 +666,9 @@ def test_a_fill_whose_windows_answered_with_no_contracts_writes_nothing(lake_roo
     empty = VendorResponse(
         status=200, body={"status": "FAILED", "callExpDateMap": {}, "putExpDateMap": {}}
     )
-    captured = _fill(lake_root, _WindowVendor(windows={NEAR: empty, TAIL: empty}))
+    result = _fill(lake_root, _WindowVendor(windows={NEAR: empty, TAIL: empty}))
 
-    assert captured is None
+    assert not result.landed
     assert _rows(lake_root) == []
     assert latest_entries(lake_root) == {}
 
@@ -766,11 +773,11 @@ def test_the_returned_set_is_what_landed_rather_than_what_the_body_claimed(lake_
         windows={NEAR: VendorResponse(status=200, body=body), TAIL: _chain([TAIL_EXP])}
     )
 
-    captured = _fill(lake_root, vendor)
+    result = _fill(lake_root, vendor)
 
     # The body named two series. Only one of them landed with an expiration a reader can
     # resolve, and that is the one the fill reports.
-    assert captured == [TAIL_EXP]
+    assert result.expirations == (TAIL_EXP,)
     landed = {r["expiration_date"] for r in _rows(lake_root)}
     assert None in landed, "the nameless contract did not land, so the case is not exercised"
 
@@ -897,3 +904,215 @@ def test_two_fills_of_one_close_slot_land_as_separate_segments(lake_root):
     segments = sorted(LakePaths(lake_root).segment_dir(CHAINS, "SPY", DAY).glob("*.arrows"))
     assert len(segments) == 2, "two fills of one close collided on a single segment name"
     assert {r["snap_ts"][:16] for r in _rows(lake_root)} == {"2026-09-02T16:15"}
+
+
+# -- the membership marker: a series absent from the fill is a row, not a hole ----------
+
+
+def _captured_result(*expirations: str) -> capture.FillResult:
+    """A fill that landed, carrying what it captured and no window given up."""
+    return capture.FillResult(expirations or ("2026-09-04",))
+
+
+def _markers(root: Path, ticker: str = "SPY") -> list[dict]:
+    """Every membership-marker row the guard wrote for the day."""
+    return [
+        r for r in _rows(root, ticker) if r["error_class"] == close_guard.OPTION_CLOSE_SERIES_ABSENT
+    ]
+
+
+def _intraday(lake_root: Path, expirations: list[str], *, pid: int = 3) -> None:
+    """One ordinary cycle before the close, the baseline the fill is judged against."""
+    capture.run_cycle(
+        ManualClock(start=et(2026, 9, 2, 15, 59)),
+        _WindowVendor(windows={NEAR: _chain(expirations), TAIL: _chain([])}),
+        Roster.from_mapping({"SPY": {"options": True, "chain_cadence": "1m"}}),
+        lake_root,
+        pid=pid,
+        guards=GuardConstants(),
+        plan=TWO_WINDOWS,
+    )
+
+
+def test_a_series_the_fill_did_not_return_gets_a_row_naming_it(lake_root):
+    """The reason constant exists and, until now, no code path ever wrote it.
+
+    The intraday chain carried two near-term series. The fill's windows all succeed and it
+    comes back with one, which is the case the design names: Schwab may stop serving a
+    same-day-expired series by close+5. The series that vanished has to become a row,
+    because completeness is counted from rows, and a series never offered reads exactly
+    like one quietly dropped when both are holes.
+    """
+    _intraday(lake_root, [NEAR_EXP, "2026-09-11"])
+    short = _WindowVendor(windows={NEAR: _chain([NEAR_EXP]), TAIL: _chain([])})
+
+    outcome = _guard(
+        lake_root, at=FILL_MINUTE, fill=lambda t, s: _fill(lake_root, short, ticker=t)
+    ).run(DAY)
+
+    assert outcome.filled == ("SPY",)
+    assert outcome.shortfalls == ("SPY: 1 expirations",)
+    markers = _markers(lake_root)
+    assert [m["expiration_date"] for m in markers] == ["2026-09-11"]
+    assert markers[0]["row_kind"] == journal.ROW_KIND_GAP
+
+
+def test_a_series_the_fetch_missed_is_not_relabelled_as_one_never_offered(lake_root):
+    """The two populations are the whole point of the row, and they must stay apart.
+
+    A series inside a window the fetch gave up was missed, and the fill already marked it
+    with that window's own class. A series inside a window that was fetched successfully
+    is one the vendor no longer offers. A plain expiration difference holds both, so
+    marking that difference would write a second row over the first and call a fetch
+    failure a delisting, which is the distinction this row exists to make.
+    """
+    _intraday(lake_root, [NEAR_EXP])
+    # The near window carried the baseline's only series and now fails outright, so the
+    # difference names it while the fill has already marked it as a window it lost.
+    lost = _WindowVendor(windows={NEAR: TOO_BIG, TAIL: _chain([TAIL_EXP])})
+
+    def fill(ticker: str, slot: datetime):
+        return capture.fill_option_close(
+            ManualClock(start=FILL_MINUTE),
+            lost,
+            ticker,
+            slot=slot,
+            lake_root=lake_root,
+            guards=GuardConstants(chain_chunk_max_split_depth=0),
+            plan=TWO_WINDOWS,
+            pid=7,
+        )
+
+    outcome = _guard(lake_root, at=FILL_MINUTE, fill=fill).run(DAY)
+
+    assert outcome.filled == ("SPY",)
+    # Named as a window the fetch lost, never as a series the vendor withdrew.
+    assert outcome.shortfalls == ("SPY: 1 windows absent",)
+    assert _markers(lake_root) == []
+    # The fill's own marker still stands, carrying the window's class rather than this
+    # writer's, which is how a reader tells missed from never offered.
+    lost_rows = [r for r in _rows(lake_root) if r["error_class"] == capture.CHAIN_CHUNK_FAILED]
+    assert [r["expiration_date"] for r in lost_rows] == [NEAR_EXP]
+
+
+def test_several_absent_series_land_as_several_rows_in_one_segment(lake_root):
+    """One fact per series about one minute, so one batch rather than one segment each."""
+    _intraday(lake_root, [NEAR_EXP, "2026-09-11", "2026-09-14"])
+    short = _WindowVendor(windows={NEAR: _chain([NEAR_EXP]), TAIL: _chain([])})
+
+    _guard(lake_root, at=FILL_MINUTE, fill=lambda t, s: _fill(lake_root, short, ticker=t)).run(DAY)
+
+    markers = _markers(lake_root)
+    assert [m["expiration_date"] for m in markers] == ["2026-09-11", "2026-09-14"]
+    holding = [
+        path
+        for path in LakePaths(lake_root).segment_dir(CHAINS, "SPY", DAY).glob("*.arrows")
+        if any(
+            r["error_class"] == close_guard.OPTION_CLOSE_SERIES_ABSENT
+            for r in journal.read_segment(path).to_pylist()
+        )
+    ]
+    assert len(holding) == 1, "the markers were split across segments"
+
+
+def test_the_membership_marker_carries_the_close_slot_and_its_minutes_phase(lake_root):
+    """A marker a reader can place: the close it stands for, and the tags of that minute.
+
+    ``session_phase`` is a fact about the minute rather than about the writer, so it is
+    read off the calendar the same way the fill's own data rows at this minute read it.
+    Two rows of one minute disagreeing about the phase would split a reader's day.
+    """
+    _intraday(lake_root, [NEAR_EXP, "2026-09-11"])
+    short = _WindowVendor(windows={NEAR: _chain([NEAR_EXP]), TAIL: _chain([])})
+
+    _guard(lake_root, at=FILL_MINUTE, fill=lambda t, s: _fill(lake_root, short, ticker=t)).run(DAY)
+
+    marker = _markers(lake_root)[0]
+    assert marker["snap_ts"].startswith("2026-09-02T16:15")
+    assert marker["close_tag"] == OPTION_CLOSE
+    assert marker["session_phase"] == "post_equity_close"
+    # The window bounds stay null. Those name a range a fetch gave up on, and this series
+    # sat in a window that was fetched successfully.
+    assert marker["window_start"] is None
+    assert marker["window_end"] is None
+
+
+def test_the_equity_close_marker_stays_phaseless_because_its_minute_is_open(lake_root):
+    """The two close markers differ, and deriving the phase is why that is correct.
+
+    16:00 is the last minute of the ``open`` phase, which the column records as null, and
+    16:15 sits in ``post_equity_close``. Hardcoding either answer would put one of the two
+    markers wrong, so both read the calendar.
+    """
+    _guard(lake_root, at=FILL_MINUTE, fill=lambda t, s: _captured_result()).run(DAY)
+
+    spot = [
+        r
+        for r in _rows(lake_root, "SPY", journal.QUOTES_SURFACE)
+        if r["error_class"] == close_guard.SPOT_CLOSE_UNOBSERVED
+    ]
+    assert spot and spot[0]["snap_ts"].startswith("2026-09-02T16:00")
+    assert spot[0]["session_phase"] is None
+
+
+def test_a_fill_that_captured_nothing_marks_no_series(lake_root):
+    """No fill, no membership question. The day's own gap row still stands alone."""
+    _intraday(lake_root, [NEAR_EXP, "2026-09-11"])
+    before = len(_rows(lake_root))
+    dead = VendorResponse(status=401, body={})
+
+    outcome = _guard(
+        lake_root,
+        at=FILL_MINUTE,
+        fill=lambda t, s: _fill(
+            lake_root, _WindowVendor(windows={NEAR: dead, TAIL: dead}), ticker=t
+        ),
+    ).run(DAY)
+
+    assert outcome.filled == ()
+    assert _markers(lake_root) == []
+    assert len(_rows(lake_root)) == before
+
+
+def test_a_baseline_less_fill_marks_no_series(lake_root):
+    """With no same-day cycle there is nothing to be short of, so nothing is claimed."""
+    outcome = _guard(
+        lake_root, at=FILL_MINUTE, fill=lambda t, s: _fill(lake_root, _both_windows(), ticker=t)
+    ).run(DAY)
+
+    assert outcome.baseline_less == ("SPY",)
+    assert _markers(lake_root) == []
+
+
+def test_a_second_guard_run_adds_no_duplicate_markers(lake_root):
+    """The fill landed, so the close is observed and the second run must say nothing."""
+    _intraday(lake_root, [NEAR_EXP, "2026-09-11"])
+    short = _WindowVendor(windows={NEAR: _chain([NEAR_EXP]), TAIL: _chain([])})
+
+    def runner(ticker, slot):
+        return _fill(lake_root, short, ticker=ticker, pid=11)
+
+    first = _guard(lake_root, at=FILL_MINUTE, fill=runner).run(DAY)
+    after_first = len(_markers(lake_root))
+    second = _guard(lake_root, at=FILL_MINUTE, fill=runner).run(DAY)
+
+    assert first.filled == ("SPY",)
+    assert second.filled == (), "the close was already observed, so nothing was owed"
+    assert len(_markers(lake_root)) == after_first == 1
+
+
+def test_an_absent_series_marker_refuses_a_surface_with_no_expirations():
+    """An expiration is a chains column, so naming one elsewhere is a mistake, not a drop.
+
+    The quotes schema has no ``expiration_date``. Building the row anyway would either
+    raise deep in the batch builder or quietly discard the one field the row exists to
+    carry, and a marker that names no series is indistinguishable from a plain gap.
+    """
+    with pytest.raises(ValueError, match="expiration"):
+        journal.absent_series_rows(
+            journal.QUOTES_SURFACE,
+            ticker="SPY",
+            slot=CLOSE,
+            expirations=[NEAR_EXP],
+            error_class=close_guard.OPTION_CLOSE_SERIES_ABSENT,
+        )

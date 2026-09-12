@@ -15,6 +15,16 @@ that landed but gave up a date window is named too, because the window that fail
 close+5 is usually the one that failed intraday, so the membership comparison is blind
 in the same place and nothing else would say the close is a window short.
 
+A fill that landed short of the day's intraday chain gets one marker row per missing
+series, so a series the vendor stopped offering is recorded rather than left a hole.
+Which series those are is a subtraction, not a difference. Every expiration in the
+baseline and absent from the fill splits into two populations: the ones whose date
+window was fetched successfully, which the vendor withdrew, and the ones inside a window
+the fetch gave up, which were merely missed and which the fill has already marked with
+that window's own class. Only the first population is this writer's. Marking the second
+would duplicate a row and relabel a collection failure as a delisting, which is the
+distinction the marker exists to draw.
+
 A ``spot_close`` that never landed is unrecoverable by construction. The 16:00 moment
 cannot be re-observed at 16:20. A post-close fetch would carry frozen option marks
 against an extended-hours underlying, which is the moment-mixing the tag exists to
@@ -51,7 +61,7 @@ from lake.capture_spans import CaptureSpans
 from lake.manifest import latest_entries
 from lake.paths import LakePaths
 from lake.security_master import SecurityMaster
-from lake.session import OPTION_CLOSE, SPOT_CLOSE, SessionClock
+from lake.session import OPTION_CLOSE, SPOT_CLOSE, SessionClock, SessionPhase
 
 # The reason on a marker for a close that was never observed. The equity close is one
 # moment and it passed unwitnessed, so nothing names a failure to retry.
@@ -60,6 +70,12 @@ SPOT_CLOSE_UNOBSERVED = "spot_close_unobserved"
 # The reason on a marker for an expiration the intraday chain carried and the close+5
 # fill did not. The fill still stands for the series it does hold, so this names the
 # shortfall rather than voiding the fill.
+#
+# It means the series was fetched for and not returned, so the vendor no longer offers
+# it. A series the fetch never reached, because its date window was given up, carries
+# that window's own class instead, written by the fill rather than here. Keeping the two
+# apart is the whole point of the reason: one is a delisting and the other is a
+# collection failure, and they need different answers downstream.
 OPTION_CLOSE_SERIES_ABSENT = "option_close_series_absent"
 
 _STAMP = "%Y%m%dT%H%M%S%f"
@@ -356,64 +372,129 @@ class CloseGuard:
         # is baseline-less, which is what a ``None`` here becomes below.
         baseline = journal.latest_expirations(self._root, ticker, on=day)
         try:
-            captured = self._fill(ticker, bounds.option_close)
+            result = self._fill(ticker, bounds.option_close)
         except Exception as exc:  # noqa: BLE001 - a vendor failure must not stop the guard
             found.problems.append(f"chains/{ticker} option_close: {type(exc).__name__}")
             return
-        if captured is None:
+        if not result.landed:
             # Nothing landed, so nothing is written. The day already carries the gap row
             # from the cycle that failed at the close, and a second row for that minute
             # would double-count it in every per-slot completeness read. The refusal is
-            # the record of the attempt, and it reaches the report like the others.
-            found.refused.append(f"{ticker}: fill fetch returned nothing")
+            # the record of the attempt, and it reaches the report like the others. The
+            # class the fill carries back is what tells auth death from a transient fault.
+            found.refused.append(f"{ticker}: captured nothing ({result.error_class or 'empty'})")
             return
         found.filled.append(ticker)
 
-        # A fill can land and still have given up on a date window. Those windows ride the
-        # snapshot as absence-marker gap rows carrying their own class, so the lake's own
+        # A fill can land and still have given up on a date window. Those windows rode the
+        # snapshot as absence-marker gap rows carrying their own class, so the lake's
         # record stands, but nothing in the outcome named them and the report went silent
-        # on a close of record missing a whole window. Worse, the membership comparison
-        # below cannot see it either: the window that failed at close+5 is usually the one
-        # that failed intraday, so the baseline is blind in exactly the same place and the
+        # on a close of record missing a whole window. The membership comparison below
+        # cannot see them either: the window that fails at close+5 is usually the one that
+        # failed intraday, so the baseline is blind in exactly the same place and the
         # difference comes out empty.
-        #
-        # The count is the gap rows the fill added, read against the same tag this method
-        # opened with. Only the fill wrote between the two reads, so the difference is
-        # the fill's own.
-        landed = journal.close_tag_rows(
-            self._root, journal.CHAINS_SURFACE, ticker, day, OPTION_CLOSE
-        )
-        if landed.gaps > rows.gaps:
-            found.shortfalls.append(f"{ticker}: {landed.gaps - rows.gaps} windows absent")
+        if result.absent:
+            found.shortfalls.append(f"{ticker}: {len(result.absent)} windows absent")
 
         if baseline is None:
             # No same-day cycle to compare against. The fill still stands, and the
             # battery is told to judge it rather than the guard voiding it.
             found.baseline_less.append(ticker)
             return
-        missing = sorted(set(baseline) - set(captured))
-        if missing:
-            found.shortfalls.append(f"{ticker}: {len(missing)} expirations")
+        # Two different populations are absent from a fill, and only one of them is this
+        # marker's. A series inside a window the fetch gave up was *missed*, and the fill
+        # already marked it with that window's own class. A series inside a window that
+        # was fetched successfully is one the vendor no longer offers, which is what
+        # ``option_close_series_absent`` means and what the design expects when Schwab
+        # stops serving same-day-expired series by close+5. Subtracting the first
+        # population keeps this writer from marking it twice and from relabelling a fetch
+        # failure as a delisting.
+        missing = sorted(set(baseline) - set(result.expirations) - result.absent_expirations)
+        if not missing:
+            return
+        try:
+            self._series_marker(ticker, bounds.option_close, missing)
+        except OSError as exc:
+            found.problems.append(f"chains/{ticker} option_close: {type(exc).__name__}")
+            return
+        found.shortfalls.append(f"{ticker}: {len(missing)} expirations")
 
     # -- the marker write ------------------------------------------------------
+
+    def _phase_of(self, slot: datetime) -> str | None:
+        """The ``session_phase`` a row for this minute carries.
+
+        The column is a fact about the minute rather than about the writer, which is why
+        ``phase_at`` exists and why gap marking stamps its own markers through it. Asking
+        the calendar rather than hardcoding an answer is what keeps two rows of one minute
+        agreeing: the option-close fill's data rows and a marker beside them are stamped
+        from the same source.
+
+        It also explains why the two close markers differ without contradicting. The
+        equity close is the last minute of the ``open`` phase, which the column records as
+        null, and the option close sits in ``post_equity_close``.
+
+        A calendar that cannot place the day costs the stamp rather than the marker. The
+        marker is the record completeness is counted from, and the phase is provenance on
+        it, so the row still goes down.
+        """
+        try:
+            phase = self._session_clock.phase_at(slot)
+        except Exception:  # noqa: BLE001 - a stamp is never worth the marker it rides on
+            return None
+        return phase.value if phase is SessionPhase.POST_EQUITY_CLOSE else None
+
+    def _write(self, surface: str, ticker: str, slot: datetime, batch) -> None:
+        """Lay one batch down as its own segment, the way the option-close fill does."""
+        stamp = slot.strftime(_STAMP)
+        with journal.SegmentWriter.open(
+            self._root, surface, ticker, slot.date(), stamp, self._pid
+        ) as writer:
+            writer.write_cycle(batch)
 
     def _marker(
         self, surface: str, ticker: str, slot: datetime, close_tag: str, error_class: str
     ) -> None:
         """One tagged marker row in its own segment, like the option-close fill."""
-        stamp = slot.strftime(_STAMP)
-        with journal.SegmentWriter.open(
-            self._root, surface, ticker, slot.date(), stamp, self._pid
-        ) as writer:
-            writer.write_cycle(
-                journal.gap_batch(
-                    surface,
-                    ticker=ticker,
-                    snap_ts=slot,
-                    error_class=error_class,
-                    close_tag=close_tag,
-                )
-            )
+        self._write(
+            surface,
+            ticker,
+            slot,
+            journal.gap_batch(
+                surface,
+                ticker=ticker,
+                snap_ts=slot,
+                error_class=error_class,
+                close_tag=close_tag,
+                session_phase=self._phase_of(slot),
+            ),
+        )
+
+    def _series_marker(self, ticker: str, slot: datetime, expirations: list[str]) -> None:
+        """One row per expiration the intraday chain carried and the fill did not.
+
+        All of them ride one segment and one batch, because they are one fact per series
+        about one minute rather than several minutes. That is the shape ``gap_rows``
+        already uses for the many-minutes case.
+
+        The segment is written beside the fill's own, never into it. A segment is opened
+        by one writer session and never re-opened, and the fill closed its own before this
+        comparison could be made.
+        """
+        self._write(
+            journal.CHAINS_SURFACE,
+            ticker,
+            slot,
+            journal.absent_series_rows(
+                journal.CHAINS_SURFACE,
+                ticker=ticker,
+                slot=slot,
+                expirations=expirations,
+                error_class=OPTION_CLOSE_SERIES_ABSENT,
+                close_tag=OPTION_CLOSE,
+                session_phase=self._phase_of(slot),
+            ),
+        )
 
 
 __all__ = [

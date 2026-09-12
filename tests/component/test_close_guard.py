@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from lake import close_guard, daemon, journal
+from lake import capture, close_guard, daemon, journal
 from lake.capture import CycleResult
 from lake.capture_spans import CaptureSpans, spans_path
 from lake.manifest import append_manifest, manifest_path, sha256_file
@@ -54,6 +54,11 @@ def _scope(*entries):
         if end is not None:
             spans.close_span(iid, end)
     return (lambda: spans), (lambda: master)
+
+
+def _captured(*expirations: str) -> capture.FillResult:
+    """A fill that landed, carrying the expirations it captured and no absent window."""
+    return capture.FillResult(expirations)
 
 
 def _guard(root, clock, entries, *, fill=None, pid=9):
@@ -239,7 +244,7 @@ def test_an_unobserved_equity_close_is_marked_and_never_fetched(tmp_path):
         tmp_path,
         _clock(et(2026, 9, 2, 16, 18)),
         [("XYZ", False)],
-        fill=lambda ticker, slot: fetches.append(ticker),
+        fill=lambda ticker, slot: fetches.append(ticker) or _captured("2026-09-04"),
     )
     outcome = guard.run(DAY)
 
@@ -277,7 +282,7 @@ def test_a_missing_option_close_is_filled_at_the_close_slot(tmp_path):
 
     def fill(ticker: str, slot: datetime):
         asked.append((ticker, slot))
-        return ["2026-09-04"]
+        return _captured("2026-09-04")
 
     outcome = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 18)), [("SPY", True)], fill=fill).run(DAY)
 
@@ -297,7 +302,7 @@ def test_an_option_close_that_ran_and_failed_is_still_filled(tmp_path):
         tmp_path,
         _clock(et(2026, 9, 2, 16, 18)),
         [("SPY", True)],
-        fill=lambda ticker, slot: filled.append(ticker) or ["2026-09-04"],
+        fill=lambda ticker, slot: filled.append(ticker) or _captured("2026-09-04"),
     ).run(DAY)
     assert outcome.filled == ("SPY",)
     assert filled == ["SPY"]
@@ -310,7 +315,7 @@ def test_an_option_close_that_landed_is_not_refetched(tmp_path):
         tmp_path,
         _clock(et(2026, 9, 2, 16, 18)),
         [("SPY", True)],
-        fill=lambda ticker, slot: filled.append(ticker),
+        fill=lambda ticker, slot: filled.append(ticker) or _captured("2026-09-04"),
     ).run(DAY)
     assert outcome.filled == ()
     assert filled == []
@@ -322,7 +327,7 @@ def test_the_fill_is_refused_outright_past_close_plus_five(tmp_path):
         tmp_path,
         _clock(et(2026, 9, 2, 16, 21)),
         [("SPY", True)],
-        fill=lambda ticker, slot: filled.append(ticker),
+        fill=lambda ticker, slot: filled.append(ticker) or _captured("2026-09-04"),
     ).run(DAY)
     # Past close+5 the marks are no longer the close's. The limit defines what an option
     # close means, so it is pinned in code and not in config.
@@ -335,7 +340,7 @@ def test_a_fill_with_no_same_day_baseline_is_flagged_for_the_battery(tmp_path):
         tmp_path,
         _clock(et(2026, 9, 2, 16, 18)),
         [("SPY", True)],
-        fill=lambda ticker, slot: ["2026-09-04"],
+        fill=lambda ticker, slot: _captured("2026-09-04"),
     ).run(DAY)
     assert outcome.baseline_less == ("SPY",)
     assert outcome.reportable
@@ -548,7 +553,7 @@ def test_each_close_is_clamped_to_its_own_moment(tmp_path):
         tmp_path,
         _clock(et(2026, 9, 2, 16, 18)),
         [("SPY", True, et(2026, 9, 2, 16, 5))],
-        fill=lambda ticker, slot: fetches.append(ticker) or ["2026-09-18"],
+        fill=lambda ticker, slot: fetches.append(ticker) or _captured("2026-09-18"),
     ).run(DAY)
 
     assert outcome.unobserved == (), "16:00 was before SPY came into scope"
@@ -937,9 +942,9 @@ def test_an_empty_segment_reads_as_absent_rather_than_unreadable(tmp_path):
 
     asked: list[str] = []
 
-    def fill(ticker: str, slot: datetime) -> list[str]:
+    def fill(ticker: str, slot: datetime) -> capture.FillResult:
         asked.append(ticker)
-        return ["2026-09-18"]
+        return _captured("2026-09-18")
 
     guard = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 20)), [("SPY", True)], fill=fill)
     outcome = guard.run(DAY)
