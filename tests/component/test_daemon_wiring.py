@@ -61,7 +61,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from lake import capture, close_guard, daemon, gap, journal
-from lake.alert import Message
+from lake.alert import PAGE_PRIORITY, Message
 from lake.capture import CycleResult, SegmentOutcome
 from lake.capture_spans import CaptureSpans, spans_path
 from lake.chain_plan import ChainPlan, load_chain_plan
@@ -1209,3 +1209,170 @@ def test_a_drifted_segment_does_not_stop_the_daemon_either(tmp_path):
     _run(rig, clock, ticks=2, cycle_runner=_no_cycle, hooks=hooks)
 
     assert seen == ["17:01", "17:02"], "the daemon died on a segment it could not read"
+
+
+# -- the power assertion, whose failure the machine may not live to report ---------------
+
+
+class _FailingAssertions:
+    """An ``AssertionRunner`` that refuses the first ``fail`` spawns, then works.
+
+    ``BlockingIOError`` is the failure an exhausted process table gives, which is the
+    realistic one: it is a property of ``fork`` rather than of ``caffeinate``, so it hits
+    this spawn exactly as it hits the compaction child's.
+    """
+
+    def __init__(self, fail: int = 10_000) -> None:
+        self.calls: list[tuple[str, ...]] = []
+        self._left = fail
+
+    def __call__(self, args) -> None:
+        self.calls.append(tuple(args))
+        if self._left > 0:
+            self._left -= 1
+            raise BlockingIOError(35, "Resource temporarily unavailable")
+
+
+def _assertion_run(rig, clock, *, ticks: int, runner, hooks=None) -> None:
+    daemon.run_loop_from_config(
+        config_path=str(rig.config),
+        tickers_path=str(rig.tickers),
+        token_path=str(rig.token),
+        clock=clock,
+        calendar=weekday_sessions(WEEK),
+        assertion_runner=runner,
+        transport=rig.transport,
+        pinger=rig.pinger,
+        compaction_runner=rig.compaction,
+        cycle_runner=_no_cycle,
+        hooks=hooks,
+        should_continue=_stop_after(ticks),
+    )
+
+
+def test_a_caffeinate_spawn_that_fails_does_not_stop_the_daemon(tmp_path):
+    """The crash this closes, and the one whose blast radius is the whole session.
+
+    The assertion is taken from the tick hook, which ``run_loop`` does not wrap, so a
+    spawn that will not start exited the process. ``_held`` was never assigned, so the
+    ``KeepAlive`` successor landed in the same window and spawned again. The weekday
+    window runs 08:25 to 18:45, which brackets the entire session, so this was a crash
+    loop across the trading day.
+    """
+    rig = _rig(tmp_path)
+    runner = _FailingAssertions()
+    seen: list[str] = []
+    hooks = daemon.DaemonHooks(on_tick=lambda slot: seen.append(slot.strftime("%H:%M")))
+    # Past the option close, so no cycle is owed and the assertion is what this drives.
+    _assertion_run(
+        rig, ManualClock(start=et(2026, 9, 2, 17, 0, 30)), ticks=3, runner=runner, hooks=hooks
+    )
+
+    assert seen == ["17:01", "17:02", "17:03"], "the daemon died on a failed spawn"
+
+
+def test_a_failed_spawn_is_retried_the_next_minute(tmp_path):
+    """The next minute is the retry, which is why the failure does not mark the window held.
+
+    This is the opposite choice from the once-a-day dispatched jobs, and deliberately so.
+    Those fail at a moment already past, so retrying cannot help. This one is owed every
+    minute the window is open, so a transient cause such as a full process table clears
+    on its own and the assertion is taken late rather than not at all.
+    """
+    rig = _rig(tmp_path)
+    runner = _FailingAssertions(fail=1)
+    # Two ticks exactly. Three would pass for a retry on either of the two minutes after
+    # the failure, and "eventually" is not the claim: the machine can sleep in one.
+    _assertion_run(rig, ManualClock(start=et(2026, 9, 2, 17, 0, 30)), ticks=2, runner=runner)
+
+    assert len(runner.calls) == 2, (
+        "the retry did not come on the very next minute, so the window went unasserted"
+    )
+
+
+def test_a_spawn_that_keeps_failing_pages_once_for_the_window(tmp_path):
+    """The page has to leave while the machine is still awake to send it.
+
+    AC idle sleep on the capture machine is one minute and the design rejected
+    ``pmset disablesleep``, so this assertion is the only thing keeping the machine up. A
+    minute later it can be asleep, and a sleeping machine sends nothing, the dead-man's
+    ping included. So the daemon says so itself, at the moment it still can.
+
+    Once, not once a minute: the holder retries every minute, and a page repeated for the
+    length of the window is one nobody reads.
+    """
+    rig = _rig(tmp_path)
+    runner = _FailingAssertions()
+    _assertion_run(rig, ManualClock(start=et(2026, 9, 2, 17, 0, 30)), ticks=4, runner=runner)
+
+    pages = [m for m in rig.transport.sent if m.event == "assertion_lost"]
+    assert len(runner.calls) == 4, "the retry stopped"
+    assert len(pages) == 1, f"one page per window, got {len(pages)}"
+
+    page = pages[0]
+    # The priority is what makes this a page rather than a notification. At anything
+    # below it the transport attaches no rotating-light tag and the push arrives silently,
+    # which for this message is the same as not sending it.
+    assert page.priority == PAGE_PRIORITY, "the page was demoted out of the page tier"
+    assert page.title == "Capture at risk: power assertion not held", page.title
+    assert "BlockingIOError" in page.body, page.body
+    assert "08:25" in page.body, "the page did not say which window was left unasserted"
+    assert "stop capturing" in page.body, "the page did not say what it costs"
+
+
+class _RefusingTransport:
+    """A ``Transport`` that counts attempts and refuses every one."""
+
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    def send(self, message: Message) -> None:
+        self.attempts += 1
+        raise OSError("ntfy unreachable")
+
+
+def test_the_page_leaves_in_the_minute_the_spawn_failed(tmp_path, capsys):
+    """One tick late is the whole margin, so the timing is the assertion.
+
+    AC idle sleep on the capture machine is one minute. A page that waits for the next
+    tick is scheduled to depart exactly when the machine may already be asleep, and a
+    sleeping machine sends nothing. The first draft did wait: the report ran from the
+    outermost tick wrapper and ``hold`` runs from the innermost, so it asked about a
+    minute the spawn had not been attempted in yet. One tick, zero pages.
+    """
+    rig = _rig(tmp_path)
+    _assertion_run(
+        rig, ManualClock(start=et(2026, 9, 2, 17, 0, 30)), ticks=1, runner=_FailingAssertions()
+    )
+
+    pages = [m for m in rig.transport.sent if m.event == "assertion_lost"]
+    assert len(pages) == 1, "the page waited for a minute the machine might sleep through"
+    assert "BlockingIOError" in capsys.readouterr().err, "nothing reached the daemon's own log"
+
+
+def test_a_page_the_transport_refuses_is_not_retried_every_minute(tmp_path, capsys):
+    """Told either way, because the alternative is a page a minute for the whole window.
+
+    The publisher refuses for a leaked secret, the daily cap, or a POST that will not go,
+    and it journals what it refused under ``reports/`` where the Now panel counts it. So
+    the window counts as told once the attempt is made, and the refusal goes to stderr
+    rather than turning one lost assertion into six hundred pages.
+    """
+    rig = _rig(tmp_path)
+    refusing = _RefusingTransport()
+    daemon.run_loop_from_config(
+        config_path=str(rig.config),
+        tickers_path=str(rig.tickers),
+        token_path=str(rig.token),
+        clock=ManualClock(start=et(2026, 9, 2, 17, 0, 30)),
+        calendar=weekday_sessions(WEEK),
+        assertion_runner=_FailingAssertions(),
+        transport=refusing,
+        pinger=rig.pinger,
+        compaction_runner=rig.compaction,
+        cycle_runner=_no_cycle,
+        should_continue=_stop_after(4),
+    )
+
+    assert refusing.attempts == 1, f"the page was retried every minute, {refusing.attempts} times"
+    assert "page not sent" in capsys.readouterr().err, "a refused page left no trace"
