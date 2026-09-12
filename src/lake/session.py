@@ -304,8 +304,11 @@ class SessionDispatch:
     def check(self, now: datetime) -> bool:
         """Run the job if its moment has passed today and it has not run yet.
 
-        Returns whether the job ran, so a caller can order two dispatches or report
-        what a startup pass did.
+        Returns whether the job was dispatched, so a caller can order two dispatches or
+        report what a startup pass did. Dispatched is not succeeded. The day is marked
+        served before the job is called, and the daemon wraps both of its jobs so a
+        failure is reported rather than raised, so a caller ordering on this boolean is
+        reading that the job had its turn and nothing more.
         """
         eastern = now.astimezone(MARKET_TZ)
         day = eastern.date()

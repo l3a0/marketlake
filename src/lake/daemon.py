@@ -92,7 +92,7 @@ import argparse
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -477,14 +477,52 @@ def _start_compaction(runner: CompactionRunner, args: Sequence[str]) -> None:
     after its backup, so a run that died sends nothing and healthchecks pages on the
     silence. Its own stderr lands in the launchd log beside the daemon's.
 
-    What is caught is a spawn that never started, which is the one failure this call can
-    still see. A raise here would exit the process, because no hook is wrapped in a try,
-    and under ``KeepAlive`` the successor would reach the same minute and raise again.
+    A spawn that never started is the one failure this call can still see, and it is
+    caught by ``_dispatched`` rather than here. The two spellings named the same event,
+    because this call does nothing but spawn, and one place deciding what a dispatched
+    job's failure costs is worth more than the word "spawn" in the message.
     """
-    try:
-        runner(args)
-    except Exception as exc:  # noqa: BLE001 - a raise here would crash-loop the daemon
-        print(f"compaction: spawn failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+    runner(args)
+
+
+def _dispatched(name: str, job: Callable[[date], None]) -> Callable[[date], None]:
+    """Wrap a session-relative job so its failure costs the job and never the daemon.
+
+    Everything session-relative is dispatched from the tick hook, and ``run_loop`` wraps
+    no hook in a try. So a job that raises exits the process, and under ``KeepAlive`` the
+    successor reaches the same minute, runs the same job against the same lake, and raises
+    again. A deterministic failure at a fixed moment therefore becomes a crash loop with
+    capture dead inside it, which inverts the design's order of precedence: capture is the
+    un-buy-backable thing, and every other job is arranged not to block it.
+
+    The trade is only right for a job whose own failure is cheap. Both jobs here qualify.
+    A close+5 run that could not finish costs markers, and a marker stands for a minute
+    already gone. A compaction that never started costs a seal, and the ``compaction``
+    check pages on the silence while the next run sweeps the day it missed. The loop's
+    other hooks are deliberately left bare for the opposite reason: the watchdog and the
+    dead-man ride them, so swallowing a failure there would silence the very thing that
+    reports trouble, while a crash loop is at least loud through the missed dead-man ping.
+
+    Reporting is one line on stderr, which launchd captures beside the daemon's own log.
+    The close+5 guard's findings already go there through ``_report_guard``, so a run that
+    failed outright lands beside the runs that merely had something to say.
+
+    One thing is given up by catching here, and it is worth naming rather than leaving for
+    a reader to find. The crash was itself a retry: each ``KeepAlive`` successor built a
+    fresh ``SessionDispatch`` whose served day was unset, so ``on_start`` re-ran the job.
+    A transient failure therefore got another attempt, at the price of every capture
+    minute in between. Now the day is served once, because ``SessionDispatch.check`` marks
+    it before calling in. That is the right trade for a deterministic failure, which would
+    only fail again, and it does spend a transient failure's one chance.
+    """
+
+    def run(day: date) -> None:
+        try:
+            job(day)
+        except Exception as exc:  # noqa: BLE001 - a raise here would crash-loop the daemon
+            print(f"{name}: {day.isoformat()}: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+    return run
 
 
 def _idle_stamp(
@@ -668,9 +706,13 @@ def run_loop_from_config(
     cannot report its own death.
 
     The close+15 compaction is dispatched from the tick hook as well, one tick past its
-    moment, so the day seals after every writer that can still add a row to it. A run
-    that raises is reported and swallowed rather than allowed to exit the process, since
-    the missed ``compaction`` ping already pages and a crash loop would cost capture.
+    moment, so the day seals after every writer that can still add a row to it.
+
+    Both session-relative jobs are dispatched through ``_dispatched``, so a job that
+    raises is reported and the loop keeps ticking. Capture outranks both of them. A
+    close+5 run that failed costs markers for minutes already gone, and a compaction that
+    never started is paged for by the ``compaction`` check's own silence, while a crash
+    loop costs every minute the daemon is down.
     """
     clock = clock if clock is not None else SystemClock()
     calendar = calendar if calendar is not None else ExchangeCalendar()
@@ -728,7 +770,7 @@ def run_loop_from_config(
         dispatch = SessionDispatch(
             session_clock=session_clock,
             moment=lambda bounds: bounds.option_close_deadline,
-            job=lambda day: _report_guard(guard.run(day)),
+            job=_dispatched("close+5", lambda day: _report_guard(guard.run(day))),
         )
         guard_on_start = hooks.on_start
         guard_on_tick = hooks.on_tick
@@ -777,7 +819,9 @@ def run_loop_from_config(
         # The day is the dispatcher's, not the job's. ``compact`` sweeps every date under
         # ``journal/`` whose close+5 has passed, so a day left unsealed by an earlier
         # death is recovered by the next run rather than needing a dispatch of its own.
-        job=lambda day: _start_compaction(compaction_runner, compaction_args),
+        job=_dispatched(
+            "compaction", lambda day: _start_compaction(compaction_runner, compaction_args)
+        ),
     )
     compaction_on_tick = hooks.on_tick
     # The previous tick's slot, and the only state this holds across ticks. It is ``None``
