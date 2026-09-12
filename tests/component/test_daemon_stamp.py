@@ -7,9 +7,9 @@ them there. A capture cycle stamps the mint off the vendor it fetched with, whic
 the capture window, where no cycle runs and no client exists.
 
 These drive ``run_loop_from_config`` over a real lake, a real token file, and a real
-config, with the clock, the calendar, the cycle, the pinger, and the transport all
-faked. So the tier is component. Deleting either binding in the daemon must not leave
-the suite green, which is what each test is written to catch.
+config, with the clock, the calendar, the cycle, the pinger, the transport, and the
+compaction spawn all faked. So the tier is component. Deleting either binding in the
+daemon must not leave the suite green, which is what each test is written to catch.
 """
 
 from __future__ import annotations
@@ -91,6 +91,7 @@ def _run(
         assertion_runner=lambda args: None,
         transport=Broken(),
         pinger=pinger if pinger is not None else FakePinger(),
+        compaction_runner=lambda args: None,
         cycle_runner=_no_cycle,
         should_continue=more,
     )
@@ -176,6 +177,7 @@ def test_a_capture_minute_is_left_to_the_cycle_s_own_stamp(tmp_path):
         assertion_runner=lambda args: None,
         transport=Broken(),
         pinger=FakePinger(),
+        compaction_runner=lambda args: None,
         cycle_runner=record_cycle,
         should_continue=once,
     )

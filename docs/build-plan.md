@@ -68,9 +68,70 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   3. `SessionClock.phase_at`, the phase of any slot rather than the current one, so a marker for a post-equity-close minute carries the phase a captured row would have.
   4. `session.missed_slots`, D9's own day-by-day walk moved beside `skipped_slots` so both hooks share one enumerator and `lake.gap` needs no import of `lake.daemon`.
 - **Unowned.** The backup-copy scrub, and the `--checksum` drop that waits on it. `manifest.scrub` reads under `lake_root` only, so nothing verifies the backup target today. `control_plane`'s Sunday gap list already names it as gap 3 of 5. The two land together or in that order, because until the scrub exists `--checksum` in `RsyncBackup.sync` is the only thing that would notice the backup rotting. Dropping it first trades a deadline that fails in a few years for a verification hole that starts now. **Both stay in slice 2.** The scrub is a Sunday-job activity, the Sunday job is D14's, and `manifest.scrub` already exists and already runs there over `lake_root`. Reaching the backup target is a target and a parameter rather than new machinery, so slice 5's validation battery is the wrong home for it. The pairing is a sequencing rule inside slice 2, not a reason to defer either half out of it.
-- **Unowned.** The daemon's in-loop close+15 compaction dispatch. `compact.compact` is reachable only from `python -m lake.compact`, and no job renders it. The design's rule that a catch-up compaction of an unsealed day is ordered after startup gap-marking is satisfied in-process today, because `run_loop` calls `on_start` before its first tick. Whoever builds the dispatch owns keeping it so. D11 built the seam it binds to, `session.SessionDispatch`, so what remains is the compaction job itself. **It stays in slice 2.** Every part it needs is already here: the dispatcher from D11, `compact.compact` from D12, and the loop from D9. It fetches nothing, so slice 3 would not help it, and it blocks the `compaction` check, which cannot be created before a producer exists.
+- **The close+15 compaction dispatch.** Built. The daemon dispatches the close+15 job
+  through D11's `session.SessionDispatch`, on the same tick hook the close+5 guard rides,
+  so the machine seals and backs up its own day instead of waiting for a hand-run
+  `python -m lake.compact`. That entry stays for the catch-up and the run under an
+  operator's eye, and the lake-root lock is what keeps the two from racing.
+
+  **The job runs in its own process, not on the loop thread.** The design gives compaction
+  and its backup roughly 25 minutes, and it gives the dead-man a 5-minute grace on an idle
+  heartbeat that rides this same per-minute hook. Those two cannot both hold on one thread.
+  A compaction outrunning the grace would page "capture down" about a healthy daemon, which
+  is the one page reserved for a daemon that is actually gone. A child process keeps the
+  loop ticking through it, keeps an `rsync` and a ticker-day of Parquet out of the resident
+  daemon's heap, and cannot take capture down by failing. Serialisation is already the
+  lake-root lock's job, and the manifest protocol wrote that lock for exactly this shape:
+  the scheduled run, a sleep-missed catch-up and a hand-invoked one contending for one
+  lake. This adds a fourth caller rather than a new mechanism. `CompactionRunner` is the
+  seam, mirroring the `AssertionRunner` the loop already spawns `caffeinate` through, and
+  it is required rather than defaulted, because a caller who forgot it would run a real
+  compaction against whatever config the daemon was handed.
+
+  **A thread was considered and rejected.** It would keep the loop ticking too, and it is
+  the smaller diff. It shares the daemon's heap, so an allocation failure or a native fault
+  inside compaction reaches capture, and the memory a ticker-day's merge takes stays in a
+  resident process rather than returning to the OS. It would also be a genuinely new
+  sharing model in a daemon the design describes as one loop, where a child process is the
+  model the lock already assumes.
+
+  Two rules bound when the dispatch may fire.
+
+  1. **One tick past its moment.** Sealing is the one act here that cannot be taken back,
+     so it follows every writer that can still add a row to the day. Startup marking runs
+     from `on_start`, before the first tick. The close+5 guard runs from the tick hook,
+     already wrapped inside this one. The third decides it: `run_loop` calls `on_skipped`
+     *after* `on_tick`, so a compaction dispatched from the tick the daemon woke on would
+     seal the day a minute before the loop wrote the markers it owed for it, and the next
+     run would delete them as debris. A lid closed at 16:10 and opened at 17:00 is that
+     case, and it is an ordinary laptop day. The price is one minute against a job the
+     design schedules fifteen minutes past the close.
+  2. **Never inside a capture window.** A stall that begins just past one day's close+15
+     and ends inside the next session leaves the dispatch owed on a minute the loop is
+     capturing, and starting it there would put a seal and a full-lake `rsync` in front of
+     a live fetch. The day it skips is swept by the next run outside the window, because
+     the job already walks every date under `journal/`.
+
+  **A day with no session still owes the job.** `SessionDispatch` refuses a non-session day,
+  because close+15 does not exist without a close, and the design has compaction run at its
+  regular wall-clock time on a non-session weekday instead. A job that correctly no-ops
+  still pings, and silence always means broken rather than idle, so skipping holidays would
+  take the `compaction` check down nine or ten times a year on a daemon doing exactly the
+  right thing. The dispatcher takes an opt-in `fallback` for it, default off, so the close+5
+  guard's holiday refusal is unchanged. `control_plane.COMPACTION_RUN` is the 16:30 constant,
+  beside `VENDOR_SWEEP`'s 18:30, and a weekend owes nothing because the check expects a ping
+  on weekdays only.
+
+  One thing this change had to fix beside itself. The close+5 guard read a ticker-day's
+  close tags from the segment directory alone, and compaction unlinks that directory once
+  the partition is manifested. Before the daemon sealed its own day the two never
+  overlapped. Now a restart after the evening's seal made the guard read an empty directory,
+  call a captured close unobserved, and write a false marker that the next run deleted as
+  debris. Gap-marking already skipped a sealed date for this exact reason. The guard now
+  does too.
+
 - **Unowned.** Seven residual gaps in the daemon's production wiring. `test_daemon_wiring.py`
-  now covers the seven hook bindings `run_loop_from_config` builds, and deleting any one of
+  now covers the ten hook bindings `run_loop_from_config` builds, and deleting any one of
   them fails a test. What no test covers is narrower than a binding, and two of the seven
   reach production behaviour rather than test strength. Each was confirmed by mutating
   `src/lake/daemon.py` and running the whole suite, which stays green:
@@ -88,7 +149,7 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
      the cycle observer feeds,
   7. the security master the wiring loads for the gap marker, whose absence loses a freshly
      onboarded ticker's marked minutes.
-- **D11** close tags and the close+5 guard. Close+5 is the five-minute window after the option close, the last moment an option-close fetch may land. It plugs into D9's close-tag hook, and it builds the session-relative dispatcher the design calls for. Everything session-relative runs from inside the daemon, because launchd's calendar intervals are fixed wall-clock and cannot express a close-relative time. `SessionDispatch` fires one job once per session day at a moment the calendar decides, including on a daemon that starts after that moment has passed. The close+15 compaction dispatch binds to the same seam when someone builds it. Two rules are worth stating where both writers can see them:
+- **D11** close tags and the close+5 guard. Close+5 is the five-minute window after the option close, the last moment an option-close fetch may land. It plugs into D9's close-tag hook, and it builds the session-relative dispatcher the design calls for. Everything session-relative runs from inside the daemon, because launchd's calendar intervals are fixed wall-clock and cannot express a close-relative time. `SessionDispatch` fires one job once per session day at a moment the calendar decides, including on a daemon that starts after that moment has passed. The close+15 compaction dispatch binds to the same seam, one tick later than its own moment, for the reason the entry above gives. Two rules are worth stating where both writers can see them:
   1. The guard's fill triggers on missing marks, not a missing cycle. A chain that failed at the option close leaves a tagged gap row holding nothing a reader can price against, and a close+5 refetch is exactly what rescues it.
   2. On a post-close restart the guard runs before startup gap-marking, so the two close minutes it owns are already recorded when D10's marker walks the day.
 - **Unowned.** The close+5 fill's producer. `CloseGuard` takes an injected `fill` and
@@ -326,7 +387,7 @@ Now panel's fields nor a scrub that already runs in the Sunday job. Two items in
 integration roster below are the only slice-2-era work that genuinely waits on slice 3, and
 they are tests rather than deliverables.
 
-Slice 2 builds in two waves. D9 comes first and defines the hooks. D12, D14, and D15 do not touch the loop, so they build in parallel with D9. D10, D11, and D13 plug into D9's hooks, so they follow it, in parallel with each other.
+Slice 2 builds in two waves. D9 comes first and defines the hooks. D14 and D15 do not touch the loop, so they build in parallel with D9. D12 built in parallel too, and its job later came back to the loop: the close+15 dispatch above is what wires it there. D10, D11, and D13 plug into D9's hooks, so they follow it, in parallel with each other.
 
 ### Slice 3, vendor fetch
 
@@ -425,6 +486,13 @@ Each healthchecks.io check is created by hand, in the session that first makes i
 
 1. **D8**, `slice1-capture`, and the channel. Subscribe the phone to the topic from the clipboard, never from a printed string. Create the healthchecks.io project, its ntfy integration and its email integration with the design's settings, and the `slice1-capture` check named `Slice-1 capture`. Confirm ntfy and email both read on for it. Prove the chain before the first unattended run. Give the check a 2-minute period and a 1-minute grace, ping once, wait for `Slice-1 capture is DOWN` on the phone, ping again for `is UP`, then set the real envelope. A new check sends no up push on its first ping, so down is the first thing the phone can show. The phone is an iPhone, and ntfy documents priority behavior for Android only. So the same session confirms that the priority-5 push interrupts the locked screen. It also sets the ntfy app's pass through Focus, the iPhone's do-not-disturb modes, by hand in each Focus, and confirms it with the same push. Slice 1 shipped before this step was written, so any part of it still owed runs before D13.
 2. **D12**, `compaction`. Create the check and confirm ntfy and email both read on for it.
+   The producer exists now: the daemon dispatches the job at close+15 and the job pings
+   after its backup, so this row is owed on the next weekday the daemon runs through one.
+   Weekday, not session: the dispatch falls back to the regular wall-clock time on a
+   holiday, so the check expects a ping every weekday and a holiday is not an exception to
+   it. Until the row is created the ping goes to a slug healthchecks does not know, which
+   is the mistyped-slug silence the design names, with the difference that here the job is
+   working and only the report is missing.
 3. **D13**, `capture`, and the daemon's own pages. The per-cycle dead-man. Delete the `slice1-capture` row in the same session, because `capture` supersedes it. Ship every daemon page path through one publisher: auth death, sustained 429s, the watchdog, and the sampler collapse. The auth-gap reminder, the parser's schema-drift page, and a `--test-push` on the onboarding command are not built yet and are pinned as unowned above. Rehearse the topic rotation once, end to end. The 09:35 calendar probe ships here too, with its page and its `calendar-probe` check.
 4. **D14**, `pre-open` and `sunday`, and the Sunday reminder. D14 renders the launchd jobs and the wake schedules those two checks watch. The Sunday job sends the re-auth reminder on its 20:00, 21:00, and 22:00 canary runs only, while the throwaway call or the coverage assertion still fails, reading the token's mint time from `token.json` itself.
 5. **D16**, `eod-sweep`, and the nightly summary. The vendor sweep writes the dated report file under `reports/` and sends its one-screen digest at priority 2 after its own ping lands, holiday no-ops included. Until D20 the quarantine count is zero and the History panel that renders the file does not exist yet, so the file is read by hand.

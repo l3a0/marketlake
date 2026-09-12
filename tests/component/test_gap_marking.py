@@ -732,6 +732,7 @@ def test_the_daemon_wires_gap_marking_into_the_startup_hook(tmp_path, monkeypatc
         assertion_runner=lambda args: None,
         transport=FakeTransport(),
         pinger=FakePinger(),
+        compaction_runner=lambda args: None,
         should_continue=once,
     )
     marked = sorted(_gap_snaps(lake_root, "quotes", "XYZ", date(2026, 9, 1)))
@@ -916,6 +917,7 @@ def _overrun_after_a_roster_change(
         assertion_runner=lambda args: None,
         transport=alerts,
         pinger=FakePinger(),
+        compaction_runner=lambda args: None,
         cycle_runner=cycle,
         should_continue=twice,
     )

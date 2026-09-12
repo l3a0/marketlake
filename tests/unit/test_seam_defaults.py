@@ -19,12 +19,15 @@ that looked sanctioned. So a ``main`` must accept none of its leaky seams. The F
 table asserts each named seam is absent from the signature, which is stricter than a
 no-default check. A re-added seam fails it in any form, required or defaulted.
 
-``probe_calendar.main`` already took none. ``compact.main`` and ``control_plane.main`` now
-build ``rsync``, the ntfy POST, the healthchecks GET, the vendor canary, and the
-``launchctl``, ``pmset`` and ``tmutil`` reads internally. ``clock`` and ``calendar`` stay
-injectable on both. A system clock and an exchange calendar never reach past this process,
-so neither is a seam. A test drives a seam-requiring helper directly, or, to exercise a
-``main``, monkeypatches the producer the ``main`` builds and checks the objects it built.
+``probe_calendar.main`` already took none. ``compact.main``, ``control_plane.main`` and
+``daemon.main`` now build ``rsync``, the ntfy POST, the healthchecks GET, the vendor
+canary, and the ``launchctl``, ``pmset`` and ``tmutil`` reads internally. ``daemon.main``
+joined them with the close+15 compaction: it spawns that job as its own process, so the
+seam is the spawn rather than the ``rsync`` the child goes on to run. ``clock`` and
+``calendar`` stay injectable on both. A system clock and an exchange calendar never
+reach past this process, so neither is a seam. A test drives a seam-requiring helper
+directly, or, to exercise a ``main``, monkeypatches the producer the ``main`` builds and
+checks the objects it built.
 """
 
 from __future__ import annotations
@@ -42,6 +45,7 @@ from lake import compact, control_plane, daemon, runner
 REQUIRED = [
     (daemon.run_loop_from_config, "transport"),
     (daemon.run_loop_from_config, "pinger"),
+    (daemon.run_loop_from_config, "compaction_runner"),
     (daemon._alarm, "transport"),
     (daemon._alarm, "pinger"),
     (runner.run_once_from_config, "pinger"),
@@ -62,6 +66,7 @@ REQUIRED = [
 FORBIDDEN = [
     (compact.main, "backup"),
     (compact.main, "pinger"),
+    (daemon.main, "compaction_runner"),
     (control_plane.main, "probe"),
     (control_plane.main, "pinger"),
     (control_plane.main, "schedule_reader"),

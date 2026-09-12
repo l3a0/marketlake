@@ -204,6 +204,7 @@ def test_the_daemon_pages_through_the_publisher_when_a_surface_goes_quiet(tmp_pa
         assertion_runner=lambda args: None,
         transport=Broken(),
         pinger=FakePinger(),
+        compaction_runner=lambda args: None,
         cycle_runner=failing_cycle,
         should_continue=four,
     )

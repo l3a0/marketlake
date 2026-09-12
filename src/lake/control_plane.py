@@ -140,6 +140,7 @@ WEEKDAY_WAKE = WallClockTime(8, 25)  # pmset repeat wakeorpoweron MTWRF
 PRE_OPEN_SELF_CHECK = WallClockTime(8, 30)  # the self-check launchd job, Mon-Fri
 CALENDAR_PROBE = WallClockTime(9, 35)  # the says-closed-but-open probe, Mon-Fri
 VENDOR_SWEEP = WallClockTime(18, 30)  # the sweep job, which sets the Sunday one-shot
+COMPACTION_RUN = WallClockTime(16, 30)  # the close+15 job's regular time, for a day with no close
 WEEKDAY_ASSERTION_END = WallClockTime(18, 45)  # when the vendor sweep's ping lands
 SUNDAY_WAKE = WallClockTime(19, 55)  # the Friday-set one-shot wake
 SUNDAY_MAINTENANCE = WallClockTime(20, 0)  # the canary + scrub launchd job
@@ -836,6 +837,22 @@ def assertion_window(day: date) -> AssertionWindow | None:
     if weekday == _PY_SUNDAY:
         return AssertionWindow(SUNDAY_WAKE.on(day), SUNDAY_ASSERTION_END.on(day))
     return None
+
+
+def holiday_compaction_moment(day: date) -> datetime | None:
+    """When the close+15 job is owed on a day with no session, or ``None`` if it is not.
+
+    Close+15 does not exist without a session, and the design still wants the job to run.
+    A job that runs and correctly no-ops, such as on a holiday with nothing to do, still
+    pings, because silence always means broken and never idle. So a non-session weekday
+    falls back to the regular wall-clock time the job would have had, 16:30, and the
+    ``compaction`` check sees its ping like any other weekday.
+
+    A weekend owes nothing. The check expects a ping on weekdays only, and Saturday and
+    Sunday sit outside that expectation the same way they sit outside the assertion
+    window above. Sunday's own maintenance job is a different job with a different check.
+    """
+    return COMPACTION_RUN.on(day) if day.weekday() in _PY_WEEKDAYS else None
 
 
 def caffeinate_args(window: AssertionWindow, now: datetime) -> tuple[str, ...] | None:

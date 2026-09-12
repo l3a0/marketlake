@@ -293,10 +293,12 @@ class SessionDispatch:
         session_clock: SessionClock,
         moment: Callable[[SessionBounds], datetime],
         job: Callable[[date], None],
+        fallback: Callable[[date], datetime | None] | None = None,
     ) -> None:
         self._session_clock = session_clock
         self._moment = moment
         self._job = job
+        self._fallback = fallback
         self._served: date | None = None
 
     def check(self, now: datetime) -> bool:
@@ -309,12 +311,27 @@ class SessionDispatch:
         day = eastern.date()
         if day == self._served:
             return False
-        try:
-            bounds = self._session_clock.bounds(day)
-        except NotASession:
-            return False
-        if eastern < self._moment(bounds):
+        due = self._due(day)
+        if due is None or eastern < due:
             return False
         self._served = day
         self._job(day)
         return True
+
+    def _due(self, day: date) -> datetime | None:
+        """When the job is owed on ``day``, or ``None`` when the day owes it nothing.
+
+        A session day answers from its own bounds, which is the whole point: an early
+        close moves every moment derived from it, and a fixed wall-clock job could not
+        follow. A day with no session has no bounds to derive from, so it falls to the
+        caller's ``fallback``.
+
+        Without a fallback a non-session day owes nothing, which is right for a job whose
+        subject is the session itself. The close+5 guard has no close to check on a
+        holiday. A job that must report even on an empty day supplies one, because a
+        check that expects a ping cannot tell a holiday from a broken daemon.
+        """
+        try:
+            return self._moment(self._session_clock.bounds(day))
+        except NotASession:
+            return None if self._fallback is None else self._fallback(day)

@@ -947,8 +947,12 @@ def main(
     so ``main`` builds them and a test drives the ``compact`` helper directly instead.
 
     ``clock`` and ``calendar`` stay injectable. A system clock and an exchange calendar
-    never reach past this process, so a test injects them with no live effect. The daemon's
-    internal close+15 dispatch of this job is a later wiring. This entry runs it standalone.
+    never reach past this process, so a test injects them with no live effect.
+
+    The daemon dispatches this job itself at close+15, so the scheduled run comes from
+    in there rather than from here. This entry stays for the hand run: a catch-up after
+    a machine was off for a day, or a run under the operator's eye. Both reach the same
+    ``compact`` below, and its lake-root lock is what keeps the two from racing.
     """
     args = build_parser().parse_args(argv)
     with input_errors_exit("compact"):
