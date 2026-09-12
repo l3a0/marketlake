@@ -329,9 +329,15 @@ def test_a_partial_snapshot_reports_the_class_of_the_window_it_lost(lake_root):
         fetch_end_ts=FILL_MINUTE,
         slot=CLOSE,
         pid=7,
-        absent_markers=[journal.AbsentMarker(NEAR[0], NEAR[1], "http_429", NEAR_EXP)],
+        absent_markers=[
+            journal.AbsentMarker(NEAR[0], NEAR[1], "http_429", NEAR_EXP),
+            journal.AbsentMarker(TAIL[0], TAIL[1], "http_401", TAIL_EXP),
+        ],
     )
 
+    # The first, not the last. The classes are deliberately different, because the reason
+    # for "first" is that a rate-limit, auth death, and a transient fault must stay apart,
+    # and two markers of one class could not tell which end was reported.
     assert outcome.error_class == "http_429"
     assert outcome.row_kind == journal.ROW_KIND_DATA
 
@@ -737,3 +743,157 @@ def test_a_dark_session_is_baseline_less_rather_than_a_phantom_shortfall(lake_ro
     assert outcome.baseline_less == ("SPY",)
     # 2026-09-01 expired yesterday. It cannot be missing from today's close.
     assert outcome.shortfalls == ()
+
+
+# -- what the mutation lens found: guarantees the suite stated and did not hold ---------
+
+
+def test_the_returned_set_is_what_landed_rather_than_what_the_body_claimed(lake_root):
+    """The read-back is the point, and counting off the body would pass without it.
+
+    The returned set is compared against ``journal.latest_expirations``, which reads the
+    ``expiration_date`` column of a durable batch. So this side has to be built from that
+    same column. A series whose contract carries no ``expirationDate`` lands with a null
+    there, so the body's expiration map names it and the landed column does not. Counting
+    map keys would report a series the fill cannot actually price, and the guard's
+    shortfall comparison would go quiet on exactly the case it exists to find.
+    """
+    nameless = _contract(NEAR_EXP, "CALL", bid=1.0)
+    del nameless["expirationDate"]
+    body = _chain_body([])
+    body["callExpDateMap"] = {f"{NEAR_EXP}:7": {"650.0": [nameless]}}
+    vendor = _WindowVendor(
+        windows={NEAR: VendorResponse(status=200, body=body), TAIL: _chain([TAIL_EXP])}
+    )
+
+    captured = _fill(lake_root, vendor)
+
+    # The body named two series. Only one of them landed with an expiration a reader can
+    # resolve, and that is the one the fill reports.
+    assert captured == [TAIL_EXP]
+    landed = {r["expiration_date"] for r in _rows(lake_root)}
+    assert None in landed, "the nameless contract did not land, so the case is not exercised"
+
+
+def test_the_fill_honours_a_recalibrated_guard_constant(tmp_path, monkeypatch):
+    """A machine that tuned the split-depth bound must get a tuned close+5 fill.
+
+    The bound decides how many midpoint splits a too-big window is worth before the range
+    is given up, and it is tuned for the biggest chains, which are the ones a close+5
+    rescue is for. Falling back to the built-in default here would leave the fill splitting
+    on a machine whose config says not to.
+    """
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root, guards={"chain_chunk_max_split_depth": 0})
+    vendor = _WindowVendor(windows={NEAR: TOO_BIG, TAIL: _chain([TAIL_EXP])})
+
+    class _Stub:
+        @staticmethod
+        def from_token(token_path, *, api_key, app_secret):
+            return vendor
+
+    monkeypatch.setattr(capture, "SchwabVendor", _Stub)
+    monkeypatch.setattr(capture, "load_chain_plan", lambda: TWO_WINDOWS)
+
+    capture.fill_option_close_from_config(
+        "SPY",
+        slot=CLOSE,
+        clock=ManualClock(start=FILL_MINUTE),
+        config_path=str(config),
+        token_path=str(tmp_path / "token.json"),
+        pid=7,
+    )
+
+    # Depth 0 gives the near window up where it stands. The built-in default of 4 would
+    # halve it and ask for ranges this vendor has never heard of.
+    assert vendor.calls == [("SPY", *NEAR), ("SPY", *TAIL)]
+
+
+def test_the_fill_builds_its_vendor_from_the_token_and_config_it_was_given(tmp_path, monkeypatch):
+    """``--token`` is a real operator flag, and the fill has to honour it like the cycle.
+
+    The daemon takes a token path and threads it down. A fill that fell back to the
+    standard location would read a different token than the cycle running beside it, and
+    blank credentials would fail every fill at the one moment the window is open.
+    """
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
+    token = tmp_path / "elsewhere" / "token.json"
+    seen: list[tuple] = []
+
+    class _Stub:
+        @staticmethod
+        def from_token(token_path, *, api_key, app_secret):
+            seen.append((str(token_path), api_key, app_secret))
+            return _both_windows()
+
+    monkeypatch.setattr(capture, "SchwabVendor", _Stub)
+    monkeypatch.setattr(capture, "load_chain_plan", lambda: TWO_WINDOWS)
+
+    capture.fill_option_close_from_config(
+        "SPY",
+        slot=CLOSE,
+        clock=ManualClock(start=FILL_MINUTE),
+        config_path=str(config),
+        token_path=str(token),
+        pid=7,
+    )
+
+    assert seen == [(str(token), "api-key", "app-secret")]
+
+
+def test_the_daemon_threads_its_token_path_down_to_the_fill(tmp_path, monkeypatch):
+    """The same flag, through the daemon's own wiring rather than the capture entry."""
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
+    token = tmp_path / "elsewhere" / "token.json"
+    seen: list[str] = []
+
+    class _Stub:
+        @staticmethod
+        def from_token(token_path, *, api_key, app_secret):
+            seen.append(str(token_path))
+            return _both_windows()
+
+    monkeypatch.setattr(capture, "SchwabVendor", _Stub)
+    monkeypatch.setattr(capture, "load_chain_plan", lambda: TWO_WINDOWS)
+    clock = ManualClock(start=FILL_MINUTE)
+
+    fill = daemon._close_fill(
+        str(config),
+        str(token),
+        SessionClock(clock=clock, calendar=weekday_sessions(WEEK)),
+        clock,
+    )
+    fill("SPY", CLOSE)
+
+    assert seen == [str(token)]
+
+
+def test_two_fills_of_one_close_slot_land_as_separate_segments(lake_root):
+    """The writer-session stamp comes from the fetch instant, never the slot.
+
+    ``journal_snapshot`` promises that a re-run stamps a different ``start_ts`` so the
+    ``O_CREAT | O_EXCL`` create never collides. Stamping from the close slot instead would
+    give two fills of one close the same segment path, and the second would raise rather
+    than land. The guard reaches here when the first fill's segment will not read, which
+    it deliberately treats as a reason to fill anyway.
+    """
+    for minute in (FILL_MINUTE, FILL_MINUTE + timedelta(minutes=1)):
+        capture.fill_option_close(
+            ManualClock(start=minute),
+            _both_windows(),
+            "SPY",
+            slot=CLOSE,
+            lake_root=lake_root,
+            guards=GuardConstants(),
+            plan=TWO_WINDOWS,
+            pid=7,
+        )
+
+    segments = sorted(LakePaths(lake_root).segment_dir(CHAINS, "SPY", DAY).glob("*.arrows"))
+    assert len(segments) == 2, "two fills of one close collided on a single segment name"
+    assert {r["snap_ts"][:16] for r in _rows(lake_root)} == {"2026-09-02T16:15"}

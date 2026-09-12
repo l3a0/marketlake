@@ -519,6 +519,51 @@ def test_whole_chain_gap_carries_the_first_failed_windows_class(lake_root):
     ]
 
 
+def test_the_representative_class_is_the_first_failed_window_and_not_the_last(lake_root):
+    """Two windows fail differently, so "first" is distinguishable from "last".
+
+    The case above returns 401 from both windows, so it cannot tell one end from the
+    other and the guarantee its name states goes unheld. The reason the first is
+    representative is that auth death, a rate-limit, and a transient fault must stay
+    apart in the failure model. With the near window unauthorized and the tail throttled,
+    reporting the last would read as a rate-limit on a chain that is really locked out.
+    """
+    plan = ChainPlan(((0, 10), (11, None)))
+    vendor = _WindowVendor(
+        windows={
+            (_d(0), _d(10)): VendorResponse(status=401, body={"error": "unauthorized"}),
+            (_d(11), None): VendorResponse(status=429, body={"error": "slow down"}),
+        },
+    )
+    result = _run(vendor, lake_root, plan)
+
+    outcome = result.segment(CHAINS, "SPY")
+    assert outcome.row_kind == journal.ROW_KIND_GAP
+    assert outcome.error_class == "http_401"
+
+
+def test_a_partial_snapshots_segment_flag_is_the_first_failed_window_too(lake_root):
+    """The same rule on the path where some windows did land.
+
+    A partial snapshot journals as a data segment, and its segment flag carries the
+    representative class the same way a whole-chain gap does. Two failed windows with
+    different classes are what make the end being reported observable.
+    """
+    plan = ChainPlan(((0, 4), (5, 10), (11, None)))
+    vendor = _WindowVendor(
+        windows={
+            (_d(0), _d(4)): VendorResponse(status=401, body={"error": "unauthorized"}),
+            (_d(5), _d(10)): VendorResponse(status=429, body={"error": "slow down"}),
+            (_d(11), None): _chain_response(["2026-09-18"]),
+        },
+    )
+    result = _run(vendor, lake_root, plan)
+
+    outcome = result.segment(CHAINS, "SPY")
+    assert outcome.row_kind == journal.ROW_KIND_DATA
+    assert outcome.error_class == "http_401"
+
+
 # -- 6. absence markers name expirations off the journal, never live state ---------------
 
 
