@@ -249,6 +249,22 @@ def missed_slots(
     return skipped
 
 
+def session_slots(bounds: SessionBounds) -> list[datetime]:
+    """Every capture slot of a session: the open through the option close, one a minute.
+
+    A regular 09:30 to 16:15 day yields exactly 406 slots, both ends inclusive, and an
+    early close 226, with no literal here. This is the full set of minutes a session
+    owed. The dashboard's completeness strip and gap marking's hole-aware walk both derive
+    from it, each applying its own per-ticker scope clamp on top.
+    """
+    slots: list[datetime] = []
+    slot = bounds.open
+    while slot <= bounds.option_close:
+        slots.append(slot)
+        slot += TICK
+    return slots
+
+
 # -- session-relative dispatch ---------------------------------------------------
 
 

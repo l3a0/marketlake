@@ -360,10 +360,12 @@ def spans_of_ticker(
 ) -> tuple[CaptureSpan, ...] | None:
     """The ticker's capture spans as of ``on``, or ``None`` when scope cannot be read.
 
-    ``None`` means no spans file, no master, an unresolvable ticker, or a refusal. Every
-    caller treats that as no clamp, which only ever widens what gets marked or checked.
-    This never raises, for the same reason ``capture_start_in_market_time`` does not: the
-    daemon runs it from unguarded hooks under ``KeepAlive``.
+    ``None`` means no spans file, no master, an unresolvable ticker, or a refusal. The
+    startup walk that reads this treats ``None`` as out of scope and marks nothing, so a
+    restart whose scope cannot be read defers to the next readable one rather than
+    inventing a full session of gaps. This never raises, for the same reason
+    ``capture_start_in_market_time`` does not: the daemon runs it from unguarded hooks
+    under ``KeepAlive``.
     """
     if spans is None or master is None:
         return None

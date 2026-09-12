@@ -112,7 +112,7 @@ from lake.security_master import (
     SecurityMasterError,
     master_path,
 )
-from lake.session import SessionBounds, SessionClock, SessionPhase
+from lake.session import SessionClock, SessionPhase, session_slots
 
 log = logging.getLogger(__name__)
 
@@ -873,23 +873,6 @@ def _minutes(span: timedelta) -> float:
     being clamped to zero.
     """
     return round(span.total_seconds() / 60, 1)
-
-
-def session_slots(bounds: SessionBounds) -> list[datetime]:
-    """Every capture slot of a session: the open through the option close, one a minute.
-
-    This is the strip's denominator, derived from the calendar's bounds for the day. A
-    regular 09:30 to 16:15 day yields exactly 406 slots, both ends inclusive, and an
-    early close 226, with no literal here. The per-ticker ``capture_start`` clamp is
-    applied on the strip, not here, because one denominator serves every ticker and each
-    ticker was onboarded on its own day.
-    """
-    slots: list[datetime] = []
-    slot = bounds.open
-    while slot <= bounds.option_close:
-        slots.append(slot)
-        slot += SLOT
-    return slots
 
 
 # -- the named queries -------------------------------------------------------
