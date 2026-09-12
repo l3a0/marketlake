@@ -1,12 +1,14 @@
 """Shared fixtures that expose the four seams and the fixture-lake builder.
 
 It also carries the network guard, which fails any test that reaches another machine
-from inside this process.
+from inside this process, and the subprocess guard, which fails any test that shells
+out to rsync, launchctl, pmset, or tmutil.
 """
 
 from __future__ import annotations
 
 import socket
+import subprocess
 import urllib.request
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -145,4 +147,90 @@ def _no_network() -> Iterator[None]:
         mp.setattr(urllib.request, "urlopen", refuse_urlopen)
         mp.setattr(socket.socket, "connect", refuse_connect)
         mp.setattr(socket, "create_connection", refuse_create_connection)
+        yield
+
+
+# -- the subprocess guard --------------------------------------------------------------
+
+# Four production call sites shell out to a named external tool through
+# ``subprocess.run``: ``RsyncBackup.sync`` runs ``rsync``, ``launchctl_probe`` runs
+# ``launchctl``, ``read_pmset_schedule`` runs ``pmset``, and ``read_exclusions`` runs
+# ``tmutil``. Each is a seam, so a test injects a fake in place of the function that
+# calls it. A test that forgets runs the real tool instead, which the network guard
+# above cannot catch: none of the four touch a socket in this process. This fixture
+# closes that gap the same way, on those four names only.
+#
+# The refusal has to name the program rather than block every subprocess. Four tests in
+# ``tests/component/test_control_plane_render.py`` run the rendered install, reinstall,
+# restart, and uninstall scripts for real, each sandboxed by a fake ``PATH`` that points
+# at stand-ins for the tools the script calls. Those calls name a script path or
+# ``bash``, never one of the four guarded names directly, so refusing only the four
+# leaves them untouched.
+
+_GUARDED_PROGRAMS = frozenset({"rsync", "launchctl", "pmset", "tmutil"})
+
+
+class SubprocessAccessInTest(BaseException):
+    """Raised when a test reaches ``rsync``, ``launchctl``, ``pmset``, or ``tmutil``.
+
+    It derives from ``BaseException``, the same reason ``NetworkAccessInTest`` does.
+    The Sunday self-check wraps both ``schedule_reader()`` and ``exclusion_reader()``
+    in a broad ``except Exception``, on purpose, so a read-back it cannot parse becomes
+    a report line instead of a page. A guard that inherited from ``Exception`` would
+    land in that same catch, turn into a line reading "pmset read-back unreadable", and
+    the forgotten seam would ship green.
+    """
+
+
+def _program_of(args: object) -> str | None:
+    """The program a subprocess call names, or ``None`` when there is not one.
+
+    ``subprocess.run`` and ``Popen`` both take the command as a sequence whose first
+    element is the program, which is how all four guarded call sites and all four
+    render tests call them. Neither passes a single string with ``shell=True``, so
+    that form is not handled here.
+    """
+    if isinstance(args, (list, tuple)) and args:
+        return Path(str(args[0])).name
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _no_subprocess() -> Iterator[None]:
+    """Fail any test that would shell out to rsync, launchctl, pmset, or tmutil.
+
+    Autouse, for the same reason ``_no_network`` is: the failure this catches is a test
+    forgetting to inject one of the four seams, and a test that forgets one would
+    equally forget to ask for the guard.
+
+    Every other subprocess call passes through untouched, ``caffeinate`` included: it is
+    injected as a seam by its caller rather than built unconditionally by a main, so it
+    carries none of the risk the other four do.
+
+    The fixture holds its own ``MonkeyPatch``, not the shared one, for the same reason
+    ``_no_network`` does: a test calling ``monkeypatch.undo()`` must not disarm it.
+    """
+
+    def refuse_run(args: object, *pos: object, **kwargs: object) -> object:
+        program = _program_of(args)
+        if program in _GUARDED_PROGRAMS:
+            raise SubprocessAccessInTest(
+                f"a test tried to run {program}. Inject the seam instead of shelling out for real."
+            )
+        return real_run(args, *pos, **kwargs)
+
+    def refuse_popen(args: object, *pos: object, **kwargs: object) -> object:
+        program = _program_of(args)
+        if program in _GUARDED_PROGRAMS:
+            raise SubprocessAccessInTest(
+                f"a test tried to run {program}. Inject the seam instead of shelling out for real."
+            )
+        return real_popen(args, *pos, **kwargs)
+
+    real_run = subprocess.run
+    real_popen = subprocess.Popen
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(subprocess, "run", refuse_run)
+        mp.setattr(subprocess, "Popen", refuse_popen)
         yield
