@@ -105,6 +105,50 @@ def test_the_threshold_is_the_configured_one():
     assert [len(pages) for pages in raised] == [0, 1]
 
 
+# -- the threshold is read at the moment of comparison -------------------------------
+
+
+def test_a_lowered_threshold_trips_the_running_counter_without_a_restart():
+    """A recalibrated threshold takes effect without rebuilding the watchdog.
+
+    The threshold can be a zero-argument callable, read when the watchdog decides whether
+    to page rather than at construction. So an operator who lowers ``watchdog_page_minutes``
+    mid-session trips the counter already running, at the new number, with no restart.
+    """
+    threshold = [9]
+    watchdog = Watchdog(page_minutes=lambda: threshold[0])
+    # Two failing minutes under a high threshold raise nothing.
+    early = [watchdog.observe(_cycle(_seg("chains", "SPY", "gap"), at=_at(i))) for i in range(2)]
+    assert [len(pages) for pages in early] == [0, 0]
+    assert watchdog.count("chains", "SPY") == 2
+    # The threshold drops to three. The counter is untouched, so the third failing minute
+    # is the one that trips it, at the new number.
+    threshold[0] = 3
+    pages = watchdog.observe(_cycle(_seg("chains", "SPY", "gap"), at=_at(2)))
+    assert [p.title for p in pages] == ["Capture down: SPY chains"]
+    assert pages[0].minutes == 3
+
+
+def test_a_raised_threshold_holds_off_a_page_the_old_one_would_have_sent():
+    """The read-live threshold moves both ways.
+
+    Raising ``watchdog_page_minutes`` mid-session quiets a surface that would have paged
+    at the old number. That is the operator action the change exists for, quieting a
+    flapping ticker without a restart.
+    """
+    threshold = [3]
+    watchdog = Watchdog(page_minutes=lambda: threshold[0])
+    # Two failing minutes leave the counter one short of the old threshold of three.
+    for i in range(2):
+        watchdog.observe(_cycle(_seg("chains", "SPY", "gap"), at=_at(i)))
+    # Raising it to a hundred means the third failing minute, which would have paged at
+    # three, does not.
+    threshold[0] = 100
+    pages = watchdog.observe(_cycle(_seg("chains", "SPY", "gap"), at=_at(2)))
+    assert pages == []
+    assert watchdog.count("chains", "SPY") == 3
+
+
 # -- the sampler collapse ------------------------------------------------------------
 
 
@@ -286,6 +330,39 @@ def test_a_dead_token_pages_once_naming_auth_rather_than_the_roster():
     assert [p.title for p in raised] == ["Capture down: token dead"]
     assert raised[0].cause == "http_401"
     assert len(raised[0].surfaces) == 4
+
+
+def test_the_whole_daemon_cause_path_reads_the_threshold_live():
+    """The token-dead page reads the recalibrated threshold too, not only the surface page.
+
+    A dead token gaps every surface at once, and that page fires from a different
+    comparison than a single surface's does. Both have to read the live threshold, or the
+    load-bearing case, the seven-day token death, would keep the old number.
+    """
+    threshold = [9]
+    watchdog = Watchdog(page_minutes=lambda: threshold[0])
+    # Two dead minutes under a high threshold raise nothing.
+    early = []
+    for minute in range(2):
+        early += watchdog.observe(
+            _cycle(
+                _fail("chains", "SPY", "http_401"),
+                _fail("quotes", "SPY", "http_401"),
+                at=_at(minute),
+            )
+        )
+    assert early == []
+    # The threshold drops to three, so the third dead minute trips the whole-daemon page.
+    threshold[0] = 3
+    pages = watchdog.observe(
+        _cycle(
+            _fail("chains", "SPY", "http_401"),
+            _fail("quotes", "SPY", "http_401"),
+            at=_at(2),
+        )
+    )
+    assert [p.title for p in pages] == ["Capture down: token dead"]
+    assert pages[0].cause == "http_401"
 
 
 def test_sustained_rate_limiting_names_itself_too():

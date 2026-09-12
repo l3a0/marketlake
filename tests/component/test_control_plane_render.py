@@ -424,10 +424,16 @@ def test_sudoers_refuses_an_owner_that_is_not_an_account_name():
 # -- the two jobs and pmset through the command line ----------------------------------
 
 
-def test_self_check_cli_pings_the_pre_open_slug_when_the_daemon_is_up(tmp_path, capsys):
+def test_self_check_cli_pings_the_pre_open_slug_when_the_daemon_is_up(
+    tmp_path, capsys, monkeypatch
+):
     config = write_config(tmp_path, tmp_path / "lake")
     pinger = FakePinger()
-    code = cp.main(["self-check", "--config", str(config)], probe=lambda label: True, pinger=pinger)
+    # main builds the probe and the pinger itself, so a fake reaches them by replacing
+    # the producer main names, not by a seam this entry no longer accepts.
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    code = cp.main(["self-check", "--config", str(config)])
     assert code == 0
     assert pinger.urls == ["https://hc-ping.com/secret-key/pre-open"]
     printed = capsys.readouterr().out
@@ -435,7 +441,7 @@ def test_self_check_cli_pings_the_pre_open_slug_when_the_daemon_is_up(tmp_path, 
     assert "secret-key" not in printed
 
 
-def test_self_check_cli_names_a_failed_ping_and_still_reports(tmp_path, capsys):
+def test_self_check_cli_names_a_failed_ping_and_still_reports(tmp_path, capsys, monkeypatch):
     # The ping is the last step, so a raise there used to replace the summary line with
     # a traceback in the job's err log. The line is what the operator reads.
     config = write_config(tmp_path, tmp_path / "lake")
@@ -444,7 +450,9 @@ def test_self_check_cli_names_a_failed_ping_and_still_reports(tmp_path, capsys):
         def ping(self, url: str) -> None:
             raise urllib.error.URLError(OSError("connection refused"))
 
-    code = cp.main(["self-check", "--config", str(config)], probe=lambda label: True, pinger=Boom())
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "UrllibPinger", Boom)
+    code = cp.main(["self-check", "--config", str(config)])
     assert code == 1
     printed = capsys.readouterr().out
     assert "self-check: ping failed: URLError" in printed
@@ -452,12 +460,12 @@ def test_self_check_cli_names_a_failed_ping_and_still_reports(tmp_path, capsys):
     assert "secret-key" not in printed
 
 
-def test_self_check_cli_exits_non_zero_without_pinging_when_down(tmp_path):
+def test_self_check_cli_exits_non_zero_without_pinging_when_down(tmp_path, monkeypatch):
     config = write_config(tmp_path, tmp_path / "lake")
     pinger = FakePinger()
-    code = cp.main(
-        ["self-check", "--config", str(config)], probe=lambda label: False, pinger=pinger
-    )
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: False)
+    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    code = cp.main(["self-check", "--config", str(config)])
     assert code == 1
     assert pinger.urls == []
 
@@ -475,8 +483,9 @@ def _token(tmp_path: Path, minted: datetime | None = None) -> Path:
 def _passing_canary() -> bool:
     """A canary that answers True without calling anything.
 
-    Every ``sunday`` test states one. The command line's own default builds a real
-    client and quotes a symbol, so a test that left it out would reach the network.
+    Every ``sunday`` test replaces ``token_canary`` with one. main builds the real
+    canary, which quotes a symbol through the vendor, so a test that left the producer
+    live would reach the network.
     """
     return True
 
@@ -498,11 +507,21 @@ class _BrokenTransport:
         raise OSError("network down")
 
 
-def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys):
+def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys, monkeypatch):
     lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
     config = write_config(tmp_path, lake)
     pinger = FakePinger()
     pushes = _Pushes()
+    # main builds each past-process producer itself. A fake reaches the run by replacing
+    # the producer, so the test drives main's real wiring with nothing live at the leaves.
+    monkeypatch.setattr(
+        cp,
+        "read_pmset_schedule",
+        lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
+    )
+    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
+    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: pushes)
     # An explicit --token keeps the test off the real token under HOME.
     code = cp.main(
         [
@@ -514,10 +533,6 @@ def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys):
         ],
         clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
         calendar=weekday_sessions(date(2026, 8, 31)),
-        schedule_reader=lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
-        pinger=pinger,
-        canary=_passing_canary,
-        transport=pushes,
     )
     assert code == 0
     assert pinger.urls == ["https://hc-ping.com/secret-key/sunday"]
@@ -527,7 +542,7 @@ def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys):
     assert "secret-key" not in printed
 
 
-def test_sunday_cli_withholds_the_ping_for_a_stale_token(tmp_path, capsys):
+def test_sunday_cli_withholds_the_ping_for_a_stale_token(tmp_path, capsys, monkeypatch):
     # Minted late the prior week: still valid on Sunday, dead before Friday's option
     # close. Validity is not freshness, and the command line has to act on that, not
     # just the decision functions that already enforce it. This is the case the deleted
@@ -535,6 +550,14 @@ def test_sunday_cli_withholds_the_ping_for_a_stale_token(tmp_path, capsys):
     lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
     config = write_config(tmp_path, lake)
     pinger = FakePinger()
+    monkeypatch.setattr(
+        cp,
+        "read_pmset_schedule",
+        lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
+    )
+    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
+    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
     code = cp.main(
         [
             "sunday",
@@ -545,10 +568,6 @@ def test_sunday_cli_withholds_the_ping_for_a_stale_token(tmp_path, capsys):
         ],
         clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
         calendar=weekday_sessions(date(2026, 8, 31), date(2026, 9, 7)),
-        schedule_reader=lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
-        pinger=pinger,
-        canary=_passing_canary,
-        transport=_Pushes(),
     )
     assert code == 1
     assert pinger.urls == []
@@ -557,19 +576,23 @@ def test_sunday_cli_withholds_the_ping_for_a_stale_token(tmp_path, capsys):
     assert "secret-key" not in printed
 
 
-def test_sunday_cli_reads_the_mint_time_from_the_token_file(tmp_path, capsys):
+def test_sunday_cli_reads_the_mint_time_from_the_token_file(tmp_path, capsys, monkeypatch):
     lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
     config = write_config(tmp_path, lake)
     token = _token(tmp_path)
     pinger = FakePinger()
+    monkeypatch.setattr(
+        cp,
+        "read_pmset_schedule",
+        lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
+    )
+    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
+    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(token)],
         clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
         calendar=weekday_sessions(date(2026, 8, 31)),
-        schedule_reader=lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
-        pinger=pinger,
-        canary=_passing_canary,
-        transport=_Pushes(),
     )
     assert code == 0
     assert pinger.urls == ["https://hc-ping.com/secret-key/sunday"]
@@ -577,9 +600,9 @@ def test_sunday_cli_reads_the_mint_time_from_the_token_file(tmp_path, capsys):
     assert "never-read" not in printed and "secret-key" not in printed
 
 
-def test_sunday_cli_checks_the_time_machine_exclusion(tmp_path, capsys):
-    # Production must always run the check, so the CLI passes the reader and the
-    # standard targets. A lost exclusion rides the report and the ping still fires.
+def test_sunday_cli_checks_the_time_machine_exclusion(tmp_path, capsys, monkeypatch):
+    # Production must always run the check, so main builds the reader and the standard
+    # targets. A lost exclusion rides the report and the ping still fires.
     lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
     config = write_config(tmp_path, lake)
     pinger = FakePinger()
@@ -589,6 +612,15 @@ def test_sunday_cli_checks_the_time_machine_exclusion(tmp_path, capsys):
         asked.append(tuple(paths))
         return "".join(f"[Included]\t{p}\n" for p in paths)
 
+    monkeypatch.setattr(
+        cp,
+        "read_pmset_schedule",
+        lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
+    )
+    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
+    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr(cp, "read_exclusions", reader)
     code = cp.main(
         [
             "sunday",
@@ -599,11 +631,6 @@ def test_sunday_cli_checks_the_time_machine_exclusion(tmp_path, capsys):
         ],
         clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
         calendar=weekday_sessions(date(2026, 8, 31)),
-        schedule_reader=lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
-        pinger=pinger,
-        canary=_passing_canary,
-        transport=_Pushes(),
-        exclusion_reader=reader,
     )
     assert code == 0  # report tier: the ping still fires
     assert pinger.urls == ["https://hc-ping.com/secret-key/sunday"]
@@ -615,18 +642,18 @@ def test_sunday_cli_checks_the_time_machine_exclusion(tmp_path, capsys):
     assert "secret-key" not in printed
 
 
-def test_sunday_cli_reports_problems_and_exits_non_zero(tmp_path, capsys):
+def test_sunday_cli_reports_problems_and_exits_non_zero(tmp_path, capsys, monkeypatch):
     lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
     config = write_config(tmp_path, lake)
     pinger = FakePinger()
+    monkeypatch.setattr(cp, "read_pmset_schedule", lambda: "")
+    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr(cp, "token_canary", lambda **kwargs: lambda: False)
+    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(tmp_path / "absent.json")],
         clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
         calendar=weekday_sessions(date(2026, 8, 31)),
-        schedule_reader=lambda: "",
-        pinger=pinger,
-        canary=lambda: False,
-        transport=_Pushes(),
     )
     assert code == 1
     assert pinger.urls == []
@@ -668,13 +695,13 @@ def test_the_sunday_cli_builds_a_real_canary_rather_than_passing_through(tmp_pat
 
     monkeypatch.setattr(cp, "token_canary", fake_token_canary)
     pinger = FakePinger()
+    monkeypatch.setattr(cp, "read_pmset_schedule", lambda: REPEAT_ONLY)
+    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(token)],
         clock=ManualClock(start=SUNDAY_20),
         calendar=WEEK_AHEAD,
-        schedule_reader=lambda: REPEAT_ONLY,
-        pinger=pinger,
-        transport=_Pushes(),
     )
     assert asked == [{"token_path": str(token), "api_key": "api-key", "app_secret": "app-secret"}]
     # The producer's answer drives the run, so a failing call withholds the ping.
@@ -682,21 +709,21 @@ def test_the_sunday_cli_builds_a_real_canary_rather_than_passing_through(tmp_pat
     assert pinger.urls == []
 
 
-def test_the_sunday_cli_pushes_the_reminder_to_the_phone(tmp_path):
+def test_the_sunday_cli_pushes_the_reminder_to_the_phone(tmp_path, monkeypatch):
     # A token minted late last week is still valid on Sunday and dead before Friday's
     # option close, so the ritual was skipped and the reminder is owed. The design sends
     # it on the 20:00, 21:00 and 22:00 runs while the check still fails.
     lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
     config = write_config(tmp_path, lake)
     pushes = _Pushes()
+    monkeypatch.setattr(cp, "read_pmset_schedule", lambda: REPEAT_ONLY)
+    monkeypatch.setattr(cp, "UrllibPinger", FakePinger)
+    monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
+    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: pushes)
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(_token(tmp_path, LATE_LAST_WEEK))],
         clock=ManualClock(start=SUNDAY_20),
         calendar=WEEK_AHEAD,
-        schedule_reader=lambda: REPEAT_ONLY,
-        pinger=FakePinger(),
-        canary=_passing_canary,
-        transport=pushes,
     )
     assert code == 1
     assert len(pushes.sent) == 3
@@ -711,7 +738,7 @@ def test_the_sunday_cli_pushes_the_reminder_to_the_phone(tmp_path):
 
 
 def test_a_reminder_that_cannot_be_pushed_is_written_down_and_the_evening_carries_on(
-    tmp_path, capsys
+    tmp_path, capsys, monkeypatch
 ):
     # ntfy is unreachable. A Sunday job that died here would lose the scrub, the alarm
     # read-back and the check's ping with it, and the missed ping would page at 23:30
@@ -719,14 +746,14 @@ def test_a_reminder_that_cannot_be_pushed_is_written_down_and_the_evening_carrie
     # on its own summary line.
     lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
     config = write_config(tmp_path, lake)
+    monkeypatch.setattr(cp, "read_pmset_schedule", lambda: REPEAT_ONLY)
+    monkeypatch.setattr(cp, "UrllibPinger", FakePinger)
+    monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
+    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _BrokenTransport())
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(_token(tmp_path, LATE_LAST_WEEK))],
         clock=ManualClock(start=SUNDAY_20),
         calendar=WEEK_AHEAD,
-        schedule_reader=lambda: REPEAT_ONLY,
-        pinger=FakePinger(),
-        canary=_passing_canary,
-        transport=_BrokenTransport(),
     )
     assert code == 1
     printed = capsys.readouterr().out

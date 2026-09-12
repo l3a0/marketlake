@@ -7,17 +7,22 @@ of it entirely.
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pyarrow.parquet as pq
 import pytest
 
+from lake import security_master
+from lake.paths import TEMP_MARKER, temp_write_path
 from lake.security_master import (
     ID_TYPE_TICKER,
     MASTER_SCHEMA,
     MASTER_SCHEMA_VERSION,
+    MasterUnreadable,
     SecurityMaster,
+    SecurityMasterError,
     UnknownInstrument,
     UnsupportedSchemaVersion,
     capture_start_in_market_time,
@@ -104,6 +109,72 @@ def test_read_rejects_an_unsupported_schema_version(lake_root: Path):
 
     with pytest.raises(UnsupportedSchemaVersion):
         SecurityMaster.read(path)
+
+
+# -- the write does not expose a torn master ------------------------------------------
+
+
+def test_write_goes_through_a_temp_file_and_one_rename(lake_root: Path, monkeypatch):
+    """Onboarding writes the master while the daemon and dashboard read it.
+
+    A write straight onto the target truncates it first, so a reader can catch it half
+    done. The write instead lands in a temp file beside the target and renames over it in
+    one step. This checks that the rename happens, and that the temp path is the one
+    ``paths.temp_write_path`` owns, which is the spelling the backup exclusion matches.
+    """
+    path = master_path(lake_root)
+    calls: list[tuple[Path, Path]] = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        calls.append((Path(src), Path(dst)))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(security_master.os, "replace", spy)
+    _sample_master().write(path)
+
+    assert calls == [(temp_write_path(path, os.getpid()), path)]
+    assert path.exists()
+
+
+def test_a_failed_write_leaves_the_prior_master_intact(lake_root: Path, monkeypatch):
+    """A write that fails partway must not take the old master with it.
+
+    The write goes to a temp file, so an interrupted write leaves the target untouched and
+    removes the temp. A write straight onto the target would truncate it first, so the same
+    failure would leave a torn master where a whole one was.
+    """
+    path = _sample_master().write(master_path(lake_root))
+    before = set(SecurityMaster.read(path).mappings)
+
+    def torn_write(table, where, *args, **kwargs):
+        Path(where).write_bytes(b"partial, not parquet")
+        raise RuntimeError("interrupted mid-write")
+
+    monkeypatch.setattr(security_master.pq, "write_table", torn_write)
+    with pytest.raises(RuntimeError):
+        SecurityMaster().write(path)
+
+    assert set(SecurityMaster.read(path).mappings) == before, "the prior master was lost"
+    leftovers = [p.name for p in path.parent.iterdir() if TEMP_MARKER in p.name]
+    assert leftovers == [], f"a temp file was left behind: {leftovers}"
+
+
+def test_read_folds_a_torn_master_into_a_security_master_error(lake_root: Path):
+    """A torn or corrupt master raises the master's own error family, not pyarrow's.
+
+    ``pyarrow`` refuses a torn parquet with ``ArrowInvalid``, which is a ``ValueError`` and
+    not a ``SecurityMasterError``. A caller guarding the master's own errors alone would
+    let it escape. The daemon's startup reader is exactly such a caller, so ``read`` folds
+    the pyarrow error into ``MasterUnreadable`` for every caller at once.
+    """
+    path = master_path(lake_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"not parquet at all")
+
+    with pytest.raises(MasterUnreadable) as caught:
+        SecurityMaster.read(path)
+    assert isinstance(caught.value, SecurityMasterError)
 
 
 # -- the shared capture-start lookup ---------------------------------------------------

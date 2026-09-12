@@ -23,7 +23,7 @@ dying at once. That sends one page naming the sampler, never one page per ticker
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 
@@ -84,14 +84,28 @@ class Watchdog:
 
     It is handed what happened and returns what should page. It sends nothing and reads
     no clock, so a caller decides both when to ask and where a page goes.
+
+    ``page_minutes`` is the threshold, either a fixed count or a zero-argument callable.
+    A callable is read at the moment of comparison, so a recalibrated
+    ``watchdog_page_minutes`` takes effect on the next page decision rather than at the
+    next restart. The running counters are left untouched when it changes.
     """
 
-    def __init__(self, *, page_minutes: int = DEFAULT_PAGE_MINUTES) -> None:
+    def __init__(self, *, page_minutes: int | Callable[[], int] = DEFAULT_PAGE_MINUTES) -> None:
         self._page_minutes = page_minutes
         self._counts: dict[Surface, int] = {}
         self._day: date | None = None
         self._paged_causes: set[str] = set()
         self._paged: set[Surface] = set()
+
+    def _threshold(self) -> int:
+        """The page threshold as it stands now.
+
+        A callable source is read here, at the moment of comparison, so a recalibrated
+        value takes effect on the next decision. A fixed count is returned as given.
+        """
+        source = self._page_minutes
+        return source() if callable(source) else source
 
     def count(self, surface: str, ticker: str) -> int:
         """The current count for one surface and ticker."""
@@ -119,10 +133,11 @@ class Watchdog:
             self._reset(key)
         for key in sorted(failed, key=str):
             self._counts[key] = self._counts.get(key, 0) + 1
-        cause = self._whole_daemon(result, failed, touched)
+        threshold = self._threshold()
+        cause = self._whole_daemon(result, failed, touched, threshold)
         if cause is not None:
             return cause
-        return self._pages(failed, touched, attempted=True)
+        return self._pages(failed, touched, attempted=True, threshold=threshold)
 
     def missed(self, surfaces: Iterable[Surface], slots: Sequence[datetime]) -> list[Page]:
         """Charge a run of slept-through slots, one increment per slot.
@@ -134,17 +149,22 @@ class Watchdog:
         """
         watched = list(surfaces)
         pages: list[Page] = []
+        # One overrun is reported in a single call, so the threshold is read once for the
+        # batch rather than per slot.
+        threshold = self._threshold()
         for slot in sorted(slots):
             self._roll(slot)
             for key in sorted(watched, key=str):
                 self._counts[key] = self._counts.get(key, 0) + 1
             # Nothing was attempted for these minutes, so a quotes fan-out here says the
             # loop overran rather than that the shared request failed.
-            pages.extend(self._pages(set(watched), set(watched), attempted=False))
+            pages.extend(
+                self._pages(set(watched), set(watched), attempted=False, threshold=threshold)
+            )
         return pages
 
     def _whole_daemon(
-        self, result: CycleResult, failed: set[Surface], touched: set[Surface]
+        self, result: CycleResult, failed: set[Surface], touched: set[Surface], threshold: int
     ) -> list[Page] | None:
         """One page naming the cause, when every surface failed the same way.
 
@@ -172,7 +192,7 @@ class Watchdog:
             return None
         if error_class in self._paged_causes:
             return []
-        if any(self._counts.get(key, 0) < self._page_minutes for key in failed):
+        if any(self._counts.get(key, 0) < threshold for key in failed):
             return None
         self._paged_causes.add(error_class)
         self._paged.update(failed)
@@ -209,7 +229,9 @@ class Watchdog:
         # lifted, so the cause re-arms with the counters.
         self._paged_causes.clear()
 
-    def _pages(self, failed: set[Surface], watched: set[Surface], *, attempted: bool) -> list[Page]:
+    def _pages(
+        self, failed: set[Surface], watched: set[Surface], *, attempted: bool, threshold: int
+    ) -> list[Page]:
         """The pages this minute owes, collapsing a dead sampler into one.
 
         The collapse is decided by what failed this minute, not by what newly tripped. A
@@ -224,7 +246,7 @@ class Watchdog:
         tripped = [
             key
             for key in sorted(failed, key=str)
-            if self._counts.get(key, 0) >= self._page_minutes and key not in self._paged
+            if self._counts.get(key, 0) >= threshold and key not in self._paged
         ]
         if not tripped:
             return []

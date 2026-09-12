@@ -87,7 +87,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
-from lake.alert import Message, NtfyTransport, Publisher, Transport
+from lake.alert import Message, NtfyTransport, Publisher
 from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
 from lake.config import input_errors_exit, load_config
@@ -2207,22 +2207,19 @@ def main(
     *,
     clock: Clock | None = None,
     calendar: Calendar | None = None,
-    probe: DaemonProbe | None = None,
-    pinger: Pinger | None = None,
-    schedule_reader: ScheduleReader | None = None,
-    canary: CanaryCall | None = None,
-    exclusion_reader: ExclusionReader | None = None,
-    transport: Transport | None = None,
 ) -> int:
     """The ``python -m lake.control_plane`` entry. Returns a process exit code.
 
-    The seams default to the real ones and are built lazily, so a test injects fakes
-    and nothing here reads the wall clock or shells out.
+    Every seam that reaches past this process is built here, not accepted. The
+    healthchecks GET, the ntfy POST, the vendor canary, and the ``launchctl``, ``pmset``
+    and ``tmutil`` reads all shell out or go to the network. A ``main`` that accepted them
+    let a test omit one and reach the real effect. So ``main`` builds them, and a test
+    drives the ``self_check`` or ``sunday_run`` helper directly, which requires its seams.
 
-    Two of those defaults reach the outside world, and a test that wants the Sunday job
-    must pass its own for both. ``canary`` defaults to one real quote through the
-    vendor, and ``transport`` defaults to the real ntfy POST. A push sent from a test is
-    a push a person receives.
+    ``clock`` and ``calendar`` stay injectable. Neither reaches past this process, so a
+    test injects the wall clock and the trading calendar with no live effect. The ``pmset``
+    command prints from them, and the Sunday retry loop shares one clock across its
+    attempts and the reminder stamp.
     """
     args = _build_parser().parse_args(argv)
 
@@ -2275,8 +2272,8 @@ def main(
         with input_errors_exit("self-check"):
             config = load_config(args.config)
         outcome = self_check(
-            probe=probe if probe is not None else launchctl_probe,
-            pinger=pinger if pinger is not None else UrllibPinger(),
+            probe=launchctl_probe,
+            pinger=UrllibPinger(),
             ping_url=config.healthchecks_url(PRE_OPEN_SLUG),
             label=args.label,
         )
@@ -2312,35 +2309,27 @@ def main(
         # phone, checked against the message itself.
         publisher = Publisher(
             lake_root=config.lake_root,
-            transport=(
-                transport if transport is not None else NtfyTransport(config.ntfy_topic.reveal())
-            ),
+            transport=NtfyTransport(config.ntfy_topic.reveal()),
             secrets=(config.healthchecks_ping_key.reveal(), config.ntfy_topic.reveal()),
         )
         outcomes = sunday_run(
             lake_root=config.lake_root,
             clock=run_clock,
             calendar=calendar if calendar is not None else _exchange_calendar(),
-            schedule_reader=schedule_reader if schedule_reader is not None else read_pmset_schedule,
-            pinger=pinger if pinger is not None else UrllibPinger(),
+            schedule_reader=read_pmset_schedule,
+            pinger=UrllibPinger(),
             ping_url=config.healthchecks_url(SUNDAY_SLUG),
-            canary=(
-                canary
-                if canary is not None
-                else token_canary(
-                    token_path=token_path,
-                    api_key=config.schwab_api_key.reveal(),
-                    app_secret=config.schwab_app_secret.reveal(),
-                )
+            canary=token_canary(
+                token_path=token_path,
+                api_key=config.schwab_api_key.reveal(),
+                app_secret=config.schwab_app_secret.reveal(),
             ),
             mint_reader=read_mint,
             reminder_sink=reminder_publisher(publisher=publisher, clock=run_clock),
             exclusion_targets=tmutil_exclusion_targets(
                 default_config_dir(str(Path.home())), token_path
             ),
-            exclusion_reader=(
-                exclusion_reader if exclusion_reader is not None else read_exclusions
-            ),
+            exclusion_reader=read_exclusions,
         )
         for number, outcome in enumerate(outcomes, start=1):
             if len(outcomes) > 1:
