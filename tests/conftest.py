@@ -7,10 +7,11 @@ out to rsync, launchctl, pmset, or tmutil.
 
 from __future__ import annotations
 
+import os
 import socket
 import subprocess
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -187,11 +188,17 @@ def _program_of(args: object) -> str | None:
 
     ``subprocess.run`` and ``Popen`` both take the command as a sequence whose first
     element is the program, which is how all four guarded call sites and all four
-    render tests call them. Neither passes a single string with ``shell=True``, so
-    that form is not handled here.
+    render tests call them. A ``bytes`` element is decoded first, since ``subprocess``
+    accepts one and a raw ``str()`` of it would never match a guarded name. Two forms
+    still are not handled: a single string with ``shell=True``, and a prefix wrapper
+    (``env``, ``arch``, ``sudo``) naming the guarded program as a later element. No
+    call site in this repo uses either form today.
     """
     if isinstance(args, (list, tuple)) and args:
-        return Path(str(args[0])).name
+        head = args[0]
+        if isinstance(head, bytes):
+            head = os.fsdecode(head)
+        return Path(str(head)).name
     return None
 
 
@@ -203,34 +210,31 @@ def _no_subprocess() -> Iterator[None]:
     forgetting to inject one of the four seams, and a test that forgets one would
     equally forget to ask for the guard.
 
-    Every other subprocess call passes through untouched, ``caffeinate`` included: it is
-    injected as a seam by its caller rather than built unconditionally by a main, so it
-    carries none of the risk the other four do.
+    Every other subprocess call passes through untouched, ``caffeinate`` included. Its
+    seam (``AssertionHolder``'s ``runner``, threaded through ``run_loop_from_config``'s
+    ``assertion_runner``) is out of scope per #80. That is narrower than safe: a bare
+    ``AssertionHolder()``, or a call that omits ``assertion_runner``, still falls
+    through to a real ``caffeinate`` spawn, the same forgotten-seam shape this fixture
+    exists to catch elsewhere, just with a smaller blast radius and not covered here or
+    by ``test_seam_defaults.py``'s ``REQUIRED`` table. No test omits it today.
 
     The fixture holds its own ``MonkeyPatch``, not the shared one, for the same reason
     ``_no_network`` does: a test calling ``monkeypatch.undo()`` must not disarm it.
     """
 
-    def refuse_run(args: object, *pos: object, **kwargs: object) -> object:
-        program = _program_of(args)
-        if program in _GUARDED_PROGRAMS:
-            raise SubprocessAccessInTest(
-                f"a test tried to run {program}. Inject the seam instead of shelling out for real."
-            )
-        return real_run(args, *pos, **kwargs)
+    def _refuser(real: Callable[..., object]) -> Callable[..., object]:
+        def refuse(args: object, *pos: object, **kwargs: object) -> object:
+            program = _program_of(args)
+            if program in _GUARDED_PROGRAMS:
+                raise SubprocessAccessInTest(
+                    f"a test tried to run {program}. Inject the seam instead of shelling "
+                    "out for real."
+                )
+            return real(args, *pos, **kwargs)
 
-    def refuse_popen(args: object, *pos: object, **kwargs: object) -> object:
-        program = _program_of(args)
-        if program in _GUARDED_PROGRAMS:
-            raise SubprocessAccessInTest(
-                f"a test tried to run {program}. Inject the seam instead of shelling out for real."
-            )
-        return real_popen(args, *pos, **kwargs)
-
-    real_run = subprocess.run
-    real_popen = subprocess.Popen
+        return refuse
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(subprocess, "run", refuse_run)
-        mp.setattr(subprocess, "Popen", refuse_popen)
+        mp.setattr(subprocess, "run", _refuser(subprocess.run))
+        mp.setattr(subprocess, "Popen", _refuser(subprocess.Popen))
         yield

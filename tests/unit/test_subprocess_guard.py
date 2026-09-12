@@ -43,6 +43,13 @@ def test_popen_is_refused_for_each_guarded_program(program):
         subprocess.Popen([program, "--version"])
 
 
+def test_a_bytes_argv_is_still_refused():
+    # subprocess accepts a bytes argv. str(b"rsync") renders "b'rsync'", which never
+    # matches a guarded name, so the guard decodes bytes before comparing.
+    with pytest.raises(SubprocessAccessInTest):
+        subprocess.run([b"rsync", b"--version"], capture_output=True)
+
+
 def test_an_unguarded_program_still_runs_for_real():
     # None of the four render tests name rsync, launchctl, pmset, or tmutil directly,
     # only a rendered script or bash. Confirms the guard leaves everything else
@@ -73,8 +80,9 @@ def test_the_refusal_is_not_caught_by_a_bare_except_exception():
 def test_a_test_calling_monkeypatch_undo_does_not_disarm_the_guard(monkeypatch):
     # The guard used to have no counterpart here at all; this mirrors the network
     # guard's own regression, so the same undo-stack mistake cannot recur unnoticed.
-    monkeypatch.setattr(subprocess, "DEVNULL", subprocess.DEVNULL)
+    monkeypatch.setattr(subprocess, "DEVNULL", -999)
     monkeypatch.undo()
+    assert subprocess.DEVNULL != -999
     with pytest.raises(SubprocessAccessInTest):
         subprocess.run(["tmutil", "isexcluded", "/lake"], capture_output=True)
 
@@ -98,8 +106,9 @@ def test_a_forgotten_exclusion_reader_fake_is_caught():
 
 
 def test_a_forgotten_rsync_backup_fake_is_caught(tmp_path):
+    # RsyncBackup.sync only stats the target, never the source, so only target needs
+    # to exist on disk.
     source = tmp_path / "lake"
-    source.mkdir()
     target = tmp_path / "backup"
     target.mkdir()
     with pytest.raises(SubprocessAccessInTest):
