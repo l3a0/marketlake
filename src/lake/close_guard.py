@@ -266,10 +266,22 @@ class CloseGuard:
         under the tag means the cycle landed. A gap row means it ran and failed, which
         is already recorded, so nothing is added.
         """
-        data, gaps = journal.close_tag_rows(
+        rows = journal.close_tag_rows(
             self._root, journal.QUOTES_SURFACE, ticker, slot.date(), SPOT_CLOSE
         )
-        if data or gaps:
+        if rows.data or rows.gaps:
+            return
+        if rows.unreadable:
+            # The marker this would write is a claim that nothing observed the close. A
+            # segment that will not read might hold the very row that refutes it, and the
+            # next run deletes a false marker as debris, so a row a live writer wrote goes
+            # with it. Saying so and writing nothing is the honest answer.
+            #
+            # This withholds a marker for a minute nothing else records either, because
+            # the startup walk refuses the same pair. The day then reads short with no row
+            # naming why, which is the loss #102 tracks. It is the right side to err on
+            # only because the alternative is a false claim sealed into the record.
+            found.problems.append(f"quotes/{ticker}: {len(rows.unreadable)} unreadable")
             return
         try:
             self._marker(journal.QUOTES_SURFACE, ticker, slot, SPOT_CLOSE, SPOT_CLOSE_UNOBSERVED)
@@ -289,11 +301,28 @@ class CloseGuard:
         rescues it, so a failed cycle qualifies the same as one that never ran.
         """
         day = bounds.day
-        data, _ = journal.close_tag_rows(
-            self._root, journal.CHAINS_SURFACE, ticker, day, OPTION_CLOSE
-        )
-        if data:
+        rows = journal.close_tag_rows(self._root, journal.CHAINS_SURFACE, ticker, day, OPTION_CLOSE)
+        if rows.data:
             return
+        if rows.unreadable:
+            # Named, and then the fill runs anyway. The two closes are not symmetric and
+            # this is where that bites. Withholding the equity close's marker withholds a
+            # claim, which is cheap to be wrong about. Withholding the option close's fill
+            # withholds the sample, and the window shuts five minutes later, so being
+            # wrong here is permanent.
+            #
+            # The risk taken instead is a duplicate. If the file that will not read does
+            # hold the close, the fill writes a second close-tagged segment beside it and
+            # compaction merges both. That is a row count the battery can see and argue
+            # with. A close nobody fetched is a row that does not exist and cannot be
+            # bought back, which is the loss the whole lake is built to avoid.
+            #
+            # A zero-byte segment is the case that decides it. ``SegmentWriter`` creates
+            # the file and fsyncs its directory entry before any schema bytes land, so a
+            # process killed in between leaves one durably empty. That is precisely what
+            # the crash loop this issue fixes used to produce, and such a file holds
+            # nothing to duplicate.
+            found.problems.append(f"chains/{ticker}: {len(rows.unreadable)} unreadable")
         if self._fill is None:
             found.refused.append(f"{ticker}: no fill fetcher")
             return

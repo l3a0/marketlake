@@ -87,6 +87,10 @@ class RowCountRegression(Exception):
 # -- paths -------------------------------------------------------------------
 
 
+class ManifestError(Exception):
+    """Raised for a ledger line that parses and names no partition."""
+
+
 def manifest_path(lake_root: Path) -> Path:
     """The manifest path for a lake, derived from its root."""
     return Path(lake_root) / MANIFEST_FILE
@@ -140,11 +144,29 @@ def _read_jsonl(path: Path) -> list[dict]:
     return _parse_jsonl(path.read_text())
 
 
-def _latest_by_partition(entries: Sequence[dict]) -> dict[str, dict]:
-    """Resolve last-entry-wins per partition path over entries in file order."""
+def _latest_by_partition(entries: Sequence[dict], path: Path) -> dict[str, dict]:
+    """Resolve last-entry-wins per partition path over entries in file order.
+
+    A line that parses as JSON and names no partition raises ``ManifestError``. Skipping
+    it was considered and rejected. The torn-tail precedent does not carry: a torn
+    trailing line is a write that did not finish, which ``_read_jsonl`` already discards,
+    while a line in the body that parses and names nothing is a record no reader can
+    interpret. This file is the lake's integrity root, so a reader that quietly stepped
+    over damage in it would make every check downstream weaker than it reads.
+
+    Raising is safe precisely because the two callers that must survive it already catch
+    it: the close+5 guard's prologue and the marking pass. Every other caller is a place
+    where stopping is correct, and the compaction child's own silence pages.
+    """
     latest: dict[str, dict] = {}
-    for entry in entries:
-        latest[entry["partition"]] = entry
+    for position, entry in enumerate(entries, start=1):
+        try:
+            partition = entry["partition"]
+        except (KeyError, TypeError) as exc:
+            # TypeError covers a line that parsed to something other than an object, such
+            # as a bare list or string, which indexes differently but is damage the same.
+            raise ManifestError(f"{path}: entry {position} names no partition") from exc
+        latest[partition] = entry
     return latest
 
 
@@ -155,7 +177,7 @@ def read_manifest(lake_root: Path) -> list[dict]:
 
 def latest_entries(lake_root: Path) -> dict[str, dict]:
     """The current authoritative manifest entry per partition path."""
-    return _latest_by_partition(read_manifest(lake_root))
+    return _latest_by_partition(read_manifest(lake_root), manifest_path(lake_root))
 
 
 def read_quarantine(lake_root: Path) -> list[dict]:
@@ -165,7 +187,7 @@ def read_quarantine(lake_root: Path) -> list[dict]:
 
 def latest_quarantine(lake_root: Path) -> dict[str, dict]:
     """The current authoritative quarantine verdict per partition path."""
-    return _latest_by_partition(read_quarantine(lake_root))
+    return _latest_by_partition(read_quarantine(lake_root), quarantine_path(lake_root))
 
 
 # -- appending ---------------------------------------------------------------

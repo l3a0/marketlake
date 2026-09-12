@@ -41,8 +41,17 @@ CHAIN_BODY = {
 }
 
 
-def _chain_batch() -> pa.RecordBatch:
-    return journal.chains_data_batch(CHAIN_BODY, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+def _chain_batch(expiration: str | None = None) -> pa.RecordBatch:
+    """One chains batch. ``expiration`` rewrites the single contract's expiry."""
+    body = CHAIN_BODY
+    if expiration is not None:
+        import copy as _copy
+
+        body = _copy.deepcopy(CHAIN_BODY)
+        leg = body["callExpDateMap"].pop("2026-09-18:25")
+        leg["650.0"][0]["expirationDate"] = f"{expiration}T20:00:00.000+00:00"
+        body["callExpDateMap"][f"{expiration}:25"] = leg
+    return journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
 
 
 def _stream_bytes(nbatches: int) -> bytes:
@@ -104,3 +113,45 @@ def test_walks_back_past_a_gap_only_latest_segment(lake_root):
     _manifest(lake_root, w2.path, 1)
 
     assert journal.latest_expirations(lake_root, "SPY") == ["2026-09-18"]
+
+
+# -- the third widened reader ----------------------------------------------------------
+
+
+def test_a_drifted_segment_is_walked_past_rather_than_raising(lake_root):
+    """The reader on the live cycle's failure path, which had no test for drift.
+
+    ``latest_expirations`` is called from the chain chunker's failure path inside a
+    running cycle and from the close+5 guard. A segment whose schema drifted opens
+    cleanly and raises on ``row_kind``, so before this it took whichever caller asked
+    with it. The newest segment here is that file, and the read must walk past it to the
+    older durable batch below rather than raise.
+    """
+    with journal.SegmentWriter.open(lake_root, "chains", "SPY", DAY, "20260824T160000", 4242) as w1:
+        w1.write_cycle(_chain_batch())
+    _manifest(lake_root, w1.path, 1)
+
+    drifted = w1.path.parent / "20260824T160100-4242.arrows"
+    schema = pa.schema([("nothing_useful", pa.string())])
+    with pa.ipc.new_stream(drifted, schema) as writer:
+        writer.write_batch(pa.record_batch([pa.array(["x"])], schema=schema))
+    _manifest(lake_root, drifted, 1)
+
+    assert journal.latest_expirations(lake_root, "SPY") == ["2026-09-18"]
+
+
+def test_the_newest_batch_with_data_wins_inside_one_segment(lake_root):
+    """The docstring's claim about batch order, which nothing held.
+
+    One segment can carry many cycles, and the read returns the newest batch that holds
+    data rows. Segment order is covered elsewhere; this is the order inside a segment,
+    which the extracted helper now states and so has to keep.
+    """
+    with journal.SegmentWriter.open(lake_root, "chains", "SPY", DAY, "20260824T160000", 4242) as w:
+        w.write_cycle(_chain_batch())
+        w.write_cycle(_chain_batch(expiration="2026-12-18"))
+    _manifest(lake_root, w.path, 2)
+
+    assert journal.latest_expirations(lake_root, "SPY") == ["2026-12-18"], (
+        "the read took an older batch, so the newest cycle's expirations were lost"
+    )
