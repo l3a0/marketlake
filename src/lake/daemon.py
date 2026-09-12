@@ -98,7 +98,7 @@ from typing import Protocol
 
 from lake.alert import Message, NtfyTransport, Publisher, Transport
 from lake.calendar import Calendar, ExchangeCalendar
-from lake.capture import CycleResult, run_cycle_from_config
+from lake.capture import CycleResult, fill_option_close_from_config, run_cycle_from_config
 from lake.capture_spans import CaptureSpans, CaptureSpansError, spans_path
 from lake.clock import Clock, SystemClock
 from lake.close_guard import CloseGuard
@@ -399,10 +399,50 @@ def _report_guard(outcome: CloseGuardOutcome) -> None:
     print(" ".join(parts), file=sys.stderr)
 
 
+def _close_fill(
+    config_path: str | Path | None,
+    token_path: str | Path | None,
+    session_clock: SessionClock,
+    clock: Clock,
+) -> Callable[[str, datetime], list[str] | None]:
+    """The close+5 guard's fill: refetch one ticker's option close and journal it.
+
+    The guard decides who is owed a fill and refuses past close+5. This is what it calls
+    once it has decided. It hands back the expirations the fill captured, or ``None``
+    when nothing could be fetched, which is the shape the guard's membership comparison
+    reads.
+
+    Nothing is built until a fill is actually owed. The vendor is constructed inside
+    ``fill_option_close_from_config``, on the call, which is how a daemon whose token
+    file is missing still runs every other minute of the day. A missing option close is
+    rare, so that construction normally never happens at all.
+
+    The two provenance tags are the ones the 16:15 cycle would have carried. The close
+    tag is ``option_close`` by definition, stamped by the fill itself. The session phase
+    is read off the slot the same way ``_serve_slot`` reads it off a capture minute, so
+    the filled row and the cycle it replaces agree.
+    """
+
+    def fill(ticker: str, slot: datetime) -> list[str] | None:
+        phase = session_clock.phase_at(slot)
+        return fill_option_close_from_config(
+            ticker,
+            slot=slot,
+            clock=clock,
+            config_path=config_path,
+            token_path=token_path,
+            session_phase=phase.value if phase is SessionPhase.POST_EQUITY_CLOSE else None,
+        )
+
+    return fill
+
+
 def _close_guard(
     config_path: str | Path | None,
     tickers_path: str | Path | None,
     session_clock: SessionClock,
+    clock: Clock,
+    token_path: str | Path | None = None,
 ) -> CloseGuard | None:
     """The close+5 guard for this daemon, or ``None`` when it cannot be built.
 
@@ -415,6 +455,10 @@ def _close_guard(
     id back into a ticker. Both answer at the moment the guard runs rather than at daemon
     start, so a ticker onboarded or retired mid-session is judged against the moment. A
     missing spans file leaves the guard checking nothing, which writes no false marker.
+
+    The fill is wired here too. Without it the guard finds a missing option close, says
+    "no fill fetcher", and returns, so the five-minute window the whole close+5 rule
+    exists for is watched and never used.
     """
     try:
         config = load_config(config_path)
@@ -428,6 +472,7 @@ def _close_guard(
         spans=_spans_reader(config.lake_root),
         session_clock=session_clock,
         master=_master_reader(config.lake_root),
+        fill=_close_fill(config_path, token_path, session_clock, clock),
     )
 
 
@@ -765,7 +810,7 @@ def run_loop_from_config(
     # load-bearing. On a post-close restart the guard owns the two close minutes, and it
     # must write them before startup marking walks the day, or the day's 16:00 and 16:15
     # would carry a marker from each writer.
-    guard = _close_guard(config_path, tickers_path, session_clock)
+    guard = _close_guard(config_path, tickers_path, session_clock, clock, token_path)
     if guard is not None:
         dispatch = SessionDispatch(
             session_clock=session_clock,

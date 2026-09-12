@@ -155,24 +155,22 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
 - **D11** close tags and the close+5 guard. Close+5 is the five-minute window after the option close, the last moment an option-close fetch may land. It plugs into D9's close-tag hook, and it builds the session-relative dispatcher the design calls for. Everything session-relative runs from inside the daemon, because launchd's calendar intervals are fixed wall-clock and cannot express a close-relative time. `SessionDispatch` fires one job once per session day at a moment the calendar decides, including on a daemon that starts after that moment has passed. The close+15 compaction dispatch binds to the same seam, one tick later than its own moment, for the reason the entry above gives. Two rules are worth stating where both writers can see them:
   1. The guard's fill triggers on missing marks, not a missing cycle. A chain that failed at the option close leaves a tagged gap row holding nothing a reader can price against, and a close+5 refetch is exactly what rescues it.
   2. On a post-close restart the guard runs before startup gap-marking, so the two close minutes it owns are already recorded when D10's marker walks the day.
-- **[#90](https://github.com/l3a0/marketlake/issues/90).** The close+5 fill's producer. `CloseGuard` takes an injected `fill` and
-  `daemon._close_guard` never passes one, so `self._fill` is `None` in production. The guard
-  detects a missing `option_close`, appends a `no fill fetcher` line to its own outcome, and
-  returns. Nothing is refetched and nothing is written. The reason constant
-  `OPTION_CLOSE_SERIES_ABSENT` is defined and exported and never written by any code path, and
-  `_marker` is called once in the file, on the `spot_close` side. So the close minute leaves
-  no trace from this writer at all. The whole point of close+5 is that option quotes freeze at
-  the option close, so a fetch inside that window still observes the closing marks. Until the
-  producer exists, the window is observed and never used. It needs no vendor work that slice 2
-  lacks: `SchwabVendor.get_chain` already ships and capture calls it every minute. What is
-  missing is a caller at close+5 and a decision about what a failed fill records.
+- **D11's fill.** The producer `daemon._close_guard` hands the guard. It fetches by the chain
+  chunk plan through `capture.fetch_chain` and lands the result through
+  `capture.journal_snapshot`, so the fill and a loop cycle share one code path rather than two.
+  A whole chain in one request trips the gateway body limit, and the biggest chains are both
+  the likeliest to trip it and the likeliest to need rescuing, which is why the fill reuses the
+  plan rather than firing once. The landed rows carry the close slot in `snap_ts` and the fetch
+  minute in `fetch_ts`. A fill that captured nothing writes no row. The day already holds the
+  gap row from the cycle that failed at the close, and a second row for that minute would
+  double-count it in every per-slot completeness read.
 - **[#91](https://github.com/l3a0/marketlake/issues/91).** The membership guard's absent-marker rows. The guard counts missing expirations
   and writes no marker for them, so a series that was never offered and one that was missed
-  read the same downstream. This one is ordered behind the fill above, because the comparison
-  it marks against only exists once a fill has landed. The findings the guard does produce
-  reach the daemon's stderr through `_report_guard`, so launchd captures them to a log file. A
-  log file is a worse home than a page or a panel, and that is a separate question from this
-  entry.
+  read the same downstream. The reason constant `OPTION_CLOSE_SERIES_ABSENT` is defined and
+  exported and written by no code path, and this entry is what writes it. The findings the
+  guard does produce reach the daemon's stderr through `_report_guard`, so launchd captures
+  them to a log file. A log file is a worse home than a page or a panel, and that is a separate
+  question from this entry.
 - **D12** compaction and backup, plus the nightly window re-tune. Compaction merges a day's segments into one sealed partition. The re-tune runs after it. The job groups the day's rows by `window_start` and `window_end`, compares each window's contract count to the body limit, and rewrites `chain_plan.json` when the profile drifts.
 - **D12's exclusion list.** The design's *Backup, defined* names the sync root as `lake/`
   only, "with an explicit exclusion list". `runner.BACKUP_EXCLUSIONS` is now that list,

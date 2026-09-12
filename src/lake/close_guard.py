@@ -7,7 +7,10 @@ closes are not equally recoverable.
 An ``option_close`` that never landed can be refetched. Option quotes freeze at the
 option close, so a fetch at close+5 still observes the closing marks. The fill is
 written as its own segment and carries the close slot in ``snap_ts``, never its fetch
-minute, so a reader asking for the close gets the close.
+minute, so a reader asking for the close gets the close. A fill that captured nothing
+writes no segment at all. The day already holds the gap row from the cycle that failed
+at the close, and a second row for that one minute would double-count it in every
+per-slot completeness read, so the attempt is recorded in the outcome instead.
 
 A ``spot_close`` that never landed is unrecoverable by construction. The 16:00 moment
 cannot be re-observed at 16:20. A post-close fetch would carry frozen option marks
@@ -102,9 +105,11 @@ class CloseGuard:
     """Checks both close tags landed, fills the recoverable one, marks the other.
 
     ``fill`` is the injected fetch. It is handed a ticker and the close slot and returns
-    the expirations it captured, or ``None`` when it could not fetch. Leaving it unset
-    makes the guard marker-only, which is what a test wants and what a daemon with no
-    vendor client falls back to.
+    the expirations it captured, or ``None`` when it could not fetch. It both fetches and
+    journals, because the row it lands carries the close slot rather than its own fetch
+    minute and only the writer can stamp that. ``capture.fill_option_close`` is the one
+    the daemon passes. Leaving it unset makes the guard marker-only, which is what a
+    marker-side test wants.
 
     ``spans`` and ``master`` are both readers, not values. Between them they answer the
     only question the guard asks before it writes: did this ticker owe a close at this
@@ -333,17 +338,27 @@ class CloseGuard:
             # option close means.
             found.refused.append(f"{ticker}: past close+5")
             return
+        # Read before the fill, never after. ``latest_expirations`` answers with the
+        # newest durable batch on the ticker, and the fill lands one. Reading after would
+        # hand back the fill's own expirations, so the comparison below would compare the
+        # fill against itself and never find a shortfall. The baseline the design names
+        # is the day's last loop-captured cycle, which is what this read returns while the
+        # fill has not landed yet.
+        baseline = journal.latest_expirations(self._root, ticker)
         try:
             captured = self._fill(ticker, bounds.option_close)
         except Exception as exc:  # noqa: BLE001 - a vendor failure must not stop the guard
             found.problems.append(f"chains/{ticker} option_close: {type(exc).__name__}")
             return
         if captured is None:
+            # Nothing landed, so nothing is written. The day already carries the gap row
+            # from the cycle that failed at the close, and a second row for that minute
+            # would double-count it in every per-slot completeness read. The refusal is
+            # the record of the attempt, and it reaches the report like the others.
             found.refused.append(f"{ticker}: fill fetch returned nothing")
             return
         found.filled.append(ticker)
 
-        baseline = journal.latest_expirations(self._root, ticker)
         if baseline is None:
             # No same-day cycle to compare against. The fill still stands, and the
             # battery is told to judge it rather than the guard voiding it.
