@@ -86,6 +86,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 from lake.alert import Message, NtfyTransport, Publisher
 from lake.calendar import MARKET_TZ, Calendar
@@ -438,7 +439,7 @@ def parse_pmset_assertions(output: str) -> bool:
     the owning pid is not matched against the daemon's child, and the assertion's timer
     sits on a continuation line the match never reaches. So a hand-run ``caffeinate -i``
     left over from the night before satisfies this. Closing that needs the daemon to
-    record its child's pid somewhere this separate process can read, which is #107.
+    record its child's pid somewhere this separate process can read, which is #111.
 
     The kind has to be on the line too, because ``caffeinate -d`` holds the display up and
     lets the system idle to sleep underneath it.
@@ -991,6 +992,17 @@ def caffeinate_args(window: AssertionWindow, now: datetime) -> tuple[str, ...] |
 AssertionRunner = Callable[[Sequence[str]], object]
 
 
+@runtime_checkable
+class AssertionHandle(Protocol):
+    """The slice of the spawned child the holder reads: whether it is still running.
+
+    ``subprocess.Popen`` satisfies this. A test double that returns nothing does not, and
+    that is a supported answer rather than a broken one. See ``AssertionHolder._holding``.
+    """
+
+    def poll(self) -> int | None: ...
+
+
 def _spawn(args: Sequence[str]) -> object:
     import subprocess  # lazy: only the live daemon spawns
 
@@ -1014,6 +1026,9 @@ class AssertionHolder:
     def __init__(self, *, runner: AssertionRunner | None = None) -> None:
         self._runner = runner if runner is not None else _spawn
         self._held: AssertionWindow | None = None
+        self._child: object | None = None
+        self._retaken = False
+        self._retake_reported: AssertionWindow | None = None
         self._failure: tuple[AssertionWindow, Exception] | None = None
         self._reported: AssertionWindow | None = None
 
@@ -1041,19 +1056,80 @@ class AssertionHolder:
         """
         eastern = now.astimezone(MARKET_TZ)
         window = assertion_window(eastern.date())
-        if window is None or window == self._held or not window.contains(eastern):
+        if window is None or not window.contains(eastern):
             return None
+        retaking = False
+        if window == self._held:
+            if self._holding():
+                return None
+            # The child is gone and the window is not. Nothing releases a ``caffeinate``
+            # early on purpose: its timer runs to the window's end, so an exit before then
+            # means it was killed, reaped, or died. Whatever the cause, the machine is no
+            # longer being held awake and this loop is the only thing awake to notice.
+            self._held = None
+            retaking = True
         args = caffeinate_args(window, eastern)
         if args is None:  # pragma: no cover - contains() already excludes the end
             return None
         try:
-            self._runner(args)
+            child = self._runner(args)
         except Exception as exc:  # noqa: BLE001 - a raise here would crash-loop the daemon
             self._failure = (window, exc)
             return None
         self._held = window
+        self._child = child
         self._failure = None
+        # A hold that landed makes this window tellable again. Without this, a window that
+        # paged for an early failure and then recovered would never page for a second,
+        # distinct loss later the same day, because ``pending_failure`` suppresses on the
+        # window it already reported. The once-per-window rule is about not repeating one
+        # unresolved failure, not about spending the window's only page on the first of
+        # two. A failure that never recovers never reaches here, so it still pages once.
+        self._reported = None
+        # Marked only now, so this says a re-take happened rather than that one was tried.
+        # Collapsed per window for the reason the page is: a ``caffeinate`` that exits on
+        # every spawn would otherwise write a line every minute of a ten-hour window, in
+        # the log the restart script sends the operator to read.
+        if retaking and window != self._retake_reported:
+            self._retaken = True
+            self._retake_reported = window
         return args
+
+    def _holding(self) -> bool:
+        """Whether the child spawned for the current window is still running.
+
+        ``poll`` answers ``None`` while the process lives and its exit status once it is
+        gone, and it reaps without blocking, so this costs a ``waitpid`` and no new
+        process. Asking ``pmset -g assertions`` instead would answer a slightly wider
+        question, an assertion released by a living process included, at the price of a
+        subprocess every minute of every window. The wider case has no known cause and
+        the narrow one does, so the cheap read wins until something shows otherwise.
+
+        A runner that returns nothing, which is every test double and any future caller
+        that does not hand back a process, leaves this unable to tell. It answers held.
+        Guessing the other way would re-spawn a ``caffeinate`` every minute of the window
+        on the strength of knowing nothing, which is the failure this method exists to
+        prevent, inverted.
+        """
+        if not isinstance(self._child, AssertionHandle):
+            return True
+        try:
+            return self._child.poll() is None
+        except Exception:  # noqa: BLE001 - a raise here would crash-loop the daemon
+            # The same rule as the spawn below, for the same reason: this runs from a hook
+            # ``run_loop`` does not wrap. ``Popen.poll`` does not raise in CPython, but the
+            # protocol only promises the attribute exists, not that calling it is safe.
+            # Unable to tell answers held, which is the answer that spawns nothing.
+            return True
+
+    def took_over_dead_child(self) -> bool:
+        """Whether the last ``hold`` replaced a child that had gone, asked once.
+
+        One-shot, like ``pending_failure``'s window collapse, because the caller reports
+        it and a report worth making once is worth making exactly once.
+        """
+        taken, self._retaken = self._retaken, False
+        return taken
 
     def pending_failure(self) -> tuple[AssertionWindow, Exception] | None:
         """The spawn failure owed a report, or ``None`` when none is owed.
