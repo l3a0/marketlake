@@ -163,7 +163,11 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   plan rather than firing once. The landed rows carry the close slot in `snap_ts` and the fetch
   minute in `fetch_ts`. A fill that captured nothing writes no row. The day already holds the
   gap row from the cycle that failed at the close, and a second row for that minute would
-  double-count it in every per-slot completeness read.
+  double-count it in every per-slot completeness read. A window that answers 200 with an
+  empty chain counts as captured nothing, because Schwab reports some faults in the body
+  rather than in the status. A fill that landed but gave up a window is named in the
+  guard's outcome, since the membership comparison cannot see a window that failed both
+  intraday and at close+5.
 - **[#91](https://github.com/l3a0/marketlake/issues/91).** The membership guard's absent-marker rows. The guard counts missing expirations
   and writes no marker for them, so a series that was never offered and one that was missed
   read the same downstream. The reason constant `OPTION_CLOSE_SERIES_ABSENT` is defined and

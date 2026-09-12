@@ -153,6 +153,26 @@ def _collect_contracts(
                 bucket.setdefault(str(strike), []).extend(contracts)
 
 
+def _has_contracts(body: Mapping[str, object]) -> bool:
+    """Whether a reassembled chain body holds at least one contract.
+
+    A window that answers 200 with empty expiration maps is a successful window that
+    captured nothing. The cycle still journals that as a data segment, because what the
+    vendor sent is what the cycle records. The close+5 fill cannot, because a fill is a
+    claim that the close of record was rescued, and a segment with no contract row
+    rescues nothing.
+    """
+    for map_key in _CHAIN_EXP_MAPS:
+        exp_map = body.get(map_key) or {}
+        if not isinstance(exp_map, Mapping):
+            continue
+        for strikes in exp_map.values():
+            for contracts in strikes.values():
+                if contracts:
+                    return True
+    return False
+
+
 def _snake_case(name: str) -> str:
     """A CamelCase name as snake_case."""
     return _CAMEL_BOUNDARY.sub("_", name).lower()
@@ -1163,7 +1183,14 @@ def fill_option_close(
         plan=plan if plan is not None else load_chain_plan(),
         guards=guards if guards is not None else GuardConstants(),
     )
-    if fetched.body is None:
+    if fetched.body is None or not _has_contracts(fetched.body):
+        # Nothing to land. ``body is None`` is every window having failed. An empty body
+        # is the subtler case: a window that answers 200 with empty expiration maps is a
+        # successful fetch that carries no contract, and Schwab serves exactly that shape
+        # for a fault it reports in the body rather than the status. Writing either one
+        # would leave a zero-row segment and a ``rows=0`` manifest entry standing for a
+        # close nobody captured, and would report the close as filled. The check runs
+        # before the write, so no segment is created to clean up.
         return None
     outcome = journal_snapshot(
         lake_root,

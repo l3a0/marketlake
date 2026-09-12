@@ -7,7 +7,7 @@ clock, and a small injected plan, writing into a throwaway lake. No network and 
 clock are crossed, so the tier is component: capture and the guard over real files, with
 the vendor and the clock still fake.
 
-Six claims are covered.
+Nine claims are covered.
 
 1. The landed segment carries the option close in ``snap_ts`` and the fetch minute in
    ``fetch_ts``. Both matter, and collapsing them loses one of the two.
@@ -18,9 +18,16 @@ Six claims are covered.
    so the fill still lands what the other windows returned.
 4. A fill where every window failed writes no row at all, leaving the day's existing gap
    row to stand for the minute.
-5. The landed row is the shape an ordinary cycle writes, column for column, apart from
+5. A fill whose windows answered 200 with no contracts writes no row either. That is a
+   successful fetch that captured nothing, and landing it would leave a zero-row segment
+   standing for a close nobody captured.
+6. A fill that gave up a window says so in the outcome, even when the baseline is blind
+   to the same window and the expiration comparison comes out empty.
+7. The membership baseline is the day's own last cycle. A session that captured nothing
+   is baseline-less rather than short by every series that expired earlier.
+8. The landed row is the shape an ordinary cycle writes, column for column, apart from
    the coordinates and tags the fill owns.
-6. The daemon's production wiring really passes the producer, and a guard the daemon
+9. The daemon's production wiring really passes the producer, and a guard the daemon
    built lands the close.
 """
 
@@ -629,3 +636,104 @@ def test_the_daemon_hands_the_guard_a_fill_that_lands_the_close(tmp_path, monkey
     assert {r["fetch_ts"][:16] for r in rows} == {"2026-09-02T16:20"}
     # The daemon's producer went through the chunk plan, not one whole-chain request.
     assert vendor.calls == [("SPY", *NEAR), ("SPY", *TAIL)]
+
+
+# -- what the lenses found: a fill that captured nothing, and one that gave up a window --
+
+
+def test_a_fill_whose_windows_answered_with_no_contracts_writes_nothing(lake_root):
+    """A 200 carrying an empty chain is a successful fetch that captured nothing.
+
+    Schwab reports some faults in the body rather than in the status, so a window can
+    come back 200 with empty expiration maps. That is a successful window to the chunker,
+    which seeds the header and merges no contract, so the reassembled body is not
+    ``None``. Landing it would leave a zero-row segment and a ``rows=0`` manifest entry
+    standing for a close nobody captured, and the guard would report the close as filled.
+    """
+    empty = VendorResponse(
+        status=200, body={"status": "FAILED", "callExpDateMap": {}, "putExpDateMap": {}}
+    )
+    captured = _fill(lake_root, _WindowVendor(windows={NEAR: empty, TAIL: empty}))
+
+    assert captured is None
+    assert _rows(lake_root) == []
+    assert latest_entries(lake_root) == {}
+
+
+def test_a_fill_reports_a_window_it_gave_up_even_when_the_baseline_is_blind(lake_root):
+    """The membership comparison cannot see a window that failed both times.
+
+    The window that fails at close+5 is usually the one that failed intraday, so the
+    baseline is blind in exactly the same place and the expiration difference comes out
+    empty. The absence rides the snapshot as a gap row carrying its own class, so the
+    lake's record stands, but without this the outcome named nothing and the operator's
+    only channel printed an empty string for a close of record missing a whole window.
+    """
+    failing = {NEAR: _chain([NEAR_EXP]), TAIL: TOO_BIG}
+    capture.run_cycle(
+        ManualClock(start=et(2026, 9, 2, 15, 59)),
+        _WindowVendor(windows=dict(failing)),
+        Roster.from_mapping({"SPY": {"options": True, "chain_cadence": "1m"}}),
+        lake_root,
+        pid=3,
+        guards=GuardConstants(chain_chunk_max_split_depth=0),
+        plan=TWO_WINDOWS,
+    )
+
+    def fill(ticker: str, slot: datetime):
+        return capture.fill_option_close(
+            ManualClock(start=FILL_MINUTE),
+            _WindowVendor(windows=dict(failing)),
+            ticker,
+            slot=slot,
+            lake_root=lake_root,
+            guards=GuardConstants(chain_chunk_max_split_depth=0),
+            plan=TWO_WINDOWS,
+            pid=7,
+        )
+
+    outcome = _guard(lake_root, at=FILL_MINUTE, fill=fill).run(DAY)
+
+    # The fill stands for the series it does hold, which is the design's rule.
+    assert outcome.filled == ("SPY",)
+    # And the window it lost is named, so the report has something to print.
+    assert outcome.shortfalls == ("SPY: 1 windows absent",)
+    assert outcome.reportable
+
+
+def test_a_dark_session_is_baseline_less_rather_than_a_phantom_shortfall(lake_root):
+    """The baseline is the day's own cycle. Reaching back a day invents a shortfall.
+
+    `latest_expirations` walks a ticker's segments across every date. On a session that
+    captured nothing, the post-close restart this guard exists for, an unscoped read
+    reaches back to an earlier session whose same-day series have since expired. Every
+    one of them reads as missing from today's fill, which is a shortfall that cannot be
+    true. The design's answer for a day with no cycle to compare against is baseline-less.
+    """
+    # Yesterday captured a series expiring yesterday, and one that lives on.
+    capture.run_cycle(
+        ManualClock(start=et(2026, 9, 1, 15, 59)),
+        _WindowVendor(
+            windows={
+                (
+                    date(2026, 9, 1).isoformat(),
+                    (date(2026, 9, 1) + timedelta(days=9)).isoformat(),
+                ): _chain(["2026-09-01"]),
+                ((date(2026, 9, 1) + timedelta(days=10)).isoformat(), None): _chain([TAIL_EXP]),
+            }
+        ),
+        Roster.from_mapping({"SPY": {"options": True, "chain_cadence": "1m"}}),
+        lake_root,
+        pid=3,
+        guards=GuardConstants(),
+        plan=TWO_WINDOWS,
+    )
+    # Today captured nothing at all, and the fill lands today's chain.
+    outcome = _guard(
+        lake_root, at=FILL_MINUTE, fill=lambda t, s: _fill(lake_root, _both_windows(), ticker=t)
+    ).run(DAY)
+
+    assert outcome.filled == ("SPY",)
+    assert outcome.baseline_less == ("SPY",)
+    # 2026-09-01 expired yesterday. It cannot be missing from today's close.
+    assert outcome.shortfalls == ()
