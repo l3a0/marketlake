@@ -1308,7 +1308,7 @@ def describe_unusable(entries: Sequence[UnusableSegment]) -> str:
         return ""
     counts = Counter(entry.kind for entry in entries)
     parts = [f"{counts[kind]} {kind}" for kind in _SEGMENT_KIND_ORDER if counts[kind]]
-    # A kind outside the four is not possible from the classifiers above. Printing any
+    # A kind outside the five is not possible from the classifiers above. Printing any
     # stray one rather than dropping it keeps the breakout's total equal to the count.
     parts.extend(
         f"{count} {kind}" for kind, count in counts.items() if kind not in _SEGMENT_KIND_ORDER
