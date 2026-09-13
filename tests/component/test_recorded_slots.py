@@ -121,6 +121,9 @@ def test_bytes_that_are_no_arrow_stream_read_as_corrupt_rather_than_drifted(tmp_
     assert found.slots == frozenset()
     assert len(found.unreadable) == 1
     assert found.unreadable[0].kind == journal.SEGMENT_CORRUPT
+    # The path half of the pair. Nothing prints it yet, so without this the field could be
+    # filled with anything and the suite would not notice.
+    assert found.unreadable[0].path == directory / "20260902T100000-1.arrows"
 
 
 def test_a_shadow_appended_segment_keeps_its_own_kind(tmp_path):
@@ -318,3 +321,52 @@ def test_close_tag_rows_still_counts_the_segments_it_can_read(tmp_path):
 
     assert found.data == 1, "the good segment's row was lost to its neighbour"
     assert [entry.kind for entry in found.unreadable] == [journal.SEGMENT_DRIFTED]
+
+
+def test_a_zero_byte_segment_reads_as_absent_rather_than_unreadable(tmp_path):
+    """Created and never written to is absent, not damaged, and the difference is a day.
+
+    ``SegmentWriter`` opens with ``O_CREAT|O_EXCL`` and fsyncs the directory entry before
+    the first schema bytes, so a process killed in between leaves one of these durably
+    behind, and a ``KeepAlive`` crash loop makes them in quantity. Counting one as corrupt
+    would have the startup walk refuse the whole ticker-day and mark nothing, which is a
+    full session of gap marking lost to a file holding no batches at all.
+
+    ``close_tag_rows`` has had this case since before the kinds existed. Its twin had none,
+    so the skip could be deleted here alone with the suite green.
+    """
+    directory = journal.segment_dir(tmp_path, journal.QUOTES_SURFACE, "XYZ", DAY)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "20260902T100000-1.arrows").touch()
+
+    found = journal.recorded_slots(tmp_path, journal.QUOTES_SURFACE, "XYZ", DAY)
+
+    assert found.slots == frozenset()
+    assert found.unreadable == (), "an empty file was reported as damage"
+
+
+def test_the_kind_names_are_the_panel_s_own_counter_names():
+    """The alignment the whole scheme rests on, which nothing connected.
+
+    These names are reused from ``dashboard.SegmentHealth`` so the panel and the readers
+    under it name one failure one way. Nothing linked the two sides, so either could be
+    renamed and the alignment would break in silence, which is the drift this reader exists
+    to stop, spelled with identifiers instead of data.
+
+    ``unparseable`` is deliberately absent from the four. The panel draws that line among
+    rows rather than segments, under ``unparseable_stamp_rows``, so it has no segment-level
+    counter to match and is this reader's own.
+    """
+    from dataclasses import fields
+
+    from lake.dashboard import SegmentHealth
+
+    counters = {field.name for field in fields(SegmentHealth)}
+    assert {
+        journal.SEGMENT_CORRUPT,
+        journal.SEGMENT_VANISHED,
+        journal.SEGMENT_SHADOW_APPEND,
+        journal.SEGMENT_DRIFTED,
+    } <= counters
+    assert journal.SEGMENT_UNPARSEABLE not in counters
+    assert "unparseable_stamp_rows" in counters
