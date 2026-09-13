@@ -378,6 +378,57 @@ def test_an_unobserved_close_says_so_on_stderr(tmp_path, capsys):
     assert "unobserved=XYZ" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    ("field", "label"),
+    [("baseline_less", "baseline-less"), ("shortfalls", "shortfall"), ("refused", "refused")],
+)
+def test_the_other_three_findings_reach_stderr_too(field, label, capsys):
+    """Five fields are reportable and two of them have cases of their own above.
+
+    These are the other three. Each is one line in the report's loop, and deleting any
+    one of them leaves every other case here green while a whole class of finding stops
+    being printed. A refusal is the one that costs most: it is how a fill that captured
+    nothing is recorded at all.
+    """
+    outcome = close_guard.GuardOutcome(DAY, **{field: ("XYZ: reason",)})
+    assert outcome.reportable, f"{field} alone did not count as worth reporting"
+
+    daemon._report_guard(outcome)
+
+    assert f"{label}=XYZ: reason" in capsys.readouterr().err
+
+
+def test_a_field_with_nothing_in_it_is_left_out(capsys):
+    """The empty ones are dropped, so the line says what happened rather than the schema.
+
+    Without the filter every reportable day prints all five names with nothing after
+    four of them, and the one finding that matters is buried in a row of empty keys.
+    """
+    daemon._report_guard(close_guard.GuardOutcome(DAY, unobserved=("XYZ",)))
+
+    reported = capsys.readouterr().err
+    assert "unobserved=XYZ" in reported
+    assert "refused=" not in reported, "an empty field was printed anyway"
+    assert "problems=" not in reported
+
+
+def test_a_config_that_will_not_load_still_reaches_stderr(tmp_path, capsys):
+    """The reporter's fallback, which no run through the production entry reaches.
+
+    ``_guard_reporter`` resolves the lake root so the findings can be filed. A config it
+    cannot load costs the file, and the print is the half that must survive it. Nothing
+    executes this branch otherwise, which is how ``pmset_assertions_probe`` and
+    ``control_plane._spawn`` both shipped with a ``return`` in front of them.
+    """
+    reporter = daemon._guard_reporter(
+        tmp_path / "no-such-config.yaml", ManualClock(start=et(2026, 9, 2, 16, 20))
+    )
+
+    reporter(close_guard.GuardOutcome(DAY, unobserved=("XYZ",)))
+
+    assert "unobserved=XYZ" in capsys.readouterr().err
+
+
 def test_a_run_that_only_had_problems_still_says_so_on_stderr(capsys):
     """Problems are the whole operator-visible output of a run that wrote nothing.
 

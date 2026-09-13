@@ -10,7 +10,8 @@ two runs on one day both survive, and that an exception's message stops at the b
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+import os
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -127,7 +128,11 @@ def test_the_day_keying_the_directory_is_the_guards_day_not_the_clocks(lake_root
     path = report.write_close_guard(lake_root, FINDINGS, now=after_midnight, pid=11)
 
     assert path.parent.name == "date=2026-09-02"
-    assert _entries(lake_root)[0]["at"].startswith("2026-09-03T00:30")
+    (entry,) = _entries(lake_root)
+    assert entry["at"].startswith("2026-09-03T00:30")
+    # The field and the directory have to agree. A record filed under the 2nd whose own
+    # contents say the 3rd hands a reader two answers and no way to pick.
+    assert entry["day"] == "2026-09-02"
 
 
 # -- 2. a clean run still writes a file ----------------------------------------------
@@ -177,6 +182,9 @@ def test_a_guard_report_alone_leaves_the_page_count_at_zero(lake_root):
     report.write_close_guard(lake_root, FINDINGS, now=AT, pid=11)
 
     assert undelivered(lake_root, DAY) == 0
+    # Without this the case passes on an empty lake, so a writer that did nothing at all
+    # would satisfy it.
+    assert _files(lake_root), "the guard finding was not written at all"
 
 
 # -- 4. two runs on one day do not collide -------------------------------------------
@@ -290,3 +298,136 @@ def test_a_problem_naming_no_exception_survives_whole(lake_root):
         "quotes/XYZ: 2 unreadable",
         "chains/SPY: 1 unreadable",
     ]
+
+
+# -- the instant: Eastern, and the guard's day ---------------------------------------
+
+
+def test_a_utc_instant_is_filed_in_eastern(lake_root):
+    """The daemon's clock is UTC, and every other case here hands this one Eastern.
+
+    ``SystemClock.now`` returns ``datetime.now(UTC)``, so the instant production passes is
+    four hours ahead of the wall clock the lake is keyed on in September. Dropping the
+    conversion is invisible to a suite that only ever passes Eastern, and it moves both
+    halves of the record: close+5 files itself as 20:20 and ``at`` carries ``+00:00``.
+    """
+    utc_close_plus_five = datetime(2026, 9, 2, 20, 20, tzinfo=UTC)
+
+    path = report.write_close_guard(lake_root, FINDINGS, now=utc_close_plus_five, pid=11)
+
+    assert path.name.startswith("1620"), "the file name was stamped in the wrong zone"
+    (entry,) = _entries(lake_root)
+    assert entry["at"] == "2026-09-02T16:20:00-04:00"
+    assert datetime.fromisoformat(entry["at"]).utcoffset() is not None, "the offset was dropped"
+
+
+def test_two_days_are_filed_under_two_directories(lake_root):
+    """Every other case here uses one date, so a hardcoded one would satisfy them all."""
+    report.write_close_guard(lake_root, GuardOutcome(DAY), now=AT, pid=11)
+    next_day = date(2026, 9, 3)
+    report.write_close_guard(lake_root, GuardOutcome(next_day), now=et(2026, 9, 3, 16, 20), pid=11)
+
+    tree = Path(lake_root) / "reports" / "close_guard"
+    assert sorted(child.name for child in tree.iterdir()) == [
+        "date=2026-09-02",
+        "date=2026-09-03",
+    ]
+    assert _entries(lake_root, next_day)[0]["day"] == "2026-09-03"
+
+
+# -- the name: microseconds and the writing process ----------------------------------
+
+
+def test_two_processes_writing_at_one_instant_both_land(lake_root):
+    """A restart inside the same minute is what the pid in the name is for.
+
+    The restart case above is twenty-one minutes apart, so it separates on the stamp
+    alone and cannot tell whether the pid is carried. Two daemons reaching close+5 inside
+    one microsecond is the shape that needs it, and under a name without the pid the
+    second run's findings are lost to a ``FileExistsError``.
+    """
+    report.write_close_guard(lake_root, GuardOutcome(DAY, unobserved=("XYZ",)), now=AT, pid=11)
+    report.write_close_guard(lake_root, GuardOutcome(DAY, unobserved=("ABC",)), now=AT, pid=12)
+
+    entries = _entries(lake_root)
+    assert len(entries) == 2, "the second process overwrote or collided with the first"
+    assert {entry["unobserved"][0] for entry in entries} == {"XYZ", "ABC"}
+
+
+def test_two_writes_a_microsecond_apart_both_land(lake_root):
+    """A slot's stamp carries no sub-minute part, which is why the name carries one.
+
+    One process writing twice inside a minute is not reachable through the dispatcher
+    today, and the name is what keeps it from becoming a loss if it ever is.
+    """
+    report.write_close_guard(lake_root, GuardOutcome(DAY), now=AT, pid=11)
+    report.write_close_guard(lake_root, GuardOutcome(DAY), now=AT.replace(microsecond=1), pid=11)
+
+    assert len(_files(lake_root)) == 2, "the sub-minute part of the stamp was dropped"
+
+
+def test_the_default_pid_is_the_writing_process(lake_root):
+    """The daemon passes no pid, so the default is the one production files under."""
+    path = report.write_close_guard(lake_root, FINDINGS, now=AT)
+
+    assert path.name.endswith(f"-{os.getpid()}.json"), path.name
+
+
+# -- reportable: the field a nightly reader filters on -------------------------------
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["unobserved", "baseline_less", "shortfalls", "refused", "problems"],
+)
+def test_any_one_finding_files_the_day_as_reportable(lake_root, field):
+    """Each clause on its own, because the filed field is what D16 will filter on.
+
+    A fixture with every field populated cannot say which clause drove the value, so a
+    day whose only finding is a refusal could file as ``reportable: false`` and drop out
+    of the nightly report with its ``refused`` list sitting unread in the file.
+    """
+    outcome = GuardOutcome(DAY, **{field: ("XYZ",)})
+    assert outcome.reportable, f"{field} alone did not count as worth reporting"
+
+    report.write_close_guard(lake_root, outcome, now=AT, pid=11)
+
+    entry = _entries(lake_root)[0]
+    assert entry["reportable"] is True
+    assert entry[field] == ["XYZ"]
+
+
+def test_a_run_that_only_filled_is_not_reportable(lake_root):
+    """The other side of the same field. A repaired close is not a finding."""
+    report.write_close_guard(lake_root, GuardOutcome(DAY, filled=("XYZ",)), now=AT, pid=11)
+
+    assert _entries(lake_root)[0]["reportable"] is False
+
+
+# -- the refusal, and the branch redaction keeps for a shape it was not written for --
+
+
+def test_a_lake_root_that_is_a_file_is_refused(lake_root):
+    """``is_dir`` rather than ``exists``, and the two differ on exactly this.
+
+    A regular file where the lake root should be is the shape a half-finished install
+    leaves. ``exists`` calls it present and the failure then comes out of ``mkdir`` as a
+    different exception, past the deliberate refusal.
+    """
+    not_a_lake = lake_root / "lake.txt"
+    not_a_lake.write_text("not a lake\n")
+
+    with pytest.raises(FileNotFoundError):
+        report.write_close_guard(not_a_lake, FINDINGS, now=AT, pid=11)
+
+
+def test_a_problem_with_no_separator_at_all_survives_verbatim(lake_root):
+    """Redaction can only shorten, so the shape it was not written for must keep its text.
+
+    Every problem the guard composes today carries a place and a colon. This is the
+    branch that decides what happens to one that does not, and a rule that returned an
+    empty string there would erase the only thing the run had to say.
+    """
+    report.write_close_guard(lake_root, GuardOutcome(DAY, problems=("boom",)), now=AT, pid=11)
+
+    assert _entries(lake_root)[0]["problems"] == ["boom"]
