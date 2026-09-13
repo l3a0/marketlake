@@ -4,9 +4,11 @@ Marketlake is a capture-first market data lake. It records full option chains an
 equity quotes at one-minute cadence from the Schwab Trader API. Every snapshot not
 taken is gone forever. So capture reliability is the first-order concern.
 
-The design doc at [docs/design.md](docs/design.md) is the source of truth. Read it
-before proposing any change. The build plan at [docs/build-plan.md](docs/build-plan.md)
-sequences the work into deliverables D0 through D21.
+An unbuilt deliverable's issue is the source of truth for its scope. The design doc at
+[docs/design.md](docs/design.md) carries the reasoning, the premise, and the
+considered-and-rejected register, and it is the source of truth for everything already built.
+The build plan at [docs/build-plan.md](docs/build-plan.md) sequences the work into
+deliverables D0 through D21 and links each unbuilt one to its issue.
 
 ## Status
 
