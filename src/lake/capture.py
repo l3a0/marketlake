@@ -635,8 +635,11 @@ def _fetch_window(
     default depth of 4, because at each level one half succeeds and stops while only the
     other recurses. A window whose every expiration drifted fails both halves at every
     level and walks the full binary tree, 31 requests at that same depth, and it does that
-    every minute for as long as the drift lasts. Whether a wholesale drift should stop
-    splitting is a question of its own, tracked in #122.
+    every minute for as long as the drift lasts. The depth bound caps that case too, and it
+    is deliberately the only cap. Considered and rejected: a second rule stopping the split
+    once both halves have failed, or bounding drift lower than size. Either buys a smaller
+    number in a case the vendor has never produced, and the price is a second thing to reason
+    about on the split path. One number an operator can read and lower is worth more.
 
     The give-up class is decided where the failure is seen, not where the window is given
     up, because a window split for drift can have a half that is genuinely too big and the

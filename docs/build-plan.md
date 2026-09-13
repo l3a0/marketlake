@@ -182,8 +182,12 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
      split costs depends on how wide the drift is, and the depth bound is the only thing
      that caps it. One bad expiration in a 30-day window costs 9 requests at the default
      depth of 4. A window whose every expiration drifted walks the full binary tree at 31,
-     every minute for as long as the drift lasts. That is unchanged from before this entry
-     and is tracked in [#122](https://github.com/l3a0/marketlake/issues/122). Filing drift
+     every minute for as long as the drift lasts. The bound caps that case too, and it is
+     deliberately the only cap. **Considered and rejected: a second rule for drift**, either
+     stopping the split once both halves have failed or bounding drift lower than size.
+     Either buys a smaller number in a case the vendor has never produced, and the price is
+     a second thing to reason about on the split path. One number an operator can read and
+     lower is worth more. Filing drift
      under the size class would send a reader to the chunk plan for a problem no chunk plan
      fixes. The class is named to read as drift, so the schema-drift page in
      [#92](https://github.com/l3a0/marketlake/issues/92) has one string to subscribe to and
