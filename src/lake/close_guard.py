@@ -308,15 +308,46 @@ class CloseGuard:
         if rows.data or rows.gaps:
             return
         if rows.unreadable:
-            # The marker this would write is a claim that nothing observed the close. A
-            # segment that will not read might hold the very row that refutes it, and the
-            # next run deletes a false marker as debris, so a row a live writer wrote goes
-            # with it. Saying so and writing nothing is the honest answer.
+            # Withheld for every kind, and for a different reason per kind rather than one
+            # reason repeated. The marker is a claim that nothing observed the close, so
+            # the question each kind has to answer is whether the file it names could be
+            # hiding the row that refutes the claim. Every kind answers yes, or worse:
             #
-            # This withholds a marker for a minute nothing else records either, because
-            # the startup walk refuses the same pair. The day then reads short with no row
-            # naming why, which is the loss #120 tracks. It is the right side to err on
-            # only because the alternative is a false claim sealed into the record.
+            # 1. ``drifted`` opened and its rows went unread, because the column asked of
+            #    it is gone or came back retyped. The rows are still sitting in there.
+            # 2. ``corrupt`` does not mean the file holds nothing. It covers a torn header,
+            #    which really does hold no batch, and it covers an ``OSError`` over a
+            #    segment that is whole and merely unopenable right now, which holds
+            #    everything. A segment carrying this very close reads back as ``corrupt``
+            #    under ``chmod 000`` and answers one data row with its mode restored. The
+            #    open stage cannot tell those apart, so neither can the kind it assigns.
+            # 3. ``vanished`` is the seal landing between the prologue's ledger read and
+            #    this one. The rows did not go anywhere. They moved into the partition
+            #    compaction just sealed, so the claim is false on its face. Writing it
+            #    would also write into a sealed day, which the next run deletes as debris
+            #    and takes any live row beside it, and that is the failure ``_is_sealed``
+            #    exists to stop, reached by a race instead of a stale read. Going and
+            #    counting the rows in that partition is not the repair. The guard's window
+            #    closes before compaction's opens, so a sealed day is one this writer is
+            #    already finished with, and silence is what it owes a sealed day anyway.
+            # 4. ``shadow_append`` refuses a file whose complete prefix read back fine,
+            #    because bytes sit past its end-of-stream marker. The rows are readable and
+            #    they are the ones under the design's tamper signature, so a fresh claim
+            #    about that ticker-day is the worst of the set to write, not the safest.
+            #
+            # ``unparseable`` takes drift's answer for drift's reason, the file opened and
+            # its rows went unread. It is covered here rather than left out, because which
+            # kinds this reader can produce is the reader's business and not this branch's.
+            #
+            # #104 asked for the refusal to narrow to drift, reading an unopenable or
+            # shadow-appended file as one that refutes nothing. Point 2 is the
+            # counter-example and point 3 is worse than leaving the rule alone, so the
+            # refusal stays whole. The rejection is pinned in the design doc beside the
+            # guard's other one.
+            #
+            # What it costs is unchanged and still #120's. This withholds a marker for a
+            # minute nothing else records either, because the startup walk refuses the
+            # same pair, so the day reads short with no row naming why.
             found.problems.append(f"quotes/{ticker}: {journal.describe_unusable(rows.unreadable)}")
             return
         try:

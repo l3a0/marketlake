@@ -7,6 +7,7 @@ tests are too. Each one names the rule it checks.
 from __future__ import annotations
 
 import collections
+import os
 from datetime import date, datetime
 from pathlib import Path
 
@@ -1107,6 +1108,94 @@ def test_a_drifted_segment_is_recorded_rather_than_raised(tmp_path):
         journal.segment_dir(tmp_path, "quotes", "XYZ", date(2026, 9, 2)).glob("*.arrows")
     )
     assert len(written) == 1, "the walk marked a day whose record it could not read"
+
+
+# The refusal above is uniform across every kind a segment can fail as, and only two of
+# the five had a case. The three below close that, because a narrowing here is worse than
+# the same narrowing in the close+5 guard: withholding a marker costs one minute, while
+# marking a day whose record cannot be read writes a full session of holes over rows that
+# exist.
+
+
+DRIFT_DAY = date(2026, 9, 2)
+
+
+def _one_recorded_segment(root: Path, ticker: str) -> Path:
+    """A real captured cycle on the day the walk will look at, returned for damaging."""
+    _record(root, "quotes", ticker, et(2026, 9, 2, 11, 0))
+    (path,) = journal.segment_dir(root, "quotes", ticker, DRIFT_DAY).glob("*.arrows")
+    return path
+
+
+def test_a_shadow_appended_day_is_refused_rather_than_over_marked(tmp_path):
+    """Bytes past the end-of-stream marker, which the design treats as a tamper signature.
+
+    The complete prefix reads back, so the minutes really are recorded, and marking the day
+    would write a full session of ``daemon_dead`` rows over them.
+    """
+    path = _one_recorded_segment(tmp_path, "XYZ")
+    with path.open("ab") as handle:
+        handle.write(b"shadow bytes past the end of stream")
+
+    report = _marker(tmp_path, et(2026, 9, 2, 12, 0), roster=_roster_of("XYZ")).on_start()
+
+    assert report.problems == ("quotes/XYZ 2026-09-02: 1 unreadable (1 shadow_append)",), (
+        report.problems
+    )
+    written = sorted(journal.segment_dir(tmp_path, "quotes", "XYZ", DRIFT_DAY).glob("*.arrows"))
+    assert written == [path], "the walk marked over a day under a tamper signature"
+
+
+def test_a_day_whose_segment_vanishes_under_the_read_is_refused_too(tmp_path, monkeypatch):
+    """Compaction unlinking a sealed day's segments, caught mid-walk.
+
+    The rows moved into the partition rather than disappearing, so a full session of
+    markers here would be written over a record that exists and is already sealed.
+    """
+    _one_recorded_segment(tmp_path, "XYZ")
+    real_read = journal.read_segment
+
+    def vanishing_read(target):
+        os.unlink(target)
+        return real_read(target)
+
+    monkeypatch.setattr(journal, "read_segment", vanishing_read)
+
+    report = _marker(tmp_path, et(2026, 9, 2, 12, 0), roster=_roster_of("XYZ")).on_start()
+
+    assert report.problems == ("quotes/XYZ 2026-09-02: 1 unreadable (1 vanished)",), report.problems
+    assert report.rows == 0, "the walk marked a day compaction had just sealed"
+
+
+def test_a_day_whose_stamps_will_not_decode_is_refused_too(tmp_path):
+    """The fifth kind: the column is present and the right type, and a value is unusable.
+
+    ``snap_ts`` is still ``string``, so nothing went missing and nothing was retyped. The
+    minutes are in the file all the same, unread, which is the only thing the refusal turns
+    on. Written by hand because no writer makes bytes like these.
+    """
+    import pyarrow as pa
+
+    stamp = et(2026, 9, 2, 11, 0).isoformat()
+    directory = journal.segment_dir(tmp_path, "quotes", "XYZ", DRIFT_DAY)
+    directory.mkdir(parents=True, exist_ok=True)
+    values = stamp.encode() + b"\xff\xfe"
+    offsets = pa.array([0, len(stamp), len(values)], type=pa.int32())
+    stamps = pa.Array.from_buffers(
+        pa.string(), 2, [None, offsets.buffers()[1], pa.py_buffer(values)]
+    )
+    schema = pa.schema([("snap_ts", pa.string())])
+    path = directory / "20260902T110000000000-1.arrows"
+    with pa.ipc.new_stream(path, schema) as writer:
+        writer.write_batch(pa.record_batch([stamps], schema=schema))
+
+    report = _marker(tmp_path, et(2026, 9, 2, 12, 0), roster=_roster_of("XYZ")).on_start()
+
+    assert report.problems == ("quotes/XYZ 2026-09-02: 1 unreadable (1 unparseable)",), (
+        report.problems
+    )
+    written = sorted(directory.glob("*.arrows"))
+    assert written == [path], "the walk marked over a day whose minutes it could not decode"
 
 
 def test_a_roster_that_will_not_load_is_still_fatal(tmp_path):

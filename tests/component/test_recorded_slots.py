@@ -240,7 +240,7 @@ def test_a_kind_outside_the_known_set_still_reaches_the_line(tmp_path):
 # ``close_tag_rows`` splits its stages the same way and for the same reason, and the two are
 # written alike, which is exactly why each needs its own cases. Covering only
 # ``recorded_slots`` would leave its twin free to mislabel every kind silently, and the
-# close+5 guard is about to branch on that set to decide whether to withhold a marker.
+# close+5 guard reads that set to decide whether to withhold a marker.
 
 CLOSE_TAG = "spot_close"
 
