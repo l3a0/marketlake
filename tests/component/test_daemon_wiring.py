@@ -13,7 +13,7 @@ test is a page a person receives, and a sync from one copies a throwaway lake on
 machine running the suite. So the tier is component: the daemon over real files, with the
 clock, the calendar, the network, and the backup still fake.
 
-Ten bindings are covered here.
+Eleven bindings are covered here.
 
 1. The skipped-slot hook reaches the gap marker, so a live overrun records the minutes
    it slept through.
@@ -46,10 +46,14 @@ Ten bindings are covered here.
     moment, which puts the seal after both gap-marking writers, and never inside a capture
     window. A day with no session falls back to the regular wall-clock time, so the
     ``compaction`` check is fed on a holiday rather than paging about an idle daemon.
+11. The close+5 dispatch's job reaches the reports tree, so what the guard found lands in
+    a file rather than only on the stderr launchd captures and nothing reads. The write is
+    wired through a factory that resolves the lake root, which the printer never had.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -60,7 +64,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from lake import capture, close_guard, daemon, gap, journal
+from lake import capture, close_guard, daemon, gap, journal, report
 from lake.alert import PAGE_PRIORITY, Message
 from lake.capture import CycleResult, SegmentOutcome
 from lake.capture_spans import CaptureSpans, spans_path
@@ -1082,6 +1086,123 @@ def test_a_spawn_that_fails_is_reported_and_never_takes_capture_down(tmp_path):
     assert rig.pinger.urls == [CAPTURE_URL] * 4
     # Once, not once a minute: the dispatcher marks the day served before it runs.
     assert rig.compaction.calls == 1
+
+
+# -- 11. the close+5 outcome reaches the reports tree ---------------------------------
+
+
+def _tagged(root: Path, ticker: str, slot: datetime, *, close_tag: str) -> None:
+    """One close-tagged gap row, standing for a cycle that ran at a close and failed.
+
+    A tagged gap row is enough to satisfy the guard. It ran and it is recorded, so the
+    guard adds nothing, which is what a day with nothing to report looks like. ``_record``
+    above writes an untagged row, and the guard reads a close by its tag.
+    """
+    batch = journal.gap_batch(
+        journal.QUOTES_SURFACE,
+        ticker=ticker,
+        snap_ts=slot,
+        error_class="http_500",
+        close_tag=close_tag,
+    )
+    stamp = slot.strftime(gap.SEGMENT_STAMP_FORMAT)
+    with journal.SegmentWriter.open(
+        root, journal.QUOTES_SURFACE, ticker, slot.date(), stamp, 1
+    ) as writer:
+        writer.write_cycle(batch)
+
+
+def test_a_guard_run_from_the_real_wiring_files_its_findings(tmp_path):
+    """The report file has to come from the daemon, not only from a helper called direct.
+
+    The reporter is a seam, and a seam only ever replaced is a seam nothing executes.
+    ``pmset_assertions_probe`` and ``control_plane._spawn`` both shipped that way, where
+    a bare ``return`` left the suite green. So this drives the production entry over the
+    close+5 minute and reads what landed on disk.
+    """
+    rig = _rig(tmp_path)
+    master = SecurityMaster()
+    xyz = master.register(
+        kind="equity", capture_start=et(2026, 9, 2, 9, 30), valid_from=DAY, ticker="XYZ"
+    )
+    master.write(master_path(rig.lake_root))
+    spans = CaptureSpans()
+    spans.open_span(xyz, et(2026, 9, 2, 9, 30), False)
+    spans.write(spans_path(rig.lake_root))
+
+    # Close+5 is 16:20. The start sits before it and the second tick lands on it.
+    clock = ManualClock(start=et(2026, 9, 2, 16, 18, 30))
+    _run(rig, clock, ticks=2, cycle_runner=_no_cycle)
+
+    files = sorted(report.close_guard_dir(rig.lake_root, DAY).glob("*.json"))
+    assert len(files) == 1, "the guard's findings reached no file"
+    entry = json.loads(files[0].read_text())
+    assert entry["unobserved"] == ["XYZ"], entry
+    assert entry["at"].startswith("2026-09-02T16:20"), entry
+
+
+def test_a_clean_day_from_the_real_wiring_files_one_too(tmp_path):
+    """A day with nothing to report still has to leave a file, or absence means nothing.
+
+    The equity close is already recorded here, so the guard owes XYZ nothing and
+    ``reportable`` is false. A reporter that returned early on that would make an absent
+    file ambiguous between a healthy day and a daemon that never reached close+5.
+    """
+    rig = _rig(tmp_path)
+    master = SecurityMaster()
+    xyz = master.register(
+        kind="equity", capture_start=et(2026, 9, 2, 9, 30), valid_from=DAY, ticker="XYZ"
+    )
+    master.write(master_path(rig.lake_root))
+    spans = CaptureSpans()
+    spans.open_span(xyz, et(2026, 9, 2, 9, 30), False)
+    spans.write(spans_path(rig.lake_root))
+    _tagged(rig.lake_root, "XYZ", et(2026, 9, 2, 16, 0), close_tag=SPOT_CLOSE)
+
+    clock = ManualClock(start=et(2026, 9, 2, 16, 18, 30))
+    _run(rig, clock, ticks=2, cycle_runner=_no_cycle)
+
+    files = sorted(report.close_guard_dir(rig.lake_root, DAY).glob("*.json"))
+    assert len(files) == 1, "a clean run left nothing behind, so a reader cannot tell it ran"
+    assert json.loads(files[0].read_text())["reportable"] is False
+
+
+def test_a_report_that_cannot_be_written_costs_the_file_and_not_the_markers(tmp_path, capsys):
+    """The markers are the record. The file is a copy of what the run said about them.
+
+    A raise from the write reaches ``_dispatched``, which reports it and lets the loop
+    tick on. The guard's own run is finished by then, so its rows are already down. This
+    blocks the directory the day's reports go in with a file of the same name, which is
+    the shape a filesystem can actually present.
+    """
+    rig = _rig(tmp_path)
+    master = SecurityMaster()
+    xyz = master.register(
+        kind="equity", capture_start=et(2026, 9, 2, 9, 30), valid_from=DAY, ticker="XYZ"
+    )
+    master.write(master_path(rig.lake_root))
+    spans = CaptureSpans()
+    spans.open_span(xyz, et(2026, 9, 2, 9, 30), False)
+    spans.write(spans_path(rig.lake_root))
+    blocked = rig.lake_root / "reports" / "close_guard"
+    blocked.parent.mkdir(parents=True)
+    blocked.write_text("not a directory\n")
+
+    seen: list[str] = []
+    hooks = daemon.DaemonHooks(on_tick=lambda slot: seen.append(slot.strftime("%H:%M")))
+    clock = ManualClock(start=et(2026, 9, 2, 16, 18, 30))
+    _run(rig, clock, ticks=3, cycle_runner=_no_cycle, hooks=hooks)
+
+    assert seen == ["16:19", "16:20", "16:21"], "the loop died on the minute the write failed"
+    marked = [
+        row
+        for row in _rows(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", DAY)
+        if row["error_class"] == close_guard.SPOT_CLOSE_UNOBSERVED
+    ]
+    assert len(marked) == 1, "the failed write cost the marker the guard had already made"
+    reported = capsys.readouterr().err
+    assert "close+5 2026-09-02: unobserved=XYZ" in reported, "stderr lost the findings too"
+    assert "close+5: 2026-09-02:" in reported, "the failed write was swallowed silently"
 
 
 # -- a dispatched job that raises must not take the loop down --------------------------
