@@ -21,6 +21,10 @@ They cover the chunker's contract:
 5. A chain where every window fails is a whole-chain gap carrying the first failed
    window's class.
 6. The midpoint-split recursion honours the depth bound.
+7. A body the merge cannot read is given up under its own drift class rather than the size
+   class, leaves nothing half-merged behind it, and costs only the sub-range holding the
+   unreadable expiration. A reassembled body the row builder rejects fails open to a
+   whole-chain gap carrying that failure's own class, rather than leaving the cycle.
 """
 
 from __future__ import annotations
@@ -652,3 +656,187 @@ def test_a_clean_cycle_never_reads_the_journal_for_expirations(lake_root, monkey
     )
     _run(vendor, lake_root, plan)
     assert calls == []
+
+
+# -- 7. a body the merge cannot read, and one the row builder rejects ---------------------
+
+# The two payload shapes that reach the merge's failure handler. Each sits inside one
+# expiration, which is why a date-keyed split isolates it. A string where the vendor nests a
+# strike map raises ``AttributeError`` on the walk, and a strike holding a number where the
+# vendor sends a list of contracts raises ``TypeError`` when the merge extends it. Envelope
+# drift, a ``callExpDateMap`` that is not a mapping at all, never reaches here: the merge
+# skips it outright.
+_DRIFT_SHAPES = {
+    "expiration_is_not_a_strike_map": "not a strike map",
+    "strike_is_not_a_list": {"650.0": 1.0},
+}
+
+
+def _drifted_body(good: list[str], drifted: str, shape: str) -> dict:
+    """A chain body whose ``drifted`` expiration carries a shape the merge cannot read.
+
+    The ``good`` expirations are well formed and are inserted first, so a merge writing
+    into the reassembly maps as it walked would have committed them before it raised.
+    """
+    body = _chain_body(good)
+    body["callExpDateMap"][f"{drifted}:7"] = _DRIFT_SHAPES[shape]
+    return body
+
+
+def _drifted_response(good: list[str], drifted: str, shape: str) -> VendorResponse:
+    return VendorResponse(status=200, body=_drifted_body(good, drifted, shape))
+
+
+@pytest.mark.parametrize("shape", list(_DRIFT_SHAPES))
+def test_an_unreadable_body_gives_up_its_window_under_the_drift_class(lake_root, shape):
+    # A one-day near window, so it cannot be midpoint-split and is given up as it stands.
+    # Its body holds one well-formed expiration ahead of one the merge cannot read. The
+    # window is given up under the drift class rather than the size class, because the
+    # vendor's payload changed shape and no narrower chunk plan would fix that. The open
+    # tail still lands as data.
+    plan = ChainPlan(((0, 0), (1, None)))
+    vendor = _WindowVendor(
+        windows={
+            (_d(0), _d(0)): _drifted_response(["2026-08-24"], "2026-10-16", shape),
+            (_d(1), None): _chain_response(["2026-09-18"]),
+        },
+    )
+    result = _run(vendor, lake_root, plan)
+
+    outcome = result.segment(CHAINS, "SPY")
+    assert outcome.row_kind == journal.ROW_KIND_DATA
+    assert outcome.error_class == capture.CHAIN_SCHEMA_DRIFT
+    assert outcome.error_class != capture.CHAIN_CHUNK_FAILED
+
+    rows = _chain_rows(result)
+    gap_rows = [r for r in rows if r["row_kind"] == journal.ROW_KIND_GAP]
+    assert len(gap_rows) == 1
+    assert gap_rows[0]["error_class"] == capture.CHAIN_SCHEMA_DRIFT
+    assert gap_rows[0]["expiration_date"] is None
+    assert (gap_rows[0]["window_start"], gap_rows[0]["window_end"]) == (_d(0), _d(0))
+
+    # The open tail's two contracts are the whole data side, so the fetch still landed what
+    # the other windows returned rather than dropping the chain.
+    data_rows = [r for r in rows if r["row_kind"] == journal.ROW_KIND_DATA]
+    assert {r["expiration_date"] for r in data_rows} == {"2026-09-18T20:00:00.000+00:00"}
+
+
+@pytest.mark.parametrize("shape", list(_DRIFT_SHAPES))
+def test_a_window_that_raised_mid_merge_leaves_nothing_half_written(lake_root, shape):
+    """The window given up for drift contributes no row at all, good expirations included.
+
+    The merge walks an expiration at a time, so a body whose second expiration is
+    unreadable has already read the first. Committing as it walked left those contracts in
+    the reassembly maps while the same window drew an absence marker saying it was never
+    collected, and invented an empty bucket for the expiration it raised on. One window
+    carrying both data rows and its own absence marker is the double-record the markers
+    exist to prevent, so the merge stages the whole body and commits only on success.
+    """
+    plan = ChainPlan(((0, 0), (1, None)))
+    vendor = _WindowVendor(
+        windows={
+            (_d(0), _d(0)): _drifted_response(["2026-08-24"], "2026-10-16", shape),
+            (_d(1), None): _chain_response(["2026-09-18"]),
+        },
+    )
+    result = _run(vendor, lake_root, plan)
+
+    rows = _chain_rows(result)
+    expirations = {r["expiration_date"] for r in rows}
+    # Neither the readable expiration ahead of the raise nor the one it raised on reached a
+    # row. The only data expiration is the tail's.
+    assert "2026-08-24T20:00:00.000+00:00" not in expirations
+    assert not any(e is not None and e.startswith("2026-10-16") for e in expirations)
+    data_rows = [r for r in rows if r["row_kind"] == journal.ROW_KIND_DATA]
+    assert len(data_rows) == 2
+    # The chain-level count is recomputed from what was stored, so it sees two contracts and
+    # not the four a half-merge would have left.
+    assert {r["number_of_contracts"] for r in data_rows} == {2}
+    assert {r["is_chain_truncated"] for r in data_rows} == {True}
+
+
+@pytest.mark.parametrize("shape", list(_DRIFT_SHAPES))
+def test_one_unreadable_expiration_costs_its_sub_range_and_not_the_window(lake_root, shape):
+    # The whole four-day window is unreadable because one expiration inside it drifted, so it
+    # splits at its date midpoint like a too-big window. Each half is refetched, and only the
+    # single day still carrying the bad expiration is given up. The three readable sub-ranges
+    # land as data. Refusing to split would have cost the whole four-day window instead.
+    plan = ChainPlan(((0, 3), (4, None)))
+    drifted = _drifted_response(["2026-08-24"], "2026-10-16", shape)
+    vendor = _WindowVendor(
+        windows={
+            (_d(0), _d(3)): drifted,
+            (_d(0), _d(1)): _chain_response(["2026-08-26"]),
+            (_d(2), _d(3)): drifted,
+            (_d(2), _d(2)): _chain_response(["2026-08-27"]),
+            (_d(3), _d(3)): drifted,
+            (_d(4), None): _chain_response([]),
+        },
+    )
+    result = _run(vendor, lake_root, plan)
+
+    rows = _chain_rows(result)
+    data_rows = [r for r in rows if r["row_kind"] == journal.ROW_KIND_DATA]
+    gap_rows = [r for r in rows if r["row_kind"] == journal.ROW_KIND_GAP]
+    # Both readable halves landed: a call and a put each.
+    assert len(data_rows) == 4
+    assert {r["expiration_date"] for r in data_rows} == {
+        "2026-08-26T20:00:00.000+00:00",
+        "2026-08-27T20:00:00.000+00:00",
+    }
+    # The loss is one day wide, not four, and it carries the drift class.
+    assert [(r["window_start"], r["window_end"], r["error_class"]) for r in gap_rows] == [
+        (_d(3), _d(3), capture.CHAIN_SCHEMA_DRIFT)
+    ]
+    # The split recursed only down the unreadable side. The readable halves terminated.
+    assert _calls_for(vendor, _d(0), _d(1)) == 1
+    assert _calls_for(vendor, _d(0), _d(0)) == 0
+    assert _calls_for(vendor, _d(2), _d(2)) == 1
+
+
+def _retyped_expiration_response(expirations: list[str]) -> VendorResponse:
+    """A body that merges cleanly and that the calibrated row builder then rejects.
+
+    The contracts nest exactly as the vendor's do, so nothing in the merge notices. One
+    contract's ``expirationDate`` arrives as an epoch integer where the pinned schema holds
+    a string, which is the retyped known field the design's schema policy names. Arrow
+    refuses it when the batch is built, one layer past the fetch.
+    """
+    body = _chain_body(expirations)
+    body["callExpDateMap"][f"{expirations[0]}:7"]["650.0"][0]["expirationDate"] = 1787000000000
+    return VendorResponse(status=200, body=body)
+
+
+def test_a_body_the_row_builder_rejects_fails_open_to_a_whole_chain_gap(lake_root):
+    """A reassembled body Arrow refuses becomes a gap row, and the cycle runs on.
+
+    Every window succeeds and the snapshot reassembles, so the failure lands where the row
+    builder runs rather than in the fetch. Letting it propagate would leave the cycle
+    runner, leave the daemon loop, and exit the process, and the ``KeepAlive`` successor
+    would reach the same minute and do it again. So it fails open: the chain is one gap row
+    carrying the failure's own class, and the quote surface for the same cycle still lands.
+    """
+    plan = ChainPlan(((0, 9), (10, None)))
+    vendor = _WindowVendor(
+        windows={
+            (_d(0), _d(9)): _retyped_expiration_response(["2026-08-28"]),
+            (_d(10), None): _chain_response(["2026-09-18"]),
+        },
+    )
+    result = _run(vendor, lake_root, plan)
+
+    outcome = result.segment(CHAINS, "SPY")
+    assert outcome.row_kind == journal.ROW_KIND_GAP
+    # The class is the exception's own name, snake-cased, the way every raised failure is
+    # classified. Arrow refuses the retyped field with an ArrowTypeError.
+    assert outcome.error_class == "arrow_type_error"
+    assert outcome.rows == 1
+
+    gap = _chain_rows(result)[0]
+    assert gap["row_kind"] == journal.ROW_KIND_GAP
+    assert gap["error_class"] == "arrow_type_error"
+    assert gap["bid"] is None and gap["open_interest"] is None
+    # The cycle survived the rejection: the quote surface journaled beside the gap, and the
+    # gap segment is durable and manifested rather than lost with the process.
+    assert result.segment(QUOTES, "SPY").row_kind == journal.ROW_KIND_DATA
+    assert outcome.partition in latest_entries(lake_root)

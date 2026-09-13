@@ -168,12 +168,28 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   rather than in the status. A fill that landed but gave up a window is named in the
   guard's outcome, since the membership comparison cannot see a window that failed both
   intraday and at close+5.
-- **[#116](https://github.com/l3a0/marketlake/issues/116).** The chain fetch's two fail-open branches are reached by no test. A
-  chains body the row builder rejects is meant to fail open to a gap row, and a body that
-  will not merge is meant to be treated like a too-big window. Replacing either branch
-  with a raise leaves the whole suite green, so the first could exit the process on a
-  minute `KeepAlive` will retry forever, and the second drops a window with no marker and
-  no class. Both predate the close+5 fill, which carried them across unchanged.
+- **The chain fetch's two fail-open branches.** Both predate the close+5 fill, which carried
+  them across unchanged.
+  1. A reassembled body the row builder rejects fails open to a whole-chain gap row carrying
+     that failure's own class. Letting it propagate would leave the cycle runner, leave the
+     daemon loop, and exit the process, and the `KeepAlive` successor would reach the same
+     minute and do it again, so one malformed payload costs every capture minute until
+     someone notices it.
+  2. A window body the merge cannot read splits like a too-big window and is given up under
+     `chain_schema_drift`, a class of its own. Two shapes reach it, an expiration whose value
+     is not a strike map and a strike whose value is not a list, and both sit inside one
+     expiration, which is exactly what a date-keyed split isolates. Refusing to split would
+     cost the whole window to save the few requests the split spends, and the fan-out stays
+     linear in the depth bound because one half of each level succeeds and stops. Filing
+     drift under the size class would send a reader to the chunk plan for a problem no chunk
+     plan fixes. The class is named to read as drift, so the schema-drift page in
+     [#92](https://github.com/l3a0/marketlake/issues/92) has one string to subscribe to and
+     it matches the reason the segment readers are to carry for the same signal in
+     [#104](https://github.com/l3a0/marketlake/issues/104). Neither of those is built here.
+     The merge itself reads a whole body into scratch maps and copies them into the
+     reassembly maps only on success. So a window given up carries no data rows beside the
+     absence marker saying it was never collected, which is the double-record the markers
+     exist to prevent.
 - **D11's membership marker.** Every expiration the intraday chain carried and the close+5
   fill did not becomes one row under `option_close_series_absent`, written by the guard
   into its own segment beside the fill's. Only series whose date window was fetched
