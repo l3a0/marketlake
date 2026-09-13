@@ -1213,17 +1213,35 @@ def read_segment(path: Path | str) -> pa.Table:
 # kind below.
 UNUSABLE_SEGMENT = (OSError, ShadowAppendError, KeyError, TypeError, ValueError)
 
-# Why a segment could not be used. These are the four kinds ``dashboard.SegmentHealth``
-# already counts apart, reused rather than renamed, so the panel and the readers under it
-# cannot end up calling one failure two things.
+# Why a segment could not be used. The first four names are ``dashboard.SegmentHealth``'s,
+# reused rather than renamed so the panel and the readers under it name one failure one way.
 SEGMENT_VANISHED = "vanished"  # listed and then gone, a seal landing mid-read
 SEGMENT_CORRUPT = "corrupt"  # the bytes will not open: a torn header, or no Arrow stream
 SEGMENT_SHADOW_APPEND = "shadow_append"  # bytes follow the end-of-stream marker
 SEGMENT_DRIFTED = "drifted"  # it opened, and the column asked of it is gone or retyped
+SEGMENT_UNPARSEABLE = "unparseable"  # the column is the right type and a value is not usable
 
-# The order a breakout prints in. Drift leads because it is the one the design pages on,
-# and a fixed order keeps the line deterministic across runs.
-_SEGMENT_KIND_ORDER = (SEGMENT_DRIFTED, SEGMENT_SHADOW_APPEND, SEGMENT_CORRUPT, SEGMENT_VANISHED)
+# ``unparseable`` is the fifth because the panel already draws this line and drawing it
+# differently here would be the conflation this reader exists to end, one layer down. A
+# ``snap_ts`` column that is still ``string`` and holds ``the third minute`` is neither a
+# missing field nor a retyped one, which is what the design's schema policy pages on, so the
+# panel counts exactly that input under ``unparseable_stamp_rows`` and asserts it is not a
+# drifted row. Folding it into ``drifted`` here would have a garbage value fire a severity-5
+# ``Schema drift: retyped`` page while the panel beside it reported no drift on the same file.
+# The panel counts rows and this counts segments, so the granularity differs and the line
+# between the two meanings does not.
+
+# The order a breakout prints in. Drift leads because it is the kind the design pages on,
+# then the two other ways a payload can be wrong, then the two about the file itself. A
+# fixed order makes the line independent of which segment happened to fail first, so two
+# lakes with the same damage read alike.
+_SEGMENT_KIND_ORDER = (
+    SEGMENT_DRIFTED,
+    SEGMENT_UNPARSEABLE,
+    SEGMENT_SHADOW_APPEND,
+    SEGMENT_CORRUPT,
+    SEGMENT_VANISHED,
+)
 
 
 class UnusableSegment(NamedTuple):
@@ -1256,6 +1274,26 @@ def _open_failure_kind(exc: BaseException) -> str:
     if isinstance(exc, ShadowAppendError):
         return SEGMENT_SHADOW_APPEND
     return SEGMENT_CORRUPT
+
+
+def _parse_failure_kind(exc: BaseException) -> str:
+    """Which kind a failure after the open is.
+
+    The file read back, so what is wrong is what it holds. Two of those are the schema and
+    one is a single value, and the type separates them cleanly at this stage in a way it
+    could not at the open:
+
+    1. ``KeyError`` means the column asked for is gone, a missing known field.
+    2. ``TypeError`` means its values came back as the wrong Python type, which is what a
+       retyped column does. An ``int64`` or ``timestamp`` ``snap_ts`` reaches
+       ``datetime.fromisoformat`` as an ``int`` or a ``datetime`` and is refused on type.
+    3. Anything else, in practice a ``ValueError``, means the column is the right type and
+       one of its values is not usable. That is not drift, and calling it drift would page
+       on a vendor typo as though a field had changed shape.
+    """
+    if isinstance(exc, KeyError | TypeError):
+        return SEGMENT_DRIFTED
+    return SEGMENT_UNPARSEABLE
 
 
 def describe_unusable(entries: Sequence[UnusableSegment]) -> str:
@@ -1330,15 +1368,15 @@ def recorded_slots(
         try:
             # Parsed inside a try of its own, and into a list before anything is kept, so a
             # segment that fails partway contributes none of its minutes rather than the
-            # prefix that happened to parse. Anything raised here is drift by construction:
-            # the file opened, so what is wrong is the column, either gone or retyped.
+            # prefix that happened to parse. What raised here is about what the file holds
+            # rather than its bytes, and ``_parse_failure_kind`` says which.
             parsed = [
                 datetime.fromisoformat(value)
                 for value in table.column("snap_ts").to_pylist()
                 if value is not None
             ]
-        except UNUSABLE_SEGMENT:
-            unreadable.append(UnusableSegment(path, SEGMENT_DRIFTED))
+        except UNUSABLE_SEGMENT as exc:
+            unreadable.append(UnusableSegment(path, _parse_failure_kind(exc)))
             continue
         snaps.extend(parsed)
     return RecordedSet(frozenset(snaps), tuple(unreadable))
@@ -1416,14 +1454,13 @@ def close_tag_rows(
             unreadable.append(UnusableSegment(path, _open_failure_kind(exc)))
             continue
         try:
-            # The same two stages ``recorded_slots`` keeps apart, for the same reason. A
-            # failure on either column is drift: the file opened and answered the wrong
-            # question, which is the shape that reads back perfectly and still cannot be
-            # trusted.
+            # The same two stages ``recorded_slots`` keeps apart, for the same reason. The
+            # file opened and then answered the wrong question, which is the shape that
+            # reads back perfectly and still cannot be trusted.
             tags = table.column("close_tag").to_pylist()
             kinds = table.column("row_kind").to_pylist()
-        except UNUSABLE_SEGMENT:
-            unreadable.append(UnusableSegment(path, SEGMENT_DRIFTED))
+        except UNUSABLE_SEGMENT as exc:
+            unreadable.append(UnusableSegment(path, _parse_failure_kind(exc)))
             continue
         for tag, kind in zip(tags, kinds, strict=True):
             if tag != close_tag:

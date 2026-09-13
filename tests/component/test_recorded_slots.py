@@ -38,9 +38,11 @@ def test_a_snap_ts_the_parse_refuses_makes_the_segment_unreadable(tmp_path):
 
     assert found.slots == frozenset(), "an unparseable value was counted as a present minute"
     assert len(found.unreadable) == 1, "the segment was not reported unreadable"
-    # A string column holding a value the parse refuses is drift, not a damaged file. The
-    # bytes opened cleanly and the column answered the wrong thing.
-    assert found.unreadable[0].kind == journal.SEGMENT_DRIFTED
+    # Not drift. The column is still ``string``, exactly the type the schema pins, so no
+    # field went missing and none was retyped. The dashboard counts this same input under
+    # ``unparseable_stamp_rows`` and asserts it is not a drifted row, and calling it drift
+    # here would page on a vendor typo as though the payload had changed shape.
+    assert found.unreadable[0].kind == journal.SEGMENT_UNPARSEABLE
 
 
 def test_a_retyped_snap_ts_makes_the_segment_unreadable(tmp_path):
@@ -75,7 +77,7 @@ def test_a_segment_that_fails_partway_contributes_none_of_its_minutes(tmp_path):
 
     assert found.slots == frozenset(), "the prefix before the bad value was kept"
     assert len(found.unreadable) == 1
-    assert found.unreadable[0].kind == journal.SEGMENT_DRIFTED
+    assert found.unreadable[0].kind == journal.SEGMENT_UNPARSEABLE
 
 
 def test_a_readable_segment_beside_an_unreadable_one_still_counts(tmp_path):
@@ -192,3 +194,127 @@ def test_the_breakout_names_every_kind_it_holds(tmp_path):
     # pages on and a fixed order keeps the line stable across runs.
     assert journal.describe_unusable(entries) == "3 unreadable (2 drifted, 1 corrupt)"
     assert journal.describe_unusable(()) == ""
+
+
+def test_the_breakout_orders_every_kind_the_same_way_whatever_failed_first(tmp_path):
+    """Two lakes with the same damage read alike, whichever segment failed first.
+
+    ``Counter`` keeps insertion order, so without a fixed order the leading kind would be
+    whichever file the directory walk reached first. That makes two operators comparing the
+    same damage read two different lines.
+    """
+    kinds = (
+        journal.SEGMENT_VANISHED,
+        journal.SEGMENT_CORRUPT,
+        journal.SEGMENT_SHADOW_APPEND,
+        journal.SEGMENT_UNPARSEABLE,
+        journal.SEGMENT_DRIFTED,
+    )
+    entries = tuple(journal.UnusableSegment(tmp_path / f"{k}.arrows", k) for k in kinds)
+
+    expected = "5 unreadable (1 drifted, 1 unparseable, 1 shadow_append, 1 corrupt, 1 vanished)"
+    assert journal.describe_unusable(entries) == expected
+    # Reversing the input changes nothing, which is the property the fixed order buys.
+    assert journal.describe_unusable(tuple(reversed(entries))) == expected
+
+
+def test_a_kind_outside_the_known_set_still_reaches_the_line(tmp_path):
+    """The breakout's total and its parts always agree, even on a kind added later.
+
+    Dropping an unrecognised kind would print a total larger than the parts under it, which
+    reads as a counting bug to whoever is looking at it during an incident.
+    """
+    entries = (
+        journal.UnusableSegment(tmp_path / "a.arrows", journal.SEGMENT_DRIFTED),
+        journal.UnusableSegment(tmp_path / "b.arrows", "something_new"),
+    )
+
+    assert journal.describe_unusable(entries) == "2 unreadable (1 drifted, 1 something_new)"
+
+
+# -- the twin reader --------------------------------------------------------------------
+#
+# ``close_tag_rows`` splits its stages the same way and for the same reason, and the two are
+# written alike, which is exactly why each needs its own cases. Covering only
+# ``recorded_slots`` would leave its twin free to mislabel every kind silently, and the
+# close+5 guard is about to branch on that set to decide whether to withhold a marker.
+
+CLOSE_TAG = "spot_close"
+
+
+def _tagged_segment(root, name: str = "20260902T160000-1.arrows"):
+    """A readable segment holding one row under the close tag the guard asks about."""
+    schema = pa.schema([("close_tag", pa.string()), ("row_kind", pa.string())])
+    return _segment(root, schema, [pa.array([CLOSE_TAG]), pa.array(["data"])], name=name)
+
+
+def _close_rows(root):
+    return journal.close_tag_rows(root, journal.QUOTES_SURFACE, "XYZ", DAY, CLOSE_TAG)
+
+
+def test_close_tag_rows_names_bytes_that_will_not_open_as_corrupt(tmp_path):
+    directory = journal.segment_dir(tmp_path, journal.QUOTES_SURFACE, "XYZ", DAY)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "20260902T160000-1.arrows").write_bytes(b"not an arrow stream at all")
+
+    found = _close_rows(tmp_path)
+
+    assert (found.data, found.gaps) == (0, 0)
+    assert [entry.kind for entry in found.unreadable] == [journal.SEGMENT_CORRUPT]
+
+
+def test_close_tag_rows_keeps_a_shadow_append_apart(tmp_path):
+    path = _tagged_segment(tmp_path)
+    with path.open("ab") as handle:
+        handle.write(b"shadow bytes past the end of stream")
+
+    found = _close_rows(tmp_path)
+
+    assert found.data == 0, "a row behind a shadow append was counted"
+    assert [entry.kind for entry in found.unreadable] == [journal.SEGMENT_SHADOW_APPEND]
+
+
+def test_close_tag_rows_names_a_vanished_segment_rather_than_a_damaged_one(tmp_path, monkeypatch):
+    path = _tagged_segment(tmp_path)
+    real_read = journal.read_segment
+
+    def vanishing_read(target):
+        os.unlink(target)
+        return real_read(target)
+
+    monkeypatch.setattr(journal, "read_segment", vanishing_read)
+
+    found = _close_rows(tmp_path)
+
+    assert path.exists() is False
+    assert [entry.kind for entry in found.unreadable] == [journal.SEGMENT_VANISHED]
+
+
+def test_close_tag_rows_names_a_lost_column_as_drift(tmp_path):
+    # Valid Arrow holding none of the columns the guard asks for, which is what a schema
+    # rotation leaves behind. It opens cleanly and raises on the column.
+    _segment(tmp_path, pa.schema([("nothing_useful", pa.string())]), [pa.array(["x"])])
+
+    found = _close_rows(tmp_path)
+
+    assert [entry.kind for entry in found.unreadable] == [journal.SEGMENT_DRIFTED]
+
+
+def test_close_tag_rows_still_counts_the_segments_it_can_read(tmp_path):
+    """One bad file costs the guard its own rows and not the rows beside it.
+
+    The guard reads these counts to decide whether a close was ever observed, so a readable
+    segment lost to its neighbour would have it claim a close was missed that was not.
+    """
+    _tagged_segment(tmp_path, name="20260902T160000-1.arrows")
+    _segment(
+        tmp_path,
+        pa.schema([("nothing_useful", pa.string())]),
+        [pa.array(["x"])],
+        name="20260902T160100-1.arrows",
+    )
+
+    found = _close_rows(tmp_path)
+
+    assert found.data == 1, "the good segment's row was lost to its neighbour"
+    assert [entry.kind for entry in found.unreadable] == [journal.SEGMENT_DRIFTED]

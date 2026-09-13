@@ -284,19 +284,29 @@ def test_an_exception_message_never_reaches_the_file(lake_root):
 
 
 def test_a_problem_naming_no_exception_survives_whole(lake_root):
-    """``quotes/XYZ: 2 unreadable`` has no message to drop, and says nothing without it.
+    """An unreadable-segment problem has no message to drop, and says nothing without it.
 
     Redaction can only ever shorten a problem, so the risk runs the other way: a rule
     that cut at the first colon would file a bare surface and ticker for every finding
     the guard makes about damaged segments.
+
+    The lines are the real shape ``journal.describe_unusable`` builds, breakout and all,
+    because the breakout is the part that says whether to look at a disk or at the vendor's
+    payload and it sits past the colon where the redaction rule cuts.
     """
-    outcome = GuardOutcome(DAY, problems=("quotes/XYZ: 2 unreadable", "chains/SPY: 1 unreadable"))
+    outcome = GuardOutcome(
+        DAY,
+        problems=(
+            "quotes/XYZ: 2 unreadable (1 drifted, 1 corrupt)",
+            "chains/SPY: 1 unreadable (1 drifted)",
+        ),
+    )
 
     report.write_close_guard(lake_root, outcome, now=AT, pid=11)
 
     assert _entries(lake_root)[0]["problems"] == [
-        "quotes/XYZ: 2 unreadable",
-        "chains/SPY: 1 unreadable",
+        "quotes/XYZ: 2 unreadable (1 drifted, 1 corrupt)",
+        "chains/SPY: 1 unreadable (1 drifted)",
     ]
 
 

@@ -127,7 +127,8 @@ def _redacted(problem: str) -> str:
     stderr keeps the fuller string for a reader who has the log.
 
     Dropping everything past the second field is what does it. A problem naming no
-    exception, like ``quotes/XYZ: 2 unreadable``, has only two fields and survives whole.
+    exception, like ``quotes/XYZ: 2 unreadable (1 drifted, 1 corrupt)``, has only two fields
+    and survives whole, breakout included.
     The rule can only ever shorten a problem, so a shape it was not written for loses
     detail rather than leaking it.
     """
