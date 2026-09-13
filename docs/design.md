@@ -94,7 +94,7 @@ flowchart TB
 
 | Source | Role | Verified limits |
 | --- | --- | --- |
-| **Schwab Trader API**, the data path | Chain snapshots: one request returns the full chain with bid/ask/last, greeks, and OI. Batched equity quotes: one request returns bid/ask/last for every ticker. Equity bars: 1-min and official daily, fetched forward only. The \~48-day 1-min lookback matters solely as outage recovery. Dividend fields on quotes. | 120 req/min per app. The refresh token expires every 7 days. Manual browser re-auth is the only renewal. Free with account. Real-time only if the account's exchange agreements grant it. That is asserted at onboarding and watched by the battery, never assumed. |
+| **Schwab Trader API**, the data path | Chain snapshots: one request returns the full chain with bid/ask/last, greeks, and OI. Batched equity quotes: one request returns bid/ask/last for every ticker. Equity bars: 1-min and official daily, fetched forward only. The \~30-day 1-min lookback matters solely as outage recovery. Dividend fields on quotes. | 120 req/min per app. The refresh token expires every 7 days. Manual browser re-auth is the only renewal. Free with account. Real-time only if the account's exchange agreements grant it. That is asserted at onboarding and watched by the battery, never assumed. |
 | **yfinance**, cross-check only | Nightly independent comparison of closes and corporate actions inside the validation battery. Never a data path into the lake. Nothing it returns is stored as market data. | Unofficial. Free. Adequate for a once-a-day comparison. |
 
 Everything in the lake is Schwab-sourced. That keeps lineage trivial: one vendor, one auth, one set of quirks. All Schwab figures were re-verified Aug 2026 against maintained client libraries. Sources are listed at the end. The official portal gates its docs behind login.
@@ -159,7 +159,7 @@ The capture loop is **parallel per ticker**. Each ticker has its own worker firi
 | close+15 | **Compact + backup** | Depends only on our own journals, and those are final once the option-close guard passes. So it runs immediately: merge and compact all of the day's journal segments into each day's Parquet partition (sweeping every date present under `journal/`, so segments orphaned by an earlier failed compaction are recovered) → verify (re-read, row-count against the sum across segments) → manifest + checksums → backup sync. Running early shrinks the window where the day's capture exists in exactly one place. There is no reason to wait for the vendor sweep: chains and quotes are born final (no vendor keeps a history to revise them from), the sweep's outputs (`bars/`, `actions/`) land in their own partitions, and battery verdicts are metadata in the quarantine list, never a rewrite of sealed data. |
 | 18:30 | **Vendor EOD sweep** | Waits for vendor end-of-day data to settle. Auction prints and consolidated-tape corrections land in the hours after the bell. Corporate-actions poll first (so today's split flags before bars land) → official daily bar + 1-min bar top-up from Schwab → yfinance cross-check → validation battery → (Fridays only) set the Sunday 19:55 wake and read it back. |
 
-The 48-day 1-minute window at Schwab means even a multi-week bar outage is recoverable. Chain and quote snapshots are the things with no second chance. That is why they get the loudest alarms.
+The \~30-day 1-minute window at Schwab means even a multi-week bar outage is recoverable. Chain and quote snapshots are the things with no second chance. That is why they get the loudest alarms.
 
 ### Minutely mechanics
 
@@ -441,6 +441,6 @@ A three-way survey confirmed build-against-this-spec. It covered existing pipeli
 Schwab limits were re-verified 2026-08-24. The portal docs are login-gated. These are maintained client libraries tracking the live API:
 
 - [schwab-py auth docs](https://schwab-py.readthedocs.io/en/latest/auth.html) document the 30-min access token. The refresh token lasts 7 days, with no programmatic renewal.
-- [schwab-py client docs](https://schwab-py.readthedocs.io/en/latest/client.html) report a \~48-day 1-min lookback. The docs say it "currently appears to return up to 48 days". Community reports 30–35 days, so plan on \~30. The 5–30-min lookback is \~9 months. Daily data is observed back to 1985.
+- [schwab-py client docs](https://schwab-py.readthedocs.io/en/latest/client.html) report a \~48-day 1-min lookback. The docs say it "currently appears to return up to 48 days". Community reports 30–35 days, so plan on \~30. This doc uses \~30 wherever the window is named, because planning against the vendor's hedged upper figure would quietly shorten the outage the design promises to survive. The 5–30-min lookback is \~9 months. Daily data is observed back to 1985.
 - [schwab-client-js config](https://github.com/slimandslam/schwab-client-js/blob/main/docs/SchwabConfig.md) documents 120 calls/min overall. It also documents the HTTP 429 semantics.
 - [schwabr (CRAN, May 2026)](https://cran.r-project.org/web/packages/schwabr/schwabr.pdf) confirms the 7-day policy was current as of three months ago.
