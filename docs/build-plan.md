@@ -176,13 +176,16 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
      minute and do it again, so one malformed payload costs every capture minute until
      someone notices it.
   2. A window body the merge cannot read splits like a too-big window and is given up under
-     `chain_schema_drift`, a class of its own. Two shapes reach it, an expiration whose value
-     is not a strike map and a strike whose value is not a list, and both sit inside one
-     expiration, which is exactly what a date-keyed split isolates. Refusing to split would
-     cost the whole window to save the few requests the split spends, and the fan-out stays
-     linear in the depth bound because one half of each level succeeds and stops. Filing
-     drift under the size class would send a reader to the chunk plan for a problem no chunk
-     plan fixes. The class is named to read as drift, so the schema-drift page in
+     `chain_schema_drift`, a class of its own. The shapes that raise there sit inside one
+     expiration or one strike, which is what a date-keyed split isolates, so refusing to
+     split would cost the whole window to save the few requests the split spends. What the
+     split costs depends on how wide the drift is, and the depth bound is the only thing
+     that caps it. One bad expiration in a 30-day window costs 9 requests at the default
+     depth of 4. A window whose every expiration drifted walks the full binary tree at 31,
+     every minute for as long as the drift lasts. That is unchanged from before this entry
+     and is tracked in [#122](https://github.com/l3a0/marketlake/issues/122). Filing drift
+     under the size class would send a reader to the chunk plan for a problem no chunk plan
+     fixes. The class is named to read as drift, so the schema-drift page in
      [#92](https://github.com/l3a0/marketlake/issues/92) has one string to subscribe to and
      it matches the reason the segment readers are to carry for the same signal in
      [#104](https://github.com/l3a0/marketlake/issues/104). Neither of those is built here.

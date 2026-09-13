@@ -101,15 +101,21 @@ _CAMEL_BOUNDARY = re.compile(r"(?<!^)(?=[A-Z])")
 # a raised exception) carries its own class instead, so the failure model keeps those apart.
 CHAIN_CHUNK_FAILED = "chain_chunk_failed"
 
-# The error class stamped on a window whose body would not merge. The two shapes that reach
-# it are a vendor payload shape change: an expiration whose value is not a strike map, and a
-# strike whose value is not a list. Both are drift in the sense the design's schema policy
-# uses, where a missing or retyped known field pages. It is kept apart from the size class
-# above because a parse failure filed under a size class reads as a chain too big to fetch,
-# which is a chunk-plan problem rather than a vendor problem. The name is recognisable as
-# drift so the unbuilt schema-drift page (#92) has one string to subscribe to, and it matches
-# the reason the segment readers are to carry for the same signal (#104). Neither of those is
-# built here.
+# The error class stamped on a window whose body would not merge. Two shapes raise inside the
+# merge, and both are a vendor payload shape change:
+#
+# 1. An expiration whose value is not a strike map, which has no ``items`` to walk.
+# 2. A strike whose value is not iterable, which no contract list can be extended with.
+#
+# A strike value that is iterable but wrong, a string or an object where the vendor sends a
+# list of contracts, merges without complaint. It is caught one layer on by the row builder's
+# own fail-open instead, which costs the whole chain rather than one window. Both raising
+# shapes are drift in the sense the design's schema policy uses, where a missing or retyped
+# known field pages. Drift is kept apart from the size class above because a parse failure
+# filed under a size class reads as a chain too big to fetch, which is a chunk-plan problem
+# rather than a vendor problem. The name is recognisable as drift so the unbuilt schema-drift
+# page (#92) has one string to subscribe to, and it matches the reason the segment readers are
+# to carry for the same signal (#104). Neither of those is built here.
 CHAIN_SCHEMA_DRIFT = "chain_schema_drift"
 
 # The two chain maps every window response nests contracts under.
@@ -618,15 +624,19 @@ def _fetch_window(
        readable halves and the other windows returned, and it gives up under
        ``chain_schema_drift`` rather than the size class.
 
-    Splitting is the right answer to a body that will not merge because only two shapes
-    reach that handler and both sit inside one expiration or one strike. An expiration
-    whose value is not a strike map raises ``AttributeError``, and a strike whose value is
-    not a list raises ``TypeError``. A date-keyed split is exactly what isolates damage
-    that narrow: the halves that read cleanly still land and only the half carrying the bad
-    expiration is given up. Envelope drift cannot reach here, because a ``callExpDateMap``
-    that is not a mapping is skipped outright, so the fan-out stays linear in the depth
-    bound rather than exponential. At each level one half succeeds and stops while only the
-    other recurses.
+    Splitting is the right answer to a body that will not merge because both shapes that
+    raise there sit inside one expiration or one strike. An expiration whose value is not a
+    strike map raises ``AttributeError``, and a strike whose value is not iterable raises
+    ``TypeError``. A date-keyed split is what isolates damage that narrow. The halves that
+    read cleanly still land, and only the half carrying the bad expiration is given up.
+
+    What the split costs depends on how wide the drift is, and the depth bound is the only
+    thing that caps it. One bad expiration in a 30-day window costs 9 requests at the
+    default depth of 4, because at each level one half succeeds and stops while only the
+    other recurses. A window whose every expiration drifted fails both halves at every
+    level and walks the full binary tree, 31 requests at that same depth, and it does that
+    every minute for as long as the drift lasts. Whether a wholesale drift should stop
+    splitting is a question of its own, tracked in #122.
 
     The give-up class is decided where the failure is seen, not where the window is given
     up, because a window split for drift can have a half that is genuinely too big and the
@@ -665,12 +675,12 @@ def _fetch_window(
         to_date is not None and to_date > from_date and depth < guards.chain_chunk_max_split_depth
     )
     if not splittable:
-        # An open-ended tail window (``to_date is None``) that comes back too big
-        # cannot be midpoint-split, so it is given up with the size class. Far-term
-        # sparsity makes this unreachable in practice: the open tail holds the fewest
-        # expirations of any window. A window given up for drift instead of size is the
-        # reachable case, since a single unreadable expiration survives every split down
-        # to the one day it sits on.
+        # An open-ended tail window (``to_date is None``) that comes back too big cannot be
+        # midpoint-split, so it is given up as it stands. Far-term sparsity makes that case
+        # unreachable in practice: the open tail holds the fewest expirations of any window.
+        # A window given up for drift is the reachable one, since an unreadable expiration
+        # survives every split down to the single day it sits on. The class is whichever of
+        # the two this call saw.
         failed.append((from_date, to_date, give_up_class))
         return
     mid = from_date + timedelta(days=(to_date - from_date).days // 2)

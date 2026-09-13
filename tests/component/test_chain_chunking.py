@@ -663,12 +663,15 @@ def test_a_clean_cycle_never_reads_the_journal_for_expirations(lake_root, monkey
 # The two payload shapes that reach the merge's failure handler. Each sits inside one
 # expiration, which is why a date-keyed split isolates it. A string where the vendor nests a
 # strike map raises ``AttributeError`` on the walk, and a strike holding a number where the
-# vendor sends a list of contracts raises ``TypeError`` when the merge extends it. Envelope
-# drift, a ``callExpDateMap`` that is not a mapping at all, never reaches here: the merge
-# skips it outright.
+# vendor sends a list of contracts raises ``TypeError`` when the merge extends a list with it.
+# Two shapes deliberately absent. Envelope drift, a ``callExpDateMap`` that is not a mapping
+# at all, is skipped outright and reaches nothing. And a strike value that is iterable but
+# wrong, a string or an object, merges without complaint, because ``list.extend`` takes any
+# iterable. That one is caught a layer on by the row builder instead, which the last test in
+# this section covers.
 _DRIFT_SHAPES = {
     "expiration_is_not_a_strike_map": "not a strike map",
-    "strike_is_not_a_list": {"650.0": 1.0},
+    "strike_is_not_a_number_sequence": {"650.0": 1.0},
 }
 
 
@@ -840,3 +843,39 @@ def test_a_body_the_row_builder_rejects_fails_open_to_a_whole_chain_gap(lake_roo
     # gap segment is durable and manifested rather than lost with the process.
     assert result.segment(QUOTES, "SPY").row_kind == journal.ROW_KIND_DATA
     assert outcome.partition in latest_entries(lake_root)
+
+
+def test_an_iterable_strike_value_passes_the_merge_and_gaps_at_the_row_builder(lake_root):
+    """Where the merge's reach actually ends, and what catches what gets past it.
+
+    ``list.extend`` takes any iterable, so a strike arriving as a string merges into the
+    reassembly maps one character at a time rather than raising. The window is never given
+    up and draws no marker. The damage surfaces a layer on, when the row builder reads those
+    characters where contract dicts belong, and the cycle fails open to a whole-chain gap.
+    So the two fail-open branches compose: what the merge cannot see, the row builder does,
+    and neither one lets the payload out of the cycle. The price is that the loss is the
+    whole chain rather than the one window, which is why the merge's limit is worth stating
+    rather than leaving to be rediscovered.
+    """
+    body = _chain_body(["2026-08-28"])
+    body["callExpDateMap"]["2026-08-28:7"]["655.0"] = "XY"
+    plan = ChainPlan(((0, 9), (10, None)))
+    vendor = _WindowVendor(
+        windows={
+            (_d(0), _d(9)): VendorResponse(status=200, body=body),
+            (_d(10), None): _chain_response(["2026-09-18"]),
+        },
+    )
+    result = _run(vendor, lake_root, plan)
+
+    # The merge accepted it, so the window was never split and never given up. One request.
+    assert _calls_for(vendor, _d(0), _d(9)) == 1
+    assert _calls_for(vendor, _d(0), _d(4)) == 0
+
+    outcome = result.segment(CHAINS, "SPY")
+    # Not the drift class. This never reached the merge's handler at all.
+    assert outcome.error_class != capture.CHAIN_SCHEMA_DRIFT
+    assert outcome.row_kind == journal.ROW_KIND_GAP
+    assert outcome.error_class == "attribute_error"
+    assert outcome.rows == 1
+    assert result.segment(QUOTES, "SPY").row_kind == journal.ROW_KIND_DATA
