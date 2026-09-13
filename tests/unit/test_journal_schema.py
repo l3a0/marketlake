@@ -1007,6 +1007,119 @@ def test_fetch_end_ts_is_stored_when_given_and_null_when_omitted():
     assert gap.to_pylist()[0]["fetch_end_ts"] == FETCH_END
 
 
+# -- integer columns refuse a truncating float -------------------------------
+
+# Every field name below is a vendor key that lands in an ``int64`` column, paired with
+# the value the vendor would have to send to truncate. The chain and the quote surface
+# each get one, so the refusal is checked on both row builders rather than one.
+
+
+def test_a_fractional_float_in_an_integer_chain_column_raises_instead_of_truncating():
+    """A vendor ``openInterest`` of 1234.7 must not land as 1234.
+
+    Building the column straight from Python objects truncated it and returned the
+    truncated value with no error. Nothing downstream could tell 1234 apart from a real
+    1234, which is why this one shape was the silent member of the corruption class.
+    """
+    body = dict(
+        CHAIN_BODY,
+        callExpDateMap={"2026-09-18:25": {"650.0": [_full_contract(openInterest=1234.7)]}},
+        putExpDateMap={},
+    )
+    with pytest.raises(pa.ArrowInvalid):
+        journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+
+
+def test_a_fractional_float_in_an_integer_quote_column_raises_instead_of_truncating():
+    """The same refusal on the quotes surface, whose 18 integer columns take one route."""
+    envelope = dict(QUOTE, quote=dict(QUOTE["quote"], totalVolume=88_888_888.5))
+    with pytest.raises(pa.ArrowInvalid):
+        journal.quotes_data_batch(
+            envelope, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH, vendor_quote_ts=VENDOR
+        )
+
+
+def test_a_lossless_float_still_lands_in_an_integer_column():
+    """A whole-numbered float carries no lost digit, so it lands as the integer it is.
+
+    Schwab serializes some counts as JSON floats. Refusing those would gap a chain over a
+    value that round-trips exactly, so the check rejects only a float it cannot represent.
+    """
+    body = dict(
+        CHAIN_BODY,
+        callExpDateMap={
+            "2026-09-18:25": {"650.0": [_full_contract(openInterest=1500.0, bidSize=0.0)]}
+        },
+        putExpDateMap={},
+    )
+    row = journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH).to_pylist()[0]
+    assert row["open_interest"] == 1500
+    assert row["bid_size"] == 0
+
+
+def test_an_all_null_integer_column_still_lands_typed_int64():
+    """An absent vendor field leaves the column null, and the null column stays int64.
+
+    Inferring a column of nothing but nulls gives Arrow's ``null`` type, so the inferred
+    array has to be cast back. Without that cast the batch would not match the pinned
+    schema at all.
+    """
+    contract = _full_contract()
+    for key in ("openInterest", "bidSize", "askSize", "lastSize", "totalVolume", "ssid"):
+        contract.pop(key)
+    body = dict(
+        CHAIN_BODY,
+        callExpDateMap={"2026-09-18:25": {"650.0": [contract]}},
+        putExpDateMap={},
+    )
+    batch = journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+    assert batch.schema == journal.CHAINS_SCHEMA
+    assert batch.schema.field("open_interest").type == pa.int64()
+    assert batch.column("open_interest").type == pa.int64()
+    assert batch.to_pylist()[0]["open_interest"] is None
+
+
+def test_the_other_three_types_keep_refusing_every_wrong_shape():
+    """The change stays on the integer columns. The other 119 keep the direct build.
+
+    Each case below is a wrong shape in a ``double``, ``string``, or ``bool`` column that
+    raised before the change. A test that only checked the integer columns would not
+    notice the fix widening onto a path that already worked.
+    """
+    cases = (
+        ("bid", "not-a-number"),  # string into double
+        ("description", 7),  # int into string
+        ("description", 7.5),  # float into string
+        ("inTheMoney", 1),  # int into bool
+        ("inTheMoney", 1.5),  # float into bool
+    )
+    for field, value in cases:
+        body = dict(
+            CHAIN_BODY,
+            callExpDateMap={"2026-09-18:25": {"650.0": [_full_contract(**{field: value})]}},
+            putExpDateMap={},
+        )
+        with pytest.raises((pa.ArrowInvalid, pa.ArrowTypeError)):
+            journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+
+
+def test_a_bool_or_a_string_in_an_integer_column_keeps_raising():
+    """Arrow's cast would turn ``True`` into 1 and ``"7"`` into 7. Neither may land.
+
+    Inferring the column type first opens a cast Arrow is willing to perform on shapes the
+    direct build refused. Both stay refused, so the fix removes a silent conversion without
+    adding two.
+    """
+    for value in (True, "7"):
+        body = dict(
+            CHAIN_BODY,
+            callExpDateMap={"2026-09-18:25": {"650.0": [_full_contract(openInterest=value)]}},
+            putExpDateMap={},
+        )
+        with pytest.raises((pa.ArrowInvalid, pa.ArrowTypeError)):
+            journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+
+
 # -- path convention ---------------------------------------------------------
 
 

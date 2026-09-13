@@ -420,6 +420,163 @@ def test_top_level_envelope_cusip_lands_in_the_column(lake_root):
     assert row["extra"] is None
 
 
+# -- 6b. a truncating float gaps the ticker ----------------------------------
+
+
+def _chain_body_with(**contract_overrides) -> dict:
+    """A one-contract SPY chain body, the contract overridden by the caller.
+
+    Only the fields the row builder reads are set. Everything it does not find stays
+    null, which is the same fail-open a sparse vendor payload gets.
+    """
+    contract = {
+        "putCall": "CALL",
+        "symbol": "SPY   260918C00650000",
+        "bid": 4.2,
+        "ask": 4.25,
+        "openInterest": 1234,
+        "quoteTimeInLong": 1787000099000,
+        "expirationDate": "2026-09-18T20:00:00.000+00:00",
+    }
+    contract.update(contract_overrides)
+    return {
+        "symbol": "SPY",
+        "status": "SUCCESS",
+        "isDelayed": False,
+        "underlyingPrice": 650.01,
+        "isChainTruncated": False,
+        "numberOfContracts": 1,
+        "underlying": None,
+        "callExpDateMap": {"2026-09-18:25": {"650.0": [contract]}},
+        "putExpDateMap": {},
+    }
+
+
+def _one_chain_cassette(body: dict) -> Cassette:
+    """A cassette serving that chain body for SPY, plus the quote batch SPY needs."""
+    return Cassette(
+        interactions=(
+            Interaction(
+                endpoint="chains",
+                params={"symbol": "SPY", "from_date": "2026-08-24"},
+                status=200,
+                body=body,
+            ),
+            Interaction(
+                endpoint="quotes",
+                params={"symbols": ["SPY"]},
+                status=200,
+                body={
+                    "SPY": {
+                        "assetMainType": "EQUITY",
+                        "realtime": True,
+                        "quote": {
+                            "bidPrice": 649.98,
+                            "askPrice": 650.02,
+                            "quoteTime": 1787000100000,
+                        },
+                    }
+                },
+            ),
+        )
+    )
+
+
+def _spy_only() -> Roster:
+    """A roster of the one option-bearing ticker."""
+    return Roster.from_mapping({"SPY": {"options": True, "chain_cadence": "1m"}})
+
+
+def test_a_truncating_float_gaps_the_chain_rather_than_recording_the_truncation(lake_root):
+    """A vendor integer field sent fractional must gap the ticker, not land rounded.
+
+    This is the handler the refusal actually reaches. ``chain_schema_drift`` guards the
+    fetch, where a body that will not merge is split and given up, and the row build runs
+    well past it. The raise lands in ``_plan_chain``'s fail-open instead, which turns any
+    row-building failure into a whole-chain gap classed by the exception name. So the
+    class on disk is ``arrow_invalid``, and the quote sampler is untouched.
+    """
+    vendor = CassetteVendor(_one_chain_cassette(_chain_body_with(openInterest=1234.7)))
+    result = capture.run_cycle(
+        ManualClock(start=_CLOCK_START), vendor, _spy_only(), lake_root, pid=4242, plan=_ONE_WINDOW
+    )
+
+    assert result.errors == ()
+    chain = result.segment(CHAINS, "SPY")
+    assert chain.row_kind == journal.ROW_KIND_GAP
+    assert chain.error_class == "arrow_invalid"
+
+    # The gap carries no market data, so the truncated 1234 never reaches the lake.
+    gap_row = _rows(chain)[0]
+    assert gap_row["row_kind"] == journal.ROW_KIND_GAP
+    assert gap_row["error_class"] == "arrow_invalid"
+    assert gap_row["open_interest"] is None
+    assert gap_row["snap_ts"] == _EXPECTED_SNAP.isoformat()
+
+    # One surface failing never takes the other down.
+    assert result.segment(QUOTES, "SPY").row_kind == journal.ROW_KIND_DATA
+
+
+def test_the_same_chain_captures_when_the_integer_field_is_whole(lake_root):
+    """The control. Only the fractional value gaps, so the refusal is not blanket.
+
+    Without this the gap test above would still pass if the row builder had been broken
+    outright, since a builder that refused every chain would gap this one too.
+    """
+    vendor = CassetteVendor(_one_chain_cassette(_chain_body_with(openInterest=1234.0)))
+    result = capture.run_cycle(
+        ManualClock(start=_CLOCK_START), vendor, _spy_only(), lake_root, pid=4242, plan=_ONE_WINDOW
+    )
+
+    chain = result.segment(CHAINS, "SPY")
+    assert chain.row_kind == journal.ROW_KIND_DATA
+    assert _rows(chain)[0]["open_interest"] == 1234
+
+
+def test_a_truncating_float_gaps_only_that_ticker(lake_root):
+    """A second ticker's chain still captures, so the gap stays scoped to the bad one."""
+    cassette = Cassette(
+        interactions=(
+            Interaction(
+                endpoint="chains",
+                params={"symbol": "SPY", "from_date": "2026-08-24"},
+                status=200,
+                body=_chain_body_with(openInterest=1234.7),
+            ),
+            Interaction(
+                endpoint="chains",
+                params={"symbol": "QQQ", "from_date": "2026-08-24"},
+                status=200,
+                body=_chain_body_with(),
+            ),
+            Interaction(
+                endpoint="quotes",
+                params={"symbols": ["SPY", "QQQ"]},
+                status=200,
+                body={
+                    sym: {
+                        "assetMainType": "EQUITY",
+                        "realtime": True,
+                        "quote": {"bidPrice": 1.0, "askPrice": 1.1, "quoteTime": 1787000100000},
+                    }
+                    for sym in ("SPY", "QQQ")
+                },
+            ),
+        )
+    )
+    result = capture.run_cycle(
+        ManualClock(start=_CLOCK_START),
+        CassetteVendor(cassette),
+        _both_options(),
+        lake_root,
+        pid=4242,
+        plan=_ONE_WINDOW,
+    )
+
+    assert result.segment(CHAINS, "SPY").error_class == "arrow_invalid"
+    assert result.segment(CHAINS, "QQQ").row_kind == journal.ROW_KIND_DATA
+
+
 # -- 7. the journal metadata stamp -------------------------------------------
 
 

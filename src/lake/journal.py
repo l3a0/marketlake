@@ -568,13 +568,57 @@ def _extra_json(fields: Mapping[str, object], known: set[str]) -> str | None:
     return json.dumps(overflow, sort_keys=True)
 
 
+def _int_column(values: Sequence[object]) -> pa.Array:
+    """One ``int64`` column, built so a fractional float raises instead of truncating.
+
+    Building an integer column straight from Python objects coerces a fractional float to
+    its truncated value and hands it back with no error, so a vendor ``3.7`` lands as
+    ``3``. Across the four types the pinned schemas use, that is the only conversion that
+    changes a value silently. Every other wrong shape already raises, so only the 29
+    integer columns need this route and the other 119 keep the direct build.
+
+    Inferring the column's type first and then casting to ``int64`` moves the check into
+    Arrow, which refuses a float it cannot represent exactly and still passes a lossless
+    one like ``1500.0``. Only an inferred integer, floating, or null type takes that
+    route. An inferred bool or string falls back to the direct build, because Arrow's
+    cast would happily turn ``True`` into ``1`` and ``"7"`` into ``7``, and both of those
+    must keep raising the way they do today. Inference that raises falls back for the
+    same reason, so the caller still sees the exception the direct build would have
+    raised.
+
+    An empty or all-null column infers the ``null`` type and casts to an ``int64`` column
+    of nulls, so it still lands typed rather than guessed.
+    """
+    try:
+        inferred = pa.array(values)
+    except Exception:
+        return pa.array(values, type=pa.int64())
+    if inferred.type == pa.int64():
+        return inferred
+    if (
+        pa.types.is_integer(inferred.type)
+        or pa.types.is_floating(inferred.type)
+        or pa.types.is_null(inferred.type)
+    ):
+        return inferred.cast(pa.int64())
+    return pa.array(values, type=pa.int64())
+
+
 def _batch(schema: pa.Schema, rows: Sequence[Mapping[str, object]]) -> pa.RecordBatch:
     """Build one record batch from row mappings, typed by the schema.
 
     A missing key becomes null. Each column is built with its schema type, so an
-    all-null column still lands with the right type instead of guessing.
+    all-null column still lands with the right type instead of guessing. An ``int64``
+    column goes through ``_int_column``, which refuses a fractional float rather than
+    recording it truncated.
     """
-    arrays = [pa.array([row.get(field.name) for row in rows], type=field.type) for field in schema]
+    arrays = []
+    for field in schema:
+        values = [row.get(field.name) for row in rows]
+        if field.type == pa.int64():
+            arrays.append(_int_column(values))
+        else:
+            arrays.append(pa.array(values, type=field.type))
     return pa.RecordBatch.from_arrays(arrays, schema=schema)
 
 
