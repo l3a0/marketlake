@@ -140,6 +140,30 @@ def test_a_drifted_segment_is_walked_past_rather_than_raising(lake_root):
     assert journal.latest_expirations(lake_root, "SPY") == ["2026-09-18"]
 
 
+def test_a_segment_whose_bytes_will_not_open_is_walked_past_too(lake_root):
+    """The same tolerance, for the kinds the drift case above does not reach.
+
+    ``latest_expirations`` catches one tuple covering five causes, and only the missing
+    column above exercised it. Narrowing the catch to ``KeyError`` alone left the whole
+    suite green, so a corrupt segment propagating out of here and into the chain chunker's
+    failure path, mid-cycle, would have gone unnoticed.
+
+    This reader is deliberately left tolerant rather than made to carry a kind. It runs on
+    the capture failure path, where raising costs a capture minute, and it has no reporting
+    channel to carry a reason into: it skips and walks on. A test pins that choice so the
+    next change to the shared tuple cannot quietly undo it.
+    """
+    with journal.SegmentWriter.open(lake_root, "chains", "SPY", DAY, "20260824T160000", 4242) as w1:
+        w1.write_cycle(_chain_batch())
+    _manifest(lake_root, w1.path, 1)
+
+    unopenable = w1.path.parent / "20260824T160100-4242.arrows"
+    unopenable.write_bytes(b"not an arrow stream at all")
+    _manifest(lake_root, unopenable, 1)
+
+    assert journal.latest_expirations(lake_root, "SPY") == ["2026-09-18"]
+
+
 def test_the_newest_batch_with_data_wins_inside_one_segment(lake_root):
     """The docstring's claim about batch order, which nothing held.
 

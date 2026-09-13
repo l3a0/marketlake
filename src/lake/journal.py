@@ -34,6 +34,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -1205,17 +1206,121 @@ def read_segment(path: Path | str) -> pa.Table:
 # question. A reader that let that raise would take the daemon down from inside a hook
 # nothing guards, which is what #100 was.
 #
-# Every case here means the same thing: the file exists and cannot be trusted to say what
-# it holds. That is never the same as the file not being there, which is why these land in
-# ``unreadable`` rather than reading as an absent minute.
+# Every case here means the same thing to a reader deciding whether to act: the file exists
+# and cannot be trusted to say what it holds. That is never the same as the file not being
+# there, which is why these land in ``unreadable`` rather than reading as an absent minute.
+# They do not all mean the same thing to an operator, so each one is carried with its own
+# kind below.
 UNUSABLE_SEGMENT = (OSError, ShadowAppendError, KeyError, TypeError, ValueError)
+
+# Why a segment could not be used. The first four names are ``dashboard.SegmentHealth``'s,
+# reused rather than renamed so the panel and the readers under it name one failure one way.
+SEGMENT_VANISHED = "vanished"  # listed and then gone, a seal landing mid-read
+SEGMENT_CORRUPT = "corrupt"  # the bytes will not open: a torn header, or no Arrow stream
+SEGMENT_SHADOW_APPEND = "shadow_append"  # bytes follow the end-of-stream marker
+SEGMENT_DRIFTED = "drifted"  # it opened, and the column asked of it is gone or retyped
+SEGMENT_UNPARSEABLE = "unparseable"  # the column is the right type and a value is not usable
+
+# ``unparseable`` is the fifth because the panel already draws this line and drawing it
+# differently here would be the conflation this reader exists to end, one layer down. A
+# ``snap_ts`` column that is still ``string`` and holds ``the third minute`` is neither a
+# missing field nor a retyped one, which is what the design's schema policy pages on, so the
+# panel counts exactly that input under ``unparseable_stamp_rows`` and asserts it is not a
+# drifted row. Folding it into ``drifted`` here would have a garbage value fire a severity-5
+# ``Schema drift: retyped`` page while the panel beside it reported no drift on the same file.
+# The panel counts rows and this counts segments, so the granularity differs and the line
+# between the two meanings does not.
+
+# The order a breakout prints in. Drift leads because it is the kind the design pages on,
+# then the two other ways a payload can be wrong, then the two about the file itself. A
+# fixed order makes the line independent of which segment happened to fail first, so two
+# lakes with the same damage read alike.
+_SEGMENT_KIND_ORDER = (
+    SEGMENT_DRIFTED,
+    SEGMENT_UNPARSEABLE,
+    SEGMENT_SHADOW_APPEND,
+    SEGMENT_CORRUPT,
+    SEGMENT_VANISHED,
+)
+
+
+class UnusableSegment(NamedTuple):
+    """One segment that could not be used, and why.
+
+    The reason used to stop here. Both readers below knew it at the moment they caught it
+    and returned a bare path, so every caller could report was a count. Schema drift then
+    read the same as a disk error, and the design asks for a page on the one and not on the
+    other. Carrying the kind with the path is what lets a producer tell them apart.
+    """
+
+    path: Path
+    kind: str
+
+
+def _open_failure_kind(exc: BaseException) -> str:
+    """Which kind an open-stage failure is.
+
+    Only the open stage calls this. The stage a failure came from decides the kind rather
+    than the exception's type, because the types overlap and would misfile both directions.
+    ``pa.ArrowInvalid`` is a ``ValueError``, so a torn header and an unparseable stamp
+    arrive as one type. A ``snap_ts`` retyped to a real timestamp raises a plain
+    ``TypeError`` from ``datetime.fromisoformat``, not ``pa.ArrowTypeError``, so keying
+    drift on the pyarrow type would file the very case the schema policy pages on as a
+    corrupt file. Where it raised carries no such ambiguity: a failure to open the file is
+    about its bytes, and a failure after it opened is about its schema.
+    """
+    if isinstance(exc, FileNotFoundError):
+        return SEGMENT_VANISHED
+    if isinstance(exc, ShadowAppendError):
+        return SEGMENT_SHADOW_APPEND
+    return SEGMENT_CORRUPT
+
+
+def _parse_failure_kind(exc: BaseException) -> str:
+    """Which kind a failure after the open is.
+
+    The file read back, so what is wrong is what it holds. Two of those are the schema and
+    one is a single value, and the type separates them cleanly at this stage in a way it
+    could not at the open:
+
+    1. ``KeyError`` means the column asked for is gone, a missing known field.
+    2. ``TypeError`` means its values came back as the wrong Python type, which is what a
+       retyped column does. An ``int64`` or ``timestamp`` ``snap_ts`` reaches
+       ``datetime.fromisoformat`` as an ``int`` or a ``datetime`` and is refused on type.
+    3. Anything else, in practice a ``ValueError``, means the column is the right type and
+       one of its values is not usable. That is not drift, and calling it drift would page
+       on a vendor typo as though a field had changed shape.
+    """
+    if isinstance(exc, KeyError | TypeError):
+        return SEGMENT_DRIFTED
+    return SEGMENT_UNPARSEABLE
+
+
+def describe_unusable(entries: Sequence[UnusableSegment]) -> str:
+    """A one-line breakout of what could not be read, by kind.
+
+    Reads ``2 unreadable (1 drifted, 1 corrupt)``. The total keeps the wording every caller
+    printed before, so a reader who knows the old line reads this one, and the breakout
+    after it is the part a drift page subscribes to. An empty set returns an empty string,
+    which no caller asks for, since each tests the set first.
+    """
+    if not entries:
+        return ""
+    counts = Counter(entry.kind for entry in entries)
+    parts = [f"{counts[kind]} {kind}" for kind in _SEGMENT_KIND_ORDER if counts[kind]]
+    # A kind outside the four is not possible from the classifiers above. Printing any
+    # stray one rather than dropping it keeps the breakout's total equal to the count.
+    parts.extend(
+        f"{count} {kind}" for kind, count in counts.items() if kind not in _SEGMENT_KIND_ORDER
+    )
+    return f"{len(entries)} unreadable ({', '.join(parts)})"
 
 
 class RecordedSet(NamedTuple):
     """The distinct recorded minutes for a ticker-day, and what could not be read."""
 
     slots: frozenset[datetime]
-    unreadable: tuple[Path, ...]
+    unreadable: tuple[UnusableSegment, ...]
 
 
 def recorded_slots(
@@ -1243,7 +1348,7 @@ def recorded_slots(
     if not directory.is_dir():
         return RecordedSet(frozenset(), ())
     snaps: list[datetime] = []
-    unreadable: list[Path] = []
+    unreadable: list[UnusableSegment] = []
     for path in sorted(directory.glob("*.arrows")):
         try:
             if path.stat().st_size == 0:
@@ -1255,16 +1360,23 @@ def recorded_slots(
                 # to be wrong about and nothing a later writer would duplicate.
                 continue
             table = read_segment(path)
-            # Parsed inside the try, and into a list of its own before anything is kept,
-            # so a segment that fails partway contributes none of its minutes rather than
-            # the prefix that happened to parse.
+        except UNUSABLE_SEGMENT as exc:
+            # The file's bytes are the problem. Which of the three it is comes from the
+            # exception, since the open stage is where those three are distinguishable.
+            unreadable.append(UnusableSegment(path, _open_failure_kind(exc)))
+            continue
+        try:
+            # Parsed inside a try of its own, and into a list before anything is kept, so a
+            # segment that fails partway contributes none of its minutes rather than the
+            # prefix that happened to parse. What raised here is about what the file holds
+            # rather than its bytes, and ``_parse_failure_kind`` says which.
             parsed = [
                 datetime.fromisoformat(value)
                 for value in table.column("snap_ts").to_pylist()
                 if value is not None
             ]
-        except UNUSABLE_SEGMENT:
-            unreadable.append(path)
+        except UNUSABLE_SEGMENT as exc:
+            unreadable.append(UnusableSegment(path, _parse_failure_kind(exc)))
             continue
         snaps.extend(parsed)
     return RecordedSet(frozenset(snaps), tuple(unreadable))
@@ -1300,7 +1412,7 @@ class CloseTagRows(NamedTuple):
 
     data: int
     gaps: int
-    unreadable: tuple[Path, ...]
+    unreadable: tuple[UnusableSegment, ...]
 
 
 def close_tag_rows(
@@ -1325,7 +1437,7 @@ def close_tag_rows(
     directory = LakePaths(lake_root).segment_dir(surface, ticker, day)
     if not directory.is_dir():
         return CloseTagRows(0, 0, ())
-    unreadable: list[Path] = []
+    unreadable: list[UnusableSegment] = []
     data = gaps = 0
     for path in sorted(directory.glob("*.arrows"), reverse=True):
         try:
@@ -1338,10 +1450,17 @@ def close_tag_rows(
                 # to be wrong about and nothing a later writer would duplicate.
                 continue
             table = read_segment(path)
+        except UNUSABLE_SEGMENT as exc:
+            unreadable.append(UnusableSegment(path, _open_failure_kind(exc)))
+            continue
+        try:
+            # The same two stages ``recorded_slots`` keeps apart, for the same reason. The
+            # file opened and then answered the wrong question, which is the shape that
+            # reads back perfectly and still cannot be trusted.
             tags = table.column("close_tag").to_pylist()
             kinds = table.column("row_kind").to_pylist()
-        except UNUSABLE_SEGMENT:
-            unreadable.append(path)
+        except UNUSABLE_SEGMENT as exc:
+            unreadable.append(UnusableSegment(path, _parse_failure_kind(exc)))
             continue
         for tag, kind in zip(tags, kinds, strict=True):
             if tag != close_tag:

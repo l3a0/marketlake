@@ -479,7 +479,8 @@ class GapMarker:
                 # this day would write a full session over a record that exists. Refuse
                 # the pair and say so, so the next restart tries again.
                 self._unreadable.append(
-                    f"{surface}/{ticker} {day.isoformat()}: {len(present.unreadable)} unreadable"
+                    f"{surface}/{ticker} {day.isoformat()}: "
+                    f"{journal.describe_unusable(present.unreadable)}"
                 )
                 return [], False, sealed
             owed = [
