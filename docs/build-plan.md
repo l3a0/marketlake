@@ -1,6 +1,6 @@
 # Marketlake — build plan
 
-This plan sequences the build. The design doc at [design.md](design.md) is the source of truth. Read it first. This plan says what ships, in what order, and how each piece is tested. It does not restate the design.
+This plan sequences the build. It says what ships, in what order, and how each piece is tested. It does not restate the design, and it does not carry a deliverable's scope. Each unbuilt deliverable's issue is the source of truth for what that deliverable is, per the directive in `CLAUDE.md`. The design doc at [design.md](design.md) carries the reasoning and the considered-and-rejected register. Read the issue for scope and the design doc for why.
 
 Status: PLAN, 2026-08-26.
 
@@ -18,7 +18,9 @@ The capture clock is the daily job that records the market. Nothing in a later s
 
 The build is a sequence of deliverables, D0 through D21. Each is one focused unit of work. They group into the five slices from the design doc, plus the test harness that comes first.
 
-An entry that leads with an issue number rather than a D number is work a deliverable did not finish. The issue is the source of truth for its status, and the entry is the scope and the reasoning behind it. Neither repeats the other: an entry describes the gap and why it belongs to this slice, and never records whether the work has since been done, which is the issue's to say. Where an entry's description of a gap and its issue disagree, the issue is right. An entry that claimed both would go stale the moment the work landed, which is what happened while the entries were marked unowned.
+An entry that leads with an issue number rather than a D number is work a deliverable did not finish. The issue is the source of truth for it, and the entry says why the work belongs to this slice. Neither repeats the other: an entry gives the sequencing reason, and never records whether the work has since been done, which is the issue's to say. Where an entry and its issue disagree, the issue is right. That holds for a D-numbered entry naming an unbuilt deliverable too, not only for an issue-led one. An entry that claimed both would go stale the moment the work landed, which is what happened while the entries were marked unowned.
+
+The same rule now covers the unbuilt deliverables themselves. D16 through D21 are links, because an issue holding a deliverable's scope beside its status is one place to read rather than two to reconcile.
 
 ### D0, the test harness
 
@@ -439,24 +441,26 @@ Slice 2 builds in two waves. D9 comes first and defines the hooks. D14 and D15 d
 
 ### Slice 3, vendor fetch
 
+The deliverable entries below are links. Each issue is the source of truth for its own scope, per the directive in `CLAUDE.md`. What stays here is the slicing rule, the build order, and each slice's test surface.
+
 Slice 3 adds the vendor-fetch surfaces. Its test surface is recorded vendor payloads.
 
-- **D16** bars, actions, and the cross-check.
+- **D16** bars, actions, and the cross-check. Scope in [#134](https://github.com/l3a0/marketlake/issues/134).
 
 ### Slice 4, the read layer
 
 Slice 4 is pure derivation over sealed partitions. It fetches nothing. Its test surface is a fixture lake.
 
-- **D17** loader API and adjusted views.
-- **D18** chains-to-bars join views.
-- **D19** the OI view.
+- **D17** loader API and adjusted views. Scope in [#135](https://github.com/l3a0/marketlake/issues/135).
+- **D18** chains-to-bars join views. Scope in [#136](https://github.com/l3a0/marketlake/issues/136).
+- **D19** the OI view. Scope in [#137](https://github.com/l3a0/marketlake/issues/137).
 
 ### Slice 5, validation and the full dashboard
 
 Slice 5 adds the validation battery, the rest of the dashboard, and the quarantine sign-off tool.
 
-- **D20** validation battery plus the History and Lake panels.
-- **D21** the quarantine sign-off tool. It is the flock-guarded CLI that resolves quarantines, placed beside the panel that surfaces them.
+- **D20** validation battery plus the History and Lake panels. Scope in [#138](https://github.com/l3a0/marketlake/issues/138).
+- **D21** the quarantine sign-off tool, the flock-guarded CLI that resolves quarantines, placed beside the panel that surfaces them. Scope in [#139](https://github.com/l3a0/marketlake/issues/139).
 
 Computed greeks stay deferred beyond the build, per the design doc.
 
@@ -543,7 +547,7 @@ Each healthchecks.io check is created by hand, in the session that first makes i
    working and only the report is missing.
 3. **D13**, `capture`, and the daemon's own pages. The per-cycle dead-man. Delete the `slice1-capture` row in the same session, because `capture` supersedes it. Ship every daemon page path through one publisher: auth death, sustained 429s, the watchdog, and the sampler collapse. The auth-gap reminder, the parser's schema-drift page, and a `--test-push` on the onboarding command are tracked in [#92](https://github.com/l3a0/marketlake/issues/92) above. Rehearse the topic rotation once, end to end. The 09:35 calendar probe ships here too, with its page and its `calendar-probe` check.
 4. **D14**, `pre-open` and `sunday`, and the Sunday reminder. D14 renders the launchd jobs and the wake schedules those two checks watch. The Sunday job sends the re-auth reminder on its 20:00, 21:00, and 22:00 canary runs only, while the throwaway call or the coverage assertion still fails, reading the token's mint time from `token.json` itself.
-5. **D16**, `eod-sweep`, and the nightly summary. The vendor sweep writes the dated report file under `reports/` and sends its one-screen digest at priority 2 after its own ping lands, holiday no-ops included. Until D20 the quarantine count is zero and the History panel that renders the file does not exist yet, so the file is read by hand. One of its inputs is already on disk: the close+5 guard files each run under `reports/close_guard/date=D/`, on findings and on a clean day alike, so an absent file means the guard never ran.
+5. **D16**, `eod-sweep`, and the nightly summary. This is where the report channel is created, and the sweep's own ping lands before the digest it sends. Scope in [#134](https://github.com/l3a0/marketlake/issues/134), which holds the digest's priority, the holiday no-op rule, and the inputs already on disk.
 6. **D20**, the battery's pages, delayed feed and nightly schema drift.
 
 ## Discipline rules
