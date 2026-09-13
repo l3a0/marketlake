@@ -1103,6 +1103,49 @@ def test_the_other_three_types_keep_refusing_every_wrong_shape():
             journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
 
 
+def test_a_bool_after_a_float_in_the_same_integer_column_keeps_raising():
+    """Two contracts, the first a lossless float and the second a bool, must still raise.
+
+    Arrow reads a column's type from its first non-null value and widens the later ones
+    into it, so the bool is already 1.0 by the time inference returns and the inferred
+    type cannot tell it from a real 1. Checking the bool alone in the column misses this,
+    because ``[True, 1500.0]`` raises during inference while ``[1500.0, True]`` does not.
+    A vendor ``true`` recorded as an open interest of 1 is the same silent corruption the
+    fractional float was.
+    """
+    for values in ((1500.0, True), (1500.0, False), (1500.0, True, 7)):
+        contracts = [
+            _full_contract(symbol=f"SPY   260918C0065000{i}", openInterest=value)
+            for i, value in enumerate(values)
+        ]
+        body = dict(
+            CHAIN_BODY,
+            callExpDateMap={"2026-09-18:25": {"650.0": contracts}},
+            putExpDateMap={},
+        )
+        with pytest.raises((pa.ArrowInvalid, pa.ArrowTypeError)):
+            journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+
+
+def test_a_lossless_float_still_lands_when_the_column_holds_several_rows():
+    """The control for the case above. Several float rows with no bool still capture.
+
+    Without this, refusing every multi-row float column would pass the bool test while
+    breaking the lossless-float rule the fix is built around.
+    """
+    contracts = [
+        _full_contract(symbol=f"SPY   260918C0065000{i}", openInterest=value)
+        for i, value in enumerate((1500.0, 2, 0.0))
+    ]
+    body = dict(
+        CHAIN_BODY,
+        callExpDateMap={"2026-09-18:25": {"650.0": contracts}},
+        putExpDateMap={},
+    )
+    batch = journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+    assert batch.column("open_interest").to_pylist() == [1500, 2, 0]
+
+
 def test_a_bool_or_a_string_in_an_integer_column_keeps_raising():
     """Arrow's cast would turn ``True`` into 1 and ``"7"`` into 7. Neither may land.
 

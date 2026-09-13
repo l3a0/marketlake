@@ -573,21 +573,24 @@ def _int_column(values: Sequence[object]) -> pa.Array:
 
     Building an integer column straight from Python objects coerces a fractional float to
     its truncated value and hands it back with no error, so a vendor ``3.7`` lands as
-    ``3``. Across the four types the pinned schemas use, that is the only conversion that
-    changes a value silently. Every other wrong shape already raises, so only the 29
-    integer columns need this route and the other 119 keep the direct build.
+    ``3``. Among the 29 integer columns that is the conversion which changes a value
+    without raising, so only they take this route and the other 119 keep the direct build.
 
     Inferring the column's type first and then casting to ``int64`` moves the check into
     Arrow, which refuses a float it cannot represent exactly and still passes a lossless
-    one like ``1500.0``. Only an inferred integer, floating, or null type takes that
-    route. An inferred bool or string falls back to the direct build, because Arrow's
-    cast would happily turn ``True`` into ``1`` and ``"7"`` into ``7``, and both of those
-    must keep raising the way they do today. Inference that raises falls back for the
-    same reason, so the caller still sees the exception the direct build would have
-    raised.
+    one like ``1500.0``. Everything else falls back to the direct build, so the caller
+    sees the same exception it saw before this route existed. That covers an inferred bool
+    or string, where Arrow's own cast would turn ``True`` into ``1`` and ``"7"`` into
+    ``7``, and inference that raises outright. It also covers the empty and all-null
+    column, which the direct build already lands as a typed column of nulls.
 
-    An empty or all-null column infers the ``null`` type and casts to an ``int64`` column
-    of nulls, so it still lands typed rather than guessed.
+    A column holding both a float and a bool needs the explicit scan below. Arrow reads a
+    column's type from its first non-null value and widens the later ones into it, so a
+    bool that follows a float is already ``1.0`` by the time inference returns and the
+    inferred type alone can no longer tell it from a real 1. Ordering is what hides it:
+    ``[True, 1500.0]`` raises during inference while ``[1500.0, True]`` does not. The scan
+    runs only once a float is present, never on the ordinary all-integer column, which
+    returns on the line above without touching it.
     """
     try:
         inferred = pa.array(values)
@@ -595,11 +598,7 @@ def _int_column(values: Sequence[object]) -> pa.Array:
         return pa.array(values, type=pa.int64())
     if inferred.type == pa.int64():
         return inferred
-    if (
-        pa.types.is_integer(inferred.type)
-        or pa.types.is_floating(inferred.type)
-        or pa.types.is_null(inferred.type)
-    ):
+    if pa.types.is_floating(inferred.type) and not any(isinstance(value, bool) for value in values):
         return inferred.cast(pa.int64())
     return pa.array(values, type=pa.int64())
 
