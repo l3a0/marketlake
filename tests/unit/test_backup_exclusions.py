@@ -197,6 +197,7 @@ def _full_lake(root: Path) -> Path:
         .with_partition("bars", "SPY", DAY, sample_quotes_table())
         .with_reference("security_master", sample_chains_table())
         .with_reference("contracts", sample_chains_table())
+        .with_reference("schema_versions", sample_chains_table())
         .with_journal_segment(
             "chains", "SPY", DAY, sample_chains_table(), start_ts="20260824T133000Z", pid=4242
         )

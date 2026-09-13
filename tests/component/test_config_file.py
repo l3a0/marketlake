@@ -131,6 +131,7 @@ def test_input_errors_exit_lets_every_other_exception_through():
         ("lake.dashboard", ["--config", "MISSING"]),
         ("lake.probe_calendar", ["--config", "MISSING"]),
         ("lake.control_plane", ["sunday", "--config", "MISSING"]),
+        ("lake.schema_versions", ["--config", "MISSING"]),
     ],
 )
 def test_a_missing_config_names_itself_at_every_cli_entry(module, argv, tmp_path, capsys):

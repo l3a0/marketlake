@@ -23,11 +23,17 @@ the suite, and the fix the failure names is a deliberate bump with its own entry
 These tests read the schema objects in memory. No file, process, or query engine is
 crossed, so they sit in the unit tier.
 
-Recording the map here is deliberate but not final. Read against a sealed partition, the
-map is what says a null on a version N+1 row is a non-observation rather than a vendor
-null, and a map that lives only in the repo cannot be read beside a restored backup.
-Moving it into ``reference/`` is the second deliverable of marketlake #128, so this
-literal is the seed that tool will write rather than its permanent home.
+The map recorded here is the in-repo half, and it is not the only copy. Read against a
+sealed partition, the map is what says a null on a version N+1 row is a non-observation
+rather than a vendor null, and a map that lives only in the repo cannot be read beside a
+restored backup. So ``lake.schema_versions`` writes the same shape into the lake itself,
+at ``reference/schema_versions.parquet``, where it restores with the data.
+
+The two are not a second source of truth for the same fact. Both read the shape off
+``journal.schema_fingerprint``, which is the one derivation. What each adds is different.
+The literal below is what forces a human to notice a shape change, because a test cannot
+read the owner's machine-local lake. The ledger is what lets a reader interpret a version
+long after the code that wrote it is gone.
 """
 
 from __future__ import annotations
@@ -207,21 +213,18 @@ def _drift_report(
     """Name every column that moved, then name the bump as the fix.
 
     Naming the columns is the reason the fingerprint is a column list rather than a
-    digest. A digest says only that something moved.
+    digest. A digest says only that something moved. Which columns moved comes from
+    ``journal.fingerprint_diff``, so the ledger's own refusal message and this one agree
+    on what counts as a change.
     """
-    dropped = sorted(set(recorded) - set(derived))
-    added = sorted(set(derived) - set(recorded))
-    retyped = sorted(
-        f"{name} {recorded[name]} -> {derived[name]}"
-        for name in set(recorded) & set(derived)
-        if recorded[name] != derived[name]
-    )
+    diff = journal.fingerprint_diff(derived, recorded)
+    retyped = [f"{name} {was} -> {now}" for name, was, now in diff.retyped]
     return "\n".join(
         [
             f"the {surface} shape no longer matches the fingerprint recorded for "
             f"schema_version {version}.",
-            f"  dropped: {', '.join(dropped) or 'none'}",
-            f"  added: {', '.join(added) or 'none'}",
+            f"  dropped: {', '.join(diff.dropped) or 'none'}",
+            f"  added: {', '.join(diff.added) or 'none'}",
             f"  retyped: {', '.join(retyped) or 'none'}",
             "Fix: bump journal.SCHEMA_VERSION and record the new shape under that new "
             "version in RECORDED_FINGERPRINTS.",
@@ -375,3 +378,55 @@ def test_unknown_surface_raises():
     """The fingerprint inherits the loud failure ``schema_for`` already gives."""
     with pytest.raises(ValueError, match="unknown surface 'bars'"):
         journal.schema_fingerprint("bars")
+
+
+# -- what counts as a change, defined once ------------------------------------
+
+
+def test_the_diff_names_what_moved_in_each_direction():
+    """The comparison both callers share, exercised directly rather than only through one.
+
+    The suite's drift report and the ledger's refusal message each format their own text
+    and each read the difference off this, so a change to what counts as a move has to
+    show up here.
+    """
+    recorded = {"kept": "string", "dropped_one": "double", "retyped_one": "int64"}
+    derived = {"kept": "string", "retyped_one": "double", "added_one": "bool"}
+    diff = journal.fingerprint_diff(derived, recorded)
+    assert diff.dropped == ("dropped_one",)
+    assert diff.added == ("added_one",)
+    assert diff.retyped == (("retyped_one", "int64", "double"),)
+    assert diff.moved is True
+
+
+def test_the_diff_reads_the_recorded_type_first_and_the_derived_type_second():
+    """The order inside a retyped triple is what the message renders as ``was -> now``.
+
+    Swapping the two would read the change backwards, and a reader would bump for the
+    opposite change.
+    """
+    ((_, was, now),) = journal.fingerprint_diff({"c": "double"}, {"c": "int64"}).retyped
+    assert (was, now) == ("int64", "double")
+
+
+def test_identical_fingerprints_moved_nothing():
+    same = {"kept": "string", "other": "int64"}
+    diff = journal.fingerprint_diff(same, dict(same))
+    assert diff == ((), (), ())
+    assert diff.moved is False
+
+
+def test_a_reordered_fingerprint_moved_nothing():
+    """Order is not a change, which is the same rule ``schema_fingerprint`` encodes."""
+    recorded = {"a": "string", "b": "int64", "c": "double"}
+    reordered = {"c": "double", "b": "int64", "a": "string"}
+    assert journal.fingerprint_diff(reordered, recorded).moved is False
+
+
+def test_the_diff_sorts_every_category_so_a_message_reads_the_same_every_run():
+    recorded = {"z": "string", "y": "string", "m": "int64", "n": "int64"}
+    derived = {"b": "string", "a": "string", "m": "double", "n": "double"}
+    diff = journal.fingerprint_diff(derived, recorded)
+    assert diff.dropped == ("y", "z")
+    assert diff.added == ("a", "b")
+    assert [name for name, _, _ in diff.retyped] == ["m", "n"]

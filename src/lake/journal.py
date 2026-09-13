@@ -377,6 +377,50 @@ def schema_fingerprint(surface: str) -> dict[str, str]:
     return {field.name: str(field.type) for field in schema_for(surface)}
 
 
+class FingerprintDiff(NamedTuple):
+    """What moved between a recorded fingerprint and the one the code derives now.
+
+    ``dropped`` names the columns the record has and the code no longer does, ``added``
+    the ones the code has and the record does not, and ``retyped`` the columns both hold
+    under different types, each as ``(name, recorded_type, derived_type)``. Every tuple is
+    sorted, so a message built from one reads the same on every run.
+    """
+
+    dropped: tuple[str, ...]
+    added: tuple[str, ...]
+    retyped: tuple[tuple[str, str, str], ...]
+
+    @property
+    def moved(self) -> bool:
+        """Whether anything moved at all."""
+        return bool(self.dropped or self.added or self.retyped)
+
+
+def fingerprint_diff(derived: Mapping[str, str], recorded: Mapping[str, str]) -> FingerprintDiff:
+    """Compare a derived fingerprint against a recorded one and name what moved.
+
+    Two callers ask this same question of the same pair, and what counts as a change is
+    defined here once rather than in each of them. The suite compares every surface's
+    derived shape against the shape recorded for the current ``SCHEMA_VERSION``. The
+    schema-version ledger compares the same derived shape against what the lake already
+    holds for that version. Each writes its own message, because the fix each names is
+    its own, and both read the difference off this.
+
+    Order is not compared, for the reason ``schema_fingerprint`` returns a mapping: a
+    reorder captures the same values, so it moves nothing.
+    """
+    dropped = tuple(sorted(set(recorded) - set(derived)))
+    added = tuple(sorted(set(derived) - set(recorded)))
+    retyped = tuple(
+        sorted(
+            (name, recorded[name], derived[name])
+            for name in set(recorded) & set(derived)
+            if recorded[name] != derived[name]
+        )
+    )
+    return FingerprintDiff(dropped, added, retyped)
+
+
 # -- vendor field maps -------------------------------------------------------
 
 # The per-contract vendor fields that land in typed chains columns, each stored
