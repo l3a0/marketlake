@@ -955,13 +955,79 @@ def _spot_close_row(root: Path, ticker: str) -> Path:
     return path
 
 
-def _segments(root: Path, ticker: str) -> list[Path]:
+def _segments(root: Path, ticker: str, surface: str = journal.QUOTES_SURFACE) -> list[Path]:
     """Every segment under a ticker-day, counted rather than read.
 
     A marker is its own segment, so counting files says whether one landed without opening
     a file the test has deliberately made unopenable.
     """
-    return sorted(LakePaths(root).segment_dir(journal.QUOTES_SURFACE, ticker, DAY).glob("*.arrows"))
+    return sorted(LakePaths(root).segment_dir(surface, ticker, DAY).glob("*.arrows"))
+
+
+def _unparseable_segment(root: Path, surface: str, ticker: str) -> Path:
+    """A segment that opens cleanly and whose close-tag column will not decode.
+
+    The two columns are the right type and the file is valid Arrow IPC, so the open
+    succeeds and ``to_pylist`` raises a ``UnicodeDecodeError``, which is a ``ValueError``
+    and lands as ``unparseable`` rather than as drift. Nothing went missing and nothing was
+    retyped, which is the line the dashboard already draws and the reason the fifth kind
+    exists.
+
+    The first row's tag is a legible ``spot_close``. It is written by hand because no
+    writer produces bytes like these, and it is there so the file this plants is one that
+    demonstrably holds the close while refusing to say so.
+    """
+    import pyarrow as pa
+
+    directory = LakePaths(root).segment_dir(surface, ticker, DAY)
+    directory.mkdir(parents=True, exist_ok=True)
+    values = SPOT_CLOSE.encode() + b"\xff\xfe"
+    offsets = pa.array([0, len(SPOT_CLOSE), len(values)], type=pa.int32())
+    tags = pa.Array.from_buffers(pa.string(), 2, [None, offsets.buffers()[1], pa.py_buffer(values)])
+    schema = pa.schema([("close_tag", pa.string()), ("row_kind", pa.string())])
+    path = directory / "20260902T160000000000-1.arrows"
+    with pa.ipc.new_stream(path, schema) as writer:
+        writer.write_batch(pa.record_batch([tags, pa.array(["data", "data"])], schema=schema))
+    return path
+
+
+def test_a_segment_whose_values_will_not_decode_withholds_the_marker(tmp_path):
+    """The fifth kind, which the rule covers by argument and this covers by example.
+
+    ``unparseable`` is not drift: the columns are present and the right type, and one value
+    in them is unusable. It reaches the marker question the same way drift does, because
+    the file opened and its rows went unread, and one of those rows is the close. Without a
+    case here the refusal could be narrowed to exclude this kind alone with the suite
+    green, and the comment's own sentence about covering it invites exactly that edit.
+    """
+    path = _unparseable_segment(tmp_path, journal.QUOTES_SURFACE, "GARBLE")
+
+    guard = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 20)), [("GARBLE", False), ("OK", False)])
+    outcome = guard.run(DAY)
+
+    assert outcome.problems == ("quotes/GARBLE: 1 unreadable (1 unparseable)",), outcome.problems
+    assert outcome.unobserved == ("OK",), "the guard denied a close the garbled file holds"
+    assert _segments(tmp_path, "GARBLE") == [path], "a marker landed beside a garbled file"
+
+
+def test_the_option_close_names_a_bad_file_whatever_kind_it_is(tmp_path):
+    """The chains half reports rather than refuses, and it still has to name the kind.
+
+    Only a drifted segment reaches that report today, so the branch could be narrowed to
+    drift alone with the suite green and an operator would lose the line naming the file on
+    every other kind. The fill running anyway is the asymmetry the comment there sets out,
+    and it is unchanged: the line is what this pins.
+    """
+    directory = LakePaths(tmp_path).segment_dir(journal.CHAINS_SURFACE, "TORN", DAY)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "20260902T161500000000-1.arrows").write_bytes(b"not an arrow stream at all")
+
+    guard = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 20)), [("TORN", True)])
+    outcome = guard.run(DAY)
+
+    assert outcome.problems == ("chains/TORN: 1 unreadable (1 corrupt)",), outcome.problems
+    # Still reaches the fill path, which is the half that must not change.
+    assert outcome.refused == ("TORN: no fill fetcher",), outcome.refused
 
 
 def test_a_segment_that_will_not_open_still_withholds_the_marker(tmp_path):
