@@ -658,12 +658,13 @@ def _fetch_window(
                 header_holder.append(response.body)
             return
         except Exception:
-            # A body that would not merge splits like a too-big window, so the fetch still
-            # lands what the other windows returned. What it is given up under differs: the
-            # vendor's payload changed shape, which is not a chain too big to fetch, and
-            # filing one under the other would send a reader to the chunk plan for a
-            # problem the chunk plan cannot fix.
-            too_big = True
+            # A body that would not merge falls through to the split below, the same path a
+            # too-big window takes, so the fetch still lands what the other windows
+            # returned. What it is given up under differs: the vendor's payload changed
+            # shape, which is not a chain too big to fetch, and filing one under the other
+            # would send a reader to the chunk plan for a problem the chunk plan cannot fix.
+            # ``too_big`` is deliberately not set here. Nothing reads it past this point,
+            # and setting it would read as meaningful when it decides nothing.
             give_up_class = CHAIN_SCHEMA_DRIFT
     elif not too_big:
         # A non-2xx status that is not the TooBigBody fault is not a size problem. Record
