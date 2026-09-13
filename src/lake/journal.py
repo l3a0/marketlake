@@ -48,6 +48,15 @@ from lake.paths import LakePaths, parse_segment_rel
 # The schema version stamped on every row. The vendor columns' full list is fixed by
 # the first day's payload and recorded as version 1. A later payload change mints a
 # new version rather than mutating this one.
+#
+# This constant stays hand-set rather than derived from the column set. A version has to
+# be orderable, because a reader asks whether a row sits below the version that promoted
+# a field out of ``extra`` into its own column, and a derived digest answers no such
+# question. A change that leaves the shape alone also needs a version, as when the vendor
+# keeps ``open_interest`` an int64 and changes what it counts. Only a human knows that.
+# What is derived instead is the shape, via ``schema_fingerprint`` below, and
+# ``tests/unit/test_schema_fingerprint.py`` compares the two. So a column added, dropped,
+# or retyped without a bump fails the suite.
 SCHEMA_VERSION = 1
 
 # The two surfaces this module writes.
@@ -316,6 +325,12 @@ QUOTES_SCHEMA = pa.schema(
 
 _SCHEMAS = {CHAINS_SURFACE: CHAINS_SCHEMA, QUOTES_SURFACE: QUOTES_SCHEMA}
 
+# The surfaces this module pins a capture schema for. ``paths.SURFACES`` is wider,
+# because the lake lays out directories for surfaces nothing captures yet. Deriving this
+# from the schema map keeps a third surface from being pinned in one place and forgotten
+# in the other.
+PINNED_SURFACES = tuple(_SCHEMAS)
+
 
 def schema_for(surface: str) -> pa.Schema:
     """The pinned capture schema for a surface. Unknown surfaces raise loudly."""
@@ -323,6 +338,43 @@ def schema_for(surface: str) -> pa.Schema:
         return _SCHEMAS[surface]
     except KeyError:
         raise ValueError(f"unknown surface {surface!r}") from None
+
+
+def schema_fingerprint(surface: str) -> dict[str, str]:
+    """The surface's pinned schema reduced to a column-name-to-type mapping.
+
+    This is what makes ``SCHEMA_VERSION`` mean something. The version is the only
+    provenance that survives a seal: compaction unlinks a ticker-day's segments once the
+    partition is manifested, so after that moment the per-segment schemas are gone and the
+    integer stamped on every row is the sole record of which code shape wrote it. That
+    matters most for a dropped column, which has no repair, because the values were never
+    written. Reading the shape off the schema rather than restating it by hand is what
+    keeps the record from going stale.
+
+    Types render through pyarrow, so ``pa.float64()`` reads as ``double``. A retyped
+    column therefore moves the fingerprint the same way a dropped one does.
+
+    The result is a mapping rather than a sequence, which leaves column order out on
+    purpose. What the fingerprint records is which values a version captured, and a
+    reorder captures the same values. A null on a reordered row means exactly what it
+    meant before, so a reorder mints no version and moving one column past another should
+    not fail the suite. Whether a reorder is safe to *ship* is a separate question with a
+    separate answer. ``compact`` merges segments with ``promote_options="default"``, the
+    dashboard's multi-day read uses DuckDB's ``union_by_name``, and the dashboard's
+    per-segment read projects each segment into a fixed schema before it concatenates, so
+    all three absorb one. ``measure.read_surface_cycles`` calls ``pa.concat_tables`` plain
+    and refuses a reordered schema outright. That gap is marketlake #143 and not this
+    function's to catch.
+
+    The two reference tables that carry a version of their own, the security master and
+    the capture spans, are deliberately out of scope. Neither file is ever unlinked, so
+    each still carries the schema it was written with, and both refuse at read time a file
+    whose version they do not recognise. The journal differs only because compaction
+    unlinks its segments.
+
+    Unknown surfaces raise loudly, through ``schema_for``.
+    """
+    return {field.name: str(field.type) for field in schema_for(surface)}
 
 
 # -- vendor field maps -------------------------------------------------------

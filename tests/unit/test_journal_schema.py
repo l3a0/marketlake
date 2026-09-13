@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pyarrow as pa
 import pytest
@@ -222,10 +223,6 @@ VENDOR = "2026-08-24T16:15:00-04:00"
 
 
 # -- schema shape ------------------------------------------------------------
-
-
-def test_schema_version_is_one():
-    assert journal.SCHEMA_VERSION == 1
 
 
 def test_chains_schema_names_and_types():
@@ -713,7 +710,7 @@ def test_chains_data_batch_provenance_and_stamps():
     assert row["suspect"] is False
     assert row["close_tag"] == "option_close"
     assert row["session_phase"] is None
-    assert row["schema_version"] == 1
+    assert row["schema_version"] == journal.SCHEMA_VERSION
     assert row["snap_ts"] == SNAP
     assert row["fetch_ts"] == FETCH
     # The stamp is derived from the call contract's own quoteTimeInLong.
@@ -1188,6 +1185,79 @@ def test_a_bool_or_a_string_in_an_integer_column_keeps_raising():
         )
         with pytest.raises(expected):
             journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+
+
+# -- the version stamp on every row ------------------------------------------
+
+# Every builder in the module, each with the arguments that reach every stamp site it
+# owns. ``chains_data_batch`` owns two, one for its contract rows and one for its
+# absence-marker rows, so it appears once with both. The count is asserted against the
+# module's source below, so a builder added later is covered here or the suite says so.
+STAMPING_BUILDERS = {
+    "chains_data_batch": lambda: journal.chains_data_batch(
+        CHAIN_BODY,
+        ticker="SPY",
+        snap_ts=SNAP,
+        fetch_ts=FETCH,
+        windows=[("2026-08-24", "2026-10-15"), ("2026-10-16", None)],
+        absent_markers=[
+            journal.AbsentMarker("2026-10-16", None, "chain_chunk_failed", "2026-10-16")
+        ],
+    ),
+    "quotes_data_batch": lambda: journal.quotes_data_batch(
+        QUOTE, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH, vendor_quote_ts=VENDOR
+    ),
+    "gap_batch": lambda: journal.gap_batch(
+        "chains", ticker="SPY", snap_ts=SNAP, error_class="http_429"
+    ),
+    "gap_rows": lambda: journal.gap_rows(
+        "quotes",
+        ticker="SPY",
+        slots=[
+            datetime.fromisoformat("2026-08-24T15:58:00-04:00"),
+            datetime.fromisoformat("2026-08-24T15:59:00-04:00"),
+        ],
+        error_class="daemon_down",
+    ),
+    "absent_series_rows": lambda: journal.absent_series_rows(
+        "chains",
+        ticker="SPY",
+        slot=datetime.fromisoformat("2026-08-24T16:00:00-04:00"),
+        expirations=["2026-09-18", "2026-10-16"],
+        error_class="option_close_series_absent",
+    ),
+}
+
+
+@pytest.mark.parametrize("builder", sorted(STAMPING_BUILDERS))
+def test_every_builder_stamps_the_schema_version_on_every_row(builder):
+    """The stamp is the provenance, so every row of every builder carries it.
+
+    Compaction unlinks a ticker-day's segments once the partition is sealed, so this
+    integer is the only record left of which code shape wrote a row. A row that carries
+    the wrong version, or a null, is a row whose shape cannot be recovered at all.
+    """
+    batch = STAMPING_BUILDERS[builder]()
+    stamps = batch.column("schema_version").to_pylist()
+    assert stamps, f"{builder} built no rows, so it stamped nothing"
+    assert set(stamps) == {journal.SCHEMA_VERSION}, stamps
+
+
+def test_the_builders_covered_are_every_stamp_site_in_the_module():
+    """The set covered is enumerated against the module's source, not assumed.
+
+    A test that builds five builders proves nothing about a sixth. Counting the stamp
+    sites in the source is what makes this cover the class. ``chains_data_batch`` owns two
+    of them, one for contract rows and one for absence markers.
+    """
+    source = Path(journal.__file__).read_text()
+    sites = source.count('"schema_version": SCHEMA_VERSION')
+    assert sites == len(STAMPING_BUILDERS) + 1, (
+        f"{sites} stamp sites in journal.py against {len(STAMPING_BUILDERS)} builders "
+        "covered here. A builder that stamps the version needs an entry in "
+        "STAMPING_BUILDERS, and one that does not stamp it writes rows whose shape "
+        "cannot be recovered after a seal."
+    )
 
 
 # -- path convention ---------------------------------------------------------

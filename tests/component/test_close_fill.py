@@ -1185,7 +1185,7 @@ def test_the_membership_marker_fills_only_the_columns_it_is_entitled_to(lake_roo
     assert marker["error_class"] == "option_close_series_absent"
     assert marker["ticker"] == "SPY"
     assert marker["suspect"] is False
-    assert marker["schema_version"] == 1
+    assert marker["schema_version"] == journal.SCHEMA_VERSION
     filled = {name for name, value in marker.items() if value is not None}
     assert filled == _MARKER_FILLED, f"unexpected columns on a gap row: {filled - _MARKER_FILLED}"
 
