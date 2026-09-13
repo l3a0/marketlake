@@ -1087,19 +1087,19 @@ def test_the_other_three_types_keep_refusing_every_wrong_shape():
     notice the fix widening onto a path that already worked.
     """
     cases = (
-        ("bid", "not-a-number"),  # string into double
-        ("description", 7),  # int into string
-        ("description", 7.5),  # float into string
-        ("inTheMoney", 1),  # int into bool
-        ("inTheMoney", 1.5),  # float into bool
+        ("bid", "not-a-number", pa.ArrowInvalid),  # string into double
+        ("description", 7, pa.ArrowTypeError),  # int into string
+        ("description", 7.5, pa.ArrowTypeError),  # float into string
+        ("inTheMoney", 1, pa.ArrowInvalid),  # int into bool
+        ("inTheMoney", 1.5, pa.ArrowInvalid),  # float into bool
     )
-    for field, value in cases:
+    for field, value, expected in cases:
         body = dict(
             CHAIN_BODY,
             callExpDateMap={"2026-09-18:25": {"650.0": [_full_contract(**{field: value})]}},
             putExpDateMap={},
         )
-        with pytest.raises((pa.ArrowInvalid, pa.ArrowTypeError)):
+        with pytest.raises(expected):
             journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
 
 
@@ -1123,7 +1123,34 @@ def test_a_bool_after_a_float_in_the_same_integer_column_keeps_raising():
             callExpDateMap={"2026-09-18:25": {"650.0": contracts}},
             putExpDateMap={},
         )
-        with pytest.raises((pa.ArrowInvalid, pa.ArrowTypeError)):
+        with pytest.raises(pa.ArrowTypeError):
+            journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+
+
+def test_a_column_arrow_cannot_infer_keeps_the_direct_build_s_own_exception():
+    """When inference itself fails, the caller must still see the direct build's class.
+
+    Two contracts whose ``openInterest`` is a bool and a string give Arrow nothing to
+    infer, so the inference attempt raises before any type check runs. Its exception is
+    not the one the direct build raises, and the two disagree in both directions:
+    ``[True, "7"]`` fails inference with ``ArrowInvalid`` where the direct build raises
+    ``ArrowTypeError``, and reversing the contracts swaps them.
+
+    The class matters past the raise. ``lake.capture`` records a gap under the exception's
+    own name, so leaking the inference failure would rewrite a gap on disk from
+    ``arrow_type_error`` to ``arrow_invalid`` and change what an operator reads.
+    """
+    for values, expected in (((True, "7"), pa.ArrowTypeError), (("7", True), pa.ArrowInvalid)):
+        contracts = [
+            _full_contract(symbol=f"SPY   260918C0065000{i}", openInterest=value)
+            for i, value in enumerate(values)
+        ]
+        body = dict(
+            CHAIN_BODY,
+            callExpDateMap={"2026-09-18:25": {"650.0": contracts}},
+            putExpDateMap={},
+        )
+        with pytest.raises(expected):
             journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
 
 
@@ -1153,13 +1180,13 @@ def test_a_bool_or_a_string_in_an_integer_column_keeps_raising():
     direct build refused. Both stay refused, so the fix removes a silent conversion without
     adding two.
     """
-    for value in (True, "7"):
+    for value, expected in ((True, pa.ArrowTypeError), ("7", pa.ArrowInvalid)):
         body = dict(
             CHAIN_BODY,
             callExpDateMap={"2026-09-18:25": {"650.0": [_full_contract(openInterest=value)]}},
             putExpDateMap={},
         )
-        with pytest.raises((pa.ArrowInvalid, pa.ArrowTypeError)):
+        with pytest.raises(expected):
             journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
 
 

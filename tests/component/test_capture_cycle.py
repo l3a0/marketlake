@@ -533,6 +533,36 @@ def test_the_same_chain_captures_when_the_integer_field_is_whole(lake_root):
     assert _rows(chain)[0]["open_interest"] == 1234
 
 
+def test_the_recorded_gap_class_is_the_direct_build_s_own_exception(lake_root):
+    """A chain Arrow cannot infer gaps under ``arrow_type_error``, not ``arrow_invalid``.
+
+    Two contracts send ``openInterest`` as a bool and as a string, which gives Arrow
+    nothing to infer from, so the inference attempt raises before any type check runs.
+    Its exception class differs from the direct build's, and the recorded gap class is
+    taken from the exception's own name. Asserting only that the ticker gapped would pass
+    either way, so this pins the class an operator actually reads.
+    """
+    body = _chain_body_with()
+    contracts = [
+        dict(body["callExpDateMap"]["2026-09-18:25"]["650.0"][0], openInterest=value)
+        for value in (True, "7")
+    ]
+    body["callExpDateMap"]["2026-09-18:25"]["650.0"] = contracts
+    result = capture.run_cycle(
+        ManualClock(start=_CLOCK_START),
+        CassetteVendor(_one_chain_cassette(body)),
+        _spy_only(),
+        lake_root,
+        pid=4242,
+        plan=_ONE_WINDOW,
+    )
+
+    chain = result.segment(CHAINS, "SPY")
+    assert chain.row_kind == journal.ROW_KIND_GAP
+    assert chain.error_class == "arrow_type_error"
+    assert _rows(chain)[0]["error_class"] == "arrow_type_error"
+
+
 def test_a_truncating_float_gaps_only_that_ticker(lake_root):
     """A second ticker's chain still captures, so the gap stays scoped to the bad one."""
     cassette = Cassette(
