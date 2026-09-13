@@ -300,11 +300,11 @@ def test_the_round_trip_preserves_every_version(tmp_path):
     assert back.versions() == (1, 2)
     assert back.row_count == ledger.row_count
     for version in (1, 2):
-        mine, theirs = ledger.get(version), back.get(version)
-        assert theirs is not None and mine is not None
-        assert theirs.recorded_at == mine.recorded_at
-        assert {s: dict(c) for s, c in theirs.fingerprints.items()} == {
-            s: dict(c) for s, c in mine.fingerprints.items()
+        original, restored = ledger.get(version), back.get(version)
+        assert original is not None and restored is not None
+        assert restored.recorded_at == original.recorded_at
+        assert {s: dict(c) for s, c in restored.fingerprints.items()} == {
+            s: dict(c) for s, c in original.fingerprints.items()
         }
 
 
