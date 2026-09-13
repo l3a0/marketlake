@@ -769,7 +769,9 @@ def test_a_day_whose_record_cannot_be_read_is_refused_rather_than_over_marked(tm
     # A full session of daemon_dead markers over a day that really was captured would
     # be worse than marking nothing.
     assert report.rows == 0
-    assert report.problems == ("quotes/XYZ 2026-09-01: 1 unreadable",)
+    # Named as corrupt, the kind that fits the damage: these bytes are not an Arrow
+    # stream at all, so the file says nothing about its own schema.
+    assert report.problems == ("quotes/XYZ 2026-09-01: 1 unreadable (1 corrupt)",)
 
 
 def test_the_walk_back_cap_counts_sessions_not_calendar_days(tmp_path, monkeypatch):
@@ -1094,7 +1096,10 @@ def test_a_drifted_segment_is_recorded_rather_than_raised(tmp_path):
     # The pair is refused and named, which is what the reader's ``unreadable`` channel is
     # for. Marking the day would write a full session of holes over a record that may
     # exist inside the file nobody can read.
-    assert report.problems == ("quotes/XYZ 2026-09-02: 1 unreadable",), report.problems
+    # Named as drifted rather than corrupt. The file opened cleanly and answered the wrong
+    # question, which is the kind the design's schema policy pages on, and the only reason
+    # a reader can tell it from the unopenable file in the case above.
+    assert report.problems == ("quotes/XYZ 2026-09-02: 1 unreadable (1 drifted)",), report.problems
     # Counted as segments rather than read as rows, because the planted file has no
     # columns to read. One segment means only the planted one is there and the walk added
     # no marker beside it.

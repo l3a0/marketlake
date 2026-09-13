@@ -913,7 +913,9 @@ def test_a_drifted_segment_is_reported_rather_than_marked_over(tmp_path):
     guard = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 20)), [("DRIFT", False), ("OK", False)])
     outcome = guard.run(DAY)
 
-    assert outcome.problems == ("quotes/DRIFT: 2 unreadable",), "the bad ticker was not named"
+    assert outcome.problems == ("quotes/DRIFT: 2 unreadable (2 drifted)",), (
+        "the bad ticker was not named"
+    )
     assert outcome.unobserved == ("OK",), "the guard claimed a close it could not see"
     # The drifted segment itself is one row in that directory, so what must be absent is a
     # marker, not a row. A marker carries the close tag; the drifted schema has no such
@@ -966,7 +968,9 @@ def test_the_option_close_loop_survives_a_bad_file_the_same_way(tmp_path):
     guard = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 20)), [("DRIFT", True), ("OK", True)])
     outcome = guard.run(DAY)
 
-    assert outcome.problems == ("chains/DRIFT: 1 unreadable",), "the bad ticker was not named"
+    assert outcome.problems == ("chains/DRIFT: 1 unreadable (1 drifted)",), (
+        "the bad ticker was not named"
+    )
     # Both are refused for want of a fetcher, DRIFT included. That it reaches the fill
     # path at all is the point: an unreadable segment names a problem here and does not
     # call the close off, because the fill is the only thing that can still rescue it.

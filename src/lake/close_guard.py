@@ -317,7 +317,7 @@ class CloseGuard:
             # the startup walk refuses the same pair. The day then reads short with no row
             # naming why, which is the loss #120 tracks. It is the right side to err on
             # only because the alternative is a false claim sealed into the record.
-            found.problems.append(f"quotes/{ticker}: {len(rows.unreadable)} unreadable")
+            found.problems.append(f"quotes/{ticker}: {journal.describe_unusable(rows.unreadable)}")
             return
         try:
             self._marker(journal.QUOTES_SURFACE, ticker, slot, SPOT_CLOSE, SPOT_CLOSE_UNOBSERVED)
@@ -358,7 +358,7 @@ class CloseGuard:
             # process killed in between leaves one durably empty. That is precisely what
             # the crash loop this issue fixes used to produce, and such a file holds
             # nothing to duplicate.
-            found.problems.append(f"chains/{ticker}: {len(rows.unreadable)} unreadable")
+            found.problems.append(f"chains/{ticker}: {journal.describe_unusable(rows.unreadable)}")
         if self._fill is None:
             found.refused.append(f"{ticker}: no fill fetcher")
             return
