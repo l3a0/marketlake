@@ -1,6 +1,10 @@
 # CLAUDE.md — Marketlake
 
-Marketlake is a capture-first market data lake. It records full option chains and equity quotes at one-minute cadence from the Schwab Trader API. The design doc at [docs/design.md](docs/design.md) is the source of truth. Read it before proposing any change. Status: implementation is underway. Code lives in `src/lake`, with tests under `tests/`. Build order and slices are defined at the end of the doc.
+Marketlake is a capture-first market data lake. It records full option chains and equity quotes at one-minute cadence from the Schwab Trader API. Status: implementation is underway. Code lives in `src/lake`, with tests under `tests/`.
+
+**The tracker is authoritative for scope (owner directive, 2026-09-13).** An unbuilt deliverable's issue is the source of truth for what it is and what it must do. The design doc at [docs/design.md](docs/design.md) carries the reasoning, the premise, and the considered-and-rejected register, and it links to the issue rather than competing with it. [docs/build-plan.md](docs/build-plan.md) carries the slicing rule, the build order, and each slice's test surface, and its deliverable entries are links. Read the issue before proposing a change to a deliverable, and read the design doc before proposing a change to why any of it exists.
+
+The price of this is named rather than hidden: the same substance now exists in an issue and in the doc that reasons about it, so the two can drift. The issue wins. When they disagree, the doc is what gets corrected.
 
 ## Writing style (owner directive, 2026-08-26)
 
@@ -63,7 +67,7 @@ While a piece is outstanding, a PR writes `Part of #NN` and the closing keyword 
 
 An issue whose pieces have all been split has no finishing PR left, so close it by hand and name where each piece went. Do the same when two PRs are open against one issue, because merge order decides which lands last and neither body can know it. The split is the guard that matters here. The keyword discipline only keeps the issue open long enough to make the split.
 
-A split leaves code comments pointing at the parent for work that moved, so repoint those in the PR that splits. A comment naming a closed issue in the past tense records what happened rather than pointing anywhere, and it stays. An unstarted piece goes to an issue, not to the build plan's unowned register. The two are not alternatives: issues carry status, and the plan carries scope and the reasoning for it. A plan entry that also claims status goes stale the moment work lands, which is why the plan names the issue rather than marking a deliverable unowned.
+A split leaves code comments pointing at the parent for work that moved, so repoint those in the PR that splits. A comment naming a closed issue in the past tense records what happened rather than pointing anywhere, and it stays. An unstarted piece goes to an issue, not to the build plan's unowned register. The issue carries that piece's scope and its status together, per the directive at the top of this file. The plan names the issue rather than restating it, so a plan entry cannot go stale the moment work lands.
 
 PR titles use a Conventional Commits prefix. The form is `type(scope): summary`. Types in use: `docs`, `feat`, `fix`, `refactor`, `chore`, `ci`, `perf`. Add a scope in parens when it sharpens the title, like `docs(CLAUDE.md)`. Drop it when none does, like a plain `docs:` for a whole-doc change. The form and the scope rule match the sibling `trading-strategies` repo. Its list carries every type but `refactor`, which this repo uses and that one does not.
 
