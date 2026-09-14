@@ -1874,7 +1874,7 @@ def test_the_recomputed_chain_level_columns_are_what_the_rows_say():
 def test_every_value_a_payload_can_carry_refuses_in_one_of_the_four_named_families():
     """The routing names four exception families. A fifth would cost cycles silently.
 
-    ``_UNFIT_ERRORS`` is what decides whether a refusal is one value's doing. A pyarrow
+    ``UNFIT_ERRORS`` is what decides whether a refusal is one value's doing. A pyarrow
     upgrade that starts raising something outside it would send a retyped field back to
     gapping the whole cycle, and nothing else in the suite would notice. So the families
     are checked by enumeration: every JSON-representable value against every type the two
@@ -1914,15 +1914,15 @@ def test_every_value_a_payload_can_carry_refuses_in_one_of_the_four_named_famili
         for value in values:
             try:
                 journal.typed_column(field_type, [value])
-            except journal._UNFIT_ERRORS as exc:
+            except journal.UNFIT_ERRORS as exc:
                 raised.add(type(exc))
             except Exception as exc:  # noqa: BLE001 - the point is to catch a fifth family
                 raise AssertionError(
                     f"{type(exc).__name__} from {value!r} into {field_type}, which "
-                    "_UNFIT_ERRORS does not name, so that shape would gap the cycle"
+                    "UNFIT_ERRORS does not name, so that shape would gap the cycle"
                 ) from exc
-    assert raised == set(journal._UNFIT_ERRORS), (
-        "a family in _UNFIT_ERRORS that no value reaches is a family that was guessed"
+    assert raised == set(journal.UNFIT_ERRORS), (
+        "a family in UNFIT_ERRORS that no value reaches is a family that was guessed"
     )
 
 
@@ -2100,7 +2100,7 @@ def test_an_integer_too_wide_for_the_column_routes_like_any_other_refusal():
 
     The enumeration test asks ``typed_column`` which families a value can raise, and never
     reaches the routing. So each family also needs one end-to-end case, or the ``except``
-    clauses that consume ``_UNFIT_ERRORS`` could narrow away from the constant and send a
+    clauses that consume ``UNFIT_ERRORS`` could narrow away from the constant and send a
     whole shape back to gapping the cycle with nothing noticing.
     """
     row = _chain_row(openInterest=2**64)

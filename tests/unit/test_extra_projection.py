@@ -782,6 +782,163 @@ def test_a_lossless_float_still_lands_in_an_integer_column_as_an_integer():
     assert isinstance(column.to_pylist()[0], int)
 
 
+def test_an_integer_too_wide_for_the_column_is_reported_rather_than_raised():
+    """``OverflowError`` is the family that comes from the conversion rather than Arrow.
+
+    It subclasses ``ArithmeticError``, so a handler naming ``TypeError`` and ``ValueError``
+    beside Arrow's own two lets it through, and the whole read dies on one oversized
+    integer. The writer already refuses this value cleanly, so the two sides disagreed
+    about the same value in the same builder.
+
+    The value goes in through ``extra`` on a row whose version had no ``open_interest``
+    column, which is the promotion path, so what is asserted is the whole projection and
+    not the converter on its own.
+    """
+    table = _rows(_row(1, {"openInterest": 2**70}), _row(1, {"openInterest": 1234}))
+
+    result = project_extra(
+        table, surface="chains", ledger=_ledger((1, _shape_without("chains", "open_interest")))
+    )
+
+    assert result.table.column("open_interest").to_pylist() == [None, 1234]
+    assert result.filled == {"open_interest": 1}
+    assert [(u.column, u.schema_version, u.rows) for u in result.unfit] == [("open_interest", 1, 1)]
+    assert "OverflowError" in result.unfit[0].detail
+    assert "1180591620717411303424" in result.table.column(EXTRA_COLUMN).to_pylist()[0]
+    assert not result.complete
+
+
+# One value per family in ``journal.UNFIT_ERRORS``, with the column its type reaches that
+# family through. The control test below checks the coverage, so a fifth family added to the
+# constant fails here rather than going untested through the reader.
+_UNFIT_FAMILY_CASES = [
+    (pa.ArrowInvalid, "bid", "bid", "n/a"),
+    (pa.ArrowTypeError, "option_root", "optionRoot", {"a": 1}),
+    (OverflowError, "open_interest", "openInterest", 2**70),
+    (UnicodeEncodeError, "option_root", "optionRoot", "\ud800"),
+]
+
+
+@pytest.mark.parametrize(("family", "column", "vendor", "value"), _UNFIT_FAMILY_CASES)
+def test_every_family_the_writer_refuses_is_reported_by_the_reader_too(
+    family, column, vendor, value
+):
+    """The reader consumes the writer's own list, so neither side can go a family short.
+
+    ``journal.UNFIT_ERRORS`` is enumerated and checked in
+    ``tests/unit/test_journal_schema.py``, and that test never reaches this module. So each
+    family also needs a case driven through ``project_extra``, or the handler could narrow
+    away from the constant and take a whole read with one value.
+    """
+    table = _rows(_row(1, {vendor: value}))
+
+    result = project_extra(
+        table, surface="chains", ledger=_ledger((1, _shape_without("chains", column)))
+    )
+
+    assert result.filled == {}
+    assert [(u.column, u.schema_version, u.rows) for u in result.unfit] == [(column, 1, 1)]
+    assert result.unfit[0].detail.startswith(f"{family.__name__}: ")
+    assert not result.complete
+
+
+def test_the_families_driven_through_the_reader_are_the_writer_s_whole_list():
+    """The control for the cases above, so the coverage cannot quietly go stale.
+
+    A pyarrow upgrade that adds a fifth family fails the journal enumeration, which is where
+    the constant is checked. Nothing there says the reader was driven through the new
+    family, and the cases above are a hand-written list. This is what says they are the
+    whole list.
+    """
+    assert {family for family, *_ in _UNFIT_FAMILY_CASES} == set(journal.UNFIT_ERRORS)
+
+
+def test_the_reader_asks_the_writer_s_list_rather_than_carrying_a_copy():
+    """A copy of the four families passes every test above, which is the gap this closes.
+
+    Every other test here offers a value and checks what comes back, and a handler that
+    restates today's four families answers all of them identically. So none of them can
+    tell a list that is consumed from a list that was copied, and a copy is what went a
+    family short in the first place.
+
+    What separates the two is a family the constant names and the reader has never seen.
+    The writer's list is replaced with one, and the shared builder is made to raise it. A
+    reader deriving from the constant reports it. A reader carrying a copy lets it through.
+    """
+
+    class SentinelUnfit(Exception):
+        """A family no spelled-out handler in this module could name."""
+
+    def refuses(field_type, values):
+        raise SentinelUnfit("the vendor sent something this column will not take")
+
+    table = _rows(_row(1, {"bid": 4.25}))
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(journal, "UNFIT_ERRORS", (SentinelUnfit,))
+        patch.setattr(journal, "typed_column", refuses)
+        result = project_extra(
+            table, surface="chains", ledger=_ledger((1, _shape_without("chains", "bid")))
+        )
+
+    assert result.filled == {}
+    assert [(u.column, u.schema_version, u.rows) for u in result.unfit] == [("bid", 1, 1)]
+    assert result.unfit[0].detail.startswith("SentinelUnfit: ")
+    assert not result.complete
+
+
+def test_a_boolean_is_named_as_one_in_every_column_that_is_not_boolean():
+    """The hand-checked guard runs ahead of Arrow for every type, not only a floating one.
+
+    ``True`` into a floating column is the case the guard exists for, because Arrow takes
+    it silently as ``1.0``. An integer or string column refuses it on its own, so narrowing
+    the guard to floating columns would leave every value where it is and change only what
+    an operator reads. ``ArrowTypeError: Expected integer, got bool`` describes Arrow's
+    machinery, while the guard's own text names the drift, and the report is the whole
+    output of a refusal.
+    """
+    table = _rows(_row(1, {"openInterest": True}), _row(1, {"optionRoot": True}))
+
+    result = project_extra(
+        table,
+        surface="chains",
+        ledger=_ledger((1, _shape_without("chains", "open_interest", "option_root"))),
+    )
+
+    assert result.filled == {}
+    assert [(u.column, u.detail) for u in result.unfit] == [
+        ("open_interest", "boolean value in a int64 column"),
+        ("option_root", "boolean value in a string column"),
+    ]
+
+
+def test_a_defect_in_the_shared_builder_still_costs_the_read():
+    """The narrow catch is the point, so a failure that is not the value's doing propagates.
+
+    ``UNFIT_ERRORS`` names what a value can do to a column build. Anything else came from
+    this code rather than the vendor, and absorbing it would report a defect as vendor
+    drift and hand back a table with a silently null column. So the builder is broken here
+    and the read is expected to die.
+
+    The defect is a ``ValueError`` on purpose. The handler this replaced named that builtin
+    beside Arrow's own two, which is wider than Arrow's errors and is the case the comment
+    above the handler says must not be absorbed. A ``RuntimeError`` here would pass against
+    either handler and so would say nothing about the narrowing.
+    """
+
+    def broken(field_type, values):
+        raise ValueError("a defect in the shared builder")
+
+    table = _rows(_row(1, {"bid": 4.25}))
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(journal, "typed_column", broken)
+        with pytest.raises(ValueError, match="a defect in the shared builder"):
+            project_extra(
+                table, surface="chains", ledger=_ledger((1, _shape_without("chains", "bid")))
+            )
+
+
 def test_refusals_of_the_same_shape_are_counted_rather_than_repeated():
     """One line per column, version, and reason, with the row count beside it.
 
