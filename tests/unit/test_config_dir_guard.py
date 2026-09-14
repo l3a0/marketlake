@@ -1,8 +1,10 @@
 """The config-directory guard itself, which nothing else covers.
 
-The guard in ``tests/conftest.py`` is the reason a test that writes the machine's real
-``~/.config/marketlake/`` fails instead of destroying what is there. It is autouse, so
-every test depends on it and no test asserts it. These do.
+The guard is the reason a test that writes the machine's real ``~/.config/marketlake/``
+fails instead of destroying what is there. It is autouse, so every test depends on it and
+no test asserts it. These do. It comes in two halves. ``tests/support/config_guard.py``
+settles what counts as the real directory and answers whether a path is inside it, and
+the autouse fixture in ``tests/conftest.py`` patches thirteen names and raises.
 
 On 2026-09-13 a stub landed at that directory's ``token.json`` and the working Schwab
 token it replaced was gone. The daemon read the stub for half an hour and the
@@ -44,8 +46,9 @@ import pytest
 from lake.paths import CONFIG_DIR_ENV, CONFIG_DIR_PARTS, TOKEN_FILE
 from lake.reauth import token_writer, write_token
 from lake.tickers import upsert_ticker
-from tests import conftest
-from tests.conftest import ConfigWriteInTest, _is_protected, _protected_roots
+from tests.conftest import ConfigWriteInTest
+from tests.support import config_guard
+from tests.support.config_guard import is_protected, protected_roots
 
 # The real directory, spelled here from the process's own home rather than through
 # ``paths.config_dir``, so an exported ``MARKETLAKE_CONFIG_DIR`` cannot move what these
@@ -71,14 +74,14 @@ def monkeypatch_protected_roots(directory: Path) -> Iterator[None]:
 
     Some properties are about what survives a call rather than about the refusal, and
     those cannot be driven at the real directory, whose files are the ones this whole
-    module exists to keep. A stand-in gets the same treatment because ``_is_protected``
-    reads this one module global.
+    module exists to keep. A stand-in gets the same treatment because ``is_protected``
+    reads this one module global at call time.
 
     The real directory is unprotected inside the block, so keep the block to the single
     call under test.
     """
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(conftest, "_PROTECTED_ROOTS", _protected_roots(directory))
+        mp.setattr(config_guard, "PROTECTED_ROOTS", protected_roots(directory))
         yield
 
 
@@ -90,13 +93,13 @@ def test_the_stand_in_really_is_guarded(tmp_path):
     """
     stand_in = tmp_path / "protected"
     stand_in.mkdir()
-    assert not _is_protected(str(stand_in / "x.json"))
+    assert not is_protected(str(stand_in / "x.json"))
     with monkeypatch_protected_roots(stand_in):
-        assert _is_protected(str(stand_in / "x.json"))
-        assert not _is_protected(str(tmp_path / "outside.json"))
-    assert not _is_protected(str(stand_in / "x.json"))
+        assert is_protected(str(stand_in / "x.json"))
+        assert not is_protected(str(tmp_path / "outside.json"))
+    assert not is_protected(str(stand_in / "x.json"))
     # And the real directory is protected again the moment the block ends.
-    assert _is_protected(str(PROBE))
+    assert is_protected(str(PROBE))
 
 
 def test_the_probe_paths_are_not_real_files():
@@ -224,7 +227,7 @@ def test_rmtree_of_the_directory_is_refused_before_it_empties_it(tmp_path):
     gone. A run like that reports a refusal that protected nothing.
 
     Driven against a stand-in directory rather than the real one, because the point is
-    what survives the call and the real one holds a live credential. ``_is_protected``
+    what survives the call and the real one holds a live credential. ``is_protected``
     is the guard's own predicate, so pointing it at the stand-in exercises the same
     patched ``shutil.rmtree``.
     """
@@ -257,15 +260,15 @@ def test_the_two_spellings_of_a_symlinked_config_directory_are_both_roots(tmp_pa
     home.mkdir()
     (home / ".config").symlink_to(real)
 
-    roots = _protected_roots(home.joinpath(*CONFIG_DIR_PARTS))
+    roots = protected_roots(home.joinpath(*CONFIG_DIR_PARTS))
     assert str(home.joinpath(*CONFIG_DIR_PARTS)) in roots
     assert str((real / "marketlake").resolve()) in roots
     assert len(roots) == 2
 
     # One directory, two names, and a write through either is the same write.
     with monkeypatch_protected_roots(home.joinpath(*CONFIG_DIR_PARTS)):
-        assert _is_protected(str(home / ".config" / "marketlake" / "token.json"))
-        assert _is_protected(str((real / "marketlake").resolve() / "token.json"))
+        assert is_protected(str(home / ".config" / "marketlake" / "token.json"))
+        assert is_protected(str((real / "marketlake").resolve() / "token.json"))
 
 
 def test_a_rename_into_the_directory_is_refused(tmp_path):
@@ -366,16 +369,16 @@ def test_a_sibling_whose_name_starts_with_the_directorys_is_left_alone():
     a string prefix and is a different directory. Sweeping it up would fail a test for
     writing somewhere it was entitled to write.
 
-    ``_is_protected`` is asked directly rather than driven through a write, because the
+    ``is_protected`` is asked directly rather than driven through a write, because the
     honest probe for this is a real sibling in the real ``~/.config/`` and creating one
     is not something a test should do. The predicate is what the refusal is built on, so
     asking it decides the same question and touches no disk.
     """
-    assert not _is_protected(str(REAL_CONFIG_DIR) + "-scratch")
-    assert not _is_protected(str(REAL_CONFIG_DIR) + "-scratch/token.json")
+    assert not is_protected(str(REAL_CONFIG_DIR) + "-scratch")
+    assert not is_protected(str(REAL_CONFIG_DIR) + "-scratch/token.json")
     # The other direction, so this cannot pass by refusing nothing at all.
-    assert _is_protected(str(REAL_CONFIG_DIR))
-    assert _is_protected(str(REAL_CONFIG_DIR / "token.json"))
+    assert is_protected(str(REAL_CONFIG_DIR))
+    assert is_protected(str(REAL_CONFIG_DIR / "token.json"))
 
 
 # -- the guard cannot be moved or swallowed ---------------------------------------------
@@ -407,9 +410,10 @@ def test_the_config_directory_override_does_not_disarm_the_guard(monkeypatch):
 
     This covers a guard that read the variable at call time. It cannot cover one that
     read it at import, because ``setenv`` here runs long after ``tests/conftest`` was
-    imported. That half is covered by
-    ``tests/component/test_config_dir_override.py``, in a process that starts with the
-    variable already set.
+    imported. That half is covered twice elsewhere: in
+    ``tests/component/test_suite_config_dir_redirect.py`` for this process, whose
+    redirect exports the variable before the guard decides anything, and in
+    ``tests/component/test_config_dir_override.py`` for a child that starts with it set.
     """
     monkeypatch.setenv(CONFIG_DIR_ENV, "/tmp/somewhere-else")
     with pytest.raises(ConfigWriteInTest):

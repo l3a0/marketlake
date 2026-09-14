@@ -17,7 +17,10 @@ already bound. Only a process that started with it set is the real thing, so tha
 what these run, and each drives production code rather than a stand-in for it.
 
 The child's own writes land under the test's ``tmp_path``. The parent's guard does not
-reach a child, which the guard says about itself, so nothing here relies on it.
+reach a child, which the guard says about itself, so nothing here relies on it. The
+redirect that does reach a child is covered in
+``tests/component/test_suite_config_dir_redirect.py``, and these children are built to
+sit outside it so one of them can still ask what the real directory is.
 """
 
 from __future__ import annotations
@@ -30,32 +33,64 @@ from pathlib import Path
 from lake import control_plane as cp
 from lake.paths import CONFIG_DIR_ENV
 from tests.component.test_control_plane_render import RENDER_ARGS
+from tests.support.config_defaults import defaults_built_from_config_dir
 
-# Every module-level default built from the config directory, and the file each names.
-# All five move together or the override is not worth having, since a redirected token
-# beside a live config is a half-redirected process.
-_DEFAULTS = """
-import json
-from lake.chain_plan import DEFAULT_CHAIN_PLAN_PATH
-from lake.config import DEFAULT_CONFIG_PATH
-from lake.reauth import DEFAULT_TOKEN_PATH as REAUTH_TOKEN_PATH
-from lake.schwab import DEFAULT_TOKEN_PATH as SCHWAB_TOKEN_PATH
-from lake.tickers import DEFAULT_TICKERS_PATH
-print(json.dumps({
-    "chain_plan": str(DEFAULT_CHAIN_PLAN_PATH),
-    "config": str(DEFAULT_CONFIG_PATH),
-    "reauth_token": str(REAUTH_TOKEN_PATH),
-    "schwab_token": str(SCHWAB_TOKEN_PATH),
-    "tickers": str(DEFAULT_TICKERS_PATH),
-}))
-"""
+# The repo root. One script below imports the ``tests`` package, which needs the root on
+# ``sys.path``, and ``python -c`` supplies only the working directory. Giving the child
+# this as its cwd is what lets the suite run from anywhere rather than from the root
+# alone.
+ROOT = Path(__file__).resolve().parents[2]
+
+# Every module-level default built from the config directory, read out of ``src/lake``
+# rather than typed here. All of them move together or the override is not worth having,
+# since a redirected token beside a live config is a half-redirected process, and a
+# sixth one added to the package has to join them without anyone remembering to come
+# back and edit this file.
+DEFAULT_PAIRS = defaults_built_from_config_dir()
+
+# ``module.CONSTANT`` for each, which is what the child prints and the tests compare.
+DEFAULT_KEYS = tuple(f"{module}.{name}" for module, name in DEFAULT_PAIRS)
+
+# The floor under every assertion built on the scan. A scan that came back empty would
+# leave each loop below iterating nothing and each set comparison holding two empty sets,
+# so both tests here and both in the redirect module would pass while checking nothing.
+# The token's own default is named rather than a count, because it is the file the whole
+# arrangement exists to keep and a count goes stale the day a default is retired.
+TOKEN_DEFAULT = "lake.reauth.DEFAULT_TOKEN_PATH"
+
+
+def assert_the_scan_found_something() -> None:
+    """Fail loudly when the derived list is empty or has lost the token's default."""
+    assert DEFAULT_KEYS, "the scan found no defaults, so every assertion built on it is vacuous"
+    assert TOKEN_DEFAULT in DEFAULT_KEYS, DEFAULT_KEYS
+
+
+def _defaults_script(pairs: tuple[tuple[str, str], ...]) -> str:
+    """A child script printing where each default resolved, keyed by its full name.
+
+    ``import_module`` rather than a written-out ``from x import y``, because the list is
+    generated. Either binds the constant the same way, which is the thing under test.
+    """
+    entries = "\n".join(
+        f"    {f'{module}.{name}'!r}: str(getattr(import_module({module!r}), {name!r})),"
+        for module, name in pairs
+    )
+    header = "import json\nfrom importlib import import_module\n"
+    return f"{header}print(json.dumps({{\n{entries}\n}}))\n"
+
+
+_DEFAULTS = _defaults_script(DEFAULT_PAIRS)
 
 
 def _child(script: str, config_dir: Path | None) -> dict[str, str]:
     """Run ``script`` in a fresh interpreter, with or without the override set.
 
-    The environment is built rather than inherited, so a variable exported in the shell
-    running the suite cannot decide the answer either way.
+    The environment is built rather than inherited, so nothing outside a test decides the
+    answer. That matters twice over. A variable exported in the shell running the suite
+    would otherwise reach the child, and so would the redirect ``tests/conftest.py`` sets
+    for every child the suite spawns. Passing ``None`` here is the only way left to ask
+    what a process with no override resolves, which is what
+    ``test_without_the_override_every_default_is_the_real_directory`` asks.
     """
     env = {"PATH": "/usr/bin:/bin", "HOME": str(Path.home())}
     if config_dir is not None:
@@ -64,6 +99,7 @@ def _child(script: str, config_dir: Path | None) -> dict[str, str]:
         [sys.executable, "-c", script],
         capture_output=True,
         text=True,
+        cwd=ROOT,
         env=env,
         check=False,
     )
@@ -73,8 +109,9 @@ def _child(script: str, config_dir: Path | None) -> dict[str, str]:
 
 def test_the_override_moves_every_default_in_the_package(tmp_path):
     throwaway = tmp_path / "throwaway"
+    assert_the_scan_found_something()
     defaults = _child(_DEFAULTS, throwaway)
-    assert set(defaults) == {"chain_plan", "config", "reauth_token", "schwab_token", "tickers"}
+    assert set(defaults) == set(DEFAULT_KEYS)
     for name, value in defaults.items():
         assert Path(value).parent == throwaway, name
 
@@ -85,6 +122,7 @@ def test_without_the_override_every_default_is_the_real_directory(tmp_path):
     A redirect that applied unconditionally would take the daemon and the weekly ritual
     with it. Nothing is written here. The paths are printed and compared.
     """
+    assert_the_scan_found_something()
     real = Path.home() / ".config" / "marketlake"
     for name, value in _child(_DEFAULTS, None).items():
         assert Path(value).parent == real, name
@@ -96,8 +134,10 @@ def test_the_token_a_redirected_reauth_writes_lands_in_the_throwaway(tmp_path):
     This is what happened on 2026-09-13: a token written to ``DEFAULT_TOKEN_PATH`` by a
     by-hand run. ``reauth.write_token`` is the function the login flow's callback lands
     in, driven here at the default it would have used, and with the override exported it
-    cannot reach the real file. The real path is checked for a stub afterwards, since a
-    redirect that also wrote the real path would be no redirect at all.
+    cannot reach the real file. What the write landed on is read back, because a redirect
+    that resolved the throwaway and still wrote the real path would be no redirect at all.
+    The real path itself is never read: it holds the live token, and the child printing
+    where it wrote is what settles the question.
     """
     throwaway = tmp_path / "throwaway"
     script = f"""
@@ -146,29 +186,44 @@ print(json.dumps({{"written": target}}))
 
 
 def test_the_override_does_not_disarm_the_guard_in_a_process_that_starts_with_it_set():
-    """The two mechanisms must not cancel each other out, checked where it can be checked.
+    """The two mechanisms must not cancel each other out, checked from a real process.
 
-    The guard settles what it protects when ``tests/conftest`` is imported. So a test
-    that exports the variable with ``monkeypatch.setenv`` runs after that decision is
-    made and cannot reach it, which is why the sibling test in
-    ``tests/unit/test_config_dir_guard.py`` covers only the other half: a guard that read
-    the variable at call time rather than at import. Reading it at import is the half
-    that lives here, and only a process that started with the variable set can tell.
+    The guard settles what it protects when it is imported. So a test that exports the
+    variable with ``monkeypatch.setenv`` runs after that decision is made and cannot
+    reach it, which is why the sibling test in ``tests/unit/test_config_dir_guard.py``
+    covers only the other half: a guard that read the variable at call time rather than
+    at import. Reading it at import is the half that lives here, and only a process that
+    started with the variable set can tell.
 
-    Nothing is written. ``_is_protected`` is the predicate the refusal is built on, so
+    The child imports ``tests.support.config_guard`` rather than ``tests.conftest``, and
+    that is the whole reason the guard's predicate sits in a module of its own. Importing
+    ``tests.conftest`` would run the suite's redirect, which replaces this variable with a
+    throwaway of its own before the guard reads anything. The test's own value would then
+    never reach the code under test, and the same answer would come back whatever this
+    test passed. The assertion on ``exported`` below is what holds that: it fails if the
+    child's environment was moved out from under it.
+
+    Nothing is written. ``is_protected`` is the predicate the refusal is built on, so
     asking it about the real token path drives the real decision and touches no file.
     """
+    override = Path("/tmp/throwaway-not-the-real-directory")
     script = """
-import json
+import json, os
 from pathlib import Path
-from tests.conftest import _PROTECTED_ROOTS, _is_protected
+from lake.paths import CONFIG_DIR_ENV
+from tests.support.config_guard import PROTECTED_ROOTS, is_protected
 real_token = Path.home() / ".config" / "marketlake" / "token.json"
 print(json.dumps({
-    "protected": _is_protected(str(real_token)),
-    "roots": sorted(_PROTECTED_ROOTS),
+    "protected": is_protected(str(real_token)),
+    "roots": sorted(PROTECTED_ROOTS),
+    "exported": os.environ[CONFIG_DIR_ENV],
 }))
 """
-    result = _child(script, Path("/tmp/throwaway-not-the-real-directory"))
+    result = _child(script, override)
+    assert result["exported"] == str(override), (
+        "the child's own override was replaced before the guard read anything, so this "
+        "test no longer decides what its name says"
+    )
     assert result["protected"] is True, result["roots"]
     assert str(Path.home() / ".config" / "marketlake") in result["roots"]
 
