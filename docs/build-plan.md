@@ -501,7 +501,7 @@ One rule places every test. Apply it in order and stop at the first match.
 
 1. Slice-1 cycle end to end.
 2. Full simulated session.
-3. Kill and restart mid-day. Slow.
+3. Restart mid-day, across two writer sessions.
 4. Kill compaction mid-seal.
 5. Early-close day.
 6. Overnight death.
