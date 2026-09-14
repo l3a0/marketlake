@@ -9,8 +9,10 @@ with a live Schwab token in it and nothing to refuse a write.
 So ``tests/conftest.py`` exports ``MARKETLAKE_CONFIG_DIR`` at a throwaway directory when
 it is imported. These tests drive that from both sides. One side is a child spawned the
 plain way, with no environment arranged for it, which is the shape a test writes without
-thinking about the config directory at all. The other side is this process, whose five
-module-level defaults move with the children rather than staying behind.
+thinking about the config directory at all. The other side is this process, whose
+module-level defaults move with the children rather than staying behind. Which constants
+those are is read out of ``src/lake`` rather than written down here, so a new one joins
+without anyone remembering to come back.
 
 A child handed an explicit ``env=`` is outside the redirect, since it carries only what
 that mapping names, and so is anything the rendered ``reauth.sh`` runs, since that script
@@ -94,8 +96,8 @@ def test_the_throwaway_is_not_the_real_directory():
 def test_a_child_that_arranges_nothing_resolves_into_the_throwaway():
     """The deliverable. A child inherits the redirect without its test lifting a finger.
 
-    All five defaults are checked together, because a redirected token beside a live
-    config is a half-redirected process.
+    Every default is checked together, because a redirected token beside a live config
+    is a half-redirected process.
     """
     defaults = _inheriting_child(_DEFAULTS)
     assert set(defaults) == set(PARENT_DEFAULTS)
@@ -185,7 +187,7 @@ def test_the_redirect_moved_every_default_in_this_process_too():
     directory. A redirect reaching only children would split those apart.
 
     This is also what notices an import-order regression, and it is the second of two
-    things that do. ``tests/conftest.py`` refuses to import at all when one of the five
+    things that do. ``tests/conftest.py`` refuses to import at all when one of the
     default-building modules is already in ``sys.modules``, which is the rule itself. This
     assertion catches the consequence from the other end, including a way in that the
     check cannot see, such as a default rebound after the fact.

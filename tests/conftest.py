@@ -431,7 +431,7 @@ def _no_config_writes() -> Iterator[None]:
        ``os.ftruncate``, and metadata-only changes such as ``os.chmod`` and
        ``os.utime``. Neither destroys the file's contents.
        A path that reaches the directory through a symlink of its own is not covered
-       either, for the reason ``_is_protected`` gives.
+       either, for the reason ``config_guard.is_protected`` gives.
     4. A path resolved against a directory descriptor, through the ``dir_fd`` argument
        these calls accept. The path is then relative to that descriptor rather than to
        the working directory, so the text check reads it wrongly. No call site in this
@@ -529,25 +529,45 @@ def _no_config_writes() -> Iterator[None]:
 
 
 def _config_dir_listing(directory: str) -> dict[str, tuple[int, int, int]]:
-    """Each name in ``directory``, with the three stat fields a write moves.
+    """Every path under ``directory``, with the three stat fields a write moves.
+
+    Keyed by the path relative to ``directory``, and the walk goes all the way down. The
+    real directory holds three regular files and no subdirectory today, and watching only
+    the top level would miss a rewrite one level in: a parent's mtime does not move when
+    a grandchild's contents change.
+
+    A subdirectory is recorded with zeroes rather than its own stat, so that one
+    appearing or going is reported while the mtime it gains every time a child is written
+    does not add a second line about a change already named.
 
     A directory that is not there comes back empty, which is the case on CI and on a
     fresh machine, and an empty listing compared against another empty one is no change.
 
     Symlinks are stated without following them, so a link whose target moves counts as
-    the link being unchanged. The names this watches are four regular files.
+    the link being unchanged, and a link to a directory is never descended into. That
+    rules out a cycle and matches what the guard beside this does with symlinks.
     """
-    try:
-        entries = list(os.scandir(directory))
-    except OSError:
-        return {}
+    base = Path(directory)
     listing: dict[str, tuple[int, int, int]] = {}
-    for entry in entries:
+    pending = [base]
+    while pending:
         try:
-            status = entry.stat(follow_symlinks=False)
+            entries = list(os.scandir(pending.pop()))
         except OSError:
             continue
-        listing[entry.name] = (status.st_mtime_ns, status.st_size, status.st_ino)
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+                status = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            key = str(path.relative_to(base))
+            if is_dir:
+                listing[key] = (0, 0, 0)
+                pending.append(path)
+            else:
+                listing[key] = (status.st_mtime_ns, status.st_size, status.st_ino)
     return listing
 
 
@@ -586,7 +606,11 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     changes = _config_dir_changes(_CONFIG_DIR_AT_START, _config_dir_listing(REAL_CONFIG_DIR))
     if not changes:
         return
-    session.exitstatus = 1
+    # Only a run that would otherwise have passed is turned into a failure. A run that
+    # was interrupted, or that already failed, keeps the status it earned, because
+    # overwriting it would say "tests failed" about a session that was cancelled.
+    if not session.exitstatus:
+        session.exitstatus = 1
     lines = [
         f"{REAL_CONFIG_DIR} changed while the suite ran.",
         "",

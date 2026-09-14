@@ -69,7 +69,7 @@ PROBES = (PROBE, PROBE_DIR)
 
 
 @contextmanager
-def monkeypatchprotected_roots(directory: Path) -> Iterator[None]:
+def monkeypatch_protected_roots(directory: Path) -> Iterator[None]:
     """Point the guard at ``directory`` instead of the real one, for one block.
 
     Some properties are about what survives a call rather than about the refusal, and
@@ -94,7 +94,7 @@ def test_the_stand_in_really_is_guarded(tmp_path):
     stand_in = tmp_path / "protected"
     stand_in.mkdir()
     assert not is_protected(str(stand_in / "x.json"))
-    with monkeypatchprotected_roots(stand_in):
+    with monkeypatch_protected_roots(stand_in):
         assert is_protected(str(stand_in / "x.json"))
         assert not is_protected(str(tmp_path / "outside.json"))
     assert not is_protected(str(stand_in / "x.json"))
@@ -236,7 +236,7 @@ def test_rmtree_of_the_directory_is_refused_before_it_empties_it(tmp_path):
     for name in ("token.json", "config.yaml", "tickers.yaml"):
         (stand_in / name).write_text("real")
 
-    with monkeypatchprotected_roots(stand_in):
+    with monkeypatch_protected_roots(stand_in):
         with pytest.raises(ConfigWriteInTest):
             shutil.rmtree(stand_in)
 
@@ -266,7 +266,7 @@ def test_the_two_spellings_of_a_symlinked_config_directory_are_both_roots(tmp_pa
     assert len(roots) == 2
 
     # One directory, two names, and a write through either is the same write.
-    with monkeypatchprotected_roots(home.joinpath(*CONFIG_DIR_PARTS)):
+    with monkeypatch_protected_roots(home.joinpath(*CONFIG_DIR_PARTS)):
         assert is_protected(str(home / ".config" / "marketlake" / "token.json"))
         assert is_protected(str((real / "marketlake").resolve() / "token.json"))
 

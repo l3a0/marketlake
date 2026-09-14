@@ -27,7 +27,10 @@ Five properties carry the check, and each is covered below.
 
 from __future__ import annotations
 
+import builtins
+import io
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -38,6 +41,10 @@ from tests.conftest import (
     _config_dir_listing,
     pytest_sessionfinish,
 )
+
+# The repo root, which the nested pytest session below runs from so that this repo's own
+# tests/conftest.py is the one it loads.
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def _populate(directory: Path) -> Path:
@@ -187,39 +194,91 @@ def test_a_directory_that_appears_during_the_run_is_reported(tmp_path):
 # -- it reads no secret ------------------------------------------------------------------
 
 
-def test_the_listing_opens_no_file(tmp_path):
+def test_the_listing_opens_no_file(tmp_path, monkeypatch):
     """The check watches a live brokerage credential, so it must never read one.
 
-    Driven with an audit hook rather than asserted in a comment, because "it only stats"
-    is exactly the kind of claim that stays true until someone adds a content hash to
-    make the comparison stricter.
+    Driven rather than asserted in a comment, because "it only stats" is exactly the kind
+    of claim that stays true until someone adds a content hash to make the comparison
+    stricter.
 
-    An audit hook cannot be removed once installed, so this one is installed for the life
-    of the process and filters on a path under this test's own directory. It sees every
-    open in the process after that, and only the ones inside the stand-in are recorded.
+    The three names the guard beside this one patches are the three a read would go
+    through, so recording them covers every form. ``monkeypatch`` puts them back, which
+    an audit hook could not: an audit hook cannot be removed once installed and would
+    charge every ``open`` in the rest of the session for this one assertion.
     """
     stand_in = _populate(tmp_path / "marketlake")
     opened: list[str] = []
-    root = str(stand_in)
 
-    def hook(event: str, args: tuple) -> None:
-        if event != "open":
-            return
-        try:
-            path = os.fsdecode(args[0])
-        except (TypeError, ValueError):
-            return
-        if os.path.abspath(path).startswith(root + os.sep):
-            opened.append(path)
+    def record(real):
+        def watch(file, *args, **kwargs):
+            opened.append(os.fsdecode(file) if not isinstance(file, int) else str(file))
+            return real(file, *args, **kwargs)
 
-    sys.addaudithook(hook)
+        return watch
 
-    _config_dir_listing(root)
+    monkeypatch.setattr(builtins, "open", record(builtins.open))
+    monkeypatch.setattr(io, "open", record(io.open))
+    monkeypatch.setattr(os, "open", record(os.open))
+
+    assert _config_dir_listing(str(stand_in)) != {}
     assert opened == []
 
-    # The other direction, so this cannot pass because the hook never fires at all.
+    # The other direction, so this cannot pass because the recorder never fires.
     (stand_in / "token.json").read_text()
     assert [Path(p).name for p in opened] == ["token.json"]
+
+
+def test_a_file_one_level_down_is_watched(tmp_path):
+    """A parent's mtime does not move when a grandchild's contents change.
+
+    Watching only the top level would call a rewrite one level in no change at all. The
+    real directory has no subdirectory today, which is exactly why nothing else would
+    notice this going wrong.
+    """
+    stand_in = _populate(tmp_path / "marketlake")
+    nested = stand_in / "sub"
+    nested.mkdir()
+    (nested / "secret.json").write_text("original")
+    before = _config_dir_listing(str(stand_in))
+    assert "sub/secret.json".replace("/", os.sep) in before
+
+    (nested / "secret.json").write_text("STUB-DESTROYED")
+    after = _config_dir_listing(str(stand_in))
+    assert _config_dir_changes(before, after) == (f"sub{os.sep}secret.json was rewritten",)
+
+
+def test_a_subdirectory_appearing_is_reported_once(tmp_path):
+    """A directory is recorded with zeroes, so its own mtime churn adds no second line.
+
+    A directory's mtime moves every time a child is written. Recording it would report
+    the directory alongside the file, which says one change twice.
+    """
+    stand_in = _populate(tmp_path / "marketlake")
+    before = _config_dir_listing(str(stand_in))
+    nested = stand_in / "sub"
+    nested.mkdir()
+    (nested / "probe.json").write_text("{}")
+    assert _config_dir_changes(before, _config_dir_listing(str(stand_in))) == (
+        "sub appeared",
+        f"sub{os.sep}probe.json appeared",
+    )
+
+
+def test_a_symlink_is_not_followed(tmp_path):
+    """A link is stated as itself, so a link to a directory cannot make the walk loop."""
+    stand_in = _populate(tmp_path / "marketlake")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "deep.json").write_text("{}")
+    (stand_in / "link").symlink_to(elsewhere)
+
+    listing = _config_dir_listing(str(stand_in))
+    assert "link" in listing
+    assert f"link{os.sep}deep.json" not in listing
+
+    # A loop back onto the directory itself terminates rather than hanging.
+    (stand_in / "loop").symlink_to(stand_in)
+    assert "loop" in _config_dir_listing(str(stand_in))
 
 
 # -- the session hook --------------------------------------------------------------------
@@ -303,6 +362,86 @@ def test_the_hook_reaches_a_terminal_reporter_when_there_is_one(monkeypatch, tmp
     pytest_sessionfinish(session, 0)
     assert session.exitstatus == 1
     assert any("probe.json appeared" in line for line in written)
+
+
+def test_a_run_that_already_failed_keeps_the_status_it_earned(monkeypatch, tmp_path, capsys):
+    """An interrupted session must not be relabelled as a plain test failure.
+
+    The hook turns a passing run into a failing one. It has no business overwriting a
+    status a run already earned, and a cancelled session reported as "tests failed" sends
+    the reader after the wrong thing.
+    """
+    stand_in = _populate(tmp_path / "marketlake")
+    monkeypatch.setattr("tests.conftest.REAL_CONFIG_DIR", str(stand_in))
+    monkeypatch.setattr("tests.conftest._CONFIG_DIR_AT_START", _config_dir_listing(str(stand_in)))
+    (stand_in / "token.json").unlink()
+
+    session = _FakeSession()
+    session.exitstatus = 2  # ExitCode.INTERRUPTED
+    pytest_sessionfinish(session, 2)
+
+    assert session.exitstatus == 2
+    # The report is still printed, because the change still happened.
+    assert "token.json is gone" in capsys.readouterr().out
+
+
+def test_a_real_pytest_session_exits_non_zero_when_the_directory_changed(tmp_path):
+    """The wiring, driven rather than assumed.
+
+    Every other test here calls the hook directly, which says what the hook does and
+    nothing about whether pytest calls it or honours what it sets. This runs a real
+    pytest session against this repo's own ``tests/conftest.py``, points the check at a
+    stand-in directory through a plugin, damages that directory mid-session, and reads
+    the process exit status.
+
+    The clean run is checked first. Without it this would pass against a session that
+    exits non-zero for some unrelated reason.
+    """
+    stand_in = _populate(tmp_path / "marketlake")
+    plugin = tmp_path / "damage_plugin.py"
+    plugin.write_text(
+        "import os\n"
+        f"STAND_IN = {str(stand_in)!r}\n"
+        f"DAMAGE = {os.environ.get('MARKETLAKE_TEST_DAMAGE', '')!r}\n"
+        "def pytest_configure(config):\n"
+        "    from tests import conftest\n"
+        "    conftest.REAL_CONFIG_DIR = STAND_IN\n"
+        "    conftest._CONFIG_DIR_AT_START = conftest._config_dir_listing(STAND_IN)\n"
+        "def pytest_collection_finish(session):\n"
+        "    if os.environ.get('MARKETLAKE_TEST_DAMAGE'):\n"
+        "        os.unlink(os.path.join(STAND_IN, 'token.json'))\n"
+    )
+
+    def run(damage: bool) -> subprocess.CompletedProcess[str]:
+        environment = {**os.environ, "PYTHONPATH": str(tmp_path)}
+        if damage:
+            environment["MARKETLAKE_TEST_DAMAGE"] = "1"
+        else:
+            environment.pop("MARKETLAKE_TEST_DAMAGE", None)
+        return subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "--collect-only",
+                "-q",
+                "-p",
+                "damage_plugin",
+                "tests/unit/test_paths.py",
+            ],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    clean = run(damage=False)
+    assert clean.returncode == 0, clean.stdout + clean.stderr
+
+    damaged = run(damage=True)
+    assert damaged.returncode == 1, damaged.stdout + damaged.stderr
+    assert "token.json is gone" in damaged.stdout
 
 
 def test_the_check_is_watching_the_real_directory():

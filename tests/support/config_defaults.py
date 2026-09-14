@@ -20,15 +20,22 @@ that moment.
 the clock and calendar seams. It differs in what it is for. Those scanners forbid a call.
 This one enumerates a declaration, so a new one is picked up rather than refused.
 
-Two limits are named rather than hidden.
+Three limits are named rather than hidden.
 
-1. Only module-level assignments count. A default built inside a function is not a
-   constant bound at import, so it is not the shape this is about.
+1. Only a name bound when the module is imported counts. That includes an assignment
+   nested under a top-level ``if``, ``try``, ``with``, or loop, since those run at
+   import too. It excludes a function body and a class body, because neither binds a
+   module-level name, and the redirect's check would otherwise refuse imports that bind
+   no default at all.
 2. A call is recognised by name: a bare ``config_dir(...)``, an aliased import of it, or
    any attribute call spelled ``....config_dir(...)``. A module that reached the function
    through some further indirection, such as looking it up in a dict, would be missed.
    Nothing in this repo does that, and ``test_the_scanner_finds_what_is_there_today``
    fails if the five known ones stop being found.
+3. Every name a tuple assignment binds is reported when any part of the value calls
+   ``config_dir``, so ``A, B = config_dir() / X, something_else()`` names ``B`` as well.
+   That over-reports rather than under-reports, which is the safe direction here, and
+   nothing in this repo writes one.
 """
 
 from __future__ import annotations
@@ -72,6 +79,43 @@ def _calls_config_dir(value: ast.expr, local_names: set[str]) -> bool:
     return False
 
 
+def _binds_at_import(body: list[ast.stmt]) -> list[ast.stmt]:
+    """Every assignment in ``body`` that runs when the module is imported.
+
+    A statement nested under a top-level ``if``, ``try``, ``with``, or loop still runs at
+    import, so an optional default guarded by one is still a default. A function body and
+    a class body are not descended into, because neither binds a module-level name.
+    """
+    found: list[ast.stmt] = []
+    for node in body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            found.append(node)
+        elif isinstance(node, ast.If):
+            found.extend(_binds_at_import(node.body))
+            found.extend(_binds_at_import(node.orelse))
+        elif isinstance(node, ast.Try):
+            found.extend(_binds_at_import(node.body))
+            for handler in node.handlers:
+                found.extend(_binds_at_import(handler.body))
+            found.extend(_binds_at_import(node.orelse))
+            found.extend(_binds_at_import(node.finalbody))
+        elif isinstance(node, (ast.With, ast.For, ast.While)):
+            found.extend(_binds_at_import(node.body))
+            found.extend(_binds_at_import(getattr(node, "orelse", [])))
+    return found
+
+
+def _bound_names(target: ast.expr) -> list[str]:
+    """Every plain name ``target`` binds, unpacking a tuple or list target."""
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [name for element in target.elts for name in _bound_names(element)]
+    if isinstance(target, ast.Starred):
+        return _bound_names(target.value)
+    return []
+
+
 def _module_name(path: Path, root: Path, package: str) -> str:
     """The dotted import name of ``path`` inside ``package``."""
     relative = path.relative_to(root)
@@ -93,28 +137,27 @@ def defaults_built_from_config_dir(
     found: list[tuple[str, str]] = []
     for path in sorted(root.rglob("*.py")):
         source = path.read_text(encoding="utf-8")
-        # Parsing every file costs about 84 ms on this tree, and this runs once per
-        # process rather than once per suite, children included. A file that never
-        # spells the name cannot call it under any of the three forms below, so it is
-        # skipped before the parser sees it. That is the whole cost saved, because the
-        # two files that do spell it are small.
+        # Parsing every file costs about 84 ms on this tree, against 20 ms with this
+        # line, and it runs once per process rather than once per suite, children
+        # included. A file that never spells the name cannot call it under any of the
+        # three forms below, so it is skipped before the parser sees it. Seven of the
+        # forty-one files spell it, so most of the tree is never parsed.
         if CONFIG_DIR_FUNC not in source:
             continue
         tree = ast.parse(source, filename=str(path))
         local_names = _local_names_for_config_dir(tree)
         module = _module_name(path, root, package)
-        for node in tree.body:
+        for node in _binds_at_import(tree.body):
             if isinstance(node, ast.Assign):
-                targets = [t for t in node.targets if isinstance(t, ast.Name)]
+                names = [name for target in node.targets for name in _bound_names(target)]
                 value: ast.expr | None = node.value
-            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-                targets = [node.target]
-                value = node.value
             else:
+                assert isinstance(node, ast.AnnAssign)
+                names = _bound_names(node.target)
+                value = node.value
+            if value is None or not names or not _calls_config_dir(value, local_names):
                 continue
-            if value is None or not targets or not _calls_config_dir(value, local_names):
-                continue
-            found.extend((module, target.id) for target in targets)
+            found.extend((module, name) for name in names)
     return tuple(sorted(found))
 
 

@@ -141,6 +141,69 @@ def test_each_call_shape(tmp_path, source, found):
         assert pairs == (("lake.probe", "D"),)
 
 
+@pytest.mark.parametrize(
+    ("name", "source"),
+    [
+        (
+            "if",
+            "from lake.paths import config_dir\nif True:\n    D = config_dir() / 'x'\n",
+        ),
+        (
+            "else",
+            "from lake.paths import config_dir\n"
+            "if False:\n    pass\nelse:\n    D = config_dir() / 'x'\n",
+        ),
+        (
+            "try",
+            "from lake.paths import config_dir\n"
+            "try:\n    D = config_dir() / 'x'\nexcept OSError:\n    pass\n",
+        ),
+        (
+            "except",
+            "from lake.paths import config_dir\n"
+            "try:\n    pass\nexcept OSError:\n    D = config_dir() / 'x'\n",
+        ),
+        (
+            "finally",
+            "from lake.paths import config_dir\n"
+            "try:\n    pass\nfinally:\n    D = config_dir() / 'x'\n",
+        ),
+        (
+            "with",
+            "from lake.paths import config_dir\nimport contextlib\n"
+            "with contextlib.suppress(OSError):\n    D = config_dir() / 'x'\n",
+        ),
+        (
+            "for",
+            "from lake.paths import config_dir\nfor _ in range(1):\n    D = config_dir() / 'x'\n",
+        ),
+    ],
+)
+def test_a_default_bound_under_a_top_level_block_is_found(tmp_path, name, source):
+    """These all run at import, so each one binds a default just as a bare line does.
+
+    A module that guarded its default with a ``try`` would otherwise drop out of the
+    redirect's import-order check and both default tests, which is the exact failure
+    deriving the list was meant to end. Nothing in ``src/lake`` is written this way
+    today, so only a synthetic tree can show it.
+    """
+    root = _package(tmp_path / "lake", {"probe.py": source})
+    assert defaults_built_from_config_dir(root) == (("lake.probe", "D"),), name
+
+
+def test_a_tuple_assignment_names_everything_it_binds(tmp_path):
+    """Over-reporting is the safe direction, and the module docstring names it as a limit.
+
+    A pair assigned together where one half calls ``config_dir`` reports both. Reporting
+    neither would put a real default outside every check that reads this list.
+    """
+    root = _package(
+        tmp_path / "lake",
+        {"probe.py": "from lake.paths import config_dir\nA, B = config_dir() / 'a', 1\n"},
+    )
+    assert defaults_built_from_config_dir(root) == (("lake.probe", "A"), ("lake.probe", "B"))
+
+
 def test_a_default_built_inside_a_function_is_not_one(tmp_path):
     """Only a module-level assignment binds at import, which is the shape this is about.
 
