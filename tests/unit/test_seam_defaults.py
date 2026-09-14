@@ -70,9 +70,14 @@ REQUIRED = [
 # forget one into the live object. ``control_plane.main`` reaches the ntfy POST through the
 # ``Publisher`` it builds, so ``transport`` is forbidden on the ``main`` even though
 # ``sunday_run`` takes it by way of ``reminder_sink`` rather than as a named seam.
+# ``compact.main`` reaches it the same way, through the ``Publisher`` its schema-drift
+# page sends on, so both names are forbidden there: the publisher it builds and the
+# transport that publisher holds.
 FORBIDDEN = [
     (compact.main, "backup"),
     (compact.main, "pinger"),
+    (compact.main, "publisher"),
+    (compact.main, "transport"),
     (daemon.main, "compaction_runner"),
     (control_plane.main, "probe"),
     (control_plane.main, "pinger"),

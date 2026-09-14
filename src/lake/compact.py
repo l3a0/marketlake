@@ -39,11 +39,13 @@ The job's rules, each glossed at first use.
    rather than a dropped one. So the check guards this project's own release process
    rather than the vendor. The merged schema is compared to the pinned one at the merge,
    which is the last moment the segments exist, and what moved is filed under
-   ``reports/`` once the seal has committed. The finding never raises, because the job
-   seals every ticker-day bare and a raise would cost the rest of the sweep, the re-tune,
-   the backup, and the ping. One disagreement never reaches this check at all. A column
-   two segments hold at different types is refused by ``concat_tables`` before the
-   comparison runs, and that refusal does raise and does cost the run. Whether it should
+   ``reports/`` once the seal has committed. One page per run carries it to a phone,
+   folding every finding the run made into a single message that names the columns. The
+   finding never raises, because the job seals every ticker-day bare and a raise would
+   cost the rest of the sweep, the re-tune, the backup, and the ping. One disagreement
+   never reaches this check at all. A column two segments hold at different types is
+   refused by ``concat_tables`` before the comparison runs, and that refusal does raise
+   and does cost the run. Whether it should
    is [#184](https://github.com/l3a0/marketlake/issues/184), which weighs for a retype the
    trade this rule declines for a dropped column. The durable remedy is
    ``schema_version`` enforcement, which is
@@ -64,7 +66,9 @@ The job's rules, each glossed at first use.
 7. *Backup, then ping.* After every eligible ticker-day is sealed, the lake is synced to
    the backup target. The health-check ping fires only after the backup succeeds, so the
    one ping attests both. An unmounted target raises before any ping. A holiday or an
-   empty journal is a correct no-op and still backs up and pings.
+   empty journal is a correct no-op and still backs up and pings. The drift page above
+   goes out ahead of both, from a ``finally`` around the sweep, because an unmounted
+   target or a failed seal must not be able to swallow it.
 8. *The nightly re-tune.* The chain is fetched in date windows so each response stays
    under Schwab's gateway body limit. After the seal, the job groups the day's chains
    rows by ``window_start`` and ``window_end``, takes each plan window's peak per-cycle
@@ -88,7 +92,7 @@ import os
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pyarrow as pa
@@ -96,6 +100,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from lake import journal
+from lake.alert import REFUSED, Message, NtfyTransport, Publisher
 from lake.calendar import Calendar, ExchangeCalendar
 from lake.chain_plan import DEFAULT_CHAIN_PLAN_PATH, ChainPlan, Window, load_chain_plan
 from lake.clock import Clock, SystemClock
@@ -112,6 +117,7 @@ from lake.manifest import (
 from lake.paths import (
     CHAINS,
     DATE_PREFIX,
+    REPORTS_DIR,
     SEGMENT_GLOB,
     SURFACE_PREFIX,
     TICKER_PREFIX,
@@ -119,7 +125,7 @@ from lake.paths import (
     parse_date_dir,
     temp_write_path,
 )
-from lake.report import SchemaDrift, write_schema_drift
+from lake.report import SCHEMA_DRIFT_DIR, SchemaDrift, write_schema_drift
 from lake.runner import PING_FAILURES, BackupRunner, Pinger, RsyncBackup, UrllibPinger
 from lake.session import SessionClock
 
@@ -133,6 +139,23 @@ COMPACTION_SOURCE = "compaction"
 
 # The chains columns the re-tune profile reads. Everything else stays on disk.
 _PROFILE_COLUMNS = ("ticker", "snap_ts", "row_kind", "window_start", "window_end")
+
+# The event and title on compaction's schema-drift page. The design's message table gives
+# schema drift one row and names two producers for it, the parser mid-day and the nightly
+# battery. Compaction is a third, and it reports a different fact. The other two read what
+# the vendor sent. This one reports what this project's own release shipped mid-session,
+# which is legible at the merge and nowhere after it. The producer is in the event name so
+# a reader of ``reports/alerts/`` can tell the three apart without opening a file.
+SCHEMA_DRIFT_EVENT = "compaction_schema_drift"
+SCHEMA_DRIFT_TITLE = "Schema drift at the merge"
+
+# How many column names the page prints per kind before it stops and says how many are
+# left. ntfy's default body limit is 4096 bytes and it answers an oversize POST with a
+# 400, which ``NtfyTransport`` does not retry. A whole-schema rename across both surfaces
+# names about 150 columns and runs to roughly 4000 bytes, so the widest drift, the one
+# that matters most, is the one that would not reach the phone. The count survives the
+# cut, and the files under ``reports/schema_drift/`` name every column either way.
+PAGE_COLUMN_CAP = 12
 
 
 # -- the named failures ------------------------------------------------------
@@ -488,8 +511,14 @@ def _schema_drift(
     )
 
 
-def _file_drift(root: Path, drift: SchemaDrift, *, clock: Clock) -> None:
-    """File one finding, and never let the filing cost the run.
+def _file_drift(
+    root: Path,
+    drift: SchemaDrift,
+    *,
+    clock: Clock,
+    found: list[SchemaDrift] | None = None,
+) -> None:
+    """File one finding, remember it for the run's page, and never let either cost the run.
 
     The sweep calls ``_seal`` bare, once per ticker-day, and ``compact``'s only
     ``try/except`` wraps the health-check ping. So anything raised here would cost every
@@ -500,13 +529,111 @@ def _file_drift(root: Path, drift: SchemaDrift, *, clock: Clock) -> None:
     A write that itself fails leaves stderr, which launchd files. That is ``alert._record``'s
     rule for the same situation: the record is the last line of defence, and when it
     fails the one place left to say so is the log.
+
+    ``found`` is the list the run collects its findings in, and ``_page_drift`` turns that
+    list into one page. This helper appends the finding before it attempts the write. The
+    order matters: a run that could not write the file down has only the page and the log
+    left as a trace, so the page has to go out even then.
     """
+    if found is not None:
+        found.append(drift)
     try:
         write_schema_drift(root, drift, now=clock.now())
     except OSError as exc:
         print(
             f"compaction: schema drift on {drift.partition} could not be filed: "
             f"{type(exc).__name__}",
+            file=sys.stderr,
+        )
+
+
+def _named(kind: str, names: Sequence[str]) -> str:
+    """One kind's columns, capped, as ``missing bid, ask and 3 more``.
+
+    The cap is what keeps the page inside ntfy's body limit. Past it the page prints how
+    many were dropped rather than dropping them silently, because the count is what tells
+    a reader whether they are looking at one moved column or a whole-schema rename.
+    """
+    shown = ", ".join(names[:PAGE_COLUMN_CAP])
+    rest = len(names) - PAGE_COLUMN_CAP
+    return f"{kind} {shown}" if rest <= 0 else f"{kind} {shown} and {rest} more"
+
+
+def _drift_body(drifted: Sequence[SchemaDrift]) -> str:
+    """Compose what the run's page says.
+
+    The page carries how many ticker-days drifted, over which session dates, and which
+    columns moved. The columns are a union across the findings, so one drifted column is
+    named once however many ticker-days carried it. The body counts ticker-days and never
+    names the tickers, because one bad release drifts every ticker-day still in flight and
+    a page listing them all would be unreadable on a phone while saying no more than the
+    count does.
+
+    ``SchemaDrift`` allows its three column lists, ``missing``, ``unexpected`` and
+    ``retyped``, to be empty at once. A difference the names and the types do not show
+    still files a record, and a nullability change is the difference that reaches here. The
+    page has to say that plainly rather than trailing off after "did not carry".
+    """
+    days = sorted({drift.day.isoformat() for drift in drifted})
+    moved = "; ".join(
+        _named(kind, names)
+        for kind, names in (
+            ("missing", sorted({name for drift in drifted for name in drift.missing})),
+            ("unexpected", sorted({name for drift in drifted for name in drift.unexpected})),
+            ("retyped", sorted({name for drift in drifted for name in drift.retyped})),
+        )
+        if names
+    )
+    if not moved:
+        moved = "no column named, so the schemas differ some other way"
+    return (
+        f"{len(drifted)} ticker-day(s) over {', '.join(days)} did not carry the pinned "
+        f"schema at the merge. {moved}. Findings under "
+        f"{REPORTS_DIR}/{SCHEMA_DRIFT_DIR}/. Correct the schema and bump schema_version."
+    )
+
+
+def _page_drift(
+    publisher: Publisher | None, drifted: Sequence[SchemaDrift], *, now: datetime
+) -> None:
+    """Page once for the whole run, naming every column that moved.
+
+    **One page, not one per finding.** A wide drift has one cause. The check guards this
+    project's own release process rather than the vendor, so a daemon that restarted
+    mid-session onto code carrying a different schema drifts every ticker-day still in
+    flight, and each finding then restates the same columns. Paging per finding would
+    scale the page count with the roster while the fact stayed one fact, and one bad
+    release would spend the publisher's forty-a-day cap on its own. The page the cap
+    swallowed could be the auth-death page, so this producer must not cause that storm.
+    Nothing is lost by folding: ``reports/schema_drift/`` holds one file per finding, with
+    the ticker, the partition, and the segments in it.
+
+    The finding reaches stderr as well as the phone, which is what the daemon's assertion
+    page already does. launchd files that log and the restart script sends the operator to
+    it. A publisher that refused the page found one of its own secrets in the body, and it
+    redacted its record for that reason, so stderr must not undo the redaction. That is
+    the one case where the body stops here.
+
+    ``publish`` never raises, so this cannot cost the backup that runs after it. A page
+    that did not reach the phone is written down under ``reports/alerts/`` by the
+    publisher itself, and the reason is named on stderr too.
+    """
+    if not drifted:
+        return
+    body = _drift_body(drifted)
+    delivery = None
+    if publisher is not None:
+        delivery = publisher.publish(
+            Message(event=SCHEMA_DRIFT_EVENT, title=SCHEMA_DRIFT_TITLE, body=body), now=now
+        )
+        if delivery.reason == REFUSED:
+            print("compaction: schema-drift page refused: it carried a secret", file=sys.stderr)
+            return
+    print(f"compaction: {SCHEMA_DRIFT_TITLE}: {body}", file=sys.stderr)
+    if delivery is not None and not delivery.sent:
+        kept = "written down" if delivery.recorded else "lost"
+        print(
+            f"compaction: schema-drift page not sent: {delivery.reason}, {kept}",
             file=sys.stderr,
         )
 
@@ -540,6 +667,7 @@ def _seal(
     *,
     clock: Clock,
     guard: bool,
+    found: list[SchemaDrift] | None = None,
 ) -> SealedPartition:
     """Merge one ticker-day's segments into its partition, verify, manifest, unlink.
 
@@ -561,6 +689,10 @@ def _seal(
     finding is filed after the manifest append, so only a seal that committed files one.
     It is reported rather than raised, because a raise from this function costs the rest
     of the sweep.
+
+    ``found`` is the list the caller collects this run's findings in. ``compact`` passes
+    one and pages once from it. The repair passes one too and pages nobody from it, so the
+    operator who started it reads the drift on their own terminal instead.
     """
     tables: list[pa.Table] = []
     expected = 0
@@ -650,7 +782,7 @@ def _seal(
     # leaves the segments on disk, and the next one merges them again and finds the same
     # difference.
     if drift is not None:
-        _file_drift(root, drift, clock=clock)
+        _file_drift(root, drift, clock=clock, found=found)
     for path in segments:
         path.unlink()
     return SealedPartition(
@@ -947,6 +1079,7 @@ def compact(
     backup_target: Path | str,
     pinger: Pinger | None = None,
     ping_url: str | None = None,
+    publisher: Publisher | None = None,
     guards: GuardConstants | None = None,
     plan_path: Path | str = DEFAULT_CHAIN_PLAN_PATH,
 ) -> CompactionResult:
@@ -964,6 +1097,14 @@ def compact(
 
     ``pinger`` is optional so a caller without a health check, like a test, can skip
     it. When given, ``ping_url`` is required.
+
+    ``publisher`` is the schema-drift page and it follows ``pinger`` exactly. Both reach
+    past this process, so ``main`` builds them and never accepts them, and a test drives
+    this helper with a fake instead. It is optional for the same reason ``pinger`` is: a
+    caller with nowhere to page skips it, and the default is ``None`` rather than a live
+    object, so omitting it can never reach a real phone. What a run without one loses is
+    only the page. The finding is still filed under ``reports/schema_drift/`` and still
+    named on stderr.
     """
     if pinger is not None and ping_url is None:
         raise ValueError("a pinger needs a ping_url")
@@ -978,26 +1119,47 @@ def compact(
         sealed: list[SealedPartition] = []
         verified: list[SealedPartition] = []
         problem: str | None = None
+        drifted: list[SchemaDrift] = []
         chains_by_day: dict[date, list[SealedPartition]] = {}
-        for day, date_dir in eligible:
-            for surface, ticker, ticker_dir in _ticker_days(date_dir):
-                segments = sorted(ticker_dir.glob(SEGMENT_GLOB))
-                if not segments:
-                    continue
-                rel = paths.partition_path(surface, ticker, day).relative_to(root).as_posix()
-                entry = latest.get(rel)
-                if entry is not None:
-                    outcome = _recover(root, paths, surface, ticker, day, segments, entry)
-                    verified.append(outcome)
-                else:
-                    outcome = _seal(
-                        root, paths, surface, ticker, day, segments, clock=clock, guard=True
-                    )
-                    latest[rel] = {"sha256": outcome.sha256, "rows": outcome.rows}
-                    sealed.append(outcome)
-                if surface == CHAINS:
-                    chains_by_day.setdefault(day, []).append(outcome)
-            _prune_empty(date_dir)
+        # The page goes out in a ``finally``, so no raise anywhere can swallow it. The
+        # sweep itself raises on a row-count regression, a failed verify, a partition that
+        # does not match its manifest entry, and any OSError from the write or the unlink.
+        # A ticker-day that already drifted and sealed has had its segments unlinked, so
+        # the next run finds nothing to merge for it and never runs the check again. The
+        # finding would then be filed and never paged, for good. The re-tune and the
+        # backup sit after the sweep and raise too, which is the same loss one step later.
+        # The design's schema policy says a missing or retyped known field pages, and a
+        # page any later step can swallow does not satisfy it.
+        try:
+            for day, date_dir in eligible:
+                for surface, ticker, ticker_dir in _ticker_days(date_dir):
+                    segments = sorted(ticker_dir.glob(SEGMENT_GLOB))
+                    if not segments:
+                        continue
+                    rel = paths.partition_path(surface, ticker, day).relative_to(root).as_posix()
+                    entry = latest.get(rel)
+                    if entry is not None:
+                        outcome = _recover(root, paths, surface, ticker, day, segments, entry)
+                        verified.append(outcome)
+                    else:
+                        outcome = _seal(
+                            root,
+                            paths,
+                            surface,
+                            ticker,
+                            day,
+                            segments,
+                            clock=clock,
+                            guard=True,
+                            found=drifted,
+                        )
+                        latest[rel] = {"sha256": outcome.sha256, "rows": outcome.rows}
+                        sealed.append(outcome)
+                    if surface == CHAINS:
+                        chains_by_day.setdefault(day, []).append(outcome)
+                _prune_empty(date_dir)
+        finally:
+            _page_drift(publisher, drifted, now=clock.now())
 
         retune: RetuneResult | None = None
         if chains_by_day:
@@ -1046,6 +1208,10 @@ def recompact_ticker_day(
     refuses a rebuild with fewer rows than the recorded count, before the partition
     file is touched. A human who has established that the recorded count is the wrong
     one passes ``allow_shrink=True`` to supersede it on their own authority.
+
+    The merge runs the same schema check the scheduled job does, so the rebuild can find
+    drift. It files the finding and writes it to stderr, and it pages nobody. The operator
+    started this run and is reading its output, which is the reader a page exists to reach.
     """
     root = Path(lake_root)
     paths = LakePaths(root)
@@ -1057,10 +1223,26 @@ def recompact_ticker_day(
                 f"no segments remain for {surface}/{ticker}/{day.isoformat()}; "
                 "a recompaction needs the day's segments"
             )
-        outcome = _seal(
-            root, paths, surface, ticker, day, segments, clock=clock, guard=not allow_shrink
-        )
-        _prune_empty(ticker_dir.parent.parent)
+        drifted: list[SchemaDrift] = []
+        try:
+            outcome = _seal(
+                root,
+                paths,
+                surface,
+                ticker,
+                day,
+                segments,
+                clock=clock,
+                guard=not allow_shrink,
+                found=drifted,
+            )
+            _prune_empty(ticker_dir.parent.parent)
+        finally:
+            # No publisher, so this pages nobody and only writes the drift to stderr. A
+            # repair prints the partition and the row count and nothing else, so without
+            # this line an operator reads a clean-looking success over a ticker-day whose
+            # merged schema was not the pinned one.
+            _page_drift(None, drifted, now=clock.now())
         return outcome
 
 
@@ -1105,9 +1287,10 @@ def main(
 ) -> int:
     """The ``python -m lake.compact`` entry. Returns a process exit code.
 
-    ``backup`` and ``pinger`` are built here, not accepted. Each reaches past this
-    process. ``rsync`` shells out to copy the lake, and the healthchecks GET goes to the
-    network. A ``main`` that accepted them let a test omit one and reach the real effect,
+    ``backup``, ``pinger`` and the drift page's ``Publisher`` are built here, not
+    accepted. Each reaches past this process. ``rsync`` shells out to copy the lake, the
+    healthchecks GET goes to the network, and the publisher POSTs to ntfy, which reaches
+    a phone. A ``main`` that accepted them let a test omit one and reach the real effect,
     so ``main`` builds them and a test drives the ``compact`` helper directly instead.
 
     ``clock`` and ``calendar`` stay injectable. A system clock and an exchange calendar
@@ -1146,6 +1329,12 @@ def main(
         backup_target=config.backup_target,
         pinger=UrllibPinger(),
         ping_url=config.healthchecks_url(COMPACTION_SLUG),
+        publisher=Publisher(
+            lake_root=config.lake_root,
+            transport=NtfyTransport(config.ntfy_topic.reveal()),
+            # The values that must never reach a phone, checked against the page itself.
+            secrets=(config.healthchecks_ping_key.reveal(), config.ntfy_topic.reveal()),
+        ),
         guards=config.guards,
         plan_path=args.plan if args.plan is not None else DEFAULT_CHAIN_PLAN_PATH,
     )
@@ -1161,6 +1350,8 @@ __all__ = [
     "PartitionMismatch",
     "RecompactionRefused",
     "RetuneResult",
+    "SCHEMA_DRIFT_EVENT",
+    "SCHEMA_DRIFT_TITLE",
     "SealedPartition",
     "SkippedDay",
     "WindowProfile",

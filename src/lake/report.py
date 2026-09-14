@@ -3,7 +3,9 @@
 The design gives report-tier findings no message of their own. They ride the nightly
 report, one dated file per night under ``reports/`` in the lake root, which sits inside
 the backup sync root and outside the manifest. D16 writes that file and D20 renders it,
-so the reader arrives later than the producers do.
+so the reader arrives later than the producers do. Compaction's finding is the exception,
+and the schema policy is what makes it one. A missing or retyped known field pages, so
+compaction pages once per run on top of filing here.
 
 The close+5 guard is one of those producers and it has been finding things with nowhere
 to put them. Three of the design's rules for it end in "flags the nightly report", and
@@ -37,9 +39,11 @@ Three rules hold for everything written here, and each has a failure behind it.
    because one cycle can raise several pages at one instant.
 
 The second producer is compaction's merge. It compares a ticker-day's merged segments to
-the pinned schema at the one moment the segments still exist, and files what moved. That
-finding has no alerting value until D20 renders it, and forensic value from the day it
-lands, because the merged schema is gone the moment the seal unlinks the segments.
+the pinned schema at the one moment the segments still exist, and files what moved. The
+file has forensic value from the day it lands, because the merged schema is gone the
+moment the seal unlinks the segments, and it has no reader until D20 renders it. What
+reaches a human in the meantime is compaction's own page, which folds the run's findings
+into one message and sends the reader here for the per-ticker-day detail.
 """
 
 from __future__ import annotations

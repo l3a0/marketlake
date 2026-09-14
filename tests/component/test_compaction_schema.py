@@ -27,6 +27,8 @@ These cover the check's contract:
 6. The human-invoked repair runs the same check, and a repair the no-shrink guard
    refuses files nothing, because it leaves the partition alone.
 7. The writer itself: where the file lands, what it holds, and that it never overwrites.
+8. One page per run carries the finding to a phone, naming every column that moved, and
+   an ordinary run sends none.
 """
 
 from __future__ import annotations
@@ -42,16 +44,24 @@ import pytest
 
 from lake import compact as compact_module
 from lake import journal, report
-from lake.alert import undelivered
+from lake.alert import Message, Publisher, undelivered
 from lake.calendar import MARKET_TZ
-from lake.compact import CompactionResult, compact, recompact_ticker_day
+from lake.compact import (
+    SCHEMA_DRIFT_EVENT,
+    SCHEMA_DRIFT_TITLE,
+    CompactionResult,
+    compact,
+    recompact_ticker_day,
+)
 from lake.journal import CHAINS_SCHEMA
 from lake.manifest import RowCountRegression, append_manifest, read_manifest
 from lake.paths import REPORTS_DIR, LakePaths
 from tests.support.backup import FakeBackup
 from tests.support.calendar import FakeCalendar, SessionTimes
 from tests.support.clock import ManualClock
+from tests.support.config import NTFY_TOPIC, PING_KEY, write_config
 from tests.support.pinger import FakePinger
+from tests.support.transport import FakeTransport
 
 FRIDAY = date(2026, 8, 21)
 DAY = date(2026, 8, 24)
@@ -88,6 +98,7 @@ def _run(
     clock: ManualClock | None = None,
     backup=None,
     pinger=None,
+    publisher=None,
 ) -> tuple[CompactionResult, list[str]]:
     events: list[str] = []
     backup = backup if backup is not None else FakeBackup(events)
@@ -100,9 +111,21 @@ def _run(
         backup_target=TARGET,
         pinger=pinger,
         ping_url=URL,
+        publisher=publisher,
         plan_path=lake_root.parent / "chain_plan.json",
     )
     return result, events
+
+
+def _paging(lake_root: Path, transport=None) -> tuple[Publisher, FakeTransport]:
+    """A publisher over a recording transport, holding the config's two secrets.
+
+    The secrets are what the real ``main`` passes, so a page composed here is refused on
+    exactly the terms a page composed in production would be.
+    """
+    transport = FakeTransport() if transport is None else transport
+    publisher = Publisher(lake_root=lake_root, transport=transport, secrets=(PING_KEY, NTFY_TOPIC))
+    return publisher, transport
 
 
 # -- building rows and segments ----------------------------------------------
@@ -785,3 +808,388 @@ def test_a_lake_root_that_is_a_file_is_refused(lake_root):
         report.write_schema_drift(impostor, DRIFT, now=AT, pid=11)
 
     assert impostor.read_text() == ""
+
+
+# -- 8. the page -------------------------------------------------------------
+
+
+def _drifted_day(lake_root: Path, monkeypatch, tickers=("SPY",)) -> None:
+    """One mid-day column drop per named ticker, with the pinned schema past the drop."""
+    for ticker in tickers:
+        _segment(
+            lake_root,
+            CHAINS_SCHEMA,
+            _table(CHAINS_SCHEMA, _rows(2, snap_ts=_snap(DAY, 0), ticker=ticker)),
+            start_ts="a",
+            ticker=ticker,
+        )
+    _pin(monkeypatch, _without(CHAINS_SCHEMA, COLUMN))
+
+
+def test_a_drifted_run_pages(lake_root, monkeypatch):
+    # The design's schema policy says a missing or retyped known field pages. The file
+    # under `reports/schema_drift/` has no reader until D20 renders it, so until this
+    # wiring the finding reached nobody on the evening it happened.
+    _drifted_day(lake_root, monkeypatch)
+    publisher, transport = _paging(lake_root)
+
+    _run(lake_root, publisher=publisher)
+
+    assert len(transport.messages) == 1
+    page = transport.messages[0]
+    assert page.event == SCHEMA_DRIFT_EVENT
+    assert page.title == SCHEMA_DRIFT_TITLE
+    assert page.priority == 5
+    assert COLUMN in page.body
+    assert DAY.isoformat() in page.body
+
+
+def test_the_page_names_the_directory_the_findings_are_in(lake_root, monkeypatch):
+    # The page folds the run, so the per-ticker-day detail lives only in the files. A
+    # page that did not say where they are would leave the reader to guess.
+    _drifted_day(lake_root, monkeypatch)
+    publisher, transport = _paging(lake_root)
+
+    _run(lake_root, publisher=publisher)
+
+    assert "reports/schema_drift/" in transport.messages[0].body
+    assert _findings(lake_root) != []
+
+
+def test_a_wide_drift_is_one_page_and_not_one_per_finding(lake_root, monkeypatch):
+    # This is the cadence the issue settles. One bad release drifts every ticker-day
+    # still in flight and each finding restates the same columns, so paging per finding
+    # would scale the page count with the roster while the fact stayed one fact. The
+    # publisher caps the day at forty and writes the forty-first down rather than sending
+    # it, so a producer that storms spends the cap the auth-death page needs.
+    _drifted_day(lake_root, monkeypatch, tickers=("IWM", "QQQ", "SPY"))
+    publisher, transport = _paging(lake_root)
+
+    _run(lake_root, publisher=publisher)
+
+    assert len(_findings(lake_root)) == 3
+    assert len(transport.messages) == 1
+    body = transport.messages[0].body
+    assert body.startswith("3 ticker-day(s)")
+    # The columns are a union, so one drifted column is named once however many
+    # ticker-days carried it.
+    assert body.count(COLUMN) == 1
+
+
+def test_the_page_counts_ticker_days_and_never_names_the_tickers(lake_root, monkeypatch):
+    # A body listing every drifted ticker would be unreadable on a phone and would say
+    # no more than the count does. The files carry the ticker.
+    _drifted_day(lake_root, monkeypatch, tickers=("IWM", "QQQ", "SPY"))
+    publisher, transport = _paging(lake_root)
+
+    _run(lake_root, publisher=publisher)
+
+    body = transport.messages[0].body
+    assert [finding["ticker"] for finding in _findings(lake_root)] == ["IWM", "QQQ", "SPY"]
+    assert "QQQ" not in body
+
+
+def test_an_ordinary_run_pages_nothing(lake_root):
+    # This is the over-reach half. A lake that drifted nowhere leaves the phone silent.
+    _segment(
+        lake_root,
+        CHAINS_SCHEMA,
+        _table(CHAINS_SCHEMA, _rows(4, snap_ts=_snap(DAY, 0))),
+        start_ts="a",
+    )
+    publisher, transport = _paging(lake_root)
+
+    result, events = _run(lake_root, publisher=publisher)
+
+    assert transport.messages == []
+    assert not (lake_root / REPORTS_DIR).exists()
+    assert result.sealed[0].rows == 4
+    assert events == ["backup", "ping"]
+
+
+def test_a_legitimate_column_addition_pages_nothing(lake_root, monkeypatch):
+    # The shape that would page on every schema bump if the reorder or the comparison
+    # were wrong. The detector already refuses to file it, and the page must not
+    # reintroduce the noise a step later.
+    added = _added()
+    _segment(
+        lake_root,
+        CHAINS_SCHEMA,
+        _table(CHAINS_SCHEMA, _rows(2, snap_ts=_snap(DAY, 0))),
+        start_ts="a",
+    )
+    _segment(lake_root, added, _table(added, _rows(3, snap_ts=_snap(DAY, 1))), start_ts="b")
+    _pin(monkeypatch, added)
+    publisher, transport = _paging(lake_root)
+
+    _run(lake_root, publisher=publisher)
+
+    assert transport.messages == []
+
+
+def test_an_empty_lake_pages_nothing(lake_root):
+    # Nothing to sweep is the commonest run of all, and a producer that pages on it
+    # would page every night.
+    publisher, transport = _paging(lake_root)
+
+    _run(lake_root, publisher=publisher)
+
+    assert transport.messages == []
+
+
+def test_the_page_never_raises_out_of_the_sweep(lake_root, monkeypatch):
+    # ``publish`` never raises, which is what lets a page sit inside a job that must not
+    # die. A transport that throws must still leave the seal, the backup and the ping
+    # exactly as they were.
+    class Broken:
+        def send(self, message):
+            raise ConnectionError("ntfy unreachable")
+
+    _drifted_day(lake_root, monkeypatch)
+    publisher, _ = _paging(lake_root, transport=Broken())
+
+    result, events = _run(lake_root, publisher=publisher)
+
+    assert result.sealed[0].rows == 2
+    assert result.problem is None
+    assert events == ["backup", "ping"]
+    assert _findings(lake_root) != []
+
+
+def test_a_page_that_could_not_be_sent_is_written_down(lake_root, monkeypatch, capsys):
+    # The publisher's own rule: a page that never left the laptop is never invisible. It
+    # lands under ``reports/alerts/``, which the Now panel counts, and the reason is
+    # named on stderr as well.
+    class Broken:
+        def send(self, message):
+            raise ConnectionError("ntfy unreachable")
+
+    _drifted_day(lake_root, monkeypatch)
+    publisher, _ = _paging(lake_root, transport=Broken())
+
+    _run(lake_root, publisher=publisher)
+
+    assert undelivered(lake_root, DAY) == 1
+    directory = lake_root / REPORTS_DIR / "alerts" / f"date={DAY.isoformat()}"
+    record = json.loads(next(iter(directory.glob("*.json"))).read_text())
+    assert record["event"] == SCHEMA_DRIFT_EVENT
+    assert record["reason"] == "post_failed"
+    assert "page not sent" in capsys.readouterr().err
+
+
+def test_a_raise_later_in_the_sweep_cannot_swallow_the_page(lake_root, monkeypatch):
+    # The loss this guards is permanent. A drifted ticker-day that sealed has had its
+    # segments unlinked, so the next run finds nothing to merge for it and never runs the
+    # check again. A raise on a later ticker-day would carry the finding out of the run
+    # with the phone silent and no second chance, which is why the page sits in a
+    # ``finally`` around the whole sweep rather than after it.
+    _drifted_day(lake_root, monkeypatch, tickers=("SPY",))
+    real = compact_module._prune_empty
+
+    def refuse(date_dir):
+        real(date_dir)
+        raise OSError("the journal directory went away")
+
+    monkeypatch.setattr(compact_module, "_prune_empty", refuse)
+    publisher, transport = _paging(lake_root)
+
+    with pytest.raises(OSError, match="went away"):
+        _run(lake_root, publisher=publisher)
+
+    assert len(transport.messages) == 1
+    assert COLUMN in transport.messages[0].body
+
+
+def test_the_page_goes_out_before_the_backup(lake_root, monkeypatch):
+    # The backup shells out to ``rsync`` and a raise from it propagates out of the run.
+    # Paging after it would let an unplugged drive swallow the drift page, which is the
+    # one signal the missed compaction ping cannot name.
+    class Unplugged:
+        def sync(self, source, target):
+            raise RuntimeError("backup target not mounted")
+
+    _drifted_day(lake_root, monkeypatch)
+    publisher, transport = _paging(lake_root)
+
+    with pytest.raises(RuntimeError, match="backup target not mounted"):
+        _run(lake_root, backup=Unplugged(), publisher=publisher)
+
+    assert len(transport.messages) == 1
+    assert COLUMN in transport.messages[0].body
+
+
+def test_a_drift_that_names_no_column_still_says_so(lake_root, monkeypatch):
+    # ``SchemaDrift`` allows all three lists to be empty. A nullability change is the
+    # difference that reaches here naming nothing, and the page has to say that plainly
+    # rather than trailing off after "did not carry".
+    index = CHAINS_SCHEMA.get_field_index(COLUMN)
+    field = CHAINS_SCHEMA.field(index)
+    renullable = CHAINS_SCHEMA.set(index, field.with_nullable(not field.nullable))
+    _segment(
+        lake_root,
+        CHAINS_SCHEMA,
+        _table(CHAINS_SCHEMA, _rows(2, snap_ts=_snap(DAY, 0))),
+        start_ts="a",
+    )
+    _pin(monkeypatch, renullable)
+    publisher, transport = _paging(lake_root)
+
+    _run(lake_root, publisher=publisher)
+
+    finding = _findings(lake_root)[0]
+    assert (finding["missing"], finding["unexpected"], finding["retyped"]) == ([], [], [])
+    assert "no column named" in transport.messages[0].body
+
+
+def test_a_run_with_no_publisher_still_files_and_says_so_on_stderr(lake_root, monkeypatch, capsys):
+    # The seam is optional the way ``pinger`` is, and its default is ``None`` rather
+    # than a live object, so a caller that omits it can never reach a real phone. What
+    # such a run loses is only the page. launchd files the log the line lands in.
+    _drifted_day(lake_root, monkeypatch)
+
+    _run(lake_root)
+
+    assert _findings(lake_root) != []
+    err = capsys.readouterr().err
+    assert SCHEMA_DRIFT_TITLE in err
+    assert COLUMN in err
+
+
+def test_a_write_that_cannot_land_still_pages(lake_root, monkeypatch):
+    # The order inside ``_file_drift``. The drift is the fact and the file is the
+    # record of it, so a run that could not write the record is a run whose only
+    # remaining trace is the page and the log.
+    _drifted_day(lake_root, monkeypatch)
+
+    def refuse(*args, **kwargs):
+        raise PermissionError("read-only lake")
+
+    monkeypatch.setattr(compact_module, "write_schema_drift", refuse)
+    publisher, transport = _paging(lake_root)
+
+    _run(lake_root, publisher=publisher)
+
+    assert _findings(lake_root) == []
+    assert len(transport.messages) == 1
+
+
+def test_the_repair_writes_its_finding_to_the_terminal_and_pages_nobody(
+    lake_root, monkeypatch, capsys
+):
+    # ``recompact_ticker_day`` is human-invoked and takes no publisher, because the
+    # operator who started it is reading its output. That only holds if the output says
+    # so. A repair prints the partition and the row count and nothing else, so without
+    # the stderr line an operator reads a clean-looking success over a ticker-day whose
+    # merged schema was not the pinned one.
+    _drifted_day(lake_root, monkeypatch)
+    clock = ManualClock(_et(DAY, 16, 30))
+
+    outcome = recompact_ticker_day(lake_root, "chains", "SPY", DAY, clock=clock)
+
+    assert outcome.rows == 2
+    assert len(_findings(lake_root)) == 1
+    assert undelivered(lake_root, DAY) == 0
+    err = capsys.readouterr().err
+    assert SCHEMA_DRIFT_TITLE in err
+    assert COLUMN in err
+
+
+def test_a_page_the_record_could_not_keep_either_says_it_was_lost(lake_root, monkeypatch, capsys):
+    # ``Delivery.recorded`` separates a page written down from one lost twice. Only the
+    # second leaves nothing behind, so the log has to tell them apart. A publisher
+    # pointed at a lake root that is not there refuses to write the record, because
+    # creating it would turn "lake root missing" into a green check on the next attempt.
+    class Broken:
+        def send(self, message):
+            raise ConnectionError("ntfy unreachable")
+
+    _drifted_day(lake_root, monkeypatch)
+    gone = lake_root.parent / "not-a-lake"
+    publisher = Publisher(lake_root=gone, transport=Broken(), secrets=(PING_KEY, NTFY_TOPIC))
+
+    _run(lake_root, publisher=publisher)
+
+    assert not gone.exists()
+    err = capsys.readouterr().err
+    assert "page not sent: post_failed, lost" in err
+
+
+def test_a_page_carrying_a_secret_is_refused_and_stays_off_the_log(lake_root, monkeypatch, capsys):
+    # The publisher redacts a refused page's title from its own record, because the title
+    # is what the refusal objected to. A producer that printed the body first would route
+    # the secret around that seam and into the launchd log.
+    _drifted_day(lake_root, monkeypatch)
+    publisher, transport = _paging(lake_root)
+    monkeypatch.setattr(compact_module, "_drift_body", lambda drifted: f"the topic is {NTFY_TOPIC}")
+
+    _run(lake_root, publisher=publisher)
+
+    assert transport.messages == []
+    err = capsys.readouterr().err
+    assert "refused: it carried a secret" in err
+    assert NTFY_TOPIC not in err
+
+
+def test_a_drift_too_wide_for_one_message_is_capped_and_counted(lake_root, monkeypatch):
+    # ntfy's default body limit is 4096 bytes and it answers an oversize POST with a 400,
+    # which ``NtfyTransport`` does not retry. A whole-schema rename names every column,
+    # so the widest drift would be the one page that never landed. The count is what
+    # survives the cut, because it is what separates one moved column from a rename.
+    wide = pa.schema([pa.field(f"renamed_{index:03d}", pa.string()) for index in range(60)])
+    _segment(
+        lake_root,
+        CHAINS_SCHEMA,
+        _table(CHAINS_SCHEMA, _rows(2, snap_ts=_snap(DAY, 0))),
+        start_ts="a",
+    )
+    _pin(monkeypatch, wide)
+    publisher, transport = _paging(lake_root)
+
+    _run(lake_root, publisher=publisher)
+
+    body = transport.messages[0].body
+    assert len(body.encode("utf-8")) < 4096
+    assert "renamed_011" in body
+    assert "renamed_012" not in body
+    assert f"and {60 - compact_module.PAGE_COLUMN_CAP} more" in body
+
+
+def test_main_builds_the_publisher_that_pages(lake_root, monkeypatch, tmp_path):
+    # A ``main`` builds its live seams itself. The ntfy POST reaches a phone, so a
+    # ``main`` that accepted it would let a test hand it a fake from inside the place
+    # that looked sanctioned. Two things have to be true of what it built.
+    #
+    # 1. The page goes over the real POST, carrying the config's topic.
+    # 2. The publisher holds both secrets, which is what makes it refuse a page that
+    #    carries either one.
+    topics: list[str] = []
+    transport = FakeTransport()
+
+    def fake_transport(topic: str) -> FakeTransport:
+        topics.append(topic)
+        return transport
+
+    seen: dict = {}
+
+    def fake_compact(*args, **kwargs) -> CompactionResult:
+        seen.update(kwargs)
+        return CompactionResult(
+            sealed=(), verified=(), skipped=(), retune=None, backed_up=True, pinged=True
+        )
+
+    monkeypatch.setattr(compact_module, "NtfyTransport", fake_transport)
+    monkeypatch.setattr(compact_module, "compact", fake_compact)
+    config = write_config(tmp_path, lake_root)
+
+    compact_module.main(["--config", str(config)])
+
+    publisher = seen["publisher"]
+    assert isinstance(publisher, Publisher)
+    assert topics == [NTFY_TOPIC]
+
+    page = Message(event=SCHEMA_DRIFT_EVENT, title=SCHEMA_DRIFT_TITLE, body="a column moved")
+    assert publisher.publish(page, now=_et(DAY, 16, 30)).sent
+    assert transport.messages == [page]
+
+    leaked = Message(event="probe", title="t", body=f"the key is {PING_KEY}")
+    assert publisher.publish(leaked, now=_et(DAY, 16, 30)).reason == "refused"
