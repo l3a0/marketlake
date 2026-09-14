@@ -1,10 +1,14 @@
-"""A promotion, end to end, over real segments and the real ledger file on disk.
+"""A promotion and a retype, end to end, over real segments and the real ledger on disk.
 
 The unit tests hand-build tables and ledgers. These do not. A real chain payload carrying
 a field the parser does not recognise is written through the real ``SegmentWriter``, the
 real ``python -m lake.schema_versions`` recording tool writes the ledger into a real lake,
 and the projection reads that file back through ``lake.schema_versions``. Files are
 crossed, so these sit in the component tier. No vendor, no network, and no wall clock.
+
+The retype is not simulated at all. The payload sends ``bid`` as a string, the real row
+builder routes the raw value into ``extra`` and leaves the column null, and the projection
+reads the signature that leaves behind.
 
 The promotion itself is simulated the only way it can be inside one test run. The version
 below the boundary is written by the real code as it stands, where ``sigmaScore`` is an
@@ -15,6 +19,7 @@ parser's own contract map, which is exactly the two-line edit a real promotion i
 
 from __future__ import annotations
 
+import copy
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,7 +28,7 @@ import pyarrow as pa
 import pytest
 
 from lake import journal
-from lake.extra_projection import project_extra
+from lake.extra_projection import RetypedColumn, project_extra
 from lake.schema_versions import SchemaVersionLedger, ledger_path, record_schema_version
 from tests.support.clock import ManualClock
 
@@ -87,15 +92,28 @@ def _promote(monkeypatch) -> None:
     monkeypatch.setattr(journal, "SCHEMA_VERSION", 2)
 
 
-def _write_segment(lake_root: Path, start: str, pid: int) -> Path:
-    """One real chains segment from the payload above, through the real writer."""
+def _write_segment(lake_root: Path, start: str, pid: int, body: dict | None = None) -> Path:
+    """One real chains segment from a payload, through the real writer.
+
+    The payload defaults to the one above. A test that needs a drifted field passes its
+    own, so the routing under test is the parser's own rather than a fixture's.
+    """
     with journal.SegmentWriter.open(
         lake_root, journal.CHAINS_SURFACE, "SPY", DAY, start, pid
     ) as writer:
         writer.write_cycle(
-            journal.chains_data_batch(CHAIN_BODY, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+            journal.chains_data_batch(
+                CHAIN_BODY if body is None else body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
+            )
         )
     return journal.segment_path(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, start, pid)
+
+
+def _retyped_body() -> dict:
+    """The same payload with the vendor sending ``bid`` as a string rather than a number."""
+    body = copy.deepcopy(CHAIN_BODY)
+    body["callExpDateMap"]["2026-09-18:7"]["650.0"][0]["bid"] = "n/a"
+    return body
 
 
 def _ledger_off_disk(lake_root: Path) -> SchemaVersionLedger:
@@ -182,6 +200,61 @@ def test_the_ledger_the_projection_reads_is_the_file_the_tool_wrote(lake_root, m
     assert result.unrecorded_versions == (1,)
     assert not result.complete
     assert json.loads(result.table.column("extra").to_pylist()[0]) == {VENDOR_FIELD: 0.42}
+
+
+def test_a_value_the_column_refused_reads_as_a_retype_rather_than_as_the_column(lake_root):
+    """The other half of the deliverable, with the real parser doing the routing.
+
+    The vendor sends ``bid`` as a string. The real row builder writes the raw value into
+    ``extra`` and leaves the column null rather than failing the row, which is what keeps
+    the minute. Version 1's recorded shape carries a ``bid`` column, so nothing is lifted,
+    and the value beside the column is the signature that says the column refused it.
+    """
+    segment = _write_segment(lake_root, "20260911T153000", 4242, body=_retyped_body())
+    record_schema_version(clock=ManualClock(NOW), lake_root=lake_root)
+
+    written = journal.read_segment(segment)
+    assert written.column("bid").to_pylist() == [None]
+    assert json.loads(written.column("extra").to_pylist()[0]) == {
+        "bid": "n/a",
+        VENDOR_FIELD: 0.42,
+    }
+
+    result = project_extra(
+        written, surface=journal.CHAINS_SURFACE, ledger=_ledger_off_disk(lake_root)
+    )
+
+    assert result.retyped == (
+        RetypedColumn(column="bid", schema_version=1, recorded_type="double", rows=1),
+    )
+    assert result.table.column("bid").to_pylist() == [None]
+    assert result.filled == {}
+    assert not result.complete
+    assert json.loads(result.table.column("extra").to_pylist()[0])["bid"] == "n/a"
+
+
+def test_a_retype_read_under_the_version_that_promoted_a_sibling_reports_both_answers(
+    lake_root, monkeypatch
+):
+    """One read, one column lifted and another refused, off one real segment.
+
+    ``sigmaScore`` is unrecognised at version 1 and promoted at version 2, so it lifts.
+    ``bid`` was a column at version 1 and the vendor sent a string, so it is refused. A
+    detection that keyed on a populated overflow alone would report the promotion too.
+    """
+    segment = _write_segment(lake_root, "20260911T153000", 4242, body=_retyped_body())
+    record_schema_version(clock=ManualClock(NOW), lake_root=lake_root)
+    written = journal.read_segment(segment)
+
+    _promote(monkeypatch)
+    result = project_extra(
+        written, surface=journal.CHAINS_SURFACE, ledger=_ledger_off_disk(lake_root)
+    )
+
+    assert result.table.column(PROMOTED_COLUMN).to_pylist() == [0.42]
+    assert result.filled == {PROMOTED_COLUMN: 1}
+    assert [(r.column, r.schema_version) for r in result.retyped] == [("bid", 1)]
+    assert not result.complete
 
 
 def test_no_ledger_file_at_all_refuses_rather_than_reading_as_empty(lake_root):

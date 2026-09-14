@@ -7,18 +7,43 @@ the answer is to promote it: give it a typed column and bump ``SCHEMA_VERSION``.
 version on the value lands in its column. Every row already sealed below that version
 still holds it in ``extra``.
 
-Two writers put a value in that column, and this module reads back exactly one of them.
-The promotion above is the one it reads. The other is the parser routing a known field
-whose value its column refused, which leaves the column null and the raw value in the
-overflow. That value is out of reach here by construction, because the row's recorded
-version *does* carry the column and this module only fills a column the version lacked.
-Reaching it needs a different test and a different answer, and both are
-[#149](https://github.com/l3a0/marketlake/issues/149), which is authoritative for that
-scope. Until it lands, what makes those rows safe is that a known field's name in ``extra``
-says the parser routed it, so a routed null is still distinguishable from a vendor null.
-One payload can write that name without routing, a chains contract field named ``chain``
-carrying a chain-level field's own name, and closing it is
-[#156](https://github.com/l3a0/marketlake/issues/156).
+Two writers put a value in that column, and this module answers them differently. The
+promotion above is the one it presents as a column. The other is the parser routing a known
+field whose value its column refused, which leaves the column null and the raw value in the
+overflow. That is a vendor retype seen from inside a capture, and the row's recorded version
+*does* carry the column, so there is no free cell to lift the value into. The version's
+other rows hold that column at the type the vendor stopped sending, and one Arrow column
+cannot hold those values and the shape the vendor moved to at once. So a retype is refused
+rather than presented, and the refusal is a report naming the column, the version whose rows
+routed the value, and the type that version recorded for it.
+
+What finds a retype is the signature marketlake #129 pins. The parser builds ``extra`` from
+the fields its vendor maps do not name, so a known field's name can never otherwise appear
+there, and its presence on a row whose version carries the column says the column refused
+that row's value. The signature is what says a value was routed, so a value that happens to
+fit the running column is a retype too. What the value looks like decides nothing here,
+because the parser writes a known field's name into the overflow for one reason only.
+
+One payload can write that name without routing, and it costs this reader a false report. A
+chains contract field named ``chain`` carrying a chain-level field's own name lands on the
+key those fields nest under, so the projection names a column whose values are present and
+correct and calls the read partial with nothing missing from it. Closing that is
+[#156](https://github.com/l3a0/marketlake/issues/156), which is authoritative for it. The
+trigger is a compound coincidence and nothing observed suggests it is coming.
+
+Two other answers to a retype were weighed, and
+[#149](https://github.com/l3a0/marketlake/issues/149) is authoritative for both. The first
+is rejected outright. The second waits.
+
+1. *Casting the overflow-held values into the running column's type.* Raw is
+   vendor-verbatim, so a cast manufactures values that were never observed and hands them
+   to a downstream computation with no marker, which is the one outcome nobody can detect
+   afterwards. It also has no defensible direction, because the running type is the one the
+   vendor stopped honouring, and some retypes have no cast at all.
+2. *An opt-in that hands back both representations.* Deferred until a caller asks for it,
+   rather than cut. A retype pages at severity 5 under the schema policy, so it is a thing
+   a human fixes by correcting the schema and bumping the version, rather than a condition
+   a reader copes with forever.
 
 So a promotion splits history in two. The same measurement reads as a column above the
 boundary and as an overflow key below it, and a reader asking for the column sees nulls
@@ -97,6 +122,29 @@ class UnfitValue(NamedTuple):
     rows: int
 
 
+class RetypedColumn(NamedTuple):
+    """A column whose value a version's rows carry in ``extra`` rather than in the column.
+
+    The parser routes a known field's value into the overflow and leaves the column null
+    when the column refuses that value, which is what a vendor retype looks like from
+    inside a capture. The row's own version carries the column, so nothing here lifts the
+    value out. The version's other rows hold that column at the recorded type, and one
+    Arrow column cannot hold those values and the shape the vendor moved to at once.
+
+    ``column`` names the column. ``schema_version`` names the version whose rows routed the
+    value, and ``recorded_type`` is what that version recorded the column as, which is the
+    type the vendor stopped sending. ``rows`` counts how many rows at that version routed.
+
+    Nothing is lost by reporting rather than repairing. The raw value stays in the
+    overflow, and the repair is a human correcting the schema and bumping the version.
+    """
+
+    column: str
+    schema_version: int
+    recorded_type: str
+    rows: int
+
+
 class ExtraProjection(NamedTuple):
     """A projected table and everything the projection could not do silently.
 
@@ -111,17 +159,28 @@ class ExtraProjection(NamedTuple):
     caller reads this field to know the read was partial.
 
     ``unfit`` names every value a column refused.
+
+    ``retyped`` names every column a version's rows routed into the overflow, which is a
+    vendor retype. Those rows come back exactly as written, because presenting the routed
+    value as its column would need a cast and a cast manufactures a value the vendor never
+    sent. A caller reads this field to know the column it asked for is partial.
     """
 
     table: pa.Table
     filled: Mapping[str, int]
     unrecorded_versions: tuple[int, ...]
     unfit: tuple[UnfitValue, ...]
+    retyped: tuple[RetypedColumn, ...]
 
     @property
     def complete(self) -> bool:
-        """Whether every row was projected against a recorded shape with nothing refused."""
-        return not self.unrecorded_versions and not self.unfit
+        """Whether every row projected against a recorded shape with nothing left behind.
+
+        Every reported thing counts. A read that refused a value, met a version it had no
+        shape for, or found a column a retype routed away is partial, and saying otherwise
+        would hand a caller a table it believes is whole.
+        """
+        return not self.unrecorded_versions and not self.unfit and not self.retyped
 
 
 def _overflow(raw: object, row: int) -> Mapping[str, object]:
@@ -132,10 +191,12 @@ def _overflow(raw: object, row: int) -> Mapping[str, object]:
     presenting such a row as projected would claim its overflow held nothing when the
     truth is that nothing could read it.
 
-    Only a row the projection actually reads is decoded, which is a row whose version is
-    missing at least one projectable column. A row with nothing to project is left alone
-    rather than validated, because a read has no business failing over an overflow it was
-    never going to look at.
+    Only a row the projection actually reads is decoded, which is every row at a version
+    the ledger holds a shape for. A retype's signature sits in the overflow of a row whose
+    version misses no column at all, so finding it means reading those overflows as well as
+    the ones a promotion lifts from. A row at an unrecorded version is still left alone
+    rather than validated, because the projection reads nothing on it and a read has no
+    business failing over an overflow it was never going to look at.
     """
     if raw is None or raw == "":
         return {}
@@ -217,19 +278,42 @@ def project_extra(
 
     A row is projected column by column. For each column the running schema carries and
     the row's own recorded version did not, the value is looked up in that row's overflow
-    and written into the column. A row whose version already carried the column is left
-    alone, because the column is where its value already is.
+    and written into the column.
+
+    A row whose version already carried the column is left alone, because the column is
+    where its value already is. A value for such a column sitting in that row's overflow
+    says the parser put it there after the column refused it, which is a vendor retype. The
+    projection refuses to present it and reports it instead. The version's other rows hold
+    the column at the recorded type, one Arrow column cannot hold those values and the
+    retyped ones at once, and casting between them would manufacture values the vendor
+    never sent.
+
+    A retype on one version's rows never withholds a lift another version's rows earned.
+    The lifted value is not in dispute, and the report is what says the column is partial.
 
     The target shape is the running code's, via ``journal.schema_fingerprint``, and the
     candidate columns are the ones a vendor field could have reached, via
     ``journal.extra_paths``. A column outside that set was never in the overflow, so there
-    is nothing to lift.
+    is nothing to lift and nothing the parser could have routed there.
 
     Three things are reported rather than raised, because each leaves the table readable.
 
     1. A version the ledger holds no shape for on this surface.
     2. A value the column refuses.
-    3. A row that simply has nothing in its overflow.
+    3. A column a version's rows routed into the overflow, which is a retype.
+
+    A row that simply has nothing in its overflow is left alone and named by nothing. An
+    empty overflow is the column's normal state, so reporting one would report the ordinary
+    case and drown the three above.
+
+    The price of finding a retype is named rather than hidden. A promotion on its own needs
+    only the rows whose version misses a column, and a retype can sit on any row at a
+    recorded version, so every one of those rows is decoded and asked for each reachable
+    column. A row whose overflow is absent or empty still costs nothing, because such a row
+    is never decoded, which leaves a steady-state read where it was. What pays is a
+    ticker-day the vendor drifted through, measured at about a second per 200,000 chains
+    rows against about a fiftieth of that before. That read is the one this module exists
+    for, so the cost lands where the answer does.
     """
     fingerprint = journal.schema_fingerprint(surface)
     schema = journal.schema_for(surface)
@@ -243,9 +327,15 @@ def project_extra(
     versions = _versions(table)
     extras = table.column(EXTRA_COLUMN).to_pylist()
 
-    # Which columns each version in the table is missing, asked of the ledger once per
-    # version rather than once per row.
+    # Every column a value in an overflow could belong to, which is every column the
+    # running schema carries and a vendor field overflows into. A promotion lifts out of
+    # this set and a retype is found inside it, so both questions are asked of one list.
+    reachable = sorted(column for column in paths if column in fingerprint)
+
+    # Which columns each version in the table is missing, and what shape it recorded,
+    # asked of the ledger once per version rather than once per row.
     targets: dict[int, frozenset[str]] = {}
+    shapes: dict[int, Mapping[str, str]] = {}
     unrecorded: set[int] = set()
     for version in set(versions):
         entry = ledger.get(version)
@@ -258,10 +348,9 @@ def project_extra(
             unrecorded.add(version)
             targets[version] = frozenset()
             continue
+        shapes[version] = entry.fingerprints[surface]
         targets[version] = frozenset(
-            column
-            for column in paths
-            if column in fingerprint and not entry.has_column(surface, column)
+            column for column in reachable if not entry.has_column(surface, column)
         )
 
     # Every column any version in the table is missing, each one's cells started from what
@@ -282,20 +371,26 @@ def project_extra(
 
     filled: dict[str, int] = {}
     refused: dict[tuple[str, int, str], int] = {}
+    routed: dict[tuple[str, int], int] = {}
     # Rows outer, columns inner, so a row's overflow is decoded once however many columns
-    # it feeds. A row whose version misses nothing is never decoded at all.
+    # it feeds. A row at a version the ledger has no shape for is never decoded at all,
+    # because without the shape nothing here can tell a promotion from a retype.
     for row, version in enumerate(versions):
-        missing = targets[version]
-        if not missing:
+        if version in unrecorded:
             continue
         overflow = _overflow(extras[row], row)
         if not overflow:
             continue
-        for column in wanted:
-            if column not in missing:
-                continue
+        missing = targets[version]
+        for column in reachable:
             raw = _lookup(overflow, paths[column])
             if raw is None:
+                continue
+            if column not in missing:
+                # The version carried this column, so the parser wrote the value here
+                # after the column refused it. Presenting it would take a cast.
+                routed_key = (column, version)
+                routed[routed_key] = routed.get(routed_key, 0) + 1
                 continue
             converted, detail = _convert(fields[column].type, raw)
             if detail is not None:
@@ -324,6 +419,15 @@ def project_extra(
             UnfitValue(column=column, schema_version=version, detail=detail, rows=rows)
             for (column, version, detail), rows in sorted(refused.items())
         ),
+        retyped=tuple(
+            RetypedColumn(
+                column=column,
+                schema_version=version,
+                recorded_type=shapes[version][column],
+                rows=rows,
+            )
+            for (column, version), rows in sorted(routed.items())
+        ),
     )
 
 
@@ -332,6 +436,7 @@ __all__ = [
     "VERSION_COLUMN",
     "ExtraProjection",
     "ExtraProjectionError",
+    "RetypedColumn",
     "UnfitValue",
     "project_extra",
 ]
