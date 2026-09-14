@@ -887,6 +887,11 @@ def typed_column(field_type: pa.DataType, values: Sequence[object]) -> pa.Array:
 # ``tests/unit/test_journal_schema.py`` checks by enumeration so a pyarrow upgrade that
 # adds a fifth fails the suite rather than quietly costing a cycle.
 #
+# The name is public because the reader consumes it too. ``extra_projection._convert``
+# offers a value to ``typed_column`` and asks the same question the writer asks, so what a
+# refusal looks like has to be one list. A second copy is how the two drifted apart once
+# already, and the copy was the one that went a family short.
+#
 # 1. ``ArrowInvalid`` is the value Arrow understands and cannot represent, like a
 #    fractional float in an integer column.
 # 2. ``ArrowTypeError`` is the value whose Python type the column will not take at all,
@@ -897,7 +902,7 @@ def typed_column(field_type: pa.DataType, values: Sequence[object]) -> pa.Array:
 #
 # Any other exception is not the value's doing, so it propagates and costs the cycle the
 # way it always did.
-_UNFIT_ERRORS = (pa.ArrowInvalid, pa.ArrowTypeError, OverflowError, UnicodeEncodeError)
+UNFIT_ERRORS = (pa.ArrowInvalid, pa.ArrowTypeError, OverflowError, UnicodeEncodeError)
 
 
 def _fits(field_type: pa.DataType, value: object) -> bool:
@@ -909,7 +914,7 @@ def _fits(field_type: pa.DataType, value: object) -> bool:
     """
     try:
         typed_column(field_type, [value])
-    except _UNFIT_ERRORS:
+    except UNFIT_ERRORS:
         return False
     return True
 
@@ -961,7 +966,7 @@ def _routed_column(
     """
     try:
         return typed_column(field.type, values), ()
-    except _UNFIT_ERRORS:
+    except UNFIT_ERRORS:
         if path is None:
             raise
         unfit = tuple(index for index, value in enumerate(values) if not _fits(field.type, value))

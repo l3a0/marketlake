@@ -247,10 +247,11 @@ def _convert(field_type: pa.DataType, value: object) -> tuple[object, str | None
         return None, f"boolean value in a {field_type} column"
     try:
         converted = journal.typed_column(field_type, [value])
-    # Arrow refuses through ``ArrowInvalid`` or ``ArrowTypeError`` depending on the pair,
-    # and both subclass a builtin, so the builtins are named too. Anything wider would let
-    # a defect in the shared builder read as vendor drift.
-    except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError, ValueError) as exc:
+    # ``journal.UNFIT_ERRORS`` is the writer's own list of the ways that builder refuses
+    # one value, and it is consumed here rather than restated, so the two sides cannot go
+    # a family apart. Anything wider would let a defect in the shared builder read as
+    # vendor drift.
+    except journal.UNFIT_ERRORS as exc:
         return None, f"{type(exc).__name__}: {exc}"
     return converted.to_pylist()[0], None
 
