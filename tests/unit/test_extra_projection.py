@@ -111,8 +111,7 @@ def test_a_row_whose_version_carried_the_column_is_left_exactly_as_written():
 
     A key in the overflow must never win over the column, because above the promotion the
     column is where the parser put the value. The key is not stale, either. It is the
-    routed value of a retype, which is reported rather than filled, and the report is
-    checked where the retypes are.
+    routed value of a retype, so it is reported rather than filled.
     """
     table = _rows(
         _row(2, {"bid": 99.0}, bid=4.25),
@@ -123,6 +122,9 @@ def test_a_row_whose_version_carried_the_column_is_left_exactly_as_written():
 
     assert result.table.column("bid").to_pylist() == [4.25]
     assert result.filled == {}
+    assert result.retyped == (
+        RetypedColumn(column="bid", schema_version=2, recorded_type="double", rows=1),
+    )
 
 
 def test_one_table_spanning_the_boundary_reads_as_one_shape():
@@ -851,6 +853,29 @@ def test_a_retype_leaves_the_table_exactly_as_written():
     assert "n/a" in result.table.column(EXTRA_COLUMN).to_pylist()[0]
 
 
+def test_a_routed_value_that_fits_the_column_is_still_a_retype():
+    """What the value looks like decides nothing. Its key being there is the whole signal.
+
+    ``99.0`` fits a ``double`` column, so a detection that skipped a value the column would
+    accept reports nothing here. That is wrong twice over. The parser writes a known
+    field's name into the overflow for one reason, which is that the column refused that
+    row's value, so the value in hand says nothing about why it was routed. And the case
+    where a routed value fits again is the case where a human has already corrected the
+    schema, which is exactly when an operator wants the span named rather than hidden.
+    """
+    schema = ROW_SCHEMA.append(pa.field("bid", pa.float64()))
+    table = _rows(_row(1, None, bid=4.25), _row(1, {"bid": 99.0}, bid=None), schema=schema)
+
+    result = project_extra(table, surface="chains", ledger=_ledger((1, _shape())))
+
+    assert result.retyped == (
+        RetypedColumn(column="bid", schema_version=1, recorded_type="double", rows=1),
+    )
+    assert result.table.column("bid").to_pylist() == [4.25, None]
+    assert result.filled == {}
+    assert not result.complete
+
+
 def test_a_promotion_is_never_reported_as_a_retype():
     """The ledger tells the two apart, not the key being in the overflow at all.
 
@@ -1142,6 +1167,21 @@ def test_an_overflow_that_is_not_a_json_object_refuses(overflow):
 
     with pytest.raises(ExtraProjectionError, match="row 0"):
         project_extra(table, surface="chains", ledger=_ledger((1, _shape_without("chains", "bid"))))
+
+
+def test_an_overflow_column_that_is_not_a_string_refuses():
+    """``json.loads`` raises ``TypeError`` rather than ``ValueError`` on a non-string.
+
+    Every fixture that feeds a bad overflow feeds a string, which reaches only the
+    ``ValueError`` half of the decode's refusal. An ``extra`` column typed as anything but
+    a string reaches the other half, and a bare ``TypeError`` out of a read is not the
+    clean refusal the error class promises.
+    """
+    schema = pa.schema([(VERSION_COLUMN, pa.int64()), (EXTRA_COLUMN, pa.int64())])
+    table = pa.Table.from_pylist([{VERSION_COLUMN: 1, EXTRA_COLUMN: 5}], schema=schema)
+
+    with pytest.raises(ExtraProjectionError, match="row 0"):
+        project_extra(table, surface="chains", ledger=_ledger((1, _shape())))
 
 
 def test_an_unknown_surface_refuses():

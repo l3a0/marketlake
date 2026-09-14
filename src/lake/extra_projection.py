@@ -20,22 +20,30 @@ routed the value, and the type that version recorded for it.
 What finds a retype is the signature marketlake #129 pins. The parser builds ``extra`` from
 the fields its vendor maps do not name, so a known field's name can never otherwise appear
 there, and its presence on a row whose version carries the column says the column refused
-that row's value. One payload can write that name without routing, a chains contract field
-named ``chain`` carrying a chain-level field's own name, and closing that is
-[#156](https://github.com/l3a0/marketlake/issues/156).
+that row's value. The signature is what says a value was routed, so a value that happens to
+fit the running column is a retype too. What the value looks like decides nothing here,
+because the parser writes a known field's name into the overflow for one reason only.
 
-Two other answers to a retype were weighed and rejected, and
-[#149](https://github.com/l3a0/marketlake/issues/149) is authoritative for both.
+One payload can write that name without routing, and it costs this reader a false report. A
+chains contract field named ``chain`` carrying a chain-level field's own name lands on the
+key those fields nest under, so the projection names a column whose values are present and
+correct and calls the read partial with nothing missing from it. Closing that is
+[#156](https://github.com/l3a0/marketlake/issues/156), which is authoritative for it. The
+trigger is a compound coincidence and nothing observed suggests it is coming.
+
+Two other answers to a retype were weighed, and
+[#149](https://github.com/l3a0/marketlake/issues/149) is authoritative for both. The first
+is rejected outright. The second waits.
 
 1. *Casting the overflow-held values into the running column's type.* Raw is
    vendor-verbatim, so a cast manufactures values that were never observed and hands them
    to a downstream computation with no marker, which is the one outcome nobody can detect
    afterwards. It also has no defensible direction, because the running type is the one the
    vendor stopped honouring, and some retypes have no cast at all.
-2. *An opt-in that hands back both representations.* It waits until a caller asks for it. A
-   retype pages at severity 5 under the schema policy, so it is a thing a human fixes by
-   correcting the schema and bumping the version, rather than a condition a reader copes
-   with forever.
+2. *An opt-in that hands back both representations.* Deferred until a caller asks for it,
+   rather than cut. A retype pages at severity 5 under the schema policy, so it is a thing
+   a human fixes by correcting the schema and bumping the version, rather than a condition
+   a reader copes with forever.
 
 So a promotion splits history in two. The same measurement reads as a column above the
 boundary and as an overflow key below it, and a reader asking for the column sees nulls
@@ -288,12 +296,24 @@ def project_extra(
     ``journal.extra_paths``. A column outside that set was never in the overflow, so there
     is nothing to lift and nothing the parser could have routed there.
 
-    Four things are reported rather than raised, because each leaves the table readable.
+    Three things are reported rather than raised, because each leaves the table readable.
 
     1. A version the ledger holds no shape for on this surface.
     2. A value the column refuses.
     3. A column a version's rows routed into the overflow, which is a retype.
-    4. A row that simply has nothing in its overflow.
+
+    A row that simply has nothing in its overflow is left alone and named by nothing. An
+    empty overflow is the column's normal state, so reporting one would report the ordinary
+    case and drown the three above.
+
+    The price of finding a retype is named rather than hidden. A promotion on its own needs
+    only the rows whose version misses a column, and a retype can sit on any row at a
+    recorded version, so every one of those rows is decoded and asked for each reachable
+    column. A row whose overflow is absent or empty still costs nothing, because such a row
+    is never decoded, which leaves a steady-state read where it was. What pays is a
+    ticker-day the vendor drifted through, measured at about a second per 200,000 chains
+    rows against about a fiftieth of that before. That read is the one this module exists
+    for, so the cost lands where the answer does.
     """
     fingerprint = journal.schema_fingerprint(surface)
     schema = journal.schema_for(surface)

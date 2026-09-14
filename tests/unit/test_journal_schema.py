@@ -1435,10 +1435,9 @@ def test_a_known_fields_name_in_extra_is_the_signature_that_its_column_refused_a
     maps do *not* name, so a known vendor field's name can never reach ``extra`` any other
     way. That makes its presence self-describing, with no marker and no new machinery.
 
-    It is load-bearing twice. It is what #149 keys on, and it is what makes the window
-    before #149 lands safe: without it a routed null and a genuine vendor null look
-    identical, and an operator would reasonably read the column as a field the vendor
-    stopped sending.
+    It is what the read-time refusal keys on. Without it a routed null and a genuine vendor
+    null look identical, and an operator would reasonably read the column as a field the
+    vendor stopped sending.
 
     Both directions are checked, because only one of them would pass on a writer that put
     a known name in ``extra`` on every row.
