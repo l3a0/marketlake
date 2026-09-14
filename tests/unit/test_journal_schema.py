@@ -1671,6 +1671,43 @@ def test_a_retyped_envelope_field_routes_under_the_envelope_block(envelope, colu
     assert (row["bid"], row["pe_ratio"], row["extended_last_price"]) == (649.98, 24.5, 651.0)
 
 
+@pytest.mark.parametrize(
+    ("envelope", "column", "landed"),
+    [
+        ({"realtime": False}, "realtime", False),
+        ({"cusip": ""}, "cusip", ""),
+        ({"reference": {"cusip": ""}}, "cusip", ""),
+    ],
+)
+def test_a_falsy_envelope_value_is_captured_rather_than_read_as_absent(envelope, column, landed):
+    """A false entitlement flag is a fact, and an empty CUSIP is a value the vendor sent.
+
+    Both are read off the envelope by asking whether the key is there, never whether its
+    value is truthy. A truthiness test would drop `realtime: false`, which says the feed is
+    delayed, and record a null that reads as a field the vendor stopped sending. That is the
+    confusion the whole routing exists to keep out of the lake, one level up.
+    """
+    row = _quote_row_with_envelope(**envelope)
+
+    assert row[column] == landed and type(row[column]) is type(landed)
+    assert row["extra"] is None
+
+
+@pytest.mark.parametrize("value", [0, ""])
+def test_a_falsy_retype_of_the_entitlement_flag_routes_like_any_other(value):
+    """The same rule where it costs most: a falsy value the column refuses still routes.
+
+    A truthiness test would drop the value before the column ever saw it, so the column
+    would be null with nothing in ``extra``, which is a retype that left no signature at
+    all. These two are the shapes that reach that path, since every other falsy value the
+    flag could take is a bool the column accepts.
+    """
+    row = _quote_row_with_envelope(realtime=value)
+
+    assert row["realtime"] is None
+    assert json.loads(row["extra"]) == {"envelope": {"realtime": value}}
+
+
 def test_a_contract_field_named_like_a_chain_level_one_stays_apart_from_it():
     """Why the chain-level values nest rather than sitting flat beside the contract's.
 
@@ -1719,7 +1756,9 @@ def test_a_contract_field_named_chain_refuses_the_row_rather_than_merging_into_i
         underlyingPrice="six hundred and fifty",
     )
 
-    with pytest.raises(ValueError, match="collides with the overflow block"):
+    # The message names the vendor's key first, because that is the one an operator reads
+    # off the gap reason to find the field that collided.
+    with pytest.raises(ValueError, match="named 'chain' collides with the overflow block"):
         journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
 
 
@@ -1920,6 +1959,30 @@ def test_a_value_this_code_put_on_a_gap_row_never_routes():
         )
 
 
+def test_one_column_refusing_on_both_row_kinds_routes_neither():
+    """The rule is every refusal on a data row, not some refusal on a data row.
+
+    One column can refuse in two places at once, a contract's drifted value and an absence
+    marker's, and then the batch carries a refusal this code owns beside one the vendor
+    does. Routing on the strength of the vendor's would strip the marker of the one fact it
+    exists to name and stamp a data row's drift signature on a gap. So the whole batch
+    refuses, and this code's bug surfaces as this code's bug.
+
+    Checking that any refusal sits on a data row would pass every other test in this file,
+    because each of them puts every refusal on one kind of row.
+    """
+    with pytest.raises(pa.ArrowTypeError):
+        journal.chains_data_batch(
+            _chain_of(_full_contract(expirationDate=20260918)),
+            ticker="SPY",
+            snap_ts=SNAP,
+            fetch_ts=FETCH,
+            absent_markers=[
+                journal.AbsentMarker("2026-09-13", None, "chain_chunk_failed", 20260918)
+            ],
+        )
+
+
 def test_the_marker_a_gap_row_names_still_lands_when_it_is_the_right_type():
     """The control for the refusal above, so it is not a builder broken outright."""
     slot = datetime.fromisoformat("2026-09-13T16:00:00-04:00")
@@ -2080,6 +2143,10 @@ def test_the_overflow_serializes_the_same_bytes_however_the_payload_was_ordered(
     been merged in as well as on the fail-open's own output. A routed key added last would
     otherwise serialize last, and the same contract arriving with its fields in a different
     order would write different bytes for the same facts.
+
+    Both surfaces are driven, because each dumps its own overflow. The routed merge re-dumps
+    a row it touches, so a quotes row that never routed is the one whose bytes come straight
+    off the fail-open's dump and nothing else would see it.
     """
     # The fail-open's own output, from two payloads that differ only in key order.
     first = _chain_row(zzzNewField=1, aaaNewField=2)
@@ -2089,6 +2156,22 @@ def test_the_overflow_serializes_the_same_bytes_however_the_payload_was_ordered(
     # dump would put the routed key last instead.
     merged = _chain_row(zzzNewField=1, openInterest=1234.7)
     assert merged["extra"] == '{"openInterest": 1234.7, "zzzNewField": 1}'
+    # The quotes surface, whose overflow nests, so both the block keys and the keys inside
+    # one block have to sort.
+    first = _quote_row("quote", zzzNewStat=1, aaaNewStat=2)
+    second = _quote_row("quote", aaaNewStat=2, zzzNewStat=1)
+    assert first["extra"] == second["extra"] == '{"quote": {"aaaNewStat": 2, "zzzNewStat": 1}}'
+    blocks = journal.quotes_data_batch(
+        dict(
+            _quote_with("extended", zzzNewStat=1),
+            **{"fundamental": dict(QUOTE["fundamental"], aaaNewStat=2)},
+        ),
+        ticker="SPY",
+        snap_ts=SNAP,
+        fetch_ts=FETCH,
+        vendor_quote_ts=VENDOR,
+    ).to_pylist()[0]
+    assert blocks["extra"] == ('{"extended": {"zzzNewStat": 1}, "fundamental": {"aaaNewStat": 2}}')
 
 
 # -- the version stamp on every row ------------------------------------------
