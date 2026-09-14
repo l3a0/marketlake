@@ -168,7 +168,7 @@ STATUS_CAPTURED = "captured"  # a data cycle landed
 STATUS_SUSPECT = "suspect"  # a data cycle landed, flagged for the battery to judge
 STATUS_GAP = "gap"  # a gap row records the missed minute and its reason
 STATUS_MISSING = "missing"  # a past slot with no row at all, not even a gap marker
-STATUS_PENDING = "pending"  # a slot still in the future as of the injected clock
+STATUS_PENDING = "pending"  # a slot whose cycle may still be running, so not yet judged
 STATUS_OUT_OF_SCOPE = "out_of_scope"  # a slot before the ticker's capture_start epoch
 STATUSES = (
     STATUS_CAPTURED,
@@ -178,6 +178,19 @@ STATUSES = (
     STATUS_PENDING,
     STATUS_OUT_OF_SCOPE,
 )
+
+# How long after a slot before its absence means anything. The cycle that owes a slot
+# starts at the top of that minute and has to fetch, journal and fsync before any row
+# exists, so the slot instant is not the moment a row was owed. A slot is judged only
+# once its own minute has ended and one further minute has passed on top. That second
+# minute covers two things. It covers a cycle that overruns its minute, which the loop
+# treats as an ordinary slow sample rather than a failure, and it covers the page's own
+# 60-second refresh landing between the write and the read. Judging any sooner makes the
+# verdict flap. A slot called missing while its cycle is still running flips to captured
+# on the next refresh, and a cell that goes grey and then green reads worse than the
+# premature verdict it replaced. This is the span and the reasoning the static page
+# already uses for a stale stamp, applied to the other question of the same shape.
+SLOT_VERDICT_GRACE = timedelta(minutes=2)
 
 # The static page, shipped inside the package so it works offline.
 STATUS_PAGE = "status.html"
@@ -1280,8 +1293,10 @@ def query_today(
     gap reason it carried. A slot with data rows beside a gap marker, a partial chain
     snapshot, reads captured, or suspect when a row carries the suspect flag, and still
     carries the marker's class among its reasons. A slot with no rows at all is pending
-    when it falls after the injected clock, never missing. A slot before the ticker's
-    ``capture_start`` epoch is out of scope, neither missing nor pending. Data rows win
+    until ``SLOT_VERDICT_GRACE`` has run out past it, never missing, so the minute being
+    captured right now is not accused of a marker its cycle has not had time to write.
+    A slot before the ticker's ``capture_start`` epoch is out of scope, neither missing
+    nor pending. Data rows win
     over both of those, so a real cycle is never hidden. A gap row wins over pending but
     not over out of scope, because the design pins minutes before the epoch as out of
     scope and never gaps.
@@ -1354,13 +1369,18 @@ def _strip(
        covers a slot before the first span, after a closed one, and between two spans
        following a retirement and a rejoin.
     3. A slot with gap rows is a gap.
-    4. A slot after the injected instant is pending.
+    4. A slot whose verdict grace has not run out against the injected instant is
+       pending. That covers a slot still in the future and the recent past alike, so a
+       cycle still fetching is never called absent.
     5. Anything else is missing.
 
     ``spans`` empty means no scope clamp: every slot is in scope.
     """
     by_slot = {agg.slot_ms: agg for agg in aggregates}
-    now_ms = _slot_ms(now)
+    # The instant a slot must be at or before to be judged at all. Slots after it are
+    # still owed rather than absent, so the strip says pending instead of accusing a
+    # cycle that has not finished running.
+    judgeable_ms = _slot_ms(now - SLOT_VERDICT_GRACE)
     cells: list[dict[str, object]] = []
     counts = dict.fromkeys(STATUSES, 0)
     for slot in slots:
@@ -1375,7 +1395,7 @@ def _strip(
         elif agg is not None:
             status = agg.status
         else:
-            status = STATUS_PENDING if key > now_ms else STATUS_MISSING
+            status = STATUS_PENDING if key > judgeable_ms else STATUS_MISSING
         counts[status] += 1
         cells.append(
             {
@@ -1794,6 +1814,7 @@ __all__ = [
     "QUERY_MEMORY_LIMIT",
     "QUERY_THREADS",
     "ROUTES",
+    "SLOT_VERDICT_GRACE",
     "STATUSES",
     "DashboardService",
     "NamedQuery",
