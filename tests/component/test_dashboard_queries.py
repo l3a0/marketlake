@@ -506,6 +506,21 @@ def test_the_stamp_keeps_landing_while_the_ping_starves(root: Path):
     assert now["dead_man_starved"] is True
 
 
+def test_a_ping_exactly_at_the_grace_has_not_passed_it(root: Path):
+    """The check is starving *past* the grace, so the grace itself is still inside it.
+
+    healthchecks goes down once the grace has elapsed, not as it elapses. A test here
+    keeps the comparison strict, because loosening it to ``>=`` changes nothing a reader
+    would notice and moves the line one minute early on every reading.
+    """
+    # NOW is 09:40:30, so these pings are exactly 5.0 and 5.1 minutes old.
+    stamp_ping(root, at=et(MONDAY, 9, 35, 30))
+    assert service_over(root).run_query("now", {})["dead_man_starved"] is False
+
+    stamp_ping(root, at=et(MONDAY, 9, 35, 24))
+    assert service_over(root).run_query("now", {})["dead_man_starved"] is True
+
+
 def test_a_check_that_starved_while_owed_stays_loud_after_the_window_shuts(root: Path):
     """A starved check does not stop being starved when the expectation window closes.
 
