@@ -61,6 +61,12 @@ Review by fanning out independent lenses, then verifying each finding adversaria
 
 Verify by executing, not by reading. Mutate the code and confirm a test fails. A test that still passes under mutation does not cover what it claims to cover. Say plainly what the review found and what it refuted, including when it found nothing.
 
+**A filed issue carries its milestone and its labels (owner directive, 2026-09-14).** Filing is not finished when the issue exists. An issue with no milestone appears in no slice view and no filtered list, so it is invisible until someone sweeps for nulls, and nothing brings it back on its own. Three arrived that way in a single day, each from a session told to file what it found and nothing further: #143, then #145 and #146. The sessions did exactly what was asked, which is why the rule belongs here rather than in a reminder.
+
+So an issue is finished when it says three things. Which slice owns it, through a milestone. What kind of work it is, through a label. And what it waits on, through a dependency, where it waits on anything. No automation supplies the first two. A project's auto-add makes an untriaged issue visible and does not triage it, and nothing infers which slice a gap belongs to.
+
+The same applies to an issue a spawned session is told it may file. The instruction to file carries the instruction to triage, or the work lands where nothing will look for it.
+
 **Close an issue only when nothing is left in it (owner directive, 2026-09-12).** Before a PR closes an issue, move whatever that PR does not do into its own issue. A piece described only inside a body goes when the body closes, and nothing surfaces it again. Two issues have already gone that way, and in both the closing PR's own text named the work it was leaving. #101 was closed by the PR that did half of it. #85 opened with `Closes #77.` and then said a later PR would drop the column, whose remainder survives only because #96 was filed for it afterwards.
 
 While a piece is outstanding, a PR writes `Part of #NN` and the closing keyword waits for the PR that leaves nothing. GitHub reads the keyword only when the number follows it immediately, so `Closes #101` closes and `Closes the second half of #101` closes nothing at all. #109 wrote the second form and linked no issue.
