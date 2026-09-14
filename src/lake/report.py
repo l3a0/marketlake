@@ -35,12 +35,18 @@ Three rules hold for everything written here, and each has a failure behind it.
    a producer the dispatcher serves once per day, and a restart that serves the day again
    writes under a new pid. ``alert._record`` needs more and adds a per-message sequence,
    because one cycle can raise several pages at one instant.
+
+The second producer is compaction's merge. It compares a ticker-day's merged segments to
+the pinned schema at the one moment the segments still exist, and files what moved. That
+finding has no alerting value until D20 renders it, and forensic value from the day it
+lands, because the merged schema is gone the moment the seal unlinks the segments.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 
@@ -51,6 +57,60 @@ from lake.paths import DATE_PREFIX, REPORTS_DIR
 # The close+5 guard's own subdirectory under ``reports/``. Its own, and deliberately not
 # ``alerts/``, per rule 2 above.
 CLOSE_GUARD_DIR = "close_guard"
+
+# Compaction's merge-time schema check. Its own subdirectory, per rule 2 above, so a
+# drifted ticker-day never counts as a page that failed to send.
+SCHEMA_DRIFT_DIR = "schema_drift"
+
+
+@dataclass(frozen=True)
+class SchemaDrift:
+    """One ticker-day whose merged segments do not carry the pinned schema.
+
+    ``GuardOutcome`` lives in ``close_guard`` and this record lives here, and the
+    asymmetry is the import direction. The guard's producer never learns about this
+    module, because the daemon wires the two together. Compaction's producer is inside
+    ``_seal``, so ``compact`` imports this module directly and a record defined there
+    would close the loop. The dataclass carries strings and dates alone, which keeps
+    pyarrow out of the module that writes JSON.
+
+    The three difference fields say what moved, each naming columns rather than counting
+    them, because a human reading the file wants the column.
+
+    ``unexpected`` is a merged column the pinned schema has no place for, and it is the
+    field that catches the shape nothing else can. A daemon that restarts mid-session
+    onto code that *dropped* a column leaves the day's earlier segments carrying it and
+    its later ones without it, and the merge fills the gap with nulls. Compaction runs
+    the code that dropped it, so the column the merged table carries is one the pinned
+    schema no longer names, and that mismatch is the whole of the evidence. After the
+    seal there is none: the sealed partition holds the column with nulls on the
+    post-rotation rows, which reads exactly like a vendor that stopped sending it.
+
+    ``missing`` is a pinned column no segment carried, the same accident with the code
+    versions the other way round. It has no repair either, because the values were never
+    written, but it does survive the seal, since the partition carries one fewer column
+    than the schema forever.
+
+    ``retyped`` is a column every segment agreed on at a type the pinned schema does not
+    hold, rendered ``name: pinned -> merged``. A retype the segments *disagree* on never
+    reaches here, because the merge itself refuses it.
+
+    All three can be empty. The producer decides there is a difference by comparing the
+    two schemas outright and these fields explain it, so a difference the names and the
+    types do not show, a nullability change being the one that can reach here, files a
+    record that names the ticker-day and lists nothing. That is still the finding: the
+    merged schema was not the pinned one and this says which day to go and look at.
+    """
+
+    surface: str
+    ticker: str
+    day: date
+    partition: str
+    schema_version: int
+    missing: tuple[str, ...] = ()
+    unexpected: tuple[str, ...] = ()
+    retyped: tuple[str, ...] = ()
+    segments: tuple[str, ...] = field(default_factory=tuple)
 
 
 def close_guard_dir(lake_root: Path | str, day: date) -> Path:
@@ -115,6 +175,71 @@ def write_close_guard(
     return path
 
 
+def schema_drift_dir(lake_root: Path | str, day: date) -> Path:
+    """Where one session day's merge-time schema findings are filed.
+
+    Keyed on the ticker-day the merge was sealing, not the instant compaction ran. Those
+    differ by hours on a swept date a failed earlier run left behind, and the day a
+    reader asking "what happened on the 2nd" wants is the day the rows belong to.
+    """
+    return Path(lake_root) / REPORTS_DIR / SCHEMA_DRIFT_DIR / f"{DATE_PREFIX}{day.isoformat()}"
+
+
+def write_schema_drift(
+    lake_root: Path | str,
+    drift: SchemaDrift,
+    *,
+    now: datetime,
+    pid: int | None = None,
+) -> Path:
+    """File one drifted ticker-day, and hand back the path it landed at.
+
+    **A clean merge writes nothing.** The close+5 guard files on every run, because it
+    runs once a day and an absent file would be ambiguous between "found nothing" and
+    "never ran". Compaction has no such ambiguity to resolve. It seals hundreds of
+    ticker-days a run and appends a manifest entry for each, so the manifest already
+    says which ticker-days were merged. A file per ticker-day per run would be hundreds
+    of empty findings a day, and the reader would have to filter them all back out.
+
+    **Raises rather than swallowing.** The caller contains it, because a raise out of
+    ``_seal`` would cost the rest of the sweep, and the containment belongs where that
+    blast radius is, not here. Hiding the failure inside the writer would take it away
+    from every caller, including a test that wants to see a write fail.
+
+    The name carries the surface and the ticker as well as the stamp and the pid. One
+    sweep can find drift on several ticker-days, and the stamps that separate them are
+    microseconds apart, so the name says which finding it is without opening it.
+    """
+    pid = os.getpid() if pid is None else pid
+    eastern = now.astimezone(MARKET_TZ)
+    entry = {
+        "at": eastern.isoformat(),
+        "day": drift.day.isoformat(),
+        "surface": drift.surface,
+        "ticker": drift.ticker,
+        "partition": drift.partition,
+        "schema_version": drift.schema_version,
+        "missing": list(drift.missing),
+        "unexpected": list(drift.unexpected),
+        "retyped": list(drift.retyped),
+        "segments": list(drift.segments),
+    }
+    # A report is written inside a lake that exists, or not at all. The same rule as
+    # ``write_close_guard`` above, and for the same reason: `parents=True` from a missing
+    # root would create the lake itself and turn "lake root missing" into a green check.
+    root = Path(lake_root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"lake root missing: {root}")
+    directory = schema_drift_dir(root, drift.day)
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = eastern.strftime("%H%M%S%f")
+    path = directory / f"{stamp}-{drift.surface}-{drift.ticker}-{pid}.json"
+    with open(path, "x", encoding="utf-8") as handle:
+        json.dump(entry, handle, sort_keys=True)
+        handle.write("\n")
+    return path
+
+
 def _redacted(problem: str) -> str:
     """One of the guard's problems, with any exception message dropped.
 
@@ -141,6 +266,10 @@ def _redacted(problem: str) -> str:
 
 __all__ = [
     "CLOSE_GUARD_DIR",
+    "SCHEMA_DRIFT_DIR",
+    "SchemaDrift",
     "close_guard_dir",
+    "schema_drift_dir",
     "write_close_guard",
+    "write_schema_drift",
 ]

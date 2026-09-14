@@ -506,11 +506,11 @@ One rule places every test. Apply it in order and stop at the first match.
 13. Synthetic split replay.
 14. Restore from backup.
 
-Five of those have no test today. `tests/integration/` holds four files, and the rest of
-the roster is served at the component level, which is fine for the ones that need no real
-process to die partway. Test 4 is the first test in any tier to kill a running process,
-and the child it kills is `tests/support/compaction_child.py`. The five split into two
-kinds.
+Five of those have no test today. `tests/integration/` holds five files, three of them
+roster items, and the rest of the roster is served at the component level, which is fine
+for the ones that need no real process to die partway. Test 4 is the first test in any
+tier to kill a running process, and the child it kills is
+`tests/support/compaction_child.py`. The five split into two kinds.
 
 Three are buildable now, and each covers a failure the unit and component suites cannot
 reach:

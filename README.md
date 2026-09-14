@@ -51,8 +51,8 @@ Tests sit in one folder per tier, matching the build plan's placement rule.
   enforcement guards.
 - `tests/component` crosses exactly one real boundary: the real filesystem, or the
   real dependency behind a seam.
-- `tests/integration` wires two or more subsystems through real boundaries. It is
-  empty until the slice-1 cycle test lands at D7.
+- `tests/integration` wires two or more subsystems through real boundaries. It is also
+  where a test that needs a second real process lives.
 
 ## Develop
 
