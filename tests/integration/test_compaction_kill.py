@@ -362,7 +362,8 @@ def test_a_killed_compaction_recovers_byte_identical(
     # rebuild lands on a new inode even when it happens to produce the same bytes. This
     # detector therefore rests on that rename, which is why the manifest line count below
     # is asserted beside it rather than instead of it. Either one alone would miss a case
-    # the other catches.
+    # the other catches. That rename is covered by ``tests/component/test_partition_write.py``,
+    # so taking it away fails there rather than quietly disarming this detector.
     killed_identity = _identity(partition)
 
     # The kernel dropped the killed process's lock, so the next run is not wedged.
