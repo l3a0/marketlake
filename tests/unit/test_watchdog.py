@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -514,3 +514,276 @@ def test_a_different_cause_still_pages_on_its_own_transition():
         )
     )
     assert [page.title for page in switched] == ["Capture down: rate limited"]
+
+
+# -- a cause speaks for the surfaces it named ----------------------------------------
+
+
+def _rate_limited(minute: int, *, spy_chains_returns: bool) -> CycleResult:
+    """One minute of a rate limit, with ``chains SPY`` either producing or gapping.
+
+    ``chains SPY`` is the surface that comes and goes. ``chains QQQ`` and ``quotes SPY``
+    gap every minute of the episode.
+    """
+    spy = (
+        _seg("chains", "SPY", "data") if spy_chains_returns else _fail("chains", "SPY", "http_429")
+    )
+    return _cycle(
+        spy,
+        _fail("chains", "QQQ", "http_429"),
+        _fail("quotes", "SPY", "http_429"),
+        at=_at(minute),
+    )
+
+
+def test_a_flapping_surface_does_not_re_page_the_cause():
+    """One rate limit that runs all session is one condition, not one per flap.
+
+    A cause speaks for every surface it named, and that used to outlive the cause
+    itself. One surface producing dropped the cause while the others stayed suppressed,
+    so the next run of dead minutes paged the same rate limit again. A full session of
+    that spends the whole 40-a-day cap restating the first page.
+    """
+    watchdog = Watchdog()
+    raised = []
+    # Three dead minutes open the episode and page the cause.
+    for minute in range(3):
+        raised += watchdog.observe(_rate_limited(minute, spy_chains_returns=False))
+    assert [page.title for page in raised] == ["Capture down: rate limited"]
+    # Ten flaps of chains SPY, each with three dead minutes behind it, which is long
+    # enough to re-arm every gate the first page passed.
+    for cycle in range(10):
+        start = 3 + cycle * 4
+        raised += watchdog.observe(_rate_limited(start, spy_chains_returns=True))
+        for minute in range(start + 1, start + 4):
+            raised += watchdog.observe(_rate_limited(minute, spy_chains_returns=False))
+    assert [page.title for page in raised] == ["Capture down: rate limited"]
+
+
+def test_a_partial_recovery_keeps_the_cause_live_over_the_surfaces_still_dead():
+    """One surface coming back sends no page, and it does not clear the cause either.
+
+    The design pages once on the transition and then stays quiet, so one surface coming
+    back says nothing new to an operator whose remedy has not changed. What it must leave
+    behind is correct state. The cause still counts the surfaces that are still down, and
+    no longer counts the one that returned.
+    """
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(3):
+        raised += watchdog.observe(_rate_limited(minute, spy_chains_returns=False))
+    assert [page.title for page in raised] == ["Capture down: rate limited"]
+    # chains SPY returns every third minute for the rest of the episode.
+    for minute in range(3, 30):
+        raised += watchdog.observe(_rate_limited(minute, spy_chains_returns=minute % 3 == 0))
+    assert [page.title for page in raised] == ["Capture down: rate limited"]
+    assert watchdog._paged_causes == {
+        "Capture down: rate limited": {Surface("chains", "QQQ"), Surface("quotes", "SPY")}
+    }
+
+
+def test_a_surface_failing_a_way_another_cause_names_pages_on_its_own():
+    """A token dying inside a rate limit is the failure that must still page.
+
+    The rate-limit page explains a 429. It explains nothing about a 401, so covering the
+    surface any longer would hide a dead token behind a page about something else, for
+    as long as the rate limit lasted.
+    """
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(6):
+        raised += watchdog.observe(_rate_limited(minute, spy_chains_returns=False))
+    assert [page.title for page in raised] == ["Capture down: rate limited"]
+    # chains SPY returns while chains QQQ escalates to a dead token. quotes SPY is still
+    # rate limited, so the cause still covers it and stays quiet about it.
+    for minute in range(6, 10):
+        raised += watchdog.observe(
+            _cycle(
+                _seg("chains", "SPY", "data"),
+                _fail("chains", "QQQ", "http_401"),
+                _fail("quotes", "SPY", "http_429"),
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in raised] == [
+        "Capture down: rate limited",
+        "Capture down: QQQ chains",
+    ]
+    # chains QQQ is still down, so the cause that named it has not lifted and still
+    # counts it. What changed is that the cause no longer speaks for how it is failing.
+    assert watchdog._paged_causes == {
+        "Capture down: rate limited": {Surface("chains", "QQQ"), Surface("quotes", "SPY")}
+    }
+
+
+def test_a_new_class_under_the_same_title_keeps_the_surface_quiet():
+    """The release compares titles, because one outage arrives under several classes.
+
+    A dead refresh token arrives as ``http_401`` while the cached access token still
+    works, and as ``vendor_auth_error`` once the refresh fails. Comparing raw classes
+    would read that switch as a new failure and page the same dead token a second time,
+    which is what the one-page rule for a cause exists to stop.
+    """
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(3):
+        raised += watchdog.observe(
+            _cycle(
+                _fail("chains", "SPY", "http_401"),
+                _fail("chains", "QQQ", "http_401"),
+                _fail("quotes", "SPY", "http_401"),
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in raised] == ["Capture down: token dead"]
+    # chains SPY returns, and chains QQQ switches to the other shape of the same death.
+    for minute in range(3, 8):
+        raised += watchdog.observe(
+            _cycle(
+                _seg("chains", "SPY", "data"),
+                _fail("chains", "QQQ", "vendor_auth_error"),
+                _fail("quotes", "SPY", "http_401"),
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in raised] == ["Capture down: token dead"]
+    assert watchdog._paged_causes == {
+        "Capture down: token dead": {Surface("chains", "QQQ"), Surface("quotes", "SPY")}
+    }
+
+
+def test_a_failure_no_cause_names_does_not_lift_the_cause():
+    """An ordinary transient failure during an outage is not the outage ending.
+
+    Timeouts and 5xx are expected while capture is down, and the remedy for the outage
+    does not change when one arrives. Treating a blip as the cause lifting would re-arm
+    the cause and page the same dead token again, once per blip, until the daily cap ran
+    out. Measured on a 390-minute session with a blip minute every tenth minute, that is
+    42 pages for one dead token against a cap of 40.
+    """
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(390):
+        error_class = "timeout" if minute >= 3 and minute % 10 == 0 else "http_401"
+        raised += watchdog.observe(
+            _cycle(
+                _fail("chains", "SPY", error_class),
+                _fail("chains", "QQQ", error_class),
+                _fail("quotes", "SPY", error_class),
+                at=_at(0) + timedelta(minutes=minute),
+            )
+        )
+    assert [page.title for page in raised] == ["Capture down: token dead"]
+    assert watchdog._paged_causes == {
+        "Capture down: token dead": {
+            Surface("chains", "SPY"),
+            Surface("chains", "QQQ"),
+            Surface("quotes", "SPY"),
+        }
+    }
+
+
+def test_a_retired_ticker_does_not_strand_its_cause():
+    """A cause must not be held live by a surface nobody captures any more.
+
+    A ticker retired mid-session stops appearing in cycles, which the daemon supports.
+    Nothing about that surface changes again, so a cause that kept counting it would
+    never re-arm, and the next genuine outage under the same title would page nobody for
+    the rest of the session.
+    """
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(3):
+        raised += watchdog.observe(
+            _cycle(
+                _fail("chains", "SPY", "http_401"),
+                _fail("chains", "QQQ", "http_401"),
+                _fail("quotes", "SPY", "http_401"),
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in raised] == ["Capture down: token dead"]
+    # chains QQQ is retired. The other two recover, which leaves the cause holding only
+    # a surface no cycle will ever touch again.
+    for minute in range(3, 6):
+        watchdog.observe(
+            _cycle(_seg("chains", "SPY", "data"), _seg("quotes", "SPY", "data"), at=_at(minute))
+        )
+    assert watchdog._paged_causes == {}
+    # A second, genuinely separate token death still pages.
+    for minute in range(6, 10):
+        raised += watchdog.observe(
+            _cycle(
+                _fail("chains", "SPY", "http_401"),
+                _fail("quotes", "SPY", "http_401"),
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in raised] == [
+        "Capture down: token dead",
+        "Capture down: token dead",
+    ]
+
+
+def test_a_cause_pages_again_on_the_next_session_date():
+    """A counter measures consecutive session minutes, and so does a cause.
+
+    An outage still open next morning is worth a page that morning. Carrying a paged
+    cause overnight would silence the new session's first page, which is the failure the
+    counters are already protected from.
+    """
+    watchdog = Watchdog()
+    first = []
+    for minute in range(4):
+        first += watchdog.observe(
+            _cycle(
+                _fail("chains", "SPY", "http_429"),
+                _fail("quotes", "SPY", "http_429"),
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in first] == ["Capture down: rate limited"]
+    second = []
+    for minute in range(4):
+        second += watchdog.observe(
+            _cycle(
+                _fail("chains", "SPY", "http_429"),
+                _fail("quotes", "SPY", "http_429"),
+                at=_at(minute, day=3),
+            )
+        )
+    assert [page.title for page in second] == ["Capture down: rate limited"]
+
+
+def test_a_surface_that_paged_yesterday_pages_again_today():
+    # The sibling of the rule above, one surface at a time. A gap still open next
+    # morning pages again then.
+    watchdog = Watchdog()
+    first = [watchdog.observe(_cycle(_seg("chains", "SPY", "gap"), at=_at(i))) for i in range(4)]
+    assert [len(pages) for pages in first] == [0, 0, 1, 0]
+    second = [
+        watchdog.observe(_cycle(_seg("chains", "SPY", "gap"), at=_at(i, day=3))) for i in range(4)
+    ]
+    assert [len(pages) for pages in second] == [0, 0, 1, 0]
+
+
+def test_a_slept_through_slot_stays_quiet_under_a_live_cause():
+    """An overrun during a whole-daemon outage is the outage, not a second finding.
+
+    ``missed`` charges the minutes the loop never ran a cycle for. Nothing was attempted
+    in them, so they say nothing about how a surface is failing, and a live cause still
+    speaks for every surface it named.
+    """
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(3):
+        raised += watchdog.observe(
+            _cycle(
+                _fail("chains", "SPY", "http_401"),
+                _fail("quotes", "SPY", "http_401"),
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in raised] == ["Capture down: token dead"]
+    watched = [Surface("chains", "SPY"), Surface("quotes", "SPY")]
+    assert watchdog.missed(watched, [_at(minute) for minute in range(3, 9)]) == []

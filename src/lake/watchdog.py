@@ -16,6 +16,13 @@ until a durable cycle resets the counter, and re-arms when one does. A flapping 
 can therefore page many times an hour, which is the honest signal rather than a
 comfortable one.
 
+One failure can take every surface down at once, such as a dead token or a rate
+limit. The watchdog calls that a cause, pages it once under its own title, and then
+suppresses the pages of every surface it named. That suppression ends one surface at a
+time, and the cause re-arms only when the last of them is back. So a rate limit that
+runs all session stays one condition, and one surface returning and dying again never
+re-pages the cause.
+
 One case collapses. Every quotes ticker shares one batched request, so all quotes
 counters tripping in the same minute means the sampler died rather than N tickers
 dying at once. That sends one page naming the sampler, never one page per ticker.
@@ -95,7 +102,10 @@ class Watchdog:
         self._page_minutes = page_minutes
         self._counts: dict[Surface, int] = {}
         self._day: date | None = None
-        self._paged_causes: set[str] = set()
+        # A cause maps to the surfaces its page covers. A surface leaves that set when
+        # it produces data, when it starts failing a way another cause names, or when
+        # the roster drops it. A cause whose set empties is dropped, which re-arms it.
+        self._paged_causes: dict[str, set[Surface]] = {}
         self._paged: set[Surface] = set()
 
     def _threshold(self) -> int:
@@ -133,11 +143,17 @@ class Watchdog:
             self._reset(key)
         for key in sorted(failed, key=str):
             self._counts[key] = self._counts.get(key, 0) + 1
+        titles = {
+            Surface(segment.surface, segment.ticker): _WHOLE_DAEMON_CAUSES.get(segment.error_class)
+            for segment in result.segments
+            if Surface(segment.surface, segment.ticker) in failed
+        }
+        self._release_retired(touched)
         threshold = self._threshold()
         cause = self._whole_daemon(result, failed, touched, threshold)
         if cause is not None:
             return cause
-        return self._pages(failed, touched, attempted=True, threshold=threshold)
+        return self._pages(failed, touched, attempted=True, threshold=threshold, titles=titles)
 
     def missed(self, surfaces: Iterable[Surface], slots: Sequence[datetime]) -> list[Page]:
         """Charge a run of slept-through slots, one increment per slot.
@@ -159,7 +175,13 @@ class Watchdog:
             # Nothing was attempted for these minutes, so a quotes fan-out here says the
             # loop overran rather than that the shared request failed.
             pages.extend(
-                self._pages(set(watched), set(watched), attempted=False, threshold=threshold)
+                self._pages(
+                    set(watched),
+                    set(watched),
+                    attempted=False,
+                    threshold=threshold,
+                    titles={},
+                )
             )
         return pages
 
@@ -201,8 +223,7 @@ class Watchdog:
             return []
         if any(self._counts.get(key, 0) < threshold for key in failed):
             return None
-        self._paged_causes.add(title)
-        self._paged.update(failed)
+        self._paged_causes[title] = set(failed)
         return [
             Page(
                 title=title,
@@ -232,12 +253,65 @@ class Watchdog:
     def _reset(self, key: Surface) -> None:
         self._counts[key] = 0
         self._paged.discard(key)
-        # A surface producing again means whatever took the whole daemon down has
-        # lifted, so the cause re-arms with the counters.
-        self._paged_causes.clear()
+        # This surface is back, so no cause covers it now. A cause that named others is
+        # still true of them and stays live until the last one returns.
+        self._release(key)
+
+    def _release(self, key: Surface) -> None:
+        """Take one surface out of the causes covering it, dropping one that empties.
+
+        A cause with no surfaces left has nothing to explain, so dropping it re-arms it.
+        Only two things bring a surface here: it produced data, or the roster dropped it.
+        A surface that merely started failing another way is still down, so the cause
+        that named it has not lifted and keeps it.
+        """
+        for title in list(self._paged_causes):
+            held = self._paged_causes[title]
+            if key not in held:
+                continue
+            held.discard(key)
+            if not held:
+                del self._paged_causes[title]
+
+    def _release_retired(self, touched: set[Surface]) -> None:
+        """Stop covering a surface the roster has dropped.
+
+        A ticker retired mid-session stops appearing in cycles, which is a supported
+        path. Nothing about that surface ever changes again, so a cause that kept
+        covering one would never re-arm, and the next genuine outage under the same
+        title would page nobody for the rest of the session.
+
+        A cycle that touched nothing at all is an empty roster rather than a retired
+        one. It is evidence about no surface, so it releases none.
+        """
+        if not self._paged_causes or not touched:
+            return
+        for key in {key for held in self._paged_causes.values() for key in held}:
+            if key not in touched:
+                self._release(key)
+
+    def _covered(self, key: Surface, title: str | None) -> bool:
+        """Whether a live cause speaks for how this surface is failing right now.
+
+        ``title`` is the cause this minute's failure resolves to, or ``None`` when it
+        resolves to no cause and when nothing was attempted. A cause covers the surface
+        it named while that surface keeps failing its way, and an ordinary transient
+        failure counts as still covered. The one thing that lifts the cover is the
+        surface failing a way some other cause names, because that is a different outage
+        with a different remedy, and the operator has to hear it.
+        """
+        return any(
+            key in held and title in (None, cause) for cause, held in self._paged_causes.items()
+        )
 
     def _pages(
-        self, failed: set[Surface], watched: set[Surface], *, attempted: bool, threshold: int
+        self,
+        failed: set[Surface],
+        watched: set[Surface],
+        *,
+        attempted: bool,
+        threshold: int,
+        titles: dict[Surface, str | None],
     ) -> list[Page]:
         """The pages this minute owes, collapsing a dead sampler into one.
 
@@ -253,7 +327,9 @@ class Watchdog:
         tripped = [
             key
             for key in sorted(failed, key=str)
-            if self._counts.get(key, 0) >= threshold and key not in self._paged
+            if self._counts.get(key, 0) >= threshold
+            and key not in self._paged
+            and not self._covered(key, titles.get(key))
         ]
         if not tripped:
             return []
