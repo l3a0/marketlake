@@ -148,16 +148,19 @@ QUERY_MEMORY_LIMIT = "2GB"
 MAX_LOOKBACK_SESSIONS = 10
 
 # The dead-man's last-owed walk. It steps back a day at a time looking for the newest
-# expectation window that has already run, and a weekend is the longest run of days
-# carrying none, so four days reaches past one with a day to spare. The step back from a
-# window's end lands on the last minute inside it, because the window excludes its own
-# end instant.
+# expectation window that has already run. The longest reach is a Monday morning before
+# the expectation arms, which walks Monday, Sunday, Saturday and lands on Friday. The
+# starting day spends an iteration, so four is exactly enough rather than four with room
+# over. The step back from a window's end lands on the last minute inside it, because the
+# window excludes its own end instant.
 OWED_LOOKBACK_DAYS = 4
 OWED_WALK_STEP = timedelta(minutes=1)
 
 # How far back the Now table's walk looks for the last session whose option close has
-# passed. The longest run of days a session cannot be found on is a holiday against a
-# weekend, which is four, so ten leaves room for a run no calendar has produced yet.
+# passed. The worst case is a Monday morning after a Friday holiday: the walk spends an
+# iteration on Monday, whose own close is still ahead, then Sunday, Saturday and the
+# holiday, and lands on Thursday as the fifth. Ten leaves room for a run of closures no
+# calendar has produced yet.
 OWED_SESSION_LOOKBACK_DAYS = 10
 
 # The six slot statuses the Today strip reports.
@@ -995,7 +998,7 @@ def _capture_owed_through(ctx: QueryContext) -> datetime | None:
     for _ in range(OWED_SESSION_LOOKBACK_DAYS):
         try:
             bounds = ctx.session.bounds(day)
-        except NotASession:
+        except (NotASession, *_CALENDAR_RANGE_ERRORS):
             bounds = None
         if bounds is not None and bounds.option_close <= ctx.now:
             return bounds.option_close
@@ -1008,15 +1011,22 @@ def _surface_stale(
     owed_through: datetime | None,
     last_data_ms: int | None,
     capture_start: datetime | None,
+    in_scope: bool,
 ) -> bool:
     """Whether a surface has gone past the watchdog's threshold without a data cycle.
 
-    Two states owe nothing and so are never stale. A lake with no session behind it at
-    all has no minute to measure against. And a ticker whose ``capture_start`` epoch
-    falls after that minute was never owed a cycle by it, which is the ticker onboarded
-    after today's close.
+    Three states owe nothing and so are never stale.
+
+    1. A lake with no closed session behind it at all has no minute to measure against.
+    2. A ticker out of scope is either retired or not yet onboarded, and neither is owed
+       a cycle now. The Today strip marks those same slots out of scope, so a verdict
+       here that ignored scope would contradict the strip one panel over.
+    3. A ticker whose ``capture_start`` epoch falls after the owed minute was never owed
+       a cycle by it, which is the ticker onboarded after today's close. Scope does not
+       cover that one, because the clock has passed the epoch and the ticker really is
+       in scope now.
     """
-    if owed_through is None:
+    if owed_through is None or not in_scope:
         return False
     if capture_start is not None and capture_start > owed_through:
         return False
@@ -1081,11 +1091,13 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
     is against ``capture_owed_through``, the last minute the loop owed a cycle, which is
     the only minute the age means anything against once the session has ended.
 
-    Eleven more fields sit beside the rows, grouped into the seven entries below. Seven
-    of them read what another component wrote under ``lake_root``. The dashboard never
-    reads ``~/.config``. The other four, the grace, the expectation, the starvation
-    verdict and the owed-through instant, come from the guard constants, the clock, the
-    calendar and the ping together.
+    Seven entries below describe the daemon and the clock rather than a ticker, and they
+    carry eleven fields between them. The rest of the payload names the request itself:
+    ``as_of``, ``session_date``, ``is_session``, ``phase``, ``stale_after_minutes`` and
+    ``tickers``. Seven of the eleven read what another component wrote under
+    ``lake_root``, and the dashboard never reads ``~/.config``. The other four, the
+    grace, the expectation, the starvation verdict and the owed-through instant, come
+    from the guard constants, the clock, the calendar and the ping together.
 
     1. ``token_minted_at``, the refresh token's mint stamp, from the journal metadata
        the daemon stamps every cycle and every idle minute.
@@ -1121,11 +1133,16 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
        that is the last option close that has passed, so a healthy evening reads clean
        while the ages beside it climb. It is null only on a lake with no closed session
        behind it at all.
-    7. ``stamp_age_minutes``, ``now`` minus the stamp's own instant. Every field above
-       it is only as fresh as the write that produced it, and the daemon stamps every
-       minute it is awake. So a stamp older than a few minutes means the writer stopped,
-       and each of the four values beside it is the last thing a dead daemon said rather
-       than a reading of now. Without this the panel cannot tell those apart.
+    7. ``stamp_age_minutes``, ``now`` minus the stamp's own instant. The token fields are
+       only as fresh as the write that produced them, and the daemon stamps every minute
+       it is awake. So a stamp older than a few minutes means the writer stopped, and the
+       mint, the age and the countdown are the last thing a dead daemon said rather than
+       a reading of now. Without this the panel cannot tell those apart.
+
+       The dead-man fields are the exception, and the stamp must not disclaim them. A
+       stopped writer stops the ping too, so the starvation verdict reads a dead daemon
+       correctly rather than going stale with it. That verdict is the one an operator
+       needs at the moment the stamp itself has gone old.
 
     Each instant and each age is null when nothing has been written. A daemon that has
     never run leaves the token and ping stamps absent, and the panel says so rather than
@@ -1226,6 +1243,7 @@ def _latest_cycle(
     if last_data_ms is not None:
         minutes_since = round((_slot_ms(ctx.now) - last_data_ms) / 60_000, 1)
     capture_start = spans[-1].start if spans else None
+    in_scope = not spans or _in_scope(ctx.now, spans)
     return {
         "ticker": ticker,
         "surface": surface,
@@ -1236,8 +1254,8 @@ def _latest_cycle(
         "last_error_class": list(last_error),
         "last_error_class_count": len(last_error),
         "capture_start": None if capture_start is None else _iso(capture_start),
-        "in_scope": not spans or _in_scope(ctx.now, spans),
-        "stale": _surface_stale(ctx, owed_through, last_data_ms, capture_start),
+        "in_scope": in_scope,
+        "stale": _surface_stale(ctx, owed_through, last_data_ms, capture_start, in_scope),
         "lookback_exhausted": last_data_ms is None and len(days) > len(walked),
         **health.payload(),
     }

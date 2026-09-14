@@ -420,9 +420,11 @@
     if (now.capture_owed_through === null) {
       return "No session has closed yet, so there is no minute to read this against.";
     }
-    return "Nothing captured through " + fmt(now.capture_owed_through, stampFmt) +
-      " ET, the last minute a cycle was owed. The session is over, so the age keeps " +
-      "climbing on its own and the verdict reads against that minute rather than now.";
+    return "No durable data cycle in the " +
+      plural(now.stale_after_minutes, "minute", "minutes") + " before " +
+      fmt(now.capture_owed_through, stampFmt) + " ET, the last minute a cycle was owed. " +
+      "The session is over, so the age keeps climbing on its own and the same threshold " +
+      "reads against that minute rather than against now.";
   }
 
   function reasonCell(row) {
@@ -513,10 +515,13 @@
   // because a day with no file written is a true zero. The grace and the expectation
   // are never null either, since they come from the clock rather than from the lake.
   //
-  // The stamp age comes last and reads on every other line above it. The daemon stamps
+  // The stamp age comes last and reads on the token lines above it. The daemon stamps
   // every minute it is awake, so a stamp older than STALE_STAMP_MINUTES means the writer
-  // stopped and the four values above are what a dead daemon last said. It alarms at
-  // that point for the same reason.
+  // stopped and the mint, the age and the countdown are what a dead daemon last said. It
+  // alarms at that point for the same reason. It does not disclaim the dead-man line,
+  // because a stopped writer stops the ping too, so that line reads a dead daemon
+  // correctly rather than going stale with it. It is the line the operator needs exactly
+  // when the stamp has gone old.
   //
   // What the stamp line cannot say is whether capture worked, because the stamp rides
   // every minute the loop runs and a session of nothing but gaps stamps each of them.
@@ -554,7 +559,8 @@
           ? "Stamp: nothing written yet, so the four lines above are unread."
           : now.stamp_age_minutes > STALE_STAMP_MINUTES
             ? "Stamp is " + plural(now.stamp_age_minutes, "minute", "minutes") +
-              " old, so the lines above are what the daemon last said, not now."
+              " old, so the token lines above are what the daemon last said, not now. " +
+              "The dead-man line judges its own age, so it still holds."
             : "Stamp written " + plural(now.stamp_age_minutes, "minute", "minutes") +
               " ago, so the loop is running. The loop stamps every minute whether or " +
               "not it captured anything, so this line never says capture worked.",

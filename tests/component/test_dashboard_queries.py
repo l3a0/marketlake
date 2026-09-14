@@ -374,12 +374,158 @@ def test_a_lake_with_no_closed_session_behind_it_paints_nothing_stale(root: Path
     assert [row["stale"] for row in before_any["surfaces"]] == [False, False, False]
 
 
+def test_a_ticker_registered_before_the_owed_minute_is_still_judged(root: Path):
+    """The late-onboard guard must exempt a late epoch, never every epoch.
+
+    Dropping the comparison and exempting any ticker that carries a ``capture_start`` at
+    all reads green against a suite whose stale rows all have none. In production every
+    ticker has one, so that simplification switches the column off altogether.
+    """
+    write_master(root, "QQQ", et(MONDAY, 9, 0))
+
+    evening = service_over(root, now=et(MONDAY, 17, 0)).run_query("now", {})
+    qqq = next(row for row in evening["surfaces"] if row["ticker"] == "QQQ")
+
+    assert qqq["capture_start"] == et(MONDAY, 9, 0).isoformat()
+    assert qqq["stale"] is True
+
+
+def test_a_ticker_registered_exactly_at_the_owed_minute_is_judged(root: Path):
+    """An epoch on the owed minute was owed that cycle, so it is not exempt."""
+    write_master(root, "QQQ", et(MONDAY, 16, 15))
+
+    evening = service_over(root, now=et(MONDAY, 17, 0)).run_query("now", {})
+    qqq = next(row for row in evening["surfaces"] if row["ticker"] == "QQQ")
+
+    assert qqq["capture_start"] == evening["capture_owed_through"]
+    assert qqq["stale"] is True
+
+
+def test_a_retired_ticker_is_never_late(root: Path):
+    """Nothing is owed of a ticker whose capture span has closed.
+
+    The Today strip marks every post-retirement slot out of scope, so a verdict here that
+    ignored scope would contradict the strip one panel over. The page happens to test
+    scope before staleness, which hid the wrong value rather than fixing it.
+    """
+    write_closed_span(root, "SPY", et(MONDAY, 9, 30), et(MONDAY, 12, 0))
+
+    evening = service_over(root, now=et(MONDAY, 17, 0)).run_query("now", {})
+    spy = [row for row in evening["surfaces"] if row["ticker"] == "SPY"]
+
+    assert [row["in_scope"] for row in spy] == [False, False]
+    assert [row["stale"] for row in spy] == [False, False]
+
+
+def test_a_recent_cycle_inside_the_threshold_is_not_late(root: Path):
+    """A small positive gap is the case a zero threshold would paint stale."""
+    # SPY quotes' newest data cycle is 09:31, one minute before this instant.
+    payload = service_over(root, now=et(MONDAY, 9, 32)).run_query("now", {})
+    quotes = next(row for row in payload["surfaces"] if row["surface"] == "quotes")
+
+    assert quotes["minutes_since"] == 1.0
+    assert quotes["stale"] is False
+
+
+def test_the_injected_guard_decides_the_verdict_and_not_only_the_label(root: Path):
+    """The page reports the threshold and colours by it, so one guard must drive both.
+
+    Asserting only that ``stale_after_minutes`` carries the injected number leaves the
+    verdict free to use a hardcoded one, and the panel would then report a threshold it
+    does not colour by.
+    """
+    tightened = GuardConstants(watchdog_page_minutes=0)
+    at = et(MONDAY, 9, 32)
+
+    loose = service_over(root, now=at).run_query("now", {})
+    tight = service_over(root, guards=tightened, now=at).run_query("now", {})
+
+    def quotes(payload):
+        return next(row for row in payload["surfaces"] if row["surface"] == "quotes")
+
+    assert quotes(loose)["stale"] is False
+    assert tight["stale_after_minutes"] == 0
+    assert quotes(tight)["stale"] is True
+
+
+def test_a_cycle_exactly_at_the_threshold_has_not_passed_it(root: Path):
+    """A row is late *past* the threshold, so the threshold itself is still inside it."""
+    # SPY quotes' newest data cycle is 09:31, exactly three minutes before this instant.
+    at_threshold = service_over(root, now=et(MONDAY, 9, 34)).run_query("now", {})
+    past_it = service_over(root, now=et(MONDAY, 9, 34, 6)).run_query("now", {})
+
+    def quotes(payload):
+        return next(row for row in payload["surfaces"] if row["surface"] == "quotes")
+
+    assert at_threshold["stale_after_minutes"] == 3
+    assert quotes(at_threshold)["minutes_since"] == 3.0
+    assert quotes(at_threshold)["stale"] is False
+    assert quotes(past_it)["stale"] is True
+
+
+def test_a_recent_gap_does_not_stand_in_for_a_data_cycle(root: Path):
+    """Stale means no durable *data* cycle, and a gap row is not one.
+
+    QQQ's newest slot on the fixture's Monday is a gap two minutes old, while its newest
+    data cycle is the previous Friday. Reading the latest slot of any kind here would
+    call that clean, which is a daemon writing markers every minute while capturing
+    nothing.
+    """
+    payload = service_over(root, now=et(MONDAY, 9, 32)).run_query("now", {})
+    qqq = next(row for row in payload["surfaces"] if row["ticker"] == "QQQ")
+
+    assert qqq["last_snap_ts"] == et(MONDAY, 9, 30).isoformat()
+    assert qqq["last_status"] == "gap"
+    assert qqq["last_data_snap_ts"] == et(FRIDAY, 16, 15).isoformat()
+    assert qqq["stale"] is True
+
+
+def test_the_post_equity_close_quarter_hour_reads_against_now(root: Path):
+    """The capture window runs to the option close, not to the equity close.
+
+    Narrowing the check to the open phase alone drops 16:00 through 16:15, the quarter
+    hour the option close itself lives in, and sends the reading three days back.
+    """
+    payload = service_over(root, now=et(MONDAY, 16, 5)).run_query("now", {})
+
+    assert payload["phase"] == "post_equity_close"
+    assert payload["capture_owed_through"] == et(MONDAY, 16, 5).isoformat()
+
+
 def test_the_owed_minute_walks_back_over_a_weekend(root: Path):
     """A Sunday reads against Friday's close, because no session has closed since."""
     sunday = service_over(root, now=et(date(2026, 8, 23), 12, 0)).run_query("now", {})
 
     assert sunday["phase"] == "non_session"
     assert sunday["capture_owed_through"] == et(FRIDAY, 16, 15).isoformat()
+
+
+def test_the_walk_reaches_back_over_a_holiday_against_a_weekend(root: Path):
+    """The longest reach the calendar can ask for, which is what sizes the walk's bound.
+
+    A Friday holiday against a weekend, read on the Monday before the open. The walk
+    spends an iteration on Monday, whose own close is still ahead, then Sunday, Saturday
+    and the holiday, and lands on Thursday as the fifth. A bound of four stops one day
+    short and reports that nothing has ever been owed.
+    """
+    holiday_week = FakeCalendar(
+        {
+            THURSDAY: SessionTimes(open=et(THURSDAY, 9, 30), close=et(THURSDAY, 16, 0)),
+            MONDAY: SessionTimes(open=et(MONDAY, 9, 30), close=et(MONDAY, 16, 0)),
+        }
+    )
+    service = DashboardService(
+        root,
+        clock=ManualClock(et(MONDAY, 9, 0).astimezone(UTC)),
+        calendar=holiday_week,
+        page=b"<!doctype html>",
+        icon=b"",
+    )
+
+    payload = service.run_query("now", {})
+
+    assert payload["phase"] == "pre_open"
+    assert payload["capture_owed_through"] == et(THURSDAY, 16, 15).isoformat()
 
 
 def test_a_pre_open_morning_reads_against_the_previous_close(root: Path):
