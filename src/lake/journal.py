@@ -626,6 +626,70 @@ _QUOTE_BLOCK_SPECS = (
 )
 
 
+class ExtraPath(NamedTuple):
+    """Where one column's value sits inside a row's ``extra`` JSON.
+
+    ``field`` is the vendor's own name for the value, which is the key the overflow is
+    written under. ``block`` is the vendor block that key is nested inside, or ``None``
+    when the overflow is flat.
+
+    The two surfaces differ because their payloads do. A chains row is built from one
+    contract dict, so its overflow is flat. A quotes row is built from several blocks that
+    reuse field names, so its overflow is nested one level under the block key and
+    ``quote.lastPrice`` stays distinct from ``extended.lastPrice``.
+    """
+
+    block: str | None
+    field: str
+
+
+# Every column whose value could have arrived through ``extra``, per surface, derived
+# from the same vendor maps the parser projects with. Nothing here restates a name.
+#
+# A column is reachable only if the parser would overflow its vendor field, which is a
+# narrower set than the schema. Four groups are deliberately absent.
+#
+# 1. The chain-level fields (``interest_rate`` and its five siblings). The chains overflow
+#    is computed from the contract dict alone, so a top-level body field never lands in
+#    ``extra`` at all.
+# 2. ``vendor_quote_ts``, on both surfaces. The vendor quote time is consumed into that
+#    stamp rather than stored, and it is named as consumed so it never overflows.
+# 3. The quotes envelope's ``realtime`` and ``cusip``. Both are read off the envelope
+#    rather than a captured block, and only a captured block's leftovers overflow.
+# 4. The stamps, the provenance columns, and the chains window pair. None is a vendor
+#    field, so none was ever a candidate for the overflow.
+_EXTRA_PATHS: dict[str, dict[str, ExtraPath]] = {
+    CHAINS_SURFACE: {
+        **{column: ExtraPath(None, vendor) for vendor, column in _CHAINS_CONTRACT_MAP.items()},
+        _CHAINS_DELIVERABLES_COLUMN: ExtraPath(None, _CHAINS_DELIVERABLES_FIELD),
+    },
+    QUOTES_SURFACE: {
+        column: ExtraPath(block_key, vendor)
+        for block_key, field_map, _consumed in _QUOTE_BLOCK_SPECS
+        for vendor, column in field_map.items()
+    },
+}
+
+
+def extra_paths(surface: str) -> dict[str, ExtraPath]:
+    """The surface's columns that a value in ``extra`` could be projected into.
+
+    A field the schema does not name lands in ``extra``. A later version that promotes it
+    into its own column leaves the older rows holding it there, and reading those rows as
+    the newer shape needs to know which key in the overflow feeds which column. That is
+    what this returns: the parser's vendor maps read backwards, column name to overflow
+    key.
+
+    It is derived from those maps rather than restated, so promoting a field is still the
+    one edit it always was. Add the vendor field to its block's map and the column becomes
+    projectable in the same motion.
+
+    Unknown surfaces raise loudly, through ``schema_for``.
+    """
+    schema_for(surface)
+    return dict(_EXTRA_PATHS[surface])
+
+
 # -- row building ------------------------------------------------------------
 
 
@@ -699,21 +763,30 @@ def _int_column(values: Sequence[object]) -> pa.Array:
     return pa.array(values, type=pa.int64())
 
 
+def typed_column(field_type: pa.DataType, values: Sequence[object]) -> pa.Array:
+    """One column of ``values`` at ``field_type``, built the way every write site builds it.
+
+    An all-null column still lands with the right type instead of guessing. An ``int64``
+    column goes through ``_int_column``, which refuses a fractional float rather than
+    recording it truncated.
+
+    Two callers share this. The row builders below type every column they write, and the
+    read-time projection in ``extra_projection`` types a value it lifts back out of
+    ``extra``. Neither should be able to accept a value the other refuses, so the rule
+    lives here once.
+    """
+    if field_type == pa.int64():
+        return _int_column(values)
+    return pa.array(values, type=field_type)
+
+
 def _batch(schema: pa.Schema, rows: Sequence[Mapping[str, object]]) -> pa.RecordBatch:
     """Build one record batch from row mappings, typed by the schema.
 
-    A missing key becomes null. Each column is built with its schema type, so an
-    all-null column still lands with the right type instead of guessing. An ``int64``
-    column goes through ``_int_column``, which refuses a fractional float rather than
-    recording it truncated.
+    A missing key becomes null. Each column is built with its schema type through
+    ``typed_column``.
     """
-    arrays = []
-    for field in schema:
-        values = [row.get(field.name) for row in rows]
-        if field.type == pa.int64():
-            arrays.append(_int_column(values))
-        else:
-            arrays.append(pa.array(values, type=field.type))
+    arrays = [typed_column(field.type, [row.get(field.name) for row in rows]) for field in schema]
     return pa.RecordBatch.from_arrays(arrays, schema=schema)
 
 

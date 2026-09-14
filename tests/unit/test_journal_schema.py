@@ -747,6 +747,117 @@ def test_chains_unknown_contract_field_lands_in_extra():
     assert batch.slice(1, 1).to_pylist()[0]["extra"] is None
 
 
+# -- where a value in extra would be projected back to ------------------------
+
+
+def test_every_extra_path_names_a_real_column_of_its_surface():
+    """A path pointing at no column could never fill anything.
+
+    Both sides are derived, the paths from the parser's vendor maps and the columns from
+    the schema, so this is what catches a map entry that names a column the schema does
+    not carry.
+    """
+    for surface in journal.PINNED_SURFACES:
+        columns = set(journal.schema_fingerprint(surface))
+        assert set(journal.extra_paths(surface)) <= columns
+
+
+def test_the_chains_paths_are_flat_and_the_quotes_paths_are_nested():
+    """The overflow's shape differs per surface, and the paths have to match it.
+
+    A chains row is built from one contract dict, so its overflow is flat. A quotes row is
+    built from blocks that reuse field names, so its overflow nests under the block key.
+    """
+    assert journal.extra_paths("chains")["bid"] == journal.ExtraPath(None, "bid")
+    assert journal.extra_paths("chains")["ask_size"] == journal.ExtraPath(None, "askSize")
+    assert journal.extra_paths("quotes")["bid"] == journal.ExtraPath("quote", "bidPrice")
+    assert journal.extra_paths("quotes")["extended_last_price"] == journal.ExtraPath(
+        "extended", "lastPrice"
+    )
+    assert journal.extra_paths("quotes")["pe_ratio"] == journal.ExtraPath("fundamental", "peRatio")
+
+
+def test_the_two_quote_blocks_sharing_field_names_keep_separate_paths():
+    """``quote.lastPrice`` and ``extended.lastPrice`` are different measurements.
+
+    A flat quotes path map would collapse them, which is the collision the block-keyed
+    overflow exists to prevent.
+    """
+    paths = journal.extra_paths("quotes")
+    assert paths["last"] == journal.ExtraPath("quote", "lastPrice")
+    assert paths["extended_last_price"] == journal.ExtraPath("extended", "lastPrice")
+    assert len(set(paths.values())) == len(paths)
+
+
+def test_the_deliverables_column_is_reachable_through_its_vendor_name():
+    """It is JSON-encoded rather than mapped, so it needs its own entry."""
+    assert journal.extra_paths("chains")["option_deliverables_list"] == journal.ExtraPath(
+        None, "optionDeliverablesList"
+    )
+
+
+@pytest.mark.parametrize(
+    ("surface", "column"),
+    [
+        # The chain-level header fields. The chains overflow is built from the contract
+        # dict alone, so a top-level body field never reaches ``extra``.
+        ("chains", "interest_rate"),
+        ("chains", "underlying_price"),
+        ("chains", "is_delayed"),
+        # The consumed vendor quote time, on both surfaces.
+        ("chains", "vendor_quote_ts"),
+        ("quotes", "vendor_quote_ts"),
+        # The quotes envelope's own fields, read off the envelope rather than a block.
+        ("quotes", "realtime"),
+        ("quotes", "cusip"),
+        # Provenance, stamps, and the chains window pair. None is a vendor field.
+        ("chains", "snap_ts"),
+        ("chains", "window_start"),
+        ("quotes", "schema_version"),
+        ("quotes", "extra"),
+    ],
+)
+def test_a_column_no_vendor_field_overflows_into_is_not_projectable(surface, column):
+    """Projecting one of these would manufacture a value the overflow never held."""
+    assert column in journal.schema_fingerprint(surface)
+    assert column not in journal.extra_paths(surface)
+
+
+def test_every_vendor_mapped_column_is_projectable_and_nothing_else_is():
+    """Promoting a field is one edit, not two.
+
+    The paths are read off the parser's own vendor maps, so adding the field to its
+    block's map is what makes the column projectable. This walks those maps and checks
+    both directions: every mapped column has its path, and the counts match, so a path
+    the maps do not account for fails here too.
+
+    The chains map is short by one on purpose. ``optionDeliverablesList`` is JSON-encoded
+    rather than mapped, so it carries its own entry.
+    """
+    chains = journal.extra_paths("chains")
+    for vendor, column in journal._CHAINS_CONTRACT_MAP.items():
+        assert chains[column] == journal.ExtraPath(None, vendor)
+    assert len(chains) == len(journal._CHAINS_CONTRACT_MAP) + 1
+
+    quotes = journal.extra_paths("quotes")
+    for block, field_map, _consumed in journal._QUOTE_BLOCK_SPECS:
+        for vendor, column in field_map.items():
+            assert quotes[column] == journal.ExtraPath(block, vendor)
+    assert len(quotes) == sum(len(field_map) for _, field_map, _ in journal._QUOTE_BLOCK_SPECS)
+
+
+def test_a_caller_editing_the_paths_it_got_back_changes_nothing():
+    """The map is module state, and a reader holds a copy of it rather than the thing."""
+    paths = journal.extra_paths("chains")
+    paths["bid"] = journal.ExtraPath(None, "somethingElse")
+    assert journal.extra_paths("chains")["bid"] == journal.ExtraPath(None, "bid")
+
+
+def test_extra_paths_rejects_an_unknown_surface():
+    with pytest.raises(ValueError, match="unknown surface"):
+        journal.extra_paths("bars")
+
+
 def test_chains_suspect_flag_rides_every_row():
     batch = journal.chains_data_batch(
         CHAIN_BODY,
