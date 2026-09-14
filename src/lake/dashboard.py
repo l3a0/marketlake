@@ -95,6 +95,7 @@ from lake.capture_spans import CaptureSpan, CaptureSpans, CaptureSpansError, spa
 from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants, input_errors_exit, load_config
 from lake.control_plane import sunday_canary_due
+from lake.deadman import in_envelope
 from lake.metadata import read_metadata
 from lake.paths import (
     CHAINS,
@@ -901,6 +902,29 @@ def _minutes(span: timedelta) -> float:
     return round(span.total_seconds() / 60, 1)
 
 
+def _ping_owed(now: datetime, grace_minutes: int) -> bool:
+    """Whether the dead-man check is owed a ping by ``now``.
+
+    The panel's dead-man line reads the ping's age against the grace healthchecks pages
+    at. That reading only means something while a ping is owed. Outside the daemon's
+    weekday envelope nothing pings at all, by design, so a threshold that ran around the
+    clock would go loud every night and weekend. A line that is loud every night is a
+    line the reader learns to skip, which is the failure the threshold is here to fix.
+
+    The envelope's own opening carries the same trap one step smaller. The envelope
+    starts at the firmware wake, and the daemon's first heartbeat lands a moment after
+    it, so the instant before that the newest ping is the previous evening's. Asking for
+    the envelope one grace back rather than at ``now`` spends those minutes as slack.
+    The line arms at the wake plus the grace, which is the minute healthchecks itself
+    starts expecting a ping.
+
+    The envelope is ``lake.deadman``'s, not a second copy of it. The two going out of
+    step is how a page ends up contradicting the alerting, which is what this line is
+    for.
+    """
+    return in_envelope(now) and in_envelope(now - timedelta(minutes=grace_minutes))
+
+
 # -- the named queries -------------------------------------------------------
 
 
@@ -937,8 +961,10 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
     or after it. A ticker onboarded later today has no in-scope slot yet, so it is not a
     stale capture.
 
-    Six more fields sit beside the rows, and each reads what another component wrote
-    under ``lake_root``. The dashboard never reads ``~/.config``.
+    Nine more fields sit beside the rows, grouped into the six entries below. Seven of
+    them read what another component wrote under ``lake_root``. The dashboard never
+    reads ``~/.config``. The other two, the grace and the expectation, come from the
+    guard constants and the clock instead.
 
     1. ``token_minted_at``, the refresh token's mint stamp, from the journal metadata
        the daemon stamps every cycle and every idle minute.
@@ -948,7 +974,15 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
        control plane owns the ritual. It goes negative once the ritual is overdue, which
        is the honest reading of a token past its Sunday.
     4. ``dead_man_last_ping``, the instant the dead-man ping last landed, written by the
-       daemon's own feed.
+       daemon's own feed, with ``dead_man_age_minutes`` beside it. Two more fields let
+       the panel judge that age rather than leaving the reader to subtract it by eye.
+       ``dead_man_grace_minutes`` is the grace healthchecks pages after, so the page
+       reads the ping against the same threshold the alerting does.
+       ``dead_man_expected`` says whether a ping is owed at all, per ``_ping_owed``.
+       Inside the capture window only a durable data cycle feeds the check, because the
+       idle heartbeat stands down there by design. So a session whose every cycle fails
+       starves this ping while the stamp below keeps landing, and the two together are
+       what separate a running loop from working capture.
     5. ``pages_failed_to_send``, today's count of pages that never reached the phone,
        counted from the files the publisher writes under ``reports/``. The day is the
        Eastern one, the same key the publisher files them under.
@@ -958,10 +992,12 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
        and each of the four values beside it is the last thing a dead daemon said rather
        than a reading of now. Without this the panel cannot tell those apart.
 
-    Each of the five is null when nothing has been written. A daemon that has never run
-    leaves the token and ping stamps absent, and the panel says so rather than showing a
-    zero. The page count is the exception: an ordinary day writes no file at all, so its
-    absence is a true zero and reads as one.
+    Each instant and each age is null when nothing has been written. A daemon that has
+    never run leaves the token and ping stamps absent, and the panel says so rather than
+    showing a zero. The page count is never null, because an ordinary day writes no file
+    at all, so its absence is a true zero and reads as one. The grace and the
+    expectation are never null either, because they hold whether or not anything has
+    ever been stamped.
     """
     spans_by_ticker = _capture_spans(ctx.paths, ctx.roster, ctx.session.session_date())
     surfaces: list[dict[str, object]] = []
@@ -989,6 +1025,13 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
         "dead_man_last_ping": (
             None if stamp.dead_man_last_ping is None else _iso(stamp.dead_man_last_ping)
         ),
+        "dead_man_age_minutes": (
+            None
+            if stamp.dead_man_last_ping is None
+            else _minutes(ctx.now - stamp.dead_man_last_ping)
+        ),
+        "dead_man_expected": _ping_owed(ctx.now, ctx.guards.dead_man_grace_minutes),
+        "dead_man_grace_minutes": ctx.guards.dead_man_grace_minutes,
         "stamp_age_minutes": (
             None if stamp.stamped_at is None else _minutes(ctx.now - stamp.stamped_at)
         ),

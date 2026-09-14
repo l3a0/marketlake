@@ -386,6 +386,105 @@ def test_now_reports_the_dead_man_ping_the_daemon_recorded(root: Path):
     assert now["dead_man_last_ping"] == et(MONDAY, 9, 40).isoformat()
 
 
+def test_the_dead_man_ping_carries_its_age_and_the_grace_it_is_judged_against(root: Path):
+    """The line said when the ping fired and nothing else, so a reader subtracted by eye.
+
+    That is what let the panel read healthy through the 2026-09-09 auth outage. The age
+    and the grace ride beside the instant so the page can judge it against the same
+    threshold healthchecks pages after, rather than leaving the reading to the reader.
+    """
+    stamp_ping(root, at=et(MONDAY, 9, 40))
+
+    now = service_over(root).run_query("now", {})
+
+    # NOW is 09:40:30, so the ping is half a minute old and well inside the grace.
+    assert now["dead_man_age_minutes"] == 0.5
+    assert now["dead_man_grace_minutes"] == 5
+
+
+def test_a_recalibrated_grace_reaches_the_panel(root: Path):
+    """The page must not carry its own copy of a constant slice 1 recalibrates."""
+    guards = GuardConstants(dead_man_grace_minutes=9)
+
+    now = service_over(root, guards=guards).run_query("now", {})
+
+    assert now["dead_man_grace_minutes"] == 9
+
+
+def test_an_unrecorded_ping_has_no_age_rather_than_a_zero(root: Path):
+    """A zero would read as "fired this instant", which is the opposite of the truth."""
+    now = service_over(root).run_query("now", {})
+
+    assert now["dead_man_last_ping"] is None
+    assert now["dead_man_age_minutes"] is None
+
+
+def test_a_ping_is_owed_inside_the_weekday_envelope(root: Path):
+    """Inside the envelope a silent ping is a failure, so the panel may judge it."""
+    assert service_over(root).run_query("now", {})["dead_man_expected"] is True
+
+
+def test_no_ping_is_owed_when_nothing_is_meant_to_be_pinging(root: Path):
+    """Nothing pings outside the envelope, by design, so nothing there is a failure.
+
+    A threshold that ran around the clock would light the line every night and every
+    weekend. A line that is loud every night is one the reader learns to skip, which is
+    the failure the threshold exists to fix.
+    """
+    overnight = et(MONDAY, 2, 0)
+    saturday = et(SATURDAY, 12, 0)
+    sunday_canary = et(date(2026, 8, 23), 21, 0)
+
+    for instant in (overnight, saturday, sunday_canary):
+        payload = service_over(root, now=instant).run_query("now", {})
+        assert payload["dead_man_expected"] is False, instant
+
+
+def test_the_wake_is_not_owed_a_ping_until_the_grace_has_run(root: Path):
+    """The envelope opens at the firmware wake, and the first heartbeat lands after it.
+
+    So the instant the envelope opens, the newest ping is the previous evening's. Owing
+    a ping from that instant would go loud every morning on a daemon that is starting
+    exactly as designed. The expectation arms one grace later, which is the minute
+    healthchecks itself starts expecting a ping.
+    """
+    before = service_over(root, now=et(MONDAY, 8, 29)).run_query("now", {})
+    after = service_over(root, now=et(MONDAY, 8, 30)).run_query("now", {})
+
+    assert before["dead_man_expected"] is False
+    assert after["dead_man_expected"] is True
+
+
+def test_the_expectation_closes_with_the_envelope(root: Path):
+    """The sweep's ping ends the weekday window, and the evening owes nothing after it."""
+    inside = service_over(root, now=et(MONDAY, 18, 44)).run_query("now", {})
+    past = service_over(root, now=et(MONDAY, 18, 45)).run_query("now", {})
+
+    assert inside["dead_man_expected"] is True
+    assert past["dead_man_expected"] is False
+
+
+def test_the_stamp_keeps_landing_while_the_ping_starves(root: Path):
+    """The two lines say different things, and a dead session is where they part.
+
+    Through the 2026-09-09 auth outage every cycle failed and wrote a gap. The loop kept
+    stamping, because the stamp rides the end of every cycle whether or not it produced
+    rows, so the stamp age read zero and alarmed at nothing. The dead-man ping starved,
+    because inside the capture window only a durable data cycle feeds it. The panel needs
+    both to tell a running loop from working capture.
+    """
+    # The last ping is the pre-open heartbeat. The idle heartbeat stands down once the
+    # capture window opens, so nothing has fed the check since.
+    stamp_ping(root, at=et(MONDAY, 9, 29))
+    stamp_cycle(root, at=et(MONDAY, 9, 40), token_minted_at=MINTED, roster=_roster())
+
+    now = service_over(root).run_query("now", {})
+
+    assert now["stamp_age_minutes"] == 0.5
+    assert now["dead_man_age_minutes"] == 11.5
+    assert now["dead_man_expected"] is True
+
+
 def test_now_counts_the_pages_that_never_reached_the_phone(root: Path):
     # The publisher writes one file per undelivered page. Raising them through the real
     # publisher is what proves the reader and the writer agree on where they land.

@@ -439,16 +439,60 @@
     return "Sunday re-mint in " + plural(minutes, "minute", "minutes") + ".";
   }
 
-  // Six payload fields describe the daemon rather than a ticker. They render as five
-  // lines, since token_age_minutes shares a line with token_minted_at. A null means
-  // nothing has been stamped yet, so the line says that rather than showing a zero. The
-  // page count is the one that is never null, because a day with no file written is a
-  // true zero. Its null branch is a guard, not an expected state.
+  // The dead-man line reads its ping's age against the grace healthchecks pages after,
+  // and only while a ping is owed. Nothing pings outside the daemon's weekday envelope,
+  // by design, so a threshold that ran around the clock would go loud every night and
+  // every weekend. A line that is loud every night is a line the reader learns to skip,
+  // which is the failure the threshold is here to fix. The payload owns the question,
+  // because the envelope is the control plane's window and a second copy of it on the
+  // page is one more thing to keep in step.
+  //
+  // Inside the capture window only a durable data cycle feeds the check. The idle
+  // heartbeat stands down there by design, so a session whose every cycle fails starves
+  // this ping. That is why this line, and not the stamp below it, is what goes loud
+  // when capture is dead.
+  function deadManStarved(now) {
+    if (!now.dead_man_expected) { return false; }
+    return now.dead_man_age_minutes === null ||
+      now.dead_man_age_minutes > now.dead_man_grace_minutes;
+  }
+
+  function deadManText(now) {
+    if (now.dead_man_last_ping === null) {
+      return now.dead_man_expected
+        ? "Dead-man ping: never recorded, and one is owed now."
+        : "Dead-man ping: not recorded yet.";
+    }
+    var fired = "Dead-man ping last fired " + fmt(now.dead_man_last_ping, stampFmt) +
+      " ET, " + plural(now.dead_man_age_minutes, "minute", "minutes") + " ago.";
+    if (!now.dead_man_expected) {
+      return fired + " The daemon's weekday window is closed, so none is owed.";
+    }
+    if (deadManStarved(now)) {
+      return fired + " That is past the grace of " +
+        plural(now.dead_man_grace_minutes, "minute", "minutes") +
+        ", so the check is starving: either no cycle is producing data, or the " +
+        "daemon has stopped.";
+    }
+    return fired;
+  }
+
+  // Nine payload fields describe the daemon rather than a ticker. They render as five
+  // lines, because the token line carries its own age and the dead-man line carries
+  // three values beside its ping. A null instant means nothing has been stamped yet, so
+  // the line says that rather than showing a zero. The page count is never null,
+  // because a day with no file written is a true zero. The grace and the expectation
+  // are never null either, since they come from the clock rather than from the lake.
   //
   // The stamp age comes last and reads on every other line above it. The daemon stamps
   // every minute it is awake, so a stamp older than STALE_STAMP_MINUTES means the writer
   // stopped and the four values above are what a dead daemon last said. It alarms at
   // that point for the same reason.
+  //
+  // What the stamp line cannot say is whether capture worked, because the stamp rides
+  // every minute the loop runs and a session of nothing but gaps stamps each of them.
+  // The dead-man line is what says that, so the stamp line names it rather than letting
+  // a reader take a fresh stamp for health.
   function renderDaemon(now) {
     var list = byId("daemon");
     clear(list);
@@ -466,9 +510,8 @@
         className: now.token_sunday_countdown_minutes < 0 ? "alarm" : null
       },
       {
-        text: now.dead_man_last_ping === null
-          ? "Dead-man ping: not recorded yet."
-          : "Dead-man ping last fired " + fmt(now.dead_man_last_ping, stampFmt) + " ET."
+        text: deadManText(now),
+        className: deadManStarved(now) ? "alarm" : null
       },
       {
         text: now.pages_failed_to_send === null
@@ -482,7 +525,10 @@
           : now.stamp_age_minutes > STALE_STAMP_MINUTES
             ? "Stamp is " + plural(now.stamp_age_minutes, "minute", "minutes") +
               " old, so the lines above are what the daemon last said, not now."
-            : "Stamp written " + plural(now.stamp_age_minutes, "minute", "minutes") + " ago.",
+            : "Stamp written " + plural(now.stamp_age_minutes, "minute", "minutes") +
+              " ago, so the loop is running. The loop stamps every minute whether or " +
+              "not it captured anything, so the dead-man line above is the one that " +
+              "says capture is working.",
         className: now.stamp_age_minutes === null ||
           now.stamp_age_minutes > STALE_STAMP_MINUTES ? "alarm" : null
       }
