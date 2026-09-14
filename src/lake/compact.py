@@ -32,23 +32,35 @@ The job's rules, each glossed at first use.
    compared to the sum across the segments, and its digest is what the manifest records.
    Only after that does the manifest entry land, and only after the manifest append are
    the segments unlinked. A crash at any point re-runs with nothing lost.
-4. *A torn tail is dropped, a shadow-append is refused.* A torn tail is a segment cut
+4. *A drifted merge is reported, never raised.* Segments in one ticker-day can disagree
+   about columns only when the daemon restarted onto different code mid-session, because
+   every production segment takes its schema from ``journal.schema_for`` and a vendor
+   that stops sending a field yields a null column rather than a dropped one. So the
+   check guards this project's own release process rather than the vendor. The merged
+   schema is compared to the pinned one at the merge, which is the last moment the
+   segments exist, and what moved is filed under ``reports/`` once the seal has
+   committed. Nothing raises, because the job seals every ticker-day bare and a raise
+   would cost the rest of the sweep, the re-tune, the backup, and the ping. The durable
+   remedy is ``schema_version`` enforcement, which is
+   [#128](https://github.com/l3a0/marketlake/issues/128) and not compaction's business.
+   This check is a detector and secondary to it.
+5. *A torn tail is dropped, a shadow-append is refused.* A torn tail is a segment cut
    mid-batch by a power loss. Its complete batches are kept and the cut bytes dropped,
    never an error. A *shadow-append* is bytes after a segment's end-of-stream marker, the
    signature of a second writer appending past a closed stream. Standard readers never
    see those rows, so the job refuses to bless the file and fails the run loudly.
-5. *Manifest-aware recovery.* If the manifest already holds a last entry for a partition,
+6. *Manifest-aware recovery.* If the manifest already holds a last entry for a partition,
    no automatic run ever recompacts it. The job verifies the partition's sha256 against
    the entry and finishes the interrupted cleanup by deleting the debris segments. Any
    mismatch raises to human review. The one repair is ``recompact_ticker_day``, a
    deliberate, human-invoked rebuild that appends a superseding entry. The standing
    invariant holds throughout: no automatic run ever replaces a manifested partition with
    fewer rows than its recorded count.
-6. *Backup, then ping.* After every eligible ticker-day is sealed, the lake is synced to
+7. *Backup, then ping.* After every eligible ticker-day is sealed, the lake is synced to
    the backup target. The health-check ping fires only after the backup succeeds, so the
    one ping attests both. An unmounted target raises before any ping. A holiday or an
    empty journal is a correct no-op and still backs up and pings.
-7. *The nightly re-tune.* The chain is fetched in date windows so each response stays
+8. *The nightly re-tune.* The chain is fetched in date windows so each response stays
    under Schwab's gateway body limit. After the seal, the job groups the day's chains
    rows by ``window_start`` and ``window_end``, takes each plan window's peak per-cycle
    contract count, and compares it to two guard constants. A window over the max splits
@@ -68,6 +80,7 @@ import argparse
 import fcntl
 import json
 import os
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -101,6 +114,7 @@ from lake.paths import (
     parse_date_dir,
     temp_write_path,
 )
+from lake.report import SchemaDrift, write_schema_drift
 from lake.runner import PING_FAILURES, BackupRunner, Pinger, RsyncBackup, UrllibPinger
 from lake.session import SessionClock
 
@@ -408,6 +422,90 @@ def _durable_dir(path: Path) -> None:
         os.close(fd)
 
 
+def _pinned_order(table: pa.Table, pinned: pa.Schema) -> pa.Table:
+    """The merged table with its pinned columns back in the pinned schema's order.
+
+    Promotion appends. A segment written before a column was added has no place to put
+    it, so ``concat_tables`` adds the promoted column at the end of the merged table
+    rather than where the pinned schema holds it. The columns are then right and the
+    order is not, and a comparison that read order as drift would file a finding on every
+    legitimate column addition. Reordering first is what makes the comparison a plain
+    equality.
+
+    Order itself is not a correctness concern. Every read in ``src/`` is by name, and the
+    documented multi-day path is DuckDB's ``union_by_name``. This exists to make the
+    check cheap, not to fix a read.
+
+    A column the pinned schema does not name keeps its place at the end rather than being
+    dropped, so the reorder moves columns and never loses one.
+    """
+    present = set(table.schema.names)
+    named = set(pinned.names)
+    order = [name for name in pinned.names if name in present]
+    order += [name for name in table.schema.names if name not in named]
+    if order == table.schema.names:
+        return table
+    return table.select(order)
+
+
+def _schema_drift(
+    merged: pa.Schema,
+    pinned: pa.Schema,
+    *,
+    surface: str,
+    ticker: str,
+    day: date,
+    partition: str,
+    segments: Sequence[str],
+) -> SchemaDrift:
+    """What the merged schema carries that the pinned one does not.
+
+    Called only once the two schemas have already been found unequal, so this explains a
+    difference rather than deciding there is one. The three fields name columns, because
+    a human reading the file wants the column and not a count.
+    """
+    pinned_names = set(pinned.names)
+    merged_types = {field.name: str(field.type) for field in merged}
+    return SchemaDrift(
+        surface=surface,
+        ticker=ticker,
+        day=day,
+        partition=partition,
+        schema_version=journal.SCHEMA_VERSION,
+        missing=tuple(name for name in pinned.names if name not in merged_types),
+        unexpected=tuple(name for name in merged.names if name not in pinned_names),
+        retyped=tuple(
+            f"{name}: {pinned.field(name).type} -> {merged_types[name]}"
+            for name in pinned.names
+            if name in merged_types and merged_types[name] != str(pinned.field(name).type)
+        ),
+        segments=tuple(segments),
+    )
+
+
+def _file_drift(root: Path, drift: SchemaDrift, *, clock: Clock) -> None:
+    """File one finding, and never let the filing cost the run.
+
+    The sweep calls ``_seal`` bare, once per ticker-day, and ``compact``'s only
+    ``try/except`` wraps the health-check ping. So anything raised here would cost every
+    ticker-day still to be sealed, the window re-tune, the backup, and the ping. Trading
+    a null column on one ticker for a lake-wide backup outage is a bad trade, which is
+    why the finding is reported and never raised.
+
+    A write that itself fails leaves stderr, which launchd files. That is ``alert._record``'s
+    rule for the same situation: the record is the last line of defence, and when it
+    fails the one place left to say so is the log.
+    """
+    try:
+        write_schema_drift(root, drift, now=clock.now())
+    except OSError as exc:
+        print(
+            f"compaction: schema drift on {drift.partition} could not be filed: "
+            f"{type(exc).__name__}",
+            file=sys.stderr,
+        )
+
+
 def _write_partition(table: pa.Table, partition: Path) -> None:
     """Write a Parquet partition atomically: a temp file, a flush, then one rename.
 
@@ -449,6 +547,13 @@ def _seal(
     With ``guard`` on, the no-shrink invariant is checked before the partition file is
     replaced, not only at the manifest append. A refused rebuild must leave the larger
     partition on disk, untouched, beside its still-valid entry.
+
+    The merged schema is compared to the surface's pinned one on the way past. The
+    comparison happens at the merge, because that is the last moment the merged schema
+    exists and the reorder it rests on has to run before the write either way. The
+    finding is filed after the manifest append, so only a seal that committed files one.
+    It is reported rather than raised, because a raise from this function costs the rest
+    of the sweep.
     """
     tables: list[pa.Table] = []
     expected = 0
@@ -467,6 +572,34 @@ def _seal(
 
     partition = paths.partition_path(surface, ticker, day)
     rel = partition.relative_to(root).as_posix()
+
+    # The merge is the last moment the segments still exist, so it is the only moment a
+    # mid-day drop is plain. Unifying by name fills a column one segment lacks with
+    # nulls, which is right for a rotation that adds a column and indistinguishable from
+    # one that drops it. What separates the two is the pinned schema this code is running
+    # with. A dropped column is one the merged table still carries and the pinned schema
+    # no longer names. An added one is named by both. After the seal neither is legible:
+    # the partition holds the column with nulls on the post-rotation rows either way.
+    #
+    # ``schema_for`` raises on a surface it does not know, and that raise is reachable
+    # from neither caller. Both build the partition path first, and ``partition_path``
+    # refuses exactly the surfaces the schemas have no entry for.
+    pinned = journal.schema_for(surface)
+    merged = _pinned_order(merged, pinned)
+    drift = (
+        None
+        if merged.schema.equals(pinned)
+        else _schema_drift(
+            merged.schema,
+            pinned,
+            surface=surface,
+            ticker=ticker,
+            day=day,
+            partition=rel,
+            segments=[path.relative_to(root).as_posix() for path in segments],
+        )
+    )
+
     if guard:
         guard_row_count(root, rel, expected)
 
@@ -487,6 +620,13 @@ def _seal(
         fetched_at=clock.now().isoformat(),
         guard=guard,
     )
+    # Filed once the seal has committed, and never before. A refused rebuild and a write
+    # that fails both leave the partition alone, so a finding filed earlier would name a
+    # file that does not carry the drift. Nothing is lost by waiting: a run that raises
+    # leaves the segments on disk, and the next one merges them again and finds the same
+    # difference.
+    if drift is not None:
+        _file_drift(root, drift, clock=clock)
     for path in segments:
         path.unlink()
     return SealedPartition(

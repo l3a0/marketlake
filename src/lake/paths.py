@@ -83,12 +83,16 @@ _DATE_PARTITIONED = frozenset({CHAINS, QUOTES})
 
 # The journal top-level directory, the reference directory, the reports directory, and
 # the two ledgers. ``reports/`` holds one dated file per night, written by the vendor
-# sweep. The daemon writes two more trees under it, each in a subdirectory of its own so
-# a reader counting one never picks up the other. One file per page that never reached
-# the phone goes under `reports/alerts/date=D/`, and one file per close+5 guard run goes
-# under `reports/close_guard/date=D/`. The tree sits inside the backup sync root, so a
-# restore carries the reports with the data, and outside the manifest, because none of
-# the three is a measurement.
+# sweep. Three more trees sit under it, each in a subdirectory of its own so a reader
+# counting one never picks up another.
+#
+# 1. One file per page that never reached the phone, under `reports/alerts/date=D/`.
+# 2. One file per close+5 guard run, under `reports/close_guard/date=D/`.
+# 3. One file per ticker-day whose merged segments did not carry the pinned schema,
+#    under `reports/schema_drift/date=D/`, written by compaction rather than the daemon.
+#
+# The tree sits inside the backup sync root, so a restore carries the reports with the
+# data, and outside the manifest, because none of the four is a measurement.
 JOURNAL_DIR = "journal"
 REFERENCE_DIR = "reference"
 REPORTS_DIR = "reports"
