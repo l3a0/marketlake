@@ -19,10 +19,16 @@ with a path it never created pays nothing for the extra fact.
 A backup that fails is a different thing and stays where it is used. One test defines
 a runner that raises ``BackupTargetUnavailable`` in place. That test covers the design's
 rule that an unplugged drive fails the run loudly rather than skipping the sync.
+
+``mirror_lake`` is the other half. Where ``FakeBackup`` copies nothing, this puts a real
+copy of a lake on disk, so a test can point the backup scrub at a target that a clean
+sync would have left. No ``rsync`` runs, and none could: the suite's subprocess guard
+fails any test that reaches it.
 """
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 
@@ -40,3 +46,16 @@ class FakeBackup:
             sorted(p.relative_to(source).as_posix() for p in source.rglob("*") if p.is_file())
         )
         self.events.append("backup")
+
+
+def mirror_lake(lake_root: Path, target: Path) -> Path:
+    """Copy a lake to ``target`` the way a clean ``rsync`` sync would leave it.
+
+    A plain whole-tree copy is faithful here. The two ``BACKUP_EXCLUSIONS`` patterns
+    name a temp file and the config directory, and a fixture lake holds neither, so
+    nothing a real sync would drop is in the tree to drop. A test that wants a backup
+    behind its lake mirrors first and writes to the lake after.
+    """
+    target = Path(target)
+    shutil.copytree(Path(lake_root), target, dirs_exist_ok=True)
+    return target

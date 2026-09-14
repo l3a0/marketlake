@@ -29,6 +29,7 @@ import pytest
 from lake import control_plane as cp
 from lake.paths import TOKEN_FILE, config_dir
 from lake.schwab import DEFAULT_TOKEN_PATH
+from tests.support.backup import mirror_lake
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import write_config
@@ -529,9 +530,22 @@ class _BrokenTransport:
         raise OSError("network down")
 
 
-def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys, monkeypatch):
+def _sunday_lake(tmp_path: Path) -> tuple[Path, Path]:
+    """A one-partition lake, a config naming it, and the backup copy on the SSD.
+
+    The Sunday job scrubs both copies, so a run that should come back clean needs the
+    copy to be there. ``write_config`` makes the target directory and this fills it the
+    way the close+15 sync would have. A plain file copy, never an ``rsync``: the
+    subprocess guard fails any test that reaches one.
+    """
     lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
     config = write_config(tmp_path, lake)
+    mirror_lake(lake, tmp_path / "ssd")
+    return lake, config
+
+
+def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys, monkeypatch):
+    lake, config = _sunday_lake(tmp_path)
     pinger = FakePinger()
     pushes = _Pushes()
     # main builds each past-process producer itself. A fake reaches the run by replacing
@@ -570,8 +584,7 @@ def test_sunday_cli_withholds_the_ping_for_a_stale_token(tmp_path, capsys, monke
     # close. Validity is not freshness, and the command line has to act on that, not
     # just the decision functions that already enforce it. This is the case the deleted
     # `--mint` override could hide, by supplying a mint the token does not carry.
-    lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
-    config = write_config(tmp_path, lake)
+    lake, config = _sunday_lake(tmp_path)
     pinger = FakePinger()
     monkeypatch.setattr(
         cp,
@@ -601,8 +614,7 @@ def test_sunday_cli_withholds_the_ping_for_a_stale_token(tmp_path, capsys, monke
 
 
 def test_sunday_cli_reads_the_mint_time_from_the_token_file(tmp_path, capsys, monkeypatch):
-    lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
-    config = write_config(tmp_path, lake)
+    lake, config = _sunday_lake(tmp_path)
     token = _token(tmp_path)
     pinger = FakePinger()
     monkeypatch.setattr(
@@ -628,8 +640,7 @@ def test_sunday_cli_reads_the_mint_time_from_the_token_file(tmp_path, capsys, mo
 def test_sunday_cli_checks_the_time_machine_exclusion(tmp_path, capsys, monkeypatch):
     # Production must always run the check, so main builds the reader and the standard
     # targets. A lost exclusion rides the report and the ping still fires.
-    lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
-    config = write_config(tmp_path, lake)
+    lake, config = _sunday_lake(tmp_path)
     pinger = FakePinger()
     asked: list[tuple[str, ...]] = []
 
@@ -668,8 +679,7 @@ def test_sunday_cli_checks_the_time_machine_exclusion(tmp_path, capsys, monkeypa
 
 
 def test_sunday_cli_reports_problems_and_exits_non_zero(tmp_path, capsys, monkeypatch):
-    lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
-    config = write_config(tmp_path, lake)
+    lake, config = _sunday_lake(tmp_path)
     pinger = FakePinger()
     monkeypatch.setattr(cp, "read_pmset_schedule", lambda: "")
     monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
@@ -710,8 +720,7 @@ WEEK_AHEAD = weekday_sessions(date(2026, 8, 31), date(2026, 9, 7))
 def test_the_sunday_cli_builds_a_real_canary_rather_than_passing_through(tmp_path, monkeypatch):
     # The seam's producer is built from the token path and the config's credentials. A
     # command line that passed none would report a healthy weekend on a dead token.
-    lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
-    config = write_config(tmp_path, lake)
+    lake, config = _sunday_lake(tmp_path)
     token = _token(tmp_path)
     asked: list[dict] = []
 
@@ -740,8 +749,7 @@ def test_the_sunday_cli_pushes_the_reminder_to_the_phone(tmp_path, monkeypatch):
     # A token minted late last week is still valid on Sunday and dead before Friday's
     # option close, so the ritual was skipped and the reminder is owed. The design sends
     # it on the 20:00, 21:00 and 22:00 runs while the check still fails.
-    lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
-    config = write_config(tmp_path, lake)
+    lake, config = _sunday_lake(tmp_path)
     pushes = _Pushes()
     monkeypatch.setattr(cp, "read_pmset_schedule", lambda: REPEAT_ONLY)
     monkeypatch.setattr(cp, "UrllibPinger", FakePinger)
@@ -772,8 +780,7 @@ def test_a_reminder_that_cannot_be_pushed_is_written_down_and_the_evening_carrie
     # read-back and the check's ping with it, and the missed ping would page at 23:30
     # naming the wrong cause. So the push is recorded under reports/ and the run ends
     # on its own summary line.
-    lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
-    config = write_config(tmp_path, lake)
+    lake, config = _sunday_lake(tmp_path)
     monkeypatch.setattr(cp, "read_pmset_schedule", lambda: REPEAT_ONLY)
     monkeypatch.setattr(cp, "UrllibPinger", FakePinger)
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)

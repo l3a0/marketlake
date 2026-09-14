@@ -34,7 +34,10 @@ Terms, glossed at first use.
 - The *canary* is the Sunday throwaway authenticated call that proves the brokerage
   token still works. It retries every 30 minutes until it passes or its deadline.
 - The *scrub* is the weekly integrity pass over the lake. It checks every recorded file
-  against its recorded checksum, and checks that no data file went unrecorded.
+  against its recorded checksum, and checks that no data file went unrecorded. The
+  *backup scrub* asks the same two questions of the rsync copy on the external SSD,
+  against the lake's manifest rather than the copy's. It is what notices the backup
+  rotting, which is why ``rsync`` no longer pays for ``--checksum`` every day.
 - The *mint* is the moment the brokerage refresh token was issued. The *coverage
   assertion* adds the token's lifetime to the mint and requires the sum to clear the
   week's last option close.
@@ -92,7 +95,7 @@ from lake.alert import Message, NtfyTransport, Publisher
 from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
 from lake.config import CALLBACK_KEY, input_errors_exit, load_config
-from lake.manifest import ScrubResult, scrub
+from lake.manifest import BackupScrubResult, ScrubResult, backup_scrub, scrub
 from lake.paths import CONFIG_DIR_ENV, TOKEN_FILE, config_dir
 from lake.runner import PING_FAILURES, LaunchdJob, Pinger, UrllibPinger, calendar_interval
 from lake.vendor import Vendor
@@ -1396,20 +1399,24 @@ class SundayOutcome:
 
     ``problems`` are the findings that withhold the ping, plus the ping's own failure
     when it is reached and fails. The withholding ones are a missing lake root, a
-    failed scrub, a failed canary, a token that does not cover the coming week, and a
-    mint time that could not be read. The ping's failure is different in kind. It is
-    recorded after the others have all passed, and it names why the ping did not land
-    rather than why it was not attempted.
+    failed scrub, a failed backup scrub, a failed canary, a token that does not cover
+    the coming week, and a mint time that could not be read. The ping's failure is
+    different in kind. It is recorded after the others have all passed, and it names why
+    the ping did not land rather than why it was not attempted.
 
-    ``report`` carries the report-tier findings. Today that is only pmset alarm drift.
-    The design pins drift to the nightly report, because the pre-open self-check already
-    catches a missed wake an hour before the bell, so drift never withholds the ping.
+    ``report`` carries the report-tier findings. Two kinds ride it. The first is pmset
+    alarm drift, which the design pins to the nightly report because the pre-open
+    self-check already catches a missed wake an hour before the bell. The second is a
+    backup that is merely behind the lake. That is the normal state between one sync and
+    the next, so it never withholds the ping, and a count that keeps growing is the one
+    reading that says the close+15 sync has stopped landing.
 
     ``covered`` is ``None`` when the mint time could not be read. That is a problem,
     never a skip. ``pinged`` is the success condition.
     """
 
     scrub: ScrubResult
+    backup: BackupScrubResult
     alarms: AlarmCheck
     canary_passed: bool
     covered: bool | None
@@ -1422,6 +1429,7 @@ class SundayOutcome:
 def sunday_maintenance(
     *,
     lake_root: Path,
+    backup_target: Path,
     now: datetime,
     calendar: Calendar,
     schedule_reader: ScheduleReader,
@@ -1432,10 +1440,10 @@ def sunday_maintenance(
     exclusion_targets: Sequence[str] = (),
     exclusion_reader: ExclusionReader | None = None,
 ) -> SundayOutcome:
-    """Scrub, verify the wake alarms, run the canary, assert coverage, then ping.
+    """Scrub both copies, verify the wake alarms, run the canary, assert coverage, ping.
 
     Every check runs and every finding is named, so one run reports all of them.
-    The ping fires only when the scrub, the canary, and the coverage assertion pass.
+    The ping fires only when both scrubs, the canary, and the coverage assertion pass.
     Alarm drift is checked and named in ``report`` but never withholds the ping. A
     read-back that cannot be run or parsed is named there too, for the same reason:
     the design routes the whole read-back step to the nightly report, and the
@@ -1452,21 +1460,25 @@ def sunday_maintenance(
     the scrub, the canary, and the coverage verdict it just spent its time computing.
     A coverage assertion that never ran must not read as a pass.
 
-    Five duties the design gives the Sunday run are not built here. Each is named so
+    Four duties the design gives the Sunday run are not built here. Each is named so
     the gap is a decision rather than an oversight.
 
     1. Regenerate the weekday wake alarm when the machine's timezone has moved. That
        is a ``pmset`` write, so it needs the operator's sudoers grant at run time.
     2. Check ``exchange_calendars`` for a package update, per the design's provenance
        rule that the library learns schedule changes only through releases.
-    3. Scrub the backup copy as well as the primary lake. That needs the backup target
-       mounted, which the compaction job owns.
-    4. Check the disk runway, free space over trailing growth, and flag the nightly
+    3. Check the disk runway, free space over trailing growth, and flag the nightly
        report under a few weeks of headroom.
-    5. Rotate the logs.
+    4. Rotate the logs.
 
-    ``canary`` has no default, so a caller cannot leave it out and be told the weekend's
-    auth check passed. The production one is ``token_canary``.
+    Neither ``canary`` nor ``backup_target`` has a default, and for one reason. A caller
+    that left either out would be told the weekend's auth check passed, or that the
+    backup verified, on the strength of nothing having been asked. The production canary
+    is ``token_canary`` and the production target is the config's ``backup_target``.
+
+    An unmounted target is a problem rather than a skip, for the same reason the
+    compaction job refuses to sync to one. The backup scrub is now the only thing that
+    notices the copy rotting, so a week it could not run is a week nothing looked.
 
     The canary's 30-minute retry until the deadline belongs to ``sunday_run``, not to
     this function. This function decides one attempt.
@@ -1483,6 +1495,10 @@ def sunday_maintenance(
             f"missing={len(result.missing)} sha_mismatches={len(result.sha_mismatches)} "
             f"orphans={len(result.orphans)}"
         )
+
+    backup = backup_scrub(root, Path(backup_target))
+    if backup.problem is not None:
+        problems.append(backup.problem)
 
     # The design routes this whole step to the nightly report, so nothing it can raise
     # may withhold the ping. The reader is an injected seam that shells out in
@@ -1501,6 +1517,9 @@ def sunday_maintenance(
     else:
         alarms = check_alarms(schedule, one_shot_date=expected_one_shot(now, calendar))
     report = list(alarms.problems)
+
+    if backup.pending:
+        report.append(f"backup behind the lake by {len(backup.pending)} partitions")
 
     if exclusion_reader is not None and exclusion_targets:
         try:
@@ -1535,6 +1554,7 @@ def sunday_maintenance(
             problems.append(f"ping failed: {type(exc).__name__}")
     return SundayOutcome(
         scrub=result,
+        backup=backup,
         alarms=alarms,
         canary_passed=canary_passed,
         covered=covered,
@@ -1557,6 +1577,7 @@ MintReader = Callable[[], datetime | None]
 def sunday_run(
     *,
     lake_root: Path,
+    backup_target: Path,
     clock: Clock,
     calendar: Calendar,
     schedule_reader: ScheduleReader,
@@ -1579,9 +1600,11 @@ def sunday_run(
 
     launchd has no repeat-until key, so the retry lives here rather than in the plist.
     The loop returns on the first success, so a healthy Sunday makes one attempt and
-    scrubs once. An evening that keeps failing scrubs again on each attempt. That is
-    the price of keeping one attempt one decision, and it buys a re-check of an
-    integrity failure that may have been a disk unplugged for a moment.
+    scrubs once. An evening that keeps failing scrubs both copies again on each attempt.
+    That is the price of keeping one attempt one decision, and it buys a re-check of an
+    integrity failure that may have been a disk unplugged for a moment. The backup scrub
+    is the case that pays off most directly, because plugging the SSD back in between
+    two attempts is exactly the repair the retry was built to see.
 
     Retrying is Sunday-evening behaviour alone. A run started outside that window makes
     one attempt and returns. That covers the Monday catch-up launchd fires for a wake
@@ -1603,6 +1626,7 @@ def sunday_run(
         attempt_now = clock.now()
         outcome = sunday_maintenance(
             lake_root=lake_root,
+            backup_target=backup_target,
             now=attempt_now,
             calendar=calendar,
             schedule_reader=schedule_reader,
@@ -2695,6 +2719,7 @@ def main(
         )
         outcomes = sunday_run(
             lake_root=config.lake_root,
+            backup_target=config.backup_target,
             clock=run_clock,
             calendar=calendar if calendar is not None else _exchange_calendar(),
             schedule_reader=read_pmset_schedule,

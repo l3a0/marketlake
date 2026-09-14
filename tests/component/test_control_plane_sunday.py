@@ -1,22 +1,28 @@
 """The Sunday maintenance job across one real boundary: the filesystem.
 
-The scrub reads a lake the fixture builder put on disk. Everything else is injected:
-``now``, the calendar, the schedule reader, the canary, the pinger, and the mint time.
-The rules under test: the ping fires only when the scrub, the canary, and the
-coverage assertion pass, pmset alarm drift rides the report and never withholds the
-ping, an unreadable mint time is a problem and never a skip, and every finding is
-named at once.
+The two scrubs read a lake the fixture builder put on disk and a copy of it beside
+that lake. Everything else is injected: ``now``, the calendar, the schedule reader, the
+canary, the pinger, and the mint time. The rules under test: the ping fires only when
+both scrubs, the canary, and the coverage assertion pass, pmset alarm drift rides the
+report and never withholds the ping, an unreadable mint time is a problem and never a
+skip, and every finding is named at once.
+
+The backup copy is taken while the lake is clean, so a test that then corrupts the lake
+is exercising the primary scrub alone. The copy is a plain file copy, never an
+``rsync``. ``tests/conftest.py`` fails any test that shells out to one.
 """
 
 from __future__ import annotations
 
 import io
+import shutil
 import subprocess
 import urllib.error
 from datetime import date
 from pathlib import Path
 
 from lake import control_plane as cp
+from tests.support.backup import mirror_lake
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.lake import FixtureLake
@@ -32,10 +38,23 @@ REPEAT_ONLY = "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n"
 BOTH = REPEAT_ONLY + "Scheduled power events:\n [0]  wakepoweron at 08/30/26 19:55:00 by 'pmset'\n"
 
 
+def _backup_of(lake_root: Path) -> Path:
+    """Where a lake's backup copy sits. A sibling of the lake, standing in for the SSD.
+
+    Every call site needs one, because ``sunday_maintenance`` gives ``backup_target``
+    no default. A lake that was never built has no copy, so this names a directory that
+    is not there and the scrub reports it, which is the honest reading of a machine
+    carrying neither.
+    """
+    return Path(lake_root).parent / "ssd"
+
+
 def _clean_lake(fixture_lake: FixtureLake) -> Path:
     fixture_lake.with_chains("SPY", date(2026, 8, 28))
     fixture_lake.with_quotes("SPY", date(2026, 8, 28))
-    return fixture_lake.build()
+    root = fixture_lake.build()
+    mirror_lake(root, _backup_of(root))
+    return root
 
 
 def _passing_canary() -> bool:
@@ -53,6 +72,7 @@ def _run(
     pinger = FakePinger()
     outcome = cp.sunday_maintenance(
         lake_root=lake_root,
+        backup_target=_backup_of(lake_root),
         now=now,
         calendar=CALENDAR,
         schedule_reader=lambda: schedule,
@@ -112,11 +132,72 @@ def test_a_failed_scrub_blocks_the_ping(fixture_lake):
     assert any(p.startswith("scrub failed") for p in outcome.problems)
 
 
+# -- the backup copy -----------------------------------------------------------------
+
+# The Sunday job scrubs both copies. Until it did, ``rsync --checksum`` was the only
+# thing that would have noticed the backup rotting, and it paid for that every day.
+
+
+def test_a_rotted_backup_withholds_the_ping_while_the_lake_scrubs_clean(fixture_lake):
+    root = _clean_lake(fixture_lake)
+    partition = next((_backup_of(root)).glob("chains/**/*.parquet"))
+    partition.write_bytes(b"rot")
+
+    outcome, pinger = _run(root)
+    # The lake is fine and the copy is not, which is the pair naming the side.
+    assert outcome.scrub.ok is True
+    assert outcome.backup.ok is False
+    assert outcome.pinged is False and pinger.urls == []
+    assert any(p.startswith("backup scrub failed") for p in outcome.problems)
+
+
+def test_a_backup_file_gone_withholds_the_ping(fixture_lake):
+    root = _clean_lake(fixture_lake)
+    next((_backup_of(root)).glob("chains/**/*.parquet")).unlink()
+
+    outcome, pinger = _run(root)
+    assert outcome.backup.missing != ()
+    assert outcome.pinged is False and pinger.urls == []
+
+
+def test_an_unmounted_backup_target_withholds_the_ping(fixture_lake):
+    # A week the scrub could not run is a week nothing looked at the copy, so this is a
+    # problem rather than a skip. It is the same rule the compaction job applies when it
+    # refuses to sync to an unplugged drive.
+    root = _clean_lake(fixture_lake)
+    shutil.rmtree(_backup_of(root))
+
+    outcome, pinger = _run(root)
+    assert outcome.backup.target_missing is True
+    assert outcome.pinged is False and pinger.urls == []
+    assert any("backup target not mounted" in p for p in outcome.problems)
+
+
+def test_a_backup_merely_behind_the_lake_still_pings(fixture_lake):
+    # The edge that decides whether this check is worth having. The copy is written at
+    # close+15 and scrubbed on Sunday, so a partition sealed in between is legitimately
+    # absent. Calling that loss would withhold the ping every week.
+    root = _clean_lake(fixture_lake)
+    fixture_lake.with_chains("SPY", date(2026, 9, 4))
+    fixture_lake.build()
+
+    outcome, pinger = _run(root)
+    assert outcome.backup.ok is True
+    assert outcome.backup.pending != () and outcome.backup.missing == ()
+    assert outcome.problems == ()
+    assert outcome.pinged is True and pinger.urls == [URL]
+    # Named all the same, at report tier. A count that keeps growing is what says the
+    # close+15 sync has stopped landing.
+    assert any("backup behind the lake by 1 partitions" == line for line in outcome.report)
+
+
 def test_a_missing_lake_root_is_a_failure_not_a_clean_scrub(tmp_path):
     outcome, pinger = _run(tmp_path / "nowhere")
     assert outcome.pinged is False
     assert pinger.urls == []
     assert any("lake root missing" in p for p in outcome.problems)
+    # A machine with no lake has no copy of one either, and both are named.
+    assert any("backup target not mounted" in p for p in outcome.problems)
 
 
 def test_a_missing_repeat_alarm_rides_the_report_and_the_ping_still_fires(fixture_lake):
@@ -195,6 +276,7 @@ def test_a_reader_that_raises_rides_the_report_and_the_ping_still_fires(fixture_
         pinger = FakePinger()
         outcome = cp.sunday_maintenance(
             lake_root=root,
+            backup_target=_backup_of(root),
             now=SUNDAY_20,
             calendar=CALENDAR,
             schedule_reader=_raise(exc),
@@ -280,6 +362,7 @@ def _retry_run(lake_root, *, start, mints, canary=None, schedule=REPEAT_ONLY, re
     pinger = FakePinger()
     outcomes = cp.sunday_run(
         lake_root=lake_root,
+        backup_target=_backup_of(lake_root),
         clock=clock,
         calendar=CALENDAR,
         schedule_reader=lambda: schedule,
@@ -376,8 +459,10 @@ class _RaisingPinger:
 
 def test_a_failed_ping_is_a_named_problem_and_the_run_still_reports(fixture_lake):
     pinger = _RaisingPinger(urllib.error.URLError(OSError("connection refused")))
+    root = _clean_lake(fixture_lake)
     outcome = cp.sunday_maintenance(
-        lake_root=_clean_lake(fixture_lake),
+        lake_root=root,
+        backup_target=_backup_of(root),
         now=SUNDAY_20,
         calendar=CALENDAR,
         schedule_reader=lambda: REPEAT_ONLY,
@@ -396,8 +481,10 @@ def test_a_failed_ping_is_a_named_problem_and_the_run_still_reports(fixture_lake
 
 def test_a_failed_ping_never_carries_the_key(fixture_lake):
     pinger = _RaisingPinger(urllib.error.HTTPError(URL, 500, "Server Error", {}, io.BytesIO(b"")))
+    root = _clean_lake(fixture_lake)
     outcome = cp.sunday_maintenance(
-        lake_root=_clean_lake(fixture_lake),
+        lake_root=root,
+        backup_target=_backup_of(root),
         now=SUNDAY_20,
         calendar=CALENDAR,
         schedule_reader=lambda: REPEAT_ONLY,
@@ -416,8 +503,10 @@ def test_the_retry_loop_gives_a_failed_ping_another_chance(fixture_lake):
     # 20:30 with no HTTP-level retry in the pinger.
     clock = ManualClock(start=SUNDAY_20)
     pinger = _RaisingPinger(TimeoutError("timed out"))
+    root = _clean_lake(fixture_lake)
     outcomes = cp.sunday_run(
-        lake_root=_clean_lake(fixture_lake),
+        lake_root=root,
+        backup_target=_backup_of(root),
         clock=clock,
         calendar=CALENDAR,
         schedule_reader=lambda: REPEAT_ONLY,
@@ -448,6 +537,7 @@ def _exclusion_run(lake_root, *, reader, targets=(CONFIG_DIR,)):
     pinger = FakePinger()
     outcome = cp.sunday_maintenance(
         lake_root=lake_root,
+        backup_target=_backup_of(lake_root),
         now=SUNDAY_20,
         calendar=CALENDAR,
         schedule_reader=lambda: REPEAT_ONLY,

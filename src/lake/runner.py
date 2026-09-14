@@ -226,10 +226,15 @@ class RsyncBackup:
         if not target.exists() or not target.is_dir():
             raise BackupTargetUnavailable(f"backup target not mounted: {target}")
         # A trailing slash on the source copies its contents into the target. ``-a``
-        # preserves metadata. ``--checksum`` is pinned as cut in the design: it cannot
-        # see a half-written target, only bit rot, and it costs an O(lake) MD4 pass a
-        # day. It stays until the backup-copy scrub lands, because until then nothing
-        # else would notice the backup rotting.
+        # preserves metadata, so size and mtime mean the same thing on both sides and
+        # the default size-and-mtime comparison is a sound change detector here.
+        #
+        # ``--checksum`` is gone, and the design pins it as cut. It never saw a
+        # half-written target, only bit rot, and it read and MD4-hashed both trees every
+        # day to do it. What kept it here was that nothing else would notice the backup
+        # rotting. ``manifest.backup_scrub`` notices now, on the Sunday job, and it
+        # names the file it found. The flag never did: it copied over the rot and exited
+        # clean, so a failing disk reported nothing.
         #
         # The exclusions come before ``extra_args``, so a caller's extra flags can never
         # land between them. The list is policy rather than a parameter, and a caller
@@ -237,7 +242,6 @@ class RsyncBackup:
         args = [
             "rsync",
             "-a",
-            "--checksum",
             *(f"--exclude={pattern}" for pattern in BACKUP_EXCLUSIONS),
             *self._extra_args,
             f"{source}/",

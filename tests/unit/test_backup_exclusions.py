@@ -1,7 +1,8 @@
 """The backup's exclusion list.
 
 The design pins the sync root as ``lake/`` only, with an explicit exclusion list.
-``runner.BACKUP_EXCLUSIONS`` is that list. These tests cover three things about it.
+``runner.BACKUP_EXCLUSIONS`` is that list. These tests cover three things about it, and
+a fourth about the flags the same command carries.
 
 1. Every pattern reaches ``rsync``, ahead of the source and target operands.
 2. The list is exactly the two justified entries, each derived from the constant that
@@ -11,6 +12,9 @@ The design pins the sync root as ``lake/`` only, with an explicit exclusion list
    over-broad pattern is the dangerous failure. It drops real data, the sync still
    exits clean, and the loss surfaces only at a restore. So the list is run against a
    fixture lake holding one of everything the design's lake tree names.
+
+4. The command asks for a plain size-and-mtime sync. ``--checksum`` is cut, and the
+   check that replaced it is the weekly backup scrub.
 
 No real ``rsync`` runs. ``RsyncBackup`` takes its command runner as a seam, so a fake
 records the argument list instead of copying anything. That is the same shape as the
@@ -26,8 +30,10 @@ from pathlib import Path
 import pytest
 
 from lake import compact
+from lake.manifest import backup_scrub
 from lake.paths import CONFIG_DIR_PARTS, CONFIG_FILE, TEMP_MARKER, LakePaths, temp_write_path
 from lake.runner import BACKUP_EXCLUSIONS, BackupTargetUnavailable, RsyncBackup
+from tests.support.backup import mirror_lake
 from tests.support.lake import FixtureLake, sample_chains_table, sample_quotes_table
 
 DAY = date(2026, 8, 24)
@@ -281,3 +287,32 @@ def test_the_matcher_refuses_a_shape_it_does_not_model():
     # The anchored form is refused rather than mismatched.
     with pytest.raises(AssertionError, match="does not model"):
         _excluded(segment, ("/journal/",))
+
+
+# -- 4. the flags the command carries ----------------------------------------
+
+
+def test_the_sync_asks_for_no_checksum_pass(tmp_path):
+    """The flag is gone, and something else now notices the backup rotting.
+
+    ``--checksum`` re-read and hashed both whole trees on every sync, and what kept it
+    here was that nothing else would see bit rot on the target. ``manifest.backup_scrub``
+    sees it, on the Sunday job, and names the file rather than copying over it. This
+    asserts both halves, because the flag may only go while its replacement is in place.
+    """
+    assert "--checksum" not in _sync(tmp_path)
+
+    lake = _full_lake(tmp_path / "lake")
+    backup = mirror_lake(lake, tmp_path / "ssd")
+    partition = LakePaths(backup).chains_partition_path("SPY", DAY)
+    partition.write_bytes(b"rot")
+
+    rotted = backup_scrub(lake, backup).sha_mismatches
+    assert rotted == (partition.relative_to(backup).as_posix(),)
+
+
+def test_the_sync_still_preserves_metadata(tmp_path):
+    # ``-a`` is what leaves size and mtime meaning the same thing on both sides, which
+    # is the premise the default comparison rests on. Dropping ``--checksum`` makes that
+    # flag load-bearing rather than merely conventional.
+    assert "-a" in _sync(tmp_path)
