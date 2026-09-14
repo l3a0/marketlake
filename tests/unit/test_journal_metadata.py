@@ -1,18 +1,21 @@
-"""The journal metadata stamp: two writers, one file, and a total reader.
+"""The journal metadata stamp: three writers, one file, and a total reader.
 
 The stamp carries the three facts the Now panel cannot read off a captured row: the
-refresh token's mint time, the roster, and the last dead-man ping. It decides nothing
-and touches no clock, so the tier is unit.
+refresh token's mint time, the roster, and the last dead-man ping. It carries a fourth
+for the 08:30 self-check, the pid of the ``caffeinate`` the daemon is holding. It decides
+nothing and touches no clock, so the tier is unit.
 
-Four properties are covered here, because each one is what a panel field rests on.
+Five properties are covered here, because each one is what a reader's field rests on.
 
-1. The two writers share the file without clobbering each other. The cycle stamps the
-   mint time and the roster, the dead-man stamps its ping, and each carries the other's
-   keys forward.
+1. The three writers share the file without clobbering each other. The cycle stamps the
+   mint time and the roster, the dead-man stamps its ping, the assertion hook stamps its
+   pid, and each carries the others' keys forward.
 2. The roster is stored as the surfaces each ticker is captured on, so a ticker that
    journaled nothing still has rows to show as failing.
 3. The mint stamp is a timestamp. No token material reaches the file.
-4. Reading is total. Absent, corrupt, or naive-timestamped, the stamp reads as an empty
+4. The pid is a pid. A stamp holding anything else reads as no pid at all, because the
+   check that reads it must never be handed a number that names the wrong process.
+5. Reading is total. Absent, corrupt, or naive-timestamped, the stamp reads as an empty
    record rather than raising into a panel.
 """
 
@@ -23,9 +26,11 @@ from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 from lake.metadata import (
+    ASSERTION_PID,
     JournalMetadata,
     metadata_path,
     read_metadata,
+    stamp_assertion_pid,
     stamp_cycle,
     stamp_ping,
 )
@@ -81,6 +86,97 @@ def test_the_two_writers_carry_each_others_keys_forward(lake_root):
     again = read_metadata(lake_root)
     assert again.dead_man_last_ping == PING
     assert again.stamped_at == later
+
+
+def test_the_assertion_pid_rides_beside_the_panel_s_own_keys(lake_root):
+    """The third writer, and it fires every minute of a ten-hour window.
+
+    A merge that dropped the others would blank the Now panel's token age and ticker
+    list for the whole trading day, which is the exact shape the two-writer rule exists
+    to prevent and now has one more writer to survive.
+    """
+    stamp_cycle(lake_root, at=SLOT, token_minted_at=MINTED, roster=_roster())
+    stamp_ping(lake_root, at=PING)
+    stamp_assertion_pid(lake_root, pid=4242)
+
+    stamp = read_metadata(lake_root)
+    assert stamp.assertion_pid == 4242
+    assert stamp.token_minted_at == MINTED
+    assert stamp.dead_man_last_ping == PING
+    assert stamp.tickers == {"SPY": ("chains", "quotes"), "XYZ": ("quotes",)}
+
+    # And the other way round: a later cycle keeps the pid.
+    stamp_cycle(lake_root, at=SLOT, token_minted_at=MINTED, roster=_roster())
+    assert read_metadata(lake_root).assertion_pid == 4242
+
+
+def test_a_cleared_pid_reads_as_no_pid_rather_than_the_last_one(lake_root):
+    """The window ends and the ``caffeinate`` releases itself, so the pid stops being true.
+
+    Leaving the number behind would have the self-check match a process that has exited,
+    or worse, one whose pid the operating system has since handed to something else.
+    """
+    stamp_assertion_pid(lake_root, pid=4242)
+    stamp_assertion_pid(lake_root, pid=None)
+
+    assert read_metadata(lake_root).assertion_pid is None
+
+
+def test_a_stamp_with_no_pid_key_at_all_reads_as_no_pid(lake_root):
+    """Every lake written before this shipped looks like this."""
+    stamp_cycle(lake_root, at=SLOT, token_minted_at=MINTED, roster=_roster())
+
+    assert read_metadata(lake_root).assertion_pid is None
+
+
+def test_a_pid_that_is_not_a_pid_reads_as_no_pid(lake_root):
+    """The reader is total, and the check it feeds fails closed on nothing.
+
+    ``True`` is the one worth spelling out: JSON ``true`` is an ``int`` in Python, so a
+    bare type test would read it as pid 1, which is ``launchd``. A check told to look for
+    a ``caffeinate`` at pid 1 asks a question about the wrong process entirely.
+    """
+    for value in (True, False, 0, -1, "4242", 42.0, None, [4242], {"pid": 4242}):
+        metadata_path(lake_root).parent.mkdir(parents=True, exist_ok=True)
+        metadata_path(lake_root).write_text(json.dumps({ASSERTION_PID: value}))
+
+        assert read_metadata(lake_root).assertion_pid is None, f"{value!r} read as a pid"
+
+
+def test_stamping_the_pid_already_written_writes_nothing(lake_root):
+    """Ten hours of ticks are not ten hours of writes, which is why this is cheap enough
+    to ride the per-minute hook at all."""
+    stamp_assertion_pid(lake_root, pid=4242)
+    before = metadata_path(lake_root).stat().st_mtime_ns
+
+    stamp_assertion_pid(lake_root, pid=4242)
+
+    assert metadata_path(lake_root).stat().st_mtime_ns == before, "it rewrote the stamp"
+
+
+def test_a_stamp_that_goes_missing_is_put_back_on_the_next_call(lake_root):
+    """The skip compares against the file, never against what a caller remembers.
+
+    A guard held in the daemon's memory would say "already stamped" for the rest of the
+    window, and the 08:30 check would withhold its ping on a machine being held awake
+    perfectly well. Nothing in this repo deletes the file, so the cause would be an
+    operator or another tool, and recovering without one is worth a read per tick.
+    """
+    stamp_assertion_pid(lake_root, pid=4242)
+    metadata_path(lake_root).unlink()
+
+    stamp_assertion_pid(lake_root, pid=4242)
+
+    assert read_metadata(lake_root).assertion_pid == 4242
+
+
+def test_a_stamp_overwritten_underneath_the_daemon_is_corrected(lake_root):
+    stamp_assertion_pid(lake_root, pid=4242)
+    metadata_path(lake_root).write_text(json.dumps({ASSERTION_PID: 9999}))
+
+    stamp_assertion_pid(lake_root, pid=4242)
+
+    assert read_metadata(lake_root).assertion_pid == 4242
 
 
 def test_a_ping_alone_writes_a_stamp_with_nothing_else_in_it(lake_root):

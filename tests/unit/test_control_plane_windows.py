@@ -11,7 +11,7 @@ from __future__ import annotations
 import http.client
 import io
 import urllib.error
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -712,3 +712,170 @@ def test_the_real_spawn_hands_back_something_the_holder_can_ask():
     assert isinstance(child, cp.AssertionHandle), "the spawn returned something unaskable"
     child.wait()
     assert child.poll() is not None, "a finished child still read as running"
+
+
+def test_the_real_spawn_hands_back_something_the_holder_can_name():
+    """The other half of the contract, and the live daemon is the only caller that needs it.
+
+    Every double in this suite could satisfy ``IdentifiedHandle`` or not without the
+    check noticing, because each one decides its own answer. On the capture machine the
+    pid comes from here. A ``_spawn`` returning something nameless would stamp no pid,
+    and the 08:30 check would fail closed every weekday morning on a healthy machine.
+    """
+    child = cp._spawn(["true"])
+
+    assert isinstance(child, cp.IdentifiedHandle), "the spawn returned something unnameable"
+    assert isinstance(child.pid, int) and child.pid > 0
+    child.wait()
+
+
+class _PidChild:
+    """A child that answers both halves of the contract: alive, and named."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self._status: int | None = None
+
+    def die(self) -> None:
+        self._status = 0
+
+    def poll(self) -> int | None:
+        return self._status
+
+
+def test_the_holder_names_the_child_it_spawned_for_the_open_window():
+    """The pid the daemon stamps, and the only thing that makes the 08:30 check ours."""
+    holder = cp.AssertionHolder(runner=lambda args: _PidChild(4242))
+    holder.hold(et(2026, 9, 2, 8, 30))
+
+    assert holder.child_pid(et(2026, 9, 2, 8, 30)) == 4242
+    assert holder.child_pid(et(2026, 9, 2, 14, 0)) == 4242, "it forgot mid-window"
+
+
+def test_the_holder_names_nothing_once_the_window_has_ended():
+    """``caffeinate -i -t`` releases itself at the window's end, so the pid stops meaning
+    anything there. Reporting it past that would have the daemon stamp a claim about a
+    process that has exited, and a reused pid would make that claim actively wrong.
+
+    This clamp is also what lets the check stop at identity. A pid only ever reported
+    inside its own window is a pid whose timer runs to that window's end.
+    """
+    holder = cp.AssertionHolder(runner=lambda args: _PidChild(4242))
+    holder.hold(et(2026, 9, 2, 8, 30))
+
+    assert holder.child_pid(et(2026, 9, 2, 18, 45)) is None, "the window end is exclusive"
+    assert holder.child_pid(et(2026, 9, 2, 22, 0)) is None
+    assert holder.child_pid(et(2026, 9, 3, 8, 30)) is None, "yesterday's pid survived the night"
+
+
+def test_the_holder_names_nothing_before_it_has_held_anything():
+    holder = cp.AssertionHolder(runner=lambda args: _PidChild(4242))
+
+    assert holder.child_pid(et(2026, 9, 2, 8, 30)) is None
+
+
+def test_a_failed_spawn_leaves_no_pid_to_name():
+    """Nothing holds the machine awake, so nothing may be named as holding it."""
+
+    def refuse(args):
+        raise OSError("no process table")
+
+    holder = cp.AssertionHolder(runner=refuse)
+    holder.hold(et(2026, 9, 2, 8, 30))
+
+    assert holder.child_pid(et(2026, 9, 2, 8, 30)) is None
+
+
+def test_a_re_take_names_the_replacement_rather_than_the_child_that_died():
+    """The re-take path and the pid have to agree, or the stamp names a dead process.
+
+    The holder already replaces a child that has gone. Before this the pid was read off
+    whatever ``_child`` happened to hold, so the two could only disagree if one of them
+    was written wrong, and this is the test that would say so.
+    """
+    children = [_PidChild(4242), _PidChild(5353)]
+    spawned: list[object] = []
+
+    def runner(args):
+        child = children[len(spawned)]
+        spawned.append(child)
+        return child
+
+    holder = cp.AssertionHolder(runner=runner)
+    holder.hold(et(2026, 9, 2, 8, 30))
+    assert holder.child_pid(et(2026, 9, 2, 8, 30)) == 4242
+
+    children[0].die()
+    holder.hold(et(2026, 9, 2, 8, 31))
+
+    assert holder.child_pid(et(2026, 9, 2, 8, 31)) == 5353, "the stamp kept the dead pid"
+
+
+def test_a_handle_with_no_pid_names_nothing_rather_than_raising():
+    """``AssertionHandle`` never required a pid, and that stays true.
+
+    A double that answers only ``poll`` is supported, and its supported answer here is
+    that there is no pid to report. Reaching for the attribute instead would raise from a
+    hook ``run_loop`` does not wrap, which is the crash loop this area exists to prevent.
+    """
+    holder = cp.AssertionHolder(runner=lambda args: _Child())
+    holder.hold(et(2026, 9, 2, 8, 30))
+
+    assert holder.child_pid(et(2026, 9, 2, 8, 30)) is None
+
+
+def test_a_child_whose_pid_raises_names_nothing_rather_than_crashing():
+    """The guard ``_holding`` puts on ``poll`` belongs on ``pid`` for the same reason.
+
+    Both run from a hook ``run_loop`` does not wrap, so a raise from either exits the
+    daemon into a KeepAlive relaunch on the same tick. ``IdentifiedHandle`` promises the
+    attribute is there and never that reading it is safe, which is word for word what
+    ``AssertionHandle`` promises about ``poll``.
+    """
+
+    class Hostile:
+        @property
+        def pid(self) -> int:
+            raise RuntimeError("no")
+
+        def poll(self) -> int | None:
+            return None
+
+    holder = cp.AssertionHolder(runner=lambda args: Hostile())
+    holder.hold(et(2026, 9, 2, 8, 30))
+
+    assert holder.child_pid(et(2026, 9, 2, 8, 30)) is None
+
+
+def test_a_pid_that_is_not_a_pid_names_nothing():
+    """A runtime-checkable protocol tests for the attribute, never for its type.
+
+    So anything at all can arrive as ``pid``, and two of these are worse than useless.
+    A string or an object reaches the stamp's ``json.dumps`` as something it cannot
+    write, raising from that same unwrapped hook. ``True`` is an ``int`` in Python and
+    would stamp pid 1, which is ``launchd``, sending the check after the wrong process.
+    """
+    for value in (True, False, 0, -1, "4242", 42.0, None, object()):
+
+        class Odd:
+            pid = value
+
+            def poll(self) -> int | None:
+                return None
+
+        holder = cp.AssertionHolder(runner=lambda args: Odd())
+        holder.hold(et(2026, 9, 2, 8, 30))
+
+        assert holder.child_pid(et(2026, 9, 2, 8, 30)) is None, f"{value!r} read as a pid"
+
+
+def test_a_utc_clock_still_names_the_eastern_window(tmp_path):
+    """The daemon's tick hands whatever the clock gives it, and the window is Eastern.
+
+    A comparison that skipped the conversion would read 13:30 UTC as an hour outside the
+    window and clear a pid that is being held perfectly well.
+    """
+    holder = cp.AssertionHolder(runner=lambda args: _PidChild(4242))
+    holder.hold(et(2026, 9, 2, 8, 30))
+
+    assert holder.child_pid(datetime(2026, 9, 2, 12, 30, tzinfo=UTC)) == 4242

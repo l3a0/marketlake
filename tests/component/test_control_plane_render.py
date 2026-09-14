@@ -27,6 +27,7 @@ from types import SimpleNamespace
 import pytest
 
 from lake import control_plane as cp
+from lake.metadata import stamp_assertion_pid
 from lake.paths import TOKEN_FILE, config_dir
 from lake.schwab import DEFAULT_TOKEN_PATH
 from tests.support.backup import mirror_lake
@@ -440,8 +441,12 @@ def test_self_check_cli_pings_the_pre_open_slug_when_the_daemon_is_up(
     # main builds the probe and the pinger itself, so a fake reaches them by replacing
     # the producer main names, not by a seam this entry no longer accepts.
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
-    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
     monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    # Saturday, so no assertion is owed and this stays about the slug. Without a fixed
+    # clock the answer would depend on the hour the suite ran, because a lake with no
+    # stamped pid fails the check inside a weekday window.
+    monkeypatch.setattr(cp, "_system_clock", lambda: ManualClock(start=et(2026, 9, 5, 12, 0)))
     code = cp.main(["self-check", "--config", str(config)])
     assert code == 0
     assert pinger.urls == ["https://hc-ping.com/secret-key/pre-open"]
@@ -460,8 +465,11 @@ def test_self_check_cli_names_a_failed_ping_and_still_reports(tmp_path, capsys, 
             raise urllib.error.URLError(OSError("connection refused"))
 
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
-    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
     monkeypatch.setattr(cp, "UrllibPinger", Boom)
+    # Saturday, for the reason the test above names: nothing owed, so the ping is what
+    # this measures.
+    monkeypatch.setattr(cp, "_system_clock", lambda: ManualClock(start=et(2026, 9, 5, 12, 0)))
     code = cp.main(["self-check", "--config", str(config)])
     assert code == 1
     printed = capsys.readouterr().out
@@ -476,7 +484,7 @@ def test_self_check_cli_exits_non_zero_without_pinging_when_down(tmp_path, monke
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: False)
     # Faked even though the daemon probe returns first, so a reordering cannot reach the
     # real tool. The guard would catch it, but as a refusal rather than as the finding.
-    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
     monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
     code = cp.main(["self-check", "--config", str(config)])
     assert code == 1
@@ -1934,6 +1942,10 @@ def test_the_written_uninstall_script_is_executable(tmp_path):
 
 # -- the assertion the self-check now also verifies -------------------------------------
 
+# The pid the daemon stamped for its own child. Every dump below that should read as
+# held carries this pid, and every dump that should not carries another.
+_DAEMON_PID = 4242
+
 # Trimmed from a real `pmset -g assertions` dump. The tally comes first, then one line
 # per owning process, which is the half that names who is holding what.
 _HELD = """Assertion status system-wide:
@@ -1960,7 +1972,68 @@ Listed by owning process:
 
 
 def test_a_caffeinate_assertion_is_recognised():
-    assert cp.parse_pmset_assertions(_HELD)
+    assert cp.parse_pmset_assertions(_HELD, pid=_DAEMON_PID)
+
+
+def test_a_caffeinate_under_another_pid_is_not_the_daemons():
+    """The whole of #111. A hand-run ``caffeinate -i`` is a real holder and not ours.
+
+    The dump here is the held one verbatim, so nothing about the assertion differs. Only
+    the pid the check was told to look for does, and that is enough to refuse it. An
+    operator who ran ``caffeinate -i`` the night before leaves exactly this: a genuine
+    ``PreventUserIdleSystemSleep`` under a pid the daemon never spawned, whose timer
+    says nothing about 15:59.
+    """
+    assert not cp.parse_pmset_assertions(_HELD, pid=9999)
+
+
+def test_a_pid_with_no_caffeinate_on_it_is_not_held():
+    """A stale stamp names a process that is gone, and the check must say so.
+
+    A daemon that died overnight leaves its last pid in the journal. The dump the next
+    morning carries no line for it, so there is nothing to match and nothing to vouch
+    for the machine.
+    """
+    dump = """Assertion status system-wide:
+   PreventUserIdleSystemSleep     1
+Listed by owning process:
+   pid 991(Music): [0x0000abc] 00:31:02 PreventUserIdleSystemSleep named: "playing"
+"""
+
+    assert not cp.parse_pmset_assertions(dump, pid=_DAEMON_PID)
+
+
+def test_the_owner_field_is_read_rather_than_the_whole_line():
+    """``named:`` is free text, so the pid shape written there must not pass for the owner.
+
+    The match is anchored at the start of the line, where ``pmset`` prints the owner. A
+    substring search over the line would let any process claim the daemon's identity by
+    naming its assertion after it, which is the same spoof the process-name test below
+    refuses, one field further in.
+    """
+    dump = """Assertion status system-wide:
+   PreventUserIdleSystemSleep     1
+Listed by owning process:
+   pid 991(Music): [0x0abc] 00:31:02 PreventUserIdleSystemSleep named: "pid 4242(caffeinate):"
+"""
+
+    assert not cp.parse_pmset_assertions(dump, pid=_DAEMON_PID)
+
+
+def test_a_pid_that_is_a_prefix_of_another_does_not_match_it():
+    """424 and 4242 are different processes, and a loose match would conflate them.
+
+    The owner field is read whole rather than searched for, so a stamped pid only ever
+    matches the process that actually owns the line.
+    """
+    dump = """Assertion status system-wide:
+   PreventUserIdleSystemSleep     1
+Listed by owning process:
+   pid 4242(caffeinate): [0x0000f0a] 09:59:58 PreventUserIdleSystemSleep named: ""
+"""
+
+    assert not cp.parse_pmset_assertions(dump, pid=424)
+    assert not cp.parse_pmset_assertions(dump, pid=42420)
 
 
 def test_an_assertion_held_by_another_process_does_not_count():
@@ -1970,16 +2043,18 @@ def test_an_assertion_held_by_another_process_does_not_count():
     carries a timer to the window's end, so it is the only holder whose presence at 08:30
     says anything about 15:59. Reading the system-wide tally would accept either.
     """
-    assert not cp.parse_pmset_assertions(_HELD_BY_SOMETHING_ELSE)
+    assert not cp.parse_pmset_assertions(_HELD_BY_SOMETHING_ELSE, pid=991)
 
 
 def test_a_caffeinate_holding_only_display_sleep_does_not_count():
-    """``caffeinate`` has flags, and only one of them keeps the machine awake.
+    """``caffeinate`` has flags, and only one of them puts the kind on its own line.
 
-    ``-d`` holds the display up and lets the system idle to sleep underneath it. The
-    daemon spawns ``-i``, which is the system one. Matching on the process name alone
-    would accept a hand-run ``caffeinate -d`` from an operator as proof the capture
-    machine will stay up, which is the one thing it is not.
+    The daemon spawns ``-i``, and that is what makes its child's line read
+    ``PreventUserIdleSystemSleep``. A ``-d`` at the same pid prints
+    ``PreventUserIdleDisplaySleep`` there. A ``-d`` does keep the machine awake, because
+    macOS holds system sleep off while the display is on, but it does that on a separate
+    ``powerd`` line at ``powerd``'s pid. So the daemon's own line is the only evidence
+    this reads, and a display-only holder at that pid is not it.
     """
     dump = """Assertion status system-wide:
    PreventUserIdleDisplaySleep    1
@@ -1988,15 +2063,15 @@ Listed by owning process:
    pid 4242(caffeinate): [0x0000f0a] 09:59:58 PreventUserIdleDisplaySleep named: ""
 """
 
-    assert not cp.parse_pmset_assertions(dump)
+    assert not cp.parse_pmset_assertions(dump, pid=_DAEMON_PID)
 
 
 def test_no_assertion_at_all_is_not_held():
-    assert not cp.parse_pmset_assertions(_NOT_HELD)
+    assert not cp.parse_pmset_assertions(_NOT_HELD, pid=991)
 
 
 def test_an_empty_dump_is_not_held():
-    assert not cp.parse_pmset_assertions("")
+    assert not cp.parse_pmset_assertions("", pid=_DAEMON_PID)
 
 
 def test_a_daemon_up_without_its_assertion_does_not_ping(tmp_path):
@@ -2013,15 +2088,65 @@ def test_a_daemon_up_without_its_assertion_does_not_ping(tmp_path):
         probe=lambda label: True,
         pinger=pinger,
         ping_url="https://example.invalid/ping",
-        assertion_probe=lambda: False,
+        assertion_probe=lambda pid: False,
+        assertion_pid=_DAEMON_PID,
         now=et(2026, 9, 2, 8, 30),
     )
 
     assert outcome.daemon_up is True
     assert outcome.assertion_held is False
     assert outcome.pinged is False, "the check pinged for a machine that may sleep"
-    assert outcome.problem == "no caffeinate assertion held"
+    assert outcome.problem == f"no caffeinate assertion held by pid {_DAEMON_PID}"
     assert pinger.urls == [], "a ping left despite the missing assertion"
+
+
+def test_the_check_asks_about_the_pid_the_daemon_stamped(tmp_path):
+    """The stamp is the only thing that makes this an answer about the daemon.
+
+    A check that asked the probe about anything else, or about nothing, would be back to
+    accepting any holder on the machine. The pid handed to the probe is what says which
+    ``caffeinate`` was looked for.
+    """
+    asked: list[int] = []
+    pinger = FakePinger()
+
+    outcome = cp.self_check(
+        probe=lambda label: True,
+        pinger=pinger,
+        ping_url="https://example.invalid/ping",
+        assertion_probe=lambda pid: asked.append(pid) or True,
+        assertion_pid=_DAEMON_PID,
+        now=et(2026, 9, 2, 8, 30),
+    )
+
+    assert asked == [_DAEMON_PID], "the probe was asked about the wrong process"
+    assert outcome.pinged is True
+
+
+def test_a_daemon_up_with_no_recorded_pid_does_not_ping(tmp_path):
+    """No stamp is no confirmation, and the check reports that rather than assuming.
+
+    Two machines leave no pid inside an open window: one whose daemon predates the stamp,
+    and one whose ``caffeinate`` would not spawn. Neither can be vouched for, and the
+    green this used to print was the vouching. The price is a page on the first morning
+    after an upgrade that did not restart the daemon, which the restart script fixes.
+    """
+    pinger = FakePinger()
+
+    outcome = cp.self_check(
+        probe=lambda label: True,
+        pinger=pinger,
+        ping_url="https://example.invalid/ping",
+        assertion_probe=lambda pid: True,
+        assertion_pid=None,
+        now=et(2026, 9, 2, 8, 30),
+    )
+
+    assert outcome.daemon_up is True
+    assert outcome.assertion_held is False, "an unconfirmed machine read as confirmed"
+    assert outcome.pinged is False, "the check pinged for a machine nothing vouches for"
+    assert outcome.problem == "no caffeinate pid recorded"
+    assert pinger.urls == []
 
 
 def test_a_daemon_up_with_its_assertion_pings(tmp_path):
@@ -2031,7 +2156,8 @@ def test_a_daemon_up_with_its_assertion_pings(tmp_path):
         probe=lambda label: True,
         pinger=pinger,
         ping_url="https://example.invalid/ping",
-        assertion_probe=lambda: True,
+        assertion_probe=lambda pid: True,
+        assertion_pid=_DAEMON_PID,
         now=et(2026, 9, 2, 8, 30),
     )
 
@@ -2046,10 +2172,12 @@ def test_the_self_check_cli_asks_about_the_assertion(tmp_path, capsys, monkeypat
     caller that has no way to ask. That default is also exactly what an unwired ``main``
     would look like, and it would look healthy every morning.
     """
-    config = write_config(tmp_path, tmp_path / "lake")
+    lake_root = tmp_path / "lake"
+    config = write_config(tmp_path, lake_root)
     pinger = FakePinger()
+    stamp_assertion_pid(lake_root, pid=_DAEMON_PID)
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
-    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda: False)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: False)
     monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
     monkeypatch.setattr(cp, "_system_clock", lambda: ManualClock(start=et(2026, 9, 2, 8, 30)))
 
@@ -2057,7 +2185,46 @@ def test_the_self_check_cli_asks_about_the_assertion(tmp_path, capsys, monkeypat
 
     assert code == 1, "the check passed a daemon holding no assertion"
     assert pinger.urls == [], "it pinged anyway"
-    assert "no caffeinate assertion held" in capsys.readouterr().out
+    assert f"no caffeinate assertion held by pid {_DAEMON_PID}" in capsys.readouterr().out
+
+
+def test_the_self_check_cli_reads_the_pid_from_the_journal_stamp(tmp_path, monkeypatch):
+    """The production entry has to find the stamp, or the probe is asked about nothing.
+
+    ``self_check`` fails closed on a missing pid, so an unwired ``main`` would page every
+    weekday morning on a healthy machine. The opposite wiring mistake, a pid read from
+    somewhere the daemon never writes, looks the same. Only the value reaching the probe
+    tells them apart.
+    """
+    lake_root = tmp_path / "lake"
+    config = write_config(tmp_path, lake_root)
+    asked: list[int] = []
+    stamp_assertion_pid(lake_root, pid=7331)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: asked.append(pid) or True)
+    monkeypatch.setattr(cp, "UrllibPinger", FakePinger)
+    monkeypatch.setattr(cp, "_system_clock", lambda: ManualClock(start=et(2026, 9, 2, 8, 30)))
+
+    assert cp.main(["self-check", "--config", str(config)]) == 0
+    assert asked == [7331], "the CLI did not carry the stamped pid to the probe"
+
+
+def test_the_self_check_cli_fails_a_lake_with_no_stamped_pid(tmp_path, capsys, monkeypatch):
+    """Every lake written before the stamp shipped looks like this, and so does a
+    daemon whose ``caffeinate`` never started. The check says it could not confirm.
+    """
+    config = write_config(tmp_path, tmp_path / "lake")
+    pinger = FakePinger()
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
+    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr(cp, "_system_clock", lambda: ManualClock(start=et(2026, 9, 2, 8, 30)))
+
+    code = cp.main(["self-check", "--config", str(config)])
+
+    assert code == 1, "an unconfirmable machine passed the check"
+    assert pinger.urls == [], "it pinged for a machine nothing vouches for"
+    assert "no caffeinate pid recorded" in capsys.readouterr().out
 
 
 def test_no_assertion_is_owed_outside_a_window_so_none_is_demanded(tmp_path):
@@ -2075,7 +2242,10 @@ def test_no_assertion_is_owed_outside_a_window_so_none_is_demanded(tmp_path):
         probe=lambda label: True,
         pinger=pinger,
         ping_url="https://example.invalid/ping",
-        assertion_probe=lambda: False,
+        assertion_probe=lambda pid: False,
+        # No pid either, which is what the daemon stamps outside a window. The
+        # fail-closed rule is gated on being owed one, so it must not reach here.
+        assertion_pid=None,
         # Saturday. ``assertion_window`` answers ``None``, so nothing is owed.
         now=et(2026, 9, 5, 12, 0),
     )
@@ -2090,7 +2260,7 @@ def test_a_check_with_no_clock_asks_nothing(tmp_path):
         probe=lambda label: True,
         pinger=FakePinger(),
         ping_url="https://example.invalid/ping",
-        assertion_probe=lambda: False,
+        assertion_probe=lambda pid: False,
     )
 
     assert outcome.pinged is True
@@ -2122,8 +2292,20 @@ def test_the_probe_asks_pmset_for_assertions(monkeypatch):
     run = _FakeRun(0, _HELD)
     monkeypatch.setattr(subprocess, "run", run)
 
-    assert cp.pmset_assertions_probe() is True
+    assert cp.pmset_assertions_probe(_DAEMON_PID) is True
     assert run.calls == [["pmset", "-g", "assertions"]]
+
+
+def test_the_probe_carries_the_pid_into_the_parse(monkeypatch):
+    """The command is fixed, so the pid can only reach the answer through the parse.
+
+    A probe that took the pid and dropped it would ask ``pmset`` the same question and
+    answer the old, undiscriminating one, with the command assertion above still green.
+    """
+    run = _FakeRun(0, _HELD)
+    monkeypatch.setattr(subprocess, "run", run)
+
+    assert cp.pmset_assertions_probe(9999) is False
 
 
 def test_a_pmset_that_exits_non_zero_is_not_an_assertion_held(monkeypatch):
@@ -2136,7 +2318,7 @@ def test_a_pmset_that_exits_non_zero_is_not_an_assertion_held(monkeypatch):
     run = _FakeRun(1, _HELD)
     monkeypatch.setattr(subprocess, "run", run)
 
-    assert cp.pmset_assertions_probe() is False
+    assert cp.pmset_assertions_probe(_DAEMON_PID) is False
 
 
 def test_an_assertion_named_after_caffeinate_is_not_caffeinate_holding_it():
@@ -2152,7 +2334,7 @@ Listed by owning process:
    pid 991(Music): [0x0000abc] 00:31:02 PreventUserIdleSystemSleep named: "caffeinate"
 """
 
-    assert not cp.parse_pmset_assertions(dump)
+    assert not cp.parse_pmset_assertions(dump, pid=991)
 
 
 def test_a_down_daemon_is_reported_as_down_even_with_no_assertion(tmp_path):
