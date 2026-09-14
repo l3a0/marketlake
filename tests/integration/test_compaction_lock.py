@@ -7,9 +7,14 @@ stops them is the lock rather than a schedule.
 
 Rule 1 makes two claims, and they need separate evidence, so there are two tests.
 
-1. A run that finds the lock held waits for it rather than proceeding.
+1. A run that finds the lock held waits for it rather than proceeding, and still holds the
+   lock once it is doing the work.
 2. The lock it takes covers the whole run, out to the backup, rather than only the seal at
    the front of it.
+
+Both tests ask whether the lock is held rather than only watching for silence. A run that
+waited at the door and then dropped the lock before doing anything would produce exactly
+the silence claim 1 watches for, so silence alone is not enough.
 
 This file is not on the build plan's integration roster, so it claims no number from it,
 the same way ``test_dashboard_http.py`` does not.
@@ -241,6 +246,13 @@ def test_a_compaction_run_waits_for_the_lake_root_lock(lake_root: Path, tmp_path
         released = timing.monotonic()
         line = milestones.await_line(READY, REACH_TIMEOUT)
         proceeded = timing.monotonic() - released
+        if line is not None and line.strip() == READY.encode():
+            # The run is mid-seal, between its manifest append and its unlinks, so the
+            # lock has to be in its hand right now. Waiting at the door and then dropping
+            # the lock before doing the work would satisfy everything above this line.
+            assert not _lock_is_free(lake_root), (
+                "the run waited for the lock and then did its work without holding it"
+            )
         stderr = _reap(child)
         if line is None:
             pytest.fail(f"the child never announced {READY!r} within {REACH_TIMEOUT}s")

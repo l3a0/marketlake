@@ -488,8 +488,15 @@ def _seal(
     # ``guard`` off, and the append has to be told, or it would refuse the very
     # supersession that was asked for. #170 established both halves by mutation. Forcing
     # ``guard=False`` here changed no test in the suite, and forcing ``guard=True`` failed
-    # the deliberate-recompaction test. The second layer is therefore live for every other
-    # caller of ``append_manifest`` and unreachable from this one.
+    # the deliberate-recompaction test. So the check is live for every other caller of
+    # ``append_manifest`` and unreachable from this one.
+    #
+    # Which caller got here decides whether either check has anything to refuse.
+    # ``compact`` reaches ``_seal`` only for a ticker-day with no manifest entry, and
+    # ``guard_row_count`` has nothing to compare against for such a path, so both checks
+    # are inert on that route. ``recompact_ticker_day`` is the one caller that rebuilds a
+    # manifested partition, so it is the only one either check can refuse, and the
+    # pre-write one above is where that refusal lands.
     entry = append_manifest(
         root,
         partition=rel,
