@@ -6,9 +6,12 @@ so this is a standing weekly task rather than a one-time setup step. Every other
 step is rendered by ``lake.control_plane`` and run from a script that says what it does.
 This one is rendered beside them as ``reauth.sh``, which calls this module.
 
-The work is three steps. It reads the two Schwab app credentials and the registered
-callback URL from ``config.yaml``, resolves the token path, and runs ``schwab-py``'s
-login flow with a token writer of this module's own.
+The work is three steps.
+
+1. Read the two Schwab app credentials and the registered callback URL from
+   ``config.yaml``.
+2. Resolve the token path.
+3. Run ``schwab-py``'s login flow with a token writer of this module's own.
 
 Three rules shape the module.
 
@@ -56,7 +59,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from lake.config import input_errors_exit, load_config
+from lake.config import CALLBACK_KEY, input_errors_exit, load_config
 from lake.paths import TOKEN_FILE, config_dir, temp_write_path
 
 # The standard location of the Schwab token, per the design's Configuration section. The
@@ -68,9 +71,6 @@ DEFAULT_TOKEN_PATH = config_dir() / TOKEN_FILE
 # else. The design pins ``chmod 600`` on this file. The mode goes on the temp file before
 # the rename, so the token is never briefly readable at its real path.
 TOKEN_MODE = 0o600
-
-# The config key the login flow needs and capture does not.
-CALLBACK_KEY = "schwab_callback_url"
 
 
 class ReauthError(Exception):
@@ -102,7 +102,10 @@ class LoginFlow(Protocol):
 class ReauthReport:
     """What a re-auth did, for the sign-off block.
 
-    ``token_written`` says whether a token file exists at the path once the flow returns.
+    ``token_written`` says this run wrote a token, taken from the writer rather than from
+    the filesystem. The two answers differ exactly where it matters: the weekly ritual
+    always runs over a token that is already there, so a flow that returns without writing
+    would read as a success if the report asked whether a file exists.
     ``replaced_existing`` says a token was already there and this run wrote over it, which
     is allowed and wanted rather than a warning. No field carries a secret.
     """
@@ -157,19 +160,32 @@ def write_token(token_path: Path | str, payload: object) -> None:
         raise
 
 
-def token_writer(token_path: Path | str) -> Callable[..., None]:
-    """The ``token_write_func`` ``schwab-py`` calls, writing atomically to ``token_path``.
+class TokenWriter:
+    """The ``token_write_func`` ``schwab-py`` calls, writing atomically to a path.
 
     ``schwab-py`` wraps whatever it is given and calls it as ``func(token, *args,
     **kwargs)``, so the extra arguments are accepted and ignored. Only the token matters
     here, and it arrives already wrapped in the library's metadata envelope, which is
     what ``creation_timestamp`` is read back off later.
+
+    ``wrote`` records that a token was actually written, and it is what the report's
+    "token landed" reads. A file sitting at the path is a different fact. The ritual runs
+    every week over a token that is already there, so asking the filesystem would report
+    last week's token as this week's and hand a failed login an exit code of zero.
     """
 
-    def write(token: object, *args: object, **kwargs: object) -> None:
-        write_token(token_path, token)
+    def __init__(self, token_path: Path | str) -> None:
+        self.token_path = Path(token_path)
+        self.wrote = False
 
-    return write
+    def __call__(self, token: object, *args: object, **kwargs: object) -> None:
+        write_token(self.token_path, token)
+        self.wrote = True
+
+
+def token_writer(token_path: Path | str) -> TokenWriter:
+    """A fresh ``TokenWriter`` for one run. One per login, because ``wrote`` is per run."""
+    return TokenWriter(token_path)
 
 
 def reauth(
@@ -192,7 +208,9 @@ def reauth(
     A missing callback URL refuses too, naming the key and the file it belongs in. That
     refusal lives here rather than in the config loader, because capture never reads the
     key and a loader that required it would take the daemon down for a value only this
-    command uses.
+    command uses. A value that is only whitespace counts as missing. ``load_config``
+    already normalises one to ``None``, and this catches the same thing for a caller
+    reaching here with a value from anywhere else.
     """
     if not stdin_is_tty:
         raise ReauthError(
@@ -200,26 +218,27 @@ def reauth(
             "terminal. It cannot run from launchd or any other unattended job. Run it "
             "yourself from a shell."
         )
-    if not callback_url:
+    if callback_url is None or not callback_url.strip():
         raise ReauthError(
             f"no {CALLBACK_KEY} in config.yaml. Add the callback URL registered on the "
             "Schwab app, such as https://127.0.0.1:8182, and run this again."
         )
 
     target = Path(token_path)
-    replaced_existing = target.exists()
+    existed_before = target.exists()
+    writer = token_writer(target)
     login_flow(
         api_key,
         app_secret,
         callback_url,
         str(target),
-        token_write_func=token_writer(target),
+        token_write_func=writer,
     )
     return ReauthReport(
         token_path=target,
         callback_url=callback_url,
-        token_written=target.exists(),
-        replaced_existing=replaced_existing,
+        token_written=writer.wrote,
+        replaced_existing=existed_before and writer.wrote,
     )
 
 
@@ -317,6 +336,7 @@ __all__ = [
     "LoginFlow",
     "ReauthError",
     "ReauthReport",
+    "TokenWriter",
     "main",
     "reauth",
     "reauth_from_config",

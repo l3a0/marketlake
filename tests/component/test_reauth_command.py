@@ -229,6 +229,31 @@ def test_main_exits_one_when_the_flow_leaves_no_token(tmp_path, lake_root, monke
     assert "token landed:  no" in capsys.readouterr().out
 
 
+def test_main_exits_one_when_the_flow_writes_nothing_over_a_live_token(
+    tmp_path, lake_root, monkeypatch, capsys
+):
+    """The failed ritual in the shape every Sunday but the first has.
+
+    A token is already at the path, so a report that asked the filesystem would see one
+    and call the run a success. The rendered script runs under ``set -e``, so a zero here
+    would let a failed Sunday login pass in the transcript with last week's token still
+    in place, which is the silence the whole auth subsystem exists to avoid.
+    """
+    config = _config(tmp_path, lake_root)
+    token = tmp_path / "token.json"
+    token.write_text(json.dumps(OLD_TOKEN))
+    _install_seam(monkeypatch, FakeLoginFlow(token=None))
+    _at_a_terminal(monkeypatch)
+
+    code = reauth.main(["--config", str(config), "--token", str(token)])
+
+    assert code == 1
+    printed = capsys.readouterr().out
+    assert "token landed:  no" in printed
+    assert "replaced" not in printed
+    assert json.loads(token.read_text()) == OLD_TOKEN
+
+
 def test_main_without_a_token_argument_falls_back_to_the_module_default(
     tmp_path, lake_root, monkeypatch
 ):

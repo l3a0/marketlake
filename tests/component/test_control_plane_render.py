@@ -60,16 +60,6 @@ EXPECTED_FILES = {
     cp.REAUTH_SCRIPT_FILE,
 }
 
-# The rendered files the operator runs. Each is written 0o755, and each is checked off
-# disk below. They are named here rather than derived from ``render_all``, so a script
-# that lost its mode is a failure rather than a smaller list.
-SCRIPT_FILES = (
-    cp.INSTALL_SCRIPT_FILE,
-    cp.UNINSTALL_SCRIPT_FILE,
-    cp.RESTART_SCRIPT_FILE,
-    cp.REAUTH_SCRIPT_FILE,
-)
-
 
 # -- render ------------------------------------------------------------------------
 
@@ -914,6 +904,10 @@ def test_the_reauth_script_runs_the_reauth_module_and_nothing_else(tmp_path):
     out = tmp_path / "out"
     assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
     lines = (out / cp.REAUTH_SCRIPT_FILE).read_text().splitlines()
+    # The interpreter is named, not merely present. The execution test below proves a
+    # shebang exists; only this says which one, and the golden alone would report a
+    # swapped interpreter as a stale fixture.
+    assert lines[0] == "#!/bin/bash"
     commands = [line for line in lines if line and not line.startswith("#")]
     assert commands == [
         "set -euo pipefail",
@@ -921,6 +915,17 @@ def test_the_reauth_script_runs_the_reauth_module_and_nothing_else(tmp_path):
         'exec /opt/py/bin/python -m lake.reauth "$@"',
     ]
     assert not any("sudo" in line for line in commands)
+
+
+def test_the_written_reauth_script_is_executable(tmp_path):
+    """``./reauth.sh`` is the whole interface, so the bit is read off disk.
+
+    The uninstall and restart scripts each have the same test in their own section. The
+    golden cannot stand in for any of them: git stores those fixtures at 0o644.
+    """
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    assert (out / cp.REAUTH_SCRIPT_FILE).stat().st_mode & 0o777 == 0o755
 
 
 def test_the_reauth_script_says_it_cannot_run_unattended(tmp_path):
@@ -1117,18 +1122,18 @@ def _run_script(tmp_path: Path, *, visudo_fails: bool):
     return proc, [line for line in log.read_text().splitlines() if line]
 
 
-@pytest.mark.parametrize("name", SCRIPT_FILES)
-def test_every_written_script_is_executable(tmp_path, name):
+def test_the_written_install_script_is_executable(tmp_path):
     """The bit is read off disk, because that is where it has to be.
 
     Asserting ``RenderedFile.mode`` instead would pass with the ``chmod`` deleted, and
-    the golden cannot cover it either: git stores those fixtures at 0o644. Being one
-    command the operator runs is the whole point of each script, so ``./install.sh`` and
-    every sibling have to work.
+    the golden cannot cover it either: git stores that fixture at 0o644. Being one
+    command the operator runs is the whole point of the script, so ``./install.sh``
+    has to work.
     """
     out = tmp_path / "out"
     assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
-    assert (out / name).stat().st_mode & 0o777 == 0o755
+    script = out / cp.INSTALL_SCRIPT_FILE
+    assert script.stat().st_mode & 0o777 == 0o755
     # The plists are not executable. A blanket chmod would pass the line above.
     assert (out / cp.SUDOERS_FILE).stat().st_mode & 0o777 == 0o644
 

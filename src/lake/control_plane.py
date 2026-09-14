@@ -91,10 +91,9 @@ from typing import Protocol, runtime_checkable
 from lake.alert import Message, NtfyTransport, Publisher
 from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
-from lake.config import input_errors_exit, load_config
+from lake.config import CALLBACK_KEY, input_errors_exit, load_config
 from lake.manifest import ScrubResult, scrub
 from lake.paths import TOKEN_FILE, config_dir
-from lake.reauth import CALLBACK_KEY
 from lake.runner import PING_FAILURES, LaunchdJob, Pinger, UrllibPinger, calendar_interval
 from lake.vendor import Vendor
 
@@ -2397,11 +2396,10 @@ def reauth_script(host: LaunchdHost) -> str:
     login flow, the config read, and the atomic token write, so the behaviour is testable
     and the file beside the plists stays a header and one command.
 
-    It must not be wired into launchd, and saying so is not the enforcement. The tool
-    refuses when stdin is not a terminal, which is what a launchd job has. Left to
-    documentation alone, a plist pointed here would wait out
-    ``client_from_login_flow``'s five-minute callback timeout with no browser to answer
-    it and then fail, which reads as a broken job rather than a misuse of one.
+    It must not be wired into launchd, and the header saying so is not the enforcement.
+    ``lake.reauth`` refuses when stdin is not a terminal, which is what a launchd job
+    has. The header states that refusal rather than standing in for it, and the reason
+    it gives is the one in that module's docstring.
 
     Arguments pass through, so an operator can point the tool at a throwaway config or a
     token path without editing the rendered file.

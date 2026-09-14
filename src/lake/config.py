@@ -56,9 +56,14 @@ CONFIG_PATH_ENV = "MARKETLAKE_CONFIG"
 # The config holds the one rotatable ping key, never six immutable UUID URLs.
 HEALTHCHECKS_HOST = "hc-ping.com"
 
+# The Schwab callback key, spelled once. The re-auth refuses without it and names it,
+# and the rendered re-auth script names it too, so all three read this rather than
+# repeating the string.
+CALLBACK_KEY = "schwab_callback_url"
+
 # The required keys. Guard constants are optional and default to the pinned values, and
-# so is ``schwab_callback_url``: no capture path reads it, so a config missing it must
-# load rather than take the daemon down for a key the daemon has no use for.
+# so is ``CALLBACK_KEY``: no capture path reads it, so a config missing it must load
+# rather than take the daemon down for a key the daemon has no use for.
 _REQUIRED_KEYS = (
     "lake_root",
     "backup_target",
@@ -234,7 +239,7 @@ class Config:
             ntfy_topic=Secret(str(mapping["ntfy_topic"])),
             schwab_api_key=Secret(str(mapping["schwab_api_key"])),
             schwab_app_secret=Secret(str(mapping["schwab_app_secret"])),
-            schwab_callback_url=_optional_text(mapping.get("schwab_callback_url")),
+            schwab_callback_url=_optional_text(mapping.get(CALLBACK_KEY)),
             guards=GuardConstants.from_mapping(mapping.get("guards")),
         )
 

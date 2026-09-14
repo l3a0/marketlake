@@ -20,6 +20,7 @@ with every other test still green.
 
 from __future__ import annotations
 
+import builtins
 import inspect
 import json
 import os
@@ -128,13 +129,18 @@ def test_the_tty_answer_has_no_default(tmp_path):
         assert parameter.default is inspect.Parameter.empty, entry.__name__
 
 
-@pytest.mark.parametrize("absent", [None, ""])
+@pytest.mark.parametrize("absent", [None, "", "   "])
 def test_a_missing_callback_refuses_and_names_the_key(tmp_path, absent):
     """The refusal lives here because the config loader must stay fail-open.
 
     Capture never reads the callback, so ``load_config`` cannot require it without
     taking the daemon down. This command is where the requirement belongs, and the
     message has to name the key so the operator knows what to add.
+
+    A whitespace-only value is refused here as well as in the loader. ``_optional_text``
+    normalises one to ``None`` on the way out of ``config.yaml``, so the end-to-end path
+    is already defended. This guard is what stands for a caller that reaches ``reauth``
+    with a value from anywhere else.
     """
     flow = RecordingFlow()
     with pytest.raises(m.ReauthError) as excinfo:
@@ -227,6 +233,26 @@ def test_a_flow_that_writes_no_token_reports_none_landed(tmp_path):
     assert "token landed:  no" in report.render()
 
 
+def test_a_flow_that_writes_nothing_over_a_live_token_reports_none_landed(tmp_path):
+    """The shape the ritual actually has, and the one a file check gets wrong.
+
+    Every Sunday run but the first starts with a token already at the path, so reading
+    "did a token land" off ``exists()`` answers about last week's token. A login that
+    returned without writing would then print a replacement that did not happen and hand
+    back an exit code of zero. The answer comes from the writer instead.
+    """
+    token = tmp_path / "token.json"
+    token.write_text(json.dumps(OLD_TOKEN))
+
+    report = _run(RecordingFlow(token=None), token)
+
+    assert report.token_written is False
+    assert report.replaced_existing is False
+    assert "token landed:  no" in report.render()
+    # The previous token is still there, untouched, which is why the file cannot answer.
+    assert json.loads(token.read_text()) == OLD_TOKEN
+
+
 # -- the atomic write ------------------------------------------------------------------
 
 
@@ -272,6 +298,59 @@ def test_the_write_publishes_by_renaming_the_paths_temp_file(tmp_path, monkeypat
     m.write_token(token, FRESH_TOKEN)
 
     assert renames == [(str(temp_write_path(token, os.getpid())), str(token))]
+
+
+def test_the_contents_are_flushed_to_disk_before_the_rename(tmp_path, monkeypatch):
+    """The durability half of the atomic write, which the rename alone does not buy.
+
+    A rename publishes the temp file's name. It does not promise the bytes reached the
+    disk. Without the flush a power loss just after the rename can leave a short or empty
+    token at the real path, which is the file capture cannot start without, and that is
+    the failure this whole function exists to prevent.
+
+    The order is what is recorded, not just the call. An fsync after the rename would
+    flush a file the temp path no longer names.
+    """
+    token = tmp_path / "token.json"
+    steps: list[str] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def record_fsync(fd):
+        steps.append("fsync")
+        return real_fsync(fd)
+
+    def record_replace(src, dst):
+        steps.append("replace")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    monkeypatch.setattr(os, "replace", record_replace)
+    m.write_token(token, FRESH_TOKEN)
+
+    assert steps == ["fsync", "replace"]
+
+
+def test_nothing_is_opened_until_the_whole_payload_is_serialised(tmp_path, monkeypatch):
+    """Serialising first is the property, and the surviving files cannot state it.
+
+    ``json.dump`` into an open file writes what it can and then raises. The temp file's
+    cleanup hides that, because the half-written file is removed either way, so a test
+    that only checks what is left on disk passes for both forms. What separates them is
+    whether a file was opened at all.
+    """
+    token = tmp_path / "token.json"
+    opened: list[str] = []
+    real_open = builtins.open
+
+    def record_open(path, *args, **kwargs):
+        opened.append(str(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", record_open)
+    with pytest.raises(TypeError):
+        m.write_token(token, {"creation_timestamp": 1, "token": {"nope"}})
+
+    assert opened == []
 
 
 def test_the_token_is_written_owner_only(tmp_path):
