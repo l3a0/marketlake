@@ -224,11 +224,13 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   `chain_chunk_failed` once the fill gave up a window naming five series, which was
   reachable without the membership marker at all. The marker widened the count rather than
   creating the hole. No figure was wrong. The one reason string an operator reads was.
-  Reporting the set discards nothing, and the classes that can share one slot are three,
-  so it stays a handful of strings. `error_class` on a slot and `last_error_class` on a
-  Now row are lists in both payloads, ordered by name, and the count beside each is the
-  size of the set it sits next to. The design doc's dashboard section carries why the two
-  alternatives were cut.
+  Reporting the set discards nothing. How many reasons a slot can hold follows from how
+  many of its windows failed, and the chunk plan's window count and the split depth bound
+  that, so the list stays a handful of strings. `error_class` on a slot and
+  `last_error_class` on a Now row are lists in both payloads, ordered by name. Each
+  payload still carries its count beside the list, derived from that list rather than
+  counted separately. The design doc's dashboard section carries why the two alternatives
+  were cut.
 - **D12** compaction and backup, plus the nightly window re-tune. Compaction merges a day's segments into one sealed partition. The re-tune runs after it. The job groups the day's rows by `window_start` and `window_end`, compares each window's contract count to the body limit, and rewrites `chain_plan.json` when the profile drifts.
 - **D12's exclusion list.** The design's *Backup, defined* names the sync root as `lake/`
   only, "with an explicit exclusion list". `runner.BACKUP_EXCLUSIONS` is now that list,

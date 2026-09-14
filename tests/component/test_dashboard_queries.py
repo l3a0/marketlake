@@ -315,6 +315,7 @@ def test_now_reports_the_last_data_cycle_and_minutes_since(service: DashboardSer
     assert spy_chains["minutes_since"] == 7.5
     assert spy_chains["last_status"] == "suspect"
     assert spy_chains["last_error_class"] == []
+    assert spy_chains["last_error_class_count"] == 0
     # The garbage file is counted, never silently skipped, and never blanks the row.
     assert spy_chains["unreadable_segments"] == 1
 
@@ -673,13 +674,25 @@ def test_a_failed_close_names_its_own_reason_beside_the_absence_markers(
     """The reason a close is missing survives the markers the rescue attempt writes.
 
     The 16:15 cycle fails with ``http_500`` and leaves one gap row saying so. The close+5
-    fill then lands one window and gives up another, writing one ``chain_chunk_failed``
-    marker per series that window named. The markers outnumber the failure five to one,
-    so counting rows to pick one reason reported the rescue attempt's benign class and
-    dropped the reason the close of record is missing.
+    fill then lands the tail window and gives up the near one, writing one
+    ``chain_chunk_failed`` marker per series that window named. The markers outnumber the
+    failure five to one, so counting rows to pick one reason reported the rescue
+    attempt's benign class and dropped the reason the close of record is missing.
+
+    The landed window's data rows sit in the same slot carrying a null class, which is
+    the shape the query's null filter exists for. They also decide the slot's status: it
+    reads captured, exactly as the issue says, and what degraded was only the reason.
+
+    A 15:59 gap under a different class sits below the close, so the Now panel reporting
+    any slot but the latest one would name that class instead.
     """
     close = et(MONDAY, 16, 15)
-    rows = [_chains("SPY", close, journal.ROW_KIND_GAP, error_class="http_500")]
+    rows = [
+        _chains("SPY", et(MONDAY, 15, 59), journal.ROW_KIND_GAP, error_class="http_401"),
+        _chains("SPY", close, journal.ROW_KIND_GAP, error_class="http_500"),
+        _chains("SPY", close, occ_symbol="A"),
+        _chains("SPY", close, occ_symbol="B"),
+    ]
     rows += [
         _chains(
             "SPY",
@@ -691,14 +704,16 @@ def test_a_failed_close_names_its_own_reason_beside_the_absence_markers(
         for index in range(5)
     ]
     root = one_segment_lake(fixture_lake, rows)
-    slot = next(
-        slot
+    slots = {
+        slot["slot"]: slot
         for slot in service_over(root).run_query("today", {})["strips"][0]["slots"]
-        if slot["slot"] == close.isoformat()
-    )
-    assert slot["status"] == "gap"
+    }
+    slot = slots[close.isoformat()]
+    assert slot["status"] == "captured"
     assert slot["error_class"] == [capture.CHAIN_CHUNK_FAILED, "http_500"]
     assert slot["error_class_count"] == 2
+    # The slot below it carries one class, and reports that one class alone.
+    assert slots[et(MONDAY, 15, 59).isoformat()]["error_class"] == ["http_401"]
     row = service_over(root).run_query("now", {})["surfaces"][0]
     assert row["last_error_class"] == [capture.CHAIN_CHUNK_FAILED, "http_500"]
     assert row["last_error_class_count"] == 2

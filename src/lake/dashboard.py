@@ -402,10 +402,13 @@ _JOURNAL_VIEW = "journal_rows"
 #
 # The order is alphabetical, so a given set always renders the same way. It says nothing
 # about severity: ``chain_chunk_failed`` sorts above ``vendor_auth_error`` and is the
-# milder of the two. Within one surface, ticker and slot the classes that can co-occur
-# are the cycle's own gap class, ``chain_chunk_failed`` for a window the close+5 fill
-# gave up, and ``option_close_series_absent`` for a series the vendor withdrew, so this
-# is a handful of strings rather than an open list.
+# milder of the two. What bounds the list is how many of a slot's windows failed rather
+# than any enumeration of the classes, because ``capture._error_class`` snake-cases the
+# exception type name and each window given up carries the class its own failure saw.
+# The close slot holds the most, since the close+5 fill's classes and
+# ``option_close_series_absent`` land there on top of the cycle's own. The chunk plan's
+# window count and the split depth are what keep that a handful of strings, so the list
+# renders whole and nothing caps it.
 #
 # The ``FILTER`` keeps nulls out, which is what makes the list the distinct reasons the
 # slot carried. A slot whose rows all carry a null class aggregates to a null list, and
@@ -532,15 +535,6 @@ class SlotAggregate:
         aggregate holds nothing mutable.
         """
         object.__setattr__(self, "error_classes", tuple(self.error_classes or ()))
-
-    @property
-    def error_class_count(self) -> int:
-        """How many distinct reasons the slot carried.
-
-        Derived from the reported set rather than counted separately, so the count and
-        the classes beside it cannot disagree.
-        """
-        return len(self.error_classes)
 
     @property
     def row_count(self) -> int:
