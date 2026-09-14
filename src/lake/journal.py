@@ -66,6 +66,7 @@ QUOTES_SURFACE = "quotes"
 # The two kinds of row. A ``data`` row carries a vendor observation. A ``gap`` row is
 # the surface schema with all vendor columns null. It records a minute that was
 # missed and why, so completeness is counted from rows and never inferred from holes.
+ROW_KIND_COLUMN = "row_kind"
 ROW_KIND_DATA = "data"
 ROW_KIND_GAP = "gap"
 
@@ -88,7 +89,14 @@ F_FULLFSYNC = getattr(fcntl, "F_FULLFSYNC", None)
 # is ``option_close``, ``spot_close``, or null, stamped on every row of a tagged cycle.
 # ``session_phase`` tags rows observed after the equity close. ``extra`` is a
 # normally-empty JSON overflow column. Any vendor field the schema does not name lands
-# there, so vendor-verbatim stays structurally true even when a payload drifts.
+# there, so vendor-verbatim stays structurally true even when a payload drifts. A known
+# field whose value its column refuses lands there too, through ``_routed_column``, and
+# because the overflow otherwise holds only fields the maps do not name, a known field's
+# name appearing in ``extra`` says exactly that. The name is a constant because the row
+# builders, the routing, and ``lake.extra_projection`` all reach for that column by name,
+# and one spelling is what keeps them reaching for the same one.
+EXTRA_COLUMN = "extra"
+
 _PROVENANCE_FIELDS = [
     ("row_kind", pa.string()),
     ("error_class", pa.string()),
@@ -96,7 +104,7 @@ _PROVENANCE_FIELDS = [
     ("close_tag", pa.string()),
     ("session_phase", pa.string()),
     ("schema_version", pa.int64()),
-    ("extra", pa.string()),
+    (EXTRA_COLUMN, pa.string()),
 ]
 
 # Two more provenance columns the chains surface alone carries: the date window that
@@ -740,6 +748,12 @@ def _extra_json(fields: Mapping[str, object], known: set[str]) -> str | None:
     """JSON for the vendor fields the schema does not name, or ``None`` when empty.
 
     Keys are sorted so the same overflow always serializes identically.
+
+    The comprehension below is what makes the routing's signature readable. It keeps only
+    the keys outside ``known``, so a known vendor field's name can never reach ``extra``
+    this way. When ``_routed_column`` later writes one there, its presence needs no marker
+    to be recognized. The quotes surface builds its overflow the same way, per block, in
+    ``_project_quote_envelope``.
     """
     overflow = {key: value for key, value in fields.items() if key not in known}
     if not overflow:
@@ -789,24 +803,168 @@ def typed_column(field_type: pa.DataType, values: Sequence[object]) -> pa.Array:
     column goes through ``_int_column``, which refuses a fractional float rather than
     recording it truncated.
 
-    Two callers share this. The row builders below type every column they write, and the
+    Three callers share this. The row builders below type every column they write, the
     read-time projection in ``extra_projection`` types a value it lifts back out of
-    ``extra``. Neither should be able to accept a value the other refuses, so the rule
-    lives here once.
+    ``extra``, and ``_fits`` asks it whether one value belongs in its column at all. None
+    of them should be able to accept a value another refuses, so the rule lives here once.
     """
     if field_type == pa.int64():
         return _int_column(values)
     return pa.array(values, type=field_type)
 
 
-def _batch(schema: pa.Schema, rows: Sequence[Mapping[str, object]]) -> pa.RecordBatch:
-    """Build one record batch from row mappings, typed by the schema.
+# The ways a column build refuses one value. Every JSON value, offered to every type the
+# two pinned schemas use, raises one of these four and nothing else, which
+# ``tests/unit/test_journal_schema.py`` checks by enumeration so a pyarrow upgrade that
+# adds a fifth fails the suite rather than quietly costing a cycle.
+#
+# 1. ``ArrowInvalid`` is the value Arrow understands and cannot represent, like a
+#    fractional float in an integer column.
+# 2. ``ArrowTypeError`` is the value whose Python type the column will not take at all,
+#    like a bool where an integer belongs.
+# 3. ``OverflowError`` comes from the conversion rather than from Arrow, and is the integer
+#    too wide for int64.
+# 4. ``UnicodeEncodeError`` is the string Arrow cannot encode, which a lone surrogate is.
+#
+# Any other exception is not the value's doing, so it propagates and costs the cycle the
+# way it always did.
+_UNFIT_ERRORS = (pa.ArrowInvalid, pa.ArrowTypeError, OverflowError, UnicodeEncodeError)
+
+
+def _fits(field_type: pa.DataType, value: object) -> bool:
+    """Whether one value builds at a column's type on its own.
+
+    The check runs the value through ``typed_column``, the same builder the column build
+    uses, so a value this calls unfit is exactly a value that build refused. ``None``
+    always fits, because an all-null column lands typed.
+    """
+    try:
+        typed_column(field_type, [value])
+    except _UNFIT_ERRORS:
+        return False
+    return True
+
+
+def _routed_column(
+    field: pa.Field,
+    values: Sequence[object],
+    path: ExtraPath | None,
+    observed: frozenset[int],
+) -> tuple[pa.Array, tuple[int, ...]]:
+    """One column at its schema type, with the values it refuses nulled and named.
+
+    The fast path is the whole column built at once, which is what every cycle takes. The
+    scan below runs only after that build has already refused, so the ordinary cycle pays
+    nothing for it.
+
+    A vendor that retypes a known field is the case this exists for. The old behaviour cost
+    the whole chain for that cycle and threw the offending value away, and a minute is the
+    one thing this lake cannot buy back. So the value is nulled in its column and handed
+    back for the caller to park in ``extra``, and the cycle lands.
+
+    Three conditions have to hold before any value is routed. Each one is what keeps a
+    failure that is not the vendor's doing failing the way it did before.
+
+    1. **The column has somewhere to put the value.** ``path`` is the column's entry in
+       ``extra_paths``, which is the parser's vendor maps read backwards. A column outside
+       that set either holds a value this module computed rather than copied, like a stamp
+       or a transformed one, or holds a vendor value the overflow has no key for. Either
+       way there is no honest place to park it and no reader that would find it, so the
+       refusal propagates and the cycle gaps.
+    2. **Every refused value sits on a row that carries a vendor observation.**
+       ``observed`` is the data rows. A gap row holds no vendor value at all, so anything
+       on one came from this code. Two builders put a value on a gap row, the chunker's
+       absence marker and the close guard's absent-series marker, and both write the one
+       ``expiration_date`` those rows exist to name. Routing that would delete the marker's
+       only fact and stamp a data row's drift signature on a gap, so a refusal there
+       propagates instead.
+    3. **Nulling the values the scan named is enough.** The rebuild at the end is the
+       diagnosis being checked, not a formality, so it is deliberately not caught. A
+       refusal there propagates and the cycle gaps. That covers a scan that names no value
+       at all, because then the rebuild is the same call that just failed and it fails
+       again. So a column refused for a reason no row carries never yields a partial column
+       written off a wrong diagnosis.
+
+    The cost is named rather than hidden. A vendor map that sends a field to the wrong
+    column is indistinguishable at run time from a vendor that retyped that field, and both
+    route. What surfaces either one is the signature the routing writes, a known field's
+    name sitting in ``extra``, which is the thing to page on.
+    """
+    try:
+        return typed_column(field.type, values), ()
+    except _UNFIT_ERRORS:
+        if path is None:
+            raise
+        unfit = tuple(index for index, value in enumerate(values) if not _fits(field.type, value))
+        if not set(unfit) <= observed:
+            raise
+        kept = list(values)
+        for index in unfit:
+            kept[index] = None
+        # An empty scan leaves ``kept`` equal to ``values``, so this is the call that just
+        # refused and it refuses again. That is the intended outcome, and it is why the
+        # empty case needs no guard of its own.
+        return typed_column(field.type, kept), unfit
+
+
+def _extra_with_routed(raw: object, routed: Sequence[tuple[ExtraPath, object]]) -> str:
+    """One row's ``extra`` with the values its columns refused added, verbatim.
+
+    Each value is written under the key ``extra_paths`` says feeds its column, which is the
+    vendor's own name for it, nested under its block on the quotes surface. That is the
+    same key an unrecognized field of that name would have landed under, so the reader in
+    ``extra_projection`` needs no second rule to find it.
+
+    The value is the vendor's, unchanged. Nothing is cast, rounded, or stringified on the
+    way in. A cast would manufacture a value the vendor never sent and hand it to a
+    downstream computation with no marker, which is the one outcome nobody can detect
+    afterwards, and the design's vendor-verbatim rule is what forbids it.
+
+    A collision is not possible. ``_extra_json`` and the quotes projection both build the
+    overflow from the fields their maps do *not* name, so a key a routed field writes under
+    is a key the overflow could not already hold.
+    """
+    overflow = dict(json.loads(raw)) if raw else {}
+    for path, value in routed:
+        if path.block is None:
+            overflow[path.field] = value
+        else:
+            block = dict(overflow.get(path.block) or {})
+            block[path.field] = value
+            overflow[path.block] = block
+    return json.dumps(overflow, sort_keys=True)
+
+
+def _batch(surface: str, rows: Sequence[Mapping[str, object]]) -> pa.RecordBatch:
+    """Build one record batch from row mappings, typed by the surface's pinned schema.
 
     A missing key becomes null. Each column is built with its schema type through
-    ``typed_column``.
+    ``typed_column``. A known vendor field whose value the column refuses is routed into
+    that row's ``extra`` and left null in its column, per ``_routed_column``, so a vendor
+    retype costs the field rather than the cycle. Only a data row can route, since a gap
+    row carries no vendor observation and anything on one came from this code.
+
+    ``extra`` is built last, because the routing decides what goes in it.
     """
-    arrays = [typed_column(field.type, [row.get(field.name) for row in rows]) for field in schema]
-    return pa.RecordBatch.from_arrays(arrays, schema=schema)
+    schema = schema_for(surface)
+    paths = extra_paths(surface)
+    observed = frozenset(
+        index for index, row in enumerate(rows) if row.get(ROW_KIND_COLUMN) == ROW_KIND_DATA
+    )
+    routed: dict[int, list[tuple[ExtraPath, object]]] = {}
+    columns: dict[str, pa.Array] = {}
+    for field in schema:
+        if field.name == EXTRA_COLUMN:
+            continue
+        values = [row.get(field.name) for row in rows]
+        columns[field.name], unfit = _routed_column(field, values, paths.get(field.name), observed)
+        for index in unfit:
+            routed.setdefault(index, []).append((paths[field.name], values[index]))
+    extras = [row.get(EXTRA_COLUMN) for row in rows]
+    for index, entries in routed.items():
+        extras[index] = _extra_with_routed(extras[index], entries)
+    columns[EXTRA_COLUMN] = typed_column(schema.field(EXTRA_COLUMN).type, extras)
+    return pa.RecordBatch.from_arrays([columns[field.name] for field in schema], schema=schema)
 
 
 def _iter_contracts(body: Mapping[str, object]) -> list[Mapping[str, object]]:
@@ -944,7 +1102,7 @@ def chains_data_batch(
         deliverables = contract.get(_CHAINS_DELIVERABLES_FIELD)
         if deliverables is not None:
             row[_CHAINS_DELIVERABLES_COLUMN] = json.dumps(deliverables, sort_keys=True)
-        row["extra"] = _extra_json(contract, _CHAINS_CONTRACT_KNOWN)
+        row[EXTRA_COLUMN] = _extra_json(contract, _CHAINS_CONTRACT_KNOWN)
         # The fetch provenance: the plan window holding this contract's expiration date.
         # The vendor's expiration is an ISO datetime, so its date part is the key.
         expiration = contract.get("expirationDate")
@@ -985,10 +1143,10 @@ def chains_data_batch(
                 "expiration_date": expiration_date,
                 "window_start": window_start,
                 "window_end": window_end,
-                "extra": None,
+                EXTRA_COLUMN: None,
             }
         )
-    return _batch(CHAINS_SCHEMA, rows)
+    return _batch(CHAINS_SURFACE, rows)
 
 
 def quote_cusip(envelope: Mapping[str, object]) -> object | None:
@@ -1080,8 +1238,8 @@ def quotes_data_batch(
     }
     columns, extra = _project_quote_envelope(envelope)
     row.update(columns)
-    row["extra"] = extra
-    return _batch(QUOTES_SCHEMA, [row])
+    row[EXTRA_COLUMN] = extra
+    return _batch(QUOTES_SURFACE, [row])
 
 
 def gap_batch(
@@ -1110,7 +1268,6 @@ def gap_batch(
     ``open_interest``, ``volume``, ``realtime``, ``cusip``, and the whole fundamental,
     regular, and extended blocks are all null, per surface, without being enumerated here.
     """
-    schema = schema_for(surface)
     row: dict[str, object] = {
         "snap_ts": _iso(snap_ts),
         "fetch_ts": _iso(fetch_ts),
@@ -1123,9 +1280,9 @@ def gap_batch(
         "close_tag": close_tag,
         "session_phase": session_phase,
         "schema_version": SCHEMA_VERSION,
-        "extra": None,
+        EXTRA_COLUMN: None,
     }
-    return _batch(schema, [row])
+    return _batch(surface, [row])
 
 
 def gap_rows(
@@ -1148,7 +1305,6 @@ def gap_rows(
     after the equity close carries the same ``session_phase`` a captured row would have
     carried. Passing nothing leaves every phase null.
     """
-    schema = schema_for(surface)
     rows = [
         {
             "snap_ts": _iso(slot),
@@ -1162,11 +1318,11 @@ def gap_rows(
             "close_tag": None,
             "session_phase": None if session_phase_at is None else session_phase_at(slot),
             "schema_version": SCHEMA_VERSION,
-            "extra": None,
+            EXTRA_COLUMN: None,
         }
         for slot in slots
     ]
-    return _batch(schema, rows)
+    return _batch(surface, rows)
 
 
 def absent_series_rows(
@@ -1197,7 +1353,6 @@ def absent_series_rows(
     """
     if surface != CHAINS_SURFACE:
         raise ValueError(f"an absent-series marker names an expiration, so not {surface!r}")
-    schema = schema_for(surface)
     rows = [
         {
             "snap_ts": _iso(slot),
@@ -1214,11 +1369,11 @@ def absent_series_rows(
             "expiration_date": expiration,
             "window_start": None,
             "window_end": None,
-            "extra": None,
+            EXTRA_COLUMN: None,
         }
         for expiration in expirations
     ]
-    return _batch(schema, rows)
+    return _batch(surface, rows)
 
 
 # -- segment paths -----------------------------------------------------------
@@ -1704,14 +1859,22 @@ def close_tag_rows(
 
 
 def _expirations_of(batches: list) -> list[str] | None:
-    """The expirations of the newest batch holding data rows, or ``None`` for none.
+    """The expirations of the newest batch that names any, or ``None`` for none.
 
     Split out so the column reads sit inside the caller's ``UNUSABLE_SEGMENT`` handler. A
     segment whose schema drifted opens cleanly and raises here, on the column, which is
     the shape that took the daemon down in #100.
+
+    A data batch whose ``expiration_date`` is null on every row is walked past rather than
+    answered with an empty list. Two shapes reach that. The vendor can send contracts that
+    carry no expiration at all, and a vendor that retypes ``expirationDate`` across the
+    chain has every contract's value routed into ``extra`` with the column left null.
+    Either way the batch names no series. Stopping on it would hand the caller an empty
+    answer that reads as this ticker having no expirations, when an older batch knows
+    better. That is the same blinding the walk past a gap-only segment exists to prevent.
     """
     for batch in reversed(batches):
-        kinds = batch.column("row_kind").to_pylist()
+        kinds = batch.column(ROW_KIND_COLUMN).to_pylist()
         if ROW_KIND_DATA not in kinds:
             continue
         expirations = batch.column("expiration_date").to_pylist()
@@ -1720,7 +1883,8 @@ def _expirations_of(batches: list) -> list[str] | None:
             for kind, exp in zip(kinds, expirations, strict=True)
             if kind == ROW_KIND_DATA and exp
         }
-        return sorted(dates)
+        if dates:
+            return sorted(dates)
     return None
 
 
@@ -1742,11 +1906,12 @@ def latest_expirations(
     cycle order, keyed by the segment path, so the ticker's chains-segment entries in file
     order are its segments oldest to newest. The read walks them newest first, opens each
     with the Arrow IPC stream reader, and takes every complete batch, so a torn tail is
-    safe. The first segment holding a batch with data rows wins. Its last such batch's
+    safe. The first segment holding a batch that names an expiration wins. That batch's
     ``expiration_date`` values, reduced to their date part and de-duplicated, are the
     result, sorted. Walking back past a newer gap-only segment is what makes this the
     latest *durable data* batch rather than merely the latest segment, so a whole-chain gap
-    last minute does not blind the marker.
+    last minute does not blind the marker. A data batch that names no expiration is walked
+    past for the same reason, since it answers the question no better than a gap does.
 
     ``on`` narrows the walk to one session date. The capture chunker leaves it unset,
     because the expirations it names absent come from whatever batch is latest and a
@@ -1755,9 +1920,10 @@ def latest_expirations(
     cross-day baseline would call a series that expired yesterday missing from today's
     fill, which is a shortfall that cannot be true.
 
-    ``None`` means no prior durable data batch exists in scope: no manifest, no chains
-    segment for the ticker, none on the named date, or none of its segments holds a data
-    batch. A manifested segment whose file is gone is skipped, never an error.
+    ``None`` means nothing in scope names an expiration. That covers no manifest, no chains
+    segment for the ticker, none on the named date, none of its segments holding a data
+    batch, and every data batch leaving the column null. A manifested segment whose file is
+    gone is skipped, never an error.
     """
     root = Path(lake_root)
     ordered: dict[str, dict] = {}

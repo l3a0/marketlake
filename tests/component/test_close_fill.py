@@ -458,9 +458,8 @@ def test_a_quotes_snapshot_refuses_a_chain_fetchs_windows(lake_root):
 
 def _gap_row(root: Path, ticker: str, slot: datetime) -> None:
     """One tagged chains gap row, standing for the close cycle that ran and failed."""
-    schema = journal.schema_for(CHAINS)
     batch = journal._batch(
-        schema,
+        CHAINS,
         [
             {
                 "snap_ts": slot.isoformat(),

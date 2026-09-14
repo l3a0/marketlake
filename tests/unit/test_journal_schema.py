@@ -1140,36 +1140,55 @@ def test_fetch_end_ts_is_stored_when_given_and_null_when_omitted():
     assert gap.to_pylist()[0]["fetch_end_ts"] == FETCH_END
 
 
-# -- integer columns refuse a truncating float -------------------------------
+# -- a value its column refuses never lands coerced ---------------------------
 
-# Every field name below is a vendor key that lands in an ``int64`` column, paired with
-# the value the vendor would have to send to truncate. The chain and the quote surface
-# each get one, so the refusal is checked on both row builders rather than one.
+# Every field name below is a vendor key whose value the pinned column will not take. The
+# chain and the quote surface each get one, so the rule is checked on both row builders
+# rather than one. What must never happen is the value landing changed. Where it goes
+# instead, its column null and the raw value in ``extra``, is checked in the routing
+# section further down.
 
 
-def test_a_fractional_float_in_an_integer_chain_column_raises_instead_of_truncating():
+def _chain_of(*contracts):
+    """A chain body carrying the given contracts under one expiration and strike."""
+    return dict(
+        CHAIN_BODY,
+        callExpDateMap={"2026-09-18:25": {"650.0": list(contracts)}},
+        putExpDateMap={},
+    )
+
+
+def _chain_row(**overrides):
+    """The one row a chain body carrying a single overridden contract builds."""
+    body = _chain_of(_full_contract(**overrides))
+    return journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH).to_pylist()[
+        0
+    ]
+
+
+def test_a_fractional_float_in_an_integer_chain_column_routes_instead_of_truncating():
     """A vendor ``openInterest`` of 1234.7 must not land as 1234.
 
     Building the column straight from Python objects truncated it and returned the
     truncated value with no error. Nothing downstream could tell 1234 apart from a real
     1234, which is why this one shape was the silent member of the corruption class.
+
+    The column is null and the vendor's own 1234.7 is in ``extra``, so the minute lands
+    and the value survives to be read back.
     """
-    body = dict(
-        CHAIN_BODY,
-        callExpDateMap={"2026-09-18:25": {"650.0": [_full_contract(openInterest=1234.7)]}},
-        putExpDateMap={},
-    )
-    with pytest.raises(pa.ArrowInvalid):
-        journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+    row = _chain_row(openInterest=1234.7)
+    assert row["open_interest"] is None
+    assert json.loads(row["extra"]) == {"openInterest": 1234.7}
 
 
-def test_a_fractional_float_in_an_integer_quote_column_raises_instead_of_truncating():
-    """The same refusal on the quotes surface, whose 18 integer columns take one route."""
+def test_a_fractional_float_in_an_integer_quote_column_routes_instead_of_truncating():
+    """The same rule on the quotes surface, whose 18 integer columns take one route."""
     envelope = dict(QUOTE, quote=dict(QUOTE["quote"], totalVolume=88_888_888.5))
-    with pytest.raises(pa.ArrowInvalid):
-        journal.quotes_data_batch(
-            envelope, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH, vendor_quote_ts=VENDOR
-        )
+    row = journal.quotes_data_batch(
+        envelope, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH, vendor_quote_ts=VENDOR
+    ).to_pylist()[0]
+    assert row["total_volume"] is None
+    assert json.loads(row["extra"]) == {"quote": {"totalVolume": 88_888_888.5}}
 
 
 def test_a_lossless_float_still_lands_in_an_integer_column():
@@ -1212,79 +1231,90 @@ def test_an_all_null_integer_column_still_lands_typed_int64():
     assert batch.to_pylist()[0]["open_interest"] is None
 
 
-def test_the_other_three_types_keep_refusing_every_wrong_shape():
-    """The change stays on the integer columns. The other 119 keep the direct build.
+def test_the_other_three_types_route_every_wrong_shape_rather_than_coercing_it():
+    """The rule covers every pinned type, not just the 29 integer columns.
 
-    Each case below is a wrong shape in a ``double``, ``string``, or ``bool`` column that
-    raised before the change. A test that only checked the integer columns would not
-    notice the fix widening onto a path that already worked.
+    Each case below is a wrong shape in a ``double``, ``string``, or ``bool`` column. A
+    test that only checked the integer columns would not notice the routing widening onto
+    a path that already refused, or a coercion creeping into one of the other three types.
     """
     cases = (
-        ("bid", "not-a-number", pa.ArrowInvalid),  # string into double
-        ("description", 7, pa.ArrowTypeError),  # int into string
-        ("description", 7.5, pa.ArrowTypeError),  # float into string
-        ("inTheMoney", 1, pa.ArrowInvalid),  # int into bool
-        ("inTheMoney", 1.5, pa.ArrowInvalid),  # float into bool
+        ("bid", "not-a-number", "bid"),  # string into double
+        ("description", 7, "description"),  # int into string
+        ("description", 7.5, "description"),  # float into string
+        ("inTheMoney", 1, "in_the_money"),  # int into bool
+        ("inTheMoney", 1.5, "in_the_money"),  # float into bool
     )
-    for field, value, expected in cases:
-        body = dict(
-            CHAIN_BODY,
-            callExpDateMap={"2026-09-18:25": {"650.0": [_full_contract(**{field: value})]}},
-            putExpDateMap={},
-        )
-        with pytest.raises(expected):
-            journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+    for vendor_field, value, column in cases:
+        row = _chain_row(**{vendor_field: value})
+        assert row[column] is None, (vendor_field, value)
+        assert json.loads(row["extra"]) == {vendor_field: value}
 
 
-def test_a_bool_after_a_float_in_the_same_integer_column_keeps_raising():
-    """Two contracts, the first a lossless float and the second a bool, must still raise.
+def test_a_bool_after_a_float_in_the_same_integer_column_never_lands_as_one():
+    """Two contracts, the first a lossless float and the second a bool.
 
     Arrow reads a column's type from its first non-null value and widens the later ones
     into it, so the bool is already 1.0 by the time inference returns and the inferred
     type cannot tell it from a real 1. Checking the bool alone in the column misses this,
     because ``[True, 1500.0]`` raises during inference while ``[1500.0, True]`` does not.
     A vendor ``true`` recorded as an open interest of 1 is the same silent corruption the
-    fractional float was.
+    fractional float was, and routing must not reintroduce it.
+
+    The contract that sent the bool loses its column and keeps its value in ``extra``. The
+    contracts around it keep the integers they sent, so one drifted row costs one row.
     """
     for values in ((1500.0, True), (1500.0, False), (1500.0, True, 7)):
         contracts = [
             _full_contract(symbol=f"SPY   260918C0065000{i}", openInterest=value)
             for i, value in enumerate(values)
         ]
-        body = dict(
-            CHAIN_BODY,
-            callExpDateMap={"2026-09-18:25": {"650.0": contracts}},
-            putExpDateMap={},
+        batch = journal.chains_data_batch(
+            _chain_of(*contracts), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
         )
-        with pytest.raises(pa.ArrowTypeError):
-            journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+        rows = batch.to_pylist()
+        landed = batch.column("open_interest").to_pylist()
+        expected = [None if isinstance(value, bool) else int(value) for value in values]
+        assert landed == expected, values
+        for row, value in zip(rows, values, strict=True):
+            if isinstance(value, bool):
+                assert json.loads(row["extra"]) == {"openInterest": value}
+            else:
+                assert row["extra"] is None
+
+
+def test_the_routed_value_keeps_its_own_type_and_is_never_the_coercion():
+    """``True`` routed as ``1`` would be the corruption this exists to prevent.
+
+    Comparing values alone would pass on a ``1`` written where ``True`` arrived, since
+    ``True == 1`` in Python. The type is what separates the vendor's boolean from the
+    integer Arrow's cast would have manufactured, so the type is what this compares.
+    """
+    row = _chain_row(openInterest=True)
+    routed = json.loads(row["extra"])["openInterest"]
+    assert routed is True
+    assert type(routed) is bool
 
 
 def test_a_column_arrow_cannot_infer_keeps_the_direct_build_s_own_exception():
     """When inference itself fails, the caller must still see the direct build's class.
 
-    Two contracts whose ``openInterest`` is a bool and a string give Arrow nothing to
-    infer, so the inference attempt raises before any type check runs. Its exception is
-    not the one the direct build raises, and the two disagree in both directions:
-    ``[True, "7"]`` fails inference with ``ArrowInvalid`` where the direct build raises
-    ``ArrowTypeError``, and reversing the contracts swaps them.
+    Two values that are a bool and a string give Arrow nothing to infer, so the inference
+    attempt raises before any type check runs. Its exception is not the one the direct
+    build raises, and the two disagree in both directions: ``[True, "7"]`` fails inference
+    with ``ArrowInvalid`` where the direct build raises ``ArrowTypeError``, and reversing
+    them swaps the pair.
 
-    The class matters past the raise. ``lake.capture`` records a gap under the exception's
-    own name, so leaking the inference failure would rewrite a gap on disk from
-    ``arrow_type_error`` to ``arrow_invalid`` and change what an operator reads.
+    The class matters past the raise. A column with no route into ``extra`` still gaps the
+    cycle, and ``lake.capture`` records that gap under the exception's own name, so leaking
+    the inference failure would rewrite a gap on disk from ``arrow_type_error`` to
+    ``arrow_invalid`` and change what an operator reads. This asks ``typed_column``
+    directly, because that is where the class is decided and where every route into it,
+    the row build, the per-value scan, and the read-time projection, goes through.
     """
     for values, expected in (((True, "7"), pa.ArrowTypeError), (("7", True), pa.ArrowInvalid)):
-        contracts = [
-            _full_contract(symbol=f"SPY   260918C0065000{i}", openInterest=value)
-            for i, value in enumerate(values)
-        ]
-        body = dict(
-            CHAIN_BODY,
-            callExpDateMap={"2026-09-18:25": {"650.0": contracts}},
-            putExpDateMap={},
-        )
         with pytest.raises(expected):
-            journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+            journal.typed_column(pa.int64(), list(values))
 
 
 def test_a_lossless_float_still_lands_when_the_column_holds_several_rows():
@@ -1306,21 +1336,489 @@ def test_a_lossless_float_still_lands_when_the_column_holds_several_rows():
     assert batch.column("open_interest").to_pylist() == [1500, 2, 0]
 
 
-def test_a_bool_or_a_string_in_an_integer_column_keeps_raising():
+def test_a_bool_or_a_string_in_an_integer_column_never_lands_as_a_number():
     """Arrow's cast would turn ``True`` into 1 and ``"7"`` into 7. Neither may land.
 
     Inferring the column type first opens a cast Arrow is willing to perform on shapes the
-    direct build refused. Both stay refused, so the fix removes a silent conversion without
-    adding two.
+    direct build refused. Both stay refused, so neither the fractional-float fix nor the
+    routing adds a silent conversion back.
     """
-    for value, expected in ((True, pa.ArrowTypeError), ("7", pa.ArrowInvalid)):
-        body = dict(
-            CHAIN_BODY,
-            callExpDateMap={"2026-09-18:25": {"650.0": [_full_contract(openInterest=value)]}},
-            putExpDateMap={},
+    for value in (True, "7"):
+        row = _chain_row(openInterest=value)
+        assert row["open_interest"] is None
+        routed = json.loads(row["extra"])["openInterest"]
+        assert routed == value and type(routed) is type(value)
+
+
+# -- a refused known field is routed into extra -------------------------------
+
+# Where a value its column refuses actually goes. The section above pins that it never
+# lands coerced. These pin that it lands in ``extra``, under the key the reader looks for,
+# with the vendor's own value, and that a column with no key to land under still costs the
+# cycle the way it always did.
+
+
+def _quote_with(block: str, **overrides):
+    """The quote envelope with one captured block's fields overridden."""
+    return dict(QUOTE, **{block: dict(QUOTE[block], **overrides)})
+
+
+def _quote_row(block: str, **overrides):
+    """The one row the quote envelope builds with one block's fields overridden."""
+    return journal.quotes_data_batch(
+        _quote_with(block, **overrides),
+        ticker="SPY",
+        snap_ts=SNAP,
+        fetch_ts=FETCH,
+        vendor_quote_ts=VENDOR,
+    ).to_pylist()[0]
+
+
+def _known_names_in(surface: str, extra: str | None) -> set[journal.ExtraPath]:
+    """Every path in a row's overflow that names a column of the running schema.
+
+    This is the signature read off a row, derived rather than restated: the paths come
+    from ``journal.extra_paths``, the same mapping the reader uses to find a value, and a
+    path is counted only when the overflow actually carries a value at it.
+    """
+    overflow = json.loads(extra) if extra else {}
+    found = set()
+    for path in journal.extra_paths(surface).values():
+        block = overflow if path.block is None else overflow.get(path.block) or {}
+        if isinstance(block, dict) and path.field in block:
+            found.add(path)
+    return found
+
+
+def test_a_known_fields_name_in_extra_is_the_signature_that_its_column_refused_a_value():
+    """The invariant the read-time refusal in marketlake #149 detects on.
+
+    ``_extra_json`` and the quotes projection both build the overflow from the fields their
+    maps do *not* name, so a known vendor field's name can never reach ``extra`` any other
+    way. That makes its presence self-describing, with no marker and no new machinery.
+
+    It is load-bearing twice. It is what #149 keys on, and it is what makes the window
+    before #149 lands safe: without it a routed null and a genuine vendor null look
+    identical, and an operator would reasonably read the column as a field the vendor
+    stopped sending.
+
+    Both directions are checked, because only one of them would pass on a writer that put
+    a known name in ``extra`` on every row.
+    """
+    # Steady state, with an unrecognised field present on both surfaces so the overflow is
+    # populated. No known field's name is in it.
+    drifted = _full_contract(brandNewGreek=1.5)
+    row = journal.chains_data_batch(
+        _chain_of(drifted), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
+    ).to_pylist()[0]
+    assert json.loads(row["extra"]) == {"brandNewGreek": 1.5}
+    assert _known_names_in(journal.CHAINS_SURFACE, row["extra"]) == set()
+
+    quote_row = _quote_row("quote", brandNewStat=1.5)
+    assert json.loads(quote_row["extra"]) == {"quote": {"brandNewStat": 1.5}}
+    assert _known_names_in(journal.QUOTES_SURFACE, quote_row["extra"]) == set()
+
+    # A retype, and the signature is exactly the one field that drifted.
+    retyped = _chain_row(openInterest="1234")
+    assert _known_names_in(journal.CHAINS_SURFACE, retyped["extra"]) == {
+        journal.ExtraPath(None, "openInterest")
+    }
+    retyped_quote = _quote_row("quote", totalVolume="90000000")
+    assert _known_names_in(journal.QUOTES_SURFACE, retyped_quote["extra"]) == {
+        journal.ExtraPath("quote", "totalVolume")
+    }
+
+
+def test_the_reader_finds_a_routed_value_at_the_path_extra_paths_names():
+    """The writer and the reader agree on where a routed value sits, by derivation.
+
+    ``extra_paths`` is the parser's vendor maps read backwards, and it is what
+    ``extra_projection`` looks a value up through. The routing writes under that same
+    mapping rather than a second rule of its own, so a key it writes is a key the reader
+    already knows how to reach. Walking the mapping here is what makes this cover the
+    class rather than the two fields it happens to drift.
+    """
+    for surface, column, vendor_value, row in (
+        (journal.CHAINS_SURFACE, "open_interest", "1234", _chain_row(openInterest="1234")),
+        (journal.QUOTES_SURFACE, "bid", "649.98", _quote_row("quote", bidPrice="649.98")),
+        (
+            journal.QUOTES_SURFACE,
+            "extended_last_price",
+            "651.0",
+            _quote_row("extended", lastPrice="651.0"),
+        ),
+    ):
+        path = journal.extra_paths(surface)[column]
+        overflow = json.loads(row["extra"])
+        held = overflow if path.block is None else overflow[path.block]
+        assert held[path.field] == vendor_value
+        assert row[column] is None
+
+
+def test_two_blocks_sharing_a_field_name_route_into_their_own_block():
+    """``quote.lastPrice`` and ``extended.lastPrice`` are one name and two columns.
+
+    A flat overflow would make a retype of either read as a retype of both, and the reader
+    would fill the wrong column. The nesting is the whole reason the quotes overflow is
+    block-keyed, so the routing has to keep it.
+    """
+    row = _quote_row("extended", lastPrice="651.0")
+    assert row["extended_last_price"] is None
+    # The quote block's own lastPrice is untouched, in its own column.
+    assert row["last"] == 650.0
+    assert json.loads(row["extra"]) == {"extended": {"lastPrice": "651.0"}}
+
+
+def test_a_routed_value_joins_the_overflow_rather_than_replacing_it():
+    """A contract that drifted and also carries a new field keeps both in ``extra``.
+
+    Serializing the routed value over the top would throw away the unrecognised field the
+    fail-open was built to keep, which is the same loss in the other direction.
+    """
+    row = _chain_row(openInterest=1234.7, brandNewGreek=1.5)
+    assert json.loads(row["extra"]) == {"openInterest": 1234.7, "brandNewGreek": 1.5}
+
+
+def test_a_routed_value_is_the_vendors_own_and_keeps_its_shape_through_the_json():
+    """Nothing is cast, rounded, or stringified on the way into ``extra``.
+
+    A cast would manufacture a value the vendor never sent and hand it to a downstream
+    computation with no marker, which is the one outcome nobody can detect afterwards. The
+    nested value is the case that would break a writer that stringified, since a dict has
+    no sensible string form to fall back on.
+    """
+    for value in (1234.7, "1234", True, {"amount": 3, "unit": "contracts"}, [1, 2, 3], -0.5):
+        row = _chain_row(openInterest=value)
+        routed = json.loads(row["extra"])["openInterest"]
+        assert routed == value and type(routed) is type(value), value
+
+
+def test_only_the_contract_that_drifted_loses_its_column():
+    """One drifted row costs one row's field, not the batch's.
+
+    Nulling the whole column would turn a narrow vendor change into a wide one, and the
+    other contracts' open interest is data the vendor did send.
+    """
+    contracts = [
+        _full_contract(symbol=f"SPY   260918C0065000{index}", openInterest=value)
+        for index, value in enumerate((1234, "1235", 1236))
+    ]
+    batch = journal.chains_data_batch(
+        _chain_of(*contracts), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
+    )
+    assert batch.column("open_interest").to_pylist() == [1234, None, 1236]
+    assert [json.loads(e) if e else None for e in batch.column("extra").to_pylist()] == [
+        None,
+        {"openInterest": "1235"},
+        None,
+    ]
+
+
+def test_a_string_arrow_cannot_encode_routes_too():
+    """A lone surrogate is a string the column refuses, and it reaches a different family.
+
+    Arrow raises ``UnicodeEncodeError`` rather than one of its own errors here, so a
+    routing that named only the Arrow families would still cost the cycle for it. JSON
+    carries the surrogate through, so the value survives where the column cannot hold it.
+    """
+    row = _chain_row(description="\ud800")
+    assert row["description"] is None
+    assert json.loads(row["extra"]) == {"description": "\ud800"}
+
+
+def test_a_column_with_no_route_into_extra_still_costs_the_cycle():
+    """What still fails loudly, one case per group that has no key to land under.
+
+    A value with nowhere honest to go must not be parked somewhere nothing reads. Each
+    group below is a column ``extra_paths`` deliberately leaves out, named in its
+    docstring, so this covers the reasons rather than one example of one.
+    """
+    # A chain-level body field. The chains overflow is computed from the contract dict
+    # alone, so a top-level field has no key in it.
+    with pytest.raises(pa.ArrowInvalid):
+        journal.chains_data_batch(
+            dict(_chain_of(_full_contract()), underlyingPrice="high"),
+            ticker="SPY",
+            snap_ts=SNAP,
+            fetch_ts=FETCH,
         )
-        with pytest.raises(expected):
-            journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+    # The quotes envelope's own fields. Only a captured block's leftovers overflow.
+    for envelope in (dict(QUOTE, realtime="yes"), dict(QUOTE, reference={"cusip": 111111111})):
+        with pytest.raises((pa.ArrowInvalid, pa.ArrowTypeError)):
+            journal.quotes_data_batch(
+                envelope, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH, vendor_quote_ts=VENDOR
+            )
+    # A column this module fills itself. A stamp that will not build is this code's bug,
+    # not the vendor's, and parking it would hide the bug and keep writing rows.
+    with pytest.raises(pa.ArrowTypeError):
+        journal.gap_batch(journal.CHAINS_SURFACE, ticker=7, snap_ts=SNAP, error_class="http_429")
+    # A column whose value this module transforms rather than copies. The epoch-to-ISO
+    # conversion refuses first, before any column is built.
+    with pytest.raises(ValueError):
+        journal.chains_data_batch(
+            _chain_of(_full_contract(quoteTimeInLong="not-an-epoch")),
+            ticker="SPY",
+            snap_ts=SNAP,
+            fetch_ts=FETCH,
+        )
+
+
+def test_every_value_a_payload_can_carry_refuses_in_one_of_the_four_named_families():
+    """The routing names four exception families. A fifth would cost cycles silently.
+
+    ``_UNFIT_ERRORS`` is what decides whether a refusal is one value's doing. A pyarrow
+    upgrade that starts raising something outside it would send a retyped field back to
+    gapping the whole cycle, and nothing else in the suite would notice. So the families
+    are checked by enumeration: every JSON-representable value against every type the two
+    pinned schemas use.
+    """
+    values = [
+        None,
+        0,
+        1,
+        -1,
+        2**63,
+        2**64,
+        -(2**64),
+        0.0,
+        1.0,
+        3.7,
+        1e19,
+        float("nan"),
+        float("inf"),
+        True,
+        False,
+        "7",
+        "a",
+        "",
+        "\ud800",
+        "\U0001f600",
+        {"a": 1},
+        {},
+        [1, 2],
+        [],
+    ]
+    types = {
+        field.type for surface in journal.PINNED_SURFACES for field in journal.schema_for(surface)
+    }
+    raised = set()
+    for field_type in types:
+        for value in values:
+            try:
+                journal.typed_column(field_type, [value])
+            except journal._UNFIT_ERRORS as exc:
+                raised.add(type(exc))
+            except Exception as exc:  # noqa: BLE001 - the point is to catch a fifth family
+                raise AssertionError(
+                    f"{type(exc).__name__} from {value!r} into {field_type}, which "
+                    "_UNFIT_ERRORS does not name, so that shape would gap the cycle"
+                ) from exc
+    assert raised == set(journal._UNFIT_ERRORS), (
+        "a family in _UNFIT_ERRORS that no value reaches is a family that was guessed"
+    )
+
+
+def test_a_value_this_code_put_on_a_gap_row_never_routes():
+    """A gap row carries no vendor observation, so nothing on one can be vendor drift.
+
+    Two builders write a value on a gap row, and both write the ``expiration_date`` those
+    rows exist to name. Routing it would delete the marker's only fact and leave a gap row
+    carrying the signature that says a vendor retyped a field. Both are wrong, and the
+    second is worse, because the read-time refusal in marketlake #149 reads that signature.
+
+    So the refusal propagates instead, which is this code's bug surfacing as this code's
+    bug.
+    """
+    slot = datetime.fromisoformat("2026-09-13T16:00:00-04:00")
+    with pytest.raises(pa.ArrowTypeError):
+        journal.absent_series_rows(
+            journal.CHAINS_SURFACE,
+            ticker="SPY",
+            slot=slot,
+            expirations=[20261016],
+            error_class="option_close_series_absent",
+        )
+    with pytest.raises(pa.ArrowTypeError):
+        journal.chains_data_batch(
+            _chain_of(_full_contract()),
+            ticker="SPY",
+            snap_ts=SNAP,
+            fetch_ts=FETCH,
+            absent_markers=[
+                journal.AbsentMarker("2026-09-13", None, "chain_chunk_failed", 20260918)
+            ],
+        )
+
+
+def test_the_marker_a_gap_row_names_still_lands_when_it_is_the_right_type():
+    """The control for the refusal above, so it is not a builder broken outright."""
+    slot = datetime.fromisoformat("2026-09-13T16:00:00-04:00")
+    batch = journal.absent_series_rows(
+        journal.CHAINS_SURFACE,
+        ticker="SPY",
+        slot=slot,
+        expirations=["2026-10-16"],
+        error_class="option_close_series_absent",
+    )
+    row = batch.to_pylist()[0]
+    assert row["row_kind"] == journal.ROW_KIND_GAP
+    assert row["expiration_date"] == "2026-10-16"
+    assert row["extra"] is None
+
+
+def test_a_drifted_contract_beside_a_marker_routes_the_contract_alone():
+    """One batch holding both kinds of row, with the drift on the data row.
+
+    ``chains_data_batch`` puts the chunker's absence markers in the same batch as the
+    captured contracts, so one ``expiration_date`` column holds a vendor value and a value
+    this code wrote. The rule has to read per row rather than per column, or a marker beside
+    a drifted contract would either block the routing or be swept into it.
+    """
+    batch = journal.chains_data_batch(
+        _chain_of(_full_contract(expirationDate=1787000000000)),
+        ticker="SPY",
+        snap_ts=SNAP,
+        fetch_ts=FETCH,
+        absent_markers=[
+            journal.AbsentMarker("2026-10-16", None, "chain_chunk_failed", "2026-10-16")
+        ],
+    )
+    data, marker = batch.to_pylist()
+    assert data["row_kind"] == journal.ROW_KIND_DATA
+    assert data["expiration_date"] is None
+    assert json.loads(data["extra"]) == {"expirationDate": 1787000000000}
+    assert marker["row_kind"] == journal.ROW_KIND_GAP
+    assert marker["expiration_date"] == "2026-10-16"
+    assert marker["extra"] is None
+
+
+def test_an_identity_column_routes_and_the_row_still_lands_as_data():
+    """The sharpest edge of the trade #129 took, recorded rather than left implicit.
+
+    ``occ_symbol``, ``strike_price``, ``expiration_date``, and ``put_call`` are ordinary
+    vendor fields the parser copies verbatim, so they route like any other. A row that
+    loses all four lands as data with nothing left to join it on, and every completeness
+    counter reads the minute as captured.
+
+    That is the accepted cost and not an oversight. The alternative is losing the minute
+    for every contract in the chain, and the raw values are all still in ``extra``, so the
+    row is repairable where a lost minute is not. What makes it findable is the signature,
+    which this checks names all four.
+    """
+    row = _chain_row(symbol=123456, strikePrice="650.0", expirationDate=1787000000000, putCall=7)
+    assert row["row_kind"] == journal.ROW_KIND_DATA
+    assert row["error_class"] is None
+    assert (row["occ_symbol"], row["strike_price"], row["expiration_date"], row["put_call"]) == (
+        None,
+        None,
+        None,
+        None,
+    )
+    assert json.loads(row["extra"]) == {
+        "symbol": 123456,
+        "strikePrice": "650.0",
+        "expirationDate": 1787000000000,
+        "putCall": 7,
+    }
+    assert _known_names_in(journal.CHAINS_SURFACE, row["extra"]) == {
+        journal.ExtraPath(None, "symbol"),
+        journal.ExtraPath(None, "strikePrice"),
+        journal.ExtraPath(None, "expirationDate"),
+        journal.ExtraPath(None, "putCall"),
+    }
+
+
+def test_a_row_that_drifted_twice_keeps_both_values():
+    """A contract can drift in more than one field, and both have to survive.
+
+    Each column is built on its own, so a row accumulates one routed entry per column that
+    refused it. Keeping only the first would throw the second value away with no signature
+    left behind, which is the loss this whole change exists to stop, one field narrower.
+    """
+    row = _chain_row(openInterest=1234.7, bid="nope")
+    assert row["open_interest"] is None and row["bid"] is None
+    assert json.loads(row["extra"]) == {"openInterest": 1234.7, "bid": "nope"}
+    assert _known_names_in(journal.CHAINS_SURFACE, row["extra"]) == {
+        journal.ExtraPath(None, "openInterest"),
+        journal.ExtraPath(None, "bid"),
+    }
+
+
+def test_two_drifted_fields_in_one_quote_block_both_land_under_it():
+    """The same on the nested surface, where both entries share one block dict."""
+    row = _quote_row("quote", totalVolume="90000000", bidPrice="649.98")
+    assert row["total_volume"] is None and row["bid"] is None
+    assert json.loads(row["extra"]) == {"quote": {"totalVolume": "90000000", "bidPrice": "649.98"}}
+
+
+def test_a_routed_quote_field_joins_its_blocks_existing_overflow():
+    """A block holding an unrecognized field and a drifted one keeps both.
+
+    The chains overflow is flat, so its merge writes straight onto the top-level dict. The
+    quotes overflow nests, so the merge has to read that block's dict and add to it.
+    Replacing the block instead would drop the unrecognized field the fail-open was built
+    to keep, and the flat test cannot see that because it has no block to clobber.
+    """
+    row = _quote_row("quote", totalVolume="90000000", brandNewStat=1.5)
+    assert json.loads(row["extra"]) == {"quote": {"brandNewStat": 1.5, "totalVolume": "90000000"}}
+
+
+def test_an_integer_too_wide_for_the_column_routes_like_any_other_refusal():
+    """The ``OverflowError`` family, driven through a row builder rather than the column.
+
+    The enumeration test asks ``typed_column`` which families a value can raise, and never
+    reaches the routing. So each family also needs one end-to-end case, or the ``except``
+    clauses that consume ``_UNFIT_ERRORS`` could narrow away from the constant and send a
+    whole shape back to gapping the cycle with nothing noticing.
+    """
+    row = _chain_row(openInterest=2**64)
+    assert row["open_interest"] is None
+    assert json.loads(row["extra"]) == {"openInterest": 2**64}
+
+
+def test_a_genuinely_absent_field_beside_a_drifted_one_leaves_no_signature():
+    """A null is not drift, and must never be written into ``extra`` as though it were.
+
+    Every routed value is found by offering each of a column's values to ``_fits`` on its
+    own, and a null fits, because an all-null column lands typed. Were it counted unfit,
+    then in any batch where one contract drifted, every other contract whose field the
+    vendor simply did not send would get that field's name into its overflow. That is a
+    known field's name on a row that never drifted, which is the false positive the
+    signature cannot afford and which the read-time refusal in marketlake #149 keys on.
+
+    The fixtures elsewhere fill every field, so only a batch built with one missing can see
+    this.
+    """
+    absent = _full_contract(symbol="SPY   260918C00650001")
+    absent.pop("openInterest")
+    contracts = [absent, _full_contract(symbol="SPY   260918C00650002", openInterest="1235")]
+    batch = journal.chains_data_batch(
+        _chain_of(*contracts), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
+    )
+    quiet, drifted = batch.to_pylist()
+    assert quiet["open_interest"] is None
+    assert quiet["extra"] is None, "a vendor null was recorded as drift"
+    assert _known_names_in(journal.CHAINS_SURFACE, quiet["extra"]) == set()
+    assert drifted["open_interest"] is None
+    assert json.loads(drifted["extra"]) == {"openInterest": "1235"}
+
+
+def test_the_overflow_serializes_the_same_bytes_however_the_payload_was_ordered():
+    """One logical overflow is one string, so a byte comparison of segments is stable.
+
+    Sorting the keys is what makes that true, and it has to hold once a routed value has
+    been merged in as well as on the fail-open's own output. A routed key added last would
+    otherwise serialize last, and the same contract arriving with its fields in a different
+    order would write different bytes for the same facts.
+    """
+    # The fail-open's own output, from two payloads that differ only in key order.
+    first = _chain_row(zzzNewField=1, aaaNewField=2)
+    second = _chain_row(aaaNewField=2, zzzNewField=1)
+    assert first["extra"] == second["extra"] == '{"aaaNewField": 2, "zzzNewField": 1}'
+    # The merged output. The unrecognized key sorts after the routed one, so an unsorted
+    # dump would put the routed key last instead.
+    merged = _chain_row(zzzNewField=1, openInterest=1234.7)
+    assert merged["extra"] == '{"openInterest": 1234.7, "zzzNewField": 1}'
 
 
 # -- the version stamp on every row ------------------------------------------

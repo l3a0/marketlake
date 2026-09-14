@@ -9,7 +9,8 @@ They cover the cycle's observable contract:
 
 1. A happy cycle writes chains and quotes segments with the right rows and the right
    ``snap_ts`` / ``fetch_ts`` / ``vendor_quote_ts`` stamps.
-2. A failing chain fetch gaps only that ticker while the others still capture.
+2. A failing chain fetch gaps only that ticker while the others still capture, and a
+   known field whose value its column refuses costs that field rather than the minute.
 3. A failing quote batch gaps every ticker's quotes, because the sampler is one shared
    failure unit.
 4. The manifest gains one entry per segment, keyed by the segment path.
@@ -19,6 +20,7 @@ They cover the cycle's observable contract:
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -420,7 +422,7 @@ def test_top_level_envelope_cusip_lands_in_the_column(lake_root):
     assert row["extra"] is None
 
 
-# -- 6b. a truncating float gaps the ticker ----------------------------------
+# -- 6b. a value its column refuses ------------------------------------------
 
 
 def _chain_body_with(**contract_overrides) -> dict:
@@ -487,14 +489,18 @@ def _spy_only() -> Roster:
     return Roster.from_mapping({"SPY": {"options": True, "chain_cadence": "1m"}})
 
 
-def test_a_truncating_float_gaps_the_chain_rather_than_recording_the_truncation(lake_root):
-    """A vendor integer field sent fractional must gap the ticker, not land rounded.
+def test_a_retyped_known_field_lands_the_cycle_and_parks_the_raw_value(lake_root):
+    """A vendor integer field sent fractional must cost the field, not the minute.
 
-    This is the handler the refusal actually reaches. ``chain_schema_drift`` guards the
-    fetch, where a body that will not merge is split and given up, and the row build runs
-    well past it. The raise lands in ``_plan_chain``'s fail-open instead, which turns any
-    row-building failure into a whole-chain gap classed by the exception name. So the
-    class on disk is ``arrow_invalid``, and the quote sampler is untouched.
+    This is the whole path, driven through ``run_cycle`` rather than the row builder, so
+    the routing is exercised where it actually runs and the assertion reads the segment
+    back off disk. Before the routing, the raise reached ``_plan_chain``'s fail-open and
+    the ticker gapped under ``arrow_invalid``, which cost every minute the vendor held the
+    new shape and threw the value away on top.
+
+    Now the chain lands as data, ``open_interest`` is null because 1234 was never what the
+    vendor sent, and 1234.7 is in ``extra`` where the read-time refusal in marketlake #149
+    will find it.
     """
     vendor = CassetteVendor(_one_chain_cassette(_chain_body_with(openInterest=1234.7)))
     result = capture.run_cycle(
@@ -503,25 +509,26 @@ def test_a_truncating_float_gaps_the_chain_rather_than_recording_the_truncation(
 
     assert result.errors == ()
     chain = result.segment(CHAINS, "SPY")
-    assert chain.row_kind == journal.ROW_KIND_GAP
-    assert chain.error_class == "arrow_invalid"
+    assert chain.row_kind == journal.ROW_KIND_DATA
+    assert chain.error_class is None
 
-    # The gap carries no market data, so the truncated 1234 never reaches the lake.
-    gap_row = _rows(chain)[0]
-    assert gap_row["row_kind"] == journal.ROW_KIND_GAP
-    assert gap_row["error_class"] == "arrow_invalid"
-    assert gap_row["open_interest"] is None
-    assert gap_row["snap_ts"] == _EXPECTED_SNAP.isoformat()
+    row = _rows(chain)[0]
+    assert row["row_kind"] == journal.ROW_KIND_DATA
+    assert row["open_interest"] is None
+    assert json.loads(row["extra"]) == {"openInterest": 1234.7}
+    # The rest of the contract is untouched, so one drifted field costs one field.
+    assert (row["bid"], row["ask"]) == (4.2, 4.25)
+    assert row["snap_ts"] == _EXPECTED_SNAP.isoformat()
 
-    # One surface failing never takes the other down.
+    # One surface drifting never takes the other down.
     assert result.segment(QUOTES, "SPY").row_kind == journal.ROW_KIND_DATA
 
 
 def test_the_same_chain_captures_when_the_integer_field_is_whole(lake_root):
-    """The control. Only the fractional value gaps, so the refusal is not blanket.
+    """The control. Only the drifted value routes, so the routing is not blanket.
 
-    Without this the gap test above would still pass if the row builder had been broken
-    outright, since a builder that refused every chain would gap this one too.
+    Without this the test above would still pass if the row builder had been broken
+    outright, since a builder that nulled every open interest would null this one too.
     """
     vendor = CassetteVendor(_one_chain_cassette(_chain_body_with(openInterest=1234.0)))
     result = capture.run_cycle(
@@ -530,24 +537,24 @@ def test_the_same_chain_captures_when_the_integer_field_is_whole(lake_root):
 
     chain = result.segment(CHAINS, "SPY")
     assert chain.row_kind == journal.ROW_KIND_DATA
-    assert _rows(chain)[0]["open_interest"] == 1234
+    row = _rows(chain)[0]
+    assert row["open_interest"] == 1234
+    assert row["extra"] is None
 
 
-def test_the_recorded_gap_class_is_the_direct_build_s_own_exception(lake_root):
-    """A chain Arrow cannot infer gaps under ``arrow_type_error``, not ``arrow_invalid``.
+def test_a_chain_level_field_the_column_refuses_still_gaps_under_its_own_class(lake_root):
+    """What the routing deliberately leaves alone, read at the class an operator sees.
 
-    Two contracts send ``openInterest`` as a bool and as a string, which gives Arrow
-    nothing to infer from, so the inference attempt raises before any type check runs.
-    Its exception class differs from the direct build's, and the recorded gap class is
-    taken from the exception's own name. Asserting only that the ticker gapped would pass
-    either way, so this pins the class an operator actually reads.
+    The chains overflow is built from the contract dict alone, so a top-level body field
+    has no key in it and nowhere honest to be parked. It keeps the old behaviour: the raise
+    reaches ``_plan_chain``'s fail-open and the ticker gaps under the exception's own name.
+
+    ``chain_schema_drift`` is not that name and never was. It guards the fetch, where a body
+    that will not merge is split and given up, and the row build runs well past it. So the
+    class on disk here is ``arrow_invalid``, and the quote sampler is untouched.
     """
     body = _chain_body_with()
-    contracts = [
-        dict(body["callExpDateMap"]["2026-09-18:25"]["650.0"][0], openInterest=value)
-        for value in (True, "7")
-    ]
-    body["callExpDateMap"]["2026-09-18:25"]["650.0"] = contracts
+    body["underlyingPrice"] = "six hundred and fifty"
     result = capture.run_cycle(
         ManualClock(start=_CLOCK_START),
         CassetteVendor(_one_chain_cassette(body)),
@@ -559,12 +566,16 @@ def test_the_recorded_gap_class_is_the_direct_build_s_own_exception(lake_root):
 
     chain = result.segment(CHAINS, "SPY")
     assert chain.row_kind == journal.ROW_KIND_GAP
-    assert chain.error_class == "arrow_type_error"
-    assert _rows(chain)[0]["error_class"] == "arrow_type_error"
+    assert chain.error_class == "arrow_invalid"
+    gap_row = _rows(chain)[0]
+    assert gap_row["error_class"] == "arrow_invalid"
+    assert gap_row["underlying_price"] is None
+    assert gap_row["extra"] is None
+    assert result.segment(QUOTES, "SPY").row_kind == journal.ROW_KIND_DATA
 
 
-def test_a_truncating_float_gaps_only_that_ticker(lake_root):
-    """A second ticker's chain still captures, so the gap stays scoped to the bad one."""
+def test_a_retype_that_lands_stays_scoped_to_the_contract_that_drifted(lake_root):
+    """A second ticker's chain is untouched, and so is the first ticker's other field."""
     cassette = Cassette(
         interactions=(
             Interaction(
@@ -603,8 +614,13 @@ def test_a_truncating_float_gaps_only_that_ticker(lake_root):
         plan=_ONE_WINDOW,
     )
 
-    assert result.segment(CHAINS, "SPY").error_class == "arrow_invalid"
-    assert result.segment(CHAINS, "QQQ").row_kind == journal.ROW_KIND_DATA
+    spy = result.segment(CHAINS, "SPY")
+    assert spy.row_kind == journal.ROW_KIND_DATA
+    assert json.loads(_rows(spy)[0]["extra"]) == {"openInterest": 1234.7}
+    qqq = result.segment(CHAINS, "QQQ")
+    assert qqq.row_kind == journal.ROW_KIND_DATA
+    assert _rows(qqq)[0]["open_interest"] == 1234
+    assert _rows(qqq)[0]["extra"] is None
 
 
 # -- 7. the journal metadata stamp -------------------------------------------

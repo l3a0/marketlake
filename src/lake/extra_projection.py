@@ -7,6 +7,17 @@ the answer is to promote it: give it a typed column and bump ``SCHEMA_VERSION``.
 version on the value lands in its column. Every row already sealed below that version
 still holds it in ``extra``.
 
+Two writers put a value in that column, and this module reads back exactly one of them.
+The promotion above is the one it reads. The other is the parser routing a known field
+whose value its column refused, which leaves the column null and the raw value in the
+overflow. That value is out of reach here by construction, because the row's recorded
+version *does* carry the column and this module only fills a column the version lacked.
+Reaching it needs a different test and a different answer, and both are
+[#149](https://github.com/l3a0/marketlake/issues/149), which is authoritative for that
+scope. Until it lands, what makes those rows safe is that a known field's name in ``extra``
+can only have got there by routing, so a routed null is still distinguishable from a
+vendor null.
+
 So a promotion splits history in two. The same measurement reads as a column above the
 boundary and as an overflow key below it, and a reader asking for the column sees nulls
 across the older half that look exactly like vendor nulls. This module closes that split at
@@ -49,9 +60,11 @@ from lake import journal
 from lake.schema_versions import SchemaVersionLedger
 
 # The two columns a journal table must carry for the projection to mean anything. The
-# version says which shape wrote the row, and the overflow holds the value.
+# version says which shape wrote the row, and the overflow holds the value. The overflow's
+# name comes from the writer rather than being spelled again here, so the two cannot drift
+# apart on the one column this module exists to read.
 VERSION_COLUMN = "schema_version"
-EXTRA_COLUMN = "extra"
+EXTRA_COLUMN = journal.EXTRA_COLUMN
 
 
 class ExtraProjectionError(Exception):

@@ -528,9 +528,8 @@ def test_a_master_that_raises_leaves_the_walk_marking_nothing_not_crashing(tmp_p
 @pytest.mark.parametrize("kind", [journal.ROW_KIND_DATA, journal.ROW_KIND_GAP])
 def test_recorded_slots_counts_rows_of_every_kind(tmp_path, kind):
     slot = et(2026, 9, 2, 11, 0)
-    schema = journal.schema_for("quotes")
     batch = journal._batch(
-        schema,
+        "quotes",
         [{"snap_ts": slot.isoformat(), "ticker": "XYZ", "row_kind": kind, "schema_version": 1}],
     )
     with journal.SegmentWriter.open(tmp_path, "quotes", "XYZ", slot.date(), "s", 1) as writer:
