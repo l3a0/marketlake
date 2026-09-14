@@ -61,7 +61,9 @@ inverts. ``parse_segment_rel`` inverts ``segment_path``. ``parse_date_dir`` read
 
 from __future__ import annotations
 
+import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -366,15 +368,52 @@ CHAIN_PLAN_FILE = "chain_plan.json"
 # list joins with "/" into an rsync pattern.
 CONFIG_DIR_PARTS = (".config", "marketlake")
 
+# The whole config directory, moved somewhere else for one process. Every default path
+# in this package is built from ``config_dir`` at import, so setting this before a
+# process starts points its token, config, roster, and chain plan at a throwaway
+# directory together.
+#
+# It exists because the live token is a real credential that a by-hand run can destroy.
+# ``python -m lake.reauth`` with no ``--token`` writes the standard location, which is
+# right for the weekly ritual and wrong for someone exercising the tool. That is how a
+# stub reached the production token path on 2026-09-13 and took a working token with
+# it. Export this and a development run cannot reach the real file, whatever it is
+# given on the command line.
+#
+# It redirects the directory rather than the token alone, because the token is the
+# file that was lost and not the only one that can be. ``config.yaml`` holds four
+# secrets and the roster is hand-maintained.
+#
+# Two limits are worth stating. It is read when this module is imported, not when a
+# path is used, so exporting it from inside a running process moves nothing. And it is
+# an override a person sets, so it does not protect a run that forgets it. The test
+# suite is covered by the config-directory guard in ``tests/conftest.py`` instead,
+# which needs nobody to remember anything.
+CONFIG_DIR_ENV = "MARKETLAKE_CONFIG_DIR"
 
-def config_dir(home: str | Path | None = None) -> Path:
-    """The config directory, resolved under ``home`` or the current user's home.
+
+def config_dir(
+    home: str | Path | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> Path:
+    """The config directory: an explicit ``home``, then the env var, then this user's home.
 
     A running process omits ``home`` and gets its own. The control plane's renderer
-    passes one, because it builds a plist for another account.
+    passes one, because it builds a plist for another account, and an explicit ``home``
+    wins over the override so a render stays a render whatever the environment says.
+
+    ``MARKETLAKE_CONFIG_DIR`` names the directory itself rather than a home, the way
+    ``MARKETLAKE_CONFIG`` names a file. It is whatever a person typed, so a ``~`` in it
+    is expanded, which matches how ``load_config`` and ``load_tickers`` treat theirs.
     """
-    base = Path(home) if home is not None else Path.home()
-    return base.joinpath(*CONFIG_DIR_PARTS)
+    if home is not None:
+        return Path(home).joinpath(*CONFIG_DIR_PARTS)
+    environment = os.environ if env is None else env
+    override = environment.get(CONFIG_DIR_ENV)
+    if override:
+        return Path(override).expanduser()
+    return Path.home().joinpath(*CONFIG_DIR_PARTS)
 
 
 __all__ = [
@@ -382,6 +421,7 @@ __all__ = [
     "BARS",
     "CHAINS",
     "CHAIN_PLAN_FILE",
+    "CONFIG_DIR_ENV",
     "CONFIG_DIR_PARTS",
     "CONFIG_FILE",
     "CONTRACTS",

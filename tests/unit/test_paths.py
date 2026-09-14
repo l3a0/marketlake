@@ -22,6 +22,8 @@ from lake.paths import (
     BARS,
     CHAIN_PLAN_FILE,
     CHAINS,
+    CONFIG_DIR_ENV,
+    CONFIG_DIR_PARTS,
     CONFIG_FILE,
     QUOTES,
     SEGMENT_GLOB,
@@ -277,7 +279,55 @@ def test_a_malformed_date_directory_parses_to_none(name: str):
 
 def test_the_config_directory_is_the_location_the_design_pins():
     assert config_dir("/Users/alice") == Path("/Users/alice/.config/marketlake")
-    assert config_dir() == Path.home() / ".config" / "marketlake"
+    # env={} pins the fallback rather than reading whatever the developer exported, so
+    # this asserts the design's location whether or not an override is set.
+    assert config_dir(env={}) == Path.home() / ".config" / "marketlake"
+
+
+# The whole directory, moved for one process. A tool whose default is the live token
+# path gets run against that default by someone verifying it by hand, which is how a
+# stub reached the production token on 2026-09-13 and took a working token with it.
+
+
+def test_the_override_moves_the_directory():
+    assert config_dir(env={CONFIG_DIR_ENV: "/tmp/throwaway"}) == Path("/tmp/throwaway")
+
+
+def test_the_override_names_the_directory_rather_than_a_home():
+    # MARKETLAKE_CONFIG names a file, so this names a directory. Appending the two
+    # CONFIG_DIR_PARTS to it would make the override a home instead, and a developer
+    # pointing it at an empty directory would find the files one level down.
+    resolved = config_dir(env={CONFIG_DIR_ENV: "/tmp/throwaway"})
+    assert resolved.name != CONFIG_DIR_PARTS[-1]
+    assert resolved.parts[-len(CONFIG_DIR_PARTS) :] != CONFIG_DIR_PARTS
+
+
+def test_the_override_is_expanded():
+    # It is whatever a person typed, so it can carry a "~", the same as the overrides
+    # load_config and load_tickers take. An unexpanded one would have open() make a
+    # literal "~" directory rather than fail.
+    assert config_dir(env={CONFIG_DIR_ENV: "~/throwaway"}) == Path.home() / "throwaway"
+
+
+def test_an_explicit_home_beats_the_override():
+    # The control plane renders a plist for another account. A render has to stay a
+    # render whatever the environment of the machine rendering it says.
+    assert config_dir("/Users/alice", env={CONFIG_DIR_ENV: "/tmp/throwaway"}) == Path(
+        "/Users/alice/.config/marketlake"
+    )
+
+
+def test_an_empty_override_falls_through_to_the_home():
+    # An exported-but-empty variable is an unset one, which is how load_config and
+    # load_tickers both read theirs.
+    assert config_dir(env={CONFIG_DIR_ENV: ""}) == Path.home() / ".config" / "marketlake"
+
+
+def test_the_override_is_read_from_the_real_environment_by_default(monkeypatch):
+    # The env argument is the test seam. Production passes nothing and gets os.environ,
+    # which is what makes exporting the variable before a process starts work at all.
+    monkeypatch.setenv(CONFIG_DIR_ENV, "/tmp/throwaway")
+    assert config_dir() == Path("/tmp/throwaway")
 
 
 @pytest.mark.parametrize(
@@ -310,4 +360,7 @@ def test_the_control_plane_renderer_agrees_with_the_shared_rule():
     # directory the same way a running process does.
     assert cp.default_config_dir("/Users/alice") == str(config_dir("/Users/alice"))
     assert cp.default_token_path("/Users/alice") == str(config_dir("/Users/alice") / TOKEN_FILE)
-    assert cp.default_token_path(str(Path.home())) == str(DEFAULT_TOKEN_PATH)
+    # For this user's own home, the renderer's spelling and the module rule's fallback
+    # agree. config_dir(env={}) rather than DEFAULT_TOKEN_PATH, because that constant
+    # honours the override and this claim is about the home-relative default.
+    assert cp.default_token_path(str(Path.home())) == str(config_dir(env={}) / TOKEN_FILE)

@@ -1,12 +1,15 @@
 """Shared fixtures that expose the four seams and the fixture-lake builder.
 
-It also carries the network guard, which fails any test that reaches another machine
-from inside this process, and the subprocess guard, which fails any test that shells
-out to rsync, launchctl, pmset, or tmutil.
+It also carries three guards. The network guard fails any test that reaches another
+machine from inside this process. The subprocess guard fails any test that shells out
+to rsync, launchctl, pmset, or tmutil. The config-directory guard fails any test that
+writes under the machine's real ``~/.config/marketlake/``.
 """
 
 from __future__ import annotations
 
+import builtins
+import io
 import os
 import socket
 import subprocess
@@ -18,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from lake.cassette import load_cassette
+from lake.paths import CONFIG_DIR_PARTS
 from tests.support.clock import ManualClock
 from tests.support.lake import FixtureLake
 from tests.support.vendor import CassetteVendor
@@ -237,4 +241,186 @@ def _no_subprocess() -> Iterator[None]:
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(subprocess, "run", _refuser(subprocess.run))
         mp.setattr(subprocess, "Popen", _refuser(subprocess.Popen))
+        yield
+
+
+# -- the config-directory guard ----------------------------------------------------------
+
+# The machine's real config directory holds four files the suite has no business
+# touching, and one of them is a live brokerage credential. On 2026-09-13 a stub landed
+# at ``~/.config/marketlake/token.json`` and the working token it replaced was gone. The
+# daemon read the stub for half an hour and the dashboard's token age went with it.
+#
+# Neither guard above catches that. No socket is opened and no named program is run. A
+# write to the live path is an ordinary ``open`` in an ordinary test, so it succeeds,
+# quietly, and the damage is a file the suite cannot put back. This fixture turns that
+# silent success into a loud failure that names the path.
+#
+# What counts as the real directory is settled here, at import, and deliberately not
+# through ``paths.config_dir``. Two reasons, and they pull the same way. ``config_dir``
+# honours ``MARKETLAKE_CONFIG_DIR``, so reading it would let the override disarm the
+# guard, when the override's whole purpose is to keep a process off this path. And
+# ``Path.home()`` reads ``$HOME``, which a test is free to monkeypatch, so asking later
+# would let a test move the protected directory out from under the guard.
+#
+# Both spellings are protected. A home whose ``.config`` is a symlink has two names for
+# one directory, and a write through the resolved one is the same write.
+
+_REAL_CONFIG_DIR = str(Path.home().joinpath(*CONFIG_DIR_PARTS))
+_PROTECTED_ROOTS = tuple({_REAL_CONFIG_DIR, os.path.realpath(_REAL_CONFIG_DIR)})
+
+# The open modes and flags that can change a file. Reads are left alone: the issue this
+# fixture answers is a write, and refusing reads would fail tests that legitimately load
+# a config the operator put there.
+_WRITE_MODES = frozenset("wax+")
+_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
+
+
+class ConfigWriteInTest(BaseException):
+    """Raised when a test writes under the machine's real ``~/.config/marketlake/``.
+
+    It derives from ``BaseException``, the same reason ``NetworkAccessInTest`` and
+    ``SubprocessAccessInTest`` do. ``reauth.write_token`` wraps its whole write in
+    ``except BaseException`` to clean up the temp file, and the Sunday self-check wraps
+    its read-backs in a bare ``except Exception``. A guard deriving from ``Exception``
+    would be swallowed somewhere on that path and the destroyed token would ship green,
+    which is the exact silence being fixed.
+    """
+
+
+def _is_protected(target: object) -> bool:
+    """Whether ``target`` names the real config directory or something inside it.
+
+    An ``int`` is an already-open file descriptor, which carries no path to check, so it
+    passes through. ``os.fsdecode`` accepts ``str``, ``bytes``, and anything with
+    ``__fspath__``, which is every form these calls take, and raises ``TypeError`` on
+    anything else.
+
+    The comparison is on the path's text, expanded and made absolute, and touches no
+    filesystem. That keeps the check free on the hot path, since every ``open`` in the
+    suite runs it, and it is enough because both names of the directory are already in
+    ``_PROTECTED_ROOTS``.
+    """
+    if isinstance(target, int):
+        return False
+    try:
+        text = os.fsdecode(target)
+    except TypeError:
+        return False
+    absolute = os.path.abspath(os.path.expanduser(text))
+    return any(absolute == root or absolute.startswith(root + os.sep) for root in _PROTECTED_ROOTS)
+
+
+def _refuse(path: object) -> None:
+    """Raise, naming the path. Called only once a path is known to be protected."""
+    raise ConfigWriteInTest(
+        f"a test tried to write {os.fsdecode(path)}, inside the machine's real config "
+        "directory. That directory holds the live Schwab token. Point the write at "
+        "tmp_path instead."
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_config_writes() -> Iterator[None]:
+    """Fail any test that writes under the machine's real ``~/.config/marketlake/``.
+
+    Autouse, for the reason the other two guards are: a test that writes the live path
+    does it by accident, and a test making that mistake would not have asked for the
+    guard.
+
+    Twelve names are patched, in four kinds.
+
+    1. Opening a file for writing: ``builtins.open``, ``io.open``, and ``os.open``. The
+       first two are the same function object, but patching one does not reach the
+       other, because ``pathlib`` looked ``open`` up on the ``io`` module and a bare
+       ``open(...)`` looks it up in builtins at each call. So ``Path.write_text``,
+       ``Path.write_bytes``, ``Path.open``, ``shutil``'s copies, and every bare ``open``
+       are covered. ``os.open`` is the low-level descriptor, which ``Path.touch`` uses
+       and ``builtins.open`` does not go through.
+    2. Putting a name in the directory or taking one out: ``os.rename``, ``os.replace``,
+       ``os.link``, and ``os.symlink``. The first two are checked at both ends, because
+       a move out of the directory destroys what was there as surely as a move in
+       overwrites it. ``os.replace`` is the step that ends every atomic write in this
+       package, the token's included. The two link calls are checked at the destination
+       only, since neither writes its source.
+    3. Destroying what is there: ``os.unlink``, ``os.remove``, ``os.rmdir``, and
+       ``os.truncate``. ``remove`` and ``unlink`` are separate function objects, so both
+       are named.
+    4. Creating the directory: ``os.mkdir``. ``os.makedirs`` and ``Path.mkdir`` both
+       funnel through it, so neither needs its own patch. This is the one that fires
+       first on ``reauth.write_token``, which calls ``parent.mkdir(parents=True,
+       exist_ok=True)`` before it opens anything.
+
+    Five things a monkeypatch cannot reach, and the guard does not claim:
+
+    1. A child process. A test that shells out to something that writes the directory is
+       outside this, the same limit the network guard names.
+    2. Anything at import or collection time, before the fixture arms.
+    3. A write through a descriptor that is already open, such as ``os.write`` or
+       ``os.ftruncate``, and metadata-only changes such as ``os.chmod`` and
+       ``os.utime``. Neither destroys the file's contents.
+    4. A path resolved against a directory descriptor, through the ``dir_fd`` argument
+       these calls accept. The path is then relative to that descriptor rather than to
+       the working directory, so the text check reads it wrongly. No call site in this
+       repo passes one.
+    5. A writer that never goes through these names, such as an extension module holding
+       the path itself. ``pyarrow`` writes through its own filesystem layer, and no
+       Parquet or Arrow write in this package targets the config directory.
+
+    The fixture holds its own ``MonkeyPatch``, not the shared one, for the reason the
+    other two guards do: a test calling ``monkeypatch.undo()`` must not disarm it.
+    """
+
+    def guard_open(real: Callable[..., object]) -> Callable[..., object]:
+        def refuse(file: object, mode: object = "r", *pos: object, **kwargs: object) -> object:
+            text_mode = mode if isinstance(mode, str) else ""
+            if _WRITE_MODES & set(text_mode) and _is_protected(file):
+                _refuse(file)
+            return real(file, mode, *pos, **kwargs)
+
+        return refuse
+
+    def guard_os_open(real: Callable[..., object]) -> Callable[..., object]:
+        def refuse(path: object, flags: int = 0, *pos: object, **kwargs: object) -> object:
+            if flags & _WRITE_FLAGS and _is_protected(path):
+                _refuse(path)
+            return real(path, flags, *pos, **kwargs)
+
+        return refuse
+
+    def guard_one(real: Callable[..., object]) -> Callable[..., object]:
+        def refuse(path: object, *pos: object, **kwargs: object) -> object:
+            if _is_protected(path):
+                _refuse(path)
+            return real(path, *pos, **kwargs)
+
+        return refuse
+
+    def guard_both_ends(real: Callable[..., object]) -> Callable[..., object]:
+        def refuse(src: object, dst: object, *pos: object, **kwargs: object) -> object:
+            for end in (src, dst):
+                if _is_protected(end):
+                    _refuse(end)
+            return real(src, dst, *pos, **kwargs)
+
+        return refuse
+
+    def guard_destination(real: Callable[..., object]) -> Callable[..., object]:
+        def refuse(src: object, dst: object, *pos: object, **kwargs: object) -> object:
+            if _is_protected(dst):
+                _refuse(dst)
+            return real(src, dst, *pos, **kwargs)
+
+        return refuse
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(builtins, "open", guard_open(builtins.open))
+        mp.setattr(io, "open", guard_open(io.open))
+        mp.setattr(os, "open", guard_os_open(os.open))
+        mp.setattr(os, "rename", guard_both_ends(os.rename))
+        mp.setattr(os, "replace", guard_both_ends(os.replace))
+        mp.setattr(os, "link", guard_destination(os.link))
+        mp.setattr(os, "symlink", guard_destination(os.symlink))
+        for name in ("unlink", "remove", "rmdir", "truncate", "mkdir"):
+            mp.setattr(os, name, guard_one(getattr(os, name)))
         yield

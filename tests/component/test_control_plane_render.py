@@ -27,6 +27,7 @@ from types import SimpleNamespace
 import pytest
 
 from lake import control_plane as cp
+from lake.paths import TOKEN_FILE, config_dir
 from lake.schwab import DEFAULT_TOKEN_PATH
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
@@ -214,7 +215,11 @@ def test_the_three_consumers_name_one_file(tmp_path, capsys):
     daemon = plistlib.loads((out / "com.marketlake.daemon.plist").read_bytes())
     assert daemon["EnvironmentVariables"]["HOME"] == "/Users/someone"
     assert "--token" not in daemon["ProgramArguments"]
-    assert str(DEFAULT_TOKEN_PATH) == cp.default_token_path(str(Path.home()))
+    # config_dir rather than this process's own home: DEFAULT_TOKEN_PATH honours
+    # MARKETLAKE_CONFIG_DIR, and this leg is about schwab spelling the shared rule.
+    # The renderer's leg of the same rule is asserted on the line below and in
+    # test_paths.test_the_control_plane_renderer_agrees_with_the_shared_rule.
+    assert str(DEFAULT_TOKEN_PATH) == str(config_dir() / TOKEN_FILE)
     assert cp.default_token_path(daemon["EnvironmentVariables"]["HOME"]) == token
     # The exclusion protects the directory holding it.
     assert "tmutil addexclusion /Users/someone/.config/marketlake" in capsys.readouterr().out
@@ -1757,8 +1762,8 @@ def test_the_uninstall_leaves_the_config_directory_and_its_exclusion(tmp_path):
     out = tmp_path / "out"
     assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
     commands = _commands((out / cp.UNINSTALL_SCRIPT_FILE).read_text())
-    config_dir = cp.default_config_dir("/Users/someone")
-    assert not [line for line in commands if config_dir in line], commands
+    excluded = cp.default_config_dir("/Users/someone")
+    assert not [line for line in commands if excluded in line], commands
     assert not [line for line in commands if line.startswith("tmutil")], commands
     # The install does place it, so this is a deliberate asymmetry rather than an
     # omission that nobody noticed.
