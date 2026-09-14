@@ -506,17 +506,20 @@ One rule places every test. Apply it in order and stop at the first match.
 13. Synthetic split replay.
 14. Restore from backup.
 
-Six of those have no test today. `tests/integration/` holds three files, and the rest of
+Five of those have no test today. `tests/integration/` holds four files, and the rest of
 the roster is served at the component level, which is fine for the ones that need no real
-process to die partway. The six split into two kinds.
+process to die partway. Test 4 is the first test in any tier to kill a running process,
+so the mechanism it chose is the pattern the rest of that kind follow.
+`tests/support/compaction_child.py` holds it: the child announces the window on stdout
+and blocks, and the parent kills it on reading that line, so the kill lands in the window
+on every run rather than racing a sleep. The five split into two kinds.
 
-Four are buildable now, and each covers a failure the unit and component suites cannot
+Three are buildable now, and each covers a failure the unit and component suites cannot
 reach:
 
-1. 4, kill compaction mid-seal, which is [#98](https://github.com/l3a0/marketlake/issues/98),
-2. 6, overnight death,
-3. 7, fully dark session,
-4. 14, restore from backup.
+1. 6, overnight death,
+2. 7, fully dark session,
+3. 14, restore from backup.
 
 Two are blocked on work that does not exist yet, because their subject is slice 3's:
 
