@@ -114,7 +114,7 @@ CHAIN_CHUNK_FAILED = "chain_chunk_failed"
 # known field pages. Drift is kept apart from the size class above because a parse failure
 # filed under a size class reads as a chain too big to fetch, which is a chunk-plan problem
 # rather than a vendor problem. The name is recognisable as drift so the unbuilt schema-drift
-# page (#92) has one string to subscribe to, and it matches the reason the segment readers are
+# page (#197) has one string to subscribe to, and it matches the reason the segment readers are
 # to carry for the same signal (#104). Neither of those is built here.
 #
 # A retyped known field is not one of those two shapes and never was. It merges cleanly, and
@@ -122,7 +122,7 @@ CHAIN_CHUNK_FAILED = "chain_chunk_failed"
 # carried Arrow's own exception name rather than this class. Since marketlake #129 it leaves
 # no gap at all, because the raw value is routed into ``extra`` and the cycle lands. So this
 # class still means one thing, a window body that would not merge, and it means exactly what
-# it meant before that change. What #92 subscribes to for a retype is the routing's own
+# it meant before that change. What #197 subscribes to for a retype is the routing's own
 # signature instead, a known field's name sitting in ``extra``.
 CHAIN_SCHEMA_DRIFT = "chain_schema_drift"
 

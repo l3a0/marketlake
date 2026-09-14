@@ -178,6 +178,13 @@ class Watchdog:
         class, once. It suppresses the fan-out for that minute rather than adding to it,
         and the counters keep climbing underneath, so the surface pages resume by
         themselves if the cause turns out to be something else.
+
+        Once means once per cause, and the cause is the title, not the error class that
+        resolved to it. A dead refresh token has two shapes. ``schwab.VendorAuthError``
+        records both: ``http_401`` while the cached access token still works, and
+        ``vendor_auth_error`` once the refresh fails and no request goes out. One session
+        carries both, so counting by class would page the same outage a second time under
+        the same title when the vendor changed how it said no.
         """
         if not failed or failed != touched or len(touched) < 2:
             return None
@@ -190,11 +197,11 @@ class Watchdog:
         title = _WHOLE_DAEMON_CAUSES.get(error_class)
         if title is None:
             return None
-        if error_class in self._paged_causes:
+        if title in self._paged_causes:
             return []
         if any(self._counts.get(key, 0) < threshold for key in failed):
             return None
-        self._paged_causes.add(error_class)
+        self._paged_causes.add(title)
         self._paged.update(failed)
         return [
             Page(

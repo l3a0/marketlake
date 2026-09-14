@@ -457,3 +457,60 @@ def test_one_surface_failing_with_an_auth_class_is_not_a_dead_daemon():
         )
     assert [p.title for p in raised] == ["Capture down: SPY chains"]
     assert raised[0].cause is None
+
+
+def test_one_dead_token_reported_two_ways_is_still_one_page():
+    """A dead refresh token has two shapes, and they are one outage.
+
+    ``schwab.VendorAuthError`` records both. While the cached access token still works
+    the request goes out and comes back refused, which capture records as ``http_401``.
+    Once the refresh itself fails no request is made at all, which raises instead and
+    lands as ``vendor_auth_error``. A session carries both, in whatever order the access
+    token happens to expire in.
+
+    Counted by error class, the switch reads as a second outage starting and sends a
+    second ``Capture down: token dead``. The operator is then paged twice for one token
+    and has to work out whether two things broke. Counted by the title the class resolves
+    to, the two shapes share one page.
+    """
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(20):
+        error_class = "http_401" if minute < 10 else "vendor_auth_error"
+        raised += watchdog.observe(
+            _cycle(
+                _fail("chains", "SPY", error_class),
+                _fail("quotes", "SPY", error_class),
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in raised] == ["Capture down: token dead"]
+    assert raised[0].cause == "http_401"
+
+
+def test_a_different_cause_still_pages_on_its_own_transition():
+    """One page per cause, not one page per session.
+
+    Suppressing by title must not suppress a title that has not paged. Rate limiting
+    following a dead token is a different outage and the operator has to be told, or the
+    collapse that exists to stop a page storm would start swallowing real pages instead.
+    """
+    watchdog = Watchdog()
+    opened = []
+    for minute in range(3):
+        opened += watchdog.observe(
+            _cycle(
+                _fail("chains", "SPY", "vendor_auth_error"),
+                _fail("quotes", "SPY", "vendor_auth_error"),
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in opened] == ["Capture down: token dead"]
+    switched = watchdog.observe(
+        _cycle(
+            _fail("chains", "SPY", "http_429"),
+            _fail("quotes", "SPY", "http_429"),
+            at=_at(3),
+        )
+    )
+    assert [page.title for page in switched] == ["Capture down: rate limited"]
