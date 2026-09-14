@@ -54,8 +54,12 @@ The job's rules, each glossed at first use.
    cost the whole run nightly, which
    [#184](https://github.com/l3a0/marketlake/issues/184) settled by weighing for a retype
    the trade this rule already made for a dropped column. The repair for a refused
-   ticker-day is [#189](https://github.com/l3a0/marketlake/issues/189), and nothing in
-   this module clears one today.
+   ticker-day is ``recompact_ticker_day(allow_retype=True)``, which is
+   [#189](https://github.com/l3a0/marketlake/issues/189). It merges the two types on a
+   human's say-so, for the one ticker-day the flag was passed for, and refuses any
+   promotion that would change a value. That merge does produce a merged schema, so the
+   first shape's comparison runs over it and files a finding whenever the promoted type is
+   not the pinned one. No automatic run can reach it.
 
    One page per run carries both shapes to a phone, folding every finding the run made
    into a single message that names the columns. The durable remedy is ``schema_version``
@@ -208,6 +212,27 @@ class CompactionVerifyError(Exception):
 
 class RecompactionRefused(Exception):
     """Raised when a human-invoked recompaction has no segments left to rebuild from."""
+
+
+class RetypeRefused(RecompactionRefused):
+    """Raised when an authorized widening would not return every value unchanged.
+
+    ``recompact_ticker_day(allow_retype=True)`` authorizes a permissive merge for one
+    ticker-day, and this is what that authorization does not extend to. The human is
+    asserting that two segments measure the same thing at two types, so the merge may
+    widen one to the other. They are not authorizing a cast that changes a value. Where
+    the widening would, the repair refuses and the ticker-day stays exactly as the
+    capture left it.
+
+    It is a ``RecompactionRefused`` because only the repair can reach it. The scheduled
+    sweep never passes the flag, so its merge is the ``"default"`` one and this refusal
+    is unreachable from there.
+
+    It is deliberately not a ``SegmentSchemaConflict``. The sweep catches that one and
+    skips the ticker-day, which is the right answer for a merge nobody authorized and the
+    wrong one for a repair a human asked for. A refused repair has to reach the operator
+    who started it, so this raises past every caller.
+    """
 
 
 class SegmentSchemaConflict(Exception):
@@ -869,6 +894,82 @@ def _write_partition(table: pa.Table, partition: Path) -> None:
         raise
 
 
+def _survives_widening(column: pa.ChunkedArray, target: pa.DataType) -> bool:
+    """Whether every value in ``column`` comes back unchanged from a round trip to ``target``.
+
+    This is what "lossless" is decided by, and it is decided on the values this
+    ticker-day actually holds rather than on the type pair alone. The pair the repair
+    exists for says why. An int64 widened to a double is exact up to 2^53 and rounds
+    above it, so ``int64 -> double`` is neither lossless nor lossy as a pair. It is
+    lossless for a column of epoch-millisecond stamps, which run around 1.7e12, and
+    lossy for one that reached past 2^53. A rule written on types would have to refuse
+    both or bless both.
+
+    The round trip decides it in one step. The column is widened to the promoted type
+    and cast straight back, and the answer is whether the two are equal. Arrow's own
+    safe cast refuses the forward step for most of the loss it can detect, naming the
+    2^53 bound for that pair, and the equality catches the rest. A
+    ``decimal128(38, 0)`` widened to a double is the case that needs the second half:
+    the forward cast succeeds and returns a value with eighteen of its digits rewritten.
+
+    A null-typed column is lossless by construction. It holds no values to change, and
+    Arrow has no cast back to the null type, so the round trip is skipped rather than
+    attempted.
+    """
+    if column.type == target or pa.types.is_null(column.type):
+        return True
+    try:
+        restored = column.cast(target).cast(column.type)
+    except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError):
+        return False
+    return restored.equals(column)
+
+
+def _merge_authorized(tables: Sequence[pa.Table], label: str) -> pa.Table:
+    """Merge segments that disagree about a column's type, but only where nothing moves.
+
+    Reached only from a repair a human authorized for one ticker-day. Arrow's
+    ``"permissive"`` promotion is what does the widening, and it is not offered as-is.
+    Two gates sit in front of it.
+
+    1. Arrow decides which pairs it will widen at all. It refuses a bool against a
+       number and a string against a number outright, which is the whole family with no
+       lossless direction, and those refusals are re-raised here as a refused repair
+       rather than an Arrow error.
+    2. Every pair Arrow would widen is then checked value by value, per
+       ``_survives_widening``. A widening that rewrites a value is refused, because what
+       the human authorized is a merge of two recordings of the same thing and not a
+       cast that manufactures one.
+
+    The check runs against ``unify_schemas``, ahead of the concatenation, so a merge
+    that would not be lossless is never built. The refusal names every column and pair
+    it found, not the first, because an operator who has to go and look at the segments
+    wants the whole list on the first run.
+    """
+    schemas = [table.schema for table in tables]
+    try:
+        unified = pa.unify_schemas(schemas, promote_options="permissive")
+    except (pa.ArrowInvalid, pa.ArrowTypeError) as exc:
+        raise RetypeRefused(
+            f"{label}: the segments hold a column at two types Arrow will not widen in "
+            f"either direction, so there is nothing to authorize: {exc}"
+        ) from exc
+
+    lossy: dict[str, None] = {}
+    for table in tables:
+        for field in table.schema:
+            target = unified.field(field.name).type
+            if not _survives_widening(table.column(field.name), target):
+                lossy[f"{field.name}: {field.type} -> {target}"] = None
+    if lossy:
+        raise RetypeRefused(
+            f"{label}: widening would not return every value unchanged for "
+            f"{', '.join(lossy)}; the flag authorizes a merge of two recordings of the "
+            "same thing, never a cast that changes one"
+        )
+    return pa.concat_tables(tables, promote_options="permissive")
+
+
 def _seal(
     root: Path,
     paths: LakePaths,
@@ -880,6 +981,7 @@ def _seal(
     clock: Clock,
     guard: bool,
     found: list[SchemaDrift] | None = None,
+    allow_retype: bool = False,
 ) -> SealedPartition:
     """Merge one ticker-day's segments into its partition, verify, manifest, unlink.
 
@@ -913,6 +1015,14 @@ def _seal(
     ``found`` is the list the caller collects this run's findings in. ``compact`` passes
     one and pages once from it. The repair passes one too and pages nobody from it, so the
     operator who started it reads the drift on their own terminal instead.
+
+    ``allow_retype`` is off for every automatic run and stays off. With it off the merge
+    unifies by name alone, so a column two segments hold at two types raises the
+    ``SegmentSchemaConflict`` above, which is the loud failure the schema policy wants.
+    ``recompact_ticker_day`` is the one caller that can turn it on, for one ticker-day,
+    on a human's say-so. The authorized merge is reached before that ``try``, so a
+    promotion it refuses raises ``RetypeRefused`` and is never mistaken for a conflict
+    the sweep may skip past.
     """
     partition = paths.partition_path(surface, ticker, day)
     rel = partition.relative_to(root).as_posix()
@@ -925,7 +1035,12 @@ def _seal(
         if table is not None:
             tables.append(table)
             expected += table.num_rows
-    if tables:
+    if tables and allow_retype:
+        # A human has authorized the widening for this one ticker-day and is standing
+        # behind the claim that the two types are two recordings of the same thing. The
+        # branch exists only for that, and nothing automatic reaches it.
+        merged = _merge_authorized(tables, f"{surface}/{ticker}/{day.isoformat()}")
+    elif tables:
         # A mid-day vendor change rotates to a new segment with a new schema. Unifying by
         # name adds the new column as nulls on the older rows. A column the segments hold
         # at different types is refused rather than widened. Widening it silently would
@@ -1499,6 +1614,7 @@ def recompact_ticker_day(
     *,
     clock: Clock,
     allow_shrink: bool = False,
+    allow_retype: bool = False,
 ) -> SealedPartition:
     """The human-invoked repair: rebuild one manifested partition from its segments.
 
@@ -1509,6 +1625,16 @@ def recompact_ticker_day(
     file is touched. A human who has established that the recorded count is the wrong
     one passes ``allow_shrink=True`` to supersede it on their own authority.
 
+    ``allow_retype`` is the same move for the other refusal. A ticker-day whose segments
+    hold one column at two types is refused by the merge itself, before the pinned
+    schema is a party to it, so correcting the pinned schema does not clear it and
+    neither does an ordinary rebuild. With the flag on, the merge widens the column
+    instead, on the human's assertion that the two segments recorded the same thing at
+    two types. The authorization is narrow on purpose. It covers one ticker-day, and
+    within it only widenings that return every value unchanged. Anything else raises
+    ``RetypeRefused`` and leaves the day alone. Nothing automatic can pass the flag: the
+    scheduled sweep does not take it and does not offer it.
+
     The merge runs the same schema check the scheduled job does, so the rebuild can find
     drift. It files the finding and writes it to stderr, and it pages nobody. The operator
     started this run and is reading its output, which is the reader a page exists to reach.
@@ -1516,9 +1642,8 @@ def recompact_ticker_day(
     ``SegmentSchemaConflict`` is raised here rather than contained. The scheduled sweep
     contains it because a raise there costs every other ticker-day, the backup, and the
     ping. This call has no other ticker-day to protect, so the operator gets the failure
-    named on their own terminal with a non-zero exit. It cannot repair the conflict either, because
-    it reaches the same ``concat_tables``. That repair is
-    [#189](https://github.com/l3a0/marketlake/issues/189).
+    named on their own terminal with a non-zero exit. Passing ``allow_retype`` is what
+    turns that refusal into a repair rather than a second report of it.
     """
     root = Path(lake_root)
     paths = LakePaths(root)
@@ -1542,6 +1667,7 @@ def recompact_ticker_day(
                 clock=clock,
                 guard=not allow_shrink,
                 found=drifted,
+                allow_retype=allow_retype,
             )
             _prune_empty(ticker_dir.parent.parent)
         finally:
@@ -1583,6 +1709,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Supersede the recorded row count even when the rebuild has fewer rows.",
     )
+    repair.add_argument(
+        "--allow-retype",
+        action="store_true",
+        help="Widen a column the segments hold at two types, where no value changes.",
+    )
     return parser
 
 
@@ -1621,6 +1752,7 @@ def main(
             date.fromisoformat(args.day),
             clock=clock,
             allow_shrink=args.allow_shrink,
+            allow_retype=args.allow_retype,
         )
         print(
             f"recompacted {outcome.partition} rows={outcome.rows} "
@@ -1658,6 +1790,7 @@ __all__ = [
     "RecompactionRefused",
     "RefusedTickerDay",
     "RetuneResult",
+    "RetypeRefused",
     "SCHEMA_DRIFT_EVENT",
     "SCHEMA_DRIFT_TITLE",
     "SealedPartition",

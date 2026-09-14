@@ -107,6 +107,12 @@ class SchemaDrift:
     segments and the pinned schema is not a party to it. That second one used to reach
     nothing at all, because the refusal raised and ended the run.
 
+    A disagreement the repair was authorized to merge reaches the first producer rather
+    than the second. ``recompact_ticker_day(allow_retype=True)`` promotes the column
+    instead of refusing, so a merged schema exists again and is compared to the pinned
+    one, which renders it ``pinned -> merged`` whenever the promoted type is not the
+    pinned one. Such a record carries ``refused`` false, because nothing was refused.
+
     All three can be empty, and each producer has a way of getting there. The merged
     producer decides there is a difference by comparing the two schemas outright and these
     fields explain it, so a difference the names and the types do not show files a record

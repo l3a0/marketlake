@@ -34,10 +34,14 @@ These cover the check's contract:
    survived the merge, it files again on every run the conflict survives, it still pages
    when the file cannot be written, and the human-invoked repair lets it out rather than
    containing it.
+10. The human-invoked repair widens a column the segments hold at two types, but only on
+    the flag, only for the one ticker-day it was passed for, and only where every
+    value comes back unchanged. The scheduled sweep still refuses the same day.
 """
 
 from __future__ import annotations
 
+import decimal
 import json
 import os
 from datetime import UTC, date, datetime, time, timedelta
@@ -55,11 +59,12 @@ from lake.compact import (
     SCHEMA_DRIFT_EVENT,
     SCHEMA_DRIFT_TITLE,
     CompactionResult,
+    RetypeRefused,
     compact,
     recompact_ticker_day,
 )
 from lake.journal import CHAINS_SCHEMA
-from lake.manifest import RowCountRegression, append_manifest, read_manifest
+from lake.manifest import RowCountRegression, append_manifest, latest_entries, read_manifest
 from lake.paths import REPORTS_DIR, LakePaths
 from tests.support.backup import FakeBackup
 from tests.support.calendar import FakeCalendar, SessionTimes
@@ -1233,6 +1238,45 @@ def _conflicted_day(lake_root: Path, ticker: str = "SPY", day: date = DAY) -> tu
     return morning, afternoon
 
 
+# -- 10. the authorized widening, and everything it does not authorize ------
+
+
+def _retyped(name: str, type_: pa.DataType, schema: pa.Schema = CHAINS_SCHEMA) -> pa.Schema:
+    """The chains schema with one column at a type of the test's choosing."""
+    return schema.set(schema.get_field_index(name), pa.field(name, type_))
+
+
+def _split_day(
+    lake_root: Path,
+    *,
+    morning_type: pa.DataType,
+    morning_values: list,
+    afternoon_type: pa.DataType,
+    afternoon_values: list,
+) -> tuple[Path, Path]:
+    """One ticker-day whose two segments hold ``COLUMN`` at two types.
+
+    This is the mid-day retype the merge refuses: a daemon that restarted onto different
+    code in the middle of a session, so the morning's segment and the afternoon's
+    disagree about one column's type.
+    """
+    morning_schema = _retyped(COLUMN, morning_type)
+    afternoon_schema = _retyped(COLUMN, afternoon_type)
+    morning_rows = _rows(len(morning_values), snap_ts=_snap(DAY, 0))
+    for row, value in zip(morning_rows, morning_values, strict=True):
+        row[COLUMN] = value
+    afternoon_rows = _rows(len(afternoon_values), snap_ts=_snap(DAY, 1))
+    for row, value in zip(afternoon_rows, afternoon_values, strict=True):
+        row[COLUMN] = value
+    morning = _segment(
+        lake_root, morning_schema, _table(morning_schema, morning_rows), start_ts="a"
+    )
+    afternoon = _segment(
+        lake_root, afternoon_schema, _table(afternoon_schema, afternoon_rows), start_ts="b"
+    )
+    return morning, afternoon
+
+
 def test_a_refused_merge_files_a_finding_naming_both_types(lake_root):
     # The refusal commits no seal, so ``_seal``'s own filing, which waits for the manifest
     # append, can never reach it. The sweep files this one instead. ``SchemaDrift`` already
@@ -1427,7 +1471,8 @@ def test_the_repair_lets_a_refused_merge_out(lake_root):
     # The scheduled sweep contains the refusal because a raise there costs every other
     # ticker-day, the backup, and the ping. A hand-run repair has no other ticker-day to
     # protect, so the operator gets the failure named on their own terminal instead of a
-    # silent no-op. It cannot clear the conflict either: it reaches the same merge.
+    # silent no-op. Clearing the conflict is what ``--allow-retype`` is for, and section
+    # 10 holds that; without it the repair reaches the same merge and is refused.
     morning, afternoon = _conflicted_day(lake_root)
     morning_before = morning.read_bytes()
 
@@ -1440,3 +1485,317 @@ def test_the_repair_lets_a_refused_merge_out(lake_root):
     assert f"{COLUMN}: int64 -> double" in str(conflict)
     assert morning.read_bytes() == morning_before and afternoon.exists()
     assert read_manifest(lake_root) == []
+
+
+def _repair(lake_root: Path, **kwargs):
+    return recompact_ticker_day(
+        lake_root, "chains", "SPY", DAY, clock=ManualClock(_et(DAY, 16, 30)), **kwargs
+    )
+
+
+def test_the_repair_widens_a_column_the_segments_hold_at_two_types(lake_root, monkeypatch):
+    # The whole point of the flag. An int64 all morning and a double after lunch is the
+    # disagreement the merge refuses, and the human is asserting the two segments
+    # recorded the same quantity. The widening is exact here, so every value arrives in
+    # the partition unchanged and the day seals.
+    _split_day(
+        lake_root,
+        morning_type=pa.int64(),
+        morning_values=[100, 101],
+        afternoon_type=pa.float64(),
+        afternoon_values=[200.5, 201.5],
+    )
+    _pin(monkeypatch, _retyped(COLUMN, pa.int64()))
+
+    outcome = _repair(lake_root, allow_retype=True)
+
+    table = _partition(lake_root)
+    assert outcome.rows == 4
+    assert table.schema.field(COLUMN).type == pa.float64()
+    assert table.column(COLUMN).to_pylist() == [100.0, 101.0, 200.5, 201.5]
+    assert latest_entries(lake_root)[outcome.partition]["rows"] == 4
+
+
+def test_the_same_ticker_day_without_the_flag_is_still_refused(lake_root, monkeypatch):
+    # The flag is the only thing that changed. Left off, the repair reaches the same merge
+    # it always did, raises the same named conflict, and leaves the day untouched.
+    morning, afternoon = _split_day(
+        lake_root,
+        morning_type=pa.int64(),
+        morning_values=[100, 101],
+        afternoon_type=pa.float64(),
+        afternoon_values=[200.5, 201.5],
+    )
+    before = (morning.read_bytes(), afternoon.read_bytes())
+    _pin(monkeypatch, _retyped(COLUMN, pa.int64()))
+
+    with pytest.raises(compact_module.SegmentSchemaConflict):
+        _repair(lake_root)
+
+    assert not LakePaths(lake_root).chains_partition_path("SPY", DAY).exists()
+    assert read_manifest(lake_root) == []
+    assert (morning.read_bytes(), afternoon.read_bytes()) == before
+
+
+# -- the automatic sweep never widens ----------------------------------------
+
+
+def test_the_automatic_sweep_still_refuses_a_retyped_ticker_day(lake_root, monkeypatch):
+    # The over-reach this whole design is built against. The flag authorizes one human
+    # repair of one ticker-day, and the scheduled run has no way to ask for it. A sweep
+    # that widened on its own would turn a contained, reported failure into silent
+    # coercion across every ticker-day the lake holds, which is the outcome the schema
+    # policy exists to prevent. So the nightly run merges by name alone and refuses the
+    # ticker-day, exactly as it did before the flag existed. It now carries on past the
+    # refusal rather than raising, which is #184's change and not this one's, and the
+    # thing this test holds is that carrying on is not widening.
+    morning, afternoon = _split_day(
+        lake_root,
+        morning_type=pa.int64(),
+        morning_values=[100, 101],
+        afternoon_type=pa.float64(),
+        afternoon_values=[200.5, 201.5],
+    )
+    before = (morning.read_bytes(), afternoon.read_bytes())
+    _pin(monkeypatch, _retyped(COLUMN, pa.int64()))
+
+    result, _ = _run(lake_root)
+
+    assert [refused.ticker for refused in result.refused] == ["SPY"]
+    assert result.sealed == ()
+    assert not LakePaths(lake_root).chains_partition_path("SPY", DAY).exists()
+    assert read_manifest(lake_root) == []
+    assert (morning.read_bytes(), afternoon.read_bytes()) == before
+    # The refusal files its own finding, and it is a refusal rather than a seal. Nothing
+    # the sweep wrote says a column was promoted, because the sweep promoted nothing.
+    (finding,) = _findings(lake_root)
+    assert finding["refused"] is True
+
+
+def test_a_repair_on_one_ticker_does_not_authorize_the_sweep_on_another(lake_root, monkeypatch):
+    # "One ticker-day" read literally. SPY is repaired under the flag, and the sweep that
+    # follows still refuses QQQ, whose segments carry the very same disagreement. The
+    # authorization is an argument to one call and never a setting the lake remembers.
+    _split_day(
+        lake_root,
+        morning_type=pa.int64(),
+        morning_values=[100, 101],
+        afternoon_type=pa.float64(),
+        afternoon_values=[200.5],
+    )
+    int_schema = _retyped(COLUMN, pa.int64())
+    float_schema = _retyped(COLUMN, pa.float64())
+    qqq_morning = _rows(2, snap_ts=_snap(DAY, 0), ticker="QQQ")
+    qqq_afternoon = _rows(1, snap_ts=_snap(DAY, 1), ticker="QQQ")
+    qqq_afternoon[0][COLUMN] = 200.5
+    _segment(lake_root, int_schema, _table(int_schema, qqq_morning), start_ts="a", ticker="QQQ")
+    _segment(
+        lake_root,
+        float_schema,
+        _table(float_schema, qqq_afternoon),
+        start_ts="b",
+        ticker="QQQ",
+    )
+    _pin(monkeypatch, int_schema)
+
+    assert _repair(lake_root, allow_retype=True).rows == 3
+
+    result, _ = _run(lake_root)
+
+    assert [refused.ticker for refused in result.refused] == ["QQQ"]
+    assert not LakePaths(lake_root).chains_partition_path("QQQ", DAY).exists()
+
+
+# -- a widening with no lossless direction is still refused ------------------
+
+
+def test_a_widening_that_rewrites_a_value_is_refused(lake_root, monkeypatch):
+    # Arrow's permissive promotion is not safe in general, and this is the pair that
+    # proves it. A ``decimal128(38, 0)`` against a double widens to a double, the cast
+    # raises nothing, and the value comes back with eighteen of its digits rewritten.
+    # The human authorized a merge of two recordings of one quantity, never a cast that
+    # invents one, so the repair refuses and the day is untouched.
+    morning, afternoon = _split_day(
+        lake_root,
+        morning_type=pa.decimal128(38, 0),
+        morning_values=[decimal.Decimal("12345678901234567890123456789012345678")],
+        afternoon_type=pa.float64(),
+        afternoon_values=[200.5],
+    )
+    before = (morning.read_bytes(), afternoon.read_bytes())
+    _pin(monkeypatch, _retyped(COLUMN, pa.float64()))
+
+    with pytest.raises(RetypeRefused) as raised:
+        _repair(lake_root, allow_retype=True)
+
+    assert f"{COLUMN}: decimal128(38, 0) -> double" in str(raised.value)
+    assert not LakePaths(lake_root).chains_partition_path("SPY", DAY).exists()
+    assert read_manifest(lake_root) == []
+    assert (morning.read_bytes(), afternoon.read_bytes()) == before
+
+
+def test_an_integer_past_the_double_bound_is_refused(lake_root, monkeypatch):
+    # The bound the issue names. An int64 to double promotion is exact below 2^53 and
+    # rounds above it, so the pair is neither safe nor unsafe on its own and the values
+    # decide. This column reached past the bound, so the same flag that seals the
+    # ordinary day refuses this one.
+    _split_day(
+        lake_root,
+        morning_type=pa.int64(),
+        morning_values=[2**53 + 1],
+        afternoon_type=pa.float64(),
+        afternoon_values=[200.5],
+    )
+    _pin(monkeypatch, _retyped(COLUMN, pa.int64()))
+
+    with pytest.raises(RetypeRefused) as raised:
+        _repair(lake_root, allow_retype=True)
+
+    assert f"{COLUMN}: int64 -> double" in str(raised.value)
+    assert not LakePaths(lake_root).chains_partition_path("SPY", DAY).exists()
+
+
+def test_an_integer_under_the_double_bound_is_the_same_pair_and_seals(lake_root, monkeypatch):
+    # The other side of that bound, so the refusal above is read as being about the
+    # value and not about the pair. Same two types, a value that fits, and it seals.
+    _split_day(
+        lake_root,
+        morning_type=pa.int64(),
+        morning_values=[2**53 - 1],
+        afternoon_type=pa.float64(),
+        afternoon_values=[200.5],
+    )
+    _pin(monkeypatch, _retyped(COLUMN, pa.int64()))
+
+    _repair(lake_root, allow_retype=True)
+
+    assert _partition(lake_root).column(COLUMN).to_pylist() == [float(2**53 - 1), 200.5]
+
+
+def test_a_pair_with_no_lossless_direction_at_all_is_refused(lake_root, monkeypatch):
+    # A bool against a number has no widening in either direction, and Arrow declines to
+    # invent one. The flag does not reach past that: it turns a refusal into a widening
+    # only where a widening exists, so this stays refused and says why.
+    morning, afternoon = _split_day(
+        lake_root,
+        morning_type=pa.bool_(),
+        morning_values=[True, False],
+        afternoon_type=pa.int64(),
+        afternoon_values=[200],
+    )
+    before = (morning.read_bytes(), afternoon.read_bytes())
+    _pin(monkeypatch, _retyped(COLUMN, pa.int64()))
+
+    with pytest.raises(RetypeRefused) as raised:
+        _repair(lake_root, allow_retype=True)
+
+    assert "will not widen in either direction" in str(raised.value)
+    assert not LakePaths(lake_root).chains_partition_path("SPY", DAY).exists()
+    assert (morning.read_bytes(), afternoon.read_bytes()) == before
+
+
+def test_a_string_against_a_number_is_refused_too(lake_root, monkeypatch):
+    # The same family through the other pair an operator might reach for. A string
+    # column parsed into a number is a conversion and not a widening, so the flag
+    # declines it.
+    _split_day(
+        lake_root,
+        morning_type=pa.string(),
+        morning_values=["100"],
+        afternoon_type=pa.int64(),
+        afternoon_values=[200],
+    )
+    _pin(monkeypatch, _retyped(COLUMN, pa.int64()))
+
+    with pytest.raises(RetypeRefused):
+        _repair(lake_root, allow_retype=True)
+
+
+def test_a_refused_widening_files_no_finding(lake_root, monkeypatch):
+    # The rule the rest of the check already follows. A finding describes a sealed
+    # partition, and a refused repair leaves none, so nothing is filed and the segments
+    # survive for the next attempt.
+    morning, _ = _split_day(
+        lake_root,
+        morning_type=pa.int64(),
+        morning_values=[2**53 + 1],
+        afternoon_type=pa.float64(),
+        afternoon_values=[200.5],
+    )
+    _pin(monkeypatch, _retyped(COLUMN, pa.int64()))
+
+    with pytest.raises(RetypeRefused):
+        _repair(lake_root, allow_retype=True)
+
+    assert _findings(lake_root) == []
+    assert morning.exists(), "the evidence has to survive a refusal"
+
+
+# -- what the repaired partition leaves behind -------------------------------
+
+
+def test_a_widening_past_the_pinned_type_is_filed_as_a_retype(lake_root, monkeypatch):
+    # The merged type is the wider of the two, and the pinned schema holds the narrower
+    # one, so the schema check finds the difference and names the column. That report is
+    # what tells a later reader this partition came out of a repair.
+    _split_day(
+        lake_root,
+        morning_type=pa.int64(),
+        morning_values=[100],
+        afternoon_type=pa.float64(),
+        afternoon_values=[200.5],
+    )
+    _pin(monkeypatch, _retyped(COLUMN, pa.int64()))
+
+    outcome = _repair(lake_root, allow_retype=True)
+
+    (finding,) = _findings(lake_root)
+    assert finding["retyped"] == [f"{COLUMN}: int64 -> double"]
+    assert finding["partition"] == outcome.partition
+    assert sorted(finding["segments"]) == sorted(outcome.segments)
+
+
+def test_a_widening_onto_the_pinned_type_files_nothing(lake_root, monkeypatch):
+    # The honest limit of that record, held here so it is not discovered by surprise.
+    # When the pinned schema already holds the wider type, the merged schema equals it
+    # and the check has no difference to report. The repair seals a ticker-day whose
+    # segments disagreed and files nothing, so the only trace left is the superseding
+    # manifest entry. Narrowing that gap is
+    # [#193](https://github.com/l3a0/marketlake/issues/193).
+    _split_day(
+        lake_root,
+        morning_type=pa.int64(),
+        morning_values=[100],
+        afternoon_type=pa.float64(),
+        afternoon_values=[200.5],
+    )
+    _pin(monkeypatch, _retyped(COLUMN, pa.float64()))
+
+    outcome = _repair(lake_root, allow_retype=True)
+
+    assert _findings(lake_root) == []
+    assert latest_entries(lake_root)[outcome.partition]["rows"] == 2
+
+
+# -- the flag reaches the repair from the command line -----------------------
+
+
+def test_the_command_line_carries_the_authorization(lake_root, tmp_path, monkeypatch):
+    # The operator's actual move. ``--allow-retype`` is what a paged human types, so the
+    # subcommand has to pass it through rather than the flag existing in Python alone.
+    _split_day(
+        lake_root,
+        morning_type=pa.int64(),
+        morning_values=[100],
+        afternoon_type=pa.float64(),
+        afternoon_values=[200.5],
+    )
+    _pin(monkeypatch, _retyped(COLUMN, pa.int64()))
+    config = write_config(tmp_path, lake_root)
+    argv = ["--config", str(config), "recompact", "chains", "SPY", DAY.isoformat()]
+
+    with pytest.raises(compact_module.SegmentSchemaConflict):
+        compact_module.main(argv, clock=ManualClock(_et(DAY, 16, 30)))
+
+    assert compact_module.main(argv + ["--allow-retype"], clock=ManualClock(_et(DAY, 16, 30))) == 0
+    assert _partition(lake_root).column(COLUMN).to_pylist() == [100.0, 200.5]
