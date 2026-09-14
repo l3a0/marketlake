@@ -91,6 +91,30 @@ def test_schwab_credentials_load_from_the_file(tmp_path: Path):
     assert cfg.schwab_app_secret.reveal() == "SCHWABSECRET"
 
 
+def test_a_file_with_no_callback_url_still_loads(tmp_path: Path):
+    """The daemon must not die for a key the capture path never reads.
+
+    ``YAML`` above is the shape every machine's config has today, and none of them
+    carries a callback. Making the key required would turn every one of those into a
+    ``ConfigError`` from ``load_config``, which is the first call the daemon makes.
+    So this asserts the whole config resolves and only the callback is absent.
+    """
+    cfg = load_config(_write(tmp_path / "config.yaml"))
+    assert cfg.schwab_callback_url is None
+    assert cfg.lake_root == Path("/data/lake")
+    assert cfg.schwab_api_key.reveal() == "SCHWABKEY"
+
+
+def test_a_callback_url_in_the_file_reaches_the_config(tmp_path: Path):
+    """Set, it loads as written, so the re-auth reads the registered callback back."""
+    path = tmp_path / "with-callback.yaml"
+    path.write_text(
+        YAML.format(root="/data/lake", backup="/Volumes/ssd")
+        + "schwab_callback_url: https://127.0.0.1:8182\n"
+    )
+    assert load_config(path).schwab_callback_url == "https://127.0.0.1:8182"
+
+
 def test_secret_stays_out_of_repr_after_a_file_load(tmp_path: Path):
     cfg = load_config(_write(tmp_path / "config.yaml"))
     for secret_value in ("PINGKEY", "mytopic", "SCHWABKEY", "SCHWABSECRET"):

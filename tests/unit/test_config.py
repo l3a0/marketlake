@@ -29,6 +29,41 @@ def test_from_mapping_resolves_paths_and_secrets():
     assert cfg.schwab_app_secret.reveal() == "SCHWAB-APP-SECRET-VALUE"
 
 
+def test_the_callback_url_is_optional_and_absent_by_default():
+    """No capture path reads it, so a mapping without it must still resolve.
+
+    Requiring it would take the daemon down for a key only the weekly re-auth uses.
+    ``BASE`` is what every other test here builds on and names no callback, so this
+    states the property the rest of the suite silently depends on.
+    """
+    assert Config.from_mapping(BASE).schwab_callback_url is None
+
+
+def test_the_callback_url_loads_as_a_plain_string_not_a_secret():
+    """It is the one Schwab registration input that is not a credential.
+
+    A ``Secret`` redacts in every repr and format, and the re-auth has to print the
+    callback so the operator can check it against the app registration. Comparing the
+    type as well as the value is what catches a wrap: ``Secret.__eq__`` refuses a plain
+    string, but a later ``__eq__`` that did not would make a value-only check pass.
+    """
+    cfg = Config.from_mapping({**BASE, "schwab_callback_url": "https://127.0.0.1:8182"})
+    assert cfg.schwab_callback_url == "https://127.0.0.1:8182"
+    assert type(cfg.schwab_callback_url) is str
+    # It prints, which is the whole reason it is not wrapped.
+    assert "https://127.0.0.1:8182" in repr(cfg)
+
+
+@pytest.mark.parametrize("written", [None, "", "   "])
+def test_a_callback_key_with_no_value_reads_as_absent(written):
+    """A key written blank means the operator has not set it, so it must not be carried.
+
+    An empty string would otherwise reach the login flow as a callback URL, where the
+    failure is a vendor error rather than the named refusal the re-auth owes.
+    """
+    assert Config.from_mapping({**BASE, "schwab_callback_url": written}).schwab_callback_url is None
+
+
 def test_guard_defaults_are_the_designs_pinned_values():
     guards = Config.from_mapping(BASE).guards
     assert guards.watchdog_page_minutes == 3

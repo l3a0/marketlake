@@ -19,6 +19,14 @@ elsewhere. All four secrets are wrapped in ``Secret``, which redacts itself in e
 log, repr, and traceback. The one caller that must use a raw value calls ``reveal``. So
 a stray ``print(config)`` or a logged exception never leaks any of them.
 
+One key is optional rather than required: ``schwab_callback_url``, the third static
+app-registration input. Only the weekly re-auth in ``lake.reauth`` reads it, and capture
+never does, so a config without it loads and the daemon runs. The re-auth is the one
+place that refuses without it, naming the key. It is not wrapped in ``Secret``. A
+registered callback is a loopback URL rather than a credential, and the re-auth prints
+it so the operator can check it against the Schwab app registration, which a redacting
+wrapper would make impossible.
+
 A *guard constant* is a tunable threshold the failure machinery reads, like the
 watchdog's page-after count or the suspect-snapshot ratio. The defaults here are the
 values the design pins. Slice 1 measures the real distributions and recalibrates them.
@@ -48,7 +56,9 @@ CONFIG_PATH_ENV = "MARKETLAKE_CONFIG"
 # The config holds the one rotatable ping key, never six immutable UUID URLs.
 HEALTHCHECKS_HOST = "hc-ping.com"
 
-# The required keys. Guard constants are optional and default to the pinned values.
+# The required keys. Guard constants are optional and default to the pinned values, and
+# so is ``schwab_callback_url``: no capture path reads it, so a config missing it must
+# load rather than take the daemon down for a key the daemon has no use for.
 _REQUIRED_KEYS = (
     "lake_root",
     "backup_target",
@@ -189,6 +199,7 @@ class Config:
     ntfy_topic: Secret
     schwab_api_key: Secret
     schwab_app_secret: Secret
+    schwab_callback_url: str | None = None
     guards: GuardConstants = field(default_factory=GuardConstants)
 
     def paths(self) -> LakePaths:
@@ -209,7 +220,9 @@ class Config:
 
         This is the value-only core that ``load_config`` calls after reading YAML. A
         missing required key raises ``ConfigError`` naming the key. Paths carrying a
-        leading ``~`` are expanded to the home directory.
+        leading ``~`` are expanded to the home directory. ``schwab_callback_url`` is not
+        a required key, so a mapping without it yields ``None`` there and every other
+        value as usual.
         """
         missing = [key for key in _REQUIRED_KEYS if mapping.get(key) is None]
         if missing:
@@ -221,8 +234,23 @@ class Config:
             ntfy_topic=Secret(str(mapping["ntfy_topic"])),
             schwab_api_key=Secret(str(mapping["schwab_api_key"])),
             schwab_app_secret=Secret(str(mapping["schwab_app_secret"])),
+            schwab_callback_url=_optional_text(mapping.get("schwab_callback_url")),
             guards=GuardConstants.from_mapping(mapping.get("guards")),
         )
+
+
+def _optional_text(value: object) -> str | None:
+    """An optional string value, or ``None`` when the key is absent or left empty.
+
+    A key written with no value parses to ``None``, and one written as blank spaces
+    parses to a string that names nothing. Both mean the operator has not set it, so
+    both become ``None`` and the one tool that needs the value refuses with the key
+    named rather than carrying an empty string into a login flow.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def load_config(

@@ -19,6 +19,11 @@ that looked sanctioned. So a ``main`` must accept none of its leaky seams. The F
 table asserts each named seam is absent from the signature, which is stricter than a
 no-default check. A re-added seam fails it in any form, required or defaulted.
 
+``reauth.main`` is the same shape. Its seam is the vendor login flow, which opens a
+browser, listens on a local callback port, and talks to Schwab. It builds that itself, so
+a test drives the entry with a fake ``schwab`` package in ``sys.modules`` rather than by
+handing the entry a flow.
+
 ``probe_calendar.main`` already took none. ``compact.main``, ``control_plane.main`` and
 ``daemon.main`` now build ``rsync``, the ntfy POST, the healthchecks GET, the vendor
 canary, and the ``launchctl``, ``pmset`` and ``tmutil`` reads internally. ``daemon.main``
@@ -36,7 +41,7 @@ import inspect
 
 import pytest
 
-from lake import compact, control_plane, daemon, runner
+from lake import compact, control_plane, daemon, reauth, runner
 
 # Each row is an entry and a seam it must never default. Requiring the seam means a caller
 # that omits it gets a TypeError, not a live object. The protection follows each seam to
@@ -56,6 +61,8 @@ REQUIRED = [
     (control_plane.sunday_run, "schedule_reader"),
     (control_plane.sunday_run, "pinger"),
     (control_plane.sunday_run, "canary"),
+    (reauth.reauth, "login_flow"),
+    (reauth.reauth_from_config, "login_flow"),
 ]
 
 # Each row is a ``main`` and a seam it must never accept. A ``main`` builds its live seams
@@ -73,6 +80,7 @@ FORBIDDEN = [
     (control_plane.main, "canary"),
     (control_plane.main, "exclusion_reader"),
     (control_plane.main, "transport"),
+    (reauth.main, "login_flow"),
 ]
 
 

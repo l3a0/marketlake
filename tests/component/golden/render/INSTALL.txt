@@ -25,6 +25,13 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.marketlake.self-check
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.marketlake.calendar-probe.plist
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.marketlake.sunday.plist
 launchctl print system/com.marketlake.daemon
+# The token. None of the above captures anything until a Schwab token exists at
+# ~/.config/marketlake/token.json. Schwab's refresh token dies every seven days and an
+# interactive browser login is its only renewal, so this is a standing Sunday
+# ritual rather than a step of the install, and nothing can do it for you.
+# Run ./reauth.sh beside this file, as the owner, at a terminal on a
+# machine with a browser. It reads schwab_callback_url from config.yaml, which must
+# match the callback registered on the Schwab app.
 # 6. Set the Sunday one-shot. The slice-3 vendor sweep will do this every Friday.
 # Until that sweep lands, run this line each Friday and run the second command it
 # prints under sudo. Nothing else sets the one-shot, and the Sunday read-back

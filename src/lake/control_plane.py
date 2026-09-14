@@ -94,6 +94,7 @@ from lake.clock import Clock
 from lake.config import input_errors_exit, load_config
 from lake.manifest import ScrubResult, scrub
 from lake.paths import TOKEN_FILE, config_dir
+from lake.reauth import CALLBACK_KEY
 from lake.runner import PING_FAILURES, LaunchdJob, Pinger, UrllibPinger, calendar_interval
 from lake.vendor import Vendor
 
@@ -213,6 +214,12 @@ UNINSTALL_SCRIPT_FILE = "uninstall.sh"
 # stale: each holds the Python it imported at start, and the working tree can move under
 # it. The calendar jobs exec fresh on every fire, so they never need this.
 RESTART_SCRIPT_FILE = "restart.sh"
+
+# The weekly Schwab re-auth. It is the one install step that is also a standing ritual,
+# because the refresh token dies every seven days and a browser login is its only
+# renewal. The script calls ``python -m lake.reauth``, which refuses when stdin is not a
+# terminal, so pointing launchd at it fails fast rather than hanging on the callback.
+REAUTH_SCRIPT_FILE = "reauth.sh"
 
 
 # -- the host description and the plists -------------------------------------
@@ -1831,7 +1838,7 @@ class RenderedFile:
     """One file the dry-run renderer produces.
 
     ``mode`` is the permission bits to write it with. Everything is 0o644 except the
-    two scripts the operator runs, which are 0o755.
+    scripts the operator runs, which are 0o755.
     """
 
     name: str
@@ -1846,6 +1853,7 @@ def render_all(host: LaunchdHost) -> tuple[RenderedFile, ...]:
     files.append(RenderedFile(INSTALL_SCRIPT_FILE, install_script(host), mode=0o755))
     files.append(RenderedFile(UNINSTALL_SCRIPT_FILE, uninstall_script(host), mode=0o755))
     files.append(RenderedFile(RESTART_SCRIPT_FILE, restart_script(host), mode=0o755))
+    files.append(RenderedFile(REAUTH_SCRIPT_FILE, reauth_script(host), mode=0o755))
     return tuple(files)
 
 
@@ -1970,6 +1978,11 @@ def install_script(host: LaunchdHost) -> str:
             else:
                 body.append(f"echo {shlex.quote('+ ' + command)}")
                 body.append(command)
+
+    # The token pointer closes the script. It is comment-only, so it runs nothing and
+    # cannot fail under ``set -e``, and it sits after the read-back rather than before it
+    # because a machine with no jobs installed has nothing for a token to feed.
+    body += _token_step_lines()
 
     # Counted from the body rather than written down, so the header cannot drift from
     # what the script actually runs.
@@ -2350,6 +2363,103 @@ def restart_script(host: LaunchdHost) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _token_step_lines() -> list[str]:
+    """The token pointer, as comment lines, for both renderings of the install.
+
+    One source for two renderings, the same reason ``_first_install_lines`` is one. The
+    install script appends these after its last step and the install text prints them
+    after the same block, so the two cannot drift about where a token comes from.
+
+    Every line is a comment. Acquiring a token needs a browser and a person, so the
+    install must point at the step rather than take it.
+    """
+    return [
+        "# The token. None of the above captures anything until a Schwab token exists at",
+        f"# {default_token_path('~')}. Schwab's refresh token dies every seven days and an",
+        "# interactive browser login is its only renewal, so this is a standing Sunday",
+        "# ritual rather than a step of the install, and nothing can do it for you.",
+        f"# Run ./{REAUTH_SCRIPT_FILE} beside this file, as the owner, at a terminal on a",
+        f"# machine with a browser. It reads {CALLBACK_KEY} from config.yaml, which must",
+        "# match the callback registered on the Schwab app.",
+    ]
+
+
+def reauth_script(host: LaunchdHost) -> str:
+    """The weekly Schwab re-auth as a script the operator runs. The renderer never runs it.
+
+    The token is the one setup step that is also a standing ritual. Schwab's refresh token
+    dies every seven days and an interactive browser login is its only renewal, which the
+    design's Auth section pins. Every other step here is rendered and run from a file that
+    says what it does, and before this one the token step was knowable only by reading
+    ``lake.schwab``.
+
+    The script is a wrapper rather than the logic. ``python -m lake.reauth`` holds the
+    login flow, the config read, and the atomic token write, so the behaviour is testable
+    and the file beside the plists stays a header and one command.
+
+    It must not be wired into launchd, and saying so is not the enforcement. The tool
+    refuses when stdin is not a terminal, which is what a launchd job has. Left to
+    documentation alone, a plist pointed here would wait out
+    ``client_from_login_flow``'s five-minute callback timeout with no browser to answer
+    it and then fail, which reads as a broken job rather than a misuse of one.
+
+    Arguments pass through, so an operator can point the tool at a throwaway config or a
+    token path without editing the rendered file.
+    """
+    return (
+        "\n".join(
+            [
+                "#!/bin/bash",
+                "# Marketlake control plane: the weekly Schwab re-auth.",
+                "#",
+                "# Written by `python -m lake.control_plane render`, which never runs it. Run",
+                "# it yourself, as the owner, at a terminal on a machine with a browser. It",
+                "# needs no root and calls no sudo.",
+                "#",
+                "# Usage. It runs from anywhere, so the rendered directory can be moved:",
+                "#",
+                f"#     ./{REAUTH_SCRIPT_FILE}                     # from the rendered directory",
+                f"#     ~/marketlake-install/{REAUTH_SCRIPT_FILE}  # or by path, from anywhere",
+                "#",
+                "# Any arguments are passed straight to the tool, so --config and --token",
+                "# point it at a throwaway file without editing this script.",
+                "#",
+                "# Schwab's refresh token dies every seven days and an interactive browser",
+                "# login is its only renewal. So this is a standing Sunday-evening ritual,",
+                "# not a step of the first install. The Sunday 20:00 canary pages when the",
+                "# week's login has not happened, and retries every 30 minutes until 23:00.",
+                "#",
+                "# It cannot run unattended, and this comment is not what stops that. The",
+                "# tool refuses when stdin is not a terminal, which is what a launchd job",
+                "# has. Without the refusal a plist pointed here would wait five minutes for",
+                "# a callback no browser is going to send, then fail, which reads as a broken",
+                "# job rather than a misuse of one. Do not add it to a plist.",
+                "#",
+                f"# It reads {CALLBACK_KEY} from config.yaml, which must match the callback",
+                "# registered on the Schwab app. That key is optional for every other job,",
+                "# because no capture path reads it, so this is the one command that refuses",
+                "# without it. The tool prints the callback back so it can be checked against",
+                "# the registration. It prints no secret.",
+                "#",
+                "# Re-authing over a token that is still valid is fine and is the point. It",
+                "# costs one login and mints a fresher token, and the Sunday assertion tests",
+                "# freshness rather than validity. The write is atomic: a temp file beside",
+                "# the token, then one rename. A failure part-way through therefore leaves",
+                "# the working token where it was.",
+                "#",
+                "# Start the login from this script or from a bookmarked Schwab URL. Never",
+                "# from a link in a notification. Pages never carry auth links, so one that",
+                "# does is not from here.",
+                "set -euo pipefail",
+                "",
+                f"cd {shlex.quote(host.project_dir)}",
+                f'exec {shlex.quote(host.python)} -m lake.reauth "$@"',
+            ]
+        )
+        + "\n"
+    )
+
+
 def install_commands(out_dir: Path, host: LaunchdHost) -> str:
     """The operator's manual install steps, as text. Nothing here runs from code.
 
@@ -2364,6 +2474,7 @@ def install_commands(out_dir: Path, host: LaunchdHost) -> str:
         sudoers_path=shlex.quote(str(out / SUDOERS_FILE)),
     ):
         lines.append(f"{item[0]} && {item[1]}" if isinstance(item, tuple) else item)
+    lines += _token_step_lines()
     lines += [
         "# 6. Set the Sunday one-shot. The slice-3 vendor sweep will do this every Friday.",
         "# Until that sweep lands, run this line each Friday and run the second command it",
@@ -2676,6 +2787,7 @@ __all__ = [
     "default_token_path",
     "expected_one_shot",
     "INSTALL_SCRIPT_FILE",
+    "REAUTH_SCRIPT_FILE",
     "RESTART_SCRIPT_FILE",
     "UNINSTALL_SCRIPT_FILE",
     "install_commands",

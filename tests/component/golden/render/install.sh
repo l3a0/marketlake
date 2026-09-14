@@ -76,3 +76,10 @@ echo '+ sudo launchctl bootstrap system /Library/LaunchDaemons/com.marketlake.su
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.marketlake.sunday.plist
 echo '+ launchctl print system/com.marketlake.daemon'
 launchctl print system/com.marketlake.daemon
+# The token. None of the above captures anything until a Schwab token exists at
+# ~/.config/marketlake/token.json. Schwab's refresh token dies every seven days and an
+# interactive browser login is its only renewal, so this is a standing Sunday
+# ritual rather than a step of the install, and nothing can do it for you.
+# Run ./reauth.sh beside this file, as the owner, at a terminal on a
+# machine with a browser. It reads schwab_callback_url from config.yaml, which must
+# match the callback registered on the Schwab app.
