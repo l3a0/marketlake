@@ -88,8 +88,11 @@ _DATE_PARTITIONED = frozenset({CHAINS, QUOTES})
 #
 # 1. One file per page that never reached the phone, under `reports/alerts/date=D/`.
 # 2. One file per close+5 guard run, under `reports/close_guard/date=D/`.
-# 3. One file per ticker-day whose merged segments did not carry the pinned schema,
-#    under `reports/schema_drift/date=D/`, written by compaction rather than the daemon.
+# 3. One file per drifted ticker-day, under `reports/schema_drift/date=D/`, written by
+#    compaction rather than the daemon. A ticker-day whose merged segments did not carry
+#    the pinned schema files once, when it seals. A ticker-day the merge refused files on
+#    every run the conflict survives, because it has no manifest entry to make a later
+#    silence readable.
 #
 # The tree sits inside the backup sync root, so a restore carries the reports with the
 # data, and outside the manifest, because none of the four is a measurement.

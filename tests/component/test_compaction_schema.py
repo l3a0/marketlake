@@ -29,6 +29,11 @@ These cover the check's contract:
 7. The writer itself: where the file lands, what it holds, and that it never overwrites.
 8. One page per run carries the finding to a phone, naming every column that moved, and
    an ordinary run sends none.
+9. A merge the segments' own types refused files its own finding, flagged so a reader can
+   tell it from a sealed one, and reaches the same single page. It folds with a drift that
+   survived the merge, it files again on every run the conflict survives, it still pages
+   when the file cannot be written, and the human-invoked repair lets it out rather than
+   containing it.
 """
 
 from __future__ import annotations
@@ -530,8 +535,9 @@ def test_two_drifted_ticker_days_each_file_their_own(lake_root, monkeypatch):
 
 
 def test_the_sweep_finishes_past_a_drifted_ticker_day(lake_root, monkeypatch):
-    # ``compact`` seals every ticker-day bare and its only try/except wraps the ping, so
-    # a raise here would cost the rest of the sweep, the backup, and the ping.
+    # The sweep catches one name out of ``_seal``, the merge a column type conflict
+    # refused, and nothing else. So a raise here would cost the rest of the sweep, the
+    # backup, and the ping.
     dropped = _without(CHAINS_SCHEMA, COLUMN)
     _segment(
         lake_root,
@@ -737,6 +743,7 @@ def test_the_writer_files_exactly_what_it_was_given(lake_root):
         '"day": "2026-08-24", '
         '"missing": ["open_interest"], '
         '"partition": "chains/ticker=SPY/date=2026-08-24.parquet", '
+        '"refused": false, '
         '"retyped": ["volume: int64 -> int32"], '
         '"schema_version": 1, '
         '"segments": ['
@@ -1239,6 +1246,12 @@ def test_a_refused_merge_files_a_finding_naming_both_types(lake_root):
     assert finding["retyped"] == [f"{COLUMN}: int64 -> double"]
     assert finding["missing"] == [] and finding["unexpected"] == []
     assert finding["surface"] == "chains" and finding["ticker"] == "SPY"
+    # The discriminator. ``retyped`` renders ``pinned -> merged`` on a sealed finding and
+    # ``earlier -> later`` on this one, and the two need opposite responses. Without this
+    # flag a reader holding one file would have to go and check whether the partition
+    # exists to tell which kind it has.
+    assert finding["refused"] is True
+    assert finding["schema_version"] == journal.SCHEMA_VERSION
     assert finding["partition"] == result.refused[0].partition
     assert finding["segments"] == [
         str(morning.relative_to(lake_root)),
@@ -1246,6 +1259,57 @@ def test_a_refused_merge_files_a_finding_naming_both_types(lake_root):
     ]
     # The finding names a Parquet that is not there, which is the point of naming it.
     assert not (lake_root / finding["partition"]).exists()
+
+
+def test_an_all_null_segment_is_not_named_as_the_conflicting_column(lake_root):
+    # ``promote_options="default"`` resolves a null-typed column against any type, so a
+    # segment whose column was all nulls never causes the refusal. Counting it would name
+    # the wrong pair of types and point the reader at the wrong segment. Three segments:
+    # the column all-null in the first, int in the second, float in the third. The refusal
+    # is between the second and the third, and only those two types belong in the finding.
+    index = CHAINS_SCHEMA.get_field_index(COLUMN)
+    nulled = CHAINS_SCHEMA.set(index, pa.field(COLUMN, pa.null()))
+    retyped = CHAINS_SCHEMA.set(index, pa.field(COLUMN, pa.float64()))
+    rows = _rows(2, snap_ts=_snap(DAY, 0))
+    for row in rows:
+        row[COLUMN] = None
+    _segment(lake_root, nulled, _table(nulled, rows), start_ts="a")
+    _segment(
+        lake_root,
+        CHAINS_SCHEMA,
+        _table(CHAINS_SCHEMA, _rows(2, snap_ts=_snap(DAY, 1))),
+        start_ts="b",
+    )
+    _segment(lake_root, retyped, _table(retyped, _rows(2, snap_ts=_snap(DAY, 2))), start_ts="c")
+
+    result, _ = _run(lake_root)
+
+    (refused,) = result.refused
+    assert refused.conflicts == (f"{COLUMN}: int64 -> double",)
+    assert len(refused.segments) == 3
+
+
+def test_a_conflict_the_scan_cannot_explain_still_names_arrows_own_message(lake_root):
+    # The scan models the refusals this code anticipates, and Arrow may refuse for one it
+    # does not. The exception has to stay legible then rather than printing an empty list,
+    # because that message is what reaches the operator running the repair by hand.
+    conflict = compact_module.SegmentSchemaConflict(
+        surface="chains",
+        ticker="SPY",
+        day=DAY,
+        partition="chains/ticker=SPY/date=2026-08-24.parquet",
+        segments=("journal/date=2026-08-24/surface=chains/ticker=SPY/seg-a-1.arrows",),
+        conflicts=(),
+        detail="Unable to merge: some shape this scan does not model",
+    )
+
+    assert "some shape this scan does not model" in str(conflict)
+    assert conflict.partition in str(conflict)
+    # The finding it files lists nothing, which ``SchemaDrift`` allows, and still names
+    # the ticker-day to go and look at.
+    drift = compact_module._refused_drift(conflict)
+    assert drift.retyped == () and drift.missing == () and drift.unexpected == ()
+    assert drift.refused is True and drift.ticker == "SPY"
 
 
 def test_a_run_whose_only_drift_is_a_refusal_still_pages(lake_root):
@@ -1267,6 +1331,11 @@ def test_a_run_whose_only_drift_is_a_refusal_still_pages(lake_root):
     assert page.priority == 5
     assert f"{COLUMN}: int64 -> double" in page.body
     assert DAY.isoformat() in page.body
+    # The remedy has to match the producer. #184 established that correcting the pinned
+    # schema does not touch a disagreement between two segments, so a page prescribing the
+    # bump here would send the reader down a path that changes nothing.
+    assert "refused outright" in page.body
+    assert "schema_version" not in page.body
     # The page goes out and the backup and the ping still run. The refusal costs neither.
     assert events == ["backup", "ping"]
 
@@ -1296,6 +1365,10 @@ def test_a_refusal_and_a_surviving_drift_fold_into_one_page(lake_root, monkeypat
     assert body.startswith("2 ticker-day(s)")
     assert f"{COLUMN}: int64 -> double" in body
     assert f"unexpected {COLUMN}" in body
+    # A folded page must say which half each remedy applies to. One sealed and wants the
+    # schema bump, one was refused and does not.
+    assert "1 sealed, so correct the schema and bump schema_version" in body
+    assert "1 was refused outright" in body
 
 
 def test_a_refused_ticker_day_is_filed_again_on_every_run(lake_root):

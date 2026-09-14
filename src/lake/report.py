@@ -39,9 +39,11 @@ Three rules hold for everything written here, and each has a failure behind it.
    because one cycle can raise several pages at one instant.
 
 The second producer is compaction's merge. It compares a ticker-day's merged segments to
-the pinned schema at the one moment the segments still exist, and files what moved. The
-file has forensic value from the day it lands, because the merged schema is gone the
-moment the seal unlinks the segments, and it has no reader until D20 renders it. What
+the pinned schema at the one moment the segments still exist, and files what moved. A
+merge the segments' own types refused files here too, from the sweep rather than from the
+seal, because a refusal writes no partition and so never reaches that comparison. The file
+has forensic value from the day it lands, because the merged schema is gone the moment the
+seal unlinks the segments, and it has no reader until D20 renders it. What
 reaches a human in the meantime is compaction's own page, which folds the run's findings
 into one message and sends the reader here for the per-ticker-day detail.
 """
@@ -73,9 +75,11 @@ class SchemaDrift:
 
     ``GuardOutcome`` lives in ``close_guard`` and this record lives here, and the
     asymmetry is the import direction. The guard's producer never learns about this
-    module, because the daemon wires the two together. Compaction's producer is inside
-    ``_seal``, so ``compact`` imports this module directly and a record defined there
-    would close the loop. The dataclass carries strings and dates alone, which keeps
+    module, because the daemon wires the two together. Compaction's producers are inside
+    ``compact``, so it imports this module directly and a record defined there would close
+    the loop. There are two of them. One sits in ``_seal`` and reports a merged schema that
+    is not the pinned one. The other sits in the sweep and reports a merge the segments'
+    own types refused. The dataclass carries strings and dates alone, which keeps
     pyarrow out of the module that writes JSON.
 
     The three difference fields say what moved, each naming columns rather than counting
@@ -95,15 +99,21 @@ class SchemaDrift:
     written, but it does survive the seal, since the partition carries one fewer column
     than the schema forever.
 
-    ``retyped`` is a column every segment agreed on at a type the pinned schema does not
-    hold, rendered ``name: pinned -> merged``. A retype the segments *disagree* on never
-    reaches here, because the merge itself refuses it.
+    ``retyped`` carries both kinds of retype, rendered ``name: before -> after`` either
+    way, and which kind it is follows from which producer filed the record. A retype every
+    segment agreed on merges cleanly and disagrees with the pinned schema, so the merged
+    producer renders it ``pinned -> merged``. A retype the segments disagree on stops the
+    merge instead, so the refusal's producer renders it ``earlier -> later`` across the
+    segments and the pinned schema is not a party to it. That second one used to reach
+    nothing at all, because the refusal raised and ended the run.
 
-    All three can be empty. The producer decides there is a difference by comparing the
-    two schemas outright and these fields explain it, so a difference the names and the
-    types do not show, a nullability change being the one that can reach here, files a
-    record that names the ticker-day and lists nothing. That is still the finding: the
-    merged schema was not the pinned one and this says which day to go and look at.
+    All three can be empty, and each producer has a way of getting there. The merged
+    producer decides there is a difference by comparing the two schemas outright and these
+    fields explain it, so a difference the names and the types do not show files a record
+    that lists nothing. A nullability change is the difference that reaches it. The
+    refusal's producer scans the segments to explain a refusal Arrow already made, so a
+    refusal it cannot model lists nothing either. Both are still the finding: something was
+    wrong at the merge and this says which ticker-day to go and look at.
     """
 
     surface: str
@@ -115,6 +125,7 @@ class SchemaDrift:
     unexpected: tuple[str, ...] = ()
     retyped: tuple[str, ...] = ()
     segments: tuple[str, ...] = field(default_factory=tuple)
+    refused: bool = False
 
 
 def close_guard_dir(lake_root: Path | str, day: date) -> Path:
@@ -212,10 +223,11 @@ def write_schema_drift(
     every run the conflict survives for exactly that reason. Nothing here changes either
     way. This writer is called once per finding whichever caller reached it.
 
-    **Raises rather than swallowing.** The caller contains it, because a raise out of
-    ``_seal`` would cost the rest of the sweep, and the containment belongs where that
-    blast radius is, not here. Hiding the failure inside the writer would take it away
-    from every caller, including a test that wants to see a write fail.
+    **Raises rather than swallowing.** The caller contains it, because a raise out of the
+    filing would cost the rest of the sweep whichever caller reached it, and the
+    containment belongs where that blast radius is, not here. Hiding the failure inside
+    the writer would take it away from every caller, including a test that wants to see a
+    write fail.
 
     The name carries the surface and the ticker as well as the stamp and the pid. One
     sweep can find drift on several ticker-days, and the stamps that separate them are
@@ -234,6 +246,7 @@ def write_schema_drift(
         "unexpected": list(drift.unexpected),
         "retyped": list(drift.retyped),
         "segments": list(drift.segments),
+        "refused": drift.refused,
     }
     # A report is written inside a lake that exists, or not at all. The same rule as
     # ``write_close_guard`` above, and for the same reason: `parents=True` from a missing

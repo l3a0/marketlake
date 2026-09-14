@@ -53,6 +53,7 @@ from lake.compact import (
     CompactionVerifyError,
     PartitionMismatch,
     RecompactionRefused,
+    RefusedTickerDay,
     SkippedDay,
     _write_partition,
     build_parser,
@@ -396,147 +397,61 @@ def test_a_mid_day_schema_rotation_compacts_by_name(lake_root):
     assert result.sealed[0].rows == 5
 
 
-def _retyped_day(lake_root: Path, ticker: str = "SPY", day: date = DAY) -> tuple[Path, Path]:
-    """One ticker-day whose two segments hold ``open_interest`` at different types.
+def _retyped_segment(
+    lake_root: Path, ticker: str, day: date, *, start_ts: str, count: int = 3
+) -> Path:
+    """One chains segment holding ``open_interest`` as a float rather than an int.
 
     A vendor field that arrived as an int all morning and as a float after lunch. Unifying
     by name cannot reconcile that, and widening it silently would bless a partition whose
-    type changed inside one day. ``SegmentWriter`` can only ever write the pinned schema,
-    so the afternoon segment's stream is written by hand the way the capture loop's writer
-    would have written it under the other code shape.
+    type changed inside one day. ``SegmentWriter`` takes its schema from
+    ``journal.schema_for`` and so can only ever write the pinned one, which is why this
+    stream is written by hand the way the capture loop's writer would have written it
+    under the other code shape.
     """
+    index = CHAINS_SCHEMA.get_field_index("open_interest")
+    retyped = CHAINS_SCHEMA.set(index, pa.field("open_interest", pa.float64()))
+    rows = _chains_rows(count, snap_ts=_snap(day, 1), ticker=ticker)
+    for row in rows:
+        row["open_interest"] = 100.5
+    path = journal.segment_path(lake_root, "chains", ticker, day, start_ts, PID)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with pa.OSFile(str(path), "wb") as sink, pa.ipc.new_stream(sink, retyped) as writer:
+        writer.write_table(_table(retyped, rows))
+    return path
+
+
+def _retyped_quotes_segment(lake_root: Path, ticker: str, day: date, *, start_ts: str) -> Path:
+    """The same disagreement on the quotes surface, so a refusal there can be built too."""
+    index = QUOTES_SCHEMA.get_field_index("bid")
+    retyped = QUOTES_SCHEMA.set(index, pa.field("bid", pa.string()))
+    rows = [
+        {
+            "snap_ts": _snap(day, 1),
+            "fetch_ts": _snap(day, 1),
+            "ticker": ticker,
+            "bid": "650.0",
+            "row_kind": "data",
+            "suspect": False,
+            "schema_version": 1,
+        }
+    ]
+    path = journal.segment_path(lake_root, "quotes", ticker, day, start_ts, PID)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with pa.OSFile(str(path), "wb") as sink, pa.ipc.new_stream(sink, retyped) as writer:
+        writer.write_table(_table(retyped, rows))
+    return path
+
+
+def _retyped_day(lake_root: Path, ticker: str = "SPY", day: date = DAY) -> tuple[Path, Path]:
+    """One ticker-day whose two segments hold ``open_interest`` at different types."""
     old_rows = _chains_rows(2, snap_ts=_snap(day, 0), ticker=ticker)
     for row in old_rows:
         row["open_interest"] = 100
-    index = CHAINS_SCHEMA.get_field_index("open_interest")
-    retyped = CHAINS_SCHEMA.set(index, pa.field("open_interest", pa.float64()))
-    new_rows = _chains_rows(3, snap_ts=_snap(day, 1), ticker=ticker)
-    for row in new_rows:
-        row["open_interest"] = 100.5
     morning = _segment(
         lake_root, "chains", ticker, day, _table(CHAINS_SCHEMA, old_rows), start_ts="a"
     )
-    afternoon = journal.segment_path(lake_root, "chains", ticker, day, "b", PID)
-    with pa.OSFile(str(afternoon), "wb") as sink, pa.ipc.new_stream(sink, retyped) as writer:
-        writer.write_table(_table(retyped, new_rows))
-    return morning, afternoon
-
-
-def test_a_mid_day_retype_refuses_the_ticker_day_and_leaves_it_alone(lake_root):
-    # The other half of a rotation, and what #184 changed about it. The merge still
-    # refuses: no partition, no manifest entry, both segments byte-identical, exactly as
-    # the capture left them. What no longer happens is the run ending. The refusal is
-    # named, caught at the ticker-day, filed, and reported under its own tuple, and the
-    # backup and the ping still run. This reverses the part of #187 that held the raise.
-    morning, afternoon = _retyped_day(lake_root)
-    morning_before = morning.read_bytes()
-    afternoon_before = afternoon.read_bytes()
-
-    result, events, _, pinger = _run(lake_root)
-
-    assert not LakePaths(lake_root).chains_partition_path("SPY", DAY).exists()
-    assert read_manifest(lake_root) == []
-    assert morning.read_bytes() == morning_before
-    assert afternoon.read_bytes() == afternoon_before
-    assert result.sealed == () and result.verified == ()
-    (refused,) = result.refused
-    assert (refused.surface, refused.ticker, refused.day) == ("chains", "SPY", DAY)
-    assert refused.conflicts == ("open_interest: int64 -> double",)
-    assert refused.segments == (_rel(lake_root, morning), _rel(lake_root, afternoon))
-    # The blast radius is one ticker-day. The lake still gets its nightly copy.
-    assert result.backed_up and result.pinged
-    assert events == ["backup", "ping"]
-    assert pinger.urls == [URL]
-
-
-def test_a_refused_ticker_day_is_not_a_clean_no_op(lake_root):
-    # ``changed`` separates a run that did something from one that correctly no-opped. A
-    # refusal seals nothing, so reading it as unchanged would print the same verdict an
-    # already-sealed lake prints while a ticker-day sits unmerged. It files a fresh
-    # finding into the lake on every run besides, so the run did change the lake.
-    _retyped_day(lake_root)
-
-    result, _, _, _ = _run(lake_root)
-
-    assert result.changed
-    rendered = result.render()
-    # The top line, not only the detail below it. An operator reads the top line.
-    assert "refused=1" in rendered.splitlines()[0]
-    assert "sealed=0" in rendered.splitlines()[0]
-    assert "open_interest: int64 -> double" in rendered
-    assert "secret-key" not in rendered
-
-
-def test_a_refused_ticker_day_costs_nothing_but_itself(lake_root):
-    # The measured scenario from #184. One retyped SPY ticker-day, one healthy ZZZ that
-    # sorts after it on the same date, and one healthy AAA on an earlier date. Before the
-    # containment the raise left AAA sealed, ZZZ never reached, and the re-tune, the
-    # backup, and the ping unrun, every night.
-    _retyped_day(lake_root)
-    _segment(
-        lake_root,
-        "chains",
-        "ZZZ",
-        DAY,
-        _chains(4, snap_ts=_snap(DAY, 0), ticker="ZZZ"),
-        start_ts="a",
-    )
-    _segment(
-        lake_root,
-        "chains",
-        "AAA",
-        FRIDAY,
-        _chains(2, snap_ts=_snap(FRIDAY, 0), ticker="AAA"),
-        start_ts="a",
-    )
-
-    result, events, _, _ = _run(lake_root)
-
-    assert sorted(item.ticker for item in result.sealed) == ["AAA", "ZZZ"]
-    assert [item.ticker for item in result.refused] == ["SPY"]
-    paths = LakePaths(lake_root)
-    assert pq.read_table(paths.chains_partition_path("ZZZ", DAY)).num_rows == 4
-    assert pq.read_table(paths.chains_partition_path("AAA", FRIDAY)).num_rows == 2
-    # The re-tune profiles the latest sealed chains day, which the refusal must not have
-    # taken with it, and the two steps after the sweep both run.
-    assert result.retune is not None and result.retune.day == DAY
-    assert events == ["backup", "ping"]
-
-
-def test_a_refused_ticker_day_keeps_its_directories_through_the_prune(lake_root):
-    # The prune deletes only an empty directory, and a refused ticker-day's is not empty.
-    # Its date directory holds a sealed ticker-day too, so the prune reaches every level.
-    morning, afternoon = _retyped_day(lake_root)
-    sealed = _segment(
-        lake_root,
-        "chains",
-        "ZZZ",
-        DAY,
-        _chains(2, snap_ts=_snap(DAY, 0), ticker="ZZZ"),
-        start_ts="a",
-    )
-
-    _run(lake_root)
-
-    assert morning.exists() and afternoon.exists()
-    assert not sealed.exists() and not sealed.parent.exists()
-    assert morning.parent.parent.parent.is_dir()
-
-
-def test_a_second_run_refuses_the_same_ticker_day_again(lake_root):
-    # A refused ticker-day has no terminal state until a human clears it, and nothing in
-    # this module can. Its segments stay, so every sweep merges them again and refuses
-    # again. That repetition is what keeps the finding readable, because the ticker-day
-    # has no manifest entry to make a later silence mean anything.
-    _retyped_day(lake_root)
-
-    first, _, _, _ = _run(lake_root)
-    second, events, _, _ = _run(lake_root)
-
-    assert len(first.refused) == 1
-    assert second.refused == first.refused
-    assert second.changed
-    assert events == ["backup", "ping"]
+    return morning, _retyped_segment(lake_root, ticker, day, start_ts="b")
 
 
 # -- 2. torn tails and shadow appends ----------------------------------------
@@ -1547,3 +1462,231 @@ def test_a_stray_file_directly_under_a_date_directory_survives_the_prune(lake_ro
     assert not paths.segment_dir("chains", "SPY", DAY).exists()
     assert not (date_dir / f"{SURFACE_PREFIX}chains").exists()
     assert date_dir.is_dir()
+
+
+# -- 11. a merge the segment types refused -----------------------------------
+
+
+def test_a_mid_day_retype_refuses_the_ticker_day_and_leaves_it_alone(lake_root):
+    # The other half of a rotation, and what #184 changed about it. The merge still
+    # refuses: no partition, no manifest entry, both segments byte-identical, exactly as
+    # the capture left them. What no longer happens is the run ending. The refusal is
+    # named, caught at the ticker-day, filed, and reported under its own tuple, and the
+    # backup and the ping still run. This reverses the part of #187 that held the raise.
+    morning, afternoon = _retyped_day(lake_root)
+    morning_before = morning.read_bytes()
+    afternoon_before = afternoon.read_bytes()
+
+    result, events, _, pinger = _run(lake_root)
+
+    assert not LakePaths(lake_root).chains_partition_path("SPY", DAY).exists()
+    assert read_manifest(lake_root) == []
+    assert morning.read_bytes() == morning_before
+    assert afternoon.read_bytes() == afternoon_before
+    assert result.sealed == () and result.verified == ()
+    (refused,) = result.refused
+    assert (refused.surface, refused.ticker, refused.day) == ("chains", "SPY", DAY)
+    assert refused.conflicts == ("open_interest: int64 -> double",)
+    assert refused.segments == (_rel(lake_root, morning), _rel(lake_root, afternoon))
+    # The blast radius is one ticker-day. The lake still gets its nightly copy.
+    assert result.backed_up and result.pinged
+    assert events == ["backup", "ping"]
+    assert pinger.urls == [URL]
+
+
+def test_a_refused_ticker_day_is_not_a_clean_no_op(lake_root):
+    # ``changed`` separates a run that did something from one that correctly no-opped. A
+    # refusal seals nothing, so reading it as unchanged would print the same verdict an
+    # already-sealed lake prints while a ticker-day sits unmerged. It files a fresh
+    # finding into the lake on every run besides, so the run did change the lake.
+    _retyped_day(lake_root)
+
+    result, _, _, _ = _run(lake_root)
+
+    assert result.changed
+    rendered = result.render()
+    # The top line, not only the detail below it. An operator reads the top line.
+    assert "refused=1" in rendered.splitlines()[0]
+    assert "sealed=0" in rendered.splitlines()[0]
+    assert "open_interest: int64 -> double" in rendered
+    assert "secret-key" not in rendered
+
+
+def test_a_refused_ticker_day_costs_nothing_but_itself(lake_root):
+    # The measured scenario from #184. One retyped SPY ticker-day, one healthy ZZZ that
+    # sorts after it on the same date, and one healthy AAA on an earlier date. Before the
+    # containment the raise left AAA sealed, ZZZ never reached, and the re-tune, the
+    # backup, and the ping unrun, every night.
+    _retyped_day(lake_root)
+    _segment(
+        lake_root,
+        "chains",
+        "ZZZ",
+        DAY,
+        _chains(4, snap_ts=_snap(DAY, 0), ticker="ZZZ"),
+        start_ts="a",
+    )
+    _segment(
+        lake_root,
+        "chains",
+        "AAA",
+        FRIDAY,
+        _chains(2, snap_ts=_snap(FRIDAY, 0), ticker="AAA"),
+        start_ts="a",
+    )
+
+    result, events, _, _ = _run(lake_root)
+
+    assert sorted(item.ticker for item in result.sealed) == ["AAA", "ZZZ"]
+    assert [item.ticker for item in result.refused] == ["SPY"]
+    paths = LakePaths(lake_root)
+    assert pq.read_table(paths.chains_partition_path("ZZZ", DAY)).num_rows == 4
+    assert pq.read_table(paths.chains_partition_path("AAA", FRIDAY)).num_rows == 2
+    # The re-tune still runs and still names the day. It declines to rewrite anything,
+    # which is the next test's subject.
+    assert result.retune is not None and result.retune.day == DAY
+    assert events == ["backup", "ping"]
+
+
+def test_a_refused_chains_ticker_day_stops_the_retune_rewriting_the_plan(lake_root):
+    # The over-reach this containment opened, and the reason the re-tune takes the
+    # refusals. A window with no rows counts zero, which is right for a ticker that
+    # fetched nothing and wrong for one whose rows sit unmerged in a segment. The
+    # partitions cannot tell those apart.
+    #
+    # SPY is refused and carries a thousand contracts in the first two windows. ZZZ
+    # carries a hundred in each. Reading SPY's absence as zero puts both windows under
+    # the minimum, merges them into one wider request, and rewrites the plan the capture
+    # loop reads every cycle. The gateway body limit that plan exists to stay under is
+    # exactly what a wider request threatens, and the ticker most likely to be refused is
+    # the one carrying the widest chain.
+    #
+    # Before #184 the raise ended the run ahead of the re-tune, so this could not happen.
+    plan_path = lake_root.parent / "chain_plan.json"
+    wide = {0: 1000, 1: 1000, 2: 1000, 3: 1000, 4: 1000}
+    _segment(
+        lake_root,
+        "chains",
+        "SPY",
+        DAY,
+        _profile_table(DEFAULT_CHAIN_PLAN, DAY, wide, snap_ts=_snap(DAY, 0)),
+        start_ts="a",
+    )
+    _retyped_segment(lake_root, "SPY", DAY, start_ts="b")
+    thin = {0: 100, 1: 100, 2: 1000, 3: 1000, 4: 1000}
+    _segment(
+        lake_root,
+        "chains",
+        "ZZZ",
+        DAY,
+        _profile_table(DEFAULT_CHAIN_PLAN, DAY, thin, snap_ts=_snap(DAY, 0), ticker="ZZZ"),
+        start_ts="a",
+    )
+
+    result, events, _, _ = _run(lake_root, plan_path=plan_path)
+
+    assert [item.ticker for item in result.refused] == ["SPY"]
+    retune = result.retune
+    assert retune is not None
+    assert retune.skipped_reason == "a chains ticker-day on this day was refused: SPY"
+    assert retune.merges == () and retune.splits == ()
+    assert not retune.written and not retune.changed
+    # The plan file is the thing that must not move. Nothing wrote it at all.
+    assert not plan_path.exists()
+    # The counts are still reported, so a reader sees the partial profile that was refused.
+    assert retune.counts == (100, 100, 1000, 1000, 1000)
+    assert "a chains ticker-day on this day was refused" in result.render()
+    # Containment is intact: ZZZ still sealed, and the backup and the ping still ran.
+    assert [item.ticker for item in result.sealed] == ["ZZZ"]
+    assert events == ["backup", "ping"]
+
+
+def test_a_refused_quotes_ticker_day_leaves_the_retune_alone(lake_root):
+    # The other direction, so the block does not over-reach in its turn. A refused quotes
+    # ticker-day contributes nothing to a chains profile, so it must not stop the re-tune.
+    plan_path = lake_root.parent / "chain_plan.json"
+    counts = {0: 1000, 1: 100, 2: 200, 3: 1000, 4: 1000}
+    _segment(
+        lake_root,
+        "chains",
+        "SPY",
+        DAY,
+        _profile_table(DEFAULT_CHAIN_PLAN, DAY, counts, snap_ts=_snap(DAY, 0)),
+        start_ts="a",
+    )
+    _segment(lake_root, "quotes", "SPY", DAY, _quotes(2, snap_ts=_snap(DAY, 0)), start_ts="a")
+    _retyped_quotes_segment(lake_root, "SPY", DAY, start_ts="b")
+
+    result, _, _, _ = _run(lake_root, plan_path=plan_path)
+
+    assert [item.surface for item in result.refused] == ["quotes"]
+    retune = result.retune
+    assert retune is not None and retune.skipped_reason is None
+    assert retune.merges == (((10, 30), (31, 90)),)
+    assert retune.written
+
+
+def test_a_refused_ticker_day_keeps_its_directories_through_the_prune(lake_root):
+    # The prune deletes only an empty directory, and a refused ticker-day's is not empty.
+    # Its date directory holds a sealed ticker-day too, so the prune reaches every level.
+    morning, afternoon = _retyped_day(lake_root)
+    sealed = _segment(
+        lake_root,
+        "chains",
+        "ZZZ",
+        DAY,
+        _chains(2, snap_ts=_snap(DAY, 0), ticker="ZZZ"),
+        start_ts="a",
+    )
+
+    _run(lake_root)
+
+    assert morning.exists() and afternoon.exists()
+    assert not sealed.exists() and not sealed.parent.exists()
+    assert morning.parent.parent.parent.is_dir()
+
+
+def test_render_names_a_refusal_the_scan_could_not_explain(lake_root):
+    # The other half of the same fallback the exception carries. A refusal the column scan
+    # could not model still has to print as something a reader can act on, rather than as
+    # an empty list where the columns should be.
+    refused = RefusedTickerDay(
+        surface="chains",
+        ticker="SPY",
+        day=DAY,
+        partition="chains/ticker=SPY/date=2026-08-24.parquet",
+        conflicts=(),
+        segments=("journal/date=2026-08-24/surface=chains/ticker=SPY/seg-a-1.arrows",),
+    )
+    result = CompactionResult(
+        sealed=(),
+        verified=(),
+        skipped=(),
+        retune=None,
+        backed_up=True,
+        pinged=True,
+        refused=(refused,),
+    )
+
+    rendered = result.render()
+
+    assert "refused=1" in rendered.splitlines()[0]
+    assert "no column named" in rendered
+    assert refused.partition in rendered
+    assert result.changed
+
+
+def test_a_second_run_refuses_the_same_ticker_day_again(lake_root):
+    # A refused ticker-day has no terminal state until a human clears it, and nothing in
+    # this module can. Its segments stay, so every sweep tries the same merge and is
+    # refused again. That repetition is what keeps the finding readable, because the ticker-day
+    # has no manifest entry to make a later silence mean anything.
+    _retyped_day(lake_root)
+
+    first, _, _, _ = _run(lake_root)
+    second, events, _, _ = _run(lake_root)
+
+    assert len(first.refused) == 1
+    assert second.refused == first.refused
+    assert second.changed
+    assert events == ["backup", "ping"]
