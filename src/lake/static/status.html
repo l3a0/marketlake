@@ -389,16 +389,40 @@
 
   // A ticker whose capture_start is still ahead of the clock has no minutes-since to be
   // late by. It is not onboarded yet, so it is never painted stale.
+  //
+  // The verdict is the payload's, in row.stale. The number in the cell is the age
+  // against now, which is what a reader wants to see, and the verdict is against the
+  // last minute a cycle was owed, which is the only minute that age means anything
+  // against. The two part company the moment the session ends: a healthy ticker's age
+  // climbs all evening while its verdict stays clean, and a ticker that captured
+  // nothing all day stays stale from the option close onward rather than falling back
+  // to plain text in the hours the day gets reviewed in.
   function minutesSinceCell(now, row) {
     var text = row.minutes_since === null ? DASH : row.minutes_since.toFixed(1);
     var cell = el("td", text, "num");
     if (row.in_scope === false) {
       cell.className = "num muted";
-    } else if (capturing(now) &&
-        (row.minutes_since === null || row.minutes_since > now.stale_after_minutes)) {
+    } else if (row.stale) {
       cell.className = "num stale";
+      cell.title = staleTitle(now);
     }
     return cell;
+  }
+
+  // The threshold is worth saying out loud, because the reading changes with the hour
+  // and a bare red cell cannot say which reading it is.
+  function staleTitle(now) {
+    if (capturing(now)) {
+      return "No durable data cycle in the last " +
+        plural(now.stale_after_minutes, "minute", "minutes") +
+        ", the threshold the watchdog pages at.";
+    }
+    if (now.capture_owed_through === null) {
+      return "No session has closed yet, so there is no minute to read this against.";
+    }
+    return "Nothing captured through " + fmt(now.capture_owed_through, stampFmt) +
+      " ET, the last minute a cycle was owed. The session is over, so the age keeps " +
+      "climbing on its own and the verdict reads against that minute rather than now.";
   }
 
   function reasonCell(row) {

@@ -326,6 +326,97 @@ def test_now_reports_the_last_data_cycle_and_minutes_since(service: DashboardSer
     assert spy_quotes["last_status"] == "captured"
 
 
+def test_a_row_reads_stale_against_the_last_minute_a_cycle_was_owed(root: Path):
+    """The evening is when the day gets reviewed, and it used to be when the reading died.
+
+    Painting a row stale against ``now`` outside the capture window would light every row
+    every evening, because the age climbs on its own once the session ends. The old code
+    avoided that by painting nothing at all after the option close, so a session that
+    captured nothing read as plain text in exactly those hours. The verdict now reads
+    against the last option close that has passed, which both readings get right.
+    """
+    # QQQ's newest data cycle is Friday's option close, and Monday is gap-only. Read at
+    # Monday 17:00 the day is over, so Monday's close is the minute a cycle was owed by.
+    evening = service_over(root, now=et(MONDAY, 17, 0)).run_query("now", {})
+    qqq = next(row for row in evening["surfaces"] if row["ticker"] == "QQQ")
+
+    assert evening["phase"] == "closed"
+    assert evening["capture_owed_through"] == et(MONDAY, 16, 15).isoformat()
+    assert qqq["stale"] is True
+
+
+def test_a_healthy_ticker_reads_clean_all_evening(fixture_lake: FixtureLake):
+    """A ticker that captured through its own close is not late, however the age climbs.
+
+    This is the reading the old gate protected and the one a naive threshold would break.
+    The age at 17:00 is 45 minutes against a threshold of 3, so only the reference instant
+    keeps the row clean.
+    """
+    root = one_segment_lake(fixture_lake, [_chains("SPY", et(MONDAY, 16, 15))])
+
+    evening = service_over(root, now=et(MONDAY, 17, 0)).run_query("now", {})
+    spy = next(row for row in evening["surfaces"] if row["surface"] == "chains")
+
+    assert spy["minutes_since"] == 45.0  # far past the 3-minute threshold
+    assert spy["stale"] is False
+
+
+def test_a_lake_with_no_closed_session_behind_it_paints_nothing_stale(root: Path):
+    """Nothing has been owed yet, so nothing can be late yet.
+
+    The fixture calendar's first session is the Thursday. Read before it, the walk finds
+    no option close that has passed, and a row with no data is then a lake waiting for
+    its first session rather than a capture failure.
+    """
+    before_any = service_over(root, now=et(date(2026, 8, 19), 12, 0)).run_query("now", {})
+
+    assert before_any["capture_owed_through"] is None
+    assert [row["stale"] for row in before_any["surfaces"]] == [False, False, False]
+
+
+def test_the_owed_minute_walks_back_over_a_weekend(root: Path):
+    """A Sunday reads against Friday's close, because no session has closed since."""
+    sunday = service_over(root, now=et(date(2026, 8, 23), 12, 0)).run_query("now", {})
+
+    assert sunday["phase"] == "non_session"
+    assert sunday["capture_owed_through"] == et(FRIDAY, 16, 15).isoformat()
+
+
+def test_a_pre_open_morning_reads_against_the_previous_close(root: Path):
+    """Today's close has not happened yet, so it cannot be the minute anything is owed by."""
+    morning = service_over(root, now=et(MONDAY, 9, 0)).run_query("now", {})
+
+    assert morning["phase"] == "pre_open"
+    assert morning["capture_owed_through"] == et(FRIDAY, 16, 15).isoformat()
+
+
+def test_inside_the_capture_window_the_owed_minute_is_now(root: Path):
+    """The reading inside the session is unchanged, and that is the point."""
+    now = service_over(root).run_query("now", {})
+
+    assert now["phase"] == "open"
+    assert now["capture_owed_through"] == NOW.isoformat()
+
+
+def test_a_ticker_onboarded_after_the_close_is_not_late_that_evening(root: Path):
+    """Nothing was owed of a ticker whose epoch falls after the last owed minute.
+
+    Without this guard a ticker registered at 17:00 reads stale at 17:30, on a lake that
+    has done nothing wrong and owed it nothing yet. The in-scope clamp does not cover
+    this, because the clock has passed the epoch and the ticker really is in scope now.
+    """
+    write_master(root, "SPY", et(MONDAY, 17, 0))
+
+    evening = service_over(root, now=et(MONDAY, 17, 30)).run_query("now", {})
+    spy = next(
+        row for row in evening["surfaces"] if row["ticker"] == "SPY" and row["surface"] == "chains"
+    )
+
+    assert spy["in_scope"] is True
+    assert spy["capture_start"] == et(MONDAY, 17, 0).isoformat()
+    assert spy["stale"] is False
+
+
 def test_now_walks_back_past_a_gap_only_day(service: DashboardService):
     now = service.run_query("now", {})
     qqq = next(row for row in now["surfaces"] if row["ticker"] == "QQQ")
@@ -1075,6 +1166,9 @@ def test_a_ticker_with_no_data_cycle_ever_reports_null_freshness(fixture_lake: F
     assert row["last_status"] == "gap"
     assert row["last_error_class"] == ["http_429"]
     assert row["lookback_exhausted"] is False
+    # A null age is not a clean row. Nothing has ever captured while a cycle was owed,
+    # which is the worst reading the column has, so it is the one that must be loud.
+    assert row["stale"] is True
 
 
 # -- the roster and the lake's shape -----------------------------------------
