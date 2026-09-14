@@ -4,9 +4,9 @@ Compaction seals a ticker-day by appending the manifest entry and then unlinking
 segments it merged. A crash between those two writes leaves a manifested partition
 standing beside its own still-present segments, and ``lake.compact._recover`` exists to
 finish that cleanup on the next run. Reaching that state needs a real process to die
-part way, because what the next run has to cope with is whatever the operating system
-was left holding. A monkeypatch inside the pytest process cannot produce it. So the test
-spawns this module and kills it.
+partway, because the next run has to cope with whatever a dead process left on disk. A
+monkeypatch inside the pytest process cannot produce that. So the test spawns this module
+and kills it.
 
 The stop is a handshake, not a sleep. This module wraps two points inside the seal and
 counts what has happened. When the run reaches the requested point the module writes one
@@ -19,7 +19,7 @@ One argument selects the stop point, and both points sit inside the window.
 1. ``--unlinks 0`` stops the moment ``append_manifest`` returns, with every segment still
    on disk.
 2. ``--unlinks N`` stops once ``N`` segments have been unlinked, which is the partial
-   debris a kill part way through the loop leaves behind.
+   debris a kill partway through the loop leaves behind.
 
 Nothing here reads the machine's own configuration. Every path arrives on the command
 line, and the module refuses to run unless all of them sit under the temp root the parent
@@ -38,13 +38,16 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import tempfile
 from collections.abc import Sequence
 from datetime import date, datetime
 from pathlib import Path
 
-# The exit codes for the three ways a run ends without being killed. Each is distinct, so
-# the parent's failure message names which one happened rather than reporting a bare
-# non-zero code.
+# The exit codes for the three ways a run ends without being killed. Each is distinct so
+# the parent can say which one happened. ``NOT_STOPPED`` is the one that catches a real
+# regression: it means the run finished whole, so the window the parent meant to kill in
+# was never open. ``NOT_KILLED`` needs the parent to close stdin without killing, which
+# nothing does today, and it exists so that path cannot pass for a clean run.
 REFUSED = 97
 NOT_KILLED = 98
 NOT_STOPPED = 99
@@ -59,7 +62,7 @@ def _under(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
-def _refusal(sandbox: Path, paths: Sequence[Path]) -> str | None:
+def _refusal(sandbox: Path, forbidden: Path, paths: Sequence[Path]) -> str | None:
     """The reason to refuse this run, or ``None`` when every check passes.
 
     Three things are checked, and a failure of any one of them means a path in this run
@@ -68,16 +71,36 @@ def _refusal(sandbox: Path, paths: Sequence[Path]) -> str | None:
     1. ``MARKETLAKE_CONFIG_DIR`` is set, so the override the parent relies on is present
        rather than assumed.
     2. The directory ``lake.paths.config_dir`` resolves to is inside the sandbox and is
-       not the machine's real one. Reading the resolved value rather than the raw
-       variable is what proves the redirect took effect.
+       not ``forbidden``. Reading the resolved value rather than the raw variable is what
+       proves the redirect took effect.
     3. Every path this run will write is inside the sandbox.
-    """
-    from lake.paths import CONFIG_DIR_ENV, CONFIG_DIR_PARTS, config_dir
 
+    The sandbox itself is checked first, because the other two checks are only ever as
+    strong as it is. A caller naming ``/`` or a home directory as the sandbox would pass
+    every path under it, the real lake included. Two independent floors refuse that, and
+    either one alone would catch the home case.
+
+    1. The sandbox sits under the temp directory. ``TMPDIR`` decides where that is, and
+       the parent passes its own, so this floor is as good as the environment the parent
+       built.
+    2. The sandbox does not contain ``forbidden``. A sandbox swallowing the machine's
+       real config directory is not a sandbox, whatever ``TMPDIR`` says.
+
+    ``forbidden`` is the machine's real config directory, and it arrives as an argument
+    rather than being computed from this process's ``HOME``. So the parent never has to
+    put the operator's real home inside a process no guard reaches.
+    """
+    from lake.paths import CONFIG_DIR_ENV, config_dir
+
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    if not _under(sandbox, temp_root):
+        return f"the sandbox {sandbox} is not under the temp directory {temp_root}"
+    if _under(forbidden.resolve(), sandbox):
+        return f"the sandbox {sandbox} contains the real config directory {forbidden}"
     if not os.environ.get(CONFIG_DIR_ENV):
         return f"{CONFIG_DIR_ENV} is unset"
     resolved = config_dir().resolve()
-    if resolved == Path.home().joinpath(*CONFIG_DIR_PARTS).resolve():
+    if resolved == forbidden.resolve():
         return f"config_dir() is still the real {resolved}"
     if not _under(resolved, sandbox):
         return f"config_dir() is {resolved}, outside the sandbox {sandbox}"
@@ -91,8 +114,8 @@ def _hold_until_killed() -> None:
     """Announce the stop point, then block until the parent kills this process.
 
     The read never returns while the parent holds its end of the pipe open, and
-    ``SIGKILL`` cannot be caught, so nothing after it runs on the path this module is
-    built for. It returns only when the parent closes stdin without killing, which the
+    ``SIGKILL`` cannot be caught, so nothing after it runs when the parent kills as
+    intended. It returns only when the parent closes stdin without killing, which the
     caller reports as its own exit code rather than letting the run carry on.
     """
     sys.stdout.write(READY + "\n")
@@ -158,7 +181,16 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m tests.support.compaction_child",
         description="Run compaction and stop inside the seal so the parent can kill it.",
     )
-    parser.add_argument("--sandbox", required=True, help="The temp root every path must sit under.")
+    parser.add_argument(
+        "--sandbox",
+        required=True,
+        help="The temp root every path must sit under. Must itself be under the temp dir.",
+    )
+    parser.add_argument(
+        "--forbidden",
+        required=True,
+        help="The machine's real config directory, which this run must never resolve to.",
+    )
     parser.add_argument("--lake-root", required=True, help="The throwaway lake to compact.")
     parser.add_argument("--backup-target", required=True, help="The throwaway backup target.")
     parser.add_argument("--plan", required=True, help="The throwaway chain plan path.")
@@ -181,7 +213,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     backup_target = Path(args.backup_target).resolve()
     plan_path = Path(args.plan).resolve()
 
-    reason = _refusal(sandbox, (lake_root, backup_target, plan_path))
+    reason = _refusal(sandbox, Path(args.forbidden), (lake_root, backup_target, plan_path))
     if reason is not None:
         print(f"refused: {reason}", file=sys.stderr)
         return REFUSED
