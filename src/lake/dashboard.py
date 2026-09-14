@@ -94,7 +94,7 @@ from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
 from lake.capture_spans import CaptureSpan, CaptureSpans, CaptureSpansError, spans_path
 from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants, input_errors_exit, load_config
-from lake.control_plane import sunday_canary_due
+from lake.control_plane import assertion_window, sunday_canary_due
 from lake.deadman import in_envelope
 from lake.metadata import read_metadata
 from lake.paths import (
@@ -146,6 +146,14 @@ QUERY_MEMORY_LIMIT = "2GB"
 # stops mattering long before that. Without the cap a gap-only ticker walks the entire
 # retained history on every request, and the page refreshes every minute.
 MAX_LOOKBACK_SESSIONS = 10
+
+# The dead-man's last-owed walk. It steps back a day at a time looking for the newest
+# expectation window that has already run, and a weekend is the longest run of days
+# carrying none, so four days reaches past one with a day to spare. The step back from a
+# window's end lands on the last minute inside it, because the window excludes its own
+# end instant.
+OWED_LOOKBACK_DAYS = 4
+OWED_WALK_STEP = timedelta(minutes=1)
 
 # The six slot statuses the Today strip reports.
 STATUS_CAPTURED = "captured"  # a data cycle landed
@@ -925,6 +933,51 @@ def _ping_owed(now: datetime, grace_minutes: int) -> bool:
     return in_envelope(now) and in_envelope(now - timedelta(minutes=grace_minutes))
 
 
+def _last_owed(now: datetime, grace_minutes: int) -> datetime | None:
+    """The latest instant at or before ``now`` when a dead-man ping was owed.
+
+    ``_ping_owed`` answers whether a ping is owed this minute. The panel's line needs a
+    second answer, because a ping that starved while one was owed stays starved after the
+    window shuts. Judging only against ``now`` would drop the alarm at 18:45 and leave it
+    down until 08:30, weekends included, which is most of the week. A ping URL that broke
+    at 17:00 pages healthchecks by 17:06 and would read healthy on the page all evening.
+    That is the reading this whole change exists to remove, moved to a later hour.
+
+    So the walk finds the last minute a ping was owed and the line judges the ping there.
+    An evening after a healthy day compares against that day's own last owed minute,
+    which a live daemon fed, so the night stays quiet.
+
+    ``assertion_window`` only proposes each day's end. ``_ping_owed`` decides whether that
+    instant was owed, so the weekday rule and the Sunday exclusion stay in
+    ``lake.deadman`` rather than being restated here.
+    """
+    if _ping_owed(now, grace_minutes):
+        return now
+    eastern = now.astimezone(MARKET_TZ)
+    day = eastern.date()
+    for _ in range(OWED_LOOKBACK_DAYS):
+        window = assertion_window(day)
+        if window is not None:
+            last = min(window.end, eastern) - OWED_WALK_STEP
+            if _ping_owed(last, grace_minutes):
+                return last
+        day -= timedelta(days=1)
+    return None
+
+
+def _dead_man_starved(now: datetime, last_ping: datetime | None, grace_minutes: int) -> bool:
+    """Whether the dead-man check has gone unfed past the grace it pages after.
+
+    A ping that has never landed is a failure only while one is owed. healthchecks holds
+    a check that has never been pinged in a *new* state rather than a down one, so a lake
+    nothing has ever run against owes nothing on a Saturday and says so.
+    """
+    if last_ping is None:
+        return _ping_owed(now, grace_minutes)
+    owed = _last_owed(now, grace_minutes)
+    return owed is not None and owed - last_ping > timedelta(minutes=grace_minutes)
+
+
 # -- the named queries -------------------------------------------------------
 
 
@@ -961,10 +1014,10 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
     or after it. A ticker onboarded later today has no in-scope slot yet, so it is not a
     stale capture.
 
-    Nine more fields sit beside the rows, grouped into the six entries below. Seven of
+    Ten more fields sit beside the rows, grouped into the six entries below. Seven of
     them read what another component wrote under ``lake_root``. The dashboard never
-    reads ``~/.config``. The other two, the grace and the expectation, come from the
-    guard constants and the clock instead.
+    reads ``~/.config``. The other three, the grace, the expectation and the starvation
+    verdict, come from the guard constants, the clock and the ping together.
 
     1. ``token_minted_at``, the refresh token's mint stamp, from the journal metadata
        the daemon stamps every cycle and every idle minute.
@@ -974,15 +1027,24 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
        control plane owns the ritual. It goes negative once the ritual is overdue, which
        is the honest reading of a token past its Sunday.
     4. ``dead_man_last_ping``, the instant the dead-man ping last landed, written by the
-       daemon's own feed, with ``dead_man_age_minutes`` beside it. Two more fields let
+       daemon's own feed, with ``dead_man_age_minutes`` beside it. Three more fields let
        the panel judge that age rather than leaving the reader to subtract it by eye.
+       ``dead_man_starved`` is the verdict, per ``_dead_man_starved``, and it is what the
+       page alarms on. ``dead_man_expected`` says whether a ping is owed this minute, per
+       ``_ping_owed``, and the page says so in words rather than colouring by it.
        ``dead_man_grace_minutes`` is the grace healthchecks pages after, so the page
-       reads the ping against the same threshold the alerting does.
-       ``dead_man_expected`` says whether a ping is owed at all, per ``_ping_owed``.
+       reads the ping against the threshold the alerting uses. The two are close rather
+       than identical, because healthchecks measures from the next scheduled ping and
+       this measures from the last one that landed, so the page goes loud about a minute
+       early.
+
        Inside the capture window only a durable data cycle feeds the check, because the
        idle heartbeat stands down there by design. So a session whose every cycle fails
        starves this ping while the stamp below keeps landing, and the two together are
-       what separate a running loop from working capture.
+       what separate a running loop from working capture. Past the option close the
+       heartbeat resumes and feeds the check on a day that captured nothing, so the line
+       says which of the two is feeding it rather than letting a fresh ping read as
+       capture.
     5. ``pages_failed_to_send``, today's count of pages that never reached the phone,
        counted from the files the publisher writes under ``reports/``. The day is the
        Eastern one, the same key the publisher files them under.
@@ -995,8 +1057,8 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
     Each instant and each age is null when nothing has been written. A daemon that has
     never run leaves the token and ping stamps absent, and the panel says so rather than
     showing a zero. The page count is never null, because an ordinary day writes no file
-    at all, so its absence is a true zero and reads as one. The grace and the
-    expectation are never null either, because they hold whether or not anything has
+    at all, so its absence is a true zero and reads as one. The grace, the expectation
+    and the verdict are never null either, because each holds whether or not anything has
     ever been stamped.
     """
     spans_by_ticker = _capture_spans(ctx.paths, ctx.roster, ctx.session.session_date())
@@ -1031,6 +1093,9 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
             else _minutes(ctx.now - stamp.dead_man_last_ping)
         ),
         "dead_man_expected": _ping_owed(ctx.now, ctx.guards.dead_man_grace_minutes),
+        "dead_man_starved": _dead_man_starved(
+            ctx.now, stamp.dead_man_last_ping, ctx.guards.dead_man_grace_minutes
+        ),
         "dead_man_grace_minutes": ctx.guards.dead_man_grace_minutes,
         "stamp_age_minutes": (
             None if stamp.stamped_at is None else _minutes(ctx.now - stamp.stamped_at)

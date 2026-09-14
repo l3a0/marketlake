@@ -409,6 +409,26 @@ def test_a_recalibrated_grace_reaches_the_panel(root: Path):
     now = service_over(root, guards=guards).run_query("now", {})
 
     assert now["dead_man_grace_minutes"] == 9
+    # An int, not a float. Both compare equal to 9, and only one of them renders as
+    # "the grace of 9 minutes" rather than "the grace of 9.0 minutes" on the page.
+    assert type(now["dead_man_grace_minutes"]) is int
+
+
+def test_a_recalibrated_grace_moves_the_minute_the_expectation_arms(root: Path):
+    """The grace must reach the arming and not only the sentence that prints it.
+
+    The wake is at 08:25 and the expectation arms one grace after it, so a recalibrated
+    grace moves that minute. Probing only at the pinned default of 5 would pass against
+    a hardcoded 5 in the arming, which is the simplification a reader is most likely to
+    make of the wake-plus-grace reasoning.
+    """
+    guards = GuardConstants(dead_man_grace_minutes=9)
+
+    before = service_over(root, guards=guards, now=et(MONDAY, 8, 33)).run_query("now", {})
+    after = service_over(root, guards=guards, now=et(MONDAY, 8, 34)).run_query("now", {})
+
+    assert before["dead_man_expected"] is False
+    assert after["dead_man_expected"] is True
 
 
 def test_an_unrecorded_ping_has_no_age_rather_than_a_zero(root: Path):
@@ -483,6 +503,69 @@ def test_the_stamp_keeps_landing_while_the_ping_starves(root: Path):
     assert now["stamp_age_minutes"] == 0.5
     assert now["dead_man_age_minutes"] == 11.5
     assert now["dead_man_expected"] is True
+    assert now["dead_man_starved"] is True
+
+
+def test_a_check_that_starved_while_owed_stays_loud_after_the_window_shuts(root: Path):
+    """A starved check does not stop being starved when the expectation window closes.
+
+    A ping URL that breaks at 17:00 pages healthchecks by 17:06 and stays down. Judging
+    the ping only against the current minute would drop the page's alarm at 18:45 and
+    leave it down until 08:30 the next weekday, weekends included. That is most of the
+    week, and it is the same false-healthy reading one hour later.
+    """
+    stamp_ping(root, at=et(MONDAY, 17, 0))
+
+    evening = service_over(root, now=et(MONDAY, 18, 59)).run_query("now", {})
+    next_morning = service_over(root, now=et(MONDAY + timedelta(days=1), 7, 0)).run_query("now", {})
+
+    # Nothing is owed at either instant, and the check is down at both.
+    assert evening["dead_man_expected"] is False
+    assert evening["dead_man_starved"] is True
+    assert next_morning["dead_man_expected"] is False
+    assert next_morning["dead_man_starved"] is True
+
+
+def test_a_healthy_day_leaves_the_night_and_the_weekend_quiet(root: Path):
+    """The night must stay quiet, or the reader learns to skip the line.
+
+    The daemon's last heartbeat lands in the envelope's final minute, and the ping then
+    ages all night against a check that expects nothing. Judging it against the last
+    minute one was owed is what keeps a healthy Friday evening from alarming until
+    Monday.
+    """
+    # 18:44 is the last minute inside the weekday envelope, which ends at 18:45.
+    stamp_ping(root, at=et(FRIDAY, 18, 44))
+
+    for instant in (
+        et(FRIDAY, 23, 0),
+        et(SATURDAY, 12, 0),
+        et(MONDAY, 8, 29),
+    ):
+        payload = service_over(root, now=instant).run_query("now", {})
+        assert payload["dead_man_starved"] is False, instant
+
+
+def test_a_daemon_that_died_before_the_close_is_loud_all_weekend(root: Path):
+    """The weekend's quiet is earned by a fed check, never given by the calendar."""
+    stamp_ping(root, at=et(FRIDAY, 12, 0))
+
+    for instant in (et(SATURDAY, 12, 0), et(MONDAY, 8, 29)):
+        payload = service_over(root, now=instant).run_query("now", {})
+        assert payload["dead_man_starved"] is True, instant
+
+
+def test_a_lake_nothing_has_run_against_owes_nothing_at_the_weekend(root: Path):
+    """healthchecks holds a never-pinged check *new* rather than down, and so does this.
+
+    A ping that has never landed is a failure only while one is owed. Reading a never-run
+    lake as a starving check every weekend would be the noise this line exists to avoid.
+    """
+    weekend = service_over(root, now=et(SATURDAY, 12, 0)).run_query("now", {})
+    session = service_over(root).run_query("now", {})
+
+    assert weekend["dead_man_starved"] is False
+    assert session["dead_man_starved"] is True
 
 
 def test_now_counts_the_pages_that_never_reached_the_phone(root: Path):

@@ -432,12 +432,12 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   message at the reminder tier to go through the transport. The tag follows the priority
   rather than becoming a second field a producer could set wrong.
 - **D15** query service with the Now and Today panels. The query service is the read-only localhost dashboard.
-- **D15's writers.** The Now panel reads five fields no captured row can carry: the token's mint stamp, its age, the countdown to the Sunday ritual, the last dead-man ping, and the count of pages that failed to send. Every one of them is now filled from under `lake_root`, because the dashboard never opens `~/.config`. `lake.metadata` owns the stamp at `journal/metadata.json`, which sits inside the reverse scrub's journal exclusion and outside the date directories compaction prunes. Three writers fill it:
+- **D15's writers.** The Now panel reads three stamped facts no captured row can carry: the token's mint stamp, the last dead-man ping, and the count of pages that failed to send. Every one of them is now filled from under `lake_root`, because the dashboard never opens `~/.config`. `lake.metadata` owns the stamp at `journal/metadata.json`, which sits inside the reverse scrub's journal exclusion and outside the date directories compaction prunes. Three writers fill it:
   1. The capture cycle stamps the token's mint time, off the vendor it fetched with, and the cycle's roster as the surfaces each ticker is captured on. That roster stamp is what lets the panel show a ticker that journaled nothing as failing rather than dropping it.
   2. The daemon stamps the same two facts on every minute off the capture window, reading the mint from `token.json` because no client exists there. That is the path the Sunday re-auth reaches the panel by on the night it happens.
   3. The dead-man records each landed ping, and only a landed one.
 
-  The page count needed no writer. `alert.undelivered` already counted the pages that never reached the phone, and the panel now reads it for the Eastern day the publisher files them under. The age and the countdown are arithmetic over the mint stamp, the countdown against `control_plane.sunday_canary_due`, which keeps the ritual's moment beside the ritual.
+  The page count needed no writer. `alert.undelivered` already counted the pages that never reached the phone, and the panel now reads it for the Eastern day the publisher files them under. The ages and the countdown are arithmetic over those stamps, the countdown against `control_plane.sunday_canary_due`, which keeps the ritual's moment beside the ritual. The dead-man's starvation verdict is arithmetic too, over its ping and the last minute the check was owed one.
 
 Every issue-linked entry above belongs to slice 2, and none is deferred. The test is whether an
 entry needs something a later slice introduces. None does. Slice 3 adds vendor-fetch surfaces,
