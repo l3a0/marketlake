@@ -46,7 +46,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from lake import dashboard, journal
+from lake import capture, dashboard, journal
 from lake.alert import Message, Publisher
 from lake.calendar import MARKET_TZ
 from lake.capture_spans import SPANS_SCHEMA, CaptureSpans, spans_path
@@ -314,7 +314,7 @@ def test_now_reports_the_last_data_cycle_and_minutes_since(service: DashboardSer
     assert spy_chains["last_data_snap_ts"] == et(MONDAY, 9, 33).isoformat()
     assert spy_chains["minutes_since"] == 7.5
     assert spy_chains["last_status"] == "suspect"
-    assert spy_chains["last_error_class"] is None
+    assert spy_chains["last_error_class"] == []
     # The garbage file is counted, never silently skipped, and never blanks the row.
     assert spy_chains["unreadable_segments"] == 1
 
@@ -332,7 +332,7 @@ def test_now_walks_back_past_a_gap_only_day(service: DashboardService):
     # option close: 2 days, 17 hours, 25.5 minutes before the clock's instant.
     assert qqq["last_snap_ts"] == et(MONDAY, 9, 30).isoformat()
     assert qqq["last_status"] == "gap"
-    assert qqq["last_error_class"] == "daemon_dead"
+    assert qqq["last_error_class"] == ["daemon_dead"]
     assert qqq["last_data_snap_ts"] == et(FRIDAY, 16, 15).isoformat()
     assert qqq["minutes_since"] == 3925.5
 
@@ -484,9 +484,9 @@ def test_today_strip_carries_status_rows_and_gap_reason(service: DashboardServic
     first, second, third, fourth, fifth = chains["slots"][:5]
     assert (first["status"], first["rows"]) == ("captured", 2)
     assert (second["status"], second["rows"]) == ("captured", 2)
-    assert (third["status"], third["rows"], third["error_class"]) == ("gap", 0, "http_429")
+    assert (third["status"], third["rows"], third["error_class"]) == ("gap", 0, ["http_429"])
     assert (fourth["status"], fourth["rows"]) == ("suspect", 2)
-    assert (fifth["status"], fifth["rows"], fifth["error_class"]) == ("missing", 0, None)
+    assert (fifth["status"], fifth["rows"], fifth["error_class"]) == ("missing", 0, [])
     assert chains["slots"][-1]["status"] == "pending"
 
 
@@ -518,7 +518,7 @@ def test_today_defaults_to_every_ticker_and_the_clock_session_date(service: Dash
         "pending": 395,
         "out_of_scope": 0,
     }
-    assert qqq["slots"][0]["error_class"] == "daemon_dead"
+    assert qqq["slots"][0]["error_class"] == ["daemon_dead"]
 
 
 def test_today_denominates_an_early_close_at_the_short_session(service: DashboardService):
@@ -643,12 +643,13 @@ def test_one_suspect_row_makes_the_whole_slot_suspect(fixture_lake: FixtureLake)
     assert service_over(root).run_query("now", {})["surfaces"][0]["last_status"] == "suspect"
 
 
-def test_a_slot_reports_its_most_common_error_class_and_how_many_it_carried(
+def test_a_slot_reports_every_error_class_it_carried_and_how_many(
     fixture_lake: FixtureLake,
 ):
     # A partial chain carries one class per failed date window, so several reasons in one
-    # minute is normal. The reported reason is the most common, not the smallest by name:
-    # ``http_429`` sorts first here and must not win.
+    # minute is normal. Every one of them is reported, in alphabetical order, and the
+    # count beside them is the size of that set. How often a reason repeats decides
+    # nothing: ``timeout_error`` is the most common here and lands last on name order.
     classes = ["timeout_error"] * 3 + ["http_429"] * 2 + ["http_500"]
     root = one_segment_lake(
         fixture_lake,
@@ -659,11 +660,48 @@ def test_a_slot_reports_its_most_common_error_class_and_how_many_it_carried(
     )
     slot = service_over(root).run_query("today", {})["strips"][0]["slots"][0]
     assert slot["status"] == "captured"
-    assert slot["error_class"] == "timeout_error"
+    assert slot["error_class"] == ["http_429", "http_500", "timeout_error"]
     assert slot["error_class_count"] == 3
     row = service_over(root).run_query("now", {})["surfaces"][0]
-    assert row["last_error_class"] == "timeout_error"
+    assert row["last_error_class"] == ["http_429", "http_500", "timeout_error"]
     assert row["last_error_class_count"] == 3
+
+
+def test_a_failed_close_names_its_own_reason_beside_the_absence_markers(
+    fixture_lake: FixtureLake,
+):
+    """The reason a close is missing survives the markers the rescue attempt writes.
+
+    The 16:15 cycle fails with ``http_500`` and leaves one gap row saying so. The close+5
+    fill then lands one window and gives up another, writing one ``chain_chunk_failed``
+    marker per series that window named. The markers outnumber the failure five to one,
+    so counting rows to pick one reason reported the rescue attempt's benign class and
+    dropped the reason the close of record is missing.
+    """
+    close = et(MONDAY, 16, 15)
+    rows = [_chains("SPY", close, journal.ROW_KIND_GAP, error_class="http_500")]
+    rows += [
+        _chains(
+            "SPY",
+            close,
+            journal.ROW_KIND_GAP,
+            expiration_date=f"2026-08-2{index}",
+            error_class=capture.CHAIN_CHUNK_FAILED,
+        )
+        for index in range(5)
+    ]
+    root = one_segment_lake(fixture_lake, rows)
+    slot = next(
+        slot
+        for slot in service_over(root).run_query("today", {})["strips"][0]["slots"]
+        if slot["slot"] == close.isoformat()
+    )
+    assert slot["status"] == "gap"
+    assert slot["error_class"] == [capture.CHAIN_CHUNK_FAILED, "http_500"]
+    assert slot["error_class_count"] == 2
+    row = service_over(root).run_query("now", {})["surfaces"][0]
+    assert row["last_error_class"] == [capture.CHAIN_CHUNK_FAILED, "http_500"]
+    assert row["last_error_class_count"] == 2
 
 
 def test_a_row_with_an_unparseable_snap_ts_is_dropped_not_fatal(fixture_lake: FixtureLake):
@@ -718,7 +756,7 @@ def test_a_segment_missing_an_optional_provenance_column_still_reads(fixture_lak
     )
     strip = service_over(root).run_query("today", {})["strips"][0]
     assert strip["slots"][0]["status"] == "captured"
-    assert strip["slots"][0]["error_class"] is None
+    assert strip["slots"][0]["error_class"] == []
     assert strip["slots"][0]["error_class_count"] == 0
     assert strip["drifted_segments"] == 0
 
@@ -823,7 +861,7 @@ def test_a_ticker_with_no_data_cycle_ever_reports_null_freshness(fixture_lake: F
     assert row["minutes_since"] is None
     assert row["last_snap_ts"] == et(MONDAY, 9, 30).isoformat()
     assert row["last_status"] == "gap"
-    assert row["last_error_class"] == "http_429"
+    assert row["last_error_class"] == ["http_429"]
     assert row["lookback_exhausted"] is False
 
 
@@ -1317,7 +1355,7 @@ def test_slots_before_capture_start_read_out_of_scope(root: Path):
     }
     # 09:32 carried a gap marker. Before the epoch it is out of scope, never a gap.
     assert chains["slots"][2]["status"] == "out_of_scope"
-    assert chains["slots"][2]["error_class"] is None
+    assert chains["slots"][2]["error_class"] == []
     assert chains["slots"][0]["status"] == "captured"
     assert chains["slots"][3]["status"] == "suspect"
     row = next(

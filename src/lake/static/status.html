@@ -327,14 +327,12 @@
     });
   }
 
-  // The reported class is the slot's most common reason, not its only one. A count above
-  // one says other reasons rode the same minute.
-  function appendReasonCount(node, count) {
-    if (typeof count !== "number" || count <= 1) { return; }
-    var span = el("span", " (most common of " + count + " reasons)", "muted");
-    span.title = "The slot carried " + count + " distinct error classes. The one named " +
-      "is the most common of them, not the only one.";
-    node.appendChild(span);
+  // Every reason the slot carried arrives as a list, ordered alphabetically by the
+  // query. Joining them names all of them, so nothing beside it has to say how many
+  // there were. An empty list is truthy in JavaScript, so callers test its length.
+  function reasonText(classes) {
+    if (!classes || !classes.length) { return ""; }
+    return classes.join(", ");
   }
 
   // -- the Now panel --------------------------------------------------------
@@ -405,9 +403,9 @@
 
   function reasonCell(row) {
     var cell = el("td");
-    if (row.last_error_class) {
-      cell.appendChild(el("span", row.last_error_class));
-      appendReasonCount(cell, row.last_error_class_count);
+    var reasons = reasonText(row.last_error_class);
+    if (reasons) {
+      cell.appendChild(el("span", reasons));
     }
     if (row.in_scope === false) {
       if (cell.firstChild) { cell.appendChild(el("span", ", ", "muted")); }
@@ -546,12 +544,8 @@
       var cell = el("div", null, STATUS_CLASS[slot.status] || UNKNOWN_CLASS);
       var tip = fmt(slot.slot, timeFmt) + " " + (STATUS_LABEL[slot.status] || UNKNOWN_LABEL);
       if (slot.rows > 0) { tip += ", " + plural(slot.rows, "row", "rows"); }
-      if (slot.error_class) {
-        tip += ", " + slot.error_class;
-        if (slot.error_class_count > 1) {
-          tip += " (most common of " + slot.error_class_count + " reasons)";
-        }
-      }
+      var reasons = reasonText(slot.error_class);
+      if (reasons) { tip += ", " + reasons; }
       cell.title = tip;
       row.appendChild(cell);
     });

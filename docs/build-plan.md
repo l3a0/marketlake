@@ -216,13 +216,19 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   still reach the daemon's stderr through `_report_guard`, so launchd captures them to a
   log file. A log file is a worse home than a page or a panel, and that is a separate
   question from this entry.
-- **[#118](https://github.com/l3a0/marketlake/issues/118).** The Today strip and the Now panel pick a slot's reason with
-  `mode(error_class)`, the most common one among its rows. Absence markers are per series
-  rather than per cycle, so they outnumber the row recording why the cycle failed and the
-  vote goes to the benign reason. A 16:15 that failed `http_500` reports
-  `chain_chunk_failed` once the fill gives up a window naming five series, which is
-  reachable without the membership marker at all. The marker widens the count rather than
-  creating the hole. No figure is wrong; the one reason string an operator reads is.
+- **[#118](https://github.com/l3a0/marketlake/issues/118).** The Today strip and the Now
+  panel report every error class a slot carried, rather than the one its rows named most
+  often. Picking the most common reason counted rows, and absence markers are written per
+  series rather than per cycle, so they outnumbered the row recording why the cycle failed
+  and the vote went to the benign reason. A 16:15 that failed `http_500` read as
+  `chain_chunk_failed` once the fill gave up a window naming five series, which was
+  reachable without the membership marker at all. The marker widened the count rather than
+  creating the hole. No figure was wrong. The one reason string an operator reads was.
+  Reporting the set discards nothing, and the classes that can share one slot are three,
+  so it stays a handful of strings. `error_class` on a slot and `last_error_class` on a
+  Now row are lists in both payloads, ordered by name, and the count beside each is the
+  size of the set it sits next to. The design doc's dashboard section carries why the two
+  alternatives were cut.
 - **D12** compaction and backup, plus the nightly window re-tune. Compaction merges a day's segments into one sealed partition. The re-tune runs after it. The job groups the day's rows by `window_start` and `window_end`, compares each window's contract count to the body limit, and rewrites `chain_plan.json` when the profile drifts.
 - **D12's exclusion list.** The design's *Backup, defined* names the sync root as `lake/`
   only, "with an explicit exclusion list". `runner.BACKUP_EXCLUSIONS` is now that list,

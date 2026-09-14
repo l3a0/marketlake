@@ -392,10 +392,24 @@ _JOURNAL_VIEW = "journal_rows"
 # connection's null ordering is.
 # ``row_kind`` values are bound, not spelled, so the journal module stays their one home.
 # ``other_rows`` counts the rows that match neither bound kind, including a null one, so
-# drift is counted rather than mistaken for a gap. ``mode`` reports the slot's most
-# common reason, not the alphabetically smallest, and the distinct count beside it says
-# how many reasons the slot carried. Several reasons in one minute is normal, because a
-# partial chain carries one class per failed date window.
+# drift is counted rather than mistaken for a gap. Every reason the slot carried is
+# reported, not one representative. Several reasons in one minute is normal, because a
+# partial chain carries one class per failed date window and an absence marker is written
+# per series. Counting rows to pick a representative let the per-series markers outvote
+# the row recording why the cycle failed, so the slot named the benign reason for a
+# failed close. Reporting the set discards nothing and needs no severity rank, which
+# would be a guess the operator is better placed to make.
+#
+# The order is alphabetical, so a given set always renders the same way. It says nothing
+# about severity: ``chain_chunk_failed`` sorts above ``vendor_auth_error`` and is the
+# milder of the two. Within one surface, ticker and slot the classes that can co-occur
+# are the cycle's own gap class, ``chain_chunk_failed`` for a window the close+5 fill
+# gave up, and ``option_close_series_absent`` for a series the vendor withdrew, so this
+# is a handful of strings rather than an open list.
+#
+# The ``FILTER`` keeps nulls out, which is what makes the list the distinct reasons the
+# slot carried. A slot whose rows all carry a null class aggregates to a null list, and
+# the dataclass reads that as no reason at all.
 _SLOT_SELECT = """
 SELECT slot_ms,
        count(*) FILTER (WHERE row_kind = $data_kind) AS data_rows,
@@ -405,8 +419,9 @@ SELECT slot_ms,
              AND row_kind IS DISTINCT FROM $gap_kind
        ) AS other_rows,
        bool_or(coalesce(suspect, false)) AS suspect,
-       mode(error_class) AS error_class,
-       count(DISTINCT error_class) AS error_class_count
+       list_sort(
+           array_agg(DISTINCT error_class) FILTER (WHERE error_class IS NOT NULL)
+       ) AS error_classes
 FROM (
     SELECT epoch_ms(TRY_CAST(snap_ts AS TIMESTAMPTZ)) AS slot_ms,
            row_kind, error_class, suspect
@@ -507,8 +522,25 @@ class SlotAggregate:
     gap_rows: int
     other_rows: int
     suspect: bool
-    error_class: str | None
-    error_class_count: int
+    error_classes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """Freeze the aggregated classes, whatever shape the query handed back.
+
+        DuckDB returns the aggregate as a list, and as null for a slot holding no class
+        at all. Both become a tuple here, so every reader sees one shape and a frozen
+        aggregate holds nothing mutable.
+        """
+        object.__setattr__(self, "error_classes", tuple(self.error_classes or ()))
+
+    @property
+    def error_class_count(self) -> int:
+        """How many distinct reasons the slot carried.
+
+        Derived from the reported set rather than counted separately, so the count and
+        the classes beside it cannot disagree.
+        """
+        return len(self.error_classes)
 
     @property
     def row_count(self) -> int:
@@ -902,9 +934,10 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
     For each ticker and surface the lake holds, the query walks the ticker's days newest
     first and stops at the first day with a data cycle. So a ticker whose latest day is
     gap-only still reports its true last success, and the latest slot's own status and
-    reason ride beside it. Minutes-since is ``now`` minus that slot, computed here from
-    the injected instant. The walk is bounded at ``MAX_LOOKBACK_SESSIONS`` days, and a
-    row that hit the bound says so rather than implying the ticker never captured.
+    every reason it carried ride beside it. Minutes-since is ``now`` minus that slot,
+    computed here from the injected instant. The walk is bounded at
+    ``MAX_LOOKBACK_SESSIONS`` days, and a row that hit the bound says so rather than
+    implying the ticker never captured.
 
     Each row also carries the ticker's ``capture_start`` epoch and whether ``now`` is at
     or after it. A ticker onboarded later today has no in-scope slot yet, so it is not a
@@ -985,8 +1018,7 @@ def _latest_cycle(
     last_data_ms: int | None = None
     last_ms: int | None = None
     last_status: str | None = None
-    last_error: str | None = None
-    last_error_count = 0
+    last_error: tuple[str, ...] = ()
     health = SegmentHealth()
     days = _dates_desc(ctx.paths, surface, ticker)
     walked = days[:MAX_LOOKBACK_SESSIONS]
@@ -999,8 +1031,7 @@ def _latest_cycle(
             latest = aggregates[-1]
             last_ms = latest.slot_ms
             last_status = latest.status
-            last_error = latest.error_class
-            last_error_count = latest.error_class_count
+            last_error = latest.error_classes
         with_data = [agg for agg in aggregates if agg.data_rows > 0]
         if with_data:
             last_data_ms = with_data[-1].slot_ms
@@ -1016,8 +1047,8 @@ def _latest_cycle(
         "minutes_since": minutes_since,
         "last_snap_ts": None if last_ms is None else _iso_et(last_ms),
         "last_status": last_status,
-        "last_error_class": last_error,
-        "last_error_class_count": last_error_count,
+        "last_error_class": list(last_error),
+        "last_error_class_count": len(last_error),
         "capture_start": None if capture_start is None else _iso(capture_start),
         "in_scope": not spans or _in_scope(ctx.now, spans),
         "lookback_exhausted": last_data_ms is None and len(days) > len(walked),
@@ -1040,15 +1071,15 @@ def query_today(
     calendar cannot judge at all, outside the window it loads, is a bad request.
 
     The slot list comes from the calendar through ``SessionClock.bounds``, the open
-    through the option close. Each slot reports its status, its data row count, and the
-    gap reason when one is present. A slot with data rows beside a gap marker, a partial
-    chain snapshot, reads captured, or suspect when a row carries the suspect flag, and
-    still carries the marker's class. A slot with no rows at all is pending when it falls
-    after the injected clock, never missing. A slot before the ticker's ``capture_start``
-    epoch is out of scope, neither missing nor pending. Data rows win over both of those,
-    so a real cycle is never hidden. A gap row wins over pending but not over out of
-    scope, because the design pins minutes before the epoch as out of scope and never
-    gaps.
+    through the option close. Each slot reports its status, its data row count, and every
+    gap reason it carried. A slot with data rows beside a gap marker, a partial chain
+    snapshot, reads captured, or suspect when a row carries the suspect flag, and still
+    carries the marker's class among its reasons. A slot with no rows at all is pending
+    when it falls after the injected clock, never missing. A slot before the ticker's
+    ``capture_start`` epoch is out of scope, neither missing nor pending. Data rows win
+    over both of those, so a real cycle is never hidden. A gap row wins over pending but
+    not over out of scope, because the design pins minutes before the epoch as out of
+    scope and never gaps.
     """
     session_day = day if day is not None else ctx.session.session_date()
     payload: dict[str, object] = {
@@ -1131,12 +1162,11 @@ def _strip(
         key = _slot_ms(slot)
         agg = by_slot.get(key)
         rows = 0 if agg is None else agg.data_rows
-        error_class = None if agg is None else agg.error_class
-        error_count = 0 if agg is None else agg.error_class_count
+        error_classes: tuple[str, ...] = () if agg is None else agg.error_classes
         if agg is not None and agg.data_rows > 0:
             status = agg.status
         elif spans and not _in_scope(slot, spans):
-            status, rows, error_class, error_count = STATUS_OUT_OF_SCOPE, 0, None, 0
+            status, rows, error_classes = STATUS_OUT_OF_SCOPE, 0, ()
         elif agg is not None:
             status = agg.status
         else:
@@ -1147,8 +1177,8 @@ def _strip(
                 "slot": slot.isoformat(),
                 "status": status,
                 "rows": rows,
-                "error_class": error_class,
-                "error_class_count": error_count,
+                "error_class": list(error_classes),
+                "error_class_count": len(error_classes),
             }
         )
     capture_start = spans[-1].start if spans else None
