@@ -355,8 +355,9 @@ def test_a_column_no_segment_carried_is_filed(lake_root, monkeypatch):
 
 def test_a_type_every_segment_agreed_on_is_filed(lake_root, monkeypatch):
     # A retype the segments disagree on never reaches the check, because the merge
-    # itself refuses it. A retype they agree on merges cleanly and is the one the pinned
-    # schema has to catch.
+    # itself refuses it. That refusal is covered by
+    # ``test_compaction.py::test_a_mid_day_retype_refuses_the_merge_and_leaves_the_day_alone``.
+    # A retype they agree on merges cleanly and is the one the pinned schema has to catch.
     index = CHAINS_SCHEMA.get_field_index(COLUMN)
     retyped = CHAINS_SCHEMA.set(index, pa.field(COLUMN, pa.int32()))
     _segment(

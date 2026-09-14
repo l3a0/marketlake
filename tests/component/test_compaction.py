@@ -21,6 +21,9 @@ They cover the job's contract:
    and leaves an unchanged profile's file untouched.
 8. A sealed partition that re-reads with the wrong row count, in either direction, raises
    before the manifest append, leaving the segments on disk and the backup and ping unrun.
+9. The prune deletes only an empty directory. A ticker directory holding a stray file
+   keeps both, and a repair leaves the date's other ticker-days alone.
+10. A ticker-day with no segments is passed over, and the rest of its date is still swept.
 """
 
 from __future__ import annotations
@@ -383,6 +386,43 @@ def test_a_mid_day_schema_rotation_compacts_by_name(lake_root):
     assert table.num_rows == 5
     assert table.column("vendor_new_field").null_count == 2
     assert result.sealed[0].rows == 5
+
+
+def test_a_mid_day_retype_refuses_the_merge_and_leaves_the_day_alone(lake_root):
+    # The other half of a rotation. A vendor field that arrived as an int all morning
+    # and as a float after lunch is not something unifying by name can reconcile. The
+    # merge widens nothing: silently promoting the column would bless a partition whose
+    # type changed inside one day, and the schema policy wants that failure loud. So the
+    # merge raises and the ticker-day stays exactly as the capture left it.
+    old_rows = _chains_rows(2, snap_ts=_snap(DAY, 0))
+    for row in old_rows:
+        row["open_interest"] = 100
+    index = CHAINS_SCHEMA.get_field_index("open_interest")
+    retyped = CHAINS_SCHEMA.set(index, pa.field("open_interest", pa.float64()))
+    new_rows = _chains_rows(3, snap_ts=_snap(DAY, 1))
+    for row in new_rows:
+        row["open_interest"] = 100.5
+    morning = _segment(
+        lake_root, "chains", "SPY", DAY, _table(CHAINS_SCHEMA, old_rows), start_ts="a"
+    )
+    afternoon = journal.segment_path(lake_root, "chains", "SPY", DAY, "b", PID)
+    with pa.OSFile(str(afternoon), "wb") as sink, pa.ipc.new_stream(sink, retyped) as writer:
+        writer.write_table(_table(retyped, new_rows))
+    morning_before = morning.read_bytes()
+    afternoon_before = afternoon.read_bytes()
+    events: list[str] = []
+
+    with pytest.raises(pa.ArrowTypeError):
+        _run(lake_root, backup=FakeBackup(events), pinger=FakePinger(events))
+
+    # Nothing was sealed: no partition, no manifest entry, both segments byte-identical.
+    # The backup and the ping never ran, so the failure reaches the health check as a
+    # missed ping rather than being reported as a healthy run.
+    assert not LakePaths(lake_root).chains_partition_path("SPY", DAY).exists()
+    assert read_manifest(lake_root) == []
+    assert morning.read_bytes() == morning_before
+    assert afternoon.read_bytes() == afternoon_before
+    assert events == []
 
 
 # -- 2. torn tails and shadow appends ----------------------------------------
@@ -1169,3 +1209,82 @@ def test_a_partition_that_re_reads_with_the_wrong_count_raises_and_manifests_not
     # The raise came before the backup and before the ping, so a run that sealed nothing
     # is never reported as healthy.
     assert events == []
+
+
+# -- 9. the prune deletes only an empty directory ----------------------------
+
+
+def test_a_stray_file_keeps_its_ticker_directory_through_the_prune(lake_root):
+    # Pruning is how a sealed date stops leaving empty shells behind, and the one thing
+    # it must never do is take a file with them. ``SEGMENT_GLOB`` carries the ``seg-``
+    # prefix, so a hand-made copy sitting beside the segments is not swept and not
+    # sealed. Its directory is therefore still populated when the prune reaches it.
+    paths = LakePaths(lake_root)
+    spy = _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
+    ticker_dir = paths.segment_dir("chains", "QQQ", DAY)
+    ticker_dir.mkdir(parents=True)
+    stray = ticker_dir / "copy-of-a-segment.arrows"
+    stray.write_bytes(b"not a segment")
+
+    result, _, _, _ = _run(lake_root)
+
+    # The prune did run over this date: SPY sealed and its own shell is gone.
+    assert [item.ticker for item in result.sealed] == ["SPY"]
+    assert not spy.exists()
+    assert not paths.segment_dir("chains", "SPY", DAY).exists()
+    # The stray file survives byte for byte, and so does every directory above it. The
+    # prune stops at the populated ticker directory rather than at the date.
+    assert stray.read_bytes() == b"not a segment"
+    assert ticker_dir.is_dir()
+    assert ticker_dir.parent.is_dir()
+    assert ticker_dir.parent.parent.is_dir()
+
+
+def test_a_repair_never_prunes_a_ticker_day_it_did_not_seal(lake_root):
+    # The human-invoked repair rebuilds one ticker-day and then prunes the whole date
+    # directory above it. Every other ticker-day under that date still holds the
+    # segments the repair did not read, which is unsealed captured data. Only the
+    # rebuilt ticker-day's now-empty shell goes.
+    paths = LakePaths(lake_root)
+    _manifested_day(lake_root, rows=1)
+    _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
+    untouched = _segment(
+        lake_root,
+        "chains",
+        "QQQ",
+        DAY,
+        _chains(3, snap_ts=_snap(DAY, 0), ticker="QQQ"),
+        start_ts="a",
+    )
+    before = untouched.read_bytes()
+
+    outcome = recompact_ticker_day(lake_root, "chains", "SPY", DAY, clock=_clock_at(DAY, 17, 0))
+
+    assert outcome.rows == 2
+    assert not paths.segment_dir("chains", "SPY", DAY).exists()
+    # QQQ's segment is still there, unread and unsealed, waiting for the next sweep.
+    assert untouched.read_bytes() == before
+    assert not paths.chains_partition_path("QQQ", DAY).exists()
+
+
+# -- 10. a ticker-day with no segments ---------------------------------------
+
+
+def test_a_ticker_day_with_no_segments_never_ends_the_sweep_for_its_date(lake_root):
+    # An empty ticker directory is what a writer leaves when it creates the directory
+    # and dies before its first cycle, or what an interrupted prune leaves behind. The
+    # sweep passes over it and keeps going. AAA sorts before SPY, so a sweep that
+    # stopped at the empty one rather than skipping it would seal nothing for this date.
+    paths = LakePaths(lake_root)
+    empty = paths.segment_dir("chains", "AAA", DAY)
+    empty.mkdir(parents=True)
+    spy = _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
+
+    result, _, _, _ = _run(lake_root)
+
+    assert [item.ticker for item in result.sealed] == ["SPY"]
+    assert pq.read_table(paths.chains_partition_path("SPY", DAY)).num_rows == 2
+    assert not spy.exists()
+    # The empty shell is pruned with the rest of the sealed date.
+    assert not empty.exists()
+    assert list(paths.journal_dir.iterdir()) == []
