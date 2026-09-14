@@ -143,6 +143,50 @@ def test_a_replace_that_keeps_the_size_is_still_reported(tmp_path):
     assert _config_dir_changes(before, after) == ("token.json was rewritten",)
 
 
+def test_an_in_place_rewrite_of_the_same_length_is_reported(tmp_path):
+    """The field the other two cannot carry: only the mtime moves here.
+
+    A stub written over the token through an already-open handle, or a plain ``r+`` seek
+    and write, keeps the inode because it is the same file and keeps the size because it
+    is the same length. That is a real way to lose a Schwab token, and without the mtime
+    in the tuple this listing would call it no change at all.
+    """
+    stand_in = _populate(tmp_path / "marketlake")
+    target = stand_in / "token.json"
+    original = target.stat()
+    before = _config_dir_listing(str(stand_in))
+
+    with open(target, "r+") as handle:
+        handle.write("Y" * original.st_size)
+    # Moved by hand rather than by the clock, so the assertion cannot turn on how fast
+    # the filesystem's mtime ticks.
+    os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns + 1_000_000))
+
+    after = _config_dir_listing(str(stand_in))
+    assert after["token.json"][1] == before["token.json"][1], "the size must not be what fires"
+    assert after["token.json"][2] == before["token.json"][2], "the inode must not be what fires"
+    assert after["token.json"][0] != before["token.json"][0]
+    assert _config_dir_changes(before, after) == ("token.json was rewritten",)
+
+
+def test_a_length_change_with_the_clock_pinned_is_reported(tmp_path):
+    """The mirror, isolating the size. Neither the mtime nor the inode moves here."""
+    stand_in = _populate(tmp_path / "marketlake")
+    target = stand_in / "token.json"
+    original = target.stat()
+    before = _config_dir_listing(str(stand_in))
+
+    with open(target, "r+") as handle:
+        handle.write("Z" * (original.st_size + 10))
+    os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+    after = _config_dir_listing(str(stand_in))
+    assert after["token.json"][0] == before["token.json"][0], "the mtime must not be what fires"
+    assert after["token.json"][2] == before["token.json"][2], "the inode must not be what fires"
+    assert after["token.json"][1] != before["token.json"][1]
+    assert _config_dir_changes(before, after) == ("token.json was rewritten",)
+
+
 def test_every_change_is_reported_in_one_pass(tmp_path):
     # Sorted by name, so a run that damaged several things reads as a list rather than
     # as whichever one happened to be noticed first.
@@ -279,6 +323,53 @@ def test_a_symlink_is_not_followed(tmp_path):
     # A loop back onto the directory itself terminates rather than hanging.
     (stand_in / "loop").symlink_to(stand_in)
     assert "loop" in _config_dir_listing(str(stand_in))
+
+
+def test_a_symlinks_target_changing_is_not_a_change(tmp_path):
+    """The link is stated as itself, so what it points at is not this check's business.
+
+    Following the link would have the listing report a change every time an unrelated
+    file elsewhere on the machine moved, which is a false alarm the reader cannot act on.
+    """
+    stand_in = _populate(tmp_path / "marketlake")
+    outside = tmp_path / "outside.json"
+    outside.write_text("original")
+    (stand_in / "link.json").symlink_to(outside)
+    before = _config_dir_listing(str(stand_in))
+
+    outside.write_text("rewritten, and longer than it was")
+
+    assert _config_dir_changes(before, _config_dir_listing(str(stand_in))) == ()
+
+
+def test_an_entry_that_cannot_be_stated_is_skipped(tmp_path, monkeypatch):
+    """A directory entry that vanishes between the listing and the stat must not raise.
+
+    The hook runs after every test has finished, so an exception here turns a clean run
+    into a crash with no test to blame. Driven with a stand-in entry, because losing the
+    race for real is not something a test can arrange.
+    """
+    stand_in = _populate(tmp_path / "marketlake")
+    real_scandir = os.scandir
+
+    class _Vanished:
+        path = str(stand_in / "gone.json")
+
+        @staticmethod
+        def is_dir(follow_symlinks: bool = True) -> bool:
+            return False
+
+        @staticmethod
+        def stat(follow_symlinks: bool = True):
+            raise OSError("it went away between scandir and stat")
+
+    def scandir(path):
+        return [*real_scandir(path), _Vanished()]
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    listing = _config_dir_listing(str(stand_in))
+    assert "gone.json" not in listing
+    assert "token.json" in listing
 
 
 # -- the session hook --------------------------------------------------------------------

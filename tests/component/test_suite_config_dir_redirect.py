@@ -39,8 +39,13 @@ from importlib import import_module
 from pathlib import Path
 
 from lake.paths import CONFIG_DIR_ENV, CONFIG_DIR_PARTS, TOKEN_FILE, config_dir
-from tests.component.test_config_dir_override import _DEFAULTS, DEFAULT_PAIRS
+from tests.component.test_config_dir_override import (
+    _DEFAULTS,
+    DEFAULT_PAIRS,
+    assert_the_scan_found_something,
+)
 from tests.conftest import _THROWAWAY_CONFIG_DIR
+from tests.support.config_defaults import modules_building_a_default
 from tests.support.config_guard import is_protected
 
 # The repo root. A child that imports the ``tests`` package needs it on ``sys.path``, and
@@ -99,6 +104,7 @@ def test_a_child_that_arranges_nothing_resolves_into_the_throwaway():
     Every default is checked together, because a redirected token beside a live config
     is a half-redirected process.
     """
+    assert_the_scan_found_something()
     defaults = _inheriting_child(_DEFAULTS)
     assert set(defaults) == set(PARENT_DEFAULTS)
     for name, value in defaults.items():
@@ -192,6 +198,7 @@ def test_the_redirect_moved_every_default_in_this_process_too():
     assertion catches the consequence from the other end, including a way in that the
     check cannot see, such as a default rebound after the fact.
     """
+    assert_the_scan_found_something()
     for name, default in PARENT_DEFAULTS.items():
         assert default.parent == THROWAWAY, (
             f"{name} is bound to {default.parent}. The redirect in tests/conftest.py has "
@@ -199,6 +206,49 @@ def test_the_redirect_moved_every_default_in_this_process_too():
             "what moved above it."
         )
     assert config_dir() == THROWAWAY
+
+
+def test_the_import_order_check_reads_the_scan():
+    """The check has to be looking at the modules the scan found, not at a list of its own.
+
+    Setting ``_BINDS_A_DEFAULT`` to an empty tuple leaves the whole suite green, because
+    the condition it feeds never fires on a healthy run. This is what notices.
+    """
+    from tests import conftest
+
+    assert conftest._BINDS_A_DEFAULT == modules_building_a_default()
+    assert conftest._BINDS_A_DEFAULT, "an empty list would make the check below fire never"
+
+
+def test_conftest_refuses_to_import_once_a_default_has_already_bound():
+    """The refusal itself, driven in a child, because a healthy run never reaches it.
+
+    A process that imports one of these modules first has bound that module's default
+    against whatever the environment said then, and no redirect can move it afterwards.
+    Importing ``tests.conftest`` there has to fail loudly rather than export a variable
+    that moves nothing.
+    """
+    script = "import lake.reauth\nimport tests.conftest\n"
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0, proc.stdout
+    assert "lake.reauth" in proc.stderr
+    assert CONFIG_DIR_ENV in proc.stderr
+
+    # The other direction, so this cannot pass because importing conftest always fails.
+    clean = subprocess.run(
+        [sys.executable, "-c", "import tests.conftest\n"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert clean.returncode == 0, clean.stderr
 
 
 def test_the_redirect_does_not_disarm_the_guard():

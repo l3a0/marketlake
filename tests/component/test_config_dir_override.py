@@ -51,6 +51,19 @@ DEFAULT_PAIRS = defaults_built_from_config_dir()
 # ``module.CONSTANT`` for each, which is what the child prints and the tests compare.
 DEFAULT_KEYS = tuple(f"{module}.{name}" for module, name in DEFAULT_PAIRS)
 
+# The floor under every assertion built on the scan. A scan that came back empty would
+# leave each loop below iterating nothing and each set comparison holding two empty sets,
+# so both tests here and both in the redirect module would pass while checking nothing.
+# The token's own default is named rather than a count, because it is the file the whole
+# arrangement exists to keep and a count goes stale the day a default is retired.
+TOKEN_DEFAULT = "lake.reauth.DEFAULT_TOKEN_PATH"
+
+
+def assert_the_scan_found_something() -> None:
+    """Fail loudly when the derived list is empty or has lost the token's default."""
+    assert DEFAULT_KEYS, "the scan found no defaults, so every assertion built on it is vacuous"
+    assert TOKEN_DEFAULT in DEFAULT_KEYS, DEFAULT_KEYS
+
 
 def _defaults_script(pairs: tuple[tuple[str, str], ...]) -> str:
     """A child script printing where each default resolved, keyed by its full name.
@@ -96,6 +109,7 @@ def _child(script: str, config_dir: Path | None) -> dict[str, str]:
 
 def test_the_override_moves_every_default_in_the_package(tmp_path):
     throwaway = tmp_path / "throwaway"
+    assert_the_scan_found_something()
     defaults = _child(_DEFAULTS, throwaway)
     assert set(defaults) == set(DEFAULT_KEYS)
     for name, value in defaults.items():
@@ -108,6 +122,7 @@ def test_without_the_override_every_default_is_the_real_directory(tmp_path):
     A redirect that applied unconditionally would take the daemon and the weekly ritual
     with it. Nothing is written here. The paths are printed and compared.
     """
+    assert_the_scan_found_something()
     real = Path.home() / ".config" / "marketlake"
     for name, value in _child(_DEFAULTS, None).items():
         assert Path(value).parent == real, name

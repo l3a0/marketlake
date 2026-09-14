@@ -247,6 +247,19 @@ def test_two_defaults_in_one_module_are_both_found(tmp_path):
     assert modules_building_a_default(root) == ("lake.probe",)
 
 
+def test_a_chained_assignment_names_every_target(tmp_path):
+    """``A = B = config_dir() / X`` binds both, so both have to be reported.
+
+    Every real default and every other test here uses a single target, so the loop over
+    targets is never put under load by anything else.
+    """
+    root = _package(
+        tmp_path / "lake",
+        {"probe.py": "from lake.paths import config_dir\nA = B = config_dir() / 'x'\n"},
+    )
+    assert defaults_built_from_config_dir(root) == (("lake.probe", "A"), ("lake.probe", "B"))
+
+
 def test_a_module_in_a_subpackage_is_named_with_dots(tmp_path):
     # The package is flat today. A nested module named by its bare stem would be an
     # import name that does not resolve, and the redirect's sys.modules check would
