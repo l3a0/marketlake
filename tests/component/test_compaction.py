@@ -22,7 +22,8 @@ They cover the job's contract:
 8. A sealed partition that re-reads with the wrong row count, in either direction, raises
    before the manifest append, leaving the segments on disk and the backup and ping unrun.
 9. The prune deletes only an empty directory. A ticker directory holding a stray file
-   keeps both, and a repair leaves the date's other ticker-days alone.
+   keeps both, and a repair leaves the date's other ticker-days alone. A repair that
+   empties its date prunes every level of it.
 10. A ticker-day with no segments is passed over, and the rest of its date is still swept.
 """
 
@@ -1267,17 +1268,36 @@ def test_a_repair_never_prunes_a_ticker_day_it_did_not_seal(lake_root):
     assert not paths.chains_partition_path("QQQ", DAY).exists()
 
 
+def test_a_repair_prunes_the_whole_date_it_emptied(lake_root):
+    # The other direction, and what decides where the prune is rooted. The repair prunes
+    # from the date directory down rather than from the ticker directory it rebuilt, so
+    # repairing a date's only ticker-day leaves no shell at all. Rooted one level lower
+    # the surface directory would stand forever, and two levels lower the date with it.
+    paths = LakePaths(lake_root)
+    _manifested_day(lake_root, rows=1)
+    _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
+
+    outcome = recompact_ticker_day(lake_root, "chains", "SPY", DAY, clock=_clock_at(DAY, 17, 0))
+
+    assert outcome.rows == 2
+    assert list(paths.journal_dir.iterdir()) == []
+
+
 # -- 10. a ticker-day with no segments ---------------------------------------
 
 
 def test_a_ticker_day_with_no_segments_never_ends_the_sweep_for_its_date(lake_root):
     # An empty ticker directory is what a writer leaves when it creates the directory
     # and dies before its first cycle, or what an interrupted prune leaves behind. The
-    # sweep passes over it and keeps going. AAA sorts before SPY, so a sweep that
-    # stopped at the empty one rather than skipping it would seal nothing for this date.
+    # sweep passes over it and keeps going. One empty shell sits on each side of SPY in
+    # the walk, so a sweep that stopped at an empty one rather than skipping it would
+    # seal nothing for this date whichever end it started from. One shell alone would
+    # rest the test on the iteration order rather than on the skip.
     paths = LakePaths(lake_root)
-    empty = paths.segment_dir("chains", "AAA", DAY)
-    empty.mkdir(parents=True)
+    before = paths.segment_dir("chains", "AAA", DAY)
+    after = paths.segment_dir("chains", "ZZZ", DAY)
+    for shell in (before, after):
+        shell.mkdir(parents=True)
     spy = _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
 
     result, _, _, _ = _run(lake_root)
@@ -1285,6 +1305,6 @@ def test_a_ticker_day_with_no_segments_never_ends_the_sweep_for_its_date(lake_ro
     assert [item.ticker for item in result.sealed] == ["SPY"]
     assert pq.read_table(paths.chains_partition_path("SPY", DAY)).num_rows == 2
     assert not spy.exists()
-    # The empty shell is pruned with the rest of the sealed date.
-    assert not empty.exists()
+    # Both empty shells are pruned with the rest of the sealed date.
+    assert not before.exists() and not after.exists()
     assert list(paths.journal_dir.iterdir()) == []

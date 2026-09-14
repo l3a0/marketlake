@@ -32,15 +32,20 @@ The job's rules, each glossed at first use.
    compared to the sum across the segments, and its digest is what the manifest records.
    Only after that does the manifest entry land, and only after the manifest append are
    the segments unlinked. A crash at any point re-runs with nothing lost.
-4. *A drifted merge is reported, never raised.* Segments in one ticker-day can disagree
-   about columns only when the daemon restarted onto different code mid-session, because
-   every production segment takes its schema from ``journal.schema_for`` and a vendor
-   that stops sending a field yields a null column rather than a dropped one. So the
-   check guards this project's own release process rather than the vendor. The merged
-   schema is compared to the pinned one at the merge, which is the last moment the
-   segments exist, and what moved is filed under ``reports/`` once the seal has
-   committed. Nothing raises, because the job seals every ticker-day bare and a raise
-   would cost the rest of the sweep, the re-tune, the backup, and the ping. The durable
+4. *Drift that survives the merge is reported, never raised.* Segments in one ticker-day
+   can disagree about columns only when the daemon restarted onto different code
+   mid-session, because every production segment takes its schema from
+   ``journal.schema_for`` and a vendor that stops sending a field yields a null column
+   rather than a dropped one. So the check guards this project's own release process
+   rather than the vendor. The merged schema is compared to the pinned one at the merge,
+   which is the last moment the segments exist, and what moved is filed under
+   ``reports/`` once the seal has committed. The finding never raises, because the job
+   seals every ticker-day bare and a raise would cost the rest of the sweep, the re-tune,
+   the backup, and the ping. One disagreement never reaches this check at all. A column
+   two segments hold at different types is refused by ``concat_tables`` before the
+   comparison runs, and that refusal does raise and does cost the run. Whether it should
+   is [#184](https://github.com/l3a0/marketlake/issues/184), because the trade this rule
+   declines for a dropped column has never been weighed for a retype. The durable
    remedy is ``schema_version`` enforcement, which is
    [#128](https://github.com/l3a0/marketlake/issues/128) and not compaction's business.
    This check is a detector and secondary to it.
