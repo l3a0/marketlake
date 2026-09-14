@@ -545,8 +545,10 @@ def _seal(
     entry is appended. Only then are the segments unlinked.
 
     With ``guard`` on, the no-shrink invariant is checked before the partition file is
-    replaced, not only at the manifest append. A refused rebuild must leave the larger
-    partition on disk, untouched, beside its still-valid entry.
+    replaced. A refused rebuild must leave the larger partition on disk, untouched,
+    beside its still-valid entry. ``append_manifest`` checks the same invariant again,
+    and the comment at that call says why that second check can never be the one that
+    refuses a seal started here.
 
     The merged schema is compared to the surface's pinned one on the way past. The
     comparison happens at the merge, because that is the last moment the merged schema
@@ -611,6 +613,23 @@ def _seal(
     if actual != expected:
         raise CompactionVerifyError(rel, expected, actual)
 
+    # ``guard`` is passed on, but not because this append re-checks anything reachable.
+    # It arrives with the same row count, against the same manifest, and nothing appends
+    # a line in between, because every appender takes the lake-root lock this run already
+    # holds. So a guard the pre-write check passed passes here too, always. What the
+    # argument does decide is the other direction: a human recompaction arrives with
+    # ``guard`` off, and the append has to be told, or it would refuse the very
+    # supersession that was asked for. #170 established both halves by mutation. Forcing
+    # ``guard=False`` here changed no test in the suite, and forcing ``guard=True`` failed
+    # the deliberate-recompaction test. So the check is live for every other caller of
+    # ``append_manifest`` and unreachable from this one.
+    #
+    # Which caller got here decides whether either check has anything to refuse.
+    # ``compact`` reaches ``_seal`` only for a ticker-day with no manifest entry, and
+    # ``guard_row_count`` has nothing to compare against for such a path, so both checks
+    # are inert on that route. ``recompact_ticker_day`` is the one caller that rebuilds a
+    # manifested partition, so it is the only one either check can refuse, and the
+    # pre-write one above is where that refusal lands.
     entry = append_manifest(
         root,
         partition=rel,
