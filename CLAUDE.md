@@ -61,9 +61,15 @@ Review by fanning out independent lenses, then verifying each finding adversaria
 
 Verify by executing, not by reading. Mutate the code and confirm a test fails. A test that still passes under mutation does not cover what it claims to cover. Say plainly what the review found and what it refuted, including when it found nothing.
 
-**A filed issue carries its milestone and its labels (owner directive, 2026-09-14).** Filing is not finished when the issue exists. An issue with no milestone appears in no slice view and no filtered list, so it is invisible until someone sweeps for nulls, and nothing brings it back on its own. Three arrived that way in a single day, each from a session told to file what it found and nothing further: #143, then #145 and #146. The sessions did exactly what was asked, which is why the rule belongs here rather than in a reminder.
+**A filed issue carries its milestone and its labels (owner directive, 2026-09-13).** Filing is not finished when the issue exists. An issue with no milestone appears in no slice view and no view scoped by kind, so only a sweep for nulls finds it, and nothing brings it back on its own. Three arrived that way in a single day, each from a session told to file what it found and nothing further: #143, then #145 and #146. The sessions did exactly what was asked, which is why the rule belongs here rather than in a reminder.
 
-So an issue is finished when it says three things. Which slice owns it, through a milestone. What kind of work it is, through a label. And what it waits on, through a dependency, where it waits on anything. No automation supplies the first two. A project's auto-add makes an untriaged issue visible and does not triage it, and nothing infers which slice a gap belongs to.
+So a filed issue is finished when it says three things.
+
+1. A milestone says which slice owns it.
+2. A label says what kind of work it is.
+3. A dependency says what it waits on, where it waits on anything.
+
+No automation supplies the first two. A project's auto-add makes an untriaged issue visible and does not triage it, and nothing infers which slice a gap belongs to.
 
 The same applies to an issue a spawned session is told it may file. The instruction to file carries the instruction to triage, or the work lands where nothing will look for it.
 
