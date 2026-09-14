@@ -11,6 +11,9 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # The whole job takes well under a minute today. This ceiling sits far above
+    # that, so it only fires on a hang, and it replaces GitHub's six-hour default.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
