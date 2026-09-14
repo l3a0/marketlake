@@ -916,6 +916,7 @@ def test_the_reauth_script_runs_the_reauth_module_and_nothing_else(tmp_path):
     commands = [line for line in lines if line and not line.startswith("#")]
     assert commands == [
         "set -euo pipefail",
+        "unset MARKETLAKE_CONFIG_DIR",
         "cd /Users/someone/marketlake",
         'exec /opt/py/bin/python -m lake.reauth "$@"',
     ]

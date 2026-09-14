@@ -65,3 +65,30 @@ uv run ruff check
 uv run ruff format --check
 uv run pytest
 ```
+
+### Keep development runs off the real config directory
+
+`~/.config/marketlake/` holds the live Schwab token, and several commands default to it.
+`python -m lake.reauth` with no `--token` writes the standard location, which is right
+for the weekly ritual and wrong for anyone exercising the tool. On 2026-09-13 that is how
+a stub reached the production token path and a working token was lost.
+
+`MARKETLAKE_CONFIG_DIR` moves the whole directory for one process. Set it and the run
+cannot reach the real token, the real `config.yaml`, or the real roster, whatever it is
+given on the command line.
+
+```bash
+MARKETLAKE_CONFIG_DIR=/tmp/marketlake-dev uv run python -m lake.reauth
+```
+
+It has to be set before the process starts, because every default is built when the
+module is imported. Exporting it in the shell being worked in covers that whole session.
+
+Do not put it in a shell profile. The weekly re-auth runs in that same shell, so a
+profile export would send the week's token to a throwaway directory while the daemon
+kept reading the real one as it expired. The rendered `reauth.sh` unsets the variable to
+make the ritual immune to this, and a re-auth run any other way prints the token path it
+wrote, so the sign-off block is where to check it landed where you meant.
+
+The test suite needs none of this. A guard in `tests/conftest.py` fails any test that
+writes the real directory and names the path.

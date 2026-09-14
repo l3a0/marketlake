@@ -384,11 +384,20 @@ CONFIG_DIR_PARTS = (".config", "marketlake")
 # file that was lost and not the only one that can be. ``config.yaml`` holds four
 # secrets and the roster is hand-maintained.
 #
-# Two limits are worth stating. It is read when this module is imported, not when a
-# path is used, so exporting it from inside a running process moves nothing. And it is
-# an override a person sets, so it does not protect a run that forgets it. The test
-# suite is covered by the config-directory guard in ``tests/conftest.py`` instead,
-# which needs nobody to remember anything.
+# Two limits are worth stating. ``config_dir`` reads the environment on every call, but
+# every default built from it is a module-level constant bound when that module is
+# imported, so exporting the variable from inside a running process moves nothing that
+# a caller actually uses. It has to be set before the process starts. And it is an
+# override a person sets, so it does not protect a run that forgets it. The test suite
+# is covered by the config-directory guard in ``tests/conftest.py`` instead, which needs
+# nobody to remember anything.
+#
+# Setting it for one command is the safe habit, as in
+# ``MARKETLAKE_CONFIG_DIR=/tmp/ml-dev python -m lake.reauth``, or exporting it in the
+# shell being worked in. A shell profile is the wrong home for it: the weekly re-auth
+# ritual runs in the operator's own shell, so a profile export would send the week's
+# token to a throwaway directory while the daemon kept reading the real one as it
+# expired. The rendered ``reauth.sh`` unsets the variable for exactly that reason.
 CONFIG_DIR_ENV = "MARKETLAKE_CONFIG_DIR"
 
 

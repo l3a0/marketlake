@@ -93,7 +93,7 @@ from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
 from lake.config import CALLBACK_KEY, input_errors_exit, load_config
 from lake.manifest import ScrubResult, scrub
-from lake.paths import TOKEN_FILE, config_dir
+from lake.paths import CONFIG_DIR_ENV, TOKEN_FILE, config_dir
 from lake.runner import PING_FAILURES, LaunchdJob, Pinger, UrllibPinger, calendar_interval
 from lake.vendor import Vendor
 
@@ -2403,6 +2403,15 @@ def reauth_script(host: LaunchdHost) -> str:
 
     Arguments pass through, so an operator can point the tool at a throwaway config or a
     token path without editing the rendered file.
+
+    It unsets ``MARKETLAKE_CONFIG_DIR`` before the call. That variable moves the whole
+    config directory for one process, and it exists so a development run cannot reach
+    the real token. This is the one run that must reach it. The ritual is not a launchd
+    job, so unlike every other rendered file this one inherits the operator's shell, and
+    an export left in a shell profile would send the week's token to a throwaway
+    directory while the daemon kept reading the real one as it expired. Unsetting it
+    here costs a developer nothing, because a development run of the tool is
+    ``python -m lake.reauth`` rather than this script.
     """
     return (
         "\n".join(
@@ -2448,8 +2457,17 @@ def reauth_script(host: LaunchdHost) -> str:
                 "# Start the login from this script or from a bookmarked Schwab URL. Never",
                 "# from a link in a notification. Pages never carry auth links, so one that",
                 "# does is not from here.",
+                "#",
+                f"# It unsets {CONFIG_DIR_ENV} first. That variable moves the whole config",
+                "# directory for one process so a development run cannot reach the real",
+                "# token, and this is the one run that must reach it. This script inherits",
+                "# your shell, so an export left in a shell profile would otherwise send the",
+                "# week's token to a throwaway directory while the daemon kept reading the",
+                "# real one as it expired. The tool prints the token path it wrote, so the",
+                "# sign-off block is where to check this landed where you meant.",
                 "set -euo pipefail",
                 "",
+                f"unset {CONFIG_DIR_ENV}",
                 f"cd {shlex.quote(host.project_dir)}",
                 f'exec {shlex.quote(host.python)} -m lake.reauth "$@"',
             ]

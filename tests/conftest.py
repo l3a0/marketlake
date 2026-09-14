@@ -11,6 +11,7 @@ from __future__ import annotations
 import builtins
 import io
 import os
+import shutil
 import socket
 import subprocess
 import urllib.request
@@ -263,11 +264,25 @@ def _no_subprocess() -> Iterator[None]:
 # ``Path.home()`` reads ``$HOME``, which a test is free to monkeypatch, so asking later
 # would let a test move the protected directory out from under the guard.
 #
-# Both spellings are protected. A home whose ``.config`` is a symlink has two names for
-# one directory, and a write through the resolved one is the same write.
+# Both spellings are protected. A home whose ``.config`` is a symlink, which is what a
+# dotfile manager usually leaves behind, has two names for one directory, and a write
+# through the resolved one is the same write.
+
+
+def _protected_roots(directory: str | Path) -> tuple[str, ...]:
+    """Both spellings of ``directory``: as given, and fully resolved.
+
+    It takes a directory rather than reading one so a test can drive it, since the two
+    spellings collapse to one string on a machine whose ``.config`` is a real directory.
+    That is every machine the suite has run on, so nothing would otherwise exercise the
+    resolved one.
+    """
+    as_given = str(directory)
+    return tuple({as_given, os.path.realpath(as_given)})
+
 
 _REAL_CONFIG_DIR = str(Path.home().joinpath(*CONFIG_DIR_PARTS))
-_PROTECTED_ROOTS = tuple({_REAL_CONFIG_DIR, os.path.realpath(_REAL_CONFIG_DIR)})
+_PROTECTED_ROOTS = _protected_roots(_REAL_CONFIG_DIR)
 
 # The open modes and flags that can change a file. Reads are left alone: the issue this
 # fixture answers is a write, and refusing reads would fail tests that legitimately load
@@ -297,9 +312,17 @@ def _is_protected(target: object) -> bool:
     anything else.
 
     The comparison is on the path's text, expanded and made absolute, and touches no
-    filesystem. That keeps the check free on the hot path, since every ``open`` in the
-    suite runs it, and it is enough because both names of the directory are already in
-    ``_PROTECTED_ROOTS``.
+    filesystem. It therefore catches a path spelled at the directory, under either of
+    the two names in ``_PROTECTED_ROOTS``, and it does not catch a path that arrives
+    there through a symlink of its own: a link outside the directory pointing at a file
+    inside it, or an ancestor that is a link the roots do not already name. Opening such
+    a path for writing truncates the real file and this returns ``False``.
+
+    Resolving every candidate with ``os.path.realpath`` would close that, and the price
+    is the reason it does not. Measured on this machine, ``realpath`` costs 25.8 µs
+    against ``abspath``'s 0.36 µs, and every ``open`` in the suite runs this, which is
+    seconds per run to catch a shape nothing in this repo builds. Revisit that trade if
+    anything here ever does build one.
     """
     if isinstance(target, int):
         return False
@@ -328,7 +351,7 @@ def _no_config_writes() -> Iterator[None]:
     does it by accident, and a test making that mistake would not have asked for the
     guard.
 
-    Twelve names are patched, in four kinds.
+    Thirteen names are patched, in five kinds.
 
     1. Opening a file for writing: ``builtins.open``, ``io.open``, and ``os.open``. The
        first two are the same function object, but patching one does not reach the
@@ -350,6 +373,14 @@ def _no_config_writes() -> Iterator[None]:
        funnel through it, so neither needs its own patch. This is the one that fires
        first on ``reauth.write_token``, which calls ``parent.mkdir(parents=True,
        exist_ok=True)`` before it opens anything.
+    5. Removing a tree: ``shutil.rmtree``. It gets its own patch because it does not
+       reach the others. On a platform where ``shutil.rmtree.avoids_symlink_attacks``
+       is true, which macOS is, it walks the tree on directory descriptors and unlinks
+       each child with ``dir_fd=``, a form the text check below cannot read. Only the
+       top directory reaches the guarded ``os.rmdir``, and only last. Without this
+       patch the guard raises after every file in the directory is already gone, which
+       is worse than not covering it at all: the run reports a refusal that protected
+       nothing.
 
     Five things a monkeypatch cannot reach, and the guard does not claim:
 
@@ -359,10 +390,15 @@ def _no_config_writes() -> Iterator[None]:
     3. A write through a descriptor that is already open, such as ``os.write`` or
        ``os.ftruncate``, and metadata-only changes such as ``os.chmod`` and
        ``os.utime``. Neither destroys the file's contents.
+       A path that reaches the directory through a symlink of its own is not covered
+       either, for the reason ``_is_protected`` gives.
     4. A path resolved against a directory descriptor, through the ``dir_fd`` argument
        these calls accept. The path is then relative to that descriptor rather than to
        the working directory, so the text check reads it wrongly. No call site in this
-       repo passes one.
+       repo passes one, but the standard library passes one to itself, which is why
+       ``shutil.rmtree`` is patched by name above rather than left to the ``os`` calls
+       it makes. A stdlib helper added later that walks on descriptors the same way
+       would need the same treatment.
     5. A writer that never goes through these names, such as an extension module holding
        the path itself. ``pyarrow`` writes through its own filesystem layer, and no
        Parquet or Arrow write in this package targets the config directory.
@@ -423,4 +459,5 @@ def _no_config_writes() -> Iterator[None]:
         mp.setattr(os, "symlink", guard_destination(os.symlink))
         for name in ("unlink", "remove", "rmdir", "truncate", "mkdir"):
             mp.setattr(os, name, guard_one(getattr(os, name)))
+        mp.setattr(shutil, "rmtree", guard_one(shutil.rmtree))
         yield

@@ -330,6 +330,37 @@ def test_the_override_is_read_from_the_real_environment_by_default(monkeypatch):
     assert config_dir() == Path("/tmp/throwaway")
 
 
+def test_an_explicit_empty_mapping_beats_a_set_variable(monkeypatch):
+    """``env={}`` has to mean "no override", not "go and look at the real environment".
+
+    Three assertions in this file and in the control plane's render tests pass ``env={}``
+    to say what the home-relative default is whatever a developer exported. The suite
+    runs with the variable unset, so ``{}`` and ``os.environ`` agree there and the seam
+    is never put under load. Setting the variable first is what tells them apart.
+    """
+    monkeypatch.setenv(CONFIG_DIR_ENV, "/tmp/throwaway")
+    assert config_dir(env={}) == Path.home() / ".config" / "marketlake"
+    assert config_dir(env={CONFIG_DIR_ENV: "/tmp/other"}) == Path("/tmp/other")
+
+
+def test_an_empty_home_is_still_an_explicit_home():
+    """An explicit ``home`` wins by being given, not by being truthy.
+
+    The precedence reads "an explicit home, then the variable, then this user's home",
+    and a falsy-but-given home that fell through to the variable would quietly break
+    that. Nothing passes an empty home today. This pins which rule decides when
+    something does.
+    """
+    assert config_dir("", env={CONFIG_DIR_ENV: "/tmp/throwaway"}) == Path(".config/marketlake")
+
+
+def test_the_variable_is_spelled_the_way_the_design_doc_names_it():
+    # Every other test here refers to the symbol, so a rename stays green across the
+    # whole suite while every exported override goes inert and the design doc, which
+    # writes the name out by hand, drifts. The literal is the operator-facing contract.
+    assert CONFIG_DIR_ENV == "MARKETLAKE_CONFIG_DIR"
+
+
 @pytest.mark.parametrize(
     ("default", "name"),
     [

@@ -173,6 +173,73 @@ print(json.dumps({
     assert str(Path.home() / ".config" / "marketlake") in result["roots"]
 
 
+def test_the_rendered_ritual_script_unsets_the_override(tmp_path):
+    """The weekly re-auth is the one run that must reach the real token.
+
+    Every other rendered file is run by launchd, which hands a job only the environment
+    its plist names. This one is run by the operator in their own shell, so it is the
+    single rendered thing an exported override reaches. A profile export would send the
+    week's token to a throwaway directory while the daemon kept reading the real one as
+    it expired, which is the dark Monday this whole issue is about, arrived at from the
+    other side.
+
+    The unset must come before the call, or it protects nothing.
+    """
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    lines = [
+        line
+        for line in (out / cp.REAUTH_SCRIPT_FILE).read_text().splitlines()
+        if line and not line.startswith("#")
+    ]
+    assert f"unset {CONFIG_DIR_ENV}" in lines
+    invocation = next(line for line in lines if "lake.reauth" in line)
+    assert lines.index(f"unset {CONFIG_DIR_ENV}") < lines.index(invocation)
+
+
+def test_the_ritual_script_really_ignores_an_exported_override(tmp_path):
+    """Driven rather than read, because the claim is about what bash does.
+
+    The script is rendered against a stub interpreter that prints the token path the
+    tool would have used, then run with the override exported. Reading the file for an
+    ``unset`` line proves the line is there. Running it proves the line works.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    stub = tmp_path / "stub-python"
+    stub.write_text(f'#!/bin/bash\nprintf "%s\\n" "${{{CONFIG_DIR_ENV}-<unset>}}"\n')
+    stub.chmod(0o755)
+
+    out = tmp_path / "out"
+    args = [
+        "--python",
+        str(stub),
+        "--owner",
+        "someone",
+        "--home",
+        "/Users/someone",
+        "--project-dir",
+        str(project),
+        "--log-dir",
+        "/Users/someone/Library/Logs/marketlake",
+    ]
+    assert cp.main(["render", "--out", str(out), *args]) == 0
+
+    proc = subprocess.run(
+        [str(out / cp.REAUTH_SCRIPT_FILE)],
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(Path.home()),
+            CONFIG_DIR_ENV: "/tmp/throwaway-would-be-wrong",
+        },
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "<unset>", proc.stdout
+
+
 def test_the_rendered_plists_do_not_carry_the_override(tmp_path):
     """Production is out of the override's reach, which is why the default can stay live.
 

@@ -34,6 +34,9 @@ Six properties carry the guard, and each is covered below.
 from __future__ import annotations
 
 import os
+import shutil
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -41,7 +44,8 @@ import pytest
 from lake.paths import CONFIG_DIR_ENV, CONFIG_DIR_PARTS, TOKEN_FILE
 from lake.reauth import token_writer, write_token
 from lake.tickers import upsert_ticker
-from tests.conftest import ConfigWriteInTest, _is_protected
+from tests import conftest
+from tests.conftest import ConfigWriteInTest, _is_protected, _protected_roots
 
 # The real directory, spelled here from the process's own home rather than through
 # ``paths.config_dir``, so an exported ``MARKETLAKE_CONFIG_DIR`` cannot move what these
@@ -52,6 +56,48 @@ REAL_CONFIG_DIR = Path.home().joinpath(*CONFIG_DIR_PARTS)
 # module docstring: a broken guard must land on nothing.
 PROBE = REAL_CONFIG_DIR / "guard-probe-not-a-real-file.json"
 
+# The second probe, used by the mkdir tests. It is listed beside the first because the
+# containment check below has to cover every name this module can leave behind, and it
+# did not: a run with the os.mkdir patch dropped left this directory in the live
+# ~/.config/marketlake/ and nothing noticed.
+PROBE_DIR = REAL_CONFIG_DIR / "guard-probe-dir"
+
+PROBES = (PROBE, PROBE_DIR)
+
+
+@contextmanager
+def monkeypatch_protected_roots(directory: Path) -> Iterator[None]:
+    """Point the guard at ``directory`` instead of the real one, for one block.
+
+    Some properties are about what survives a call rather than about the refusal, and
+    those cannot be driven at the real directory, whose files are the ones this whole
+    module exists to keep. A stand-in gets the same treatment because ``_is_protected``
+    reads this one module global.
+
+    The real directory is unprotected inside the block, so keep the block to the single
+    call under test.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(conftest, "_PROTECTED_ROOTS", _protected_roots(directory))
+        yield
+
+
+def test_the_stand_in_really_is_guarded(tmp_path):
+    """The helper above is load-bearing, so it is checked rather than assumed.
+
+    Without this, a helper that silently pointed the guard at nothing would make every
+    test using it pass by refusing nothing at all.
+    """
+    stand_in = tmp_path / "protected"
+    stand_in.mkdir()
+    assert not _is_protected(str(stand_in / "x.json"))
+    with monkeypatch_protected_roots(stand_in):
+        assert _is_protected(str(stand_in / "x.json"))
+        assert not _is_protected(str(tmp_path / "outside.json"))
+    assert not _is_protected(str(stand_in / "x.json"))
+    # And the real directory is protected again the moment the block ends.
+    assert _is_protected(str(PROBE))
+
 
 def test_the_probe_paths_are_not_real_files():
     """The safety this whole module rests on, asserted rather than assumed.
@@ -61,11 +107,13 @@ def test_the_probe_paths_are_not_real_files():
     working rather than a fault: the file it creates is this harmless name and never
     ``token.json``. Delete it and run again.
     """
-    assert not PROBE.exists(), (
-        f"{PROBE} exists. A run with the guard broken left it behind. Deleting it is the "
-        "whole repair, and the token beside it was never in reach."
-    )
-    assert PROBE.name != TOKEN_FILE
+    for probe in PROBES:
+        assert not probe.exists(), (
+            f"{probe} exists. A run with the guard broken left it behind. Deleting it is "
+            "the whole repair, and the token beside it was never in reach."
+        )
+        assert probe.name != TOKEN_FILE
+        assert probe.parent == REAL_CONFIG_DIR
 
 
 # -- every kind of write ---------------------------------------------------------------
@@ -104,14 +152,33 @@ def test_path_touch_is_refused():
         PROBE.touch()
 
 
-def test_os_open_for_writing_is_refused():
+@pytest.mark.parametrize(
+    "flags",
+    [
+        os.O_WRONLY,
+        os.O_RDWR,
+        os.O_WRONLY | os.O_CREAT,
+        os.O_WRONLY | os.O_APPEND,
+        os.O_WRONLY | os.O_TRUNC,
+    ],
+)
+def test_every_writing_flag_is_refused(flags):
+    # One case per flag the guard's own constant names. Covering only O_WRONLY|O_CREAT
+    # left the other three free to be dropped from that constant with nothing failing,
+    # and os.open(token, os.O_RDWR) is a real way to write the file.
     with pytest.raises(ConfigWriteInTest):
-        os.open(PROBE, os.O_WRONLY | os.O_CREAT)
+        os.open(PROBE, flags)
+
+
+def test_a_read_only_os_open_is_left_alone():
+    # The other direction, so the flag mask cannot pass by refusing everything.
+    with pytest.raises(FileNotFoundError):
+        os.open(PROBE, os.O_RDONLY)
 
 
 def test_path_mkdir_is_refused():
     with pytest.raises(ConfigWriteInTest):
-        (REAL_CONFIG_DIR / "guard-probe-dir").mkdir(parents=True, exist_ok=True)
+        PROBE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def test_making_the_directory_itself_is_refused():
@@ -123,7 +190,7 @@ def test_making_the_directory_itself_is_refused():
 
 def test_path_rmdir_is_refused():
     with pytest.raises(ConfigWriteInTest):
-        (REAL_CONFIG_DIR / "guard-probe-dir").rmdir()
+        PROBE_DIR.rmdir()
 
 
 def test_path_unlink_is_refused():
@@ -140,6 +207,61 @@ def test_os_remove_is_refused():
 def test_os_truncate_is_refused():
     with pytest.raises(ConfigWriteInTest):
         os.truncate(PROBE, 0)
+
+
+def test_rmtree_of_the_directory_is_refused_before_it_empties_it(tmp_path):
+    """The refusal has to come before the damage, not after it.
+
+    ``shutil.rmtree`` is not built out of the guarded ``os`` calls on this platform. It
+    walks on directory descriptors and unlinks each child with ``dir_fd=``, reaching the
+    guarded ``os.rmdir`` only for the top directory and only last. So before
+    ``shutil.rmtree`` was patched by name, this raised ``ConfigWriteInTest`` naming the
+    directory after ``token.json``, ``config.yaml`` and ``tickers.yaml`` were already
+    gone. A run like that reports a refusal that protected nothing.
+
+    Driven against a stand-in directory rather than the real one, because the point is
+    what survives the call and the real one holds a live credential. ``_is_protected``
+    is the guard's own predicate, so pointing it at the stand-in exercises the same
+    patched ``shutil.rmtree``.
+    """
+    stand_in = tmp_path / "protected"
+    stand_in.mkdir()
+    for name in ("token.json", "config.yaml", "tickers.yaml"):
+        (stand_in / name).write_text("real")
+
+    with monkeypatch_protected_roots(stand_in):
+        with pytest.raises(ConfigWriteInTest):
+            shutil.rmtree(stand_in)
+
+    assert sorted(p.name for p in stand_in.iterdir()) == [
+        "config.yaml",
+        "tickers.yaml",
+        "token.json",
+    ]
+
+
+def test_the_two_spellings_of_a_symlinked_config_directory_are_both_roots(tmp_path):
+    """A home whose ``.config`` is a symlink has two names for one directory.
+
+    Asked about the real home the two come back identical, on every machine the suite
+    has run on, so the second one is never exercised there and dropping it would change
+    nothing. Driving the builder with a constructed home is the only way to hold it.
+    """
+    home = tmp_path / "home"
+    real = tmp_path / "elsewhere"
+    (real / "marketlake").mkdir(parents=True)
+    home.mkdir()
+    (home / ".config").symlink_to(real)
+
+    roots = _protected_roots(home.joinpath(*CONFIG_DIR_PARTS))
+    assert str(home.joinpath(*CONFIG_DIR_PARTS)) in roots
+    assert str((real / "marketlake").resolve()) in roots
+    assert len(roots) == 2
+
+    # One directory, two names, and a write through either is the same write.
+    with monkeypatch_protected_roots(home.joinpath(*CONFIG_DIR_PARTS)):
+        assert _is_protected(str(home / ".config" / "marketlake" / "token.json"))
+        assert _is_protected(str((real / "marketlake").resolve() / "token.json"))
 
 
 def test_a_rename_into_the_directory_is_refused(tmp_path):

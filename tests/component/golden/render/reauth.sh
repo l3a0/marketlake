@@ -39,7 +39,16 @@
 # Start the login from this script or from a bookmarked Schwab URL. Never
 # from a link in a notification. Pages never carry auth links, so one that
 # does is not from here.
+#
+# It unsets MARKETLAKE_CONFIG_DIR first. That variable moves the whole config
+# directory for one process so a development run cannot reach the real
+# token, and this is the one run that must reach it. This script inherits
+# your shell, so an export left in a shell profile would otherwise send the
+# week's token to a throwaway directory while the daemon kept reading the
+# real one as it expired. The tool prints the token path it wrote, so the
+# sign-off block is where to check this landed where you meant.
 set -euo pipefail
 
+unset MARKETLAKE_CONFIG_DIR
 cd /Users/someone/marketlake
 exec /opt/py/bin/python -m lake.reauth "$@"
