@@ -193,18 +193,155 @@ def test_the_overflow_column_is_never_touched():
     assert result.table.column(EXTRA_COLUMN).to_pylist() == ['{"bid": 4.25}']
 
 
-def test_every_other_column_keeps_its_place_and_its_values():
-    """Filling one column moves nothing else. A promoted column lands at the end."""
-    schema = ROW_SCHEMA.append(pa.field("bid", pa.float64()))
-    table = _rows(_row(1, {"ask": 4.30}, bid=4.25), schema=schema)
+def test_every_other_column_keeps_its_place_and_promoted_ones_land_sorted():
+    """Filling a column moves nothing else, and added columns arrive in a fixed order.
 
-    result = project_extra(
-        table, surface="chains", ledger=_ledger((1, _shape_without("chains", "ask")))
+    Four columns are added rather than one. The set they are gathered in has no order of
+    its own, so a single added column would assert nothing about the order they come back
+    in, and a reader comparing two projections of the same partition needs that order not
+    to move between runs.
+    """
+    schema = ROW_SCHEMA.append(pa.field("open_interest", pa.int64()))
+    table = _rows(
+        _row(
+            1,
+            {"symbol": "SPY   260918C00650000", "last": 4.22, "bid": 4.25, "ask": 4.30},
+            open_interest=12,
+        ),
+        schema=schema,
     )
 
-    assert result.table.column_names == [*schema.names, "ask"]
-    assert result.table.column("bid").to_pylist() == [4.25]
+    result = project_extra(
+        table,
+        surface="chains",
+        ledger=_ledger((1, _shape_without("chains", "bid", "ask", "last", "occ_symbol"))),
+    )
+
+    assert result.table.column_names == [*schema.names, "ask", "bid", "last", "occ_symbol"]
+    assert result.table.column("open_interest").to_pylist() == [12]
     assert result.table.column("ticker").to_pylist() == ["SPY"]
+
+
+def test_two_versions_each_missing_a_different_column_never_cross():
+    """The per-row decision is per column, not per row.
+
+    Every other fixture here has one version missing something and the rest missing
+    nothing, which makes a row-level guard look like a column-level one. Here version 1
+    lacks ``bid`` and version 2 lacks ``ask``, and each row carries a stale overflow for
+    the column its own version did have. A guard that stops at the row fills both from the
+    overflow, which overwrites a value the parser authored.
+    """
+    schema = ROW_SCHEMA.append(pa.field("bid", pa.float64())).append(pa.field("ask", pa.float64()))
+    table = _rows(
+        _row(1, {"bid": 4.25, "ask": 99.0}, ask=4.30),
+        _row(2, {"bid": 99.0, "ask": 4.35}, bid=4.31),
+        schema=schema,
+    )
+
+    result = project_extra(
+        table,
+        surface="chains",
+        ledger=_ledger(
+            (1, _shape_without("chains", "bid")),
+            (2, _shape_without("chains", "ask")),
+        ),
+    )
+
+    assert result.table.column("bid").to_pylist() == [4.25, 4.31]
+    assert result.table.column("ask").to_pylist() == [4.30, 4.35]
+    assert result.filled == {"ask": 1, "bid": 1}
+
+
+@pytest.mark.parametrize(
+    ("column", "vendor"), [("interest_rate", "interestRate"), ("snap_ts", "snapTs")]
+)
+def test_a_column_no_vendor_field_overflows_into_is_never_a_candidate(column, vendor):
+    """A version missing a non-vendor column still projects nothing into it.
+
+    ``extra_paths`` already refuses these, but nothing drove the projection with such a
+    version. Widening the candidates from the vendor-mapped columns to every schema column
+    would reach for an overflow key that does not exist, and a chain-level field really can
+    be absent from an older version's shape.
+    """
+    table = _rows(_row(1, {vendor: 4.25, "bid": 4.30}))
+
+    result = project_extra(
+        table, surface="chains", ledger=_ledger((1, _shape_without("chains", column, "bid")))
+    )
+
+    assert result.filled == {"bid": 1}
+    assert column not in result.table.column_names
+
+
+def test_the_fill_count_is_the_rows_filled_and_not_the_columns_touched():
+    """Two rows filling one column count two."""
+    table = _rows(_row(1, {"bid": 4.25}), _row(1, {"bid": 4.30}), _row(1, {"bid": 4.31}))
+
+    result = project_extra(
+        table, surface="chains", ledger=_ledger((1, _shape_without("chains", "bid")))
+    )
+
+    assert result.filled == {"bid": 3}
+    assert result.table.column("bid").to_pylist() == [4.25, 4.30, 4.31]
+
+
+def test_a_row_at_a_fully_recorded_version_is_never_read_for_its_overflow():
+    """A read has no business failing over an overflow it was never going to look at.
+
+    Version 2 is missing nothing, so its row is skipped before its ``extra`` is decoded.
+    That is what makes the JSON refusal a check on rows the projection reads rather than a
+    validation pass over the whole table.
+    """
+    schema = ROW_SCHEMA.append(pa.field("bid", pa.float64()))
+    table = _rows(
+        _row(1, {"bid": 4.25}),
+        {"ticker": "SPY", VERSION_COLUMN: 2, EXTRA_COLUMN: "{not json", "bid": 4.30},
+        schema=schema,
+    )
+
+    result = project_extra(
+        table,
+        surface="chains",
+        ledger=_ledger((1, _shape_without("chains", "bid")), (2, _shape())),
+    )
+
+    assert result.table.column("bid").to_pylist() == [4.25, 4.30]
+    assert result.filled == {"bid": 1}
+
+
+def test_an_empty_overflow_string_is_no_overflow_rather_than_bad_json():
+    """``""`` is not JSON, and it is also not a row with something in its overflow."""
+    table = _rows({"ticker": "SPY", VERSION_COLUMN: 1, EXTRA_COLUMN: ""})
+
+    result = project_extra(
+        table, surface="chains", ledger=_ledger((1, _shape_without("chains", "bid")))
+    )
+
+    assert result.filled == {}
+    assert result.complete
+
+
+def test_refusals_at_different_versions_stay_apart():
+    """A refusal names the version whose row hit it, not a fixed one.
+
+    Every other refusal fixture sits at version 1, which makes a hard-coded version
+    indistinguishable from the row's own.
+    """
+    table = _rows(_row(1, {"bid": "n/a"}), _row(2, {"bid": "n/a"}))
+
+    result = project_extra(
+        table,
+        surface="chains",
+        ledger=_ledger(
+            (1, _shape_without("chains", "bid")),
+            (2, _shape_without("chains", "bid")),
+        ),
+    )
+
+    assert [(u.column, u.schema_version, u.rows) for u in result.unfit] == [
+        ("bid", 1, 1),
+        ("bid", 2, 1),
+    ]
 
 
 # -- the quotes surface's nested overflow -------------------------------------
@@ -239,6 +376,25 @@ def test_the_two_blocks_sharing_a_field_name_land_in_their_own_columns():
 
     assert result.table.column("last").to_pylist() == [5.5]
     assert result.table.column("extended_last_price").to_pylist() == [6.5]
+
+
+@pytest.mark.parametrize("block", [27.5, [1, 2], "text", None])
+def test_a_quotes_block_that_is_not_an_object_fills_nothing(block):
+    """A block key holding a scalar is drift, not a field value.
+
+    Reading the block itself as the value would put a whole block's stand-in into one
+    column, which is worse than leaving the cell null, because the null is honest and the
+    raw value is still in the overflow.
+    """
+    table = _rows(_row(1, {"fundamental": block}))
+
+    result = project_extra(
+        table, surface="quotes", ledger=_ledger((1, _shape_without("quotes", "pe_ratio")))
+    )
+
+    assert result.filled == {}
+    assert "pe_ratio" not in result.table.column_names
+    assert result.complete
 
 
 def test_a_flat_key_on_the_quotes_surface_reaches_nothing():
@@ -279,12 +435,23 @@ def test_a_version_absent_from_the_ledger_leaves_its_rows_exactly_as_written():
 
 
 def test_an_empty_ledger_names_every_version_it_could_not_place():
-    """The report is a set of versions, ascending, not a bare flag."""
-    table = _rows(_row(3, {"bid": 4.25}), _row(1, {"bid": 4.30}), _row(3, {"bid": 4.31}))
+    """The report is every version once, ascending, not a bare flag.
+
+    The versions are 9, 1 and 17 rather than 1, 2 and 3 on purpose. A small-integer set
+    built in ascending order iterates in that order anyway, so a fixture like that asserts
+    the sort against a collection already sorted and passes with the sort removed. These
+    three iterate as 9, 1, 17.
+    """
+    table = _rows(
+        _row(9, {"bid": 4.25}),
+        _row(1, {"bid": 4.30}),
+        _row(17, {"bid": 4.31}),
+        _row(9, {"bid": 4.32}),
+    )
 
     result = project_extra(table, surface="chains", ledger=SchemaVersionLedger())
 
-    assert result.unrecorded_versions == (1, 3)
+    assert result.unrecorded_versions == (1, 9, 17)
     assert result.table == table
 
 
@@ -298,6 +465,125 @@ def test_a_recorded_version_beside_an_unrecorded_one_is_still_projected():
 
     assert result.table.column("bid").to_pylist() == [4.25, None]
     assert result.unrecorded_versions == (7,)
+
+
+def test_a_version_recorded_for_another_surface_only_is_treated_as_unrecorded():
+    """A ledger holding no shape for this surface knows nothing about this surface.
+
+    ``has_column`` answers false for every column of a surface it has no entry for, which
+    reads exactly like a version that carried none. Taken at face value that fills every
+    projectable column off the overflow and calls the read whole, which is the outcome the
+    unrecorded branch exists to refuse. Reaching it by a second door is the same defect.
+    """
+    table = _rows(_row(1, {"bid": 4.25, "ask": 4.30}))
+    quotes_only = _shape()
+    del quotes_only["chains"]
+
+    result = project_extra(table, surface="chains", ledger=_ledger((1, quotes_only)))
+
+    assert result.filled == {}
+    assert "bid" not in result.table.column_names
+    assert result.unrecorded_versions == (1,)
+    assert not result.complete
+
+
+def test_a_version_recorded_with_an_empty_shape_for_the_surface_is_treated_the_same():
+    """An entry naming the surface and no column is the same absence one level down."""
+    table = _rows(_row(1, {"bid": 4.25}))
+    empty = {**_shape(), "chains": {}}
+
+    result = project_extra(table, surface="chains", ledger=_ledger((1, empty)))
+
+    assert result.filled == {}
+    assert result.unrecorded_versions == (1,)
+
+
+def test_the_other_surface_s_shape_never_decides_this_surface_s_columns():
+    """Both surfaces carry a ``bid``, so a lookup on the wrong one would pass unnoticed.
+
+    Chains records ``bid`` and quotes does not, and the table is a chains table. Reading
+    the quotes shape would fill ``bid`` from the overflow, which chains never promoted.
+    """
+    table = _rows(_row(1, {"bid": 4.25}))
+    shape = _shape()
+    del shape["quotes"]["bid"]
+
+    result = project_extra(table, surface="chains", ledger=_ledger((1, shape)))
+
+    assert result.filled == {}
+    assert result.complete
+
+
+# -- a column the table already holds at another type -------------------------
+
+
+def test_a_cell_the_projection_leaves_alone_keeps_its_own_type():
+    """Rebuilding a column must not retype the rows it was not asked to touch.
+
+    A partition merged across a retype holds the column at the older type while the
+    running schema names the newer one. Rebuilding at the running type would rewrite every
+    untouched cell, which contradicts the rule that a row whose version carried the column
+    is left alone. Comparing values alone would pass on that, since ``4 == 4.0``, so the
+    column's type is asserted too.
+    """
+    schema = ROW_SCHEMA.append(pa.field("bid", pa.int64()))
+    table = _rows(_row(2, None, bid=4), _row(1, {"bid": 5}), schema=schema)
+
+    result = project_extra(
+        table,
+        surface="chains",
+        ledger=_ledger((1, _shape_without("chains", "bid")), (2, _shape())),
+    )
+
+    column = result.table.column("bid")
+    assert column.type == pa.int64()
+    assert column.to_pylist() == [4, 5]
+    assert all(isinstance(value, int) for value in column.to_pylist())
+
+
+def test_a_value_that_does_not_fit_the_column_s_own_type_is_refused_not_cast():
+    """The target type is the column that is there, not the one the schema wants.
+
+    ``bid`` is ``int64`` on this table and ``double`` in the running schema. A fractional
+    overflow value fits the schema's type and not the table's, and the table's is the one
+    the cell has to live in.
+    """
+    schema = ROW_SCHEMA.append(pa.field("bid", pa.int64()))
+    table = _rows(_row(2, None, bid=4), _row(1, {"bid": 5.5}), schema=schema)
+
+    result = project_extra(
+        table,
+        surface="chains",
+        ledger=_ledger((1, _shape_without("chains", "bid")), (2, _shape())),
+    )
+
+    assert result.table.column("bid").to_pylist() == [4, None]
+    assert [u.column for u in result.unfit] == ["bid"]
+
+
+def test_a_column_the_table_holds_at_a_type_the_schema_refuses_still_reads():
+    """One cell the running type cannot hold must not cost the whole read.
+
+    ``open_interest`` is ``int64`` in the running schema, and Arrow refuses ``3.7`` into
+    it outright. A rebuild at the running type would raise and lose every row, including
+    the ones this projection was asked about.
+    """
+    schema = ROW_SCHEMA.append(pa.field("open_interest", pa.float64()))
+    table = _rows(
+        _row(2, None, open_interest=3.7),
+        _row(1, {"openInterest": 12}),
+        schema=schema,
+    )
+
+    result = project_extra(
+        table,
+        surface="chains",
+        ledger=_ledger((1, _shape_without("chains", "open_interest")), (2, _shape())),
+    )
+
+    column = result.table.column("open_interest")
+    assert column.type == pa.float64()
+    assert column.to_pylist() == [3.7, 12.0]
 
 
 # -- a value the column refuses -----------------------------------------------
@@ -381,11 +667,13 @@ def test_refusals_of_the_same_shape_are_counted_rather_than_repeated():
     for a different reason is its own. The lines come back sorted, so a message built from
     them reads the same on every run.
     """
+    # Inserted boolean first and "n/a" last, so the order they are reported in cannot be
+    # the order they were counted in. A fixture already in sorted order asserts nothing.
     table = _rows(
-        _row(1, {"bid": "n/a"}),
-        _row(1, {"bid": "n/a"}),
-        _row(1, {"bid": "x"}),
         _row(1, {"bid": True}),
+        _row(1, {"bid": "x"}),
+        _row(1, {"bid": "n/a"}),
+        _row(1, {"bid": "n/a"}),
     )
 
     result = project_extra(

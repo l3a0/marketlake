@@ -63,12 +63,19 @@ CHAIN_BODY = {
 def _promote(monkeypatch) -> None:
     """Install the shape a promotion of ``sigmaScore`` would leave behind.
 
-    Four edits, which is what promoting a field costs in the real module: the column joins
-    the schema, the vendor field joins the contract map so the parser stops overflowing it,
-    the known set widens with it, and ``SCHEMA_VERSION`` goes to 2.
+    Four edits, which is what promoting a field costs in the real module.
 
-    ``extra_paths`` needs no edit, which is the point of deriving it. It reads the contract
-    map, so the promoted column becomes projectable in the same motion.
+    1. The column joins the schema.
+    2. The vendor field joins the contract map, so the parser stops overflowing it.
+    3. The known set widens with it.
+    4. ``SCHEMA_VERSION`` goes to 2.
+
+    Patching ``CHAINS_SCHEMA`` and the schema map is one edit rather than two, because a
+    source promotion writes the column into the literal both names.
+
+    ``extra_paths`` takes no edit at all, which is the point of deriving it per call. It
+    reads the contract map, so edit 2 makes the column projectable in the same motion, and
+    a fifth patch here would hide exactly that.
     """
     promoted = pa.schema([*journal.CHAINS_SCHEMA, pa.field(PROMOTED_COLUMN, pa.float64())])
     monkeypatch.setattr(journal, "CHAINS_SCHEMA", promoted)
@@ -76,11 +83,6 @@ def _promote(monkeypatch) -> None:
     monkeypatch.setitem(journal._CHAINS_CONTRACT_MAP, VENDOR_FIELD, PROMOTED_COLUMN)
     monkeypatch.setattr(
         journal, "_CHAINS_CONTRACT_KNOWN", journal._CHAINS_CONTRACT_KNOWN | {VENDOR_FIELD}
-    )
-    monkeypatch.setitem(
-        journal._EXTRA_PATHS[journal.CHAINS_SURFACE],
-        PROMOTED_COLUMN,
-        journal.ExtraPath(None, VENDOR_FIELD),
     )
     monkeypatch.setattr(journal, "SCHEMA_VERSION", 2)
 

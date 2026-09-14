@@ -643,31 +643,26 @@ class ExtraPath(NamedTuple):
     field: str
 
 
-# Every column whose value could have arrived through ``extra``, per surface, derived
-# from the same vendor maps the parser projects with. Nothing here restates a name.
-#
-# A column is reachable only if the parser would overflow its vendor field, which is a
-# narrower set than the schema. Four groups are deliberately absent.
-#
-# 1. The chain-level fields (``interest_rate`` and its five siblings). The chains overflow
-#    is computed from the contract dict alone, so a top-level body field never lands in
-#    ``extra`` at all.
-# 2. ``vendor_quote_ts``, on both surfaces. The vendor quote time is consumed into that
-#    stamp rather than stored, and it is named as consumed so it never overflows.
-# 3. The quotes envelope's ``realtime`` and ``cusip``. Both are read off the envelope
-#    rather than a captured block, and only a captured block's leftovers overflow.
-# 4. The stamps, the provenance columns, and the chains window pair. None is a vendor
-#    field, so none was ever a candidate for the overflow.
-_EXTRA_PATHS: dict[str, dict[str, ExtraPath]] = {
-    CHAINS_SURFACE: {
-        **{column: ExtraPath(None, vendor) for vendor, column in _CHAINS_CONTRACT_MAP.items()},
-        _CHAINS_DELIVERABLES_COLUMN: ExtraPath(None, _CHAINS_DELIVERABLES_FIELD),
-    },
-    QUOTES_SURFACE: {
+def _chains_extra_paths() -> dict[str, ExtraPath]:
+    """The chains overflow read backwards, flat, straight off the contract map."""
+    return {column: ExtraPath(None, vendor) for vendor, column in _CHAINS_CONTRACT_MAP.items()}
+
+
+def _quotes_extra_paths() -> dict[str, ExtraPath]:
+    """The quotes overflow read backwards, block-keyed, straight off the block specs."""
+    return {
         column: ExtraPath(block_key, vendor)
         for block_key, field_map, _consumed in _QUOTE_BLOCK_SPECS
         for vendor, column in field_map.items()
-    },
+    }
+
+
+# How each surface's overflow is read backwards. The builders run per call rather than
+# once at import, so a vendor map edited at runtime is reflected rather than snapshotted,
+# and the derivation claim holds for a test that patches a map as well as for source.
+_EXTRA_PATH_BUILDERS = {
+    CHAINS_SURFACE: _chains_extra_paths,
+    QUOTES_SURFACE: _quotes_extra_paths,
 }
 
 
@@ -680,14 +675,38 @@ def extra_paths(surface: str) -> dict[str, ExtraPath]:
     what this returns: the parser's vendor maps read backwards, column name to overflow
     key.
 
-    It is derived from those maps rather than restated, so promoting a field is still the
-    one edit it always was. Add the vendor field to its block's map and the column becomes
+    It is derived from those maps rather than restated, so promoting a field stays the one
+    edit it always was. Add the vendor field to its block's map and the column becomes
     projectable in the same motion.
 
-    Unknown surfaces raise loudly, through ``schema_for``.
+    A column is reachable only if the parser would overflow its vendor field, which is a
+    narrower set than the schema. Five groups are deliberately absent.
+
+    1. The chain-level fields, ``interest_rate`` and its five siblings. The chains overflow
+       is computed from the contract dict alone, so a top-level body field never lands in
+       ``extra`` at all.
+    2. ``option_deliverables_list``. The writer JSON-encodes the vendor's nested list into
+       that string column, so a raw overflow value would not fit it, and the field has been
+       known since version 1 and so can never be in ``extra`` to begin with. Projecting a
+       value the writer transforms needs the transform, which is a promotion this surface
+       has never made.
+    3. ``vendor_quote_ts``, on both surfaces. The vendor quote time is consumed into that
+       stamp rather than stored, and it is named as consumed so it never overflows.
+    4. The quotes envelope's ``realtime`` and ``cusip``. Both are read off the envelope
+       rather than a captured block, and only a captured block's leftovers overflow.
+    5. The stamps, the provenance columns, and the chains window pair. None is a vendor
+       field, so none was ever a candidate for the overflow.
+
+    A surface with no capture schema raises through ``schema_for``. A surface that has one
+    and no vendor maps raises here, naming itself, which is what a third pinned surface
+    added in one place and forgotten in the other would hit.
     """
     schema_for(surface)
-    return dict(_EXTRA_PATHS[surface])
+    try:
+        build = _EXTRA_PATH_BUILDERS[surface]
+    except KeyError:
+        raise ValueError(f"surface {surface!r} pins a schema but no vendor maps") from None
+    return build()
 
 
 # -- row building ------------------------------------------------------------

@@ -789,19 +789,16 @@ def test_the_two_quote_blocks_sharing_field_names_keep_separate_paths():
     assert len(set(paths.values())) == len(paths)
 
 
-def test_the_deliverables_column_is_reachable_through_its_vendor_name():
-    """It is JSON-encoded rather than mapped, so it needs its own entry."""
-    assert journal.extra_paths("chains")["option_deliverables_list"] == journal.ExtraPath(
-        None, "optionDeliverablesList"
-    )
-
-
 @pytest.mark.parametrize(
     ("surface", "column"),
     [
         # The chain-level header fields. The chains overflow is built from the contract
         # dict alone, so a top-level body field never reaches ``extra``.
         ("chains", "interest_rate"),
+        # The deliverables list. The writer JSON-encodes the vendor's nested list into
+        # this string column, so a raw overflow value would not fit it, and the field has
+        # been known since version 1 and so can never reach ``extra`` at all.
+        ("chains", "option_deliverables_list"),
         ("chains", "underlying_price"),
         ("chains", "is_delayed"),
         # The consumed vendor quote time, on both surfaces.
@@ -831,13 +828,14 @@ def test_every_vendor_mapped_column_is_projectable_and_nothing_else_is():
     both directions: every mapped column has its path, and the counts match, so a path
     the maps do not account for fails here too.
 
-    The chains map is short by one on purpose. ``optionDeliverablesList`` is JSON-encoded
-    rather than mapped, so it carries its own entry.
+    The chains paths are exactly the contract map, with nothing beside it.
+    ``optionDeliverablesList`` is mapped nowhere because the writer transforms it rather
+    than copying it, which is the one exclusion that is not about where a field arrives.
     """
     chains = journal.extra_paths("chains")
     for vendor, column in journal._CHAINS_CONTRACT_MAP.items():
         assert chains[column] == journal.ExtraPath(None, vendor)
-    assert len(chains) == len(journal._CHAINS_CONTRACT_MAP) + 1
+    assert len(chains) == len(journal._CHAINS_CONTRACT_MAP)
 
     quotes = journal.extra_paths("quotes")
     for block, field_map, _consumed in journal._QUOTE_BLOCK_SPECS:
@@ -856,6 +854,33 @@ def test_a_caller_editing_the_paths_it_got_back_changes_nothing():
 def test_extra_paths_rejects_an_unknown_surface():
     with pytest.raises(ValueError, match="unknown surface"):
         journal.extra_paths("bars")
+
+
+def test_a_surface_pinned_without_vendor_maps_refuses_by_name(monkeypatch):
+    """Pinning a schema in one place and forgetting the maps in the other says so.
+
+    ``schema_for`` is happy the moment a surface joins the schema map, so the refusal has
+    to come from here, and it has to name the surface rather than surfacing a bare
+    ``KeyError`` from a lookup the caller cannot see.
+    """
+    monkeypatch.setitem(journal._SCHEMAS, "bars", journal.QUOTES_SCHEMA)
+
+    with pytest.raises(ValueError, match="bars.*no vendor maps"):
+        journal.extra_paths("bars")
+
+
+def test_a_vendor_field_added_to_a_map_is_projectable_with_no_second_edit(monkeypatch):
+    """Promoting a field is one edit, and this is what proves the paths are not a snapshot.
+
+    Patching the live map and reading the paths back only works if they are derived per
+    call. A map read once at import would answer from the shape the module was loaded
+    with, and a promotion would silently need a second edit to become readable.
+    """
+    monkeypatch.setitem(journal._CHAINS_CONTRACT_MAP, "sigmaScore", "sigma_score")
+    monkeypatch.setitem(journal._QUOTE_MAP, "sigmaScore", "sigma_score")
+
+    assert journal.extra_paths("chains")["sigma_score"] == journal.ExtraPath(None, "sigmaScore")
+    assert journal.extra_paths("quotes")["sigma_score"] == journal.ExtraPath("quote", "sigmaScore")
 
 
 def test_chains_suspect_flag_rides_every_row():

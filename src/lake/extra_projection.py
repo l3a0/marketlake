@@ -15,7 +15,7 @@ whose version had no column for it and presents it as that column.
 
 Read time is the only place this can happen. A compacted partition is immutable, and that
 immutability is what the manifest protocol, the two-way integrity scrub, and the backup all
-rest on. Rewriting a sealed partition to heal it would trade three guarantees for one
+rest on. Rewriting a sealed partition to heal it would trade those guarantees for one
 convenience.
 
 Two rules keep the healing honest.
@@ -86,7 +86,8 @@ class ExtraProjection(NamedTuple):
     """A projected table and everything the projection could not do silently.
 
     ``table`` is the input with the promoted columns filled. ``filled`` counts the rows
-    each column gained, and a column that gained none is absent from it.
+    each column gained, and a column that gained none is absent from it, because a column
+    nothing filled is a column the table never gets.
 
     ``unrecorded_versions`` names every version in the table that the ledger holds no
     shape for. Those rows come back exactly as written, because the projection cannot know
@@ -111,9 +112,15 @@ class ExtraProjection(NamedTuple):
 def _overflow(raw: object, row: int) -> Mapping[str, object]:
     """One row's ``extra`` decoded, or an empty mapping when the row has none.
 
-    A value that is not JSON raises. ``extra`` is written by ``json.dumps`` on both
-    surfaces, so a string that will not parse did not come from the parser, and reading
-    past it would present the row as whole while its overflow is unreadable.
+    A value that is not JSON raises. ``extra`` is written by ``json.dumps`` of a dict on
+    both surfaces, so a string that will not parse did not come from the parser, and
+    presenting such a row as projected would claim its overflow held nothing when the
+    truth is that nothing could read it.
+
+    Only a row the projection actually reads is decoded, which is a row whose version is
+    missing at least one projectable column. A row with nothing to project is left alone
+    rather than validated, because a read has no business failing over an overflow it was
+    never going to look at.
     """
     if raw is None or raw == "":
         return {}
@@ -148,9 +155,10 @@ def _convert(field_type: pa.DataType, value: object) -> tuple[object, str | None
     """``value`` as the column's own type, or the reason it will not fit.
 
     Conversion goes through ``journal.typed_column``, the same builder every write site
-    uses, so the projection cannot accept a value a capture would have refused. The
-    converted value is taken back out rather than the raw one, so the rebuilt column holds
-    one Python type throughout and a later inference has nothing to guess at.
+    uses, so the projection cannot accept a value a capture would have refused. What makes
+    the value fit is that call, and what types the column is the rebuild at the end. Taking
+    the converted value back out rather than the raw one only keeps the cells one Python
+    type on the way there, which leaves the rebuild nothing to widen.
 
     Arrow refuses every conversion here that would change a value, with one exception it
     performs silently: a boolean into a floating column returns ``1.0``. A boolean is
@@ -161,8 +169,10 @@ def _convert(field_type: pa.DataType, value: object) -> tuple[object, str | None
         return None, f"boolean value in a {field_type} column"
     try:
         converted = journal.typed_column(field_type, [value])
-    # Every refusal is reported rather than raised, whichever Arrow class it arrives as.
-    except Exception as exc:
+    # Arrow refuses through ``ArrowInvalid`` or ``ArrowTypeError`` depending on the pair,
+    # and both subclass a builtin, so the builtins are named too. Anything wider would let
+    # a defect in the shared builder read as vendor drift.
+    except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError, ValueError) as exc:
         return None, f"{type(exc).__name__}: {exc}"
     return converted.to_pylist()[0], None
 
@@ -198,9 +208,11 @@ def project_extra(
     ``journal.extra_paths``. A column outside that set was never in the overflow, so there
     is nothing to lift.
 
-    Three things are reported rather than raised, because each leaves the table readable:
-    a version the ledger has no shape for, a value the column refuses, and a row that
-    simply has nothing in its overflow.
+    Three things are reported rather than raised, because each leaves the table readable.
+
+    1. A version the ledger holds no shape for on this surface.
+    2. A value the column refuses.
+    3. A row that simply has nothing in its overflow.
     """
     fingerprint = journal.schema_fingerprint(surface)
     schema = journal.schema_for(surface)
@@ -220,7 +232,12 @@ def project_extra(
     unrecorded: set[int] = set()
     for version in set(versions):
         entry = ledger.get(version)
-        if entry is None:
+        # A version recorded for other surfaces and not this one is as unrecorded as one
+        # that is absent outright. ``has_column`` answers false for every column of a
+        # surface it holds no shape for, which reads identically to a version that carried
+        # none, and that would fill every projectable column off the overflow while
+        # reporting the read as whole.
+        if entry is None or not entry.fingerprints.get(surface):
             unrecorded.add(version)
             targets[version] = frozenset()
             continue
@@ -230,34 +247,53 @@ def project_extra(
             if column in fingerprint and not entry.has_column(surface, column)
         )
 
+    # Every column any version in the table is missing, each one's cells started from what
+    # the table already holds. A column the table does not have starts all null.
+    wanted = sorted({name for missing in targets.values() for name in missing})
+    cells: dict[str, list[object]] = {
+        column: (table.column(column).to_pylist() if column in present else [None] * table.num_rows)
+        for column in wanted
+    }
+    # The type each filled column is rebuilt at. A column the table already has keeps its
+    # own, so a rebuild never retypes a cell this projection promised to leave alone, and a
+    # partition merged across a retype cannot lose the whole read to one truncating cast.
+    # A column being added takes the running schema's, since the table has no opinion.
+    fields: dict[str, pa.Field] = {
+        column: (table.schema.field(column) if column in present else schema.field(column))
+        for column in wanted
+    }
+
     filled: dict[str, int] = {}
     refused: dict[tuple[str, int, str], int] = {}
-    rebuilt: dict[str, list[object]] = {}
-    for column in sorted({name for wanted in targets.values() for name in wanted}):
-        field_type = schema.field(column).type
-        values = table.column(column).to_pylist() if column in present else [None] * table.num_rows
-        hits = 0
-        for row, version in enumerate(versions):
-            if column not in targets[version]:
+    # Rows outer, columns inner, so a row's overflow is decoded once however many columns
+    # it feeds. A row whose version misses nothing is never decoded at all.
+    for row, version in enumerate(versions):
+        missing = targets[version]
+        if not missing:
+            continue
+        overflow = _overflow(extras[row], row)
+        if not overflow:
+            continue
+        for column in wanted:
+            if column not in missing:
                 continue
-            raw = _lookup(_overflow(extras[row], row), paths[column])
+            raw = _lookup(overflow, paths[column])
             if raw is None:
                 continue
-            converted, detail = _convert(field_type, raw)
+            converted, detail = _convert(fields[column].type, raw)
             if detail is not None:
                 key = (column, version, detail)
                 refused[key] = refused.get(key, 0) + 1
                 continue
-            values[row] = converted
-            hits += 1
-        if hits:
-            rebuilt[column] = values
-            filled[column] = hits
+            cells[column][row] = converted
+            filled[column] = filled.get(column, 0) + 1
 
     projected = table
-    for column, values in rebuilt.items():
-        field = schema.field(column)
-        array = journal.typed_column(field.type, values)
+    for column in wanted:
+        if column not in filled:
+            continue
+        field = fields[column]
+        array = journal.typed_column(field.type, cells[column])
         if column in present:
             projected = projected.set_column(projected.schema.get_field_index(column), field, array)
         else:
