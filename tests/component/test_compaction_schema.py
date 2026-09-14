@@ -750,6 +750,7 @@ def test_the_writer_files_exactly_what_it_was_given(lake_root):
     assert path == report.schema_drift_dir(lake_root, DAY) / "163012000000-chains-SPY-11.json"
     assert path.read_text() == (
         '{"at": "2026-08-24T16:30:12-04:00", '
+        '"carries_pinned": false, '
         '"day": "2026-08-24", '
         '"missing": ["open_interest"], '
         '"partition": "chains/ticker=SPY/date=2026-08-24.parquet", '
@@ -1850,7 +1851,7 @@ def test_a_refused_widening_files_no_finding(lake_root, monkeypatch):
 # -- what the repaired partition leaves behind -------------------------------
 
 
-def test_a_widening_past_the_pinned_type_is_filed_as_a_retype(lake_root, monkeypatch):
+def test_a_widening_past_the_pinned_type_is_filed_as_a_retype(lake_root, monkeypatch, capsys):
     # The merged type is the wider of the two, and the pinned schema holds the narrower
     # one, so the schema check finds the difference and names the column. The record
     # carries both fields here, and they say different things about the same column.
@@ -1870,8 +1871,15 @@ def test_a_widening_past_the_pinned_type_is_filed_as_a_retype(lake_root, monkeyp
     (finding,) = _findings(lake_root)
     assert finding["retyped"] == [f"{COLUMN}: int64 -> double"]
     assert finding["widened"] == [f"{COLUMN}: int64 -> double"]
+    assert finding["carries_pinned"] is False
     assert finding["partition"] == outcome.partition
     assert sorted(finding["segments"]) == sorted(outcome.segments)
+    # A widening does not excuse the bump here. The partition now holds the column wider
+    # than the pinned schema does, so the operator has something left to correct, and the
+    # terminal has to keep saying so rather than reading the widening as the whole story.
+    err = capsys.readouterr().err
+    assert "Correct the schema and bump schema_version." in err
+    assert "An authorized widening" not in err
 
 
 def test_a_widening_onto_the_pinned_type_is_filed_as_a_widening(lake_root, monkeypatch):
@@ -1897,6 +1905,7 @@ def test_a_widening_onto_the_pinned_type_is_filed_as_a_widening(lake_root, monke
     assert finding["widened"] == [f"{COLUMN}: int64 -> double"]
     assert finding["missing"] == [] and finding["unexpected"] == [] and finding["retyped"] == []
     assert finding["refused"] is False
+    assert finding["carries_pinned"] is True
     assert finding["partition"] == outcome.partition
     assert sorted(finding["segments"]) == sorted(outcome.segments)
     assert latest_entries(lake_root)[outcome.partition]["rows"] == 2
@@ -2009,6 +2018,60 @@ def test_every_type_the_segments_held_is_named(lake_root, monkeypatch):
         f"{COLUMN}: int32 -> double",
         f"{COLUMN}: int64 -> double",
     ]
+
+
+def test_one_pair_is_named_once_however_many_segments_held_it(lake_root, monkeypatch):
+    # A daemon that flapped between two releases all day leaves four segments and two
+    # types, and the pair is the same pair three times over. The page caps how many column
+    # names it prints, so a repeated entry spends that budget on a fact the reader already
+    # has and pushes a real column off the message.
+    narrow = _retyped(COLUMN, pa.int64())
+    wide = _retyped(COLUMN, pa.float64())
+    for index, (schema, stamp) in enumerate(
+        ((narrow, "a"), (wide, "b"), (narrow, "c"), (wide, "d"))
+    ):
+        _segment(
+            lake_root, schema, _table(schema, _rows(1, snap_ts=_snap(DAY, index))), start_ts=stamp
+        )
+    _pin(monkeypatch, wide)
+
+    _repair(lake_root, allow_retype=True)
+
+    (finding,) = _findings(lake_root)
+    assert finding["widened"] == [f"{COLUMN}: int64 -> double"]
+
+
+def test_a_widening_on_a_day_that_also_drifted_by_a_nullability_still_wants_the_bump(
+    lake_root, monkeypatch, capsys
+):
+    # The case that cannot be read off the three difference lists. A nullability change is
+    # a real difference against the pinned schema that names no column, so a finding
+    # carrying it looks exactly like one filed for the widening alone. The two want
+    # opposite things from the operator, and only the recorded schema-equality fact tells
+    # them apart. Inferring it from the three lists being empty would tell an operator
+    # whose pinned schema is genuinely wrong that there is nothing left to correct.
+    wide = _retyped(COLUMN, pa.float64())
+    index = wide.get_field_index("volume")
+    field = wide.field(index)
+    renullable = wide.set(index, field.with_nullable(not field.nullable))
+    _split_day(
+        lake_root,
+        morning_type=pa.int64(),
+        morning_values=[100],
+        afternoon_type=pa.float64(),
+        afternoon_values=[200.5],
+    )
+    _pin(monkeypatch, renullable)
+
+    _repair(lake_root, allow_retype=True)
+
+    (finding,) = _findings(lake_root)
+    assert finding["widened"] == [f"{COLUMN}: int64 -> double"]
+    assert (finding["missing"], finding["unexpected"], finding["retyped"]) == ([], [], [])
+    assert finding["carries_pinned"] is False, "the schemas differ, by a nullability alone"
+    err = capsys.readouterr().err
+    assert "Correct the schema and bump schema_version." in err
+    assert "An authorized widening" not in err
 
 
 # -- the flag reaches the repair from the command line -----------------------

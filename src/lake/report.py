@@ -71,16 +71,20 @@ SCHEMA_DRIFT_DIR = "schema_drift"
 
 @dataclass(frozen=True)
 class SchemaDrift:
-    """One ticker-day whose merged segments do not carry the pinned schema.
+    """One ticker-day the merge had something to say about.
+
+    Two of the three shapes are a merged schema that is not the pinned one. The third is a
+    ticker-day whose segments disagreed with each other and were merged on a human's
+    authority, and its merged schema can be the pinned one exactly.
 
     ``GuardOutcome`` lives in ``close_guard`` and this record lives here, and the
     asymmetry is the import direction. The guard's producer never learns about this
     module, because the daemon wires the two together. Compaction's producers are inside
     ``compact``, so it imports this module directly and a record defined there would close
     the loop. There are two of them. One sits in ``_seal`` and reports a merged schema that
-    is not the pinned one. The other sits in the sweep and reports a merge the segments'
-    own types refused. The dataclass carries strings and dates alone, which keeps
-    pyarrow out of the module that writes JSON.
+    is not the pinned one, or a widening an operator authorized, or both at once. The other
+    sits in the sweep and reports a merge the segments' own types refused. The dataclass
+    carries strings and dates alone, which keeps pyarrow out of the module that writes JSON.
 
     The three difference fields say what moved, each naming columns rather than counting
     them, because a human reading the file wants the column.
@@ -132,12 +136,22 @@ class SchemaDrift:
     schema bump clears and none is owed for.
 
     All three can be empty, and each producer has a way of getting there. The merged
-    producer decides there is a difference by comparing the two schemas outright and these
-    fields explain it, so a difference the names and the types do not show files a record
-    that lists nothing. A nullability change is the difference that reaches it. The
-    refusal's producer scans the segments to explain a refusal Arrow already made, so a
-    refusal it cannot model lists nothing either. Both are still the finding: something was
-    wrong at the merge and this says which ticker-day to go and look at.
+    producer files on either of two conditions, a difference against the pinned schema or a
+    widening, and these three fields explain only the first. So a record lists nothing here
+    when it was filed for the widening alone, and again when the schemas differ by
+    something the names and the types do not show. A nullability change is that second
+    difference. The refusal's producer scans the segments to explain a refusal Arrow
+    already made, so a refusal it cannot model lists nothing either. All are still the
+    finding: something was worth saying at the merge and this says which ticker-day to go
+    and look at.
+
+    ``carries_pinned`` separates those two empty-handed records, and a reader needs them
+    apart because they want opposite things. A record filed for the widening alone carries
+    the pinned schema exactly, so there is nothing to correct. A nullability difference does
+    not, and the schema is what has to move. Nothing else on the record can tell the two
+    apart, which is why the fact is carried here rather than inferred from the three lists
+    being empty. It is false on a refused record, which has no merged schema to carry
+    anything.
     """
 
     surface: str
@@ -151,6 +165,7 @@ class SchemaDrift:
     widened: tuple[str, ...] = ()
     segments: tuple[str, ...] = field(default_factory=tuple)
     refused: bool = False
+    carries_pinned: bool = False
 
 
 def close_guard_dir(lake_root: Path | str, day: date) -> Path:
@@ -281,6 +296,7 @@ def write_schema_drift(
         "widened": list(drift.widened),
         "segments": list(drift.segments),
         "refused": drift.refused,
+        "carries_pinned": drift.carries_pinned,
     }
     # A report is written inside a lake that exists, or not at all. The same rule as
     # ``write_close_guard`` above, and for the same reason: `parents=True` from a missing

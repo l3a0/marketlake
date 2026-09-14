@@ -88,9 +88,11 @@ _DATE_PARTITIONED = frozenset({CHAINS, QUOTES})
 #
 # 1. One file per page that never reached the phone, under `reports/alerts/date=D/`.
 # 2. One file per close+5 guard run, under `reports/close_guard/date=D/`.
-# 3. One file per drifted ticker-day, under `reports/schema_drift/date=D/`, written by
-#    compaction rather than the daemon. A ticker-day whose merged segments did not carry
-#    the pinned schema files once, when it seals. A ticker-day the merge refused files on
+# 3. One file per ticker-day compaction's merge had something to say about, under
+#    `reports/schema_drift/date=D/`, written by compaction rather than the daemon. A
+#    ticker-day whose merged segments did not carry the pinned schema files once, when it
+#    seals, and so does one an operator authorized a widening on, whether or not its
+#    merged segments carried the pinned schema. A ticker-day the merge refused files on
 #    every run the conflict survives, because it has no manifest entry to make a later
 #    silence readable.
 #
