@@ -817,13 +817,29 @@ def _retyped_expiration_response(expirations: list[str]) -> VendorResponse:
     return VendorResponse(status=200, body=body)
 
 
-def _retyped_header_response(expirations: list[str]) -> VendorResponse:
+def _untransformable_quote_time_response(expirations: list[str]) -> VendorResponse:
     """A body that merges cleanly and that the row builder then rejects outright.
 
-    The drift is in a chain-level field rather than a contract field. The chains overflow is
-    built from the contract dict alone, so a top-level field has no key in it and the
-    routing has nowhere honest to park the value. The refusal propagates, which is the
-    fail-open branch this file's second test covers.
+    The drift is in ``quoteTimeInLong``, which the builder consumes into
+    ``vendor_quote_ts`` rather than copying into a column of its own. A transformed value
+    is this code's rather than the vendor's, so the overflow has no key for it and the
+    routing has nowhere honest to park it. The refusal propagates, which is the fail-open
+    branch this file's second test covers.
+
+    A chain-level field used to reach this branch and no longer does. Its value is the
+    vendor's own and it routes under ``chain``, which is marketlake #152.
+    """
+    body = _chain_body(expirations)
+    body["callExpDateMap"][f"{expirations[0]}:7"]["650.0"][0]["quoteTimeInLong"] = "not-an-epoch"
+    return VendorResponse(status=200, body=body)
+
+
+def _retyped_header_response(expirations: list[str]) -> VendorResponse:
+    """A body that merges cleanly and whose chain-level field then drifts at the builder.
+
+    ``underlyingPrice`` is read off the top of the body and repeated onto every contract
+    row. The column refuses the string, and the routing parks the vendor's own value under
+    ``chain`` rather than costing the cycle.
     """
     body = _chain_body(expirations)
     body["underlyingPrice"] = "six hundred and fifty"
@@ -839,14 +855,15 @@ def test_a_body_the_row_builder_rejects_fails_open_to_a_whole_chain_gap(lake_roo
     would reach the same minute and do it again. So it fails open: the chain is one gap row
     carrying the failure's own class, and the quote surface for the same cycle still lands.
 
-    The drift is in a chain-level field on purpose. A per-contract field routes into
-    ``extra`` and the cycle lands, which the test below covers. This branch is what is left
-    once it does, and it still has to hold.
+    The drift is in a transformed field on purpose. A field the parser copies verbatim
+    routes into ``extra`` and the cycle lands, whether it arrives on the contract or at the
+    top of the body, and the two tests below cover both. This branch is what is left once
+    they do, and it still has to hold.
     """
     plan = ChainPlan(((0, 9), (10, None)))
     vendor = _WindowVendor(
         windows={
-            (_d(0), _d(9)): _retyped_header_response(["2026-08-28"]),
+            (_d(0), _d(9)): _untransformable_quote_time_response(["2026-08-28"]),
             (_d(10), None): _chain_response(["2026-09-18"]),
         },
     )
@@ -855,13 +872,13 @@ def test_a_body_the_row_builder_rejects_fails_open_to_a_whole_chain_gap(lake_roo
     outcome = result.segment(CHAINS, "SPY")
     assert outcome.row_kind == journal.ROW_KIND_GAP
     # The class is the exception's own name, snake-cased, the way every raised failure is
-    # classified. Arrow refuses the retyped chain-level field with an ArrowInvalid.
-    assert outcome.error_class == "arrow_invalid"
+    # classified. The epoch-to-ISO conversion refuses the string with a ValueError.
+    assert outcome.error_class == "value_error"
     assert outcome.rows == 1
 
     gap = _chain_rows(result)[0]
     assert gap["row_kind"] == journal.ROW_KIND_GAP
-    assert gap["error_class"] == "arrow_invalid"
+    assert gap["error_class"] == "value_error"
     assert gap["bid"] is None and gap["open_interest"] is None
     # The cycle survived the rejection: the quote surface journaled beside the gap, and the
     # gap segment is durable and manifested rather than lost with the process.
@@ -901,6 +918,43 @@ def test_a_contract_field_the_column_refuses_lands_the_reassembled_snapshot(lake
     assert json.loads(drifted[0]["extra"]) == {"expirationDate": 1787000000000}
     # Every other contract keeps the expiration it sent, from both windows.
     assert {row["expiration_date"] for row in rows if row["extra"] is None} == {
+        "2026-08-28T20:00:00.000+00:00",
+        "2026-09-18T20:00:00.000+00:00",
+    }
+    assert result.segment(QUOTES, "SPY").row_kind == journal.ROW_KIND_DATA
+    assert outcome.partition in latest_entries(lake_root)
+
+
+def test_a_chain_level_field_the_column_refuses_lands_the_reassembled_snapshot(lake_root):
+    """The chain-level retype, driven through the windowed fetch it actually reaches.
+
+    The header comes from the first window that succeeded and is repeated onto every
+    contract row, so one window's retyped ``underlyingPrice`` reaches every row in the
+    reassembled snapshot. All of them null that column and park the vendor's own string
+    under ``chain``, and every contract keeps the fields it sent. So the chain lands whole
+    and the price the design's IV inversion reads is recoverable, where before this the
+    ticker gapped for the whole minute and the string was discarded.
+    """
+    plan = ChainPlan(((0, 9), (10, None)))
+    vendor = _WindowVendor(
+        windows={
+            (_d(0), _d(9)): _retyped_header_response(["2026-08-28"]),
+            (_d(10), None): _chain_response(["2026-09-18"]),
+        },
+    )
+    result = _run(vendor, lake_root, plan)
+
+    outcome = result.segment(CHAINS, "SPY")
+    assert outcome.row_kind == journal.ROW_KIND_DATA
+    assert outcome.error_class is None
+
+    rows = _chain_rows(result)
+    assert len(rows) > 1, "one row could not show that the header rides the whole reassembly"
+    for row in rows:
+        assert row["underlying_price"] is None
+        assert json.loads(row["extra"]) == {"chain": {"underlyingPrice": "six hundred and fifty"}}
+    # Every contract's own fields survive, from both windows.
+    assert {row["expiration_date"] for row in rows} == {
         "2026-08-28T20:00:00.000+00:00",
         "2026-09-18T20:00:00.000+00:00",
     }

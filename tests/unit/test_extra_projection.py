@@ -253,15 +253,20 @@ def test_two_versions_each_missing_a_different_column_never_cross():
 
 
 @pytest.mark.parametrize(
-    ("column", "vendor"), [("interest_rate", "interestRate"), ("snap_ts", "snapTs")]
+    ("column", "vendor"),
+    [
+        ("number_of_contracts", "numberOfContracts"),
+        ("is_chain_truncated", "isChainTruncated"),
+        ("snap_ts", "snapTs"),
+    ],
 )
 def test_a_column_no_vendor_field_overflows_into_is_never_a_candidate(column, vendor):
     """A version missing a non-vendor column still projects nothing into it.
 
     ``extra_paths`` already refuses these, but nothing drove the projection with such a
     version. Widening the candidates from the vendor-mapped columns to every schema column
-    would reach for an overflow key that does not exist, and a chain-level field really can
-    be absent from an older version's shape.
+    would reach for an overflow key that does not exist, and a recomputed chain-level
+    column really can be absent from an older version's shape.
     """
     table = _rows(_row(1, {vendor: 4.25, "bid": 4.30}))
 
@@ -407,6 +412,93 @@ def test_a_flat_key_on_the_quotes_surface_reaches_nothing():
 
     assert result.filled == {}
     assert "pe_ratio" not in result.table.column_names
+
+
+def test_an_envelope_key_reaches_its_column_through_the_envelope_block():
+    """The two quotes fields that belong to no captured block still read back.
+
+    They sit under ``envelope`` rather than a vendor block key, and the reader finds them
+    the same way it finds a block's, because both are one nested path in ``extra_paths``.
+    """
+    table = _rows(_row(1, {"envelope": {"realtime": True, "cusip": "111111111"}}))
+
+    result = project_extra(
+        table, surface="quotes", ledger=_ledger((1, _shape_without("quotes", "realtime", "cusip")))
+    )
+
+    assert result.table.column("realtime").to_pylist() == [True]
+    assert result.table.column("cusip").to_pylist() == ["111111111"]
+    assert result.complete
+
+
+# -- the chains surface's chain-level block ------------------------------------
+
+
+def test_a_chain_level_key_reaches_its_column_through_the_chain_block():
+    """The chains overflow is flat for a contract field and nested for a chain-level one."""
+    table = _rows(_row(1, {"bid": 4.25, "chain": {"underlyingPrice": 650.01}}))
+
+    result = project_extra(
+        table,
+        surface="chains",
+        ledger=_ledger((1, _shape_without("chains", "bid", "underlying_price"))),
+    )
+
+    assert result.table.column("bid").to_pylist() == [4.25]
+    assert result.table.column("underlying_price").to_pylist() == [650.01]
+    assert result.filled == {"bid": 1, "underlying_price": 1}
+
+
+def test_a_flat_chain_level_key_reaches_nothing():
+    """A bare ``underlyingPrice`` is a contract field, and it names no chains column.
+
+    That is what the nesting buys. A flat lookup would read an unrecognized contract field
+    into the chain-level column, presenting one measurement as another.
+    """
+    table = _rows(_row(1, {"underlyingPrice": 1.5}))
+
+    result = project_extra(
+        table, surface="chains", ledger=_ledger((1, _shape_without("chains", "underlying_price")))
+    )
+
+    assert result.filled == {}
+    assert "underlying_price" not in result.table.column_names
+
+
+def test_a_contract_key_beside_the_chain_level_one_never_wins():
+    """One overflow holding both levels' ``underlyingPrice`` fills from the chain's.
+
+    This is the row the flat shape could not represent at all: a vendor sending the name at
+    both levels. The flat key belongs to no column, so the nested value is the only
+    candidate and the column reads the chain's price rather than the contract's.
+    """
+    table = _rows(_row(1, {"underlyingPrice": 1.5, "chain": {"underlyingPrice": 650.01}}))
+
+    result = project_extra(
+        table, surface="chains", ledger=_ledger((1, _shape_without("chains", "underlying_price")))
+    )
+
+    assert result.table.column("underlying_price").to_pylist() == [650.01]
+    assert result.filled == {"underlying_price": 1}
+
+
+@pytest.mark.parametrize("block", [650.01, [1, 2], "text", None])
+def test_a_chain_block_that_is_not_an_object_fills_nothing(block):
+    """A ``chain`` key holding a scalar is drift, not a chain-level value.
+
+    The chains overflow gained a nested level, so it gained this case too. Reading the key
+    itself as the value would put a whole level's stand-in into one column, and the null it
+    would replace is honest while the raw value is still in the overflow.
+    """
+    table = _rows(_row(1, {"chain": block}))
+
+    result = project_extra(
+        table, surface="chains", ledger=_ledger((1, _shape_without("chains", "underlying_price")))
+    )
+
+    assert result.filled == {}
+    assert "underlying_price" not in result.table.column_names
+    assert result.complete
 
 
 # -- a version the ledger has no shape for ------------------------------------
