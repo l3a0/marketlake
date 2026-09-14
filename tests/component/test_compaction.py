@@ -28,6 +28,10 @@ They cover the job's contract:
     So is every other entry neither sweep recognises: a stray file or a foreign directory
     at the journal root, under a date, or under a surface, and a date the calendar or the
     guard rules out. None of them ends the walk it sits in.
+11. A ticker-day whose segments disagree about a column type is refused and costs nothing
+    but itself. Its segments stay byte-identical, every healthy ticker-day still seals,
+    the re-tune, the backup and the ping still run, and the run reports the refusal in its
+    own tuple and on the first line of its summary. The next run refuses it again.
 """
 
 from __future__ import annotations
@@ -392,41 +396,147 @@ def test_a_mid_day_schema_rotation_compacts_by_name(lake_root):
     assert result.sealed[0].rows == 5
 
 
-def test_a_mid_day_retype_refuses_the_merge_and_leaves_the_day_alone(lake_root):
-    # The other half of a rotation. A vendor field that arrived as an int all morning
-    # and as a float after lunch is not something unifying by name can reconcile. The
-    # merge widens nothing: silently promoting the column would bless a partition whose
-    # type changed inside one day, and the schema policy wants that failure loud. So the
-    # merge raises and the ticker-day stays exactly as the capture left it.
-    old_rows = _chains_rows(2, snap_ts=_snap(DAY, 0))
+def _retyped_day(lake_root: Path, ticker: str = "SPY", day: date = DAY) -> tuple[Path, Path]:
+    """One ticker-day whose two segments hold ``open_interest`` at different types.
+
+    A vendor field that arrived as an int all morning and as a float after lunch. Unifying
+    by name cannot reconcile that, and widening it silently would bless a partition whose
+    type changed inside one day. ``SegmentWriter`` can only ever write the pinned schema,
+    so the afternoon segment's stream is written by hand the way the capture loop's writer
+    would have written it under the other code shape.
+    """
+    old_rows = _chains_rows(2, snap_ts=_snap(day, 0), ticker=ticker)
     for row in old_rows:
         row["open_interest"] = 100
     index = CHAINS_SCHEMA.get_field_index("open_interest")
     retyped = CHAINS_SCHEMA.set(index, pa.field("open_interest", pa.float64()))
-    new_rows = _chains_rows(3, snap_ts=_snap(DAY, 1))
+    new_rows = _chains_rows(3, snap_ts=_snap(day, 1), ticker=ticker)
     for row in new_rows:
         row["open_interest"] = 100.5
     morning = _segment(
-        lake_root, "chains", "SPY", DAY, _table(CHAINS_SCHEMA, old_rows), start_ts="a"
+        lake_root, "chains", ticker, day, _table(CHAINS_SCHEMA, old_rows), start_ts="a"
     )
-    afternoon = journal.segment_path(lake_root, "chains", "SPY", DAY, "b", PID)
+    afternoon = journal.segment_path(lake_root, "chains", ticker, day, "b", PID)
     with pa.OSFile(str(afternoon), "wb") as sink, pa.ipc.new_stream(sink, retyped) as writer:
         writer.write_table(_table(retyped, new_rows))
+    return morning, afternoon
+
+
+def test_a_mid_day_retype_refuses_the_ticker_day_and_leaves_it_alone(lake_root):
+    # The other half of a rotation, and what #184 changed about it. The merge still
+    # refuses: no partition, no manifest entry, both segments byte-identical, exactly as
+    # the capture left them. What no longer happens is the run ending. The refusal is
+    # named, caught at the ticker-day, filed, and reported under its own tuple, and the
+    # backup and the ping still run. This reverses the part of #187 that held the raise.
+    morning, afternoon = _retyped_day(lake_root)
     morning_before = morning.read_bytes()
     afternoon_before = afternoon.read_bytes()
-    events: list[str] = []
 
-    with pytest.raises(pa.ArrowTypeError):
-        _run(lake_root, backup=FakeBackup(events), pinger=FakePinger(events))
+    result, events, _, pinger = _run(lake_root)
 
-    # Nothing was sealed: no partition, no manifest entry, both segments byte-identical.
-    # The backup and the ping never ran, so the failure reaches the health check as a
-    # missed ping rather than being reported as a healthy run.
     assert not LakePaths(lake_root).chains_partition_path("SPY", DAY).exists()
     assert read_manifest(lake_root) == []
     assert morning.read_bytes() == morning_before
     assert afternoon.read_bytes() == afternoon_before
-    assert events == []
+    assert result.sealed == () and result.verified == ()
+    (refused,) = result.refused
+    assert (refused.surface, refused.ticker, refused.day) == ("chains", "SPY", DAY)
+    assert refused.conflicts == ("open_interest: int64 -> double",)
+    assert refused.segments == (_rel(lake_root, morning), _rel(lake_root, afternoon))
+    # The blast radius is one ticker-day. The lake still gets its nightly copy.
+    assert result.backed_up and result.pinged
+    assert events == ["backup", "ping"]
+    assert pinger.urls == [URL]
+
+
+def test_a_refused_ticker_day_is_not_a_clean_no_op(lake_root):
+    # ``changed`` separates a run that did something from one that correctly no-opped. A
+    # refusal seals nothing, so reading it as unchanged would print the same verdict an
+    # already-sealed lake prints while a ticker-day sits unmerged. It files a fresh
+    # finding into the lake on every run besides, so the run did change the lake.
+    _retyped_day(lake_root)
+
+    result, _, _, _ = _run(lake_root)
+
+    assert result.changed
+    rendered = result.render()
+    # The top line, not only the detail below it. An operator reads the top line.
+    assert "refused=1" in rendered.splitlines()[0]
+    assert "sealed=0" in rendered.splitlines()[0]
+    assert "open_interest: int64 -> double" in rendered
+    assert "secret-key" not in rendered
+
+
+def test_a_refused_ticker_day_costs_nothing_but_itself(lake_root):
+    # The measured scenario from #184. One retyped SPY ticker-day, one healthy ZZZ that
+    # sorts after it on the same date, and one healthy AAA on an earlier date. Before the
+    # containment the raise left AAA sealed, ZZZ never reached, and the re-tune, the
+    # backup, and the ping unrun, every night.
+    _retyped_day(lake_root)
+    _segment(
+        lake_root,
+        "chains",
+        "ZZZ",
+        DAY,
+        _chains(4, snap_ts=_snap(DAY, 0), ticker="ZZZ"),
+        start_ts="a",
+    )
+    _segment(
+        lake_root,
+        "chains",
+        "AAA",
+        FRIDAY,
+        _chains(2, snap_ts=_snap(FRIDAY, 0), ticker="AAA"),
+        start_ts="a",
+    )
+
+    result, events, _, _ = _run(lake_root)
+
+    assert sorted(item.ticker for item in result.sealed) == ["AAA", "ZZZ"]
+    assert [item.ticker for item in result.refused] == ["SPY"]
+    paths = LakePaths(lake_root)
+    assert pq.read_table(paths.chains_partition_path("ZZZ", DAY)).num_rows == 4
+    assert pq.read_table(paths.chains_partition_path("AAA", FRIDAY)).num_rows == 2
+    # The re-tune profiles the latest sealed chains day, which the refusal must not have
+    # taken with it, and the two steps after the sweep both run.
+    assert result.retune is not None and result.retune.day == DAY
+    assert events == ["backup", "ping"]
+
+
+def test_a_refused_ticker_day_keeps_its_directories_through_the_prune(lake_root):
+    # The prune deletes only an empty directory, and a refused ticker-day's is not empty.
+    # Its date directory holds a sealed ticker-day too, so the prune reaches every level.
+    morning, afternoon = _retyped_day(lake_root)
+    sealed = _segment(
+        lake_root,
+        "chains",
+        "ZZZ",
+        DAY,
+        _chains(2, snap_ts=_snap(DAY, 0), ticker="ZZZ"),
+        start_ts="a",
+    )
+
+    _run(lake_root)
+
+    assert morning.exists() and afternoon.exists()
+    assert not sealed.exists() and not sealed.parent.exists()
+    assert morning.parent.parent.parent.is_dir()
+
+
+def test_a_second_run_refuses_the_same_ticker_day_again(lake_root):
+    # A refused ticker-day has no terminal state until a human clears it, and nothing in
+    # this module can. Its segments stay, so every sweep merges them again and refuses
+    # again. That repetition is what keeps the finding readable, because the ticker-day
+    # has no manifest entry to make a later silence mean anything.
+    _retyped_day(lake_root)
+
+    first, _, _, _ = _run(lake_root)
+    second, events, _, _ = _run(lake_root)
+
+    assert len(first.refused) == 1
+    assert second.refused == first.refused
+    assert second.changed
+    assert events == ["backup", "ping"]
 
 
 # -- 2. torn tails and shadow appends ----------------------------------------

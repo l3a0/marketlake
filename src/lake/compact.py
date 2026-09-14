@@ -32,25 +32,35 @@ The job's rules, each glossed at first use.
    compared to the sum across the segments, and its digest is what the manifest records.
    Only after that does the manifest entry land, and only after the manifest append are
    the segments unlinked. A crash at any point re-runs with nothing lost.
-4. *Drift that survives the merge is reported, never raised.* Segments in one ticker-day
+4. *Drift is reported, and costs one ticker-day at most.* Segments in one ticker-day
    can disagree about columns only when the daemon restarted onto different code
    mid-session, because every production segment takes its schema from
    ``journal.schema_for`` and a vendor that stops sending a field yields a null column
    rather than a dropped one. So the check guards this project's own release process
-   rather than the vendor. The merged schema is compared to the pinned one at the merge,
-   which is the last moment the segments exist, and what moved is filed under
-   ``reports/`` once the seal has committed. One page per run carries it to a phone,
-   folding every finding the run made into a single message that names the columns. The
-   finding never raises, because the job seals every ticker-day bare and a raise would
-   cost the rest of the sweep, the re-tune, the backup, and the ping. One disagreement
-   never reaches this check at all. A column two segments hold at different types is
-   refused by ``concat_tables`` before the comparison runs, and that refusal does raise
-   and does cost the run. Whether it should
-   is [#184](https://github.com/l3a0/marketlake/issues/184), which weighs for a retype the
-   trade this rule declines for a dropped column. The durable remedy is
-   ``schema_version`` enforcement, which is
-   [#128](https://github.com/l3a0/marketlake/issues/128) and not compaction's business.
-   This check is a detector and secondary to it.
+   rather than the vendor. Drift comes in two shapes and both are reported.
+
+   The first survives the merge. The merged schema is compared to the pinned one at the
+   merge, which is the last moment the segments exist, and what moved is filed under
+   ``reports/`` once the seal has committed. That finding never raises, because the job
+   seals every ticker-day bare and a raise would cost the rest of the sweep, the re-tune,
+   the backup, and the ping.
+
+   The second does not survive it. A column two segments hold at different types is
+   refused by ``concat_tables`` before the comparison runs, so that ticker-day has no
+   merged schema to compare and no partition to write. The refusal is named
+   ``SegmentSchemaConflict``, the sweep catches it, files the same kind of finding, and
+   carries on to the next ticker-day. Its segments stay on disk untouched, so the next
+   run merges them again and files again. That used to raise and cost the whole run
+   nightly, which
+   [#184](https://github.com/l3a0/marketlake/issues/184) settled by weighing for a retype
+   the trade this rule already made for a dropped column. The repair for a refused
+   ticker-day is [#189](https://github.com/l3a0/marketlake/issues/189), and nothing in
+   this module clears one today.
+
+   One page per run carries both shapes to a phone, folding every finding the run made
+   into a single message that names the columns. The durable remedy is ``schema_version``
+   enforcement, which is [#128](https://github.com/l3a0/marketlake/issues/128) and not
+   compaction's business. This check is a detector and secondary to it.
 5. *A torn tail is dropped, a shadow-append is refused.* A torn tail is a segment cut
    mid-batch by a power loss. Its complete batches are kept and the cut bytes dropped,
    never an error. A *shadow-append* is bytes after a segment's end-of-stream marker, the
@@ -192,6 +202,44 @@ class RecompactionRefused(Exception):
     """Raised when a human-invoked recompaction has no segments left to rebuild from."""
 
 
+class SegmentSchemaConflict(Exception):
+    """Raised when two segments in one ticker-day hold a column at different types.
+
+    ``concat_tables`` refuses that merge outright, so the ticker-day has no partition to
+    write and the pinned-schema comparison downstream never runs. This names the refusal
+    where it happens, which is what lets the sweep contain it. Catching the bare
+    ``pa.ArrowTypeError`` in the caller would contain anything else ``_seal`` raised for
+    the same reason, and the caller cannot tell the two apart.
+
+    ``conflicts`` names each column the segments disagree about, rendered
+    ``name: earlier -> later``. The segments are read in filename order, which is
+    ``seg-<start_ts>-<pid>``, so the earlier type is the one the day started with.
+    ``detail`` is Arrow's own message, and it is what the exception prints when the scan
+    explained nothing, which keeps a refusal this code did not anticipate legible.
+    """
+
+    def __init__(
+        self,
+        *,
+        surface: str,
+        ticker: str,
+        day: date,
+        partition: str,
+        segments: tuple[str, ...],
+        conflicts: tuple[str, ...],
+        detail: str,
+    ) -> None:
+        named = "; ".join(conflicts) if conflicts else detail
+        super().__init__(f"{partition}: segments disagree about a column type: {named}")
+        self.surface = surface
+        self.ticker = ticker
+        self.day = day
+        self.partition = partition
+        self.segments = segments
+        self.conflicts = conflicts
+        self.detail = detail
+
+
 # -- the result types --------------------------------------------------------
 
 
@@ -230,6 +278,29 @@ class SkippedDay:
 
 
 @dataclass(frozen=True)
+class RefusedTickerDay:
+    """One ticker-day the merge refused, and the columns its segments disagree about.
+
+    This is not a ``SkippedDay``. That names a whole date, its three reasons are all
+    ordinary days the sweep was right to leave alone, and every one of them still pings.
+    A refused ticker-day is neither ordinary nor a date. Its segments stay on disk, no
+    partition is written, no manifest entry lands, and a finding is filed under
+    ``reports/schema_drift/`` naming what moved.
+
+    ``partition`` is the lake-relative Parquet path that was not written, which is what
+    the finding names too. ``segments`` are the lake-relative segment paths, all still
+    there. ``conflicts`` names each column, rendered ``name: earlier -> later``.
+    """
+
+    surface: str
+    ticker: str
+    day: date
+    partition: str
+    conflicts: tuple[str, ...]
+    segments: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class RetuneResult:
     """What the nightly window re-tune decided for one day's chains profile.
 
@@ -263,11 +334,13 @@ class CompactionResult:
 
     ``sealed`` lists the partitions written this run. ``verified`` lists the partitions
     that already had a manifest entry and were sha-checked, with their debris deleted.
-    ``skipped`` lists the date directories left alone. ``retune`` is the window re-tune
-    verdict, or ``None`` when no chains partition of an eligible day was available to
-    profile. ``backed_up`` and ``pinged`` record the two post-seal steps. ``problem``
-    names a ping that failed, which leaves ``pinged`` false. The seal and the backup
-    already happened, so the run's report is worth more than the lost ping.
+    ``skipped`` lists the date directories left alone. ``refused`` lists the ticker-days
+    whose segments disagreed about a column type, which the merge cannot reconcile.
+    ``retune`` is the window re-tune verdict, or ``None`` when no chains partition of an
+    eligible day was available to profile. ``backed_up`` and ``pinged`` record the two
+    post-seal steps. ``problem`` names a ping that failed, which leaves ``pinged`` false.
+    The seal and the backup already happened, so the run's report is worth more than the
+    lost ping.
     """
 
     sealed: tuple[SealedPartition, ...]
@@ -277,6 +350,7 @@ class CompactionResult:
     backed_up: bool
     pinged: bool
     problem: str | None = None
+    refused: tuple[RefusedTickerDay, ...] = ()
 
     @property
     def changed(self) -> bool:
@@ -284,17 +358,28 @@ class CompactionResult:
 
         A second run over an already-sealed lake reports ``False``: nothing sealed, no
         debris deleted, no plan rewritten.
+
+        A refusal counts, even though it writes no partition and appends no manifest
+        entry. It files a fresh finding under ``reports/schema_drift/`` on every run the
+        conflict survives, and that directory is inside the lake and inside the backup
+        sync root, so the run did change the lake. The alternative reading is worse than
+        merely pedantic. A run whose every ticker-day was refused would otherwise report
+        itself the way an already-sealed lake does, and the one thing this flag exists to
+        separate is a clean no-op from a run that did something.
         """
         debris = any(item.segments for item in self.verified)
         rewrote = self.retune is not None and self.retune.written
-        return bool(self.sealed) or debris or rewrote
+        return bool(self.sealed) or bool(self.refused) or debris or rewrote
 
     def render(self) -> str:
         """A human-readable summary. It names slugs and paths, never a ping URL."""
+        # ``refused`` sits in the first line and not only in the detail below it. An
+        # operator reads the top line, and a run that sealed nothing because every
+        # ticker-day was refused otherwise prints exactly what a healthy no-op prints.
         lines = [
             f"compaction: sealed={len(self.sealed)} verified={len(self.verified)} "
-            f"skipped={len(self.skipped)} backed_up={self.backed_up} pinged={self.pinged} "
-            f"slug={COMPACTION_SLUG}"
+            f"skipped={len(self.skipped)} refused={len(self.refused)} "
+            f"backed_up={self.backed_up} pinged={self.pinged} slug={COMPACTION_SLUG}"
         ]
         if self.problem is not None:
             lines.append(f"  {self.problem}")
@@ -306,6 +391,12 @@ class CompactionResult:
             )
         for item in self.skipped:
             lines.append(f"  skipped  {item.day} ({item.reason})")
+        for item in self.refused:
+            named = ", ".join(item.conflicts) if item.conflicts else "no column named"
+            lines.append(
+                f"  refused  {item.partition} segments={len(item.segments)} kept, "
+                f"types disagree: {named}"
+            )
         if self.retune is None:
             lines.append("  retune   no chains partition to profile")
         elif self.retune.skipped_reason is not None:
@@ -476,6 +567,87 @@ def _pinned_order(table: pa.Table, pinned: pa.Schema) -> pa.Table:
     return table.select(order)
 
 
+def _type_conflicts(tables: Sequence[pa.Table]) -> tuple[str, ...]:
+    """Every column the segments hold at more than one type, in the merged column order.
+
+    Read after ``concat_tables`` has already refused, so this explains a refusal rather
+    than deciding there is one. Each column is rendered ``name: earlier -> later``, the
+    same shape ``SchemaDrift.retyped`` uses, with the earlier type the one the first
+    segment carrying the column held it at. The segments arrive in filename order and the
+    name leads with the writer session's start stamp, so earlier means earlier in the day.
+
+    A null-typed column is left out. ``promote_options="default"`` resolves null against
+    any type, so a segment whose column was all nulls never causes the refusal, and
+    naming it would point a reader at the wrong column.
+
+    The result can be empty. Arrow refusing for a reason this scan does not model is the
+    case that reaches there, and both the exception and the finding say so plainly rather
+    than printing an empty list.
+    """
+    first: dict[str, str] = {}
+    conflicts: dict[str, str] = {}
+    for table in tables:
+        for field in table.schema:
+            if field.type == pa.null():
+                continue
+            seen = first.setdefault(field.name, str(field.type))
+            if str(field.type) != seen and field.name not in conflicts:
+                conflicts[field.name] = f"{field.name}: {seen} -> {field.type}"
+    return tuple(conflicts.values())
+
+
+def _refused_drift(conflict: SegmentSchemaConflict) -> SchemaDrift:
+    """The finding a refused merge files.
+
+    ``SchemaDrift`` already carries what this has to say. ``retyped`` names the columns
+    and both their types, ``segments`` names the files still on disk, and ``partition``
+    names the Parquet the merge did not write. ``missing`` and ``unexpected`` stay empty,
+    because the merged schema they are computed against does not exist.
+
+    The filing cadence differs from a drift that merged, and the difference is forced. A
+    sealed ticker-day files once and its manifest entry is what makes the later silence
+    readable. A refused one has no entry, so filing once would make the next night's
+    silence consistent with three worlds at once: the conflict was fixed, the conflict is
+    still there and was already filed, or the ticker-day is gone. So the writer files on
+    every run the conflict survives, and any de-duplication is the reader's policy. A
+    writer that suppressed its second finding would decide that for a reader who does not
+    exist yet, and the reader could not undo it, because the record would simply be absent.
+    """
+    return SchemaDrift(
+        surface=conflict.surface,
+        ticker=conflict.ticker,
+        day=conflict.day,
+        partition=conflict.partition,
+        schema_version=journal.SCHEMA_VERSION,
+        retyped=conflict.conflicts,
+        segments=conflict.segments,
+    )
+
+
+def _refuse(
+    root: Path,
+    conflict: SegmentSchemaConflict,
+    *,
+    clock: Clock,
+    found: list[SchemaDrift],
+) -> RefusedTickerDay:
+    """File a refused merge's finding and hand back the run's record of it.
+
+    The filing comes first and the record second, so the two can never disagree about
+    what the run refused. ``_file_drift`` swallows a write that fails, which is what keeps
+    a full disk from turning one refused ticker-day back into a lost run.
+    """
+    _file_drift(root, _refused_drift(conflict), clock=clock, found=found)
+    return RefusedTickerDay(
+        surface=conflict.surface,
+        ticker=conflict.ticker,
+        day=conflict.day,
+        partition=conflict.partition,
+        conflicts=conflict.conflicts,
+        segments=conflict.segments,
+    )
+
+
 def _schema_drift(
     merged: pa.Schema,
     pinned: pa.Schema,
@@ -520,11 +692,16 @@ def _file_drift(
 ) -> None:
     """File one finding, remember it for the run's page, and never let either cost the run.
 
-    The sweep calls ``_seal`` bare, once per ticker-day, and ``compact``'s only
-    ``try/except`` wraps the health-check ping. So anything raised here would cost every
-    ticker-day still to be sealed, the window re-tune, the backup, and the ping. Trading
-    a null column on one ticker for a lake-wide backup outage is a bad trade, which is
-    why the finding is reported and never raised.
+    The sweep catches one failure out of ``_seal``, the merge a column type conflict
+    refused, and ``compact``'s only other ``try/except`` wraps the health-check ping. So
+    anything raised here would cost every ticker-day still to be sealed, the window
+    re-tune, the backup, and the ping. Trading a null column on one ticker for a lake-wide
+    backup outage is a bad trade, which is why the finding is reported and never raised.
+
+    Both callers on the drift path reach this one. ``_seal`` calls it for a ticker-day
+    that merged and sealed, and the sweep calls it for one the merge refused. The second
+    has no partition and no manifest entry behind it, which changes what the finding says
+    and not how it is filed.
 
     A write that itself fails leaves stderr, which launchd files. That is ``alert._record``'s
     rule for the same situation: the record is the last line of defence, and when it
@@ -690,10 +867,22 @@ def _seal(
     It is reported rather than raised, because a raise from this function costs the rest
     of the sweep.
 
+    One drift stops the merge instead of surviving it. A column the segments hold at
+    different types is refused by ``concat_tables``, and this raises
+    ``SegmentSchemaConflict`` rather than letting Arrow's own error out. The sweep catches
+    that one name and nothing else, so a failure raised anywhere else in here still costs
+    the run, which is what the other named failures in this module are for. The repair
+    lets it out, because the operator started the run and a single ticker-day is the whole
+    of what they asked for.
+
     ``found`` is the list the caller collects this run's findings in. ``compact`` passes
     one and pages once from it. The repair passes one too and pages nobody from it, so the
     operator who started it reads the drift on their own terminal instead.
     """
+    partition = paths.partition_path(surface, ticker, day)
+    rel = partition.relative_to(root).as_posix()
+    named_segments = tuple(path.relative_to(root).as_posix() for path in segments)
+
     tables: list[pa.Table] = []
     expected = 0
     for path in segments:
@@ -703,14 +892,25 @@ def _seal(
             expected += table.num_rows
     if tables:
         # A mid-day vendor change rotates to a new segment with a new schema. Unifying by
-        # name adds the new column as nulls on the older rows. A retyped column still
-        # raises, which is the loud failure the schema policy wants for a retyped field.
-        merged = pa.concat_tables(tables, promote_options="default")
+        # name adds the new column as nulls on the older rows. A column the segments hold
+        # at different types is refused rather than widened. Widening it silently would
+        # bless a partition whose type changed inside one day, and the schema policy wants
+        # that failure loud. It is named here and contained by the caller, so it costs its
+        # own ticker-day and nothing more.
+        try:
+            merged = pa.concat_tables(tables, promote_options="default")
+        except pa.ArrowTypeError as exc:
+            raise SegmentSchemaConflict(
+                surface=surface,
+                ticker=ticker,
+                day=day,
+                partition=rel,
+                segments=named_segments,
+                conflicts=_type_conflicts(tables),
+                detail=str(exc),
+            ) from exc
     else:
         merged = journal.schema_for(surface).empty_table()
-
-    partition = paths.partition_path(surface, ticker, day)
-    rel = partition.relative_to(root).as_posix()
 
     # The merge is the last moment the segments still exist, so it is the only moment a
     # mid-day drop is plain. Unifying by name fills a column one segment lacks with
@@ -735,7 +935,7 @@ def _seal(
             ticker=ticker,
             day=day,
             partition=rel,
-            segments=[path.relative_to(root).as_posix() for path in segments],
+            segments=named_segments,
         )
     )
 
@@ -792,7 +992,7 @@ def _seal(
         partition=rel,
         rows=expected,
         sha256=entry["sha256"],
-        segments=tuple(path.relative_to(root).as_posix() for path in segments),
+        segments=named_segments,
     )
 
 
@@ -1087,13 +1287,18 @@ def compact(
 
     The whole run holds the lake-root lock. The sweep covers every date under
     ``journal/`` whose option-close deadline has passed on the injected clock. Each
-    eligible ticker-day is sealed, or, if its partition is already manifested,
-    sha-verified with its debris deleted. The window re-tune then profiles the latest
-    sealed day's chains partitions. The backup runs last, and the ping only after it.
+    eligible ticker-day ends one of three ways. It is sealed. Or, if its partition is
+    already manifested, it is sha-verified and its debris deleted. Or the merge refuses
+    it, because its segments disagree about a column type, and then it is filed, reported
+    under ``refused``, and left exactly as the capture wrote it. The window re-tune then
+    profiles the latest sealed day's chains partitions. The backup runs last, and the ping
+    only after it.
 
     The run is idempotent. A second run over the same lake seals nothing, deletes
     nothing, rewrites no plan, and reports ``changed`` false. It still backs up and
-    pings, because a job that correctly no-ops is healthy.
+    pings, because a job that correctly no-ops is healthy. A refused ticker-day is the one
+    thing that repeats rather than settling. Its segments are still there, so every run
+    refuses it again and files again, and ``changed`` stays true until a human clears it.
 
     ``pinger`` is optional so a caller without a health check, like a test, can skip
     it. When given, ``ping_url`` is required.
@@ -1118,12 +1323,15 @@ def compact(
         latest = latest_entries(root)
         sealed: list[SealedPartition] = []
         verified: list[SealedPartition] = []
+        refused: list[RefusedTickerDay] = []
         problem: str | None = None
         drifted: list[SchemaDrift] = []
         chains_by_day: dict[date, list[SealedPartition]] = {}
         # The page goes out in a ``finally``, so no raise anywhere can swallow it. The
         # sweep itself raises on a row-count regression, a failed verify, a partition that
         # does not match its manifest entry, and any OSError from the write or the unlink.
+        # A merge the segments' types refused is the one failure it catches instead, and
+        # that finding joins ``drifted`` like any other, so this same page carries it.
         # A ticker-day that already drifted and sealed has had its segments unlinked, so
         # the next run finds nothing to merge for it and never runs the check again. The
         # finding would then be filed and never paged, for good. The re-tune and the
@@ -1142,17 +1350,42 @@ def compact(
                         outcome = _recover(root, paths, surface, ticker, day, segments, entry)
                         verified.append(outcome)
                     else:
-                        outcome = _seal(
-                            root,
-                            paths,
-                            surface,
-                            ticker,
-                            day,
-                            segments,
-                            clock=clock,
-                            guard=True,
-                            found=drifted,
-                        )
+                        try:
+                            outcome = _seal(
+                                root,
+                                paths,
+                                surface,
+                                ticker,
+                                day,
+                                segments,
+                                clock=clock,
+                                guard=True,
+                                found=drifted,
+                            )
+                        except SegmentSchemaConflict as conflict:
+                            # The whole behaviour change. Two segments disagreeing about
+                            # a column type is not something the merge can reconcile, and
+                            # no repair in this module clears it, so the run has nothing
+                            # to gain by ending here. Raising cost every ticker-day still
+                            # to be swept, the re-tune, the backup, and the ping, every
+                            # night, over one ticker-day nobody had a tool for. Rule 4
+                            # already weighed that trade for a column dropped mid-day and
+                            # came down on reporting. Nothing in its reasoning turns on
+                            # which kind of drift it is.
+                            #
+                            # Containment is safe only because the finding reaches a
+                            # human. It goes into ``drifted``, which is what ``_page_drift``
+                            # pages from in the ``finally`` below, so a run whose only
+                            # drift is a refusal still pages. Filing a finding while
+                            # dropping it from the page would be silence with paperwork,
+                            # which is worse than the raise it replaced.
+                            refused.append(_refuse(root, conflict, clock=clock, found=drifted))
+                            # The segments stay, so the next run merges them again and
+                            # finds the same conflict. That is the cadence the finding
+                            # wants. It also skips the chains registration below: a
+                            # refused ticker-day has no partition for the re-tune to
+                            # profile.
+                            continue
                         latest[rel] = {"sha256": outcome.sha256, "rows": outcome.rows}
                         sealed.append(outcome)
                     if surface == CHAINS:
@@ -1184,6 +1417,7 @@ def compact(
         sealed=tuple(sealed),
         verified=tuple(verified),
         skipped=tuple(skipped),
+        refused=tuple(refused),
         retune=retune,
         backed_up=backed_up,
         pinged=pinged,
@@ -1212,6 +1446,14 @@ def recompact_ticker_day(
     The merge runs the same schema check the scheduled job does, so the rebuild can find
     drift. It files the finding and writes it to stderr, and it pages nobody. The operator
     started this run and is reading its output, which is the reader a page exists to reach.
+
+    ``SegmentSchemaConflict`` is raised here rather than contained. The scheduled sweep
+    contains it because a raise there costs every other ticker-day, the backup, and the
+    ping. This call has no other ticker-day to protect, so the operator gets the failure
+    named on their own terminal with a non-zero exit, which is what asking for one repair
+    and getting nothing should look like. It cannot repair the conflict either, because
+    it reaches the same ``concat_tables``. That repair is
+    [#189](https://github.com/l3a0/marketlake/issues/189).
     """
     root = Path(lake_root)
     paths = LakePaths(root)
@@ -1349,10 +1591,12 @@ __all__ = [
     "CompactionVerifyError",
     "PartitionMismatch",
     "RecompactionRefused",
+    "RefusedTickerDay",
     "RetuneResult",
     "SCHEMA_DRIFT_EVENT",
     "SCHEMA_DRIFT_TITLE",
     "SealedPartition",
+    "SegmentSchemaConflict",
     "SkippedDay",
     "WindowProfile",
     "build_parser",

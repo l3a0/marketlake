@@ -205,6 +205,13 @@ def write_schema_drift(
     says which ticker-days were merged. A file per ticker-day per run would be hundreds
     of empty findings a day, and the reader would have to filter them all back out.
 
+    **A refused merge writes on every run.** That exemption rests on the manifest entry,
+    and a ticker-day whose merge was refused has none. So its silence on the second night
+    would be consistent with three things at once: the conflict was fixed, it is still
+    there and was already filed, or the ticker-day is gone. The caller files that finding
+    every run the conflict survives for exactly that reason. Nothing here changes either
+    way. This writer is called once per finding whichever caller reached it.
+
     **Raises rather than swallowing.** The caller contains it, because a raise out of
     ``_seal`` would cost the rest of the sweep, and the containment belongs where that
     blast radius is, not here. Hiding the failure inside the writer would take it away

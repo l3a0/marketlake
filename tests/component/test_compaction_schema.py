@@ -1193,3 +1193,177 @@ def test_main_builds_the_publisher_that_pages(lake_root, monkeypatch, tmp_path):
 
     leaked = Message(event="probe", title="t", body=f"the key is {PING_KEY}")
     assert publisher.publish(leaked, now=_et(DAY, 16, 30)).reason == "refused"
+
+
+# -- 9. a merge the segment types refused ------------------------------------
+
+
+def _conflicted_day(lake_root: Path, ticker: str = "SPY", day: date = DAY) -> tuple[Path, Path]:
+    """One ticker-day whose two segments hold ``COLUMN`` at different types.
+
+    This is the drift the merge never lets the pinned-schema comparison see.
+    ``pa.concat_tables`` refuses it outright, so the ticker-day has no merged schema and
+    no partition, and the finding has to come from the refusal itself.
+    """
+    index = CHAINS_SCHEMA.get_field_index(COLUMN)
+    retyped = CHAINS_SCHEMA.set(index, pa.field(COLUMN, pa.float64()))
+    morning = _segment(
+        lake_root,
+        CHAINS_SCHEMA,
+        _table(CHAINS_SCHEMA, _rows(2, snap_ts=_snap(day, 0), ticker=ticker)),
+        start_ts="a",
+        ticker=ticker,
+        day=day,
+    )
+    afternoon = _segment(
+        lake_root,
+        retyped,
+        _table(retyped, _rows(3, snap_ts=_snap(day, 1), ticker=ticker)),
+        start_ts="b",
+        ticker=ticker,
+        day=day,
+    )
+    return morning, afternoon
+
+
+def test_a_refused_merge_files_a_finding_naming_both_types(lake_root):
+    # The refusal commits no seal, so ``_seal``'s own filing, which waits for the manifest
+    # append, can never reach it. The sweep files this one instead. ``SchemaDrift`` already
+    # carries what it has to say: the column and both its types under ``retyped``, the
+    # segments still on disk, and the Parquet path that was not written.
+    morning, afternoon = _conflicted_day(lake_root)
+
+    result, _ = _run(lake_root)
+
+    (finding,) = _findings(lake_root)
+    assert finding["retyped"] == [f"{COLUMN}: int64 -> double"]
+    assert finding["missing"] == [] and finding["unexpected"] == []
+    assert finding["surface"] == "chains" and finding["ticker"] == "SPY"
+    assert finding["partition"] == result.refused[0].partition
+    assert finding["segments"] == [
+        str(morning.relative_to(lake_root)),
+        str(afternoon.relative_to(lake_root)),
+    ]
+    # The finding names a Parquet that is not there, which is the point of naming it.
+    assert not (lake_root / finding["partition"]).exists()
+
+
+def test_a_run_whose_only_drift_is_a_refusal_still_pages(lake_root):
+    # The integration that makes containment safe rather than a regression. Before #188 a
+    # raise was the only thing a retype sent to a human. Catching it without adding the
+    # finding to what the run pages from would trade a nightly page for a file nobody
+    # reads, which is the gap #188 closed. Nothing here drifts past the merge, so this
+    # page exists only because the refusal reached ``_page_drift``.
+    _conflicted_day(lake_root)
+    publisher, transport = _paging(lake_root)
+
+    result, events = _run(lake_root, publisher=publisher)
+
+    assert result.sealed == () and len(result.refused) == 1
+    assert len(transport.messages) == 1
+    page = transport.messages[0]
+    assert page.event == SCHEMA_DRIFT_EVENT
+    assert page.title == SCHEMA_DRIFT_TITLE
+    assert page.priority == 5
+    assert f"{COLUMN}: int64 -> double" in page.body
+    assert DAY.isoformat() in page.body
+    # The page goes out and the backup and the ping still run. The refusal costs neither.
+    assert events == ["backup", "ping"]
+
+
+def test_a_refusal_and_a_surviving_drift_fold_into_one_page(lake_root, monkeypatch):
+    # One bad release drifts every ticker-day still in flight, and which shape each one
+    # takes depends only on which segments it happened to have. So the two paths file
+    # separately and page together, the same fold a wide drift already gets.
+    _conflicted_day(lake_root)
+    _segment(
+        lake_root,
+        CHAINS_SCHEMA,
+        _table(CHAINS_SCHEMA, _rows(2, snap_ts=_snap(DAY, 0), ticker="ZZZ")),
+        start_ts="a",
+        ticker="ZZZ",
+    )
+    # ZZZ merges cleanly and drifts against the pinned schema. SPY never gets that far.
+    _pin(monkeypatch, _without(CHAINS_SCHEMA, COLUMN))
+    publisher, transport = _paging(lake_root)
+
+    result, _ = _run(lake_root, publisher=publisher)
+
+    assert len(result.sealed) == 1 and len(result.refused) == 1
+    assert sorted(finding["ticker"] for finding in _findings(lake_root)) == ["SPY", "ZZZ"]
+    assert len(transport.messages) == 1
+    body = transport.messages[0].body
+    assert body.startswith("2 ticker-day(s)")
+    assert f"{COLUMN}: int64 -> double" in body
+    assert f"unexpected {COLUMN}" in body
+
+
+def test_a_refused_ticker_day_is_filed_again_on_every_run(lake_root):
+    # The cadence. A sealed ticker-day files once and its manifest entry is what makes the
+    # later silence readable. A refused one has no entry, so a writer that filed once would
+    # make night two's silence consistent with three worlds at once: fixed, still broken
+    # and already filed, or gone. De-duplication is the reader's policy, and a reader
+    # cannot undo a record that was never written.
+    _conflicted_day(lake_root)
+    publisher, transport = _paging(lake_root)
+
+    # Two nights, at different times of day. The finding's file name is a time-of-day
+    # stamp, a surface, a ticker, and a pid, with no date in it, and the directory above
+    # it is keyed on the session day rather than the night. So two runs at the same
+    # microsecond-of-day over one drifted session day write the same name, and the second
+    # is swallowed. A real clock makes that a one-in-billions coincidence, and #191 is
+    # where the structural version of it lives. Moving the second run's clock keeps this
+    # test on the cadence rather than on the file name.
+    _run(lake_root, publisher=publisher)
+    _run(lake_root, clock=ManualClock(_et(TUESDAY, 16, 31)), publisher=publisher)
+
+    # Both land under the session day they are about, which is the day that drifted and
+    # not the night that found it.
+    assert len(_findings(lake_root)) == 2
+    assert len(transport.messages) == 2
+
+
+def test_a_refusal_that_cannot_be_filed_still_pages_and_still_seals(lake_root, monkeypatch):
+    # ``_file_drift`` swallows a write that fails, and the refusal path goes through it for
+    # that reason. A full disk must not turn one refused ticker-day back into a lost run.
+    # The page goes out anyway, because the finding is remembered before the write is tried.
+    _conflicted_day(lake_root)
+    _segment(
+        lake_root,
+        CHAINS_SCHEMA,
+        _table(CHAINS_SCHEMA, _rows(2, snap_ts=_snap(DAY, 0), ticker="ZZZ")),
+        start_ts="a",
+        ticker="ZZZ",
+    )
+
+    def boom(*args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(compact_module, "write_schema_drift", boom)
+    publisher, transport = _paging(lake_root)
+
+    result, events = _run(lake_root, publisher=publisher)
+
+    assert len(result.refused) == 1 and len(result.sealed) == 1
+    assert _findings(lake_root) == []
+    assert len(transport.messages) == 1
+    assert events == ["backup", "ping"]
+
+
+def test_the_repair_lets_a_refused_merge_out(lake_root):
+    # The scheduled sweep contains the refusal because a raise there costs every other
+    # ticker-day, the backup, and the ping. A hand-run repair has no other ticker-day to
+    # protect, so the operator gets the failure named on their own terminal instead of a
+    # silent no-op. It cannot clear the conflict either: it reaches the same merge.
+    morning, afternoon = _conflicted_day(lake_root)
+    morning_before = morning.read_bytes()
+
+    with pytest.raises(compact_module.SegmentSchemaConflict) as raised:
+        recompact_ticker_day(lake_root, "chains", "SPY", DAY, clock=ManualClock(_et(DAY, 17, 0)))
+
+    conflict = raised.value
+    assert conflict.conflicts == (f"{COLUMN}: int64 -> double",)
+    assert conflict.ticker == "SPY" and conflict.day == DAY
+    assert f"{COLUMN}: int64 -> double" in str(conflict)
+    assert morning.read_bytes() == morning_before and afternoon.exists()
+    assert read_manifest(lake_root) == []
