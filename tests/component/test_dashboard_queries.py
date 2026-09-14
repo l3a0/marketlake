@@ -996,15 +996,28 @@ def _grace_lake(fixture_lake: FixtureLake) -> Path:
     )
 
 
-def _status_at(root: Path, when: datetime, slot: datetime) -> str:
-    """One slot's status on the SPY chains strip, read at one instant."""
-    strip = service_over(root, now=when).run_query(
+def _strip_at(root: Path, when: datetime, surface: str = "chains") -> dict:
+    """One SPY surface's strip, read at one instant. Found by name, never by position."""
+    strips = service_over(root, now=when).run_query(
         "today", {"date": "2026-08-24", "ticker": "SPY"}
-    )["strips"][0]
+    )["strips"]
+    matching = [strip for strip in strips if strip["surface"] == surface]
+    assert len(matching) == 1, f"expected one {surface} strip, got {len(matching)}"
+    return matching[0]
+
+
+def _cell_at(root: Path, when: datetime, slot: datetime, surface: str = "chains") -> dict:
+    """One slot's whole cell on a SPY strip, read at one instant."""
+    strip = _strip_at(root, when, surface)
     index = int((slot - et(MONDAY, 9, 30)).total_seconds() // 60)
     cell = strip["slots"][index]
     assert cell["slot"] == slot.isoformat()
-    return cell["status"]
+    return cell
+
+
+def _status_at(root: Path, when: datetime, slot: datetime, surface: str = "chains") -> str:
+    """One slot's status on a SPY strip, read at one instant."""
+    return _cell_at(root, when, slot, surface)["status"]
 
 
 @pytest.mark.parametrize("second", [0, 5, 30, 59])
@@ -1061,6 +1074,56 @@ def test_a_long_dead_morning_still_reads_missing(fixture_lake: FixtureLake):
     at = et(MONDAY, 9, 40, 30)
     for minute in range(32, 39):
         assert _status_at(root, at, et(MONDAY, 9, minute)) == "missing"
+
+
+def test_the_grace_holds_on_the_quotes_surface_too(fixture_lake: FixtureLake):
+    # Both minute-cadence surfaces are captured by the same cycle, so both owe a slot on
+    # the same terms and both must wait the same grace. Every other test here reads the
+    # chains strip, which would leave a grace that reached one surface and not the other
+    # looking identical to one that reached both.
+    root = one_segment_lake(
+        fixture_lake,
+        [
+            _quotes("SPY", et(MONDAY, 9, 30)),
+            _quotes("SPY", et(MONDAY, 9, 31)),
+        ],
+        surface="quotes",
+    )
+    slot = et(MONDAY, 9, 32)
+    assert _status_at(root, et(MONDAY, 9, 32, 5), slot, "quotes") == "pending"
+    assert _status_at(root, et(MONDAY, 9, 33, 59), slot, "quotes") == "pending"
+    assert _status_at(root, et(MONDAY, 9, 34, 0), slot, "quotes") == "missing"
+    assert _status_at(root, et(MONDAY, 9, 30, 30), et(MONDAY, 9, 30), "quotes") == "captured"
+
+
+def test_a_gap_marker_inside_the_grace_is_still_a_gap(fixture_lake: FixtureLake):
+    # The grace reaches a slot with no rows at all and nothing else. A gap row is data,
+    # recording a missed minute and why, so a cycle that failed fast and journalled its
+    # reason inside the slot's own minute must read gap immediately. Waiting would hide a
+    # recorded failure behind a status that means nobody has looked yet, and the design
+    # pins a recorded gap and a hole as different failures.
+    root = one_segment_lake(
+        fixture_lake,
+        [
+            _chains("SPY", et(MONDAY, 9, 30), occ_symbol="A"),
+            _chains(
+                "SPY",
+                et(MONDAY, 9, 31),
+                kind=journal.ROW_KIND_GAP,
+                error_class="vendor_auth_error",
+            ),
+        ],
+    )
+    slot = et(MONDAY, 9, 31)
+    # Read five seconds into the minute after the gap's own, well inside the grace.
+    cell = _cell_at(root, et(MONDAY, 9, 32, 5), slot)
+    assert cell["status"] == "gap"
+    assert cell["error_class"] == ["vendor_auth_error"]
+    # The count carries it too, so a graced cell can never be rendered without being
+    # counted. The six counts still denominate the whole session.
+    strip = _strip_at(root, et(MONDAY, 9, 32, 5))
+    assert strip["counts"]["gap"] == 1
+    assert sum(strip["counts"].values()) == 406
 
 
 def test_a_slot_with_rows_is_captured_inside_its_own_grace(fixture_lake: FixtureLake):
