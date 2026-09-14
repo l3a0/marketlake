@@ -107,6 +107,10 @@ def test_the_probe_paths_are_not_real_files():
     working rather than a fault: the file it creates is this harmless name and never
     ``token.json``. Delete it and run again.
     """
+    # The set has to name every path this module aims at, because it is the only thing
+    # that would notice one left behind. It named one until the mkdir tests added a
+    # second, and a guard-probe-dir then survived a mutation run unnoticed.
+    assert PROBES == (PROBE, PROBE_DIR)
     for probe in PROBES:
         assert not probe.exists(), (
             f"{probe} exists. A run with the guard broken left it behind. Deleting it is "
