@@ -986,6 +986,20 @@ def _last_owed(now: datetime, grace_minutes: int) -> datetime | None:
     return None
 
 
+def _session_has_a_judged_minute(ctx: QueryContext) -> bool:
+    """Whether today's session has a minute whose cycle has had time to land.
+
+    False through the session's opening grace, when no cycle of this session could have
+    written a row yet. A day the calendar will not judge answers True, so a clock inside
+    the capture window is never held back by a missing calendar entry.
+    """
+    try:
+        bounds = ctx.session.bounds(ctx.session.session_date())
+    except (NotASession, *_CALENDAR_RANGE_ERRORS):
+        return True
+    return ctx.now - SLOT_VERDICT_GRACE >= bounds.open
+
+
 def _capture_owed_through(ctx: QueryContext) -> datetime | None:
     """The last minute a capture cycle was owed, or ``None`` if none ever was.
 
@@ -1004,8 +1018,20 @@ def _capture_owed_through(ctx: QueryContext) -> datetime | None:
     loop owed a cycle. A healthy day captured through its own close and reads clean all
     evening. A day that captured nothing reads stale from the close onward, which is when
     the reader arrives.
+
+    A session's own first minutes are the one place inside the window where now is the
+    wrong reference. The open cycle starts at the top of the open minute and has to
+    fetch, journal and fsync before a row exists, so at 09:30:00 the newest cycle is
+    still the previous session's and the age measured against now is the weekend rather
+    than anything this session did. Every ticker would read stale from the instant the
+    session opened until the first row landed. So the previous close stays the reference
+    until the grace has run out past the open, and only then does now take over. The
+    grace is the one the Today strip judges a slot by, which is what makes the two panels
+    agree at the open instead of contradicting each other. Nothing else moves. From the
+    open plus the grace onward the reference is now again, so the threshold still
+    measures the same span it always did and still fires when the watchdog does.
     """
-    if ctx.session.in_capture_window():
+    if ctx.session.in_capture_window() and _session_has_a_judged_minute(ctx):
         return ctx.now
     day = ctx.session.session_date()
     for _ in range(OWED_SESSION_LOOKBACK_DAYS):

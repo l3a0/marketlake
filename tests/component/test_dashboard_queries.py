@@ -545,6 +545,117 @@ def test_inside_the_capture_window_the_owed_minute_is_now(root: Path):
     assert now["capture_owed_through"] == NOW.isoformat()
 
 
+def _opened_dark(fixture_lake: FixtureLake, monday_through: int | None = None) -> Path:
+    """A lake that captured Friday's option close, and Monday only as far as asked.
+
+    ``monday_through`` is the last Monday minute past 09:30 that landed a cycle, or None
+    for a Monday on which nothing ran at all.
+    """
+    fixture_lake.with_journal_segment(
+        "chains",
+        "SPY",
+        FRIDAY,
+        pa.Table.from_pylist(
+            [_chains("SPY", et(FRIDAY, 16, 15), occ_symbol="A")],
+            schema=journal.CHAINS_SCHEMA,
+        ),
+        start_ts="20260821T200000000000",
+        pid=1,
+    )
+    if monday_through is not None:
+        fixture_lake.with_journal_segment(
+            "chains",
+            "SPY",
+            MONDAY,
+            pa.Table.from_pylist(
+                [
+                    _chains("SPY", et(MONDAY, 9, minute), occ_symbol="A")
+                    for minute in range(30, monday_through + 1)
+                ],
+                schema=journal.CHAINS_SCHEMA,
+            ),
+            start_ts="20260824T133000000000",
+            pid=2,
+        )
+    return fixture_lake.build()
+
+
+def _spy_stale(root: Path, when: datetime) -> bool:
+    """Whether the Now panel paints SPY chains stale at one instant."""
+    now = service_over(root, now=when).run_query("now", {})
+    row = next(r for r in now["surfaces"] if r["ticker"] == "SPY" and r["surface"] == "chains")
+    return row["stale"]
+
+
+def test_the_open_minute_is_not_owed_until_its_cycle_could_have_landed(
+    fixture_lake: FixtureLake,
+):
+    # The bug this holds: inside the window the reference was the raw instant, so at
+    # 09:30:00 the newest cycle was still Friday's close and the age measured the weekend
+    # rather than anything this session did. Every ticker went red the moment the session
+    # opened, on a daemon doing exactly what it should, and cleared once the first row
+    # landed. That is a red-then-green flap on the loudest reading the panel has.
+    root = _opened_dark(fixture_lake)
+
+    assert _spy_stale(root, et(MONDAY, 9, 29, 59)) is False
+    assert _spy_stale(root, et(MONDAY, 9, 30, 0)) is False
+    assert _spy_stale(root, et(MONDAY, 9, 30, 30)) is False
+    assert _spy_stale(root, et(MONDAY, 9, 31, 59)) is False
+
+
+def test_a_daemon_that_never_woke_reads_stale_once_the_open_grace_runs_out(
+    fixture_lake: FixtureLake,
+):
+    # The grace is a delay, not an amnesty. A daemon that never woke has to be caught, and
+    # the moment it can be is the moment the open minute becomes judgeable.
+    root = _opened_dark(fixture_lake)
+
+    assert _spy_stale(root, et(MONDAY, 9, 32, 0)) is True
+    assert _spy_stale(root, et(MONDAY, 9, 40, 0)) is True
+
+
+def test_the_open_cycle_landing_keeps_the_row_clean_across_the_grace(
+    fixture_lake: FixtureLake,
+):
+    # A daemon that captured the open reads clean on both sides of the boundary, so the
+    # grace running out is not itself an event a healthy session can be seen to cross.
+    root = _opened_dark(fixture_lake, monday_through=31)
+
+    assert _spy_stale(root, et(MONDAY, 9, 31, 59)) is False
+    assert _spy_stale(root, et(MONDAY, 9, 32, 0)) is False
+    assert _spy_stale(root, et(MONDAY, 9, 33, 0)) is False
+
+
+def test_the_two_panels_agree_about_the_open(fixture_lake: FixtureLake):
+    # The reason the strip's own grace is the one reused here. _surface_stale names panel
+    # agreement as its reason for consulting scope, and a panel that called every ticker
+    # stale while the strip beside it reported nothing missing contradicted that. Both now
+    # turn at the same instant on the same dark session.
+    root = _opened_dark(fixture_lake)
+    for when, expected in (
+        (et(MONDAY, 9, 31, 59), False),
+        (et(MONDAY, 9, 32, 0), True),
+    ):
+        strip = service_over(root, now=when).run_query(
+            "today", {"date": "2026-08-24", "ticker": "SPY"}
+        )["strips"][0]
+        assert _spy_stale(root, when) is expected
+        assert (strip["counts"]["missing"] > 0) is expected
+
+
+def test_the_opening_grace_does_not_move_the_threshold(fixture_lake: FixtureLake):
+    # The over-reach check, and the one that matters most. The column reports the failure
+    # the watchdog counts, so the grace must reach the session's opening minutes and
+    # nothing else. A daemon that captured through 09:45 and then stopped still turns at
+    # 09:45 plus the injected threshold to the second, exactly as it did before.
+    root = _opened_dark(fixture_lake, monday_through=45)
+    threshold = timedelta(minutes=GuardConstants().watchdog_page_minutes)
+    turns_at = et(MONDAY, 9, 45) + threshold
+
+    assert _spy_stale(root, turns_at) is False
+    assert _spy_stale(root, turns_at + timedelta(seconds=1)) is True
+
+
 def test_a_ticker_onboarded_after_the_close_is_not_late_that_evening(root: Path):
     """Nothing was owed of a ticker whose epoch falls after the last owed minute.
 
