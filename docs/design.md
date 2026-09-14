@@ -206,7 +206,7 @@ Failures push alerts. Progress needs a pull surface. The dashboard queries the l
   2. *suspect*: a data cycle landed, flagged for the validation battery to judge.
   3. *gap*: a gap row records the missed minute and its reason.
   4. *missing*: a past slot with no row at all, not even a gap marker. A recorded gap and a hole are different failures, so they get different cells.
-  5. *pending*: a slot still ahead of the clock.
+  5. *pending*: a slot whose cycle may still be running, so it is not judged yet. A slot ahead of the clock is pending, and so is one the clock has just passed, because the cycle owing a minute starts at the top of that minute and has to fetch, journal and fsync before any row exists. Judging a slot at the instant it names would call the minute being captured right now missing for the whole of it. The verdict waits until the slot's own minute has ended and one further minute has passed, which is the span the page already allows a stale stamp. A tighter boundary would flap, flipping a slow cycle's slot from missing to captured on the next refresh.
   6. *out_of_scope*: a slot before the ticker's `capture_start` epoch, the instant capture began for that ticker. Sessions and minutes before it are out of scope, never gaps.
 
   The strip is denominated by the day's session length from the calendar. That is 406 slots on a regular 09:30–16:15 day and 226 on a half-day. Slots count both endpoints, so the 405 elapsed minutes from 09:30 to 16:15 hold 406 of them. An early close therefore never renders as a half-missing day.
