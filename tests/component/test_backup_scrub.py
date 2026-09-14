@@ -93,7 +93,12 @@ def test_a_rotted_file_on_the_copy_is_named(fixture_lake):
     assert result.sha_mismatches == (CHAINS,)
     assert result.missing == () and result.orphans == ()
     assert result.ok is False
-    assert result.problem == "backup scrub failed: missing=0 sha_mismatches=1 orphans=0"
+    # The count decides the ping and the path says where to look, so both surface, and
+    # the line names the disk it came from.
+    assert result.problem == (
+        f"backup scrub failed: missing=0 sha_mismatches=1 unaccounted=0: {target}"
+    )
+    assert f"backup file does not match the lake: {CHAINS}" in result.notes
 
 
 def test_rot_that_keeps_the_size_is_still_caught(fixture_lake):
@@ -122,7 +127,11 @@ def test_a_file_missing_from_the_copy_is_named(fixture_lake):
     result = backup_scrub(root, target)
     assert result.missing == (CHAINS,)
     assert result.sha_mismatches == () and result.orphans == ()
-    assert result.problem == "backup scrub failed: missing=1 sha_mismatches=0 orphans=0"
+    assert result.ok is False
+    assert result.problem == (
+        f"backup scrub failed: missing=1 sha_mismatches=0 unaccounted=0: {target}"
+    )
+    assert f"backup file gone: {CHAINS}" in result.notes
 
 
 def test_a_file_on_the_copy_with_no_entry_is_an_orphan(fixture_lake):
@@ -134,8 +143,14 @@ def test_a_file_on_the_copy_with_no_entry_is_an_orphan(fixture_lake):
     debris.write_bytes(b"half a transfer")
 
     result = backup_scrub(root, target)
-    assert result.orphans == (debris.relative_to(target).as_posix(),)
+    rel = debris.relative_to(target).as_posix()
+    assert result.orphans == (rel,)
     assert result.missing == () and result.sha_mismatches == ()
+    # Named, never paged. An extra file on the copy costs space rather than data, and
+    # macOS writes files to a mounted volume without anyone asking, so an orphan that
+    # withheld the ping would page on a folder someone opened in Finder.
+    assert result.ok is True and result.problem is None
+    assert f"backup file the lake never recorded: {rel}" in result.notes
 
 
 def test_the_reverse_pass_skips_what_the_lake_s_own_scrub_skips(fixture_lake):
@@ -300,21 +315,73 @@ def test_a_target_with_no_manifest_copy_is_reported_rather_than_read_as_empty(fi
 
     result = backup_scrub(root, target)
     assert result.manifest_missing is True
-    assert result.problem == f"backup carries no manifest copy: {target}"
+    assert result.ok is False
+    assert result.problem == f"backup carries no usable manifest copy: {target}"
 
 
-def test_a_rotted_manifest_copy_is_named_by_position(fixture_lake):
+def test_a_rotted_manifest_copy_is_named_by_byte_offset(fixture_lake):
     root, target = _backed_up(fixture_lake)
-    lines = (target / MANIFEST_FILE).read_text().splitlines()
-    entry = json.loads(lines[0])
-    entry["rows"] = entry["rows"] + 1
-    lines[0] = json.dumps(entry, sort_keys=True)
-    (target / MANIFEST_FILE).write_text("\n".join(lines) + "\n")
+    copy = target / MANIFEST_FILE
+    original = copy.read_bytes()
+    flipped = bytearray(original)
+    flipped[4] ^= 0xFF
+    copy.write_bytes(bytes(flipped))
 
     result = backup_scrub(root, target)
-    assert result.manifest_diverged_at == 1
+    assert result.manifest_diverged_at == 4
     assert result.ok is False
-    assert "diverged from the lake's at entry 1" in result.problem
+    assert f"diverged from the lake's at byte 4: {target}" in result.problem
+
+
+def test_a_manifest_copy_that_diverges_late_is_caught_too(fixture_lake):
+    # The first entry is the easy case and the only one a naive check holds. Rot lands
+    # wherever it lands, so the check has to reach the whole file.
+    root, target = _backed_up(fixture_lake)
+    copy = target / MANIFEST_FILE
+    original = copy.read_bytes()
+    offset = original.index(b"\n") + 30
+    flipped = bytearray(original)
+    flipped[offset] ^= 0xFF
+    copy.write_bytes(bytes(flipped))
+
+    assert backup_scrub(root, target).manifest_diverged_at == offset
+
+
+def test_a_manifest_copy_longer_than_the_lake_s_is_not_a_clean_prefix(fixture_lake):
+    # A lake restored or rebuilt from behind, beside an older copy. The copy carries
+    # ledger lines the lake does not, so the watermark means nothing and reading the
+    # copy as merely ahead would scrub against a ledger the lake never wrote.
+    root, target = _backed_up(fixture_lake)
+    source = root / MANIFEST_FILE
+    end = len(source.read_bytes())
+    with (target / MANIFEST_FILE).open("a") as handle:
+        handle.write(json.dumps({"partition": "chains/ticker=IWM/date=2026-08-28.parquet"}) + "\n")
+
+    result = backup_scrub(root, target)
+    assert result.manifest_diverged_at == end
+    assert result.ok is False
+
+
+def test_rot_that_breaks_a_line_s_json_does_not_switch_the_scrub_off(fixture_lake):
+    """The hole a parsed-entry comparison leaves, closed by comparing bytes.
+
+    ``_parse_jsonl`` discards the first line it cannot parse and every line after it,
+    because the append rule says only the last line can be torn. Rot on an SSD obeys no
+    such rule. Read through that parser, one wrecked byte in the copy's first line would
+    discard the whole tail, collapse the watermark to zero, and let a backup whose every
+    file had rotted come back clean.
+    """
+    root, target = _backed_up(fixture_lake)
+    copy = target / MANIFEST_FILE
+    wrecked = bytearray(copy.read_bytes())
+    wrecked[2] = 0x00
+    copy.write_bytes(bytes(wrecked))
+    for path in target.rglob("*.parquet"):
+        path.write_bytes(b"rot")
+
+    result = backup_scrub(root, target)
+    assert result.manifest_diverged_at == 2
+    assert result.ok is False
 
 
 def test_a_copy_that_agrees_with_itself_and_not_with_the_lake_is_reported(fixture_lake):
@@ -338,15 +405,84 @@ def test_a_copy_that_agrees_with_itself_and_not_with_the_lake_is_reported(fixtur
     assert backup_scrub(root, target).ok is False
 
 
-def test_a_torn_trailing_line_shortens_the_watermark_rather_than_diverging(fixture_lake):
-    # rsync can only ever catch the manifest mid-append, and the append rule says that
-    # tears the last line and no earlier one. A shorter watermark is the right reading,
-    # so the entry whose line was torn becomes pending rather than damage.
+def test_a_torn_trailing_line_is_not_divergence_and_the_copy_still_says_so(fixture_lake):
+    """A prefix that stops mid-line is still a prefix, so it is not divergence.
+
+    The entry whose line was torn drops out of the watermark, so its partition reads as
+    pending. Its file is on the copy all the same, because a file is written before its
+    entry is appended, and that is ``unaccounted``: the copy holding something its own
+    manifest copy does not reach. Both readings say the one true thing, which is that
+    this copy's manifest is shorter than the copy that was taken. Under the compaction
+    job's lock no append is ever in flight, so the sync that writes the real backup
+    never sees a torn line at all.
+    """
     root, target = _backed_up(fixture_lake)
     text = (target / MANIFEST_FILE).read_text()
+    torn = json.loads(text.splitlines()[-1])["partition"]
     (target / MANIFEST_FILE).write_text(text[: text.rindex("\n") - 10])
 
     result = backup_scrub(root, target)
     assert result.manifest_diverged_at is None
-    assert result.ok
-    assert len(result.pending) == 1
+    assert result.pending == (torn,)
+    assert result.unaccounted == (torn,)
+    assert result.ok is False
+
+
+def test_a_manifest_copy_truncated_to_nothing_is_not_a_clean_watermark(fixture_lake):
+    # A watermark of zero over a lake that has entries would put every partition past it
+    # and leave nothing for the scrub to check, which is the quietest way for this whole
+    # feature to stop working.
+    root, target = _backed_up(fixture_lake)
+    (target / MANIFEST_FILE).write_bytes(b"")
+
+    result = backup_scrub(root, target)
+    assert result.manifest_missing is True
+    assert result.ok is False
+
+
+def test_a_plain_file_where_the_target_should_be_is_not_a_mounted_disk(fixture_lake):
+    # The repair for an unmounted disk and the repair for a disk carrying no backup are
+    # different, so the finding has to tell them apart.
+    root = _lake(fixture_lake)
+    target = root.parent / "ssd"
+    target.write_bytes(b"not a mount point")
+
+    result = backup_scrub(root, target)
+    assert result.target_missing is True
+    assert result.problem == f"backup target not mounted: {target}"
+
+
+def test_a_read_that_fails_is_a_named_finding_rather_than_a_raise(fixture_lake):
+    """The scrub reads the one disk in this system built to fail.
+
+    Every other Sunday check runs after it, so a raise would cost the run its canary,
+    its coverage assertion and its re-auth reminder, and report a traceback in place of
+    the disk. A bad sector, or the cable pulled mid-walk, is a named finding instead.
+    """
+    root, target = _backed_up(fixture_lake)
+    (target / CHAINS).chmod(0o000)
+    try:
+        result = backup_scrub(root, target)
+    finally:
+        (target / CHAINS).chmod(0o644)
+
+    assert result.unreadable is not None
+    assert result.ok is False
+    assert result.problem.startswith("backup could not be read: PermissionError")
+
+
+def test_many_wrong_files_name_a_few_and_then_say_how_many(fixture_lake):
+    # A disk going bad names every file it carries. One report line per partition would
+    # bury every other finding the run made, so the naming stops and counts the rest.
+    for ticker in ("SPY", "QQQ", "IWM", "DIA", "XLF"):
+        fixture_lake.with_chains(ticker, DAY)
+    root = fixture_lake.build()
+    target = mirror_lake(root, root.parent / "ssd")
+    for path in target.glob("chains/**/*.parquet"):
+        path.write_bytes(b"rot")
+
+    result = backup_scrub(root, target)
+    assert len(result.sha_mismatches) == 5
+    named = [line for line in result.notes if "does not match" in line]
+    assert len(named) == 4
+    assert named[-1] == "backup file does not match the lake: and 2 more"

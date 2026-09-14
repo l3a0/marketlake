@@ -400,89 +400,143 @@ def scrub(lake_root: Path) -> ScrubResult:
 
 # -- the backup-copy scrub ---------------------------------------------------
 
+# How many paths one finding names before it stops and says how many are left. A disk
+# going bad names every file it carries, and a line per partition would bury every other
+# finding the same run made.
+_NAMED_PATHS = 3
+
+
+def _named(label: str, paths: Sequence[str]) -> list[str]:
+    """One line per path, up to the cap, then a line saying how many are left."""
+    lines = [f"{label}: {rel}" for rel in paths[:_NAMED_PATHS]]
+    if len(paths) > _NAMED_PATHS:
+        lines.append(f"{label}: and {len(paths) - _NAMED_PATHS} more")
+    return lines
+
+
+def _first_difference(source: bytes, backup: bytes) -> int:
+    """The byte offset where the backup's manifest copy stops matching the lake's.
+
+    When the copy matches for its whole length and is longer, the offset is the end of
+    the lake's own ledger, which is where the copy started carrying bytes the lake does
+    not have.
+    """
+    limit = min(len(source), len(backup))
+    for index in range(limit):
+        if source[index] != backup[index]:
+            return index
+    return limit
+
 
 @dataclass(frozen=True)
 class BackupScrubResult:
     """The verdict of a scrub over the backup copy.
 
-    ``target`` is the backup root the scrub walked, so a finding names the disk it came
-    from rather than leaving the caller to say which one.
+    ``target`` is the backup root the scrub walked, and every finding repeats it, so a
+    line read on its own names the disk it came from.
 
-    Three tuples name what is wrong with the copied files, in the two directions
-    ``ScrubResult`` already uses.
+    Three tuples name what is wrong with the copied files. Each withholds the Sunday
+    ping, because each is the copy no longer holding what the lake says it holds.
 
-    - ``missing``: the backup should carry this partition by now and does not.
+    - ``missing``: the backup carried this partition at its own watermark and does not
+      now.
     - ``sha_mismatches``: the backup carries it and its bytes do not match the sha the
       lake's manifest recorded. This is the silent bit rot the scrub exists to catch.
-    - ``orphans``: a file on the backup with no manifest entry. A killed ``rsync``
-      leaves its hidden temp file behind, and the design puts that orphan here rather
-      than on ``rsync``.
+    - ``unaccounted``: the backup carries a partition whose entry sits past the
+      watermark. The sync copies a file and the ledger line that records it from one
+      locked snapshot, so a file can never arrive ahead of its line. Seeing one means
+      the copy's manifest is shorter than the copy, which makes the watermark a number
+      that cannot be trusted.
 
-    Three fields name a scrub that could not run to the end. Each stops the walk where
-    it stands, because every answer past it would be derived from a reading already
-    known to be wrong.
+    Four fields name a scrub that could not run to the end. Each stops the walk where it
+    stands, because every answer past it would be derived from a reading already known
+    to be wrong, and each withholds the ping for the same reason: a week the scrub could
+    not run is a week nothing looked at the copy.
 
     - ``target_missing``: the backup target is not a mounted directory.
-    - ``manifest_missing``: the target is mounted and carries no manifest copy, so
-      either no sync has ever landed or the copy's integrity root is gone.
-    - ``manifest_diverged_at``: the 1-based position of the first entry in the backup's
-      manifest copy that is not the lake's entry at that same position. ``None`` when
-      the copy is a clean prefix.
+    - ``unreadable``: a read of the target failed partway through.
+    - ``manifest_missing``: the target is mounted and carries no usable manifest copy,
+      either because the file is absent or because it holds no entries while the lake
+      holds some. So no sync has ever landed, or the copy's integrity root is gone.
+    - ``manifest_diverged_at``: the byte offset where the copy's manifest stops matching
+      the lake's. ``None`` when the copy is a clean prefix.
 
-    ``pending`` is not a failure. It names the partitions the lake manifested after the
-    backup's last sync, which the backup legitimately does not carry yet.
+    Two tuples are reported and never withhold the ping, because neither can be lake
+    data going missing.
+
+    - ``orphans``: a file on the backup that the lake's manifest does not record at all.
+      A killed ``rsync`` leaves its hidden temp behind, and the design puts that orphan
+      here rather than on ``rsync``. So does the debris macOS writes to any mounted
+      volume on its own, which is why an orphan rides the report rather than paging.
+    - ``pending``: the partitions the lake manifested after the backup's last sync,
+      which the backup legitimately does not carry yet.
     """
 
     target: str
     missing: tuple[str, ...] = ()
     sha_mismatches: tuple[str, ...] = ()
+    unaccounted: tuple[str, ...] = ()
     orphans: tuple[str, ...] = ()
     pending: tuple[str, ...] = ()
     target_missing: bool = False
     manifest_missing: bool = False
     manifest_diverged_at: int | None = None
-
-    @property
-    def ok(self) -> bool:
-        """Whether the scrub ran to the end and found nothing wrong.
-
-        ``pending`` is deliberately not read here. A backup behind the lake is the
-        normal state between one sync and the next, and a check that called it a
-        failure would fail every week.
-        """
-        return not (
-            self.missing
-            or self.sha_mismatches
-            or self.orphans
-            or self.target_missing
-            or self.manifest_missing
-            or self.manifest_diverged_at is not None
-        )
+    unreadable: str | None = None
 
     @property
     def problem(self) -> str | None:
-        """The one finding to report, or ``None`` when the scrub came back clean.
+        """The one finding that withholds the ping, or ``None`` when there is none.
 
-        The three stopping conditions are mutually exclusive by construction, because
-        each returns before the next can be reached. So one line always says the whole
-        verdict.
+        The four stopping conditions are mutually exclusive by construction, because
+        each returns before the next can be reached, so one line always says the whole
+        verdict. ``orphans`` and ``pending`` are deliberately absent. An extra file on
+        the copy costs space rather than data, and a copy behind its lake is the normal
+        state between one sync and the next. Both are named in ``notes`` instead.
         """
         if self.target_missing:
             return f"backup target not mounted: {self.target}"
+        if self.unreadable is not None:
+            return f"backup could not be read: {self.unreadable}"
         if self.manifest_missing:
-            return f"backup carries no manifest copy: {self.target}"
+            return f"backup carries no usable manifest copy: {self.target}"
         if self.manifest_diverged_at is not None:
             return (
-                "backup manifest copy diverged from the lake's at entry "
+                "backup manifest copy diverged from the lake's at byte "
                 f"{self.manifest_diverged_at}: {self.target}"
             )
-        if self.ok:
+        if not (self.missing or self.sha_mismatches or self.unaccounted):
             return None
         return (
-            "backup scrub failed: "
-            f"missing={len(self.missing)} sha_mismatches={len(self.sha_mismatches)} "
-            f"orphans={len(self.orphans)}"
+            f"backup scrub failed: missing={len(self.missing)} "
+            f"sha_mismatches={len(self.sha_mismatches)} "
+            f"unaccounted={len(self.unaccounted)}: {self.target}"
         )
+
+    @property
+    def notes(self) -> tuple[str, ...]:
+        """The report-tier lines, which name what a count alone cannot.
+
+        Every wrong file is named here, capped, including the ones ``problem`` already
+        counted. A count says whether to ping and a path says where to look, and an
+        operator handed "sha_mismatches=1" and nothing else cannot act on it.
+        """
+        lines = _named("backup file does not match the lake", self.sha_mismatches)
+        lines += _named("backup file gone", self.missing)
+        lines += _named("backup holds a file its manifest copy does not reach", self.unaccounted)
+        lines += _named("backup file the lake never recorded", self.orphans)
+        if self.pending:
+            lines.append(f"backup behind the lake by {len(self.pending)} partitions")
+        return tuple(lines)
+
+    @property
+    def ok(self) -> bool:
+        """Whether the copy holds what the lake says it should.
+
+        This is ``problem is None`` and nothing more, so the two can never disagree. A
+        reported orphan and a backup behind its lake both leave it true, which is the
+        point: neither is lake data going missing.
+        """
+        return self.problem is None
 
 
 def backup_scrub(lake_root: Path, backup_root: Path) -> BackupScrubResult:
@@ -501,16 +555,20 @@ def backup_scrub(lake_root: Path, backup_root: Path) -> BackupScrubResult:
 
     Why the copy can say that exactly. The manifest is append-only, so the copy on the
     backup is a prefix of the lake's. Every lake write appends its manifest entry under
-    the lake-root lock, and the sync holds that same lock, so at the moment the copy was
-    taken every file's bytes matched its newest entry at or before the copy's last line.
-    The number of lines in the copy is therefore a watermark. Resolving the lake's own
-    entries up to that watermark gives exactly what the backup should be carrying, and
-    everything the lake manifested past it is ``pending`` rather than missing.
+    the lake-root lock, and the compaction job's sync holds that same lock, so at the
+    moment the copy was taken every file's bytes matched its newest entry at or before
+    the copy's last line. The number of lines in the copy is therefore a watermark.
+    Resolving the lake's own entries up to that watermark gives exactly what the backup
+    should be carrying, and everything the lake manifested past it is ``pending``.
 
-    The watermark is trustworthy only while the copy really is a prefix, so that is
-    checked first, entry by entry. A backup manifest that rotted stops matching, and the
-    scrub names the position and stops. That is the hole checking against the copy alone
-    would leave, closed directly.
+    The watermark is worth nothing unless the copy really is a prefix, so that is checked
+    first, and checked over bytes rather than over parsed entries. The reason is exact.
+    ``_parse_jsonl`` discards the first line it cannot parse and every line after it, by
+    the append rule that says only the last line can be torn. Rot on an SSD obeys no such
+    rule. One flipped byte in the middle of the copy would discard the whole tail, the
+    watermark would collapse to the rot's position, every partition past it would read as
+    not copied yet, and a wholly rotted backup would come back clean. Comparing bytes has
+    no such hole: a torn tail is still a prefix, and any rot that changes a byte is not.
 
     The two passes then mirror ``scrub``.
 
@@ -519,11 +577,14 @@ def backup_scrub(lake_root: Path, backup_root: Path) -> BackupScrubResult:
     partition inside the same watermark is skipped, the same rule and for the same
     reason, because compaction unlinked the segment before the sync ran.
 
-    Reverse: every file on the backup must have a manifest entry. ``SCRUB_EXCLUSIONS``
-    is reused rather than a second list written, so the two scrubs skip the same files
-    and a file that is an orphan on one is an orphan on the other. Membership is tested
-    against the lake's whole manifest rather than the watermark, because a file ahead of
-    the watermark is staleness in the other direction and never loss.
+    Reverse: every file on the backup must be accounted for. A file the lake never
+    recorded is an ``orphan``, and one it recorded past the watermark is ``unaccounted``,
+    which is the watermark failing its own cross-check. ``SCRUB_EXCLUSIONS`` is reused
+    rather than a second list written, so the two scrubs skip the same files and a
+    decision about that list is made once. The price is named rather than hidden: that
+    list skips ``journal/`` and ``reports/``, so a killed sync's temp file under either
+    is not seen. Scanning the journal instead would name every segment in it, because
+    segments carry no manifest entry by rule.
 
     ``BACKUP_EXCLUSIONS`` is deliberately not consulted. Its two patterns name a temp
     file, which is renamed away before any entry is appended and so can never be
@@ -531,21 +592,44 @@ def backup_scrub(lake_root: Path, backup_root: Path) -> BackupScrubResult:
     manifested path can match one, and
     ``test_no_pattern_drops_a_file_a_real_lake_holds`` is what holds that.
     """
-    root = Path(lake_root)
     target = Path(backup_root)
+    try:
+        return _backup_scrub(Path(lake_root), target)
+    except OSError as exc:
+        # The one disk in this system built to fail, on a cable a person can pull. Every
+        # other Sunday check runs after this call, so a raise here would cost the run its
+        # canary, its coverage assertion and its re-auth reminder, and report a traceback
+        # instead of the disk. A read that fails is a named finding instead.
+        return BackupScrubResult(target=str(target), unreadable=f"{type(exc).__name__}: {exc}")
+
+
+def _backup_scrub(root: Path, target: Path) -> BackupScrubResult:
+    """The walk itself. Every read in here is on the removable disk or the lake."""
     if not target.is_dir():
         return BackupScrubResult(target=str(target), target_missing=True)
-    if not manifest_path(target).exists():
+    copy = manifest_path(target)
+    if not copy.exists():
         return BackupScrubResult(target=str(target), manifest_missing=True)
 
-    source_entries = read_manifest(root)
-    backup_entries = read_manifest(target)
-    for position, entry in enumerate(backup_entries):
-        if position >= len(source_entries) or source_entries[position] != entry:
-            return BackupScrubResult(target=str(target), manifest_diverged_at=position + 1)
+    source_bytes = manifest_path(root).read_bytes() if manifest_path(root).exists() else b""
+    backup_bytes = copy.read_bytes()
+    if not source_bytes.startswith(backup_bytes):
+        return BackupScrubResult(
+            target=str(target),
+            manifest_diverged_at=_first_difference(source_bytes, backup_bytes),
+        )
 
-    # The watermark, and the two views of the ledger it splits: what the backup should
-    # be carrying, and what the lake holds now.
+    # A prefix split mid-character decodes with a replacement, and the line it sits in is
+    # the torn tail ``_parse_jsonl`` discards anyway.
+    source_entries = _parse_jsonl(source_bytes.decode("utf-8", "replace"))
+    backup_entries = _parse_jsonl(backup_bytes.decode("utf-8", "replace"))
+    if not backup_entries and source_entries:
+        # A watermark of zero over a lake that has entries would make every partition
+        # pending and the whole scrub a no-op.
+        return BackupScrubResult(target=str(target), manifest_missing=True)
+
+    # The watermark, and the two views of the ledger it splits: what the backup should be
+    # carrying, and what the lake holds now.
     copied = _latest_by_partition(source_entries[: len(backup_entries)], manifest_path(root))
     latest = _latest_by_partition(source_entries, manifest_path(root))
 
@@ -562,19 +646,20 @@ def backup_scrub(lake_root: Path, backup_root: Path) -> BackupScrubResult:
             sha_mismatches.append(partition)
 
     orphans: list[str] = []
+    unaccounted: list[str] = []
     for path in sorted(target.rglob("*")):
         if not path.is_file():
             continue
         rel = path.relative_to(target).as_posix()
-        if _is_excluded(rel, SCRUB_EXCLUSIONS):
+        if _is_excluded(rel, SCRUB_EXCLUSIONS) or rel in copied:
             continue
-        if rel not in latest:
-            orphans.append(rel)
+        (unaccounted if rel in latest else orphans).append(rel)
 
     return BackupScrubResult(
         target=str(target),
         missing=tuple(sorted(missing)),
         sha_mismatches=tuple(sorted(sha_mismatches)),
+        unaccounted=tuple(sorted(unaccounted)),
         orphans=tuple(sorted(orphans)),
         pending=tuple(sorted(set(latest) - set(copied))),
     )

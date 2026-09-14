@@ -1406,10 +1406,12 @@ class SundayOutcome:
 
     ``report`` carries the report-tier findings. Two kinds ride it. The first is pmset
     alarm drift, which the design pins to the nightly report because the pre-open
-    self-check already catches a missed wake an hour before the bell. The second is a
-    backup that is merely behind the lake. That is the normal state between one sync and
-    the next, so it never withholds the ping, and a count that keeps growing is the one
-    reading that says the close+15 sync has stopped landing.
+    self-check already catches a missed wake an hour before the bell. The second is
+    everything the backup scrub names rather than pages for. That covers the path of
+    every file it found wrong, because a count decides whether to ping and only a path
+    says where to look. It also covers an extra file on the copy and a copy behind its
+    lake, neither of which can be lake data going missing. How far behind reads by eye
+    from the partition count, and one run carries no history of the last one.
 
     ``covered`` is ``None`` when the mint time could not be read. That is a problem,
     never a skip. ``pinged`` is the success condition.
@@ -1518,8 +1520,7 @@ def sunday_maintenance(
         alarms = check_alarms(schedule, one_shot_date=expected_one_shot(now, calendar))
     report = list(alarms.problems)
 
-    if backup.pending:
-        report.append(f"backup behind the lake by {len(backup.pending)} partitions")
+    report.extend(backup.notes)
 
     if exclusion_reader is not None and exclusion_targets:
         try:

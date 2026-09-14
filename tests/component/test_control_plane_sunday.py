@@ -173,6 +173,32 @@ def test_an_unmounted_backup_target_withholds_the_ping(fixture_lake):
     assert any("backup target not mounted" in p for p in outcome.problems)
 
 
+def test_an_orphan_on_the_copy_is_named_and_still_pings(fixture_lake):
+    # macOS writes to a mounted external volume without anyone asking, so an orphan that
+    # withheld the ping would page on a folder someone opened in Finder. An extra file
+    # on the copy costs space rather than data, so it rides the report.
+    root = _clean_lake(fixture_lake)
+    (_backup_of(root) / ".DS_Store").write_bytes(b"finder state")
+
+    outcome, pinger = _run(root)
+    assert outcome.backup.orphans == (".DS_Store",)
+    assert outcome.problems == ()
+    assert outcome.pinged is True and pinger.urls == [URL]
+    assert "backup file the lake never recorded: .DS_Store" in outcome.report
+
+
+def test_the_path_of_a_wrong_backup_file_reaches_the_report(fixture_lake):
+    # The problem line carries a count, which decides the ping. Only a path says where
+    # to look, and an operator handed "sha_mismatches=1" and nothing else cannot act.
+    root = _clean_lake(fixture_lake)
+    partition = next((_backup_of(root)).glob("chains/**/*.parquet"))
+    partition.write_bytes(b"rot")
+    rel = partition.relative_to(_backup_of(root)).as_posix()
+
+    outcome, _ = _run(root)
+    assert f"backup file does not match the lake: {rel}" in outcome.report
+
+
 def test_a_backup_merely_behind_the_lake_still_pings(fixture_lake):
     # The edge that decides whether this check is worth having. The copy is written at
     # close+15 and scrubbed on Sunday, so a partition sealed in between is legitimately
@@ -186,9 +212,15 @@ def test_a_backup_merely_behind_the_lake_still_pings(fixture_lake):
     assert outcome.backup.pending != () and outcome.backup.missing == ()
     assert outcome.problems == ()
     assert outcome.pinged is True and pinger.urls == [URL]
-    # Named all the same, at report tier. A count that keeps growing is what says the
-    # close+15 sync has stopped landing.
-    assert any("backup behind the lake by 1 partitions" == line for line in outcome.report)
+    # Named all the same, at report tier, and the count is how far behind it is rather
+    # than a fixed line that says nothing.
+    assert "backup behind the lake by 1 partitions" in outcome.report
+
+    fixture_lake.with_chains("SPY", date(2026, 9, 3))
+    fixture_lake.build()
+    behind, pinger = _run(root)
+    assert "backup behind the lake by 2 partitions" in behind.report
+    assert behind.pinged is True
 
 
 def test_a_missing_lake_root_is_a_failure_not_a_clean_scrub(tmp_path):
@@ -373,6 +405,19 @@ def _retry_run(lake_root, *, start, mints, canary=None, schedule=REPEAT_ONLY, re
         reminder_sink=reminder_sink,
     )
     return outcomes, pinger, clock
+
+
+def test_the_retry_loop_scrubs_the_copy_it_was_handed(fixture_lake):
+    # A clean lake scrubbed as its own backup comes back clean, so a target that never
+    # reached ``sunday_maintenance`` is invisible from every test that starts from a
+    # clean pair. This damages the copy alone, which only the real target can see.
+    root = _clean_lake(fixture_lake)
+    next((_backup_of(root)).glob("chains/**/*.parquet")).write_bytes(b"rot")
+
+    outcomes, pinger, _ = _retry_run(root, start=SUNDAY_20, mints=_Mints(FRESH_MINT))
+    assert pinger.urls == []
+    assert all(o.scrub.ok for o in outcomes)
+    assert all(any(p.startswith("backup scrub failed") for p in o.problems) for o in outcomes)
 
 
 def test_a_healthy_sunday_makes_one_attempt(fixture_lake):

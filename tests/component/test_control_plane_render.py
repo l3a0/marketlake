@@ -579,6 +579,43 @@ def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys, monke
     assert "secret-key" not in printed
 
 
+def test_the_sunday_cli_scrubs_the_configured_backup_target(tmp_path, capsys, monkeypatch):
+    """The config's ``backup_target`` reaches the scrub, and not the lake root.
+
+    A lake scrubbed as its own backup comes back clean forever, so that substitution is
+    invisible from any test whose lake and copy are both clean. Damaging the copy alone
+    is what tells the two apart, and it is the whole feature: a wiring slip here would
+    check the lake against itself and report green every Sunday.
+    """
+    lake, config = _sunday_lake(tmp_path)
+    next((tmp_path / "ssd").glob("chains/**/*.parquet")).write_bytes(b"rot")
+    pinger = FakePinger()
+    monkeypatch.setattr(
+        cp,
+        "read_pmset_schedule",
+        lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
+    )
+    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
+    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr(cp, "read_exclusions", _excluded)
+    code = cp.main(
+        ["sunday", "--config", str(config), "--token", str(_token(tmp_path))],
+        clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
+        calendar=weekday_sessions(date(2026, 8, 31)),
+    )
+
+    assert code == 1
+    assert pinger.urls == []
+    printed = capsys.readouterr().out
+    assert "backup scrub failed" in printed
+    # The disk is named, and so is the file on it, because a count alone cannot be acted
+    # on. The lake itself is clean, which is what says the copy is the side that went bad.
+    assert str(tmp_path / "ssd") in printed
+    assert "backup file does not match the lake: chains/" in printed
+    assert "scrub failed: missing=0" not in printed.replace("backup scrub failed", "")
+
+
 def test_sunday_cli_withholds_the_ping_for_a_stale_token(tmp_path, capsys, monkeypatch):
     # Minted late the prior week: still valid on Sunday, dead before Friday's option
     # close. Validity is not freshness, and the command line has to act on that, not
