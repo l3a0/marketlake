@@ -1,4 +1,4 @@
-"""The compaction process integration test 4 kills between its two writes.
+"""The compaction child the integration tests spawn, and how they spawn it.
 
 Compaction seals a ticker-day by appending the manifest entry and then unlinking the
 segments it merged. A crash between those two writes leaves a manifested partition
@@ -21,6 +21,22 @@ One argument selects the stop point, and both points sit inside the window.
 2. ``--unlinks N`` stops once ``N`` segments have been unlinked, which is the partial
    debris a kill partway through the loop leaves behind.
 
+Stdout carries the run's milestones in order, one line each, and a parent reads until the
+one it wants.
+
+1. ``STARTING`` goes out once every import is done and the run is about to begin.
+2. ``READY`` goes out at the stop point, and the run then blocks.
+
+``STARTING`` exists for the lock test. A parent holding the lake-root lock needs to know
+the child is at the lock's door rather than still starting an interpreter, because only
+then does a short window of silence say anything. The kill test reads past it.
+
+``spawn`` starts this module the way both tests need it started, so the argument list, the
+sandbox paths, and the built environment sit here beside the checks that refuse them. A
+second copy of that construction in a test file would be a second chance to get the
+refusal arguments wrong. The lakes the two tests build are deliberately not shared. Those
+are test data, and each test wants its own.
+
 Nothing here reads the machine's own configuration. Every path arrives on the command
 line, and the module refuses to run unless all of them sit under the temp root the parent
 names. ``load_config`` is never called, so the real ``config.yaml`` and the live Schwab
@@ -37,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 import tempfile
 from collections.abc import Sequence
@@ -52,9 +69,19 @@ REFUSED = 97
 NOT_KILLED = 98
 NOT_STOPPED = 99
 
-# The single line stdout carries once the run reaches the stop point. The parent blocks
-# on reading it and kills the process the moment it arrives.
+# The line stdout carries once every import is done and the run is about to begin. A
+# parent holding the lake-root lock reads it to learn the child is at the lock's door.
+STARTING = "starting-compaction"
+
+# The line stdout carries once the run reaches the stop point. The parent blocks on
+# reading it and kills the process the moment it arrives.
 READY = "at-stop-point"
+
+
+def exit_reason(code: int | None) -> str:
+    """An exit code as this module's own name for it, so a failure message reads."""
+    named = {REFUSED: "REFUSED", NOT_KILLED: "NOT_KILLED", NOT_STOPPED: "NOT_STOPPED"}
+    return f"{code} ({named[code]})" if code in named else str(code)
 
 
 def _under(path: Path, root: Path) -> bool:
@@ -223,6 +250,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     from tests.support.clock import ManualClock
 
     _install_stop(args.unlinks)
+    # Every import is done and the next statement asks for the lake-root lock, so a parent
+    # holding that lock can start timing its window of silence from here.
+    sys.stdout.write(STARTING + "\n")
+    sys.stdout.flush()
     compact(
         lake_root,
         clock=ManualClock(datetime.fromisoformat(args.now)),
@@ -234,6 +265,79 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Reaching here means the stop point was never hit and the run finished whole, so
     # the parent never had a window to kill in.
     return NOT_STOPPED
+
+
+# -- the parent side ---------------------------------------------------------
+
+
+def spawn(
+    *,
+    sandbox: Path,
+    lake_root: Path,
+    day: date,
+    now: datetime,
+    unlinks: int,
+) -> subprocess.Popen[bytes]:
+    """Start this module as a child that sweeps ``lake_root`` and stops inside the seal.
+
+    Every path the child touches is built under ``sandbox`` here, and the environment is
+    built rather than inherited, the same way
+    ``tests/component/test_config_dir_override.py`` builds its child's. So a
+    ``MARKETLAKE_`` variable exported in the shell running the suite cannot point the
+    child at the real config directory or the real lake. ``HOME`` is deliberately not
+    passed. The directory the child must refuse is read here, in the guarded parent, and
+    goes over as an argument, so the operator's real home never enters a process no guard
+    reaches. ``TMPDIR`` goes because the child's sandbox floor asks where the temp
+    directory is, and a child with none would answer ``/tmp`` while pytest hands out its
+    temp directory somewhere else entirely.
+
+    Both imports happen inside the function. Nothing here runs in the child, and reading
+    the real home at import time would put it in the very process no guard reaches.
+    """
+    from lake.paths import CONFIG_DIR_ENV, CONFIG_DIR_PARTS
+
+    # The repo root, three levels up from this file. The child needs it on ``PYTHONPATH``
+    # to import ``tests.support``.
+    repo_root = Path(__file__).resolve().parents[2]
+    real_config_dir = Path.home().joinpath(*CONFIG_DIR_PARTS)
+    config_dir = sandbox / "config"
+    config_dir.mkdir(exist_ok=True)
+    backup_target = sandbox / "backup"
+    backup_target.mkdir(exist_ok=True)
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "TMPDIR": tempfile.gettempdir(),
+        "PYTHONPATH": str(repo_root),
+        CONFIG_DIR_ENV: str(config_dir),
+    }
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "tests.support.compaction_child",
+            "--sandbox",
+            str(sandbox),
+            "--forbidden",
+            str(real_config_dir),
+            "--lake-root",
+            str(lake_root),
+            "--backup-target",
+            str(backup_target),
+            "--plan",
+            str(sandbox / "chain_plan.json"),
+            "--day",
+            day.isoformat(),
+            "--now",
+            now.isoformat(),
+            "--unlinks",
+            str(unlinks),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=environment,
+        cwd=sandbox,
+    )
 
 
 if __name__ == "__main__":

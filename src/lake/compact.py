@@ -447,8 +447,9 @@ def _seal(
     entry is appended. Only then are the segments unlinked.
 
     With ``guard`` on, the no-shrink invariant is checked before the partition file is
-    replaced, not only at the manifest append. A refused rebuild must leave the larger
-    partition on disk, untouched, beside its still-valid entry.
+    replaced. A refused rebuild must leave the larger partition on disk, untouched,
+    beside its still-valid entry. ``append_manifest`` checks the same invariant again,
+    and the comment at that call says why nothing here can ever reach that second check.
     """
     tables: list[pa.Table] = []
     expected = 0
@@ -478,6 +479,16 @@ def _seal(
     if actual != expected:
         raise CompactionVerifyError(rel, expected, actual)
 
+    # ``guard`` is passed on, but not because this append re-checks anything reachable.
+    # It arrives with the same row count, against the same manifest, and nothing appends
+    # a line in between, because every appender takes the lake-root lock this run already
+    # holds. So a guard the pre-write check passed passes here too, always. What the
+    # argument does decide is the other direction: a human recompaction arrives with
+    # ``guard`` off, and the append has to be told, or it would refuse the very
+    # supersession that was asked for. #170 established both halves by mutation. Forcing
+    # ``guard=False`` here changed no test in the suite, and forcing ``guard=True`` failed
+    # the deliberate-recompaction test. The second layer is therefore live for every other
+    # caller of ``append_manifest`` and unreachable from this one.
     entry = append_manifest(
         root,
         partition=rel,

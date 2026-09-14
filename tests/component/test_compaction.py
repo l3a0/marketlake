@@ -19,6 +19,8 @@ They cover the job's contract:
    pings the ``compaction`` slug once. An empty journal no-ops and still pings.
 7. The re-tune splits, merges, preserves the open tail, writes a plan that parses back,
    and leaves an unchanged profile's file untouched.
+8. A sealed partition that re-reads with the wrong row count raises before the manifest
+   append, leaving the segments on disk and the backup and the ping unrun.
 """
 
 from __future__ import annotations
@@ -37,9 +39,11 @@ from lake.chain_plan import DEFAULT_CHAIN_PLAN, ChainPlan, load_chain_plan
 from lake.compact import (
     COMPACTION_SLUG,
     CompactionResult,
+    CompactionVerifyError,
     PartitionMismatch,
     RecompactionRefused,
     SkippedDay,
+    _write_partition,
     build_parser,
     compact,
     main,
@@ -1100,3 +1104,52 @@ def test_a_manifest_line_naming_no_partition_stops_the_seal(tmp_path):
 
     with pytest.raises(ManifestError):
         _run(lake_root)
+
+
+# -- 8. the seal's own post-write verification --------------------------------
+
+
+def test_a_partition_that_re_reads_short_raises_and_manifests_nothing(lake_root, monkeypatch):
+    """Rule 3's row count, with the write made to land fewer rows than it was handed.
+
+    The seal reads the Parquet it just wrote back once, and that read yields both the row
+    count it compares to the sum across the segments and the digest the manifest entry
+    will carry. The comparison is what stands between a Parquet whose pages do not all
+    decode and a manifest entry blessing those bytes as the day's record.
+
+    Reaching it needs the file on disk to disagree with the table that went into it, and
+    no input a test can write produces that, because the merge and the write are both
+    correct. So the fault goes in one seam below the check. ``_write_partition`` is
+    replaced by a writer that drops a row on the way to disk, which is what a Parquet with
+    a page that does not decode looks like from the check's side. The check itself is
+    untouched, and what the test asks is whether it notices.
+    """
+    segment = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(3, snap_ts=_snap(DAY, 0)), start_ts="a"
+    )
+    partition = LakePaths(lake_root).chains_partition_path("SPY", DAY)
+    rel = _rel(lake_root, partition)
+
+    def write_one_row_short(table: pa.Table, target: Path) -> None:
+        # The module-level import holds the real writer, so this calls the original
+        # however the module attribute is patched.
+        _write_partition(table.slice(0, table.num_rows - 1), target)
+
+    monkeypatch.setattr("lake.compact._write_partition", write_one_row_short)
+    events: list[str] = []
+
+    with pytest.raises(CompactionVerifyError) as info:
+        _run(lake_root, backup=FakeBackup(events), pinger=FakePinger(events))
+
+    assert (info.value.partition, info.value.expected, info.value.actual) == (rel, 3, 2)
+    # Nothing blessed the short file. The manifest gained no line, so no integrity layer
+    # records these bytes as the day, and a later run still sees the ticker-day as unsealed.
+    assert read_manifest(lake_root) == []
+    # The short file is still on disk, unmanifested and unmentioned. Nothing deletes it,
+    # because a repair run rebuilds over it from the segments the raise left alone.
+    assert pq.read_table(partition).num_rows == 2
+    assert segment.exists()
+    assert pq.read_table(partition).num_rows < journal.read_segment(segment).num_rows
+    # The raise came before the backup and before the ping, so a run that sealed nothing
+    # is never reported as healthy.
+    assert events == []
