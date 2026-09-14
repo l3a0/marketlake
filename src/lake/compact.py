@@ -899,28 +899,50 @@ def _survives_widening(column: pa.ChunkedArray, target: pa.DataType) -> bool:
 
     This is what "lossless" is decided by, and it is decided on the values this
     ticker-day actually holds rather than on the type pair alone. The pair the repair
-    exists for says why. An int64 widened to a double is exact up to 2^53 and rounds
-    above it, so ``int64 -> double`` is neither lossless nor lossy as a pair. It is
-    lossless for a column of epoch-millisecond stamps, which run around 1.7e12, and
-    lossy for one that reached past 2^53. A rule written on types would have to refuse
-    both or bless both.
+    exists for says why. An int64 promoted to a double is exact up to 2^53, so
+    ``int64 -> double`` is neither lossless nor lossy as a pair. It is lossless for a
+    column of epoch-millisecond stamps, which run around 1.7e12, and lossy for one that
+    reached past the bound. A rule written on types would have to refuse both or bless
+    both.
 
-    The round trip decides it in one step. The column is widened to the promoted type
-    and cast straight back, and the answer is whether the two are equal. Arrow's own
-    safe cast refuses the forward step for most of the loss it can detect, naming the
-    2^53 bound for that pair, and the equality catches the rest. A
-    ``decimal128(38, 0)`` widened to a double is the case that needs the second half:
-    the forward cast succeeds and returns a value with eighteen of its digits rewritten.
+    The round trip decides it in one step. The column is cast to the promoted type and
+    straight back, and the answer is whether the two are equal. Both halves carry
+    weight. Arrow's own safe cast refuses the forward step for most of the loss it can
+    detect, naming the 2^53 bound for that pair. The equality catches what the cast
+    blesses, and a ``decimal128(38, 0)`` promoted to a double is that case: the cast
+    succeeds and returns a value with eighteen of its digits rewritten.
+
+    Three limits are worth stating rather than leaving to be discovered.
+
+    1. Past 2^53 an int64 is still exact whenever it lands on a representable double,
+       and Arrow's safe cast draws no such line. It refuses every int64 past the bound,
+       exact or not, so a handful of faithful promotions are refused with the lossy
+       ones.
+    2. A NaN never equals itself under Arrow's default comparison, so a float column
+       holding one is refused even though its bytes survive the round trip.
+    3. The guarantee is that no value changes, which is not the same as the promoted
+       type being wider. Arrow's common type can be a different family, as a string
+       against a binary is, and this accepts that when the bytes come back identical.
+
+    The first two err toward refusing, which is the safe direction for a repair, and
+    both cost nothing today. The widest int64 column either pinned schema holds is an
+    epoch-millisecond stamp, around 1.7e12, and neither schema holds a float narrower
+    than a double, which is the only width that ever reaches the comparison.
 
     A null-typed column is lossless by construction. It holds no values to change, and
     Arrow has no cast back to the null type, so the round trip is skipped rather than
-    attempted.
+    attempted. The scheduled merge already promotes such a column, so skipping here is
+    what keeps the authorized merge from refusing a day the ordinary one seals.
+
+    Any Arrow failure of either cast is the answer "no". The refusal is the safe
+    direction, so the catch is the whole ``ArrowException`` family rather than the two
+    members the reachable pairs happen to raise.
     """
     if column.type == target or pa.types.is_null(column.type):
         return True
     try:
         restored = column.cast(target).cast(column.type)
-    except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError):
+    except pa.ArrowException:
         return False
     return restored.equals(column)
 
@@ -949,7 +971,7 @@ def _merge_authorized(tables: Sequence[pa.Table], label: str) -> pa.Table:
     schemas = [table.schema for table in tables]
     try:
         unified = pa.unify_schemas(schemas, promote_options="permissive")
-    except (pa.ArrowInvalid, pa.ArrowTypeError) as exc:
+    except pa.ArrowException as exc:
         raise RetypeRefused(
             f"{label}: the segments hold a column at two types Arrow will not widen in "
             f"either direction, so there is nothing to authorize: {exc}"

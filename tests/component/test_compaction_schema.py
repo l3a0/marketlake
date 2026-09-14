@@ -59,6 +59,7 @@ from lake.compact import (
     SCHEMA_DRIFT_EVENT,
     SCHEMA_DRIFT_TITLE,
     CompactionResult,
+    RecompactionRefused,
     RetypeRefused,
     compact,
     recompact_ticker_day,
@@ -387,9 +388,12 @@ def test_a_column_no_segment_carried_is_filed(lake_root, monkeypatch):
 
 
 def test_a_type_every_segment_agreed_on_is_filed(lake_root, monkeypatch):
-    # A retype the segments disagree on never reaches the check, because the merge
-    # itself refuses it. That refusal is covered by
-    # ``test_compaction.py::test_a_mid_day_retype_refuses_the_merge_and_leaves_the_day_alone``.
+    # A retype the segments disagree on reaches the check on one route only, because the
+    # automatic merge refuses it and only the authorized repair widens it. The refusal is
+    # held in That refusal is covered by
+    # ``test_compaction.py::test_a_mid_day_retype_refuses_the_merge_and_leaves_the_day_alone``
+    # and the repair's route in section 9's
+    # ``test_a_widening_past_the_pinned_type_is_filed_as_a_retype``.
     # A retype they agree on merges cleanly and is the one the pinned schema has to catch.
     index = CHAINS_SCHEMA.get_field_index(COLUMN)
     retyped = CHAINS_SCHEMA.set(index, pa.field(COLUMN, pa.int32()))
@@ -1635,10 +1639,11 @@ def test_a_widening_that_rewrites_a_value_is_refused(lake_root, monkeypatch):
 
 
 def test_an_integer_past_the_double_bound_is_refused(lake_root, monkeypatch):
-    # The bound the issue names. An int64 to double promotion is exact below 2^53 and
-    # rounds above it, so the pair is neither safe nor unsafe on its own and the values
-    # decide. This column reached past the bound, so the same flag that seals the
-    # ordinary day refuses this one.
+    # The bound the issue names. An int64 to double promotion is exact below 2^53, so the
+    # pair is neither safe nor unsafe on its own and the values decide. This column
+    # reached past the bound, so the same flag that seals the ordinary day refuses this
+    # one. Past the bound Arrow's safe cast refuses every int64, exact or not, so the
+    # refusal is a little wider than the loss. That errs in the safe direction.
     _split_day(
         lake_root,
         morning_type=pa.int64(),
@@ -1709,6 +1714,115 @@ def test_a_string_against_a_number_is_refused_too(lake_root, monkeypatch):
 
     with pytest.raises(RetypeRefused):
         _repair(lake_root, allow_retype=True)
+
+
+def test_the_lossy_segment_is_found_wherever_it_sits(lake_root, monkeypatch):
+    # Every other refusal here puts the offending value in the morning segment, so on its
+    # own the check is only ever proven to run over the first one. The same day with the
+    # two segments swapped refuses too, which is what says the scan reads all of them.
+    _split_day(
+        lake_root,
+        morning_type=pa.float64(),
+        morning_values=[200.5],
+        afternoon_type=pa.decimal128(38, 0),
+        afternoon_values=[decimal.Decimal("12345678901234567890123456789012345678")],
+    )
+    _pin(monkeypatch, _retyped(COLUMN, pa.float64()))
+
+    with pytest.raises(RetypeRefused) as raised:
+        _repair(lake_root, allow_retype=True)
+
+    assert f"{COLUMN}: decimal128(38, 0) -> double" in str(raised.value)
+    assert not LakePaths(lake_root).chains_partition_path("SPY", DAY).exists()
+
+
+def test_the_refusal_names_every_lossy_column_and_the_ticker_day(lake_root, monkeypatch):
+    # An operator who has to go and look at the segments wants the whole list on the first
+    # run, and wants to know which ticker-day to look at. A refusal naming one of two
+    # columns sends them back for a second run, and one naming none of the day sends them
+    # to the wrong directory.
+    second = "volume"
+    morning = _retyped(second, pa.int64(), _retyped(COLUMN, pa.int64()))
+    afternoon = _retyped(second, pa.float64(), _retyped(COLUMN, pa.float64()))
+    morning_rows = _rows(1, snap_ts=_snap(DAY, 0))
+    morning_rows[0][COLUMN] = 2**53 + 1
+    morning_rows[0][second] = 2**53 + 3
+    afternoon_rows = _rows(1, snap_ts=_snap(DAY, 1))
+    afternoon_rows[0][COLUMN] = 200.5
+    afternoon_rows[0][second] = 300.5
+    _segment(lake_root, morning, _table(morning, morning_rows), start_ts="a")
+    _segment(lake_root, afternoon, _table(afternoon, afternoon_rows), start_ts="b")
+    _pin(monkeypatch, _retyped(COLUMN, pa.int64()))
+
+    with pytest.raises(RetypeRefused) as raised:
+        _repair(lake_root, allow_retype=True)
+
+    message = str(raised.value)
+    assert f"{COLUMN}: int64 -> double" in message
+    assert f"{second}: int64 -> double" in message
+    assert f"chains/SPY/{DAY.isoformat()}" in message
+
+
+def test_a_refused_widening_is_a_refused_recompaction(lake_root, monkeypatch):
+    # Only the repair can reach this refusal, so it belongs to the repair's own family. A
+    # caller that handles a refused recompaction handles this one without being taught it.
+    _split_day(
+        lake_root,
+        morning_type=pa.bool_(),
+        morning_values=[True],
+        afternoon_type=pa.int64(),
+        afternoon_values=[200],
+    )
+    _pin(monkeypatch, _retyped(COLUMN, pa.int64()))
+
+    with pytest.raises(RetypeRefused) as raised:
+        _repair(lake_root, allow_retype=True)
+
+    assert isinstance(raised.value, RecompactionRefused)
+    assert f"chains/SPY/{DAY.isoformat()}" in str(raised.value)
+
+
+def test_a_cast_arrow_has_not_implemented_refuses_rather_than_raising(lake_root, monkeypatch):
+    # Arrow's common type is not always the wider of the two. A half-float against a
+    # 38-digit decimal unifies to the half-float, which is a savage narrowing, and the
+    # cast to it is not implemented at all. That is a different Arrow error from the
+    # out-of-range one every other refusal here raises, and it has to come out as the same
+    # refused repair rather than as a traceback.
+    _split_day(
+        lake_root,
+        morning_type=pa.decimal128(38, 0),
+        morning_values=[decimal.Decimal("12345678901234567890123456789012345678")],
+        afternoon_type=pa.float16(),
+        afternoon_values=[1.5],
+    )
+    _pin(monkeypatch, _retyped(COLUMN, pa.float64()))
+
+    with pytest.raises(RetypeRefused) as raised:
+        _repair(lake_root, allow_retype=True)
+
+    assert f"{COLUMN}: decimal128(38, 0) -> halffloat" in str(raised.value)
+    assert not LakePaths(lake_root).chains_partition_path("SPY", DAY).exists()
+
+
+def test_a_null_column_still_seals_under_the_flag(lake_root, monkeypatch):
+    # A segment written before a column carried any value holds it at Arrow's null type,
+    # and the scheduled merge already promotes that, because a column with no values has
+    # nothing to lose. The authorized merge has to seal the same day. Round-tripping a
+    # null column would refuse it, since Arrow has no cast back to the null type, so the
+    # repair would refuse a day the ordinary run seals.
+    _split_day(
+        lake_root,
+        morning_type=pa.null(),
+        morning_values=[None, None],
+        afternoon_type=pa.float64(),
+        afternoon_values=[200.5],
+    )
+    _pin(monkeypatch, _retyped(COLUMN, pa.float64()))
+
+    outcome = _repair(lake_root, allow_retype=True)
+
+    assert outcome.rows == 3
+    assert _partition(lake_root).column(COLUMN).to_pylist() == [None, None, 200.5]
 
 
 def test_a_refused_widening_files_no_finding(lake_root, monkeypatch):
