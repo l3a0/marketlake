@@ -24,7 +24,9 @@ import pytest
 from lake import journal
 from lake.lock import lake_lock
 from lake.manifest import latest_entries, read_manifest, scrub
+from lake.paths import TEMP_MARKER
 from lake.schema_versions import (
+    LEDGER_FILENAME,
     LEDGER_PARTITION,
     LEDGER_SCHEMA,
     LEDGER_SCHEMA_VERSION,
@@ -34,6 +36,7 @@ from lake.schema_versions import (
     SchemaVersionLedger,
     SchemaVersionsError,
     UnsupportedLedgerSchemaVersion,
+    _conflict_detail,
     ledger_path,
     main,
     record_schema_version,
@@ -48,6 +51,48 @@ LATER = datetime(2026, 10, 1, 15, 0, tzinfo=UTC)
 
 def _record(lake_root: Path, when: datetime = NOW):
     return record_schema_version(clock=ManualClock(when), lake_root=lake_root)
+
+
+# -- the file's own contract --------------------------------------------------
+
+
+def test_the_ledger_sits_at_the_path_a_restored_lake_reader_queries(lake_root):
+    """The path is spelled out, because it is published rather than internal.
+
+    ``docs/design.md`` names ``reference/schema_versions.parquet`` in the lake tree, and a
+    reader opening a restored backup types that path. Everything else in this file routes
+    through ``ledger_path`` and ``LEDGER_PARTITION``, so a renamed constant would move both
+    sides of every other assertion together and none of them would notice.
+    """
+    assert LEDGER_FILENAME == "schema_versions.parquet"
+    assert LEDGER_PARTITION == "reference/schema_versions.parquet"
+    assert ledger_path(lake_root) == lake_root / "reference" / "schema_versions.parquet"
+
+
+def test_the_tables_own_shape_is_pinned_against_its_own_version():
+    """The column names, the types, and the stamped version move together or not at all.
+
+    This file is meant to outlive the code that wrote it, so a reader binds to this shape.
+    Comparing a written file against ``LEDGER_SCHEMA`` only proves the writer used the
+    constant, never that the constant says the right thing, so the shape is spelled out
+    here. Changing any of it needs a deliberate bump of ``LEDGER_SCHEMA_VERSION``, which
+    is what ``from_table`` refuses an unknown value of.
+    """
+    assert LEDGER_SCHEMA_VERSION == 1
+    assert LEDGER_SCHEMA.names == [
+        "journal_schema_version",
+        "surface",
+        "column_name",
+        "column_type",
+        "recorded_at",
+        "schema_version",
+    ]
+    assert LEDGER_SCHEMA.field("journal_schema_version").type == pa.int32()
+    assert LEDGER_SCHEMA.field("surface").type == pa.string()
+    assert LEDGER_SCHEMA.field("column_name").type == pa.string()
+    assert LEDGER_SCHEMA.field("column_type").type == pa.string()
+    assert LEDGER_SCHEMA.field("recorded_at").type == pa.timestamp("us", tz="UTC")
+    assert LEDGER_SCHEMA.field("schema_version").type == pa.int32()
 
 
 # -- what the first run writes -----------------------------------------------
@@ -68,10 +113,12 @@ def test_the_first_run_writes_one_row_per_surface_column_derived_from_the_schema
         assert row["schema_version"] == LEDGER_SCHEMA_VERSION
         assert row["recorded_at"] == NOW
         written.setdefault(row["surface"], {})[row["column_name"]] = row["column_type"]
-    assert written == running_fingerprints()
-    assert written == {
-        surface: journal.schema_fingerprint(surface) for surface in journal.PINNED_SURFACES
-    }
+    # Against the derivation spelled out, rather than against ``running_fingerprints``,
+    # which is the helper the writer itself called and so would compare the file to
+    # itself. The helper is pinned to the same derivation on the line below.
+    derived = {surface: journal.schema_fingerprint(surface) for surface in journal.PINNED_SURFACES}
+    assert written == derived
+    assert running_fingerprints() == derived
     assert len(rows) == sum(len(columns) for columns in written.values())
     assert report.already_recorded is False
     assert report.versions == (journal.SCHEMA_VERSION,)
@@ -235,6 +282,33 @@ def test_a_version_recorded_under_a_different_shape_refuses_rather_than_overwrit
     assert (lake_root / "manifest.jsonl").read_bytes() == manifest_before
 
 
+def test_the_conflict_message_names_a_surface_only_one_side_holds():
+    """A surface gained or lost between the two shapes is named, not skipped.
+
+    ``PINNED_SURFACES`` itself can move, and that is a shape change the ledger exists to
+    describe. A message assembled over only the surfaces both sides hold would say a
+    version disagrees and then name nothing at all.
+    """
+    gained = _conflict_detail(1, {"chains": {"bid": "double"}}, {})
+    assert "chains added: bid" in gained
+    lost = _conflict_detail(1, {}, {"quotes": {"ask": "double"}})
+    assert "quotes dropped: ask" in lost
+
+
+def test_the_conflict_message_names_a_retype_that_moved_nothing_else():
+    """The one-category conflict, which is the vendor retyping a column and nothing else.
+
+    The reshaped schema used above drops, adds, and retypes at once, so it cannot tell
+    whether a retype alone reaches the message.
+    """
+    detail = _conflict_detail(
+        1, {"chains": {"open_interest": "double"}}, {"chains": {"open_interest": "int64"}}
+    )
+    assert "chains retyped: open_interest int64 -> double" in detail
+    assert "chains dropped: none" in detail
+    assert "chains added: none" in detail
+
+
 def test_the_conflict_message_stays_silent_about_a_surface_that_did_not_move(
     lake_root, monkeypatch
 ):
@@ -365,5 +439,62 @@ def test_main_records_through_the_real_entry(lake_root, tmp_path, capsys):
     assert ledger_path(lake_root).exists()
     assert scrub(lake_root).ok
 
+    # Every line the sign-off renders, not only its first. The versions line is the one a
+    # reader scans for a gap in the sequence, which is a bump whose tool run never ran.
+    rows = len(pq.read_table(ledger_path(lake_root)))
+    assert f"versions:        {journal.SCHEMA_VERSION}" in out
+    assert f"ledger rows:     {rows}" in out
+    for surface in journal.PINNED_SURFACES:
+        assert f"{surface} ({len(journal.schema_fingerprint(surface))} columns)" in out
+    assert "recorded at:     20" in out
+
     assert main(["--config", str(config)]) == 0
     assert "already recorded with this shape" in capsys.readouterr().out
+
+
+# -- the atomic write ---------------------------------------------------------
+
+
+def test_the_write_goes_through_a_temp_file_the_backup_excludes(tmp_path, monkeypatch):
+    """A temp file has to carry the marker, or a crashed write rides to the backup.
+
+    ``runner.BACKUP_EXCLUSIONS`` drops ``*{marker}*`` and nothing else temp-shaped, so a
+    writer that invents its own suffix puts half a reference table on the backup disk.
+    The path handed to the parquet writer is captured, since the finished write renames it
+    away before anything could look.
+    """
+    import lake.schema_versions as module
+
+    seen: list[Path] = []
+    real_write = module.pq.write_table
+
+    def capture(table, where, *args, **kwargs):
+        seen.append(Path(where))
+        return real_write(table, where, *args, **kwargs)
+
+    monkeypatch.setattr(module.pq, "write_table", capture)
+    target = tmp_path / "reference" / "schema_versions.parquet"
+    SchemaVersionLedger().write(target)
+
+    assert len(seen) == 1
+    assert seen[0] != target
+    assert seen[0].parent == target.parent
+    assert TEMP_MARKER in seen[0].name
+    assert seen[0].name.startswith(target.name)
+
+
+def test_a_failed_write_leaves_no_temp_file_behind(tmp_path, monkeypatch):
+    """The target is untouched and no debris is left, so a retry starts clean."""
+    import lake.schema_versions as module
+
+    def explode(table, where, *args, **kwargs):
+        Path(where).write_bytes(b"half a table")
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(module.pq, "write_table", explode)
+    target = tmp_path / "reference" / "schema_versions.parquet"
+    with pytest.raises(RuntimeError, match="disk full"):
+        SchemaVersionLedger().write(target)
+
+    assert not target.exists()
+    assert list(target.parent.iterdir()) == []

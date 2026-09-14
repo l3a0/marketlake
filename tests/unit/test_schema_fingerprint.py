@@ -416,6 +416,25 @@ def test_identical_fingerprints_moved_nothing():
     assert diff.moved is False
 
 
+@pytest.mark.parametrize(
+    ("derived", "recorded"),
+    [
+        pytest.param({}, {"gone": "string"}, id="dropped-only"),
+        pytest.param({"fresh": "string"}, {}, id="added-only"),
+        pytest.param({"c": "double"}, {"c": "int64"}, id="retyped-only"),
+    ],
+)
+def test_one_category_alone_still_counts_as_moved(derived, recorded):
+    """Each category on its own is a change, and the retype case is the one that hides.
+
+    ``moved`` decides whether a surface is named at all in the ledger's refusal message,
+    and a conflict is not always all three kinds at once. A vendor that retypes a column
+    and touches nothing else moves only ``retyped``, so a ``moved`` reading any two of the
+    three would let that conflict be raised with no columns named.
+    """
+    assert journal.fingerprint_diff(derived, recorded).moved is True
+
+
 def test_a_reordered_fingerprint_moved_nothing():
     """Order is not a change, which is the same rule ``schema_fingerprint`` encodes."""
     recorded = {"a": "string", "b": "int64", "c": "double"}
@@ -424,9 +443,40 @@ def test_a_reordered_fingerprint_moved_nothing():
 
 
 def test_the_diff_sorts_every_category_so_a_message_reads_the_same_every_run():
-    recorded = {"z": "string", "y": "string", "m": "int64", "n": "int64"}
-    derived = {"b": "string", "a": "string", "m": "double", "n": "double"}
+    """Each category comes out sorted, whatever order the sets iterate in.
+
+    The categories are built by set arithmetic, and a set of strings iterates in an order
+    Python decides per process from its hash seed. So a two-name category lands in sorted
+    order about half the time by luck, and a test built on one would pass or fail on the
+    run rather than on the code. Six names per category drops that coincidence to one run
+    in 720, and the assertion is stated twice: against the spelled-out sorted answer, and
+    against ``sorted`` of the result itself.
+    """
+    common = {f"same_{i}": "string" for i in range(3)}
+    recorded = {
+        **common,
+        "zulu": "string",
+        "yankee": "string",
+        "xray": "string",
+        "whiskey": "string",
+        "victor": "string",
+        "uniform": "string",
+        **{f"moved_{i}": "int64" for i in range(6)},
+    }
+    derived = {
+        **common,
+        "foxtrot": "string",
+        "echo": "string",
+        "delta": "string",
+        "charlie": "string",
+        "bravo": "string",
+        "alfa": "string",
+        **{f"moved_{i}": "double" for i in range(6)},
+    }
     diff = journal.fingerprint_diff(derived, recorded)
-    assert diff.dropped == ("y", "z")
-    assert diff.added == ("a", "b")
-    assert [name for name, _, _ in diff.retyped] == ["m", "n"]
+    assert diff.dropped == ("uniform", "victor", "whiskey", "xray", "yankee", "zulu")
+    assert diff.added == ("alfa", "bravo", "charlie", "delta", "echo", "foxtrot")
+    assert [name for name, _, _ in diff.retyped] == [f"moved_{i}" for i in range(6)]
+    assert list(diff.dropped) == sorted(diff.dropped)
+    assert list(diff.added) == sorted(diff.added)
+    assert list(diff.retyped) == sorted(diff.retyped)

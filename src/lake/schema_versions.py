@@ -180,8 +180,9 @@ class RecordedVersion:
 class SchemaVersionLedger:
     """Every journal schema version the lake has recorded a shape for.
 
-    Versions are held in ascending order. Nothing here mutates an entry already present,
-    because a recorded version is what sealed rows are read through.
+    Versions come back in ascending order, sorted on the way out rather than relied on
+    from insertion. Nothing here mutates an entry already present, because a recorded
+    version is what sealed rows are read through.
     """
 
     def __init__(self, versions: Iterable[RecordedVersion] = ()) -> None:
