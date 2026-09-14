@@ -100,13 +100,24 @@ def test_the_token_a_redirected_reauth_writes_lands_in_the_throwaway(tmp_path):
     redirect that also wrote the real path would be no redirect at all.
     """
     throwaway = tmp_path / "throwaway"
-    script = """
+    script = f"""
 import json
+from pathlib import Path
 from lake.reauth import DEFAULT_TOKEN_PATH, write_token
-write_token(DEFAULT_TOKEN_PATH, {"creation_timestamp": 1, "token": {"refresh_token": "x"}})
-print(json.dumps({"written": str(DEFAULT_TOKEN_PATH)}))
+# The child checks the redirect before it writes, and this is not belt and braces. A
+# child process has no conftest guard, so with the redirect broken this line is the only
+# thing standing between the write below and the machine's real token. Breaking
+# config_dir on purpose is how this suite is reviewed, and the first such run destroyed
+# a working token from exactly here. Refusing the write leaves the parent's assertion to
+# fail instead, which is the whole point of a mutation run.
+redirected = DEFAULT_TOKEN_PATH.parent == Path({str(throwaway)!r})
+if redirected:
+    write_token(DEFAULT_TOKEN_PATH, {{"creation_timestamp": 1, "token": {{"refresh_token": "x"}}}})
+print(json.dumps({{"written": str(DEFAULT_TOKEN_PATH), "redirected": redirected}}))
 """
-    written = Path(_child(script, throwaway)["written"])
+    result = _child(script, throwaway)
+    assert result["redirected"] is True, f"the override did not take: {result['written']}"
+    written = Path(result["written"])
     assert written.parent == throwaway
     assert json.loads(written.read_text())["creation_timestamp"] == 1
     # chmod 600 survives the redirect. The token is a brokerage credential wherever it
