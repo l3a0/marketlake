@@ -762,19 +762,48 @@ def test_every_extra_path_names_a_real_column_of_its_surface():
         assert set(journal.extra_paths(surface)) <= columns
 
 
-def test_the_chains_paths_are_flat_and_the_quotes_paths_are_nested():
-    """The overflow's shape differs per surface, and the paths have to match it.
+def test_a_contract_field_sits_flat_and_every_other_level_nests():
+    """The overflow's shape follows the payload's, and the paths have to match it.
 
-    A chains row is built from one contract dict, so its overflow is flat. A quotes row is
-    built from blocks that reuse field names, so its overflow nests under the block key.
+    A chains row's contract fields are the one level that cannot collide with another, so
+    they sit flat. The chain-level fields repeated onto that row nest under ``chain``,
+    since a contract could carry a field of the same name. Every quotes block nests under
+    its own key, and the two fields read off the envelope nest under ``envelope``.
     """
-    assert journal.extra_paths("chains")["bid"] == journal.ExtraPath(None, "bid")
-    assert journal.extra_paths("chains")["ask_size"] == journal.ExtraPath(None, "askSize")
-    assert journal.extra_paths("quotes")["bid"] == journal.ExtraPath("quote", "bidPrice")
-    assert journal.extra_paths("quotes")["extended_last_price"] == journal.ExtraPath(
-        "extended", "lastPrice"
-    )
-    assert journal.extra_paths("quotes")["pe_ratio"] == journal.ExtraPath("fundamental", "peRatio")
+    chains = journal.extra_paths("chains")
+    assert chains["bid"] == journal.ExtraPath(None, "bid")
+    assert chains["ask_size"] == journal.ExtraPath(None, "askSize")
+    assert chains["underlying_price"] == journal.ExtraPath("chain", "underlyingPrice")
+    assert chains["interest_rate"] == journal.ExtraPath("chain", "interestRate")
+    assert chains["dividend_yield"] == journal.ExtraPath("chain", "dividendYield")
+    assert chains["is_delayed"] == journal.ExtraPath("chain", "isDelayed")
+
+    quotes = journal.extra_paths("quotes")
+    assert quotes["bid"] == journal.ExtraPath("quote", "bidPrice")
+    assert quotes["extended_last_price"] == journal.ExtraPath("extended", "lastPrice")
+    assert quotes["pe_ratio"] == journal.ExtraPath("fundamental", "peRatio")
+    assert quotes["realtime"] == journal.ExtraPath("envelope", "realtime")
+    assert quotes["cusip"] == journal.ExtraPath("envelope", "cusip")
+
+
+def test_a_chain_level_path_cannot_collide_with_a_contract_field_of_the_same_name():
+    """Why the chain-level fields nest rather than sitting flat beside the contract's.
+
+    Nothing in a flat overflow says which level a key came from, so a vendor that added a
+    contract field named ``underlyingPrice`` would land it on the key the chain-level value
+    uses, and the two measurements would merge with nothing able to tell them apart. The
+    nesting is what makes that structurally impossible rather than merely unlikely.
+    """
+    chains = journal.extra_paths("chains")
+    flat = {path.field for path in chains.values() if path.block is None}
+    nested = {path.field for path in chains.values() if path.block is not None}
+    assert nested, "the chain-level fields are what nest, so an empty set means none do"
+    # Both directions of the same claim. No two paths are equal, and no chain-level field
+    # would read as a flat key even where the vendor uses one name at both levels.
+    assert len(set(chains.values())) == len(chains)
+    for field in nested:
+        assert journal.ExtraPath(None, field) not in set(chains.values())
+    assert flat.isdisjoint({"chain"}), "a flat key named chain would shadow the nested block"
 
 
 def test_the_two_quote_blocks_sharing_field_names_keep_separate_paths():
@@ -792,21 +821,17 @@ def test_the_two_quote_blocks_sharing_field_names_keep_separate_paths():
 @pytest.mark.parametrize(
     ("surface", "column"),
     [
-        # The chain-level header fields. The chains overflow is built from the contract
-        # dict alone, so a top-level body field never reaches ``extra``.
-        ("chains", "interest_rate"),
+        # The two chain-level fields the row builder recomputes from the captured rows.
+        # Neither column ever holds the vendor's own value, so neither has one to park.
+        ("chains", "is_chain_truncated"),
+        ("chains", "number_of_contracts"),
         # The deliverables list. The writer JSON-encodes the vendor's nested list into
         # this string column, so a raw overflow value would not fit it, and the field has
         # been known since version 1 and so can never reach ``extra`` at all.
         ("chains", "option_deliverables_list"),
-        ("chains", "underlying_price"),
-        ("chains", "is_delayed"),
         # The consumed vendor quote time, on both surfaces.
         ("chains", "vendor_quote_ts"),
         ("quotes", "vendor_quote_ts"),
-        # The quotes envelope's own fields, read off the envelope rather than a block.
-        ("quotes", "realtime"),
-        ("quotes", "cusip"),
         # Provenance, stamps, and the chains window pair. None is a vendor field.
         ("chains", "snap_ts"),
         ("chains", "window_start"),
@@ -828,20 +853,33 @@ def test_every_vendor_mapped_column_is_projectable_and_nothing_else_is():
     both directions: every mapped column has its path, and the counts match, so a path
     the maps do not account for fails here too.
 
-    The chains paths are exactly the contract map, with nothing beside it.
-    ``optionDeliverablesList`` is mapped nowhere because the writer transforms it rather
-    than copying it, which is the one exclusion that is not about where a field arrives.
+    The chains paths are the contract map plus the header map's verbatim fields, and the
+    quotes paths are the four blocks plus the envelope map. What each exclusion leaves out
+    is checked above. ``optionDeliverablesList`` is mapped nowhere because the writer
+    transforms it rather than copying it, which is the one exclusion that is not about
+    where a field arrives or whether the builder recomputes it.
     """
     chains = journal.extra_paths("chains")
     for vendor, column in journal._CHAINS_CONTRACT_MAP.items():
         assert chains[column] == journal.ExtraPath(None, vendor)
-    assert len(chains) == len(journal._CHAINS_CONTRACT_MAP)
+    headers = {
+        vendor: column
+        for vendor, column in journal._CHAINS_HEADER_MAP.items()
+        if vendor not in journal._CHAINS_HEADER_RECOMPUTED
+    }
+    for vendor, column in headers.items():
+        assert chains[column] == journal.ExtraPath(journal._CHAINS_HEADER_BLOCK, vendor)
+    assert len(chains) == len(journal._CHAINS_CONTRACT_MAP) + len(headers)
 
     quotes = journal.extra_paths("quotes")
     for block, field_map, _consumed in journal._QUOTE_BLOCK_SPECS:
         for vendor, column in field_map.items():
             assert quotes[column] == journal.ExtraPath(block, vendor)
-    assert len(quotes) == sum(len(field_map) for _, field_map, _ in journal._QUOTE_BLOCK_SPECS)
+    for vendor, column in journal._QUOTES_ENVELOPE_MAP.items():
+        assert quotes[column] == journal.ExtraPath(journal._QUOTES_ENVELOPE_BLOCK, vendor)
+    assert len(quotes) == sum(
+        len(field_map) for _, field_map, _ in journal._QUOTE_BLOCK_SPECS
+    ) + len(journal._QUOTES_ENVELOPE_MAP)
 
 
 def test_a_caller_editing_the_paths_it_got_back_changes_nothing():
@@ -1533,21 +1571,6 @@ def test_a_column_with_no_route_into_extra_still_costs_the_cycle():
     group below is a column ``extra_paths`` deliberately leaves out, named in its
     docstring, so this covers the reasons rather than one example of one.
     """
-    # A chain-level body field. The chains overflow is computed from the contract dict
-    # alone, so a top-level field has no key in it.
-    with pytest.raises(pa.ArrowInvalid):
-        journal.chains_data_batch(
-            dict(_chain_of(_full_contract()), underlyingPrice="high"),
-            ticker="SPY",
-            snap_ts=SNAP,
-            fetch_ts=FETCH,
-        )
-    # The quotes envelope's own fields. Only a captured block's leftovers overflow.
-    for envelope in (dict(QUOTE, realtime="yes"), dict(QUOTE, reference={"cusip": 111111111})):
-        with pytest.raises((pa.ArrowInvalid, pa.ArrowTypeError)):
-            journal.quotes_data_batch(
-                envelope, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH, vendor_quote_ts=VENDOR
-            )
     # A column this module fills itself. A stamp that will not build is this code's bug,
     # not the vendor's, and parking it would hide the bug and keep writing rows.
     with pytest.raises(pa.ArrowTypeError):
@@ -1561,6 +1584,253 @@ def test_a_column_with_no_route_into_extra_still_costs_the_cycle():
             snap_ts=SNAP,
             fetch_ts=FETCH,
         )
+
+
+# -- the levels outside the contract dict and the captured blocks --------------
+
+# The six vendor fields that arrive above the level each surface's overflow was built
+# from: the four chain-level body fields repeated onto every contract row, and the two
+# read off the quotes envelope. Each is a verbatim copy of a vendor value, so a retype of
+# one is the vendor's doing and has to route like any other rather than costing the cycle.
+
+
+def _chain_row_with_header(**header):
+    """The one row a chain body builds with chain-level fields overridden."""
+    body = dict(_chain_of(_full_contract()), **header)
+    return journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH).to_pylist()[
+        0
+    ]
+
+
+def _quote_row_with_envelope(**envelope):
+    """The one row a quote envelope builds with envelope-level fields overridden."""
+    return journal.quotes_data_batch(
+        dict(QUOTE, **envelope),
+        ticker="SPY",
+        snap_ts=SNAP,
+        fetch_ts=FETCH,
+        vendor_quote_ts=VENDOR,
+    ).to_pylist()[0]
+
+
+@pytest.mark.parametrize(
+    ("vendor", "column", "value"),
+    [
+        ("interestRate", "interest_rate", "four and a quarter"),
+        ("underlyingPrice", "underlying_price", "six hundred and fifty"),
+        ("dividendYield", "dividend_yield", "one point two eight"),
+        ("isDelayed", "is_delayed", "no"),
+    ],
+)
+def test_every_verbatim_chain_level_field_routes_under_the_chain_block(vendor, column, value):
+    """All four, not just the one the design reads.
+
+    Each is read off the top of the chain body and copied onto every contract row, so a
+    retype of one used to cost the whole chain for as long as the vendor held the shape and
+    threw the raw value away on top. ``underlyingPrice`` is the one the design's IV
+    inversion reads and ``isDelayed`` is the entitlement flag, but the loss is the same
+    shape for all four, so all four are driven rather than one standing in for the rest.
+    """
+    row = _chain_row_with_header(**{vendor: value})
+
+    assert row["row_kind"] == journal.ROW_KIND_DATA
+    assert row[column] is None
+    assert json.loads(row["extra"]) == {"chain": {vendor: value}}
+    assert _known_names_in(journal.CHAINS_SURFACE, row["extra"]) == {
+        journal.ExtraPath("chain", vendor)
+    }
+    # One drifted chain-level field costs that field alone, not the row's contract.
+    assert (row["bid"], row["open_interest"]) == (4.2, 1234)
+
+
+@pytest.mark.parametrize(
+    ("envelope", "column", "vendor", "value"),
+    [
+        ({"realtime": "yes"}, "realtime", "realtime", "yes"),
+        ({"cusip": 111111111}, "cusip", "cusip", 111111111),
+        ({"reference": {"cusip": 111111111}}, "cusip", "cusip", 111111111),
+    ],
+)
+def test_a_retyped_envelope_field_routes_under_the_envelope_block(envelope, column, vendor, value):
+    """The quotes surface's other two verbatim fields, which sit outside every block.
+
+    ``realtime`` is the entitlement flag the validation battery checks. The CUSIP arrives
+    either at the top of the envelope or inside ``reference``, and both route under the
+    field's own name, because the overflow key is what the vendor calls the value rather
+    than where on the payload it sat.
+    """
+    row = _quote_row_with_envelope(**envelope)
+
+    assert row["row_kind"] == journal.ROW_KIND_DATA
+    assert row[column] is None
+    assert json.loads(row["extra"]) == {"envelope": {vendor: value}}
+    assert _known_names_in(journal.QUOTES_SURFACE, row["extra"]) == {
+        journal.ExtraPath("envelope", vendor)
+    }
+    # The captured blocks are untouched, so the envelope's drift costs the envelope.
+    assert (row["bid"], row["pe_ratio"], row["extended_last_price"]) == (649.98, 24.5, 651.0)
+
+
+def test_a_contract_field_named_like_a_chain_level_one_stays_apart_from_it():
+    """Why the chain-level values nest rather than sitting flat beside the contract's.
+
+    A contract carrying ``underlyingPrice`` is an unrecognized contract field, and it
+    overflows flat under that name. Were the chain-level value written flat too, the two
+    would be one key, and a reader could not tell a routed chain-level price from a field
+    the vendor added to every contract. Nested, they sit apart and both survive.
+    """
+    body = dict(
+        _chain_of(_full_contract(underlyingPrice=1.5)),
+        underlyingPrice="six hundred and fifty",
+    )
+    row = journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH).to_pylist()[0]
+
+    assert json.loads(row["extra"]) == {
+        "underlyingPrice": 1.5,
+        "chain": {"underlyingPrice": "six hundred and fifty"},
+    }
+    # The signature names the chain-level field alone. The flat key is an unrecognized
+    # contract field, which is not drift and must never read as it.
+    assert _known_names_in(journal.CHAINS_SURFACE, row["extra"]) == {
+        journal.ExtraPath("chain", "underlyingPrice")
+    }
+
+
+@pytest.mark.parametrize(
+    "sent", ["something the vendor sent", {"foo": 1}, {}, [1, 2], 3, 0, False, None]
+)
+def test_a_contract_field_named_chain_refuses_the_row_rather_than_merging_into_it(sent):
+    """The one key a chains overflow could hold that a routed value would land inside.
+
+    The fail-open writes an unrecognized contract field flat, so a contract field named
+    ``chain`` sits exactly where the chain-level values nest. Merging a routed value into
+    whatever the vendor sent would hide one measurement inside another, and the reader
+    would take the vendor's dict for the parser's. So the row refuses by name and the cycle
+    gaps, which is loud where the merge would be silent.
+
+    Every shape a JSON field can hold is driven, because the check has to read the key's
+    presence rather than its value. A dict is the shape that matters most: it is the one
+    that would merge cleanly and leave nothing to notice, where a scalar only ever broke
+    the merge by accident. A null and a false are the shapes a truthiness test would wave
+    through, and an empty dict the one an emptiness test would.
+    """
+    body = dict(
+        _chain_of(_full_contract(chain=sent)),
+        underlyingPrice="six hundred and fifty",
+    )
+
+    with pytest.raises(ValueError, match="collides with the overflow block"):
+        journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+
+
+def test_two_chain_level_fields_routing_at_once_share_the_block_they_created():
+    """The second value into a block this row just wrote is not a collision.
+
+    The refusal reads the overflow the vendor handed over, before anything is merged into
+    it. Checking as each value is written would take the block the first one created for a
+    vendor field of that name and refuse a row with no collision in it at all.
+    """
+    body = dict(
+        _chain_of(_full_contract()),
+        underlyingPrice="six hundred and fifty",
+        interestRate="four and a quarter",
+    )
+    row = journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH).to_pylist()[0]
+
+    assert json.loads(row["extra"]) == {
+        "chain": {"interestRate": "four and a quarter", "underlyingPrice": "six hundred and fifty"}
+    }
+
+
+def test_a_quotes_block_the_fail_open_wrote_is_merged_into_rather_than_refused():
+    """The other side of the same rule, so the refusal does not swallow an ordinary merge.
+
+    A quotes block key at the top of an overflow was written by the parser itself, holding
+    that block's unrecognized fields, and a routed value from the same block belongs inside
+    it. Refusing on presence alone would turn every drift beside an unknown field into a
+    lost cycle on the surface where the nesting has always been ordinary.
+    """
+    row = _quote_row("quote", totalVolume="90000000", brandNewStat=1.5)
+
+    assert json.loads(row["extra"]) == {"quote": {"brandNewStat": 1.5, "totalVolume": "90000000"}}
+
+
+def test_a_chain_level_field_the_vendor_did_not_send_leaves_no_signature():
+    """A null is not drift here either, and the chain-level fields repeat on every row.
+
+    Every contract row carries the same chain-level values, so a vendor that stopped
+    sending one leaves that column null on the whole chain. Counting a null as unfit would
+    write that field's name into every row's overflow the moment any other chain-level
+    field drifted, which is the false positive the signature cannot afford.
+    """
+    body = dict(_chain_of(_full_contract()), underlyingPrice="six hundred and fifty")
+    del body["dividendYield"]
+    row = journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH).to_pylist()[0]
+
+    assert row["dividend_yield"] is None
+    assert json.loads(row["extra"]) == {"chain": {"underlyingPrice": "six hundred and fifty"}}
+
+
+def test_a_drifted_chain_level_field_never_signs_an_absence_marker():
+    """The chain-level values sit on the data rows, and a gap row holds none of them.
+
+    One batch carries both kinds of row, and the routing reads per row. A gap row's
+    chain-level columns are null, so the scan leaves them alone and the marker keeps its
+    empty overflow rather than gaining a data row's drift signature.
+    """
+    body = dict(_chain_of(_full_contract()), underlyingPrice="six hundred and fifty")
+    batch = journal.chains_data_batch(
+        body,
+        ticker="SPY",
+        snap_ts=SNAP,
+        fetch_ts=FETCH,
+        absent_markers=[
+            journal.AbsentMarker("2026-10-16", None, "chain_chunk_failed", "2026-10-16")
+        ],
+    )
+    data, marker = batch.to_pylist()
+
+    assert data["row_kind"] == journal.ROW_KIND_DATA
+    assert json.loads(data["extra"]) == {"chain": {"underlyingPrice": "six hundred and fifty"}}
+    assert marker["row_kind"] == journal.ROW_KIND_GAP
+    assert marker["underlying_price"] is None
+    assert marker["extra"] is None
+
+
+def test_a_chain_level_column_the_builder_recomputes_still_fails_the_row():
+    """The two chain-level columns that are not the vendor's own value keep failing loudly.
+
+    ``is_chain_truncated`` and ``number_of_contracts`` are derived from the captured rows,
+    so no payload can put a bad value in either and no chain body can reach this. The row
+    builder is driven directly for that reason: what is being checked is that neither has a
+    key in the overflow, so a value that refuses is this code's bug surfacing as this
+    code's bug rather than being parked as vendor drift.
+    """
+    for column, value in (("is_chain_truncated", "maybe"), ("number_of_contracts", 2.5)):
+        row = {
+            "ticker": "SPY",
+            "row_kind": journal.ROW_KIND_DATA,
+            "schema_version": journal.SCHEMA_VERSION,
+            column: value,
+        }
+        with pytest.raises((pa.ArrowInvalid, pa.ArrowTypeError)):
+            journal._batch(journal.CHAINS_SURFACE, [row])
+
+
+def test_the_recomputed_chain_level_columns_are_what_the_rows_say():
+    """The control for the test above: a chain body cannot reach either column.
+
+    The vendor's own header figures are overwritten, the count by the captured rows' own
+    length and the flag by that count's source plus whether a window was given up. So a
+    body sending either as a wrong shape still lands, which is why neither needs a route
+    into ``extra`` and why the refusal above had to be driven through the row builder.
+    """
+    body = dict(_chain_of(_full_contract()), isChainTruncated="yes", numberOfContracts="lots")
+    row = journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH).to_pylist()[0]
+
+    assert row["number_of_contracts"] == 1
+    assert row["is_chain_truncated"] is True  # bool("yes"), the vendor's truthiness kept
+    assert row["extra"] is None
 
 
 def test_every_value_a_payload_can_carry_refuses_in_one_of_the_four_named_families():
@@ -1754,10 +2024,10 @@ def test_two_drifted_fields_in_one_quote_block_both_land_under_it():
 def test_a_routed_quote_field_joins_its_blocks_existing_overflow():
     """A block holding an unrecognized field and a drifted one keeps both.
 
-    The chains overflow is flat, so its merge writes straight onto the top-level dict. The
-    quotes overflow nests, so the merge has to read that block's dict and add to it.
-    Replacing the block instead would drop the unrecognized field the fail-open was built
-    to keep, and the flat test cannot see that because it has no block to clobber.
+    A chains contract field's merge writes straight onto the top-level dict. A quotes
+    block's has to read that block's dict and add to it. Replacing the block instead would
+    drop the unrecognized field the fail-open was built to keep, and the flat test cannot
+    see that because it has no block to clobber.
     """
     row = _quote_row("quote", totalVolume="90000000", brandNewStat=1.5)
     assert json.loads(row["extra"]) == {"quote": {"brandNewStat": 1.5, "totalVolume": "90000000"}}

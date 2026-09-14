@@ -526,6 +526,28 @@ _CHAINS_HEADER_MAP = {
     "numberOfContracts": "number_of_contracts",
 }
 
+# The two chain-level fields the row builder recomputes rather than copies. The contract
+# count is the captured rows' own length, and the truncation flag also takes account of a
+# window given up, so neither column ever holds the vendor's value verbatim. A value one of
+# them refuses is therefore this code's bug rather than the vendor's, so they are kept out
+# of the overflow below and keep failing the row. Every other field in the header map is a
+# verbatim copy.
+_CHAINS_HEADER_RECOMPUTED = frozenset({"isChainTruncated", "numberOfContracts"})
+
+# The key the chain-level fields' overflow nests under. They are read off the top of the
+# chain body and repeated on every contract row, so a key written flat beside the contract
+# fields would be ambiguous with a contract field of the same name, and a vendor that later
+# added one would silently merge the two. Nesting keeps ``chain.underlyingPrice`` distinct
+# from anything a contract sends, which is the same reason the quotes overflow nests.
+#
+# The one name that could collide is a contract field called ``chain``, which the fail-open
+# writes flat under exactly this key. A row that routes a chain-level value into it refuses
+# by name in ``_extra_with_routed``, whatever the vendor's value is, rather than merging one
+# measurement into another. What that refusal cannot reach is the row that routes nothing,
+# where such a field's own nested keys read back as chain-level values. That residual is
+# marketlake #156, which is authoritative for it.
+_CHAINS_HEADER_BLOCK = "chain"
+
 # The per-block quote field maps, each vendor-field to snake_case column. Each map is
 # applied against its OWN block, never a merged dict, because the ``quote`` and
 # ``extended`` blocks reuse field names (``lastPrice``, ``bidPrice``, ``askPrice``,
@@ -633,18 +655,37 @@ _QUOTE_BLOCK_SPECS = (
     ("extended", _EXTENDED_MAP, frozenset()),
 )
 
+# The two fields read off the per-symbol envelope rather than a captured block, each stored
+# verbatim. ``realtime`` is the entitlement flag the validation battery checks. The CUSIP
+# arrives either as a top-level ``cusip`` or inside the ``reference`` block, and
+# ``quote_cusip`` takes it from wherever it sits, so the key here is the vendor's name for
+# the value rather than a path through the payload.
+_QUOTES_ENVELOPE_MAP = {
+    "realtime": "realtime",
+    "cusip": "cusip",
+}
+
+# The key the envelope fields' overflow nests under. They sit outside every captured block,
+# so they need a block of their own, and the vendor's own block names are the four above.
+# Only a captured block's leftovers reach the top level of a quotes overflow, so no vendor
+# field can land under this key.
+_QUOTES_ENVELOPE_BLOCK = "envelope"
+
 
 class ExtraPath(NamedTuple):
     """Where one column's value sits inside a row's ``extra`` JSON.
 
     ``field`` is the vendor's own name for the value, which is the key the overflow is
-    written under. ``block`` is the vendor block that key is nested inside, or ``None``
-    when the overflow is flat.
+    written under. ``block`` is the key that field's own level nests under, or ``None``
+    when the value sits flat at the top of the overflow.
 
-    The two surfaces differ because their payloads do. A chains row is built from one
-    contract dict, so its overflow is flat. A quotes row is built from several blocks that
-    reuse field names, so its overflow is nested one level under the block key and
-    ``quote.lastPrice`` stays distinct from ``extended.lastPrice``.
+    A level nests whenever its field names could collide with another level's. A chains
+    row is built from one contract dict, so the contract's own fields sit flat, and the
+    chain-level fields repeated onto that row nest under ``chain`` because a vendor could
+    send a contract field of the same name. A quotes row is built from several blocks that
+    reuse field names, so every block nests and ``quote.lastPrice`` stays distinct from
+    ``extended.lastPrice``. The two fields read off the quotes envelope nest under
+    ``envelope``, since they belong to no block.
     """
 
     block: str | None
@@ -652,17 +693,37 @@ class ExtraPath(NamedTuple):
 
 
 def _chains_extra_paths() -> dict[str, ExtraPath]:
-    """The chains overflow read backwards, flat, straight off the contract map."""
-    return {column: ExtraPath(None, vendor) for vendor, column in _CHAINS_CONTRACT_MAP.items()}
+    """The chains overflow read backwards: the contract map flat, the header map nested.
+
+    The two recomputed header fields are left out. The row builder derives both from the
+    captured rows rather than copying the vendor's, so neither column holds a vendor value
+    to park.
+    """
+    paths = {column: ExtraPath(None, vendor) for vendor, column in _CHAINS_CONTRACT_MAP.items()}
+    paths.update(
+        {
+            column: ExtraPath(_CHAINS_HEADER_BLOCK, vendor)
+            for vendor, column in _CHAINS_HEADER_MAP.items()
+            if vendor not in _CHAINS_HEADER_RECOMPUTED
+        }
+    )
+    return paths
 
 
 def _quotes_extra_paths() -> dict[str, ExtraPath]:
-    """The quotes overflow read backwards, block-keyed, straight off the block specs."""
-    return {
+    """The quotes overflow read backwards, block-keyed, off the block specs and the envelope."""
+    paths = {
         column: ExtraPath(block_key, vendor)
         for block_key, field_map, _consumed in _QUOTE_BLOCK_SPECS
         for vendor, column in field_map.items()
     }
+    paths.update(
+        {
+            column: ExtraPath(_QUOTES_ENVELOPE_BLOCK, vendor)
+            for vendor, column in _QUOTES_ENVELOPE_MAP.items()
+        }
+    )
+    return paths
 
 
 # How each surface's overflow is read backwards. The builders run per call rather than
@@ -687,12 +748,17 @@ def extra_paths(surface: str) -> dict[str, ExtraPath]:
     edit it always was. Add the vendor field to its block's map and the column becomes
     projectable in the same motion.
 
-    A column is reachable only if the parser would overflow its vendor field, which is a
-    narrower set than the schema. Five groups are deliberately absent.
+    Every column whose value the parser copies verbatim from one named vendor field is
+    here, wherever on the payload that field arrives. The contract fields sit flat, the
+    chain-level ones under ``chain``, each quote block's under its own key, and the
+    envelope's ``realtime`` and ``cusip`` under ``envelope``.
 
-    1. The chain-level fields, ``interest_rate`` and its five siblings. The chains overflow
-       is computed from the contract dict alone, so a top-level body field never lands in
-       ``extra`` at all.
+    A column is reachable only if the parser would overflow its vendor field, which is a
+    narrower set than the schema. Four groups are deliberately absent.
+
+    1. ``is_chain_truncated`` and ``number_of_contracts``. The row builder recomputes both
+       from the captured rows rather than copying the vendor's header, so neither column
+       ever holds a value the vendor sent.
     2. ``option_deliverables_list``. The writer JSON-encodes the vendor's nested list into
        that string column, so a raw overflow value would not fit it, and the field has been
        known since version 1 and so can never be in ``extra`` to begin with. Projecting a
@@ -700,9 +766,7 @@ def extra_paths(surface: str) -> dict[str, ExtraPath]:
        has never made.
     3. ``vendor_quote_ts``, on both surfaces. The vendor quote time is consumed into that
        stamp rather than stored, and it is named as consumed so it never overflows.
-    4. The quotes envelope's ``realtime`` and ``cusip``. Both are read off the envelope
-       rather than a captured block, and only a captured block's leftovers overflow.
-    5. The stamps, the provenance columns, and the chains window pair. None is a vendor
+    4. The stamps, the provenance columns, and the chains window pair. None is a vendor
        field, so none was ever a candidate for the overflow.
 
     A surface with no capture schema raises through ``schema_for``. A surface that has one
@@ -754,6 +818,11 @@ def _extra_json(fields: Mapping[str, object], known: set[str]) -> str | None:
     this way. When ``_routed_column`` later writes one there, its presence needs no marker
     to be recognized. The quotes surface builds its overflow the same way, per block, in
     ``_project_quote_envelope``.
+
+    On the chains surface ``known`` is the contract's own fields, so a contract carrying a
+    chain-level name like ``underlyingPrice`` overflows under it, flat. That is not the
+    signature and must not read as one, because the value came off a contract rather than
+    the chain. Nesting the chain-level values under ``chain`` is what keeps the two apart.
     """
     overflow = {key: value for key, value in fields.items() if key not in known}
     if not overflow:
@@ -867,10 +936,10 @@ def _routed_column(
 
     1. **The column has somewhere to put the value.** ``path`` is the column's entry in
        ``extra_paths``, which is the parser's vendor maps read backwards. A column outside
-       that set either holds a value this module computed rather than copied, like a stamp
-       or a transformed one, or holds a vendor value the overflow has no key for. Either
-       way there is no honest place to park it and no reader that would find it, so the
-       refusal propagates and the cycle gaps.
+       that set holds a value this module computed, transformed, or recomputed rather than
+       copied, like a stamp or the chain's contract count. The value that refused is then
+       this code's own rather than the vendor's, so there is nothing honest to park and no
+       reader that would find it, and the refusal propagates and the cycle gaps.
     2. **Every refused value sits on a row that carries a vendor observation.**
        ``observed`` is the data rows. A gap row holds no vendor value at all, so anything
        on one came from this code. Two builders put a value on a gap row, the chunker's
@@ -907,29 +976,75 @@ def _routed_column(
         return typed_column(field.type, kept), unfit
 
 
-def _extra_with_routed(raw: object, routed: Sequence[tuple[ExtraPath, object]]) -> str:
+def _fail_open_blocks(surface: str) -> frozenset[str]:
+    """The overflow keys the surface's own fail-open nests an unrecognized field under.
+
+    A quotes row's unrecognized fields nest under the block they arrived in, so a routed
+    value bound for one of those blocks joins what is already there rather than colliding
+    with it. A chains row's nest under nothing, so every key at the top of a chains overflow
+    is a vendor field's own name and none of them is a block this module writes.
+
+    This is what tells a block to merge into from a key to refuse. It is derived from the
+    block specs rather than restated, so a fifth captured quotes block would be mergeable in
+    the same edit that captures it.
+    """
+    if surface == QUOTES_SURFACE:
+        return frozenset(block_key for block_key, _map, _consumed in _QUOTE_BLOCK_SPECS)
+    return frozenset()
+
+
+def _extra_with_routed(
+    raw: object, routed: Sequence[tuple[ExtraPath, object]], mergeable: frozenset[str]
+) -> str:
     """One row's ``extra`` with the values its columns refused added, verbatim.
 
     Each value is written under the key ``extra_paths`` says feeds its column, which is the
-    vendor's own name for it, nested under its block on the quotes surface. That is the
-    same key an unrecognized field of that name would have landed under, so the reader in
-    ``extra_projection`` needs no second rule to find it.
+    vendor's own name for it, nested under its block wherever the field's level nests. That
+    is the same key an unrecognized field of that name would have landed under, so the
+    reader in ``extra_projection`` needs no second rule to find it.
 
     The value is the vendor's, unchanged. Nothing is cast, rounded, or stringified on the
     way in. A cast would manufacture a value the vendor never sent and hand it to a
     downstream computation with no marker, which is the one outcome nobody can detect
     afterwards, and the design's vendor-verbatim rule is what forbids it.
 
-    A collision is not possible. ``_extra_json`` and the quotes projection both build the
-    overflow from the fields their maps do *not* name, so a key a routed field writes under
-    is a key the overflow could not already hold.
+    A collision on the field itself is not possible. ``_extra_json`` and the quotes
+    projection both build the overflow from the fields their maps do *not* name, so a key a
+    routed field writes under is a key the overflow could not already hold.
+
+    One key above it can collide, and only on the chains surface. The chains fail-open
+    writes an unrecognized contract field flat, so a contract field named ``chain`` lands on
+    the key the chain-level values nest under. Merging into it would put a routed value
+    inside a value the vendor sent, and no reader could then tell which level either key
+    came from. So the row refuses, naming the key, and the cycle gaps the way it did before
+    any of this routed. That is the loud failure, and the alternative is a silent misreading
+    of two different measurements as one.
+
+    ``mergeable`` is what separates that collision from an ordinary quotes merge, where the
+    fail-open wrote the block key itself and the routed value belongs inside it. Any value
+    at all under a key outside that set is the vendor's, whatever its type, so the refusal
+    reads the key's presence rather than its shape. A dict is the shape that would otherwise
+    merge cleanly and silently, which makes it the one the check must not let through.
+
+    The keys are checked before any is written, so the refusal never leaves a half-merged
+    overflow behind, and a second value routing into a block this call just created is not
+    mistaken for a collision with the vendor.
     """
     overflow = dict(json.loads(raw)) if raw else {}
+    for path, _value in routed:
+        if path.block is None or path.block not in overflow:
+            continue
+        if path.block not in mergeable or not isinstance(overflow[path.block], Mapping):
+            raise ValueError(
+                f"a vendor field named {path.block!r} collides with the overflow block "
+                f"{path.field!r} routes under"
+            )
     for path, value in routed:
         if path.block is None:
             overflow[path.field] = value
         else:
-            block = dict(overflow.get(path.block) or {})
+            held = overflow.get(path.block)
+            block = dict(held) if isinstance(held, Mapping) else {}
             block[path.field] = value
             overflow[path.block] = block
     return json.dumps(overflow, sort_keys=True)
@@ -961,8 +1076,9 @@ def _batch(surface: str, rows: Sequence[Mapping[str, object]]) -> pa.RecordBatch
         for index in unfit:
             routed.setdefault(index, []).append((paths[field.name], values[index]))
     extras = [row.get(EXTRA_COLUMN) for row in rows]
+    mergeable = _fail_open_blocks(surface)
     for index, entries in routed.items():
-        extras[index] = _extra_with_routed(extras[index], entries)
+        extras[index] = _extra_with_routed(extras[index], entries, mergeable)
     columns[EXTRA_COLUMN] = typed_column(schema.field(EXTRA_COLUMN).type, extras)
     return pa.RecordBatch.from_arrays([columns[field.name] for field in schema], schema=schema)
 
@@ -1053,7 +1169,10 @@ def chains_data_batch(
     the entitlement flag, and the truncation-and-count fields. The truncation flag and the
     contract count are recomputed from the reassembled rows, never read from ``body``. So a
     windowed chain reports its own captured contract count and whether any window was given
-    up, not one window response's header figures. The other timestamps are the caller's,
+    up, not one window response's header figures. The other four are the vendor's own
+    values, so a value one of their columns refuses routes into ``extra`` under ``chain``
+    rather than costing the cycle, while a refusal in either recomputed column is this
+    code's bug and still fails the row. The other timestamps are the caller's,
     stamped from the injected clock. ``fetch_end_ts`` is when the response landed, the
     request end, so the round-trip is ``fetch_end_ts`` minus ``fetch_ts``.
 
@@ -1173,9 +1292,10 @@ def _project_quote_envelope(envelope: Mapping[str, object]) -> tuple[dict[str, o
     land in separate columns. A field a block's map does not name, and that the block does
     not consume, overflows into ``extra`` under that block's key, so drift in any block
     surfaces without key collision and ``extra`` stays empty in steady state. The
-    envelope-level ``realtime`` flag and the ``cusip`` are captured too. Anything else on
-    the envelope, like ``assetMainType`` or the ``reference`` block beyond the CUSIP, is
-    neither captured nor overflowed.
+    envelope-level ``realtime`` flag and the ``cusip`` are captured too. Both belong to no
+    block, so a value either column refuses routes under ``envelope`` rather than a block
+    key, per ``extra_paths``. Anything else on the envelope, like ``assetMainType`` or the
+    ``reference`` block beyond the CUSIP, is neither captured nor overflowed.
     """
     columns: dict[str, object] = {}
     overflow: dict[str, dict[str, object]] = {}
@@ -1220,8 +1340,9 @@ def quotes_data_batch(
     and ``extended`` blocks lands in both its columns, never overwriting the other. The
     quote time is carried in ``vendor_quote_ts``. A field a captured block's map does not
     name overflows into ``extra`` under that block's key, so ``extra`` stays empty in
-    steady state and drift in any block still surfaces. ``fetch_end_ts`` is the
-    request-end stamp, the pair to ``fetch_ts`` for round-trip.
+    steady state and drift in any block still surfaces. The two envelope fields belong to
+    no block, so a value either column refuses routes under ``envelope``. ``fetch_end_ts``
+    is the request-end stamp, the pair to ``fetch_ts`` for round-trip.
     """
     row: dict[str, object] = {
         "snap_ts": _iso(snap_ts),

@@ -15,8 +15,10 @@ version *does* carry the column and this module only fills a column the version 
 Reaching it needs a different test and a different answer, and both are
 [#149](https://github.com/l3a0/marketlake/issues/149), which is authoritative for that
 scope. Until it lands, what makes those rows safe is that a known field's name in ``extra``
-can only have got there by routing, so a routed null is still distinguishable from a
-vendor null.
+says the parser routed it, so a routed null is still distinguishable from a vendor null.
+One payload can write that name without routing, a chains contract field named ``chain``
+carrying a chain-level field's own name, and closing it is
+[#156](https://github.com/l3a0/marketlake/issues/156).
 
 So a promotion splits history in two. The same measurement reads as a column above the
 boundary and as an overflow key below it, and a reader asking for the column sees nulls
@@ -154,7 +156,9 @@ def _lookup(overflow: Mapping[str, object], path: journal.ExtraPath) -> object:
     """The overflow value at ``path``, or ``None`` when the row does not carry it.
 
     A flat path reads the key straight off the overflow. A nested one reads the block
-    first, which is how the quotes surface keeps the field names its blocks share apart.
+    first, which is how each level that could reuse another's field names stays apart from
+    it: the quotes blocks from each other, and the chains surface's chain-level fields from
+    the contract's.
     """
     if path.block is None:
         return overflow.get(path.field)

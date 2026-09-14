@@ -542,16 +542,18 @@ def test_the_same_chain_captures_when_the_integer_field_is_whole(lake_root):
     assert row["extra"] is None
 
 
-def test_a_chain_level_field_the_column_refuses_still_gaps_under_its_own_class(lake_root):
-    """What the routing deliberately leaves alone, read at the class an operator sees.
+def test_a_retyped_chain_level_field_lands_the_cycle_and_parks_the_raw_value(lake_root):
+    """The chain-level fields route too, driven through the whole cycle.
 
-    The chains overflow is built from the contract dict alone, so a top-level body field
-    has no key in it and nowhere honest to be parked. It keeps the old behaviour: the raise
-    reaches ``_plan_chain``'s fail-open and the ticker gaps under the exception's own name.
+    ``underlyingPrice`` is read off the top of the chain body and repeated onto every
+    contract row, which is why it used to have no key in an overflow built from the
+    contract dict alone. It gapped the ticker under ``arrow_invalid`` for as long as the
+    vendor held the shape, and the price the design's IV inversion reads went in the bin
+    with the minute.
 
-    ``chain_schema_drift`` is not that name and never was. It guards the fetch, where a body
-    that will not merge is split and given up, and the row build runs well past it. So the
-    class on disk here is ``arrow_invalid``, and the quote sampler is untouched.
+    Now the chain lands as data, the column is null because a string was never a price, and
+    the vendor's own value sits under ``chain`` in ``extra``. The nesting is what keeps it
+    apart from anything a contract sends.
     """
     body = _chain_body_with()
     body["underlyingPrice"] = "six hundred and fifty"
@@ -564,12 +566,90 @@ def test_a_chain_level_field_the_column_refuses_still_gaps_under_its_own_class(l
         plan=_ONE_WINDOW,
     )
 
+    assert result.errors == ()
+    chain = result.segment(CHAINS, "SPY")
+    assert chain.row_kind == journal.ROW_KIND_DATA
+    assert chain.error_class is None
+
+    row = _rows(chain)[0]
+    assert row["underlying_price"] is None
+    assert json.loads(row["extra"]) == {"chain": {"underlyingPrice": "six hundred and fifty"}}
+    # The contract's own fields are untouched, so a chain-level retype costs one column.
+    assert (row["bid"], row["ask"]) == (4.2, 4.25)
+    assert result.segment(QUOTES, "SPY").row_kind == journal.ROW_KIND_DATA
+
+
+def test_a_retyped_envelope_field_lands_the_quote_cycle_and_parks_the_raw_value(lake_root):
+    """The same on the other surface, where the two fields sit outside every block.
+
+    ``realtime`` is the entitlement flag the validation battery checks, read off the
+    per-symbol envelope rather than a captured block, so only a block's leftovers used to
+    overflow and a retype cost the quote for the minute. It routes under ``envelope`` now,
+    and the chain for the same cycle is untouched either way.
+    """
+    body = _chain_body_with()
+    cassette = _one_chain_cassette(body)
+    quotes = cassette.interactions[1]
+    envelope = dict(quotes.body["SPY"], realtime="yes")
+    cassette = Cassette(
+        interactions=(
+            cassette.interactions[0],
+            Interaction(
+                endpoint="quotes",
+                params=quotes.params,
+                status=quotes.status,
+                body={"SPY": envelope},
+            ),
+        )
+    )
+    result = capture.run_cycle(
+        ManualClock(start=_CLOCK_START),
+        CassetteVendor(cassette),
+        _spy_only(),
+        lake_root,
+        pid=4242,
+        plan=_ONE_WINDOW,
+    )
+
+    assert result.errors == ()
+    quote = result.segment(QUOTES, "SPY")
+    assert quote.row_kind == journal.ROW_KIND_DATA
+    assert quote.error_class is None
+
+    row = _rows(quote)[0]
+    assert row["realtime"] is None
+    assert json.loads(row["extra"]) == {"envelope": {"realtime": "yes"}}
+    assert row["bid"] == 649.98
+    assert result.segment(CHAINS, "SPY").row_kind == journal.ROW_KIND_DATA
+
+
+def test_a_column_the_builder_transforms_still_gaps_under_its_own_class(lake_root):
+    """What the routing deliberately leaves alone, read at the class an operator sees.
+
+    ``quoteTimeInLong`` is consumed into ``vendor_quote_ts`` rather than copied, so the
+    column holds a value this code computed and the overflow has no key for it. The
+    epoch-to-ISO conversion refuses before any column is built, the raise reaches
+    ``_plan_chain``'s fail-open, and the ticker gaps under the exception's own name.
+
+    ``chain_schema_drift`` is not that name and never was. It guards the fetch, where a body
+    that will not merge is split and given up, and the row build runs well past it. So the
+    class on disk here is ``value_error``, and the quote sampler is untouched.
+    """
+    result = capture.run_cycle(
+        ManualClock(start=_CLOCK_START),
+        CassetteVendor(_one_chain_cassette(_chain_body_with(quoteTimeInLong="not-an-epoch"))),
+        _spy_only(),
+        lake_root,
+        pid=4242,
+        plan=_ONE_WINDOW,
+    )
+
     chain = result.segment(CHAINS, "SPY")
     assert chain.row_kind == journal.ROW_KIND_GAP
-    assert chain.error_class == "arrow_invalid"
+    assert chain.error_class == "value_error"
     gap_row = _rows(chain)[0]
-    assert gap_row["error_class"] == "arrow_invalid"
-    assert gap_row["underlying_price"] is None
+    assert gap_row["error_class"] == "value_error"
+    assert gap_row["vendor_quote_ts"] is None
     assert gap_row["extra"] is None
     assert result.segment(QUOTES, "SPY").row_kind == journal.ROW_KIND_DATA
 
