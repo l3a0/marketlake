@@ -58,6 +58,7 @@ class RecordingFlow:
 
     def __init__(self, token: object | None = FRESH_TOKEN) -> None:
         self.calls: list[dict[str, object]] = []
+        self.writers: list[object] = []
         self._token = token
 
     def __call__(
@@ -77,6 +78,7 @@ class RecordingFlow:
                 "token_path": token_path,
             }
         )
+        self.writers.append(token_write_func)
         if self._token is not None:
             token_write_func(self._token)
         return "a client this command discards"
@@ -176,6 +178,30 @@ def test_the_flow_is_called_with_exactly_what_it_needs(tmp_path):
             "token_path": str(token),
         }
     ]
+
+
+def test_the_flow_is_handed_this_modules_atomic_writer(tmp_path, monkeypatch):
+    """The hook is the whole point, so the writer that reaches the flow is checked.
+
+    ``client_from_login_flow`` writes the token itself unless it is given a
+    ``token_write_func``. Dropping the hook, or handing it a plain write, leaves the
+    token landing and every call-shape assertion green while the torn-write risk is back.
+    So the writer the flow received is exercised and the rename is what is observed.
+    """
+    token = tmp_path / "token.json"
+    flow = RecordingFlow()
+    renames: list[tuple[str, str]] = []
+    real_replace = os.replace
+
+    def record(src, dst):
+        renames.append((str(src), str(dst)))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", record)
+    _run(flow, token)
+
+    assert renames == [(str(temp_write_path(token, os.getpid())), str(token))]
+    assert token.stat().st_mode & 0o777 == m.TOKEN_MODE
 
 
 def test_an_existing_token_is_overwritten_and_the_report_says_so(tmp_path):
