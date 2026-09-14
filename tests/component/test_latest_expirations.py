@@ -179,3 +179,57 @@ def test_the_newest_batch_with_data_wins_inside_one_segment(lake_root):
     assert journal.latest_expirations(lake_root, "SPY") == ["2026-12-18"], (
         "the read took an older batch, so the newest cycle's expirations were lost"
     )
+
+
+def _retyped_chain_batch() -> pa.RecordBatch:
+    """One chains batch whose every contract sent ``expirationDate`` at the wrong type.
+
+    The column refuses an epoch integer where the schema holds a string, so the routing
+    nulls it on every row and parks each raw value in ``extra``. The batch is data, and it
+    names no expiration at all.
+    """
+    import copy as _copy
+
+    body = _copy.deepcopy(CHAIN_BODY)
+    body["callExpDateMap"]["2026-09-18:25"]["650.0"][0]["expirationDate"] = 1787000000000
+    return journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+
+
+def test_a_data_batch_naming_no_expiration_does_not_blind_the_walk(lake_root):
+    """A newer batch that names nothing must not answer for one that names something.
+
+    A whole-chain ``expirationDate`` retype used to gap the ticker, so the segment held no
+    data rows and the walk stepped past it to the last good batch. The routing lands that
+    cycle as data instead, with the column null on every row, which reaches the same walk
+    by a new route. Answering with an empty list there would read as this ticker having no
+    expirations, and the chunker would fall back to a per-window marker while an older
+    batch could still name the series.
+
+    The prior batch is written first and the drifted one after, so taking the newest batch
+    outright is what this catches.
+    """
+    with journal.SegmentWriter.open(lake_root, "chains", "SPY", DAY, "20260824T160000", 4242) as w:
+        w.write_cycle(_chain_batch())
+    _manifest(lake_root, w.path, 1)
+    with journal.SegmentWriter.open(lake_root, "chains", "SPY", DAY, "20260824T160100", 4242) as w2:
+        w2.write_cycle(_retyped_chain_batch())
+    _manifest(lake_root, w2.path, 1)
+
+    # The drifted cycle really did land as data, which is what makes this a new route.
+    landed = journal.read_segment(w2.path).to_pylist()[0]
+    assert landed["row_kind"] == journal.ROW_KIND_DATA
+    assert landed["expiration_date"] is None
+
+    assert journal.latest_expirations(lake_root, "SPY") == ["2026-09-18"], (
+        "a batch that names no expiration answered for one that does, so the absence "
+        "markers would lose the series they exist to name"
+    )
+
+
+def test_a_lake_whose_only_batch_names_no_expiration_answers_none(lake_root):
+    """With nothing older to fall back to, the read says so rather than saying nothing."""
+    with journal.SegmentWriter.open(lake_root, "chains", "SPY", DAY, "20260824T160000", 4242) as w:
+        w.write_cycle(_retyped_chain_batch())
+    _manifest(lake_root, w.path, 1)
+
+    assert journal.latest_expirations(lake_root, "SPY") is None

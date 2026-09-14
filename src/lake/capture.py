@@ -116,6 +116,14 @@ CHAIN_CHUNK_FAILED = "chain_chunk_failed"
 # rather than a vendor problem. The name is recognisable as drift so the unbuilt schema-drift
 # page (#92) has one string to subscribe to, and it matches the reason the segment readers are
 # to carry for the same signal (#104). Neither of those is built here.
+#
+# A retyped known field is not one of those two shapes and never was. It merges cleanly, and
+# what refuses it is the column build a layer on, which is why the gap it used to leave
+# carried Arrow's own exception name rather than this class. Since marketlake #129 it leaves
+# no gap at all, because the raw value is routed into ``extra`` and the cycle lands. So this
+# class still means one thing, a window body that would not merge, and it means exactly what
+# it meant before that change. What #92 subscribes to for a retype is the routing's own
+# signature instead, a known field's name sitting in ``extra``.
 CHAIN_SCHEMA_DRIFT = "chain_schema_drift"
 
 # The two chain maps every window response nests contracts under.
@@ -770,7 +778,10 @@ class _CaptureCycle:
         1. **Nothing captured.** A fetch that returned no body is a whole-chain gap for
            this ticker, tagged with the fetch's representative error class.
         2. **A body the row builder could not read.** It fails open to a whole-chain gap,
-           the same fail-open the single-fetch path used. Raw stays vendor-verbatim.
+           the same fail-open the single-fetch path used. Raw stays vendor-verbatim. This is
+           narrower than it was. A known field whose value its column refuses is routed into
+           ``extra`` and the cycle lands, so what reaches here is a value the overflow has no
+           key for, or a payload shaped so the builder cannot read a contract at all.
         3. **A partial snapshot.** It still journals as a data segment. Its absence
            markers ride inside it, each carrying its own window's class. The segment flag
            takes the first failed window's class, the representative signal, mirroring the

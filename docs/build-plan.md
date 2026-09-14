@@ -176,7 +176,10 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
      that failure's own class. Letting it propagate would leave the cycle runner, leave the
      daemon loop, and exit the process, and the `KeepAlive` successor would reach the same
      minute and do it again, so one malformed payload costs every capture minute until
-     someone notices it.
+     someone notices it. This branch is narrower than it was. A known field whose value its
+     column refuses is now routed into `extra` and the cycle lands, so what still reaches
+     this fail-open is a value with no key in the overflow to land under. The design doc's
+     schema-policy section carries the rule and the columns it covers.
   2. A window body the merge cannot read splits like a too-big window and is given up under
      `chain_schema_drift`, a class of its own. The shapes that raise there sit inside one
      expiration or one strike, which is what a date-keyed split isolates, so refusing to

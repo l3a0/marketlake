@@ -29,6 +29,7 @@ They cover the chunker's contract:
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -803,15 +804,29 @@ def test_one_unreadable_expiration_costs_its_sub_range_and_not_the_window(lake_r
 
 
 def _retyped_expiration_response(expirations: list[str]) -> VendorResponse:
-    """A body that merges cleanly and that the calibrated row builder then rejects.
+    """A body that merges cleanly and whose contract then drifts at the row builder.
 
     The contracts nest exactly as the vendor's do, so nothing in the merge notices. One
     contract's ``expirationDate`` arrives as an epoch integer where the pinned schema holds
-    a string, which is the retyped known field the design's schema policy names. Arrow
-    refuses it when the batch is built, one layer past the fetch.
+    a string, which is the retyped known field the design's schema policy names. The column
+    refuses it when the batch is built, one layer past the fetch, and the routing parks it
+    in ``extra`` rather than costing the cycle.
     """
     body = _chain_body(expirations)
     body["callExpDateMap"][f"{expirations[0]}:7"]["650.0"][0]["expirationDate"] = 1787000000000
+    return VendorResponse(status=200, body=body)
+
+
+def _retyped_header_response(expirations: list[str]) -> VendorResponse:
+    """A body that merges cleanly and that the row builder then rejects outright.
+
+    The drift is in a chain-level field rather than a contract field. The chains overflow is
+    built from the contract dict alone, so a top-level field has no key in it and the
+    routing has nowhere honest to park the value. The refusal propagates, which is the
+    fail-open branch this file's second test covers.
+    """
+    body = _chain_body(expirations)
+    body["underlyingPrice"] = "six hundred and fifty"
     return VendorResponse(status=200, body=body)
 
 
@@ -823,6 +838,48 @@ def test_a_body_the_row_builder_rejects_fails_open_to_a_whole_chain_gap(lake_roo
     runner, leave the daemon loop, and exit the process, and the ``KeepAlive`` successor
     would reach the same minute and do it again. So it fails open: the chain is one gap row
     carrying the failure's own class, and the quote surface for the same cycle still lands.
+
+    The drift is in a chain-level field on purpose. A per-contract field routes into
+    ``extra`` and the cycle lands, which the test below covers. This branch is what is left
+    once it does, and it still has to hold.
+    """
+    plan = ChainPlan(((0, 9), (10, None)))
+    vendor = _WindowVendor(
+        windows={
+            (_d(0), _d(9)): _retyped_header_response(["2026-08-28"]),
+            (_d(10), None): _chain_response(["2026-09-18"]),
+        },
+    )
+    result = _run(vendor, lake_root, plan)
+
+    outcome = result.segment(CHAINS, "SPY")
+    assert outcome.row_kind == journal.ROW_KIND_GAP
+    # The class is the exception's own name, snake-cased, the way every raised failure is
+    # classified. Arrow refuses the retyped chain-level field with an ArrowInvalid.
+    assert outcome.error_class == "arrow_invalid"
+    assert outcome.rows == 1
+
+    gap = _chain_rows(result)[0]
+    assert gap["row_kind"] == journal.ROW_KIND_GAP
+    assert gap["error_class"] == "arrow_invalid"
+    assert gap["bid"] is None and gap["open_interest"] is None
+    # The cycle survived the rejection: the quote surface journaled beside the gap, and the
+    # gap segment is durable and manifested rather than lost with the process.
+    assert result.segment(QUOTES, "SPY").row_kind == journal.ROW_KIND_DATA
+    assert outcome.partition in latest_entries(lake_root)
+
+
+def test_a_contract_field_the_column_refuses_lands_the_reassembled_snapshot(lake_root):
+    """The same reassembled body, drifted in a contract field, costs the field alone.
+
+    One window's contract sends ``expirationDate`` as an epoch integer where the schema
+    holds a string. Both windows merge, the snapshot reassembles, and the routing nulls
+    that one column and parks the epoch in ``extra``. So the partial-snapshot machinery and
+    the routing compose: what the fetch reassembled still lands, and the drifted field is
+    recoverable rather than gone with the minute.
+
+    The other window's contract is untouched, which is what separates a routed field from a
+    builder that nulled the column outright.
     """
     plan = ChainPlan(((0, 9), (10, None)))
     vendor = _WindowVendor(
@@ -834,18 +891,19 @@ def test_a_body_the_row_builder_rejects_fails_open_to_a_whole_chain_gap(lake_roo
     result = _run(vendor, lake_root, plan)
 
     outcome = result.segment(CHAINS, "SPY")
-    assert outcome.row_kind == journal.ROW_KIND_GAP
-    # The class is the exception's own name, snake-cased, the way every raised failure is
-    # classified. Arrow refuses the retyped field with an ArrowTypeError.
-    assert outcome.error_class == "arrow_type_error"
-    assert outcome.rows == 1
+    assert outcome.row_kind == journal.ROW_KIND_DATA
+    assert outcome.error_class is None
 
-    gap = _chain_rows(result)[0]
-    assert gap["row_kind"] == journal.ROW_KIND_GAP
-    assert gap["error_class"] == "arrow_type_error"
-    assert gap["bid"] is None and gap["open_interest"] is None
-    # The cycle survived the rejection: the quote surface journaled beside the gap, and the
-    # gap segment is durable and manifested rather than lost with the process.
+    rows = _chain_rows(result)
+    drifted = [row for row in rows if row["extra"] is not None]
+    assert len(drifted) == 1
+    assert drifted[0]["expiration_date"] is None
+    assert json.loads(drifted[0]["extra"]) == {"expirationDate": 1787000000000}
+    # Every other contract keeps the expiration it sent, from both windows.
+    assert {row["expiration_date"] for row in rows if row["extra"] is None} == {
+        "2026-08-28T20:00:00.000+00:00",
+        "2026-09-18T20:00:00.000+00:00",
+    }
     assert result.segment(QUOTES, "SPY").row_kind == journal.ROW_KIND_DATA
     assert outcome.partition in latest_entries(lake_root)
 

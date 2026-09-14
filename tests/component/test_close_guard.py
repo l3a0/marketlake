@@ -83,9 +83,8 @@ def _row(
     root: Path, surface: str, ticker: str, slot: datetime, *, tag: str | None, kind: str
 ) -> None:
     """One recorded row under a close tag, standing for a cycle that ran."""
-    schema = journal.schema_for(surface)
     batch = journal._batch(
-        schema,
+        surface,
         [
             {
                 "snap_ts": slot.isoformat(),
