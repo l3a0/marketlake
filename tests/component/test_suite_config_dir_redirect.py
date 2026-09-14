@@ -33,16 +33,13 @@ import json
 import os
 import subprocess
 import sys
+from importlib import import_module
 from pathlib import Path
 
-from lake.chain_plan import DEFAULT_CHAIN_PLAN_PATH
-from lake.config import DEFAULT_CONFIG_PATH
 from lake.paths import CONFIG_DIR_ENV, CONFIG_DIR_PARTS, TOKEN_FILE, config_dir
-from lake.reauth import DEFAULT_TOKEN_PATH as REAUTH_TOKEN_PATH
-from lake.schwab import DEFAULT_TOKEN_PATH as SCHWAB_TOKEN_PATH
-from lake.tickers import DEFAULT_TICKERS_PATH
-from tests.component.test_config_dir_override import _DEFAULTS
-from tests.conftest import _THROWAWAY_CONFIG_DIR, _is_protected
+from tests.component.test_config_dir_override import _DEFAULTS, DEFAULT_PAIRS
+from tests.conftest import _THROWAWAY_CONFIG_DIR
+from tests.support.config_guard import is_protected
 
 # The repo root. A child that imports the ``tests`` package needs it on ``sys.path``, and
 # ``python -c`` supplies only the working directory, so a child is given this as its cwd
@@ -56,15 +53,12 @@ THROWAWAY = Path(_THROWAWAY_CONFIG_DIR)
 # spells it this way.
 REAL_CONFIG_DIR = Path.home().joinpath(*CONFIG_DIR_PARTS)
 
-# The same five defaults ``_DEFAULTS`` asks a child about, read here instead. The script
-# is imported rather than rewritten so one list covers both processes, and the keys are
-# compared below so a sixth default added to one cannot go missing from the other.
+# The same defaults ``_DEFAULTS`` asks a child about, read in this process instead. Both
+# come from one scan of ``src/lake``, so a sixth default added to the package joins both
+# without anyone editing either file, which is what the two hand-written lists here used
+# to get wrong.
 PARENT_DEFAULTS = {
-    "chain_plan": DEFAULT_CHAIN_PLAN_PATH,
-    "config": DEFAULT_CONFIG_PATH,
-    "reauth_token": REAUTH_TOKEN_PATH,
-    "schwab_token": SCHWAB_TOKEN_PATH,
-    "tickers": DEFAULT_TICKERS_PATH,
+    f"{module}.{name}": Path(getattr(import_module(module), name)) for module, name in DEFAULT_PAIRS
 }
 
 
@@ -216,11 +210,11 @@ def test_the_redirect_does_not_disarm_the_guard():
     the variable set before the guard decides, so asking the guard here drives the half
     that needed a child before.
 
-    Nothing is written. ``_is_protected`` is the predicate the refusal is built on, so
+    Nothing is written. ``is_protected`` is the predicate the refusal is built on, so
     asking it decides the real question and touches no file.
     """
-    assert _is_protected(str(REAL_CONFIG_DIR / TOKEN_FILE))
-    assert _is_protected(str(REAL_CONFIG_DIR))
+    assert is_protected(str(REAL_CONFIG_DIR / TOKEN_FILE))
+    assert is_protected(str(REAL_CONFIG_DIR))
     # The other direction, so this cannot pass by refusing everything. The throwaway is
     # where the suite's own children write, and a guard sweeping it up would fail them.
-    assert not _is_protected(str(THROWAWAY / TOKEN_FILE))
+    assert not is_protected(str(THROWAWAY / TOKEN_FILE))

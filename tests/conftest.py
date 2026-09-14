@@ -1,11 +1,15 @@
 """Shared fixtures that expose the four seams and the fixture-lake builder.
 
-It also carries three guards and one redirect. The network guard fails any test that
-reaches another machine from inside this process. The subprocess guard fails any test
-that shells out to rsync, launchctl, pmset, or tmutil. The config-directory guard fails
-any test that writes under the machine's real ``~/.config/marketlake/``. The redirect
-points this process, and every child that inherits its environment, at a throwaway config
-directory, which is what covers the children the three guards cannot reach.
+It also carries three guards, one redirect, and one check on the outcome. The network
+guard fails any test that reaches another machine from inside this process. The
+subprocess guard fails any test that shells out to rsync, launchctl, pmset, or tmutil.
+The config-directory guard fails any test that writes under the machine's real
+``~/.config/marketlake/``, and its other half, the predicate deciding what counts as that
+directory, sits in ``tests/support/config_guard.py`` so a child can ask without importing
+this file. The redirect points this process, and every child that inherits its
+environment, at a throwaway config directory, which is what covers the children the three
+guards cannot reach. The check on the outcome lists the real config directory when this
+file is imported and again when the session ends, and fails the run when it changed.
 """
 
 from __future__ import annotations
@@ -20,13 +24,14 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from lake.paths import CONFIG_DIR_ENV, CONFIG_DIR_PARTS
+from lake.paths import CONFIG_DIR_ENV
+from tests.support.config_defaults import modules_building_a_default
 
 # -- the config-directory redirect -------------------------------------------------------
 
@@ -75,10 +80,16 @@ from lake.paths import CONFIG_DIR_ENV, CONFIG_DIR_PARTS
 # None of this stands in for the guard below. The guard settles what it protects from
 # ``Path.home()`` and never reads this variable, on purpose, so a test that names the
 # real path by hand still fails rather than slipping past a redirect that path ignores.
-# The five modules that build a module-level default from ``config_dir``. Each binds
-# its constant at import, so one already in ``sys.modules`` here has bound it against
+# The modules that build a module-level default from ``config_dir``. Each binds its
+# constant at import, so one already in ``sys.modules`` here has bound it against
 # whatever the environment said before this file ran.
-_BINDS_A_DEFAULT = ("lake.chain_plan", "lake.config", "lake.reauth", "lake.schwab", "lake.tickers")
+#
+# Read out of ``src/lake`` rather than typed, because a sixth default added there would
+# otherwise be outside this check with nothing to say so. The scanner imports nothing,
+# which it has to avoid: importing one of these modules is the very act this guards
+# against. ``tests.support.config_defaults`` reaches only ``ast`` and ``pathlib``, so it
+# is safe to import ahead of the export below.
+_BINDS_A_DEFAULT = modules_building_a_default()
 _ALREADY_BOUND = [name for name in _BINDS_A_DEFAULT if name in sys.modules]
 if _ALREADY_BOUND:
     raise RuntimeError(
@@ -94,6 +105,10 @@ atexit.register(shutil.rmtree, _THROWAWAY_CONFIG_DIR, ignore_errors=True)
 
 from lake.cassette import load_cassette  # noqa: E402
 from tests.support.clock import ManualClock  # noqa: E402
+from tests.support.config_guard import (  # noqa: E402
+    REAL_CONFIG_DIR,
+    is_protected,
+)
 from tests.support.lake import FixtureLake  # noqa: E402
 from tests.support.vendor import CassetteVendor  # noqa: E402
 
@@ -327,32 +342,13 @@ def _no_subprocess() -> Iterator[None]:
 # quietly, and the damage is a file the suite cannot put back. This fixture turns that
 # silent success into a loud failure that names the path.
 #
-# What counts as the real directory is settled here, at import, and deliberately not
-# through ``paths.config_dir``. Two reasons, and they pull the same way. ``config_dir``
-# honours ``MARKETLAKE_CONFIG_DIR``, so reading it would let the override disarm the
-# guard, when the override's whole purpose is to keep a process off this path. And
-# ``Path.home()`` reads ``$HOME``, which a test is free to monkeypatch, so asking later
-# would let a test move the protected directory out from under the guard.
-#
-# Both spellings are protected. A home whose ``.config`` is a symlink, which is what a
-# dotfile manager usually leaves behind, has two names for one directory, and a write
-# through the resolved one is the same write.
+# What counts as the real directory, and whether a path is inside it, is settled in
+# ``tests/support/config_guard.py`` rather than here. That module has no import side
+# effect, so a child process can ask it the question without importing this file and
+# having the redirect above replace the very variable the child was set up to test.
+# The reasoning about which home is read, and why both spellings are protected, lives
+# there beside the code it explains.
 
-
-def _protected_roots(directory: str | Path) -> tuple[str, ...]:
-    """Both spellings of ``directory``: as given, and fully resolved.
-
-    It takes a directory rather than reading one so a test can drive it, since the two
-    spellings collapse to one string on a machine whose ``.config`` is a real directory.
-    That is every machine the suite has run on, so nothing would otherwise exercise the
-    resolved one.
-    """
-    as_given = str(directory)
-    return tuple({as_given, os.path.realpath(as_given)})
-
-
-_REAL_CONFIG_DIR = str(Path.home().joinpath(*CONFIG_DIR_PARTS))
-_PROTECTED_ROOTS = _protected_roots(_REAL_CONFIG_DIR)
 
 # The open modes and flags that can change a file. Reads are left alone: the issue this
 # fixture answers is a write, and refusing reads would fail tests that legitimately load
@@ -371,37 +367,6 @@ class ConfigWriteInTest(BaseException):
     would be swallowed somewhere on that path and the destroyed token would ship green,
     which is the exact silence being fixed.
     """
-
-
-def _is_protected(target: object) -> bool:
-    """Whether ``target`` names the real config directory or something inside it.
-
-    An ``int`` is an already-open file descriptor, which carries no path to check, so it
-    passes through. ``os.fsdecode`` accepts ``str``, ``bytes``, and anything with
-    ``__fspath__``, which is every form these calls take, and raises ``TypeError`` on
-    anything else.
-
-    The comparison is on the path's text, expanded and made absolute, and touches no
-    filesystem. It therefore catches a path spelled at the directory, under either of
-    the two names in ``_PROTECTED_ROOTS``, and it does not catch a path that arrives
-    there through a symlink of its own: a link outside the directory pointing at a file
-    inside it, or an ancestor that is a link the roots do not already name. Opening such
-    a path for writing truncates the real file and this returns ``False``.
-
-    Resolving every candidate with ``os.path.realpath`` would close that, and the price
-    is the reason it does not. Measured on this machine, ``realpath`` costs 25.8 µs
-    against ``abspath``'s 0.36 µs, and every ``open`` in the suite runs this, which is
-    seconds per run to catch a shape nothing in this repo builds. Revisit that trade if
-    anything here ever does build one.
-    """
-    if isinstance(target, int):
-        return False
-    try:
-        text = os.fsdecode(target)
-    except TypeError:
-        return False
-    absolute = os.path.abspath(os.path.expanduser(text))
-    return any(absolute == root or absolute.startswith(root + os.sep) for root in _PROTECTED_ROOTS)
 
 
 def _refuse(path: object) -> None:
@@ -485,7 +450,7 @@ def _no_config_writes() -> Iterator[None]:
     def guard_open(real: Callable[..., object]) -> Callable[..., object]:
         def refuse(file: object, mode: object = "r", *pos: object, **kwargs: object) -> object:
             text_mode = mode if isinstance(mode, str) else ""
-            if _WRITE_MODES & set(text_mode) and _is_protected(file):
+            if _WRITE_MODES & set(text_mode) and is_protected(file):
                 _refuse(file)
             return real(file, mode, *pos, **kwargs)
 
@@ -493,7 +458,7 @@ def _no_config_writes() -> Iterator[None]:
 
     def guard_os_open(real: Callable[..., object]) -> Callable[..., object]:
         def refuse(path: object, flags: int = 0, *pos: object, **kwargs: object) -> object:
-            if flags & _WRITE_FLAGS and _is_protected(path):
+            if flags & _WRITE_FLAGS and is_protected(path):
                 _refuse(path)
             return real(path, flags, *pos, **kwargs)
 
@@ -501,7 +466,7 @@ def _no_config_writes() -> Iterator[None]:
 
     def guard_one(real: Callable[..., object]) -> Callable[..., object]:
         def refuse(path: object, *pos: object, **kwargs: object) -> object:
-            if _is_protected(path):
+            if is_protected(path):
                 _refuse(path)
             return real(path, *pos, **kwargs)
 
@@ -510,7 +475,7 @@ def _no_config_writes() -> Iterator[None]:
     def guard_both_ends(real: Callable[..., object]) -> Callable[..., object]:
         def refuse(src: object, dst: object, *pos: object, **kwargs: object) -> object:
             for end in (src, dst):
-                if _is_protected(end):
+                if is_protected(end):
                     _refuse(end)
             return real(src, dst, *pos, **kwargs)
 
@@ -518,7 +483,7 @@ def _no_config_writes() -> Iterator[None]:
 
     def guard_destination(real: Callable[..., object]) -> Callable[..., object]:
         def refuse(src: object, dst: object, *pos: object, **kwargs: object) -> object:
-            if _is_protected(dst):
+            if is_protected(dst):
                 _refuse(dst)
             return real(src, dst, *pos, **kwargs)
 
@@ -536,3 +501,107 @@ def _no_config_writes() -> Iterator[None]:
             mp.setattr(os, name, guard_one(getattr(os, name)))
         mp.setattr(shutil, "rmtree", guard_one(shutil.rmtree))
         yield
+
+
+# -- the real config directory is unchanged by the run -----------------------------------
+
+# Everything above is a check on the attempt. The guard refuses a write, the redirect
+# moves what a default resolves to, and two child tests refuse to write until they have
+# confirmed their own redirect took. None of them looks at the outcome, and each names
+# limits it cannot cover. The guard cannot see a write through a descriptor that is
+# already open, a path resolved against a directory descriptor, or an extension module
+# holding the path. The redirect does not reach a child handed an explicit environment.
+#
+# So the directory is listed when this file is imported and again when the session ends,
+# and a difference fails the run. This is the only thing here that holds the property the
+# whole arrangement exists for, which is that the four files are still the four files.
+#
+# It opens nothing. ``os.scandir`` and ``stat`` read directory metadata, so the live
+# brokerage credential is never read into this process. That is the same care every other
+# test of this directory takes.
+#
+# One limit decides how to read a failure, so it is stated rather than buried. A running
+# daemon rewrites ``token.json`` on its own when it refreshes the access token, and no
+# stat field tells that apart from a stub landing on the same path. The report therefore
+# names both explanations and leaves the reader to open the file. A rare false alarm that
+# explains itself is the better trade against a blind spot on the one file whose loss
+# costs a browser login and half an hour of gapped capture.
+
+
+def _config_dir_listing(directory: str) -> dict[str, tuple[int, int, int]]:
+    """Each name in ``directory``, with the three stat fields a write moves.
+
+    A directory that is not there comes back empty, which is the case on CI and on a
+    fresh machine, and an empty listing compared against another empty one is no change.
+
+    Symlinks are stated without following them, so a link whose target moves counts as
+    the link being unchanged. The names this watches are four regular files.
+    """
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return {}
+    listing: dict[str, tuple[int, int, int]] = {}
+    for entry in entries:
+        try:
+            status = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        listing[entry.name] = (status.st_mtime_ns, status.st_size, status.st_ino)
+    return listing
+
+
+def _config_dir_changes(
+    before: Mapping[str, tuple[int, int, int]],
+    after: Mapping[str, tuple[int, int, int]],
+) -> tuple[str, ...]:
+    """One line per name that appeared, went, or was rewritten. Empty when nothing moved.
+
+    The inode is compared alongside the mtime and the size because an atomic write puts
+    the bytes in a temp file and renames over the target, which can land inside one
+    mtime tick while carrying a different inode. That rename is the call that destroyed
+    the token on 2026-09-13.
+    """
+    lines = []
+    for name in sorted(set(before) | set(after)):
+        if name not in after:
+            lines.append(f"{name} is gone")
+        elif name not in before:
+            lines.append(f"{name} appeared")
+        elif before[name] != after[name]:
+            lines.append(f"{name} was rewritten")
+    return tuple(lines)
+
+
+_CONFIG_DIR_AT_START = _config_dir_listing(REAL_CONFIG_DIR)
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Fail the run when the real config directory changed while it ran.
+
+    The exit status is set rather than a test failed, because there is no test left to
+    fail by the time this runs. A green summary above a non-zero exit is confusing on its
+    own, so the report says what changed and what the two explanations are.
+    """
+    changes = _config_dir_changes(_CONFIG_DIR_AT_START, _config_dir_listing(REAL_CONFIG_DIR))
+    if not changes:
+        return
+    session.exitstatus = 1
+    lines = [
+        f"{REAL_CONFIG_DIR} changed while the suite ran.",
+        "",
+        *(f"  {line}" for line in changes),
+        "",
+        "Two things do that. Something outside the suite wrote the directory, which a",
+        "running daemon does every time it refreshes the access token. Or the suite",
+        "reached it, past the guard and past the redirect, which is what this check",
+        "exists to notice. No stat field tells those apart, so open the file and look",
+        "before assuming either. The tests above can still all have passed.",
+    ]
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is None:
+        print("\n".join(lines))
+        return
+    reporter.write_sep("=", "the real config directory changed", red=True)
+    for line in lines:
+        reporter.write_line(line)

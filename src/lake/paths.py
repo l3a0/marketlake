@@ -389,12 +389,14 @@ CONFIG_DIR_PARTS = (".config", "marketlake")
 # imported, so exporting the variable from inside a running process moves nothing that
 # a caller actually uses. It has to be set before the process starts. And it is an
 # override a person sets, so it does not protect a run that forgets it. The test suite
-# needs nobody to remember anything, because ``tests/conftest.py`` covers it twice. A
-# guard there fails any test that writes the real directory, and because that guard is a
+# needs nobody to remember anything, because ``tests/conftest.py`` covers it three ways.
+# A guard there fails any test that writes the real directory. Because that guard is a
 # monkeypatch that reaches no child process, the same file exports this variable at a
-# throwaway directory so a child inheriting the suite's environment resolves its defaults
-# there. A child handed an explicit environment is outside that, which the two tests
-# needing to ask what the real directory is rely on.
+# throwaway directory, so a child inheriting the suite's environment resolves its
+# defaults there. A child handed an explicit environment is outside that, which the two
+# tests needing to ask what the real directory is rely on. And because both of those are
+# checks on the attempt, the directory is listed at the start of a run and again at the
+# end, so a run that reached it past both fails rather than passing quietly.
 #
 # Setting it for one command is the safe habit, as in
 # ``MARKETLAKE_CONFIG_DIR=/tmp/ml-dev python -m lake.reauth``, or exporting it in the

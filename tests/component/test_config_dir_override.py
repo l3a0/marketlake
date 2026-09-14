@@ -33,6 +33,7 @@ from pathlib import Path
 from lake import control_plane as cp
 from lake.paths import CONFIG_DIR_ENV
 from tests.component.test_control_plane_render import RENDER_ARGS
+from tests.support.config_defaults import defaults_built_from_config_dir
 
 # The repo root. One script below imports the ``tests`` package, which needs the root on
 # ``sys.path``, and ``python -c`` supplies only the working directory. Giving the child
@@ -40,24 +41,32 @@ from tests.component.test_control_plane_render import RENDER_ARGS
 # alone.
 ROOT = Path(__file__).resolve().parents[2]
 
-# Every module-level default built from the config directory, and the file each names.
-# All five move together or the override is not worth having, since a redirected token
-# beside a live config is a half-redirected process.
-_DEFAULTS = """
-import json
-from lake.chain_plan import DEFAULT_CHAIN_PLAN_PATH
-from lake.config import DEFAULT_CONFIG_PATH
-from lake.reauth import DEFAULT_TOKEN_PATH as REAUTH_TOKEN_PATH
-from lake.schwab import DEFAULT_TOKEN_PATH as SCHWAB_TOKEN_PATH
-from lake.tickers import DEFAULT_TICKERS_PATH
-print(json.dumps({
-    "chain_plan": str(DEFAULT_CHAIN_PLAN_PATH),
-    "config": str(DEFAULT_CONFIG_PATH),
-    "reauth_token": str(REAUTH_TOKEN_PATH),
-    "schwab_token": str(SCHWAB_TOKEN_PATH),
-    "tickers": str(DEFAULT_TICKERS_PATH),
-}))
-"""
+# Every module-level default built from the config directory, read out of ``src/lake``
+# rather than typed here. All of them move together or the override is not worth having,
+# since a redirected token beside a live config is a half-redirected process, and a
+# sixth one added to the package has to join them without anyone remembering to come
+# back and edit this file.
+DEFAULT_PAIRS = defaults_built_from_config_dir()
+
+# ``module.CONSTANT`` for each, which is what the child prints and the tests compare.
+DEFAULT_KEYS = tuple(f"{module}.{name}" for module, name in DEFAULT_PAIRS)
+
+
+def _defaults_script(pairs: tuple[tuple[str, str], ...]) -> str:
+    """A child script printing where each default resolved, keyed by its full name.
+
+    ``import_module`` rather than a written-out ``from x import y``, because the list is
+    generated. Either binds the constant the same way, which is the thing under test.
+    """
+    entries = "\n".join(
+        f"    {f'{module}.{name}'!r}: str(getattr(import_module({module!r}), {name!r})),"
+        for module, name in pairs
+    )
+    header = "import json\nfrom importlib import import_module\n"
+    return f"{header}print(json.dumps({{\n{entries}\n}}))\n"
+
+
+_DEFAULTS = _defaults_script(DEFAULT_PAIRS)
 
 
 def _child(script: str, config_dir: Path | None) -> dict[str, str]:
@@ -88,7 +97,7 @@ def _child(script: str, config_dir: Path | None) -> dict[str, str]:
 def test_the_override_moves_every_default_in_the_package(tmp_path):
     throwaway = tmp_path / "throwaway"
     defaults = _child(_DEFAULTS, throwaway)
-    assert set(defaults) == {"chain_plan", "config", "reauth_token", "schwab_token", "tickers"}
+    assert set(defaults) == set(DEFAULT_KEYS)
     for name, value in defaults.items():
         assert Path(value).parent == throwaway, name
 
@@ -164,35 +173,42 @@ print(json.dumps({{"written": target}}))
 def test_the_override_does_not_disarm_the_guard_in_a_process_that_starts_with_it_set():
     """The two mechanisms must not cancel each other out, checked from a real process.
 
-    The guard settles what it protects when ``tests/conftest`` is imported. So a test
-    that exports the variable with ``monkeypatch.setenv`` runs after that decision is
-    made and cannot reach it, which is why the sibling test in
-    ``tests/unit/test_config_dir_guard.py`` covers only the other half: a guard that read
-    the variable at call time rather than at import. Reading it at import is the half
-    that lives here.
+    The guard settles what it protects when it is imported. So a test that exports the
+    variable with ``monkeypatch.setenv`` runs after that decision is made and cannot
+    reach it, which is why the sibling test in ``tests/unit/test_config_dir_guard.py``
+    covers only the other half: a guard that read the variable at call time rather than
+    at import. Reading it at import is the half that lives here, and only a process that
+    started with the variable set can tell.
 
-    What this child starts with is replaced by the suite's own redirect, since importing
-    ``tests.conftest`` exports a throwaway of its own before the guard decides anything.
-    Both values name a directory that is not the real one, so the assertion below asks
-    the same question either way: a guard reading either would come back with roots that
-    do not cover the real token and fail here.
-    ``tests/component/test_suite_config_dir_redirect.py`` puts the same question to the
-    pytest process itself, which the redirect is what made possible.
+    The child imports ``tests.support.config_guard`` rather than ``tests.conftest``, and
+    that is the whole reason the guard's predicate sits in a module of its own. Importing
+    ``tests.conftest`` would run the suite's redirect, which replaces this variable with a
+    throwaway of its own before the guard reads anything. The test's own value would then
+    never reach the code under test, and the same answer would come back whatever this
+    test passed. The assertion on ``exported`` below is what holds that: it fails if the
+    child's environment was moved out from under it.
 
-    Nothing is written. ``_is_protected`` is the predicate the refusal is built on, so
+    Nothing is written. ``is_protected`` is the predicate the refusal is built on, so
     asking it about the real token path drives the real decision and touches no file.
     """
+    override = Path("/tmp/throwaway-not-the-real-directory")
     script = """
-import json
+import json, os
 from pathlib import Path
-from tests.conftest import _PROTECTED_ROOTS, _is_protected
+from lake.paths import CONFIG_DIR_ENV
+from tests.support.config_guard import PROTECTED_ROOTS, is_protected
 real_token = Path.home() / ".config" / "marketlake" / "token.json"
 print(json.dumps({
-    "protected": _is_protected(str(real_token)),
-    "roots": sorted(_PROTECTED_ROOTS),
+    "protected": is_protected(str(real_token)),
+    "roots": sorted(PROTECTED_ROOTS),
+    "exported": os.environ[CONFIG_DIR_ENV],
 }))
 """
-    result = _child(script, Path("/tmp/throwaway-not-the-real-directory"))
+    result = _child(script, override)
+    assert result["exported"] == str(override), (
+        "the child's own override was replaced before the guard read anything, so this "
+        "test no longer decides what its name says"
+    )
     assert result["protected"] is True, result["roots"]
     assert str(Path.home() / ".config" / "marketlake") in result["roots"]
 
