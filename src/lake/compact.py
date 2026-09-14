@@ -44,9 +44,9 @@ The job's rules, each glossed at first use.
    the backup, and the ping. One disagreement never reaches this check at all. A column
    two segments hold at different types is refused by ``concat_tables`` before the
    comparison runs, and that refusal does raise and does cost the run. Whether it should
-   is [#184](https://github.com/l3a0/marketlake/issues/184), because the trade this rule
-   declines for a dropped column has never been weighed for a retype. The durable
-   remedy is ``schema_version`` enforcement, which is
+   is [#184](https://github.com/l3a0/marketlake/issues/184), which weighs for a retype the
+   trade this rule declines for a dropped column. The durable remedy is
+   ``schema_version`` enforcement, which is
    [#128](https://github.com/l3a0/marketlake/issues/128) and not compaction's business.
    This check is a detector and secondary to it.
 5. *A torn tail is dropped, a shadow-append is refused.* A torn tail is a segment cut
