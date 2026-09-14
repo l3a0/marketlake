@@ -449,7 +449,8 @@ def _seal(
     With ``guard`` on, the no-shrink invariant is checked before the partition file is
     replaced. A refused rebuild must leave the larger partition on disk, untouched,
     beside its still-valid entry. ``append_manifest`` checks the same invariant again,
-    and the comment at that call says why nothing here can ever reach that second check.
+    and the comment at that call says why that second check can never be the one that
+    refuses a seal started here.
     """
     tables: list[pa.Table] = []
     expected = 0

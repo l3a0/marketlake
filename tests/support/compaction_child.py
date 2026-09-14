@@ -14,12 +14,16 @@ line to stdout and then blocks on a read from stdin that the parent never answer
 parent reads that line, which is what tells it the window is open, and sends ``SIGKILL``.
 So the kill lands inside the window on every run rather than on most of them.
 
-One argument selects the stop point, and both points sit inside the window.
+``--stop-at`` selects where the run stops, and there are three places.
 
-1. ``--unlinks 0`` stops the moment ``append_manifest`` returns, with every segment still
-   on disk.
-2. ``--unlinks N`` stops once ``N`` segments have been unlinked, which is the partial
-   debris a kill partway through the loop leaves behind.
+1. ``seal`` with ``--unlinks 0`` stops the moment ``append_manifest`` returns, with every
+   segment still on disk.
+2. ``seal`` with ``--unlinks N`` stops once ``N`` segments have been unlinked, which is
+   the partial debris a kill partway through the loop leaves behind.
+3. ``backup`` stops inside the backup seam instead. ``compact`` calls that seam from
+   inside the lake-root lock, after the seal and the re-tune, so a parent that finds the
+   lock still held while the child sits there has watched the lock span the whole run
+   rather than only its front. ``--unlinks`` is not read in this mode.
 
 Stdout carries the run's milestones in order, one line each, and a parent reads until the
 one it wants.
@@ -30,6 +34,14 @@ one it wants.
 ``STARTING`` exists for the lock test. A parent holding the lake-root lock needs to know
 the child is at the lock's door rather than still starting an interpreter, because only
 then does a short window of silence say anything. The kill test reads past it.
+
+``Milestones`` is the parent's reader for those lines, and it reads the pipe's file
+descriptor rather than a buffered file object. The reason is a trap. ``select`` reports
+what the descriptor holds, while ``readline`` on a buffered reader can pull a second line
+into a buffer the next ``select`` cannot see. A parent waiting for that line would then
+time out holding it, and a parent waiting for silence would read it as silence, which is
+the one reading the lock test must never get wrong. So the buffer the waits consult has
+to be the parent's own.
 
 ``spawn`` starts this module the way both tests need it started, so the argument list, the
 sandbox paths, and the built environment sit here beside the checks that refuse them. A
@@ -53,9 +65,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import select
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Sequence
 from datetime import date, datetime
 from pathlib import Path
@@ -150,6 +164,21 @@ def _hold_until_killed() -> None:
     sys.stdin.buffer.read(1)
 
 
+class _HoldingBackup:
+    """A backup seam that stops the run inside itself rather than recording a sync.
+
+    ``compact`` calls the backup from inside the lake-root lock, after the seal and the
+    re-tune, so this is the last place in the run where the lock is still held. A parent
+    that asks for the lock while this is blocked and is refused has watched the lock cover
+    the whole run. The real fake, ``tests.support.backup.FakeBackup``, records and returns,
+    and this one never returns.
+    """
+
+    def sync(self, source: Path, target: Path) -> None:
+        _hold_until_killed()
+        raise SystemExit(NOT_KILLED)
+
+
 def _install_stop(stop_after_unlinks: int) -> None:
     """Wrap the manifest append and the segment unlink so the run stops in the window.
 
@@ -229,6 +258,12 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Stop once this many segments have been unlinked, 0 for the manifest append.",
     )
+    parser.add_argument(
+        "--stop-at",
+        choices=("seal", "backup"),
+        default="seal",
+        help="Where to stop: inside the seal at --unlinks, or inside the backup seam.",
+    )
     return parser
 
 
@@ -249,7 +284,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     from tests.support.backup import FakeBackup
     from tests.support.clock import ManualClock
 
-    _install_stop(args.unlinks)
+    if args.stop_at == "backup":
+        backup: object = _HoldingBackup()
+    else:
+        backup = FakeBackup()
+        _install_stop(args.unlinks)
     # Every import is done and the next statement asks for the lake-root lock, so a parent
     # holding that lock can start timing its window of silence from here.
     sys.stdout.write(STARTING + "\n")
@@ -258,7 +297,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         lake_root,
         clock=ManualClock(datetime.fromisoformat(args.now)),
         calendar=_calendar(date.fromisoformat(args.day)),
-        backup=FakeBackup(),
+        backup=backup,  # type: ignore[arg-type]
         backup_target=backup_target,
         plan_path=plan_path,
     )
@@ -276,7 +315,8 @@ def spawn(
     lake_root: Path,
     day: date,
     now: datetime,
-    unlinks: int,
+    unlinks: int = 0,
+    stop_at: str = "seal",
 ) -> subprocess.Popen[bytes]:
     """Start this module as a child that sweeps ``lake_root`` and stops inside the seal.
 
@@ -291,15 +331,22 @@ def spawn(
     directory is, and a child with none would answer ``/tmp`` while pytest hands out its
     temp directory somewhere else entirely.
 
-    Both imports happen inside the function. Nothing here runs in the child, and reading
-    the real home at import time would put it in the very process no guard reaches.
+    Both imports happen inside the function. Nothing here runs in the child, and importing
+    either at module level would run it in the very process no guard reaches.
+
+    ``--forbidden`` comes from ``tests.support.config_guard``, which settles the real
+    config directory at its own import and says why: ``Path.home()`` reads ``$HOME``,
+    which a test is free to monkeypatch, so asking later would let a test move the
+    protected directory out from under the guard. Three test modules do patch ``HOME``.
+    None of them calls this today, and computing the answer here rather than reading the
+    frozen one would leave that as the only thing keeping a child's refusal honest.
     """
-    from lake.paths import CONFIG_DIR_ENV, CONFIG_DIR_PARTS
+    from lake.paths import CONFIG_DIR_ENV
+    from tests.support.config_guard import REAL_CONFIG_DIR
 
     # The repo root, three levels up from this file. The child needs it on ``PYTHONPATH``
     # to import ``tests.support``.
     repo_root = Path(__file__).resolve().parents[2]
-    real_config_dir = Path.home().joinpath(*CONFIG_DIR_PARTS)
     config_dir = sandbox / "config"
     config_dir.mkdir(exist_ok=True)
     backup_target = sandbox / "backup"
@@ -318,7 +365,7 @@ def spawn(
             "--sandbox",
             str(sandbox),
             "--forbidden",
-            str(real_config_dir),
+            REAL_CONFIG_DIR,
             "--lake-root",
             str(lake_root),
             "--backup-target",
@@ -331,6 +378,8 @@ def spawn(
             now.isoformat(),
             "--unlinks",
             str(unlinks),
+            "--stop-at",
+            stop_at,
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -338,6 +387,60 @@ def spawn(
         env=environment,
         cwd=sandbox,
     )
+
+
+class Milestones:
+    """A parent's reader for one child's milestone lines, with a bound on every wait.
+
+    Lines are read off the pipe's file descriptor and buffered here, for the reason the
+    module docstring gives: a buffered reader can hold a line that ``select`` on the
+    descriptor can no longer see.
+
+    Both methods answer in the same three ways. A line means the child announced it,
+    ``b""`` means the child's stdout reached end of file, which is what a child that
+    exited instead of announcing leaves behind, and ``None`` means the wait ran out.
+    """
+
+    def __init__(self, child: subprocess.Popen[bytes]) -> None:
+        assert child.stdout is not None
+        self._fd = child.stdout.fileno()
+        self._pending = b""
+        self._ended = False
+
+    def _buffered(self) -> bytes | None:
+        """The next complete line already in hand, or ``None`` when there is none."""
+        line, newline, rest = self._pending.partition(b"\n")
+        if not newline:
+            return None
+        self._pending = rest
+        return line + newline
+
+    def next_line(self, timeout: float) -> bytes | None:
+        """The child's next announcement, whatever it is."""
+        deadline = time.monotonic() + timeout
+        while True:
+            line = self._buffered()
+            if line is not None:
+                return line
+            if self._ended:
+                return b""
+            remaining = max(deadline - time.monotonic(), 0.0)
+            ready, _, _ = select.select([self._fd], [], [], remaining)
+            if not ready:
+                return None
+            chunk = os.read(self._fd, 4096)
+            if not chunk:
+                self._ended = True
+                return b""
+            self._pending += chunk
+
+    def await_line(self, expected: str, timeout: float) -> bytes | None:
+        """The ``expected`` announcement, skipping the milestones announced before it."""
+        deadline = time.monotonic() + timeout
+        while True:
+            line = self.next_line(max(deadline - time.monotonic(), 0.0))
+            if line is None or line == b"" or line.strip() == expected.encode():
+                return line
 
 
 if __name__ == "__main__":

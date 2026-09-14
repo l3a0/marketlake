@@ -1,39 +1,53 @@
-"""Integration test 5: a compaction run waits for the lake-root lock.
+"""A compaction run waits for the lake-root lock, and holds it for the whole run.
 
 Rule 1 of the close+15 job is that the whole run holds the lake-root lock, the kernel
 ``flock`` on ``manifest.jsonl``. Every other serialization claim rests on it. A hand-run
 compaction and the scheduled one must not race, and neither must race the backup, and what
 stops them is the lock rather than a schedule.
 
-The tier is integration because the claim needs two processes. ``flock`` is granted per
-process, so a second request from inside the same process for the same file waits on the
-first rather than being refused. A test that took the lock and then called ``compact`` in
-the pytest process would therefore wedge the suite forever, with no timeout and no failure
-message. The lock holder and the run have to be separate processes. Here the test process
-holds the lock and ``tests/support/compaction_child.py`` runs the compaction.
+Rule 1 makes two claims, and they need separate evidence, so there are two tests.
 
-The evidence is a pair, and neither half alone would carry it.
+1. A run that finds the lock held waits for it rather than proceeding.
+2. The lock it takes covers the whole run, out to the backup, rather than only the seal at
+   the front of it.
+
+This file is not on the build plan's integration roster, so it claims no number from it,
+the same way ``test_dashboard_http.py`` does not.
+
+The tier is integration because the race rule 1 names is between processes. A hand-run
+compaction, the scheduled daemon job, and the backup are separate processes, and ``flock``
+is the kernel's arbiter between them, so the test runs the compaction in a real second
+process. A thread would also work, and
+``tests/component/test_schema_versions.py`` takes that route for the ledger write. What
+would wedge the suite is holding the lock and calling ``compact`` in the same thread,
+because ``flock`` conflicts between two descriptors even inside one process and
+``lake_lock`` never asks with ``LOCK_NB``. That call would block forever with no timeout
+and no message.
+
+The first test's evidence is a pair, and neither half alone would carry it.
 
 1. While the lock is held the child announces that it has started, and then goes quiet. It
    reaches no stop point inside the seal, writes no partition, and appends no manifest
-   entry, across a window many times longer than the whole seal takes.
-2. The moment the lock is released the same child proceeds and reaches its stop point
-   inside the seal. So the silence above was the lock, and not a child that was broken or
-   merely slow to start.
+   entry.
+2. The moment the lock is released the same child proceeds and reaches its stop point. So
+   the silence above was the lock, and not a child that was broken or merely slow to start.
 
-The child's ``STARTING`` line is what lets the window in claim 1 be short. Timing from the
-spawn instead would mean paying for an interpreter start and a pyarrow import inside the
-window, and most of the wait would be spent on a child that had not yet asked for the lock.
+The silence is judged over a fixed window, and a window is only as good as its margin. A
+run that ignored the lock takes tens of milliseconds to reach the stop point on an idle
+machine and about a second on a badly loaded one, against a window of three seconds. That
+margin is comfortable rather than enormous, so the second half measures the same span on
+the same machine and refuses to pass where the window has stopped being generous. Without
+that check, a machine slow enough would read a lockless run as silence and pass with rule 1
+deleted, which is the one way this test could fail at its job while looking healthy.
 
-The pass direction cannot flake. While the parent genuinely holds the lock, no waiting run
-can proceed however long the window runs. The window's length only decides how much room a
-run that ignored the lock is given to give itself away, and the seal it would finish in
-that case takes milliseconds.
+The pass direction does not depend on the margin. While the parent genuinely holds the
+lock, no waiting run can proceed however long the window runs.
 """
 
 from __future__ import annotations
 
-import select
+import fcntl
+import os
 import signal
 import subprocess
 import time as timing
@@ -48,9 +62,9 @@ from lake.calendar import MARKET_TZ
 from lake.compact import COMPACTION_SOURCE
 from lake.journal import QUOTES_SCHEMA
 from lake.lock import lake_lock
-from lake.manifest import read_manifest
+from lake.manifest import manifest_path, read_manifest
 from lake.paths import SEGMENT_GLOB, LakePaths
-from tests.support.compaction_child import READY, REFUSED, STARTING, exit_reason, spawn
+from tests.support.compaction_child import READY, REFUSED, STARTING, Milestones, exit_reason, spawn
 
 DAY = date(2026, 8, 24)
 PID = 4242
@@ -61,17 +75,25 @@ TICKER = "SPY"
 # non-zero, so that a run which proceeded leaves a partition and a manifest entry behind.
 SEGMENT_START = "a"
 SEGMENT_ROWS = 3
+SEGMENT_NAME = f"seg-{SEGMENT_START}-{PID}.arrows"
 
 # How long the parent waits for each thing it waits for. ``START_TIMEOUT`` and
 # ``REACH_TIMEOUT`` cover an interpreter start and a pyarrow import on a loaded machine.
-# ``HELD_WINDOW`` is the silence the held lock has to produce, and it is short because the
-# child has already announced that its imports are done. ``DEATH_TIMEOUT`` is generous only
-# so a loaded machine's scheduler delay never reads as a failed kill. All four exist so a
-# mechanism that never signals fails with a message instead of hanging the suite.
+# ``DEATH_TIMEOUT`` is generous only so a loaded machine's scheduler delay never reads as a
+# failed kill. All of them exist so a mechanism that never signals fails with a message
+# instead of hanging the suite.
 START_TIMEOUT = 120.0
 REACH_TIMEOUT = 120.0
-HELD_WINDOW = 3.0
 DEATH_TIMEOUT = 30.0
+
+# The silence a held lock has to produce, and the margin that keeps it meaningful. The
+# window is short because the child has already announced that its imports are done, so
+# only the run itself has to fit inside it. ``MARGIN`` is what the measured run is required
+# to beat: a machine where a whole lockless run takes more than half the window is a
+# machine where silence no longer proves anything, and the test says so rather than
+# passing.
+HELD_WINDOW = 3.0
+MARGIN = 2.0
 
 
 # -- the lake the blocked run would sweep -------------------------------------
@@ -121,60 +143,31 @@ def _compaction_entries(lake_root: Path, rel: str) -> list[dict]:
     ]
 
 
-# -- reading the child's milestones with a bound on every wait ----------------
+def _lock_is_free(lake_root: Path) -> bool:
+    """Whether the lake-root lock can be taken right now, without waiting for it.
 
-
-def _await_line(child: subprocess.Popen, expected: str, timeout: float) -> bytes:
-    """The child's ``expected`` milestone line, skipping the milestones announced before it.
-
-    ``select`` is what puts a bound on the wait. ``readline`` alone would block forever if
-    the child never announced, which would hang the suite rather than fail it. End of file
-    comes back as empty bytes, which the caller reports with the child's own exit code.
+    ``LOCK_NB`` is what makes this a question rather than a wait. Asking the blocking way
+    would park this process behind the child it is asking about, which is the failure mode
+    this whole file is written around.
     """
-    assert child.stdout is not None
-    deadline = timing.monotonic() + timeout
-    while True:
-        remaining = max(deadline - timing.monotonic(), 0.0)
-        ready, _, _ = select.select([child.stdout], [], [], remaining)
-        if not ready:
-            child.kill()
-            pytest.fail(f"the child never announced {expected!r} within {timeout}s")
-        line = child.stdout.readline()
-        if line == b"" or line.strip() == expected.encode():
-            return line
-
-
-def _expect_silence(child: subprocess.Popen, window: float) -> None:
-    """Wait out ``window``, failing if the child announces anything or exits inside it.
-
-    This is the negative half of the pair, and it is the assertion the whole test turns
-    on. A run that ignored the lake-root lock would have sealed the ticker-day and reached
-    its stop point long before the window ran out, and the line it wrote saying so is what
-    lands here.
-    """
-    assert child.stdout is not None
-    ready, _, _ = select.select([child.stdout], [], [], window)
-    if not ready:
-        return
-    line = child.stdout.readline()
-    child.kill()
-    if line == b"":
-        pytest.fail(
-            f"the child exited {exit_reason(child.poll())} while the lake-root lock was "
-            "held, so nothing here says the run waited for the lock"
-        )
-    pytest.fail(
-        f"the child announced {line!r} while the lake-root lock was held, so the run did "
-        "not wait for the lock"
-    )
+    fd = os.open(manifest_path(lake_root), os.O_RDONLY | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return True
+    finally:
+        os.close(fd)
 
 
 def _reap(child: subprocess.Popen) -> bytes:
     """Kill the child if it is still alive, wait for it, and return its stderr.
 
-    Calling this twice is safe. The second call finds the pipes already drained and
-    closed and answers with nothing more, so the ``finally`` below never has to know
-    whether the body it is unwinding already reaped.
+    Calling this twice is safe. The second call finds the pipes already drained and closed
+    and answers with nothing more, so a ``finally`` never has to know whether the body it
+    is unwinding already reaped.
     """
     if child.poll() is None:
         child.kill()
@@ -186,7 +179,23 @@ def _reap(child: subprocess.Popen) -> bytes:
     return stderr
 
 
-# -- the run that waits -------------------------------------------------------
+def _require_started(child: subprocess.Popen, milestones: Milestones) -> None:
+    """Wait for the child to say its run is about to begin, or fail naming what came instead."""
+    line = milestones.await_line(STARTING, START_TIMEOUT)
+    if line is not None and line.strip() == STARTING.encode():
+        return
+    if line is None:
+        _reap(child)
+        pytest.fail(f"the child never announced {STARTING!r} within {START_TIMEOUT}s")
+    stderr = _reap(child)
+    assert child.returncode != REFUSED, f"the child refused its paths: {stderr.decode()}"
+    pytest.fail(
+        f"the child exited {exit_reason(child.returncode)} instead of starting its run: "
+        f"{stderr.decode()}"
+    )
+
+
+# -- 1. a run that finds the lock held waits for it ---------------------------
 
 
 def test_a_compaction_run_waits_for_the_lake_root_lock(lake_root: Path, tmp_path: Path):
@@ -200,48 +209,111 @@ def test_a_compaction_run_waits_for_the_lake_root_lock(lake_root: Path, tmp_path
         # held. Spawning first would leave which process won up to the scheduler.
         with lake_lock(lake_root):
             child = spawn(
-                sandbox=tmp_path,
-                lake_root=lake_root,
-                day=DAY,
-                now=_et(DAY, 16, 30),
-                unlinks=0,
+                sandbox=tmp_path, lake_root=lake_root, day=DAY, now=_et(DAY, 16, 30), unlinks=0
             )
-            started = _await_line(child, STARTING, START_TIMEOUT)
-            if started.strip() != STARTING.encode():
-                stderr = _reap(child)
-                assert child.returncode != REFUSED, (
-                    f"the child refused its paths: {stderr.decode()}"
-                )
-                pytest.fail(
-                    f"the child exited {exit_reason(child.returncode)} instead of starting "
-                    f"its run: {stderr.decode()}"
-                )
+            milestones = Milestones(child)
+            _require_started(child, milestones)
 
-            # Claim 1. The run is at the lock's door and it stays there. Three independent
-            # readings agree: it announced no stop point, it wrote no partition, and it
-            # appended no manifest entry.
-            _expect_silence(child, HELD_WINDOW)
-            assert not partition.exists()
-            assert _compaction_entries(lake_root, rel) == []
-            assert _segments(lake_root) == [f"seg-{SEGMENT_START}-{PID}.arrows"]
+            # Claim 1. The run is at the lock's door and it stays there. What the lake
+            # looks like is captured here and judged after the lock is released. Nothing
+            # inside this block may take the lake-root lock, because this process already
+            # holds it and ``flock`` conflicts between two descriptors even inside one
+            # process, so the ask would never return. Reading the manifest's bytes rather
+            # than parsing it through ``read_manifest`` keeps that true whatever the
+            # readers grow later.
+            announced = milestones.next_line(HELD_WINDOW)
+            manifest_while_held = manifest_path(lake_root).read_bytes()
+            partition_while_held = partition.exists()
+            segments_while_held = _segments(lake_root)
+
+        if announced is not None:
+            said = "exited" if announced == b"" else f"announced {announced!r}"
+            pytest.fail(
+                f"the child {said} while the lake-root lock was held, so the run did not "
+                "wait for the lock"
+            )
+        assert manifest_while_held == b""
+        assert partition_while_held is False
+        assert segments_while_held == [SEGMENT_NAME]
 
         # Claim 2. The lock is free now, and the same run proceeds far enough to seal the
         # ticker-day and announce its stop point. So the silence above was the lock.
-        line = _await_line(child, READY, REACH_TIMEOUT)
+        released = timing.monotonic()
+        line = milestones.await_line(READY, REACH_TIMEOUT)
+        proceeded = timing.monotonic() - released
         stderr = _reap(child)
+        if line is None:
+            pytest.fail(f"the child never announced {READY!r} within {REACH_TIMEOUT}s")
         assert line.strip() == READY.encode(), (
             f"the child exited {exit_reason(child.returncode)} rather than proceeding once "
             f"the lock was free. It said: {stderr.decode()}"
         )
         assert child.returncode == -signal.SIGKILL
+
+        # A whole run, measured on this machine, is what the window of silence had to be
+        # longer than. A machine where it is not comfortably shorter makes that silence
+        # meaningless, and this says so rather than passing on it.
+        assert proceeded * MARGIN < HELD_WINDOW, (
+            f"a whole run took {proceeded:.2f}s on this machine against a {HELD_WINDOW}s "
+            f"window of silence, so a run that ignored the lock could have gone unnoticed. "
+            f"Raise HELD_WINDOW above {proceeded * MARGIN:.2f}s."
+        )
     finally:
         if child is not None:
             _reap(child)
 
     # The run it was holding back is the real one. It sealed the ticker-day and manifested
-    # it, which is what makes the silence during the held window a wait rather than a
-    # no-op.
+    # it, which is what makes the silence during the held window a wait rather than a no-op.
     assert partition.exists()
     entries = _compaction_entries(lake_root, rel)
     assert len(entries) == 1
     assert entries[0]["rows"] == SEGMENT_ROWS
+
+
+# -- 2. the lock covers the whole run, not just the seal ----------------------
+
+
+def test_the_lake_root_lock_is_still_held_when_the_backup_runs(lake_root: Path, tmp_path: Path):
+    """The backup is the last step inside the lock, so it is where the span is measured.
+
+    ``compact`` seals, re-tunes, then backs up, and rule 1 says one lock covers all of it.
+    A lock taken around the seal alone would satisfy every other test in this repo while
+    leaving the backup to race a hand-run compaction, which is the torn-copy case rule 1
+    names. So the child stops inside its backup seam, and the question is asked from here,
+    in a second process, at the one moment that tells the two shapes apart.
+    """
+    _build_day(lake_root)
+    partition = LakePaths(lake_root).partition_path(SURFACE, TICKER, DAY)
+
+    assert _lock_is_free(lake_root), "the lake starts with its lock free"
+
+    child = spawn(
+        sandbox=tmp_path,
+        lake_root=lake_root,
+        day=DAY,
+        now=_et(DAY, 16, 30),
+        stop_at="backup",
+    )
+    try:
+        milestones = Milestones(child)
+        _require_started(child, milestones)
+        line = milestones.await_line(READY, REACH_TIMEOUT)
+        if line is None:
+            pytest.fail(f"the child never reached its backup within {REACH_TIMEOUT}s")
+        assert line.strip() == READY.encode(), (
+            f"the child exited {exit_reason(child.poll())} rather than reaching its backup. "
+            f"It said: {_reap(child).decode()}"
+        )
+
+        # The run has sealed the day and is now inside its backup. The lock it took at the
+        # top of the run is still held, so this process cannot have it.
+        assert partition.exists(), "the seal ran before the backup, as the job's order says"
+        assert not _lock_is_free(lake_root), (
+            "the run reached its backup without holding the lake-root lock, so the backup "
+            "can race a hand-run compaction"
+        )
+    finally:
+        _reap(child)
+
+    # The kernel drops the lock when the holder dies, so the lake is left usable.
+    assert _lock_is_free(lake_root)

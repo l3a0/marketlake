@@ -40,10 +40,7 @@ from __future__ import annotations
 
 import fcntl
 import os
-import select
 import signal
-import subprocess
-import time as timing
 from datetime import date, datetime, time
 from pathlib import Path
 
@@ -60,7 +57,7 @@ from lake.paths import SEGMENT_GLOB, LakePaths
 from tests.support.backup import FakeBackup
 from tests.support.calendar import FakeCalendar, SessionTimes
 from tests.support.clock import ManualClock
-from tests.support.compaction_child import READY, REFUSED, exit_reason, spawn
+from tests.support.compaction_child import READY, REFUSED, Milestones, exit_reason, spawn
 
 DAY = date(2026, 8, 24)
 PID = 4242
@@ -154,29 +151,6 @@ def _compaction_entries(lake_root: Path, rel: str) -> list[dict]:
 # -- killing a real compaction inside the window ------------------------------
 
 
-def _await_line(child: subprocess.Popen, expected: str, timeout: float) -> bytes:
-    """The child's ``expected`` milestone line, skipping the milestones announced before it.
-
-    ``select`` is what puts a bound on the wait. ``readline`` alone would block forever
-    if the child never reached the window, which would hang the suite rather than fail
-    it. The child writes each line with one flushed write, far under the pipe's atomic
-    size, so a readable pipe carries the whole line. End of file comes back as empty
-    bytes rather than as a failure here, because a child that exited instead of
-    announcing has an exit code the caller reports better than a timeout would.
-    """
-    assert child.stdout is not None
-    deadline = timing.monotonic() + timeout
-    while True:
-        remaining = max(deadline - timing.monotonic(), 0.0)
-        ready, _, _ = select.select([child.stdout], [], [], remaining)
-        if not ready:
-            child.kill()
-            pytest.fail(f"the child never announced {expected!r} within {timeout}s")
-        line = child.stdout.readline()
-        if line == b"" or line.strip() == expected.encode():
-            return line
-
-
 def _kill_mid_seal(lake_root: Path, tmp_path: Path, *, unlinks: int) -> None:
     """Run compaction in a real process and ``SIGKILL`` it inside the seal's window.
 
@@ -196,7 +170,10 @@ def _kill_mid_seal(lake_root: Path, tmp_path: Path, *, unlinks: int) -> None:
         unlinks=unlinks,
     )
     try:
-        line = _await_line(child, READY, REACH_TIMEOUT)
+        line = Milestones(child).await_line(READY, REACH_TIMEOUT)
+        if line is None:
+            child.kill()
+            pytest.fail(f"the child never announced {READY!r} within {REACH_TIMEOUT}s")
         # Only a child that announced the window gets killed. One that exited instead,
         # a refusal above all, has already closed stdout and is left to be reaped below,
         # so its own exit code survives to be reported rather than a failed kill.
