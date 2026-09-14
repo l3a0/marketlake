@@ -17,7 +17,10 @@ already bound. Only a process that started with it set is the real thing, so tha
 what these run, and each drives production code rather than a stand-in for it.
 
 The child's own writes land under the test's ``tmp_path``. The parent's guard does not
-reach a child, which the guard says about itself, so nothing here relies on it.
+reach a child, which the guard says about itself, so nothing here relies on it. The
+redirect that does reach a child is covered in
+``tests/component/test_suite_config_dir_redirect.py``, and these children are built to
+sit outside it so one of them can still ask what the real directory is.
 """
 
 from __future__ import annotations
@@ -30,6 +33,12 @@ from pathlib import Path
 from lake import control_plane as cp
 from lake.paths import CONFIG_DIR_ENV
 from tests.component.test_control_plane_render import RENDER_ARGS
+
+# The repo root. One script below imports the ``tests`` package, which needs the root on
+# ``sys.path``, and ``python -c`` supplies only the working directory. Giving the child
+# this as its cwd is what lets the suite run from anywhere rather than from the root
+# alone.
+ROOT = Path(__file__).resolve().parents[2]
 
 # Every module-level default built from the config directory, and the file each names.
 # All five move together or the override is not worth having, since a redirected token
@@ -54,8 +63,12 @@ print(json.dumps({
 def _child(script: str, config_dir: Path | None) -> dict[str, str]:
     """Run ``script`` in a fresh interpreter, with or without the override set.
 
-    The environment is built rather than inherited, so a variable exported in the shell
-    running the suite cannot decide the answer either way.
+    The environment is built rather than inherited, so nothing outside a test decides the
+    answer. That matters twice over. A variable exported in the shell running the suite
+    would otherwise reach the child, and so would the redirect ``tests/conftest.py`` sets
+    for every child the suite spawns. Passing ``None`` here is the only way left to ask
+    what a process with no override resolves, which is what
+    ``test_without_the_override_every_default_is_the_real_directory`` asks.
     """
     env = {"PATH": "/usr/bin:/bin", "HOME": str(Path.home())}
     if config_dir is not None:
@@ -64,6 +77,7 @@ def _child(script: str, config_dir: Path | None) -> dict[str, str]:
         [sys.executable, "-c", script],
         capture_output=True,
         text=True,
+        cwd=ROOT,
         env=env,
         check=False,
     )
@@ -96,8 +110,10 @@ def test_the_token_a_redirected_reauth_writes_lands_in_the_throwaway(tmp_path):
     This is what happened on 2026-09-13: a token written to ``DEFAULT_TOKEN_PATH`` by a
     by-hand run. ``reauth.write_token`` is the function the login flow's callback lands
     in, driven here at the default it would have used, and with the override exported it
-    cannot reach the real file. The real path is checked for a stub afterwards, since a
-    redirect that also wrote the real path would be no redirect at all.
+    cannot reach the real file. What the write landed on is read back, because a redirect
+    that resolved the throwaway and still wrote the real path would be no redirect at all.
+    The real path itself is never read: it holds the live token, and the child printing
+    where it wrote is what settles the question.
     """
     throwaway = tmp_path / "throwaway"
     script = f"""
@@ -146,14 +162,22 @@ print(json.dumps({{"written": target}}))
 
 
 def test_the_override_does_not_disarm_the_guard_in_a_process_that_starts_with_it_set():
-    """The two mechanisms must not cancel each other out, checked where it can be checked.
+    """The two mechanisms must not cancel each other out, checked from a real process.
 
     The guard settles what it protects when ``tests/conftest`` is imported. So a test
     that exports the variable with ``monkeypatch.setenv`` runs after that decision is
     made and cannot reach it, which is why the sibling test in
     ``tests/unit/test_config_dir_guard.py`` covers only the other half: a guard that read
     the variable at call time rather than at import. Reading it at import is the half
-    that lives here, and only a process that started with the variable set can tell.
+    that lives here.
+
+    What this child starts with is replaced by the suite's own redirect, since importing
+    ``tests.conftest`` exports a throwaway of its own before the guard decides anything.
+    Both values name a directory that is not the real one, so the assertion below asks
+    the same question either way: a guard reading either would come back with roots that
+    do not cover the real token and fail here.
+    ``tests/component/test_suite_config_dir_redirect.py`` puts the same question to the
+    pytest process itself, which the redirect is what made possible.
 
     Nothing is written. ``_is_protected`` is the predicate the refusal is built on, so
     asking it about the real token path drives the real decision and touches no file.

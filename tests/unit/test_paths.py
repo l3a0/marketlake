@@ -333,10 +333,14 @@ def test_the_override_is_read_from_the_real_environment_by_default(monkeypatch):
 def test_an_explicit_empty_mapping_beats_a_set_variable(monkeypatch):
     """``env={}`` has to mean "no override", not "go and look at the real environment".
 
-    Three assertions in this file and in the control plane's render tests pass ``env={}``
-    to say what the home-relative default is whatever a developer exported. The suite
-    runs with the variable unset, so ``{}`` and ``os.environ`` agree there and the seam
-    is never put under load. Setting the variable first is what tells them apart.
+    Three assertions in this file pass ``env={}`` to say what the home-relative default
+    is whatever a developer exported, one of them about the renderer's spelling. They need
+    ``{}`` to mean what it says, because the suite runs with the variable set: the
+    redirect in ``tests/conftest.py`` points this process and its children at a throwaway
+    directory. So ``{}`` and ``os.environ`` disagree on every run, and an ``env={}`` that
+    fell through to the real environment would make those three assertions read the
+    throwaway and fail. Setting the variable by hand here says the same thing without
+    depending on the redirect.
     """
     monkeypatch.setenv(CONFIG_DIR_ENV, "/tmp/throwaway")
     assert config_dir(env={}) == Path.home() / ".config" / "marketlake"

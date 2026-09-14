@@ -407,9 +407,10 @@ def test_the_config_directory_override_does_not_disarm_the_guard(monkeypatch):
 
     This covers a guard that read the variable at call time. It cannot cover one that
     read it at import, because ``setenv`` here runs long after ``tests/conftest`` was
-    imported. That half is covered by
-    ``tests/component/test_config_dir_override.py``, in a process that starts with the
-    variable already set.
+    imported. That half is covered twice elsewhere: in
+    ``tests/component/test_suite_config_dir_redirect.py`` for this process, whose
+    redirect exports the variable before the guard decides anything, and in
+    ``tests/component/test_config_dir_override.py`` for a child that starts with it set.
     """
     monkeypatch.setenv(CONFIG_DIR_ENV, "/tmp/somewhere-else")
     with pytest.raises(ConfigWriteInTest):

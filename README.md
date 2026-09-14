@@ -90,5 +90,9 @@ kept reading the real one as it expired. The rendered `reauth.sh` unsets the var
 make the ritual immune to this, and a re-auth run any other way prints the token path it
 wrote, so the sign-off block is where to check it landed where you meant.
 
-The test suite needs none of this. A guard in `tests/conftest.py` fails any test that
-writes the real directory and names the path.
+The test suite needs none of this, because `tests/conftest.py` covers it twice. A guard
+there fails any test that writes the real directory and names the path. That guard is a
+monkeypatch, so it reaches no child process, and the same file therefore exports
+`MARKETLAKE_CONFIG_DIR` at a throwaway directory when it is imported. A child inheriting
+the suite's environment picks that up, whether or not the test that spawned it arranged
+anything.

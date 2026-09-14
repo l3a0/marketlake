@@ -1,19 +1,24 @@
 """Shared fixtures that expose the four seams and the fixture-lake builder.
 
-It also carries three guards. The network guard fails any test that reaches another
-machine from inside this process. The subprocess guard fails any test that shells out
-to rsync, launchctl, pmset, or tmutil. The config-directory guard fails any test that
-writes under the machine's real ``~/.config/marketlake/``.
+It also carries three guards and one redirect. The network guard fails any test that
+reaches another machine from inside this process. The subprocess guard fails any test
+that shells out to rsync, launchctl, pmset, or tmutil. The config-directory guard fails
+any test that writes under the machine's real ``~/.config/marketlake/``. The redirect
+points this process, and every child that inherits its environment, at a throwaway config
+directory, which is what covers the children the three guards cannot reach.
 """
 
 from __future__ import annotations
 
+import atexit
 import builtins
 import io
 import os
 import shutil
 import socket
 import subprocess
+import sys
+import tempfile
 import urllib.request
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
@@ -21,11 +26,76 @@ from pathlib import Path
 
 import pytest
 
-from lake.cassette import load_cassette
-from lake.paths import CONFIG_DIR_PARTS
-from tests.support.clock import ManualClock
-from tests.support.lake import FixtureLake
-from tests.support.vendor import CassetteVendor
+from lake.paths import CONFIG_DIR_ENV, CONFIG_DIR_PARTS
+
+# -- the config-directory redirect -------------------------------------------------------
+
+# Every guard in this file is a monkeypatch, so each holds inside this process and
+# nowhere else. A child the suite spawns has none of them. That limit bit during the
+# config-directory guard's own review: a test spawned a child running
+# ``lake.reauth.write_token`` at ``DEFAULT_TOKEN_PATH``, nothing in the child refused
+# it, and a stub landed on a working Schwab token. Nothing in the suite reaches the real
+# directory from a child today, and the next test that spawns one starts from the same
+# place.
+#
+# So the suite exports ``MARKETLAKE_CONFIG_DIR`` at a throwaway directory. A child that
+# inherits this process's environment resolves its config directory there, whether or not
+# the test that spawned it remembered to arrange anything.
+#
+# Two shapes of child are outside it, both on purpose, and neither can be closed from
+# here. A child handed an explicit ``env=`` carries only what that mapping names, which
+# is how ``_child`` in ``tests/component/test_config_dir_override.py`` asks what a
+# process with no override resolves, and how the four render tests sandbox a rendered
+# script. And the rendered ``reauth.sh`` unsets the variable before it calls the tool, so
+# anything it runs is outside this by design. Neither reaches real code at a default path
+# today, and both would have to arrange their own redirect if one ever did.
+#
+# The export sits above the rest of this file's imports because every default in the
+# package is built from ``config_dir`` when its module is imported. Exporting the
+# variable after ``lake.reauth`` had been imported would move nothing a caller uses.
+# ``lake.paths`` is safe to import first, since it only spells the variable's name and
+# builds no default from it. The check below enforces that rather than trusting the
+# line's position, because moving the export down this file is harmless until the day an
+# import above it binds a default, and by then the damage is a default pointing at the
+# live token with nothing to say so.
+#
+# This process moves with its children rather than staying behind. Two assertions bind a
+# module's bound default to a later ``config_dir()`` call, one in
+# ``tests/unit/test_paths.py`` and one in
+# ``tests/component/test_control_plane_render.py``. They are what would catch a module
+# that spelled the config directory its own way. A redirect reaching only children would
+# put a real-directory default beside a throwaway ``config_dir()``, and the only way to
+# keep those two assertions green would be to loosen them, which discards the rule they
+# exist to hold.
+#
+# An inherited value is replaced rather than honoured. It is whatever a person exported,
+# so it can name anything the real directory included, and where the suite's children
+# write is not for the shell that launched pytest to decide.
+#
+# None of this stands in for the guard below. The guard settles what it protects from
+# ``Path.home()`` and never reads this variable, on purpose, so a test that names the
+# real path by hand still fails rather than slipping past a redirect that path ignores.
+# The five modules that build a module-level default from ``config_dir``. Each binds
+# its constant at import, so one already in ``sys.modules`` here has bound it against
+# whatever the environment said before this file ran.
+_BINDS_A_DEFAULT = ("lake.chain_plan", "lake.config", "lake.reauth", "lake.schwab", "lake.tickers")
+_ALREADY_BOUND = [name for name in _BINDS_A_DEFAULT if name in sys.modules]
+if _ALREADY_BOUND:
+    raise RuntimeError(
+        f"{', '.join(_ALREADY_BOUND)} was imported before tests/conftest.py set "
+        f"{CONFIG_DIR_ENV}, so its default is bound to the real config directory and no "
+        "redirect can move it. Import it after this file, or move this export above "
+        "whatever pulled it in."
+    )
+
+_THROWAWAY_CONFIG_DIR = tempfile.mkdtemp(prefix="marketlake-suite-config-")
+os.environ[CONFIG_DIR_ENV] = _THROWAWAY_CONFIG_DIR
+atexit.register(shutil.rmtree, _THROWAWAY_CONFIG_DIR, ignore_errors=True)
+
+from lake.cassette import load_cassette  # noqa: E402
+from tests.support.clock import ManualClock  # noqa: E402
+from tests.support.lake import FixtureLake  # noqa: E402
+from tests.support.vendor import CassetteVendor  # noqa: E402
 
 # A fixed instant for the default manual clock: 2026-08-24 09:30 ET.
 _DEFAULT_NOW = datetime(2026, 8, 24, 13, 30, tzinfo=UTC)
@@ -385,7 +455,12 @@ def _no_config_writes() -> Iterator[None]:
     Five things a monkeypatch cannot reach, and the guard does not claim:
 
     1. A child process. A test that shells out to something that writes the directory is
-       outside this, the same limit the network guard names.
+       outside this, the same limit the network guard names. That one is covered
+       separately, by the redirect at the top of this file: a child inheriting this
+       process's environment resolves a throwaway config directory rather than the real
+       one, so there is nothing there for it to destroy. The redirect is not a second
+       guard, though. It moves what a default resolves to and refuses nothing, so a
+       child handed the real path by hand still writes it.
     2. Anything at import or collection time, before the fixture arms.
     3. A write through a descriptor that is already open, such as ``os.write`` or
        ``os.ftruncate``, and metadata-only changes such as ``os.chmod`` and
