@@ -41,7 +41,7 @@ import pytest
 from lake.paths import CONFIG_DIR_ENV, CONFIG_DIR_PARTS, TOKEN_FILE
 from lake.reauth import token_writer, write_token
 from lake.tickers import upsert_ticker
-from tests.conftest import ConfigWriteInTest
+from tests.conftest import ConfigWriteInTest, _is_protected
 
 # The real directory, spelled here from the process's own home rather than through
 # ``paths.config_dir``, so an exported ``MARKETLAKE_CONFIG_DIR`` cannot move what these
@@ -54,8 +54,17 @@ PROBE = REAL_CONFIG_DIR / "guard-probe-not-a-real-file.json"
 
 
 def test_the_probe_paths_are_not_real_files():
-    """The safety this whole module rests on, asserted rather than assumed."""
-    assert not PROBE.exists()
+    """The safety this whole module rests on, asserted rather than assumed.
+
+    This also fails after a mutation run that broke the guard on purpose, because the
+    write the guard should have refused then lands for real. That is the containment
+    working rather than a fault: the file it creates is this harmless name and never
+    ``token.json``. Delete it and run again.
+    """
+    assert not PROBE.exists(), (
+        f"{PROBE} exists. A run with the guard broken left it behind. Deleting it is the "
+        "whole repair, and the token beside it was never in reach."
+    )
     assert PROBE.name != TOKEN_FILE
 
 
@@ -224,13 +233,23 @@ def test_writing_anywhere_else_still_works(tmp_path):
     assert (tmp_path / "moved.json").exists()
 
 
-def test_a_path_that_only_looks_like_the_directory_is_left_alone(tmp_path):
-    # The check is a path-component prefix, not a string prefix, so a sibling whose
-    # name starts with the directory's name is not swept up.
-    sibling = tmp_path / (REAL_CONFIG_DIR.name + "-scratch")
-    sibling.mkdir()
-    (sibling / "x.json").write_text("{}")
-    assert (sibling / "x.json").exists()
+def test_a_sibling_whose_name_starts_with_the_directorys_is_left_alone():
+    """The match is on whole path components, not on the text of the prefix.
+
+    ``~/.config/marketlake-scratch`` shares the protected directory's entire spelling as
+    a string prefix and is a different directory. Sweeping it up would fail a test for
+    writing somewhere it was entitled to write.
+
+    ``_is_protected`` is asked directly rather than driven through a write, because the
+    honest probe for this is a real sibling in the real ``~/.config/`` and creating one
+    is not something a test should do. The predicate is what the refusal is built on, so
+    asking it decides the same question and touches no disk.
+    """
+    assert not _is_protected(str(REAL_CONFIG_DIR) + "-scratch")
+    assert not _is_protected(str(REAL_CONFIG_DIR) + "-scratch/token.json")
+    # The other direction, so this cannot pass by refusing nothing at all.
+    assert _is_protected(str(REAL_CONFIG_DIR))
+    assert _is_protected(str(REAL_CONFIG_DIR / "token.json"))
 
 
 # -- the guard cannot be moved or swallowed ---------------------------------------------
@@ -255,9 +274,17 @@ def test_the_refusal_is_not_caught_by_a_bare_except_exception():
 
 
 def test_the_config_directory_override_does_not_disarm_the_guard(monkeypatch):
-    # MARKETLAKE_CONFIG_DIR points a process away from the real directory. Reading it to
-    # decide what to protect would let the one thing that exists to keep a process off
-    # this path be the thing that opens it.
+    """MARKETLAKE_CONFIG_DIR points a process away from the real directory.
+
+    Reading it to decide what to protect would make the one thing that exists to keep a
+    process off this path the thing that opens it.
+
+    This covers a guard that read the variable at call time. It cannot cover one that
+    read it at import, because ``setenv`` here runs long after ``tests/conftest`` was
+    imported. That half is covered by
+    ``tests/component/test_config_dir_override.py``, in a process that starts with the
+    variable already set.
+    """
     monkeypatch.setenv(CONFIG_DIR_ENV, "/tmp/somewhere-else")
     with pytest.raises(ConfigWriteInTest):
         PROBE.write_text("{}")

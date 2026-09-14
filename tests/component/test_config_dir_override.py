@@ -145,6 +145,34 @@ print(json.dumps({{"written": target}}))
     assert not (throwaway / "token.json").exists()
 
 
+def test_the_override_does_not_disarm_the_guard_in_a_process_that_starts_with_it_set():
+    """The two mechanisms must not cancel each other out, checked where it can be checked.
+
+    The guard settles what it protects when ``tests/conftest`` is imported. So a test
+    that exports the variable with ``monkeypatch.setenv`` runs after that decision is
+    made and cannot reach it, which is why the sibling test in
+    ``tests/unit/test_config_dir_guard.py`` covers only the other half: a guard that read
+    the variable at call time rather than at import. Reading it at import is the half
+    that lives here, and only a process that started with the variable set can tell.
+
+    Nothing is written. ``_is_protected`` is the predicate the refusal is built on, so
+    asking it about the real token path drives the real decision and touches no file.
+    """
+    script = """
+import json
+from pathlib import Path
+from tests.conftest import _PROTECTED_ROOTS, _is_protected
+real_token = Path.home() / ".config" / "marketlake" / "token.json"
+print(json.dumps({
+    "protected": _is_protected(str(real_token)),
+    "roots": sorted(_PROTECTED_ROOTS),
+}))
+"""
+    result = _child(script, Path("/tmp/throwaway-not-the-real-directory"))
+    assert result["protected"] is True, result["roots"]
+    assert str(Path.home() / ".config" / "marketlake") in result["roots"]
+
+
 def test_the_rendered_plists_do_not_carry_the_override(tmp_path):
     """Production is out of the override's reach, which is why the default can stay live.
 
