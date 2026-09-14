@@ -113,6 +113,24 @@ class SchemaDrift:
     one, which renders it ``pinned -> merged`` whenever the promoted type is not the
     pinned one. Such a record carries ``refused`` false, because nothing was refused.
 
+    ``widened`` is the fourth column list and the only one that is not a comparison
+    against the pinned schema. It names what an authorized promotion moved, rendered
+    ``segment -> promoted`` once per distinct type a segment held the column at, so a
+    reader sees both types the segments disagreed about and the type they were merged to.
+    The other three fields cannot say this, because all three compare the merged schema to
+    the pinned one and the disagreement here is between two segments. Which is why the
+    record a widening onto the pinned type leaves needed a field of its own: the merged
+    schema and the pinned one are then equal, the three difference fields have nothing to
+    report, and without this one the repair would seal a ticker-day whose segments
+    disagreed and leave no report at all.
+
+    So a record exists whenever ``widened`` is non-empty, whether or not the merged schema
+    differs from the pinned one. A widening past the pinned type fills ``retyped`` as well,
+    and the two fields then say different things about the same column. ``retyped`` says
+    the pinned schema is now narrower than the partition and wants a schema bump.
+    ``widened`` says the segments disagreed and a human authorized the merge, which no
+    schema bump clears and none is owed for.
+
     All three can be empty, and each producer has a way of getting there. The merged
     producer decides there is a difference by comparing the two schemas outright and these
     fields explain it, so a difference the names and the types do not show files a record
@@ -130,6 +148,7 @@ class SchemaDrift:
     missing: tuple[str, ...] = ()
     unexpected: tuple[str, ...] = ()
     retyped: tuple[str, ...] = ()
+    widened: tuple[str, ...] = ()
     segments: tuple[str, ...] = field(default_factory=tuple)
     refused: bool = False
 
@@ -222,6 +241,14 @@ def write_schema_drift(
     says which ticker-days were merged. A file per ticker-day per run would be hundreds
     of empty findings a day, and the reader would have to filter them all back out.
 
+    **An authorized widening writes even when the merge came out clean.** A repair run
+    with ``allow_retype`` on merges segments that disagreed about a column's type, and the
+    human who authorized it usually pins the wider type first, so the merged schema then
+    equals the pinned one and the three difference fields find nothing. That partition is
+    still not an ordinary seal, so the caller files on ``widened`` alone. It files once,
+    for the same reason a drifted seal does: the partition has a manifest entry behind it,
+    so a later silence is readable.
+
     **A refused merge writes on every run.** That exemption rests on the manifest entry,
     and a ticker-day whose merge was refused has none. So its silence on the second night
     would be consistent with three things at once: the conflict was fixed, it is still
@@ -251,6 +278,7 @@ def write_schema_drift(
         "missing": list(drift.missing),
         "unexpected": list(drift.unexpected),
         "retyped": list(drift.retyped),
+        "widened": list(drift.widened),
         "segments": list(drift.segments),
         "refused": drift.refused,
     }

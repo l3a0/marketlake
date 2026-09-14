@@ -697,12 +697,20 @@ def _schema_drift(
     day: date,
     partition: str,
     segments: Sequence[str],
+    widened: Sequence[str] = (),
 ) -> SchemaDrift:
-    """What the merged schema carries that the pinned one does not.
+    """What the merged schema carries that the pinned one does not, and what a repair widened.
 
-    Called only once the two schemas have already been found unequal, so this explains a
-    difference rather than deciding there is one. The three fields name columns, because
-    a human reading the file wants the column and not a count.
+    The three difference fields explain a difference rather than deciding there is one,
+    and they name columns, because a human reading the file wants the column and not a
+    count. Two schemas that are equal fill all three with nothing, which is a record the
+    caller asks for only when there is something else to say.
+
+    ``widened`` is that something else, and it is carried through rather than computed
+    here. It compares the segments to each other, not the merged schema to the pinned one,
+    so nothing at this point in the seal still holds the fact. ``_merge_authorized`` is
+    where it is known and where it comes from. It is empty for every caller but the
+    authorized repair.
     """
     pinned_names = set(pinned.names)
     merged_types = {field.name: str(field.type) for field in merged}
@@ -719,6 +727,7 @@ def _schema_drift(
             for name in pinned.names
             if name in merged_types and merged_types[name] != str(pinned.field(name).type)
         ),
+        widened=tuple(widened),
         segments=tuple(segments),
     )
 
@@ -798,6 +807,13 @@ def _drift_body(drifted: Sequence[SchemaDrift]) -> str:
     ``retyped``, to be empty at once. A difference the names and the types do not show
     still files a record, and a nullability change is the difference that reaches here. The
     page has to say that plainly rather than trailing off after "did not carry".
+
+    A third kind reaches this text, and only ever on a terminal. A finding whose only
+    content is ``widened`` is an authorized repair, and the schema bump is the wrong move
+    for it, because the operator has already pinned the type they meant. Such a finding
+    cannot reach a phone at all. Widening is reachable from ``recompact_ticker_day`` alone,
+    which passes no publisher, so this body renders to the stderr of the operator who
+    started the run. It is written for them.
     """
     days = sorted({drift.day.isoformat() for drift in drifted})
     moved = "; ".join(
@@ -806,6 +822,7 @@ def _drift_body(drifted: Sequence[SchemaDrift]) -> str:
             ("missing", sorted({name for drift in drifted for name in drift.missing})),
             ("unexpected", sorted({name for drift in drifted for name in drift.unexpected})),
             ("retyped", sorted({name for drift in drifted for name in drift.retyped})),
+            ("widened", sorted({name for drift in drifted for name in drift.widened})),
         )
         if names
     )
@@ -816,6 +833,14 @@ def _drift_body(drifted: Sequence[SchemaDrift]) -> str:
         f"{len(drifted)} ticker-day(s) over {', '.join(days)} drifted at the merge. {moved}. "
         f"Findings under {REPORTS_DIR}/{SCHEMA_DRIFT_DIR}/."
     )
+    authorized = all(drift.widened for drift in drifted) and not any(
+        drift.missing or drift.unexpected or drift.retyped for drift in drifted
+    )
+    if refused == 0 and authorized:
+        return (
+            f"{lead} An authorized widening, so the segments disagreed and a human merged "
+            "them. The pinned schema already carries the promoted type, so no bump follows."
+        )
     if refused == 0:
         return f"{lead} Correct the schema and bump schema_version."
     if refused == len(drifted):
@@ -947,7 +972,7 @@ def _survives_widening(column: pa.ChunkedArray, target: pa.DataType) -> bool:
     return restored.equals(column)
 
 
-def _merge_authorized(tables: Sequence[pa.Table], label: str) -> pa.Table:
+def _merge_authorized(tables: Sequence[pa.Table], label: str) -> tuple[pa.Table, tuple[str, ...]]:
     """Merge segments that disagree about a column's type, but only where nothing moves.
 
     Reached only from a repair a human authorized for one ticker-day. Arrow's
@@ -967,6 +992,19 @@ def _merge_authorized(tables: Sequence[pa.Table], label: str) -> pa.Table:
     that would not be lossless is never built. The refusal names every column and pair
     it found, not the first, because an operator who has to go and look at the segments
     wants the whole list on the first run.
+
+    The merged table comes back with what the widening moved, rendered
+    ``name: segment -> promoted``, one entry per distinct type a segment held the column
+    at. This is the only place that knows it. The disagreement is between two segments and
+    it exists only while the segments do, so the schema check downstream, which compares
+    the merged schema to the pinned one, cannot recover it and comes up empty whenever the
+    pinned type is already the promoted one. The caller files what is returned here, which
+    is what leaves a repaired partition distinguishable from an ordinary seal.
+
+    A null-typed column is left out, for the reason ``_type_conflicts`` leaves it out. A
+    segment whose column was all nulls is promoted by the scheduled merge too, so it is
+    not a disagreement this flag authorized and naming it would point a reader at the
+    wrong column.
     """
     schemas = [table.schema for table in tables]
     try:
@@ -978,18 +1016,21 @@ def _merge_authorized(tables: Sequence[pa.Table], label: str) -> pa.Table:
         ) from exc
 
     lossy: dict[str, None] = {}
+    widened: dict[str, None] = {}
     for table in tables:
         for field in table.schema:
             target = unified.field(field.name).type
             if not _survives_widening(table.column(field.name), target):
                 lossy[f"{field.name}: {field.type} -> {target}"] = None
+            elif field.type != target and not pa.types.is_null(field.type):
+                widened[f"{field.name}: {field.type} -> {target}"] = None
     if lossy:
         raise RetypeRefused(
             f"{label}: widening would not return every value unchanged for "
             f"{', '.join(lossy)}; the flag authorizes a merge of two recordings of the "
             "same thing, never a cast that changes one"
         )
-    return pa.concat_tables(tables, promote_options="permissive")
+    return pa.concat_tables(tables, promote_options="permissive"), tuple(widened)
 
 
 def _seal(
@@ -1026,6 +1067,13 @@ def _seal(
     It is reported rather than raised, because a raise from this function that the sweep
     does not catch costs the rest of it.
 
+    A widening the operator authorized files that same finding, on its own and whether or
+    not the two schemas differ. The comparison above cannot report it. It is the merged
+    schema against the pinned one, and a widening is two segments against each other, so
+    the two agree exactly when the human pinned the wider type before running the repair.
+    That is the ordinary case, and it is the one that used to seal a ticker-day whose
+    segments disagreed and leave no report at all.
+
     One drift stops the merge instead of surviving it. A column the segments hold at
     different types is refused by ``concat_tables``, and this raises
     ``SegmentSchemaConflict`` rather than letting Arrow's own error out. The sweep catches
@@ -1052,6 +1100,7 @@ def _seal(
 
     tables: list[pa.Table] = []
     expected = 0
+    widened: tuple[str, ...] = ()
     for path in segments:
         table = _read_complete(path)
         if table is not None:
@@ -1061,7 +1110,13 @@ def _seal(
         # A human has authorized the widening for this one ticker-day and is standing
         # behind the claim that the two types are two recordings of the same thing. The
         # branch exists only for that, and nothing automatic reaches it.
-        merged = _merge_authorized(tables, f"{surface}/{ticker}/{day.isoformat()}")
+        #
+        # What it widened comes back with the merged table, because this is the last
+        # moment anything knows. The schema check below compares the merged schema to the
+        # pinned one, and a human correcting a mid-day retype pins the type they meant
+        # before running the repair, so that comparison usually comes out equal and can
+        # report nothing at all. ``widened`` is the fact it cannot see.
+        merged, widened = _merge_authorized(tables, f"{surface}/{ticker}/{day.isoformat()}")
     elif tables:
         # A mid-day vendor change rotates to a new segment with a new schema. Unifying by
         # name adds the new column as nulls on the older rows. A column the segments hold
@@ -1097,9 +1152,16 @@ def _seal(
     # refuses exactly the surfaces the schemas have no entry for.
     pinned = journal.schema_for(surface)
     merged = _pinned_order(merged, pinned)
+    # Two things file a record here, and either one alone is enough. A merged schema that
+    # is not the pinned one is the check this seal has always run. A widening an operator
+    # authorized is the other, and it files whether or not the schemas differ, because the
+    # comparison that decides the first has no way of seeing it. Without that second
+    # condition a repair that widened onto the pinned type would seal a ticker-day whose
+    # segments disagreed and leave nothing behind but a second manifest entry, whose
+    # ``source`` is the same string an ordinary seal writes.
     drift = (
         None
-        if merged.schema.equals(pinned)
+        if merged.schema.equals(pinned) and not widened
         else _schema_drift(
             merged.schema,
             pinned,
@@ -1108,6 +1170,7 @@ def _seal(
             day=day,
             partition=rel,
             segments=named_segments,
+            widened=widened,
         )
     )
 
