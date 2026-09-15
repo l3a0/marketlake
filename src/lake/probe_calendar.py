@@ -25,7 +25,9 @@ import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
+from typing import NamedTuple
 
+from lake import journal
 from lake.alert import Message
 from lake.calendar import MARKET_TZ
 from lake.runner import PING_FAILURES, escalate_ping_failure
@@ -43,12 +45,23 @@ SESSION_DAY_TAG = "session day, probe n/a"
 
 @dataclass(frozen=True)
 class ProbeResult:
-    """What the probe found, and whether it pages."""
+    """What the probe found, and whether it pages.
+
+    ``problem`` says the probe learned nothing either way. It reads as a whole phrase
+    rather than a bare exception name, because two states reach it.
+
+    1. A vendor the probe could not reach.
+    2. A batch carrying no readable stamp.
+
+    ``refused`` counts the stamps the epoch transform refuses, so a partly unreadable
+    batch says so even on a day that reports no problem.
+    """
 
     day: date
     checked: bool
     trading: tuple[str, ...] = ()
     problem: str | None = None
+    refused: int = 0
 
     @property
     def pages(self) -> bool:
@@ -56,39 +69,102 @@ class ProbeResult:
         return bool(self.trading)
 
 
-def fresh_symbols(quotes: dict, day: date) -> tuple[str, ...]:
-    """The symbols whose vendor timestamp falls on ``day`` in market time.
+class Reading(NamedTuple):
+    """What one batch of vendor quotes said, and what it could not say.
+
+    ``trading`` names the symbols stamped today. ``readable`` counts the stamps that
+    converted at all, today's and prior sessions' alike. ``refused`` counts the stamps
+    the shared epoch transform refuses, and ``absent`` the symbols the vendor sent no
+    stamp for. The three counts account for the whole batch, so they sum to its size.
+    """
+
+    trading: tuple[str, ...] = ()
+    readable: int = 0
+    refused: int = 0
+    absent: int = 0
+
+
+def read_batch(quotes: dict, day: date) -> Reading:
+    """Who the vendor's stamps say is trading on ``day``, and how many would not read.
 
     Same-day freshness is the predicate, not a seconds threshold. The question is
     whether the market traded at all today, and a stamp from a prior session answers it
     as clearly as one from an hour ago. A seconds threshold would also have to be
     guessed, and the design pins none for this.
+
+    A refused stamp is no evidence of trading, the same as an absent one. Counting it as
+    trading would page on every closed day a vendor sends junk, and a page that fires on
+    ordinary holidays is a page nobody reads.
+
+    It is counted rather than dropped. A batch reads as quiet when nothing in it was
+    readable, and that looks exactly like a market that is genuinely shut. That session
+    is what the probe exists to save.
     """
     trading: list[str] = []
+    readable = 0
+    refused = 0
+    absent = 0
     for symbol, envelope in sorted(quotes.items()):
-        stamp = _quote_time(envelope)
-        if stamp is None:
+        try:
+            stamp = _quote_time(envelope)
+        except journal.UnfitEpochError:
+            refused += 1
             continue
+        if stamp is None:
+            absent += 1
+            continue
+        readable += 1
         if stamp.astimezone(MARKET_TZ).date() == day:
             trading.append(symbol)
-    return tuple(trading)
+    return Reading(tuple(trading), readable=readable, refused=refused, absent=absent)
 
 
 def _quote_time(envelope: object) -> datetime | None:
-    """The vendor quote time inside one quote envelope, or ``None``."""
+    """The vendor quote time inside one quote envelope, or ``None`` when it is absent.
+
+    Absent means the vendor sent no stamp, whether that is no envelope, no quote, or no
+    ``quoteTime`` inside it. A stamp that arrived and cannot be read raises
+    ``journal.UnfitEpochError`` from the shared transform, and counting it is the
+    caller's job.
+
+    The two states must not swap places. Every caller reads ``None`` as not trading, and
+    that is the right answer for a symbol the vendor stayed quiet about. Only a refusal
+    is new information.
+
+    The conversion itself is ``journal.epoch_ms_to_utc``, the same one the two capture
+    surfaces call. Writing it a third time here is what let a vendor ``true`` through as
+    a stamp one millisecond past the epoch, which reads as 1969 in market time. That is
+    because ``int(True)`` is ``1`` and nothing raised.
+    """
     if not isinstance(envelope, dict):
         return None
     quote = envelope.get("quote")
     if not isinstance(quote, dict):
         return None
-    raw = quote.get("quoteTime")
-    if raw is None:
-        return None
-    try:
-        # Schwab reports this as epoch milliseconds.
-        return datetime.fromtimestamp(int(raw) / 1000, tz=MARKET_TZ)
-    except (TypeError, ValueError, OSError):
-        return None
+    return journal.epoch_ms_to_utc(quote.get("quoteTime"))
+
+
+def _unreadable_problem(reading: Reading) -> str | None:
+    """The problem a batch with no readable stamp in it reports, or ``None``.
+
+    A batch carrying at least one refused stamp and no readable stamp is no evidence
+    either way, which is the state an unreachable vendor already leaves. It reports a
+    problem and it does not page.
+
+    A batch of nothing but absent stamps does not reach that state. The vendor saying
+    nothing about a symbol is the ordinary case, and reporting a problem on it would
+    fire on every quiet day.
+
+    Both counts go in the line, because a refusal and a silence are different things to
+    go and look at, and the refusal count alone would not say how big the batch was. The
+    wording borrows ``journal.describe_unusable``, which reads ``2 unreadable`` ahead of
+    its own parenthesised counts. The helper itself is not reused. It takes segment
+    entries and the probe has none, so bending the probe into that shape to reach it
+    would cost more than the shared wording is worth.
+    """
+    if reading.refused and not reading.readable:
+        return f"no readable quote time ({reading.refused} unreadable, {reading.absent} absent)"
+    return None
 
 
 def run_probe(*, calendar, clock, symbols: Sequence[str], fetch) -> ProbeResult:
@@ -100,6 +176,10 @@ def run_probe(*, calendar, clock, symbols: Sequence[str], fetch) -> ProbeResult:
     A vendor that cannot be reached is a problem, not a page. The probe exists to catch
     a calendar that is wrong, and an unreachable vendor is no evidence either way. Its
     own dead-man check notices a probe that stops running.
+
+    A batch that came back and could not be read leaves the probe knowing just as
+    little. It reports a problem the same way, and it pages no more than an unreachable
+    vendor does.
     """
     now = clock.now().astimezone(MARKET_TZ)
     day = now.date()
@@ -108,8 +188,15 @@ def run_probe(*, calendar, clock, symbols: Sequence[str], fetch) -> ProbeResult:
     try:
         quotes = fetch(list(symbols))
     except Exception as exc:  # noqa: BLE001 - an unreachable vendor must not page
-        return ProbeResult(day, checked=True, problem=type(exc).__name__)
-    return ProbeResult(day, checked=True, trading=fresh_symbols(quotes, day))
+        return ProbeResult(day, checked=True, problem=f"vendor unreachable: {type(exc).__name__}")
+    reading = read_batch(quotes, day)
+    return ProbeResult(
+        day,
+        checked=True,
+        trading=reading.trading,
+        problem=_unreadable_problem(reading),
+        refused=reading.refused,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -196,9 +283,17 @@ def report(result: ProbeResult, *, publisher, pinger, ping_url: str, slug: str, 
         print(f"calendar probe: {PAGE_TITLE} ({len(result.trading)} symbols)", file=sys.stderr)
         return 1
 
-    status = SESSION_DAY_TAG if not result.checked else "calendar agrees"
     if result.problem is not None:
-        status = f"vendor unreachable: {result.problem}"
+        status = result.problem
+    elif not result.checked:
+        status = SESSION_DAY_TAG
+    elif result.refused:
+        # A batch that read in part is not a problem. Dropping the count would hide a
+        # vendor going bad one symbol at a time, until the day nothing in the batch
+        # reads at all and the line above says so instead.
+        status = f"calendar agrees, {result.refused} unreadable"
+    else:
+        status = "calendar agrees"
     print(f"calendar probe: {status}")
     return 0
 
@@ -207,8 +302,9 @@ __all__ = [
     "PAGE_TITLE",
     "SESSION_DAY_TAG",
     "ProbeResult",
-    "fresh_symbols",
+    "Reading",
     "main",
+    "read_batch",
     "report",
     "run_probe",
 ]

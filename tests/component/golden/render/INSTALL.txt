@@ -8,14 +8,14 @@ sudo install -o root -g wheel -m 644 <OUT>/com.marketlake.sunday.plist /Library/
 # 2. Install the sudoers drop-in after visudo validates it.
 sudo visudo -cf <OUT>/marketlake.sudoers && sudo install -o root -g wheel -m 440 <OUT>/marketlake.sudoers /etc/sudoers.d/marketlake
 # visudo checks the syntax only. This prints the two rules as sudo parsed them,
-# which is what shows the one-shot's regular expression survived as one.
+# which is what shows the one-shot regular expression survived as one rule.
 sudo -l | grep pmset
 # 3. Set the weekday firmware wake, then read it back.
 sudo pmset repeat wakeorpoweron MTWRF 08:25:00
 pmset -g sched
 # 4. Keep the token and the config secrets out of Time Machine. As the owner,
 # never under sudo. The whole directory goes, so an editor that saves by rename
-# cannot drop the exclusion, and config.yaml's four secrets are covered too.
+# cannot drop the exclusion, and the four secrets in config.yaml are covered too.
 tmutil addexclusion /Users/someone/.config/marketlake
 tmutil isexcluded /Users/someone/.config/marketlake
 # 5. Load the jobs into the system domain, then confirm the daemon is running.
@@ -26,7 +26,7 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.marketlake.calendar-p
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.marketlake.sunday.plist
 launchctl print system/com.marketlake.daemon
 # The token. None of the above captures anything until a Schwab token exists at
-# ~/.config/marketlake/token.json. Schwab's refresh token dies every seven days and an
+# ~/.config/marketlake/token.json. The Schwab refresh token dies every seven days and an
 # interactive browser login is its only renewal, so this is a standing Sunday
 # ritual rather than a step of the install, and nothing can do it for you.
 # Run ./reauth.sh beside this file, as the owner, at a terminal on a
@@ -57,7 +57,7 @@ cd /Users/someone/marketlake && /opt/py/bin/python -m lake.control_plane pmset
 # standing Friday task until slice 3 lands.
 # Step by step is not the recommended path. Run the two scripts beside this file
 #     ./uninstall.sh && ./install.sh
-# which re-runs every step and so cannot skip one that changed. The `&&` is
+# which re-runs every step and so cannot skip one that changed. The && is
 # load-bearing: an uninstall that cannot finish must leave the install unrun.
 # If you do it step by step, the trap is that a re-render can change steps 2, 3
 # and 4 while every plist stays byte-identical. Re-tuning either wake rewrites
@@ -65,10 +65,10 @@ cd /Users/someone/marketlake && /opt/py/bin/python -m lake.control_plane pmset
 # nothing to do while the drop-in keeps granting the old command. Check it
 # directly:
 #     sudo diff /etc/sudoers.d/marketlake <OUT>/marketlake.sudoers
-# launchd keeps a job's definition from the bootstrap that loaded it, so
+# launchd keeps the definition a job had at the bootstrap that loaded it, so
 # overwriting a plist in step 1 changes nothing by itself. After a re-render that
 # changes a plist, boot out that label, then run its step 1 and step 5 lines again.
-# `launchctl kickstart -k` is not the reload. It restarts the process under the
+# launchctl kickstart -k is not the reload. It restarts the process under the
 # definition already loaded. A re-render that only adds a plist needs step 1 and
 # step 5 for the new label alone, with no bootout. Steps 2, 3, and 4 write files
 # and settings, so they re-run as they are.

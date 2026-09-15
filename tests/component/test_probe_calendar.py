@@ -7,8 +7,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from lake import journal, probe_calendar
 from lake.control_plane import CALENDAR_PROBE_SLUG
-from lake.probe_calendar import ProbeResult, fresh_symbols, run_probe
+from lake.probe_calendar import ProbeResult, Reading, read_batch, run_probe
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
 
@@ -84,7 +85,7 @@ def test_an_unreachable_vendor_is_a_problem_and_never_a_page():
     result = _probe(et(2026, 9, 5, 9, 35), boom=True)
     assert result.checked
     assert not result.pages
-    assert result.problem == "ConnectionError"
+    assert result.problem == "vendor unreachable: ConnectionError"
 
 
 @pytest.mark.parametrize(
@@ -98,7 +99,7 @@ def test_an_unreachable_vendor_is_a_problem_and_never_a_page():
     ],
 )
 def test_a_quote_the_probe_cannot_read_is_not_evidence_of_trading(envelope):
-    assert fresh_symbols({"SPY": envelope}, SATURDAY) == ()
+    assert read_batch({"SPY": envelope}, SATURDAY).trading == ()
 
 
 def test_freshness_is_same_day_in_market_time_not_a_seconds_window():
@@ -108,10 +109,152 @@ def test_freshness_is_same_day_in_market_time_not_a_seconds_window():
     day = date(2026, 9, 5)
     just_before_midnight = datetime(2026, 9, 5, 0, 1, tzinfo=ET)
     long_ago_but_today = datetime(2026, 9, 5, 23, 58, tzinfo=ET)
-    assert fresh_symbols({"A": _quote(just_before_midnight)}, day) == ("A",)
-    assert fresh_symbols({"A": _quote(long_ago_but_today)}, day) == ("A",)
+    assert read_batch({"A": _quote(just_before_midnight)}, day).trading == ("A",)
+    assert read_batch({"A": _quote(long_ago_but_today)}, day).trading == ("A",)
     yesterday = _quote(datetime(2026, 9, 5, 0, 1, tzinfo=ET) - timedelta(hours=2))
-    assert fresh_symbols({"A": yesterday}, day) == ()
+    assert read_batch({"A": yesterday}, day).trading == ()
+
+
+# -- a stamp that arrived and cannot be read -----------------------------------------
+
+
+REFUSED = [True, False, "not a number", 10**20, {}, [], float("nan")]
+ABSENT = [{}, {"quote": {}}, {"quote": {"quoteTime": None}}, "not a dict", {"quote": "not a dict"}]
+
+
+def _stamped(value: object) -> dict:
+    return {"quote": {"quoteTime": value}}
+
+
+def test_a_bool_quote_time_is_refused_rather_than_read_as_a_1969_stamp():
+    # `int(True)` is 1, so the probe's own copy of the transform turned a vendor `true`
+    # into one millisecond past the epoch with nothing raised. Dropping the symbol is
+    # the small cost. The 1969 date is the large one, and a probe run on that date would
+    # have read the bool as a trading market.
+    reading = read_batch({"SPY": _stamped(True)}, SATURDAY)
+    assert reading.refused == 1
+    assert reading.readable == 0
+    assert read_batch({"SPY": _stamped(True)}, date(1969, 12, 31)).trading == ()
+
+
+@pytest.mark.parametrize("value", REFUSED)
+def test_every_unreadable_stamp_shape_is_refused_rather_than_converted(value):
+    reading = read_batch({"SPY": _stamped(value)}, SATURDAY)
+    assert reading == Reading(trading=(), readable=0, refused=1, absent=0)
+
+
+def test_a_refused_stamp_is_no_evidence_of_trading_and_the_symbol_beside_it_pages():
+    # The refusal must not take the batch down with it. A vendor that sent junk for one
+    # symbol still answered the question the probe asked, as long as another symbol
+    # carries today's stamp.
+    result = _probe(
+        et(2026, 9, 5, 9, 35),
+        {"SPY": _stamped(True), "QQQ": _quote(et(2026, 9, 5, 9, 34))},
+    )
+    assert result.trading == ("QQQ",)
+    assert result.pages
+    assert result.refused == 1
+    assert result.problem is None
+
+
+def test_a_batch_that_read_nothing_reports_a_problem_and_pages_nobody():
+    # Silence caused by unreadable stamps is otherwise indistinguishable from a market
+    # that is genuinely shut, and that session is what the probe exists to save.
+    result = _probe(et(2026, 9, 5, 9, 35), {"SPY": _stamped(True), "QQQ": _stamped("junk")})
+    assert result.checked
+    assert not result.pages
+    assert result.trading == ()
+    assert result.refused == 2
+    assert result.problem == "no readable quote time (2 unreadable, 0 absent)"
+
+
+def test_a_refusal_beside_an_absent_stamp_still_reports_a_problem():
+    # A batch of refusals and silences is a batch nothing could be read from, which is
+    # the state the problem names. The absent stamp carries no evidence either way, so
+    # it neither raises the problem nor argues against it.
+    result = _probe(
+        et(2026, 9, 5, 9, 35),
+        {"SPY": _stamped(True), "QQQ": {"quote": {}}},
+    )
+    assert result.refused == 1
+    assert result.problem == "no readable quote time (1 unreadable, 1 absent)"
+    assert not result.pages
+
+
+@pytest.mark.parametrize("envelope", ABSENT)
+def test_an_absent_stamp_is_not_a_refusal(envelope):
+    # Every caller reads a missing stamp as not trading, and that is the right answer
+    # for a symbol the vendor stayed quiet about. Only a refusal is new information, so
+    # turning silence into a problem would report one on every quiet day.
+    reading = read_batch({"SPY": envelope}, SATURDAY)
+    assert reading == Reading(trading=(), readable=0, refused=0, absent=1)
+
+
+def test_a_batch_of_absent_stamps_reports_no_problem():
+    result = _probe(et(2026, 9, 5, 9, 35), {sym: {"quote": {}} for sym in ("SPY", "QQQ")})
+    assert result.checked
+    assert not result.pages
+    assert result.refused == 0
+    assert result.problem is None
+
+
+def test_a_stale_stamp_beside_a_refused_one_is_still_the_ordinary_closed_day():
+    # A holiday answers the probe with the prior session's stamp, which reads fine and
+    # simply is not today. One junk symbol beside it does not make the day a problem.
+    result = _probe(
+        et(2026, 9, 5, 9, 35),
+        {"SPY": _quote(et(2026, 9, 4, 16, 0)), "QQQ": _stamped(True)},
+    )
+    assert result.trading == ()
+    assert not result.pages
+    assert result.refused == 1
+    assert result.problem is None
+
+
+def test_the_three_counts_account_for_every_symbol_in_the_batch():
+    # `Reading` promises the counts sum to the batch size. A count that silently drops a
+    # symbol is how a batch reads as smaller than the one the vendor answered.
+    quotes = {
+        "AAA": _quote(et(2026, 9, 5, 9, 34)),
+        "BBB": _quote(et(2026, 9, 4, 16, 0)),
+        "CCC": _stamped(True),
+        "DDD": {"quote": {}},
+        "EEE": "not a dict",
+    }
+    reading = read_batch(quotes, SATURDAY)
+    assert reading.readable + reading.refused + reading.absent == len(quotes)
+    assert reading == Reading(trading=("AAA",), readable=2, refused=1, absent=2)
+
+
+def test_a_quote_time_in_float_notation_reads_as_a_stamp():
+    # The shared transform converts with `float`, and the lake already holds values in
+    # this shape. The probe's own copy used `int`, which refused them.
+    at = et(2026, 9, 5, 9, 34)
+    reading = read_batch({"SPY": _stamped(f"{at.timestamp() * 1000:.6e}")}, SATURDAY)
+    assert reading.trading == ("SPY",)
+    assert reading.refused == 0
+
+
+def test_an_out_of_range_epoch_is_refused_rather_than_raising_out_of_the_probe():
+    # `OverflowError` was absent from the probe's own except tuple. `10**400` is the
+    # value that reached it: `int(raw) / 1000` raises `OverflowError` there and took the
+    # whole probe down, which cost the healthchecks ping as well as the answer. A
+    # smaller out-of-range epoch like `10**20` raises `OSError`, which the old tuple
+    # caught, so it would not tell the two behaviours apart.
+    result = _probe(et(2026, 9, 5, 9, 35), {"SPY": _stamped(10**400)})
+    assert result.checked
+    assert result.refused == 1
+    assert result.problem == "no readable quote time (1 unreadable, 0 absent)"
+
+
+def test_the_transform_is_the_shared_one_rather_than_a_third_copy():
+    # A third copy of one transform is what let the bool through here after #223 fixed
+    # it on the two capture surfaces. Comparing instants alone does not say which
+    # transform ran, because the copy named the same instant in market time. The zone
+    # does say it: the shared transform returns UTC and the copy returned MARKET_TZ.
+    stamp = probe_calendar._quote_time(_stamped("1758000000000"))
+    assert stamp == journal.epoch_ms_to_utc("1758000000000")
+    assert stamp.utcoffset() == timedelta(0)
 
 
 # -- the entry that actually pages ---------------------------------------------------
@@ -216,3 +359,55 @@ def test_the_page_title_is_the_one_the_design_pins():
     from lake.probe_calendar import PAGE_TITLE
 
     assert PAGE_TITLE == "Calendar says closed, market looks open"
+
+
+# -- what the operator line says -----------------------------------------------------
+
+
+def _status(result: ProbeResult, capsys) -> str:
+    from lake.probe_calendar import report
+
+    report(
+        result,
+        publisher=Sink(),
+        pinger=Pings(),
+        ping_url="https://x/y",
+        slug=CALENDAR_PROBE_SLUG,
+        now=et(2026, 9, 5, 9, 35),
+    )
+    return capsys.readouterr().out.strip()
+
+
+def test_the_line_tells_an_unreachable_vendor_from_an_unreadable_batch(capsys):
+    # `problem` reaches the operator verbatim, because an unreachable vendor and an
+    # unreadable batch are different things to go and look at.
+    day = date(2026, 9, 5)
+    unreachable = ProbeResult(day, checked=True, problem="vendor unreachable: ConnectionError")
+    unreadable = ProbeResult(
+        day, checked=True, problem="no readable quote time (2 unreadable, 0 absent)", refused=2
+    )
+    assert _status(unreachable, capsys) == "calendar probe: vendor unreachable: ConnectionError"
+    assert _status(unreadable, capsys) == (
+        "calendar probe: no readable quote time (2 unreadable, 0 absent)"
+    )
+
+
+def test_a_partly_unreadable_batch_says_so_without_calling_it_a_problem(capsys):
+    # The count is what makes a vendor going bad one symbol at a time visible before the
+    # day nothing in the batch reads at all.
+    result = ProbeResult(date(2026, 9, 5), checked=True, refused=1)
+    assert _status(result, capsys) == "calendar probe: calendar agrees, 1 unreadable"
+
+
+def test_a_clean_closed_day_still_says_the_calendar_agrees(capsys):
+    assert _status(ProbeResult(date(2026, 9, 5), checked=True), capsys) == (
+        "calendar probe: calendar agrees"
+    )
+
+
+def test_a_session_day_still_carries_the_tag_the_design_words(capsys):
+    from lake.probe_calendar import SESSION_DAY_TAG
+
+    assert _status(ProbeResult(date(2026, 9, 2), checked=False), capsys) == (
+        f"calendar probe: {SESSION_DAY_TAG}"
+    )
