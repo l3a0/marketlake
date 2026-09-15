@@ -6,6 +6,22 @@ Marketlake is a capture-first market data lake. It records full option chains an
 
 The price of this is named rather than hidden: the same substance now exists in an issue and in the doc that reasons about it, so the two can drift. The issue wins. When they disagree, the doc is what gets corrected.
 
+**Prioritize by MVP, and iterate on usage feedback (owner directive, 2026-09-14).** Rank work by what the product needs to be usable end to end, never by how severe a failure would be if it happened. Before proposing an order, name what is missing from the shortest path to a working product, and put that first.
+
+For everything else, ask whether the path has ever fired, and say the number. Zero observations means defer it and say so out loud, rather than ranking it by how bad the failure would be.
+
+Three measurements produced this rule, all taken on 2026-09-14.
+
+1. Slice 2, the daemon, stood at 43 issues closed and 32 open. Slice 4, the read layer, stood at 0 closed.
+2. The lake held one real capture day, 2026-09-14 with 9,839,816 chain rows, and no supported way to read any of it. There is no loader in `src/lake`.
+3. The family of fixes around a retyped known field hardened the `extra` overflow path, which was non-null on zero of those 9,842,636 rows.
+
+Ranking by severity has no stopping condition. That is how the capture path came to be hardened three times over while the lake stayed unreadable.
+
+A large deliverable gets split to the part that runs against data that already exists. D17's `load_chain` reads sealed chains partitions today, while its `load_bars` waits on D16's bars, which slice 3 has not built.
+
+The price is named rather than hidden. Shipping the usable path first leaves known gaps open on paths with no observations, and one of them will eventually fire. That is accepted on purpose. A lake nobody can read produces no evidence about which hardening mattered, so the deferred work is also the work with the least behind it.
+
 ## Writing style (owner directive, 2026-08-26)
 
 Clarity comes first. Write plain sentences a reader understands on one read. Prefer short, complete sentences, but never at the cost of clarity. Do not chop an idea into cryptic one-idea fragments. When a short sentence turns hard to parse, write the clear sentence instead, even if it runs a little longer. Explain as you go, like teaching, so the reader follows without backtracking. Avoid em dashes and semicolons. Break a genuinely long sentence into two when that reads better. This applies to every prose surface: this file, the design doc, commit messages, PR bodies, and chat replies. Use plain language. Give the intuition first. Put the precise rule right behind it.
