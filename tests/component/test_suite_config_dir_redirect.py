@@ -7,12 +7,14 @@ Before the redirect, what it resolved was the machine's real ``~/.config/marketl
 with a live Schwab token in it and nothing to refuse a write.
 
 So ``tests/conftest.py`` exports ``MARKETLAKE_CONFIG_DIR`` at a throwaway directory when
-it is imported. These tests drive that from both sides. One side is a child spawned the
-plain way, with no environment arranged for it, which is the shape a test writes without
-thinking about the config directory at all. The other side is this process, whose
-module-level defaults move with the children rather than staying behind. Which constants
-those are is read out of ``src/lake`` rather than written down here, so a new one joins
-without anyone remembering to come back.
+it is imported, and deletes any ``MARKETLAKE_CONFIG`` it inherited beside it. The second
+is the file, which the directory redirect cannot move, and ``load_config`` reads it first.
+These tests drive the redirect from both sides, and the deletion from the child side. One
+side is a child spawned the plain way, with no environment arranged for it, which is the
+shape a test writes without thinking about the config directory at all. The other side is
+this process, whose module-level defaults move with the children rather than staying
+behind. Which constants those are is read out of ``src/lake`` rather than written down
+here, so a new one joins without anyone remembering to come back.
 
 A child handed an explicit ``env=`` is outside the redirect, since it carries only what
 that mapping names, and so is anything the rendered ``reauth.sh`` runs, since that script
@@ -38,6 +40,7 @@ import sys
 from importlib import import_module
 from pathlib import Path
 
+from lake.config import CONFIG_PATH_ENV
 from lake.paths import CONFIG_DIR_ENV, CONFIG_DIR_PARTS, TOKEN_FILE, config_dir
 from tests.component.test_config_dir_override import (
     _DEFAULTS,
@@ -183,6 +186,45 @@ print(json.dumps({"before": before, "after": os.environ[CONFIG_DIR_ENV]}))
     # runs on one machine share a config directory and the first to finish deletes it
     # from under the second. A fixed path passes every other assertion in this file.
     assert result["after"] != str(THROWAWAY)
+
+
+def test_an_inherited_config_file_is_deleted_rather_than_honoured():
+    """The same rule as its sibling above, for the variable that names a file.
+
+    ``MARKETLAKE_CONFIG`` is what ``load_config`` reads before the default, and the
+    directory redirect does not reach it, because that one names a directory and this one
+    names a file. An inherited value would decide which ``config.yaml`` the suite resolves,
+    the operator's real one included, now that ``loader.load_chain`` resolves config when
+    it is given no lake root.
+
+    A child is the only place this can be asked, for the reason the sibling gives: importing
+    ``tests.conftest`` is what runs the deletion, and this process already ran it once. That
+    also fixes how the child names the variable. It has to read the value before importing
+    ``tests.conftest``, and importing ``lake.config`` to get the name would bind that
+    module's default against the sentinel directory, which ``tests/conftest.py`` refuses to
+    import after. So the parent interpolates the name and the child spells no import of its
+    own.
+    """
+    sentinel = "/tmp/marketlake-inherited-config-that-must-not-survive.yaml"
+    script = f"""
+import json, os
+name = {CONFIG_PATH_ENV!r}
+before = os.environ.get(name)
+import tests.conftest
+print(json.dumps({{"before": before, "after": os.environ.get(name)}}))
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        env={**os.environ, CONFIG_PATH_ENV: sentinel},
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["before"] == sentinel
+    assert result["after"] is None
 
 
 def test_the_redirect_moved_every_default_in_this_process_too():

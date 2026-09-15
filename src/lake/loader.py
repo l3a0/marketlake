@@ -167,8 +167,17 @@ back quietly wrong rather than loudly refused, and each raises instead.
    the minute asked for. A read that found its minute has no ambiguity to resolve, so one
    unreadable value elsewhere in the day does not take the answer away.
 
-Nothing here reads a clock, a config file, or the network. ``lake_root`` is an argument,
-so a test points it at a fixture lake and a caller points it at the configured root.
+Nothing here reads a clock or the network. One line reads a config file, and it is the
+branch at the top of ``load_chain`` that resolves ``lake_root=None`` to the configured
+lake. Every resolution below that line takes the root as an argument, so a test points it
+at a fixture lake and no helper here reaches for config.
+
+That branch is the only call to ``load_config`` in ``src/lake`` that names no config path
+and does not sit in a ``main``. The other two no-argument calls are ``probe.main`` and
+``record.main``, and every remaining call in the package is handed a path by its caller,
+the eight ``*_from_config`` wiring functions included. So a reader who expects a config
+path to arrive as an argument finds the one place it does not, written down here rather
+than generalised.
 """
 
 from __future__ import annotations
@@ -187,6 +196,7 @@ import pyarrow.parquet as pq
 
 from lake import journal
 from lake.calendar import MARKET_TZ
+from lake.config import load_config
 from lake.extra_projection import EXTRA_COLUMN, ExtraProjection, project_extra
 from lake.manifest import is_quarantined, latest_quarantine
 from lake.paths import CHAINS, LakePaths
@@ -365,11 +375,11 @@ class PartialRead(LoadError):
 
 
 def load_chain(
-    lake_root: Path | str,
     ticker: str,
     day: date | str,
     snap: str | None = None,
     *,
+    lake_root: Path | str | None = None,
     include_quarantined: bool = False,
 ) -> pa.Table:
     """The chain for one ticker and session, at one minute, as a table of data rows.
@@ -380,19 +390,43 @@ def load_chain(
     ``include_quarantined`` reads a partition the battery flagged. It defaults off, so a
     caller that has not decided what a bad partition means never silently gets one.
 
+    ``lake_root=None`` reads the lake that ``config.yaml`` names. A root given here is used
+    as given, and is never checked against the configured one or replaced when it turns out
+    to hold nothing. An explicit root that names an empty directory is a refusal rather
+    than a quiet read of the production lake, which is what points a test at a fixture lake
+    and keeps it there.
+
+    The root is keyword-only rather than a fourth positional argument, so an old call
+    cannot bind onto the new parameters. The old shape was
+    ``load_chain(root, ticker, day, snap)``. A fourth positional root would still accept
+    those four arguments, landing the root on ``ticker`` and the minute on ``lake_root``,
+    and the read would build a path out of a minute. Keyword-only rejects that call where
+    it is written instead. The three-argument ``load_chain(root, ticker, day)`` is not
+    rejected either way, because ``ticker``, ``day``, and ``snap`` take three positional
+    arguments between them under both shapes. The root lands on ``ticker`` there, and the
+    read resolves the configured lake and raises ``PartitionAbsent`` against it.
+
     Every way a read resolves to no table raises a ``LoadError``, a malformed ``snap``
-    included. A lake whose files contradict their own writers raises that file's own
-    module's error instead, ``ExtraProjectionError`` for an overflow that is not JSON and
-    ``ManifestError`` for a ledger line naming no partition. Those say the lake is damaged
-    rather than that this read found nothing, and folding them in would blur the two. The
-    first of them reaches the rows this read is made of rather than every row of the
-    session, which the module docstring's account of the two passes settles. Sweeping a
-    partition for damage is the validation battery's job rather than this reader's.
+    included. Three conditions raise something other than a ``LoadError``, because each
+    one means the read stopped before it could establish that nothing matched.
+
+    1. A machine with no ``config.yaml`` raises ``ConfigError`` out of the resolution
+       above. That says the machine is unconfigured.
+    2. An overflow value that is not JSON raises ``ExtraProjectionError``.
+    3. A ledger line naming no partition raises ``ManifestError``.
+
+    The last two say the lake's own files contradict their writers, so each raises the
+    error of the module that owns that file. Folding any of the three into ``LoadError``
+    would blur an unconfigured machine, or a damaged lake, with a read that found nothing.
+    ``ExtraProjectionError`` reaches the rows this read is made of rather than every row
+    of the session, which the module docstring's account of the two passes settles.
+    Sweeping a partition for damage is the validation battery's job rather than this
+    reader's.
 
     Nothing comes back empty, because an empty chain and an absent one read the same to a
     caller and mean opposite things.
     """
-    root = Path(lake_root)
+    root = Path(load_config().lake_root if lake_root is None else lake_root)
     day_text = day.isoformat() if isinstance(day, date) else str(day)
     path = LakePaths(root).chains_partition_path(ticker, day_text)
     if not (path.is_file() and _spelled_exactly(root, path)):

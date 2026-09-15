@@ -1,15 +1,17 @@
 """Shared fixtures that expose the four seams and the fixture-lake builder.
 
-It also carries three guards, one redirect, and one check on the outcome. The network
-guard fails any test that reaches another machine from inside this process. The
-subprocess guard fails any test that shells out to rsync, launchctl, pmset, or tmutil.
-The config-directory guard fails any test that writes under the machine's real
+It also carries three guards, one redirect, one deletion, and one check on the outcome.
+The network guard fails any test that reaches another machine from inside this process.
+The subprocess guard fails any test that shells out to rsync, launchctl, pmset, or
+tmutil. The config-directory guard fails any test that writes under the machine's real
 ``~/.config/marketlake/``, and its other half, the predicate deciding what counts as that
 directory, sits in ``tests/support/config_guard.py`` so a child can ask without importing
 this file. The redirect points this process, and every child that inherits its
 environment, at a throwaway config directory, which is what covers the children the three
-guards cannot reach. The check on the outcome lists the real config directory when this
-file is imported and again when the session ends, and fails the run when it changed.
+guards cannot reach. The deletion drops an inherited ``MARKETLAKE_CONFIG``, which names a
+config file rather than a directory and so is not moved by that redirect. The check on the
+outcome lists the real config directory when this file is imported and again when the
+session ends, and fails the run when it changed.
 """
 
 from __future__ import annotations
@@ -104,6 +106,7 @@ os.environ[CONFIG_DIR_ENV] = _THROWAWAY_CONFIG_DIR
 atexit.register(shutil.rmtree, _THROWAWAY_CONFIG_DIR, ignore_errors=True)
 
 from lake.cassette import load_cassette  # noqa: E402
+from lake.config import CONFIG_PATH_ENV  # noqa: E402
 from tests.support.clock import ManualClock  # noqa: E402
 from tests.support.config_guard import (  # noqa: E402
     REAL_CONFIG_DIR,
@@ -111,6 +114,23 @@ from tests.support.config_guard import (  # noqa: E402
 )
 from tests.support.lake import FixtureLake  # noqa: E402
 from tests.support.vendor import CassetteVendor  # noqa: E402
+
+# An inherited ``MARKETLAKE_CONFIG`` is deleted for the same reason the directory above is
+# replaced. ``load_config`` checks that variable before the default, and it names a file
+# rather than a directory, so the redirect above does not move it. Without this line, a
+# test that omits ``lake_root`` would resolve the real ``config.yaml`` on a machine whose
+# shell exported one, and the throwaway path only on a machine where it did not. Resolving
+# it merely reads the file, so nothing is lost, but where the suite's reads land is not for
+# the launching shell to decide.
+#
+# It runs once at import rather than per test, because what it covers is a child that
+# inherits this process's environment, and a child spawned outside a test body would
+# inherit a value a per-test fixture had put back. A test setting the variable through
+# ``monkeypatch.setenv`` is untouched either way.
+# ``test_an_inherited_config_file_is_deleted_rather_than_honoured`` in
+# ``tests/component/test_suite_config_dir_redirect.py`` is what checks this, from a child,
+# on a machine that exported nothing of its own.
+os.environ.pop(CONFIG_PATH_ENV, None)
 
 # A fixed instant for the default manual clock: 2026-08-24 09:30 ET.
 _DEFAULT_NOW = datetime(2026, 8, 24, 13, 30, tzinfo=UTC)
