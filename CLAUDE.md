@@ -6,16 +6,17 @@ Marketlake is a capture-first market data lake. It records full option chains an
 
 The price of this is named rather than hidden: the same substance now exists in an issue and in the doc that reasons about it, so the two can drift. The issue wins. When they disagree, the doc is what gets corrected.
 
-**Rank work by what makes the product usable (owner directive, 2026-09-14).** Capture reliability still ranks first, as the premise in [docs/design.md](docs/design.md) states. This directive decides what comes next, and what comes next is not severity. Before proposing an order, name what is missing from the shortest path to a product someone can use, and put that first.
+**Rank work by what makes the product usable (owner directive, 2026-09-14).** Capture reliability still ranks first, as the premise in [docs/design.md](docs/design.md) states, and [docs/build-plan.md](docs/build-plan.md) still carries the slice order and the dependencies between slices. This directive decides what to take next from the work those two allow, and what decides it is not severity. Before proposing an order, name what is missing from the shortest path to a product someone can use, and put that first.
 
 Then ship it, use it, and let what breaks set the order after that. Evidence from real use outranks any ranking made in advance, including this one.
 
-For everything else in the product's own code, ask how many times the path has run, and give the count. Zero means defer the work and say that in the proposal.
+For everything else in the product's own code, ask how many times the path has run, and give the count. Zero means defer the work, and write the deferral on its issue so the next reader finds it rather than only the next message.
 
-Two exceptions come from the design's own reasoning.
+Three exceptions come from the design's own reasoning.
 
-1. A path that can lose or corrupt a captured minute is never deferred. That minute is gone forever, while everything computed downstream is regenerable. The design already defers on that axis rather than on this one.
+1. A path that can lose or corrupt a captured minute is never deferred. That minute is gone forever, while everything computed downstream is regenerable.
 2. An alarm reads zero while it is healthy, so the count says nothing about it. The dead-man, the watchdog, the Sunday canary, and the backup sit outside this rule. Count the cycles they watched, not the times they fired.
+3. A guard whose price is paid by building it late is not cheaper deferred. The chain loader's quarantine exclusion is inert until the validation battery writes a verdict, and adding it afterwards leaves a second read path that skips it.
 
 Three measurements produced this rule.
 
@@ -25,9 +26,9 @@ Three measurements produced this rule.
 
 Ranking by severity never runs out of work, because any path with no test behind it can be called a failure waiting to happen. That is how three rounds of hardening reached the capture path while the lake stayed unreadable.
 
-Cut a large deliverable down to the part that runs against data the lake already holds. Deliverable 17 in [docs/build-plan.md](docs/build-plan.md) is the example. Its chain loader reads partitions that exist today, while its bars loader waits on deliverable 16, which slice 3 has not built. A cut like that obeys the closing rule below: the shipping pull request writes `Part of`, and the issue keeps what is left.
+Cut a large deliverable down to the part that runs against data the lake already holds. Its issue stays the source of truth for what the deliverable is, so the cut is proposed there first. The shipping pull request then writes `Part of`, and the issue keeps the remainder, per the closing rule below.
 
-The price of this is named rather than hidden. Shipping the usable path first leaves gaps open on paths nothing has exercised, and one of them will eventually cost something. That is accepted on purpose, inside the two exceptions above. A lake nobody can read produces no evidence about which hardening mattered, so the deferred work is also the work with the least evidence behind it.
+The price of this is named rather than hidden. Shipping the usable path first leaves gaps open on paths nothing has exercised, and one of them will eventually cost something. That is accepted on purpose, inside the three exceptions above. A lake nobody can read produces no evidence about which hardening mattered, so the deferred work is also the work with the least evidence behind it.
 
 ## Writing style (owner directive, 2026-08-26)
 
