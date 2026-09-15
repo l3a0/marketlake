@@ -447,6 +447,69 @@ def test_a_nap_after_a_surface_has_paged_does_not_page_again():
         )
 
 
+def test_a_stall_that_trips_one_surface_while_the_others_sit_below_still_pages():
+    # The roster is rarely uniform. Surfaces recover at different minutes, so the stall
+    # that pushes one of them over arrives while the rest are nowhere near. The page
+    # carries the minutes of the surface that tripped, not the slot it tripped on.
+    watchdog = Watchdog()
+    roster = _roster(1)
+    for minute in range(2):
+        watchdog.observe(
+            _cycle(
+                _seg("chains", "T000", "gap"),
+                _seg("quotes", "T000", "data"),
+                at=_at(minute),
+            )
+        )
+    pages = watchdog.missed(roster, [_at(2)])
+    assert [page.title for page in pages] == ["Capture down: loop overran"]
+    assert pages[0].minutes == 3
+    assert len(pages[0].surfaces) == 2
+    assert watchdog.count("quotes", "T000") == 1
+
+
+def test_a_barren_cycle_between_two_stalls_does_not_re_arm_the_page():
+    # What re-arms the stall page is a durable data cycle, because that is what proves
+    # the loop is running again. A cycle that ran and gapped everything is the outage
+    # carrying on, so the next stall inside it is not a second finding.
+    watchdog = Watchdog()
+    roster = _roster(2)
+    assert len(watchdog.missed(roster, [_at(minute) for minute in range(3)])) == 1
+    watchdog.observe(_cycle(*[_seg(key.surface, key.ticker, "gap") for key in roster], at=_at(3)))
+    assert watchdog.missed(roster, [_at(minute) for minute in range(4, 7)]) == []
+
+
+def test_slots_out_of_order_charge_the_same_as_slots_in_order():
+    # The date-roll guard reads the slots in time order, so the order they arrive in
+    # cannot decide what the page says. A shuffled run that crosses a session date would
+    # otherwise charge yesterday's minutes onto today's counters.
+    slots = [_at(minute) for minute in range(50)] + [_at(minute, day=3) for minute in range(4)]
+    in_order = Watchdog()
+    shuffled = Watchdog()
+    ordered_pages = in_order.missed(_roster(2), slots)
+    shuffled_pages = shuffled.missed(_roster(2), list(reversed(slots)))
+    assert [page.minutes for page in shuffled_pages] == [page.minutes for page in ordered_pages]
+    assert shuffled.count("chains", "T000") == in_order.count("chains", "T000") == 4
+
+
+def test_a_call_with_nothing_to_charge_pages_nothing():
+    """An empty roster and an empty run of slots are both nothing happening.
+
+    A fully retired lake is a supported state, and a call carrying no slots is a stall
+    that did not happen. Neither is a fact about the loop, so neither raises a page, and
+    the counters standing past the threshold does not make one. The threshold is lowered
+    here the way a mid-session recalibration lowers it, which is how a counter comes to
+    sit past the threshold with no page of its own behind it.
+    """
+    threshold = [5]
+    watchdog = Watchdog(page_minutes=lambda: threshold[0])
+    roster = _roster(2)
+    assert watchdog.missed(roster, [_at(minute) for minute in range(3)]) == []
+    threshold[0] = 3
+    assert watchdog.missed(roster, []) == []
+    assert watchdog.missed([], [_at(minute) for minute in range(10)]) == []
+
+
 def test_a_stall_pages_again_on_the_next_session_date():
     # The sibling of the counter rule and the cause rule. A stall flag carried overnight
     # would silence the next morning's first stall, however long that one ran.

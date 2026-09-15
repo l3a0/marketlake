@@ -216,6 +216,8 @@ class Watchdog:
         durable data cycle proves the loop is running and re-arms it, and so does the
         session date.
         """
+        if not slots:
+            return []
         watched = list(surfaces)
         # One overrun is reported in a single call, so the threshold is read once for the
         # batch rather than per slot.
