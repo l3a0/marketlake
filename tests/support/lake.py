@@ -108,13 +108,36 @@ def sample_chains_table(rows: Sequence[dict] | None = None) -> pa.Table:
 
 
 def sample_quotes_table(rows: Sequence[dict] | None = None) -> pa.Table:
-    """A small quotes table in the fixture schema. Defaults to one data row."""
+    """A small quotes table in the fixture schema.
+
+    Defaults to three rows mirroring what a sealed quotes partition actually carries: an
+    intraday row with no close tag, the equity close tagged ``spot_close``, and the option
+    close tagged ``option_close``. The underlying is captured in both close cycles, so a
+    quotes partition carries both tags, and a default that carried only one could not tell
+    a reader resolving the right one from a reader that inherited the other.
+    """
     if rows is None:
         rows = [
             {
-                "snap_ts": "2026-08-24T16:15:00-04:00",
-                "fetch_ts": "2026-08-24T16:15:00.300-04:00",
-                "vendor_quote_ts": "2026-08-24T16:15:00-04:00",
+                "snap_ts": "2026-08-24T13:30:00-04:00",
+                "fetch_ts": "2026-08-24T13:30:00.300-04:00",
+                "vendor_quote_ts": "2026-08-24T13:30:00-04:00",
+                "ticker": "SPY",
+                "bid": 649.50,
+                "ask": 649.55,
+                "last": 649.52,
+                "row_kind": "data",
+                "error_class": None,
+                "suspect": False,
+                "close_tag": None,
+                "session_phase": None,
+                "schema_version": 1,
+                "extra": None,
+            },
+            {
+                "snap_ts": "2026-08-24T16:00:00-04:00",
+                "fetch_ts": "2026-08-24T16:00:00.300-04:00",
+                "vendor_quote_ts": "2026-08-24T16:00:00-04:00",
                 "ticker": "SPY",
                 "bid": 649.98,
                 "ask": 650.02,
@@ -122,11 +145,27 @@ def sample_quotes_table(rows: Sequence[dict] | None = None) -> pa.Table:
                 "row_kind": "data",
                 "error_class": None,
                 "suspect": False,
+                "close_tag": "spot_close",
+                "session_phase": None,
+                "schema_version": 1,
+                "extra": None,
+            },
+            {
+                "snap_ts": "2026-08-24T16:15:00-04:00",
+                "fetch_ts": "2026-08-24T16:15:00.300-04:00",
+                "vendor_quote_ts": "2026-08-24T16:15:00-04:00",
+                "ticker": "SPY",
+                "bid": 650.10,
+                "ask": 650.15,
+                "last": 650.12,
+                "row_kind": "data",
+                "error_class": None,
+                "suspect": False,
                 "close_tag": "option_close",
                 "session_phase": None,
                 "schema_version": 1,
                 "extra": None,
-            }
+            },
         ]
     return _table(FIXTURE_QUOTES_SCHEMA, rows)
 

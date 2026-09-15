@@ -288,6 +288,8 @@ def test_a_session_with_no_option_close_tag_raises(fixture_lake: FixtureLake):
         load_chain("QQQ", FULL_DAY, lake_root=root)
 
     assert caught.value.tagged_gaps == 0
+    assert caught.value.close_tag == "option_close"
+    assert caught.value.ticker == "QQQ"
     assert "option_close" in str(caught.value)
 
 

@@ -1,13 +1,15 @@
-"""The read layer's door onto sealed chain partitions.
+"""The read layer's door onto sealed chains and quotes partitions.
 
 The lake has been write-only. Capture seals a ticker-day into one immutable Parquet
 partition at close+15, the manifest checksums it, and until now nothing in ``src/lake``
 read it back. ``load_chain`` is that read, and it is the first one, so every rule the
 design puts on reading sealed data has to live here rather than beside each caller.
+``load_quotes`` is the same machinery pointed at the underlying's quote instead of the
+chain, sharing every rule below except which tag its close of record resolves against.
 
-A reader asks for a ticker, a session date, and a minute. It gets back the chain as it
-stood at that minute, as a ``pyarrow.Table``. That matches what the lake stores, and
-``.to_pandas()`` is one call for anyone who wants a frame.
+A reader asks for a ticker, a session date, and a minute. It gets back the chain, or the
+underlying's quote, as it stood at that minute, as a ``pyarrow.Table``. That matches what
+the lake stores, and ``.to_pandas()`` is one call for anyone who wants a frame.
 
 Four defaults are settled by marketlake #135, which is authoritative for this deliverable.
 
@@ -21,13 +23,17 @@ Four defaults are settled by marketlake #135, which is authoritative for this de
 
 Two resolutions, and each resolves against exactly one column.
 
-*The close of record.* ``snap=None`` means the session's option-close snapshot, and it
+*The close of record.* ``snap=None`` means the session's close-of-record snapshot, and it
 resolves against the ``close_tag`` column that capture stamped on every row of that
-cycle. It never does timestamp arithmetic, because the option close moves with the
-calendar's half days and the tag is what capture actually observed. A session whose rows
-carry no ``option_close`` tag raises ``NoOptionClose``. It never substitutes the last
-snapshot of the day, because a reader asking for the close of record and silently getting
-15:59 has no way to tell.
+cycle. It never does timestamp arithmetic, because the close moves with the calendar's
+half days and the tag is what capture actually observed. Which tag names that cycle is a
+property of the surface: chains resolve against ``option_close``, the option market's
+close, and quotes resolve against ``spot_close``, the equity close. A quotes partition
+carries both tags, because the underlying is captured in both close cycles, and only one
+of them is that surface's close of record. A session whose rows carry no matching tag
+raises ``NoOptionClose`` on chains and ``NoSpotClose`` on quotes, siblings under the
+shared ``NoCloseOfRecord``. It never substitutes the last snapshot of the day, because a
+reader asking for the close of record and silently getting 15:59 has no way to tell.
 
 *An intraday minute.* ``snap='10:31'`` resolves against ``snap_ts``, the minute slot the
 cycle was scheduled for, and never against ``fetch_ts``, which is when the request went
@@ -161,16 +167,17 @@ back quietly wrong rather than loudly refused, and each raises instead.
 1. A row whose ``row_kind`` is null is neither a vendor observation nor an absence marker,
    and Arrow's filter drops it from both sides. It would vanish from the result and from
    the counts that explain an empty one.
-2. An ``option_close`` tag on two cycles would return a chain stitched from two minutes.
-   A close of record is one cycle.
+2. A close tag on two cycles would return a table stitched from two minutes. A close of
+   record is one cycle.
 3. A ``snap_ts`` that cannot be read as an instant is refused only when nothing matched
    the minute asked for. A read that found its minute has no ambiguity to resolve, so one
    unreadable value elsewhere in the day does not take the answer away.
 
 Nothing here reads a clock or the network. One line reads a config file, and it is the
-branch at the top of ``load_chain`` that resolves ``lake_root=None`` to the configured
-lake. Every resolution below that line takes the root as an argument, so a test points it
-at a fixture lake and no helper here reaches for config.
+branch at the top of ``_load_surface``, the body ``load_chain`` and ``load_quotes`` share,
+that resolves ``lake_root=None`` to the configured lake. Every resolution below that line
+takes the root as an argument, so a test points it at a fixture lake and no helper here
+reaches for config.
 
 That branch is the only call to ``load_config`` in ``src/lake`` that names no config path
 and does not sit in a ``main``. The other two no-argument calls are ``probe.main`` and
@@ -199,14 +206,14 @@ from lake.calendar import MARKET_TZ
 from lake.config import load_config
 from lake.extra_projection import EXTRA_COLUMN, ExtraProjection, project_extra
 from lake.manifest import is_quarantined, latest_quarantine
-from lake.paths import CHAINS, LakePaths
+from lake.paths import CHAINS, QUOTES, LakePaths
 from lake.schema_versions import SchemaVersionLedger, ledger_path
-from lake.session import OPTION_CLOSE
+from lake.session import OPTION_CLOSE, SPOT_CLOSE
 
-# The three columns a chain read resolves against: ``snap_ts`` is the minute slot the
-# cycle was scheduled for, ``close_tag`` is the tag capture stamps on a close-of-record
-# cycle, and ``row_kind`` tells a vendor observation from an absence marker. The row-kind
-# names come from the writer rather than being spelled again here.
+# The three columns a read resolves against, on either surface: ``snap_ts`` is the minute
+# slot the cycle was scheduled for, ``close_tag`` is the tag capture stamps on a
+# close-of-record cycle, and ``row_kind`` tells a vendor observation from an absence
+# marker. The row-kind names come from the writer rather than being spelled again here.
 SNAP_TS_COLUMN = "snap_ts"
 CLOSE_TAG_COLUMN = "close_tag"
 ROW_KIND_COLUMN = journal.ROW_KIND_COLUMN
@@ -224,13 +231,16 @@ _SNAP_SHAPE = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
 
 __all__ = [
     "LoadError",
+    "NoCloseOfRecord",
     "NoOptionClose",
+    "NoSpotClose",
     "PartialRead",
     "PartitionAbsent",
     "PartitionQuarantined",
     "SnapAbsent",
     "SnapMalformed",
     "load_chain",
+    "load_quotes",
 ]
 
 
@@ -242,7 +252,7 @@ class PartitionAbsent(LoadError):
     """Raised when the ticker-day has no sealed partition spelled the way it was asked for.
 
     A session the lake never captured and today's session before close+15 both land here.
-    Neither is an empty chain, so neither comes back as an empty table.
+    Neither is an empty read, so neither comes back as an empty table.
 
     A ticker whose case does not match the directory on disk lands here too. macOS matches
     a path case-insensitively, so ``ticker=spy`` opens the ``ticker=SPY`` partition while
@@ -277,46 +287,78 @@ class SnapMalformed(LoadError, ValueError):
     """
 
 
-class NoOptionClose(LoadError):
-    """Raised when a session's rows carry no ``option_close`` tag on a data row.
+class NoCloseOfRecord(LoadError):
+    """Raised when a session's rows carry no data row tagged the surface's close of record.
 
     This is the explicit marker the design asks for. The close of record is the one
     snapshot a reader cannot be quietly handed a substitute for, so the last snapshot of
     the day is never returned in its place.
 
-    ``tagged_gaps`` counts absence markers that do carry the tag, which tells the two cases
+    Which tag names that cycle is a property of the surface, and each surface raises its
+    own sibling rather than this base directly: ``NoOptionClose`` names ``option_close`` on
+    chains, and ``NoSpotClose`` names ``spot_close`` on quotes. Both carry the tag on
+    ``close_tag`` for a caller that catches the base and wants to know which one fired.
+
+    ``tagged_gaps`` counts absence markers that do carry the tag, which tells two cases
     apart. Zero means the close-of-record cycle never ran. A positive count means it ran
     and failed, and the failure is recorded in the partition. Reading every sealed
-    ticker-day in the lake on 2026-09-14 raised this eight times out of eleven, and each of
-    the eight carried exactly one tagged gap row, which said an auth error took the close
-    rather than the cycle never having been scheduled.
+    ticker-day in the lake on 2026-09-14 raised ``NoOptionClose`` eight times out of eleven,
+    and each of the eight carried exactly one tagged gap row, which said an auth error took
+    the close rather than the cycle never having been scheduled.
     """
 
-    def __init__(self, ticker: str, day: str, tagged_gaps: int) -> None:
+    def __init__(self, close_tag: str, ticker: str, day: str, tagged_gaps: int) -> None:
         detail = (
             f"{tagged_gaps} tagged gap rows record the attempt"
             if tagged_gaps
             else "no cycle recorded the attempt"
         )
         super().__init__(
-            f"{ticker} {day} has no {OPTION_CLOSE}-tagged data row, and {detail}. "
+            f"{ticker} {day} has no {close_tag}-tagged data row, and {detail}. "
             "The close of record is never substituted."
         )
+        self.close_tag = close_tag
         self.ticker = ticker
         self.day = day
         self.tagged_gaps = tagged_gaps
 
 
+class NoOptionClose(NoCloseOfRecord):
+    """Raised when a chains session's rows carry no ``option_close`` tag on a data row.
+
+    The chains sibling of ``NoCloseOfRecord``, shipped under this name by #241 before the
+    base existed. The name stays, because it is public API and renaming it breaks a caller
+    already catching it.
+    """
+
+    def __init__(self, ticker: str, day: str, tagged_gaps: int) -> None:
+        super().__init__(OPTION_CLOSE, ticker, day, tagged_gaps)
+
+
+class NoSpotClose(NoCloseOfRecord):
+    """Raised when a quotes session's rows carry no ``spot_close`` tag on a data row.
+
+    The quotes sibling of ``NoOptionClose``. A quotes partition carries both close tags,
+    because the underlying is captured in both close cycles, so this is the marker for the
+    tag ``load_quotes`` actually resolves against, ``spot_close``, the equity close of
+    record.
+    """
+
+    def __init__(self, ticker: str, day: str, tagged_gaps: int) -> None:
+        super().__init__(SPOT_CLOSE, ticker, day, tagged_gaps)
+
+
 class SnapAbsent(LoadError):
     """Raised when no data row carries the requested minute.
 
-    Returning an empty table would read as a chain with no contracts, which is a different
-    answer from a minute the capture loop never recorded.
+    Returning an empty table would read as a chain with no contracts, or a quote with
+    nothing in it, which is a different answer from a minute the capture loop never
+    recorded.
 
-    ``tagged_gaps`` counts absence markers at that minute, the same way ``NoOptionClose``
-    does. ``unreadable`` names every ``snap_ts`` in the partition that could not be read as
-    an instant, because a read that found nothing cannot claim the minute is absent while
-    values it could not read sit beside the answer.
+    ``tagged_gaps`` counts absence markers at that minute, the same way ``NoCloseOfRecord``
+    counts them for its own tag. ``unreadable`` names every ``snap_ts`` in the partition
+    that could not be read as an instant, because a read that found nothing cannot claim
+    the minute is absent while values it could not read sit beside the answer.
     """
 
     def __init__(
@@ -352,11 +394,13 @@ class PartialRead(LoadError):
     which is what ``include_quarantined`` is for on the guard that has one.
     """
 
-    def __init__(self, ticker: str, day: str, projection: ExtraProjection) -> None:
+    def __init__(self, ticker: str, day: str, surface: str, projection: ExtraProjection) -> None:
         parts = []
         if projection.unrecorded_versions:
             versions = ", ".join(str(v) for v in projection.unrecorded_versions)
-            parts.append(f"the schema-version ledger holds no chains shape for version {versions}")
+            parts.append(
+                f"the schema-version ledger holds no {surface} shape for version {versions}"
+            )
         for unfit in projection.unfit:
             parts.append(
                 f"{unfit.rows} rows at version {unfit.schema_version} hold an "
@@ -371,6 +415,7 @@ class PartialRead(LoadError):
         super().__init__(f"{ticker} {day} reads partial. " + ". ".join(parts) + ".")
         self.ticker = ticker
         self.day = day
+        self.surface = surface
         self.projection = projection
 
 
@@ -426,12 +471,80 @@ def load_chain(
     Nothing comes back empty, because an empty chain and an absent one read the same to a
     caller and mean opposite things.
     """
+    return _load_surface(
+        ticker,
+        day,
+        snap,
+        lake_root=lake_root,
+        include_quarantined=include_quarantined,
+        surface=CHAINS,
+        close_tag=OPTION_CLOSE,
+        no_close_error=NoOptionClose,
+    )
+
+
+def load_quotes(
+    ticker: str,
+    day: date | str,
+    snap: str | None = None,
+    *,
+    lake_root: Path | str | None = None,
+    include_quarantined: bool = False,
+) -> pa.Table:
+    """The underlying's quote for one ticker and session, at one minute, as a table of data rows.
+
+    The signature, the resolutions, and every guard match ``load_chain``, pointed at the
+    quotes surface instead. ``snap=None`` is the session's equity-close snapshot, resolved
+    against ``close_tag``. ``snap='10:31'`` is that ET wall-clock minute, resolved against
+    ``snap_ts``. ``include_quarantined`` and ``lake_root`` carry the same meaning and the
+    same defaults ``load_chain`` gives them.
+
+    The one difference is which tag the close of record resolves against. A quotes
+    partition carries both ``option_close`` and ``spot_close``, because the underlying is
+    captured in both close cycles, and only the equity close is this surface's close of
+    record. ``spot_close`` is the design's pinned name for it. A session whose rows carry
+    no ``spot_close`` tag raises ``NoSpotClose`` rather than ``NoOptionClose``, so a caller
+    reading the exception name is told which tag was missing rather than being pointed at
+    the sibling surface's.
+    """
+    return _load_surface(
+        ticker,
+        day,
+        snap,
+        lake_root=lake_root,
+        include_quarantined=include_quarantined,
+        surface=QUOTES,
+        close_tag=SPOT_CLOSE,
+        no_close_error=NoSpotClose,
+    )
+
+
+def _load_surface(
+    ticker: str,
+    day: date | str,
+    snap: str | None,
+    *,
+    lake_root: Path | str | None,
+    include_quarantined: bool,
+    surface: str,
+    close_tag: str,
+    no_close_error: type[NoCloseOfRecord],
+) -> pa.Table:
+    """The body ``load_chain`` and ``load_quotes`` share, parameterised on what differs.
+
+    ``surface`` names the partition to ``lake.paths`` and the schema-shape lookup to
+    ``project_extra``. ``LakePaths.partition_path`` already dispatches a date-partitioned
+    partition on that same name, so nothing here needs a second, per-surface way to find
+    the file. ``close_tag`` is the tag the close of record resolves against, and
+    ``no_close_error`` is the exception raised when no row carries it, so each surface
+    names its own marker rather than the other's.
+    """
     root = Path(load_config().lake_root if lake_root is None else lake_root)
     day_text = day.isoformat() if isinstance(day, date) else str(day)
-    path = LakePaths(root).chains_partition_path(ticker, day_text)
+    path = LakePaths(root).partition_path(surface, ticker, day_text)
     if not (path.is_file() and _spelled_exactly(root, path)):
         raise PartitionAbsent(
-            f"{ticker} {day_text} has no sealed chains partition at {path}. "
+            f"{ticker} {day_text} has no sealed {surface} partition at {path}. "
             "A session seals at close+15, and a ticker is spelled as its directory is."
         )
 
@@ -452,14 +565,14 @@ def load_chain(
     data = resolved.filter(is_data)
 
     if snap is None:
-        selection = _at_close(resolved, data, ticker, day_text)
+        selection = _at_close(resolved, data, ticker, day_text, close_tag, no_close_error)
     else:
         selection = _at_minute(resolved, data, ticker, day_text, snap)
 
     fetched = _read(path, filters=_predicate(selection, pq.read_schema(path).names))
-    projection = project_extra(fetched, surface=CHAINS, ledger=_ledger(root))
+    projection = project_extra(fetched, surface=surface, ledger=_ledger(root))
     if not projection.complete:
-        raise PartialRead(ticker, day_text, projection)
+        raise PartialRead(ticker, day_text, surface, projection)
     table = projection.table
     return table.filter(
         pc.and_(
@@ -506,9 +619,9 @@ def _predicate(selection: _Selection, carried: Sequence[str]) -> ds.Expression:
     through.
 
     A partition whose schema has no ``extra`` column at all gets the first half alone.
-    Naming a column Parquet does not have fails the scan, and what a chains table missing
-    its overflow column means belongs to ``lake.extra_projection``, which says so by name
-    the moment the fetch hands it the rows. The column set needs no protecting on such a
+    Naming a column Parquet does not have fails the scan, and what a table missing its
+    overflow column means belongs to ``lake.extra_projection``, which says so by name the
+    moment the fetch hands it the rows. The column set needs no protecting on such a
     partition, because that refusal takes the read away either way.
     """
     rows = ds.field(selection.column).isin(selection.values)
@@ -517,24 +630,36 @@ def _predicate(selection: _Selection, carried: Sequence[str]) -> ds.Expression:
     return rows | ds.field(EXTRA_COLUMN).is_valid()
 
 
-def _at_close(resolved: pa.Table, data: pa.Table, ticker: str, day: str) -> _Selection:
-    """The session's option-close cycle, by tag and never by clock."""
-    tagged = data.filter(pc.equal(data.column(CLOSE_TAG_COLUMN), OPTION_CLOSE))
+def _at_close(
+    resolved: pa.Table,
+    data: pa.Table,
+    ticker: str,
+    day: str,
+    close_tag: str,
+    no_close_error: type[NoCloseOfRecord],
+) -> _Selection:
+    """The session's close-of-record cycle, by tag and never by clock.
+
+    ``close_tag`` is the tag that cycle carries on this surface, and ``no_close_error`` is
+    the marker raised when no row carries it, so a chains read and a quotes read each
+    resolve against their own tag and name their own exception when it is absent.
+    """
+    tagged = data.filter(pc.equal(data.column(CLOSE_TAG_COLUMN), close_tag))
     if tagged.num_rows == 0:
-        raise NoOptionClose(ticker, day, _tagged_gaps(resolved, OPTION_CLOSE))
+        raise no_close_error(ticker, day, _tagged_gaps(resolved, close_tag))
     spellings = pc.unique(tagged.column(SNAP_TS_COLUMN)).to_pylist()
     instants = {_instant(text) for text in spellings}
     if None in instants:
         raise LoadError(
-            f"{ticker} {day} tags {OPTION_CLOSE} on a row whose {SNAP_TS_COLUMN} cannot "
+            f"{ticker} {day} tags {close_tag} on a row whose {SNAP_TS_COLUMN} cannot "
             f"be read as an instant, among {sorted(str(text) for text in spellings)}."
         )
     if len(instants) > 1:
         raise LoadError(
-            f"{ticker} {day} tags {OPTION_CLOSE} on {len(instants)} cycles, "
+            f"{ticker} {day} tags {close_tag} on {len(instants)} cycles, "
             f"{sorted(str(moment) for moment in instants)}. A close of record is one cycle."
         )
-    return _Selection(CLOSE_TAG_COLUMN, (OPTION_CLOSE,))
+    return _Selection(CLOSE_TAG_COLUMN, (close_tag,))
 
 
 def _at_minute(resolved: pa.Table, data: pa.Table, ticker: str, day: str, snap: str) -> _Selection:
