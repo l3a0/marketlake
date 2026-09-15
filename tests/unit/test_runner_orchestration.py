@@ -64,6 +64,20 @@ def _all_gap_result() -> CycleResult:
     )
 
 
+def _mixed_result() -> CycleResult:
+    return CycleResult(
+        snap_ts=_SNAP,
+        segments=(
+            _segment("chains", "SPY", ROW_KIND_DATA),
+            _segment("quotes", "SPY", ROW_KIND_GAP),
+        ),
+    )
+
+
+def _no_segments_result() -> CycleResult:
+    return CycleResult(snap_ts=_SNAP, segments=())
+
+
 def _run(cycle_runner):
     events: list[str] = []
     pinger = FakePinger(events)
@@ -205,6 +219,31 @@ def test_a_failing_backup_blocks_the_ping_and_surfaces():
 def test_cycle_succeeded_predicate():
     assert runner.cycle_succeeded(_data_result()) is True
     assert runner.cycle_succeeded(_all_gap_result()) is False
+
+
+def test_cycle_succeeded_on_a_mixed_cycle():
+    # One surface landed data and the other gapped, the shape a real session produces
+    # whenever a ticker's fetch fails while another's lands. The cycle still captured
+    # real data, so it counts as succeeded.
+    assert runner.cycle_succeeded(_mixed_result()) is True
+
+
+def test_cycle_succeeded_on_no_segments():
+    # A cycle that journaled nothing and raised no write error is the crash-looping
+    # zombie the dead-man rule must stay silent for, not a success.
+    assert runner.cycle_succeeded(_no_segments_result()) is False
+
+
+def test_a_mixed_cycle_still_backs_up_and_pings():
+    # The predicate alone proves the boolean, not that `run_once` still reaches the
+    # ping on a mixed cycle. A wrong reading that treats a mixed cycle as failed would
+    # skip the backup and go silent on a run that captured real data.
+    outcome, pinger, backup, events = _run(_mixed_result)
+    assert outcome.succeeded is True
+    assert outcome.backed_up is True and outcome.pinged is True
+    assert backup.calls == [(_LAKE, _TARGET)]
+    assert pinger.urls == [_URL]
+    assert events == ["backup", "ping"]
 
 
 def test_main_wires_the_live_seams(tmp_path, monkeypatch, capsys):
