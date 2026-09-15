@@ -244,12 +244,13 @@ def append_line(path: Path, entry: dict) -> None:
     ``sort_keys`` keeps the on-disk bytes stable across callers. The line is written
     in one ``os.write`` so it cannot interleave with a concurrent append.
 
-    A file that does not end in a newline gets one first. The torn-tail rule assumes a
-    crash can only damage the last line, and appending straight onto a torn fragment would
-    fuse the fragment and this entry into one unparseable line, destroying an entry that
-    was written whole. Starting a new line leaves the fragment as its own line, which is
-    the one a reader discards. On a well-formed file this reads the last byte and writes
-    nothing extra.
+    One write is the whole rule, so nothing here reads the file first. Starting a new line
+    when the file does not end in one was tried, to keep a torn fragment from fusing with
+    the next entry, and it broke this rule two ways. It takes a second ``os.write``, which
+    another writer can interleave with, and its check can observe a concurrent write
+    partway and insert a blank line. ``test_concurrent_appends_never_interleave`` caught
+    the second within one run. A torn fragment therefore still costs the entry appended
+    after it, and repairing one is a human's job under the lock.
 
     This is the line primitive rather than the way to record a partition. A manifest entry
     goes through ``append_manifest``, which enforces the standing row-count invariant
@@ -258,25 +259,9 @@ def append_line(path: Path, entry: dict) -> None:
     line = (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     try:
-        if _needs_leading_newline(path):
-            os.write(fd, b"\n")
         os.write(fd, line)
     finally:
         os.close(fd)
-
-
-def _needs_leading_newline(path: Path) -> bool:
-    """Whether the file has bytes that do not end in a newline, so a torn tail is open."""
-    path = Path(path)
-    if not path.exists():
-        return False
-    with path.open("rb") as handle:
-        try:
-            handle.seek(-1, os.SEEK_END)
-        except OSError:
-            # An empty file cannot be seeked from its end, and has no open line anyway.
-            return False
-        return handle.read(1) != b"\n"
 
 
 def would_shrink(lake_root: Path, partition: str, rows: int) -> bool:

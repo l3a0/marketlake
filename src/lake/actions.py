@@ -11,12 +11,12 @@ writing beside a nightly job.
 
 1. *One entry is one line*, appended with a single ``O_APPEND`` write. A reader that
    meets a torn trailing line discards it, because a crash can only tear the last line.
-   ``append_line`` starts a new line when the file does not end in one, so a torn fragment
-   stays its own line rather than swallowing the bytes of the next entry. What the
-   fragment still costs is every entry after it, because the read stops at the first line
-   it cannot parse. That is the manifest's rule rather than this ledger's, and the
-   manifest entry's row count is what makes the loss visible: it counts the file's lines,
-   so a count above what :func:`read` returns says the file is damaged.
+   A fragment left by a crash costs more than itself, because the read stops at the first
+   line it cannot parse and the next entry appends onto the open line. That is the
+   manifest's rule rather than this ledger's, and it is not worked around here: a guard
+   that read the file before writing broke the one-write rule the atomicity rests on. What
+   this ledger adds is a way to see the damage. The manifest entry's row count counts the
+   file's lines, so a count above what :func:`read` returns says the file needs a human.
 2. *Last entry wins*, keyed by ``(instrument_id, ex_date, type)``. A correction is a
    superseding entry, never a rewrite of the one it corrects.
 3. *It is manifested and scrubbed like any lake file.* The reverse scrub's exclusion set

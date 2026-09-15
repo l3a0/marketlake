@@ -466,12 +466,14 @@ def test_a_bad_line_names_its_position_in_the_file_not_in_the_filtered_read(lake
 # -- a ledger that was damaged before this write ---------------------------------------
 
 
-def test_an_append_after_a_torn_line_lands_whole_and_the_writer_keeps_working(lake_root):
-    # A torn fragment costs the entries after it in every read, which is the manifest's
-    # own line rule. What it must not cost is the writer. Counting the manifest's rows
-    # from what ``read`` returns would drop the count below the manifested one, so
-    # ``guard_row_count`` would raise on this append and on every append after it, each
-    # one having already written its line.
+def test_an_append_after_a_torn_line_keeps_the_writer_working(lake_root):
+    # A torn fragment costs the entries after it in every read, and it costs the entry
+    # appended straight onto its open line. That is the manifest's line rule, and a guard
+    # that read the file before writing broke the single-write atomicity the rule rests
+    # on. What must not happen is the writer stopping. Counting the manifest's rows from
+    # what ``read`` returns would drop the count below the manifested one, so
+    # ``guard_row_count`` would raise on this append and every append after it, each one
+    # having already written its line.
     _dividend(lake_root, cash_amount=1.90352, recorded_at=RECORDED)
     _dividend(lake_root, cash_amount=1.92, recorded_at=RECORDED)
     path = actions_path(lake_root)
@@ -480,11 +482,9 @@ def test_an_append_after_a_torn_line_lands_whole_and_the_writer_keeps_working(la
     _dividend(lake_root, cash_amount=1.95, recorded_at=CORRECTED)
     _dividend(lake_root, cash_amount=1.97, recorded_at=CORRECTED)
 
-    # Both later entries are on disk, whole, and the manifest counts every line.
     lines = [line for line in path.read_text().splitlines() if line.strip()]
     assert json.loads(lines[-1])["cash_amount"] == 1.97
-    assert json.loads(lines[-2])["cash_amount"] == 1.95
     assert latest_entries(lake_root)[ACTIONS_PARTITION]["rows"] == len(lines)
-    # And the count the manifest carries is above what the damaged file reads back, which
-    # is the signal that the ledger needs a human.
+    # The count the manifest carries is above what the damaged file reads back, which is
+    # the signal that the ledger needs a human.
     assert len(actions.read(lake_root)) < latest_entries(lake_root)[ACTIONS_PARTITION]["rows"]
