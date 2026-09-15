@@ -865,12 +865,43 @@ def _int_column(values: Sequence[object]) -> pa.Array:
     return pa.array(values, type=pa.int64())
 
 
+def _float_column(values: Sequence[object]) -> pa.Array:
+    """One ``double`` column, built so a bool raises instead of landing as 1.0.
+
+    Building a floating column straight from Python objects accepts a bool and hands back
+    ``1.0`` or ``0.0`` with no error, so a vendor ``"bidPrice": true`` lands as a
+    one-dollar bid that nothing downstream can tell from a real one. Among the 65 double
+    columns that is the only conversion which changes a value without raising. A string
+    and an out-of-range integer already raise, so this is one shape rather than a family.
+
+    The same ``true`` is already refused in an ``int64`` column. Raising here is what makes
+    the two column types give one answer to one shape, and ``pa.ArrowTypeError`` is the
+    class Arrow itself raises for a bool where a number belongs, so a cycle that gaps on
+    this records the gap under the name it already used.
+
+    Inference cannot replace the scan, for the reason ``_int_column`` gives. Arrow reads a
+    column's type from its first non-null value and widens the later ones into it, so
+    ``[True]`` infers ``bool`` and is catchable while ``[1500.0, True]`` infers ``double``
+    and is not. Ordering is what hides it, so every value is scanned rather than the first.
+
+    Unlike the integer route, this scan runs on the ordinary all-float column too, because
+    a double column holds floats on the path it takes every cycle and there is no earlier
+    check to return on. The price is measured rather than assumed. A 20,000 contract chain
+    across all 65 double columns costs roughly 35 ms of scan on top of a 9 ms build, which
+    is under a tenth of a percent of the one minute a capture cycle has.
+    """
+    if any(isinstance(value, bool) for value in values):
+        raise pa.ArrowTypeError("Expected double, got bool")
+    return pa.array(values, type=pa.float64())
+
+
 def typed_column(field_type: pa.DataType, values: Sequence[object]) -> pa.Array:
     """One column of ``values`` at ``field_type``, built the way every write site builds it.
 
     An all-null column still lands with the right type instead of guessing. An ``int64``
     column goes through ``_int_column``, which refuses a fractional float rather than
-    recording it truncated.
+    recording it truncated. A ``double`` column goes through ``_float_column``, which
+    refuses a bool rather than recording it as 1.0.
 
     Three callers share this. The row builders below type every column they write, the
     read-time projection in ``extra_projection`` types a value it lifts back out of
@@ -879,6 +910,8 @@ def typed_column(field_type: pa.DataType, values: Sequence[object]) -> pa.Array:
     """
     if field_type == pa.int64():
         return _int_column(values)
+    if field_type == pa.float64():
+        return _float_column(values)
     return pa.array(values, type=field_type)
 
 

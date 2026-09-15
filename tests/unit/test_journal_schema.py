@@ -1388,6 +1388,115 @@ def test_a_bool_or_a_string_in_an_integer_column_never_lands_as_a_number():
         assert routed == value and type(routed) is type(value)
 
 
+def test_a_bool_in_a_double_column_never_lands_as_one_or_zero():
+    """A vendor ``bid`` of ``true`` must not land as a one-dollar bid.
+
+    Building a double column straight from Python objects accepts a bool and returns
+    ``1.0`` or ``0.0`` with no error. Nothing downstream could tell that from a real
+    one-dollar bid, which is why this was the silent member of the corruption class on the
+    65 double columns, the way the fractional float was on the 29 integer ones.
+
+    Both bools are checked, because ``False`` landing as ``0.0`` is the same corruption
+    wearing a value an empty book plausibly carries.
+
+    The comparison is type-strict on purpose. ``1.0 == True`` is true in Python, so a test
+    that compared values alone would pass against the bug rather than catch it.
+    """
+    for value in (True, False):
+        row = _chain_row(bid=value)
+        assert row["bid"] is None, value
+        routed = json.loads(row["extra"])["bid"]
+        assert routed is value
+        assert type(routed) is bool
+
+
+def test_a_bool_after_a_float_in_the_same_double_column_never_lands_as_a_price():
+    """Two contracts, the first a real price and the second a bool.
+
+    Arrow reads a column's type from its first non-null value and widens the later ones
+    into it, so ``[True]`` infers ``bool`` while ``[1500.0, True]`` infers ``double`` and
+    the inferred type can no longer tell the bool from a real 1. Ordering is what hides
+    it, so checking the bool alone in the column would miss this ordering entirely.
+
+    The contract that sent the bool loses its column and keeps its value in ``extra``. The
+    contracts around it keep the prices they sent, so one drifted row costs one row.
+    """
+    for values in ((1500.0, True), (1500.0, False), (1500.0, True, 2.5)):
+        contracts = [
+            _full_contract(symbol=f"SPY   260918C0065000{i}", bid=value)
+            for i, value in enumerate(values)
+        ]
+        batch = journal.chains_data_batch(
+            _chain_of(*contracts), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
+        )
+        rows = batch.to_pylist()
+        landed = batch.column("bid").to_pylist()
+        expected = [None if isinstance(value, bool) else value for value in values]
+        assert landed == expected, values
+        assert [type(cell) for cell in landed] == [type(cell) for cell in expected], values
+        for row, value in zip(rows, values, strict=True):
+            if isinstance(value, bool):
+                routed = json.loads(row["extra"])["bid"]
+                assert routed is value
+            else:
+                assert row["extra"] is None
+
+
+def test_a_bool_in_a_double_quote_column_routes_the_same_way():
+    """The same rule on the quotes surface, whose double columns take the same route.
+
+    The issue's own reproduction is a quote envelope carrying ``"bidPrice": true``. This
+    is that envelope, checked end to end through the row builder rather than through the
+    column builder alone.
+    """
+    row = _quote_row("quote", bidPrice=True, askPrice=False)
+    assert row["bid"] is None
+    assert row["ask"] is None
+    overflow = json.loads(row["extra"])["quote"]
+    assert overflow["bidPrice"] is True
+    assert overflow["askPrice"] is False
+
+
+def test_an_ordinary_all_float_double_column_is_unaffected():
+    """The control. A column of real prices still lands, unchanged and un-routed.
+
+    The scan added to the double route runs on every cycle, including this one, so a
+    version of it that refused a legitimate price would gap every chain. Zero and a
+    whole-numbered float are included because they are the floats a bool converts to, and
+    a scan written against values rather than types would refuse exactly these.
+    """
+    values = (1500.0, 0.0, 1.0, 2.5, 0.01)
+    contracts = [
+        _full_contract(symbol=f"SPY   260918C0065000{i}", bid=value)
+        for i, value in enumerate(values)
+    ]
+    batch = journal.chains_data_batch(
+        _chain_of(*contracts), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
+    )
+    assert batch.column("bid").type == pa.float64()
+    assert batch.column("bid").to_pylist() == list(values)
+    assert all(row["extra"] is None for row in batch.to_pylist())
+
+
+def test_a_bool_is_refused_by_a_double_column_the_way_an_integer_column_refuses_it():
+    """One shape, one answer, on both numeric types.
+
+    The two column types disagreed before this. The same vendor ``true`` was refused in
+    ``total_volume``, an ``int64`` column, and accepted in ``bid``, a ``double`` one. The
+    check runs against ``typed_column`` directly, because that is the one place the answer
+    is decided and every route into it goes through there.
+
+    The exception class is checked rather than only the refusal. ``lake.capture`` records
+    a gap under the exception's own name, so a double column refusing under a different
+    class than the integer column would write two names on disk for one shape.
+    """
+    for field_type in (pa.int64(), pa.float64()):
+        for values in ([True], [False], [1500.0, True]):
+            with pytest.raises(pa.ArrowTypeError):
+                journal.typed_column(field_type, list(values))
+            assert journal._fits(field_type, values[-1]) is False, (field_type, values)
+
+
 # -- a refused known field is routed into extra -------------------------------
 
 # Where a value its column refuses actually goes. The section above pins that it never
