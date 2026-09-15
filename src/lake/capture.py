@@ -113,17 +113,19 @@ CHAIN_CHUNK_FAILED = "chain_chunk_failed"
 # shapes are drift in the sense the design's schema policy uses, where a missing or retyped
 # known field pages. Drift is kept apart from the size class above because a parse failure
 # filed under a size class reads as a chain too big to fetch, which is a chunk-plan problem
-# rather than a vendor problem. The name is recognisable as drift so the unbuilt schema-drift
-# page (#197) has one string to subscribe to, and it matches the reason the segment readers are
-# to carry for the same signal (#104). Neither of those is built here.
+# rather than a vendor problem. The name is recognisable as drift so a reader sweeping the gap
+# classes finds it under one string, and it matches the reason the segment readers are to carry
+# for the same signal (#104), which is not built here.
 #
 # A retyped known field is not one of those two shapes and never was. It merges cleanly, and
 # what refuses it is the column build a layer on, which is why the gap it used to leave
 # carried Arrow's own exception name rather than this class. Since marketlake #129 it leaves
 # no gap at all, because the raw value is routed into ``extra`` and the cycle lands. So this
 # class still means one thing, a window body that would not merge, and it means exactly what
-# it meant before that change. What #197 subscribes to for a retype is the routing's own
-# signature instead, a known field's name sitting in ``extra``.
+# it meant before that change. So the parser's schema-drift page shipped in #197 reads the
+# routing's own signature instead, a known field's name sitting in ``extra``, and subscribes to
+# no gap class at all. A window body that would not merge gaps the ticker, and the watchdog is
+# what speaks for a ticker that stopped producing data.
 CHAIN_SCHEMA_DRIFT = "chain_schema_drift"
 
 # The two chain maps every window response nests contracts under.
@@ -345,6 +347,11 @@ class SegmentOutcome:
     ``row_kind`` is ``data`` or ``gap``. ``error_class`` names the failure on a gap and
     is ``None`` on data. ``rows`` is the batch's row count, the same count recorded in
     the manifest.
+
+    ``routed_columns`` names the columns whose vendor field arrived at a type the column
+    refused, which is the schema-drift signature ``journal.routed_columns`` reads off the
+    batch. It rides the outcome because the batch does not outlive the write, and the
+    daemon's drift observer is what reads it. It is empty on every ordinary segment.
     """
 
     surface: str
@@ -355,6 +362,7 @@ class SegmentOutcome:
     rows: int
     error_class: str | None
     fetched_at: str | None
+    routed_columns: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -905,7 +913,14 @@ class _CaptureCycle:
         The writer creates the segment exclusively, appends the one batch, and closes it
         with the end-of-stream marker. Every write is a full flush, so a returned outcome
         means the segment is on disk.
+
+        The drift scan runs before the writer opens, and the order is deliberate. It reads
+        the batch already in hand and touches no disk, so nothing about it needs the
+        segment to exist. Running it after the write would put a raise between a durable
+        segment and its manifest entry, and the caller records that as a write failure and
+        skips the entry, which leaves a segment on disk nothing points at.
         """
+        routed = journal.routed_columns(surface, plan.batch)
         writer = journal.SegmentWriter.open(
             self.lake_root, surface, ticker, self.day, self.start_ts, self.pid
         )
@@ -921,6 +936,7 @@ class _CaptureCycle:
             rows=plan.batch.num_rows,
             error_class=plan.error_class,
             fetched_at=plan.fetch_ts.isoformat() if plan.fetch_ts is not None else None,
+            routed_columns=routed,
         )
 
     # -- the cycle -----------------------------------------------------------

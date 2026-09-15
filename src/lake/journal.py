@@ -1184,6 +1184,63 @@ def _batch(surface: str, rows: Sequence[Mapping[str, object]]) -> pa.RecordBatch
     return pa.RecordBatch.from_arrays([columns[field.name] for field in schema], schema=schema)
 
 
+def routed_columns(surface: str, batch: pa.RecordBatch) -> tuple[str, ...]:
+    """The surface's own columns whose vendor name sits in a built batch's ``extra``.
+
+    This is the drift signature ``_routed_column`` names, read back off a batch. A known
+    vendor field's name can only reach the overflow by being routed there, because
+    ``_extra_json`` and the quotes projection both build the overflow from the fields their
+    maps do *not* name. So a name from ``extra_paths`` found in ``extra`` means that
+    column refused the value the vendor sent, and the column is null on that row.
+
+    It answers the one question a page needs, which column drifted, and deliberately not
+    how many rows carried it or what the value was. Both of those are already on disk in
+    the rows themselves, and ``reports/`` and the nightly report are where a reader goes
+    for them.
+
+    A key the surface's paths do not name is an unrecognized vendor field, which is the
+    fail-open working as designed and belongs to the nightly report rather than to a
+    phone. Matching against ``extra_paths`` is the whole distinction between the two.
+
+    The cost is named rather than hidden. This re-derives a fact ``_batch`` already knew
+    and discarded, so a routing change that wrote under some other key would leave the two
+    out of step. The guard against that is derivation: both sides read ``extra_paths``
+    rather than a list of their own, and
+    ``tests/unit/test_journal_schema.py::test_routed_columns_names_every_column_the_routing_writes``
+    walks every path on both surfaces so a new one is covered the day it is added.
+
+    An all-null overflow returns on the null count alone, with no path map built, no
+    overflow column materialized, and no JSON parsed. That is every ordinary cycle, and it
+    is why the scan is affordable between the row build and the segment write. The saving
+    is real rather than a dict lookup, because ``extra_paths`` rebuilds both vendor maps on
+    every call. A gap batch is that same case by construction, since a gap row carries no
+    vendor observation and ``_routed_column`` refuses to route onto one, so nothing here
+    needs to read ``row_kind``.
+    """
+    overflow = batch.column(EXTRA_COLUMN)
+    if overflow.null_count == len(overflow):
+        return ()
+    paths = extra_paths(surface)
+    found: set[str] = set()
+    for raw in overflow.to_pylist():
+        # A vendor retype reaches every row of the payload, so the first row usually names
+        # every column that moved and the rest of the chain is walked for nothing.
+        if len(found) == len(paths):
+            break
+        if not raw:
+            continue
+        held = json.loads(raw)
+        if not isinstance(held, Mapping):
+            continue
+        for column, path in paths.items():
+            if column in found:
+                continue
+            block = held if path.block is None else held.get(path.block)
+            if isinstance(block, Mapping) and path.field in block:
+                found.add(column)
+    return tuple(sorted(found))
+
+
 def _iter_contracts(body: Mapping[str, object]) -> list[Mapping[str, object]]:
     """Every contract dict in a chain body, calls first then puts, in payload order.
 

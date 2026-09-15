@@ -33,7 +33,8 @@ has a no-op default, so the loop ships standalone.
   and ``option_close`` at the option close. The default answers ``None``.
 - ``on_cycle(slot, result)`` is handed each cycle's ``CycleResult`` after it returns. The
   watchdog (D13), which counts consecutive session minutes without a durable data cycle,
-  plugs in here.
+  plugs in here. So does the schema-drift observer, which reads the columns the parser
+  refused off the same result and pages when a vendor retype starts.
 - ``on_skipped(slots)`` is handed the capture slots the loop missed, in order, when a
   cycle overran its minute. The same gap-marking writer plugs in here, so a slot the
   loop slept through is recorded rather than left a hole.
@@ -121,6 +122,8 @@ from lake.journal import ROW_KIND_DATA
 from lake.metadata import stamp_assertion_pid, stamp_cycle, stamp_ping
 from lake.report import write_close_guard
 from lake.runner import Pinger, UrllibPinger
+from lake.schema_drift import SchemaDriftObserver
+from lake.schema_drift import page as page_schema_drift
 from lake.schwab import DEFAULT_TOKEN_PATH
 from lake.security_master import SecurityMaster, SecurityMasterError, master_path
 from lake.session import (
@@ -729,8 +732,8 @@ def _alarm(
     session_clock: SessionClock,
     transport: Transport,
     pinger: Pinger,
-) -> tuple[Watchdog, Publisher, DeadMan]:
-    """The watchdog, its publisher, and the dead-man feed.
+) -> tuple[Watchdog, Publisher, DeadMan, SchemaDriftObserver]:
+    """The watchdog, its publisher, the dead-man feed, and the schema-drift observer.
 
     Both seams are handed in. Neither is defaulted here, because a default reaching a
     public endpoint is one a caller gets without asking, and the caller that most needs
@@ -770,10 +773,18 @@ def _alarm(
     # restart. That matches the chain chunker's split-depth bound, which the cycle already
     # reads off the config every minute. The price is a config read on the alerting path,
     # the same one the skipped-slot hook pays for the roster.
+    #
+    # The drift observer is built here rather than at its one call site, beside the two
+    # other observers that carry state between cycles. It needs nothing from the config,
+    # and what the placement buys is that every stateful observer the loop closes over is
+    # constructed in one function. The missing half of the schema policy's page, tracked
+    # in #265, is a second detection on this same observer, so a second home for the state
+    # would be a second thing to keep in step.
     return (
         Watchdog(page_minutes=lambda: load_config(config_path).guards.watchdog_page_minutes),
         publisher,
         deadman,
+        SchemaDriftObserver(),
     )
 
 
@@ -1000,7 +1011,7 @@ def run_loop_from_config(
     # runs no cycle for a slot it slept through and those are the minutes the daemon was
     # worst off. The dead-man rides the same two plus every tick, so an idle weekday
     # keeps feeding the check that pages on silence.
-    watchdog, publisher, deadman = _alarm(
+    watchdog, publisher, deadman, schema_drift = _alarm(
         config_path, tickers_path, session_clock, transport, pinger
     )
     alarm_on_cycle = hooks.on_cycle
@@ -1107,6 +1118,11 @@ def run_loop_from_config(
         landed_data = any(seg.row_kind == ROW_KIND_DATA for seg in result.segments)
         if landed_data or result.nothing_to_capture:
             deadman.captured(slot)
+        # The vendor's payload changing shape, read off the batches this cycle just built.
+        # It pages once when a column starts drifting rather than once a minute for as
+        # long as it does, because a cycle a minute against a forty-a-day cap would spend
+        # the whole cap in forty minutes.
+        page_schema_drift(publisher, schema_drift.observe(result), now=slot)
         alarm_on_cycle(slot, result)
 
     def on_skipped(slots: list[datetime]) -> None:
