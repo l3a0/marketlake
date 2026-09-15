@@ -6,7 +6,7 @@ produces ``SegmentOutcome.routed_columns`` from a real vendor payload is covered
 ``tests/unit/test_journal_schema.py``, and the page this observer feeds is covered in
 ``tests/component/test_schema_drift.py``.
 
-What they cover is the state machine, which is where the two settled rules live.
+What they cover is the state machine, which is where the settled rules live. There are five.
 
 1. A column that starts routing is reported once, when it starts.
 2. A column that keeps routing is not reported again, because a cycle a minute against a
@@ -207,3 +207,161 @@ def test_an_ordinary_cycle_reports_nothing():
     )
     assert observer.observe(ordinary) == ()
     assert observer.observe(ordinary) == ()
+
+
+# -- the evidence is per ticker, not per surface -------------------------------
+
+# The rule these hold is what separates one page from a page every other minute. The
+# observer shipped with the evidence counted per surface, which looks right and is not. A
+# surface produces data every cycle as long as any ticker on it does, so a drift confined to
+# one ticker had the surface's own health read back as proof the drift had cleared. Every
+# ordinary transient gap on that ticker then read as a clearance and its return as a fresh
+# drift.
+
+
+def test_a_drifting_ticker_that_gaps_does_not_re_arm_while_the_surface_stays_healthy():
+    """The defect this section exists for, at its smallest.
+
+    AAPL is retyped and MSFT is clean. The chains surface lands data every cycle because
+    MSFT does, so a surface-level evidence rule sees a healthy surface and clears AAPL's
+    column on the minute AAPL gaps. The only ticker that could speak about AAPL's payload
+    is AAPL, and it said nothing.
+    """
+    observer = SchemaDriftObserver()
+    drifting = (_segment(ticker="AAPL", routed=("open_interest",)), _segment(ticker="MSFT"))
+    gapped = (_segment(ticker="AAPL", row_kind=ROW_KIND_GAP), _segment(ticker="MSFT"))
+
+    assert len(observer.observe(_cycle(*drifting))) == 1
+    assert observer.observe(_cycle(*gapped)) == ()
+    assert observer.observe(_cycle(*drifting)) == ()
+
+
+def test_a_flapping_ticker_pages_once_for_one_unchanging_vendor_fact():
+    """The arithmetic, run out over the cycles the cap is measured against.
+
+    One retype that never changes, on a ticker whose fetch fails every other minute. Under
+    the surface-level rule this sent five pages in ten minutes, which spends
+    ``alert.DEFAULT_DAILY_CAP`` of forty inside eighty session minutes and swallows every
+    page any other producer owed for the rest of the day.
+    """
+    observer = SchemaDriftObserver()
+    pages = 0
+    for cycle in range(10):
+        landed = cycle % 2 == 0
+        aapl = (
+            _segment(ticker="AAPL", routed=("open_interest",))
+            if landed
+            else _segment(ticker="AAPL", row_kind=ROW_KIND_GAP)
+        )
+        if observer.observe(_cycle(aapl, _segment(ticker="MSFT"))):
+            pages += 1
+    assert pages == 1
+
+
+def test_a_column_clears_only_when_the_ticker_that_drifted_it_lands_clean_data():
+    """The reset needs the drifting ticker's own word, and nothing else substitutes.
+
+    A clean cycle from every other ticker on the surface is not evidence about this one.
+    Once AAPL itself lands a data row without the column, the column clears and the next
+    drift is a new fact that pages again.
+    """
+    observer = SchemaDriftObserver()
+    observer.observe(_cycle(_segment(ticker="AAPL", routed=("open_interest",))))
+
+    # MSFT joining the surface clean says nothing about AAPL.
+    assert observer.observe(_cycle(_segment(ticker="MSFT"))) == ()
+    # AAPL's own clean data row is what clears it.
+    assert observer.observe(_cycle(_segment(ticker="AAPL"), _segment(ticker="MSFT"))) == ()
+    assert observer.observe(_cycle(_segment(ticker="AAPL", routed=("open_interest",)))) == (
+        ColumnDrift(CHAINS_SURFACE, "open_interest", ("AAPL",)),
+    )
+
+
+def test_a_drifting_ticker_retired_clears_the_column_it_held():
+    """A ticker off the roster can never produce the evidence that would clear it.
+
+    Without a release rule its column would stay drifting for the life of the process, and
+    a genuine later retype of that column on another ticker would then never page. A cycle
+    that no longer names the ticker at all is what says it is gone, since a cycle writes
+    data or a gap for every ticker it still carries.
+    """
+    observer = SchemaDriftObserver()
+    observer.observe(
+        _cycle(_segment(ticker="AAPL", routed=("open_interest",)), _segment(ticker="MSFT"))
+    )
+
+    # AAPL is retired, so it appears in no segment at all.
+    assert observer.observe(_cycle(_segment(ticker="MSFT"))) == ()
+    # The column is re-armed, so MSFT drifting it now is a new fact.
+    assert observer.observe(_cycle(_segment(ticker="MSFT", routed=("open_interest",)))) == (
+        ColumnDrift(CHAINS_SURFACE, "open_interest", ("MSFT",)),
+    )
+
+
+def test_a_ticker_whose_segment_could_not_be_written_is_not_a_retirement():
+    """A write failure leaves the ticker on the roster, so it must not clear a drift.
+
+    ``SegmentError`` is the disk refusing a segment rather than the roster dropping a
+    ticker. Reading it as a retirement would clear the column and page again on the next
+    cycle that could write.
+    """
+    observer = SchemaDriftObserver()
+    observer.observe(
+        _cycle(_segment(ticker="AAPL", routed=("open_interest",)), _segment(ticker="MSFT"))
+    )
+    unwritable = _cycle(
+        _segment(ticker="MSFT"), errors=(SegmentError(CHAINS_SURFACE, "AAPL", "disk_full"),)
+    )
+
+    assert observer.observe(unwritable) == ()
+    assert observer.observe(_cycle(_segment(ticker="AAPL", routed=("open_interest",)))) == ()
+
+
+def test_the_state_empties_when_every_column_clears():
+    """The state is not a leak. A surface with nothing drifting holds nothing."""
+    observer = SchemaDriftObserver()
+    observer.observe(_cycle(_segment(routed=("open_interest", "bid"))))
+    assert observer.observe(_cycle(_segment())) == ()
+    assert observer._routing == {}
+
+
+# -- the order the page prints in ----------------------------------------------
+
+# The page prints these in the order they arrive and ``PAGE_COLUMN_CAP`` cuts the tail, so
+# the order decides which column names an operator sees. Every fixture above happens to
+# feed chains before quotes and one column at a time, which would let payload order through
+# unnoticed.
+
+
+def test_the_surfaces_come_back_sorted_whatever_order_the_cycle_wrote_them_in():
+    """A cycle that wrote quotes first still reports chains first.
+
+    Segment order is roster order, so without sorting the page's surface order would follow
+    whichever ticker the cycle reached first. The same vendor change would then print
+    differently from one cycle to the next.
+    """
+    observer = SchemaDriftObserver()
+    quotes_first = _cycle(
+        _segment(QUOTES_SURFACE, routed=("bid",)),
+        _segment(CHAINS_SURFACE, routed=("open_interest",)),
+    )
+    assert observer.observe(quotes_first) == (
+        ColumnDrift(CHAINS_SURFACE, "open_interest", ("SPY",)),
+        ColumnDrift(QUOTES_SURFACE, "bid", ("SPY",)),
+    )
+
+
+def test_two_columns_starting_on_one_surface_come_back_sorted():
+    """Two columns of one surface in one cycle, which no other case here produces.
+
+    ``journal.routed_columns`` already sorts, so an unsorted step here would only show on a
+    cycle where two tickers drifted different columns. That is the shape a vendor retyping
+    one block produces, and it is the shape the cap cuts.
+    """
+    observer = SchemaDriftObserver()
+    spread = _cycle(
+        _segment(ticker="SPY", routed=("volume",)),
+        _segment(ticker="QQQ", routed=("ask",)),
+        _segment(ticker="IWM", routed=("bid",)),
+    )
+    assert [drift.column for drift in observer.observe(spread)] == ["ask", "bid", "volume"]

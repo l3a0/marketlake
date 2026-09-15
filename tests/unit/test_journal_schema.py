@@ -2790,6 +2790,77 @@ def test_an_unrecognized_field_sharing_a_blocks_name_is_still_not_a_routed_colum
     assert journal.routed_columns(journal.QUOTES_SURFACE, batch) == ()
 
 
+def test_a_vendor_field_named_chain_does_not_fabricate_a_chain_level_drift():
+    """The one shape that reads as drift while nothing refused anything.
+
+    The chains fail-open writes an unrecognized contract field flat, so a vendor contract
+    field named ``chain`` lands on the key the chain-level values nest under, and its own
+    subkeys then read as chain-level vendor names. ``_extra_with_routed`` refuses that
+    collision by name, but only on a row where something actually routed, so a row that
+    routed nothing never reaches that refusal.
+
+    What settles it is the row's own column. A routed value is nulled in its column on the
+    same row, so a key naming a column that still holds a value cannot be the signature.
+    Here both columns hold the vendor's real header values, and a page naming them would
+    send an operator to look for a retype that never happened.
+    """
+    row = _full_contract(chain={"underlyingPrice": 250.0, "interestRate": 4.5})
+    batch = journal.chains_data_batch(_chain_of(row), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+    assert json.loads(batch.column("extra").to_pylist()[0]) == {
+        "chain": {"underlyingPrice": 250.0, "interestRate": 4.5}
+    }
+    # The real chain-level values are in their columns, untouched.
+    assert batch.column("underlying_price").to_pylist() == [650.01]
+    assert batch.column("interest_rate").to_pylist() == [4.25]
+    assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ()
+
+
+@pytest.mark.parametrize("value", [5, "a string", [1, 2, 3], 1.5, True, None])
+def test_a_vendor_field_named_chain_of_any_shape_is_read_rather_than_raising(value):
+    """The collision key can hold anything, and the scan has to survive all of it.
+
+    A dict is the shape that would otherwise be walked as a block, so the scan asks the
+    shape before walking. Without that question an integer under the key raises a
+    ``TypeError`` from iterating it, and the raise reaches the capture path. It is caught
+    there, so it would cost the finding rather than the minute, but it would cost every
+    finding on every segment for as long as the vendor sent that field.
+    """
+    batch = journal.chains_data_batch(
+        _chain_of(_full_contract(chain=value)), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
+    )
+    assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ()
+
+
+def test_a_genuine_chain_level_retype_still_routes_beside_that_collision():
+    """The control for the test above, so the null check cannot buy silence.
+
+    A check that refused every chain-block key would pass the collision test and lose every
+    real chain-level drift, which is half the chains surface's paths.
+    """
+    body = dict(_chain_of(_full_contract()), underlyingPrice="six hundred and fifty")
+    batch = journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+    assert batch.column("underlying_price").to_pylist() == [None]
+    assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ("underlying_price",)
+
+
+def test_a_routed_column_is_named_off_the_row_that_actually_routed():
+    """One contract drifts and another carries the column, in the same batch.
+
+    The scan walks rows until it has named every path, so a check that read the column's
+    nulls in bulk rather than at the routed row would answer from whichever row it reached
+    first. The drifted contract is second here for that reason.
+    """
+    contracts = [
+        _full_contract(symbol="SPY   260918C00650000", openInterest=1234),
+        _full_contract(symbol="SPY   260918C00650001", openInterest=UNFIT_VALUE),
+    ]
+    batch = journal.chains_data_batch(
+        _chain_of(*contracts), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
+    )
+    assert batch.column("open_interest").to_pylist() == [1234, None]
+    assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ("open_interest",)
+
+
 def test_a_vendor_null_is_not_a_routed_column():
     """A field the vendor sent as null never routes, so it never reads as drift.
 
@@ -2849,6 +2920,82 @@ def test_an_all_null_overflow_is_answered_on_the_null_count_alone(monkeypatch):
     monkeypatch.setattr(journal, "extra_paths", refuse)
     monkeypatch.setattr(journal.json, "loads", refuse)
     assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ()
+
+
+def test_a_populated_overflow_with_every_column_filled_parses_no_json(monkeypatch):
+    """The gate that makes an ordinary populated overflow cheap, held by breaking the parse.
+
+    An unrecognized vendor field lands in ``extra`` on every row of the payload, and the
+    design calls that the fail-open working rather than a page. So a populated overflow is
+    an ordinary event, and a scan that parsed every row for it would pay that cost on the
+    capture path for a finding that is always empty. Measured before this gate existed, one
+    new greek cost 137 ms on a 13,500-row chain.
+
+    A routed value is nulled in its own column, so a column the vendor is still filling
+    cannot have routed. Every known column here holds a value, so nothing is a candidate and
+    no row is ever read.
+    """
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("the scan parsed a row with no candidate column to find")
+
+    batch = _chain_batch(brandNewGreek=1.5)
+    assert batch.column("extra").null_count == 0
+    monkeypatch.setattr(journal.json, "loads", refuse)
+    assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ()
+
+
+def test_a_retype_is_still_found_beside_a_column_the_vendor_left_null():
+    """The control for the gate above, so it cannot buy its speed with silence.
+
+    A sparse contract nulls columns the vendor simply had nothing for, which makes them
+    candidates. The drifted column has to be told apart from them by the overflow key, not
+    by the null alone, and the sparse ones must not page.
+    """
+    row = _full_contract(openInterest=UNFIT_VALUE, delta=None, gamma=None, rho=None)
+    batch = journal.chains_data_batch(_chain_of(row), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+    assert batch.column("delta").to_pylist() == [None]
+    assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ("open_interest",)
+
+
+def test_a_drift_on_a_later_row_is_found_when_earlier_rows_are_clean():
+    """A vendor that retypes a field on only some contracts, which is a partial rollout.
+
+    Every other drift fixture retypes on every row, so a scan that stopped at the first
+    clean row, or that required every row to carry an overflow, would pass all of them and
+    miss this. The drifted contract is last here for that reason.
+    """
+    contracts = [
+        _full_contract(symbol=f"SPY   260918C0065000{index}", openInterest=1234)
+        for index in range(4)
+    ]
+    contracts.append(_full_contract(symbol="SPY   260918C00650009", openInterest=UNFIT_VALUE))
+    batch = journal.chains_data_batch(
+        _chain_of(*contracts), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
+    )
+    assert batch.column("extra").to_pylist()[:4] == [None] * 4
+    assert batch.column("open_interest").to_pylist() == [1234, 1234, 1234, 1234, None]
+    assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ("open_interest",)
+
+
+def test_the_columns_come_back_in_a_stable_order_whatever_the_payload_order():
+    """The page prints these and the cap cuts them, so the order cannot follow the payload.
+
+    Without sorting, which columns survive ``PAGE_COLUMN_CAP`` would depend on the order the
+    vendor happened to send fields in. Enough columns are drifted here that set iteration
+    order essentially never matches sorted order by accident.
+    """
+    drifted = dict.fromkeys(
+        ("openInterest", "totalVolume", "bid", "ask", "delta", "gamma", "theta", "rho"),
+        UNFIT_VALUE,
+    )
+    batch = journal.chains_data_batch(
+        _chain_of(_full_contract(**drifted)), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
+    )
+    got = journal.routed_columns(journal.CHAINS_SURFACE, batch)
+    assert len(got) == len(drifted)
+    assert list(got) == sorted(got)
+    assert got == ("ask", "bid", "delta", "gamma", "open_interest", "rho", "theta", "volume")
 
 
 def test_a_gap_batch_carries_no_overflow_to_scan():

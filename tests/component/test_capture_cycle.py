@@ -668,6 +668,46 @@ def test_a_retype_puts_its_column_on_the_segment_outcome_the_daemon_reads(lake_r
     assert result.segment(QUOTES, "SPY").routed_columns == ("realtime",)
 
 
+def test_a_drift_scan_that_raises_costs_the_finding_and_never_the_minute(lake_root, capsys):
+    """The scan is a page's input and the segment is a minute, so they are not equal stakes.
+
+    A minute cannot be bought back and a page can be sent again. So a scan that raised has
+    to leave the segment written, manifested and readable, carrying no column name, which
+    reads as the ordinary cycle it otherwise is. Without the guard a bug in a diagnostic
+    would gap every ticker on every cycle for as long as it stood.
+
+    The failure is not silent either. It reaches the launchd log the restart script already
+    sends the operator to.
+    """
+
+    def explode(surface, batch):
+        raise RuntimeError("a bug in the scan")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(journal, "routed_columns", explode)
+    try:
+        result = capture.run_cycle(
+            ManualClock(start=_CLOCK_START),
+            CassetteVendor(_one_chain_cassette(_chain_body_with(openInterest=1234.7))),
+            _spy_only(),
+            lake_root,
+            pid=4242,
+            plan=_ONE_WINDOW,
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert result.errors == ()
+    chain = result.segment(CHAINS, "SPY")
+    assert chain.row_kind == journal.ROW_KIND_DATA
+    assert chain.routed_columns == ()
+    # The minute is on disk, manifested, and the routed value is still in the rows.
+    assert chain.path.exists()
+    assert chain.partition in latest_entries(lake_root)
+    assert json.loads(_rows(chain)[0]["extra"]) == {"openInterest": 1234.7}
+    assert "schema-drift scan failed on chains SPY: RuntimeError" in capsys.readouterr().err
+
+
 def test_an_ordinary_cycle_leaves_every_outcome_carrying_no_drifted_column(lake_root):
     """The steady state, which is every cycle the lake has ever recorded.
 

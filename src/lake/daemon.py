@@ -776,8 +776,8 @@ def _alarm(
     #
     # The drift observer is built here rather than at its one call site, beside the two
     # other observers that carry state between cycles. It needs nothing from the config,
-    # and what the placement buys is that every stateful observer the loop closes over is
-    # constructed in one function. The missing half of the schema policy's page, tracked
+    # and what the placement buys is that every observer of a cycle result the loop closes
+    # over is constructed in one function. The missing half of the schema policy's page, tracked
     # in #265, is a second detection on this same observer, so a second home for the state
     # would be a second thing to keep in step.
     return (

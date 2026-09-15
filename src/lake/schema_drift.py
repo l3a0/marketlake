@@ -28,10 +28,18 @@ Two rules keep one vendor change to one page, and both are arithmetic rather tha
    page count with the roster while the fact stayed one fact. The page carries how many
    tickers each column drifted on, and the tickers themselves go to stderr.
 
-Evidence comes from data segments alone. A gap segment carries no vendor observation, so
-a cycle whose every fetch failed says nothing about the payload's shape and leaves the
-state where it stood. Without that rule a whole-roster outage would re-arm every column
-and page again the minute capture came back.
+Evidence comes from data segments alone, and it is counted per ticker rather than per
+surface. A gap segment carries no vendor observation, so a ticker that gapped says nothing
+about the payload's shape and a column it was drifting stays drifting until that same
+ticker lands a clean data row.
+
+Counting the evidence per surface instead is the shape that fails, and it fails quietly.
+One ticker retyped against a roster that is otherwise healthy means the surface produces
+data every cycle, so the surface looks like evidence while the only ticker that could
+speak is the one that gapped. Every ordinary transient gap on that ticker then reads as
+the drift clearing, and its return reads as a new drift. A ticker flapping against an
+unchanging vendor fact pages every other minute, which spends the forty-a-day cap before
+11:00 and swallows whatever the watchdog owed after that.
 """
 
 from __future__ import annotations
@@ -57,7 +65,9 @@ SCHEMA_DRIFT_TITLE = "Schema drift in the vendor payload"
 # left. The bound is the design's own, which pins every page body at plain text under 1,000
 # bytes. ``extra_paths`` enumerates every column that can ever reach one of these bodies,
 # 119 of them across the two surfaces today, so the widest drift is computable rather than
-# hypothetical: uncapped it runs to 3,867 bytes, and capped it runs to 866.
+# hypothetical. On the 115-ticker roster the design sizes for, every one of them drifting
+# at once runs to 3,867 bytes uncapped and 866 capped. The roster size is part of the
+# measurement, because the body prints a ticker count per column.
 #
 # What makes the cap load-bearing rather than defensive is the shape of those two numbers.
 # The capped body is bounded by the cap, and the uncapped one grows with the column count,
@@ -90,34 +100,70 @@ class SchemaDriftObserver:
     reads no clock, so the caller decides both when to ask and where a page goes, which is
     the shape the watchdog already has.
 
-    The state is one set of routing columns per surface. A column entering its surface's
-    set is the transition that pages. A column leaving re-arms it. A surface the cycle
-    produced no data for is not evidence and is left alone.
+    The state is, per surface, each drifting column and the tickers known to be drifting
+    it. A column entering its surface's state is the transition that pages. A column
+    leaving re-arms it, and a column leaves only on positive evidence: every ticker that
+    was drifting it has since produced a data row that did not.
+
+    Remembering the tickers is what makes the reset honest, and it is the difference
+    between one page and a page every other minute. Their absence is also what clears a
+    retired ticker, since a ticker the cycle no longer names at all is off the roster and
+    can never produce the evidence that would clear it.
     """
 
     def __init__(self) -> None:
-        self._routing: dict[str, frozenset[str]] = {}
+        self._routing: dict[str, dict[str, frozenset[str]]] = {}
 
     def observe(self, result: CycleResult) -> tuple[ColumnDrift, ...]:
         """Take one cycle's outcome and return the columns that started drifting in it."""
-        carried: dict[str, dict[str, list[str]]] = {}
+        # Three readings of the cycle, because the three answer different questions. The
+        # roster is who the cycle still names, which is what tells a retired ticker from a
+        # gapped one. The data rows are the only evidence about the vendor's payload. The
+        # drifting columns are this cycle's finding.
+        roster: dict[str, set[str]] = {}
+        landed: dict[str, set[str]] = {}
+        drifting: dict[str, dict[str, list[str]]] = {}
         for segment in result.segments:
+            roster.setdefault(segment.surface, set()).add(segment.ticker)
             if segment.row_kind != ROW_KIND_DATA:
                 continue
-            columns = carried.setdefault(segment.surface, {})
+            landed.setdefault(segment.surface, set()).add(segment.ticker)
             for column in segment.routed_columns:
+                columns = drifting.setdefault(segment.surface, {})
                 columns.setdefault(column, []).append(segment.ticker)
-        drifted: list[ColumnDrift] = []
-        for surface in sorted(carried):
-            columns = carried[surface]
-            was = self._routing.get(surface, frozenset())
-            self._routing[surface] = frozenset(columns)
-            drifted.extend(
-                ColumnDrift(surface, column, tuple(columns[column]))
-                for column in sorted(columns)
-                if column not in was
-            )
-        return tuple(drifted)
+        # A ticker whose segment could not be written at all is still on the roster. It
+        # produced no observation, so it is not evidence, and dropping it here would read
+        # as a retirement and clear a drift it says nothing about.
+        for error in result.errors:
+            roster.setdefault(error.surface, set()).add(error.ticker)
+
+        started: list[ColumnDrift] = []
+        # Only the surfaces this cycle touched. A surface it named at all, even to gap, is
+        # a surface the roster still carries. One it did not name at all is no evidence of
+        # anything, so its state stands untouched rather than being read as a clearance.
+        for surface in sorted(roster):
+            named = roster[surface]
+            observed = landed.get(surface, set())
+            now = drifting.get(surface, {})
+            was = self._routing.get(surface, {})
+            held: dict[str, frozenset[str]] = {}
+            for column in sorted(set(now) | set(was)):
+                reported = now.get(column, [])
+                if reported and column not in was:
+                    started.append(ColumnDrift(surface, column, tuple(reported)))
+                # A ticker that was drifting this column and has not landed a data row
+                # since is unresolved rather than clean. It keeps the column drifting, so
+                # its next data row is not a fresh transition. A ticker the roster no
+                # longer names drops out here, which is what lets a retirement clear.
+                unresolved = (was.get(column, frozenset()) - observed) & named
+                remembered = frozenset(reported) | unresolved
+                if remembered:
+                    held[column] = remembered
+            if held:
+                self._routing[surface] = held
+            else:
+                self._routing.pop(surface, None)
+        return tuple(started)
 
 
 def _body(drifted: Sequence[ColumnDrift]) -> str:
@@ -135,11 +181,11 @@ def _body(drifted: Sequence[ColumnDrift]) -> str:
         parts.append(f"{surface}: {', '.join(shown)}")
     return (
         "The vendor sent a known field at a type its column refused, so the column is null "
-        f"on the rows that carried it and the raw value is in extra. {'; '.join(parts)}."
+        f"on the rows that carried it and the raw value is in extra. {'. '.join(parts)}."
     )
 
 
-def page(publisher: Publisher | None, drifted: Sequence[ColumnDrift], *, now: datetime) -> None:
+def page(publisher: Publisher, drifted: Sequence[ColumnDrift], *, now: datetime) -> None:
     """Page once for the cycle, naming every column that started drifting in it.
 
     The finding reaches stderr as well as the phone, which is what compaction's drift page
@@ -154,23 +200,26 @@ def page(publisher: Publisher | None, drifted: Sequence[ColumnDrift], *, now: da
     ``Publisher.publish`` never raises, so this cannot cost the cycle that produced the
     finding. A page that did not reach the phone is written down under ``reports/alerts/``
     by the publisher itself, and the reason is named on stderr too.
+
+    The publisher is required rather than optional. ``compact._page_drift`` takes one that
+    may be ``None`` because ``recompact_ticker_day`` is a hand run that passes none. This
+    producer has one caller, the daemon's cycle hook, and ``_alarm`` always builds a
+    publisher, so an optional one here would be a branch nothing reaches.
     """
     if not drifted:
         return
     body = _body(drifted)
-    delivery = None
-    if publisher is not None:
-        delivery = publisher.publish(
-            Message(event=SCHEMA_DRIFT_EVENT, title=SCHEMA_DRIFT_TITLE, body=body), now=now
-        )
-        if delivery.reason == REFUSED:
-            print("capture: schema-drift page refused: it carried a secret", file=sys.stderr)
-            return
+    delivery = publisher.publish(
+        Message(event=SCHEMA_DRIFT_EVENT, title=SCHEMA_DRIFT_TITLE, body=body), now=now
+    )
+    if delivery.reason == REFUSED:
+        print("capture: schema-drift page refused: it carried a secret", file=sys.stderr)
+        return
     print(f"capture: {SCHEMA_DRIFT_TITLE}: {body}", file=sys.stderr)
     for drift in drifted:
         reach = ", ".join(drift.tickers)
         print(f"capture: schema drift: {drift.surface}.{drift.column} on {reach}", file=sys.stderr)
-    if delivery is not None and not delivery.sent:
+    if not delivery.sent:
         kept = "written down" if delivery.recorded else "lost"
         print(
             f"capture: schema-drift page not sent: {delivery.reason}, {kept}",

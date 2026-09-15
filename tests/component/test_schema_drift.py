@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from lake import schema_drift
+from lake import compact, schema_drift
 from lake.alert import PAGE_PRIORITY, Publisher
 from lake.capture import CycleResult, SegmentOutcome
 from lake.journal import CHAINS_SURFACE, QUOTES_SURFACE, ROW_KIND_DATA, extra_paths
@@ -333,10 +333,35 @@ def test_the_per_ticker_detail_reaches_stderr(lake_root, capsys):
     assert "chains.open_interest on SPY, QQQ, IWM" in err
 
 
-def test_a_producer_with_no_publisher_still_reports_to_stderr(lake_root, capsys):
-    """A caller that passes no publisher is a hand run, and it still gets the finding."""
-    schema_drift.page(None, (_drift("open_interest", "SPY"),), now=NOW)
+# -- the values a reader of reports/alerts/ depends on -------------------------
 
-    err = capsys.readouterr().err
-    assert SCHEMA_DRIFT_TITLE in err
-    assert "chains.open_interest on SPY" in err
+# Every assertion above spells the event and the title through the imported symbols, which
+# is what keeps a test from disagreeing with the code. The cost is that the values
+# themselves are then free to be anything, and they are not: the module docstring rests the
+# whole tell-the-producers-apart argument on this event name, and a phone shows the title.
+# So the values are pinned literally, once, here.
+
+
+def test_the_event_name_and_title_are_the_pinned_ones():
+    """The literal values, because every other assertion moves with the constant.
+
+    Collide this event with compaction's and the two producers interleave under one name in
+    ``reports/alerts/``, which is exactly the distinction the naming convention exists to
+    make. A reader could no longer tell the vendor's mid-day retype from this project's own
+    release rotating a schema at the nightly merge.
+    """
+    assert SCHEMA_DRIFT_EVENT == "parser_schema_drift"
+    assert SCHEMA_DRIFT_TITLE == "Schema drift in the vendor payload"
+    assert SCHEMA_DRIFT_EVENT != compact.SCHEMA_DRIFT_EVENT
+    assert SCHEMA_DRIFT_TITLE != compact.SCHEMA_DRIFT_TITLE
+
+
+def test_the_column_cap_is_the_number_the_design_budget_was_reasoned_to():
+    """The cap's literal value, which the two cap tests above cannot hold.
+
+    Both spell the constant symbolically, so they move with it and can never disagree with
+    it. They hold the mechanism and an upper bound from the byte budget, and nothing holds a
+    lower bound: at a cap of one, a twelve-column retype pages one name and "and 11 more"
+    off a body with room for all of them.
+    """
+    assert PAGE_COLUMN_CAP == 12

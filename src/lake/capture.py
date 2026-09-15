@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -352,6 +353,13 @@ class SegmentOutcome:
     refused, which is the schema-drift signature ``journal.routed_columns`` reads off the
     batch. It rides the outcome because the batch does not outlive the write, and the
     daemon's drift observer is what reads it. It is empty on every ordinary segment.
+
+    The loop's own cycle is what fills it. ``journal_snapshot`` writes the same shape of
+    segment for the close+5 fill and for an onboarding snapshot, and leaves this empty,
+    because neither reaches the drift observer: the fill's outcome is folded into a
+    ``FillResult`` that keeps the path alone, and onboarding runs outside the daemon. So a
+    retype that starts inside the close+5 window is on disk and unpaged until the next
+    session's first cycle, which is marketlake #271.
     """
 
     surface: str
@@ -914,13 +922,28 @@ class _CaptureCycle:
         with the end-of-stream marker. Every write is a full flush, so a returned outcome
         means the segment is on disk.
 
-        The drift scan runs before the writer opens, and the order is deliberate. It reads
-        the batch already in hand and touches no disk, so nothing about it needs the
-        segment to exist. Running it after the write would put a raise between a durable
-        segment and its manifest entry, and the caller records that as a write failure and
-        skips the entry, which leaves a segment on disk nothing points at.
+        The drift scan runs first, and it cannot cost the segment. Both halves of that are
+        deliberate.
+
+        It runs before the writer opens because a raise after the write would sit between a
+        durable segment and its manifest entry, and the caller records that as a write
+        failure and skips the entry, which leaves a segment on disk nothing points at.
+
+        It is guarded because the segment is a minute and the scan is a page's input. A
+        minute cannot be bought back and a page can be sent again, so a scan that raised
+        costs the finding rather than the capture. The failure is not silent: it reaches
+        the launchd log the restart script already sends the operator to, and the segment
+        lands with no column named, which reads as the ordinary cycle it otherwise is.
         """
-        routed = journal.routed_columns(surface, plan.batch)
+        try:
+            routed = journal.routed_columns(surface, plan.batch)
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must never cost a minute
+            print(
+                f"capture: schema-drift scan failed on {surface} {ticker}: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            routed = ()
         writer = journal.SegmentWriter.open(
             self.lake_root, surface, ticker, self.day, self.start_ts, self.pid
         )
