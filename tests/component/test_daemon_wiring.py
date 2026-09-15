@@ -390,6 +390,8 @@ def test_the_minutes_a_live_overrun_slept_through_charge_the_watchdog(tmp_path):
     (page,) = rig.transport.sent
     assert page.event == "capture_down"
     assert page.title == "Capture down: XYZ quotes"
+    # No class is named, and that is the point rather than an omission. Nothing was
+    # attempted in a slept-through slot, so there is no failure to name.
     assert page.body == "3 session minutes without a durable cycle"
 
 
@@ -799,10 +801,52 @@ def test_a_mid_session_recalibration_reaches_the_watchdog(tmp_path):
     (page,) = rig.transport.sent
     assert page.event == "capture_down"
     assert page.title == "Capture down: XYZ quotes"
-    assert page.body == f"{RECALIBRATED_PAGE_MINUTES} session minutes without a durable cycle"
+    assert page.body == (
+        f"{RECALIBRATED_PAGE_MINUTES} session minutes without a durable cycle, failing with boom"
+    )
 
 
 # -- 9. an empty roster keeps the daemon running ---------------------------------------
+
+
+class _RateLimited:
+    """A cycle runner whose every cycle gaps one surface with a rate-limit class."""
+
+    def __init__(self, rig: _Rig, clock: ManualClock):
+        self._rig = rig
+        self._clock = clock
+
+    def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        slot = self._clock.now().replace(second=0, microsecond=0)
+        segment = SegmentOutcome(
+            surface=journal.QUOTES_SURFACE,
+            ticker="XYZ",
+            path=self._rig.lake_root / "segment.arrows",
+            partition="quotes/ticker=XYZ/date=2026-09-02/segment.arrows",
+            row_kind=journal.ROW_KIND_GAP,
+            rows=1,
+            error_class="http_429",
+            fetched_at=None,
+        )
+        return CycleResult(snap_ts=slot, segments=(segment,))
+
+
+def test_a_surface_page_names_the_class_it_is_failing_with(tmp_path):
+    """The title says what went quiet, and the body has to say why.
+
+    A rate limit that starves one ticker while another still lands rows is not a
+    whole-daemon cause, so the page that goes out names the ticker. Without the class in
+    the body, that page sends the operator to look at one dead surface when the budget is
+    what is failing. The watchdog has held the class all along and dropped it here.
+    """
+    rig = _rig(tmp_path)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=4, cycle_runner=_RateLimited(rig, clock))
+
+    (page,) = rig.transport.sent
+    assert page.event == "capture_down"
+    assert page.title == "Capture down: XYZ quotes"
+    assert page.body == "3 session minutes without a durable cycle, failing with http_429"
 
 
 def test_an_empty_roster_still_runs_the_loop_and_reports(tmp_path):

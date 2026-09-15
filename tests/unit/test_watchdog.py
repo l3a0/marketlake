@@ -380,6 +380,8 @@ def test_sustained_rate_limiting_names_itself_too():
 
 
 def test_one_dead_surface_is_still_a_surface_page():
+    # The page names the surface, and carries the class it is failing with, so the body
+    # can say why without the title claiming the whole daemon is down.
     watchdog = Watchdog()
     raised = []
     for minute in range(4):
@@ -389,7 +391,7 @@ def test_one_dead_surface_is_still_a_surface_page():
             )
         )
     assert [p.title for p in raised] == ["Capture down: SPY chains"]
-    assert raised[0].cause is None
+    assert raised[0].cause == "http_500"
 
 
 def test_mixed_failure_classes_are_not_one_cause():
@@ -444,6 +446,9 @@ def test_one_surface_failing_with_an_auth_class_is_not_a_dead_daemon():
     One surface 401-ing while another still returns data is that surface's problem, not
     the token's. Naming the token would send the operator to re-authenticate against a
     daemon that is authenticating fine.
+
+    The page still carries the class, because what is rejected here is the title's claim
+    about the whole daemon, not the fact that this surface saw a 401.
     """
     watchdog = Watchdog()
     raised = []
@@ -456,7 +461,7 @@ def test_one_surface_failing_with_an_auth_class_is_not_a_dead_daemon():
             )
         )
     assert [p.title for p in raised] == ["Capture down: SPY chains"]
-    assert raised[0].cause is None
+    assert raised[0].cause == "http_401"
 
 
 def test_one_dead_token_reported_two_ways_is_still_one_page():
@@ -787,3 +792,118 @@ def test_a_slept_through_slot_stays_quiet_under_a_live_cause():
     assert [page.title for page in raised] == ["Capture down: token dead"]
     watched = [Surface("chains", "SPY"), Surface("quotes", "SPY")]
     assert watchdog.missed(watched, [_at(minute) for minute in range(3, 9)]) == []
+
+
+# -- a page names what it is failing with --------------------------------------------
+
+
+def test_a_starved_ticker_pages_with_the_class_that_starved_it():
+    """The case this exists for, at the roster the project runs.
+
+    A chain is fetched as several date windows. A ticker that loses every window journals
+    a whole-chain gap. A ticker that loses only some journals a data segment carrying the
+    class of the window it lost, which resets that surface's counter. So a rate limit that
+    starves one ticker and merely degrades another is never one whole-daemon failure, and
+    the page that goes out names a ticker. It has to carry the class, or it sends the
+    operator to look at one chain worker while the budget is what is failing.
+    """
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(4):
+        raised += watchdog.observe(
+            _cycle(
+                _fail("chains", "SPY", "http_429"),
+                # A partial snapshot is a data row carrying the lost window's class.
+                _seg("chains", "QQQ", "data"),
+                _seg("quotes", "SPY", "data"),
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in raised] == ["Capture down: SPY chains"]
+    assert raised[0].cause == "http_429"
+    # The degraded ticker is not paged at all. A partial snapshot is a durable data cycle,
+    # and the design gives degradation to the validation battery, not to the watchdog.
+    assert watchdog.count("chains", "QQQ") == 0
+
+
+def test_a_surface_that_could_not_be_written_pages_with_its_own_class():
+    # An unwritten segment carries its class too, and the surface is just as down.
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(3):
+        raised += watchdog.observe(
+            _cycle(errors=(SegmentError("chains", "SPY", "os_error"),), at=_at(minute))
+        )
+    assert [page.title for page in raised] == ["Capture down: SPY chains"]
+    assert raised[0].cause == "os_error"
+
+
+def test_a_page_for_a_failure_with_no_recorded_class_names_none():
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(3):
+        raised += watchdog.observe(
+            _cycle(
+                SegmentOutcome(
+                    surface="chains",
+                    ticker="SPY",
+                    path=Path("seg.arrows"),
+                    partition="p",
+                    row_kind="gap",
+                    rows=1,
+                    error_class=None,
+                    fetched_at=None,
+                ),
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in raised] == ["Capture down: SPY chains"]
+    assert raised[0].cause is None
+
+
+def test_a_slept_through_slot_pages_with_no_class():
+    # Nothing was attempted in a slot the loop slept through, so there is no failure to
+    # name. Guessing one would point at a request that was never made.
+    watchdog = Watchdog()
+    pages = watchdog.missed([Surface("chains", "SPY")], [_at(minute) for minute in range(3)])
+    assert [page.title for page in pages] == ["Capture down: SPY chains"]
+    assert pages[0].cause is None
+
+
+def test_the_sampler_page_names_the_class_every_collapsed_ticker_shares():
+    # A chains surface still landing rows is what keeps this a sampler death rather than
+    # a whole-daemon cause, which would name itself and never reach the collapse.
+    watchdog = Watchdog()
+    for minute in range(3):
+        pages = watchdog.observe(
+            _cycle(
+                _fail("quotes", "SPY", "http_429"),
+                _fail("quotes", "QQQ", "http_429"),
+                _fail("quotes", "IWM", "http_429"),
+                _seg("chains", "SPY", "data"),
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in pages] == ["Capture down: quote sampler dead"]
+    assert pages[0].cause == "http_429"
+
+
+def test_the_sampler_page_names_no_class_when_the_collapsed_tickers_disagree():
+    """One batched request died, so in practice the collapsed tickers agree.
+
+    When they do not, there is no one class the page can honestly name, and picking one
+    of several would send the operator after whichever sorted first.
+    """
+    watchdog = Watchdog()
+    for minute in range(3):
+        pages = watchdog.observe(
+            _cycle(
+                _fail("quotes", "SPY", "http_429"),
+                _fail("quotes", "QQQ", "timeout"),
+                _fail("quotes", "IWM", "http_429"),
+                _seg("chains", "SPY", "data"),
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in pages] == ["Capture down: quote sampler dead"]
+    assert pages[0].cause is None

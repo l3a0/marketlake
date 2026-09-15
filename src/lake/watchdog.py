@@ -143,17 +143,21 @@ class Watchdog:
             self._reset(key)
         for key in sorted(failed, key=str):
             self._counts[key] = self._counts.get(key, 0) + 1
-        titles = {
-            Surface(segment.surface, segment.ticker): _WHOLE_DAEMON_CAUSES.get(segment.error_class)
+        classes: dict[Surface, str | None] = {
+            Surface(segment.surface, segment.ticker): segment.error_class
             for segment in result.segments
             if Surface(segment.surface, segment.ticker) in failed
         }
+        # A segment that could not be written carries its own class, and that surface is
+        # just as down, so its page names that class the same way.
+        for error in result.errors:
+            classes[Surface(error.surface, error.ticker)] = error.error_class
         self._release_retired(touched)
         threshold = self._threshold()
         cause = self._whole_daemon(result, failed, touched, threshold)
         if cause is not None:
             return cause
-        return self._pages(failed, touched, attempted=True, threshold=threshold, titles=titles)
+        return self._pages(failed, touched, attempted=True, threshold=threshold, classes=classes)
 
     def missed(self, surfaces: Iterable[Surface], slots: Sequence[datetime]) -> list[Page]:
         """Charge a run of slept-through slots, one increment per slot.
@@ -180,7 +184,7 @@ class Watchdog:
                     set(watched),
                     attempted=False,
                     threshold=threshold,
-                    titles={},
+                    classes={},
                 )
             )
         return pages
@@ -311,7 +315,7 @@ class Watchdog:
         *,
         attempted: bool,
         threshold: int,
-        titles: dict[Surface, str | None],
+        classes: dict[Surface, str | None],
     ) -> list[Page]:
         """The pages this minute owes, collapsing a dead sampler into one.
 
@@ -329,7 +333,7 @@ class Watchdog:
             for key in sorted(failed, key=str)
             if self._counts.get(key, 0) >= threshold
             and key not in self._paged
-            and not self._covered(key, titles.get(key))
+            and not self._covered(key, _WHOLE_DAEMON_CAUSES.get(classes.get(key)))
         ]
         if not tripped:
             return []
@@ -344,19 +348,29 @@ class Watchdog:
         self._paged.update(tripped)
         pages: list[Page] = []
         if collapsed:
+            # One batched request died, so in practice every collapsed ticker reports the
+            # same class. Naming one of several would pick a winner arbitrarily, so a
+            # disagreement names none.
+            shared = {classes.get(key) for key in quotes_failed}
             pages.append(
                 Page(
                     title="Capture down: quote sampler dead",
                     minutes=max(self._counts[key] for key in quotes_failed),
                     surfaces=tuple(sorted(quotes_failed, key=str)),
                     sampler_collapse=True,
+                    cause=shared.pop() if len(shared) == 1 else None,
                 )
             )
         for key in tripped:
             if collapsed and key.surface == QUOTES_SURFACE:
                 continue
             pages.append(
-                Page(title=f"Capture down: {key}", minutes=self._counts[key], surfaces=(key,))
+                Page(
+                    title=f"Capture down: {key}",
+                    minutes=self._counts[key],
+                    surfaces=(key,),
+                    cause=classes.get(key),
+                )
             )
         return pages
 
