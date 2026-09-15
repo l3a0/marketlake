@@ -98,7 +98,15 @@ from lake.config import CALLBACK_KEY, input_errors_exit, load_config
 from lake.manifest import BackupScrubResult, ScrubResult, backup_scrub, scrub
 from lake.metadata import read_metadata
 from lake.paths import CONFIG_DIR_ENV, TOKEN_FILE, config_dir
-from lake.runner import PING_FAILURES, LaunchdJob, Pinger, UrllibPinger, calendar_interval
+from lake.runner import (
+    PING_FAILURES,
+    LaunchdJob,
+    Pinger,
+    SlugEscalation,
+    UrllibPinger,
+    calendar_interval,
+    escalate_ping_failure,
+)
 from lake.vendor import Vendor
 
 # -- the wall-clock constants ------------------------------------------------
@@ -561,8 +569,15 @@ def self_check(
     assertion_probe: AssertionProbe | None = None,
     assertion_pid: int | None = None,
     now: datetime | None = None,
+    publisher: Publisher | None = None,
 ) -> SelfCheckOutcome:
     """Verify the daemon is up and holding its assertion, and ping only then.
+
+    ``publisher`` carries the page a refused ping raises. With none, a refusal is named
+    in ``problem`` and pages nobody, which is what lets a test drive this helper without
+    a page reaching anywhere. A page needs a moment to stamp, so a caller that passes no
+    ``now`` escalates nothing, the same answer ``_assertion_owed`` gives above. The
+    command line always passes one.
 
     The ping means awake, daemon up, and the machine held awake. A missed ping means
     one of those failed, paged a full hour before the bell. So the ping fires only on
@@ -661,6 +676,11 @@ def self_check(
         pinger.ping(ping_url)
     except PING_FAILURES as exc:
         problem = f"ping failed: {type(exc).__name__}"
+        # A refused ping feeds no check, so no check will ever go silent to report it.
+        # Without a moment there is nothing to stamp a page with, which is the same
+        # answer ``_assertion_owed`` gives above. The command line always passes one.
+        if now is not None:
+            escalate_ping_failure(exc, slug=PRE_OPEN_SLUG, publisher=publisher, now=now)
         return SelfCheckOutcome(daemon_up=True, pinged=False, problem=problem, assertion_held=held)
     return SelfCheckOutcome(daemon_up=True, pinged=True, assertion_held=held)
 
@@ -1601,6 +1621,7 @@ def sunday_maintenance(
     mint: datetime | None = None,
     exclusion_targets: Sequence[str] = (),
     exclusion_reader: ExclusionReader | None = None,
+    escalation: SlugEscalation | None = None,
 ) -> SundayOutcome:
     """Scrub both copies, verify the wake alarms, run the canary, assert coverage, ping.
 
@@ -1615,12 +1636,19 @@ def sunday_maintenance(
     sticky exclusion is invisible once set and dies quietly if the item it marks is
     replaced, so something has to look. With no ``exclusion_reader`` the check does not
     run, which costs a report line and never a ping. The command line always passes
-    one. The
-    coverage assertion needs the token's mint time. ``mint`` is ``None`` when the
+    one.
+
+    The coverage assertion needs the token's mint time. ``mint`` is ``None`` when the
     caller could not read it, and that withholds the ping. A ping that is attempted
     and fails is named in ``problems`` rather than raised, so the run still reports
     the scrub, the canary, and the coverage verdict it just spent its time computing.
     A coverage assertion that never ran must not read as a pass.
+
+    ``escalation`` carries the page a refused ping raises, and it is the caller's object
+    rather than one built here because ``sunday_run`` re-runs this whole job every half
+    hour while anything is failing. See the comment at the ping itself. With none, a
+    refusal is named in ``problems`` and pages nobody, which is what lets a test drive
+    this helper without a page reaching anywhere.
 
     Four duties the design gives the Sunday run are not built here. Each is named so
     the gap is a decision rather than an oversight.
@@ -1713,6 +1741,17 @@ def sunday_maintenance(
             pinged = True
         except PING_FAILURES as exc:
             problems.append(f"ping failed: {type(exc).__name__}")
+            # A refused ping feeds no check, so no check will ever go silent to report
+            # it. The ``problems`` line reaches a log nobody reads.
+            #
+            # The guard is handed in rather than built here, and that is not decoration.
+            # A refused ping is a problem, so ``sunday_run`` retries this attempt every
+            # half hour until the canary deadline, which is seven attempts on an evening
+            # that starts at 20:00. Escalating from a fresh guard each time would page
+            # seven times for one missing row. The evening's guard lives up there, beside
+            # the reminder's own once-an-hour state.
+            if escalation is not None:
+                escalation.failed(exc, slug=SUNDAY_SLUG, now=now)
     return SundayOutcome(
         scrub=result,
         backup=backup,
@@ -1750,6 +1789,7 @@ def sunday_run(
     exclusion_targets: Sequence[str] = (),
     exclusion_reader: ExclusionReader | None = None,
     reminder_sink: ReminderSink | None = None,
+    publisher: Publisher | None = None,
 ) -> list[SundayOutcome]:
     """Run the Sunday job, retrying until it passes or the canary deadline.
 
@@ -1776,6 +1816,10 @@ def sunday_run(
     publisher's contract rather than every caller's. ``reminder_publisher`` is the
     production sink and holds that promise for this one. With no sink the reminder is
     still decided and still returned on the outcome, and nothing pushes it.
+
+    ``publisher`` is where a refused ping pages, and it is the same one the reminder
+    pushes through. One guard covers the whole evening rather than one attempt, for the
+    reason the loop below gives. With no publisher nothing escalates.
     """
     start = clock.now().astimezone(MARKET_TZ)
     in_the_window = start.weekday() == _PY_SUNDAY and SUNDAY_MAINTENANCE.on(start.date()) <= start
@@ -1783,6 +1827,10 @@ def sunday_run(
 
     outcomes: list[SundayOutcome] = []
     reminded: set[int] = set()
+    # One page for the evening, not one per attempt. The loop below re-runs the whole
+    # job every half hour while anything is still failing, and a slug with no row fails
+    # every one of those attempts.
+    escalation = SlugEscalation(publisher)
     while True:
         attempt_now = clock.now()
         outcome = sunday_maintenance(
@@ -1797,6 +1845,7 @@ def sunday_run(
             mint=mint_reader(),
             exclusion_targets=exclusion_targets,
             exclusion_reader=exclusion_reader,
+            escalation=escalation,
         )
         # One reminder an hour. Later attempts in the same hour owe nothing, so the
         # outcome records only the one that went out.
@@ -2891,6 +2940,14 @@ def main(
             assertion_probe=pmset_assertions_probe,
             assertion_pid=read_metadata(config.lake_root).assertion_pid,
             now=_system_clock().now(),
+            # A ping healthchecks refuses feeds no check, so nothing goes silent to
+            # report it. The secrets are the two values that must never reach a phone,
+            # checked against the page itself.
+            publisher=Publisher(
+                lake_root=config.lake_root,
+                transport=NtfyTransport(config.ntfy_topic.reveal()),
+                secrets=(config.healthchecks_ping_key.reveal(), config.ntfy_topic.reveal()),
+            ),
         )
         status = "daemon up" if outcome.daemon_up else "daemon down"
         if outcome.problem is not None:
@@ -2920,8 +2977,8 @@ def main(
         # The job's own clock, shared by the retry loop and the reminder's timestamp, so
         # a push is stamped with the attempt that raised it.
         run_clock = clock if clock is not None else _system_clock()
-        # The reminder's delivery. The secrets are the two values that must never reach a
-        # phone, checked against the message itself.
+        # The reminder's delivery, and the refused-ping page's. The secrets are the two
+        # values that must never reach a phone, checked against the message itself.
         publisher = Publisher(
             lake_root=config.lake_root,
             transport=NtfyTransport(config.ntfy_topic.reveal()),
@@ -2942,6 +2999,9 @@ def main(
             ),
             mint_reader=read_mint,
             reminder_sink=reminder_publisher(publisher=publisher, clock=run_clock),
+            # The same publisher the reminder pushes through. A refused ping is a page,
+            # not a reminder, so it goes out as one.
+            publisher=publisher,
             exclusion_targets=tmutil_exclusion_targets(
                 default_config_dir(str(Path.home())), token_path
             ),

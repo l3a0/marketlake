@@ -28,7 +28,7 @@ from datetime import date, datetime
 
 from lake.alert import Message
 from lake.calendar import MARKET_TZ
-from lake.runner import PING_FAILURES
+from lake.runner import PING_FAILURES, escalate_ping_failure
 from lake.schwab import DEFAULT_TOKEN_PATH
 
 # What the probe reports, per the design's message table. A session the daemon slept
@@ -154,16 +154,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         pinger=UrllibPinger(),
         ping_url=config.healthchecks_url(CALENDAR_PROBE_SLUG),
+        slug=CALENDAR_PROBE_SLUG,
         now=clock.now(),
     )
 
 
-def report(result: ProbeResult, *, publisher, pinger, ping_url: str, now) -> int:
+def report(result: ProbeResult, *, publisher, pinger, ping_url: str, slug: str, now) -> int:
     """Feed the check, page if the market is open, and say what happened.
 
     The check is fed before the paging branch returns. It is fed on every answer, so
     its silence means the probe stopped running rather than that every day was fine, and
     a day that pages is exactly a day the probe did run.
+
+    ``slug`` names the check the URL addresses, and it is required rather than derived,
+    so the page a refused ping raises can never name a different check than the one that
+    was pinged. The URL carries the ping key and never reaches a page.
     """
     try:
         pinger.ping(ping_url)
@@ -171,6 +176,9 @@ def report(result: ProbeResult, *, publisher, pinger, ping_url: str, now) -> int
         # A ping that does not land is what the check exists to notice. Losing the page
         # because of it would be the wrong trade.
         print(f"calendar probe: ping failed: {type(exc).__name__}", file=sys.stderr)
+        # A refused ping is the other failure. It feeds no check, so nothing will ever
+        # go silent to report it.
+        escalate_ping_failure(exc, slug=slug, publisher=publisher, now=now)
 
     if result.pages:
         publisher.publish(

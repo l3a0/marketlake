@@ -31,6 +31,7 @@ from datetime import datetime, timedelta
 
 from lake.calendar import MARKET_TZ
 from lake.control_plane import CAPTURE_SLUG, assertion_window
+from lake.runner import SlugEscalation
 from lake.session import SessionClock
 
 # How often an idle heartbeat goes out. The loop ticks every minute, and a ping a minute
@@ -70,6 +71,15 @@ class DeadMan:
     landed, and the Now panel is meant to show it too. The panel reads the lake, so a
     landed ping is written down there. Only a landed one, because the panel's line says
     the check is being fed and a ping that never left the laptop is not feeding it.
+
+    The publisher is the one failure that must not be swallowed. A ping healthchecks
+    refuses feeds no check, so this check never arms and the whole-daemon guarantee sits
+    inert while every other job reports healthy. Silence cannot report that, because
+    there is nothing there to go silent. So a refusal pages, once, and the page re-arms
+    when a ping to this slug lands. A ping lost in transport still pages nobody, which is
+    the trade the design already made when it set this check's grace looser than the
+    watchdog's. With no publisher nothing escalates, which is what lets a test drive the
+    dead-man without a page reaching anywhere.
     """
 
     def __init__(
@@ -79,12 +89,16 @@ class DeadMan:
         url: str,
         session_clock: SessionClock,
         recorder: Callable[[datetime], None] | None = None,
+        publisher=None,
     ) -> None:
         self._pinger = pinger
         self._url = url
         self._session_clock = session_clock
         self._recorder = recorder
         self._last: datetime | None = None
+        # Long-lived, because this object is. The one-shot jobs page at most once per
+        # run by construction and need no state.
+        self._escalation = SlugEscalation(publisher)
 
     def captured(self, now: datetime) -> bool:
         """Feed the check for a cycle that produced durable data."""
@@ -110,8 +124,10 @@ class DeadMan:
         self._last = now
         try:
             self._pinger.ping(self._url)
-        except Exception:  # noqa: BLE001 - a missed ping is what the check is for
+        except Exception as exc:  # noqa: BLE001 - a missed ping is what the check is for
+            self._escalation.failed(exc, slug=CAPTURE_SLUG, now=now)
             return False
+        self._escalation.landed(CAPTURE_SLUG)
         self._record(now)
         return True
 

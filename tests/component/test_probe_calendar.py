@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from lake.control_plane import CALENDAR_PROBE_SLUG
 from lake.probe_calendar import ProbeResult, fresh_symbols, run_probe
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
@@ -144,7 +145,12 @@ def test_a_market_found_open_is_actually_sent(tmp_path):
     sink, pings = Sink(), Pings()
     result = ProbeResult(date(2026, 9, 5), checked=True, trading=("SPY",))
     code = report(
-        result, publisher=sink, pinger=pings, ping_url="https://x/y", now=et(2026, 9, 5, 9, 35)
+        result,
+        publisher=sink,
+        pinger=pings,
+        ping_url="https://x/y",
+        slug=CALENDAR_PROBE_SLUG,
+        now=et(2026, 9, 5, 9, 35),
     )
     assert code == 1
     assert [m.title for m in sink.sent] == [PAGE_TITLE]
@@ -163,6 +169,7 @@ def test_the_check_is_fed_on_the_day_it_pages_too():
         publisher=Sink(),
         pinger=pings,
         ping_url="https://x/y",
+        slug=CALENDAR_PROBE_SLUG,
         now=et(2026, 9, 5, 9, 35),
     )
     assert pings.urls == ["https://x/y"]
@@ -177,6 +184,7 @@ def test_a_quiet_day_feeds_the_check_and_pages_nobody():
         publisher=sink,
         pinger=pings,
         ping_url="https://x/y",
+        slug=CALENDAR_PROBE_SLUG,
         now=et(2026, 9, 5, 9, 35),
     )
     assert code == 0
@@ -197,6 +205,7 @@ def test_a_failing_ping_never_costs_the_page():
         publisher=sink,
         pinger=Broken(),
         ping_url="https://x/y",
+        slug=CALENDAR_PROBE_SLUG,
         now=et(2026, 9, 5, 9, 35),
     )
     assert code == 1

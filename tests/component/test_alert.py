@@ -3,18 +3,30 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import UTC, date, datetime
+from pathlib import Path
+from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
 import pytest
 
+from lake import alert
 from lake.alert import (
     CAP_REACHED,
+    PAGE_PRIORITY,
     POST_FAILED,
     REFUSED,
     Message,
     Publisher,
     undelivered,
+)
+from tests.support.clock import ManualClock
+from tests.support.config import (
+    NTFY_TOPIC,
+    PING_KEY,
+    SCHWAB_API_KEY,
+    SCHWAB_APP_SECRET,
+    write_config,
 )
 
 ET = ZoneInfo("America/New_York")
@@ -162,8 +174,6 @@ def test_the_daemon_pages_through_the_publisher_when_a_surface_goes_quiet(tmp_pa
     from lake import daemon
     from lake.capture import CycleResult, SegmentOutcome
     from tests.support.calendar import et, weekday_sessions
-    from tests.support.clock import ManualClock
-    from tests.support.config import write_config
     from tests.support.pinger import FakePinger
 
     lake_root = tmp_path / "lake"
@@ -335,3 +345,316 @@ def test_only_a_page_carries_the_tag():
     assert bodies[0]["tags"] == [PAGE_TAG]
     assert "tags" not in bodies[1]
     assert "tags" not in bodies[2]
+
+
+# -- the hand-run channel test -------------------------------------------------------
+#
+# ``python -m lake.alert --test-push`` exercises the one assumption every page rides: that
+# a priority-5 push reaches the phone and interrupts it. These drive `main` with the real
+# wiring and a fake at the leaf, the way the other command entries are tested, because a
+# shortcut around `main` would leave the wiring this command exists to exercise untested.
+
+UTC_NOON = datetime(2026, 9, 2, 16, 0, tzinfo=UTC)
+"""16:00 UTC is 12:00 ET on this date.
+
+Deliberately not Eastern. `Clock.now()` returns UTC by contract, so a fixture already in
+Eastern hides a missing conversion: the body would read the same either way.
+"""
+
+
+def _no_secret(captured) -> None:
+    """Neither stream carries any of the four secrets `config.yaml` holds.
+
+    One sweep, called from every outcome below, so a new outcome cannot get a weaker
+    check than the others. `main` loads the whole config, so all four are live in the
+    frame, and the design puts the Schwab pair in the same class as the ping key and the
+    topic. A sweep for two of four passes a command that prints the other two.
+    """
+    for stream in (captured.out, captured.err):
+        for secret in (NTFY_TOPIC, PING_KEY, SCHWAB_API_KEY, SCHWAB_APP_SECRET):
+            assert secret not in stream
+
+
+def _config(tmp_path, *, lake_exists: bool = True) -> tuple[Path, Path]:
+    """A config naming a lake under ``tmp_path``, and that lake's root.
+
+    ``lake_exists=False`` leaves the root uncreated, which is what makes the publisher
+    unable to write its record. That is the third outcome, the one lost twice.
+    """
+    lake_root = tmp_path / "lake"
+    if lake_exists:
+        lake_root.mkdir()
+    return write_config(tmp_path, lake_root), lake_root
+
+
+class _Run(NamedTuple):
+    """What one drive of the entry produced."""
+
+    code: int
+    lake_root: Path
+    topics: list[str]
+    built: dict
+
+
+def _push(tmp_path, monkeypatch, transport, *, lake_exists=True, config=None, now=UTC_NOON):
+    """Drive `main` against ``transport``, capturing what the entry built on the way.
+
+    The topic reaching `NtfyTransport` and the keywords reaching `Publisher` are captured
+    rather than discarded. A patch that throws them away cannot tell the configured topic
+    from any other string, and substituting the ping key there would publish it to ntfy.
+    """
+    if config is None:
+        config, lake_root = _config(tmp_path, lake_exists=lake_exists)
+    else:
+        lake_root = Path(yaml_value(config, "lake_root"))
+    topics: list[str] = []
+    built: dict = {}
+    real = alert.Publisher
+
+    class Watched(real):
+        def __init__(self, **kwargs):
+            built.update(kwargs)
+            super().__init__(**kwargs)
+
+    def factory(topic):
+        topics.append(topic)
+        return transport
+
+    monkeypatch.setattr(alert, "NtfyTransport", factory)
+    monkeypatch.setattr(alert, "Publisher", Watched)
+    code = alert.main(["--test-push", "--config", str(config)], clock=ManualClock(start=now))
+    return _Run(code, lake_root, topics, built)
+
+
+def yaml_value(path: Path, key: str) -> str:
+    """One scalar out of a hand-written config, without importing the loader."""
+    for line in Path(path).read_text().splitlines():
+        if line.startswith(f"{key}:"):
+            return line.split(":", 1)[1].strip()
+    raise KeyError(key)
+
+
+def test_a_test_push_that_sends_exits_zero_and_says_what_went_out(tmp_path, capsys, monkeypatch):
+    transport = Recording()
+    run = _push(tmp_path, monkeypatch, transport)
+
+    assert run.code == 0
+    (sent,) = transport.sent
+    assert sent.event == alert.TEST_PUSH_EVENT
+    assert sent.title == alert.TEST_PUSH_TITLE
+    captured = capsys.readouterr()
+    assert "accepted the push at priority 5" in captured.out
+    # Acceptance is not delivery, and saying so is the point. An unauthenticated topic
+    # accepts a mistyped name, so a zero exit alone would be read as proof it works.
+    assert "read by nobody" in captured.out
+    assert "the phone is the only evidence" in captured.out
+    # A success sends, so there is nothing to write down.
+    assert _records(run.lake_root) == []
+    _no_secret(captured)
+
+
+def test_the_message_carries_the_pinned_event_name_and_title(tmp_path, capsys, monkeypatch):
+    """The literals, not the constants.
+
+    Asserting `sent.event == alert.TEST_PUSH_EVENT` moves with the constant and so holds
+    nothing. An operator reads the topic against a fixed shape, so the shape is the thing
+    that must not drift.
+    """
+    assert alert.TEST_PUSH_EVENT == "test_push"
+    assert alert.TEST_PUSH_TITLE == "Test push"
+    transport = Recording()
+    _push(tmp_path, monkeypatch, transport)
+    (sent,) = transport.sent
+    assert sent.event == "test_push"
+    assert sent.title == "Test push"
+    _no_secret(capsys.readouterr())
+
+
+def test_the_body_stamps_eastern_and_says_nothing_is_wrong(tmp_path, capsys, monkeypatch):
+    """`Clock.now()` is UTC, so the conversion to Eastern is a real step.
+
+    The body prints the letters ET, so a missing or wrong conversion still reads as an
+    Eastern time and is invisible to the eye. The clock here is 16:00 UTC, which is 12:00
+    in New York, and no other zone gives that answer.
+    """
+    transport = Recording()
+    _push(tmp_path, monkeypatch, transport)
+
+    (sent,) = transport.sent
+    assert "2026-09-02 12:00:00 ET" in sent.body
+    # It arrives at the page tier with a page's emoji, possibly at 3am. A body that read
+    # like a real page would teach the operator to distrust the tier.
+    assert "Nothing is wrong" in sent.body
+    _no_secret(capsys.readouterr())
+
+
+def test_the_topic_comes_from_the_config_every_other_producer_reads(tmp_path, capsys, monkeypatch):
+    """Substituting the ping key here would publish it to ntfy.
+
+    `NtfyTransport` puts the topic in the POST body, and `Publisher._leak` scans only the
+    message title and body, never the transport. So the secret refusal cannot catch this
+    one, and a patch that discards the topic cannot tell the two apart.
+    """
+    run = _push(tmp_path, monkeypatch, Recording())
+
+    assert run.topics == [NTFY_TOPIC]
+    _no_secret(capsys.readouterr())
+
+
+def test_a_refused_test_push_exits_non_zero_and_prints_the_reason(tmp_path, capsys, monkeypatch):
+    """Recorded is not sent.
+
+    A page written down because it could not be sent left the phone silent. Exiting 0
+    here would hand an operator a green result for a channel that does not work, which
+    is the one failure this command exists to catch.
+    """
+    run = _push(tmp_path, monkeypatch, Broken())
+
+    assert run.code != 0
+    captured = capsys.readouterr()
+    assert POST_FAILED in captured.err
+    assert "NOT sent" in captured.err
+    # Written down and lost twice are different outcomes. Telling an operator whose page
+    # was recorded that nothing records it sends them past the file that holds it.
+    assert "written down under reports/alerts/" in captured.err
+    assert "lost twice" not in captured.err
+    # The record is there. The exit code still says the channel did not carry it.
+    (record,) = _records(run.lake_root)
+    assert record["reason"] == POST_FAILED
+    _no_secret(captured)
+
+
+def test_a_test_push_lost_twice_says_it_was_lost_twice(tmp_path, capsys, monkeypatch):
+    """Not sent and not written down is a third outcome, not a louder second one.
+
+    An operator whose lake root is missing has a push that reached nothing and a record
+    that reached nothing either, so there is no file to go back to.
+    """
+    run = _push(tmp_path, monkeypatch, Broken(), lake_exists=False)
+
+    assert run.code != 0
+    captured = capsys.readouterr()
+    assert "lost twice" in captured.err
+    assert "written down under reports/alerts/" not in captured.err
+    assert not run.lake_root.exists(), "the test push created the lake root it was handed"
+    _no_secret(captured)
+
+
+def test_a_refusal_blames_the_config_rather_than_the_phone(tmp_path, capsys, monkeypatch):
+    """The refusal is the one failure whose cause lives in `config.yaml`.
+
+    `Publisher._leak` is a plain substring match of the topic against the message text,
+    and this body is fixed English prose. A topic that is an ordinary word refuses every
+    run identically, and the channel is never contacted. Sending the operator to check
+    the phone would be an answer no phone-side fix can ever clear.
+    """
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = tmp_path / "collide.yaml"
+    config.write_text(
+        f"lake_root: {lake_root}\n"
+        f"backup_target: {tmp_path}\n"
+        f"healthchecks_ping_key: {PING_KEY}\n"
+        # A word the fixed body already uses, which is what makes the leak check fire.
+        "ntfy_topic: interrupts\n"
+        f"schwab_api_key: {SCHWAB_API_KEY}\n"
+        f"schwab_app_secret: {SCHWAB_APP_SECRET}\n"
+    )
+    transport = Recording()
+    run = _push(tmp_path, monkeypatch, transport, config=config)
+
+    assert run.code != 0
+    # The channel was never contacted, so nothing about the phone is in question.
+    assert transport.sent == []
+    captured = capsys.readouterr()
+    assert REFUSED in captured.err
+    assert "carries a value from config.yaml" in captured.err
+    assert "the phone is not in question" in captured.err
+    _no_secret(captured)
+
+
+def test_the_test_push_goes_at_the_page_tier(tmp_path, capsys, monkeypatch):
+    """Priority 5 is the half that matters.
+
+    The design says this push is the evidence that a page interrupts a locked iPhone. At
+    the report tier it would prove delivery and prove nothing about the interrupt, and
+    the interrupt is what every alarm depends on. The literal sits beside the constant,
+    so moving the constant cannot quietly move this test with it.
+    """
+    transport = Recording()
+    run = _push(tmp_path, monkeypatch, transport)
+
+    assert run.code == 0
+    (sent,) = transport.sent
+    assert sent.priority == PAGE_PRIORITY == 5
+    _no_secret(capsys.readouterr())
+
+
+def test_the_test_push_goes_through_the_publisher(tmp_path, capsys, monkeypatch):
+    """A direct POST would reach the phone and prove a path production does not use.
+
+    The publisher is where the daily cap, the secret refusal, and the record of an
+    undelivered page live. A send that skipped it would exercise none of them, so a
+    green result would say nothing about what happens when the daemon pages.
+    """
+    seen: list[Message] = []
+    real = alert.Publisher
+
+    class Watched(real):
+        def publish(self, message: Message, *, now):
+            seen.append(message)
+            return super().publish(message, now=now)
+
+    monkeypatch.setattr(alert, "Publisher", Watched)
+    run = _push(tmp_path, monkeypatch, Broken())
+
+    assert run.code != 0
+    assert [message.event for message in seen] == [alert.TEST_PUSH_EVENT]
+    # The publisher is armed the same way every other producer arms it, so the test push
+    # is refused if it ever carries a secret.
+    assert run.built["secrets"] == (PING_KEY, NTFY_TOPIC)
+    assert run.built["lake_root"] == run.lake_root
+    # No override, so the design's forty stands. A raised cap here would exempt the hand
+    # run from the path it exists to exercise.
+    assert "daily_cap" not in run.built
+    assert alert.DEFAULT_DAILY_CAP == 40
+    # The record is the publisher's own mark on the filesystem. A direct POST leaves none.
+    assert undelivered(run.lake_root, date(2026, 9, 2)) == 1
+    _no_secret(capsys.readouterr())
+
+
+def test_the_entry_refuses_a_bare_invocation_rather_than_paging(tmp_path, capsys, monkeypatch):
+    """Running the module with no arguments must not send a page to a phone.
+
+    The config is valid and named, so argparse is the only thing left that can exit 2.
+    Without that, a missing config exits 2 by its own route and the test passes whether
+    or not the flag is required, which is the mutation it exists to catch.
+    """
+    config, _ = _config(tmp_path)
+    monkeypatch.setenv("MARKETLAKE_CONFIG", str(config))
+    built: list[str] = []
+    monkeypatch.setattr(alert, "NtfyTransport", lambda topic: built.append(topic) or Recording())
+
+    with pytest.raises(SystemExit) as excinfo:
+        alert.main([])
+
+    assert excinfo.value.code == 2
+    assert "--test-push" in capsys.readouterr().err
+    assert built == [], "a bare invocation built a transport and reached the topic"
+
+
+def test_an_abbreviated_flag_does_not_reach_a_phone(tmp_path, capsys, monkeypatch):
+    """argparse accepts any unambiguous prefix unless told not to.
+
+    `--test` is what someone reaches for when they mean a dry run, and by default it
+    parses as `--test-push` and puts a priority-5 push on the topic.
+    """
+    config, _ = _config(tmp_path)
+    built: list[str] = []
+    monkeypatch.setattr(alert, "NtfyTransport", lambda topic: built.append(topic) or Recording())
+
+    with pytest.raises(SystemExit) as excinfo:
+        alert.main(["--test", "--config", str(config)])
+
+    assert excinfo.value.code == 2
+    assert built == [], "an abbreviated flag built a transport and reached the topic"

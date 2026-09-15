@@ -146,6 +146,7 @@ def test_input_errors_exit_lets_every_other_exception_through():
 @pytest.mark.parametrize(
     ("module", "argv"),
     [
+        ("lake.alert", ["--test-push", "--config", "MISSING"]),
         ("lake.compact", ["--config", "MISSING"]),
         ("lake.measure", ["SPY", "2026-01-02", "--config", "MISSING"]),
         ("lake.onboard", ["SPY", "--config", "MISSING"]),

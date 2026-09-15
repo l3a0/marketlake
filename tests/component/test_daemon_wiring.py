@@ -13,7 +13,7 @@ test is a page a person receives, and a sync from one copies a throwaway lake on
 machine running the suite. So the tier is component: the daemon over real files, with the
 clock, the calendar, the network, and the backup still fake.
 
-Eleven bindings are covered here.
+Twelve bindings are covered here.
 
 1. The skipped-slot hook reaches the gap marker, so a live overrun records the minutes
    it slept through.
@@ -49,12 +49,16 @@ Eleven bindings are covered here.
 11. The close+5 dispatch's job reaches the reports tree, so what the guard found lands in
     a file rather than only on the stderr launchd captures and nothing reads. The write is
     wired through a factory that resolves the lake root, which the printer never had.
+12. The daemon builds the dead-man with the same publisher the watchdog pages through, so a
+    capture ping healthchecks refuses reaches a phone. That ping feeds no check, so the
+    check never arms and nothing in the lake would ever go silent to say so.
 """
 
 from __future__ import annotations
 
 import json
 import sys
+import urllib.error
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -73,6 +77,7 @@ from lake.compact import COMPACTION_SLUG, compact, write_chain_plan
 from lake.config import GuardConstants
 from lake.deadman import CAPTURE_SLUG
 from lake.paths import LakePaths
+from lake.runner import PING_REFUSED_EVENT
 from lake.security_master import SecurityMaster, master_path
 from lake.session import SPOT_CLOSE, TICK
 from lake.tickers import TickersError
@@ -428,6 +433,67 @@ def test_an_idle_minute_feeds_the_capture_dead_man(tmp_path):
     _run(rig, clock, ticks=1, cycle_runner=_no_cycle)
 
     assert rig.pinger.urls == [CAPTURE_URL]
+
+
+# -- 12. the dead-man pages when its own ping is refused ---------------------------
+
+
+class _RefusingPinger:
+    """A pinger healthchecks answers with a 404: the slug has no row.
+
+    It records the same way ``FakePinger`` does, so a test can still read which check was
+    addressed. What it adds is the status, which is the whole distinction: a refused ping
+    means the request was read and the check does not exist.
+    """
+
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    def ping(self, url: str) -> None:
+        self.urls.append(url)
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+
+
+def test_a_capture_ping_the_service_refuses_pages_through_the_daemon(tmp_path):
+    """The dead-man's own slug is the one failure nothing else can report.
+
+    Every other check goes down on its own when its job stops. This one cannot: a ping
+    to a slug with no row feeds nothing, so there is no check to go silent. The daemon
+    would run a whole session reporting healthy while its whole-daemon guarantee sat
+    inert. The page has to come from in here, and it comes through the publisher the
+    watchdog already pages through, which a wiring slip would leave unbuilt.
+    """
+    rig = replace(_rig(tmp_path), pinger=_RefusingPinger())
+    clock = ManualClock(start=et(2026, 9, 2, 8, 29, 30))
+    _run(rig, clock, ticks=3, cycle_runner=_no_cycle)
+
+    assert rig.pinger.urls == [CAPTURE_URL] * 3
+    pages = [m for m in rig.transport.sent if m.event == PING_REFUSED_EVENT]
+    # Three minutes, three refused pings, one page. A slug with no row is refused on
+    # every minute of the session, and forty of those would empty the day's cap.
+    assert len(pages) == 1
+    assert CAPTURE_SLUG in pages[0].body
+    assert PING_KEY not in pages[0].body
+
+
+def test_a_capture_ping_lost_in_transport_pages_nobody(tmp_path):
+    """A wifi blip drops pings while capture keeps journaling locally.
+
+    The design sets this check's grace looser than the watchdog's for exactly that, so
+    healthchecks pages from outside if the outage lasts. A page raised from in here
+    would fail in the same outage that dropped the ping.
+    """
+
+    class _Unreachable:
+        urls: list[str] = []
+
+        def ping(self, url: str) -> None:
+            raise urllib.error.URLError(OSError("connection refused"))
+
+    rig = replace(_rig(tmp_path), pinger=_Unreachable())
+    _run(rig, ManualClock(start=et(2026, 9, 2, 8, 29, 30)), ticks=3, cycle_runner=_no_cycle)
+
+    assert rig.transport.sent == []
 
 
 # -- 4. the cycle hook feeds the same dead-man -------------------------------------

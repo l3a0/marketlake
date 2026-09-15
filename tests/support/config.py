@@ -24,6 +24,10 @@ from pathlib import Path
 CONFIG_NAME = "config.yaml"
 PING_KEY = "secret-key"
 NTFY_TOPIC = "secret-topic"
+# The other two secrets the design names, in the same class as the ping key and the topic.
+# A sweep that checks only the first two passes a command that prints these.
+SCHWAB_API_KEY = "api-key"
+SCHWAB_APP_SECRET = "app-secret"
 
 
 def write_config(
@@ -61,8 +65,8 @@ def write_config(
         f"backup_target: {target}\n"
         f"healthchecks_ping_key: {PING_KEY}\n"
         f"ntfy_topic: {NTFY_TOPIC}\n"
-        "schwab_api_key: api-key\n"
-        "schwab_app_secret: app-secret\n"
+        f"schwab_api_key: {SCHWAB_API_KEY}\n"
+        f"schwab_app_secret: {SCHWAB_APP_SECRET}\n"
         f"{callback}"
         f"{section}"
     )
