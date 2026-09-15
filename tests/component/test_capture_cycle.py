@@ -669,9 +669,9 @@ def test_a_quote_time_the_transform_refuses_lands_the_minute_instead_of_gapping_
 def test_a_quote_block_quote_time_the_transform_refuses_lands_the_minute_too(lake_root):
     """The same rule on the quotes surface, driven through the whole cycle.
 
-    The transform is written twice, once per surface, so a fix to the chains site alone
-    leaves the quotes site turning a vendor ``true`` into a 1970 stamp. Both halves are
-    read off disk here: ``lake.capture`` nulls the stamp, and the journal's projection
+    Both surfaces call one transform, so this test and the one above drive the same rule
+    down two different paths rather than two copies of it. Both halves are read off disk
+    here: ``lake.capture`` nulls the stamp, and the journal's projection
     stops counting ``quoteTime`` as consumed for this envelope and overflows it under the
     block it arrived in.
 

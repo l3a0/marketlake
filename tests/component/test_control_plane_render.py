@@ -280,6 +280,58 @@ def test_the_install_text_numbers_its_steps_in_order(tmp_path, capsys):
     assert steps == ["1", "2", "3", "4", "5", "6"]
 
 
+def _pasted_comment_lines(printed: str) -> list[str]:
+    """Every comment line of the printed install text, at any indentation.
+
+    zsh reads a line as a comment only when ``#`` is the first character it meets, not
+    only when that character sits at column 0. So the sweep strips leading whitespace
+    before checking for ``#``, and a comment nested under a numbered step is swept the
+    same as one that starts the line.
+    """
+    return [line for line in printed.splitlines() if line.lstrip().startswith("#")]
+
+
+def test_the_comment_sweep_covers_an_indented_comment_line():
+    """Some of the printed comments carry an indented example rather than starting
+    flush against the left margin. The sweep must not skip them: a character that
+    changes meaning when pasted is just as dangerous there as at column 0.
+    """
+    indented = "    # an indented example carrying an apostrophe: it is here"
+    assert _pasted_comment_lines(indented) == [indented]
+
+
+def test_the_install_text_carries_no_apostrophe_in_a_comment(tmp_path, capsys):
+    """zsh does not set INTERACTIVE_COMMENTS, so at an interactive prompt ``#`` does not
+    start a comment. An apostrophe in a comment line therefore opens a quote, and the
+    shell swallows every pasted line after it as part of that string until a later line
+    happens to close it. ``sudo -l | grep pmset``, the read-back that proves the sudoers
+    rules parsed as intended, is one of the lines an apostrophe above it used to
+    swallow.
+
+    The sweep reads the render command's own standard output, captured with ``capsys``,
+    rather than the golden file. The golden's ``<OUT>`` placeholder is written by this
+    module's own ``_normalise``, so checking the golden would pass or fail for the
+    wrong reason.
+    """
+    out = tmp_path / "out"
+    cp.main(["render", "--out", str(out), *RENDER_ARGS])
+    printed = capsys.readouterr().out
+    for line in _pasted_comment_lines(printed):
+        assert "'" not in line, line
+
+
+def test_the_install_text_carries_no_backtick_in_a_comment(tmp_path, capsys):
+    """A paired backtick does not stall a paste the way an apostrophe does, so there is
+    no ``quote>`` prompt to warn the operator that anything went wrong. The command
+    inside the backticks runs instead, silently, which is worse than a stalled paste.
+    """
+    out = tmp_path / "out"
+    cp.main(["render", "--out", str(out), *RENDER_ARGS])
+    printed = capsys.readouterr().out
+    for line in _pasted_comment_lines(printed):
+        assert "`" not in line, line
+
+
 def test_the_install_text_quotes_every_path_that_needs_it(tmp_path, capsys):
     # These lines are pasted into a shell. Every operator-supplied path gets a space
     # here, not just one of them, because a guard that only exercises --home lets the

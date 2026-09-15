@@ -48,7 +48,7 @@ sudo visudo -cf "$HERE/marketlake.sudoers"
 echo '+ sudo install -o root -g wheel -m 440 "$HERE/marketlake.sudoers" /etc/sudoers.d/marketlake'
 sudo install -o root -g wheel -m 440 "$HERE/marketlake.sudoers" /etc/sudoers.d/marketlake
 # visudo checks the syntax only. This prints the two rules as sudo parsed them,
-# which is what shows the one-shot's regular expression survived as one.
+# which is what shows the one-shot regular expression survived as one rule.
 echo '+ sudo -l | grep pmset'
 sudo -l | grep pmset
 # 3. Set the weekday firmware wake, then read it back.
@@ -58,7 +58,7 @@ echo '+ pmset -g sched'
 pmset -g sched
 # 4. Keep the token and the config secrets out of Time Machine. As the owner,
 # never under sudo. The whole directory goes, so an editor that saves by rename
-# cannot drop the exclusion, and config.yaml's four secrets are covered too.
+# cannot drop the exclusion, and the four secrets in config.yaml are covered too.
 echo '+ tmutil addexclusion /Users/someone/.config/marketlake'
 tmutil addexclusion /Users/someone/.config/marketlake
 echo '+ tmutil isexcluded /Users/someone/.config/marketlake'
@@ -77,7 +77,7 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.marketlake.sunday.pli
 echo '+ launchctl print system/com.marketlake.daemon'
 launchctl print system/com.marketlake.daemon
 # The token. None of the above captures anything until a Schwab token exists at
-# ~/.config/marketlake/token.json. Schwab's refresh token dies every seven days and an
+# ~/.config/marketlake/token.json. The Schwab refresh token dies every seven days and an
 # interactive browser login is its only renewal, so this is a standing Sunday
 # ritual rather than a step of the install, and nothing can do it for you.
 # Run ./reauth.sh beside this file, as the owner, at a terminal on a

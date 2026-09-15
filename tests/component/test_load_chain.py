@@ -26,8 +26,12 @@ schema writes an Eastern one, and SPY's real 2026-09-11 partition holds 408 dist
 both ways. A loader comparing the stored text would answer one spelling and not the other.
 
 The numbered tests carry the numbering of the issue that asked for them, so a mutation an
-issue names points at the test that issue names. Two issues number tests here, #135 for the
-loader itself and #242 for the two-pass read, and each test says which.
+issue names points at the test that issue names. Three issues number tests here, and each
+test says which.
+
+1. #135 numbers the tests for the loader itself.
+2. #242 numbers the tests for the two-pass read.
+3. #249 numbers the tests for the lake root the call resolves.
 """
 
 from __future__ import annotations
@@ -35,6 +39,7 @@ from __future__ import annotations
 import json
 import random
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -43,6 +48,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from lake import loader
+from lake.config import CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH, ConfigError
 from lake.extra_projection import ExtraProjectionError
 from lake.loader import (
     LoadError,
@@ -56,6 +62,8 @@ from lake.loader import (
     load_chain,
 )
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
+from tests.support.config import write_config
+from tests.support.config_guard import is_protected
 from tests.support.lake import FixtureLake, sample_chains_table
 
 # The full session and the half day. Both are real sessions on the exchange calendar,
@@ -175,6 +183,13 @@ UNTAGGED_ROWS = [
     _data("2026-09-14T19:59:00+00:00", PUT),
 ]
 
+# The half day again, in a second lake, holding a different contract at the same minute.
+# It is what separates the configured root from an explicit one in the tests at the foot of
+# this file, because the rows that come back name which lake answered.
+OTHER_HALF_ROWS = [
+    _data("2026-11-27T18:15:00+00:00", STRADDLE, close_tag="option_close"),
+]
+
 FULL_PARTITION = f"chains/ticker=SPY/date={FULL_DAY}.parquet"
 
 
@@ -243,7 +258,7 @@ def test_snap_none_returns_the_option_close_cycle_on_a_half_day(fixture_lake: Fi
     """
     root = _lake(fixture_lake)
 
-    table = load_chain(root, "SPY", HALF_DAY)
+    table = load_chain("SPY", HALF_DAY, lake_root=root)
 
     assert table.num_rows == 2
     assert _snaps(table) == {"2026-11-27T18:15:00+00:00"}
@@ -254,7 +269,7 @@ def test_snap_none_takes_the_option_close_cycle_and_not_its_neighbour(fixture_la
     """#135 test 1, on a full session. The ``spot_close`` cycle 15 minutes earlier stays out."""
     root = _lake(fixture_lake)
 
-    table = load_chain(root, "SPY", FULL_DAY)
+    table = load_chain("SPY", FULL_DAY, lake_root=root)
 
     assert table.num_rows == 2
     assert _snaps(table) == {"2026-09-14T16:15:00-04:00"}
@@ -270,7 +285,7 @@ def test_a_session_with_no_option_close_tag_raises(fixture_lake: FixtureLake):
     root = _lake(fixture_lake)
 
     with pytest.raises(NoOptionClose) as caught:
-        load_chain(root, "QQQ", FULL_DAY)
+        load_chain("QQQ", FULL_DAY, lake_root=root)
 
     assert caught.value.tagged_gaps == 0
     assert "option_close" in str(caught.value)
@@ -290,7 +305,7 @@ def test_the_marker_counts_tagged_gap_rows(fixture_lake: FixtureLake):
     root = fixture_lake.build()
 
     with pytest.raises(NoOptionClose) as caught:
-        load_chain(root, "SPY", FULL_DAY)
+        load_chain("SPY", FULL_DAY, lake_root=root)
 
     assert caught.value.tagged_gaps == 1
 
@@ -302,7 +317,7 @@ def test_snap_resolves_as_an_eastern_wall_clock_minute(fixture_lake: FixtureLake
     """#135 test 3. ``10:31`` ET is 14:31Z on a September session."""
     root = _lake(fixture_lake)
 
-    table = load_chain(root, "SPY", FULL_DAY, snap="10:31")
+    table = load_chain("SPY", FULL_DAY, snap="10:31", lake_root=root)
 
     assert set(table.column("occ_symbol").to_pylist()) == {CALL, PUT, STRADDLE}
     assert {_instant(text) for text in _snaps(table)} == {datetime(2026, 9, 14, 14, 31, tzinfo=UTC)}
@@ -317,7 +332,7 @@ def test_one_instant_under_two_spellings_comes_back_whole(fixture_lake: FixtureL
     """
     root = _lake(fixture_lake)
 
-    table = load_chain(root, "SPY", FULL_DAY, snap="10:31")
+    table = load_chain("SPY", FULL_DAY, snap="10:31", lake_root=root)
 
     assert _snaps(table) == {"2026-09-14T14:31:00+00:00", "2026-09-14T10:31:00-04:00"}
     assert table.num_rows == 3
@@ -331,7 +346,7 @@ def test_snap_is_never_read_as_utc(fixture_lake: FixtureLake):
     """
     root = _lake(fixture_lake)
 
-    table = load_chain(root, "SPY", FULL_DAY, snap="14:31")
+    table = load_chain("SPY", FULL_DAY, snap="14:31", lake_root=root)
 
     assert _snaps(table) == {"2026-09-14T18:31:00+00:00"}
 
@@ -341,7 +356,7 @@ def test_a_minute_no_cycle_recorded_raises(fixture_lake: FixtureLake):
     root = _lake(fixture_lake)
 
     with pytest.raises(SnapAbsent) as caught:
-        load_chain(root, "SPY", FULL_DAY, snap="11:00")
+        load_chain("SPY", FULL_DAY, snap="11:00", lake_root=root)
 
     assert caught.value.snap == "11:00"
     assert caught.value.tagged_gaps == 0
@@ -356,7 +371,7 @@ def test_a_minute_that_ran_and_failed_counts_its_gap_rows(fixture_lake: FixtureL
     root = _lake(fixture_lake)
 
     with pytest.raises(SnapAbsent) as caught:
-        load_chain(root, "SPY", FULL_DAY, snap="15:00")
+        load_chain("SPY", FULL_DAY, snap="15:00", lake_root=root)
 
     assert caught.value.tagged_gaps == 1
 
@@ -370,7 +385,7 @@ def test_the_offset_comes_from_the_zone_and_not_from_a_constant(fixture_lake: Fi
     """
     root = _lake(fixture_lake)
 
-    table = load_chain(root, "SPY", HALF_DAY, snap="13:15")
+    table = load_chain("SPY", HALF_DAY, snap="13:15", lake_root=root)
 
     assert _snaps(table) == {"2026-11-27T18:15:00+00:00"}
 
@@ -385,7 +400,7 @@ def test_a_snap_outside_hh_mm_is_refused(fixture_lake: FixtureLake, snap: str):
     root = _lake(fixture_lake)
 
     with pytest.raises(SnapMalformed) as caught:
-        load_chain(root, "SPY", FULL_DAY, snap=snap)
+        load_chain("SPY", FULL_DAY, snap=snap, lake_root=root)
 
     assert isinstance(caught.value, ValueError)
     assert isinstance(caught.value, LoadError)
@@ -404,10 +419,10 @@ def test_an_unreadable_snap_ts_elsewhere_does_not_take_the_answer_away(
     fixture_lake.with_reference("schema_versions", _ledger_table())
     root = fixture_lake.build()
 
-    assert load_chain(root, "SPY", FULL_DAY, snap="10:31").num_rows == 3
+    assert load_chain("SPY", FULL_DAY, snap="10:31", lake_root=root).num_rows == 3
 
     with pytest.raises(SnapAbsent) as caught:
-        load_chain(root, "SPY", FULL_DAY, snap="11:00")
+        load_chain("SPY", FULL_DAY, snap="11:00", lake_root=root)
     assert sorted(caught.value.unreadable) == ["'not-a-timestamp'", "None"]
 
 
@@ -424,7 +439,7 @@ def test_a_snap_ts_with_no_offset_never_matches_silently(fixture_lake: FixtureLa
     root = fixture_lake.build()
 
     with pytest.raises(SnapAbsent) as caught:
-        load_chain(root, "SPY", FULL_DAY, snap="11:00")
+        load_chain("SPY", FULL_DAY, snap="11:00", lake_root=root)
 
     assert caught.value.unreadable == ("'2026-09-14T11:00:00'",)
 
@@ -436,7 +451,7 @@ def test_gap_rows_are_absent_from_the_close_of_record(fixture_lake: FixtureLake)
     """#135 test 5. The option-close cycle carries a gap row beside its two data rows."""
     root = _lake(fixture_lake)
 
-    table = load_chain(root, "SPY", FULL_DAY)
+    table = load_chain("SPY", FULL_DAY, lake_root=root)
 
     assert _kinds(table) == {"data"}
     assert table.num_rows == 2
@@ -446,7 +461,7 @@ def test_gap_rows_are_absent_from_an_intraday_minute(fixture_lake: FixtureLake):
     """#135 test 5, on the other resolution. 14:31 ET carries a gap row too."""
     root = _lake(fixture_lake)
 
-    table = load_chain(root, "SPY", FULL_DAY, snap="14:31")
+    table = load_chain("SPY", FULL_DAY, snap="14:31", lake_root=root)
 
     assert _kinds(table) == {"data"}
     assert table.num_rows == 2
@@ -463,7 +478,7 @@ def test_a_quarantined_partition_is_excluded_by_default(fixture_lake: FixtureLak
     )
 
     with pytest.raises(PartitionQuarantined) as caught:
-        load_chain(root, "SPY", FULL_DAY)
+        load_chain("SPY", FULL_DAY, lake_root=root)
 
     assert caught.value.partition == FULL_PARTITION
     assert caught.value.entry["verdict"] == "delayed_feed"
@@ -476,7 +491,7 @@ def test_a_quarantined_partition_reads_under_the_opt_in(fixture_lake: FixtureLak
         quarantine=[{"partition": FULL_PARTITION, "verdict": "delayed_feed"}],
     )
 
-    table = load_chain(root, "SPY", FULL_DAY, include_quarantined=True)
+    table = load_chain("SPY", FULL_DAY, lake_root=root, include_quarantined=True)
 
     assert table.num_rows == 2
 
@@ -488,7 +503,7 @@ def test_quarantine_covers_only_the_partition_it_names(fixture_lake: FixtureLake
         quarantine=[{"partition": FULL_PARTITION, "verdict": "delayed_feed"}],
     )
 
-    assert load_chain(root, "SPY", HALF_DAY).num_rows == 2
+    assert load_chain("SPY", HALF_DAY, lake_root=root).num_rows == 2
 
 
 def test_a_superseding_clean_verdict_un_quarantines(fixture_lake: FixtureLake):
@@ -501,7 +516,7 @@ def test_a_superseding_clean_verdict_un_quarantines(fixture_lake: FixtureLake):
         ],
     )
 
-    assert load_chain(root, "SPY", FULL_DAY).num_rows == 2
+    assert load_chain("SPY", FULL_DAY, lake_root=root).num_rows == 2
 
 
 def test_an_entry_the_reader_cannot_recognise_excludes(fixture_lake: FixtureLake):
@@ -514,7 +529,7 @@ def test_an_entry_the_reader_cannot_recognise_excludes(fixture_lake: FixtureLake
     root = _lake(fixture_lake, quarantine=[{"partition": FULL_PARTITION, "note": "unreadable"}])
 
     with pytest.raises(PartitionQuarantined):
-        load_chain(root, "SPY", FULL_DAY)
+        load_chain("SPY", FULL_DAY, lake_root=root)
 
 
 def test_a_ticker_spelled_differently_from_its_directory_is_refused(fixture_lake: FixtureLake):
@@ -527,7 +542,7 @@ def test_a_ticker_spelled_differently_from_its_directory_is_refused(fixture_lake
     root = _lake(fixture_lake, quarantine=[{"partition": FULL_PARTITION, "verdict": "delayed"}])
 
     with pytest.raises(PartitionAbsent):
-        load_chain(root, "spy", FULL_DAY)
+        load_chain("spy", FULL_DAY, lake_root=root)
 
 
 def test_an_absent_quarantine_ledger_excludes_nothing(fixture_lake: FixtureLake):
@@ -535,7 +550,7 @@ def test_an_absent_quarantine_ledger_excludes_nothing(fixture_lake: FixtureLake)
     root = _lake(fixture_lake)
 
     assert not (root / "quarantine.jsonl").exists()
-    assert load_chain(root, "SPY", FULL_DAY).num_rows == 2
+    assert load_chain("SPY", FULL_DAY, lake_root=root).num_rows == 2
 
 
 # -- the overflow projection -------------------------------------------------
@@ -551,7 +566,7 @@ def test_a_version_the_ledger_has_no_shape_for_reads_partial(fixture_lake: Fixtu
     root = _lake(fixture_lake, ledger=False)
 
     with pytest.raises(PartialRead) as caught:
-        load_chain(root, "SPY", FULL_DAY)
+        load_chain("SPY", FULL_DAY, lake_root=root)
 
     assert caught.value.projection.unrecorded_versions == (1,)
     assert "version 1" in str(caught.value)
@@ -571,7 +586,7 @@ def test_a_promoted_value_is_lifted_out_of_the_overflow(fixture_lake: FixtureLak
     rows = [_with_extra(row, {"totalVolume": 5678}) for row in HALF_ROWS]
     root = _lake_missing_column(fixture_lake, rows, "volume")
 
-    table = load_chain(root, "SPY", HALF_DAY)
+    table = load_chain("SPY", HALF_DAY, lake_root=root)
 
     assert "volume" not in sample_chains_table(rows).column_names
     assert table.column("volume").to_pylist() == [5678, 5678]
@@ -590,7 +605,7 @@ def test_a_column_a_retype_routed_into_the_overflow_reads_partial(fixture_lake: 
     root = fixture_lake.build()
 
     with pytest.raises(PartialRead) as caught:
-        load_chain(root, "SPY", HALF_DAY)
+        load_chain("SPY", HALF_DAY, lake_root=root)
 
     assert [column.column for column in caught.value.projection.retyped] == ["volume"]
 
@@ -605,7 +620,7 @@ def test_a_value_the_promoted_column_refuses_reads_partial(fixture_lake: Fixture
     root = _lake_missing_column(fixture_lake, rows, "volume")
 
     with pytest.raises(PartialRead) as caught:
-        load_chain(root, "SPY", HALF_DAY)
+        load_chain("SPY", HALF_DAY, lake_root=root)
 
     assert caught.value.projection.unrecorded_versions == ()
     assert [unfit.column for unfit in caught.value.projection.unfit] == ["volume"]
@@ -626,8 +641,8 @@ def test_the_column_set_does_not_move_with_the_minute_asked_for(fixture_lake: Fi
     ]
     root = _lake_missing_column(fixture_lake, rows, "volume")
 
-    early = load_chain(root, "SPY", HALF_DAY, snap="09:30")
-    close = load_chain(root, "SPY", HALF_DAY)
+    early = load_chain("SPY", HALF_DAY, snap="09:30", lake_root=root)
+    close = load_chain("SPY", HALF_DAY, lake_root=root)
 
     assert "volume" in early.column_names
     assert early.column_names == close.column_names
@@ -649,7 +664,7 @@ def test_a_row_with_no_row_kind_is_refused(fixture_lake: FixtureLake):
     root = fixture_lake.build()
 
     with pytest.raises(LoadError, match="row_kind"):
-        load_chain(root, "SPY", HALF_DAY)
+        load_chain("SPY", HALF_DAY, lake_root=root)
 
 
 def test_an_option_close_tag_on_two_cycles_is_refused(fixture_lake: FixtureLake):
@@ -667,7 +682,7 @@ def test_an_option_close_tag_on_two_cycles_is_refused(fixture_lake: FixtureLake)
     root = fixture_lake.build()
 
     with pytest.raises(LoadError, match="one cycle"):
-        load_chain(root, "SPY", HALF_DAY)
+        load_chain("SPY", HALF_DAY, lake_root=root)
 
 
 # -- the partition itself ----------------------------------------------------
@@ -678,7 +693,7 @@ def test_an_unsealed_day_raises(fixture_lake: FixtureLake):
     root = _lake(fixture_lake)
 
     with pytest.raises(PartitionAbsent):
-        load_chain(root, "SPY", "2026-09-15")
+        load_chain("SPY", "2026-09-15", lake_root=root)
 
 
 def test_a_directory_where_the_partition_belongs_is_not_a_partition(fixture_lake: FixtureLake):
@@ -687,7 +702,7 @@ def test_a_directory_where_the_partition_belongs_is_not_a_partition(fixture_lake
     (root / "chains" / "ticker=SPY" / "date=2026-09-15.parquet").mkdir()
 
     with pytest.raises(PartitionAbsent):
-        load_chain(root, "SPY", "2026-09-15")
+        load_chain("SPY", "2026-09-15", lake_root=root)
 
 
 def test_a_directory_where_the_schema_version_ledger_belongs_is_not_a_ledger(
@@ -703,7 +718,7 @@ def test_a_directory_where_the_schema_version_ledger_belongs_is_not_a_ledger(
     (root / "reference" / "schema_versions.parquet").mkdir()
 
     with pytest.raises(PartialRead) as caught:
-        load_chain(root, "SPY", FULL_DAY)
+        load_chain("SPY", FULL_DAY, lake_root=root)
 
     assert caught.value.projection.unrecorded_versions == (1,)
 
@@ -712,7 +727,7 @@ def test_a_date_object_reads_the_same_partition_as_its_iso_text(fixture_lake: Fi
     """The signature takes either, so both have to land on one path."""
     root = _lake(fixture_lake)
 
-    assert load_chain(root, "SPY", date(2026, 11, 27)).num_rows == 2
+    assert load_chain("SPY", date(2026, 11, 27), lake_root=root).num_rows == 2
 
 
 # -- reading only the rows the answer is made of -----------------------------
@@ -779,7 +794,7 @@ def test_a_pushdown_read_answers_a_partition_whose_row_groups_overlap(
     assert len(ranges) > 1
     assert _overlapping(ranges)
 
-    table = load_chain(root, "SPY", FULL_DAY, snap="10:07")
+    table = load_chain("SPY", FULL_DAY, snap="10:07", lake_root=root)
 
     whole = pq.read_table(path)
     expected = whole.filter(pc.equal(whole.column("snap_ts"), "2026-09-14T14:07:00+00:00"))
@@ -846,7 +861,7 @@ def test_the_fetch_names_every_spelling_of_the_minute_to_parquet(
     """
     root = _lake(fixture_lake)
 
-    load_chain(root, "SPY", FULL_DAY, snap="10:31")
+    load_chain("SPY", FULL_DAY, snap="10:31", lake_root=root)
 
     expected = (
         ds.field("snap_ts").isin(["2026-09-14T14:31:00+00:00", "2026-09-14T10:31:00-04:00"])
@@ -869,7 +884,7 @@ def test_the_fetch_asks_for_every_row_that_could_add_a_column(
     """
     root = _lake(fixture_lake)
 
-    load_chain(root, "SPY", FULL_DAY)
+    load_chain("SPY", FULL_DAY, lake_root=root)
 
     expected = ds.field("close_tag").isin(["option_close"]) | ds.field("extra").is_valid()
     assert reads.fetch["filters"].equals(expected)
@@ -889,7 +904,7 @@ def test_the_resolve_pass_reads_only_the_columns_a_read_resolves_against(
     """
     root = _lake(fixture_lake)
 
-    load_chain(root, "SPY", FULL_DAY, snap="10:31")
+    load_chain("SPY", FULL_DAY, snap="10:31", lake_root=root)
 
     assert reads.resolve["columns"] == ["snap_ts", "row_kind"]
     assert reads.resolve["filters"] is None
@@ -903,7 +918,7 @@ def test_the_close_of_record_resolves_against_the_tag_column_as_well(
     """The other resolution reads the one column it does resolve against."""
     root = _lake(fixture_lake)
 
-    load_chain(root, "SPY", FULL_DAY)
+    load_chain("SPY", FULL_DAY, lake_root=root)
 
     assert reads.resolve["columns"] == ["snap_ts", "row_kind", "close_tag"]
 
@@ -922,7 +937,7 @@ def test_a_minute_reads_a_partition_that_carries_no_close_tag_column(
     fixture_lake.with_reference("schema_versions", _ledger_table())
     root = fixture_lake.build()
 
-    assert load_chain(root, "SPY", FULL_DAY, snap="10:31").num_rows == 3
+    assert load_chain("SPY", FULL_DAY, snap="10:31", lake_root=root).num_rows == 3
 
 
 def test_a_partition_with_no_overflow_column_says_so_by_name(fixture_lake: FixtureLake):
@@ -939,7 +954,7 @@ def test_a_partition_with_no_overflow_column_says_so_by_name(fixture_lake: Fixtu
     root = fixture_lake.build()
 
     with pytest.raises(ExtraProjectionError, match="no extra column"):
-        load_chain(root, "SPY", FULL_DAY, snap="10:31")
+        load_chain("SPY", FULL_DAY, snap="10:31", lake_root=root)
 
 
 def test_a_row_carrying_no_schema_version_refuses_the_reads_that_include_it(
@@ -961,10 +976,10 @@ def test_a_row_carrying_no_schema_version_refuses_the_reads_that_include_it(
     fixture_lake.with_reference("schema_versions", _ledger_table())
     root = fixture_lake.build()
 
-    assert load_chain(root, "SPY", HALF_DAY).num_rows == 1
+    assert load_chain("SPY", HALF_DAY, lake_root=root).num_rows == 1
 
     with pytest.raises(ExtraProjectionError, match="no schema_version"):
-        load_chain(root, "SPY", HALF_DAY, snap="09:30")
+        load_chain("SPY", HALF_DAY, snap="09:30", lake_root=root)
 
 
 def test_a_minute_is_not_projected_against_the_rest_of_the_session(fixture_lake: FixtureLake):
@@ -987,10 +1002,10 @@ def test_a_minute_is_not_projected_against_the_rest_of_the_session(fixture_lake:
     fixture_lake.with_reference("schema_versions", _ledger_table())
     root = fixture_lake.build()
 
-    assert load_chain(root, "SPY", HALF_DAY).num_rows == 1
+    assert load_chain("SPY", HALF_DAY, lake_root=root).num_rows == 1
 
     with pytest.raises(PartialRead) as caught:
-        load_chain(root, "SPY", HALF_DAY, snap="09:30")
+        load_chain("SPY", HALF_DAY, snap="09:30", lake_root=root)
     assert caught.value.projection.unrecorded_versions == (2,)
 
 
@@ -1016,7 +1031,7 @@ def test_an_overflow_at_an_unrecorded_version_refuses_from_anywhere_in_the_sessi
     root = fixture_lake.build()
 
     with pytest.raises(PartialRead) as caught:
-        load_chain(root, "SPY", HALF_DAY)
+        load_chain("SPY", HALF_DAY, lake_root=root)
 
     assert caught.value.projection.unrecorded_versions == (2,)
 
@@ -1043,10 +1058,10 @@ def test_a_resolution_that_finds_nothing_says_so_rather_than_reporting_the_proje
     root = fixture_lake.build()
 
     with pytest.raises(NoOptionClose):
-        load_chain(root, "SPY", HALF_DAY)
+        load_chain("SPY", HALF_DAY, lake_root=root)
 
     with pytest.raises(SnapAbsent):
-        load_chain(root, "SPY", HALF_DAY, snap="11:00")
+        load_chain("SPY", HALF_DAY, snap="11:00", lake_root=root)
 
 
 def test_the_read_honours_the_columns_it_is_given(fixture_lake: FixtureLake):
@@ -1067,3 +1082,165 @@ def test_the_read_honours_the_columns_it_is_given(fixture_lake: FixtureLake):
     assert columns.num_rows == pq.ParquetFile(path).metadata.num_rows
     assert _snaps(filtered) == {"2026-09-14T13:30:00+00:00"}
     assert filtered.column_names == pq.read_schema(path).names
+
+
+# -- resolving the lake root -------------------------------------------------
+
+
+def _two_lakes(tmp_path: Path) -> tuple[Path, Path]:
+    """Two fixture lakes holding the same ticker and session at different contracts.
+
+    One lake would prove nothing here. A test that omits ``lake_root`` and reads the only
+    lake on disk passes whether the loader resolved the config or reached for anything
+    else that happened to hold the partition. With two, every assertion below names which
+    root answered: the configured lake returns ``CALL`` and ``PUT``, and the other returns
+    ``STRADDLE`` alone.
+    """
+    configured = FixtureLake(tmp_path / "configured")
+    configured.with_chains("SPY", HALF_DAY, sample_chains_table(HALF_ROWS))
+    configured.with_reference("schema_versions", _ledger_table())
+
+    other = FixtureLake(tmp_path / "other")
+    other.with_chains("SPY", HALF_DAY, sample_chains_table(OTHER_HALF_ROWS))
+    other.with_reference("schema_versions", _ledger_table())
+
+    return configured.build(), other.build()
+
+
+def test_omitting_the_root_reads_the_configured_lake(tmp_path: Path, monkeypatch):
+    """#249 test 1. ``lake_root=None`` resolves the lake ``config.yaml`` names.
+
+    The other lake holds the same ticker and the same session, so a loader falling back to
+    the working directory, to a fixture root, or to anything but the config returns either
+    nothing or ``STRADDLE``.
+    """
+    configured, _other = _two_lakes(tmp_path)
+    monkeypatch.setenv(CONFIG_PATH_ENV, str(write_config(tmp_path, configured)))
+
+    table = load_chain("SPY", HALF_DAY)
+
+    assert table.num_rows == 2
+    assert set(table.column("occ_symbol").to_pylist()) == {CALL, PUT}
+
+
+@pytest.mark.parametrize("spelling", [Path, str])
+def test_an_explicit_root_beats_the_configured_one(spelling, tmp_path: Path, monkeypatch):
+    """#249 test 2. The argument wins, which is what keeps every test above on a fixture lake.
+
+    The config names the configured lake and the call names the other one, so a loader that
+    read the config regardless returns ``CALL`` and ``PUT`` instead.
+
+    Both spellings the signature admits are driven, because every other call in this file
+    passes a ``Path``. A resolution that honoured only a ``Path`` would discard a ``str``
+    root and answer the configured lake, and a resolution that dropped its ``Path()``
+    coercion would take a ``str`` as far as a ``TypeError`` inside ``_spelled_exactly``.
+    Neither is visible from a suite that never spells one.
+    """
+    configured, other = _two_lakes(tmp_path)
+    monkeypatch.setenv(CONFIG_PATH_ENV, str(write_config(tmp_path, configured)))
+
+    table = load_chain("SPY", HALF_DAY, lake_root=spelling(other))
+
+    assert table.num_rows == 1
+    assert set(table.column("occ_symbol").to_pylist()) == {STRADDLE}
+
+
+@pytest.mark.parametrize(
+    "root",
+    [
+        pytest.param("nonexistent", id="a-root-that-holds-nothing"),
+        pytest.param("", id="the-empty-string"),
+    ],
+)
+def test_an_explicit_root_is_used_as_given_rather_than_fallen_back_from(
+    root: str, tmp_path: Path, monkeypatch
+):
+    """An explicit root that answers nothing is a refusal, never a read of the configured lake.
+
+    This is the half of "an explicit root wins" the tests above cannot reach, because each
+    of them passes a root that does hold the partition. A resolution that fell back to the
+    config whenever the explicit root was missing, or empty, or merely falsy would pass
+    every one of them and would hand a caller who mistyped a root a read of the operator's
+    production lake. The configured lake here does hold this ticker-day, so a fallback
+    returns rows rather than raising.
+
+    The empty string is the same rule asked about truthiness rather than existence.
+    ``Path("")`` is ``Path(".")``, which is truthy, so the literal empty string is the one
+    value that separates ``lake_root is None`` from ``if not lake_root``.
+    """
+    configured, _other = _two_lakes(tmp_path)
+    monkeypatch.setenv(CONFIG_PATH_ENV, str(write_config(tmp_path, configured)))
+    explicit = str(tmp_path / root) if root else root
+
+    with pytest.raises(PartitionAbsent):
+        load_chain("SPY", HALF_DAY, lake_root=explicit)
+
+
+def test_an_unconfigured_machine_raises_config_error_naming_the_file():
+    """#249 test 3. A missing config says the machine is unconfigured.
+
+    That is a different answer from this read finding nothing, so ``ConfigError`` escapes
+    rather than folding into ``LoadError``, for the reason ``ManifestError`` and
+    ``ExtraProjectionError`` already escape. A ``LoadError`` here would tell a caller their
+    ticker-day is absent from a lake that was never named.
+
+    This is the one test here that sets no ``MARKETLAKE_CONFIG``. ``load_config`` reads
+    that variable ahead of the default, so on a machine whose shell exported one this read
+    would resolve whatever it names, the operator's real ``config.yaml`` included, and the
+    error would then name a different file than the first assertion below expects. What
+    stops that is conftest deleting an inherited value, and what checks the deletion on a
+    machine that exported nothing is
+    ``tests/component/test_suite_config_dir_redirect.py``, which spawns a child that did.
+
+    The second assertion says the file this did name is a throwaway rather than anything
+    under the real config directory. It reads a constant ``lake.config`` binds at import,
+    so it covers conftest's config-directory redirect rather than the resolution this test
+    is about.
+    """
+    with pytest.raises(ConfigError) as caught:
+        load_chain("SPY", HALF_DAY)
+
+    assert str(DEFAULT_CONFIG_PATH) in str(caught.value)
+    assert not is_protected(DEFAULT_CONFIG_PATH)
+
+
+def test_the_old_positional_root_is_a_type_error_at_the_call(tmp_path: Path, monkeypatch):
+    """#249 test 4. The root is keyword-only, so the replaced call shape fails where written.
+
+    The call this replaced was ``load_chain(root, ticker, day, snap)``. Spelled to four
+    positional arguments it is the shape a fourth positional root would still accept, and
+    ``load_chain``'s own docstring works through what such a call would read.
+
+    #249 asked for this test against the three-argument spelling, and running both
+    signatures against the same call refuted that. ``ticker``, ``day``, and ``snap`` take
+    three positional arguments between them either way, so ``load_chain(root, "SPY", day)``
+    binds the root to ``ticker`` and reads the configured lake under a keyword-only root
+    and under a fourth positional one alike. The fourth argument is where the two differ,
+    so that is the call this test writes.
+
+    The match is on the arity, because a bare ``TypeError`` is also what an unrelated
+    signature change raises. Making ``snap`` keyword-only would satisfy an unmatched
+    ``pytest.raises`` here for the wrong reason, which the test below refuses separately.
+    """
+    configured, other = _two_lakes(tmp_path)
+    monkeypatch.setenv(CONFIG_PATH_ENV, str(write_config(tmp_path, configured)))
+
+    with pytest.raises(TypeError, match="positional argument"):
+        load_chain(other, "SPY", HALF_DAY, "13:15")  # type: ignore[arg-type]
+
+
+def test_snap_stays_the_third_positional_argument(tmp_path: Path, monkeypatch):
+    """The published call shape spells ``snap`` positionally, so one call here does too.
+
+    ``docs/design.md`` and #135 both write ``load_chain(ticker, date, snap=None)``, which
+    makes the third positional slot a contract rather than an accident of the signature.
+    Every other call in this file, all fifty-odd of them, passes ``snap`` as a keyword, so
+    moving the ``*`` up one line and making ``snap`` keyword-only would leave the whole
+    suite green while breaking the shape the design publishes.
+    """
+    configured, _other = _two_lakes(tmp_path)
+    monkeypatch.setenv(CONFIG_PATH_ENV, str(write_config(tmp_path, configured)))
+
+    table = load_chain("SPY", HALF_DAY, "09:30", lake_root=configured)
+
+    assert _snaps(table) == {"2026-11-27T14:30:00+00:00"}
