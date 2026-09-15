@@ -58,9 +58,11 @@ import plistlib
 import urllib.error
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from lake.alert import Message, Publisher
 from lake.capture import CycleResult, run_cycle_from_config
 from lake.config import input_errors_exit, load_config
 from lake.journal import ROW_KIND_DATA
@@ -99,6 +101,111 @@ _MINUTES_PER_DAY = 24 * 60
 # Only the exception's type is ever reported. The URL carries the ping key, and the
 # design's rule is that it never reaches a log.
 PING_FAILURES = (urllib.error.URLError, OSError, http.client.HTTPException)
+
+
+# -- a ping the service refused ----------------------------------------------
+
+
+# ``PING_FAILURES`` lumps two failures together that mean opposite things, and telling
+# them apart is what this section exists for.
+#
+# A transport failure means the request never reached healthchecks. The design already
+# answers that one. It sets the dead-man grace looser than the watchdog's on purpose,
+# reasoning that a wifi blip drops pings while capture keeps journaling locally, so the
+# check goes down by itself if the outage lasts and healthchecks pages from outside.
+# Paging from the laptop would fail in that same outage anyway.
+#
+# A status response is the other failure and nothing answers it. ``urlopen`` raises
+# ``urllib.error.HTTPError`` for one, and that is a ``URLError`` subclass carrying a
+# ``.code``, which is why a ping to a slug with no row reported ``ping failed:
+# HTTPError`` rather than a transport error name. A 4xx on a ping URL means healthchecks
+# read the request and refused it, so the ping feeds no check at all. Either the slug has
+# no row or the ping key is wrong. Both are permanent, both repeat every run, and no
+# check will ever go down to report either, because there is no check. A missing row's
+# only symptom is silence, and silence is what the check exists to report.
+#
+# A 5xx stays on the transport side. That is healthchecks failing rather than refusing,
+# and the next run reaches it.
+
+# The page a refused ping raises, per the design's message table.
+PING_REFUSED_EVENT = "ping_refused"
+PING_REFUSED_TITLE = "Health check ping refused"
+
+
+def refused_status(exc: BaseException) -> int | None:
+    """The status a refused ping came back with, or ``None`` when it was never refused.
+
+    A transport failure carries no status, so it answers ``None`` and nothing pages.
+    """
+    if isinstance(exc, urllib.error.HTTPError) and 400 <= exc.code < 500:
+        return exc.code
+    return None
+
+
+def ping_refused_page(slug: str, status: int) -> Message:
+    """The page one refused ping raises.
+
+    It names the slug and the status and nothing else. The ping URL carries the ping
+    key, so it never reaches a page, and the publisher refuses one that does.
+    """
+    return Message(
+        event=PING_REFUSED_EVENT,
+        title=PING_REFUSED_TITLE,
+        body=(
+            f"{slug}: healthchecks answered {status}, so this ping feeds no check. "
+            f"Until a row for {slug} exists and is armed, its silence means nothing."
+        ),
+    )
+
+
+def escalate_ping_failure(
+    exc: BaseException,
+    *,
+    slug: str,
+    publisher: Publisher | None,
+    now: datetime,
+) -> bool:
+    """Page for a refused ping, and say nothing for one that merely did not land.
+
+    Returns whether a page went out. A caller with no publisher escalates nothing, which
+    is what lets a test drive a producer without a page reaching anywhere.
+    """
+    status = refused_status(exc)
+    if publisher is None or status is None:
+        return False
+    publisher.publish(ping_refused_page(slug, status), now=now)
+    return True
+
+
+class SlugEscalation:
+    """Escalates a refused ping once per slug, and re-arms when a ping to it lands.
+
+    A slug with no row is refused on every run forever, so a producer that paged on each
+    refusal would page on each ping. The standing rule is to page once on the transition
+    and reset on a success, and this holds that state in memory keyed by slug, so it
+    lasts exactly as long as the producer holding it.
+
+    The one-shot jobs page at most once per run by construction and need none of this.
+    ``DeadMan`` pings roughly 390 times a session inside a daemon that outlives every one
+    of them, so it is the site this was built for.
+    """
+
+    def __init__(self, publisher: Publisher | None = None) -> None:
+        self._publisher = publisher
+        self._paged: set[str] = set()
+
+    def landed(self, slug: str) -> None:
+        """Note a ping that landed, so a later refusal of this slug pages again."""
+        self._paged.discard(slug)
+
+    def failed(self, exc: BaseException, *, slug: str, now: datetime) -> bool:
+        """Page for a refused ping unless this slug has already paged. Returns whether it did."""
+        if slug in self._paged:
+            return False
+        if not escalate_ping_failure(exc, slug=slug, publisher=self._publisher, now=now):
+            return False
+        self._paged.add(slug)
+        return True
 
 
 # The backup's exclusion list. The design pins the sync root as ``lake/`` only, with an
@@ -647,6 +754,8 @@ __all__ = [
     "BACKUP_EXCLUSIONS",
     "DAILY_LABEL",
     "MEASUREMENT_LABEL",
+    "PING_REFUSED_EVENT",
+    "PING_REFUSED_TITLE",
     "SLICE1_RUNNER_SLUG",
     "BackupRunner",
     "BackupTargetUnavailable",
@@ -654,13 +763,17 @@ __all__ = [
     "Pinger",
     "RsyncBackup",
     "RunOutcome",
+    "SlugEscalation",
     "UrllibPinger",
     "calendar_interval",
     "cycle_succeeded",
     "daily_runner_job",
+    "escalate_ping_failure",
     "main",
     "measurement_runner_job",
     "minute_intervals",
+    "ping_refused_page",
+    "refused_status",
     "run_once",
     "run_once_from_config",
 ]

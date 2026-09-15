@@ -327,7 +327,28 @@ All healthchecks.io checks sit in one place: six checks in steady state, well in
 | Calendar probe | `calendar-probe` | Mon–Fri by \~09:40 | The 09:35 probe result on calendar-closed days. A tagged "session day, probe n/a" no-op on session days | The says-closed-but-open guard didn't run. A stale calendar could be silently skipping a real session |
 | Sunday canary + scrub | `sunday` | Sun by 23:30 | One ping after the canary passes and the weekly integrity scrub finishes. The canary is a throwaway authenticated call **plus a coverage assertion**: the token's mint time + 7 days must clear the coming Friday's option close. A failing canary re-runs every 30 min until pass or 23:00, so a post-20:00 ritual still clears it. The 23:30 deadline is the 23:00 cutoff plus room for that last attempt to finish | No token covering the coming week exists, which puts Monday's capture at risk. Or the scrub didn't run. The coverage assertion catches a *skipped* ritual when last week's late-minted token is still technically valid. Validity is not freshness |
 
-The **slug** is a check's wire identity, the last path segment of `hc-ping.com/<ping-key>/<slug>`. It is pinned in the table because it lives outside this repo. A slug that does not match the row created in healthchecks.io pings nothing at all, and no check inside the lake can detect that. Silence is already defined here as broken, so a mistyped slug reads exactly like a dead machine. Each job names its slug in one constant and logs the slug, never the URL, which carries the secret ping key.
+The **slug** is a check's wire identity, the last path segment of `hc-ping.com/<ping-key>/<slug>`. It is pinned in the table because it lives outside this repo. A slug that does not match the row created in healthchecks.io pings nothing at all. Silence is already defined here as broken, so a mistyped slug reads exactly like a dead machine, and no check can ever report it because there is no check. That happened. The `compaction` row did not exist, so the close+15 job's ping went nowhere on every run it ever made, and the first one to reach it sealed 21 partitions and 9.8 million rows while reporting `pinged=False` on one line among twenty-one successful seals. Each job names its slug in one constant and logs the slug, never the URL, which carries the secret ping key.
+
+What catches it is the difference between two ways a ping fails, which the producer already held and threw away. healthchecks answers a ping it cannot resolve with a status, and `urlopen` raises that as `urllib.error.HTTPError`, a `URLError` subclass carrying `.code`. That is why the compaction run printed `ping failed: HTTPError` rather than a transport error name. So a 4xx means the request was read and refused, which is either a slug with no row or a wrong ping key. Both are permanent and repeat every run. Every live producer pages on one, through the same ntfy publisher every other page goes out on, naming the slug and the status and never the URL. The page fires once and re-arms when a ping to that slug lands, the same transition rule every other page follows.
+
+A ping lost in transport pages nobody, and that is deliberate rather than an omission. A 5xx is healthchecks failing rather than refusing, and a socket error is the wifi blip this design already answers by setting the dead-man's grace looser than the watchdog's: capture keeps journaling locally while pings drop, and if the outage lasts, the check goes down on its own and healthchecks pages from outside. A page raised from the laptop would fail in the same outage that dropped the ping.
+
+Six sites ping a check and five of them escalate.
+
+1. The close+15 compaction job, `compaction`.
+2. The 09:35 calendar probe, `calendar-probe`.
+3. The 08:30 pre-open self-check, `pre-open`.
+4. The Sunday maintenance job, `sunday`.
+5. The capture dead-man, `capture`.
+
+The sixth is `slice1-capture` below, and it is excluded on purpose. Its row was deleted when the slice-2 checks superseded it, so a refusal there is the expected answer and escalating would page on every run to announce that a retired check is missing.
+
+Where the once-per-slug guard lives follows from how long its site lives. A site that runs once per process pages at most once per run by construction and holds nothing, which covers compaction, the calendar probe, and the pre-open self-check. Two sites outlive a single ping, and each holds a guard of its own.
+
+1. The capture dead-man pings roughly 390 times a session inside a daemon that outlives every one-shot job, so it keeps the guard in memory keyed by slug for as long as it lives.
+2. The Sunday job is re-run by its own retry loop every half hour until the canary deadline, which is seven attempts on an evening that starts at 20:00. So its guard lives in the loop, beside the reminder's own once-an-hour state, rather than inside the attempt.
+
+**Considered and rejected: reading the check list from the healthchecks.io management API.** It buys a new credential and a new external read to catch a class the failure already names. **Considered and rejected: verifying each slug by hand at setup.** That is what already failed.
 
 A seventh check exists during slice 1 only, `slice1-capture`. Its name on healthchecks.io is `Slice-1 capture`, so its pushes read `Slice-1 capture is DOWN` and `is UP`. The slice-1 runner is a cron-driven single cycle with no daemon, so it needs an envelope of its own. It retires when the per-cycle dead-man takes over the `capture` slug. Delete its row from healthchecks.io at that point. A retired check left in place goes silent and pages for a job that no longer exists.
 
@@ -352,6 +373,7 @@ ntfy documents that behavior for Android. The phone here is an iPhone, and the p
 | Schema drift | The parser mid-day, or the battery at night, once per field per day. Compaction at the merge, once per run | 5 | `Schema drift: <field> missing`, or `retyped`. Compaction's reads `Schema drift at the merge` | The surface, the field, and the first cycle that saw it. Compaction's names the ticker-day count, the dates, and every column that moved |
 | Delayed feed | The battery in the vendor sweep | 5 | `Delayed feed: partitions quarantined` | The session-median staleness and the partitions quarantined |
 | Calendar probe | The 09:35 probe job | 5 | `Calendar says closed, market looks open` | The vendor quote time it saw |
+| Refused ping | Any of the five live ping sites, once per slug, re-armed by a ping that lands | 5 | `Health check ping refused` | The slug and the status healthchecks answered with. Never the URL, which carries the ping key |
 | Sunday re-auth reminder | The Sunday canary job, on its 20:00, 21:00, and 22:00 runs only, while the throwaway call or the coverage assertion still fails. The canary itself keeps its 30-minute re-run | 3 | `Sunday re-auth due` | Which of the two failed, and the token's mint date |
 | Missed ping, any check | healthchecks.io, once on the transition to down | 5 | `<Check> is DOWN`, composed by the integration | Composed by healthchecks.io. The check's name is the Check column above, verbatim, because the slug never appears in the push |
 | Ping resumed | healthchecks.io, once on the transition to up | 2 | `<Check> is UP` | Composed by healthchecks.io |

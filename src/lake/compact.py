@@ -150,7 +150,14 @@ from lake.paths import (
     temp_write_path,
 )
 from lake.report import SCHEMA_DRIFT_DIR, SchemaDrift, write_schema_drift
-from lake.runner import PING_FAILURES, BackupRunner, Pinger, RsyncBackup, UrllibPinger
+from lake.runner import (
+    PING_FAILURES,
+    BackupRunner,
+    Pinger,
+    RsyncBackup,
+    UrllibPinger,
+    escalate_ping_failure,
+)
 from lake.session import SessionClock
 
 # The health-check slug the compaction job pings. It is the compaction-plus-backup check
@@ -1579,7 +1586,8 @@ def compact(
     ``pinger`` is optional so a caller without a health check, like a test, can skip
     it. When given, ``ping_url`` is required.
 
-    ``publisher`` is the schema-drift page and it follows ``pinger`` exactly. Both reach
+    ``publisher`` carries the schema-drift page and the refused-ping page, and it follows
+    ``pinger`` exactly. Both reach
     past this process, so ``main`` builds them and never accepts them, and a test drives
     this helper with a fake instead. It is optional for the same reason ``pinger`` is: a
     caller with nowhere to page skips it, and the default is ``None`` rather than a live
@@ -1696,6 +1704,11 @@ def compact(
                 pinged = True
             except PING_FAILURES as exc:
                 problem = f"ping failed: {type(exc).__name__}"
+                # A refused ping feeds no check, so no check will ever go silent to
+                # report it. This page is the only thing that can.
+                escalate_ping_failure(
+                    exc, slug=COMPACTION_SLUG, publisher=publisher, now=clock.now()
+                )
 
     return CompactionResult(
         sealed=tuple(sealed),
