@@ -437,7 +437,9 @@ def fingerprint_diff(derived: Mapping[str, str], recorded: Mapping[str, str]) ->
 # value is transformed, not copied: ``quoteTimeInLong`` is consumed into
 # ``vendor_quote_ts`` (see ``_CHAINS_CONTRACT_CONSUMED``), and ``optionDeliverablesList``
 # is JSON-encoded into a string column (see ``_CHAINS_DELIVERABLES_FIELD``). Both are
-# still counted as known below, so neither overflows into ``extra``.
+# still counted as known below, so on an ordinary row neither overflows into ``extra``. A
+# quote time the epoch transform refuses is the one exception, and it overflows because a
+# refused transform consumed nothing.
 _CHAINS_CONTRACT_MAP = {
     "symbol": "occ_symbol",
     "putCall": "put_call",
@@ -494,9 +496,10 @@ _CHAINS_CONTRACT_MAP = {
 }
 
 # The per-contract quote time. It is an epoch-millisecond int on each contract. It is
-# consumed into that contract's ``vendor_quote_ts`` stamp, not stored as a column, so it
-# never lands in ``extra`` either. This mirrors how the quotes surface consumes
-# ``quote.quoteTime``.
+# consumed into that contract's ``vendor_quote_ts`` stamp, not stored as a column, so on
+# an ordinary row it does not land in ``extra`` either. Consumed means successfully
+# transformed, so a row whose stamp the transform refused overflows it like any other
+# unrecognized field. This mirrors how the quotes surface consumes ``quote.quoteTime``.
 _CHAINS_QUOTE_TS_FIELD = "quoteTimeInLong"
 _CHAINS_CONTRACT_CONSUMED = frozenset({_CHAINS_QUOTE_TS_FIELD})
 
@@ -641,8 +644,10 @@ _EXTENDED_MAP = {
 
 # The quote-block fields the parser recognizes but does not overflow into ``extra``. The
 # vendor quote time is carried in ``vendor_quote_ts`` instead, so keeping it out of the
-# overflow keeps that column normally empty.
-_QUOTE_CONSUMED = frozenset({"quoteTime"})
+# overflow keeps that column normally empty. A stamp the epoch transform refuses was not
+# consumed, so it overflows instead, which is what ``_project_quote_envelope`` checks.
+_QUOTE_TS_FIELD = "quoteTime"
+_QUOTE_CONSUMED = frozenset({_QUOTE_TS_FIELD})
 
 # The captured blocks, each paired with its map and its consumed set. A block is
 # projected against its own sub-dict; unrecognized fields overflow into ``extra`` under
@@ -765,7 +770,9 @@ def extra_paths(surface: str) -> dict[str, ExtraPath]:
        value the writer transforms needs the transform, which is a promotion this surface
        has never made.
     3. ``vendor_quote_ts``, on both surfaces. The vendor quote time is consumed into that
-       stamp rather than stored, and it is named as consumed so it never overflows.
+       stamp rather than stored. The only value of it that reaches ``extra`` is one the
+       epoch transform refused, and projecting that back would need the transform that
+       already said no, so there is nothing for a path here to recover.
     4. The stamps, the provenance columns, and the chains window pair. None is a vendor
        field, so none was ever a candidate for the overflow.
 
@@ -795,17 +802,73 @@ def _iso(value: str | datetime | date | None) -> str | None:
     return value.isoformat()
 
 
-def _epoch_ms_to_iso(value: object) -> str | None:
-    """A vendor epoch-millisecond stamp as a UTC ISO-8601 string, or ``None``.
+class UnfitEpochError(Exception):
+    """A vendor epoch-millisecond stamp that does not name a usable instant.
 
-    Schwab stamps a contract's quote time as ``quoteTimeInLong``, an epoch in
-    milliseconds. Converting a stored epoch to a datetime is deterministic and reads no
-    wall clock, the same move ``lake.capture`` makes for the quote surface's quote time.
-    A missing value returns ``None``.
+    Raised by ``epoch_ms_to_utc``. Its callers null the stamp column and let the vendor's
+    own value overflow into ``extra``, so the row records what arrived instead of either
+    inventing a timestamp or costing the whole minute.
+
+    This is deliberately not a member of ``UNFIT_ERRORS``. That tuple is read only by
+    ``_fits`` and ``_routed_column``, both inside the column build, and the epoch transform
+    runs in the row builder before any column of that batch exists. Nothing on this path
+    would ever consult it.
+    """
+
+
+def epoch_ms_to_utc(value: object) -> datetime | None:
+    """A vendor epoch-millisecond stamp as a UTC datetime, or ``None`` when absent.
+
+    Schwab stamps a contract's quote time as ``quoteTimeInLong`` and an equity quote's as
+    ``quote.quoteTime``, both epochs in milliseconds. Converting a stored epoch to a
+    datetime is deterministic and reads no wall clock. A missing value returns ``None``,
+    which is the vendor sending nothing and stays distinct from a refusal.
+
+    The rule is refuse what converts wrongly or not at all, never refuse what is not a
+    number type. A numeric string converts correctly today, padding and all, and the lake
+    captures those values right now, so a type check would drop data rather than save it.
+
+    Two shapes are refused.
+
+    1. A bool. ``float(True)`` is ``1.0``, so a vendor ``true`` would land as a plausible
+       1970 timestamp with nothing raised and nothing to read it by. A bool is an ``int``
+       in Python, so it is excluded by name here, the way ``_float_column`` and
+       ``_int_column`` exclude it.
+    2. Anything the conversion itself rejects. That covers a non-numeric string, a dict, a
+       list, a NaN, and an epoch too far out for the platform's clock.
     """
     if value is None:
         return None
-    return datetime.fromtimestamp(float(value) / 1000.0, tz=UTC).isoformat()
+    if isinstance(value, bool):
+        raise UnfitEpochError(f"boolean value in an epoch-millisecond stamp: {value!r}")
+    try:
+        return datetime.fromtimestamp(float(value) / 1000.0, tz=UTC)
+    except (TypeError, ValueError, OverflowError, OSError) as exc:
+        raise UnfitEpochError(f"{type(exc).__name__}: {exc}") from exc
+
+
+def _epoch_ms_to_iso(value: object) -> str | None:
+    """A vendor epoch-millisecond stamp as a UTC ISO-8601 string, or ``None``.
+
+    The string form of ``epoch_ms_to_utc``, which the chains surface stores. A value that
+    transform refuses raises ``UnfitEpochError`` through here unchanged.
+    """
+    stamp = epoch_ms_to_utc(value)
+    return None if stamp is None else stamp.isoformat()
+
+
+def _epoch_refused(value: object) -> bool:
+    """Whether the epoch transform refuses this vendor stamp.
+
+    Consumed means successfully transformed. A stamp the transform refused consumed
+    nothing, so the field that carried it stops counting as consumed for that row and
+    overflows into ``extra`` under its own vendor name.
+    """
+    try:
+        epoch_ms_to_utc(value)
+    except UnfitEpochError:
+        return True
+    return False
 
 
 def _extra_json(fields: Mapping[str, object], known: set[str]) -> str | None:
@@ -1252,14 +1315,24 @@ def chains_data_batch(
     for contract in _iter_contracts(body):
         row: dict[str, object] = dict(stamps)
         row.update(header)
-        row["vendor_quote_ts"] = _epoch_ms_to_iso(contract.get(_CHAINS_QUOTE_TS_FIELD))
+        # The quote time is consumed into the stamp, so it is normally held out of the
+        # overflow. A value the transform refuses consumed nothing, so the exclusion stops
+        # applying for this row: the stamp lands null and the vendor's own value overflows
+        # under its own name, the signature a reader already knows means the column refused.
+        quote_time = contract.get(_CHAINS_QUOTE_TS_FIELD)
+        known = _CHAINS_CONTRACT_KNOWN
+        try:
+            row["vendor_quote_ts"] = _epoch_ms_to_iso(quote_time)
+        except UnfitEpochError:
+            row["vendor_quote_ts"] = None
+            known = _CHAINS_CONTRACT_KNOWN - _CHAINS_CONTRACT_CONSUMED
         for vendor, column in _CHAINS_CONTRACT_MAP.items():
             if vendor in contract:
                 row[column] = contract[vendor]
         deliverables = contract.get(_CHAINS_DELIVERABLES_FIELD)
         if deliverables is not None:
             row[_CHAINS_DELIVERABLES_COLUMN] = json.dumps(deliverables, sort_keys=True)
-        row[EXTRA_COLUMN] = _extra_json(contract, _CHAINS_CONTRACT_KNOWN)
+        row[EXTRA_COLUMN] = _extra_json(contract, known)
         # The fetch provenance: the plan window holding this contract's expiration date.
         # The vendor's expiration is an ISO datetime, so its date part is the key.
         expiration = contract.get("expirationDate")
@@ -1345,6 +1418,8 @@ def _project_quote_envelope(envelope: Mapping[str, object]) -> tuple[dict[str, o
             if vendor in block:
                 columns[column] = block[vendor]
         known = set(field_map) | consumed
+        if _QUOTE_TS_FIELD in consumed and _epoch_refused(block.get(_QUOTE_TS_FIELD)):
+            known -= {_QUOTE_TS_FIELD}
         rest = {key: value for key, value in block.items() if key not in known}
         if rest:
             overflow[block_key] = rest

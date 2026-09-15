@@ -1715,20 +1715,218 @@ def test_a_column_with_no_route_into_extra_still_costs_the_cycle():
     A value with nowhere honest to go must not be parked somewhere nothing reads. Each
     group below is a column ``extra_paths`` deliberately leaves out, named in its
     docstring, so this covers the reasons rather than one example of one.
+
+    Neither case is a shape a JSON decode produces, which is the point of both. A value
+    only this code could have put there failing loudly is this code's bug surfacing as
+    this code's bug. ``vendor_quote_ts`` used to stand here as the second case, on a
+    non-numeric quote time. It routes now, per marketlake #223, because that value is the
+    vendor's own and a minute is worth more than a stamp.
     """
     # A column this module fills itself. A stamp that will not build is this code's bug,
     # not the vendor's, and parking it would hide the bug and keep writing rows.
     with pytest.raises(pa.ArrowTypeError):
         journal.gap_batch(journal.CHAINS_SURFACE, ticker=7, snap_ts=SNAP, error_class="http_429")
-    # A column whose value this module transforms rather than copies. The epoch-to-ISO
-    # conversion refuses first, before any column is built.
-    with pytest.raises(ValueError):
+    # A column whose value this module transforms rather than copies. The JSON encoding
+    # refuses first, before any column is built.
+    with pytest.raises(TypeError):
         journal.chains_data_batch(
-            _chain_of(_full_contract(quoteTimeInLong="not-an-epoch")),
+            _chain_of(_full_contract(optionDeliverablesList={"SPY"})),
             ticker="SPY",
             snap_ts=SNAP,
             fetch_ts=FETCH,
         )
+
+
+# -- a vendor quote time the transform refuses --------------------------------
+
+# The quote time is the one vendor field neither surface copies into a column. Both
+# transform it into ``vendor_quote_ts`` and hold it out of the overflow as consumed. A
+# value the transform refuses consumed nothing, so the exclusion stops applying for that
+# row: the stamp lands null and the vendor's own value overflows under its own name. What
+# these pin is that the refusal is decided by whether the value converts, never by its
+# Python type, because a numeric string converts today and the lake captures those.
+
+
+# Every shape the transform must refuse, one per reason. The bool pair is the silent one,
+# where ``float(True)`` makes a plausible 1970 stamp with nothing raised. The rest raised
+# out of the row builder before this, which cost the whole minute.
+REFUSED_EPOCHS = (True, False, "n/a", {"a": 1}, [1], "inf", "nan", 1e30)
+
+# Every shape the transform must keep converting. The numeric strings are the trap: they
+# convert correctly today, so a fix that refused anything not an ``int`` or a ``float``
+# would drop values the lake captures right now.
+ACCEPTED_EPOCHS = ("1758000000000", " 1758000000000 ", 1758000000000.0, 1758000000000)
+
+# What all four of those name, as the stamp each must produce.
+ACCEPTED_ISO = "2025-09-16T05:20:00+00:00"
+
+
+def test_a_bool_quote_time_nulls_the_chains_stamp_and_routes_the_vendors_own_value():
+    """A vendor ``"quoteTimeInLong": true`` must not land as a 1970 timestamp.
+
+    ``float(True)`` is ``1.0``, so the conversion turned a bool into one millisecond past
+    the epoch and handed back a well-formed ISO string. Nothing raised and ``extra`` stayed
+    empty, so the row read as clean while the vendor's own value was gone. That is the
+    silent member of this class, the way the fractional float was on the integer columns
+    and the bool was on the double ones.
+
+    ``False`` is checked beside ``True`` because it lands on the epoch itself, which reads
+    as an ordinary stamp just as readily.
+
+    The routed value is checked with ``is`` rather than ``==``. ``1.0 == True`` is true in
+    Python, so an equality check alone would pass on a fix that parked the conversion's
+    output instead of the vendor's own bool. That equality is what hid the original shape in
+    marketlake #127.
+    """
+    for value in (True, False):
+        row = _chain_row(quoteTimeInLong=value)
+        assert row["vendor_quote_ts"] is None, value
+        routed = json.loads(row["extra"])["quoteTimeInLong"]
+        assert routed is value
+        assert type(routed) is bool
+
+
+def test_a_bool_quote_time_routes_under_its_block_on_the_quotes_surface():
+    """The same rule on the quotes surface, where the field arrives as ``quote.quoteTime``.
+
+    The two sites are one transform written twice, so a fix to one alone leaves the other
+    corrupting rows. Here the overflow nests under the block the field came from, which is
+    how a quotes row keeps two blocks' same-named fields apart.
+
+    This covers the journal's half, the routing. The stamp is the caller's argument on this
+    surface, computed in ``lake.capture``, and both halves are read off disk together in
+    the cycle test in tests/component/test_capture_cycle.py.
+    """
+    for value in (True, False):
+        row = _quote_row("quote", quoteTime=value)
+        routed = json.loads(row["extra"])["quote"]["quoteTime"]
+        assert routed is value
+        assert type(routed) is bool
+
+
+def test_every_refused_quote_time_routes_rather_than_costing_the_minute():
+    """A string, an object, a list, an infinity and a NaN all land the row.
+
+    Each of these used to raise out of the row builder, before any column of the batch
+    existed. The raise reached the cycle's fail-open and gapped the whole ticker, so one
+    bad field on one contract cost every contract on the chain. A minute is unrecoverable,
+    which makes that the worst outcome available for a single field.
+
+    They are driven together with the bools on purpose. Giving one vendor mistake two
+    answers, a silent 1970 stamp for a bool and a lost minute for a string, is the
+    one-shape-two-answers complaint marketlake #132 was filed over.
+
+    The infinity and the NaN arrive as strings because that is how a JSON body carries
+    them. ``1e30`` is the finite shape that still names no instant a platform clock holds.
+    """
+    for value in REFUSED_EPOCHS:
+        row = _chain_row(quoteTimeInLong=value)
+        assert row["vendor_quote_ts"] is None, value
+        assert json.loads(row["extra"]) == {"quoteTimeInLong": value}, value
+
+        quote_row = _quote_row("quote", quoteTime=value)
+        assert json.loads(quote_row["extra"])["quote"] == {"quoteTime": value}, value
+
+
+def test_a_numeric_string_quote_time_still_converts_on_both_surfaces():
+    """The regression guard. A value the lake captures correctly today must keep landing.
+
+    ``float("1758000000000")`` is the epoch the vendor meant, and ``float`` strips the
+    padding of a value sent with surrounding spaces, so both convert and both are real
+    captures rather than hypotheticals. The rule is refuse what converts wrongly or not at
+    all, never refuse what is not a number type, and this is what separates the two.
+
+    A type check is the fix that fails here, and it is the natural one to reach for, since
+    the bool has to be excluded by name anyway. ``isinstance(True, int)`` is true in Python,
+    so the guard against the bool cannot be a type check and must not become one.
+    """
+    for value in ACCEPTED_EPOCHS:
+        row = _chain_row(quoteTimeInLong=value)
+        assert row["vendor_quote_ts"] == ACCEPTED_ISO, value
+        assert row["extra"] is None, value
+
+        quote_row = _quote_row("quote", quoteTime=value)
+        assert quote_row["extra"] is None, value
+
+
+def test_a_quote_time_the_vendor_did_not_send_stays_absent_rather_than_refused():
+    """Absent and refused have to stay distinguishable, which is why the routing exists.
+
+    A null ``vendor_quote_ts`` means the vendor sent no quote time, and that reading is
+    unambiguous only while nothing else lands null there. A refused value that landed a
+    bare null would open a second meaning with nothing to tell the two apart, which is the
+    reason the value is routed rather than dropped.
+
+    Both absences are driven: the field missing from the payload, and the vendor sending an
+    explicit JSON null. Neither is a mistake the vendor made, so neither leaves a signature.
+    """
+    contract = _full_contract()
+    del contract["quoteTimeInLong"]
+    row = journal.chains_data_batch(
+        _chain_of(contract), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
+    ).to_pylist()[0]
+    assert row["vendor_quote_ts"] is None
+    assert row["extra"] is None
+
+    explicit_null = _chain_row(quoteTimeInLong=None)
+    assert explicit_null["vendor_quote_ts"] is None
+    assert explicit_null["extra"] is None
+
+    block = dict(QUOTE["quote"])
+    del block["quoteTime"]
+    envelope = dict(QUOTE, quote=block)
+    quote_row = journal.quotes_data_batch(
+        envelope, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH, vendor_quote_ts=None
+    ).to_pylist()[0]
+    assert quote_row["vendor_quote_ts"] is None
+    assert quote_row["extra"] is None
+
+    assert _quote_row("quote", quoteTime=None)["extra"] is None
+
+
+def test_a_refused_quote_time_leaves_the_rest_of_the_row_alone():
+    """One refused field costs that field, and the contract beside it costs nothing.
+
+    The routing changes which fields count as consumed for one row. Reading that decision
+    off module state rather than a per-row copy would spread one contract's drift across
+    every contract in the batch, and the second contract here is what catches it.
+    """
+    drifted = _full_contract(symbol="SPY   260918C00650000", quoteTimeInLong=True)
+    clean = _full_contract(symbol="SPY   260918P00650000", quoteTimeInLong=PUT_QUOTE_TIME_MS)
+    rows = journal.chains_data_batch(
+        _chain_of(drifted, clean), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
+    ).to_pylist()
+
+    assert rows[0]["vendor_quote_ts"] is None
+    assert json.loads(rows[0]["extra"]) == {"quoteTimeInLong": True}
+    # Every other column the drifted contract sent still landed.
+    assert rows[0]["bid"] == 4.2
+    assert rows[0]["open_interest"] == 1234
+
+    assert rows[1]["vendor_quote_ts"] == PUT_VQT
+    assert rows[1]["extra"] is None
+
+
+def test_the_refusal_is_signalled_locally_and_never_through_unfit_errors():
+    """``UNFIT_ERRORS`` is not this path's vocabulary and must not become it.
+
+    That tuple is read in exactly two places, ``_fits`` and ``_routed_column``, and both
+    run inside the column build. The epoch transform runs in the row builder, before any
+    column of that batch exists, so nothing on this path would consult the tuple whatever
+    it held. ``OverflowError`` being in it already is what makes that easy to assume and
+    worth checking by execution.
+
+    marketlake #164 is open against the tuple for the temporal-column case, which is a
+    different seam. Widening it here would answer that issue by accident.
+    """
+    assert journal.UnfitEpochError not in journal.UNFIT_ERRORS
+    assert not issubclass(journal.UnfitEpochError, journal.UNFIT_ERRORS)
+    # The transform raises before any column build, which is why the tuple cannot reach it.
+    with pytest.raises(journal.UnfitEpochError):
+        journal.epoch_ms_to_utc("n/a")
+    # And an epoch that raised OverflowError, the one member that does overlap, is refused
+    # by the transform rather than by anything the tuple governs.
+    assert _chain_row(quoteTimeInLong="inf")["vendor_quote_ts"] is None
 
 
 # -- the levels outside the contract dict and the captured blocks --------------

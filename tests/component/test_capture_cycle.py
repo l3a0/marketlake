@@ -454,8 +454,12 @@ def _chain_body_with(**contract_overrides) -> dict:
     }
 
 
-def _one_chain_cassette(body: dict) -> Cassette:
-    """A cassette serving that chain body for SPY, plus the quote batch SPY needs."""
+def _one_chain_cassette(body: dict, *, quote_time: object = 1787000100000) -> Cassette:
+    """A cassette serving that chain body for SPY, plus the quote batch SPY needs.
+
+    ``quote_time`` is the quote block's own vendor stamp, overridable so a quotes-surface
+    drift can be driven through a whole cycle the way a chains one is.
+    """
     return Cassette(
         interactions=(
             Interaction(
@@ -475,7 +479,7 @@ def _one_chain_cassette(body: dict) -> Cassette:
                         "quote": {
                             "bidPrice": 649.98,
                             "askPrice": 650.02,
-                            "quoteTime": 1787000100000,
+                            "quoteTime": quote_time,
                         },
                     }
                 },
@@ -623,17 +627,22 @@ def test_a_retyped_envelope_field_lands_the_quote_cycle_and_parks_the_raw_value(
     assert result.segment(CHAINS, "SPY").row_kind == journal.ROW_KIND_DATA
 
 
-def test_a_column_the_builder_transforms_still_gaps_under_its_own_class(lake_root):
-    """What the routing deliberately leaves alone, read at the class an operator sees.
+def test_a_quote_time_the_transform_refuses_lands_the_minute_instead_of_gapping_it(lake_root):
+    """A whole cycle over a non-numeric ``quoteTimeInLong``, read at the rows on disk.
 
-    ``quoteTimeInLong`` is consumed into ``vendor_quote_ts`` rather than copied, so the
-    column holds a value this code computed and the overflow has no key for it. The
-    epoch-to-ISO conversion refuses before any column is built, the raise reaches
-    ``_plan_chain``'s fail-open, and the ticker gaps under the exception's own name.
+    This used to gap the ticker. The epoch-to-ISO conversion raised, the raise reached
+    ``_plan_chain``'s fail-open, and a minute of every contract on the chain was spent on
+    one bad field. A minute is unrecoverable, so that was the worst outcome available, and
+    marketlake #223 ends it.
 
-    ``chain_schema_drift`` is not that name and never was. It guards the fetch, where a body
-    that will not merge is split and given up, and the row build runs well past it. So the
-    class on disk here is ``value_error``, and the quote sampler is untouched.
+    What lands instead is a data row per contract. ``vendor_quote_ts`` is null, because no
+    stamp can be made of this value, and the vendor's own value sits in ``extra`` under its
+    own name. That name in ``extra`` is the signature marketlake #129 pinned, and it is
+    what keeps a null here readable: absent still means the vendor sent nothing, and
+    refused says so out loud.
+
+    Every other column on the row is untouched, so the bad field costs the field alone. The
+    quote sampler is untouched too, as it was before.
     """
     result = capture.run_cycle(
         ManualClock(start=_CLOCK_START),
@@ -645,13 +654,51 @@ def test_a_column_the_builder_transforms_still_gaps_under_its_own_class(lake_roo
     )
 
     chain = result.segment(CHAINS, "SPY")
-    assert chain.row_kind == journal.ROW_KIND_GAP
-    assert chain.error_class == "value_error"
-    gap_row = _rows(chain)[0]
-    assert gap_row["error_class"] == "value_error"
-    assert gap_row["vendor_quote_ts"] is None
-    assert gap_row["extra"] is None
+    assert chain.row_kind == journal.ROW_KIND_DATA
+    assert chain.error_class is None
+    for row in _rows(chain):
+        assert row["row_kind"] == journal.ROW_KIND_DATA
+        assert row["vendor_quote_ts"] is None
+        assert json.loads(row["extra"]) == {"quoteTimeInLong": "not-an-epoch"}
+        # The rest of the contract still landed. One refused field costs that field alone.
+        assert row["bid"] is not None
+        assert row["open_interest"] is not None
     assert result.segment(QUOTES, "SPY").row_kind == journal.ROW_KIND_DATA
+
+
+def test_a_quote_block_quote_time_the_transform_refuses_lands_the_minute_too(lake_root):
+    """The same rule on the quotes surface, driven through the whole cycle.
+
+    The transform is written twice, once per surface, so a fix to the chains site alone
+    leaves the quotes site turning a vendor ``true`` into a 1970 stamp. Both halves are
+    read off disk here: ``lake.capture`` nulls the stamp, and the journal's projection
+    stops counting ``quoteTime`` as consumed for this envelope and overflows it under the
+    block it arrived in.
+
+    A bool is the shape driven, because it is the one that raised nothing and so left no
+    trace at all. The chains half of the same rule is the test above.
+    """
+    result = capture.run_cycle(
+        ManualClock(start=_CLOCK_START),
+        CassetteVendor(_one_chain_cassette(_chain_body_with(), quote_time=True)),
+        _spy_only(),
+        lake_root,
+        pid=4242,
+        plan=_ONE_WINDOW,
+    )
+
+    quotes = result.segment(QUOTES, "SPY")
+    assert quotes.row_kind == journal.ROW_KIND_DATA
+    row = _rows(quotes)[0]
+    assert row["vendor_quote_ts"] is None
+    routed = json.loads(row["extra"])["quote"]["quoteTime"]
+    assert routed is True
+    # The rest of the quote block still landed, so the refused field costs itself alone.
+    assert (row["bid"], row["ask"]) == (649.98, 650.02)
+    # The chain leg of the same cycle is untouched, stamp and all.
+    chain = result.segment(CHAINS, "SPY")
+    assert chain.row_kind == journal.ROW_KIND_DATA
+    assert _rows(chain)[0]["vendor_quote_ts"] == _CHAIN_VQT
 
 
 def test_a_retype_that_lands_stays_scoped_to_the_contract_that_drifted(lake_root):

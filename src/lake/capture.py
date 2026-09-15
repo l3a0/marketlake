@@ -59,7 +59,7 @@ import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from lake import journal
@@ -237,10 +237,18 @@ def _epoch_ms_to_datetime(value: object) -> datetime | None:
     Schwab stamps its quote times as epoch milliseconds. Converting a stored epoch to a
     datetime is deterministic and reads no wall clock, the same move ``lake.schwab``
     makes for the token mint time. A missing value returns ``None``.
+
+    The conversion itself is ``journal.epoch_ms_to_utc``, shared with the chains surface
+    rather than written twice, because the two surfaces read the same vendor stamp under
+    two names. A value that transform refuses returns ``None`` here, which nulls this
+    row's ``vendor_quote_ts``. The refused value is not lost: the quotes projection stops
+    counting ``quoteTime`` as consumed for that envelope, so the vendor's own value
+    overflows into ``extra`` under the ``quote`` block.
     """
-    if value is None:
+    try:
+        return journal.epoch_ms_to_utc(value)
+    except journal.UnfitEpochError:
         return None
-    return datetime.fromtimestamp(float(value) / 1000.0, tz=UTC)
 
 
 def _quote_envelope(body: Mapping[str, object], ticker: str) -> Mapping[str, object] | None:
