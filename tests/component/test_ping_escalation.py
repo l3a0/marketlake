@@ -407,6 +407,8 @@ def test_the_sunday_entry_pages_through_a_real_publisher(tmp_path, monkeypatch, 
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: lambda: True)
     monkeypatch.setattr(cp, "NtfyTransport", lambda topic: transport)
     monkeypatch.setattr(cp, "read_exclusions", _excluded)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(token)],
         clock=ManualClock(start=SUNDAY_20),

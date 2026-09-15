@@ -22,11 +22,14 @@ from datetime import date
 from pathlib import Path
 
 from lake import control_plane as cp
+from lake.alert import Publisher
+from lake.metadata import stamp_assertion_pid
 from tests.support.backup import mirror_lake
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.lake import FixtureLake
 from tests.support.pinger import FakePinger
+from tests.support.transport import FakeTransport
 
 CALENDAR = weekday_sessions(date(2026, 8, 31), date(2026, 9, 7))
 SUNDAY_20 = et(2026, 8, 30, 20, 0)
@@ -707,3 +710,240 @@ def test_a_failing_canary_names_both_halves(fixture_lake):
     assert outcome.reminder.body == (
         "The throwaway call and the coverage assertion failed. Token minted 2026-08-27."
     )
+
+
+# -- the daemon-liveness page ---------------------------------------------------------
+
+# Deadman coverage stops on the weekend on purpose, per its own docstring, and the
+# daemon's own re-take heals a lost assertion within a minute of it going, per
+# ``daemon.py``'s ``report_lost_assertion``. What is left unwatched is the daemon being
+# gone entirely through the Sunday window, which nothing else can notice or page for.
+# These tests drive ``sunday_maintenance`` and ``sunday_run`` with the same two seams
+# ``self_check`` takes: a daemon probe and an assertion probe matched against a stamped
+# pid.
+
+_DAEMON_PID = 4242
+SATURDAY = et(2026, 9, 5, 12, 0)  # outside every assertion window: nothing is owed
+
+
+def _daemon_run(
+    lake_root,
+    *,
+    now=SUNDAY_20,
+    daemon_probe,
+    assertion_probe=None,
+    assertion_pid=None,
+):
+    pinger = FakePinger()
+    outcome = cp.sunday_maintenance(
+        lake_root=lake_root,
+        backup_target=_backup_of(lake_root),
+        now=now,
+        calendar=CALENDAR,
+        schedule_reader=lambda: REPEAT_ONLY,
+        pinger=pinger,
+        ping_url=URL,
+        canary=_passing_canary,
+        mint=FRESH_MINT,
+        daemon_probe=daemon_probe,
+        assertion_probe=assertion_probe,
+        assertion_pid=assertion_pid,
+    )
+    return outcome, pinger
+
+
+def test_a_dead_daemon_pages_and_names_the_daemon_rather_than_the_assertion(fixture_lake):
+    root = _clean_lake(fixture_lake)
+    asked: list[int] = []
+    outcome, pinger = _daemon_run(
+        root,
+        daemon_probe=lambda label: False,
+        assertion_probe=lambda pid: asked.append(pid) or True,
+    )
+    assert outcome.daemon_page is not None
+    assert outcome.daemon_page.event == cp.SUNDAY_DAEMON_DOWN_EVENT
+    assert cp.DAEMON_LABEL in outcome.daemon_page.body
+    # A daemon already known dead is not also asked about its assertion. Naming the
+    # assertion here would send an operator to the wrong repair.
+    assert asked == []
+    # The finding rides the report as well as the page.
+    assert outcome.daemon_page.title in outcome.report
+    # Report-tier, not problems: it does not withhold the ping on its own.
+    assert outcome.problems == ()
+    assert outcome.pinged is True and pinger.urls == [URL]
+
+
+def test_a_live_daemon_holding_nothing_pages(fixture_lake):
+    root = _clean_lake(fixture_lake)
+    stamp_assertion_pid(root, pid=_DAEMON_PID)
+    outcome, pinger = _daemon_run(
+        root,
+        daemon_probe=lambda label: True,
+        assertion_probe=lambda pid: False,
+        assertion_pid=_DAEMON_PID,
+    )
+    assert outcome.daemon_page is not None
+    assert outcome.daemon_page.event == cp.SUNDAY_ASSERTION_UNHELD_EVENT
+    assert str(_DAEMON_PID) in outcome.daemon_page.body
+    assert outcome.daemon_page.title in outcome.report
+    assert outcome.pinged is True and pinger.urls == [URL]
+
+
+def test_a_live_daemon_holding_the_assertion_under_a_different_pid_pages(fixture_lake):
+    # The probe matches identity, not mere presence, the same rule #218 gave the
+    # weekday half: a caffeinate belonging to someone else does not satisfy this.
+    root = _clean_lake(fixture_lake)
+    stamp_assertion_pid(root, pid=_DAEMON_PID)
+
+    def probe(pid: int) -> bool:
+        assert pid == _DAEMON_PID
+        return False  # pmset holds an assertion, but under a different pid
+
+    outcome, _ = _daemon_run(
+        root, daemon_probe=lambda label: True, assertion_probe=probe, assertion_pid=_DAEMON_PID
+    )
+    assert outcome.daemon_page is not None
+    assert outcome.daemon_page.event == cp.SUNDAY_ASSERTION_UNHELD_EVENT
+
+
+def test_a_missing_stamp_reads_as_the_assertion_finding(fixture_lake):
+    # No pid was ever stamped. `self_check` treats this as the second state rather
+    # than a skip, and this mirrors it.
+    root = _clean_lake(fixture_lake)
+    outcome, _ = _daemon_run(
+        root, daemon_probe=lambda label: True, assertion_probe=lambda pid: True, assertion_pid=None
+    )
+    assert outcome.daemon_page is not None
+    assert outcome.daemon_page.event == cp.SUNDAY_ASSERTION_UNHELD_EVENT
+    assert "no pid recorded" in outcome.daemon_page.body
+
+
+def test_a_healthy_run_pages_nothing(fixture_lake):
+    root = _clean_lake(fixture_lake)
+    stamp_assertion_pid(root, pid=_DAEMON_PID)
+    outcome, pinger = _daemon_run(
+        root,
+        daemon_probe=lambda label: True,
+        assertion_probe=lambda pid: True,
+        assertion_pid=_DAEMON_PID,
+    )
+    assert outcome.daemon_page is None
+    assert outcome.report == ()
+    assert outcome.pinged is True and pinger.urls == [URL]
+
+
+def test_outside_the_assertion_window_neither_probe_is_asked(fixture_lake):
+    # A Saturday hand-run: nothing is owed, so the scrub proceeds and asks for no
+    # assertion, the same rule ``self_check`` already follows for its own probe.
+    root = _clean_lake(fixture_lake)
+    calls: list[str] = []
+    outcome, _ = _daemon_run(
+        root,
+        now=SATURDAY,
+        daemon_probe=lambda label: calls.append("daemon") or False,
+        assertion_probe=lambda pid: calls.append("assertion") or False,
+        assertion_pid=_DAEMON_PID,
+    )
+    assert calls == []
+    assert outcome.daemon_page is None
+
+
+def _publisher(lake_root, transport, *, secrets=()):
+    return Publisher(lake_root=lake_root, transport=transport, secrets=secrets)
+
+
+def test_the_same_failure_on_a_retry_does_not_page_twice(fixture_lake):
+    # Seven attempts run from 20:00 to 23:00 while the daemon stays dead the whole
+    # evening. One page for the window, not one per attempt.
+    root = _clean_lake(fixture_lake)
+    transport = FakeTransport()
+    clock = ManualClock(start=SUNDAY_20)
+    outcomes = cp.sunday_run(
+        lake_root=root,
+        backup_target=_backup_of(root),
+        clock=clock,
+        calendar=CALENDAR,
+        schedule_reader=lambda: REPEAT_ONLY,
+        pinger=FakePinger(),
+        ping_url=URL,
+        mint_reader=_Mints(STALE_MINT),
+        canary=_passing_canary,
+        daemon_probe=lambda label: False,
+        publisher=_publisher(root, transport),
+    )
+    assert len(outcomes) == 7
+    assert all(o.daemon_page is not None for o in outcomes)
+    assert len(transport.messages) == 1
+    assert transport.messages[0].event == cp.SUNDAY_DAEMON_DOWN_EVENT
+
+
+def test_the_assertion_pid_is_read_fresh_each_retry(fixture_lake):
+    # The daemon restamps a new pid when it re-takes a lost caffeinate mid-evening. A
+    # pid cached once at the start of the run would then ask about a child already gone
+    # and page a lapse that had already healed, the exact cry-wolf shape the daemon's
+    # own re-take exists to avoid. Reading the pid fresh each attempt, the way the mint
+    # already is, is what prevents it.
+    root = _clean_lake(fixture_lake)
+    # ``mints.reads`` is incremented by ``mint_reader()``, which ``sunday_run`` always
+    # calls before ``assertion_pid_reader()`` within the same attempt, so it is a safe
+    # stand-in for "which attempt this is" from both readers below.
+    mints = _Mints(STALE_MINT)
+
+    def read_pid() -> int:
+        # The restamp lands between the first attempt and the second.
+        return 4242 if mints.reads <= 1 else 9999
+
+    def held(pid: int) -> bool:
+        # pmset holds an assertion only under the pid currently real. The first
+        # child's process is gone once the restamp has happened.
+        current = 4242 if mints.reads <= 1 else 9999
+        return pid == current
+
+    clock = ManualClock(start=SUNDAY_20)
+    outcomes = cp.sunday_run(
+        lake_root=root,
+        backup_target=_backup_of(root),
+        clock=clock,
+        calendar=CALENDAR,
+        schedule_reader=lambda: REPEAT_ONLY,
+        pinger=FakePinger(),
+        ping_url=URL,
+        mint_reader=mints,
+        canary=_passing_canary,
+        daemon_probe=lambda label: True,
+        assertion_probe=held,
+        assertion_pid_reader=read_pid,
+    )
+    assert mints.reads == 7
+    assert len(outcomes) == 7
+    assert all(o.daemon_page is None for o in outcomes), (
+        "a stale pid paged a lapse that had already healed"
+    )
+
+
+def test_a_refused_page_keeps_its_body_off_stderr(fixture_lake, capsys):
+    # The bargain ``compact._page_drift`` already makes: a publisher that refused the
+    # page found one of its own secrets in the body, and stderr must not undo that
+    # redaction by printing the body anyway.
+    root = _clean_lake(fixture_lake)
+    transport = FakeTransport()
+    clock = ManualClock(start=SUNDAY_20)
+    cp.sunday_run(
+        lake_root=root,
+        backup_target=_backup_of(root),
+        clock=clock,
+        calendar=CALENDAR,
+        schedule_reader=lambda: REPEAT_ONLY,
+        pinger=FakePinger(),
+        ping_url=URL,
+        mint_reader=_Mints(FRESH_MINT),
+        canary=_passing_canary,
+        daemon_probe=lambda label: False,
+        # A publisher configured to treat the daemon label as a secret, so the page
+        # this run raises is refused the way a page carrying a real one would be.
+        publisher=_publisher(root, transport, secrets=(cp.DAEMON_LABEL,)),
+    )
+    assert transport.messages == []
+    err = capsys.readouterr().err
+    assert "refused: it carried a secret" in err
+    assert cp.DAEMON_LABEL not in err

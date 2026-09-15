@@ -606,6 +606,9 @@ def _sunday_lake(tmp_path: Path) -> tuple[Path, Path]:
 
 def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys, monkeypatch):
     lake, config = _sunday_lake(tmp_path)
+    # A stamped pid says the daemon is healthy, which is what this test's healthy Sunday
+    # is meant to exercise. An unstamped lake would read as a dead daemon here too.
+    stamp_assertion_pid(lake, pid=_DAEMON_PID)
     pinger = FakePinger()
     pushes = _Pushes()
     # main builds each past-process producer itself. A fake reaches the run by replacing
@@ -619,6 +622,8 @@ def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys, monke
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
     monkeypatch.setattr(cp, "NtfyTransport", lambda topic: pushes)
     monkeypatch.setattr(cp, "read_exclusions", _excluded)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
     # An explicit --token keeps the test off the real token under HOME.
     code = cp.main(
         [
@@ -659,6 +664,8 @@ def test_the_sunday_cli_scrubs_the_configured_backup_target(tmp_path, capsys, mo
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
     monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
     monkeypatch.setattr(cp, "read_exclusions", _excluded)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(_token(tmp_path))],
         clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
@@ -692,6 +699,8 @@ def test_sunday_cli_withholds_the_ping_for_a_stale_token(tmp_path, capsys, monke
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
     monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
     monkeypatch.setattr(cp, "read_exclusions", _excluded)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
     code = cp.main(
         [
             "sunday",
@@ -723,6 +732,8 @@ def test_sunday_cli_reads_the_mint_time_from_the_token_file(tmp_path, capsys, mo
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
     monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
     monkeypatch.setattr(cp, "read_exclusions", _excluded)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(token)],
         clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
@@ -754,6 +765,8 @@ def test_sunday_cli_checks_the_time_machine_exclusion(tmp_path, capsys, monkeypa
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
     monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
     monkeypatch.setattr(cp, "read_exclusions", reader)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
     code = cp.main(
         [
             "sunday",
@@ -783,6 +796,8 @@ def test_sunday_cli_reports_problems_and_exits_non_zero(tmp_path, capsys, monkey
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: lambda: False)
     monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
     monkeypatch.setattr(cp, "read_exclusions", _excluded)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(tmp_path / "absent.json")],
         clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
@@ -800,6 +815,63 @@ def test_sunday_cli_reports_problems_and_exits_non_zero(tmp_path, capsys, monkey
     # The job's log carries the reminder too. The phone is the channel that matters and
     # the push is checked below, but the log is what an operator reads after the fact.
     assert "sunday: reminder: The throwaway call" in printed
+
+
+def test_the_sunday_cli_asks_about_the_daemon(tmp_path, capsys, monkeypatch):
+    """The production entry has to pass the daemon probe, or a dead daemon through the
+    Sunday window is never noticed. An unwired ``main`` would look exactly this healthy.
+    """
+    lake, config = _sunday_lake(tmp_path)
+    pushes = _Pushes()
+    monkeypatch.setattr(
+        cp,
+        "read_pmset_schedule",
+        lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
+    )
+    monkeypatch.setattr(cp, "UrllibPinger", FakePinger)
+    monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
+    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: pushes)
+    monkeypatch.setattr(cp, "read_exclusions", _excluded)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: False)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
+    code = cp.main(
+        ["sunday", "--config", str(config), "--token", str(_token(tmp_path))],
+        clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
+        calendar=weekday_sessions(date(2026, 8, 31)),
+    )
+    assert code == 0  # report tier: the ping still fires despite the finding
+    printed = capsys.readouterr().out
+    assert "sunday: report: Capture at risk: Sunday daemon down" in printed
+    assert [m.event for m in pushes.sent] == [cp.SUNDAY_DAEMON_DOWN_EVENT]
+
+
+def test_the_sunday_cli_reads_the_pid_from_the_journal_stamp(tmp_path, monkeypatch):
+    """The production entry has to find the stamp, or the probe is asked about nothing.
+
+    Reading a pid from somewhere the daemon never writes looks the same as a healthy
+    machine on every other signal. Only the value reaching the probe tells them apart.
+    """
+    lake, config = _sunday_lake(tmp_path)
+    asked: list[int] = []
+    stamp_assertion_pid(lake, pid=7331)
+    monkeypatch.setattr(
+        cp,
+        "read_pmset_schedule",
+        lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
+    )
+    monkeypatch.setattr(cp, "UrllibPinger", FakePinger)
+    monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
+    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr(cp, "read_exclusions", _excluded)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: asked.append(pid) or True)
+    code = cp.main(
+        ["sunday", "--config", str(config), "--token", str(_token(tmp_path))],
+        clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
+        calendar=weekday_sessions(date(2026, 8, 31)),
+    )
+    assert code == 0
+    assert asked == [7331], "the CLI did not carry the stamped pid to the probe"
 
 
 # -- the two producers the launchd job runs on ---------------------------------------
@@ -831,6 +903,8 @@ def test_the_sunday_cli_builds_a_real_canary_rather_than_passing_through(tmp_pat
     monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
     monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
     monkeypatch.setattr(cp, "read_exclusions", _excluded)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(token)],
         clock=ManualClock(start=SUNDAY_20),
@@ -847,12 +921,17 @@ def test_the_sunday_cli_pushes_the_reminder_to_the_phone(tmp_path, monkeypatch):
     # option close, so the ritual was skipped and the reminder is owed. The design sends
     # it on the 20:00, 21:00 and 22:00 runs while the check still fails.
     lake, config = _sunday_lake(tmp_path)
+    # A stamped pid keeps the daemon-liveness page out of this evening's three reminder
+    # pushes, which is what this test counts.
+    stamp_assertion_pid(lake, pid=_DAEMON_PID)
     pushes = _Pushes()
     monkeypatch.setattr(cp, "read_pmset_schedule", lambda: REPEAT_ONLY)
     monkeypatch.setattr(cp, "UrllibPinger", FakePinger)
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
     monkeypatch.setattr(cp, "NtfyTransport", lambda topic: pushes)
     monkeypatch.setattr(cp, "read_exclusions", _excluded)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(_token(tmp_path, LATE_LAST_WEEK))],
         clock=ManualClock(start=SUNDAY_20),
@@ -878,11 +957,16 @@ def test_a_reminder_that_cannot_be_pushed_is_written_down_and_the_evening_carrie
     # naming the wrong cause. So the push is recorded under reports/ and the run ends
     # on its own summary line.
     lake, config = _sunday_lake(tmp_path)
+    # A stamped pid keeps the daemon-liveness page from adding a fourth undelivered
+    # record to the three this test counts.
+    stamp_assertion_pid(lake, pid=_DAEMON_PID)
     monkeypatch.setattr(cp, "read_pmset_schedule", lambda: REPEAT_ONLY)
     monkeypatch.setattr(cp, "UrllibPinger", FakePinger)
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
     monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _BrokenTransport())
     monkeypatch.setattr(cp, "read_exclusions", _excluded)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(_token(tmp_path, LATE_LAST_WEEK))],
         clock=ManualClock(start=SUNDAY_20),

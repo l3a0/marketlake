@@ -91,7 +91,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from lake.alert import Message, NtfyTransport, Publisher
+from lake.alert import REFUSED, Message, NtfyTransport, Publisher
 from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
 from lake.config import CALLBACK_KEY, input_errors_exit, load_config
@@ -1495,6 +1495,55 @@ ReminderSink = Callable[[ReauthReminder], None]
 # publisher writes down when a reminder never leaves the laptop.
 REMINDER_EVENT = "sunday_reauth"
 
+# The two events the daemon-liveness page below can raise. A dead daemon and a live
+# daemon holding nothing are different findings that send an operator to different
+# places, so they carry different events and titles rather than folding into one.
+SUNDAY_DAEMON_DOWN_EVENT = "sunday_daemon_down"
+SUNDAY_DAEMON_DOWN_TITLE = "Capture at risk: Sunday daemon down"
+SUNDAY_ASSERTION_UNHELD_EVENT = "sunday_assertion_unheld"
+SUNDAY_ASSERTION_UNHELD_TITLE = "Capture at risk: Sunday assertion not held"
+
+
+def sunday_daemon_page(
+    *,
+    daemon_up: bool,
+    assertion_pid: int | None,
+    daemon_label: str,
+    now: datetime,
+) -> Message:
+    """The page a dead daemon or an unheld assertion owes during the Sunday window.
+
+    Two shapes, so the operator is sent to the right place instead of guessing between
+    them. A dead daemon names the launchd label, since there is no pid to check against.
+    A live daemon holding nothing names the pid it stamped, the same identity
+    ``self_check`` matches at ``pmset_assertions_probe``. A missing stamp is the third
+    state and reads as the second, the way ``self_check`` already treats it.
+
+    The caller decides when this is owed. A daemon that is up and holding its assertion
+    has nothing to page, so this is only ever called for the other two states: pass
+    ``daemon_up=False`` for a dead daemon, or ``daemon_up=True`` for a live one that is
+    not holding its assertion.
+    """
+    when = now.astimezone(MARKET_TZ).isoformat()
+    if not daemon_up:
+        return Message(
+            event=SUNDAY_DAEMON_DOWN_EVENT,
+            title=SUNDAY_DAEMON_DOWN_TITLE,
+            body=(
+                f"launchctl shows {daemon_label} is not running, checked {when}. "
+                "Nothing is holding the Sunday assertion, and Monday's capture is at risk."
+            ),
+        )
+    pid_text = "no pid recorded" if assertion_pid is None else f"pid {assertion_pid}"
+    return Message(
+        event=SUNDAY_ASSERTION_UNHELD_EVENT,
+        title=SUNDAY_ASSERTION_UNHELD_TITLE,
+        body=(
+            f"The daemon is running but holds no caffeinate assertion ({pid_text}), "
+            f"checked {when}. The machine may idle-sleep before the window closes."
+        ),
+    )
+
 
 def reminder_publisher(*, publisher: Publisher, clock: Clock) -> ReminderSink:
     """Push each Sunday re-auth reminder to the phone, and log the ones that did not go.
@@ -1596,6 +1645,13 @@ class SundayOutcome:
 
     ``covered`` is ``None`` when the mint time could not be read. That is a problem,
     never a skip. ``pinged`` is the success condition.
+
+    ``daemon_page`` is the page this attempt found owed for a dead daemon or an unheld
+    assertion, or ``None`` when nothing was checked or the daemon was healthy. Its text
+    is also named in ``report``, matching every other report-tier finding, but it does
+    not withhold the ping the way ``problems`` does. Sending it, and sending it once per
+    window rather than once per attempt, is ``sunday_run``'s job: this function decides
+    one attempt and cannot see the ones before it.
     """
 
     scrub: ScrubResult
@@ -1607,6 +1663,7 @@ class SundayOutcome:
     reminder: ReauthReminder | None = None
     problems: tuple[str, ...] = ()
     report: tuple[str, ...] = ()
+    daemon_page: Message | None = None
 
 
 def sunday_maintenance(
@@ -1623,6 +1680,9 @@ def sunday_maintenance(
     exclusion_targets: Sequence[str] = (),
     exclusion_reader: ExclusionReader | None = None,
     escalation: SlugEscalation | None = None,
+    daemon_probe: DaemonProbe | None = None,
+    assertion_probe: AssertionProbe | None = None,
+    assertion_pid: int | None = None,
 ) -> SundayOutcome:
     """Scrub both copies, verify the wake alarms, run the canary, assert coverage, ping.
 
@@ -1650,6 +1710,31 @@ def sunday_maintenance(
     hour while anything is failing. See the comment at the ping itself. With none, a
     refusal is named in ``problems`` and pages nobody, which is what lets a test drive
     this helper without a page reaching anywhere.
+
+    ``daemon_probe`` and ``assertion_probe`` answer the question the Sunday window has
+    no other watcher for: whether the daemon itself is alive through it. Deadman
+    coverage stops on the weekend on purpose, and the daemon's own re-take heals a lost
+    assertion within a minute, so the one gap left is the daemon being gone entirely,
+    which nothing else can notice or page for. They are the same two seams ``self_check``
+    takes, so a caller wires the same ``launchctl_probe`` and ``pmset_assertions_probe``,
+    and ``assertion_pid`` is the pid the daemon last stamped, read the same way. With
+    ``daemon_probe`` left out, this attempt checks neither and ``daemon_page`` is always
+    ``None``.
+
+    Both probes are gated on ``_assertion_owed(now)``, the window ``self_check`` uses to
+    decide whether *an assertion* should be held. Here it gates the daemon probe too,
+    which is narrower than ``self_check``'s own shape: that check probes the daemon
+    unconditionally, because ``RunAtLoad`` is on there and an install-time run outside
+    every window still has to ping. The Sunday job's ``RunAtLoad`` is off, so every
+    scheduled run already sits inside the window, and the only run that could reach here
+    outside it is a hand run, on a Saturday for instance. A page naming a dead daemon on
+    a day nothing is owed would be a false alarm the design's own "Saturday owes nothing"
+    rule already refuses, so the daemon probe waits on the same gate the assertion probe
+    needs. Inside the window, a daemon that answers down pages naming ``DAEMON_LABEL``,
+    and a daemon that is up but holds nothing under ``assertion_pid`` pages naming that
+    pid. The two are kept apart because they send an operator to a different repair, and
+    a page for the assertion when the daemon itself is the failure would send them to
+    the wrong one.
 
     Four duties the design gives the Sunday run are not built here. Each is named so
     the gap is a decision rather than an oversight.
@@ -1721,6 +1806,27 @@ def sunday_maintenance(
                 if not states.get(target, False):
                     report.append(f"not excluded from time machine: {target}")
 
+    # Owed on the same window ``self_check`` uses for its own assertion question, so a
+    # Saturday hand run asks for neither probe and a scheduled Sunday attempt, which
+    # always lands inside the window, asks for both.
+    daemon_page: Message | None = None
+    if daemon_probe is not None and _assertion_owed(now):
+        if not daemon_probe(DAEMON_LABEL):
+            daemon_page = sunday_daemon_page(
+                daemon_up=False, assertion_pid=None, daemon_label=DAEMON_LABEL, now=now
+            )
+        elif assertion_probe is not None:
+            held = assertion_pid is not None and assertion_probe(assertion_pid)
+            if not held:
+                daemon_page = sunday_daemon_page(
+                    daemon_up=True,
+                    assertion_pid=assertion_pid,
+                    daemon_label=DAEMON_LABEL,
+                    now=now,
+                )
+    if daemon_page is not None:
+        report.append(daemon_page.title)
+
     canary_passed = bool(canary())
     if not canary_passed:
         problems.append("canary call failed")
@@ -1763,6 +1869,7 @@ def sunday_maintenance(
         reminder=reminder,
         problems=tuple(problems),
         report=tuple(report),
+        daemon_page=daemon_page,
     )
 
 
@@ -1773,6 +1880,35 @@ CANARY_RETRY = timedelta(minutes=30)
 # Reads the token's mint time afresh, or ``None`` when it could not be read. The retry
 # loop calls it once per attempt. That is what lets a mid-evening re-login be seen.
 MintReader = Callable[[], datetime | None]
+
+# Reads the daemon's stamped pid afresh, or ``None`` when nothing is stamped. The retry
+# loop calls it once per attempt, the same reason ``MintReader`` is a reader rather than
+# a value: the daemon restamps a new pid when it re-takes a lost ``caffeinate``, and a
+# pid cached at the start of the evening would ask about a child already gone, paging a
+# lapse that had already healed.
+AssertionPidReader = Callable[[], int | None]
+
+
+def _page_sunday_daemon_finding(
+    publisher: Publisher | None, message: Message, *, now: datetime
+) -> None:
+    """Send the once-per-window daemon-liveness page, and log what became of it.
+
+    The bargain is ``compact._page_drift``'s: a publisher that refused the page found
+    one of its own secrets in the body and redacted its record for that reason, so
+    stderr must not undo the redaction by printing the body anyway. With no publisher
+    the page goes nowhere and nothing is written, since there is nothing to try.
+    """
+    if publisher is None:
+        return
+    delivery = publisher.publish(message, now=now)
+    if delivery.reason == REFUSED:
+        print(f"sunday: {message.event} page refused: it carried a secret", file=sys.stderr)
+        return
+    print(f"sunday: {message.title}: {message.body}", file=sys.stderr)
+    if not delivery.sent:
+        kept = "written down" if delivery.recorded else "lost"
+        print(f"sunday: {message.event} page not sent: {delivery.reason}, {kept}", file=sys.stderr)
 
 
 def sunday_run(
@@ -1791,6 +1927,9 @@ def sunday_run(
     exclusion_reader: ExclusionReader | None = None,
     reminder_sink: ReminderSink | None = None,
     publisher: Publisher | None = None,
+    daemon_probe: DaemonProbe | None = None,
+    assertion_probe: AssertionProbe | None = None,
+    assertion_pid_reader: AssertionPidReader | None = None,
 ) -> list[SundayOutcome]:
     """Run the Sunday job, retrying until it passes or the canary deadline.
 
@@ -1821,6 +1960,16 @@ def sunday_run(
     ``publisher`` is where a refused ping pages, and it is the same one the reminder
     pushes through. One guard covers the whole evening rather than one attempt, for the
     reason the loop below gives. With no publisher nothing escalates.
+
+    ``daemon_probe`` and ``assertion_probe`` pass straight through to every attempt's
+    ``sunday_maintenance`` call. ``assertion_pid_reader`` is read afresh each attempt,
+    the same reason ``mint_reader`` is: the daemon restamps a new pid when it re-takes a
+    lost ``caffeinate`` mid-evening, and a pid cached once at the start would ask about a
+    child already gone, paging a lapse that had already healed by the next retry. A
+    finding still pages at most once for the whole window rather than once per attempt,
+    using a flag local to this call. The retry loop runs inside one process, so that
+    local flag is the entire state a once-per-window rule needs, unlike the daemon's own
+    once-per-window rule, which has to survive across ticks and so keeps a stamp instead.
     """
     start = clock.now().astimezone(MARKET_TZ)
     in_the_window = start.weekday() == _PY_SUNDAY and SUNDAY_MAINTENANCE.on(start.date()) <= start
@@ -1832,6 +1981,10 @@ def sunday_run(
     # job every half hour while anything is still failing, and a slug with no row fails
     # every one of those attempts.
     escalation = SlugEscalation(publisher)
+    # One page for the whole window, not one per attempt or per retry. Set the moment
+    # the first page goes, so a failure that persists across every half-hour retry is
+    # heard once rather than up to seven times.
+    daemon_paged = False
     while True:
         attempt_now = clock.now()
         outcome = sunday_maintenance(
@@ -1847,6 +2000,9 @@ def sunday_run(
             exclusion_targets=exclusion_targets,
             exclusion_reader=exclusion_reader,
             escalation=escalation,
+            daemon_probe=daemon_probe,
+            assertion_probe=assertion_probe,
+            assertion_pid=assertion_pid_reader() if assertion_pid_reader is not None else None,
         )
         # One reminder an hour. Later attempts in the same hour owe nothing, so the
         # outcome records only the one that went out.
@@ -1858,6 +2014,9 @@ def sunday_run(
                 reminded.add(hour)
                 if reminder_sink is not None:
                     reminder_sink(outcome.reminder)
+        if outcome.daemon_page is not None and not daemon_paged:
+            daemon_paged = True
+            _page_sunday_daemon_finding(publisher, outcome.daemon_page, now=attempt_now)
         outcomes.append(outcome)
         if outcome.pinged:
             return outcomes
@@ -3003,6 +3162,15 @@ def main(
                 default_config_dir(str(Path.home())), token_path
             ),
             exclusion_reader=read_exclusions,
+            # The same two seams the self-check wires. The pid is read through the lake
+            # the same way too, because this runs as its own process and the daemon's
+            # handle on its child lives in another one, but read afresh each retry
+            # rather than once: the daemon restamps a new pid when it re-takes a lost
+            # ``caffeinate``, and a pid cached at the first attempt would ask about a
+            # child already gone by the next one.
+            daemon_probe=launchctl_probe,
+            assertion_probe=pmset_assertions_probe,
+            assertion_pid_reader=lambda: read_metadata(config.lake_root).assertion_pid,
         )
         for number, outcome in enumerate(outcomes, start=1):
             if len(outcomes) > 1:
@@ -3059,6 +3227,10 @@ __all__ = [
     "SUNDAY_MAINTENANCE",
     "SUNDAY_SLUG",
     "SUNDAY_ASSERTION_END",
+    "SUNDAY_ASSERTION_UNHELD_EVENT",
+    "SUNDAY_ASSERTION_UNHELD_TITLE",
+    "SUNDAY_DAEMON_DOWN_EVENT",
+    "SUNDAY_DAEMON_DOWN_TITLE",
     "SUNDAY_WAKE",
     "TOKEN_LIFETIME",
     "VENDOR_SWEEP",
@@ -3067,6 +3239,7 @@ __all__ = [
     "WEEKDAY_WAKE",
     "AlarmCheck",
     "AssertionHolder",
+    "AssertionPidReader",
     "AssertionRunner",
     "AssertionWindow",
     "CanaryCall",
@@ -3122,6 +3295,7 @@ __all__ = [
     "self_check_job",
     "sudoers_dropin",
     "sunday_canary_due",
+    "sunday_daemon_page",
     "sunday_job",
     "sunday_maintenance",
     "sunday_run",
