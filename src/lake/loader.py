@@ -11,6 +11,16 @@ A reader asks for a ticker, a session date, and a minute. It gets back the chain
 underlying's quote, as it stood at that minute, as a ``pyarrow.Table``. That matches what
 the lake stores, and ``.to_pandas()`` is one call for anyone who wants a frame.
 
+``load_contract`` is a third door onto the same machinery, marketlake #266. It answers a
+different question: not the chain at one minute, but one contract's whole session. Its
+selection is a single OCC symbol, supplied by the caller instead of resolved off a
+whole-partition scan, so it skips the resolve pass described below and reads the
+partition once rather than twice. It shares everything past that: the path build, the
+spelling check, the quarantine guard, the overflow projection, and the final filter to
+data rows. It orders its answer by the instant each row's ``snap_ts`` names rather than
+by the partition's own layout, for the same reason the fetch predicate never trusts that
+layout either: nothing here rides on how the writer happened to order the file.
+
 Four defaults are settled by marketlake #135, which is authoritative for this deliverable.
 
 1. The return is a ``pyarrow.Table``.
@@ -210,12 +220,15 @@ from lake.paths import CHAINS, QUOTES, LakePaths
 from lake.schema_versions import SchemaVersionLedger, ledger_path
 from lake.session import OPTION_CLOSE, SPOT_CLOSE
 
-# The three columns a read resolves against, on either surface: ``snap_ts`` is the minute
-# slot the cycle was scheduled for, ``close_tag`` is the tag capture stamps on a
-# close-of-record cycle, and ``row_kind`` tells a vendor observation from an absence
-# marker. The row-kind names come from the writer rather than being spelled again here.
+# The columns a read resolves against: ``snap_ts`` is the minute slot the cycle was
+# scheduled for, ``close_tag`` is the tag capture stamps on a close-of-record cycle,
+# ``row_kind`` tells a vendor observation from an absence marker, and ``occ_symbol`` is
+# the contract identity a chains row carries. The row-kind names come from the writer
+# rather than being spelled again here. ``occ_symbol`` is on the chains schema only,
+# which is why ``load_contract`` reads chains and takes no surface argument.
 SNAP_TS_COLUMN = "snap_ts"
 CLOSE_TAG_COLUMN = "close_tag"
+OCC_SYMBOL_COLUMN = "occ_symbol"
 ROW_KIND_COLUMN = journal.ROW_KIND_COLUMN
 ROW_KIND_DATA = journal.ROW_KIND_DATA
 
@@ -230,6 +243,7 @@ CLOSE_COLUMNS = (SNAP_TS_COLUMN, ROW_KIND_COLUMN, CLOSE_TAG_COLUMN)
 _SNAP_SHAPE = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
 
 __all__ = [
+    "ContractAbsent",
     "LoadError",
     "NoCloseOfRecord",
     "NoOptionClose",
@@ -240,6 +254,7 @@ __all__ = [
     "SnapAbsent",
     "SnapMalformed",
     "load_chain",
+    "load_contract",
     "load_quotes",
 ]
 
@@ -377,6 +392,28 @@ class SnapAbsent(LoadError):
         self.snap = snap
         self.tagged_gaps = tagged_gaps
         self.unreadable = unreadable
+
+
+class ContractAbsent(LoadError):
+    """Raised when an OCC symbol names no data row in the ticker-day's chains partition.
+
+    ``SnapAbsent`` is the model for this message, since it answers the same shape of
+    question about a different key: an absent minute there, an absent contract here,
+    both against a partition that does exist. A contract present for only some of the
+    session's minutes is a different answer and comes back as one, a real partial series
+    rather than nothing, which is why only a contract with no rows at all reaches here.
+
+    ``ticker`` is the partition the read looked in, which is the ``ticker=`` override
+    when one was given to ``load_contract`` and the OCC root derived from ``occ_symbol``
+    otherwise. Naming both lets a caller relying on the derivation see which ticker was
+    tried and why.
+    """
+
+    def __init__(self, occ_symbol: str, ticker: str, day: str) -> None:
+        super().__init__(f"{ticker} {day} has no data row for {occ_symbol!r}.")
+        self.occ_symbol = occ_symbol
+        self.ticker = ticker
+        self.day = day
 
 
 class PartialRead(LoadError):
@@ -519,6 +556,84 @@ def load_quotes(
     )
 
 
+def load_contract(
+    occ_symbol: str,
+    day: date | str,
+    *,
+    ticker: str | None = None,
+    lake_root: Path | str | None = None,
+    include_quarantined: bool = False,
+) -> pa.Table:
+    """One contract's whole session, as a table of data rows ordered by ``snap_ts``.
+
+    This reads ``chains``, not a surface a caller names, because ``occ_symbol`` is on the
+    chains schema and not on the quotes one. Passing a surface the way ``_load_surface``
+    takes one for its two genuinely different callers would offer a call that cannot work.
+
+    ``ticker`` names the partition to look in. Left as ``None``, it is derived from
+    ``occ_symbol``'s first six characters: ``'SPY   260918C00650000'[:6].strip()`` is
+    ``'SPY'``, which matches every row of the live lake. It is still a guess rather than
+    a guarantee. An index root like ``SPXW``, or a symbol a corporate action rewrote,
+    can differ from the ticker the partition is keyed by, and ``ticker`` overrides the
+    derivation for those.
+
+    The selection is supplied directly, an OCC symbol rather than a tag or a minute's
+    spellings, so this skips the resolve pass ``load_chain`` and ``load_quotes`` run
+    first: there is nothing here for it to resolve. What is shared is everything past
+    that: the path build, the spelling check, the quarantine guard, the fetch pass with
+    its overflow half, the overflow projection, and the final filter to data rows.
+
+    The rows come back ordered by the instant each ``snap_ts`` names, never by the
+    stored text or the partition's own layout. The same instant has more than one ISO
+    spelling, so a lexicographic sort of the text disagrees with time order whenever
+    spellings mix, and a series is the one read whose order a caller will assume. A
+    ``snap_ts`` this read cannot parse as an instant raises a ``LoadError`` naming the
+    symbol rather than sorting anyway, because every row here is already part of the
+    answer and none of them is excused the way an unreadable value beside a resolved
+    minute is on ``load_chain``.
+
+    A contract absent from the partition raises ``ContractAbsent``, naming the symbol
+    and the ticker the read looked under, whether that ticker was derived or given.
+    A contract present for only some of the session's minutes is a real partial answer
+    and comes back as one: nothing here comes back empty, because an empty answer and an
+    absent one read the same and mean opposite things, the same rule ``load_chain`` and
+    ``load_quotes`` already apply to a session.
+
+    A row with no ``row_kind`` refuses the reads whose fetched rows include it, rather
+    than every read of the day. There is no whole-partition resolve pass here to catch
+    it ahead of the fetch the way ``load_chain`` and ``load_quotes`` do, so the check
+    runs on the rows the fetch actually reads instead.
+
+    ``include_quarantined`` and ``lake_root`` carry the same meaning and the same
+    defaults ``load_chain`` gives them. A ticker-day with no sealed chains partition
+    raises ``PartitionAbsent`` the same way, naming the derived OCC root too when
+    ``ticker`` was not given, so a caller can see why that ticker was tried.
+    """
+    day_text = day.isoformat() if isinstance(day, date) else str(day)
+    ticker_used = ticker if ticker is not None else _occ_root(occ_symbol)
+    absent_detail = (
+        f" {occ_symbol!r}'s OCC root names {ticker_used!r}; pass ticker= to override it."
+        if ticker is None
+        else ""
+    )
+    root, path = _open_partition(
+        ticker_used,
+        day_text,
+        lake_root=lake_root,
+        include_quarantined=include_quarantined,
+        surface=CHAINS,
+        absent_detail=absent_detail,
+    )
+
+    selection = _Selection(OCC_SYMBOL_COLUMN, (occ_symbol,))
+    table = _fetch_selection(
+        path, root, selection, ticker_used, day_text, CHAINS, check_row_kind=True
+    )
+    if table.num_rows == 0:
+        raise ContractAbsent(occ_symbol, ticker_used, day_text)
+    return _sorted_by_snap(table, occ_symbol, ticker_used, day_text)
+
+
 def _load_surface(
     ticker: str,
     day: date | str,
@@ -539,20 +654,14 @@ def _load_surface(
     ``no_close_error`` is the exception raised when no row carries it, so each surface
     names its own marker rather than the other's.
     """
-    root = Path(load_config().lake_root if lake_root is None else lake_root)
     day_text = day.isoformat() if isinstance(day, date) else str(day)
-    path = LakePaths(root).partition_path(surface, ticker, day_text)
-    if not (path.is_file() and _spelled_exactly(root, path)):
-        raise PartitionAbsent(
-            f"{ticker} {day_text} has no sealed {surface} partition at {path}. "
-            "A session seals at close+15, and a ticker is spelled as its directory is."
-        )
-
-    partition = path.relative_to(root).as_posix()
-    if not include_quarantined:
-        entry = latest_quarantine(root).get(partition)
-        if is_quarantined(entry):
-            raise PartitionQuarantined(partition, entry)
+    root, path = _open_partition(
+        ticker,
+        day_text,
+        lake_root=lake_root,
+        include_quarantined=include_quarantined,
+        surface=surface,
+    )
 
     resolving = CLOSE_COLUMNS if snap is None else MINUTE_COLUMNS
     resolved = _read(path, columns=list(resolving))
@@ -569,7 +678,87 @@ def _load_surface(
     else:
         selection = _at_minute(resolved, data, ticker, day_text, snap)
 
+    return _fetch_selection(path, root, selection, ticker, day_text, surface, check_row_kind=False)
+
+
+class _Selection(NamedTuple):
+    """The rows an answer is made of, as a column and the values it admits there.
+
+    ``load_chain`` and ``load_quotes`` each resolve one of these off a whole-partition
+    scan. ``load_contract`` supplies one directly, since an OCC symbol needs no
+    resolving, and skips that scan. Either way, one predicate builds the fetch and one
+    filter trims what came back. The values are the spellings a resolve pass found
+    rather than a canonical form where one runs, which is what keeps a partition holding
+    two spellings of one instant answerable whole; a supplied selection carries just the
+    one value the caller asked for.
+    """
+
+    column: str
+    values: tuple[str, ...]
+
+
+def _open_partition(
+    ticker: str,
+    day_text: str,
+    *,
+    lake_root: Path | str | None,
+    include_quarantined: bool,
+    surface: str,
+    absent_detail: str = "",
+) -> tuple[Path, Path]:
+    """The lake root and the sealed partition path, or the two refusals every read shares.
+
+    Every read resolves ``lake_root`` the same way, requires the partition to exist
+    under its exact on-disk spelling, and clears it against quarantine before touching a
+    row. ``absent_detail`` extends the ``PartitionAbsent`` message when it fires, which
+    is what lets ``load_contract`` name the OCC root it derived without a second copy of
+    the guard that raises it.
+    """
+    root = Path(load_config().lake_root if lake_root is None else lake_root)
+    path = LakePaths(root).partition_path(surface, ticker, day_text)
+    if not (path.is_file() and _spelled_exactly(root, path)):
+        raise PartitionAbsent(
+            f"{ticker} {day_text} has no sealed {surface} partition at {path}. "
+            "A session seals at close+15, and a ticker is spelled as its directory is."
+            f"{absent_detail}"
+        )
+
+    partition = path.relative_to(root).as_posix()
+    if not include_quarantined:
+        entry = latest_quarantine(root).get(partition)
+        if is_quarantined(entry):
+            raise PartitionQuarantined(partition, entry)
+    return root, path
+
+
+def _fetch_selection(
+    path: Path,
+    root: Path,
+    selection: _Selection,
+    ticker: str,
+    day_text: str,
+    surface: str,
+    *,
+    check_row_kind: bool,
+) -> pa.Table:
+    """The fetch pass, the overflow projection, and the final filter, shared by every read.
+
+    ``check_row_kind`` is the one difference among the three callers. ``load_chain`` and
+    ``load_quotes`` already rule out a null ``row_kind`` over the whole partition during
+    their resolve pass, before this ever runs. ``load_contract`` supplies its selection
+    directly and has no resolve pass to catch it there, so this checks the rows the
+    fetch actually reads instead. That refuses only the reads whose fetched rows include
+    the damaged one, the same scoping #251 already chose for a row's own schema version,
+    rather than every read of the day.
+    """
     fetched = _read(path, filters=_predicate(selection, pq.read_schema(path).names))
+    if check_row_kind:
+        is_data = pc.equal(fetched.column(ROW_KIND_COLUMN), ROW_KIND_DATA)
+        if is_data.null_count:
+            raise LoadError(
+                f"{ticker} {day_text} holds {is_data.null_count} fetched rows with no "
+                f"{ROW_KIND_COLUMN}, which are neither an observation nor an absence marker."
+            )
     projection = project_extra(fetched, surface=surface, ledger=_ledger(root))
     if not projection.complete:
         raise PartialRead(ticker, day_text, surface, projection)
@@ -580,19 +769,6 @@ def _load_surface(
             pc.is_in(table.column(selection.column), value_set=pa.array(selection.values)),
         )
     )
-
-
-class _Selection(NamedTuple):
-    """The rows an answer is made of, as a column and the values it admits there.
-
-    Both resolutions come out as one of these, so one predicate builds the fetch and one
-    filter trims what came back for either of them. The values are the spellings the
-    resolve pass found rather than a canonical form, which is what keeps a partition
-    holding two spellings of one instant answerable whole.
-    """
-
-    column: str
-    values: tuple[str, ...]
 
 
 def _read(
@@ -748,6 +924,53 @@ def _instant(text: object) -> datetime | None:
     except ValueError:
         return None
     return None if stamped.tzinfo is None else stamped
+
+
+# Where an OCC symbol carries the underlying's root: the first six characters, padded
+# with spaces and stripped. ``'SPY   260918C00650000'[:6].strip()`` is ``'SPY'``.
+_OCC_ROOT_WIDTH = 6
+
+
+def _occ_root(occ_symbol: str) -> str:
+    """The ticker ``load_contract`` derives from an OCC symbol when none is given.
+
+    This matches every row of the live lake and is still a guess rather than a
+    guarantee. An index root like ``SPXW``, or a symbol a corporate action rewrote, can
+    differ from the ticker the partition is keyed by, which is what ``ticker=`` on
+    ``load_contract`` is for.
+    """
+    return occ_symbol[:_OCC_ROOT_WIDTH].strip()
+
+
+def _sorted_by_snap(table: pa.Table, occ_symbol: str, ticker: str, day_text: str) -> pa.Table:
+    """``table`` ordered by the instant each row's ``snap_ts`` names, not the stored text.
+
+    The same instant has more than one ISO spelling, so a lexicographic sort of the text
+    disagrees with time order whenever spellings mix: SPY's sealed 2026-09-11 partition
+    holds 406 rows spelled ``+00:00`` and 2 with an Eastern offset, and the Eastern
+    spelling of a later instant sorts before the earlier one written as ``+00:00``. A
+    series is the one read whose order a caller will assume, and it cannot be inherited
+    from the partition's own layout either, per #242's audit of what row-group pruning
+    actually guarantees. So this parses every value and sorts on that instead.
+
+    A ``snap_ts`` that cannot be read as an instant raises rather than sorting anyway.
+    ``load_chain`` and ``load_quotes`` can set an unreadable value aside, because it sits
+    beside the one minute or cycle that answers their read and never in it. Every row
+    here is already part of the answer, resolved by ``occ_symbol`` rather than by
+    instant, so an unreadable ``snap_ts`` has no ambiguity to be excused from: it is a
+    row this read owes an order to and cannot give one.
+    """
+    texts = table.column(SNAP_TS_COLUMN).to_pylist()
+    instants = [_instant(text) for text in texts]
+    pairs = zip(texts, instants, strict=True)
+    unreadable = sorted({repr(text) for text, instant in pairs if instant is None})
+    if unreadable:
+        raise LoadError(
+            f"{ticker} {day_text} holds {len(unreadable)} {occ_symbol!r} rows whose "
+            f"{SNAP_TS_COLUMN} cannot be read as an instant: {unreadable}."
+        )
+    order = sorted(range(len(texts)), key=lambda index: instants[index])
+    return table.take(pa.array(order, type=pa.int64()))
 
 
 def _spelled_exactly(root: Path, path: Path) -> bool:
