@@ -1073,13 +1073,19 @@ def run_loop_from_config(
             if page.cause is not None:
                 body = f"{body}, failing with {page.cause}"
             # A folded page says how much it folded, the rule compaction's drift page
-            # already follows. This one stands for every quotes ticker, and the count is
-            # what separates a sampler death across two tickers from one across four
-            # hundred. The names are left out because the collapse only fires when every
-            # watched quotes ticker failed, so listing them says no more than the count
-            # and costs the body's byte budget as the roster grows.
-            if page.sampler_collapse:
-                body = f"{body}, one page for {len(page.surfaces)} tickers"
+            # already follows. Two pages here fold: the sampler page stands for every
+            # quotes ticker, and the cause page stands for every surface that failed the
+            # same way. Without the count, one page for two and one page for four hundred
+            # read identically. A page standing for one surface has its title to say so.
+            #
+            # The names are left out because both folds only fire when the whole set
+            # failed, so listing them says no more than the count does and costs the
+            # body's byte budget as the roster grows. The sampler's set is every surface
+            # on one ticker apiece, so it counts tickers. The cause page spans both
+            # surfaces of every ticker, so it counts surfaces.
+            if len(page.surfaces) > 1:
+                folded = "tickers" if page.sampler_collapse else "surfaces"
+                body = f"{body}, one page for {len(page.surfaces)} {folded}"
             publisher.publish(
                 Message(event="capture_down", title=page.title, body=body),
                 now=now,

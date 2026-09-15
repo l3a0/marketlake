@@ -889,7 +889,11 @@ def test_the_cause_page_names_its_class_on_the_wire_too(tmp_path):
     (page,) = rig.transport.sent
     assert page.event == "capture_down"
     assert page.title == "Capture down: token dead"
-    assert page.body == "3 session minutes without a durable cycle, failing with http_401"
+    # Two surfaces of one ticker, folded into this page. It counts surfaces rather than
+    # tickers, because a cause takes both surfaces of every ticker down together.
+    assert page.body == (
+        "3 session minutes without a durable cycle, failing with http_401, one page for 2 surfaces"
+    )
 
 
 class _DeadSampler:
