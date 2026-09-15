@@ -218,4 +218,3 @@ def test_the_quarantine_ledger_names_itself_rather_than_the_manifest(tmp_path):
     # tmp_path is derived from the test's own name. It passed with the manifest's path
     # substituted, which is the mutation it existed to catch.
     assert str(quarantine_path(tmp_path)) in str(raised.value), str(raised.value)
-
