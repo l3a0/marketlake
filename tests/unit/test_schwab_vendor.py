@@ -153,7 +153,65 @@ def test_token_mint_time_reads_off_the_injected_token():
 
 def test_token_mint_time_raises_without_a_creation_timestamp():
     client = FakeSchwabClient(chains={}, quotes={}, creation_timestamp=None)
-    with pytest.raises(VendorError):
+    # This message is the client's own missing-field check, distinct from the shared
+    # guard's "is not an epoch second", so the match pins which check actually fired.
+    with pytest.raises(VendorError, match="has no creation_timestamp"):
+        SchwabVendor(client).token_mint_time()
+
+
+def test_token_mint_time_raises_when_the_metadata_carries_no_field_at_all():
+    # FakeSchwabClient always sets creation_timestamp, even to None, which never
+    # exercises the getattr default this reads through. A real client whose metadata
+    # object lacks the attribute entirely must be refused the same way.
+    class _BareTokenMetadata:
+        """A token handle with no ``creation_timestamp`` attribute at all."""
+
+    client = FakeSchwabClient(creation_timestamp=MINT_EPOCH)
+    client.token_metadata = _BareTokenMetadata()
+    with pytest.raises(VendorError, match="has no creation_timestamp"):
+        SchwabVendor(client).token_mint_time()
+
+
+@pytest.mark.parametrize("stamp", [True, False])
+def test_token_mint_time_refuses_a_bool_creation_timestamp(stamp):
+    # float(True) is 1.0 and float(False) is 0.0, so a bare float() conversion would
+    # return 1970-01-01 rather than raise. Neither is a stamp schwab-py writes.
+    client = FakeSchwabClient(creation_timestamp=stamp)
+    with pytest.raises(VendorError, match="epoch second") as excinfo:
+        SchwabVendor(client).token_mint_time()
+    # The original is kept as the cause, so a traceback still says why it was refused.
+    assert isinstance(excinfo.value.__cause__, ValueError)
+
+
+def test_token_mint_time_refuses_a_numeric_string_creation_timestamp():
+    # The token file has no history of a numeric-string creation_timestamp, unlike a
+    # vendor payload's epoch-millisecond fields, so this reader refuses it by name too.
+    client = FakeSchwabClient(creation_timestamp=str(int(MINT_EPOCH)))
+    with pytest.raises(VendorError, match="epoch second"):
+        SchwabVendor(client).token_mint_time()
+
+
+def test_token_mint_time_reports_an_out_of_range_stamp_rather_than_raising_overflow():
+    client = FakeSchwabClient(creation_timestamp=10**400)
+    with pytest.raises(VendorError, match="epoch second") as excinfo:
+        SchwabVendor(client).token_mint_time()
+    assert isinstance(excinfo.value.__cause__, ValueError)
+
+
+def test_token_mint_time_lets_an_unrelated_failure_pass_through_unwrapped(monkeypatch):
+    """Only a refusal from the shared guard is reclassified as VendorError.
+
+    This pins the narrow ``except ValueError`` in ``token_mint_time`` against
+    widening to a bare ``except Exception``, which would silently relabel any bug in
+    the shared helper as a vendor fault instead of letting it surface as itself.
+    """
+
+    def _broken_helper(_value: object):
+        raise RuntimeError("not a guard failure")
+
+    monkeypatch.setattr("lake.schwab.epoch_second_to_utc", _broken_helper)
+    client = FakeSchwabClient(creation_timestamp=MINT_EPOCH)
+    with pytest.raises(RuntimeError, match="not a guard failure"):
         SchwabVendor(client).token_mint_time()
 
 
