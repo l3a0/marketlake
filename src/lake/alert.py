@@ -305,10 +305,10 @@ def undelivered(lake_root: Path | str, day: date) -> int:
 # The event name and the title of the one message this command sends. One fixed shape
 # rather than a line composed at the call site, so an operator learns to recognise it.
 #
-# The design's message table does not carry a row for it yet. That table is what an
-# operator reads the topic against, and the design treats a message matching no row as
-# evidence the topic leaked, so this shape can read as an exposure months after it was
-# sent by hand. Adding the row is tracked separately and this comment stays until it is.
+# The design's message table carries a row for this shape, under `Test push`. That table
+# is what an operator reads the topic against, and the design treats a message matching no
+# row as evidence the topic leaked. So a change to either literal here without the same
+# change to the row turns a hand run into a false report of a leaked topic.
 TEST_PUSH_EVENT = "test_push"
 TEST_PUSH_TITLE = "Test push"
 
