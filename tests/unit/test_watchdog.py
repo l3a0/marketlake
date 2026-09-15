@@ -450,14 +450,16 @@ def test_a_nap_after_a_surface_has_paged_does_not_page_again():
 def test_a_stall_that_trips_one_surface_while_the_others_sit_below_still_pages():
     # The roster is rarely uniform. Surfaces recover at different minutes, so the stall
     # that pushes one of them over arrives while the rest are nowhere near. The page
-    # carries the minutes of the surface that tripped, not the slot it tripped on.
+    # carries the minutes of the surface that tripped, not the slot it tripped on. The
+    # one that trips is quotes, which sorts last, so a gate reading a single surface
+    # off the front of the roster finds a counter at 1 and says nothing.
     watchdog = Watchdog()
     roster = _roster(1)
     for minute in range(2):
         watchdog.observe(
             _cycle(
-                _seg("chains", "T000", "gap"),
-                _seg("quotes", "T000", "data"),
+                _seg("quotes", "T000", "gap"),
+                _seg("chains", "T000", "data"),
                 at=_at(minute),
             )
         )
@@ -465,13 +467,14 @@ def test_a_stall_that_trips_one_surface_while_the_others_sit_below_still_pages()
     assert [page.title for page in pages] == ["Capture down: loop overran"]
     assert pages[0].minutes == 3
     assert len(pages[0].surfaces) == 2
-    assert watchdog.count("quotes", "T000") == 1
+    assert watchdog.count("chains", "T000") == 1
 
 
-def test_a_barren_cycle_between_two_stalls_does_not_re_arm_the_page():
-    # What re-arms the stall page is a durable data cycle, because that is what proves
-    # the loop is running again. A cycle that ran and gapped everything is the outage
-    # carrying on, so the next stall inside it is not a second finding.
+def test_a_second_stall_inside_an_outage_that_is_still_running_adds_nothing():
+    # A cycle that ran and gapped everything is the outage carrying on. It pages each
+    # surface on its own account, and a stall after it charges the same surfaces, so the
+    # stall has nothing left to report. What re-arms the stall page is a durable data
+    # cycle, because that is what proves the loop is running again.
     watchdog = Watchdog()
     roster = _roster(2)
     assert len(watchdog.missed(roster, [_at(minute) for minute in range(3)])) == 1
