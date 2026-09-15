@@ -19,6 +19,7 @@ from lake.manifest import (
     _compacted_partition_for_segment,
     _is_excluded,
     _latest_by_partition,
+    append_line,
     latest_entries,
     latest_quarantine,
     manifest_path,
@@ -164,10 +165,11 @@ def test_manifest_and_journal_are_excluded():
     )
 
 
-def test_data_files_and_the_quarantine_ledger_are_not_excluded():
+def test_data_files_and_the_two_other_ledgers_are_not_excluded():
     assert not _is_excluded("chains/ticker=SPY/date=2026-08-24.parquet", SCRUB_EXCLUSIONS)
-    # The quarantine ledger carries its own manifest entry, so it is scrubbed, not skipped.
+    # Each of these carries its own manifest entry, so both are scrubbed, not skipped.
     assert not _is_excluded("quarantine.jsonl", SCRUB_EXCLUSIONS)
+    assert not _is_excluded("actions/corporate_actions.jsonl", SCRUB_EXCLUSIONS)
 
 
 def test_enumerated_exclusion_set_is_exactly_the_three_documented_members():
@@ -217,3 +219,31 @@ def test_the_quarantine_ledger_names_itself_rather_than_the_manifest(tmp_path):
     # tmp_path is derived from the test's own name. It passed with the manifest's path
     # substituted, which is the mutation it existed to catch.
     assert str(quarantine_path(tmp_path)) in str(raised.value), str(raised.value)
+
+
+# -- the append that meets a torn tail --------------------------------------------------
+
+
+def test_an_append_onto_a_file_with_no_trailing_newline_starts_its_own_line(tmp_path):
+    # The torn-tail rule assumes a crash can only damage the last line. Appending straight
+    # onto a fragment would fuse the two into one unparseable line, so the entry written
+    # whole would be destroyed by the one that was not.
+    path = tmp_path / "ledger.jsonl"
+    path.write_text(json.dumps(_entry("a")) + "\n" + '{"partition": "b", "sha256": "untermin')
+
+    append_line(path, _entry("c"))
+
+    lines = path.read_text().splitlines()
+    assert len(lines) == 3
+    assert json.loads(lines[2])["partition"] == "c"
+    # The fragment is still a line nobody can read, so the tail stays discarded. What the
+    # newline bought is that the whole entry after it survives on disk to be recovered.
+    assert [e["partition"] for e in parse_jsonl(path.read_text())] == ["a"]
+
+
+def test_an_append_onto_a_well_formed_file_adds_no_blank_line(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    append_line(path, _entry("a"))
+    append_line(path, _entry("b"))
+    assert path.read_text().count("\n\n") == 0
+    assert [e["partition"] for e in parse_jsonl(path.read_text())] == ["a", "b"]

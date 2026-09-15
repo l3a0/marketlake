@@ -459,7 +459,7 @@ Slice 2 builds in two waves. D9 comes first and defines the hooks. D14 and D15 d
 
 The deliverable entries below are links. Each issue is the source of truth for its own scope, per the directive in `CLAUDE.md`. What stays here is the slicing rule, the build order, and each slice's test surface.
 
-Slice 3 adds the vendor-fetch surfaces. Its test surface is recorded vendor payloads.
+Slice 3 adds the vendor-fetch surfaces. Recorded vendor payloads are the test surface for the pieces that fetch. The pieces that derive from sealed partitions test against a fixture lake, since nothing in them reaches a vendor.
 
 - **D16** bars, actions, and the cross-check. Scope in [#134](https://github.com/l3a0/marketlake/issues/134).
 

@@ -135,8 +135,11 @@ def test_the_pattern_catches_the_temp_the_partition_writer_uses(tmp_path, monkey
 
 
 def test_nothing_the_design_keeps_in_the_sync_root_is_named():
-    # The four surfaces, the journal, the two ledgers, the reference tables, and the
-    # reports directory. Each is pinned by the design as inside the sync root.
+    # The four surfaces, the journal, the three ledgers, the reference tables, and the
+    # reports directory. Each is pinned by the design as inside the sync root. The
+    # corporate-actions ledger is named by file as well as by its ``actions`` directory,
+    # for the reason the quarantine ledger is: a restore that dropped it would carry the
+    # prices without the splits and dividends that make them comparable.
     kept = (
         "chains",
         "quotes",
@@ -147,6 +150,7 @@ def test_nothing_the_design_keeps_in_the_sync_root_is_named():
         "reports",
         "manifest.jsonl",
         "quarantine.jsonl",
+        "corporate_actions.jsonl",
     )
     for pattern in BACKUP_EXCLUSIONS:
         assert not any(name in pattern for name in kept)

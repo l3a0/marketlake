@@ -76,10 +76,10 @@ from lake.paths import (
 #    it here by name, so a subdirectory added under it needs nothing added here. None of
 #    the four is a measurement.
 #
-# The quarantine ledger is deliberately not on this list. The battery refreshes its
-# manifest entry after each run, and the sign-off tool appends the row and the refreshed
-# entry in one locked invocation. So the ledger is scrubbed like any sealed file, which
-# is the check that catches a verdict written without its entry.
+# Neither the quarantine ledger nor the corporate-actions ledger is on this list, and
+# both are off it deliberately. Each writer refreshes its own manifest entry in the same
+# locked invocation that appends the row, so both are scrubbed like any sealed file. That
+# is the check that catches a verdict, or an action, written without its entry.
 #
 # An entry ending in ``/`` is a directory prefix. Any other entry is an exact filename
 # at the lake root. The lock adds no file to skip, because it locks the manifest itself.
@@ -243,13 +243,40 @@ def append_line(path: Path, entry: dict) -> None:
 
     ``sort_keys`` keeps the on-disk bytes stable across callers. The line is written
     in one ``os.write`` so it cannot interleave with a concurrent append.
+
+    A file that does not end in a newline gets one first. The torn-tail rule assumes a
+    crash can only damage the last line, and appending straight onto a torn fragment would
+    fuse the fragment and this entry into one unparseable line, destroying an entry that
+    was written whole. Starting a new line leaves the fragment as its own line, which is
+    the one a reader discards. On a well-formed file this reads the last byte and writes
+    nothing extra.
+
+    This is the line primitive rather than the way to record a partition. A manifest entry
+    goes through ``append_manifest``, which enforces the standing row-count invariant
+    first.
     """
     line = (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     try:
+        if _needs_leading_newline(path):
+            os.write(fd, b"\n")
         os.write(fd, line)
     finally:
         os.close(fd)
+
+
+def _needs_leading_newline(path: Path) -> bool:
+    """Whether the file has bytes that do not end in a newline, so a torn tail is open."""
+    path = Path(path)
+    if not path.exists():
+        return False
+    with path.open("rb") as handle:
+        try:
+            handle.seek(-1, os.SEEK_END)
+        except OSError:
+            # An empty file cannot be seeked from its end, and has no open line anyway.
+            return False
+        return handle.read(1) != b"\n"
 
 
 def would_shrink(lake_root: Path, partition: str, rows: int) -> bool:

@@ -81,10 +81,10 @@ SURFACES = (CHAINS, QUOTES, BARS, ACTIONS)
 # level and ``actions`` is a single file, so both are excluded from the generic method.
 _DATE_PARTITIONED = frozenset({CHAINS, QUOTES})
 
-# The journal top-level directory, the reference directory, the reports directory, and
-# the two ledgers. ``reports/`` holds one dated file per night, written by the vendor
-# sweep. Three more trees sit under it, each in a subdirectory of its own so a reader
-# counting one never picks up another.
+# The journal top-level directory, the reference directory, the reports directory,
+# and the two lake-root ledgers. ``reports/`` holds one dated file per night, written by
+# the vendor sweep. Three more trees sit under it, each in a subdirectory of its own so a
+# reader counting one never picks up another.
 #
 # 1. One file per page that never reached the phone, under `reports/alerts/date=D/`.
 # 2. One file per close+5 guard run, under `reports/close_guard/date=D/`.

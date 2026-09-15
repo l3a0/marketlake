@@ -11,6 +11,12 @@ writing beside a nightly job.
 
 1. *One entry is one line*, appended with a single ``O_APPEND`` write. A reader that
    meets a torn trailing line discards it, because a crash can only tear the last line.
+   ``append_line`` starts a new line when the file does not end in one, so a torn fragment
+   stays its own line rather than swallowing the bytes of the next entry. What the
+   fragment still costs is every entry after it, because the read stops at the first line
+   it cannot parse. That is the manifest's rule rather than this ledger's, and the
+   manifest entry's row count is what makes the loss visible: it counts the file's lines,
+   so a count above what :func:`read` returns says the file is damaged.
 2. *Last entry wins*, keyed by ``(instrument_id, ex_date, type)``. A correction is a
    superseding entry, never a rewrite of the one it corrects.
 3. *It is manifested and scrubbed like any lake file.* The reverse scrub's exclusion set
@@ -31,11 +37,12 @@ on a key *in file order*, never the highest ``recorded_at``. A clock stepping ba
 from an NTP correction or a restored machine, would otherwise let an older entry win its
 key. ``recorded_at`` is the as-of filter alone, which also means it never has to be unique.
 
-**The cost of a ledger rather than a table is typed columns**, so the type discipline lives
-here. ``manifest.py`` holds its own entries two ways this copies. :func:`append` is typed
-and keyword-only, so a caller cannot assemble a malformed entry. And resolution raises at
-the offending position rather than stepping over a line it cannot interpret, the way a
-manifest line naming no partition raises ``ManifestError``.
+**The price of a ledger rather than a table is the loss of typed columns**, so the type
+discipline lives here. ``manifest.py`` holds its own entries two ways this copies. Every
+field :func:`append` takes is keyword-only and typed, so a caller cannot assemble a
+malformed entry. And resolution raises at the offending entry rather than stepping over a
+line it cannot interpret, the way a manifest line naming no partition raises
+``ManifestError``.
 
 **The three vendor dates normalize to ``YYYY-MM-DD`` on write.** This is where losing typed
 columns bites hardest, because ``ex_date`` sits in the key. Schwab supplies ``div_ex_date``
@@ -47,8 +54,8 @@ ledger every total-return factor reads. Parquet's ``date32`` enforced this for f
 :func:`normalize_date` does.
 
 **Nothing in this module writes an entry of its own.** The dividend extraction and the
-two-source gate that append the first one are marketlake #284, and the command a human
-writes a ``manual`` entry with is #286. What ships here is the record format, the writer,
+validation that append the first one are marketlake #284, and the command a human writes a
+``manual`` entry with is #286. What ships here is the record format, the writer,
 and the two reads that resolve it.
 
 ``recorded_at`` is injected, never read from a wall clock. ``manifest.py`` states that rule
@@ -60,6 +67,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
+from math import isfinite
 from pathlib import Path
 
 from lake.calendar import MARKET_TZ
@@ -158,13 +166,15 @@ def actions_path(lake_root: Path | str) -> Path:
 def normalize_date(value: date | str) -> str:
     """Render a date as ``YYYY-MM-DD``, whatever spelling it arrives in.
 
-    A ``date`` renders directly. A string may be a plain ISO date, or the timestamp
-    spelling of one that Schwab's fundamentals use, with ``Z`` or an explicit offset.
+    A ``date`` renders directly. A ``datetime`` and a string are both read as timestamps,
+    because a ``datetime`` is a ``date`` carrying a time. The string may be a plain ISO
+    date, or the timestamp spelling of one that Schwab's fundamentals use, with ``Z`` or an
+    explicit offset.
 
-    A timestamp whose time is not midnight raises. It is not a spelling of a date, and
-    deciding which day it names would mean picking one silently. A midnight timestamp
-    keeps the calendar date it is written with and is never converted across offsets,
-    because the vendor is naming a date rather than an instant.
+    A timestamp whose time is not midnight raises, whichever of the two it arrived as. It
+    is not a spelling of a date, and deciding which day it names would mean picking one
+    silently. A midnight timestamp keeps the calendar date it is written with and is never
+    converted across offsets, because the vendor is naming a date rather than an instant.
     """
     if isinstance(value, datetime):
         return _date_of_midnight(value, value.isoformat())
@@ -227,6 +237,19 @@ def read(lake_root: Path | str) -> list[dict]:
     return parse_jsonl(path.read_text())
 
 
+def entry_line_count(lake_root: Path | str) -> int:
+    """How many lines the ledger holds, parseable or not.
+
+    This is the manifest entry's row count. It counts what was written rather than what
+    reads back, so it never falls after a line the read cannot parse, and comparing it
+    against ``len(read(...))`` is how a damaged ledger announces itself.
+    """
+    path = actions_path(lake_root)
+    if not path.exists():
+        return 0
+    return sum(1 for line in path.read_text().splitlines() if line.strip())
+
+
 def entry_key(entry: dict, *, path: Path, position: int) -> ActionKey:
     """The key an entry resolves under. A line carrying no usable key raises.
 
@@ -253,9 +276,11 @@ def entry_key(entry: dict, *, path: Path, position: int) -> ActionKey:
 def _latest_by_key(numbered: Sequence[tuple[int, dict]], path: Path) -> dict[ActionKey, dict]:
     """Resolve last-entry-wins per key over entries in file order.
 
-    Each entry arrives with the line number it sits on rather than its index in the list
-    handed over, because :func:`as_of` resolves a filtered subset and a position counted
-    over that subset would send a reader to the wrong line of the file.
+    Each entry arrives with the position it has among the file's entries rather than its
+    index in the list handed over, because :func:`as_of` resolves a filtered subset and a
+    position counted over that subset would name the wrong entry. Blank lines are not
+    entries, so this counts what a reader counts rather than physical lines, which is what
+    the error message says.
     """
     latest: dict[ActionKey, dict] = {}
     for position, entry in numbered:
@@ -366,17 +391,23 @@ def append(
     refreshed manifest entry go together, so a weekend write never leaves the Sunday scrub
     facing a sha nothing has caught up to.
 
-    Every argument is keyword-only and typed, so a malformed entry cannot be assembled.
-    The three vendor dates normalize, and the rules the two action kinds carry are
+    Every field of the entry is keyword-only and typed, so a malformed entry cannot be
+    assembled. ``lake_root`` is the one positional argument, because it names where to
+    write rather than what. The three vendor dates normalize, and the either-or rule is
     enforced rather than described: a dividend fills ``cash_amount`` and leaves
-    ``split_ratio`` null, and a split fills ``split_ratio`` and leaves ``cash_amount``,
-    ``pay_date`` and ``declared_date`` null, because a split pays nothing and Schwab's
-    fundamentals carry no announcement date for one.
+    ``split_ratio`` null, and a split fills ``split_ratio`` and leaves ``cash_amount``
+    null.
+
+    What a split leaves in the two remaining dates is a convention rather than a refusal.
+    A split pays nothing and Schwab's fundamentals carry no announcement date for one, so
+    marketlake #279 writes both null. Refusing them here would foreclose an exchange that
+    does announce one, and #282 states the convention for #279 to read rather than as a
+    rule this module enforces.
 
     ``type`` shadows the builtin deliberately. It is the entry's own field name, so a
     call site reads as the record it writes, and nothing here calls the builtin.
     """
-    entry = build_entry(
+    entry = _build_entry(
         instrument_id=instrument_id,
         observed_on=observed_on,
         recorded_at=recorded_at,
@@ -400,20 +431,27 @@ def append(
 
     with lake_lock(lake_root):
         append_line(target, entry)
-        # The ledger only grows, so the row-count guard is always satisfied. The entry is
-        # what keeps the reverse scrub from calling the file an orphan: ``actions/`` is
-        # not in the scrub's exclusion set.
+        # The count comes from the file's lines rather than from the entries ``read``
+        # returns, and the difference is what keeps a damaged file from stopping the
+        # writer. A line the read cannot parse ends the read, so a parsed count can fall
+        # below the manifested one, and ``guard_row_count`` would then raise on every
+        # later append, after that append had already written its line. A line count only
+        # ever grows, so the guard is satisfied by construction and a count above what
+        # ``read`` returns is the signal that the file needs a human.
+        #
+        # The entry is also what keeps the reverse scrub from calling the ledger an
+        # orphan, since ``actions/`` is not in the scrub's exclusion set.
         record_partition(
             lake_root,
             ACTIONS_PARTITION,
             source=SWEEP_SOURCE,
-            rows=len(read(lake_root)),
+            rows=entry_line_count(lake_root),
             fetched_at=recorded_at.isoformat(),
         )
     return entry
 
 
-def build_entry(
+def _build_entry(
     *,
     instrument_id: int,
     observed_on: date | None,
@@ -432,13 +470,19 @@ def build_entry(
     :func:`append` is the writer. This is the half that decides what a well-formed entry
     is, so a caller assembling one can be checked without a lake on disk.
 
-    The eleven fields, and what each answers. ``instrument_id`` is the key every join in
-    the lake runs on. The three dates each answer a different question: ``ex_date`` is
-    when the event happened, ``observed_on`` is when the lake saw it in vendor data, and
-    ``recorded_at`` is when the entry was written down. ``pay_date`` is when the cash
-    arrives and ``declared_date`` is when the event was announced. ``type``,
-    ``cash_amount`` and ``split_ratio`` carry the event itself, ``provenance`` records
-    what the lake saw, and ``schema_version`` stamps the shape.
+    The eleven fields, and what each answers.
+
+    1. ``instrument_id`` is the key every join in the lake runs on.
+    2. ``observed_on`` is when the lake saw the event in vendor data.
+    3. ``recorded_at`` is when the entry was written down.
+    4. ``ex_date`` is when the event happened.
+    5. ``pay_date`` is when the cash arrives.
+    6. ``declared_date`` is when the event was announced.
+    7. ``type`` says which kind of event it is.
+    8. ``cash_amount`` is the per-event dividend.
+    9. ``split_ratio`` is the split's multiplier.
+    10. ``provenance`` records what the lake saw rather than what it should have seen.
+    11. ``schema_version`` stamps the shape this entry was written in.
 
     There is deliberately no ``ticker`` field. The master exists because tickers change,
     FB to META and QQQQ to QQQ. The capture surfaces carry one only because they are
@@ -461,9 +505,20 @@ def build_entry(
 
     amounts = {"cash_amount": cash_amount, "split_ratio": split_ratio}
     for name, value in amounts.items():
-        if value is not None and (isinstance(value, bool) or not isinstance(value, int | float)):
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int | float):
             raise ValueError(f"{name} must be a number or None, got {value!r}")
+        # A non-finite amount is refused because ``json.dumps`` renders it as bare ``NaN``
+        # or ``Infinity``, which no strict JSON reader accepts. One such line would refuse
+        # the whole ledger to DuckDB while Python read it back without complaint. A NaN
+        # amount also turns every adjusted price it touches into a NaN.
+        if not isfinite(value):
+            raise ValueError(f"{name} must be a finite number, got {value!r}")
 
+    # The either-or rule, both ways. Decision 1 in marketlake #282 splits the amount into
+    # two fields so a reader never has to branch on ``type`` before it can trust the
+    # number, and that only holds if exactly one of them is ever filled.
     if type == TYPE_DIVIDEND:
         if cash_amount is None:
             raise ValueError("a dividend fills cash_amount")
@@ -472,19 +527,18 @@ def build_entry(
     else:
         if split_ratio is None:
             raise ValueError("a split fills split_ratio")
-        empty = [
-            name
-            for name, value in (
-                ("cash_amount", cash_amount),
-                ("pay_date", pay_date),
-                ("declared_date", declared_date),
-            )
-            if value is not None
-        ]
-        if empty:
-            raise ValueError(
-                f"a split pays nothing and is not announced, so it leaves {', '.join(empty)} null"
-            )
+        if cash_amount is not None:
+            raise ValueError("a split pays nothing, so it leaves cash_amount null")
+
+    # A ratio is a multiplier every adjusted price is computed through, so zero and
+    # negative are refused here rather than dividing by zero in each reader. A negative
+    # dividend is refused for the same reason: nothing pays one.
+    if split_ratio is not None and split_ratio <= 0:
+        raise ValueError(
+            f"split_ratio is a multiplier, so it must be positive, got {split_ratio!r}"
+        )
+    if cash_amount is not None and cash_amount < 0:
+        raise ValueError(f"cash_amount must not be negative, got {cash_amount!r}")
 
     return {
         "instrument_id": instrument_id,
@@ -519,8 +573,8 @@ __all__ = [
     "actions_path",
     "append",
     "as_of",
-    "build_entry",
     "entry_key",
+    "entry_line_count",
     "latest",
     "normalize_date",
     "read",

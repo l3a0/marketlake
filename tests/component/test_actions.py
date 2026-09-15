@@ -5,12 +5,14 @@ reader would, off the file. The security master is built in memory, because noth
 this module fetches and the master's own round trip is covered beside it.
 
 For a module whose job is a record format and a resolver, these tests are the
-specification. Marketlake #282 names the eight they cover.
+specification. Marketlake #282 names the eight behaviours they cover.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import threading
 import time
 from datetime import UTC, date, datetime
@@ -61,6 +63,14 @@ def _dividend(lake_root: Path, *, cash_amount: float, recorded_at: datetime, **o
     }
     fields.update(overrides)
     return actions.append(lake_root, **fields)
+
+
+def _write_lines(lake_root: Path, entries: list[dict]) -> Path:
+    """Write ledger lines by hand, for the damage ``append`` cannot produce."""
+    path = actions_path(lake_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+    return path
 
 
 def _master() -> SecurityMaster:
@@ -128,6 +138,16 @@ def test_the_as_of_read_returns_what_the_lake_knew_on_the_day(lake_root):
     assert actions.as_of(lake_root, date(2026, 8, 4))[key]["cash_amount"] == 1.90352
     # Before anything was recorded, the lake knew nothing.
     assert actions.as_of(lake_root, date(2026, 6, 18)) == {}
+
+
+def test_the_as_of_read_resolves_in_file_order_like_the_current_read(lake_root):
+    # The backwards-clock fixture, run through the other resolver. Both reads answer from
+    # the file's order, and only the filter differs between them.
+    _dividend(lake_root, cash_amount=1.90352, recorded_at=CORRECTED)
+    _dividend(lake_root, cash_amount=1.95, recorded_at=RECORDED)
+
+    resolved = actions.as_of(lake_root, date(2026, 8, 6))
+    assert resolved[(SPY, EX_DATE, TYPE_DIVIDEND)]["cash_amount"] == 1.95
 
 
 def test_the_as_of_read_compares_in_market_time_rather_than_on_the_text(lake_root):
@@ -206,6 +226,34 @@ def test_an_entry_with_an_unreadable_recorded_at_raises_from_the_as_of_read(lake
 # -- one event, one key --------------------------------------------------------
 
 
+def test_an_entry_naming_no_recorded_at_raises_from_the_as_of_read(lake_root):
+    # The as-of read is the one that needs the stamp, so it is where a line without one
+    # has to stop rather than raising a bare KeyError with no position in it.
+    _write_lines(lake_root, [{"instrument_id": SPY, "ex_date": EX_DATE, "type": TYPE_DIVIDEND}])
+    with pytest.raises(LedgerLineError) as raised:
+        actions.as_of(lake_root, date(2026, 12, 31))
+    assert "recorded_at" in str(raised.value)
+
+
+def test_an_entry_whose_recorded_at_is_naive_raises_from_the_as_of_read(lake_root):
+    # ``append`` refuses a naive stamp, and a hand-written line is not written by
+    # ``append``. Read in the machine's local zone it would land on whichever day that
+    # machine happened to be in.
+    _write_lines(
+        lake_root,
+        [
+            {
+                "instrument_id": SPY,
+                "ex_date": EX_DATE,
+                "type": TYPE_DIVIDEND,
+                "recorded_at": "2026-08-05T19:00:00",
+            }
+        ],
+    )
+    with pytest.raises(LedgerLineError):
+        actions.as_of(lake_root, date(2026, 12, 31))
+
+
 def test_the_two_vendor_date_spellings_resolve_to_one_key(lake_root):
     # Schwab supplies ``div_ex_date`` as a timestamp spelling of a date. Unnormalized,
     # the correction below would land beside the original instead of superseding it, and
@@ -270,12 +318,31 @@ def test_resolution_runs_at_the_observation_date_rather_than_the_ex_date(lake_ro
         actions.resolve_instrument(master, "SPY", date(2026, 6, 18))
 
 
+def _land(lake_root: Path, master: SecurityMaster, symbol: str) -> dict:
+    """Resolve then append, the order marketlake #284's extraction runs them in.
+
+    The fail-closed tests below drive this rather than the resolver alone, so "writes
+    nothing" is a claim about a path that actually tries to write.
+    """
+    instrument_id = actions.resolve_instrument(master, symbol, OBSERVED_ON)
+    return _dividend(
+        lake_root, cash_amount=1.90352, recorded_at=RECORDED, instrument_id=instrument_id
+    )
+
+
+def test_the_landing_path_writes_when_the_symbol_resolves(lake_root):
+    # The control for the two tests below. Without it, a resolver that raised on every
+    # symbol would pass both of them.
+    _land(lake_root, _master(), "SPY")
+    assert len(actions.read(lake_root)) == 1
+    assert [entry["partition"] for entry in read_manifest(lake_root)] == [ACTIONS_PARTITION]
+
+
 def test_an_unresolvable_symbol_fails_closed_and_writes_nothing(lake_root):
     # A quote row exists only inside a capture span, so a symbol the lake observed and the
     # master cannot place means the master and the capture spans disagree.
-    master = _master()
     with pytest.raises(UnresolvedSymbol):
-        actions.resolve_instrument(master, "QQQ", OBSERVED_ON)
+        _land(lake_root, _master(), "QQQ")
 
     assert not actions_path(lake_root).exists()
     assert read_manifest(lake_root) == []
@@ -293,7 +360,7 @@ def test_an_ambiguous_symbol_fails_closed_and_writes_nothing(lake_root):
         ticker="SPY",
     )
     with pytest.raises(AmbiguousSymbol):
-        actions.resolve_instrument(master, "SPY", OBSERVED_ON)
+        _land(lake_root, master, "SPY")
 
     assert not actions_path(lake_root).exists()
     assert read_manifest(lake_root) == []
@@ -321,6 +388,33 @@ def test_the_fourth_source_value_is_new_to_the_manifest(lake_root):
     # The live manifest uses ``capture``, ``compaction`` and ``reference``. The rest of
     # D16 imports this one rather than restating the string.
     assert SWEEP_SOURCE not in {"capture", "compaction", "reference"}
+
+
+def test_the_manifest_entry_is_written_while_the_lock_is_still_held(lake_root, monkeypatch):
+    # The blocked-writer test below proves the pair starts under the lock. It cannot see
+    # the manifest write being dedented out of the hold, because a writer blocked at the
+    # ``with`` writes neither line either way. This one asks the question directly: at the
+    # moment ``record_partition`` runs, is the lake-root lock still held? A second open of
+    # the manifest conflicts with an existing ``flock`` even inside one process, so trying
+    # for it non-blocking answers that.
+    held: list[bool] = []
+    real = actions.record_partition
+
+    def spy(*args, **kwargs):
+        fd = os.open(lake_root / "manifest.jsonl", os.O_RDONLY | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            held.append(False)
+        except BlockingIOError:
+            held.append(True)
+        finally:
+            os.close(fd)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(actions, "record_partition", spy)
+    _dividend(lake_root, cash_amount=1.90352, recorded_at=RECORDED)
+    assert held == [True]
 
 
 def test_the_entry_and_its_manifest_line_are_written_under_the_lake_lock(lake_root):
@@ -367,3 +461,30 @@ def test_a_bad_line_names_its_position_in_the_file_not_in_the_filtered_read(lake
     with pytest.raises(LedgerLineError) as raised:
         actions.as_of(lake_root, date(2026, 6, 20))
     assert raised.value.position == 3
+
+
+# -- a ledger that was damaged before this write ---------------------------------------
+
+
+def test_an_append_after_a_torn_line_lands_whole_and_the_writer_keeps_working(lake_root):
+    # A torn fragment costs the entries after it in every read, which is the manifest's
+    # own line rule. What it must not cost is the writer. Counting the manifest's rows
+    # from what ``read`` returns would drop the count below the manifested one, so
+    # ``guard_row_count`` would raise on this append and on every append after it, each
+    # one having already written its line.
+    _dividend(lake_root, cash_amount=1.90352, recorded_at=RECORDED)
+    _dividend(lake_root, cash_amount=1.92, recorded_at=RECORDED)
+    path = actions_path(lake_root)
+    path.write_text(path.read_text()[:-30])
+
+    _dividend(lake_root, cash_amount=1.95, recorded_at=CORRECTED)
+    _dividend(lake_root, cash_amount=1.97, recorded_at=CORRECTED)
+
+    # Both later entries are on disk, whole, and the manifest counts every line.
+    lines = [line for line in path.read_text().splitlines() if line.strip()]
+    assert json.loads(lines[-1])["cash_amount"] == 1.97
+    assert json.loads(lines[-2])["cash_amount"] == 1.95
+    assert latest_entries(lake_root)[ACTIONS_PARTITION]["rows"] == len(lines)
+    # And the count the manifest carries is above what the damaged file reads back, which
+    # is the signal that the ledger needs a human.
+    assert len(actions.read(lake_root)) < latest_entries(lake_root)[ACTIONS_PARTITION]["rows"]
