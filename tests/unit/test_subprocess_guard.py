@@ -114,7 +114,7 @@ def test_a_forgotten_pmset_assertions_fake_is_caught():
     whether someone is at the keyboard.
     """
     with pytest.raises(SubprocessAccessInTest):
-        pmset_assertions_probe()
+        pmset_assertions_probe(4242)
 
 
 def test_a_forgotten_exclusion_reader_fake_is_caught():

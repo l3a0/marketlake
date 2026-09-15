@@ -118,7 +118,7 @@ from lake.control_plane import (
 from lake.deadman import CAPTURE_SLUG, DeadMan
 from lake.gap import GapMarker, MarkingReport, surfaces_for
 from lake.journal import ROW_KIND_DATA
-from lake.metadata import stamp_cycle, stamp_ping
+from lake.metadata import stamp_assertion_pid, stamp_cycle, stamp_ping
 from lake.report import write_close_guard
 from lake.runner import Pinger, UrllibPinger
 from lake.schwab import DEFAULT_TOKEN_PATH
@@ -668,7 +668,56 @@ def _idle_stamp(
                 token_minted_at=minted,
                 roster=Roster(roster.enabled),
             )
-        except OSError:
+        except Exception:  # noqa: BLE001 - a raise here would exit the daemon
+            # Broad for the reason the read above is. This runs from a hook ``run_loop``
+            # does not wrap, so anything escaping exits the process and KeepAlive
+            # relaunches straight into the same tick. A full disk and a read-only lake
+            # root raise ``OSError``, and this covers whatever else a write can raise
+            # rather than betting that list is complete. The stamp is worth a lost minute
+            # and never the daemon.
+            return
+
+    return stamp
+
+
+def _assertion_pid_stamp(
+    config_path: str | Path | None,
+) -> Callable[[int | None], None] | None:
+    """The tick hook that keeps the stamped ``caffeinate`` pid current, or ``None``.
+
+    The 08:30 self-check runs in its own process, so the only way it learns which
+    ``caffeinate`` is the daemon's is to read a pid the daemon wrote down. This is the
+    writing down. It rides the same tick hook that holds the assertion, one call later,
+    so the pid stamped is the one the holder settled on this minute.
+
+    Every minute is a chance to stamp, and ``stamp_assertion_pid`` writes only when the
+    file disagrees. A daemon that restarts mid-window spawns a new child and stamps its
+    pid on the first tick, so the dead one never stands. A window that closes clears the
+    stamp. In between, a whole ten-hour window costs one write, which is what keeps this
+    off the hot path of a file two other writers already rewrite every minute. Nothing is
+    remembered here, so the file is the only thing that decides, and a stamp that goes
+    missing underneath the daemon comes back on the next tick.
+
+    A config that will not load answers ``None`` here, mirroring ``_idle_stamp``'s own
+    guard on the same file. Neither guard is reachable from the production entry, because
+    ``_alarm`` below re-loads the same config and raises rather than returning. They are
+    kept so that neither helper depends on the order the entry happens to build things in.
+    """
+    try:
+        config = load_config(config_path)
+    except ConfigError:
+        return None
+
+    def stamp(pid: int | None) -> None:
+        try:
+            stamp_assertion_pid(config.lake_root, pid=pid)
+        except Exception:  # noqa: BLE001 - a raise here would exit the daemon
+            # Broad for the reason ``_idle_stamp``'s own write is: this runs from a hook
+            # ``run_loop`` does not wrap, so anything escaping exits the process and
+            # KeepAlive relaunches straight into the same tick. A full disk and a
+            # read-only lake root raise ``OSError``, and this covers whatever else a
+            # write can raise rather than betting that list is complete. The next tick
+            # retries, because nothing here records that this one was skipped.
             return
 
     return stamp
@@ -775,7 +824,9 @@ def run_loop_from_config(
 
     ``AssertionHolder`` rides ``on_tick``, so the assertion is taken when a window
     opens and again for each new day the daemon lives through. Any hook the caller
-    passed still runs.
+    passed still runs. The pid of the ``caffeinate`` it holds is stamped into the journal
+    metadata on the same hook, because the 08:30 self-check runs in its own process and
+    matching that pid is the only way it can tell the daemon's holder from anyone else's.
 
     The journal metadata stamp rides ``on_tick`` as well, for the minutes off the
     capture window. On a capture minute the cycle stamps itself, off it there is no
@@ -808,9 +859,14 @@ def run_loop_from_config(
     hooks = hooks if hooks is not None else DaemonHooks()
     holder = AssertionHolder(runner=assertion_runner)
     caller_on_tick = hooks.on_tick
+    pid_stamp = _assertion_pid_stamp(config_path)
 
     def on_tick(slot: datetime) -> None:
         holder.hold(slot)
+        # After the hold, so a window that just opened stamps the child it just spawned
+        # rather than the ``None`` that preceded it.
+        if pid_stamp is not None:
+            pid_stamp(holder.child_pid(slot))
         caller_on_tick(slot)
 
     hooks = replace(hooks, on_tick=on_tick)

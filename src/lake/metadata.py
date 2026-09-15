@@ -1,4 +1,4 @@
-"""The journal metadata stamp: what the daemon knows and the panel cannot see.
+"""The journal metadata stamp: what the daemon knows and another process cannot see.
 
 Three facts the Now panel shows are not measurements, so no captured row carries them:
 when the refresh token was minted, which tickers the daemon is capturing, and when the
@@ -11,6 +11,14 @@ three facts has to arrive through the lake, and this module is how. The daemon s
 them into the journal's metadata, and the panel reads the stamp from under
 ``lake_root``. That is the design's rule for the token age, for the roster, and for the
 ticker list that must never come from ``tickers.yaml``.
+
+A fourth fact rides here for a different reader. The 08:30 self-check has to confirm
+that the ``caffeinate`` holding idle sleep off is the daemon's own child and not some
+other one, and it runs as a separate process, so it cannot see the daemon's handle on
+that child. The daemon stamps the child's pid and the self-check matches it against the
+owner ``pmset`` names. The pid is written while the assertion window is open and cleared
+once it closes, so the stamp always says which process is holding the machine awake
+right now rather than which one used to.
 
 **The mint stamp is a timestamp, never token material.** It is the epoch second the
 refresh token was minted, rendered as an ISO instant. Nothing else from the token file
@@ -27,11 +35,16 @@ bearing.
    prunes a sealed day's directories once they are empty. A file inside one would keep
    that shell alive forever.
 
-Two writers share the file, and each replaces only its own keys. The capture cycle
-stamps the mint time and the roster. The dead-man stamps its landed ping. Both run in
-the daemon's single loop thread, so the read-modify-write below is never concurrent
-with itself. The write is atomic all the same: a temp file beside the target, a flush,
-then one rename. So a reader meets the old stamp or the new one, never half of either.
+Three writers share the file, and each replaces only its own keys.
+
+1. The capture cycle stamps the mint time and the roster.
+2. The dead-man stamps its landed ping.
+3. The tick hook that holds the power assertion stamps its child's pid.
+
+All three run in the daemon's single loop thread, so the read-modify-write below is
+never concurrent with itself. The write is atomic all the same: a temp file beside the
+target, a flush, then one rename. So a reader meets the old stamp or the new one, never
+half of either.
 
 Nothing here is durable in the journal's sense. A capture cycle counts as captured only
 once its segment is fsynced, because a lost cycle is unrecoverable. A lost stamp is
@@ -64,12 +77,13 @@ from lake.gap import surfaces_for
 from lake.paths import LakePaths
 from lake.tickers import Roster
 
-# The stamp's four keys. They are spelled once here, so a writer and the reader cannot
+# The stamp's five keys. They are spelled once here, so a writer and the reader cannot
 # drift apart on a name.
 STAMPED_AT = "stamped_at"
 TOKEN_MINTED_AT = "token_minted_at"
 TICKERS = "tickers"
 DEAD_MAN_LAST_PING = "dead_man_last_ping"
+ASSERTION_PID = "assertion_pid"
 
 
 @dataclass(frozen=True)
@@ -80,12 +94,18 @@ class JournalMetadata:
     stamp from one left by a daemon that died hours ago. ``tickers`` maps each rostered
     ticker to the surfaces it is captured on, which is what lets the panel show a
     ticker that journaled nothing at all.
+
+    ``assertion_pid`` is the ``caffeinate`` the daemon last reported holding. It reads
+    ``None`` both when no daemon ever wrote one and when the daemon cleared it because
+    no window is open, and the self-check treats those two the same way: a pid it cannot
+    match is a machine it cannot vouch for.
     """
 
     stamped_at: datetime | None = None
     token_minted_at: datetime | None = None
     tickers: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     dead_man_last_ping: datetime | None = None
+    assertion_pid: int | None = None
 
 
 def metadata_path(lake_root: Path | str) -> Path:
@@ -125,6 +145,27 @@ def stamp_ping(lake_root: Path | str, *, at: datetime) -> None:
     _merge(lake_root, {DEAD_MAN_LAST_PING: at.isoformat()})
 
 
+def stamp_assertion_pid(lake_root: Path | str, *, pid: int | None) -> None:
+    """Stamp the pid of the ``caffeinate`` now holding idle sleep off, or clear it.
+
+    ``pid`` is ``None`` when the daemon holds nothing, which is every minute outside an
+    assertion window and every minute inside one whose spawn failed. Clearing rather
+    than leaving the last pid is what keeps the stamp a statement about now. A number
+    left behind after the window closed would name a process that has already exited,
+    and the self-check reading it could only ever be told a lie or told nothing.
+
+    A stamp that already says this is left alone, which is every minute of a ten-hour
+    window after the one that opened it. The comparison is against the file rather than
+    against anything the caller remembers, so a stamp deleted or overwritten underneath
+    the daemon is put back on the next tick instead of waiting for the pid to change.
+
+    Everything else in the stamp carries forward.
+    """
+    if _pid(_read_raw(metadata_path(lake_root)).get(ASSERTION_PID)) == pid:
+        return
+    _merge(lake_root, {ASSERTION_PID: pid})
+
+
 def read_metadata(lake_root: Path | str) -> JournalMetadata:
     """The stamp, or an empty record when there is nothing readable to report."""
     raw = _read_raw(metadata_path(lake_root))
@@ -139,6 +180,7 @@ def read_metadata(lake_root: Path | str) -> JournalMetadata:
         token_minted_at=_instant(raw.get(TOKEN_MINTED_AT)),
         tickers=tickers,
         dead_man_last_ping=_instant(raw.get(DEAD_MAN_LAST_PING)),
+        assertion_pid=_pid(raw.get(ASSERTION_PID)),
     )
 
 
@@ -156,6 +198,19 @@ def _instant(value: object) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.utcoffset() is not None else None
+
+
+def _pid(value: object) -> int | None:
+    """A stamped pid as an int, or ``None`` when the stamp holds nothing usable.
+
+    ``bool`` is excluded even though it is an ``int`` in Python, because JSON ``true``
+    would otherwise read as pid 1. Zero and negatives are excluded too: no process owns
+    them, so a stamp carrying one is corrupt rather than merely stale, and the honest
+    answer is that no pid was recorded.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value > 0 else None
 
 
 def _read_raw(path: Path) -> dict:
@@ -223,6 +278,7 @@ def _merge(lake_root: Path | str, updates: Mapping[str, object]) -> None:
 
 
 __all__ = [
+    "ASSERTION_PID",
     "DEAD_MAN_LAST_PING",
     "STAMPED_AT",
     "TICKERS",
@@ -230,6 +286,7 @@ __all__ = [
     "JournalMetadata",
     "metadata_path",
     "read_metadata",
+    "stamp_assertion_pid",
     "stamp_cycle",
     "stamp_ping",
 ]

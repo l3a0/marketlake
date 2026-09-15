@@ -5,9 +5,9 @@ laptop awake, keeps the two resident processes running, and proves both to the o
 world. It is macOS-specific by construction and is rewritten per host. This module
 renders it and reasons about it. It executes nothing privileged. No ``sudo``, no
 ``pmset`` write, no ``launchctl`` bootstrap, and no ``tmutil`` write runs from here.
-Installing is the operator's step, by hand. Three read-only probes do run, from the
+Installing is the operator's step, by hand. Four read-only probes do run, from the
 rendered jobs and from the by-hand live checks: ``launchctl print``, ``pmset -g sched``,
-and ``tmutil isexcluded``. None of them needs root.
+``pmset -g assertions``, and ``tmutil isexcluded``. None of them needs root.
 
 Terms, glossed at first use.
 
@@ -96,6 +96,7 @@ from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
 from lake.config import CALLBACK_KEY, input_errors_exit, load_config
 from lake.manifest import BackupScrubResult, ScrubResult, backup_scrub, scrub
+from lake.metadata import read_metadata
 from lake.paths import CONFIG_DIR_ENV, TOKEN_FILE, config_dir
 from lake.runner import PING_FAILURES, LaunchdJob, Pinger, UrllibPinger, calendar_interval
 from lake.vendor import Vendor
@@ -318,6 +319,14 @@ def self_check_job(host: LaunchdHost) -> LaunchdJob:
     weekday evening, is the case that would otherwise fail on a healthy machine and
     withhold the first ping, the one that takes this check out of the never-pinged state
     where it cannot page at all.
+
+    An install *inside* a window does withhold that first ping, and it did before the pid
+    was stamped too. The daemon spawns its ``caffeinate`` from the loop's tick hook, so
+    for the seconds between a bootstrap and the daemon's first tick there is no assertion
+    to find and no pid to match. What changed is only that a stray ``caffeinate`` can no
+    longer stand in for the daemon's during those seconds. The remedy is the same one the
+    design already names: press healthchecks' own ``Ping Now`` to arm the check, which
+    asks the daemon to report nothing at all.
     """
     return host.job(
         SELF_CHECK_LABEL,
@@ -425,14 +434,22 @@ def launchctl_probe(label: str) -> bool:
     return result.returncode == 0 and parse_launchctl_print(result.stdout)
 
 
-# Whether a ``caffeinate`` assertion is currently held. The real one shells out to
+# Whether one named ``caffeinate`` holds the assertion. The real one shells out to
 # ``pmset -g assertions``, which is read-only and needs no root, the same shape the
-# Sunday job's ``pmset -g sched`` read already has. A test injects a callable.
-AssertionProbe = Callable[[], bool]
+# Sunday job's ``pmset -g sched`` read already has. A test injects a callable. The pid
+# comes from the journal stamp the daemon writes, because the check runs in its own
+# process and cannot see the daemon's handle on its child.
+AssertionProbe = Callable[[int], bool]
+
+# The owner field a ``pmset -g assertions`` line opens with, as ``pid 123(caffeinate)``.
+# Anchored at the start of the line so it reads the field rather than the whole line.
+# ``named:`` further along is free text the holder chooses, and a process that wrote this
+# shape into it would otherwise pass for the daemon's child.
+_ASSERTION_OWNER = re.compile(r"^\s*pid (\d+)\(caffeinate\):")
 
 
-def parse_pmset_assertions(output: str) -> bool:
-    """Whether ``caffeinate`` holds an idle-sleep assertion in a ``pmset -g`` dump.
+def parse_pmset_assertions(output: str, *, pid: int) -> bool:
+    """Whether the ``caffeinate`` at ``pid`` holds an idle-sleep assertion in a ``pmset -g`` dump.
 
     The dump lists assertions twice: a system-wide tally, then one line per owning
     process. This reads the second, because the tally answers a different question. On an
@@ -441,26 +458,43 @@ def parse_pmset_assertions(output: str) -> bool:
     The tally therefore reads safe on a machine with no daemon running at all, which is
     the exact state this check exists to find.
 
-    What it confirms is narrower than "the daemon's assertion", and the difference is
-    worth stating rather than glossing. A line carries its owner as ``pid 123(caffeinate)``
-    and its kind further along, so both must appear on one line to count, which excludes
-    every holder that is not a ``caffeinate``. It does not identify *which* ``caffeinate``:
-    the owning pid is not matched against the daemon's child, and the assertion's timer
-    sits on a continuation line the match never reaches. So a hand-run ``caffeinate -i``
-    left over from the night before satisfies this. Closing that needs the daemon to
-    record its child's pid somewhere this separate process can read, which is #111.
+    ``pid`` is the daemon's own child, read from the journal stamp. Matching it is what
+    makes this an answer about the daemon rather than about the machine. A hand-run
+    ``caffeinate -i`` left over from the night before holds a real assertion under some
+    other pid, and it no longer satisfies this. A daemon that died overnight leaves its
+    last pid in the stamp, and no line in the dump carries it, so that fails too.
 
-    The kind has to be on the line too, because ``caffeinate -d`` holds the display up and
-    lets the system idle to sleep underneath it.
+    The pid is not trusted on its own, because the operating system reuses pids. The
+    owner field has to read ``caffeinate`` at that pid, so a pid inherited by any other
+    program is refused. What survives is a pid reused by a *second* ``caffeinate`` that
+    also holds system-sleep off, which is no weaker than refusing to check at all.
+
+    Matching identity is also what settles the assertion's timer, which sits on a
+    ``Details:`` continuation line no per-line match can reach. The daemon spawns
+    ``caffeinate -i -t`` running to the window's end and nothing else, and it stamps the
+    pid only while that window is open. So a line that is the daemon's child is a line
+    whose timer runs to the window's end, and reading the continuation would confirm what
+    the pid already said.
+
+    The kind has to be on the line too. The daemon spawns ``-i``, and that flag is what
+    puts ``PreventUserIdleSystemSleep`` on its child's own line. A ``caffeinate -d`` at the
+    same pid would print ``PreventUserIdleDisplaySleep`` there instead. It would still keep
+    the machine awake, because macOS holds system sleep off while the display is on, but it
+    does that under a separate ``powerd`` line at ``powerd``'s pid rather than the daemon's.
+    So the kind is read from the line the pid already selected, and a holder that only ever
+    had the display is refused.
     """
     for line in output.splitlines():
-        if "(caffeinate)" in line and "PreventUserIdleSystemSleep" in line:
+        match = _ASSERTION_OWNER.match(line)
+        if match is None or int(match.group(1)) != pid:
+            continue
+        if "PreventUserIdleSystemSleep" in line:
             return True
     return False
 
 
-def pmset_assertions_probe() -> bool:
-    """The real probe: ``pmset -g assertions``, parsed for a caffeinate-held assertion.
+def pmset_assertions_probe(pid: int) -> bool:
+    """The real probe: ``pmset -g assertions``, parsed for the assertion ``pid`` holds.
 
     Read-only, so it needs no sudoers entry. The design's ``pmset`` table already lists
     this invocation, and the two writes the drop-in grants stay the wake schedule's.
@@ -473,7 +507,7 @@ def pmset_assertions_probe() -> bool:
         text=True,
         check=False,
     )
-    return result.returncode == 0 and parse_pmset_assertions(result.stdout)
+    return result.returncode == 0 and parse_pmset_assertions(result.stdout, pid=pid)
 
 
 @dataclass(frozen=True)
@@ -487,6 +521,11 @@ class SelfCheckOutcome:
     # was owed at the moment of the check. Distinct from ``True``, which is a probe that
     # answered. A field that read ``True`` for a check that never looked would be the
     # first false line any panel reading it printed.
+    #
+    # A check that was owed an assertion and found no pid stamped reads ``False`` rather
+    # than ``None``. The question was asked there, and the answer was that nothing could
+    # vouch for the machine. ``problem`` is what tells that apart from a pid that was
+    # matched and missing.
     assertion_held: bool | None = None
 
 
@@ -511,6 +550,7 @@ def self_check(
     ping_url: str,
     label: str = DAEMON_LABEL,
     assertion_probe: AssertionProbe | None = None,
+    assertion_pid: int | None = None,
     now: datetime | None = None,
 ) -> SelfCheckOutcome:
     """Verify the daemon is up and holding its assertion, and ping only then.
@@ -546,6 +586,43 @@ def self_check(
     that arms the check in the first place. ``now`` is what decides that, so a caller
     that passes a probe and no ``now`` gets no assertion check.
 
+    ``assertion_pid`` is the ``caffeinate`` the daemon stamped into the journal
+    metadata, and it is what turns "something holds idle sleep off" into "the daemon
+    does". Without it the check passes on any holder, which is the hand-run
+    ``caffeinate -i`` from the night before that this exists to refuse.
+
+    A missing pid fails the check rather than skipping it, and on a healthy machine in
+    steady state it is never missing. The daemon stamps within a minute of a window
+    opening and restamps every tick after.
+
+    Where the policy actually decides anything is narrower than the ways a pid can be
+    absent, because the spawn and the stamp ride one hook. A spawn that failed, and a
+    daemon that has started but not yet ticked, have no ``caffeinate`` either, so the
+    check fails on the holder whatever this rule says. A stamp cleared because no window
+    is open cannot reach here at all, since the demand above is gated on one being owed.
+
+    That leaves two, and only the first is worth the price.
+
+    1. A deploy that did not restart the daemon. The daemon is a ``KeepAlive`` resident
+       holding the Python it imported at start, while this check is a calendar job that
+       execs fresh, so a new check runs against an old daemon that stamps nothing. The
+       page is not a false alarm. It reports that the deploy is half-done, which is true
+       and is what ``restart.sh`` exists for.
+    2. A stamp the daemon could not write. Here the machine really is held awake and the
+       page really is spurious, which is the cost of this rule. It is accepted because a
+       lake root that will not take a two-hundred-byte write will not take capture
+       segments either, so the dead-man is already starving on a louder channel, and
+       because the next tick retries, leaving a one-minute window that has to land on
+       08:30 exactly.
+
+    **Considered and rejected: falling back to the old any-``caffeinate`` check when no
+    pid is stamped.** That is the one alternative that preserves today's behaviour
+    exactly, and it is why "fail open" is the wrong name for it. Skipping the assertion
+    check outright would be worse than today rather than equal to it: a failed spawn
+    would ping, where today it fails. The fallback is refused because a lake with no pid
+    would go on accepting a hand-run ``caffeinate`` forever with nothing ever saying so,
+    which is the state this whole change exists to end.
+
     A ping that fails is named rather than raised. The outcome is the same missed
     ping either way, and healthchecks pages for it after the grace. The difference is
     that the caller still gets to say what happened, instead of the job dying with a
@@ -556,12 +633,19 @@ def self_check(
         return SelfCheckOutcome(daemon_up=False, pinged=False)
     held: bool | None = None
     if _assertion_owed(now) and assertion_probe is not None:
-        held = assertion_probe()
+        if assertion_pid is None:
+            return SelfCheckOutcome(
+                daemon_up=True,
+                pinged=False,
+                problem="no caffeinate pid recorded",
+                assertion_held=False,
+            )
+        held = assertion_probe(assertion_pid)
         if not held:
             return SelfCheckOutcome(
                 daemon_up=True,
                 pinged=False,
-                problem="no caffeinate assertion held",
+                problem=f"no caffeinate assertion held by pid {assertion_pid}",
                 assertion_held=False,
             )
     try:
@@ -1007,9 +1091,33 @@ class AssertionHandle(Protocol):
 
     ``subprocess.Popen`` satisfies this. A test double that returns nothing does not, and
     that is a supported answer rather than a broken one. See ``AssertionHolder._holding``.
+
+    ``pid`` is deliberately not required here. ``IdentifiedHandle`` below asks for it
+    separately, so a double that answers only ``poll`` keeps meaning exactly what this
+    docstring has always said it means, and the two questions stay answerable one at a
+    time.
     """
 
     def poll(self) -> int | None: ...
+
+
+@runtime_checkable
+class IdentifiedHandle(Protocol):
+    """The other slice of the spawned child: the pid the 08:30 check matches against.
+
+    Kept apart from ``AssertionHandle`` rather than folded into it. Widening that one
+    would make every double that answers only ``poll`` stop satisfying it, which would
+    flip ``_holding`` to its unable-to-tell branch for callers that are answering the
+    liveness question perfectly well. The two questions have different answerers, so
+    they get different protocols.
+
+    ``subprocess.Popen`` satisfies this, so the live daemon always has a pid. A double
+    that does not is supported the same way, and it reports no pid. See
+    ``AssertionHolder.child_pid``.
+    """
+
+    @property
+    def pid(self) -> int: ...
 
 
 def _spawn(args: Sequence[str]) -> object:
@@ -1130,6 +1238,49 @@ class AssertionHolder:
             # protocol only promises the attribute exists, not that calling it is safe.
             # Unable to tell answers held, which is the answer that spawns nothing.
             return True
+
+    def child_pid(self, now: datetime) -> int | None:
+        """The pid of the ``caffeinate`` held for the window ``now`` sits in, or ``None``.
+
+        This is what the daemon stamps into the journal metadata for the 08:30 check to
+        match, and the whole value of stamping it is that the check can then tell the
+        daemon's holder from anyone else's.
+
+        ``None`` is returned outside the window the child was spawned for, which makes
+        the answer a statement about now rather than about a process that has already
+        exited. ``caffeinate -i -t`` releases itself when the window ends, so a pid
+        carried past that names nothing.
+
+        A spawn that failed answers ``None`` too, by the same clamp rather than by any
+        separate rule. A re-take that fails has cleared ``_held``, and a first spawn that
+        fails never set it to this window, so either way no open window names a child.
+        The runner handing back something with no readable pid answers ``None`` as well.
+
+        The window clamp is what lets the check stop at identity and skip the assertion's
+        timer. A pid reported only inside its own window is a pid whose ``-t`` runs to
+        that window's end, because that is the only line ``caffeinate_args`` builds.
+        """
+        window = self._held
+        if window is None or not window.contains(now.astimezone(MARKET_TZ)):
+            return None
+        child = self._child
+        if not isinstance(child, IdentifiedHandle):
+            return None
+        try:
+            pid = child.pid
+        except Exception:  # noqa: BLE001 - a raise here would crash-loop the daemon
+            # The same rule ``_holding`` follows for ``poll``, and for the same reason:
+            # this runs from a hook ``run_loop`` does not wrap. The protocol promises the
+            # attribute is there, never that reading it is safe.
+            return None
+        # And never that it holds a pid. A runtime-checkable protocol tests for the
+        # attribute and not its type, so anything at all can arrive here. Only a plain
+        # positive int is an answer. Passing anything else on would either name the wrong
+        # process or reach the stamp's ``json.dumps`` as something it cannot write, from
+        # the same unwrapped hook.
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return None
+        return pid
 
     def took_over_dead_child(self) -> bool:
         """Whether the last ``hold`` replaced a child that had gone, asked once.
@@ -2675,12 +2826,15 @@ def main(
     if args.command == "self-check":
         with input_errors_exit("self-check"):
             config = load_config(args.config)
+        # The pid the daemon last stamped. Read through the lake, because this runs as
+        # its own process and the daemon's handle on its child lives in another one.
         outcome = self_check(
             probe=launchctl_probe,
             pinger=UrllibPinger(),
             ping_url=config.healthchecks_url(PRE_OPEN_SLUG),
             label=args.label,
             assertion_probe=pmset_assertions_probe,
+            assertion_pid=read_metadata(config.lake_root).assertion_pid,
             now=_system_clock().now(),
         )
         status = "daemon up" if outcome.daemon_up else "daemon down"
@@ -2805,6 +2959,7 @@ __all__ = [
     "CanaryCall",
     "DaemonProbe",
     "ExclusionReader",
+    "IdentifiedHandle",
     "LaunchdHost",
     "MintReader",
     "OneShotAlarm",
