@@ -199,9 +199,9 @@ class Watchdog:
 
         What decides the page is the decision the per-surface path already makes: a
         counter at the threshold that has not paged yet and that no live cause speaks
-        for. So a stall shorter than the threshold still pages nothing, a stall during an
-        outage that already paged adds nothing, and the threshold reads live here the way
-        it does everywhere else. Only the fan-out is gone.
+        for. So a stall shorter than the threshold still pages nothing, a stall whose
+        surfaces a live cause already speaks for adds nothing, and the threshold reads
+        live here the way it does everywhere else. Only the fan-out is gone.
 
         The fold leaves ``_paged`` alone, and that is the load-bearing part. A stall says
         nothing about whether any one surface is healthy, so it must not spend the budget

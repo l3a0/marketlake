@@ -279,7 +279,7 @@ def test_a_slept_through_slot_is_not_a_dead_sampler():
     pages = watchdog.missed(
         [Surface("quotes", "SPY"), Surface("quotes", "QQQ")], [_at(i) for i in range(3)]
     )
-    assert pages
+    assert [page.title for page in pages] == ["Capture down: loop overran"]
     assert not any(page.sampler_collapse for page in pages)
 
 
@@ -334,9 +334,10 @@ def test_one_overrun_raises_one_page_rather_than_one_per_surface():
     assert not pages[0].sampler_collapse
 
 
-def test_the_overrun_page_names_the_slots_missed_and_the_surfaces_charged():
+def test_the_overrun_page_names_the_minutes_missed_and_the_surfaces_charged():
     # One page for ten surfaces and one page for two hundred read identically without
     # the counts, which is the rule the sampler page and the cause page already follow.
+    # The stall runs from a healthy roster, so the minutes it reports are its own slots.
     watchdog = Watchdog()
     roster = _roster(5)
     pages = watchdog.missed(roster, [_at(minute) for minute in range(5)])
