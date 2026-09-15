@@ -30,6 +30,18 @@ Cut a large deliverable down to the part that runs against data the lake already
 
 The price of this is named rather than hidden. Shipping the usable path first leaves gaps open on paths nothing has exercised, and one of them will eventually cost something. That is accepted on purpose, inside the three exceptions above. A lake nobody can read produces no evidence about which hardening mattered, so the deferred work is also the work with the least evidence behind it.
 
+**Audit an issue's plan before a session starts on it (owner directive, 2026-09-15).** An issue is where a plan lives, and a plan written before the work is a hypothesis about it. Reading it is where starting begins. Trusting it is not. Check the plan against the code it names first, and derive that check against `origin/main` rather than whatever a worktree is sitting on. The plan for #201 was worked out in a worktree behind `origin/main` and enumerated documentation drift that `main` had already fixed.
+
+Three checks, and each has already caught something.
+
+1. Re-derive the issue's stated blocker. #242 said pruning a read to one minute would rest on compaction's incidental row ordering and could silently return a short answer, and concluded the real fix belonged in the writer. Parquet skips only the row groups whose statistics prove they cannot match, so ordering decides how much is skipped and never what comes back. A shuffled fixture with overlapping row groups returned the same 500 rows. The writer was never involved.
+2. Measure what the issue attributes. #242 attributed its whole cost to the read. Warm, the read took 0.37 seconds over the 5,260,136-row SPY partition of 2026-09-14 and the overflow projection over the same partition took 0.50. More than half the cost sat in a reordering that needs none of the machinery the issue proposed.
+3. Read what the code already decided in writing. #249 resolves the lake root from config, and `src/lake/loader.py` ends its module docstring by stating that nothing in it reads a config file. That sentence was a deliberate decision. A session meeting it mid-change either deletes it quietly or stops to ask.
+
+What the audit produces goes on the issue. A spawned session reads the issue and reads none of the conversation that started it, so a correction that lands only in a handoff message is a correction the next reader never sees. #242's body now carries the disproof and the measurements. #249's names the sentence it contradicts. When the audit finds nothing, say that too, the same way a review does.
+
+The price is a pass over the code before any work starts, paid on issues that turn out to be correct. The alternative is paying it inside the session, where a wrong plan has already produced a branch. #242's plan as filed would have shipped a timestamp equality that passes every test today, because every row now in the lake spells its minute one way. SPY's 2026-09-11 partition already holds two minutes written both ways, so the same code returns half of each of those minutes.
+
 ## Writing style (owner directive, 2026-08-26)
 
 Clarity comes first. Write plain sentences a reader understands on one read. Prefer short, complete sentences, but never at the cost of clarity. Do not chop an idea into cryptic one-idea fragments. When a short sentence turns hard to parse, write the clear sentence instead, even if it runs a little longer. Explain as you go, like teaching, so the reader follows without backtracking. Avoid em dashes and semicolons. Break a genuinely long sentence into two when that reads better. This applies to every prose surface: this file, the design doc, commit messages, PR bodies, and chat replies. Use plain language. Give the intuition first. Put the precise rule right behind it.
