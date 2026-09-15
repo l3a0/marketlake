@@ -465,7 +465,7 @@ Slice 3 adds the vendor-fetch surfaces. Its test surface is recorded vendor payl
 
 ### Slice 4, the read layer
 
-Slice 4 is pure derivation over sealed partitions. It fetches nothing. Its test surface is a fixture lake.
+Slice 4 is pure derivation over sealed partitions. It fetches nothing. Its test surface is a fixture lake and a throwaway `config.yaml` naming one, since `load_chain` resolves the configured lake when a caller gives it no root.
 
 - **D17** loader API and adjusted views. Scope in [#135](https://github.com/l3a0/marketlake/issues/135).
 - **D18** chains-to-bars join views. Scope in [#136](https://github.com/l3a0/marketlake/issues/136).
