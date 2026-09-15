@@ -21,7 +21,7 @@ Three exceptions come from the design's own reasoning.
 Three measurements produced this rule.
 
 1. Slice 2, the daemon, stood at 43 issues closed and 32 open. Slice 4, the read layer, stood at 0 closed.
-2. The lake held 9,839,816 chain rows captured on 2026-09-14 and no supported way to read any of them. There is no loader in `src/lake`.
+2. The lake held 9,839,816 chain rows captured on 2026-09-14 and no supported way to read any of them. There was no loader in `src/lake` until #241 shipped one.
 3. Several rounds of work hardened the `extra` overflow column. That column was non-null on zero of the lake's 9,846,266 sealed rows.
 
 Ranking by severity never runs out of work, because any path with no test behind it can be called a failure waiting to happen. That is how three rounds of hardening reached the capture path while the lake stayed unreadable.
@@ -37,7 +37,7 @@ Two checks have each already caught something.
 1. Check the issue's stated blocker against the current code. #242 said pruning a read down to one minute would rest on compaction's incidental row ordering, and concluded the real fix was a change to the writer. Parquet skips only the row groups whose statistics prove they cannot match, so ordering decides how many groups are skipped and never which rows come back. A fixture written in deliberately shuffled order, with overlapping row-group ranges, returned every row a full read returned. The writer was never involved and the work stayed in the reader.
 2. Read what the code already decided in writing. #249 resolves the lake root from config, and `src/lake/loader.py` ended its module docstring by stating that nothing in it read a config file. That sentence was a deliberate decision. A session meeting it mid-change either deletes it quietly or stops to ask. #257 did neither. #249's body had already answered the sentence in advance, so the work arrived knowing what the docstring was protecting and corrected it rather than deleting it.
 
-An audit is a plan too, so it names the commit it was derived against. #249's body cites that docstring sentence at `src/lake/loader.py:99` and counts 35 call sites in one test file. #251 merged thirty minutes later, moving the sentence to line 170 and the call sites to 49. #201's body already carries the practice that prevents this. It pins its line numbers to a named commit and tells the reader to re-sweep for the class rather than trust the list.
+An audit is a plan too, so it names the commit it was derived against. #249's body first cited that docstring sentence at `src/lake/loader.py:99` and counted 35 call sites in one test file. #251 merged thirty minutes later, moving the sentence to line 170 and the call sites to 49. #201's body already carries the practice that prevents this. It pins its line numbers to a named commit and tells the reader to re-sweep for the class rather than trust the list.
 
 A correction goes on the issue, because a spawned session reads the issue and reads none of the conversation that started it. #242's body carries its own disproof, and #249's body names the sentence it contradicts. An audit that found nothing reports that to whoever asked for it and writes nothing, since an issue padded with empty notes is harder to read, which is what writing to the issue was meant to protect.
 
