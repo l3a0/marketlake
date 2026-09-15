@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import NamedTuple
@@ -48,10 +48,12 @@ class ProbeResult:
     """What the probe found, and whether it pages.
 
     ``problem`` says the probe learned nothing either way. It reads as a whole phrase
-    rather than a bare exception name, because two states reach it.
+    rather than a bare exception name, because three states reach it.
 
     1. A vendor the probe could not reach.
-    2. A batch carrying no readable stamp.
+    2. A reply the probe could not read. ``_batch_of`` classifies those and names which
+       shape each one was.
+    3. A batch carrying no readable stamp.
 
     ``refused`` counts the stamps the epoch transform refuses, so a partly unreadable
     batch says so even on a day that reports no problem.
@@ -84,7 +86,7 @@ class Reading(NamedTuple):
     absent: int = 0
 
 
-def read_batch(quotes: dict, day: date) -> Reading:
+def read_batch(quotes: Mapping[str, object], day: date) -> Reading:
     """Who the vendor's stamps say is trading on ``day``, and how many would not read.
 
     Same-day freshness is the predicate, not a seconds threshold. The question is
@@ -167,6 +169,84 @@ def _unreadable_problem(reading: Reading) -> str | None:
     return None
 
 
+def _batch_of(
+    response: object, symbols: Sequence[str]
+) -> tuple[dict[str, object] | None, str | None]:
+    """The quotes the probe asked about inside one vendor reply, or the problem stopping it.
+
+    Exactly one of the two comes back. A batch means the reader can run. A problem means
+    it cannot, and the probe reports that problem the same way it reports a vendor it
+    could not reach.
+
+    The vendor answers with a ``VendorResponse`` of ``status``, ``body`` and ``headers``,
+    and the reader wants the quotes inside it. Every other caller unwraps before reading.
+    ``record.py``, ``capture.py`` and ``onboard.py`` read ``response.body``, and the
+    Sunday canary reads ``reply.status``. The probe read neither, so the reader was handed
+    the whole reply and asked it for symbols. That raised, which costs the answer and the
+    healthchecks ping together.
+
+    Six shapes stop here rather than reaching the reader. Each gets its own line, because
+    they send the operator to different places.
+
+    1. A reply with no ``status`` at all, which is not a vendor reply.
+    2. A ``status`` that is not a whole number. A ``bool`` is a whole number in Python, so
+       it gets past this and the range test refuses it instead, which is still a problem
+       and still not a page.
+    3. A status that is not a success. Schwab reports a dead token and a throttle as a
+       status on a returned reply rather than as a raise, so a probe that never looks
+       reads a dead token as the calendar being right. The Sunday canary checks the
+       status for the same reason.
+    4. A body that is not a mapping of symbol to envelope.
+    5. A body naming none of the symbols asked for, which says the request and the roster
+       disagree. An error payload like ``{"errors": [...]}`` is a mapping, so it arrives
+       here rather than at the check above.
+    6. A body naming some of them and carrying a quote envelope for none, which says the
+       payload changed shape.
+
+    What survives is narrowed to the symbols the probe asked about, and that narrowing is
+    the step it was missing. It knew its roster and threw the list away, so it read
+    whatever came back. Three things went wrong there.
+
+    1. A reply naming none of the roster read exactly like a reply naming all of it with
+       every stamp absent, and an absent stamp is deliberately a quiet day.
+    2. A symbol nobody asked about could set ``trading`` and fire the page.
+    3. Schwab puts unresolvable symbols in an ``errors`` block beside the quotes, so that
+       block counted as one more symbol the vendor stayed quiet about, while the symbol it
+       was really about counted as nothing at all.
+
+    An envelope is a ``dict``, which is what ``_quote_time`` reads and what parsed JSON
+    produces. What the stamp inside one says is the reader's question rather than this
+    one, so an empty envelope answers here and reads as an absent stamp there. Keeping
+    those two questions apart is what holds this above the reader. Teaching ``read_batch``
+    that a garbage envelope is a refusal would reclassify an absent stamp, and a vendor
+    staying quiet about one symbol is the ordinary case.
+
+    Nothing here raises on any shape a reply can take, and the batch it hands back is
+    keyed by the roster, so the reader cannot raise on a key either. A raise costs the
+    ping as well as the answer, and the check going silent is what says the probe stopped
+    running.
+    """
+    unset = object()
+    status = getattr(response, "status", unset)
+    if status is unset:
+        return None, f"not a vendor reply: {type(response).__name__}"
+    if not isinstance(status, int):
+        return None, f"unreadable vendor status: {type(status).__name__}"
+    # A non-2xx is a fetch failure, the same rule the capture primitive and the Sunday
+    # canary hold. A 401 is the dead-token shape that arrives as a status, not a raise.
+    if not 200 <= status < 300:
+        return None, f"vendor returned http {status}"
+    body = getattr(response, "body", None)
+    if not isinstance(body, Mapping):
+        return None, f"unreadable vendor body: {type(body).__name__}"
+    named = {symbol: body[symbol] for symbol in symbols if symbol in body}
+    if not named:
+        return None, f"vendor named none of the {len(symbols)} symbols asked for"
+    if not any(isinstance(envelope, dict) for envelope in named.values()):
+        return None, f"no quote envelope for any of the {len(named)} symbols the vendor named"
+    return named, None
+
+
 def run_probe(*, calendar, clock, symbols: Sequence[str], fetch) -> ProbeResult:
     """Ask the vendor whether a day the calendar calls closed is really closed.
 
@@ -179,16 +259,27 @@ def run_probe(*, calendar, clock, symbols: Sequence[str], fetch) -> ProbeResult:
 
     A batch that came back and could not be read leaves the probe knowing just as
     little. It reports a problem the same way, and it pages no more than an unreachable
-    vendor does.
+    vendor does. A reply the probe cannot open at all is the same state one step earlier,
+    and ``_batch_of`` names which shape it was.
+
+    A roster with no symbols in it is that state earlier again. Retiring the last ticker
+    is a real thing to do, and the capture cycle skips its own quote request for it. A
+    probe with nothing to ask cannot answer, so it says so rather than asking the vendor
+    and then blaming the vendor for the empty list it was handed.
     """
     now = clock.now().astimezone(MARKET_TZ)
     day = now.date()
     if calendar.is_session(day):
         return ProbeResult(day, checked=False)
+    if not symbols:
+        return ProbeResult(day, checked=True, problem="no symbols to ask about")
     try:
-        quotes = fetch(list(symbols))
+        response = fetch(list(symbols))
     except Exception as exc:  # noqa: BLE001 - an unreachable vendor must not page
         return ProbeResult(day, checked=True, problem=f"vendor unreachable: {type(exc).__name__}")
+    quotes, unreadable = _batch_of(response, symbols)
+    if quotes is None:
+        return ProbeResult(day, checked=True, problem=unreadable)
     reading = read_batch(quotes, day)
     return ProbeResult(
         day,
