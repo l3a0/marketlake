@@ -167,7 +167,12 @@ def test_every_quotes_counter_tripping_at_once_is_one_page_not_many():
     assert len(pages) == 1
     assert pages[0].title == "Capture down: quote sampler dead"
     assert pages[0].sampler_collapse
-    assert len(pages[0].surfaces) == 3
+    # The order is deliberate, so a caller rendering the list gets the same one twice.
+    assert pages[0].surfaces == (
+        Surface("quotes", "IWM"),
+        Surface("quotes", "QQQ"),
+        Surface("quotes", "SPY"),
+    )
 
 
 def test_one_dead_quotes_ticker_is_not_a_sampler_collapse():
@@ -291,6 +296,9 @@ def test_a_paged_surface_does_not_hide_a_later_sampler_death():
         )
     assert [p.sampler_collapse for p in raised] == [False, True]
     assert raised[1].title == "Capture down: quote sampler dead"
+    # SPY had been down three minutes before QQQ joined it, and the page reports the
+    # longest of the two counters. Reporting the shortest would halve the outage.
+    assert raised[1].minutes == 6
 
 
 # -- failures that take the whole daemon down ----------------------------------------
@@ -935,6 +943,10 @@ def test_a_collapse_and_a_surface_page_in_one_minute_each_name_their_own_class()
     assert sorted(by_title) == ["Capture down: SPY chains", "Capture down: quote sampler dead"]
     assert by_title["Capture down: quote sampler dead"].cause == "http_429"
     assert by_title["Capture down: SPY chains"].cause == "http_500"
+    # The chains ticker has its own page, so it is not one of the three the sampler page
+    # stands for. Counting it would tell the operator four were folded into a fold of
+    # three.
+    assert len(by_title["Capture down: quote sampler dead"].surfaces) == 3
 
 
 def test_a_collapse_names_no_class_when_a_ticker_that_already_paged_failed_differently():
@@ -969,6 +981,9 @@ def test_a_collapse_names_no_class_when_a_ticker_that_already_paged_failed_diffe
         )
     assert [page.title for page in collapse] == ["Capture down: quote sampler dead"]
     assert collapse[0].cause is None
+    # SPY paged on its own account first, so it is no longer newly tripped. It is still
+    # down and still one of the two this page stands for.
+    assert len(collapse[0].surfaces) == 2
 
 
 def test_an_unwritten_segment_failing_another_cause_s_way_is_released():

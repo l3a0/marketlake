@@ -946,6 +946,49 @@ def test_the_sampler_page_says_how_many_tickers_it_stands_for(size, tmp_path):
     )
 
 
+class _SplitSampler:
+    """A cycle runner that gaps every quotes ticker, half of them with a second class."""
+
+    def __init__(self, rig: _Rig, clock: ManualClock, tickers: tuple[str, ...]):
+        self._rig = rig
+        self._clock = clock
+        self._tickers = tickers
+
+    def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        slot = self._clock.now().replace(second=0, microsecond=0)
+        segments = tuple(
+            SegmentOutcome(
+                surface=journal.QUOTES_SURFACE,
+                ticker=ticker,
+                path=self._rig.lake_root / "segment.arrows",
+                partition=f"quotes/ticker={ticker}/date=2026-09-02/segment.arrows",
+                row_kind=journal.ROW_KIND_GAP,
+                rows=1,
+                error_class="boom" if index % 2 else "timeout",
+                fetched_at=None,
+            )
+            for index, ticker in enumerate(self._tickers)
+        )
+        return CycleResult(snap_ts=slot, segments=segments)
+
+
+def test_a_folded_page_whose_tickers_disagree_still_says_how_many(tmp_path):
+    """The emptiest page the system can send is the one that most needs the count.
+
+    A collapsed page names no class when its tickers report more than one, because there
+    is no single class to honestly name. The count is then the only thing the body has
+    left to say beyond the minutes, so it has to survive the class being absent.
+    """
+    tickers = ("T00", "T01", "T02", "T03")
+    rig = _rig(tmp_path)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=4, cycle_runner=_SplitSampler(rig, clock, tickers))
+
+    (page,) = rig.transport.sent
+    assert page.title == "Capture down: quote sampler dead"
+    assert page.body == "3 session minutes without a durable cycle, one page for 4 tickers"
+
+
 def test_an_empty_roster_still_runs_the_loop_and_reports(tmp_path):
     """Retiring every ticker must not stop the daemon, only its capturing.
 
