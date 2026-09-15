@@ -760,6 +760,9 @@ def _alarm(
         session_clock=session_clock,
         # The panel's dead-man line reads the lake, so a landed ping is written there.
         recorder=lambda at: stamp_ping(lake_root, at=at),
+        # The same publisher the watchdog pages through. A ping healthchecks refuses
+        # leaves this check unarmed, and nothing else in the lake would ever say so.
+        publisher=publisher,
     )
     # The page threshold is read live rather than baked in. The watchdog calls this each
     # time it decides whether to page, so an operator who recalibrates
