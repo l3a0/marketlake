@@ -461,7 +461,7 @@ The deliverable entries below are links. Each issue is the source of truth for i
 
 Slice 3 adds the vendor-fetch surfaces. Its test surface is recorded vendor payloads.
 
-- **D16** bars, actions, and the cross-check. Scope in [#134](https://github.com/l3a0/marketlake/issues/134).
+- **D16** bars, actions, and the validation that gates them. Scope in [#134](https://github.com/l3a0/marketlake/issues/134).
 
 ### Slice 4, the read layer
 
