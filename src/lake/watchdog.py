@@ -26,6 +26,13 @@ re-pages the cause.
 One case collapses. Every quotes ticker shares one batched request, so all quotes
 counters tripping in the same minute means the sampler died rather than N tickers
 dying at once. That sends one page naming the sampler, never one page per ticker.
+
+A stall folds the same way. A slot the loop slept through gaps every watched surface
+at the same moment, so one overrun is one fact and sends one page, naming how many
+slots the loop slept through and how many surfaces it charged. That page leaves the
+per-surface budget alone. A stall is evidence about the loop rather than about any
+surface's health, so a surface that is genuinely dead still pages on its own account
+on the first cycle after the loop resumes.
 """
 
 from __future__ import annotations
@@ -57,6 +64,10 @@ _WHOLE_DAEMON_CAUSES = {
     "vendor_auth_error": "Capture down: token dead",
     "http_429": "Capture down: rate limited",
 }
+
+# What one overrun pages under. The gap rows the same stall produces are stamped
+# ``slot_overrun``, so operator and journal name the minute the same way.
+_OVERRUN_TITLE = "Capture down: loop overran"
 
 
 @dataclass(frozen=True)
@@ -112,6 +123,10 @@ class Watchdog:
         # the roster drops it. A cause whose set empties is dropped, which re-arms it.
         self._paged_causes: dict[str, set[Surface]] = {}
         self._paged: set[Surface] = set()
+        # Whether an overrun has already paged. It is the stall's own once-on-transition
+        # flag, kept apart from ``_paged`` so a stall never spends a surface's budget.
+        # A durable data cycle proves the loop is running again and re-arms it.
+        self._paged_overrun = False
 
     def _threshold(self) -> int:
         """The page threshold as it stands now.
@@ -162,37 +177,68 @@ class Watchdog:
         cause = self._whole_daemon(result, failed, touched, threshold)
         if cause is not None:
             return cause
-        return self._pages(failed, touched, attempted=True, threshold=threshold, classes=classes)
+        return self._pages(failed, touched, threshold=threshold, classes=classes)
 
     def missed(self, surfaces: Iterable[Surface], slots: Sequence[datetime]) -> list[Page]:
-        """Charge a run of slept-through slots, one increment per slot.
+        """Charge a run of slept-through slots, and page the overrun once.
 
         The loop never runs a cycle for a slot it slept through, so ``observe`` never
         sees those minutes, and they are exactly the ones the daemon was worst off. Each
         slot is its own session minute without a durable data cycle, so a ten-minute
-        overrun advances a counter by ten rather than by one.
+        overrun advances a counter by ten rather than by one. The counting is per slot
+        and per surface. Only the page is folded.
+
+        One stall gaps every watched surface at the same moment, so it is one fact and
+        owes one page. Fanning out instead sent a page per surface, which at the roster
+        ceiling the design names is 230 pages for one stall against a daily cap of 40.
+        The page says how many slots the loop slept through and how many surfaces it
+        charged, the way the sampler page says how many tickers it stands for.
+
+        The fold leaves ``_paged`` alone, and that is the load-bearing part. A stall says
+        nothing about whether any one surface is healthy, so it must not spend the budget
+        each surface has for its own page. A surface that is genuinely dead therefore
+        pages under its own title on the first cycle after the loop resumes, and one that
+        comes back pages not at all. Marking them instead would read as a fix and bury
+        the real outage for the rest of the session.
+
+        A live whole-daemon cause still speaks for the surfaces it named, so a stall
+        inside an outage that already paged stays quiet. It is the same outage seen from
+        a minute the loop never ran.
         """
         watched = list(surfaces)
-        pages: list[Page] = []
         # One overrun is reported in a single call, so the threshold is read once for the
         # batch rather than per slot.
         threshold = self._threshold()
+        overrun = 0
         for slot in sorted(slots):
+            day = self._day
             self._roll(slot)
+            # A rolled date cleared the counters, so the slots below the boundary are no
+            # longer minutes this session went without. Counting them would put a
+            # weekend of closed-market minutes in a page about this morning's stall.
+            if self._day != day:
+                overrun = 0
+            overrun += 1
             for key in sorted(watched, key=str):
                 self._counts[key] = self._counts.get(key, 0) + 1
-            # Nothing was attempted for these minutes, so a quotes fan-out here says the
-            # loop overran rather than that the shared request failed.
-            pages.extend(
-                self._pages(
-                    set(watched),
-                    set(watched),
-                    attempted=False,
-                    threshold=threshold,
-                    classes={},
-                )
+        if not overrun or self._paged_overrun:
+            return []
+        # Nothing was attempted in these minutes, so nothing here names a class, and the
+        # quotes fan-out this used to send is not a dead sampler. The one thing that can
+        # speak for a slept slot is a cause already paged for the surfaces it charged.
+        if not any(
+            self._counts.get(key, 0) >= threshold and not self._covered(key, None)
+            for key in watched
+        ):
+            return []
+        self._paged_overrun = True
+        return [
+            Page(
+                title=_OVERRUN_TITLE,
+                minutes=overrun,
+                surfaces=tuple(sorted(set(watched), key=str)),
             )
-        return pages
+        ]
 
     def _whole_daemon(
         self, result: CycleResult, failed: set[Surface], touched: set[Surface], threshold: int
@@ -250,7 +296,8 @@ class Watchdog:
         A counter measures consecutive session minutes. Carrying one overnight would let
         a surface sitting at 2 at the close page on the next session's first bad minute
         while claiming three minutes, when eighteen hours passed. A ``_paged`` flag
-        carried the same way would silence a genuine page all the next morning.
+        carried the same way would silence a genuine page all the next morning, and so
+        would a stall flag, so both are dropped here too.
         """
         day = slot.astimezone(MARKET_TZ).date()
         if day != self._day:
@@ -258,10 +305,14 @@ class Watchdog:
             self._counts.clear()
             self._paged.clear()
             self._paged_causes.clear()
+            self._paged_overrun = False
 
     def _reset(self, key: Surface) -> None:
         self._counts[key] = 0
         self._paged.discard(key)
+        # A durable cycle landed, so the loop is running. A later stall is a new stall
+        # and pages again.
+        self._paged_overrun = False
         # This surface is back, so no cause covers it now. A cause that named others is
         # still true of them and stays live until the last one returns.
         self._release(key)
@@ -318,7 +369,6 @@ class Watchdog:
         failed: set[Surface],
         watched: set[Surface],
         *,
-        attempted: bool,
         threshold: int,
         classes: dict[Surface, str | None],
     ) -> list[Page]:
@@ -329,9 +379,10 @@ class Watchdog:
         of a newly-tripped set, which would break the parity and send one page per
         ticker at the moment the shared request died.
 
-        It applies only where a request was actually attempted. A slot the loop slept
-        through fans out across every quotes ticker too, and calling that a dead sampler
-        would name the wrong cause.
+        It applies only where a request was actually attempted, and ``observe`` is the
+        only caller for that reason. A slot the loop slept through gaps every quotes
+        ticker too, and calling that a dead sampler would name a batched request nobody
+        made. ``missed`` folds its own page instead and never arrives here.
         """
         tripped = [
             key
@@ -345,8 +396,7 @@ class Watchdog:
         quotes_failed = {key for key in failed if key.surface == QUOTES_SURFACE}
         quotes_watched = {key for key in watched if key.surface == QUOTES_SURFACE}
         collapsed = (
-            attempted
-            and len(quotes_watched) > 1
+            len(quotes_watched) > 1
             and quotes_failed == quotes_watched
             and any(key.surface == QUOTES_SURFACE for key in tripped)
         )
