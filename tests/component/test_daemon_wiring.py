@@ -49,7 +49,7 @@ Twelve bindings are covered here.
 11. The close+5 dispatch's job reaches the reports tree, so what the guard found lands in
     a file rather than only on the stderr launchd captures and nothing reads. The write is
     wired through a factory that resolves the lake root, which the printer never had.
-12. The dead-man is built holding the same publisher the watchdog pages through, so a
+12. The daemon builds the dead-man with the same publisher the watchdog pages through, so a
     capture ping healthchecks refuses reaches a phone. That ping feeds no check, so the
     check never arms and nothing in the lake would ever go silent to say so.
 """

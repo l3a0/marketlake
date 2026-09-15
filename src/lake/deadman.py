@@ -102,7 +102,7 @@ class DeadMan:
         self._recorder = recorder
         self._last: datetime | None = None
         # Long-lived, because this object is. The one-shot jobs page at most once per
-        # run by construction and hold nothing.
+        # run by construction and need no state.
         self._escalation = SlugEscalation(publisher)
 
     def captured(self, now: datetime) -> bool:

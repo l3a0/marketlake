@@ -361,9 +361,9 @@ def test_the_calendar_probe_entry_pages_through_a_real_publisher(tmp_path, monke
     probe_module.main(["--config", str(config), "--tickers", str(tickers), "--token", str(token)])
     assert [m.body.split(":")[0] for m in _refused_pages(transport)] == [CALENDAR_PROBE_SLUG]
     # The slug the page names and the slug the URL addresses are built at this root from
-    # one constant, and only reading both holds them together. A URL built from another
-    # check's slug would feed that check and page under this one's name, and every other
-    # root is held this way already.
+    # one constant, and only a test that reads both can catch them coming apart. A URL
+    # built from another check's slug would feed that check and page under this one's
+    # name. Every other root test already reads the URL its root pinged.
     assert pinger.urls == [_url(CALENDAR_PROBE_SLUG)]
 
 
@@ -419,7 +419,7 @@ def test_the_sunday_entry_pages_through_a_real_publisher(tmp_path, monkeypatch, 
 
 
 def test_no_page_a_root_sent_carried_a_secret(tmp_path, monkeypatch, capsys):
-    """Each root builds its publisher holding the two values that must never reach a phone.
+    """Each root builds its publisher with the two values that must never reach a phone.
 
     A page carrying either is refused rather than sent, so a page arriving at the
     transport is itself the proof. This names the secrets so the assertion reads as one.

@@ -168,7 +168,7 @@ def report(result: ProbeResult, *, publisher, pinger, ping_url: str, slug: str, 
 
     ``slug`` names the check the URL addresses, and it is required rather than derived,
     so the page a refused ping raises can never name a different check than the one that
-    was pinged. The URL holds the ping key and never reaches a page.
+    was pinged. The URL carries the ping key and never reaches a page.
     """
     try:
         pinger.ping(ping_url)

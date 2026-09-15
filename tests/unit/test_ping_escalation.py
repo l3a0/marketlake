@@ -174,7 +174,7 @@ def test_a_page_that_never_left_the_laptop_leaves_the_slug_armed():
     """ntfy down at the moment of the first refusal must not silence the slug for good.
 
     The guard is spent by a page that reached the phone, never by one that was only
-    attempted. ``DeadMan`` holds its guard for the daemon's whole life and re-arms only
+    attempted. ``DeadMan`` keeps its guard for the daemon's whole life and re-arms only
     on a ping that lands, which by construction never happens while the row is missing.
     So spending the guard on a failed POST would lose the page until the daemon restarts.
     """
@@ -191,7 +191,7 @@ def test_a_page_that_never_left_the_laptop_leaves_the_slug_armed():
 
 def test_a_page_the_cap_swallowed_also_leaves_the_slug_armed():
     # The day's cap is the publisher's own decision and it turns over with the date, so
-    # the same rule holds: nobody was told, so nothing is spent.
+    # the same rule applies: nobody was told, so nothing is spent.
     capped = _Sink(Delivery(False, CAP_REACHED, recorded=True))
     escalation = SlugEscalation(capped)
     assert not escalation.failed(_refused(), slug=CAPTURE_SLUG, now=NOW)
@@ -267,11 +267,11 @@ def test_a_transport_failure_never_spends_the_one_page():
 
 @pytest.mark.parametrize("slug", LIVE_SLUGS)
 def test_no_refused_ping_page_carries_the_url_or_its_key(slug: str, tmp_path: Path):
-    """The page names the slug and the status, and never the URL that holds the key.
+    """The page names the slug and the status, and never the URL, which carries the key.
 
-    The publisher's own refusal is the sweep, so this drives a real one holding the two
-    values that must never reach a phone. A page carrying either is refused rather than
-    sent, so ``sent`` is the whole assertion.
+    The publisher's own refusal is the sweep, so this drives a real publisher built with
+    the two values that must never reach a phone. A page carrying either is refused
+    rather than sent, so ``sent`` is the whole assertion.
     """
     lake_root = tmp_path / "lake"
     lake_root.mkdir()

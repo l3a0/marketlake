@@ -220,8 +220,8 @@ class SlugEscalation:
 
     A slug with no row is refused on every run forever, so a producer that paged on each
     refusal would page on each ping. The standing rule is to page once on the transition
-    and reset on a success, and this holds that state in memory keyed by slug, so it
-    lasts exactly as long as the producer holding it.
+    and reset on a success, and this keeps that state in memory keyed by slug, so it
+    lasts exactly as long as the producer that owns it.
 
     The one-shot jobs page at most once per run by construction and need none of this.
     ``DeadMan`` pings roughly 390 times a session inside a daemon that outlives every one
