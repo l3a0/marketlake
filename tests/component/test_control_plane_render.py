@@ -1019,6 +1019,12 @@ def test_nothing_rendered_bakes_in_a_secret_url(tmp_path, capsys):
     for name, text in texts.items():
         for marker in ("hc-ping.com", "healthchecks.io/", "ntfy.sh", f"{cp.CALLBACK_KEY}:"):
             assert marker not in text, (name, marker)
+        # A ping key needs no host beside it to be a secret, so its shape is swept for
+        # too. healthchecks mints one as a UUID. The sweep names shapes rather than
+        # refusing "://" outright, because every plist carries the Apple DTD URL, and it
+        # avoids a bare run-length rule, because a tmp_path directory name trips one.
+        assert not re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-", text), name
+        assert not re.search(r"\b[0-9a-f]{32}\b", text), name
     # The re-auth script carries no URL at all. Its one job is the browser login, so a
     # baked-in callback is likelier there than anywhere else.
     assert "://" not in texts[cp.REAUTH_SCRIPT_FILE]
@@ -1087,6 +1093,66 @@ def _rendered_install(tmp_path: Path, capsys) -> tuple[str, str]:
     return (out / cp.INSTALL_SCRIPT_FILE).read_text(), capsys.readouterr().out
 
 
+def _arming_block(text: str) -> list[str]:
+    """The rendered lines of the arming step, found by the run that holds the button.
+
+    Bounded by the step itself rather than by a line count, so the block is located
+    without asserting what it says. The press line anchors it and the run extends to the
+    length the renderer produced.
+    """
+    lines = text.splitlines()
+    start = _pressed(text) - cp._arm_capture_step_lines().index(
+        next(line for line in cp._arm_capture_step_lines() if PING_NOW in line)
+    )
+    return lines[start : start + len(cp._arm_capture_step_lines())]
+
+
+def test_both_renderings_carry_one_arming_step(tmp_path, capsys):
+    """The same block, whole and contiguous, in the script and in the pasted text.
+
+    The other tests in this section ask each rendering the same questions separately, so
+    a second copy of the step that answered all of them would pass while saying
+    something different from the first. That is the drift one shared source exists to
+    stop, and only the golden files caught it. A golden carries a documented way to
+    regenerate, so a drift blessed by a refresh left nothing red.
+    """
+    step = cp._arm_capture_step_lines()
+    assert step, step
+    for text in _rendered_install(tmp_path, capsys):
+        assert _arming_block(text) == step, text
+
+
+def test_the_step_reads_the_slug_rather_than_spelling_it(tmp_path, capsys):
+    """Renaming the check moves the rendering, rather than leaving it pointing nowhere.
+
+    Comparing the rendering against the constant's current value cannot tell a real read
+    from the same word typed twice. Both agree either way. Renaming the check under the
+    test is what separates them, and it is the rename that would otherwise ship an
+    install pointing the operator at a row that no longer exists.
+    """
+    monkey = "sentinel-slug"
+    for text in _rendered_install(tmp_path, capsys):
+        assert monkey not in text
+
+    import lake.control_plane
+
+    original = lake.control_plane.CAPTURE_SLUG
+    try:
+        lake.control_plane.CAPTURE_SLUG = monkey
+        for text in _rendered_install(tmp_path, capsys):
+            line = text.splitlines()[_pressed(text)]
+            assert monkey in line, line
+            assert original not in _arming_block(text)[_pressed_offset()], line
+    finally:
+        lake.control_plane.CAPTURE_SLUG = original
+
+
+def _pressed_offset() -> int:
+    """Where the press line sits inside the step, so the rename check reads that line."""
+    step = cp._arm_capture_step_lines()
+    return next(i for i, line in enumerate(step) if PING_NOW in line)
+
+
 def test_the_arming_step_closes_the_rendered_install(tmp_path, capsys):
     """Both renderings end their install on it, because it is the last step of installing.
 
@@ -1104,7 +1170,10 @@ def test_the_arming_step_closes_the_rendered_install(tmp_path, capsys):
     lines = script.rstrip("\n").splitlines()
     press = _pressed(script)
     assert all(not line or line.startswith("#") for line in lines[press:]), lines[press:]
-    assert lines[-1].endswith("grace period.")
+    # The step's own last line is the file's last line. Compared against the step rather
+    # than against the words it happens to use, so rewording the block is free and
+    # appending anything after it is not.
+    assert lines[-1] == cp._arm_capture_step_lines()[-1]
     token = next(i for i, line in enumerate(lines) if line.startswith("# The token."))
     assert token < press
 
@@ -1161,13 +1230,16 @@ def test_every_line_of_the_arming_step_is_a_comment(tmp_path, capsys):
     it would be a command that cannot succeed, and the script stops at the first failure
     by design, so the install would end by failing on the step that closes it.
     """
-    script, _ = _rendered_install(tmp_path, capsys)
+    script, printed = _rendered_install(tmp_path, capsys)
     lines = script.rstrip("\n").splitlines()
     runnable = [line for line in lines if line and not line.startswith("#")]
     # The last thing the script runs is the read-back. Anything the arming step added
     # would run after it.
     assert runnable[-1] == f"launchctl print {cp.LAUNCHD_DOMAIN}/{cp.DAEMON_LABEL}", runnable[-1]
-    assert all(not line or line.startswith("#") for line in lines[_pressed(script) :])
+    # Both renderings, not the script alone. The pasted text is run by hand line by
+    # line, so a runnable line there is a command the operator runs at a browser step.
+    for text in (script, printed):
+        assert all(line.startswith("#") for line in _arming_block(text)), text
 
 
 # -- the golden rendering ------------------------------------------------------

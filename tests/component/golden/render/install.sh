@@ -83,14 +83,17 @@ launchctl print system/com.marketlake.daemon
 # Run ./reauth.sh beside this file, as the owner, at a terminal on a
 # machine with a browser. It reads schwab_callback_url from config.yaml, which must
 # match the callback registered on the Schwab app.
-# Arming the capture check. This is the last step of the install, and it
-# happens after the bootstrap above and never before. A check armed ahead of the
-# jobs makes the page that follows about the install order rather than about the
-# daemon.
-# Open healthchecks.io, find the capture row, and press Ping Now.
+# Arming the capture check. This is the last step of the first install,
+# and it happens after the bootstrap above and never before. A check armed ahead
+# of the jobs makes the page that follows about the install order rather than
+# about the daemon.
+# Open healthchecks.io and press Ping Now on the capture check, the one
+# the daemon feeds every cycle. The list shows a check by name rather than by
+# slug, and a retired slice-1 row can still be sitting beside it, so read the
+# slug before pressing.
 # healthchecks keeps a check that has never been pinged in a new state, which
-# never goes down and never sends. Inside the capture window no idle heartbeat is
-# owed, so an install whose every cycle fails leaves that row reading Never while
-# every other job reports healthy. That is what happened on 2026-09-08, and four
-# days of captured nothing followed. One press turns the same silence into a page
-# inside the grace period.
+# never goes down and never sends. Inside the capture window no idle heartbeat
+# is owed, so an install whose every cycle fails leaves the capture row
+# reading Never. That is what happened on 2026-09-08, when the jobs came up at
+# 13:06 ET against a token that had expired three days earlier. One press turns
+# that silence into a page inside the grace period.

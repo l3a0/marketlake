@@ -30,13 +30,8 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 
 from lake.calendar import MARKET_TZ
-from lake.control_plane import assertion_window
+from lake.control_plane import CAPTURE_SLUG, assertion_window
 from lake.session import SessionClock
-
-# The dead-man check the daemon feeds. Slice 1's ``slice1-capture`` check retires when
-# this takes over: leaving the old row in place makes it go silent and page for a job
-# that no longer runs, so deleting it is an operator step in the install text.
-CAPTURE_SLUG = "capture"
 
 # How often an idle heartbeat goes out. The loop ticks every minute, and a ping a minute
 # is the same rate a capturing day already sends.
