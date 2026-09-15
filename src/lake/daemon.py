@@ -1072,6 +1072,14 @@ def run_loop_from_config(
             body = f"{page.minutes} session minutes without a durable cycle"
             if page.cause is not None:
                 body = f"{body}, failing with {page.cause}"
+            # A folded page says how much it folded, the rule compaction's drift page
+            # already follows. This one stands for every quotes ticker, and the count is
+            # what separates a sampler death across two tickers from one across four
+            # hundred. The names are left out because the collapse only fires when every
+            # watched quotes ticker failed, so listing them says no more than the count
+            # and costs the body's byte budget as the roster grows.
+            if page.sampler_collapse:
+                body = f"{body}, one page for {len(page.surfaces)} tickers"
             publisher.publish(
                 Message(event="capture_down", title=page.title, body=body),
                 now=now,

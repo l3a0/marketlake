@@ -892,6 +892,60 @@ def test_the_cause_page_names_its_class_on_the_wire_too(tmp_path):
     assert page.body == "3 session minutes without a durable cycle, failing with http_401"
 
 
+class _DeadSampler:
+    """A cycle runner that gaps every quotes ticker in the batch, every cycle.
+
+    The class is one no whole-daemon cause names, so the cycle reaches the sampler
+    collapse rather than being reported as a cause.
+    """
+
+    def __init__(self, rig: _Rig, clock: ManualClock, tickers: tuple[str, ...]):
+        self._rig = rig
+        self._clock = clock
+        self._tickers = tickers
+
+    def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        slot = self._clock.now().replace(second=0, microsecond=0)
+        segments = tuple(
+            SegmentOutcome(
+                surface=journal.QUOTES_SURFACE,
+                ticker=ticker,
+                path=self._rig.lake_root / "segment.arrows",
+                partition=f"quotes/ticker={ticker}/date=2026-09-02/segment.arrows",
+                row_kind=journal.ROW_KIND_GAP,
+                rows=1,
+                error_class="boom",
+                fetched_at=None,
+            )
+            for ticker in self._tickers
+        )
+        return CycleResult(snap_ts=slot, segments=segments)
+
+
+@pytest.mark.parametrize("size", [2, 3, 7])
+def test_the_sampler_page_says_how_many_tickers_it_stands_for(size, tmp_path):
+    """A folded page has to say how much it folded.
+
+    The design folds every quotes ticker into one page rather than sending N, and the
+    same rule makes compaction's drift page name how many columns it left. Without the
+    count, one page for two tickers and one page for four hundred read identically, and
+    the quotes batch runs to hundreds of symbols per request.
+
+    The count comes off the page's own surfaces rather than a constant, so a roster that
+    changed mid-session reports what it is now.
+    """
+    tickers = tuple(f"T{index:02d}" for index in range(size))
+    rig = _rig(tmp_path)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=4, cycle_runner=_DeadSampler(rig, clock, tickers))
+
+    (page,) = rig.transport.sent
+    assert page.title == "Capture down: quote sampler dead"
+    assert page.body == (
+        f"3 session minutes without a durable cycle, failing with boom, one page for {size} tickers"
+    )
+
+
 def test_an_empty_roster_still_runs_the_loop_and_reports(tmp_path):
     """Retiring every ticker must not stop the daemon, only its capturing.
 
