@@ -143,8 +143,8 @@ def test_both_surfaces_drifting_at_once_fold_into_one_page(lake_root):
     schema_drift.page(
         publisher,
         (
-            _drift("open_interest", "SPY"),
             _drift("bid", "SPY", "QQQ", surface=QUOTES_SURFACE),
+            _drift("open_interest", "SPY"),
         ),
         now=NOW,
     )
@@ -153,6 +153,10 @@ def test_both_surfaces_drifting_at_once_fold_into_one_page(lake_root):
     body = transport.messages[0].body
     assert "chains: open_interest on 1 ticker(s)" in body
     assert "quotes: bid on 2 ticker(s)" in body
+    # The findings were handed over quotes first, and the body still reads chains first.
+    # The cap cuts the tail of this list, so an order that followed the roster would change
+    # which column names survive from one cycle to the next.
+    assert body.index("chains:") < body.index("quotes:")
 
 
 def test_a_whole_cycle_of_outcomes_reaches_the_phone_as_one_page(lake_root):

@@ -2821,13 +2821,21 @@ def test_a_vendor_field_named_chain_of_any_shape_is_read_rather_than_raising(val
 
     A dict is the shape that would otherwise be walked as a block, so the scan asks the
     shape before walking. Without that question an integer under the key raises a
-    ``TypeError`` from iterating it, and the raise reaches the capture path. It is caught
-    there, so it would cost the finding rather than the minute, but it would cost every
-    finding on every segment for as long as the vendor sent that field.
+    ``TypeError`` from iterating it. The capture path catches that, so it costs the finding
+    rather than the minute, but it costs every finding on every segment for as long as the
+    vendor sends that field.
+
+    Reaching the question at all takes a chain-level column the vendor left null, which is
+    what puts that column among the candidates and its block key among the ones worth
+    walking. A body still carrying ``underlyingPrice`` filters the column out first and the
+    key is never looked at, which is how an earlier version of this test passed while the
+    guard it names went unexercised.
     """
-    batch = journal.chains_data_batch(
-        _chain_of(_full_contract(chain=value)), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
-    )
+    body = dict(CHAIN_BODY, putExpDateMap={})
+    body.pop("underlyingPrice")
+    body["callExpDateMap"] = {"2026-09-18:25": {"650.0": [_full_contract(chain=value)]}}
+    batch = journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+    assert batch.column("underlying_price").to_pylist() == [None], "the guard stays unreached"
     assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ()
 
 
