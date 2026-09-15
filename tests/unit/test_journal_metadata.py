@@ -1,4 +1,4 @@
-"""The journal metadata stamp: two writers, one file, and a total reader.
+"""The journal metadata stamp: two writers, one file, and a reader that is really total.
 
 The stamp carries the three facts the Now panel cannot read off a captured row: the
 refresh token's mint time, the roster, and the last dead-man ping. It decides nothing
@@ -12,8 +12,10 @@ Four properties are covered here, because each one is what a panel field rests o
 2. The roster is stored as the surfaces each ticker is captured on, so a ticker that
    journaled nothing still has rows to show as failing.
 3. The mint stamp is a timestamp. No token material reaches the file.
-4. Reading is total. Absent, corrupt, or naive-timestamped, the stamp reads as an empty
-   record rather than raising into a panel.
+4. Reading is total, and writing is total in the matching sense. Absent, corrupt, or
+   naive-timestamped, the stamp reads as an empty record rather than raising into a
+   panel, and a stamp too damaged to carry forward is replaced rather than left
+   unwritable forever.
 """
 
 from __future__ import annotations
@@ -22,8 +24,13 @@ import json
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
+import pytest
+
+from lake import metadata
 from lake.metadata import (
+    TOKEN_MINTED_AT,
     JournalMetadata,
+    _merge,
     metadata_path,
     read_metadata,
     stamp_cycle,
@@ -154,6 +161,74 @@ def test_a_misshapen_ticker_map_reads_as_far_as_it_parses(lake_root):
     # The list's non-string entry is dropped and the ticker whose surfaces are not a
     # list is dropped whole. Neither raises into the panel.
     assert read_metadata(lake_root).tickers == {"SPY": ("chains",)}
+
+
+# -- a stamp corrupt in the one way that passed every guard ---------------------------
+
+# Deep enough that the JSON decoder refuses it outright, whatever stack the caller has
+# already spent. The exact threshold moves with that: the same 4000-deep payload decodes
+# in a bare script and raises from the encoder under pytest, because how much recursion
+# is left depends on how deep the caller already is. A test that picked a depth near the
+# boundary would pass or fail by where it was called from, so this one sits far past it.
+# The nested-*array* form never mattered, because ``_read_raw`` discards a payload that
+# is not an object.
+_TOO_DEEP = '{"a":' * 50000 + "1" + "}" * 50000
+
+
+def test_a_stamp_nested_past_the_recursion_limit_reads_as_empty(lake_root):
+    """The module promises a corrupt stamp reads as an empty record. This one did not.
+
+    ``RecursionError`` is a ``RuntimeError``, so it passed a guard naming ``OSError`` and
+    ``ValueError`` and reached ``read_metadata``'s callers. The dashboard is one of them,
+    which made this the exact failure the promise forbids: a corrupt stamp breaking the
+    page that would have shown capture failing.
+    """
+    metadata_path(lake_root).parent.mkdir(parents=True, exist_ok=True)
+    metadata_path(lake_root).write_text(_TOO_DEEP)
+
+    assert read_metadata(lake_root) == JournalMetadata()
+
+
+def test_a_stamp_that_will_not_encode_is_replaced_rather_than_left(lake_root, monkeypatch):
+    """Otherwise one bad file is permanent: every write reads the same poison back in.
+
+    The daemon would stamp nothing for as long as the file sat there, and every reader
+    would go on seeing whatever the damaged file last said. Nothing a real stamp holds is
+    lost, because a real one is a handful of flat values rewritten every minute.
+
+    The failure is injected at the encoder rather than built out of a deep file. The band
+    this guard covers is a payload the decoder accepts and the encoder refuses, and where
+    that band starts depends on how much recursion the caller has already spent, so no
+    fixed depth lands in it from every call site. The seam is the honest way to ask.
+    """
+    stamp_cycle(lake_root, at=SLOT, token_minted_at=MINTED, roster=_roster())
+    real = metadata._encode
+
+    def refuse_the_carried_payload(payload):
+        if TOKEN_MINTED_AT in payload:  # the half read back off disk
+            raise RecursionError("maximum recursion depth exceeded")
+        return real(payload)
+
+    monkeypatch.setattr(metadata, "_encode", refuse_the_carried_payload)
+
+    stamp_ping(lake_root, at=PING)
+
+    monkeypatch.undo()
+    # The damaged half is gone and this writer's key landed, so the file is a stamp again.
+    assert read_metadata(lake_root) == JournalMetadata(dead_man_last_ping=PING)
+    stamp_cycle(lake_root, at=SLOT, token_minted_at=MINTED, roster=_roster())
+    assert read_metadata(lake_root).dead_man_last_ping == PING
+
+
+def test_an_update_the_caller_cannot_encode_still_raises(lake_root):
+    """Damage in the file is forgiven. A writer handing in nonsense is not.
+
+    The two look identical at the moment of the failure and mean opposite things. One is
+    a stamp to repair, the other is a caller that would otherwise record nothing forever
+    while every test stayed green.
+    """
+    with pytest.raises(TypeError):
+        _merge(lake_root, {"whatever": object()})
 
 
 def test_a_stamp_is_published_by_one_rename_and_leaves_no_temp_file(lake_root):

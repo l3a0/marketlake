@@ -1701,6 +1701,24 @@ def test_a_malformed_stamped_ticker_never_enters_the_roster(root: Path):
         service_over(root).run_query("today", {"ticker": "DROP TABLE"})
 
 
+def test_a_stamp_nested_past_the_recursion_limit_does_not_break_the_page(root: Path):
+    # The stamp's own promise is that a corrupt one reads as an empty record rather than
+    # raising into a panel. A payload nested deeply enough raises ``RecursionError``,
+    # which is a ``RuntimeError`` and passed a guard naming ``OSError`` and ``ValueError``.
+    # The page this breaks is the one that would have shown capture failing, and the two
+    # queries below are the two that read the stamp.
+    path = root / JOURNAL_DIR / "metadata.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"a":' * 50000 + "1" + "}" * 50000)
+
+    now = service_over(root).run_query("now", {})
+
+    assert now["token_minted_at"] is None, "a corrupt stamp reported a mint time"
+    # The roster falls back to what the lake's own directories show, so the page still
+    # renders rather than reporting no tickers at all.
+    assert now["tickers"] == ["QQQ", "SPY"]
+
+
 def test_a_malformed_ticker_directory_never_enters_the_roster(root: Path):
     # The roster is the allow-list a request ticker is checked against, so its shape gate
     # is a boundary rule. A half-renamed directory, a lower-case one, and a name carrying

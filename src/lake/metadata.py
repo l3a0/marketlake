@@ -40,7 +40,15 @@ rewritten the next minute, so it is worth no more than the ordinary atomic write
 Reading is total. An absent file, an unreadable one, a corrupt one, or a naive
 timestamp with no offset all read as an empty record, and an empty record renders as
 "not recorded yet" on the panel. A stamp that cannot be parsed must never break the
-page that would have shown the capture failing.
+page that would have shown the capture failing. *Corrupt* includes nesting deep enough
+to exhaust the interpreter's recursion, which raises past a guard that names only the
+JSON and file errors, and which reached a dashboard page until it was closed.
+
+Writing is total in the matching sense. A stamp too damaged to be carried forward is
+replaced by the writer's own keys rather than failing, so one bad file costs a minute
+of the other writers' keys instead of every write from then on. What a caller hands in
+is held to a higher bar: an update that will not encode raises, because that is the
+writer being wrong rather than the file being damaged.
 """
 
 from __future__ import annotations
@@ -151,12 +159,24 @@ def _instant(value: object) -> datetime | None:
 
 
 def _read_raw(path: Path) -> dict:
-    """The stamp's JSON object, or an empty one. No failure escapes."""
+    """The stamp's JSON object, or an empty one. No failure escapes.
+
+    Three families of failure are caught, and they are the three the module promises.
+    A file that is absent or will not open raises ``OSError``. Bytes that are not JSON,
+    or not UTF-8, raise ``ValueError``. A payload nested deeper than the interpreter
+    will recurse raises ``RecursionError``, which is a ``RuntimeError`` and passed both
+    of the others until it was found reaching a dashboard page.
+    """
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _encode(payload: Mapping[str, object]) -> str:
+    """One stamp as the text that gets written."""
+    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
 
 def _merge(lake_root: Path | str, updates: Mapping[str, object]) -> None:
@@ -165,11 +185,31 @@ def _merge(lake_root: Path | str, updates: Mapping[str, object]) -> None:
     The temp file sits beside the target and carries the writer's pid, so two processes
     never share one. It is removed on any failure, and the rename is what publishes the
     new stamp.
+
+    A payload that will not encode falls back to writing this writer's own keys and
+    dropping what was carried forward. That band is narrow and real: a stamp can be
+    nested deeply enough for the encoder to refuse it while the decoder above still
+    reads it, so the corruption survives the read and only shows on the way out. Without
+    the fallback it would survive every write too, because each one reads the same file
+    back in, and a stamp nobody can write is a daemon that stamps nothing for as long as
+    the file sits there.
+
+    Dropping the carried keys costs nothing a real stamp holds. A real one is five flat
+    values rewritten every minute, so a payload deep enough to reach this is not a stamp
+    at all, and the next minute's writers put their own keys back.
+
+    An update the caller itself cannot encode is a different thing and still raises.
+    That is a bug in the writer rather than damage in the file, and swallowing it would
+    turn a stamp that silently never records into the lie the whole module is built to
+    avoid.
     """
     target = metadata_path(lake_root)
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = {**_read_raw(target), **updates}
-    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    try:
+        text = _encode(payload)
+    except (RecursionError, TypeError, ValueError):
+        text = _encode(dict(updates))
     tmp = target.with_name(f"{target.name}.tmp-{os.getpid()}")
     try:
         with open(tmp, "w", encoding="utf-8") as handle:
