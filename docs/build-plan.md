@@ -197,10 +197,14 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
      a second thing to reason about on the split path. One number an operator can read and
      lower is worth more. Filing drift
      under the size class would send a reader to the chunk plan for a problem no chunk plan
-     fixes. The class is named to read as drift, so the schema-drift page in
-     [#197](https://github.com/l3a0/marketlake/issues/197) has one string to subscribe to and
-     it matches the reason the segment readers are to carry for the same signal in
-     [#104](https://github.com/l3a0/marketlake/issues/104). Neither of those is built here.
+     fixes. The class is named to read as drift, so a reader sweeping the gap classes finds
+     it under one string, and it matches the reason the segment readers are to carry for the
+     same signal in [#104](https://github.com/l3a0/marketlake/issues/104), which is not built
+     here. The parser's schema-drift page shipped in
+     [#197](https://github.com/l3a0/marketlake/issues/197) reads a different signal, a known
+     field's name sitting in `extra` on a chain the parser could read, so it subscribes to no
+     gap class. A window body that would not merge gaps the ticker, and the watchdog is what
+     speaks for a ticker that stopped producing data.
      The merge itself reads a whole body into scratch maps and copies them into the
      reassembly maps only on success. So a window given up carries no data rows beside the
      absence marker saying it was never collected, which is the double-record the markers
@@ -251,7 +255,7 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   3. A slot the loop slept through gaps every watched surface at once, so one overrun that trips the threshold is one page rather than one per surface.
 
   A page that never reached the phone is written to a dated directory under `reports/`, one write-once file each, so the count on the Now panel has a source. It also ships the 09:35 says-closed-but-open probe, its page, its plist through D14's renderer, and the `capture` dead-man feed with its idle heartbeats.
-- **[#197](https://github.com/l3a0/marketlake/issues/197).** The parser's schema-drift page, split out of #92. The class it subscribes to was narrowed by [#129](https://github.com/l3a0/marketlake/issues/129), so a retype now shows as a known field's name sitting in `extra` rather than as a raised exception.
+- **[#265](https://github.com/l3a0/marketlake/issues/265).** The half of the parser's schema-drift page a vanished field leaves no trace of. A retype shows as a known field's name sitting in `extra`, the signature [#129](https://github.com/l3a0/marketlake/issues/129) narrowed the class to, and a field that stops arriving shows as nothing at all. So it is a second detection on the producer [#197](https://github.com/l3a0/marketlake/issues/197) builds, reading the same built batch and the same cadence state, which is why it sequences after that producer rather than beside it.
 - **D14** laptop control plane. `render --out DIR` writes every plist and setup file to a directory and prints the install commands. It refuses a system directory, and nothing here runs `sudo`, a `pmset` write, `launchctl bootstrap`, or a `tmutil` write. What does run is read-only and needs no root: `launchctl print` and `pmset -g assertions` from the self-check, `pmset -g sched` and `tmutil isexcluded` from the Sunday job. The token path comes from one rule, so the daemon that rewrites it, the Sunday job that asserts coverage over it, and the exclusion that protects it cannot name different files. `RunAtLoad` is on for the two residents and the self-check. It is off for the Sunday job, which would otherwise scrub the whole lake at every boot. Beside the sudoers drop-in it renders five LaunchDaemons, and it prints the Time Machine exclusion as an install step rather than rendering it:
   1. the capture daemon, resident under `KeepAlive`,
   2. the query service, resident the same way,
@@ -559,7 +563,7 @@ Each healthchecks.io check is created by hand, in the session that first makes i
    [#213](https://github.com/l3a0/marketlake/issues/213) came from. Until a row exists the
    ping goes to a slug healthchecks does not know, and the job now pages once to say so
    rather than reporting it on a log line nobody reads.
-3. **D13**, `capture`, and the daemon's own pages. The per-cycle dead-man. Delete the `slice1-capture` row in the same session, because `capture` supersedes it. Ship every daemon page path through one publisher: auth death, sustained 429s, the watchdog, and the sampler collapse. The parser's schema-drift page is tracked in [#197](https://github.com/l3a0/marketlake/issues/197) above. The auth-gap reminder that #92 also carried is considered and rejected, in the design's auth-death bullet. Rehearse the topic rotation once, end to end. The 09:35 calendar probe ships here too, with its page and its `calendar-probe` check.
+3. **D13**, `capture`, and the daemon's own pages. The per-cycle dead-man. Delete the `slice1-capture` row in the same session, because `capture` supersedes it. Ship every daemon page path through one publisher: auth death, sustained 429s, the watchdog, and the sampler collapse. The parser's schema-drift page carries the retype half, and the half a vanished field leaves no trace of is tracked in [#265](https://github.com/l3a0/marketlake/issues/265) above. The auth-gap reminder that #92 also carried is considered and rejected, in the design's auth-death bullet. Rehearse the topic rotation once, end to end. The 09:35 calendar probe ships here too, with its page and its `calendar-probe` check.
 4. **D14**, `pre-open` and `sunday`, and the Sunday reminder. D14 renders the launchd jobs and the wake schedules those two checks watch. The Sunday job sends the re-auth reminder on its 20:00, 21:00, and 22:00 canary runs only, while the throwaway call or the coverage assertion still fails, reading the token's mint time from `token.json` itself.
 5. **D16**, `eod-sweep`, and the nightly summary. This is where the report channel is created, and the sweep's own ping lands before the digest it sends. Its ping owes the refused-ping page the other five producers send, because it is the one steady-state check whose producer did not exist when [#213](https://github.com/l3a0/marketlake/issues/213) shipped. Scope in [#281](https://github.com/l3a0/marketlake/issues/281), which holds the digest's priority, the holiday no-op rule, and the inputs already on disk.
 6. **D20**, the battery's pages, delayed feed and nightly schema drift.

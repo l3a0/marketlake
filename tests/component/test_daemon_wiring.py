@@ -13,7 +13,7 @@ test is a page a person receives, and a sync from one copies a throwaway lake on
 machine running the suite. So the tier is component: the daemon over real files, with the
 clock, the calendar, the network, and the backup still fake.
 
-Twelve bindings are covered here.
+Thirteen bindings are covered here.
 
 1. The skipped-slot hook reaches the gap marker, so a live overrun records the minutes
    it slept through.
@@ -52,6 +52,10 @@ Twelve bindings are covered here.
 12. The daemon builds the dead-man with the same publisher the watchdog pages through, so a
     capture ping healthchecks refuses reaches a phone. That ping feeds no check, so the
     check never arms and nothing in the lake would ever go silent to say so.
+13. The cycle hook reaches the schema-drift observer, so a vendor that retypes a known
+    field pages the minute the parser sees it. The observer carries state between cycles,
+    so the binding also decides whether a drift that persists pages once or once a minute,
+    and only the production entry can be asked that.
 """
 
 from __future__ import annotations
@@ -78,6 +82,7 @@ from lake.config import GuardConstants
 from lake.deadman import CAPTURE_SLUG
 from lake.paths import LakePaths
 from lake.runner import PING_REFUSED_EVENT
+from lake.schema_drift import SCHEMA_DRIFT_EVENT, SCHEMA_DRIFT_TITLE
 from lake.security_master import SecurityMaster, master_path
 from lake.session import SPOT_CLOSE, TICK
 from lake.tickers import TickersError
@@ -338,6 +343,7 @@ def _segment(
     root: Path,
     surface: str = journal.QUOTES_SURFACE,
     ticker: str = "XYZ",
+    routed: tuple[str, ...] = (),
 ) -> SegmentOutcome:
     """One journalled segment of the named kind, the shape a cycle result carries.
 
@@ -347,6 +353,9 @@ def _segment(
     its counters on the surface and ticker together. Two calls at the defaults would be
     one surface reported twice, and a cycle plans one segment per pair, so production
     never emits that.
+
+    ``routed`` is the columns whose vendor field arrived at a type the column refused,
+    empty on every ordinary segment, which is what the schema-drift page reads.
     """
     return SegmentOutcome(
         surface=surface,
@@ -357,6 +366,7 @@ def _segment(
         rows=1,
         error_class=None if row_kind == journal.ROW_KIND_DATA else "boom",
         fetched_at=None,
+        routed_columns=routed,
     )
 
 
@@ -1889,3 +1899,92 @@ def test_the_daemon_re_takes_an_assertion_whose_child_died(tmp_path, capsys):
     assert [m for m in rig.transport.sent if m.event == "assertion_lost"] == [], (
         "a lapse that healed itself in a minute raised a page"
     )
+
+
+# -- 13. the cycle hook reaches the schema-drift observer ------------------------------
+
+
+class _Drifting:
+    """A cycle runner whose data segment carries a drifted column on chosen ticks.
+
+    The vendor payload that produces the column is covered in ``test_capture_cycle.py``
+    and the scan that reads it in ``test_journal_schema.py``. What is left for the wiring
+    is whether the daemon looks at the outcome at all, and whether the state that decides
+    a second page survives from one cycle to the next.
+    """
+
+    def __init__(self, rig: _Rig, clock: ManualClock, *, drifting_on: Sequence[int]) -> None:
+        self._rig = rig
+        self._clock = clock
+        self._drifting = set(drifting_on)
+        self.cycles = 0
+
+    def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        self.cycles += 1
+        routed = ("open_interest",) if self.cycles in self._drifting else ()
+        slot = self._clock.now().replace(second=0, microsecond=0)
+        segment = _segment(
+            journal.ROW_KIND_DATA, self._rig.lake_root, journal.CHAINS_SURFACE, "XYZ", routed
+        )
+        return CycleResult(snap_ts=slot, segments=(segment,))
+
+
+def _drift_pages(rig: _Rig) -> list[Message]:
+    """Every schema-drift page the daemon sent, in order."""
+    return [page for page in rig.transport.sent if page.event == SCHEMA_DRIFT_EVENT]
+
+
+def test_a_vendor_retype_reaches_a_phone_through_the_daemons_cycle_hook(tmp_path):
+    """The binding this deliverable exists for.
+
+    The parser already knew a known field had refused its column and threw the fact away
+    at the end of one function call. The page is only real if the daemon reads it off the
+    cycle it just ran, and nothing else in this file drives that hook to a page.
+    """
+    rig = _rig(tmp_path)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+
+    _run(rig, clock, ticks=2, cycle_runner=_Drifting(rig, clock, drifting_on=[2]))
+
+    (page,) = _drift_pages(rig)
+    assert page.title == SCHEMA_DRIFT_TITLE
+    assert page.priority == PAGE_PRIORITY
+    assert "chains: open_interest on 1 ticker(s)" in page.body
+
+
+def test_a_drift_that_persists_pages_once_rather_than_once_a_minute(tmp_path):
+    """The cadence, decided by state the daemon has to keep across cycles.
+
+    Capture runs a cycle a minute against ``alert.DEFAULT_DAILY_CAP`` of forty pages a day,
+    so a per-cycle page would spend the whole cap in forty minutes and the page it
+    swallowed could be the auth-death page. The observer is built in ``_alarm`` and closed
+    over by the hook for exactly this reason: one built per cycle would forget every time.
+    """
+    rig = _rig(tmp_path)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    runner = _Drifting(rig, clock, drifting_on=[1, 2, 3, 4])
+
+    _run(rig, clock, ticks=4, cycle_runner=runner)
+
+    assert runner.cycles == 4
+    assert len(_drift_pages(rig)) == 1
+
+
+def test_a_drift_that_clears_and_returns_pages_a_second_time(tmp_path):
+    """The reset, which is what keeps the once-on-transition rule from going silent forever."""
+    rig = _rig(tmp_path)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+
+    _run(rig, clock, ticks=4, cycle_runner=_Drifting(rig, clock, drifting_on=[1, 4]))
+
+    assert len(_drift_pages(rig)) == 2
+
+
+def test_an_ordinary_session_sends_no_schema_drift_page(tmp_path):
+    """The steady state. Every cycle the lake has recorded carried an empty overflow."""
+    rig = _rig(tmp_path)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+
+    _run(rig, clock, ticks=4, cycle_runner=_Drifting(rig, clock, drifting_on=[]))
+
+    assert _drift_pages(rig) == []

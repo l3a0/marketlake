@@ -2671,3 +2671,350 @@ def test_segment_path_mirrors_the_fixture_lake_contract(tmp_path):
     mine = journal.segment_path(root, "chains", "SPY", "2026-08-24", "20260824T160000", 4242)
     theirs = fixture.segment_path("chains", "SPY", "2026-08-24", "20260824T160000", 4242)
     assert mine == theirs
+
+
+# -- the drift signature read back off a built batch ---------------------------
+
+# ``journal.routed_columns`` is what the daemon's schema-drift page reads. The section
+# above pins where a routed value lands. These pin that the scan finds it there, that it
+# passes over everything else in the overflow, and that an ordinary cycle's all-null
+# overflow costs it nothing.
+
+# A value no pinned column type will take. All four types the two schemas use, string,
+# double, int64 and bool, refuse a JSON object, so one value drives a retype of any
+# column and the test needs no per-type table that could go stale.
+UNFIT_VALUE = {"amount": 3, "unit": "contracts"}
+
+
+def _chain_batch(**overrides):
+    """The batch a chain body carrying a single overridden contract builds."""
+    return journal.chains_data_batch(
+        _chain_of(_full_contract(**overrides)), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
+    )
+
+
+def _chain_header_batch(**header):
+    """The batch a chain body with chain-level fields overridden builds."""
+    return journal.chains_data_batch(
+        dict(_chain_of(_full_contract()), **header), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
+    )
+
+
+def _quote_batch(block: str, **overrides):
+    """The batch a quote envelope with one captured block's fields overridden builds."""
+    return journal.quotes_data_batch(
+        _quote_with(block, **overrides),
+        ticker="SPY",
+        snap_ts=SNAP,
+        fetch_ts=FETCH,
+        vendor_quote_ts=VENDOR,
+    )
+
+
+def _quote_envelope_batch(**envelope):
+    """The batch a quote envelope with envelope-level fields overridden builds."""
+    return journal.quotes_data_batch(
+        dict(QUOTE, **envelope),
+        ticker="SPY",
+        snap_ts=SNAP,
+        fetch_ts=FETCH,
+        vendor_quote_ts=VENDOR,
+    )
+
+
+def _retyped_batch(surface: str, path: journal.ExtraPath):
+    """The batch one surface builds when the vendor retypes the field at ``path``.
+
+    The level a field arrives at decides which builder drives it, and the path's own
+    ``block`` is what names that level. So this walks the same mapping the scan walks
+    rather than a list of fields, which is what makes the caller cover every path rather
+    than the handful anyone thought to write down.
+    """
+    if surface == journal.CHAINS_SURFACE:
+        if path.block is None:
+            return _chain_batch(**{path.field: UNFIT_VALUE})
+        return _chain_header_batch(**{path.field: UNFIT_VALUE})
+    if path.block == "envelope":
+        return _quote_envelope_batch(**{path.field: UNFIT_VALUE})
+    return _quote_batch(path.block, **{path.field: UNFIT_VALUE})
+
+
+@pytest.mark.parametrize("surface", [journal.CHAINS_SURFACE, journal.QUOTES_SURFACE])
+def test_routed_columns_names_every_column_the_routing_writes(surface):
+    """The scan and the routing agree on every path, by walking the mapping itself.
+
+    This is the guard on the cost the page's design accepted. ``_batch`` knows exactly
+    which columns refused and discards that, and ``routed_columns`` re-derives it from the
+    built batch, so the two could drift apart. Both read ``extra_paths`` rather than a list
+    of their own, and walking every entry here is what turns that derivation into a
+    checked fact. A path added by promoting a vendor field is covered the day it is added.
+    """
+    paths = journal.extra_paths(surface)
+    assert paths, surface
+    for column, path in paths.items():
+        batch = _retyped_batch(surface, path)
+        assert batch.column(column).to_pylist() == [None] * batch.num_rows, column
+        assert journal.routed_columns(surface, batch) == (column,), column
+
+
+def test_an_unrecognized_vendor_field_is_not_a_routed_column():
+    """The fail-open working as designed, which belongs to the nightly report.
+
+    A field the vendor invented lands in ``extra`` under a name no path claims. Paging on
+    it would page on every new greek the vendor ships, and the design already sends that
+    to the nightly report instead. Matching against ``extra_paths`` is the whole
+    distinction between the two, so a scan that read the overflow's keys alone would page
+    on both.
+    """
+    batch = _chain_batch(brandNewGreek=1.5)
+    assert json.loads(batch.column("extra").to_pylist()[0]) == {"brandNewGreek": 1.5}
+    assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ()
+
+    quotes = _quote_batch("quote", brandNewStat=1.5)
+    assert json.loads(quotes.column("extra").to_pylist()[0]) == {"quote": {"brandNewStat": 1.5}}
+    assert journal.routed_columns(journal.QUOTES_SURFACE, quotes) == ()
+
+
+def test_an_unrecognized_field_sharing_a_blocks_name_is_still_not_a_routed_column():
+    """A quotes block the fail-open filled with the vendor's own new fields.
+
+    An unrecognized quotes field nests under the block it arrived in, so the block key a
+    routed value writes under is already there in the ordinary case. What separates the
+    two is the field inside it, not the block, and a scan that stopped at the block would
+    page on every new field the vendor adds to a block it already sends.
+    """
+    batch = _quote_batch("quote", brandNewStat=1.5, anotherNewStat=2.5)
+    assert json.loads(batch.column("extra").to_pylist()[0]) == {
+        "quote": {"brandNewStat": 1.5, "anotherNewStat": 2.5}
+    }
+    assert journal.routed_columns(journal.QUOTES_SURFACE, batch) == ()
+
+
+def test_a_vendor_field_named_chain_does_not_fabricate_a_chain_level_drift():
+    """The one shape that reads as drift while nothing refused anything.
+
+    The chains fail-open writes an unrecognized contract field flat, so a vendor contract
+    field named ``chain`` lands on the key the chain-level values nest under, and its own
+    subkeys then read as chain-level vendor names. ``_extra_with_routed`` refuses that
+    collision by name, but only on a row where something actually routed, so a row that
+    routed nothing never reaches that refusal.
+
+    What settles it is the row's own column. A routed value is nulled in its column on the
+    same row, so a key naming a column that still holds a value cannot be the signature.
+    Here both columns hold the vendor's real header values, and a page naming them would
+    send an operator to look for a retype that never happened.
+    """
+    row = _full_contract(chain={"underlyingPrice": 250.0, "interestRate": 4.5})
+    batch = journal.chains_data_batch(_chain_of(row), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+    assert json.loads(batch.column("extra").to_pylist()[0]) == {
+        "chain": {"underlyingPrice": 250.0, "interestRate": 4.5}
+    }
+    # The real chain-level values are in their columns, untouched.
+    assert batch.column("underlying_price").to_pylist() == [650.01]
+    assert batch.column("interest_rate").to_pylist() == [4.25]
+    assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ()
+
+
+@pytest.mark.parametrize("value", [5, "a string", [1, 2, 3], 1.5, True, None])
+def test_a_vendor_field_named_chain_of_any_shape_is_read_rather_than_raising(value):
+    """The collision key can hold anything, and the scan has to survive all of it.
+
+    A dict is the shape that would otherwise be walked as a block, so the scan asks the
+    shape before walking. Without that question an integer under the key raises a
+    ``TypeError`` from iterating it. The capture path catches that, so it costs the finding
+    rather than the minute, but it costs every finding on every segment for as long as the
+    vendor sends that field.
+
+    Reaching the question at all takes a chain-level column the vendor left null, which is
+    what puts that column among the candidates and its block key among the ones worth
+    walking. A body still carrying ``underlyingPrice`` filters the column out first and the
+    key is never looked at, which is how an earlier version of this test passed while the
+    guard it names went unexercised.
+    """
+    body = dict(CHAIN_BODY, putExpDateMap={})
+    body.pop("underlyingPrice")
+    body["callExpDateMap"] = {"2026-09-18:25": {"650.0": [_full_contract(chain=value)]}}
+    batch = journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+    assert batch.column("underlying_price").to_pylist() == [None], "the guard stays unreached"
+    assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ()
+
+
+def test_a_genuine_chain_level_retype_still_routes_beside_that_collision():
+    """The control for the test above, so the null check cannot buy silence.
+
+    A check that refused every chain-block key would pass the collision test and lose every
+    real chain-level drift, which is half the chains surface's paths.
+    """
+    body = dict(_chain_of(_full_contract()), underlyingPrice="six hundred and fifty")
+    batch = journal.chains_data_batch(body, ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+    assert batch.column("underlying_price").to_pylist() == [None]
+    assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ("underlying_price",)
+
+
+def test_a_routed_column_is_named_off_the_row_that_actually_routed():
+    """One contract drifts and another carries the column, in the same batch.
+
+    The scan walks rows until it has named every path, so a check that read the column's
+    nulls in bulk rather than at the routed row would answer from whichever row it reached
+    first. The drifted contract is second here for that reason.
+    """
+    contracts = [
+        _full_contract(symbol="SPY   260918C00650000", openInterest=1234),
+        _full_contract(symbol="SPY   260918C00650001", openInterest=UNFIT_VALUE),
+    ]
+    batch = journal.chains_data_batch(
+        _chain_of(*contracts), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
+    )
+    assert batch.column("open_interest").to_pylist() == [1234, None]
+    assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ("open_interest",)
+
+
+def test_a_vendor_null_is_not_a_routed_column():
+    """A field the vendor sent as null never routes, so it never reads as drift.
+
+    ``None`` fits every column, because an all-null column lands typed. So a genuine
+    vendor null leaves the column null with an empty overflow, which is byte-identical to
+    a field that stopped arriving. Neither is this page's, and the missing half is
+    marketlake #265.
+    """
+    batch = _chain_batch(openInterest=None)
+    assert batch.column("open_interest").to_pylist() == [None]
+    assert batch.column("extra").to_pylist() == [None]
+    assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ()
+
+
+def test_a_second_ticker_drifting_the_same_column_still_names_it_once():
+    """The scan names columns, not rows. A whole chain drifting is one column.
+
+    A vendor retype reaches every contract in the payload at once, so a scan that
+    returned one entry per row would hand the page a list as long as the chain.
+    """
+    contracts = [
+        _full_contract(symbol=f"SPY   260918C0065000{index}", openInterest=UNFIT_VALUE)
+        for index in range(3)
+    ]
+    batch = journal.chains_data_batch(
+        _chain_of(*contracts), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
+    )
+    assert batch.num_rows == 3
+    assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ("open_interest",)
+
+
+def test_two_columns_drifting_at_once_are_both_named():
+    """A vendor change that moved two fields has to name both, in a stable order."""
+    batch = _chain_batch(openInterest=UNFIT_VALUE, bid=UNFIT_VALUE)
+    assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ("bid", "open_interest")
+
+
+def test_an_all_null_overflow_is_answered_on_the_null_count_alone(monkeypatch):
+    """The ordinary cycle's cost: one null count, and nothing else at all.
+
+    ``extra`` was non-null on zero of the lake's sealed rows, so this is the path every
+    capture minute takes and it runs between the row build and the segment write. Breaking
+    the two calls the scan would otherwise make is what proves the short-circuit rather
+    than assuming it. A scan that skipped past the null count would pass every other test
+    here while rebuilding both vendor maps and materializing the whole overflow column,
+    once per segment, every minute of the session.
+
+    ``extra_paths`` is the one that bites, because its builders run per call rather than
+    once at import, so reaching it is real work and not a dict lookup.
+    """
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("the scan did work an all-null overflow should have skipped")
+
+    batch = _chain_batch()
+    assert batch.column("extra").to_pylist() == [None]
+    monkeypatch.setattr(journal, "extra_paths", refuse)
+    monkeypatch.setattr(journal.json, "loads", refuse)
+    assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ()
+
+
+def test_a_populated_overflow_with_every_column_filled_parses_no_json(monkeypatch):
+    """The gate that makes an ordinary populated overflow cheap, held by breaking the parse.
+
+    An unrecognized vendor field lands in ``extra`` on every row of the payload, and the
+    design calls that the fail-open working rather than a page. So a populated overflow is
+    an ordinary event, and a scan that parsed every row for it would pay that cost on the
+    capture path for a finding that is always empty. Measured before this gate existed, one
+    new greek cost 137 ms on a 13,500-row chain.
+
+    A routed value is nulled in its own column, so a column the vendor is still filling
+    cannot have routed. Every known column here holds a value, so nothing is a candidate and
+    no row is ever read.
+    """
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("the scan parsed a row with no candidate column to find")
+
+    batch = _chain_batch(brandNewGreek=1.5)
+    assert batch.column("extra").null_count == 0
+    monkeypatch.setattr(journal.json, "loads", refuse)
+    assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ()
+
+
+def test_a_retype_is_still_found_beside_a_column_the_vendor_left_null():
+    """The control for the gate above, so it cannot buy its speed with silence.
+
+    A sparse contract nulls columns the vendor simply had nothing for, which makes them
+    candidates. The drifted column has to be told apart from them by the overflow key, not
+    by the null alone, and the sparse ones must not page.
+    """
+    row = _full_contract(openInterest=UNFIT_VALUE, delta=None, gamma=None, rho=None)
+    batch = journal.chains_data_batch(_chain_of(row), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH)
+    assert batch.column("delta").to_pylist() == [None]
+    assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ("open_interest",)
+
+
+def test_a_drift_on_a_later_row_is_found_when_earlier_rows_are_clean():
+    """A vendor that retypes a field on only some contracts, which is a partial rollout.
+
+    Every other drift fixture retypes on every row, so a scan that stopped at the first
+    clean row, or that required every row to carry an overflow, would pass all of them and
+    miss this. The drifted contract is last here for that reason.
+    """
+    contracts = [
+        _full_contract(symbol=f"SPY   260918C0065000{index}", openInterest=1234)
+        for index in range(4)
+    ]
+    contracts.append(_full_contract(symbol="SPY   260918C00650009", openInterest=UNFIT_VALUE))
+    batch = journal.chains_data_batch(
+        _chain_of(*contracts), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
+    )
+    assert batch.column("extra").to_pylist()[:4] == [None] * 4
+    assert batch.column("open_interest").to_pylist() == [1234, 1234, 1234, 1234, None]
+    assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ("open_interest",)
+
+
+def test_the_columns_come_back_in_a_stable_order_whatever_the_payload_order():
+    """The page prints these and the cap cuts them, so the order cannot follow the payload.
+
+    Without sorting, which columns survive ``PAGE_COLUMN_CAP`` would depend on the order the
+    vendor happened to send fields in. Enough columns are drifted here that set iteration
+    order essentially never matches sorted order by accident.
+    """
+    drifted = dict.fromkeys(
+        ("openInterest", "totalVolume", "bid", "ask", "delta", "gamma", "theta", "rho"),
+        UNFIT_VALUE,
+    )
+    batch = journal.chains_data_batch(
+        _chain_of(_full_contract(**drifted)), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
+    )
+    got = journal.routed_columns(journal.CHAINS_SURFACE, batch)
+    assert len(got) == len(drifted)
+    assert list(got) == sorted(got)
+    assert got == ("ask", "bid", "delta", "gamma", "open_interest", "rho", "theta", "volume")
+
+
+def test_a_gap_batch_carries_no_overflow_to_scan():
+    """A gap row holds no vendor observation, so a gap segment can never read as drift.
+
+    ``_routed_column`` refuses to route onto a gap row, which makes a gap batch's overflow
+    null by construction. That is why the scan needs no ``row_kind`` test of its own, and
+    a second definition of that rule here is what this exists to keep out.
+    """
+    batch = journal.gap_rows(
+        journal.CHAINS_SURFACE, ticker="SPY", slots=[SNAP], error_class="http_429"
+    )
+    assert batch.column("extra").to_pylist() == [None] * batch.num_rows
+    assert journal.routed_columns(journal.CHAINS_SURFACE, batch) == ()

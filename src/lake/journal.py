@@ -35,7 +35,7 @@ import fcntl
 import json
 import os
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import NamedTuple
@@ -1182,6 +1182,133 @@ def _batch(surface: str, rows: Sequence[Mapping[str, object]]) -> pa.RecordBatch
         extras[index] = _extra_with_routed(extras[index], entries, mergeable)
     columns[EXTRA_COLUMN] = typed_column(schema.field(EXTRA_COLUMN).type, extras)
     return pa.RecordBatch.from_arrays([columns[field.name] for field in schema], schema=schema)
+
+
+def _columns_named(
+    held: Mapping[str, object],
+    by_key: Mapping[tuple[str | None, str], str],
+    blocks: Collection[str],
+) -> Iterator[str]:
+    """Every column of the surface that one row's overflow names, flat or under a block.
+
+    Walking the row's keys rather than the surface's paths is what keeps a populated
+    overflow affordable. An unrecognized vendor field is one key, so it costs one lookup
+    rather than one per column, and the ordinary reason an overflow is populated at all is
+    exactly that field.
+    """
+    for key, value in held.items():
+        column = by_key.get((None, key))
+        if column is not None:
+            yield column
+        if key in blocks and isinstance(value, Mapping):
+            for sub in value:
+                column = by_key.get((key, sub))
+                if column is not None:
+                    yield column
+
+
+def routed_columns(surface: str, batch: pa.RecordBatch) -> tuple[str, ...]:
+    """The surface's own columns whose vendor name sits in a built batch's ``extra``.
+
+    This is the drift signature ``_routed_column`` names, read back off a batch. A known
+    vendor field's name can only reach the overflow by being routed there, for the reason
+    that docstring gives. So a name from ``extra_paths`` found in ``extra`` means that
+    column refused the value the vendor sent, and the column is null on that row.
+
+    It answers the one question a page needs, which column drifted, and deliberately not
+    how many rows carried it or what the value was. Both of those are already on disk in
+    the rows themselves, and ``reports/`` and the nightly report are where a reader goes
+    for them.
+
+    A key the surface's paths do not name is an unrecognized vendor field, which is the
+    fail-open working as designed and belongs to the nightly report rather than to a
+    phone. Matching against ``extra_paths`` is the whole distinction between the two.
+
+    The key alone is not quite enough, and the row's own column is what settles it. A
+    routed value is nulled in its column on the same row it was parked from, per
+    ``_routed_column``, so a key that names a column still holding a value cannot be the
+    routing's signature. One shape reaches here that way. The chains fail-open writes an
+    unrecognized contract field flat, so a vendor contract field named ``chain`` lands on
+    the key the chain-level values nest under, and its own subkeys then read as chain-level
+    field names. ``_extra_with_routed`` refuses that collision by name, but only on a row
+    where something actually routed, so a row that routed nothing never reaches it. The
+    null check covers that row, and it can never cost a true finding, because a column that
+    routed is null on that row by construction.
+
+    The cost is named rather than hidden. This re-derives a fact ``_batch`` already knew
+    and discarded, so a routing change that wrote under some other key would leave the two
+    out of step. The guard against that is derivation: both sides read ``extra_paths``
+    rather than a list of their own, and
+    ``tests/unit/test_journal_schema.py::test_routed_columns_names_every_column_the_routing_writes``
+    walks every path on both surfaces so a new one is covered the day it is added.
+
+    This runs between the row build and the segment write, on every segment of every
+    cycle, so what it costs when it finds nothing is the number that matters. Two gates
+    answer the ordinary cycle before any JSON is parsed.
+
+    The first is the overflow's null count. An all-null overflow is every cycle the lake
+    has recorded, and it returns immediately with no path map built and no column
+    materialized. The saving is real rather than a dict lookup, because ``extra_paths``
+    rebuilds both vendor maps on every call. A gap batch is this case by construction,
+    since a gap row carries no vendor observation and ``_routed_column`` refuses to route
+    onto one, so nothing here needs to read ``row_kind``.
+
+    The second gate is what makes a *populated* overflow cheap, and the design is why it
+    has to be. An unrecognized vendor field lands in ``extra`` on every row of the payload
+    and is explicitly not a page, so a populated overflow is an ordinary event rather than
+    a rare one. A routed value is nulled in its own column, so a column carrying no null at
+    all cannot have routed, and one cached null count per column rules out every column the
+    vendor is still filling. A chain whose only overflow is a new greek clears this gate
+    with nothing left to look for.
+
+    That second gate is also what keeps one collision from fabricating a finding. The
+    chains fail-open writes an unrecognized contract field flat, so a field named ``chain``
+    lands on the key the chain-level values nest under and its subkeys then read as
+    chain-level names. ``_extra_with_routed`` refuses that collision by name, but only on a
+    row where something actually routed, so a row that routed nothing never reaches it. The
+    columns such a key can name are block-level, and a block-level column holds one value
+    for the whole batch, so the null count answers it: while the vendor is still sending
+    that header field, the column is not a candidate and the key is never looked up. What
+    is left over is a header field the vendor stopped sending on the same payload that
+    invented a field named ``chain``, which is the residual marketlake #156 already names.
+
+    Past both gates the walk is over the row's own keys rather than over every path, so a
+    row costs the handful of fields it actually carries instead of the whole surface's
+    column list.
+    """
+    overflow = batch.column(EXTRA_COLUMN)
+    if overflow.null_count == len(overflow):
+        return ()
+    # A routed column is null on the row it routed from, so a column with no null anywhere
+    # in the batch is not a candidate and never needs a key looked up for it.
+    candidates = {
+        column: path
+        for column, path in extra_paths(surface).items()
+        if batch.column(column).null_count
+    }
+    if not candidates:
+        # Performance only, and deliberately so. The loop below breaks on its first
+        # iteration when there is nothing to find, so removing this line changes no
+        # answer and no test can see it. What it buys is skipping ``to_pylist`` on the
+        # whole overflow column, which is 0.39 ms against 0.06 ms on a 13,500-row chain
+        # and grows with the row count where this does not. It is stated as unheld by a
+        # test rather than left to look like a guard that one forgot to cover.
+        return ()
+    by_key = {(path.block, path.field): column for column, path in candidates.items()}
+    blocks = {path.block for path in candidates.values() if path.block is not None}
+    found: set[str] = set()
+    for raw in overflow.to_pylist():
+        # A vendor retype reaches every row of the payload, so the first row usually names
+        # every column that moved and the rest of the chain is walked for nothing.
+        if len(found) == len(candidates):
+            break
+        if not raw:
+            continue
+        held = json.loads(raw)
+        if not isinstance(held, Mapping):
+            continue
+        found.update(_columns_named(held, by_key, blocks))
+    return tuple(sorted(found))
 
 
 def _iter_contracts(body: Mapping[str, object]) -> list[Mapping[str, object]]:
