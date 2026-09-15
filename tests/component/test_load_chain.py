@@ -25,18 +25,25 @@ schema writes an Eastern one, and SPY's real 2026-09-11 partition holds 408 dist
 ``snap_ts`` texts naming 406 distinct instants because two of its minutes were written
 both ways. A loader comparing the stored text would answer one spelling and not the other.
 
-The numbered tests below are #135's own test list, kept in that issue's numbering so a
-mutation the issue names points at the test the issue names.
+The numbered tests carry the numbering of the issue that asked for them, so a mutation an
+issue names points at the test that issue names. Two issues number tests here, #135 for the
+loader itself and #242 for the two-pass read, and each test says which.
 """
 
 from __future__ import annotations
 
 import json
+import random
 from datetime import UTC, date, datetime
 
 import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
 import pytest
 
+from lake import loader
+from lake.extra_projection import ExtraProjectionError
 from lake.loader import (
     LoadError,
     NoOptionClose,
@@ -228,7 +235,7 @@ def _kinds(table) -> set[str]:
 
 
 def test_snap_none_returns_the_option_close_cycle_on_a_half_day(fixture_lake: FixtureLake):
-    """Test 1. The close of record comes from the tag, not from a clock.
+    """#135 test 1. The close of record comes from the tag, not from a clock.
 
     The half day's option close is 13:15 ET, so a loader computing the regular 16:15
     finds no cycle at all, and one taking the day's last snapshot takes 13:00 ET's
@@ -244,7 +251,7 @@ def test_snap_none_returns_the_option_close_cycle_on_a_half_day(fixture_lake: Fi
 
 
 def test_snap_none_takes_the_option_close_cycle_and_not_its_neighbour(fixture_lake: FixtureLake):
-    """Test 1, on a full session. The ``spot_close`` cycle 15 minutes earlier stays out."""
+    """#135 test 1, on a full session. The ``spot_close`` cycle 15 minutes earlier stays out."""
     root = _lake(fixture_lake)
 
     table = load_chain(root, "SPY", FULL_DAY)
@@ -255,7 +262,7 @@ def test_snap_none_takes_the_option_close_cycle_and_not_its_neighbour(fixture_la
 
 
 def test_a_session_with_no_option_close_tag_raises(fixture_lake: FixtureLake):
-    """Test 2. The explicit marker, never a substitute.
+    """#135 test 2. The explicit marker, never a substitute.
 
     QQQ's day ran cycles to 15:59 ET and tagged none of them. The last snapshot is
     exactly what a substituting loader would return, so it is present to be returned.
@@ -292,7 +299,7 @@ def test_the_marker_counts_tagged_gap_rows(fixture_lake: FixtureLake):
 
 
 def test_snap_resolves_as_an_eastern_wall_clock_minute(fixture_lake: FixtureLake):
-    """Test 3. ``10:31`` ET is 14:31Z on a September session."""
+    """#135 test 3. ``10:31`` ET is 14:31Z on a September session."""
     root = _lake(fixture_lake)
 
     table = load_chain(root, "SPY", FULL_DAY, snap="10:31")
@@ -302,7 +309,7 @@ def test_snap_resolves_as_an_eastern_wall_clock_minute(fixture_lake: FixtureLake
 
 
 def test_one_instant_under_two_spellings_comes_back_whole(fixture_lake: FixtureLake):
-    """Test 3, on the shape the live lake actually carries.
+    """#135 test 3, on the shape the live lake actually carries.
 
     SPY's real 2026-09-11 partition writes two of its minutes both as an Eastern offset
     and as ``+00:00``. A loader matching the stored text returns whichever spelling it
@@ -317,7 +324,7 @@ def test_one_instant_under_two_spellings_comes_back_whole(fixture_lake: FixtureL
 
 
 def test_snap_is_never_read_as_utc(fixture_lake: FixtureLake):
-    """Test 3, refuting the other reading. ``14:31`` ET is 18:31Z, and 14:31Z is a decoy.
+    """#135 test 3, refuting the other reading. ``14:31`` ET is 18:31Z, and 14:31Z is a decoy.
 
     The session holds a cycle at both minutes, so a loader treating ``snap`` as UTC
     returns rows rather than raising, which is the failure this refutes.
@@ -330,7 +337,7 @@ def test_snap_is_never_read_as_utc(fixture_lake: FixtureLake):
 
 
 def test_a_minute_no_cycle_recorded_raises(fixture_lake: FixtureLake):
-    """Test 4. An empty table would read as a chain with no contracts."""
+    """#135 test 4. An empty table would read as a chain with no contracts."""
     root = _lake(fixture_lake)
 
     with pytest.raises(SnapAbsent) as caught:
@@ -426,7 +433,7 @@ def test_a_snap_ts_with_no_offset_never_matches_silently(fixture_lake: FixtureLa
 
 
 def test_gap_rows_are_absent_from_the_close_of_record(fixture_lake: FixtureLake):
-    """Test 5. The option-close cycle carries a gap row beside its two data rows."""
+    """#135 test 5. The option-close cycle carries a gap row beside its two data rows."""
     root = _lake(fixture_lake)
 
     table = load_chain(root, "SPY", FULL_DAY)
@@ -436,7 +443,7 @@ def test_gap_rows_are_absent_from_the_close_of_record(fixture_lake: FixtureLake)
 
 
 def test_gap_rows_are_absent_from_an_intraday_minute(fixture_lake: FixtureLake):
-    """Test 5, on the other resolution. 14:31 ET carries a gap row too."""
+    """#135 test 5, on the other resolution. 14:31 ET carries a gap row too."""
     root = _lake(fixture_lake)
 
     table = load_chain(root, "SPY", FULL_DAY, snap="14:31")
@@ -449,7 +456,7 @@ def test_gap_rows_are_absent_from_an_intraday_minute(fixture_lake: FixtureLake):
 
 
 def test_a_quarantined_partition_is_excluded_by_default(fixture_lake: FixtureLake):
-    """Test 6, first half. Fail closed for data already sealed."""
+    """#135 test 6, first half. Fail closed for data already sealed."""
     root = _lake(
         fixture_lake,
         quarantine=[{"partition": FULL_PARTITION, "verdict": "delayed_feed"}],
@@ -463,7 +470,7 @@ def test_a_quarantined_partition_is_excluded_by_default(fixture_lake: FixtureLak
 
 
 def test_a_quarantined_partition_reads_under_the_opt_in(fixture_lake: FixtureLake):
-    """Test 6, second half. The opt-in is explicit and per call."""
+    """#135 test 6, second half. The opt-in is explicit and per call."""
     root = _lake(
         fixture_lake,
         quarantine=[{"partition": FULL_PARTITION, "verdict": "delayed_feed"}],
@@ -524,7 +531,7 @@ def test_a_ticker_spelled_differently_from_its_directory_is_refused(fixture_lake
 
 
 def test_an_absent_quarantine_ledger_excludes_nothing(fixture_lake: FixtureLake):
-    """Test 7. The guard is inert until the battery writes its first verdict."""
+    """#135 test 7. The guard is inert until the battery writes its first verdict."""
     root = _lake(fixture_lake)
 
     assert not (root / "quarantine.jsonl").exists()
@@ -706,3 +713,357 @@ def test_a_date_object_reads_the_same_partition_as_its_iso_text(fixture_lake: Fi
     root = _lake(fixture_lake)
 
     assert load_chain(root, "SPY", date(2026, 11, 27)).num_rows == 2
+
+
+# -- reading only the rows the answer is made of -----------------------------
+
+
+def _row_group_ranges(path) -> list[tuple[str, str]]:
+    """Each row group's ``snap_ts`` range, as Parquet's own statistics record it."""
+    metadata = pq.ParquetFile(path).metadata
+    column = {metadata.schema.column(i).name: i for i in range(metadata.num_columns)}["snap_ts"]
+    return [
+        (
+            metadata.row_group(group).column(column).statistics.min,
+            metadata.row_group(group).column(column).statistics.max,
+        )
+        for group in range(metadata.num_row_groups)
+    ]
+
+
+def _overlapping(ranges: list[tuple[str, str]]) -> bool:
+    """Whether any two of ``ranges`` share a value, so pruning cannot go by order."""
+    return any(
+        low <= other_high and other_low <= high
+        for index, (low, high) in enumerate(ranges)
+        for other_low, other_high in ranges[index + 1 :]
+    )
+
+
+def _shuffled_session(count: int = 600) -> list[dict]:
+    """A session's rows in deliberately shuffled order, spread over twenty minutes.
+
+    Compaction writes a partition in ``snap_ts`` order today, which makes its row groups
+    time-disjoint and hides the question this fixture asks. Shuffling puts every minute in
+    every row group, so a reader that pruned on an assumed ordering answers short.
+    """
+    shuffler = random.Random(7)
+    minutes = [f"2026-09-14T14:{minute:02d}:00+00:00" for minute in range(20)]
+    rows = [
+        _data(shuffler.choice(minutes), occ=f"SPY   260918C{index:08d}") for index in range(count)
+    ]
+    shuffler.shuffle(rows)
+    return rows
+
+
+def test_a_pushdown_read_answers_a_partition_whose_row_groups_overlap(
+    fixture_lake: FixtureLake,
+):
+    """#242 test 1. Row-group ordering decides how much is skipped and never what comes back.
+
+    This issue once claimed the opposite, that pruning would ride on compaction's
+    incidental ``snap_ts`` ordering and would silently return a short answer when a writer
+    restart broke it. Parquet skips a row group only when its statistics prove no row in it
+    can match, and it filters whatever it did read. So the answer is the full read's answer
+    and this loader asks the writer for no guarantee.
+
+    The assertion on the ranges is what keeps this from passing vacuously. A fixture
+    written in one row group, or in row groups that happen to be disjoint, tests nothing.
+    """
+    rows = _shuffled_session()
+    fixture_lake.with_chains("SPY", FULL_DAY, sample_chains_table(rows), row_group_size=50)
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    root = fixture_lake.build()
+    path = root / "chains" / "ticker=SPY" / f"date={FULL_DAY}.parquet"
+    ranges = _row_group_ranges(path)
+    assert len(ranges) > 1
+    assert _overlapping(ranges)
+
+    table = load_chain(root, "SPY", FULL_DAY, snap="10:07")
+
+    whole = pq.read_table(path)
+    expected = whole.filter(pc.equal(whole.column("snap_ts"), "2026-09-14T14:07:00+00:00"))
+    assert table.num_rows == expected.num_rows
+    assert sorted(table.column("occ_symbol").to_pylist()) == sorted(
+        expected.column("occ_symbol").to_pylist()
+    )
+
+
+class _Reads:
+    """A stand-in for the loader's Parquet read that records what it was asked for.
+
+    A correct predicate returns the rows a full read would, so no assertion on a returned
+    table can tell whether one happened, and a wall-clock timing is not a test. This
+    records the arguments and hands the real read through.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def __call__(self, path, *, columns=None, filters=None):
+        self.calls.append({"path": path, "columns": columns, "filters": filters})
+        return pq.read_table(path, columns=columns, filters=filters)
+
+    @property
+    def resolve(self) -> dict:
+        """The pass that reads columns over the whole partition."""
+        return next(call for call in self.calls if call["columns"] is not None)
+
+    @property
+    def fetch(self) -> dict:
+        """The pass that reads rows, named to Parquet as a predicate."""
+        return next(call for call in self.calls if call["filters"] is not None)
+
+    @property
+    def unrestricted(self) -> list[dict]:
+        """Every read that named neither its columns nor its rows.
+
+        One of those is the whole partition, which is what this change removed. Nothing
+        about a returned table would show a second one creeping back in beside the two
+        passes, because its result would simply be discarded.
+        """
+        return [c for c in self.calls if c["columns"] is None and c["filters"] is None]
+
+
+@pytest.fixture
+def reads(monkeypatch: pytest.MonkeyPatch) -> _Reads:
+    recorder = _Reads()
+    monkeypatch.setattr(loader, "_read", recorder)
+    return recorder
+
+
+def test_the_fetch_names_every_spelling_of_the_minute_to_parquet(
+    fixture_lake: FixtureLake, reads: _Reads
+):
+    """#242 test 2, the half the returned rows cannot show.
+
+    An equality would name one spelling of an instant that has two.
+
+    The returned rows cannot tell an equality from a set, because the filter behind the
+    read admits both either way and today's lake spells every row the same. What differs
+    is what Parquet was asked, and a partition a different writer spelled the other way is
+    answered short by the equality and whole by the set.
+    """
+    root = _lake(fixture_lake)
+
+    load_chain(root, "SPY", FULL_DAY, snap="10:31")
+
+    expected = (
+        ds.field("snap_ts").isin(["2026-09-14T14:31:00+00:00", "2026-09-14T10:31:00-04:00"])
+        | ds.field("extra").is_valid()
+    )
+    assert reads.fetch["filters"].equals(expected)
+    assert len(reads.calls) == 2
+    assert reads.unrestricted == []
+
+
+def test_the_fetch_asks_for_every_row_that_could_add_a_column(
+    fixture_lake: FixtureLake, reads: _Reads
+):
+    """The overflow disjunct is what keeps the column set a property of the partition.
+
+    The projection adds a promoted column only when a row it is handed carries a value for
+    it, so a fetch of the answer's rows alone would make the column set move with the
+    minute asked for. Only a row whose ``extra`` is not null can add one, so those rows
+    ride along wherever in the session they sit.
+    """
+    root = _lake(fixture_lake)
+
+    load_chain(root, "SPY", FULL_DAY)
+
+    expected = ds.field("close_tag").isin(["option_close"]) | ds.field("extra").is_valid()
+    assert reads.fetch["filters"].equals(expected)
+    assert len(reads.calls) == 2
+    assert reads.unrestricted == []
+
+
+def test_the_resolve_pass_reads_only_the_columns_a_read_resolves_against(
+    fixture_lake: FixtureLake, reads: _Reads
+):
+    """The whole-partition pass reads two columns rather than seventy-three.
+
+    A minute resolves against ``snap_ts`` and counts absence markers by ``row_kind``, and
+    it never asks about the close tag. Naming a column to Parquet makes it a requirement of
+    the layout, so a read that names one it does not use takes on a way to fail for
+    nothing. The vendor columns are read only for the rows the answer is made of.
+    """
+    root = _lake(fixture_lake)
+
+    load_chain(root, "SPY", FULL_DAY, snap="10:31")
+
+    assert reads.resolve["columns"] == ["snap_ts", "row_kind"]
+    assert reads.resolve["filters"] is None
+    assert len(reads.calls) == 2
+    assert reads.unrestricted == []
+
+
+def test_the_close_of_record_resolves_against_the_tag_column_as_well(
+    fixture_lake: FixtureLake, reads: _Reads
+):
+    """The other resolution reads the one column it does resolve against."""
+    root = _lake(fixture_lake)
+
+    load_chain(root, "SPY", FULL_DAY)
+
+    assert reads.resolve["columns"] == ["snap_ts", "row_kind", "close_tag"]
+
+
+def test_a_minute_reads_a_partition_that_carries_no_close_tag_column(
+    fixture_lake: FixtureLake,
+):
+    """A column a minute never resolves against is not a column its read depends on.
+
+    No writer drops ``close_tag``, so this is about what the read requires rather than
+    about a partition anyone has. Naming every resolving column on every read would make a
+    minute fail on a partition it can answer perfectly well.
+    """
+    table = sample_chains_table(FULL_ROWS).drop_columns(["close_tag"])
+    fixture_lake.with_chains("SPY", FULL_DAY, table)
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    root = fixture_lake.build()
+
+    assert load_chain(root, "SPY", FULL_DAY, snap="10:31").num_rows == 3
+
+
+def test_a_partition_with_no_overflow_column_says_so_by_name(fixture_lake: FixtureLake):
+    """``extra_projection`` owns what a chains table missing its overflow column means.
+
+    The fetch names ``extra`` to Parquet so the rows that decide the column set ride along,
+    and naming a column Parquet does not have fails the scan with a message about field
+    references. So the half that names it waits on the column existing, which leaves the
+    refusal with the module whose guard it is.
+    """
+    table = sample_chains_table(FULL_ROWS).drop_columns(["extra"])
+    fixture_lake.with_chains("SPY", FULL_DAY, table)
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    root = fixture_lake.build()
+
+    with pytest.raises(ExtraProjectionError, match="no extra column"):
+        load_chain(root, "SPY", FULL_DAY, snap="10:31")
+
+
+def test_a_row_carrying_no_schema_version_refuses_the_reads_that_include_it(
+    fixture_lake: FixtureLake,
+):
+    """The fourth refusal that narrowed with the read, and it narrowed on purpose.
+
+    A row with no ``schema_version`` is a row the journal did not write, and the projection
+    raises on one rather than reporting it. Nothing computed over the whole partition
+    depends on a row's version, so the refusal follows the rows the read is made of. The
+    ``row_kind`` guard beside it stays whole-partition instead, because the counts that
+    explain an empty answer are taken over every row.
+    """
+    rows = [
+        {**_data("2026-11-27T14:30:00+00:00", CALL), "schema_version": None},
+        _data("2026-11-27T18:15:00+00:00", CALL, close_tag="option_close"),
+    ]
+    fixture_lake.with_chains("SPY", HALF_DAY, sample_chains_table(rows))
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    root = fixture_lake.build()
+
+    assert load_chain(root, "SPY", HALF_DAY).num_rows == 1
+
+    with pytest.raises(ExtraProjectionError, match="no schema_version"):
+        load_chain(root, "SPY", HALF_DAY, snap="09:30")
+
+
+def test_a_minute_is_not_projected_against_the_rest_of_the_session(fixture_lake: FixtureLake):
+    """#242 test 3. The projection sees the answer's rows, not the day's.
+
+    A version the schema-version ledger holds no shape for is the projection's report made
+    visible. Here 09:30 sits at version 2, which the ledger does not record, and the
+    close-of-record cycle sits at the recorded version 1. A loader projecting the whole
+    partition meets version 2 on every read of this day and refuses them all. One that
+    projects the rows it selected refuses only the read that asked for 09:30.
+
+    That narrower scope is chosen. A read about one minute should not be taken away by a
+    defect in a minute nobody asked for.
+    """
+    rows = [
+        {**_data("2026-11-27T14:30:00+00:00", CALL), "schema_version": 2},
+        _data("2026-11-27T18:15:00+00:00", CALL, close_tag="option_close"),
+    ]
+    fixture_lake.with_chains("SPY", HALF_DAY, sample_chains_table(rows))
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    root = fixture_lake.build()
+
+    assert load_chain(root, "SPY", HALF_DAY).num_rows == 1
+
+    with pytest.raises(PartialRead) as caught:
+        load_chain(root, "SPY", HALF_DAY, snap="09:30")
+    assert caught.value.projection.unrecorded_versions == (2,)
+
+
+def test_an_overflow_at_an_unrecorded_version_refuses_from_anywhere_in_the_session(
+    fixture_lake: FixtureLake,
+):
+    """The narrowing stops where a row could move the answer's own columns.
+
+    A row carrying an overflow value is read by every fetch, because it is a row that can
+    add a column. So a version the ledger has no shape for still refuses every read of the
+    day when a row at that version holds something in its overflow, which is the case where
+    the projection cannot say whether that value belongs in a column of the table returned.
+    """
+    rows = [
+        _with_extra(
+            {**_data("2026-11-27T14:30:00+00:00", CALL), "schema_version": 2},
+            {"totalVolume": 11},
+        ),
+        _data("2026-11-27T18:15:00+00:00", CALL, close_tag="option_close"),
+    ]
+    fixture_lake.with_chains("SPY", HALF_DAY, sample_chains_table(rows))
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    root = fixture_lake.build()
+
+    with pytest.raises(PartialRead) as caught:
+        load_chain(root, "SPY", HALF_DAY)
+
+    assert caught.value.projection.unrecorded_versions == (2,)
+
+
+def test_a_resolution_that_finds_nothing_says_so_rather_than_reporting_the_projection(
+    fixture_lake: FixtureLake,
+):
+    """The projection stopped running before the resolution, so the resolution answers first.
+
+    This day's rows sit at a version the ledger has no shape for and none of them carries
+    the close-of-record tag. Projecting the whole partition first meant every read of it
+    raised ``PartialRead``, whatever the reader had asked for. The projection now runs on
+    the rows a resolution chose, so a reader asking for a close of record that was never
+    tagged is told that.
+
+    The answer does not change with the order. The projection fills promoted columns out of
+    ``extra`` and touches neither ``snap_ts`` nor ``close_tag`` nor ``row_kind``, so nothing
+    it could have done would have put a tag on a row. What the caller loses is learning that
+    the partition was also partial, on a read that was never going to return a table.
+    """
+    rows = [{**_data("2026-11-27T14:30:00+00:00", CALL), "schema_version": 2}]
+    fixture_lake.with_chains("SPY", HALF_DAY, sample_chains_table(rows))
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    root = fixture_lake.build()
+
+    with pytest.raises(NoOptionClose):
+        load_chain(root, "SPY", HALF_DAY)
+
+    with pytest.raises(SnapAbsent):
+        load_chain(root, "SPY", HALF_DAY, snap="11:00")
+
+
+def test_the_read_honours_the_columns_it_is_given(fixture_lake: FixtureLake):
+    """The seam records what the loader asked for, and this checks the asking is honoured.
+
+    Every other test about the two passes replaces ``_read`` with a recorder, so the real
+    body runs in none of them. A rewrite of that body that dropped the projection, such as
+    a switch to ``ds.dataset(path).to_table(filter=...)``, would return the same rows and
+    read the whole partition to do it. Nothing about a returned table would show it.
+    """
+    root = _lake(fixture_lake)
+    path = root / "chains" / "ticker=SPY" / f"date={FULL_DAY}.parquet"
+
+    columns = loader._read(path, columns=["snap_ts", "row_kind"])
+    filtered = loader._read(path, filters=ds.field("snap_ts").isin(["2026-09-14T13:30:00+00:00"]))
+
+    assert columns.column_names == ["snap_ts", "row_kind"]
+    assert columns.num_rows == pq.ParquetFile(path).metadata.num_rows
+    assert _snaps(filtered) == {"2026-09-14T13:30:00+00:00"}
+    assert filtered.column_names == pq.read_schema(path).names

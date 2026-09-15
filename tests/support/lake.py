@@ -178,11 +178,16 @@ class FixtureLake:
     # -- parquet writers -----------------------------------------------------
 
     def _write_parquet(
-        self, rel: Path, table: pa.Table, source: str, fetched_at: str | None
+        self,
+        rel: Path,
+        table: pa.Table,
+        source: str,
+        fetched_at: str | None,
+        row_group_size: int | None = None,
     ) -> FixtureLake:
         path = self.root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(table, path)
+        pq.write_table(table, path, row_group_size=row_group_size)
         self._manifest.append(
             {
                 "partition": rel.as_posix(),
@@ -203,9 +208,16 @@ class FixtureLake:
         *,
         source: str = "capture",
         fetched_at: str | None = None,
+        row_group_size: int | None = None,
     ) -> FixtureLake:
+        """One sealed partition.
+
+        ``row_group_size`` caps how many rows a row group holds. Parquet's default puts a
+        fixture in one group, where a reader pruning on row-group statistics has nothing to
+        prune and nothing to get wrong, so a test about pruning asks for several.
+        """
         rel = self.partition_path(surface, ticker, day).relative_to(self.root)
-        return self._write_parquet(rel, table, source, fetched_at)
+        return self._write_parquet(rel, table, source, fetched_at, row_group_size)
 
     def with_chains(
         self, ticker: str, day: date | str, table: pa.Table | None = None, **kwargs

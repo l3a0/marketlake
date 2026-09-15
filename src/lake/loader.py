@@ -67,15 +67,56 @@ a second read path that the other skips.
    account. One place owns the version-to-shape mapping, and a loader that re-derived it
    would be the second source of truth for what a sealed row means.
 
-The projection runs over the whole partition, before any row is selected. That ordering is
-the difference between a shape a caller can rely on and one that moves under it. The
-projection adds a promoted column only when some row it is handed carries a value for it,
-so projecting a single minute would make the column set a property of the minute asked
-for. Two reads of one ticker-day would then come back with different columns, and
-``pa.concat_tables`` over them raises. Stitching reads together is exactly what #136 and
-#137 do. The price is reading and projecting rows the caller did not ask for, measured at
-0.5 seconds over the 5,260,136-row SPY partition of 2026-09-14, and it buys a column set
-that is a property of the partition.
+A read touches the partition twice, and each pass reads the least it can. marketlake #242
+is authoritative for this, and it replaced a single read of every column and every row.
+
+1. *The resolve pass* reads over the whole partition the columns this read resolves
+   against. Both resolutions read ``snap_ts`` and ``row_kind``, and the close of record
+   reads ``close_tag`` as well. Naming a column to Parquet makes it a requirement of the
+   layout, so a minute read does not name a column it never asks about.
+2. *The fetch pass* reads the rows the resolve pass chose. It names them to Parquet as a
+   predicate rather than filtering after the fact, so the reader skips what it can prove it
+   does not need.
+
+Four answers therefore stay settled over the whole session, exactly as they were when the
+read pulled every column.
+
+1. Which rows the answer is made of.
+2. How many absence markers explain an empty answer.
+3. Which ``snap_ts`` values cannot be read as an instant at all.
+4. Whether any row carries no ``row_kind``.
+
+Pruning row groups asks nothing of the writer. Parquet skips a row group only when its
+statistics prove no row in it can match, and it filters whatever it did read. So ordering
+decides how many groups are skipped and never which rows come back, and a fixture written
+in deliberately shuffled order, with twelve overlapping row-group ranges, confirms that.
+Compaction may go on writing in ``snap_ts`` order or stop, and this read answers the same
+either way.
+
+The predicate names the exact ``snap_ts`` spellings the resolve pass found rather than the
+minute's canonical text. An equality would match one spelling of an instant that has
+several, so a partition written later by a different writer would come back short. The
+spellings come from the partition itself, so the rule holds for a spelling nothing has
+written yet.
+
+The fetch also reads every row whose ``extra`` is not null, wherever in the session it
+sits. That is what keeps the column set a property of the partition rather than of the
+minute asked for. The projection adds a promoted column only when a row it is handed
+carries a value for it, so a fetch of one minute alone would give the 09:30 read a column
+the close-of-record read lacks, and ``pa.concat_tables`` over the two raises. Stitching
+reads together is exactly what #136 and #137 do. A row whose overflow is null can fill no
+column, so the rows that decide the shape are precisely the ones the fetch adds. Adding
+them is free on the lake as it stands, because ``extra`` is null on all 9,846,266 sealed
+rows the lake held on 2026-09-14, and a row group whose statistics say so is skipped
+whole.
+
+Measured on the 5,260,136-row SPY partition of 2026-09-14, best of five warm runs, the two
+passes cost 0.21 seconds for an intraday minute and 0.13 for the close of record, against
+1.76 and 1.73 for the single full read they replace. The durable figure is the compressed
+bytes each pass touches, because that one does not move with what the page cache happens to
+hold. The resolve pass reads 0.1 MiB of the partition's 288.9. The fetch reads the row
+groups the predicate keeps, which is 57.6 MiB for that minute and 1.5 for the close of
+record.
 
 What the loader adds is the decision about the projection's report. A version the ledger
 holds no shape for, a value a column refused, and a column a vendor retype routed into the
@@ -83,6 +124,36 @@ overflow all mean the same thing: the read is partial. Handing the table back an
 return something that looks whole, so a partial projection raises ``PartialRead`` naming
 what was incomplete. An absent ledger is the same condition reached a different way, since
 every version in the table is then unrecorded, so it takes no case of its own.
+
+Reading fewer rows moves what that report covers, and the narrower scope is chosen rather
+than incidental. Two of the three conditions do not move, because each sits in the overflow
+and the fetch reads every row whose overflow is not null.
+
+1. A value a promoted column refused still refuses a read from anywhere in the partition.
+2. A column a retype routed away does too.
+
+The third moves. A version the ledger holds no shape for refuses the read when the minute
+asked for carries it, or when a row at that version carries an overflow value. A version
+whose rows all sit outside the minute and all hold an empty overflow no longer refuses. A
+read about one minute should not be taken away by a defect in a minute nobody asked for.
+
+The report also stopped coming first. The projection used to run before either resolution,
+so a partition the projection could not complete raised ``PartialRead`` ahead of every
+refusal below. It now runs on the rows a resolution chose, so an absent minute, an untagged
+close of record, two tagged cycles, and a row with no ``row_kind`` each raise their own
+error instead. Each of those is still true where it fires, because the projection fills
+promoted columns out of ``extra`` and touches neither ``snap_ts`` nor ``close_tag`` nor
+``row_kind``, so nothing it could have done would have changed the answer. What a caller
+loses is learning that the partition was also partial, on a read that was never going to
+return a table.
+
+One refusal outside that report moves with it, for the same reason. A row carrying no
+``schema_version`` at all is a row the journal did not write, and ``project_extra`` raises
+on one rather than reporting it. That now refuses the reads whose rows include it rather
+than every read of the day. Nothing computed over the whole partition depends on a row's
+version, which is what separates this from the ``row_kind`` refusal below. The counts that
+explain an empty answer are taken over every row, and Arrow's filter drops a row with no
+``row_kind`` from both sides of them, so that one has to stay whole-partition and does.
 
 The loader never returns a table it cannot vouch for. Three shapes would otherwise come
 back quietly wrong rather than loudly refused, and each raises instead.
@@ -104,16 +175,19 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Sequence
 from datetime import date, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from lake import journal
 from lake.calendar import MARKET_TZ
-from lake.extra_projection import ExtraProjection, project_extra
+from lake.extra_projection import EXTRA_COLUMN, ExtraProjection, project_extra
 from lake.manifest import is_quarantined, latest_quarantine
 from lake.paths import CHAINS, LakePaths
 from lake.schema_versions import SchemaVersionLedger, ledger_path
@@ -127,6 +201,13 @@ SNAP_TS_COLUMN = "snap_ts"
 CLOSE_TAG_COLUMN = "close_tag"
 ROW_KIND_COLUMN = journal.ROW_KIND_COLUMN
 ROW_KIND_DATA = journal.ROW_KIND_DATA
+
+# What the resolve pass reads for each resolution. Naming a column to Parquet makes it a
+# requirement of the layout, so a read names the ones it uses and no more. Both resolutions
+# count absence markers by ``row_kind`` at a ``snap_ts``. Only the close of record resolves
+# against ``close_tag``.
+MINUTE_COLUMNS = (SNAP_TS_COLUMN, ROW_KIND_COLUMN)
+CLOSE_COLUMNS = (SNAP_TS_COLUMN, ROW_KIND_COLUMN, CLOSE_TAG_COLUMN)
 
 # An ET wall-clock minute, ``HH:MM`` on a 24-hour clock and nothing else.
 _SNAP_SHAPE = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
@@ -303,7 +384,10 @@ def load_chain(
     included. A lake whose files contradict their own writers raises that file's own
     module's error instead, ``ExtraProjectionError`` for an overflow that is not JSON and
     ``ManifestError`` for a ledger line naming no partition. Those say the lake is damaged
-    rather than that this read found nothing, and folding them in would blur the two.
+    rather than that this read found nothing, and folding them in would blur the two. The
+    first of them reaches the rows this read is made of rather than every row of the
+    session, which the module docstring's account of the two passes settles. Sweeping a
+    partition for damage is the validation battery's job rather than this reader's.
 
     Nothing comes back empty, because an empty chain and an absent one read the same to a
     caller and mean opposite things.
@@ -323,29 +407,87 @@ def load_chain(
         if is_quarantined(entry):
             raise PartitionQuarantined(partition, entry)
 
-    projection = project_extra(pq.read_table(path), surface=CHAINS, ledger=_ledger(root))
-    if not projection.complete:
-        raise PartialRead(ticker, day_text, projection)
-    table = projection.table
-
-    is_data = pc.equal(table.column(ROW_KIND_COLUMN), ROW_KIND_DATA)
+    resolving = CLOSE_COLUMNS if snap is None else MINUTE_COLUMNS
+    resolved = _read(path, columns=list(resolving))
+    is_data = pc.equal(resolved.column(ROW_KIND_COLUMN), ROW_KIND_DATA)
     if is_data.null_count:
         raise LoadError(
             f"{ticker} {day_text} holds {is_data.null_count} rows with no "
             f"{ROW_KIND_COLUMN}, which are neither an observation nor an absence marker."
         )
-    data = table.filter(is_data)
+    data = resolved.filter(is_data)
 
     if snap is None:
-        return _at_close(table, data, ticker, day_text)
-    return _at_minute(table, data, ticker, day_text, snap)
+        selection = _at_close(resolved, data, ticker, day_text)
+    else:
+        selection = _at_minute(resolved, data, ticker, day_text, snap)
+
+    fetched = _read(path, filters=_predicate(selection, pq.read_schema(path).names))
+    projection = project_extra(fetched, surface=CHAINS, ledger=_ledger(root))
+    if not projection.complete:
+        raise PartialRead(ticker, day_text, projection)
+    table = projection.table
+    return table.filter(
+        pc.and_(
+            pc.equal(table.column(ROW_KIND_COLUMN), ROW_KIND_DATA),
+            pc.is_in(table.column(selection.column), value_set=pa.array(selection.values)),
+        )
+    )
 
 
-def _at_close(table: pa.Table, data: pa.Table, ticker: str, day: str) -> pa.Table:
-    """The rows of the session's option-close cycle, by tag and never by clock."""
+class _Selection(NamedTuple):
+    """The rows an answer is made of, as a column and the values it admits there.
+
+    Both resolutions come out as one of these, so one predicate builds the fetch and one
+    filter trims what came back for either of them. The values are the spellings the
+    resolve pass found rather than a canonical form, which is what keeps a partition
+    holding two spellings of one instant answerable whole.
+    """
+
+    column: str
+    values: tuple[str, ...]
+
+
+def _read(
+    path: Path, *, columns: list[str] | None = None, filters: ds.Expression | None = None
+) -> pa.Table:
+    """Every Parquet read of rows this module makes. Reading the schema is metadata only.
+
+    A correct predicate returns the rows a full read would, so nothing about a result says
+    whether one happened, and a wall-clock timing is not a test. This is one function so a
+    test can replace it and assert on what it was asked for.
+    """
+    return pq.read_table(path, columns=columns, filters=filters)
+
+
+def _predicate(selection: _Selection, carried: Sequence[str]) -> ds.Expression:
+    """Which rows the fetch pass reads: the answer's rows, and the ones that shape it.
+
+    The predicate has two halves. The first names the answer's rows. The second names
+    every row carrying an overflow value, wherever in the session it sits, because those
+    are the only rows that can add a promoted column and the column set has to be a
+    property of the partition rather than of the minute asked for. A row whose overflow is
+    null can fill nothing, and a row group whose statistics say every row in it is null is
+    skipped whole, so the second half is free on a partition the vendor never drifted
+    through.
+
+    A partition whose schema has no ``extra`` column at all gets the first half alone.
+    Naming a column Parquet does not have fails the scan, and what a chains table missing
+    its overflow column means belongs to ``lake.extra_projection``, which says so by name
+    the moment the fetch hands it the rows. The column set needs no protecting on such a
+    partition, because that refusal takes the read away either way.
+    """
+    rows = ds.field(selection.column).isin(selection.values)
+    if EXTRA_COLUMN not in carried:
+        return rows
+    return rows | ds.field(EXTRA_COLUMN).is_valid()
+
+
+def _at_close(resolved: pa.Table, data: pa.Table, ticker: str, day: str) -> _Selection:
+    """The session's option-close cycle, by tag and never by clock."""
     tagged = data.filter(pc.equal(data.column(CLOSE_TAG_COLUMN), OPTION_CLOSE))
     if tagged.num_rows == 0:
-        raise NoOptionClose(ticker, day, _tagged_gaps(table, OPTION_CLOSE))
+        raise NoOptionClose(ticker, day, _tagged_gaps(resolved, OPTION_CLOSE))
     spellings = pc.unique(tagged.column(SNAP_TS_COLUMN)).to_pylist()
     instants = {_instant(text) for text in spellings}
     if None in instants:
@@ -358,16 +500,16 @@ def _at_close(table: pa.Table, data: pa.Table, ticker: str, day: str) -> pa.Tabl
             f"{ticker} {day} tags {OPTION_CLOSE} on {len(instants)} cycles, "
             f"{sorted(str(moment) for moment in instants)}. A close of record is one cycle."
         )
-    return tagged
+    return _Selection(CLOSE_TAG_COLUMN, (OPTION_CLOSE,))
 
 
-def _at_minute(table: pa.Table, data: pa.Table, ticker: str, day: str, snap: str) -> pa.Table:
+def _at_minute(resolved: pa.Table, data: pa.Table, ticker: str, day: str, snap: str) -> _Selection:
     """The rows whose ``snap_ts`` is the ET wall-clock minute ``snap`` on ``day``."""
     target = _target_instant(day, snap)
     naming, unreadable = _read_snaps(data.column(SNAP_TS_COLUMN), target)
     if not naming:
-        raise SnapAbsent(ticker, day, snap, _gaps_at(table, target), unreadable)
-    return data.filter(pc.is_in(data.column(SNAP_TS_COLUMN), value_set=pa.array(naming)))
+        raise SnapAbsent(ticker, day, snap, _gaps_at(resolved, target), unreadable)
+    return _Selection(SNAP_TS_COLUMN, tuple(naming))
 
 
 def _gaps_at(table: pa.Table, target: datetime) -> int:
