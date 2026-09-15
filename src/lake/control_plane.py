@@ -564,6 +564,12 @@ def self_check(
 ) -> SelfCheckOutcome:
     """Verify the daemon is up and holding its assertion, and ping only then.
 
+    ``publisher`` carries the page a refused ping raises. With none, a refusal is named
+    in ``problem`` and pages nobody, which is what lets a test drive this helper without
+    a page reaching anywhere. A page needs a moment to stamp, so a caller that passes no
+    ``now`` escalates nothing, the same answer ``_assertion_owed`` gives above. The
+    command line always passes one.
+
     The ping means awake, daemon up, and the machine held awake. A missed ping means
     one of those failed, paged a full hour before the bell. So the ping fires only on
     the success condition. A down daemon exits without pinging. A raising probe
@@ -1623,18 +1629,17 @@ def sunday_maintenance(
     run, which costs a report line and never a ping. The command line always passes
     one.
 
+    The coverage assertion needs the token's mint time. ``mint`` is ``None`` when the
+    caller could not read it, and that withholds the ping. A ping that is attempted
+    and fails is named in ``problems`` rather than raised, so the run still reports
+    the scrub, the canary, and the coverage verdict it just spent its time computing.
+    A coverage assertion that never ran must not read as a pass.
+
     ``escalation`` carries the page a refused ping raises, and it is the caller's object
     rather than one built here because ``sunday_run`` re-runs this whole job every half
     hour while anything is failing. See the comment at the ping itself. With none, a
     refusal is named in ``problems`` and pages nobody, which is what lets a test drive
     this helper without a page reaching anywhere.
-
-    The
-    coverage assertion needs the token's mint time. ``mint`` is ``None`` when the
-    caller could not read it, and that withholds the ping. A ping that is attempted
-    and fails is named in ``problems`` rather than raised, so the run still reports
-    the scrub, the canary, and the coverage verdict it just spent its time computing.
-    A coverage assertion that never ran must not read as a pass.
 
     Four duties the design gives the Sunday run are not built here. Each is named so
     the gap is a decision rather than an oversight.
@@ -1802,6 +1807,10 @@ def sunday_run(
     publisher's contract rather than every caller's. ``reminder_publisher`` is the
     production sink and holds that promise for this one. With no sink the reminder is
     still decided and still returned on the outcome, and nothing pushes it.
+
+    ``publisher`` is where a refused ping pages, and it is the same one the reminder
+    pushes through. One guard covers the whole evening rather than one attempt, for the
+    reason the loop below gives. With no publisher nothing escalates.
     """
     start = clock.now().astimezone(MARKET_TZ)
     in_the_window = start.weekday() == _PY_SUNDAY and SUNDAY_MAINTENANCE.on(start.date()) <= start

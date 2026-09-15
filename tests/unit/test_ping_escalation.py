@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from lake.alert import PAGE_PRIORITY, Publisher
+from lake.alert import CAP_REACHED, PAGE_PRIORITY, POST_FAILED, Delivery, Publisher
 from lake.calendar import MARKET_TZ
 from lake.compact import COMPACTION_SLUG
 from lake.control_plane import CALENDAR_PROBE_SLUG, PRE_OPEN_SLUG, SUNDAY_SLUG
@@ -68,16 +68,22 @@ def _refused(status: int = 404, slug: str = COMPACTION_SLUG) -> urllib.error.HTT
 
 
 class _Sink:
-    """A publisher recording each page. The real one POSTs to ntfy."""
+    """A publisher recording each page. The real one POSTs to ntfy.
 
-    def __init__(self) -> None:
+    It answers a ``Delivery`` because the real one does, and because what that object
+    says is now load-bearing: a page that did not reach the phone must not spend the
+    once-per-slug guard. A fake answering ``None`` would hide that.
+    """
+
+    def __init__(self, delivery: Delivery | None = None) -> None:
         self.sent: list = []
         self.moments: list[datetime] = []
+        self._delivery = Delivery(True) if delivery is None else delivery
 
     def publish(self, message, *, now):
         self.sent.append(message)
         self.moments.append(now)
-        return None
+        return self._delivery
 
 
 # -- telling a refusal from a ping that never landed --------------------------
@@ -112,12 +118,28 @@ def test_a_healthchecks_outage_stays_on_the_transport_side(status):
     assert refused_status(_refused(status)) is None
 
 
-@pytest.mark.parametrize("status", [400, 403, 404, 429])
-def test_any_client_error_means_the_ping_feeds_no_check(status):
-    # A ping URL is a ping key and a slug. A 4xx on one means healthchecks read the
-    # request and refused it, so either the row is missing or the key is wrong. Both are
-    # permanent, both repeat every run, and no check reports either.
+def test_the_rate_limit_is_not_a_missing_row():
+    # healthchecks answers 429 when one check is pinged more than five times a minute.
+    # That says the row exists and is being fed too fast, which is the opposite of the
+    # failure here, and it clears on its own. A page would name a repair nobody owes.
+    assert refused_status(_refused(429)) is None
+
+
+@pytest.mark.parametrize("status", [400, 404, 409])
+def test_a_status_healthchecks_would_not_record_pages(status):
+    # 404 is a slug with no row, 409 a slug matching more than one, and 400 a malformed
+    # ping URL. None feeds a check, none clears on its own, and no check reports any of
+    # them because no check is being fed.
     assert refused_status(_refused(status)) == status
+
+
+def test_the_page_names_no_repair_it_cannot_know_is_owed():
+    # Three statuses reach the page and their repairs differ. A body reading "create the
+    # row" would send the operator after a row that already exists when the answer was a
+    # 409, so the body states the effect instead.
+    body = ping_refused_page(SUNDAY_SLUG, 409).body
+    assert "409" in body and SUNDAY_SLUG in body
+    assert "create" not in body.lower()
 
 
 # -- the page itself ----------------------------------------------------------
@@ -146,6 +168,49 @@ def test_a_ping_lost_in_transport_pages_nothing(exc):
     sink = _Sink()
     assert not escalate_ping_failure(exc, slug=COMPACTION_SLUG, publisher=sink, now=NOW)
     assert sink.sent == []
+
+
+def test_a_page_that_never_left_the_laptop_leaves_the_slug_armed():
+    """ntfy down at the moment of the first refusal must not silence the slug for good.
+
+    The guard is spent by a page that reached the phone, never by one that was only
+    attempted. ``DeadMan`` holds its guard for the daemon's whole life and re-arms only
+    on a ping that lands, which by construction never happens while the row is missing.
+    So spending the guard on a failed POST would lose the page until the daemon restarts.
+    """
+    down = _Sink(Delivery(False, POST_FAILED, recorded=True))
+    escalation = SlugEscalation(down)
+    assert not escalation.failed(_refused(), slug=CAPTURE_SLUG, now=NOW)
+    assert len(down.sent) == 1
+    # ntfy comes back, and the next refusal reaches the phone.
+    down._delivery = Delivery(True)
+    assert escalation.failed(_refused(), slug=CAPTURE_SLUG, now=NOW)
+    assert not escalation.failed(_refused(), slug=CAPTURE_SLUG, now=NOW)
+    assert len(down.sent) == 2
+
+
+def test_a_page_the_cap_swallowed_also_leaves_the_slug_armed():
+    # The day's cap is the publisher's own decision and it turns over with the date, so
+    # the same rule holds: nobody was told, so nothing is spent.
+    capped = _Sink(Delivery(False, CAP_REACHED, recorded=True))
+    escalation = SlugEscalation(capped)
+    assert not escalation.failed(_refused(), slug=CAPTURE_SLUG, now=NOW)
+    assert not escalation.failed(_refused(), slug=CAPTURE_SLUG, now=NOW)
+    assert len(capped.sent) == 2
+
+
+def test_a_page_that_did_not_go_is_named_on_stderr(capsys):
+    # A page lost quietly is invisible, which is the failure this module exists to stop.
+    # The assertion page and the Sunday reminder already name theirs the same way.
+    escalate_ping_failure(
+        _refused(),
+        slug=CAPTURE_SLUG,
+        publisher=_Sink(Delivery(False, POST_FAILED, recorded=True)),
+        now=NOW,
+    )
+    printed = capsys.readouterr().err
+    assert CAPTURE_SLUG in printed and POST_FAILED in printed
+    assert PING_KEY not in printed
 
 
 def test_a_producer_with_no_publisher_pages_nothing():

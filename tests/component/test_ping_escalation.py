@@ -31,7 +31,7 @@ import pytest
 from lake import compact as compact_module
 from lake import control_plane as cp
 from lake import probe_calendar as probe_module
-from lake.alert import Message
+from lake.alert import Delivery, Message
 from lake.compact import COMPACTION_SLUG, compact
 from lake.control_plane import CALENDAR_PROBE_SLUG, PRE_OPEN_SLUG, SUNDAY_SLUG
 from lake.deadman import CAPTURE_SLUG, DeadMan
@@ -63,13 +63,19 @@ class Refusing:
     This is the failure the compaction job ran into on every run it ever made. It is a
     ``URLError`` subclass, so every call site's existing ``PING_FAILURES`` catch already
     swallowed it into a log line.
+
+    It records the URL before raising, the way ``FakePinger`` does, so a root test can
+    also read which check the composition root addressed. A page naming the right slug
+    over a URL built from the wrong one would be a silent misdirection.
     """
 
     def __init__(self, slug: str = COMPACTION_SLUG, status: int = 404) -> None:
         self._slug = slug
         self._status = status
+        self.urls: list[str] = []
 
     def ping(self, url: str) -> None:
+        self.urls.append(url)
         raise urllib.error.HTTPError(url, self._status, "Not Found", {}, None)
 
 
@@ -81,14 +87,18 @@ class Unreachable:
 
 
 class Sink:
-    """A publisher recording each page. The real one POSTs to ntfy."""
+    """A publisher recording each page. The real one POSTs to ntfy.
+
+    It answers a ``Delivery`` because the real one does, and because what that object
+    says decides whether the once-per-slug guard is spent.
+    """
 
     def __init__(self) -> None:
         self.sent: list[Message] = []
 
     def publish(self, message, *, now):
         self.sent.append(message)
-        return None
+        return Delivery(True)
 
 
 def _paged(sink: Sink) -> list[str]:
@@ -344,11 +354,17 @@ def test_the_calendar_probe_entry_pages_through_a_real_publisher(tmp_path, monke
         def get_quotes(self, symbols):
             return {}
 
+    pinger = Refusing(CALENDAR_PROBE_SLUG)
     monkeypatch.setattr("lake.schwab.SchwabVendor", _Vendor)
-    monkeypatch.setattr("lake.runner.UrllibPinger", Refusing)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
     monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: transport)
     probe_module.main(["--config", str(config), "--tickers", str(tickers), "--token", str(token)])
     assert [m.body.split(":")[0] for m in _refused_pages(transport)] == [CALENDAR_PROBE_SLUG]
+    # The slug the page names and the slug the URL addresses are built at this root from
+    # one constant, and only reading both holds them together. A URL built from another
+    # check's slug would feed that check and page under this one's name, and every other
+    # root is held this way already.
+    assert pinger.urls == [_url(CALENDAR_PROBE_SLUG)]
 
 
 def test_the_self_check_entry_pages_through_a_real_publisher(tmp_path, monkeypatch, capsys):

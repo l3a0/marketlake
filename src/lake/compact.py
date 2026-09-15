@@ -1587,8 +1587,8 @@ def compact(
     it. When given, ``ping_url`` is required.
 
     ``publisher`` carries the schema-drift page and the refused-ping page, and it follows
-    ``pinger`` exactly. Both reach
-    past this process, so ``main`` builds them and never accepts them, and a test drives
+    ``pinger`` exactly. Both reach past this process, so ``main`` builds them and never
+    accepts them, and a test drives
     this helper with a fake instead. It is optional for the same reason ``pinger`` is: a
     caller with nowhere to page skips it, and the default is ``None`` rather than a live
     object, so omitting it can never reach a real phone. What a run without one loses is
