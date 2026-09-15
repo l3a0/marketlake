@@ -238,15 +238,17 @@ def _convert(field_type: pa.DataType, value: object) -> tuple[object, str | None
     the converted value back out rather than the raw one only keeps the cells one Python
     type on the way there, which leaves the rebuild nothing to widen.
 
-    Raw Arrow refuses every conversion here that would change a value, with one exception
-    it performs silently: a boolean into a floating column returns ``1.0``. A boolean is
-    therefore checked by hand before the builder sees it, because ``True`` arriving where a
-    price belongs is drift to report, not a number.
+    Arrow's own conversion refuses everything here that would change a value, with one
+    exception it performs silently: a boolean into a floating column returns ``1.0``. A
+    boolean is therefore checked by hand before the builder sees it, because ``True``
+    arriving where a price belongs is drift to report, not a number.
 
-    The builder now refuses that same boolean on its own, so this is a second answer to one
-    question rather than the only one. It stays because it is what names the reason a
-    reader sees, ``boolean value in a double column`` rather than the builder's own
-    wording, and because it covers a column type the pinned schemas do not carry yet.
+    ``journal.typed_column`` now refuses that boolean too, for every type the pinned schemas
+    carry, so this check no longer decides whether the value lands. What it still decides is
+    what a reader is told, ``boolean value in a double column`` rather than Arrow's
+    ``Expected double, got bool``. It also still decides the outcome for a floating type no
+    pinned column carries yet, since ``pa.array([True], type=pa.float32())`` returns ``1.0``
+    and the builder's check names ``float64`` alone.
     """
     if isinstance(value, bool) and field_type != pa.bool_():
         return None, f"boolean value in a {field_type} column"

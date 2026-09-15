@@ -1396,11 +1396,13 @@ def test_a_bool_in_a_double_column_never_lands_as_one_or_zero():
     one-dollar bid, which is why this was the silent member of the corruption class on the
     65 double columns, the way the fractional float was on the 29 integer ones.
 
-    Both bools are checked, because ``False`` landing as ``0.0`` is the same corruption
-    wearing a value an empty book plausibly carries.
+    Both bools are checked. ``False`` landing as ``0.0`` is the same corruption, and a zero
+    bid reads as an ordinary empty book, so it passes inspection just as readily.
 
-    The comparison is type-strict on purpose. ``1.0 == True`` is true in Python, so a test
-    that compared values alone would pass against the bug rather than catch it.
+    The null column is what catches the bug. The type-strict check on the routed value holds
+    something else: that what reaches ``extra`` is the vendor's own ``True`` rather than the
+    ``1.0`` the conversion would have made of it. ``1.0 == True`` is true in Python, so that
+    second guarantee needs ``is`` to say anything at all.
     """
     for value in (True, False):
         row = _chain_row(bid=value)
@@ -1414,9 +1416,9 @@ def test_a_bool_after_a_float_in_the_same_double_column_never_lands_as_a_price()
     """Two contracts, the first a real price and the second a bool.
 
     Arrow reads a column's type from its first non-null value and widens the later ones
-    into it, so ``[True]`` infers ``bool`` while ``[1500.0, True]`` infers ``double`` and
-    the inferred type can no longer tell the bool from a real 1. Ordering is what hides
-    it, so checking the bool alone in the column would miss this ordering entirely.
+    into it, so ``[True, 1500.0]`` raises during inference while ``[1500.0, True]`` does
+    not. A test that offered the bool first would pass on a fix that read the inferred type
+    and never scanned, which is the fix this column shape exists to rule out.
 
     The contract that sent the bool loses its column and keeps its value in ``extra``. The
     contracts around it keep the prices they sent, so one drifted row costs one row.
@@ -1457,15 +1459,46 @@ def test_a_bool_in_a_double_quote_column_routes_the_same_way():
     assert overflow["askPrice"] is False
 
 
+def test_a_bool_beside_a_string_in_a_double_column_is_routed_rather_than_kept():
+    """The shape where the routing itself used to let the bool through.
+
+    Two contracts, one sending ``true`` and one sending a string. The string refused the
+    whole-column build, so the routing's per-value scan ran. That scan asks ``_fits``, which
+    answered that the bool belonged in a double column, so only the string was nulled and
+    the bool was rebuilt into the column as ``1.0``.
+
+    That is worse than the plain case. The row carried a drift signature, a known field's
+    name in ``extra``, which is the thing an operator pages on, and the value beside it was
+    corrupted anyway. Both contracts must lose their column and keep their own value.
+    """
+    contracts = [
+        _full_contract(symbol=f"SPY   260918C0065000{i}", bid=value)
+        for i, value in enumerate((True, "n/a"))
+    ]
+    batch = journal.chains_data_batch(
+        _chain_of(*contracts), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
+    )
+    assert batch.column("bid").to_pylist() == [None, None]
+    routed = [json.loads(row["extra"])["bid"] for row in batch.to_pylist()]
+    assert routed[0] is True
+    assert routed[1] == "n/a"
+
+
 def test_an_ordinary_all_float_double_column_is_unaffected():
     """The control. A column of real prices still lands, unchanged and un-routed.
 
     The scan added to the double route runs on every cycle, including this one, so a
-    version of it that refused a legitimate price would gap every chain. Zero and a
-    whole-numbered float are included because they are the floats a bool converts to, and
-    a scan written against values rather than types would refuse exactly these.
+    version of it that refused a legitimate price would gap every chain.
+
+    Three of the five values are there to refuse a specific wrong scan.
+
+    1. ``0.0`` and ``1.0`` are the floats a bool converts to, so a scan written against
+       values rather than types would refuse exactly these.
+    2. ``5`` is a plain integer, which is what a vendor sends for a whole-dollar price.
+       ``bool`` is a subclass of ``int``, so a scan widened from ``bool`` to ``int`` looks
+       like a harmless simplification and would refuse every integer price on the surface.
     """
-    values = (1500.0, 0.0, 1.0, 2.5, 0.01)
+    values = (1500.0, 0.0, 1.0, 5, 0.01)
     contracts = [
         _full_contract(symbol=f"SPY   260918C0065000{i}", bid=value)
         for i, value in enumerate(values)
@@ -1473,8 +1506,11 @@ def test_an_ordinary_all_float_double_column_is_unaffected():
     batch = journal.chains_data_batch(
         _chain_of(*contracts), ticker="SPY", snap_ts=SNAP, fetch_ts=FETCH
     )
+    landed = batch.column("bid").to_pylist()
     assert batch.column("bid").type == pa.float64()
-    assert batch.column("bid").to_pylist() == list(values)
+    assert landed == [float(value) for value in values]
+    # The integer lands as the float its column is, never refused and never left an integer.
+    assert all(type(cell) is float for cell in landed)
     assert all(row["extra"] is None for row in batch.to_pylist())
 
 
@@ -1484,7 +1520,8 @@ def test_a_bool_is_refused_by_a_double_column_the_way_an_integer_column_refuses_
     The two column types disagreed before this. The same vendor ``true`` was refused in
     ``total_volume``, an ``int64`` column, and accepted in ``bid``, a ``double`` one. The
     check runs against ``typed_column`` directly, because that is the one place the answer
-    is decided and every route into it goes through there.
+    is decided, and the three routes that ask it, the row build, the per-value scan behind
+    the routing, and the read-time projection, all inherit whatever it says.
 
     The exception class is checked rather than only the refusal. ``lake.capture`` records
     a gap under the exception's own name, so a double column refusing under a different

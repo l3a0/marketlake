@@ -733,9 +733,12 @@ def test_a_value_the_column_refuses_stays_in_the_overflow_and_is_reported():
 def test_a_boolean_is_refused_by_a_numeric_column_rather_than_landing_as_one():
     """Arrow turns ``True`` into ``1.0`` for a floating column without complaint.
 
-    That is the one conversion here that changes a value silently, so it is checked by
-    hand. A comparison against ``1.0`` would pass on the broken behaviour, so the test
-    asserts the cell is null and the refusal is reported.
+    Two checks refuse it now. ``journal.typed_column`` raises on a bool in a double column,
+    and the by-hand check in ``_convert`` runs first and names the reason. Either one alone
+    keeps the value out of the cell, so what this asserts is the outcome both agree on.
+
+    A comparison against ``1.0`` would pass on the broken behaviour, so the test asserts the
+    cell is null and the refusal is reported.
     """
     table = _rows(_row(1, {"bid": True}))
 
@@ -890,12 +893,13 @@ def test_the_reader_asks_the_writer_s_list_rather_than_carrying_a_copy():
 def test_a_boolean_is_named_as_one_in_every_column_that_is_not_boolean():
     """The hand-checked guard runs ahead of Arrow for every type, not only a floating one.
 
-    ``True`` into a floating column is the case the guard exists for, because Arrow takes
-    it silently as ``1.0``. An integer or string column refuses it on its own, so narrowing
-    the guard to floating columns would leave every value where it is and change only what
-    an operator reads. ``ArrowTypeError: Expected integer, got bool`` describes Arrow's
-    machinery, while the guard's own text names the drift, and the report is the whole
-    output of a refusal.
+    ``True`` into a floating column is the case the guard was written for, because Arrow
+    takes it silently as ``1.0``. ``journal.typed_column`` refuses that shape itself now, on
+    every one of the four pinned types, so removing the guard entirely would leave every
+    value where it is and change only what an operator reads. That text is the reason the
+    guard stays. ``ArrowTypeError: Expected integer, got bool`` describes Arrow's machinery,
+    while the guard's own text names the drift, and the report is the whole output of a
+    refusal.
     """
     table = _rows(_row(1, {"openInterest": True}), _row(1, {"optionRoot": True}))
 
