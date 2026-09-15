@@ -87,7 +87,7 @@ import shlex
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -107,6 +107,7 @@ from lake.runner import (
     calendar_interval,
     escalate_ping_failure,
 )
+from lake.token_epoch import epoch_second_to_utc
 from lake.vendor import Vendor
 
 # -- the wall-clock constants ------------------------------------------------
@@ -2023,7 +2024,10 @@ def read_token_mint(token_path: Path | str) -> datetime:
     ``schwab-py`` writes ``creation_timestamp`` beside the token, the epoch second of
     the last full browser re-auth. This reads that one field and nothing else, so the
     secret half of the file never leaves the parser. Any failure raises
-    ``ValueError`` and the caller treats it as a problem, never as a skip.
+    ``ValueError`` and the caller treats it as a problem, never as a skip. The value
+    itself is untrusted, so the conversion runs through ``token_epoch``'s shared
+    policy, the same one ``schwab.token_mint_time`` calls on the live client's copy of
+    the same field.
     """
     path = Path(token_path)
     try:
@@ -2035,14 +2039,7 @@ def read_token_mint(token_path: Path | str) -> datetime:
     created = payload.get("creation_timestamp") if isinstance(payload, dict) else None
     if created is None:
         raise ValueError("token file has no creation_timestamp")
-    # A bool is an int to Python and a numeric string is a float to float(). Neither
-    # is a stamp schwab-py writes, so both are refused before the conversion.
-    if isinstance(created, bool) or not isinstance(created, (int, float)):
-        raise ValueError("creation_timestamp is not an epoch second")
-    try:
-        return datetime.fromtimestamp(float(created), tz=UTC)
-    except (OverflowError, OSError, ValueError) as exc:
-        raise ValueError("creation_timestamp is not an epoch second") from exc
+    return epoch_second_to_utc(created)
 
 
 def sunday_canary_due(minted_at: datetime) -> datetime:

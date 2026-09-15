@@ -46,7 +46,19 @@ def test_a_file_that_is_not_json_raises(tmp_path):
 def test_a_file_without_the_field_raises(tmp_path):
     path = tmp_path / "token.json"
     path.write_text(json.dumps({"token": {}}))
-    with pytest.raises(ValueError, match="creation_timestamp"):
+    # This message is distinct from the shared guard's "is not an epoch second", so
+    # the match pins the file's own missing-field check rather than the generic one.
+    with pytest.raises(ValueError, match="has no creation_timestamp"):
+        read_token_mint(path)
+
+
+def test_a_file_whose_payload_is_not_an_object_raises(tmp_path):
+    # A JSON array parses without error, so nothing upstream catches it. It must be
+    # treated the same as a missing field rather than reaching payload.get() and
+    # raising AttributeError instead of the ValueError this reader promises.
+    path = tmp_path / "token.json"
+    path.write_text(json.dumps([1, 2, 3]))
+    with pytest.raises(ValueError, match="has no creation_timestamp"):
         read_token_mint(path)
 
 
@@ -66,7 +78,7 @@ def test_an_out_of_range_timestamp_raises(tmp_path):
 
 def test_a_bool_or_numeric_string_is_refused(tmp_path):
     path = tmp_path / "token.json"
-    for stamp in (True, "1756596600"):
+    for stamp in (True, False, "1756596600"):
         path.write_text(json.dumps({"creation_timestamp": stamp}))
         with pytest.raises(ValueError, match="epoch second"):
             read_token_mint(path)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from types import MappingProxyType
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -10,23 +11,48 @@ import pytest
 from lake import journal, probe_calendar
 from lake.control_plane import CALENDAR_PROBE_SLUG
 from lake.probe_calendar import ProbeResult, Reading, read_batch, run_probe
+from lake.schwab import SchwabVendor
+from lake.vendor import VendorResponse
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
+from tests.support.schwab import FakeResponse, FakeSchwabClient
 
 ET = ZoneInfo("America/New_York")
 WEEK = date(2026, 8, 31)
 SATURDAY = date(2026, 9, 5)
+
+# `_probe` builds the vendor reply itself unless a test overrides it. The sentinel keeps
+# `None` available as an override, since a `fetch` returning nothing is one of the shapes
+# the probe has to report rather than raise on.
+NO_OVERRIDE = object()
 
 
 def _quote(at: datetime) -> dict:
     return {"quote": {"quoteTime": int(at.timestamp() * 1000)}}
 
 
-def _probe(at: datetime, quotes: dict | None = None, *, boom: bool = False) -> ProbeResult:
+def _probe(
+    at: datetime,
+    quotes: dict | None = None,
+    *,
+    boom: bool = False,
+    status: int = 200,
+    reply: object = NO_OVERRIDE,
+) -> ProbeResult:
+    """Run the probe against a reply in the shape the real vendor hands back.
+
+    ``SchwabVendor.get_quotes`` returns a ``VendorResponse``, and ``main`` wires it
+    straight in. This fake returned a bare dict, a shape production never produces, which
+    is what hid the probe reading the whole response as a batch of quotes. ``reply``
+    overrides the whole thing, for the shapes a ``VendorResponse`` cannot express.
+    """
+
     def fetch(symbols):
         if boom:
             raise ConnectionError("vendor unreachable")
-        return quotes or {}
+        if reply is not NO_OVERRIDE:
+            return reply
+        return VendorResponse(status=status, body=quotes if quotes is not None else {}, headers={})
 
     return run_probe(
         calendar=weekday_sessions(WEEK),
@@ -43,7 +69,7 @@ def test_a_session_day_asks_the_vendor_nothing():
         calendar=weekday_sessions(WEEK),
         clock=ManualClock(start=et(2026, 9, 2, 9, 35)),
         symbols=["SPY"],
-        fetch=lambda symbols: asked.append(symbols) or {},
+        fetch=lambda symbols: asked.append(symbols) or VendorResponse(status=200, body={}),
     )
     assert not result.checked
     assert not result.pages
@@ -257,6 +283,265 @@ def test_the_transform_is_the_shared_one_rather_than_a_third_copy():
     assert stamp.utcoffset() == timedelta(0)
 
 
+# -- the reply the vendor actually hands back ----------------------------------------
+
+
+def test_the_vendor_response_the_daemon_wires_is_unwrapped_rather_than_raising():
+    # `main` wires `fetch=vendor.get_quotes`, which returns a `VendorResponse` of
+    # `status`, `body` and `headers`. The reader was handed that whole response and asked
+    # it for symbols, which raised `AttributeError` before `report` could ping. The one
+    # check that asks someone else whether a closed day is really closed could not have
+    # survived reaching the vendor. Every other caller unwraps before reading.
+    result = run_probe(
+        calendar=weekday_sessions(WEEK),
+        clock=ManualClock(start=et(2026, 9, 5, 9, 35)),
+        symbols=["SPY", "QQQ"],
+        fetch=lambda symbols: VendorResponse(
+            status=200,
+            body={"SPY": _quote(et(2026, 9, 5, 9, 34)), "QQQ": _quote(et(2026, 9, 4, 16, 0))},
+            headers={},
+        ),
+    )
+    assert result.checked
+    assert result.problem is None
+    assert result.trading == ("SPY",)
+    assert result.pages
+
+
+def test_the_probe_reads_what_the_real_vendor_builds():
+    # The shape end to end, through the real `SchwabVendor` over a fake client. A
+    # hand-built fixture can drift from what production returns, which is exactly what
+    # happened here. This one cannot drift, because the vendor under test builds it.
+    symbols = ("SPY", "QQQ")
+    body = {"SPY": _quote(et(2026, 9, 5, 9, 34)), "QQQ": _quote(et(2026, 9, 4, 16, 0))}
+    client = FakeSchwabClient(quotes={symbols: FakeResponse(status_code=200, body=body)})
+    result = run_probe(
+        calendar=weekday_sessions(WEEK),
+        clock=ManualClock(start=et(2026, 9, 5, 9, 35)),
+        symbols=list(symbols),
+        fetch=SchwabVendor(client).get_quotes,
+    )
+    assert result.trading == ("SPY",)
+    assert result.pages
+
+
+@pytest.mark.parametrize("status", [199, 300, 302, 401, 429, 500])
+def test_a_status_that_is_not_a_success_is_a_problem_and_never_a_page(status):
+    # Schwab reports a dead token and a throttle as a status on a returned reply rather
+    # than as a raise, which is why the Sunday canary checks the status explicitly. A
+    # probe that never looks reads a dead token as the calendar being right. The body
+    # here carries today's stamp, so a probe that skipped the status would page on it.
+    # Both ends of the range are here rather than three failure codes in the middle. An
+    # expired Schwab session redirects to a consent page, and a 302 read as success walks
+    # past the one fact worth reporting.
+    result = _probe(
+        et(2026, 9, 5, 9, 35),
+        {"SPY": _quote(et(2026, 9, 5, 9, 34))},
+        status=status,
+    )
+    assert result.checked
+    assert not result.pages
+    assert result.problem == f"vendor returned http {status}"
+
+
+@pytest.mark.parametrize("status", [200, 204, 299])
+def test_every_success_status_reads_the_batch_rather_than_reporting_a_problem(status):
+    # The other half of the range. Without it the predicate can shrink to the exact codes
+    # the failure cases name and stay green.
+    result = _probe(
+        et(2026, 9, 5, 9, 35),
+        {"SPY": _quote(et(2026, 9, 5, 9, 34))},
+        status=status,
+    )
+    assert result.problem is None
+    assert result.trading == ("SPY",)
+    assert result.pages
+
+
+def test_a_dead_token_carrying_an_error_body_names_the_status_not_the_body():
+    # Both conditions hold at once, which is the ordinary Schwab shape for a dead token.
+    # The status is read first because it says the token is dead. The body problem would
+    # send the operator to inspect a payload while the thing to fix is the credential.
+    result = _probe(et(2026, 9, 5, 9, 35), {"errors": [{"status": "401"}]}, status=401)
+    assert result.problem == "vendor returned http 401"
+
+
+def test_a_reply_carrying_a_status_and_no_body_names_the_body():
+    class _NoBody:
+        status = 200
+
+    result = _probe(et(2026, 9, 5, 9, 35), reply=_NoBody())
+    assert result.checked
+    assert not result.pages
+    assert result.problem == "unreadable vendor body: NoneType"
+
+
+def test_a_body_that_is_a_mapping_and_not_a_dict_is_still_read():
+    # `VendorResponse.body` declares `Mapping`, so the check honours the declared type
+    # rather than narrowing to the one shape `json.loads` happens to produce.
+    stamp = int(et(2026, 9, 5, 9, 34).timestamp() * 1000)
+    body = MappingProxyType({"SPY": {"quote": {"quoteTime": stamp}}})
+    result = _probe(et(2026, 9, 5, 9, 35), reply=VendorResponse(status=200, body=body))
+    assert result.trading == ("SPY",)
+    assert result.pages
+
+
+def test_an_envelope_that_is_a_mapping_and_not_a_dict_is_not_an_answer():
+    # The reader opens an envelope only when it is a `dict`, so counting a wider type as
+    # an answer here would hand it a stamp it then reads as absent. That is the quiet day
+    # this whole change exists to stop, one layer further in. The two checks agree on what
+    # an envelope is, deliberately, and this is what says so.
+    stamp = int(et(2026, 9, 5, 9, 34).timestamp() * 1000)
+    envelope = MappingProxyType({"quote": {"quoteTime": stamp}})
+    result = _probe(et(2026, 9, 5, 9, 35), {"SPY": envelope, "QQQ": envelope})
+    assert result.checked
+    assert not result.pages
+    assert result.problem == "no quote envelope for any of the 2 symbols the vendor named"
+
+
+def test_no_reply_the_probe_cannot_read_invents_a_count_or_a_trading_symbol():
+    # `refused` feeds the operator line's partly-unreadable wording and `trading` fires the
+    # page. A reply the probe never opened has no stamp to refuse and no symbol to name, so
+    # both are structurally zero and nothing on this path may set either.
+    replies = [
+        "not a reply",
+        VendorResponse(status="200", body={}),
+        VendorResponse(status=401, body={"SPY": _quote(et(2026, 9, 5, 9, 34))}),
+        VendorResponse(status=200, body=[]),
+        VendorResponse(status=200, body={"errors": []}),
+        VendorResponse(status=200, body={"SPY": "ERROR"}),
+    ]
+    for reply in replies:
+        result = _probe(et(2026, 9, 5, 9, 35), reply=reply)
+        assert result.problem is not None
+        assert result.refused == 0
+        assert result.trading == ()
+        assert not result.pages
+
+
+def test_an_error_body_is_a_problem_rather_than_a_quiet_day():
+    # `{"errors": [...]}` is a mapping carrying no envelope the probe recognises, so every
+    # symbol read as absent, and an absent stamp is deliberately not a problem. The line
+    # printed `calendar agrees` on a day the vendor had answered nothing at all.
+    result = _probe(et(2026, 9, 5, 9, 35), {"errors": [{"status": "400"}]})
+    assert result.checked
+    assert not result.pages
+    assert result.problem == "vendor named none of the 2 symbols asked for"
+
+
+def test_a_batch_of_malformed_envelopes_is_a_problem_rather_than_a_quiet_day():
+    # A roster of garbage envelopes read as an ordinary quiet day, because each one
+    # classified as an absent stamp and a batch of absent stamps reports no problem. The
+    # line says the payload changed shape rather than that the roster went unanswered,
+    # because the vendor named both symbols and those are different things to look at.
+    result = _probe(et(2026, 9, 5, 9, 35), {"SPY": "ERROR", "QQQ": "ERROR"})
+    assert result.checked
+    assert not result.pages
+    assert result.problem == "no quote envelope for any of the 2 symbols the vendor named"
+
+
+def test_a_reply_naming_none_of_the_symbols_asked_for_is_a_problem():
+    # A reply naming none of the roster read exactly like one naming all of it with every
+    # stamp absent. `run_probe` knows the list it asked about and threw it away. The
+    # unasked-for symbol here is stamped today, so dropping the comparison turns this
+    # reply into a page.
+    result = _probe(et(2026, 9, 5, 9, 35), {"IWM": _quote(et(2026, 9, 5, 9, 34))})
+    assert result.checked
+    assert not result.pages
+    assert result.trading == ()
+    assert result.problem == "vendor named none of the 2 symbols asked for"
+
+
+@pytest.mark.parametrize("body", [[], "ERROR", None, 7])
+def test_a_body_that_is_not_a_batch_of_quotes_is_a_problem(body):
+    # A payload that changed shape is a different thing to go and look at than one that
+    # simply omitted the roster, so it says so rather than being folded into the count.
+    result = _probe(et(2026, 9, 5, 9, 35), reply=VendorResponse(status=200, body=body))
+    assert result.checked
+    assert not result.pages
+    assert result.problem == f"unreadable vendor body: {type(body).__name__}"
+
+
+@pytest.mark.parametrize("reply", [{"SPY": {"quote": {}}}, None, "ERROR"])
+def test_a_reply_that_is_not_a_vendor_response_is_a_problem_rather_than_a_raise(reply):
+    # The bare dict the fixtures used to hand back is the first of these. Nothing on this
+    # path may raise, because a raise costs the healthchecks ping as well as the answer,
+    # and the check is what says the probe stopped running.
+    result = _probe(et(2026, 9, 5, 9, 35), reply=reply)
+    assert result.checked
+    assert not result.pages
+    assert result.problem == f"not a vendor reply: {type(reply).__name__}"
+
+
+@pytest.mark.parametrize("status", ["200", 200.0, None])
+def test_a_status_of_the_wrong_type_names_the_status_rather_than_the_reply(status):
+    # This one is a vendor reply. Its status is the half the probe cannot read, and a line
+    # naming the reply type sends the operator to look at the half that is fine.
+    result = _probe(et(2026, 9, 5, 9, 35), reply=VendorResponse(status=status, body={}))
+    assert result.checked
+    assert not result.pages
+    assert result.problem == f"unreadable vendor status: {type(status).__name__}"
+
+
+def test_a_symbol_nobody_asked_about_never_reaches_the_reader():
+    # Counting the answers is not enough on its own. One answering roster symbol clears
+    # the count, and before the batch was narrowed an unasked-for ticker beside it still
+    # set `trading` and fired a priority-5 page naming a symbol nobody asked to watch.
+    result = _probe(
+        et(2026, 9, 5, 9, 35),
+        {"SPY": {"quote": {}}, "IWM": _quote(et(2026, 9, 5, 9, 34))},
+    )
+    assert result.checked
+    assert result.trading == ()
+    assert not result.pages
+    assert result.problem is None
+
+
+def test_an_errors_block_beside_the_quotes_is_not_counted_as_a_silent_symbol():
+    # Schwab puts unresolvable symbols in an `errors` block beside the quotes. Reading
+    # every key that came back counted that block as one more symbol the vendor stayed
+    # quiet about, so the operator line grew an absent symbol that was never a symbol.
+    result = _probe(
+        et(2026, 9, 5, 9, 35),
+        {"SPY": _stamped(True), "errors": {"invalidSymbols": ["QQQ"]}},
+    )
+    assert result.refused == 1
+    assert not result.pages
+    assert result.problem == "no readable quote time (1 unreadable, 0 absent)"
+
+
+def test_an_empty_roster_says_so_rather_than_blaming_the_vendor():
+    # Retiring the last ticker is a real thing to do, and the capture cycle skips its own
+    # quote request for it. A probe with nothing to ask cannot answer, which is the state
+    # it already calls no evidence either way. Counting answers against an empty roster
+    # reported none of zero symbols, which blames the vendor for a local file.
+    asked = []
+    result = run_probe(
+        calendar=weekday_sessions(WEEK),
+        clock=ManualClock(start=et(2026, 9, 5, 9, 35)),
+        symbols=[],
+        fetch=lambda symbols: asked.append(symbols) or VendorResponse(status=200, body={}),
+    )
+    assert result.checked
+    assert not result.pages
+    assert result.problem == "no symbols to ask about"
+    assert asked == []
+
+
+def test_a_malformed_envelope_beside_a_readable_one_is_still_only_an_absent_stamp():
+    # The whole fix sits above `read_batch`. Teaching the reader that a garbage envelope
+    # is a refusal would reclassify an absent stamp, which is what a vendor staying quiet
+    # about one symbol looks like, and a shipped test holds that rule.
+    result = _probe(
+        et(2026, 9, 5, 9, 35),
+        {"SPY": "ERROR", "QQQ": _quote(et(2026, 9, 4, 16, 0))},
+    )
+    assert result.checked
+    assert not result.pages
+    assert result.refused == 0
+    assert result.problem is None
+
+
 # -- the entry that actually pages ---------------------------------------------------
 
 
@@ -411,3 +696,26 @@ def test_a_session_day_still_carries_the_tag_the_design_words(capsys):
     assert _status(ProbeResult(date(2026, 9, 2), checked=False), capsys) == (
         f"calendar probe: {SESSION_DAY_TAG}"
     )
+
+
+def test_each_shape_the_probe_cannot_read_gets_its_own_operator_line(capsys):
+    # Built by running the classifier rather than by retyping its strings. Retyping them
+    # left the test green for any wording, which is no coverage at all. A dead token, a
+    # payload that changed shape, and a reply that skipped the roster are different things
+    # to go and look at, so the lines must differ as well as reach the operator intact.
+    day = date(2026, 9, 5)
+    replies = [
+        "not a reply",
+        VendorResponse(status="200", body={}),
+        VendorResponse(status=401, body={}),
+        VendorResponse(status=200, body=[]),
+        VendorResponse(status=200, body={"errors": []}),
+        VendorResponse(status=200, body={"SPY": "ERROR"}),
+    ]
+    lines = set()
+    for reply in replies:
+        batch, problem = probe_calendar._batch_of(reply, ["SPY", "QQQ"])
+        assert batch is None
+        lines.add(_status(ProbeResult(day, checked=True, problem=problem), capsys))
+        assert f"calendar probe: {problem}" in lines
+    assert len(lines) == len(replies)

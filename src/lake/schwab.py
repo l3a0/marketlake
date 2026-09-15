@@ -30,11 +30,12 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from lake.paths import TOKEN_FILE, config_dir
+from lake.token_epoch import epoch_second_to_utc
 from lake.vendor import VendorError, VendorResponse
 
 # The standard location of the Schwab token, per the design's Configuration section.
@@ -243,13 +244,21 @@ class SchwabVendor:
         This reads ``creation_timestamp`` off the token the injected client already
         holds. It is never a separate file read, so the value always matches the
         token capture actually runs on. The stored value is an epoch second, so the
-        conversion is deterministic and touches no wall clock.
+        conversion is deterministic and touches no wall clock. The value is untrusted,
+        so it runs through ``token_epoch``'s shared policy, the same one
+        ``control_plane.read_token_mint`` calls on the token file's copy of the same
+        field. A shape that policy refuses is a vendor failing to say when its own
+        token was minted, so it raises ``VendorError`` here rather than the bare
+        ``ValueError`` the file reader raises.
         """
         metadata = self._client.token_metadata
         created = getattr(metadata, "creation_timestamp", None)
         if created is None:
             raise VendorError("client token metadata has no creation_timestamp")
-        return datetime.fromtimestamp(float(created), tz=UTC)
+        try:
+            return epoch_second_to_utc(created)
+        except ValueError as exc:
+            raise VendorError(f"client token metadata: {exc}") from exc
 
     @classmethod
     def from_token(

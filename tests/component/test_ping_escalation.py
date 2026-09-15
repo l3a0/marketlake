@@ -38,6 +38,7 @@ from lake.deadman import CAPTURE_SLUG, DeadMan
 from lake.probe_calendar import ProbeResult, report
 from lake.runner import PING_REFUSED_EVENT, SlugEscalation
 from lake.session import SessionClock
+from lake.vendor import VendorResponse
 from tests.support.backup import FakeBackup, mirror_lake
 from tests.support.calendar import FakeCalendar, SessionTimes, et, weekday_sessions
 from tests.support.clock import ManualClock
@@ -352,7 +353,11 @@ def test_the_calendar_probe_entry_pages_through_a_real_publisher(tmp_path, monke
             return _Vendor()
 
         def get_quotes(self, symbols):
-            return {}
+            # The shape the real vendor returns. This ran the live calendar, so on a
+            # weekday it never fetches at all and on a weekend it does. A bare dict here
+            # sent the weekend run down the unreadable-reply path while the test passed
+            # either way, which is the same unrealistic fixture that hid the unwrap bug.
+            return VendorResponse(status=200, body={sym: {"quote": {}} for sym in symbols})
 
     pinger = Refusing(CALENDAR_PROBE_SLUG)
     monkeypatch.setattr("lake.schwab.SchwabVendor", _Vendor)
