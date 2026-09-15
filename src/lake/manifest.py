@@ -80,6 +80,14 @@ from lake.paths import (
 SCRUB_EXCLUSIONS: tuple[str, ...] = (MANIFEST_FILE, f"{JOURNAL_DIR}/", f"{REPORTS_DIR}/")
 
 
+# What a quarantine entry has to say for its partition to read. The ledger records
+# data-quality verdicts, and ``read_quarantine`` returns each entry as the opaque mapping
+# the writer appended. These two names are the one place that mapping is read for meaning,
+# so the battery, the sign-off tool and every reader resolve a verdict the same way.
+VERDICT_FIELD = "verdict"
+CLEAN_VERDICT = "clean"
+
+
 class RowCountRegression(Exception):
     """Raised when an append would shrink a manifested partition's row count.
 
@@ -200,6 +208,25 @@ def read_quarantine(lake_root: Path) -> list[dict]:
 def latest_quarantine(lake_root: Path) -> dict[str, dict]:
     """The current authoritative quarantine verdict per partition path."""
     return _latest_by_partition(read_quarantine(lake_root), quarantine_path(lake_root))
+
+
+def is_quarantined(entry: dict | None) -> bool:
+    """Whether a partition's current quarantine entry withholds it from a read.
+
+    ``entry`` is what ``latest_quarantine`` returns for one partition, or ``None`` when
+    the ledger holds no entry for it. A partition nothing has judged reads, which is what
+    keeps the guard inert until marketlake #138's battery writes the first verdict.
+
+    An entry clears its partition by carrying ``verdict: "clean"``. Every other entry
+    withholds it, including one whose shape this does not recognise, because fail closed
+    for data already sealed means an unreadable verdict refuses rather than admits.
+
+    The rule sits beside the ledger rather than inside its first reader. Marketlake #139
+    is authoritative for the entry shape and has not been built, so reader and writer have
+    to meet at one definition or the exclusion silently inverts. A sign-off tool writing
+    its own spelling of "cleared" would leave a partition it just cleared refused forever.
+    """
+    return entry is not None and entry.get(VERDICT_FIELD) != CLEAN_VERDICT
 
 
 # -- appending ---------------------------------------------------------------
