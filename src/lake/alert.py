@@ -15,13 +15,23 @@ orphan, so a ledger there would have to widen an exclusion set the design calls
 enumerated rather than implied. A dated file under ``reports/`` is already covered, and
 the date in the path means a query for today cannot accidentally count last month.
 
-``python -m lake.alert --test-push`` is the hand run that proves the channel. Every page
-the daemon sends rides one assumption nothing else tests, that a priority-5 push reaches
-a locked phone and interrupts it. The topic is typed by hand, and the ntfy app's pass
-through each Focus mode is set by hand too, so either can be wrong. The way an operator
-learns it is that a page they needed never arrived. The test goes out through the same
-publisher every producer uses, at the same tier, and against the same daily cap. A
-success proves the real channel only when nothing about the path was special.
+``python -m lake.alert --test-push`` is the hand run that exercises the channel. Every
+page the daemon sends rides one assumption nothing else tests, that a priority-5 push
+reaches a locked phone and interrupts it. The topic is typed by hand, and the ntfy app's
+pass through each Focus mode is set by hand too, so either can be wrong. The way an
+operator learns it is that a page they needed never arrived.
+
+The message goes out through the same publisher every producer uses, at the same tier,
+through the same cap, so nothing about the path is special. Two limits are worth stating
+rather than leaving for someone to discover.
+
+The cap is per process. ``Publisher`` holds its tally in memory, so a hand run in its own
+short-lived process spends nothing the daemon's forty can see. What the hand run shares
+with a page is the code, not the budget.
+
+A zero exit means ntfy accepted the POST, which is less than delivery. An ntfy topic is
+unauthenticated, so a mistyped one is accepted and read by nobody. Only the phone says
+the channel works, which is why the command sends the operator to look at it.
 """
 
 from __future__ import annotations
@@ -37,7 +47,7 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from lake.calendar import MARKET_TZ
-from lake.clock import Clock
+from lake.clock import Clock, SystemClock
 from lake.paths import LakePaths
 
 # The design's cap on pages a day. The forty-first is written down and never sent, so a
@@ -292,10 +302,13 @@ def undelivered(lake_root: Path | str, day: date) -> int:
 
 # -- the hand-run channel test ---------------------------------------------------------
 
-# The event name and the title of the one message this command sends. They are pinned
-# here rather than composed at the call site, because the design's message table is what
-# an operator reads the topic against, and a message matching no shape in it is evidence
-# the topic leaked. This shape is the hand run the rotation ritual already calls for.
+# The event name and the title of the one message this command sends. One fixed shape
+# rather than a line composed at the call site, so an operator learns to recognise it.
+#
+# The design's message table does not carry a row for it yet. That table is what an
+# operator reads the topic against, and the design treats a message matching no row as
+# evidence the topic leaked, so this shape can read as an exposure months after it was
+# sent by hand. Adding the row is tracked separately and this comment stays until it is.
 TEST_PUSH_EVENT = "test_push"
 TEST_PUSH_TITLE = "Test push"
 
@@ -309,8 +322,9 @@ def _test_push_body(now: datetime) -> str:
 
     It says outright that nothing is wrong. The message arrives at the page tier, with a
     page's emoji, and possibly in the middle of the night, so a body that read like a
-    real page would teach the operator to distrust the tier. The Eastern stamp is what
-    tells a push that just landed from one delivered late.
+    real page would teach the operator to distrust the tier. The stamp is Eastern, the
+    zone every other timestamp in the lake is written in, and it tells a push that just
+    landed from one delivered late.
     """
     eastern = now.astimezone(MARKET_TZ)
     return (
@@ -329,6 +343,18 @@ def run_test_push(publisher: Publisher, *, now: datetime) -> int:
     so both exit non-zero. Reporting a recorded page as a success would hand an operator
     a green result for a channel that does not work, which is the failure this command
     exists to catch.
+
+    Zero means ntfy accepted the POST, which is short of delivery. The topic is
+    unauthenticated, so a mistyped one is accepted and read by nobody, and no exit code
+    can tell the two apart. The phone is the evidence, and the output says so.
+
+    Each reason gets its own line, because they are not the same failure. A refusal and
+    a reached cap both stop the message inside this module, so the channel was never
+    contacted and nothing about the phone is in question. Only a failed POST says
+    anything about the channel.
+
+    Failures print to stderr. The command is meant to be run from an install script,
+    where stdout is often redirected to a log and the operator reads the terminal.
     """
     message = Message(
         event=TEST_PUSH_EVENT,
@@ -338,17 +364,55 @@ def run_test_push(publisher: Publisher, *, now: datetime) -> int:
     )
     delivery = publisher.publish(message, now=now)
     if delivery.sent:
-        print(f"test-push: sent at priority {message.priority}, the page tier.")
-        print("test-push: it counted against the daily cap of pages, the same as a real page.")
-        print("test-push: look at the phone. A page that does not arrive is the channel failing.")
+        print(f"test-push: ntfy accepted the push at priority {message.priority}, the page tier.")
+        print(
+            "test-push: acceptance means the POST left this laptop. A topic is unauthenticated, "
+            "so a mistyped one is accepted here and read by nobody."
+        )
+        print(
+            "test-push: the phone is the only evidence. The page must arrive, break through the "
+            "Focus mode in use, and carry the page emoji."
+        )
         return 0
+    if delivery.reason == REFUSED:
+        print(
+            "test-push: NOT sent. This module refused the message before any POST, so the "
+            "channel was never contacted and the phone is not in question.",
+            file=sys.stderr,
+        )
+        print(
+            "test-push: a refusal means the message text carries a value from config.yaml. "
+            "Check whether the ntfy topic is a word this body already uses.",
+            file=sys.stderr,
+        )
+    elif delivery.reason == CAP_REACHED:
+        print(
+            "test-push: NOT sent. The daily cap was reached, so the channel was never "
+            "contacted and the phone is not in question.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"test-push: NOT sent: {delivery.reason}. The POST was attempted and did not land, "
+            "so the channel did not carry this message.",
+            file=sys.stderr,
+        )
     if delivery.recorded:
-        print(f"test-push: NOT sent: {delivery.reason}.")
-        print(f"test-push: written down under reports/alerts/ as {message.event}.")
-        print("test-push: the channel did not carry this message, so it would not carry a page.")
+        print(
+            f"test-push: written down under reports/alerts/ as {message.event}.",
+            file=sys.stderr,
+        )
+        print(
+            "test-push: that record counts on the Now panel and in tonight's digest, the same "
+            "as a real page that never sent.",
+            file=sys.stderr,
+        )
         return 1
-    print(f"test-push: NOT sent: {delivery.reason}, and writing it down failed too.")
-    print("test-push: the message is lost twice, so nothing on this machine records it.")
+    print(
+        "test-push: writing it down failed too, so the message is lost twice and nothing on "
+        "this machine records it.",
+        file=sys.stderr,
+    )
     return 1
 
 
@@ -357,10 +421,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     ``--test-push`` is required rather than defaulted, so a bare invocation says what the
     entry is for instead of silently sending a page to a phone.
+
+    ``allow_abbrev`` is off for the same reason. argparse accepts any unambiguous prefix
+    by default, so ``--test`` would reach a phone, and ``--test`` is what someone reaches
+    for when they mean a dry run. There are two flags here and no abbreviation worth
+    keeping.
     """
     parser = argparse.ArgumentParser(
         prog="python -m lake.alert",
-        description="Prove the alert channel reaches the phone.",
+        description="Send one page through the production publisher and report what came back.",
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--test-push",
@@ -387,7 +457,6 @@ def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> in
     """
     args = build_parser().parse_args(argv)
 
-    from lake.clock import SystemClock
     from lake.config import input_errors_exit, load_config
 
     with input_errors_exit("alert"):
