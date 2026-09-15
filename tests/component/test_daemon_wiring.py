@@ -98,9 +98,9 @@ EQUITY_ONLY = "XYZ: {options: false}\n"
 WITH_OPTIONS = "SPY: {options: true, chain_cadence: 1m}\n"
 
 # Two equity-only tickers, and the same roster after one is retired. Neither carries
-# options, so each ticker owns exactly one counter. A slept-through slot attempts no
-# request, so the two quotes counters page one by one rather than collapsing into the
-# single sampler page a failed live cycle would raise.
+# options, so each ticker owns exactly one counter. One overrun raises one page for
+# every surface it charged, so the count on that page is how many counters the hook
+# found on the roster it read.
 TWO_TICKERS = "XYZ: {options: false}\nABC: {options: false}\n"
 ONE_RETIRED = "ABC: {options: false}\n"
 
@@ -389,7 +389,9 @@ def test_the_minutes_a_live_overrun_slept_through_charge_the_watchdog(tmp_path):
     # produced no segment, so nothing but the missed minutes charged a counter.
     (page,) = rig.transport.sent
     assert page.event == "capture_down"
-    assert page.title == "Capture down: XYZ quotes"
+    # The stall is what the page is about, and it says how many slots it slept through.
+    # One surface was charged, so there is no fold count to carry.
+    assert page.title == "Capture down: loop overran"
     # No class is named, and that is the point rather than an omission. Nothing was
     # attempted in a slept-through slot, so there is no failure to name.
     assert page.body == "3 session minutes without a durable cycle"
@@ -597,9 +599,9 @@ def _run_across_an_edit(rig: _Rig, roster: str) -> None:
 
     The 10:00 cycle takes 200 seconds, so the loop next wakes at 10:04 and hands 10:01,
     10:02, and 10:03 to the skipped-slot hook. Three slept-through slots is the design's
-    page threshold. So the hook pages every surface it charges across that stretch, and
-    every surface it does not charge stays silent. The cycles produce no segment of
-    their own, so nothing but the missed minutes charges a counter.
+    page threshold. So the stretch raises one page, and that page counts the surfaces
+    the hook charged. The cycles produce no segment of their own, so nothing but the
+    missed minutes charges a counter.
     """
     _seed_two(rig)
     clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
@@ -625,8 +627,11 @@ def test_a_ticker_retired_mid_session_stops_charging_the_watchdog(tmp_path):
     rig = _rig(tmp_path, roster=TWO_TICKERS)
     _run_across_an_edit(rig, ONE_RETIRED)
 
-    # Sorted, because the page order is the watchdog's own rule and not this one's.
-    assert sorted(page.title for page in rig.transport.sent) == ["Capture down: ABC quotes"]
+    # One counter charged, ABC's, so the page carries no fold count. A hook closed over
+    # the roster the daemon started with would have charged two and said so.
+    (page,) = rig.transport.sent
+    assert page.title == "Capture down: loop overran"
+    assert page.body == "3 session minutes without a durable cycle"
 
 
 def test_a_ticker_onboarded_mid_session_starts_charging_the_watchdog(tmp_path):
@@ -642,11 +647,11 @@ def test_a_ticker_onboarded_mid_session_starts_charging_the_watchdog(tmp_path):
     rig = _rig(tmp_path, roster=TWO_TICKERS)
     _run_across_an_edit(rig, THREE_TICKERS)
 
-    assert sorted(page.title for page in rig.transport.sent) == [
-        "Capture down: ABC quotes",
-        "Capture down: DEF quotes",
-        "Capture down: XYZ quotes",
-    ]
+    # Three counters charged, so the hook read the file the edit left rather than the
+    # two-ticker roster the daemon started with.
+    (page,) = rig.transport.sent
+    assert page.title == "Capture down: loop overran"
+    assert page.body == "3 session minutes without a durable cycle, one page for 3 surfaces"
 
 
 @pytest.mark.parametrize("roster", [UNLOADABLE, MID_LINE_TEAR], ids=["refused", "torn"])
@@ -723,11 +728,10 @@ def test_the_hook_charges_every_surface_its_ticker_is_captured_on(tmp_path):
     clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
     _run(rig, clock, ticks=2, cycle_runner=_Overrunning(clock, 200))
 
-    # One quotes ticker, so the sampler collapse cannot fire whatever the fan-out does.
-    assert sorted(page.title for page in rig.transport.sent) == [
-        "Capture down: SPY chains",
-        "Capture down: SPY quotes",
-    ]
+    # Two counters on one ticker, so charging quotes alone would have said one surface.
+    (page,) = rig.transport.sent
+    assert page.title == "Capture down: loop overran"
+    assert page.body == "3 session minutes without a durable cycle, one page for 2 surfaces"
 
 
 # -- 8. a mid-session recalibration reaches the watchdog ----------------------------

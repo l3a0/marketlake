@@ -27,12 +27,13 @@ One case collapses. Every quotes ticker shares one batched request, so all quote
 counters tripping in the same minute means the sampler died rather than N tickers
 dying at once. That sends one page naming the sampler, never one page per ticker.
 
-A stall folds the same way. A slot the loop slept through gaps every watched surface
-at the same moment, so one overrun is one fact and sends one page, naming how many
-slots the loop slept through and how many surfaces it charged. That page leaves the
-per-surface budget alone. A stall is evidence about the loop rather than about any
-surface's health, so a surface that is genuinely dead still pages on its own account
-on the first cycle after the loop resumes.
+A stall folds too. A slot the loop slept through gaps every watched surface at the
+same moment, so one overrun that trips the threshold is one fact and sends one page,
+carrying the minutes without a durable cycle it is reporting and how many surfaces it
+charged. That page leaves the per-surface budget alone, where the sampler collapse
+spends it. A stall is evidence about the loop rather than about any surface's health,
+so a surface that is genuinely dead still pages on its own account on the first cycle
+after the loop resumes.
 """
 
 from __future__ import annotations
@@ -85,9 +86,10 @@ class Surface:
 class Page:
     """One page the watchdog owes, ready for a publisher.
 
-    ``surfaces`` is what went quiet. It holds one entry for an ordinary page and every
-    quotes ticker for a collapsed sampler page, so a caller can say what it saw without
-    the watchdog formatting prose it may not want.
+    ``surfaces`` is what went quiet. It holds one entry for an ordinary page, every
+    quotes ticker for a collapsed sampler page, every surface a cause named, and every
+    surface a stall charged, so a caller can say what it saw without the watchdog
+    formatting prose it may not want.
 
     ``cause`` is the class the failure arrived as, and it is what lets a body say why
     rather than only what. It is ``None`` where there is nothing to name: a slot the loop
@@ -189,10 +191,17 @@ class Watchdog:
         and per surface. Only the page is folded.
 
         One stall gaps every watched surface at the same moment, so it is one fact and
-        owes one page. Fanning out instead sent a page per surface, which at the roster
-        ceiling the design names is 230 pages for one stall against a daily cap of 40.
-        The page says how many slots the loop slept through and how many surfaces it
-        charged, the way the sampler page says how many tickers it stands for.
+        owes one page. Fanning out instead sent a page per surface, which on a roster of
+        about 115 tickers on two surfaces is 230 pages for one stall against a daily cap
+        of 40. The page carries the minutes the surfaces it speaks for have gone without
+        a durable cycle, which for a stall from a healthy roster is the run of slots the
+        loop slept through, and how many surfaces the stall charged.
+
+        What decides the page is the decision the per-surface path already makes: a
+        counter at the threshold that has not paged yet and that no live cause speaks
+        for. So a stall shorter than the threshold still pages nothing, a stall during an
+        outage that already paged adds nothing, and the threshold reads live here the way
+        it does everywhere else. Only the fan-out is gone.
 
         The fold leaves ``_paged`` alone, and that is the load-bearing part. A stall says
         nothing about whether any one surface is healthy, so it must not spend the budget
@@ -201,42 +210,42 @@ class Watchdog:
         comes back pages not at all. Marking them instead would read as a fix and bury
         the real outage for the rest of the session.
 
-        A live whole-daemon cause still speaks for the surfaces it named, so a stall
-        inside an outage that already paged stays quiet. It is the same outage seen from
-        a minute the loop never ran.
+        The stall has a once-on-transition rule of its own instead, held in
+        ``_paged_overrun``. Without it a loop that never runs a cycle again pages on
+        every tick it wakes on, since nothing it charges ever reaches ``_paged``. A
+        durable data cycle proves the loop is running and re-arms it, and so does the
+        session date.
         """
         watched = list(surfaces)
         # One overrun is reported in a single call, so the threshold is read once for the
         # batch rather than per slot.
         threshold = self._threshold()
-        overrun = 0
         for slot in sorted(slots):
-            day = self._day
             self._roll(slot)
-            # A rolled date cleared the counters, so the slots below the boundary are no
-            # longer minutes this session went without. Counting them would put a
-            # weekend of closed-market minutes in a page about this morning's stall.
-            if self._day != day:
-                overrun = 0
-            overrun += 1
             for key in sorted(watched, key=str):
                 self._counts[key] = self._counts.get(key, 0) + 1
-        if not overrun or self._paged_overrun:
+        if self._paged_overrun:
             return []
-        # Nothing was attempted in these minutes, so nothing here names a class, and the
-        # quotes fan-out this used to send is not a dead sampler. The one thing that can
-        # speak for a slept slot is a cause already paged for the surfaces it charged.
-        if not any(
-            self._counts.get(key, 0) >= threshold and not self._covered(key, None)
-            for key in watched
-        ):
+        # Nothing was attempted in these minutes, so no class is named and no surface is
+        # asked what it is failing with. A cause already paged for a surface still speaks
+        # for it, because a stall inside that outage is the same outage from a minute the
+        # loop never ran.
+        charged = tuple(sorted(set(watched), key=str))
+        tripped = [
+            key
+            for key in charged
+            if self._counts.get(key, 0) >= threshold
+            and key not in self._paged
+            and not self._covered(key, None)
+        ]
+        if not tripped:
             return []
         self._paged_overrun = True
         return [
             Page(
                 title=_OVERRUN_TITLE,
-                minutes=overrun,
-                surfaces=tuple(sorted(set(watched), key=str)),
+                minutes=max(self._counts[key] for key in tripped),
+                surfaces=charged,
             )
         ]
 

@@ -1073,10 +1073,12 @@ def run_loop_from_config(
             if page.cause is not None:
                 body = f"{body}, failing with {page.cause}"
             # A folded page says how much it folded, the rule compaction's drift page
-            # already follows. Two pages here fold: the sampler page stands for every
-            # quotes ticker, and the cause page stands for every surface that failed the
-            # same way. Without the count, one page for two and one page for four hundred
-            # read identically. A page standing for one surface has its title to say so.
+            # already follows. Three pages here fold: the sampler page stands for every
+            # quotes ticker, the cause page stands for every surface that failed the same
+            # way, and the overrun page stands for every surface a stall charged. Without
+            # the count, one page for two and one page for four hundred read identically.
+            # A page standing for one surface carries none, and on every title but the
+            # overrun's the title itself says which surface that is.
             #
             # The names are left out because both folds only fire when the whole set
             # failed, so listing them says no more than the count does and costs the

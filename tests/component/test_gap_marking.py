@@ -934,19 +934,21 @@ OVERRUN = GuardConstants().watchdog_page_minutes
 SKIPPED = [f"2026-09-02T10:{m:02d}" for m in range(1, OVERRUN + 1)]
 
 # One stall is one page, and that page counts the surfaces it charged rather than
-# naming them, so the count is what these tests read. Every roster below puts one
-# counter on each ticker, so the count is the size of the roster the hook read, and a
-# hook reading the wrong one lands on a different number in each case here.
+# naming them. Every roster below puts one counter on each ticker, so that count is the
+# size of the roster the hook read, and a hook reading the wrong one lands on a
+# different number in each case here.
 _FOLDED = re.compile(r"one page for (\d+) surfaces")
 _OVERRUN_TITLE = "Capture down: loop overran"
 
 
 def _charged(messages: list) -> int:
-    """How many surfaces the run's overrun page says it charged.
+    """How many surfaces the run's overrun page charged.
 
-    A page standing for one surface carries no count, because its own title says so on
-    every other path. Reading the page this way keeps the watchdog's title and body
-    format asserted in one place, its own unit tests.
+    The page carries that count only when it charged more than one surface, which is the
+    daemon's rule for every folded page, so a page with no count charged one. No stall
+    page at all means the hook charged nothing the threshold reached. Reading the page
+    this way keeps the watchdog's title and body format asserted in one place, its own
+    unit tests.
     """
     bodies = [m.body for m in messages if m.title == _OVERRUN_TITLE]
     if not bodies:
