@@ -77,6 +77,11 @@ class Page:
     ``surfaces`` is what went quiet. It holds one entry for an ordinary page and every
     quotes ticker for a collapsed sampler page, so a caller can say what it saw without
     the watchdog formatting prose it may not want.
+
+    ``cause`` is the class the failure arrived as, and it is what lets a body say why
+    rather than only what. It is ``None`` where there is nothing to name: a slot the loop
+    slept through attempted no request, a failure can be recorded without a class, and a
+    collapsed sampler page whose tickers disagreed has no single class to pick.
     """
 
     title: str

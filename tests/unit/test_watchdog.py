@@ -907,3 +907,104 @@ def test_the_sampler_page_names_no_class_when_the_collapsed_tickers_disagree():
         )
     assert [page.title for page in pages] == ["Capture down: quote sampler dead"]
     assert pages[0].cause is None
+
+
+def test_a_collapse_and_a_surface_page_in_one_minute_each_name_their_own_class():
+    """Two pages in one minute, and neither borrows the other's class.
+
+    The sampler page speaks for the batched quotes request, so its class comes from the
+    quotes tickers alone. A chains ticker failing some other way in the same minute is a
+    separate failure with a separate page, and letting it into the sampler's set would
+    break the agreement and cost the sampler page its class at the moment it is needed.
+    """
+    watchdog = Watchdog()
+    for minute in range(3):
+        pages = watchdog.observe(
+            _cycle(
+                _fail("quotes", "SPY", "http_429"),
+                _fail("quotes", "QQQ", "http_429"),
+                _fail("quotes", "IWM", "http_429"),
+                _fail("chains", "SPY", "http_500"),
+                # A second chains ticker still landing rows keeps this out of the
+                # whole-daemon path, which would otherwise name one cause for everything.
+                _seg("chains", "QQQ", "data"),
+                at=_at(minute),
+            )
+        )
+    by_title = {page.title: page for page in pages}
+    assert sorted(by_title) == ["Capture down: SPY chains", "Capture down: quote sampler dead"]
+    assert by_title["Capture down: quote sampler dead"].cause == "http_429"
+    assert by_title["Capture down: SPY chains"].cause == "http_500"
+
+
+def test_a_collapse_names_no_class_when_a_ticker_that_already_paged_failed_differently():
+    """The sampler's set is every failing quotes ticker, not only the newly tripped ones.
+
+    A ticker can be gapped on its own when it goes missing from an otherwise healthy
+    batch, page for that, and still be failing when the whole batch starts being rejected
+    later. The collapse then covers a ticker whose failure is not the batch's failure, and
+    naming the batch's class would put a class on a page that stands for both.
+    """
+    watchdog = Watchdog()
+    raised = []
+    # SPY alone is missing from the batch, so it pages on its own account first.
+    for minute in range(3):
+        raised += watchdog.observe(
+            _cycle(
+                _fail("quotes", "SPY", "quote_missing"),
+                _seg("quotes", "QQQ", "data"),
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in raised] == ["Capture down: SPY quotes"]
+    # Now the batch itself starts being rejected, while SPY keeps failing its own way.
+    collapse = []
+    for minute in range(3, 7):
+        collapse += watchdog.observe(
+            _cycle(
+                _fail("quotes", "SPY", "quote_missing"),
+                _fail("quotes", "QQQ", "http_429"),
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in collapse] == ["Capture down: quote sampler dead"]
+    assert collapse[0].cause is None
+
+
+def test_an_unwritten_segment_failing_another_cause_s_way_is_released():
+    """The class decides the cover wherever the failure was recorded.
+
+    A surface can be down because its segment could not be written, and that failure
+    carries its own class. When the class is one another cause names, the cause holding
+    the surface has stopped explaining it, the same as for a gap row. ``Capture`` cannot
+    raise a vendor auth error out of the write path today, so this pins the rule rather
+    than a path in use.
+    """
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(3):
+        raised += watchdog.observe(
+            _cycle(
+                _fail("chains", "SPY", "http_429"),
+                _fail("chains", "QQQ", "http_429"),
+                _fail("quotes", "SPY", "http_429"),
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in raised] == ["Capture down: rate limited"]
+    # quotes SPY comes back, which keeps the cycle off the whole-daemon path. That path
+    # returns early while a cause is live and would never reach the per-surface pages.
+    for minute in range(3, 7):
+        raised += watchdog.observe(
+            _cycle(
+                _fail("chains", "QQQ", "http_429"),
+                _seg("quotes", "SPY", "data"),
+                errors=(SegmentError("chains", "SPY", "vendor_auth_error"),),
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in raised] == [
+        "Capture down: rate limited",
+        "Capture down: SPY chains",
+    ]
+    assert raised[1].cause == "vendor_auth_error"

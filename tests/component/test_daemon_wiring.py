@@ -849,6 +849,49 @@ def test_a_surface_page_names_the_class_it_is_failing_with(tmp_path):
     assert page.body == "3 session minutes without a durable cycle, failing with http_429"
 
 
+class _WholeDaemonFailure:
+    """A cycle runner whose every cycle fails both surfaces with one auth class."""
+
+    def __init__(self, rig: _Rig, clock: ManualClock):
+        self._rig = rig
+        self._clock = clock
+
+    def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        slot = self._clock.now().replace(second=0, microsecond=0)
+        segments = tuple(
+            SegmentOutcome(
+                surface=surface,
+                ticker="XYZ",
+                path=self._rig.lake_root / "segment.arrows",
+                partition=f"{surface}/ticker=XYZ/date=2026-09-02/segment.arrows",
+                row_kind=journal.ROW_KIND_GAP,
+                rows=1,
+                error_class="http_401",
+                fetched_at=None,
+            )
+            for surface in (journal.QUOTES_SURFACE, "chains")
+        )
+        return CycleResult(snap_ts=slot, segments=segments)
+
+
+def test_the_cause_page_names_its_class_on_the_wire_too(tmp_path):
+    """The page that names a whole-daemon cause goes out through the same composer.
+
+    A dead token arrives as ``http_401`` while the cached access token still works and as
+    ``vendor_auth_error`` once the refresh fails. Both carry the one title, so the class
+    in the body is what says which shape arrived. Only a single-surface page held the
+    class before this, so a body composer that skipped multi-surface pages passed.
+    """
+    rig = _rig(tmp_path)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=4, cycle_runner=_WholeDaemonFailure(rig, clock))
+
+    (page,) = rig.transport.sent
+    assert page.event == "capture_down"
+    assert page.title == "Capture down: token dead"
+    assert page.body == "3 session minutes without a durable cycle, failing with http_401"
+
+
 def test_an_empty_roster_still_runs_the_loop_and_reports(tmp_path):
     """Retiring every ticker must not stop the daemon, only its capturing.
 
