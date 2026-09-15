@@ -66,8 +66,8 @@ def test_bars_partition_carries_a_freq_level(paths: LakePaths):
     assert paths.bars_partition_path("SPY", "1m", DAY) == expected
 
 
-def test_actions_is_one_flat_all_ticker_file(paths: LakePaths):
-    assert paths.actions_path == ROOT / "actions" / "corporate_actions.parquet"
+def test_actions_is_one_flat_all_ticker_ledger(paths: LakePaths):
+    assert paths.actions_path == ROOT / "actions" / "corporate_actions.jsonl"
 
 
 def test_partition_path_rejects_bars_and_actions(paths: LakePaths):

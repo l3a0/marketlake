@@ -22,6 +22,12 @@ The quarantine ledger at ``quarantine.jsonl`` follows the same three rules. It r
 data-quality verdicts per partition. Un-quarantine is a superseding entry, never a
 deletion. This module gives it the same append and read helpers.
 
+The corporate-actions ledger at ``actions/corporate_actions.jsonl`` follows them too, and
+it keys on the action rather than on a path, so ``lake.actions`` resolves its own last
+entry and reuses ``append_line`` and ``parse_jsonl`` for the line rules alone. Those two
+are public for that reason: three ledgers now implement one rule, and a second copy of it
+would be a second answer to what a torn tail is.
+
 The same ledger judges the backup copy. ``backup_scrub`` walks the rsync target and
 checks it against this manifest rather than against the copy of the manifest riding on
 the backup, because the lake is the authority and a copy that rotted alongside its data
@@ -137,7 +143,7 @@ def sha256_file(path: Path) -> str:
 # -- reading -----------------------------------------------------------------
 
 
-def _parse_jsonl(text: str) -> list[dict]:
+def parse_jsonl(text: str) -> list[dict]:
     """Parse ledger text into entries, discarding a torn trailing line.
 
     A blank line is skipped. The first line that does not parse ends the read. By the
@@ -161,7 +167,7 @@ def _read_jsonl(path: Path) -> list[dict]:
     path = Path(path)
     if not path.exists():
         return []
-    return _parse_jsonl(path.read_text())
+    return parse_jsonl(path.read_text())
 
 
 def _latest_by_partition(entries: Sequence[dict], path: Path) -> dict[str, dict]:
@@ -232,7 +238,7 @@ def is_quarantined(entry: dict | None) -> bool:
 # -- appending ---------------------------------------------------------------
 
 
-def _append_line(path: Path, entry: dict) -> None:
+def append_line(path: Path, entry: dict) -> None:
     """Append one entry as exactly one line via a single ``O_APPEND`` write.
 
     ``sort_keys`` keeps the on-disk bytes stable across callers. The line is written
@@ -285,7 +291,7 @@ def append_manifest(
         "rows": rows,
         "fetched_at": fetched_at,
     }
-    _append_line(manifest_path(lake_root), entry)
+    append_line(manifest_path(lake_root), entry)
     return entry
 
 
@@ -322,7 +328,7 @@ def append_quarantine(lake_root: Path, entry: dict) -> dict:
     The entry is keyed by ``partition`` like the manifest. Last entry wins, so an
     un-quarantine is a superseding row, never a deletion of history.
     """
-    _append_line(quarantine_path(lake_root), entry)
+    append_line(quarantine_path(lake_root), entry)
     return entry
 
 
@@ -590,7 +596,7 @@ def backup_scrub(lake_root: Path, backup_root: Path) -> BackupScrubResult:
 
     The watermark is worth nothing unless the copy really is a prefix, so that is checked
     first, and checked over bytes rather than over parsed entries. The reason is exact.
-    ``_parse_jsonl`` discards the first line it cannot parse and every line after it, by
+    ``parse_jsonl`` discards the first line it cannot parse and every line after it, by
     the append rule that says only the last line can be torn. Rot on an SSD obeys no such
     rule. One flipped byte in the middle of the copy would discard the whole tail, the
     watermark would collapse to the rot's position, every partition past it would read as
@@ -647,9 +653,9 @@ def _backup_scrub(root: Path, target: Path) -> BackupScrubResult:
         )
 
     # A prefix split mid-character decodes with a replacement, and the line it sits in is
-    # the torn tail ``_parse_jsonl`` discards anyway.
-    source_entries = _parse_jsonl(source_bytes.decode("utf-8", "replace"))
-    backup_entries = _parse_jsonl(backup_bytes.decode("utf-8", "replace"))
+    # the torn tail ``parse_jsonl`` discards anyway.
+    source_entries = parse_jsonl(source_bytes.decode("utf-8", "replace"))
+    backup_entries = parse_jsonl(backup_bytes.decode("utf-8", "replace"))
     if not backup_entries and source_entries:
         # A watermark of zero over a lake that has entries would make every partition
         # pending and the whole scrub a no-op.

@@ -365,7 +365,7 @@ def test_a_manifest_copy_longer_than_the_lake_s_is_not_a_clean_prefix(fixture_la
 def test_rot_that_breaks_a_line_s_json_does_not_switch_the_scrub_off(fixture_lake):
     """The hole a parsed-entry comparison leaves, closed by comparing bytes.
 
-    ``_parse_jsonl`` discards the first line it cannot parse and every line after it,
+    ``parse_jsonl`` discards the first line it cannot parse and every line after it,
     because the append rule says only the last line can be torn. Rot on an SSD obeys no
     such rule. Read through that parser, one wrecked byte in the copy's first line would
     discard the whole tail, collapse the watermark to zero, and let a backup whose every

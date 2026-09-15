@@ -4,7 +4,7 @@ This is the single production home for path construction. It covers two location
 
 The lake is the first. Give it a ``lake_root`` and it builds every path the lake
 uses: the surface partitions, the journal segments, the daemon's journal metadata
-stamp, the two append-only ledgers, and the reference tables. The root is an argument,
+stamp, the three append-only ledgers, and the reference tables. The root is an argument,
 so a test points it at a throwaway directory and production points it at the configured
 ``lake_root``.
 
@@ -145,8 +145,11 @@ SEGMENT_GLOB = f"{SEGMENT_PREFIX}*{SEGMENT_SUFFIX}"
 SECURITY_MASTER = "security_master"
 CONTRACTS = "contracts"
 
-# The single all-ticker corporate-actions file under ``actions/``.
-CORPORATE_ACTIONS_FILE = "corporate_actions.parquet"
+# The single all-ticker corporate-actions ledger under ``actions/``. It is the third
+# append-only ledger, written on the manifest's own line rules by ``lake.actions``. The
+# name is spelled here rather than there for the reason the whole module exists: a second
+# spelling of a lake path is the failure this file guards against.
+CORPORATE_ACTIONS_FILE = "corporate_actions.jsonl"
 
 
 def _day_str(day: date | str) -> str:
@@ -212,7 +215,7 @@ class LakePaths:
 
     @property
     def actions_path(self) -> Path:
-        """The corporate-actions table: one file for splits and dividends, all tickers."""
+        """The corporate-actions ledger: one append-only file, splits and dividends, all tickers."""
         return self.root / ACTIONS / CORPORATE_ACTIONS_FILE
 
     # -- journal -------------------------------------------------------------
