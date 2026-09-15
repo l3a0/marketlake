@@ -204,20 +204,31 @@ def test_a_chains_surface_never_collapses_into_the_sampler_page():
 
 def test_a_slept_through_slot_increments_the_same_counters():
     # The loop never runs a cycle for a slot it slept through, so `observe` never sees
-    # those minutes. They are exactly the ones the daemon was worst off.
+    # those minutes. They are exactly the ones the daemon was worst off. A roster of one
+    # surface still pages the overrun rather than that surface, because the stall is what
+    # happened and the surface says nothing about its own health from a minute nothing
+    # was attempted in.
     watchdog = Watchdog()
     surfaces = [Surface("chains", "SPY")]
     raised = [watchdog.missed(surfaces, [_at(i)]) for i in range(3)]
     assert [len(pages) for pages in raised] == [0, 0, 1]
-    assert raised[2][0].title == "Capture down: SPY chains"
+    page = raised[2][0]
+    assert page.title == "Capture down: loop overran"
+    assert page.minutes == 3
+    assert page.surfaces == (Surface("chains", "SPY"),)
 
 
 def test_a_stall_and_a_failing_cycle_count_toward_the_same_page():
+    # The page fires on the third minute, which one stalled slot, one failed cycle, and
+    # one more stalled slot add up to. It carries all three, because the minutes it
+    # reports are the ones the surface went without a durable cycle.
     watchdog = Watchdog()
     watchdog.missed([Surface("chains", "SPY")], [_at(0)])
     watchdog.observe(_cycle(_seg("chains", "SPY", "gap"), at=_at(1)))
     pages = watchdog.missed([Surface("chains", "SPY")], [_at(2)])
-    assert [p.title for p in pages] == ["Capture down: SPY chains"]
+    assert [p.title for p in pages] == ["Capture down: loop overran"]
+    assert pages[0].minutes == 3
+    assert watchdog.count("chains", "SPY") == 3
 
 
 @pytest.mark.parametrize("kind", ["data", "gap"])
@@ -261,13 +272,14 @@ def test_a_run_of_missed_slots_is_charged_once_per_slot():
 
 
 def test_a_slept_through_slot_is_not_a_dead_sampler():
-    # Every quotes surface fans out on a skipped slot too. Calling that a dead sampler
-    # would send the operator to look at the batched request, which was never made.
+    # A stall charges every quotes surface at once, which is the shape the collapse looks
+    # for. Calling it a dead sampler would send the operator to look at the batched
+    # request, which was never made, so the stall folds under its own title instead.
     watchdog = Watchdog()
     pages = watchdog.missed(
         [Surface("quotes", "SPY"), Surface("quotes", "QQQ")], [_at(i) for i in range(3)]
     )
-    assert pages
+    assert [page.title for page in pages] == ["Capture down: loop overran"]
     assert not any(page.sampler_collapse for page in pages)
 
 
@@ -299,6 +311,229 @@ def test_a_paged_surface_does_not_hide_a_later_sampler_death():
     # SPY had been down three minutes before QQQ joined it, and the page reports the
     # longest of the two counters. Reporting the shortest would halve the outage.
     assert raised[1].minutes == 6
+
+
+# -- one stall, one page -------------------------------------------------------------
+
+
+def _roster(tickers: int) -> list[Surface]:
+    """The shape the design captures in: every ticker carries both surfaces."""
+    return [
+        Surface(surface, f"T{n:03d}") for n in range(tickers) for surface in ("chains", "quotes")
+    ]
+
+
+def test_one_overrun_raises_one_page_rather_than_one_per_surface():
+    # The roster the design sizes for is about 115 tickers on two surfaces. The fan-out
+    # this replaces sent 230 pages for one stall, against a daily cap of 40, so one
+    # overrun could spend the whole day's budget and bury the rest of the session.
+    watchdog = Watchdog()
+    pages = watchdog.missed(_roster(115), [_at(minute) for minute in range(3)])
+    assert len(pages) == 1
+    assert pages[0].title == "Capture down: loop overran"
+    assert not pages[0].sampler_collapse
+
+
+def test_the_overrun_page_names_the_minutes_missed_and_the_surfaces_charged():
+    # One page for ten surfaces and one page for two hundred read identically without
+    # the counts, which is the rule the sampler page and the cause page already follow.
+    # The stall runs from a healthy roster, so the minutes it reports are its own slots.
+    watchdog = Watchdog()
+    roster = _roster(5)
+    pages = watchdog.missed(roster, [_at(minute) for minute in range(5)])
+    assert pages[0].minutes == 5
+    assert pages[0].surfaces == tuple(sorted(roster, key=str))
+    assert len(pages[0].surfaces) == 10
+
+
+def test_a_folded_overrun_still_charges_every_surface_once_per_slot():
+    # The fold is the page, not the counting. A ten-minute overrun is ten session minutes
+    # without a durable cycle for every surface it charged, and each of those surfaces
+    # pages on its own account from that count once the loop resumes.
+    watchdog = Watchdog()
+    roster = _roster(3)
+    watchdog.missed(roster, [_at(minute) for minute in range(10)])
+    assert {watchdog.count(key.surface, key.ticker) for key in roster} == {10}
+
+
+def test_a_surface_still_dead_after_the_overrun_pages_on_its_own_account():
+    """The fold must not spend a surface's own budget.
+
+    A stall is evidence about the loop, not about any one surface's health. A fold that
+    put its surfaces in ``_paged`` would pass every other test in this section and make
+    the masking permanent, because the only exit from ``_paged`` is producing data. The
+    one surface that is genuinely dead has to be heard once the loop resumes.
+    """
+    watchdog = Watchdog()
+    overrun = watchdog.missed(_roster(2), [_at(minute) for minute in range(3)])
+    assert [page.title for page in overrun] == ["Capture down: loop overran"]
+    after = []
+    for minute in range(3, 6):
+        after += watchdog.observe(
+            _cycle(
+                _seg("chains", "T000", "gap"),
+                _seg("quotes", "T000", "data"),
+                _seg("chains", "T001", "data"),
+                _seg("quotes", "T001", "data"),
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in after] == ["Capture down: T000 chains"]
+
+
+def test_a_healthy_resume_after_an_overrun_pages_nothing():
+    # The other half of the rule above. A stall that everything came back from owes one
+    # page for the stall and nothing more.
+    watchdog = Watchdog()
+    roster = _roster(2)
+    watchdog.missed(roster, [_at(minute) for minute in range(3)])
+    after = []
+    for minute in range(3, 6):
+        after += watchdog.observe(
+            _cycle(*[_seg(key.surface, key.ticker, "data") for key in roster], at=_at(minute))
+        )
+    assert after == []
+
+
+def test_an_overrun_below_the_threshold_pages_nothing():
+    # Today's behaviour, which the fold keeps. Two slept slots are not three, however
+    # large the roster charged is.
+    watchdog = Watchdog()
+    assert watchdog.missed(_roster(115), [_at(0), _at(1)]) == []
+
+
+def test_a_second_stall_stays_quiet_until_a_durable_cycle_re_arms_it():
+    # Once on the transition, the rule every other page here follows. A loop stuck in a
+    # stall reports one every tick it wakes on, and each report would otherwise page.
+    watchdog = Watchdog()
+    roster = _roster(2)
+    assert len(watchdog.missed(roster, [_at(minute) for minute in range(3)])) == 1
+    assert watchdog.missed(roster, [_at(minute) for minute in range(3, 6)]) == []
+    watchdog.observe(_cycle(*[_seg(key.surface, key.ticker, "data") for key in roster], at=_at(6)))
+    assert len(watchdog.missed(roster, [_at(minute) for minute in range(7, 10)])) == 1
+
+
+def test_a_nap_after_a_surface_has_paged_does_not_page_again():
+    """The gate is the page decision the per-surface path already makes.
+
+    One surface dead all session sits at the threshold for the rest of it. Deciding the
+    stall page on the counters alone would let every later one-minute nap raise a page
+    of its own, which is this fold's own harm arriving in the time dimension instead of
+    the roster one. A surface that has already paged is not asked again.
+    """
+    watchdog = Watchdog()
+    roster = _roster(2)
+    raised = []
+    healthy = [key for key in roster if key != Surface("chains", "T000")]
+    for minute in range(3):
+        raised += watchdog.observe(
+            _cycle(
+                _seg("chains", "T000", "gap"),
+                *[_seg(key.surface, key.ticker, "data") for key in healthy],
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in raised] == ["Capture down: T000 chains"]
+    # The loop then oversleeps one slot every other minute, with a cycle in between that
+    # keeps every other surface alive.
+    for minute in range(3, 15, 2):
+        assert watchdog.missed(roster, [_at(minute)]) == []
+        watchdog.observe(
+            _cycle(
+                _seg("chains", "T000", "gap"),
+                *[_seg(key.surface, key.ticker, "data") for key in healthy],
+                at=_at(minute + 1),
+            )
+        )
+
+
+def test_a_stall_that_trips_one_surface_while_the_others_sit_below_still_pages():
+    # The roster is rarely uniform. Surfaces recover at different minutes, so the stall
+    # that pushes one of them over arrives while the rest are nowhere near. The page
+    # carries the minutes of the surface that tripped, not the slot it tripped on. The
+    # one that trips is quotes, which sorts last, so a gate reading a single surface
+    # off the front of the roster finds a counter at 1 and says nothing.
+    watchdog = Watchdog()
+    roster = _roster(1)
+    for minute in range(2):
+        watchdog.observe(
+            _cycle(
+                _seg("quotes", "T000", "gap"),
+                _seg("chains", "T000", "data"),
+                at=_at(minute),
+            )
+        )
+    pages = watchdog.missed(roster, [_at(2)])
+    assert [page.title for page in pages] == ["Capture down: loop overran"]
+    assert pages[0].minutes == 3
+    assert len(pages[0].surfaces) == 2
+    assert watchdog.count("chains", "T000") == 1
+
+
+def test_a_second_stall_inside_an_outage_that_is_still_running_adds_nothing():
+    # A cycle that ran and gapped everything is the outage carrying on. It pages each
+    # surface on its own account, and a stall after it charges the same surfaces, so the
+    # stall has nothing left to report. What re-arms the stall page is a durable data
+    # cycle, because that is what proves the loop is running again.
+    watchdog = Watchdog()
+    roster = _roster(2)
+    assert len(watchdog.missed(roster, [_at(minute) for minute in range(3)])) == 1
+    watchdog.observe(_cycle(*[_seg(key.surface, key.ticker, "gap") for key in roster], at=_at(3)))
+    assert watchdog.missed(roster, [_at(minute) for minute in range(4, 7)]) == []
+
+
+def test_slots_out_of_order_charge_the_same_as_slots_in_order():
+    # The date-roll guard reads the slots in time order, so the order they arrive in
+    # cannot decide what the page says. A shuffled run that crosses a session date would
+    # otherwise charge yesterday's minutes onto today's counters.
+    slots = [_at(minute) for minute in range(50)] + [_at(minute, day=3) for minute in range(4)]
+    in_order = Watchdog()
+    shuffled = Watchdog()
+    ordered_pages = in_order.missed(_roster(2), slots)
+    shuffled_pages = shuffled.missed(_roster(2), list(reversed(slots)))
+    assert [page.minutes for page in shuffled_pages] == [page.minutes for page in ordered_pages]
+    assert shuffled.count("chains", "T000") == in_order.count("chains", "T000") == 4
+
+
+def test_a_call_with_nothing_to_charge_pages_nothing():
+    """An empty roster and an empty run of slots are both nothing happening.
+
+    A fully retired lake is a supported state, and a call carrying no slots is a stall
+    that did not happen. Neither is a fact about the loop, so neither raises a page, and
+    the counters standing past the threshold does not make one. The threshold is lowered
+    here the way a mid-session recalibration lowers it, which is how a counter comes to
+    sit past the threshold with no page of its own behind it.
+    """
+    threshold = [5]
+    watchdog = Watchdog(page_minutes=lambda: threshold[0])
+    roster = _roster(2)
+    assert watchdog.missed(roster, [_at(minute) for minute in range(3)]) == []
+    threshold[0] = 3
+    assert watchdog.missed(roster, []) == []
+    assert watchdog.missed([], [_at(minute) for minute in range(10)]) == []
+
+
+def test_a_stall_pages_again_on_the_next_session_date():
+    # The sibling of the counter rule and the cause rule. A stall flag carried overnight
+    # would silence the next morning's first stall, however long that one ran.
+    watchdog = Watchdog()
+    roster = _roster(2)
+    first = watchdog.missed(roster, [_at(minute) for minute in range(3)])
+    assert [page.title for page in first] == ["Capture down: loop overran"]
+    second = watchdog.missed(roster, [_at(minute, day=3) for minute in range(3)])
+    assert [page.title for page in second] == ["Capture down: loop overran"]
+
+
+def test_a_stall_across_a_session_date_names_only_this_session_s_slots():
+    # The date change drops the counters, so the slots below it are no longer minutes
+    # this session went without. Counting them would put a night of closed-market
+    # minutes in a page about this morning's stall.
+    watchdog = Watchdog()
+    roster = _roster(2)
+    slots = [_at(minute) for minute in range(50)] + [_at(minute, day=3) for minute in range(4)]
+    pages = watchdog.missed(roster, slots)
+    assert [page.minutes for page in pages] == [4]
+    assert {watchdog.count(key.surface, key.ticker) for key in roster} == {4}
 
 
 # -- failures that take the whole daemon down ----------------------------------------
@@ -874,7 +1109,7 @@ def test_a_slept_through_slot_pages_with_no_class():
     # name. Guessing one would point at a request that was never made.
     watchdog = Watchdog()
     pages = watchdog.missed([Surface("chains", "SPY")], [_at(minute) for minute in range(3)])
-    assert [page.title for page in pages] == ["Capture down: SPY chains"]
+    assert [page.title for page in pages] == ["Capture down: loop overran"]
     assert pages[0].cause is None
 
 

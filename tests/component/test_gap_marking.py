@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import collections
 import os
+import re
 from datetime import date, datetime
 from pathlib import Path
 
@@ -867,13 +868,11 @@ def test_no_minute_falls_between_the_startup_pass_and_the_first_cycle(
     assert covered[-1] == captured[-1]
 
 
-def _overrun_after_a_roster_change(
-    tmp_path: Path, *, before: str, after: str
-) -> tuple[Path, list[str]]:
+def _overrun_after_a_roster_change(tmp_path: Path, *, before: str, after: str) -> tuple[Path, int]:
     """Run a loop whose first cycle rewrites ``tickers.yaml`` and then overruns.
 
-    Returns the lake root and the tickers the watchdog raised a page for. Both
-    skipped-slot consumers read the roster, so one run shows what each of them did.
+    Returns the lake root and how many surfaces the watchdog charged. Both skipped-slot
+    consumers read the roster, so one run shows what each of them did.
 
     The rewrite lands at 10:00 and that cycle returns at 10:03, so the next tick reports
     10:01 through 10:03 as skipped. A skipped slot is the one hook where no cycle ran, so
@@ -923,7 +922,7 @@ def _overrun_after_a_roster_change(
         cycle_runner=cycle,
         should_continue=twice,
     )
-    return lake_root, _charged([m.title for m in alerts.messages])
+    return lake_root, _charged(alerts.messages)
 
 
 # The minutes the overrun swallows. The length is the watchdog's own page threshold, so
@@ -934,15 +933,29 @@ def _overrun_after_a_roster_change(
 OVERRUN = GuardConstants().watchdog_page_minutes
 SKIPPED = [f"2026-09-02T10:{m:02d}" for m in range(1, OVERRUN + 1)]
 
-# Every ticker these tests put on a roster. A page names the ticker it is about, so the
-# set of names appearing across the pages is which surfaces were charged. Reading it
-# that way keeps the watchdog's title format asserted in one place, its own unit tests.
-_TICKERS = ("ABC", "NEW", "XYZ")
+# One stall is one page, and that page counts the surfaces it charged rather than
+# naming them. Every roster below puts one counter on each ticker, so that count is the
+# size of the roster the hook read, and a hook reading the wrong one lands on a
+# different number in each case here.
+_FOLDED = re.compile(r"one page for (\d+) surfaces")
+_OVERRUN_TITLE = "Capture down: loop overran"
 
 
-def _charged(titles: list[str]) -> list[str]:
-    """Which tickers the run raised a page for."""
-    return sorted({t for t in _TICKERS for title in titles if t in title})
+def _charged(messages: list) -> int:
+    """How many surfaces the run's overrun page charged.
+
+    The page carries that count only when it charged more than one surface, which is the
+    daemon's rule for every folded page, so a page with no count charged one. No stall
+    page at all means the hook charged nothing the threshold reached. Reading the page
+    this way keeps the watchdog's title and body format asserted in one place, its own
+    unit tests.
+    """
+    bodies = [m.body for m in messages if m.title == _OVERRUN_TITLE]
+    if not bodies:
+        return 0
+    (body,) = bodies
+    folded = _FOLDED.search(body)
+    return int(folded.group(1)) if folded else 1
 
 
 def _marked(root: Path, ticker: str) -> list[str]:
@@ -1006,36 +1019,36 @@ def test_the_watchdog_charges_the_roster_as_it_stands_on_a_skipped_slot(tmp_path
     ran to fix a roster snapshot, so both read ``tickers.yaml`` themselves. Deleting
     either read must not leave the suite green. XYZ is retired at 10:00 and must stop
     being charged without a restart. NEW is onboarded at 10:00, is captured from the
-    next cycle, and must start.
+    next cycle, and must start. Each run charges one counter per enabled ticker, so a
+    hook closed over the roster the daemon started with lands on the other number.
     """
     _, retired = _overrun_after_a_roster_change(
         tmp_path / "retired",
         before="ABC: {options: false}\nXYZ: {options: false}\n",
         after="ABC: {options: false}\n",
     )
-    assert retired == ["ABC"]
+    assert retired == 1
 
     _, onboarded = _overrun_after_a_roster_change(
         tmp_path / "onboarded",
         before="ABC: {options: false}\n",
         after="ABC: {options: false}\nNEW: {options: false}\n",
     )
-    assert onboarded == ["ABC", "NEW"]
+    assert onboarded == 2
 
 
 def test_the_watchdog_does_not_charge_a_ticker_disabled_in_place(tmp_path):
     """The on/off switch is the same boundary here as it is for gap marking.
 
     XYZ stays in ``tickers.yaml``, only turned off, rather than being removed. A reader
-    that iterates the raw roster would still charge it and eventually page for a surface
-    nothing owes any more.
+    that iterates the raw roster would charge both and say so on the page it raises.
     """
     _, disabled = _overrun_after_a_roster_change(
         tmp_path,
         before="ABC: {options: false}\nXYZ: {options: false}\n",
         after="ABC: {options: false}\nXYZ: {options: false, enabled: false}\n",
     )
-    assert disabled == ["ABC"]
+    assert disabled == 1
 
 
 # -- the marking pass survives a lake it cannot read -----------------------------------

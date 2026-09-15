@@ -134,25 +134,28 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   debris. Gap-marking already skipped a sealed date for this exact reason. The guard now
   does too.
 
-- **[#94](https://github.com/l3a0/marketlake/issues/94), [#95](https://github.com/l3a0/marketlake/issues/95), [#113](https://github.com/l3a0/marketlake/issues/113) and [#114](https://github.com/l3a0/marketlake/issues/114).** Four residual gaps in
+- **[#95](https://github.com/l3a0/marketlake/issues/95), [#113](https://github.com/l3a0/marketlake/issues/113) and [#114](https://github.com/l3a0/marketlake/issues/114).** Three residual gaps in
   the daemon's production wiring. `test_daemon_wiring.py` covers the hook bindings
   `run_loop_from_config` builds, and deleting any one of them fails a test. What no test
-  covers is narrower than a binding. This entry listed seven. Three have closed since, each
-  to a different change rather than to one: the close-guard layer's `on_tick` pass-through
-  to D15's idle stamp, the guard's dispatch moment to the wiring tests themselves, and the
-  gap marker's security master to the close+15 dispatch. Each of the four below was
-  re-confirmed by mutating `src/lake/daemon.py` and running the whole suite, which stays
-  green:
+  covers is narrower than a binding. This entry listed seven. Four have closed since, each
+  to a different change rather than to one:
 
-  1. the dead-man's `any` over a cycle's segments, which single-segment fixtures cannot
-     tell from `all`, which is [#94](https://github.com/l3a0/marketlake/issues/94),
-  2. the `session_phase` the loop forwards into the production cycle runner, and the fact
+  - the close-guard layer's `on_tick` pass-through, to D15's idle stamp,
+  - the guard's dispatch moment, to the wiring tests themselves,
+  - the gap marker's security master, to the close+15 dispatch,
+  - the dead-man's `any` over a cycle's segments, to one cycle carrying a data segment
+    beside a gap and one carrying no segment at all.
+
+  Each of the three below was re-confirmed by mutating `src/lake/daemon.py` and running
+  the whole suite, which stays green:
+
+  1. the `session_phase` the loop forwards into the production cycle runner, and the fact
      that no test carries either it or the close tag into a journaled row through the
      production entry, which is [#95](https://github.com/l3a0/marketlake/issues/95). The `close_tag` half of the forward is
      covered, by `test_the_daemon_answers_the_close_tag_hook_from_the_calendar`,
-  3. the caller's `on_start` and `on_skipped` pass-throughs in the gap-marker layer, which
+  2. the caller's `on_start` and `on_skipped` pass-throughs in the gap-marker layer, which
      is [#113](https://github.com/l3a0/marketlake/issues/113),
-  4. the watchdog instance the skipped-slot hook charges, which no test ties to the one the
+  3. the watchdog instance the skipped-slot hook charges, which no test ties to the one the
      cycle observer feeds, which is [#114](https://github.com/l3a0/marketlake/issues/114).
 - **D11** close tags and the close+5 guard. Close+5 is the five-minute window after the option close, the last moment an option-close fetch may land. It plugs into D9's close-tag hook, and it builds the session-relative dispatcher the design calls for. Everything session-relative runs from inside the daemon, because launchd's calendar intervals are fixed wall-clock and cannot express a close-relative time. `SessionDispatch` fires one job once per session day at a moment the calendar decides, including on a daemon that starts after that moment has passed. The close+15 compaction dispatch binds to the same seam, one tick later than its own moment, for the reason the entry above gives. Two rules are worth stating where both writers can see them:
   1. The guard's fill triggers on missing marks, not a missing cycle. A chain that failed at the option close leaves a tagged gap row holding nothing a reader can price against, and a close+5 refetch is exactly what rescues it.
@@ -245,8 +248,9 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
 - **D13** watchdog and alerting. One counter per ticker and surface. A durable data cycle resets it, a gap row does not, and three consecutive session minutes page once. Counters start at zero on every restart, never rebuilt from the journal, so a restart never pages for the downtime that preceded it. It observes both D9's cycle-outcome hook and its skipped-slot hook, because the loop runs no cycle for a slot it slept through and those are the minutes the daemon was worst off. Three collapses keep a page storm from replacing a diagnosis:
   1. Every quotes ticker rides one batched request, so all of them failing together is one page naming the sampler.
   2. A cycle where every surface failed with the same known class pages that cause instead. A dead refresh token gaps chains and quotes for every ticker at once, and the design expects one every seven days.
-  3. A page that never reached the phone is written to a dated directory under `reports/`, one write-once file each, so the count on the Now panel has a source.
-  It also ships the 09:35 says-closed-but-open probe, its page, its plist through D14's renderer, and the `capture` dead-man feed with its idle heartbeats.
+  3. A slot the loop slept through gaps every watched surface at once, so one overrun that trips the threshold is one page rather than one per surface.
+
+  A page that never reached the phone is written to a dated directory under `reports/`, one write-once file each, so the count on the Now panel has a source. It also ships the 09:35 says-closed-but-open probe, its page, its plist through D14's renderer, and the `capture` dead-man feed with its idle heartbeats.
 - **[#197](https://github.com/l3a0/marketlake/issues/197).** The parser's schema-drift page, split out of #92. The class it subscribes to was narrowed by [#129](https://github.com/l3a0/marketlake/issues/129), so a retype now shows as a known field's name sitting in `extra` rather than as a raised exception.
 - **[#198](https://github.com/l3a0/marketlake/issues/198).** `--test-push` on the onboarding command, split out of #92.
 - **[#204](https://github.com/l3a0/marketlake/issues/204).** Whether the `capture` dead-man went down during the 2026-09-09 auth outage, which its code path says it should have and #92 recorded it did not. The healthchecks event log settles it, and the answer decides whether the design's account of that outage needs correcting or the whole-daemon guarantee has a hole.

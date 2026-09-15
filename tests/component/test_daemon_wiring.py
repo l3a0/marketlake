@@ -66,7 +66,7 @@ import pytest
 
 from lake import capture, close_guard, daemon, gap, journal, report
 from lake.alert import PAGE_PRIORITY, Message
-from lake.capture import CycleResult, SegmentOutcome
+from lake.capture import CycleResult, SegmentError, SegmentOutcome
 from lake.capture_spans import CaptureSpans, spans_path
 from lake.chain_plan import ChainPlan, load_chain_plan
 from lake.compact import COMPACTION_SLUG, compact, write_chain_plan
@@ -98,9 +98,9 @@ EQUITY_ONLY = "XYZ: {options: false}\n"
 WITH_OPTIONS = "SPY: {options: true, chain_cadence: 1m}\n"
 
 # Two equity-only tickers, and the same roster after one is retired. Neither carries
-# options, so each ticker owns exactly one counter. A slept-through slot attempts no
-# request, so the two quotes counters page one by one rather than collapsing into the
-# single sampler page a failed live cycle would raise.
+# options, so each ticker owns exactly one counter. One overrun raises one page for
+# every surface it charged, so the count on that page is how many counters the hook
+# found on the roster it read.
 TWO_TICKERS = "XYZ: {options: false}\nABC: {options: false}\n"
 ONE_RETIRED = "ABC: {options: false}\n"
 
@@ -328,13 +328,26 @@ def _no_cycle(*, close_tag: str | None, session_phase: str | None) -> CycleResul
     raise AssertionError("a cycle ran off the capture window")
 
 
-def _segment(row_kind: str, root: Path) -> SegmentOutcome:
-    """One journalled segment of the named kind, the shape a cycle result carries."""
+def _segment(
+    row_kind: str,
+    root: Path,
+    surface: str = journal.QUOTES_SURFACE,
+    ticker: str = "XYZ",
+) -> SegmentOutcome:
+    """One journalled segment of the named kind, the shape a cycle result carries.
+
+    ``surface`` and ``ticker`` default to quotes on XYZ, the values every caller used
+    before they were parameters, so a test that only cares about the row kind passes
+    neither. A cycle carrying two segments has to name both, because the watchdog keys
+    its counters on the surface and ticker together. Two calls at the defaults would be
+    one surface reported twice, and a cycle plans one segment per pair, so production
+    never emits that.
+    """
     return SegmentOutcome(
-        surface=journal.QUOTES_SURFACE,
-        ticker="XYZ",
+        surface=surface,
+        ticker=ticker,
         path=root / "segment.arrows",
-        partition="quotes/ticker=XYZ/date=2026-09-02/segment.arrows",
+        partition=f"{surface}/ticker={ticker}/date=2026-09-02/segment.arrows",
         row_kind=row_kind,
         rows=1,
         error_class=None if row_kind == journal.ROW_KIND_DATA else "boom",
@@ -389,7 +402,9 @@ def test_the_minutes_a_live_overrun_slept_through_charge_the_watchdog(tmp_path):
     # produced no segment, so nothing but the missed minutes charged a counter.
     (page,) = rig.transport.sent
     assert page.event == "capture_down"
-    assert page.title == "Capture down: XYZ quotes"
+    # The stall is what the page is about, and it says how many slots it slept through.
+    # One surface was charged, so there is no fold count to carry.
+    assert page.title == "Capture down: loop overran"
     # No class is named, and that is the point rather than an omission. Nothing was
     # attempted in a slept-through slot, so there is no failure to name.
     assert page.body == "3 session minutes without a durable cycle"
@@ -437,6 +452,79 @@ def test_only_a_durable_cycle_arms_the_capture_dead_man(row_kind, pings, tmp_pat
     _run(rig, clock, ticks=1, cycle_runner=lambda *, close_tag, session_phase: result)
 
     assert rig.pinger.urls == [CAPTURE_URL] * pings
+
+
+@pytest.mark.parametrize("data_first", [True, False])
+def test_one_live_surface_beside_a_dead_one_still_arms_the_dead_man(data_first, tmp_path):
+    """A partly failing cycle is a living daemon, and the check must hear from it.
+
+    The feed asks whether the daemon is alive, not whether every surface is well. A
+    chains segment of real rows only exists because the loop ran, the vendor answered,
+    and a write landed, so the dead-man has its answer whatever else that minute lost.
+    The failed surface beside it belongs to the watchdog, which counts it and pages
+    under that surface's own name once it stays down. Going silent here would report
+    that one failure a second time, as the whole daemon being gone.
+
+    So the feed asks whether any segment landed data, and a cycle of one segment cannot
+    tell that from asking whether all of them did. This one carries two. Under ``all``
+    the common partial failure would stop feeding the check, and the check pages on
+    silence.
+
+    The two orderings run because the answer is about the whole cycle, not about
+    whichever segment the runner happened to write first. Reading only
+    ``result.segments[0]`` passes the one ordering and is wrong.
+    """
+    rig = _rig(tmp_path, WITH_OPTIONS + EQUITY_ONLY)
+    landed = _segment(journal.ROW_KIND_DATA, tmp_path, journal.CHAINS_SURFACE, "SPY")
+    gapped = _segment(journal.ROW_KIND_GAP, tmp_path, journal.QUOTES_SURFACE, "XYZ")
+    segments = (landed, gapped) if data_first else (gapped, landed)
+    result = CycleResult(et(2026, 9, 2, 11, 59), segments)
+    clock = ManualClock(start=et(2026, 9, 2, 11, 58, 30))
+    _run(rig, clock, ticks=1, cycle_runner=lambda *, close_tag, session_phase: result)
+
+    assert rig.pinger.urls == [CAPTURE_URL]
+
+
+def test_a_cycle_that_journalled_nothing_leaves_the_dead_man_silent(tmp_path):
+    """A cycle that wrote no segment at all captured nothing, and must not say it did.
+
+    A non-empty roster whose every write failed produces this shape: no segment, and one
+    error per segment the cycle could not journal. That is the daemon owing data and
+    landing none, which is the outage the external check exists to page on.
+
+    It is a separate case from the empty roster, where every ticker has retired, there
+    is nothing to fetch, and the daemon is idle by design. Only that one may feed the
+    check, and it does through ``nothing_to_capture``. Both arrive with no segments, so
+    a reading over all of them cannot tell the two apart, because an empty run of
+    segments satisfies ``all`` and fails ``any``. Under ``all`` this cycle would report
+    a daemon capturing nothing as healthy.
+
+    The watchdog page is the positive half, and it is what makes the silence evidence.
+    An assertion that no ping went out is satisfied just as well by a hook that never
+    ran at all, so on its own it would prove nothing. The page proves the cycle reached
+    the hook, the errors reached the counters, and the dead-man then declined to feed.
+    """
+    rig = _rig(tmp_path)
+
+    # ``nothing_to_capture`` is left at its default, which is the value a cycle over a
+    # non-empty roster computes for itself in ``_CaptureCycle.run``. The errors are the
+    # writes that failed, the way that cycle reports a segment it could not journal.
+    def runner(*, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        return CycleResult(
+            clock.now().replace(second=0, microsecond=0),
+            (),
+            errors=(SegmentError(journal.QUOTES_SURFACE, "XYZ", "disk_error"),),
+        )
+
+    clock = ManualClock(start=et(2026, 9, 2, 11, 58, 30))
+    # Three session minutes is the watchdog's page threshold, so the run is long enough
+    # for the surface to report itself down.
+    _run(rig, clock, ticks=3, cycle_runner=runner)
+
+    assert rig.pinger.urls == []
+    (page,) = rig.transport.sent
+    assert page.title == "Capture down: XYZ quotes"
+    assert page.body == "3 session minutes without a durable cycle, failing with disk_error"
 
 
 # -- 5. the per-tick hook reaches the close+5 guard ----------------------------------
@@ -597,9 +685,9 @@ def _run_across_an_edit(rig: _Rig, roster: str) -> None:
 
     The 10:00 cycle takes 200 seconds, so the loop next wakes at 10:04 and hands 10:01,
     10:02, and 10:03 to the skipped-slot hook. Three slept-through slots is the design's
-    page threshold. So the hook pages every surface it charges across that stretch, and
-    every surface it does not charge stays silent. The cycles produce no segment of
-    their own, so nothing but the missed minutes charges a counter.
+    page threshold. So the stretch raises one page, and that page counts the surfaces
+    the hook charged. The cycles produce no segment of their own, so nothing but the
+    missed minutes charges a counter.
     """
     _seed_two(rig)
     clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
@@ -625,8 +713,11 @@ def test_a_ticker_retired_mid_session_stops_charging_the_watchdog(tmp_path):
     rig = _rig(tmp_path, roster=TWO_TICKERS)
     _run_across_an_edit(rig, ONE_RETIRED)
 
-    # Sorted, because the page order is the watchdog's own rule and not this one's.
-    assert sorted(page.title for page in rig.transport.sent) == ["Capture down: ABC quotes"]
+    # One counter charged, ABC's, so the page carries no fold count. A hook closed over
+    # the roster the daemon started with would have charged two and said so.
+    (page,) = rig.transport.sent
+    assert page.title == "Capture down: loop overran"
+    assert page.body == "3 session minutes without a durable cycle"
 
 
 def test_a_ticker_onboarded_mid_session_starts_charging_the_watchdog(tmp_path):
@@ -642,11 +733,11 @@ def test_a_ticker_onboarded_mid_session_starts_charging_the_watchdog(tmp_path):
     rig = _rig(tmp_path, roster=TWO_TICKERS)
     _run_across_an_edit(rig, THREE_TICKERS)
 
-    assert sorted(page.title for page in rig.transport.sent) == [
-        "Capture down: ABC quotes",
-        "Capture down: DEF quotes",
-        "Capture down: XYZ quotes",
-    ]
+    # Three counters charged, so the hook read the file the edit left rather than the
+    # two-ticker roster the daemon started with.
+    (page,) = rig.transport.sent
+    assert page.title == "Capture down: loop overran"
+    assert page.body == "3 session minutes without a durable cycle, one page for 3 surfaces"
 
 
 @pytest.mark.parametrize("roster", [UNLOADABLE, MID_LINE_TEAR], ids=["refused", "torn"])
@@ -723,11 +814,10 @@ def test_the_hook_charges_every_surface_its_ticker_is_captured_on(tmp_path):
     clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
     _run(rig, clock, ticks=2, cycle_runner=_Overrunning(clock, 200))
 
-    # One quotes ticker, so the sampler collapse cannot fire whatever the fan-out does.
-    assert sorted(page.title for page in rig.transport.sent) == [
-        "Capture down: SPY chains",
-        "Capture down: SPY quotes",
-    ]
+    # Two counters on one ticker, so charging quotes alone would have said one surface.
+    (page,) = rig.transport.sent
+    assert page.title == "Capture down: loop overran"
+    assert page.body == "3 session minutes without a durable cycle, one page for 2 surfaces"
 
 
 # -- 8. a mid-session recalibration reaches the watchdog ----------------------------
