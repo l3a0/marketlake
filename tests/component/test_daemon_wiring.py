@@ -66,7 +66,7 @@ import pytest
 
 from lake import capture, close_guard, daemon, gap, journal, report
 from lake.alert import PAGE_PRIORITY, Message
-from lake.capture import CycleResult, SegmentOutcome
+from lake.capture import CycleResult, SegmentError, SegmentOutcome
 from lake.capture_spans import CaptureSpans, spans_path
 from lake.chain_plan import ChainPlan, load_chain_plan
 from lake.compact import COMPACTION_SLUG, compact, write_chain_plan
@@ -328,13 +328,26 @@ def _no_cycle(*, close_tag: str | None, session_phase: str | None) -> CycleResul
     raise AssertionError("a cycle ran off the capture window")
 
 
-def _segment(row_kind: str, root: Path) -> SegmentOutcome:
-    """One journalled segment of the named kind, the shape a cycle result carries."""
+def _segment(
+    row_kind: str,
+    root: Path,
+    surface: str = journal.QUOTES_SURFACE,
+    ticker: str = "XYZ",
+) -> SegmentOutcome:
+    """One journalled segment of the named kind, the shape a cycle result carries.
+
+    ``surface`` and ``ticker`` default to quotes on XYZ, the values every caller used
+    before they were parameters, so a test that only cares about the row kind passes
+    neither. A cycle carrying two segments has to name both, because the watchdog keys
+    its counters on the surface and ticker together. Two calls at the defaults would be
+    one surface reported twice, and a cycle plans one segment per pair, so production
+    never emits that.
+    """
     return SegmentOutcome(
-        surface=journal.QUOTES_SURFACE,
-        ticker="XYZ",
+        surface=surface,
+        ticker=ticker,
         path=root / "segment.arrows",
-        partition="quotes/ticker=XYZ/date=2026-09-02/segment.arrows",
+        partition=f"{surface}/ticker={ticker}/date=2026-09-02/segment.arrows",
         row_kind=row_kind,
         rows=1,
         error_class=None if row_kind == journal.ROW_KIND_DATA else "boom",
@@ -439,6 +452,79 @@ def test_only_a_durable_cycle_arms_the_capture_dead_man(row_kind, pings, tmp_pat
     _run(rig, clock, ticks=1, cycle_runner=lambda *, close_tag, session_phase: result)
 
     assert rig.pinger.urls == [CAPTURE_URL] * pings
+
+
+@pytest.mark.parametrize("data_first", [True, False])
+def test_one_live_surface_beside_a_dead_one_still_arms_the_dead_man(data_first, tmp_path):
+    """A partly failing cycle is a living daemon, and the check must hear from it.
+
+    The feed asks whether the daemon is alive, not whether every surface is well. A
+    chains segment of real rows only exists because the loop ran, the vendor answered,
+    and a write landed, so the dead-man has its answer whatever else that minute lost.
+    The failed surface beside it belongs to the watchdog, which counts it and pages
+    under that surface's own name once it stays down. Going silent here would report
+    that one failure a second time, as the whole daemon being gone.
+
+    So the feed asks whether any segment landed data, and a cycle of one segment cannot
+    tell that from asking whether all of them did. This one carries two. Under ``all``
+    the common partial failure would stop feeding the check, and the check pages on
+    silence.
+
+    The two orderings run because the answer is about the whole cycle, not about
+    whichever segment the runner happened to write first. Reading only
+    ``result.segments[0]`` passes the one ordering and is wrong.
+    """
+    rig = _rig(tmp_path, WITH_OPTIONS + EQUITY_ONLY)
+    landed = _segment(journal.ROW_KIND_DATA, tmp_path, journal.CHAINS_SURFACE, "SPY")
+    gapped = _segment(journal.ROW_KIND_GAP, tmp_path, journal.QUOTES_SURFACE, "XYZ")
+    segments = (landed, gapped) if data_first else (gapped, landed)
+    result = CycleResult(et(2026, 9, 2, 11, 59), segments)
+    clock = ManualClock(start=et(2026, 9, 2, 11, 58, 30))
+    _run(rig, clock, ticks=1, cycle_runner=lambda *, close_tag, session_phase: result)
+
+    assert rig.pinger.urls == [CAPTURE_URL]
+
+
+def test_a_cycle_that_journalled_nothing_leaves_the_dead_man_silent(tmp_path):
+    """A cycle that wrote no segment at all captured nothing, and must not say it did.
+
+    A non-empty roster whose every write failed produces this shape: no segment, and one
+    error per segment the cycle could not journal. That is the daemon owing data and
+    landing none, which is the outage the external check exists to page on.
+
+    It is a separate case from the empty roster, where every ticker has retired, there
+    is nothing to fetch, and the daemon is idle by design. Only that one may feed the
+    check, and it does through ``nothing_to_capture``. Both arrive with no segments, so
+    a reading over all of them cannot tell the two apart, because an empty run of
+    segments satisfies ``all`` and fails ``any``. Under ``all`` this cycle would report
+    a daemon capturing nothing as healthy.
+
+    The watchdog page is the positive half, and it is what makes the silence evidence.
+    An assertion that no ping went out is satisfied just as well by a hook that never
+    ran at all, so on its own it would prove nothing. The page proves the cycle reached
+    the hook, the errors reached the counters, and the dead-man then declined to feed.
+    """
+    rig = _rig(tmp_path)
+
+    # ``nothing_to_capture`` is left at its default, which is the value a cycle over a
+    # non-empty roster computes for itself in ``_CaptureCycle.run``. The errors are the
+    # writes that failed, the way that cycle reports a segment it could not journal.
+    def runner(*, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        return CycleResult(
+            clock.now().replace(second=0, microsecond=0),
+            (),
+            errors=(SegmentError(journal.QUOTES_SURFACE, "XYZ", "disk_error"),),
+        )
+
+    clock = ManualClock(start=et(2026, 9, 2, 11, 58, 30))
+    # Three session minutes is the watchdog's page threshold, so the run is long enough
+    # for the surface to report itself down.
+    _run(rig, clock, ticks=3, cycle_runner=runner)
+
+    assert rig.pinger.urls == []
+    (page,) = rig.transport.sent
+    assert page.title == "Capture down: XYZ quotes"
+    assert page.body == "3 session minutes without a durable cycle, failing with disk_error"
 
 
 # -- 5. the per-tick hook reaches the close+5 guard ----------------------------------
