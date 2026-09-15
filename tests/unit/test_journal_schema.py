@@ -1750,12 +1750,19 @@ def test_a_column_with_no_route_into_extra_still_costs_the_cycle():
 # Every shape the transform must refuse, one per reason. The bool pair is the silent one,
 # where ``float(True)`` makes a plausible 1970 stamp with nothing raised. The rest raised
 # out of the row builder before this, which cost the whole minute.
-REFUSED_EPOCHS = (True, False, "n/a", {"a": 1}, [1], "inf", "nan", 1e30)
+REFUSED_EPOCHS = (True, False, "n/a", "", " ", {"a": 1}, [1], "inf", "nan", 1e30)
 
 # Every shape the transform must keep converting. The numeric strings are the trap: they
 # convert correctly today, so a fix that refused anything not an ``int`` or a ``float``
 # would drop values the lake captures right now.
-ACCEPTED_EPOCHS = ("1758000000000", " 1758000000000 ", 1758000000000.0, 1758000000000)
+ACCEPTED_EPOCHS = (
+    "1758000000000",
+    " 1758000000000 ",
+    "1758000000000.0",
+    "1.758e12",
+    1758000000000.0,
+    1758000000000,
+)
 
 # What all four of those name, as the stamp each must produce.
 ACCEPTED_ISO = "2025-09-16T05:20:00+00:00"
@@ -1927,6 +1934,71 @@ def test_the_refusal_is_signalled_locally_and_never_through_unfit_errors():
     # And an epoch that raised OverflowError, the one member that does overlap, is refused
     # by the transform rather than by anything the tuple governs.
     assert _chain_row(quoteTimeInLong="inf")["vendor_quote_ts"] is None
+
+
+def test_the_demotion_belongs_to_the_quote_block_and_not_to_every_block_named_quote_time():
+    """``extended`` carries a ``quoteTime`` too, and it is an ordinary column there.
+
+    The field name is shared. ``_EXTENDED_MAP`` maps ``quoteTime`` to
+    ``extended_quote_time``, a column of its own, while the ``quote`` block's is consumed
+    into the stamp. So the demotion has to key on the block's consumed set rather than on
+    the field's name, or the extended column is written and overflowed at once.
+
+    The value here is an epoch far outside any clock's range, chosen because it is the one
+    shape that separates the two blocks. The int64 column takes it happily, and the epoch
+    transform refuses it, so a demotion that ignored the consumed set would leave the value
+    in its column and put its name in ``extra`` beside it. That name is the signature a
+    reader takes to mean the column refused the row, and here the column refused nothing.
+    """
+    row = _quote_row("extended", quoteTime=10**18)
+    assert row["extended_quote_time"] == 10**18
+    assert row["extra"] is None
+
+    # The same value in the quote block, where the demotion does belong.
+    quote_row = _quote_row("quote", quoteTime=10**18)
+    assert json.loads(quote_row["extra"])["quote"] == {"quoteTime": 10**18}
+
+
+def test_a_quote_time_keeps_the_milliseconds_the_vendor_sent():
+    """The stamp is built from an epoch in milliseconds, so the milliseconds have to survive.
+
+    Every other epoch in this file ends in three zeros, which is what a hand-written fixture
+    looks like and not what Schwab sends. A stamp that floored to the second would read as
+    correct against all of them, and ``vendor_quote_ts`` is a string column, so the schema
+    checks nothing either. Staleness is measured per row off this stamp, so the lost digits
+    would be lost from a measurement rather than a label.
+    """
+    row = _chain_row(quoteTimeInLong=1758000000123)
+    assert row["vendor_quote_ts"] == "2025-09-16T05:20:00.123000+00:00"
+
+    # The shared transform, which the quotes surface reaches through ``lake.capture``.
+    assert journal.epoch_ms_to_utc(1758000000123).isoformat() == "2025-09-16T05:20:00.123000+00:00"
+
+
+def test_a_zero_epoch_converts_and_stays_apart_from_the_bool_that_equals_it():
+    """``0`` is a timestamp and ``False`` is not, which is the whole shape of the guard.
+
+    ``False == 0`` is true in Python, so the two are one value to an equality check. The
+    guard excludes the bool by type and leaves every number alone, which is what makes the
+    rule refuse what converts wrongly rather than what is not a number type. Driving the
+    pair together is the only way to see that the guard reads the type and not the value.
+
+    A zero epoch is a common vendor sentinel for unset, so which side of the line it falls
+    on is a real decision. It converts, because it names a real instant and the transform
+    is not in the business of judging whether the vendor meant it. A negative epoch names an
+    instant before 1970 and converts for the same reason.
+    """
+    zero = _chain_row(quoteTimeInLong=0)
+    assert zero["vendor_quote_ts"] == "1970-01-01T00:00:00+00:00"
+    assert zero["extra"] is None
+
+    false = _chain_row(quoteTimeInLong=False)
+    assert false["vendor_quote_ts"] is None
+    assert json.loads(false["extra"]) == {"quoteTimeInLong": False}
+
+    negative = _chain_row(quoteTimeInLong=-1000)
+    assert negative["vendor_quote_ts"] == "1969-12-31T23:59:59+00:00"
+    assert negative["extra"] is None
 
 
 # -- the levels outside the contract dict and the captured blocks --------------

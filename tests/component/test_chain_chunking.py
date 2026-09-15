@@ -852,7 +852,7 @@ def _retyped_header_response(expirations: list[str]) -> VendorResponse:
 
 
 def test_a_body_the_row_builder_rejects_fails_open_to_a_whole_chain_gap(lake_root):
-    """A reassembled body Arrow refuses becomes a gap row, and the cycle runs on.
+    """A reassembled body the row builder refuses becomes a gap row, and the cycle runs on.
 
     Every window succeeds and the snapshot reassembles, so the failure lands where the row
     builder runs rather than in the fetch. Letting it propagate would leave the cycle
@@ -860,10 +860,11 @@ def test_a_body_the_row_builder_rejects_fails_open_to_a_whole_chain_gap(lake_roo
     would reach the same minute and do it again. So it fails open: the chain is one gap row
     carrying the failure's own class, and the quote surface for the same cycle still lands.
 
-    The drift is in a transformed field on purpose. A field the parser copies verbatim
-    routes into ``extra`` and the cycle lands, whether it arrives on the contract or at the
-    top of the body, and the two tests below cover both. This branch is what is left once
-    they do, and it still has to hold.
+    The drift is a collision on purpose, because collisions are what is left. A field the
+    parser copies verbatim routes into ``extra`` and the cycle lands, whether it arrives on
+    the contract or at the top of the body, and the two tests below cover both. A field the
+    builder transforms routes now too, per marketlake #223. What still costs the chain is a
+    row with no honest key to put a value under, which is the case the helper above builds.
     """
     plan = ChainPlan(((0, 9), (10, None)))
     vendor = _WindowVendor(

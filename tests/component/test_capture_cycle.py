@@ -701,6 +701,29 @@ def test_a_quote_block_quote_time_the_transform_refuses_lands_the_minute_too(lak
     assert _rows(chain)[0]["vendor_quote_ts"] == _CHAIN_VQT
 
 
+def test_the_quotes_stamp_keeps_the_milliseconds_the_vendor_sent(lake_root):
+    """The quotes surface builds its stamp in ``lake.capture``, so it is checked there.
+
+    Every other epoch in this file ends in three zeros, which is what a hand-written
+    cassette looks like and not what Schwab sends. A stamp that floored to the second would
+    read as correct against all of them, and ``vendor_quote_ts`` is a string column, so the
+    schema checks nothing either. Per-row staleness is measured off this stamp, so the lost
+    digits would come out of a measurement rather than a label.
+    """
+    result = capture.run_cycle(
+        ManualClock(start=_CLOCK_START),
+        CassetteVendor(_one_chain_cassette(_chain_body_with(), quote_time=1787000100123)),
+        _spy_only(),
+        lake_root,
+        pid=4242,
+        plan=_ONE_WINDOW,
+    )
+
+    row = _rows(result.segment(QUOTES, "SPY"))[0]
+    assert row["vendor_quote_ts"] == datetime.fromtimestamp(1787000100.123, tz=UTC).isoformat()
+    assert row["vendor_quote_ts"].endswith(".123000+00:00")
+
+
 def test_a_retype_that_lands_stays_scoped_to_the_contract_that_drifted(lake_root):
     """A second ticker's chain is untouched, and so is the first ticker's other field."""
     cassette = Cassette(
