@@ -4,18 +4,23 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
+from lake import alert
 from lake.alert import (
     CAP_REACHED,
+    PAGE_PRIORITY,
     POST_FAILED,
     REFUSED,
     Message,
     Publisher,
     undelivered,
 )
+from tests.support.clock import ManualClock
+from tests.support.config import NTFY_TOPIC, PING_KEY, write_config
 
 ET = ZoneInfo("America/New_York")
 NOW = datetime(2026, 9, 2, 10, 0, tzinfo=ET)
@@ -162,8 +167,6 @@ def test_the_daemon_pages_through_the_publisher_when_a_surface_goes_quiet(tmp_pa
     from lake import daemon
     from lake.capture import CycleResult, SegmentOutcome
     from tests.support.calendar import et, weekday_sessions
-    from tests.support.clock import ManualClock
-    from tests.support.config import write_config
     from tests.support.pinger import FakePinger
 
     lake_root = tmp_path / "lake"
@@ -335,3 +338,156 @@ def test_only_a_page_carries_the_tag():
     assert bodies[0]["tags"] == [PAGE_TAG]
     assert "tags" not in bodies[1]
     assert "tags" not in bodies[2]
+
+
+# -- the hand-run channel test -------------------------------------------------------
+#
+# ``python -m lake.alert --test-push`` proves the one assumption every page rides: that a
+# priority-5 push reaches the phone and interrupts it. These drive `main` with the real
+# wiring and a fake at the leaf, the way the other command entries are tested, because a
+# shortcut around `main` would leave the wiring this command exists to exercise untested.
+
+
+def _no_secret(captured) -> None:
+    """Neither stream carries the ntfy topic or the ping key.
+
+    One sweep, called from every outcome below, so a new outcome cannot get a weaker
+    check than the others. The topic is the write credential for the channel and this
+    command's whole job is to report on a push that carried it, so an operator pasting
+    the output into an issue is exactly the shape of leak to expect here.
+    """
+    for stream in (captured.out, captured.err):
+        assert NTFY_TOPIC not in stream
+        assert PING_KEY not in stream
+
+
+def _config(tmp_path, *, lake_exists: bool = True) -> tuple[Path, Path]:
+    """A config naming a lake under ``tmp_path``, and that lake's root.
+
+    ``lake_exists=False`` leaves the root uncreated, which is what makes the publisher
+    unable to write its record. That is the third outcome, the one lost twice.
+    """
+    lake_root = tmp_path / "lake"
+    if lake_exists:
+        lake_root.mkdir()
+    return write_config(tmp_path, lake_root), lake_root
+
+
+def _push(tmp_path, monkeypatch, transport, *, lake_exists: bool = True) -> tuple[int, Path]:
+    """Run the entry against ``transport``, and return its exit code and the lake root."""
+    config, lake_root = _config(tmp_path, lake_exists=lake_exists)
+    monkeypatch.setattr(alert, "NtfyTransport", lambda topic: transport)
+    code = alert.main(["--test-push", "--config", str(config)], clock=ManualClock(start=NOW))
+    return code, lake_root
+
+
+def test_a_test_push_that_sends_exits_zero_and_says_what_went_out(tmp_path, capsys, monkeypatch):
+    transport = Recording()
+    code, lake_root = _push(tmp_path, monkeypatch, transport)
+
+    assert code == 0
+    (sent,) = transport.sent
+    assert sent.event == alert.TEST_PUSH_EVENT
+    assert sent.title == alert.TEST_PUSH_TITLE
+    captured = capsys.readouterr()
+    assert "sent at priority 5" in captured.out
+    # A success sends, so there is nothing to write down.
+    assert _records(lake_root) == []
+    _no_secret(captured)
+
+
+def test_a_refused_test_push_exits_non_zero_and_prints_the_reason(tmp_path, capsys, monkeypatch):
+    """Recorded is not sent.
+
+    A page written down because it could not be sent left the phone silent. Exiting 0
+    here would hand an operator a green result for a channel that does not work, which
+    is the one failure this command exists to catch.
+    """
+    code, lake_root = _push(tmp_path, monkeypatch, Broken())
+
+    assert code != 0
+    captured = capsys.readouterr()
+    assert POST_FAILED in captured.out
+    assert "NOT sent" in captured.out
+    # The record is there. The exit code still says the channel did not carry it.
+    (record,) = _records(lake_root)
+    assert record["reason"] == POST_FAILED
+    _no_secret(captured)
+
+
+def test_a_test_push_lost_twice_says_it_was_lost_twice(tmp_path, capsys, monkeypatch):
+    """Not sent and not written down is a third outcome, not a louder second one.
+
+    An operator whose lake root is missing has a push that reached nothing and a record
+    that reached nothing either, so there is no file to go back to.
+    """
+    code, lake_root = _push(tmp_path, monkeypatch, Broken(), lake_exists=False)
+
+    assert code != 0
+    captured = capsys.readouterr()
+    assert "lost twice" in captured.out
+    assert not lake_root.exists(), "the test push created the lake root it was handed"
+    _no_secret(captured)
+
+
+def test_the_test_push_goes_at_the_page_tier(tmp_path, capsys, monkeypatch):
+    """Priority 5 is the half that matters.
+
+    The design says this push is the evidence that a page interrupts a locked iPhone. At
+    the report tier it would prove delivery and prove nothing about the interrupt, and
+    the interrupt is what every alarm depends on. The literal is pinned alongside the
+    constant, so moving the constant cannot quietly move the test.
+    """
+    transport = Recording()
+    code, _ = _push(tmp_path, monkeypatch, transport)
+
+    assert code == 0
+    (sent,) = transport.sent
+    assert sent.priority == PAGE_PRIORITY == 5
+    _no_secret(capsys.readouterr())
+
+
+def test_the_test_push_goes_through_the_publisher(tmp_path, capsys, monkeypatch):
+    """A direct POST would reach the phone and prove a path production does not use.
+
+    The publisher is where the daily cap, the secret refusal, and the record of an
+    undelivered page live. A send that skipped it would exercise none of them, so a
+    green result would say nothing about what happens when the daemon pages.
+    """
+    seen: list[Message] = []
+    built: dict = {}
+    real = alert.Publisher
+
+    class Watched(real):
+        def __init__(self, **kwargs):
+            built.update(kwargs)
+            super().__init__(**kwargs)
+
+        def publish(self, message: Message, *, now):
+            seen.append(message)
+            return super().publish(message, now=now)
+
+    monkeypatch.setattr(alert, "Publisher", Watched)
+    code, lake_root = _push(tmp_path, monkeypatch, Broken())
+
+    assert code != 0
+    assert [message.event for message in seen] == [alert.TEST_PUSH_EVENT]
+    # The publisher is armed the same way every other producer arms it, so the test push
+    # is refused if it ever carries a secret.
+    assert built["secrets"] == (PING_KEY, NTFY_TOPIC)
+    assert built["lake_root"] == lake_root
+    # The record is the publisher's own mark on the filesystem. A direct POST leaves none.
+    assert undelivered(lake_root, date(2026, 9, 2)) == 1
+    _no_secret(capsys.readouterr())
+
+
+def test_the_entry_refuses_a_bare_invocation_rather_than_paging(tmp_path, monkeypatch):
+    """Running the module with no arguments must not send a page to a phone.
+
+    ``--test-push`` names the one thing this entry does, and argparse refusing it is what
+    keeps a stray ``python -m lake.alert`` from putting a priority-5 push on the topic.
+    """
+    monkeypatch.setattr(alert, "NtfyTransport", lambda topic: Recording())
+    with pytest.raises(SystemExit) as excinfo:
+        alert.main([])
+    assert excinfo.value.code == 2

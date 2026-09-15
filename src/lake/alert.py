@@ -14,10 +14,19 @@ cosmetic. The scrub's reverse pass treats an unexpected file at the lake root as
 orphan, so a ledger there would have to widen an exclusion set the design calls
 enumerated rather than implied. A dated file under ``reports/`` is already covered, and
 the date in the path means a query for today cannot accidentally count last month.
+
+``python -m lake.alert --test-push`` is the hand run that proves the channel. Every page
+the daemon sends rides one assumption nothing else tests, that a priority-5 push reaches
+a locked phone and interrupts it. The topic is typed by hand, and the ntfy app's pass
+through each Focus mode is set by hand too, so either can be wrong. The way an operator
+learns it is that a page they needed never arrived. The test goes out through the same
+publisher every producer uses, at the same tier, and against the same daily cap. A
+success proves the real channel only when nothing about the path was special.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -28,6 +37,7 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from lake.calendar import MARKET_TZ
+from lake.clock import Clock
 from lake.paths import LakePaths
 
 # The design's cap on pages a day. The forty-first is written down and never sent, so a
@@ -280,12 +290,127 @@ def undelivered(lake_root: Path | str, day: date) -> int:
     return len(list(directory.glob("*.json")))
 
 
+# -- the hand-run channel test ---------------------------------------------------------
+
+# The event name and the title of the one message this command sends. They are pinned
+# here rather than composed at the call site, because the design's message table is what
+# an operator reads the topic against, and a message matching no shape in it is evidence
+# the topic leaked. This shape is the hand run the rotation ritual already calls for.
+TEST_PUSH_EVENT = "test_push"
+TEST_PUSH_TITLE = "Test push"
+
+
+def _test_push_body(now: datetime) -> str:
+    """What the one test message says.
+
+    Private, and named with a leading underscore on purpose. A module-level name
+    starting with ``test_`` is collected by pytest the moment a test imports it, and
+    this one takes an argument, which pytest would then read as a fixture request.
+
+    It says outright that nothing is wrong. The message arrives at the page tier, with a
+    page's emoji, and possibly in the middle of the night, so a body that read like a
+    real page would teach the operator to distrust the tier. The Eastern stamp is what
+    tells a push that just landed from one delivered late.
+    """
+    eastern = now.astimezone(MARKET_TZ)
+    return (
+        f"Hand-run channel test sent {eastern.strftime('%Y-%m-%d %H:%M:%S')} ET. "
+        "Nothing is wrong. Seeing this on a locked phone is the evidence a page "
+        "interrupts, so check that it broke through the Focus mode in use."
+    )
+
+
+def run_test_push(publisher: Publisher, *, now: datetime) -> int:
+    """Send one page through the production publisher and say what came back.
+
+    The exit code follows the ``Delivery`` rather than the process, because the publisher
+    never raises and a bare success would mean only that nothing crashed. A page written
+    down because it could not be sent left the phone just as silent as one that was lost,
+    so both exit non-zero. Reporting a recorded page as a success would hand an operator
+    a green result for a channel that does not work, which is the failure this command
+    exists to catch.
+    """
+    message = Message(
+        event=TEST_PUSH_EVENT,
+        title=TEST_PUSH_TITLE,
+        body=_test_push_body(now),
+        priority=PAGE_PRIORITY,
+    )
+    delivery = publisher.publish(message, now=now)
+    if delivery.sent:
+        print(f"test-push: sent at priority {message.priority}, the page tier.")
+        print("test-push: it counted against the daily cap of pages, the same as a real page.")
+        print("test-push: look at the phone. A page that does not arrive is the channel failing.")
+        return 0
+    if delivery.recorded:
+        print(f"test-push: NOT sent: {delivery.reason}.")
+        print(f"test-push: written down under reports/alerts/ as {message.event}.")
+        print("test-push: the channel did not carry this message, so it would not carry a page.")
+        return 1
+    print(f"test-push: NOT sent: {delivery.reason}, and writing it down failed too.")
+    print("test-push: the message is lost twice, so nothing on this machine records it.")
+    return 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The ``python -m lake.alert`` arguments.
+
+    ``--test-push`` is required rather than defaulted, so a bare invocation says what the
+    entry is for instead of silently sending a page to a phone.
+    """
+    parser = argparse.ArgumentParser(
+        prog="python -m lake.alert",
+        description="Prove the alert channel reaches the phone.",
+    )
+    parser.add_argument(
+        "--test-push",
+        action="store_true",
+        required=True,
+        help="Send one page through the production publisher and report what came back.",
+    )
+    parser.add_argument("--config", help="Path to config.yaml.")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> int:
+    """The ``python -m lake.alert`` entry. Returns a process exit code.
+
+    The transport is built here, not accepted. It POSTs to ntfy, which reaches a phone,
+    so a ``main`` that accepted one let a test omit it and send for real. A test replaces
+    ``NtfyTransport`` instead, which drives the rest of this wiring unchanged.
+
+    The topic comes from the same config every other producer reads, never from the
+    command line. A topic typed at the prompt would prove a channel nothing else uses,
+    and the channel worth proving is the one the daemon will page on.
+
+    ``clock`` stays injectable. A wall clock never reaches past this process.
+    """
+    args = build_parser().parse_args(argv)
+
+    from lake.clock import SystemClock
+    from lake.config import input_errors_exit, load_config
+
+    with input_errors_exit("alert"):
+        config = load_config(args.config)
+
+    publisher = Publisher(
+        lake_root=config.lake_root,
+        transport=NtfyTransport(config.ntfy_topic.reveal()),
+        # The values that must never reach a phone, checked against the page itself.
+        secrets=(config.healthchecks_ping_key.reveal(), config.ntfy_topic.reveal()),
+    )
+    reader = SystemClock() if clock is None else clock
+    return run_test_push(publisher, now=reader.now())
+
+
 __all__ = [
     "CAP_REACHED",
     "DEFAULT_DAILY_CAP",
     "PAGE_PRIORITY",
     "POST_FAILED",
     "REFUSED",
+    "TEST_PUSH_EVENT",
+    "TEST_PUSH_TITLE",
     "Delivery",
     "PAGE_TAG",
     "POST_TIMEOUT",
@@ -293,5 +418,12 @@ __all__ = [
     "NtfyTransport",
     "Publisher",
     "Transport",
+    "build_parser",
+    "main",
+    "run_test_push",
     "undelivered",
 ]
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised via the console, not in CI
+    raise SystemExit(main())
