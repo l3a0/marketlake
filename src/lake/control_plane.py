@@ -2159,6 +2159,11 @@ def install_script(host: LaunchdHost) -> str:
     # because a machine with no jobs installed has nothing for a token to feed.
     body += _token_step_lines()
 
+    # Arming the capture check closes the script. It is comment-only for the same reason
+    # the token pointer is, and it is last because it is the last step of the install and
+    # must not run before the bootstrap above.
+    body += _arm_capture_step_lines()
+
     # Counted from the body rather than written down, so the header cannot drift from
     # what the script actually runs.
     commands = [line for line in body if not line.startswith(("#", "echo "))]
@@ -2559,6 +2564,44 @@ def _token_step_lines() -> list[str]:
     ]
 
 
+def _arm_capture_step_lines() -> list[str]:
+    """Arming the capture check, as comment lines, for both renderings of the install.
+
+    One source for two renderings, the same reason ``_first_install_lines`` is one. The
+    install script closes on these lines and the install text prints the same block, so
+    the two cannot drift about whether the check gets armed.
+
+    Every line is a comment. Pressing a button on a web page needs a browser and a
+    person, so the install points at the step rather than takes it. That is also what
+    keeps the script safe. ``install_script`` runs under ``set -e``, and a runnable line
+    that cannot succeed would stop the install.
+
+    It sits after the bootstrap and never before, which the design's dead-man section
+    pins. A check armed before the jobs are loaded makes the page that follows about the
+    install order rather than about the daemon.
+
+    It names the check by its slug and carries no URL. A healthchecks ping URL is a
+    secret, and a rendered directory has to stay safe to paste into a bug report.
+    """
+    # lake.deadman imports this module, so the slug comes in at call time rather than
+    # at the top of the file.
+    from lake.deadman import CAPTURE_SLUG
+
+    return [
+        f"# Arming the {CAPTURE_SLUG} check. This is the last step of the install, and it",
+        "# happens after the bootstrap above and never before. A check armed ahead of the",
+        "# jobs makes the page that follows about the install order rather than about the",
+        "# daemon.",
+        f"# Open healthchecks.io, find the {CAPTURE_SLUG} row, and press Ping Now.",
+        "# healthchecks keeps a check that has never been pinged in a new state, which",
+        "# never goes down and never sends. Inside the capture window no idle heartbeat is",
+        "# owed, so an install whose every cycle fails leaves that row reading Never while",
+        "# every other job reports healthy. That is what happened on 2026-09-08, and four",
+        "# days of captured nothing followed. One press turns the same silence into a page",
+        "# inside the grace period.",
+    ]
+
+
 def reauth_script(host: LaunchdHost) -> str:
     """The weekly Schwab re-auth as a script the operator runs. The renderer never runs it.
 
@@ -2667,6 +2710,7 @@ def install_commands(out_dir: Path, host: LaunchdHost) -> str:
     ):
         lines.append(f"{item[0]} && {item[1]}" if isinstance(item, tuple) else item)
     lines += _token_step_lines()
+    lines += _arm_capture_step_lines()
     lines += [
         "# 6. Set the Sunday one-shot. The slice-3 vendor sweep will do this every Friday.",
         "# Until that sweep lands, run this line each Friday and run the second command it",
