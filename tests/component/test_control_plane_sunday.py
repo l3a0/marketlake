@@ -18,12 +18,12 @@ import io
 import shutil
 import subprocess
 import urllib.error
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from lake import control_plane as cp
 from lake.alert import Publisher
-from lake.metadata import stamp_assertion_pid
+from lake.metadata import JournalMetadata, stamp_assertion_pid
 from tests.support.backup import mirror_lake
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
@@ -733,6 +733,7 @@ def _daemon_run(
     daemon_probe,
     assertion_probe=None,
     assertion_pid=None,
+    stamped_at=None,
 ):
     pinger = FakePinger()
     outcome = cp.sunday_maintenance(
@@ -748,6 +749,7 @@ def _daemon_run(
         daemon_probe=daemon_probe,
         assertion_probe=assertion_probe,
         assertion_pid=assertion_pid,
+        stamped_at=stamped_at,
     )
     return outcome, pinger
 
@@ -816,6 +818,76 @@ def test_a_missing_stamp_reads_as_the_assertion_finding(fixture_lake):
     assert outcome.daemon_page is not None
     assert outcome.daemon_page.event == cp.SUNDAY_ASSERTION_UNHELD_EVENT
     assert "no pid recorded" in outcome.daemon_page.body
+    # Nothing was stamped at all, so the body names the stamp rather than a resident.
+    assert cp.NO_PID_NO_STAMP in outcome.daemon_page.body
+
+
+def test_a_fresh_stamp_with_no_pid_pages_the_daemon_running_old_code(fixture_lake):
+    """The Sunday half of the deploy that moved the scheduled job and left the resident.
+
+    ``sunday`` execs fresh every run while the daemon is a resident, so this evening's
+    job can read a pid field a daemon from before the pull never writes. The old body
+    ended "The machine may idle-sleep before the window closes", which on this machine is
+    a wrong diagnosis rather than a vague one: the assertion is held, nothing is going to
+    sleep, and the thing to fix is the resident.
+    """
+    root = _clean_lake(fixture_lake)
+    outcome, _ = _daemon_run(
+        root,
+        daemon_probe=lambda label: True,
+        assertion_probe=lambda pid: True,
+        assertion_pid=None,
+        stamped_at=SUNDAY_20 - timedelta(seconds=30),
+    )
+    assert outcome.daemon_page is not None
+    assert outcome.daemon_page.event == cp.SUNDAY_ASSERTION_UNHELD_EVENT
+    assert cp.NO_PID_FRESH_STAMP in outcome.daemon_page.body
+    assert "may idle-sleep" not in outcome.daemon_page.body, (
+        "a held assertion was reported as a machine about to sleep"
+    )
+
+
+def test_a_stale_stamp_with_no_pid_does_not_page_the_daemon_running_old_code(fixture_lake):
+    """The Sunday page needs the freshness bound, not just the ``None`` guard.
+
+    Without a stale case here, the whole freshness decision on this path is unheld by
+    anything: swapping the arguments, deleting the comparison, or passing the wall clock
+    in place of the stamp all leave the suite green. Each of those tells an operator to
+    restart a resident that died hours ago, and says nothing about the stamp that stopped
+    moving with it.
+    """
+    root = _clean_lake(fixture_lake)
+    outcome, _ = _daemon_run(
+        root,
+        daemon_probe=lambda label: True,
+        assertion_probe=lambda pid: True,
+        assertion_pid=None,
+        stamped_at=SUNDAY_20 - cp.STAMP_FRESH_WITHIN - timedelta(seconds=1),
+    )
+    assert outcome.daemon_page is not None
+    assert cp.NO_PID_NO_STAMP in outcome.daemon_page.body
+    assert cp.NO_PID_FRESH_STAMP not in outcome.daemon_page.body
+
+
+def test_a_stamped_pid_that_is_not_held_still_names_the_sleep_risk(fixture_lake):
+    """The other half of the page, which the new wording must not swallow.
+
+    A pid that was stamped and is not held really does mean the machine may idle-sleep
+    before the window closes. That sentence is right there and stays there, so widening
+    the missing-pid case must not reach it.
+    """
+    root = _clean_lake(fixture_lake)
+    outcome, _ = _daemon_run(
+        root,
+        daemon_probe=lambda label: True,
+        assertion_probe=lambda pid: False,
+        assertion_pid=_DAEMON_PID,
+        stamped_at=SUNDAY_20 - timedelta(seconds=30),
+    )
+    assert outcome.daemon_page is not None
+    assert f"pid {_DAEMON_PID}" in outcome.daemon_page.body
+    assert "The machine may idle-sleep before the window closes." in outcome.daemon_page.body
+    assert cp.NO_PID_FRESH_STAMP not in outcome.daemon_page.body
 
 
 def test_a_healthy_run_pages_nothing(fixture_lake):
@@ -877,26 +949,60 @@ def test_the_same_failure_on_a_retry_does_not_page_twice(fixture_lake):
     assert transport.messages[0].event == cp.SUNDAY_DAEMON_DOWN_EVENT
 
 
+def test_the_retry_loop_carries_the_stamp_instant_rather_than_the_wall_clock(fixture_lake):
+    """The instant the page reasons about is the stamp's, not the attempt's.
+
+    ``sunday_run`` has the attempt's own moment in hand when it builds the call, so
+    handing that over in place of the stamp's instant is a one-word slip that type-checks
+    and reads plausibly. It would make every stamp look written this second, so a daemon
+    that stopped stamping in March would page as one running old code, every Sunday,
+    forever.
+    """
+    root = _clean_lake(fixture_lake)
+    outcomes = cp.sunday_run(
+        lake_root=root,
+        backup_target=_backup_of(root),
+        clock=ManualClock(start=SUNDAY_20),
+        calendar=CALENDAR,
+        schedule_reader=lambda: REPEAT_ONLY,
+        pinger=FakePinger(),
+        ping_url=URL,
+        mint_reader=_Mints(FRESH_MINT),
+        canary=_passing_canary,
+        daemon_probe=lambda label: True,
+        assertion_probe=lambda pid: True,
+        stamp_reader=lambda: JournalMetadata(stamped_at=SUNDAY_20 - timedelta(hours=6)),
+    )
+    page = outcomes[-1].daemon_page
+    assert page is not None
+    assert cp.NO_PID_NO_STAMP in page.body
+    assert cp.NO_PID_FRESH_STAMP not in page.body, "a six-hour-old stamp read as written now"
+
+
 def test_the_assertion_pid_is_read_fresh_each_retry(fixture_lake):
     # The daemon restamps a new pid when it re-takes a lost caffeinate mid-evening. A
     # pid cached once at the start of the run would then ask about a child already gone
     # and page a lapse that had already healed, the exact cry-wolf shape the daemon's
-    # own re-take exists to avoid. Reading the pid fresh each attempt, the way the mint
+    # own re-take exists to avoid. Reading the stamp fresh each attempt, the way the mint
     # already is, is what prevents it.
     root = _clean_lake(fixture_lake)
-    # ``mints.reads`` is incremented by ``mint_reader()``, which ``sunday_run`` always
-    # calls before ``assertion_pid_reader()`` within the same attempt, so it is a safe
-    # stand-in for "which attempt this is" from both readers below.
     mints = _Mints(STALE_MINT)
+    # This reader's own call count, rather than the mint reader's. ``sunday_run`` calls
+    # the two in one order today and nothing in its contract fixes that order, so a test
+    # that borrowed the other counter would break on a reshuffle that changed no
+    # behaviour. It did.
+    reads = 0
 
-    def read_pid() -> int:
+    def read_stamp() -> JournalMetadata:
         # The restamp lands between the first attempt and the second.
-        return 4242 if mints.reads <= 1 else 9999
+        nonlocal reads
+        reads += 1
+        return JournalMetadata(assertion_pid=4242 if reads <= 1 else 9999)
 
     def held(pid: int) -> bool:
         # pmset holds an assertion only under the pid currently real. The first
         # child's process is gone once the restamp has happened.
-        current = 4242 if mints.reads <= 1 else 9999
+        current = 4242 if reads <= 1 else 9999
         return pid == current
 
     clock = ManualClock(start=SUNDAY_20)
@@ -912,8 +1018,9 @@ def test_the_assertion_pid_is_read_fresh_each_retry(fixture_lake):
         canary=_passing_canary,
         daemon_probe=lambda label: True,
         assertion_probe=held,
-        assertion_pid_reader=read_pid,
+        stamp_reader=read_stamp,
     )
+    assert reads == 7
     assert mints.reads == 7
     assert len(outcomes) == 7
     assert all(o.daemon_page is None for o in outcomes), (

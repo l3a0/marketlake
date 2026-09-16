@@ -20,16 +20,17 @@ import shlex
 import subprocess
 import urllib.error
 from collections.abc import Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from lake import control_plane as cp
-from lake.metadata import stamp_assertion_pid
+from lake.metadata import stamp_assertion_pid, stamp_cycle
 from lake.paths import TOKEN_FILE, config_dir
 from lake.schwab import DEFAULT_TOKEN_PATH
+from lake.tickers import Roster
 from tests.support.backup import mirror_lake
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
@@ -872,6 +873,43 @@ def test_the_sunday_cli_reads_the_pid_from_the_journal_stamp(tmp_path, monkeypat
     )
     assert code == 0
     assert asked == [7331], "the CLI did not carry the stamped pid to the probe"
+
+
+def test_the_sunday_cli_reads_the_stamp_instant_as_well_as_the_pid(tmp_path, monkeypatch):
+    """The Sunday entry owes the page the stamp's instant, not just its pid.
+
+    ``sunday_daemon_page`` defaults ``stamped_at`` to ``None``, which is what an unwired
+    entry passes, and ``None`` reads as a stamp nobody is writing. So a CLI that carried
+    the pid alone would page every half-done deploy with the words for a dead writer.
+    The lake here carries a fresh heartbeat stamp and no pid, which is exactly what a
+    daemon from before the pid field leaves behind.
+    """
+    lake, config = _sunday_lake(tmp_path)
+    now = et(2026, 8, 30, 20, 0)
+    stamp_cycle(
+        lake,
+        at=now - timedelta(seconds=30),
+        token_minted_at=now - timedelta(days=1),
+        roster=Roster(()),
+    )
+    pushes = _Pushes()
+    monkeypatch.setattr(cp, "read_pmset_schedule", lambda: REPEAT_ONLY)
+    monkeypatch.setattr(cp, "UrllibPinger", FakePinger)
+    monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
+    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: pushes)
+    monkeypatch.setattr(cp, "read_exclusions", _excluded)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
+
+    code = cp.main(
+        ["sunday", "--config", str(config), "--token", str(_token(tmp_path))],
+        clock=ManualClock(start=now),
+        calendar=weekday_sessions(date(2026, 8, 31)),
+    )
+
+    assert code == 0  # report tier: the ping still fires despite the finding
+    assert [m.event for m in pushes.sent] == [cp.SUNDAY_ASSERTION_UNHELD_EVENT]
+    assert cp.NO_PID_FRESH_STAMP in pushes.sent[0].body, "the CLI dropped the stamp instant"
 
 
 # -- the two producers the launchd job runs on ---------------------------------------
@@ -2532,6 +2570,9 @@ def test_a_daemon_up_with_no_recorded_pid_does_not_ping(tmp_path):
     and one whose ``caffeinate`` would not spawn. Neither can be vouched for, and the
     green this used to print was the vouching. The price is a page on the first morning
     after an upgrade that did not restart the daemon, which the restart script fixes.
+
+    Nothing is stamped at all here, so the words are the ones for a stamp that is not
+    being written. The sibling below covers the other half.
     """
     pinger = FakePinger()
 
@@ -2547,8 +2588,160 @@ def test_a_daemon_up_with_no_recorded_pid_does_not_ping(tmp_path):
     assert outcome.daemon_up is True
     assert outcome.assertion_held is False, "an unconfirmed machine read as confirmed"
     assert outcome.pinged is False, "the check pinged for a machine nothing vouches for"
-    assert outcome.problem == "no caffeinate pid recorded"
+    assert outcome.problem == f"no caffeinate pid recorded. {cp.NO_PID_NO_STAMP}"
     assert pinger.urls == []
+
+
+def test_a_fresh_stamp_with_no_pid_names_the_daemon_running_old_code(tmp_path):
+    """The deploy that moved the scheduled job and left the resident behind.
+
+    A resident daemon loads its Python once and keeps it, while this check is a calendar
+    job that execs fresh every run. So the morning after a pull, a check that reads the
+    pid runs against a daemon from before the pid was stamped, and the pid is missing on
+    a machine that is otherwise entirely healthy.
+
+    The check still fails, which is right: the deploy really is half-done. What the words
+    have to do is send the operator to the resident rather than to power assertions, and
+    the fresh stamp beside the missing pid is what says which of the two it is. The
+    daemon writes that stamp every minute, and has since long before the pid field
+    existed, so an old daemon writes it too.
+    """
+    now = et(2026, 9, 2, 8, 30)
+    pinger = FakePinger()
+
+    outcome = cp.self_check(
+        probe=lambda label: True,
+        pinger=pinger,
+        ping_url="https://example.invalid/ping",
+        assertion_probe=lambda pid: True,
+        assertion_pid=None,
+        stamped_at=now - timedelta(seconds=30),
+        now=now,
+    )
+
+    assert outcome.pinged is False, "a half-done deploy pinged as healthy"
+    assert outcome.problem == f"no caffeinate pid recorded. {cp.NO_PID_FRESH_STAMP}"
+    assert "Restart it" in outcome.problem
+    assert pinger.urls == []
+
+
+def test_a_fresh_stamp_with_no_pid_also_names_a_caffeinate_that_would_not_spawn(tmp_path):
+    """The deploy is not the only daemon that stamps an instant and no pid.
+
+    ``AssertionHolder.child_pid`` answers ``None`` for a spawn that failed and for a
+    re-take that failed, and the daemon stamps that ``None`` on the same tick the idle
+    heartbeat writes the instant. So a current, correctly deployed daemon whose
+    ``caffeinate`` would not start leaves the identical signature. A page that read the
+    fresh stamp as the deploy alone would send an operator to restart a daemon that is
+    already running the right code, while the actual failure sat in its log.
+
+    Both states are named, and the restart is offered because it repairs one of them and
+    costs nothing on the other at this hour, which is an hour before the open.
+    """
+    now = et(2026, 9, 2, 8, 30)
+
+    outcome = cp.self_check(
+        probe=lambda label: True,
+        pinger=FakePinger(),
+        ping_url="https://example.invalid/ping",
+        assertion_probe=lambda pid: True,
+        assertion_pid=None,
+        stamped_at=now - timedelta(seconds=30),
+        now=now,
+    )
+
+    assert "caffeinate would not spawn" in outcome.problem, (
+        "a current daemon with a failed spawn was reported as running old code"
+    )
+    assert "read its log" in outcome.problem
+
+
+def test_the_freshness_span_is_two_minutes(tmp_path):
+    """The span is pinned against the clock, not against itself.
+
+    The staleness test below writes its input as ``now - STAMP_FRESH_WITHIN - 1s``, so it
+    moves with the constant and can never disagree with it. Widening the constant to a
+    day would leave that test green while a stamp from a daemon dead since yesterday read
+    as one writing this minute. These two cases are absolute, so they fail when the span
+    moves.
+    """
+    assert cp.STAMP_FRESH_WITHIN == timedelta(minutes=2)
+    now = et(2026, 9, 2, 8, 30)
+
+    def reason_at(age: timedelta) -> str:
+        return cp.self_check(
+            probe=lambda label: True,
+            pinger=FakePinger(),
+            ping_url="https://example.invalid/ping",
+            assertion_probe=lambda pid: True,
+            assertion_pid=None,
+            stamped_at=now - age,
+            now=now,
+        ).problem
+
+    assert cp.NO_PID_FRESH_STAMP in reason_at(timedelta(minutes=1))
+    assert cp.NO_PID_NO_STAMP in reason_at(timedelta(minutes=5))
+
+
+def test_a_stamp_exactly_at_the_span_is_still_fresh(tmp_path):
+    """The bound is inclusive, and the edge is where an off-by-one lives."""
+    now = et(2026, 9, 2, 8, 30)
+
+    outcome = cp.self_check(
+        probe=lambda label: True,
+        pinger=FakePinger(),
+        ping_url="https://example.invalid/ping",
+        assertion_probe=lambda pid: True,
+        assertion_pid=None,
+        stamped_at=now - cp.STAMP_FRESH_WITHIN,
+        now=now,
+    )
+
+    assert cp.NO_PID_FRESH_STAMP in outcome.problem
+
+
+def test_a_stamp_ahead_of_now_reads_as_fresh(tmp_path):
+    """A deliberate decision in ``_no_pid_reason``, so something has to hold it.
+
+    A stamp dated after the moment the check runs is a clock that moved backwards, not a
+    daemon that went quiet. Something is writing, so the fresh reading is the honest one.
+    A later reader adding a plausible-looking lower bound would reverse that silently.
+    """
+    now = et(2026, 9, 2, 8, 30)
+
+    outcome = cp.self_check(
+        probe=lambda label: True,
+        pinger=FakePinger(),
+        ping_url="https://example.invalid/ping",
+        assertion_probe=lambda pid: True,
+        assertion_pid=None,
+        stamped_at=now + timedelta(minutes=5),
+        now=now,
+    )
+
+    assert cp.NO_PID_FRESH_STAMP in outcome.problem
+
+
+def test_a_stamp_older_than_the_freshness_span_is_not_read_as_old_code(tmp_path):
+    """A daemon that stopped writing is a different repair, so it gets different words.
+
+    The fresh stamp is the whole discriminator. Without a bound on it, a stamp left hours
+    ago by a daemon that has since died would read as a resident happily stamping away,
+    and the page would send an operator to restart something that is already gone.
+    """
+    now = et(2026, 9, 2, 8, 30)
+
+    outcome = cp.self_check(
+        probe=lambda label: True,
+        pinger=FakePinger(),
+        ping_url="https://example.invalid/ping",
+        assertion_probe=lambda pid: True,
+        assertion_pid=None,
+        stamped_at=now - cp.STAMP_FRESH_WITHIN - timedelta(seconds=1),
+        now=now,
+    )
+
+    assert outcome.problem == f"no caffeinate pid recorded. {cp.NO_PID_NO_STAMP}"
 
 
 def test_a_daemon_up_with_its_assertion_pings(tmp_path):
@@ -2626,7 +2819,52 @@ def test_the_self_check_cli_fails_a_lake_with_no_stamped_pid(tmp_path, capsys, m
 
     assert code == 1, "an unconfirmable machine passed the check"
     assert pinger.urls == [], "it pinged for a machine nothing vouches for"
-    assert "no caffeinate pid recorded" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "no caffeinate pid recorded" in out
+    # Nothing has ever been stamped into this lake, so the words are the ones for a
+    # stamp that is not being written rather than the ones for a stale resident.
+    assert cp.NO_PID_NO_STAMP in out
+
+
+def test_the_self_check_cli_reads_the_stamp_instant_as_well_as_the_pid(
+    tmp_path, capsys, monkeypatch
+):
+    """The extra field has to come off the real stamp, or the CLI prints the wrong page.
+
+    ``self_check`` defaults ``stamped_at`` to ``None``, which is what an unwired entry
+    would pass, and ``None`` reads as a stamp nobody is writing. So a CLI that read the
+    pid alone would answer every half-done deploy with the words for a dead writer, and
+    look correct from inside ``self_check``'s own tests while doing it. Only a run of
+    ``main`` against a lake carrying a fresh stamp and no pid tells the two apart.
+    """
+    lake_root = tmp_path / "lake"
+    config = write_config(tmp_path, lake_root)
+    now = et(2026, 9, 2, 8, 30)
+    # What a daemon from before the pid field leaves behind: the idle heartbeat's own
+    # stamp, written this minute, and no pid beside it.
+    stamp_cycle(
+        lake_root,
+        at=now - timedelta(seconds=30),
+        token_minted_at=now - timedelta(days=1),
+        roster=Roster(()),
+    )
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
+    monkeypatch.setattr(cp, "UrllibPinger", FakePinger)
+    monkeypatch.setattr(cp, "_system_clock", lambda: ManualClock(start=now))
+
+    reads: list[Path] = []
+    real_read = cp.read_metadata
+    monkeypatch.setattr(cp, "read_metadata", lambda root: reads.append(root) or real_read(root))
+
+    assert cp.main(["self-check", "--config", str(config)]) == 1
+    out = capsys.readouterr().out
+    assert cp.NO_PID_FRESH_STAMP in out, "the CLI did not carry the stamp instant"
+    assert cp.NO_PID_NO_STAMP not in out
+    # One reading, not one per field. The daemon restamps the pid whenever it re-takes a
+    # lost caffeinate, so two reads can straddle a restamp and pair a pid with an instant
+    # that never stood beside it.
+    assert len(reads) == 1, "the CLI read the stamp once per field"
 
 
 def test_no_assertion_is_owed_outside_a_window_so_none_is_demanded(tmp_path):

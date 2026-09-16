@@ -96,7 +96,7 @@ from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
 from lake.config import CALLBACK_KEY, input_errors_exit, load_config
 from lake.manifest import BackupScrubResult, ScrubResult, backup_scrub, scrub
-from lake.metadata import read_metadata
+from lake.metadata import JournalMetadata, read_metadata
 from lake.paths import CONFIG_DIR_ENV, TOKEN_FILE, config_dir
 from lake.runner import (
     PING_FAILURES,
@@ -569,6 +569,71 @@ def _assertion_owed(now: datetime | None) -> bool:
     return window is not None and window.contains(eastern)
 
 
+# How recent the journal stamp has to be for the daemon behind it to count as writing
+# now. The daemon stamps every minute it is awake, so anything older was left by a writer
+# that has stopped. Two minutes is the span the status page already calls a stamp stale
+# by, and it covers the same two things here: a slow write, and a scheduled job's run
+# landing between two stamps.
+STAMP_FRESH_WITHIN = timedelta(minutes=2)
+
+# The two sentences a scheduled reader adds when it is owed an assertion and finds no pid
+# stamped. They are the two places to look, and ``_no_pid_reason`` picks between them.
+NO_PID_FRESH_STAMP = (
+    "The stamp is fresh, so the daemon is writing to the lake. It is running code from "
+    "before the pid was stamped, or its caffeinate would not spawn. Restart it, and read "
+    "its log for a spawn that failed."
+)
+NO_PID_NO_STAMP = (
+    "Nothing was stamped recently either, so the journal stamp and the daemon's log are "
+    "what to read rather than the machine's power assertions."
+)
+
+
+def _no_pid_reason(stamped_at: datetime | None, now: datetime | None) -> str:
+    """Why no ``caffeinate`` pid is stamped, in words that name where to look.
+
+    An absent pid says nothing on its own about which failure this is. It reads ``None``
+    in five shapes.
+
+    1. The daemon cleared it because no window is open. Neither reader can arrive here
+       that way, because both demand the assertion only when one is owed.
+    2. The daemon never wrote one, because it is running code from before the pid field
+       existed. That is the deploy this reasoning exists for.
+    3. The daemon's ``caffeinate`` would not spawn, so ``AssertionHolder.child_pid``
+       answered ``None`` and the daemon stamped that. The daemon is current here.
+    4. The write failed.
+    5. The stamp cannot be read at all, because ``_read_raw`` answers an unreadable file
+       with an empty object.
+
+    ``stamped_at`` splits the first three from the last two, and no further. It is read
+    off the same stamp rather than stamped anew: the idle heartbeat has written it every
+    minute since long before the pid field existed, so a daemon running older code writes
+    it too. A fresh ``stamped_at`` beside a missing ``assertion_pid`` says a daemon is
+    writing and recorded no pid, which is shape 2 or shape 3. Nothing in the stamp tells
+    those two apart, so the sentence names both and sends the operator to the daemon. A
+    restart is the repair for one of them and costs nothing on the other, and the daemon's
+    own log is where a failed spawn says so.
+
+    Shapes 4 and 5 leave no fresh stamp, so the other sentence sends the operator to the
+    stamp rather than to the machine's power assertions, which is where the old wording
+    sent them for all five.
+
+    A stamp ahead of ``now`` reads as fresh. That is a clock going backwards rather than
+    a daemon going quiet, and the honest answer to it is still that something is writing.
+    """
+    if stamped_at is None or now is None:
+        return NO_PID_NO_STAMP
+    if stamped_at.utcoffset() is None or now.utcoffset() is None:
+        # Freshness cannot be judged between a naive moment and an aware one, and the
+        # subtraction below raises on the pair. ``read_metadata`` refuses a naive
+        # ``stamped_at`` and both command lines pass an aware ``now``, so only a caller
+        # building its own moment reaches this. It answers rather than raises because
+        # ``sunday_maintenance`` calls this with nothing wrapped around it, and a raise
+        # there would discard that attempt's scrub, canary and ping.
+        return NO_PID_NO_STAMP
+    return NO_PID_FRESH_STAMP if now - stamped_at <= STAMP_FRESH_WITHIN else NO_PID_NO_STAMP
+
+
 def self_check(
     *,
     probe: DaemonProbe,
@@ -577,6 +642,7 @@ def self_check(
     label: str = DAEMON_LABEL,
     assertion_probe: AssertionProbe | None = None,
     assertion_pid: int | None = None,
+    stamped_at: datetime | None = None,
     now: datetime | None = None,
     publisher: Publisher | None = None,
 ) -> SelfCheckOutcome:
@@ -628,6 +694,12 @@ def self_check(
     steady state it is never missing. The daemon stamps within a minute of a window
     opening and restamps every tick after.
 
+    ``stamped_at`` comes off the same reading of the same stamp, and it decides nothing
+    about whether the check passes. It decides what the failure is called. The two cases
+    below send an operator to different repairs, and ``no caffeinate pid recorded`` on
+    its own sends them to power assertions for both. ``_no_pid_reason`` is what tells
+    them apart.
+
     Where the policy actually decides anything is narrower than the ways a pid can be
     absent, because the spawn and the stamp ride one hook. A spawn that failed, and a
     daemon that has started but not yet ticked, have no ``caffeinate`` either, so the
@@ -670,7 +742,7 @@ def self_check(
             return SelfCheckOutcome(
                 daemon_up=True,
                 pinged=False,
-                problem="no caffeinate pid recorded",
+                problem=f"no caffeinate pid recorded. {_no_pid_reason(stamped_at, now)}",
                 assertion_held=False,
             )
         held = assertion_probe(assertion_pid)
@@ -1518,6 +1590,7 @@ def sunday_daemon_page(
     assertion_pid: int | None,
     daemon_label: str,
     now: datetime,
+    stamped_at: datetime | None = None,
 ) -> Message:
     """The page a dead daemon or an unheld assertion owes during the Sunday window.
 
@@ -1526,6 +1599,13 @@ def sunday_daemon_page(
     A live daemon holding nothing names the pid it stamped, the same identity
     ``self_check`` matches at ``pmset_assertions_probe``. A missing stamp is the third
     state and reads as the second, the way ``self_check`` already treats it.
+
+    Reading as the second state is not the same as being diagnosed as it. A pid that was
+    stamped and is not held means the machine may idle-sleep before the window closes. A
+    pid that was never stamped can mean that, and it can equally mean a resident running
+    code from before the pid was stamped, where the assertion is held and nothing is
+    going to sleep. So the missing-pid body carries ``_no_pid_reason`` instead, which
+    reads ``stamped_at`` off the same stamp the pid came from and names the repair.
 
     The caller decides when this is owed. A daemon that is up and holding its assertion
     has nothing to page, so this is only ever called for the other two states: pass
@@ -1542,14 +1622,17 @@ def sunday_daemon_page(
                 "Nothing is holding the Sunday assertion, and Monday's capture is at risk."
             ),
         )
-    pid_text = "no pid recorded" if assertion_pid is None else f"pid {assertion_pid}"
+    if assertion_pid is None:
+        detail = f"(no pid recorded), checked {when}. {_no_pid_reason(stamped_at, now)}"
+    else:
+        detail = (
+            f"(pid {assertion_pid}), checked {when}. "
+            "The machine may idle-sleep before the window closes."
+        )
     return Message(
         event=SUNDAY_ASSERTION_UNHELD_EVENT,
         title=SUNDAY_ASSERTION_UNHELD_TITLE,
-        body=(
-            f"The daemon is running but holds no caffeinate assertion ({pid_text}), "
-            f"checked {when}. The machine may idle-sleep before the window closes."
-        ),
+        body=f"The daemon is running but holds no caffeinate assertion {detail}",
     )
 
 
@@ -1691,6 +1774,7 @@ def sunday_maintenance(
     daemon_probe: DaemonProbe | None = None,
     assertion_probe: AssertionProbe | None = None,
     assertion_pid: int | None = None,
+    stamped_at: datetime | None = None,
 ) -> SundayOutcome:
     """Scrub both copies, verify the wake alarms, run the canary, assert coverage, ping.
 
@@ -1729,6 +1813,12 @@ def sunday_maintenance(
     ``daemon_probe`` left out, this attempt checks neither and ``daemon_page`` is always
     ``None``.
 
+    ``stamped_at`` comes off the same reading as ``assertion_pid`` and decides nothing
+    about whether a page is owed. It decides what a page with no pid says, per
+    ``_no_pid_reason``. A caller that reads the two separately can pair a pid with an
+    instant that never stood beside it, which is why ``sunday_run`` takes one reader for
+    the whole stamp rather than one per field.
+
     Both probes are gated on ``_assertion_owed(now)``, the window ``self_check`` uses to
     decide whether *an assertion* should be held. Here it gates the daemon probe too,
     which is narrower than ``self_check``'s own shape: that check probes the daemon
@@ -1740,9 +1830,11 @@ def sunday_maintenance(
     rule already refuses, so the daemon probe waits on the same gate the assertion probe
     needs. Inside the window, a daemon that answers down pages naming ``DAEMON_LABEL``,
     and a daemon that is up but holds nothing under ``assertion_pid`` pages naming that
-    pid. The two are kept apart because they send an operator to a different repair, and
-    a page for the assertion when the daemon itself is the failure would send them to
-    the wrong one.
+    pid. A daemon that is up and stamped no pid at all pages naming where to look
+    instead, because there is no pid to name and the reason is what an operator needs.
+    The three are kept apart because they send an operator to a different repair, and a
+    page for the assertion when the daemon itself is the failure would send them to the
+    wrong one.
 
     Four duties the design gives the Sunday run are not built here. Each is named so
     the gap is a decision rather than an oversight.
@@ -1831,6 +1923,7 @@ def sunday_maintenance(
                     assertion_pid=assertion_pid,
                     daemon_label=DAEMON_LABEL,
                     now=now,
+                    stamped_at=stamped_at,
                 )
     if daemon_page is not None:
         report.append(daemon_page.title)
@@ -1889,12 +1982,15 @@ CANARY_RETRY = timedelta(minutes=30)
 # loop calls it once per attempt. That is what lets a mid-evening re-login be seen.
 MintReader = Callable[[], datetime | None]
 
-# Reads the daemon's stamped pid afresh, or ``None`` when nothing is stamped. The retry
-# loop calls it once per attempt, the same reason ``MintReader`` is a reader rather than
-# a value: the daemon restamps a new pid when it re-takes a lost ``caffeinate``, and a
-# pid cached at the start of the evening would ask about a child already gone, paging a
-# lapse that had already healed.
-AssertionPidReader = Callable[[], int | None]
+# Reads the daemon's journal stamp afresh. The retry loop calls it once per attempt, the
+# same reason ``MintReader`` is a reader rather than a value: the daemon restamps a new
+# pid when it re-takes a lost ``caffeinate``, and a pid cached at the start of the evening
+# would ask about a child already gone, paging a lapse that had already healed.
+#
+# It answers the whole reading rather than the pid alone, because the page also needs the
+# stamp's own instant, and two separate reads could catch a restamp between them and pair
+# a pid with an instant that never stood beside it.
+StampReader = Callable[[], JournalMetadata]
 
 
 def _page_sunday_daemon_finding(
@@ -1937,7 +2033,7 @@ def sunday_run(
     publisher: Publisher | None = None,
     daemon_probe: DaemonProbe | None = None,
     assertion_probe: AssertionProbe | None = None,
-    assertion_pid_reader: AssertionPidReader | None = None,
+    stamp_reader: StampReader | None = None,
 ) -> list[SundayOutcome]:
     """Run the Sunday job, retrying until it passes or the canary deadline.
 
@@ -1970,9 +2066,9 @@ def sunday_run(
     reason the loop below gives. With no publisher nothing escalates.
 
     ``daemon_probe`` and ``assertion_probe`` pass straight through to every attempt's
-    ``sunday_maintenance`` call. ``assertion_pid_reader`` is read afresh each attempt,
-    the same reason ``mint_reader`` is: the daemon restamps a new pid when it re-takes a
-    lost ``caffeinate`` mid-evening, and a pid cached once at the start would ask about a
+    ``sunday_maintenance`` call. ``stamp_reader`` is read afresh each attempt, the same
+    reason ``mint_reader`` is: the daemon restamps a new pid when it re-takes a lost
+    ``caffeinate`` mid-evening, and a pid cached once at the start would ask about a
     child already gone, paging a lapse that had already healed by the next retry. A
     finding still pages at most once for the whole window rather than once per attempt,
     using a flag local to this call. The retry loop runs inside one process, so that
@@ -1995,6 +2091,9 @@ def sunday_run(
     daemon_paged = False
     while True:
         attempt_now = clock.now()
+        # One reading per attempt, so the pid and the instant the page reasons about
+        # come from the same file at the same moment.
+        stamp = stamp_reader() if stamp_reader is not None else JournalMetadata()
         outcome = sunday_maintenance(
             lake_root=lake_root,
             backup_target=backup_target,
@@ -2010,7 +2109,8 @@ def sunday_run(
             escalation=escalation,
             daemon_probe=daemon_probe,
             assertion_probe=assertion_probe,
-            assertion_pid=assertion_pid_reader() if assertion_pid_reader is not None else None,
+            assertion_pid=stamp.assertion_pid,
+            stamped_at=stamp.stamped_at,
         )
         # One reminder an hour. Later attempts in the same hour owe nothing, so the
         # outcome records only the one that went out.
@@ -3129,13 +3229,17 @@ def main(
             config = load_config(args.config)
         # The pid the daemon last stamped. Read through the lake, because this runs as
         # its own process and the daemon's handle on its child lives in another one.
+        # One reading carries the stamp's own instant too, which is what lets a missing
+        # pid be told apart from a stamp nothing is writing.
+        stamp = read_metadata(config.lake_root)
         outcome = self_check(
             probe=launchctl_probe,
             pinger=UrllibPinger(),
             ping_url=config.healthchecks_url(PRE_OPEN_SLUG),
             label=args.label,
             assertion_probe=pmset_assertions_probe,
-            assertion_pid=read_metadata(config.lake_root).assertion_pid,
+            assertion_pid=stamp.assertion_pid,
+            stamped_at=stamp.stamped_at,
             now=_system_clock().now(),
             # A ping healthchecks refuses feeds no check, so nothing goes silent to
             # report it. The secrets are the two values that must never reach a phone,
@@ -3203,15 +3307,15 @@ def main(
                 default_config_dir(str(Path.home())), token_path
             ),
             exclusion_reader=read_exclusions,
-            # The same two seams the self-check wires. The pid is read through the lake
-            # the same way too, because this runs as its own process and the daemon's
-            # handle on its child lives in another one, but read afresh each retry
-            # rather than once: the daemon restamps a new pid when it re-takes a lost
-            # ``caffeinate``, and a pid cached at the first attempt would ask about a
-            # child already gone by the next one.
+            # The same two seams the self-check wires. The stamp is read through the
+            # lake the same way too, because this runs as its own process and the
+            # daemon's handle on its child lives in another one, but read afresh each
+            # retry rather than once: the daemon restamps a new pid when it re-takes a
+            # lost ``caffeinate``, and a pid cached at the first attempt would ask about
+            # a child already gone by the next one.
             daemon_probe=launchctl_probe,
             assertion_probe=pmset_assertions_probe,
-            assertion_pid_reader=lambda: read_metadata(config.lake_root).assertion_pid,
+            stamp_reader=lambda: read_metadata(config.lake_root),
         )
         for number, outcome in enumerate(outcomes, start=1):
             if len(outcomes) > 1:
@@ -3257,6 +3361,8 @@ __all__ = [
     "DAEMON_LABEL",
     "DASHBOARD_LABEL",
     "LAUNCHD_DOMAIN",
+    "NO_PID_FRESH_STAMP",
+    "NO_PID_NO_STAMP",
     "PRE_OPEN_SELF_CHECK",
     "PRE_OPEN_SLUG",
     "REMINDER_EVENT",
@@ -3264,6 +3370,7 @@ __all__ = [
     "REMINDER_PRIORITY",
     "REMINDER_TITLE",
     "SELF_CHECK_LABEL",
+    "STAMP_FRESH_WITHIN",
     "SUDOERS_FILE",
     "SUNDAY_LABEL",
     "SUNDAY_MAINTENANCE",
@@ -3281,7 +3388,6 @@ __all__ = [
     "WEEKDAY_WAKE",
     "AlarmCheck",
     "AssertionHolder",
-    "AssertionPidReader",
     "AssertionRunner",
     "AssertionWindow",
     "CanaryCall",
@@ -3299,6 +3405,7 @@ __all__ = [
     "RepeatAlarm",
     "ScheduleReader",
     "SelfCheckOutcome",
+    "StampReader",
     "SundayOutcome",
     "VendorFactory",
     "WallClockTime",
