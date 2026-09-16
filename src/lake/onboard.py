@@ -46,7 +46,10 @@ The slice-1 steps, in order.
    its own moment.
 5. *Print a sign-off report.* The report pins the first snapshot's contract count as
    the day-one plausibility anchor. The median-relative battery checks have no anchor
-   until history accrues, so this count is the one early sanity number.
+   until history accrues, so this count is the one early sanity number. It also names any
+   column of that snapshot whose vendor field arrived at a type the column refused. The
+   capture loop pages a phone for that, and this command has no phone behind it, so the
+   report is where a ticker onboarded onto a drifting field says so.
 
 A windowed fetch can come back partial. ``fetch_chain`` never raises, so it returns
 whatever the windows that succeeded carried, with absence markers naming the rest. The
@@ -188,6 +191,14 @@ class OnboardReport:
     ``quotes``), and ``snapshot_segment`` is that segment's lake-relative path. The
     master's FIGI is deliberately unset here; it backfills later from the captured CUSIP.
     ``deferred`` names the later-slice steps this command does not yet do.
+
+    ``routed_columns`` names the snapshot's own columns whose vendor field arrived at a
+    type the column refused, which is the schema-drift signature the capture cycle pages
+    on. This report is where it goes, because onboarding runs in its own process with no
+    alarm behind it. It reaches neither the daemon nor the daemon's drift observer. The
+    field is empty on every ordinary onboarding, and the rendered block stays silent when
+    it is. The column name is the whole finding here. This command looks at one ticker,
+    so there is no reach to report.
     """
 
     ticker: str
@@ -202,6 +213,7 @@ class OnboardReport:
     snapshot_surface: str
     snapshot_segment: str
     partial_chain: bool = False
+    routed_columns: tuple[str, ...] = ()
     deferred: tuple[str, ...] = (
         "FIGI resolution from the captured CUSIP (deferred enrichment)",
         "corporate-actions history fetch (slice 3, D16)",
@@ -227,6 +239,15 @@ class OnboardReport:
                 + (" (partial chain: a window failed)" if self.partial_chain else "")
             )
         lines.append(f"  first cycle:     {self.snapshot_surface} segment {self.snapshot_segment}")
+        if self.routed_columns:
+            # Named rather than counted. The count is the honest number on a cycle's page,
+            # where it says how far a retype reached. Here it would always be one, and the
+            # operator can act on the column name and on nothing else.
+            lines.append(
+                f"  schema drift:    {self.snapshot_surface} "
+                f"{', '.join(self.routed_columns)} arrived at a type the column refused, "
+                "so the column is null and the raw value is in extra"
+            )
         lines.append(f"  tickers.yaml:    {self.tickers_path}")
         lines.append(f"  security master: {self.master_path}")
         lines.append("  deferred to later slices:")
@@ -619,6 +640,7 @@ def onboard(
         snapshot_surface=snapshot_surface,
         snapshot_segment=snapshot.partition,
         partial_chain=partial_chain,
+        routed_columns=snapshot.routed_columns,
     )
 
 

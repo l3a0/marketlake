@@ -7,7 +7,7 @@ clock, and a small injected plan, writing into a throwaway lake. No network and 
 clock are crossed, so the tier is component: capture and the guard over real files, with
 the vendor and the clock still fake.
 
-Nine claims are covered.
+Ten claims are covered.
 
 1. The landed segment carries the option close in ``snap_ts`` and the fetch minute in
    ``fetch_ts``. Both matter, and collapsing them loses one of the two.
@@ -29,6 +29,11 @@ Nine claims are covered.
    the coordinates and tags the fill owns.
 9. The daemon's production wiring really passes the producer, and a guard the daemon
    built lands the close.
+10. The fill computes the schema-drift signature of the segment it writes, carries it
+    back, and pages it as a partial observation naming the ticker it read. A fill for one
+    ticker must not clear a column another ticker is drifting, a scan that raises must
+    cost the finding rather than the fill, and the daemon's own wiring must hand the fill
+    the same observer its cycle hook uses.
 """
 
 from __future__ import annotations
@@ -38,21 +43,33 @@ from pathlib import Path
 
 import pytest
 
-from lake import capture, close_guard, daemon, journal
+from lake import capture, close_guard, daemon, journal, schema_drift
+from lake.alert import Publisher
 from lake.capture_spans import CaptureSpans, spans_path
 from lake.chain_plan import ChainPlan
 from lake.config import GuardConstants
 from lake.manifest import latest_entries
 from lake.paths import LakePaths
+from lake.schema_drift import SCHEMA_DRIFT_EVENT, SchemaDriftObserver
 from lake.security_master import SecurityMaster, master_path
 from lake.session import OPTION_CLOSE, SessionClock
 from lake.tickers import Roster
 from lake.vendor import VendorResponse
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
-from tests.support.config import write_config
+from tests.support.config import NTFY_TOPIC, PING_KEY, write_config
 from tests.support.pinger import FakePinger
 from tests.support.transport import FakeTransport
+
+
+def _publisher(lake_root: Path, transport: FakeTransport | None = None) -> Publisher:
+    """A publisher over a recording transport, holding the config's two secrets."""
+    return Publisher(
+        lake_root=lake_root,
+        transport=FakeTransport() if transport is None else transport,
+        secrets=(PING_KEY, NTFY_TOPIC),
+    )
+
 
 CHAINS = journal.CHAINS_SURFACE
 
@@ -74,10 +91,15 @@ TAIL = ((DAY + timedelta(days=10)).isoformat(), None)
 TOO_BIG = VendorResponse(status=502, body={"errorcode": "protocol.http.TooBigBody"})
 
 
-def _contract(exp_iso: str, put_call: str, *, bid: float) -> dict:
-    """One synthetic contract, enough fields for the calibrated row builder to read."""
+def _contract(exp_iso: str, put_call: str, *, bid: float, retyped: dict | None = None) -> dict:
+    """One synthetic contract, enough fields for the calibrated row builder to read.
+
+    ``retyped`` overwrites fields with values their pinned columns refuse, which is what a
+    vendor retype looks like on the wire. ``openInterest`` at ``1234.7`` against the pinned
+    ``int64`` is the measured case, and it is the one the drift scan reads back.
+    """
     letter = "C" if put_call == "CALL" else "P"
-    return {
+    contract = {
         "symbol": f"SPY   {exp_iso.replace('-', '')}{letter}00650000",
         "putCall": put_call,
         "strikePrice": 650.0,
@@ -85,12 +107,28 @@ def _contract(exp_iso: str, put_call: str, *, bid: float) -> dict:
         "quoteTimeInLong": 1787000099000,
         "bid": bid,
         "openInterest": 100,
+        "totalVolume": 42,
     }
+    contract.update(retyped or {})
+    return contract
 
 
-def _chain_body(expirations: list[str], *, underlying_price: float = 650.0) -> dict:
+# A vendor field sent at a type its pinned column refuses, per surface column it hits.
+RETYPED_OPEN_INTEREST = {"openInterest": 1234.7}
+RETYPED_VOLUME = {"totalVolume": 7.5}
+
+
+def _chain_body(
+    expirations: list[str],
+    *,
+    underlying_price: float = 650.0,
+    retyped: dict | None = None,
+) -> dict:
     """A chain body carrying one call per named expiration."""
-    call_map = {f"{exp}:7": {"650.0": [_contract(exp, "CALL", bid=1.0)]} for exp in expirations}
+    call_map = {
+        f"{exp}:7": {"650.0": [_contract(exp, "CALL", bid=1.0, retyped=retyped)]}
+        for exp in expirations
+    }
     return {
         "status": "SUCCESS",
         "underlying": None,
@@ -153,9 +191,18 @@ class _WindowVendor:
         return et(2026, 9, 1, 9, 0)
 
 
-def _both_windows() -> _WindowVendor:
-    """A vendor whose two windows each return one expiration."""
-    return _WindowVendor(windows={NEAR: _chain([NEAR_EXP]), TAIL: _chain([TAIL_EXP])})
+def _both_windows(retyped: dict | None = None) -> _WindowVendor:
+    """A vendor whose two windows each return one expiration.
+
+    ``retyped`` sends a known field at a type its column refuses, on every contract of
+    both windows, which is the shape a vendor-wide retype takes.
+    """
+    return _WindowVendor(
+        windows={
+            NEAR: _chain([NEAR_EXP], retyped=retyped),
+            TAIL: _chain([TAIL_EXP], retyped=retyped),
+        }
+    )
 
 
 def _fill(lake_root: Path, vendor, *, ticker: str = "SPY", pid: int = 7):
@@ -569,6 +616,8 @@ def test_the_guard_the_daemon_builds_carries_a_fill(tmp_path):
         str(tickers),
         SessionClock(clock=clock, calendar=weekday_sessions(WEEK)),
         clock,
+        observer=SchemaDriftObserver(),
+        publisher=_publisher(lake_root),
     )
 
     assert guard is not None
@@ -873,6 +922,8 @@ def test_the_daemon_threads_its_token_path_down_to_the_fill(tmp_path, monkeypatc
         str(token),
         SessionClock(clock=clock, calendar=weekday_sessions(WEEK)),
         clock,
+        observer=SchemaDriftObserver(),
+        publisher=_publisher(lake_root),
     )
     fill("SPY", CLOSE)
 
@@ -1244,3 +1295,297 @@ def test_a_calendar_that_cannot_place_the_minute_costs_the_stamp_and_not_the_mar
     assert [m["expiration_date"] for m in markers] == ["2026-09-11"], "the marker was lost"
     assert markers[0]["session_phase"] is None
     assert outcome.shortfalls == ("SPY: 1 expirations",)
+
+
+# -- 10. the schema-drift signature the fill writes and pages ---------------------------
+
+
+def _drift_fill(tmp_path, lake_root, monkeypatch, *, observer, transport, clock):
+    """The daemon's own fill closure, wired to a shared observer and a real publisher.
+
+    Nothing between the closure and the segment is replaced except the ``schwab-py``
+    client the vendor factory builds, which is the one thing a test cannot have. So a
+    fill that pages here is a fill that pages in production.
+    """
+    config = write_config(tmp_path, lake_root)
+    vendors: list = []
+
+    class _Stub:
+        @staticmethod
+        def from_token(token_path, *, api_key, app_secret):
+            return vendors.pop(0)
+
+    monkeypatch.setattr(capture, "SchwabVendor", _Stub)
+    monkeypatch.setattr(capture, "load_chain_plan", lambda: TWO_WINDOWS)
+    fill = daemon._close_fill(
+        str(config),
+        str(tmp_path / "token.json"),
+        SessionClock(clock=clock, calendar=weekday_sessions(WEEK)),
+        clock,
+        observer=observer,
+        publisher=_publisher(lake_root, transport),
+    )
+    return fill, vendors
+
+
+def _cycle_segment(ticker: str, *routed: str) -> capture.SegmentOutcome:
+    """One ordinary cycle's chains segment for a ticker, drifting the named columns."""
+    return capture.SegmentOutcome(
+        surface=CHAINS,
+        ticker=ticker,
+        path=Path("segment.arrows"),
+        partition=f"{CHAINS}/ticker={ticker}/date=2026-09-02/segment.arrows",
+        row_kind=journal.ROW_KIND_DATA,
+        rows=1,
+        error_class=None,
+        fetched_at=None,
+        routed_columns=routed,
+    )
+
+
+def test_a_fill_on_a_retyped_field_carries_the_drift_signature(lake_root):
+    """The case that is silently empty today, measured end to end.
+
+    The vendor sends ``openInterest`` as a float against the pinned ``int64``. The parser
+    nulls the column and parks the raw value in ``extra``, which is the signature, and
+    ``journal.routed_columns`` reads it back off the batch the fill just built. Before this
+    the segment carried all three of those facts and the result carried none of them.
+    """
+    result = _fill(lake_root, _both_windows(RETYPED_OPEN_INTEREST))
+
+    assert result.routed_columns == ("open_interest",)
+    rows = [r for r in _rows(lake_root) if r["row_kind"] == journal.ROW_KIND_DATA]
+    assert rows, "the fill landed nothing, so there was no payload to read"
+    assert {r["open_interest"] for r in rows} == {None}
+    assert all("openInterest" in r["extra"] for r in rows)
+
+
+def test_a_fill_that_meets_no_drift_reports_none_and_lands_the_same_segment(lake_root):
+    """The ordinary path, which is every fill this lake has run.
+
+    ``extra`` is non-null on zero of the lake's sealed rows, so this is the case the scan
+    answers on every real fill. It must cost the segment nothing and report nothing.
+    """
+    result = _fill(lake_root, _both_windows())
+
+    assert result.routed_columns == ()
+    rows = [r for r in _rows(lake_root) if r["row_kind"] == journal.ROW_KIND_DATA]
+    assert rows
+    assert {r["open_interest"] for r in rows} == {100}
+    assert {r["extra"] for r in rows} == {None}
+
+
+def test_a_drift_scan_that_raises_costs_the_finding_and_not_the_fill(lake_root, capsys):
+    """A diagnostic must never cost a minute, the rule the cycle's own writer states.
+
+    It buys more here than it does in the cycle. Onboarding calls ``journal_snapshot``
+    last of all, after the master, the spans and their manifest entries have committed, so
+    an unguarded raise would leave a registered capturing ticker with no sign-off report.
+    The failure is not silent: it reaches the launchd log the restart script points at.
+    """
+
+    def boom(surface, batch):
+        raise RuntimeError("the scan broke")
+
+    original = journal.routed_columns
+    journal.routed_columns = boom
+    try:
+        result = _fill(lake_root, _both_windows(RETYPED_OPEN_INTEREST))
+    finally:
+        journal.routed_columns = original
+
+    assert result.landed
+    assert result.routed_columns == ()
+    assert "schema-drift scan failed on chains SPY: RuntimeError: the scan broke" in (
+        capsys.readouterr().err
+    )
+
+
+def test_the_daemon_pages_a_fill_that_found_a_drift(tmp_path, monkeypatch):
+    """The whole path, from the daemon's fill closure to a message on the transport.
+
+    Capture stops at the option close, so the fill writes the session's last segment. A
+    retype that starts inside the five-minute window otherwise reaches nobody until the
+    next session's first cycle, about seventeen hours later, and those are the rows
+    ``load_chain(snap=None)`` resolves to.
+
+    The page says the observation was partial, because a fill reads one ticker and its
+    count would be one however far the retype reaches.
+    """
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    transport = FakeTransport()
+    fill, vendors = _drift_fill(
+        tmp_path,
+        lake_root,
+        monkeypatch,
+        observer=SchemaDriftObserver(),
+        transport=transport,
+        clock=ManualClock(start=FILL_MINUTE),
+    )
+    vendors.append(_both_windows(RETYPED_OPEN_INTEREST))
+
+    result = fill("SPY", CLOSE)
+
+    assert result.routed_columns == ("open_interest",)
+    assert len(transport.messages) == 1
+    message = transport.messages[0]
+    assert message.event == SCHEMA_DRIFT_EVENT
+    assert "chains: open_interest." in message.body
+    assert "Only SPY was read, not a whole cycle" in message.body
+
+
+def test_the_page_names_the_ticker_the_fill_actually_read(tmp_path, monkeypatch):
+    """Every other fill case here reads SPY, so a constant would pass all of them.
+
+    A fill's page names one ticker and the observer files the finding under that name. A
+    constant would file QQQ's drift under SPY, and the clearance line keys on the ticker,
+    so a clean SPY cycle would then forgive a drift QQQ is still carrying.
+    """
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    transport = FakeTransport()
+    fill, vendors = _drift_fill(
+        tmp_path,
+        lake_root,
+        monkeypatch,
+        observer=SchemaDriftObserver(),
+        transport=transport,
+        clock=ManualClock(start=FILL_MINUTE),
+    )
+    vendors.append(_both_windows(RETYPED_OPEN_INTEREST))
+
+    fill("QQQ", CLOSE)
+
+    assert "Only QQQ was read" in transport.messages[0].body
+
+
+def test_a_fill_does_not_clear_a_column_another_ticker_is_drifting(tmp_path, monkeypatch):
+    """The load-bearing one, and the trap a one-segment ``CycleResult`` falls into.
+
+    ``observe`` clears with ``(was - observed) & named``, where ``named`` is the cycle's
+    roster, and the comment above it says a ticker the roster no longer names "drops out
+    here, which is what lets a retirement clear". A fill names one ticker, so feeding its
+    outcome in as a cycle result reads every other ticker as retired. Such a result
+    type-checks and reads as a cycle, which is what makes it the easy wrong answer.
+
+    Nothing would be lost on disk and no page would be missed. The cost is a duplicate,
+    which is what the observer remembers tickers to prevent.
+
+    Four steps, and the page count at the end is what proves all four of them.
+
+    1. An ordinary cycle where QQQ drifts ``open_interest`` and SPY is clean. One page.
+    2. A fill on SPY that drifts ``volume``. A second page, and QQQ's drift must survive it.
+    3. A second fill on SPY drifting the same column. No page, by the transition rule.
+    4. An ordinary cycle with QQQ still drifting. No page, because nothing cleared.
+
+    Two pages in total. Feeding the observer a one-ticker cycle result costs a third at
+    step 4, and paging on every fill rather than on a transition costs one at step 3.
+    """
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    transport = FakeTransport()
+    observer = SchemaDriftObserver()
+    clock = ManualClock(start=FILL_MINUTE)
+    fill, vendors = _drift_fill(
+        tmp_path, lake_root, monkeypatch, observer=observer, transport=transport, clock=clock
+    )
+    publisher = _publisher(lake_root, transport)
+
+    def ordinary_cycle() -> None:
+        result = capture.CycleResult(
+            snap_ts=CLOSE,
+            segments=(_cycle_segment("QQQ", "open_interest"), _cycle_segment("SPY")),
+        )
+        schema_drift.page(publisher, observer.observe(result), now=CLOSE)
+
+    ordinary_cycle()
+    for minute in (FILL_MINUTE, FILL_MINUTE + timedelta(minutes=1)):
+        clock.set(minute)
+        vendors.append(_both_windows(RETYPED_VOLUME))
+        assert fill("SPY", CLOSE).routed_columns == ("volume",)
+    ordinary_cycle()
+
+    bodies = [message.body for message in transport.messages]
+    assert len(bodies) == 2, bodies
+    assert sum("open_interest" in body for body in bodies) == 1
+    assert sum("volume" in body for body in bodies) == 1
+
+
+def test_the_daemon_shares_one_drift_observer_between_its_cycles_and_its_fill(
+    tmp_path, monkeypatch
+):
+    """The wiring line, held from the outside rather than by the closure's own argument.
+
+    ``run_loop_from_config`` hoists the alarm above the guard so ``_close_guard`` can hand
+    the fill the same ``SchemaDriftObserver`` the cycle hook observes on. Every other test
+    here builds the closure by calling ``_close_fill`` directly and passes an observer it
+    made itself, so all of them pass with a private observer behind the guard and none of
+    them says the daemon shares one.
+
+    What a private observer costs is the transition rule, twice over. A column the
+    morning's cycles already paged pages again from the fill, because the fill's observer
+    has never seen it. The fill's own finding then never reaches the cycle observer, so
+    the next morning's first cycle reads it as fresh and pages a third time.
+
+    The 16:15 cycle here drifts ``open_interest`` and writes nothing to disk, so the guard
+    still finds the option close missing and fills it at 16:20. The fill's payload drifts
+    the same column. One vendor fact, and the count at the end is one page.
+    """
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("SPY: {options: true, chain_cadence: 1m}\n")
+
+    master = SecurityMaster()
+    iid = master.register(
+        kind="equity", capture_start=et(2026, 9, 2, 9, 30), valid_from=DAY, ticker="SPY"
+    )
+    master.write(master_path(lake_root))
+    spans = CaptureSpans()
+    spans.open_span(iid, et(2026, 9, 2, 9, 30), True)
+    spans.write(spans_path(lake_root))
+
+    vendor = _both_windows(RETYPED_OPEN_INTEREST)
+
+    class _Stub:
+        @staticmethod
+        def from_token(token_path, *, api_key, app_secret):
+            return vendor
+
+    monkeypatch.setattr(capture, "SchwabVendor", _Stub)
+    monkeypatch.setattr(capture, "load_chain_plan", lambda: TWO_WINDOWS)
+
+    clock = ManualClock(start=et(2026, 9, 2, 16, 14, 30))
+    transport = FakeTransport()
+    ticks = [0]
+
+    def six() -> bool:
+        ticks[0] += 1
+        return ticks[0] <= 6
+
+    def drifting_cycle(*, close_tag, session_phase):
+        return capture.CycleResult(clock.now(), (_cycle_segment("SPY", "open_interest"),))
+
+    daemon.run_loop_from_config(
+        config_path=str(config),
+        tickers_path=str(tickers),
+        token_path=str(tmp_path / "token.json"),
+        clock=clock,
+        calendar=weekday_sessions(WEEK),
+        assertion_runner=lambda args: None,
+        cycle_runner=drifting_cycle,
+        transport=transport,
+        pinger=FakePinger(),
+        compaction_runner=lambda args: None,
+        should_continue=six,
+    )
+
+    drift = [m for m in transport.messages if m.event == SCHEMA_DRIFT_EVENT]
+    assert len(drift) == 1, [m.body for m in drift]
+    # The cycle's page, not the fill's: it names a measured reach rather than one ticker.
+    assert "chains: open_interest on 1 ticker(s)" in drift[0].body
+    # The fill really ran, so the silence is a shared observer rather than a fill that
+    # never happened.
+    assert vendor.calls == [("SPY", *NEAR), ("SPY", *TAIL)]

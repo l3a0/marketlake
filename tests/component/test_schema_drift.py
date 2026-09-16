@@ -7,7 +7,7 @@ behind. The publisher is the real one over a recording transport, holding the tw
 the production ``main`` passes, and it writes its record to a throwaway lake. So the tier
 is component: the producer over real files, with the network still fake.
 
-Seven things are covered.
+Eight things are covered.
 
 1. One cycle's findings are one page, carrying the event, the title, the page priority,
    and a body naming each surface's columns and how many tickers carried them.
@@ -20,6 +20,9 @@ Seven things are covered.
 6. A transport that raises never reaches the caller, so a dead ntfy cannot cost the cycle
    that found the drift.
 7. The per-ticker detail the page folds away still reaches stderr.
+8. A finding from an observation of one ticker prints no ticker count, and the page says
+   what was read instead. The count is the reach on a cycle's finding and always one on a
+   partial one, so printing it would read as a retype isolated to one ticker.
 """
 
 from __future__ import annotations
@@ -64,8 +67,10 @@ def _paging(lake_root: Path, transport=None) -> tuple[Publisher, FakeTransport]:
     return publisher, transport
 
 
-def _drift(column: str, *tickers: str, surface: str = CHAINS_SURFACE) -> ColumnDrift:
-    return ColumnDrift(surface, column, tickers)
+def _drift(
+    column: str, *tickers: str, surface: str = CHAINS_SURFACE, partial: bool = False
+) -> ColumnDrift:
+    return ColumnDrift(surface, column, tickers, partial)
 
 
 def _segment(surface: str, ticker: str, *routed: str) -> SegmentOutcome:
@@ -369,3 +374,64 @@ def test_the_column_cap_is_the_number_the_design_budget_was_reasoned_to():
     off a body with room for all of them.
     """
     assert PAGE_COLUMN_CAP == 12
+
+
+# -- 8. a finding from one ticker rather than a whole cycle --------------------
+
+
+def test_a_partial_finding_prints_no_ticker_count_and_says_what_was_read(lake_root):
+    """The close+5 fill's page, and the number it must not print.
+
+    A fill reads one ticker, so ``len(tickers)`` is one whatever the vendor's retype
+    actually reaches. An operator woken at 16:20 reading "on 1 ticker(s)" would take a
+    change that hit the whole roster for an isolated one, and act on it that way. So the
+    count comes off and the body says what was looked at.
+    """
+    publisher, transport = _paging(lake_root)
+
+    schema_drift.page(publisher, (_drift("open_interest", "SPY", partial=True),), now=NOW)
+
+    body = transport.messages[0].body
+    assert "chains: open_interest." in body
+    assert "ticker(s)" not in body
+    assert "Only SPY was read, not a whole cycle" in body
+
+
+def test_a_whole_cycle_finding_still_prints_its_count(lake_root):
+    """The other half of the same rule, so the count is dropped where it is a floor only.
+
+    A cycle measured the whole roster, so its count is the reach and it is the fact that
+    separates one moved column from a wholesale retype.
+    """
+    publisher, transport = _paging(lake_root)
+
+    schema_drift.page(publisher, (_drift("open_interest", "SPY", "QQQ"),), now=NOW)
+
+    body = transport.messages[0].body
+    assert "chains: open_interest on 2 ticker(s)" in body
+    assert "was read, not a whole cycle" not in body
+
+
+def test_the_widest_partial_drift_fits_the_design_body_budget():
+    """The same bound the cycle's widest page is held to, on the other body shape.
+
+    A partial body drops a count per column and adds one closing sentence, so it is not
+    the cycle's body with a suffix and its length has to be measured rather than inferred.
+
+    Chains is the only surface this can run on, because the close+5 fill is the only
+    writer whose partial finding reaches a page and a fill is the chains surface alone.
+    That is not the wider of the two surfaces: quotes has 63 projectable columns to
+    chains' 56, and the chains body runs longer only because its first twelve sorted
+    column names are.
+    """
+    widest = tuple(
+        ColumnDrift(CHAINS_SURFACE, column, ("SPY",), True)
+        for column in sorted(extra_paths(CHAINS_SURFACE))
+    )
+    assert len(widest) > PAGE_COLUMN_CAP, "the worst case must exceed the cap to test it"
+
+    body = schema_drift._body(widest)
+
+    assert len(body.encode()) < DESIGN_BODY_BUDGET, len(body.encode())
+    assert "more" in body
+    assert "Only SPY was read, not a whole cycle" in body

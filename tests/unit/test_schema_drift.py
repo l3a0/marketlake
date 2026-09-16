@@ -17,6 +17,24 @@ What they cover is the state machine, which is where the settled rules live. The
    vendor retype reaches every ticker on the same cycle.
 5. Only data segments are evidence. A cycle that gapped a surface says nothing about the
    vendor's payload and must leave that surface's state where it stood.
+
+``observe_partial`` is the second way in, for the close+5 fill, which writes one ticker's
+segment from outside the loop. Four rules cover its state machine.
+
+1. A column it names that the surface was not already drifting is a transition, and it
+   comes back marked partial so the page does not print one ticker as the reach.
+2. A column it names that was already drifting is not a transition, the same cadence rule
+   an ordinary cycle follows.
+3. It clears nothing, ever. One ticker is no evidence about the rest, and the clearance
+   line reads absence from the roster as a retirement, so a roster of one would drop every
+   other ticker's drift and cost a duplicate page on the next ordinary cycle.
+4. What it remembers is what keeps that next cycle quiet. A column it started is in the
+   state, so the cycle that meets the same column reads it as standing rather than new,
+   and a ticker it names joins that column's set rather than replacing it.
+
+Three further tests cover what surrounds the state machine: the columns come back sorted
+and deduped, one surface's observation leaves the other alone, and a column a partial
+observation started still re-arms on the ordinary positive evidence.
 """
 
 from __future__ import annotations
@@ -365,3 +383,142 @@ def test_two_columns_starting_on_one_surface_come_back_sorted():
         _segment(ticker="IWM", routed=("bid",)),
     )
     assert [drift.column for drift in observer.observe(spread)] == ["ask", "bid", "volume"]
+
+
+# -- observe_partial: a writer that is not a cycle -----------------------------
+
+
+def test_a_partial_observation_reports_a_column_that_starts_drifting():
+    """The case the fill and an onboarding snapshot are silent on today.
+
+    It comes back marked partial, which is what the page reads to decide whether to print
+    a ticker count. One writer looked at one ticker, so the count would be one however far
+    the vendor's retype actually reaches.
+    """
+    observer = SchemaDriftObserver()
+
+    drifted = observer.observe_partial(CHAINS_SURFACE, "SPY", ("open_interest",))
+
+    assert drifted == (ColumnDrift(CHAINS_SURFACE, "open_interest", ("SPY",), partial=True),)
+
+
+def test_a_partial_observation_of_a_column_already_drifting_reports_nothing():
+    """The cadence rule, which does not change with the way in.
+
+    A close+5 fill runs once a session and an onboarding snapshot once a ticker, so neither
+    can spend the daily cap on its own. What it would cost is a second page for one vendor
+    fact, which is the thing the transition rule exists to stop.
+    """
+    observer = SchemaDriftObserver()
+    observer.observe(_cycle(_segment(routed=("open_interest",))))
+
+    assert observer.observe_partial(CHAINS_SURFACE, "SPY", ("open_interest",)) == ()
+
+
+def test_a_partial_observation_remembers_its_ticker_beside_the_others():
+    """The union, which is what a second observation of a standing column is for.
+
+    The already-drifting test above drives this same line and asserts only the return
+    value, so it cannot see whether the ticker joined the set or replaced it. Replacing
+    costs a page. A fill on SPY would forget QQQ, and then a cycle where QQQ gaps and SPY
+    lands clean would read the column as resolved, so QQQ's next data row pages again for
+    a drift nothing fixed.
+    """
+    observer = SchemaDriftObserver()
+    observer.observe(_cycle(_segment(ticker="QQQ", routed=("open_interest",))))
+
+    observer.observe_partial(CHAINS_SURFACE, "SPY", ("open_interest",))
+
+    assert observer._routing[CHAINS_SURFACE]["open_interest"] == frozenset({"QQQ", "SPY"})
+
+
+def test_a_partial_observation_does_not_retire_the_tickers_it_did_not_name():
+    """The trap this entry point exists for, read straight off the state.
+
+    ``observe`` clears with ``(was - observed) & named``, where ``named`` is the cycle's
+    roster. A one-ticker result would name one ticker, so QQQ would read as retired and the
+    column it is drifting would drop out. Nothing is lost on disk and no page is missed.
+    The cost is the duplicate the state exists to prevent, and the test below is what
+    catches it from the outside.
+    """
+    observer = SchemaDriftObserver()
+    observer.observe(_cycle(_segment(ticker="QQQ", routed=("open_interest",))))
+
+    observer.observe_partial(CHAINS_SURFACE, "SPY", ("volume",))
+
+    assert observer._routing[CHAINS_SURFACE]["open_interest"] == frozenset({"QQQ"})
+
+
+def test_a_column_a_partial_observation_started_does_not_page_again_on_the_next_cycle():
+    """What the partial observation remembers, and why remembering is the point.
+
+    A fill that found a drift and forgot it would page, and then the ordinary cycle that
+    meets the same column the next morning would read it as new and page again. One vendor
+    fact, two pages.
+    """
+    observer = SchemaDriftObserver()
+    assert observer.observe_partial(CHAINS_SURFACE, "SPY", ("open_interest",))
+
+    assert observer.observe(_cycle(_segment(routed=("open_interest",)))) == ()
+
+
+def test_a_column_a_partial_observation_started_still_clears_on_positive_evidence():
+    """Remembering must not be permanent, or the vendor could never be forgiven.
+
+    The reset is the ordinary one: every ticker that was drifting the column has since
+    landed a data row that did not. A partial observation puts its one ticker into that
+    set, so a clean cycle on that same ticker is the evidence that clears it.
+    """
+    observer = SchemaDriftObserver()
+    observer.observe_partial(CHAINS_SURFACE, "SPY", ("open_interest",))
+
+    assert observer.observe(_cycle(_segment())) == ()
+    assert observer._routing == {}
+
+
+def test_a_partial_observation_that_finds_nothing_touches_no_state():
+    """Absence of evidence from one ticker is no evidence about the rest.
+
+    A clean fill is the ordinary case, and the one that runs every session. If it cleared,
+    the close+5 fill would wipe the day's findings on its way out and hand the next
+    morning's first cycle a fresh transition for a drift nothing fixed.
+    """
+    observer = SchemaDriftObserver()
+    observer.observe(_cycle(_segment(ticker="QQQ", routed=("open_interest",))))
+    before = dict(observer._routing[CHAINS_SURFACE])
+
+    assert observer.observe_partial(CHAINS_SURFACE, "SPY", ()) == ()
+    assert observer._routing[CHAINS_SURFACE] == before
+
+
+def test_a_partial_observation_reports_its_columns_sorted():
+    """The page's cap cuts the tail, so the order decides which names an operator sees.
+
+    ``journal.routed_columns`` already sorts, and this keeps the second way in from being
+    the one that hands the page payload order instead.
+    """
+    observer = SchemaDriftObserver()
+
+    drifted = observer.observe_partial(
+        CHAINS_SURFACE, "SPY", ("volume", "bid", "open_interest", "bid")
+    )
+
+    # Deduped as well as sorted. A repeated column would be reported twice and would spend
+    # two of the page's ``PAGE_COLUMN_CAP`` slots on one fact.
+    assert [drift.column for drift in drifted] == ["bid", "open_interest", "volume"]
+
+
+def test_a_partial_observation_on_one_surface_leaves_the_other_alone():
+    """Onboarding reaches both surfaces, and an equity-only ticker onboards on quotes.
+
+    The surfaces carry separate state, so a quotes snapshot must say nothing about what
+    chains is drifting, the same way a cycle that named one surface leaves the other where
+    it stood.
+    """
+    observer = SchemaDriftObserver()
+    observer.observe(_cycle(_segment(CHAINS_SURFACE, routed=("open_interest",))))
+
+    assert observer.observe_partial(QUOTES_SURFACE, "QQQ", ("bid",)) == (
+        ColumnDrift(QUOTES_SURFACE, "bid", ("QQQ",), partial=True),
+    )
+    assert observer._routing[CHAINS_SURFACE] == {"open_interest": frozenset({"SPY"})}
