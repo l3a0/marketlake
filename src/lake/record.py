@@ -6,9 +6,9 @@ captures a real Schwab call into that format. The captured cassette then replays
 through ``CassetteVendor`` in the offline suite.
 
 The recorder resolves credentials, builds the real vendor from them, asks it for each
-requested chain and quote batch, and writes each reply into an ``Interaction`` keyed
-exactly the way ``CassetteVendor`` looks it up. Two injection points keep it testable
-offline.
+requested chain, quote batch and price-history window, and writes each reply into an
+``Interaction`` keyed exactly the way ``CassetteVendor`` looks it up. Two injection points
+keep it testable offline.
 
 1. The credentials arrive as plain-string arguments, never fetched inside the record
    logic. So a test passes fake strings.
@@ -19,23 +19,47 @@ offline.
 Run it by hand to record from the real vendor::
 
     python -m lake.record --out spy.json --chain SPY --chain QQQ --quotes SPY,QQQ
+    python -m lake.record --out bars.json \
+        --bars SPY,1m,2026-09-14T09:30:00-04:00,2026-09-14T16:00:00-04:00
 
 That path builds the real client and reads credentials from ``config.yaml``, so it is
 a live check, never a continuous-integration step. Credentials come from D1's config
 loader, the one source shared with the daemon's auth. They never live in the repo or
 the environment. Any cassette committed to the repo must be synthetic or sanitized. A
 recording from a real account carries real market data and must not be checked in.
+
+**An existing ``--out`` is refused rather than overwritten.** A recording costs a live
+token and a moment of market hours that does not come back, so silently replacing one
+with a second run's output is a loss nothing can undo. Pass ``--force`` to overwrite on
+purpose. This is a decision rather than the default that was there before it.
+
+**One window is what a recording is for.** A price-history fixture set wants more windows
+than a live session is worth burning requests on, so record one and build the rest with
+``tests.support.vendor.bars_interactions``. That is the same division the chain recording
+already uses, where one bare-symbol body feeds ``windowed_chain_interactions``.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from lake.cassette import Cassette, Interaction, dump_cassette
 from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor
-from lake.vendor import Vendor, VendorError, VendorResponse
+from lake.vendor import (
+    BAR_FREQS,
+    BARS_ENDPOINT,
+    MINUTE_FREQ,
+    Vendor,
+    VendorError,
+    VendorResponse,
+    bars_params,
+    require_bar_freq,
+    require_utc_bound,
+)
 
 # How the recorder builds a vendor from a token path and resolved credentials. The
 # default is the real factory. A test injects one that returns a fake-client vendor.
@@ -46,9 +70,12 @@ def _interaction(endpoint: str, params: dict, response: VendorResponse) -> Inter
     """Shape one verbatim ``VendorResponse`` into a recorded ``Interaction``.
 
     The ``params`` key must match what ``CassetteVendor`` queries: ``{"symbol": s}``
-    for a chain and ``{"symbols": [...]}`` for a quote batch. The body and headers
-    are copied into plain dicts so the recording does not alias live state. Nothing
-    in the body is inspected.
+    for a chain, ``{"symbols": [...]}`` for a quote batch, and whatever
+    ``lake.vendor.bars_params`` builds for a price-history window. The third is built by
+    that shared function rather than spelled again here, because its key carries a
+    timezone normalization a second spelling would get wrong. The body and headers are
+    copied into plain dicts so the recording does not alias live state. Nothing in the
+    body is inspected.
     """
     return Interaction(
         endpoint=endpoint,
@@ -59,11 +86,33 @@ def _interaction(endpoint: str, params: dict, response: VendorResponse) -> Inter
     )
 
 
+@dataclass(frozen=True)
+class BarRequest:
+    """One price-history window to record.
+
+    ``freq`` is ``"1m"`` or ``"1d"``, the two the vendor seam has a call for. ``start``
+    and ``end`` are both required and both timezone-aware, because ``schwab-py``
+    substitutes a fifty-five year window for a missing bound and reads a naive one in the
+    host's local zone.
+    """
+
+    symbol: str
+    freq: str
+    start: datetime
+    end: datetime
+
+    def __post_init__(self) -> None:
+        require_bar_freq(self.freq)
+        require_utc_bound(self.start, "start")
+        require_utc_bound(self.end, "end")
+
+
 def record_cassette(
     api_key: str,
     app_secret: str,
     chain_symbols: Sequence[str] = (),
     quote_batches: Sequence[Sequence[str]] = (),
+    bar_requests: Sequence[BarRequest] = (),
     *,
     token_path: str | Path = DEFAULT_TOKEN_PATH,
     vendor_factory: VendorFactory = SchwabVendor.from_token,
@@ -76,7 +125,9 @@ def record_cassette(
     a test injects a factory that returns a fake-client vendor and never touches the
     network. ``chain_symbols`` are the underlyings to record full chains for. Each
     ``quote_batches`` entry is one batched quote request, a list of symbols recorded
-    together the way the shared sampler batches them.
+    together the way the shared sampler batches them. Each ``bar_requests`` entry is one
+    price-history window, recorded through whichever per-frequency vendor method its
+    ``freq`` names.
 
     The recorder makes exactly the calls requested, in order, and never reaches past
     them. So the resulting cassette replays deterministically. The token mint time is
@@ -93,6 +144,16 @@ def record_cassette(
         symbols = list(batch)
         response = vendor.get_quotes(symbols)
         interactions.append(_interaction("quotes", {"symbols": symbols}, response))
+    for request in bar_requests:
+        fetch = vendor.get_minute_bars if request.freq == MINUTE_FREQ else vendor.get_daily_bars
+        response = fetch(request.symbol, start=request.start, end=request.end)
+        interactions.append(
+            _interaction(
+                BARS_ENDPOINT,
+                bars_params(request.symbol, request.freq, start=request.start, end=request.end),
+                response,
+            )
+        )
 
     try:
         mint = vendor.token_mint_time().isoformat()
@@ -106,7 +167,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     Factored out so the argument shaping is unit-testable without running a real
     fetch. ``--chain`` repeats per underlying. ``--quotes`` repeats per batch, each a
-    comma-separated symbol list.
+    comma-separated symbol list. ``--bars`` repeats per window.
+
+    ``--bars`` carries four fields where the other two carry one, because a price-history
+    request needs a symbol, a frequency and two bounds, and neither bound may be omitted.
+    The convention the other flags set, one repeatable flag per endpoint whose value
+    encodes the request, extends by making the value comma-separated the way ``--quotes``
+    already is. An ISO instant carries colons and no commas, so the four fields split
+    unambiguously.
     """
     parser = argparse.ArgumentParser(
         prog="python -m lake.record",
@@ -130,6 +198,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Record one batched quote request for this comma-separated list. Repeatable.",
     )
     parser.add_argument(
+        "--bars",
+        action="append",
+        default=[],
+        dest="bar_requests",
+        metavar="SYMBOL,FREQ,START,END",
+        help=(
+            "Record one price-history window. FREQ is "
+            f"{' or '.join(BAR_FREQS)}. START and END are timezone-aware ISO instants, "
+            "both required. Repeatable."
+        ),
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing --out path. Without it an existing path is refused.",
+    )
+    parser.add_argument(
         "--token",
         default=str(DEFAULT_TOKEN_PATH),
         help="Path to the Schwab token file. Defaults to the design's standard location.",
@@ -144,6 +229,52 @@ def _parse_quote_batches(raw_batches: Sequence[str]) -> list[list[str]]:
     ]
 
 
+def _parse_bar_requests(raw_requests: Sequence[str]) -> list[BarRequest]:
+    """Split each ``--bars`` value into a ``BarRequest``.
+
+    Every refusal here raises ``ValueError`` with a line naming the value and what was
+    wrong with it. ``main`` hands that line to ``argparse``, so an operator who mistypes a
+    bound reads one sentence and an exit code rather than a stack trace, and reads it
+    before any live request goes out.
+    """
+    requests: list[BarRequest] = []
+    for raw in raw_requests:
+        fields = [field.strip() for field in raw.split(",")]
+        if len(fields) != 4:
+            raise ValueError(
+                f"--bars {raw!r} needs four comma-separated fields, SYMBOL,FREQ,START,END, "
+                f"and carries {len(fields)}"
+            )
+        symbol, freq, start_text, end_text = fields
+        try:
+            start = datetime.fromisoformat(start_text)
+            end = datetime.fromisoformat(end_text)
+        except ValueError as exc:
+            raise ValueError(f"--bars {raw!r} has an unreadable instant: {exc}") from exc
+        try:
+            requests.append(BarRequest(symbol=symbol, freq=freq, start=start, end=end))
+        except ValueError as exc:
+            raise ValueError(f"--bars {raw!r}: {exc}") from exc
+    return requests
+
+
+def check_out_path(path: str | Path, *, force: bool = False) -> Path:
+    """Refuse an ``--out`` that already holds a recording, unless overwriting is asked for.
+
+    A recording costs a live token and a moment of market hours that does not come back.
+    ``dump_cassette`` writes whatever path it is given, so a second run against the same
+    ``--out`` used to replace the first silently. Refusing by default makes overwriting a
+    thing the operator asks for, and ``--force`` is how they ask.
+    """
+    resolved = Path(path)
+    if resolved.exists() and not force:
+        raise ValueError(
+            f"--out {resolved} already exists. A recording costs a live request, so it is "
+            "not overwritten by default. Pass --force to replace it, or name another path."
+        )
+    return resolved
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Record a cassette from the real vendor and write it to disk.
 
@@ -154,10 +285,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     imports and the whole suite runs even where ``lake.config`` is absent. The
     recorded cassette is for local diagnosis. Do not commit a recording from a real
     account.
+
+    Both argument refusals run before the credentials are loaded and before any request
+    goes out, so a mistyped window or an ``--out`` that already holds a recording costs
+    nothing.
     """
     from lake.config import input_errors_exit, load_config  # lazy: D1 dependency, live only
 
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        bar_requests = _parse_bar_requests(args.bar_requests)
+        out = check_out_path(args.out, force=args.force)
+    except ValueError as exc:
+        parser.error(str(exc))
     with input_errors_exit("record"):
         cfg = load_config()
     api_key = cfg.schwab_api_key.reveal()
@@ -168,10 +309,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         app_secret,
         chain_symbols=args.chains,
         quote_batches=_parse_quote_batches(args.quote_batches),
+        bar_requests=bar_requests,
         token_path=args.token,
     )
-    dump_cassette(cassette, args.out)
-    print(f"wrote {len(cassette.interactions)} interactions to {args.out}")
+    dump_cassette(cassette, out)
+    print(f"wrote {len(cassette.interactions)} interactions to {out}")
     return 0
 
 

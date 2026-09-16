@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -90,3 +90,51 @@ def test_load_rejects_an_unsupported_version(tmp_path):
     path.write_text('{"cassette_version": 999, "interactions": []}')
     with pytest.raises(CassetteError):
         load_cassette(path)
+
+
+# -- price history on the shared cassette --------------------------------------
+#
+# The checked-in minimal cassette is what ``conftest.cassette_vendor`` hands the whole
+# suite, so a happy-path price-history interaction recorded there reaches every test
+# without a fourth fixture file. The two shapes below are both synthetic. A recording
+# from a real account carries real market data and is never committed.
+
+
+_ET = timezone(timedelta(hours=-4))
+# The Monday the rest of this cassette is stamped against, and the Sunday before it.
+SESSION_OPEN = datetime(2026, 8, 24, 9, 30, tzinfo=_ET)
+SESSION_CLOSE = datetime(2026, 8, 24, 16, 0, tzinfo=_ET)
+NO_SESSION_OPEN = datetime(2026, 8, 23, 9, 30, tzinfo=_ET)
+NO_SESSION_CLOSE = datetime(2026, 8, 23, 16, 0, tzinfo=_ET)
+
+
+def test_the_shared_cassette_replays_a_populated_window(cassette_vendor: CassetteVendor):
+    response = cassette_vendor.get_minute_bars("SPY", start=SESSION_OPEN, end=SESSION_CLOSE)
+    assert response.status == 200
+    assert response.body["symbol"] == "SPY"
+    assert response.body["empty"] is False
+    candles = response.body["candles"]
+    assert len(candles) == 3
+    # Schwab stamps a candle in epoch milliseconds, not as an ISO string. The first
+    # candle is the opening minute of the session the window names.
+    assert candles[0]["datetime"] == int(SESSION_OPEN.timestamp() * 1000)
+    assert set(candles[0]) == {"open", "high", "low", "close", "volume", "datetime"}
+
+
+def test_the_shared_cassette_replays_an_empty_window(cassette_vendor: CassetteVendor):
+    """A window the vendor has no candle for is a recorded answer, not a missing one.
+
+    Schwab answers with an empty list and ``empty`` true rather than an error, so the
+    two are told apart here: this raises nothing, while an unrecorded window below does.
+    """
+    response = cassette_vendor.get_minute_bars("SPY", start=NO_SESSION_OPEN, end=NO_SESSION_CLOSE)
+    assert response.status == 200
+    assert response.body["candles"] == []
+    assert response.body["empty"] is True
+
+
+def test_the_shared_cassette_refuses_an_unrecorded_window(cassette_vendor: CassetteVendor):
+    with pytest.raises(CassetteError):
+        cassette_vendor.get_minute_bars(
+            "SPY", start=SESSION_OPEN, end=SESSION_CLOSE + timedelta(days=1)
+        )

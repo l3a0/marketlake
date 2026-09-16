@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 
 
 @dataclass(frozen=True)
@@ -52,9 +52,19 @@ class FakeSchwabClient:
     the token mint epoch second the vendor converts in ``token_mint_time``. Pass ``None``
     to model a client whose token metadata carries no mint time.
 
+    ``bars`` keys a ``FakeResponse`` by the price-history request. A key is either a
+    ``(symbol, freq)`` pair, which matches any window, or the full request tuple
+    ``(symbol, freq, start_datetime, end_datetime)``, which matches exactly. ``freq`` is
+    ``"1m"`` or ``"1d"``, naming which of ``schwab-py``'s two per-frequency methods was
+    called. The full tuple is tried first, then the pair, so one canned response serves
+    every window or each window gets its own.
+
     Every chain request is recorded so a test can assert the vendor forwarded the
     narrowing parameters. ``chain_from_date``, ``chain_to_date``, and ``chain_strike_count``
-    parallel ``chain_calls`` one-for-one.
+    parallel ``chain_calls`` one-for-one. Price history records the same way.
+    ``bar_freqs``, ``bar_start``, ``bar_end``, ``bar_extended_hours`` and
+    ``bar_previous_close`` parallel ``bar_calls``, so a test can assert the vendor picked
+    the right method and forwarded the window and both flags.
     """
 
     def __init__(
@@ -62,10 +72,12 @@ class FakeSchwabClient:
         *,
         chains: Mapping[object, FakeResponse] | None = None,
         quotes: Mapping[tuple[str, ...], FakeResponse] | None = None,
+        bars: Mapping[object, FakeResponse] | None = None,
         creation_timestamp: float | None = None,
     ) -> None:
         self._chains = dict(chains or {})
         self._quotes = dict(quotes or {})
+        self._bars = dict(bars or {})
         self.token_metadata = _FakeTokenMetadata(creation_timestamp)
         self.chain_calls: list[str] = []
         self.chain_underlying_quote: list[bool] = []
@@ -74,6 +86,12 @@ class FakeSchwabClient:
         self.chain_strike_count: list[int | None] = []
         self.quote_calls: list[list[str]] = []
         self.quote_fields: list[Sequence[str] | None] = []
+        self.bar_calls: list[str] = []
+        self.bar_freqs: list[str] = []
+        self.bar_start: list[datetime | None] = []
+        self.bar_end: list[datetime | None] = []
+        self.bar_extended_hours: list[bool | None] = []
+        self.bar_previous_close: list[bool | None] = []
 
     def get_option_chain(
         self,
@@ -105,3 +123,66 @@ class FakeSchwabClient:
         if key not in self._quotes:
             raise KeyError(f"no canned quotes for {key!r}")
         return self._quotes[key]
+
+    def _price_history(
+        self,
+        symbol: str,
+        freq: str,
+        start_datetime: datetime | None,
+        end_datetime: datetime | None,
+        need_extended_hours_data: bool | None,
+        need_previous_close: bool | None,
+    ) -> FakeResponse:
+        """Record one price-history request and serve its canned reply.
+
+        Both per-frequency methods land here, passing the frequency they name, so the
+        recording and the lookup are written once for the pair.
+        """
+        self.bar_calls.append(symbol)
+        self.bar_freqs.append(freq)
+        self.bar_start.append(start_datetime)
+        self.bar_end.append(end_datetime)
+        self.bar_extended_hours.append(need_extended_hours_data)
+        self.bar_previous_close.append(need_previous_close)
+        request = (symbol, freq, start_datetime, end_datetime)
+        if request in self._bars:
+            return self._bars[request]
+        if (symbol, freq) in self._bars:
+            return self._bars[(symbol, freq)]
+        raise KeyError(f"no canned price history for {request!r}")
+
+    def get_price_history_every_minute(
+        self,
+        symbol: str,
+        *,
+        start_datetime: datetime | None = None,
+        end_datetime: datetime | None = None,
+        need_extended_hours_data: bool | None = None,
+        need_previous_close: bool | None = None,
+    ) -> FakeResponse:
+        return self._price_history(
+            symbol,
+            "1m",
+            start_datetime,
+            end_datetime,
+            need_extended_hours_data,
+            need_previous_close,
+        )
+
+    def get_price_history_every_day(
+        self,
+        symbol: str,
+        *,
+        start_datetime: datetime | None = None,
+        end_datetime: datetime | None = None,
+        need_extended_hours_data: bool | None = None,
+        need_previous_close: bool | None = None,
+    ) -> FakeResponse:
+        return self._price_history(
+            symbol,
+            "1d",
+            start_datetime,
+            end_datetime,
+            need_extended_hours_data,
+            need_previous_close,
+        )

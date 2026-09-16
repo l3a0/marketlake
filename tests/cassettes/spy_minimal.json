@@ -807,6 +807,63 @@
         ]
       },
       "status": 200
+    },
+    {
+      "body": {
+        "candles": [
+          {
+            "close": 648.6,
+            "datetime": 1787578200000,
+            "high": 648.9,
+            "low": 647.8,
+            "open": 648.0,
+            "volume": 1450000
+          },
+          {
+            "close": 651.0,
+            "datetime": 1787587200000,
+            "high": 651.6,
+            "low": 650.9,
+            "open": 651.2,
+            "volume": 620000
+          },
+          {
+            "close": 649.0,
+            "datetime": 1787601540000,
+            "high": 649.4,
+            "low": 648.9,
+            "open": 649.2,
+            "volume": 2100000
+          }
+        ],
+        "empty": false,
+        "symbol": "SPY"
+      },
+      "endpoint": "bars",
+      "headers": {},
+      "params": {
+        "end": "2026-08-24T20:00:00+00:00",
+        "freq": "1m",
+        "start": "2026-08-24T13:30:00+00:00",
+        "symbol": "SPY"
+      },
+      "status": 200
+    },
+    {
+      "body": {
+        "candles": [],
+        "empty": true,
+        "symbol": "SPY"
+      },
+      "endpoint": "bars",
+      "headers": {},
+      "params": {
+        "end": "2026-08-23T20:00:00+00:00",
+        "freq": "1m",
+        "start": "2026-08-23T13:30:00+00:00",
+        "symbol": "SPY"
+      },
+      "status": 200
     }
   ],
   "token_mint_time": "2026-08-23T20:05:00-04:00"

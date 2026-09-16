@@ -10,8 +10,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from lake import inspect_cassette as inspect_module
 from lake.cassette import Cassette, Interaction, dump_cassette
-from lake.inspect_cassette import inspect_cassette, main
+from lake.inspect_cassette import SURFACES, inspect_cassette, main
 
 CASSETTES = Path(__file__).resolve().parents[1] / "cassettes"
 
@@ -129,3 +132,105 @@ def test_main_on_the_checked_in_minimal_cassette(capsys):
     assert "underlying:" in out
     assert "quote:" in out
     assert "extra" not in out
+
+
+# -- the bars surface ----------------------------------------------------------
+#
+# The price-history payload is the one thing the recorder exists to capture, and it was
+# the one payload this tool could not show. It fell through to <unknown surface: bars>,
+# and --surface refused the name before any code ran.
+
+
+BARS_BODY = {
+    "candles": [
+        {
+            "open": 650.0,
+            "high": 650.4,
+            "low": 649.8,
+            "close": 650.2,
+            "volume": 1_200_000,
+            "datetime": 1789054200000,
+        },
+        {"open": 650.2, "high": 650.3, "low": 650.0, "close": 650.1, "volume": 900_000},
+    ],
+    "symbol": "SPY",
+    "empty": False,
+}
+EMPTY_BARS_BODY = {"candles": [], "symbol": "SPY", "empty": True}
+
+
+def _bars_cassette(body: dict = BARS_BODY) -> Cassette:
+    params = {
+        "symbol": "SPY",
+        "freq": "1m",
+        "start": "2026-09-14T13:30:00+00:00",
+        "end": "2026-09-14T20:00:00+00:00",
+    }
+    return Cassette(interactions=(Interaction("bars", params, 200, body, {}),))
+
+
+def test_dumps_a_price_history_body_instead_of_an_unknown_surface():
+    output = inspect_cassette(_bars_cassette())
+    assert "unknown surface" not in output
+    # The top-level keys, so an empty window is visible without reading the candles.
+    assert "keys: candles, symbol, empty" in output
+    assert "open: float" in output
+    assert "volume: int" in output
+
+
+def test_dumps_exactly_one_candle():
+    output = inspect_cassette(_bars_cassette())
+    # Two candles in, one dumped, and the line says which of how many.
+    assert "candle [0 of 2]:" in output
+    assert output.count("open: float") == 1
+
+
+def test_the_candle_stamp_shows_its_value_so_an_epoch_is_visible():
+    # datetime is Schwab's epoch-millisecond stamp, not an ISO string. The time-key rule
+    # is what tells the two apart, and this is the field it exists for.
+    assert "datetime: int = 1789054200000" in inspect_cassette(_bars_cassette())
+
+
+def test_an_empty_window_is_reported_as_empty_rather_than_as_nothing():
+    # Schwab answers a window it has no candles for with an empty list, never an error,
+    # so the dump has to say so rather than print a bare params line.
+    output = inspect_cassette(_bars_cassette(EMPTY_BARS_BODY))
+    assert "candles: <empty>" in output
+    assert "empty: bool" in output
+
+
+def test_a_body_with_no_candle_list_is_reported_rather_than_crashing():
+    output = inspect_cassette(_bars_cassette({"symbol": "SPY"}))
+    assert "candles: <not a list: NoneType>" in output
+
+
+def test_the_surface_filter_accepts_the_third_name():
+    mixed = Cassette(interactions=_cassette().interactions + _bars_cassette().interactions)
+    bars_only = inspect_cassette(mixed, surface="bars")
+    assert "candle [0 of 2]:" in bars_only
+    assert "callExpDateMap" not in bars_only
+    assert "bidPrice" not in bars_only
+
+
+def test_the_command_line_accepts_the_third_name(tmp_path, capsys):
+    path = tmp_path / "bars.json"
+    dump_cassette(_bars_cassette(), path)
+    assert main([str(path), "--surface", "bars"]) == 0
+    assert "candle [0 of 2]:" in capsys.readouterr().out
+
+
+def test_the_command_line_still_refuses_a_name_the_dump_has_no_shape_for(tmp_path):
+    path = tmp_path / "bars.json"
+    dump_cassette(_bars_cassette(), path)
+    # argparse exits 2 on a bad choice, before the file is read.
+    with pytest.raises(SystemExit) as caught:
+        main([str(path), "--surface", "actions"])
+    assert caught.value.code == 2
+
+
+def test_the_offered_surfaces_are_the_ones_the_dump_can_shape():
+    # A name in the choices with no dump behind it would print <unknown surface: ...>,
+    # which is exactly the failure this issue closed for bars.
+    assert set(SURFACES) == {"chains", "quotes", "bars"}
+    for surface in SURFACES:
+        assert f"``{surface}``" in inspect_module.__doc__
