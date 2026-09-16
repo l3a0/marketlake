@@ -728,6 +728,41 @@ def test_the_quoted_count_is_what_traded_today_rather_than_what_read():
     )
 
 
+def test_answered_counts_what_the_vendor_named_rather_than_what_read():
+    """The denominator is the whole reply, stamps that would not read included.
+
+    This is the decision the page turns on, and separating it needs a batch where the three
+    outcomes differ. One stamp reads, one is absent, one is refused, and a fourth symbol the
+    vendor stays quiet about entirely never reaches the reader at all. So the four numbers
+    that could stand in for each other come apart: asked is 4, the vendor answered about 3,
+    2 read in some form, and 1 quoted.
+
+    A denominator of what read would report ``1 of 1`` on a vendor going bad one symbol at a
+    time, which says the market is open on the evidence of the symbols that still work.
+    """
+    result = run_probe(
+        calendar=weekday_sessions(WEEK),
+        clock=ManualClock(start=et(2026, 9, 5, 9, 35)),
+        symbols=["AAA", "BBB", "CCC", "DDD"],
+        fetch=lambda symbols: VendorResponse(
+            status=200,
+            body={
+                "AAA": _quote(et(2026, 9, 5, 9, 34)),
+                "BBB": {"quote": {}},
+                "CCC": _stamped(True),
+            },
+            headers={},
+        ),
+    )
+
+    assert result.trading == ("AAA",)
+    assert (result.answered, result.asked, result.refused) == (3, 4, 1)
+    assert probe_calendar._page_body(result) == (
+        "2026-09-05: 1 of 3 answered quoting today, 4 asked, latest 09:34:00 ET. "
+        "The daemon is idle. Check the Now panel."
+    )
+
+
 def test_the_body_carries_the_latest_stamp_on_the_market_clock():
     """The maximum stamp, and rendered in market time under the literal that says so.
 
