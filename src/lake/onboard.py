@@ -638,8 +638,11 @@ def onboard_from_config(
 
     This is the entry ``python -m lake.onboard`` calls. It loads the machine-local
     config and builds the Schwab-backed vendor from the token file. The Schwab client is
-    built lazily, so importing this module and running the offline suite touch neither
-    it nor the network. A test drives ``onboard`` directly with a fake vendor instead.
+    built lazily, so importing this module and running the offline suite touch neither it
+    nor the network. Most tests drive ``onboard`` directly with a fake vendor and never
+    reach here. A test that needs the command itself, and so needs this wrapper, replaces
+    ``lake.schwab.SchwabVendor`` instead. That is the one seam, because the import below
+    is function-local and there is no name in this module to patch.
 
     It reads the chain plan and passes the config's guards, the way
     ``fill_option_close_from_config`` does, so a nightly plan rewrite reaches the next

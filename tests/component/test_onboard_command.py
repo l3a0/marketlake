@@ -27,11 +27,11 @@ import pytest
 from lake import gap, journal
 from lake.calendar import MARKET_TZ
 from lake.capture import CAPTURE_SOURCE
-from lake.capture_spans import SPANS_PARTITION, CaptureSpans, spans_path
+from lake.capture_spans import SPANS_PARTITION, CaptureSpans, CaptureSpansError, spans_path
 from lake.cassette import Cassette, Interaction
 from lake.chain_plan import DEFAULT_CHAIN_PLAN, ChainPlan
 from lake.config import GuardConstants
-from lake.manifest import append_manifest, latest_entries
+from lake.manifest import ManifestError, append_manifest, latest_entries
 from lake.onboard import MASTER_PARTITION, EntitlementError, OnboardError, main, onboard
 from lake.paths import LakePaths
 from lake.security_master import (
@@ -1245,9 +1245,13 @@ def _stub_the_vendor(monkeypatch, vendor) -> None:
     """Hand ``onboard_from_config`` a recorded vendor instead of the Schwab-backed one.
 
     ``main`` builds its own vendor from the token file, so a test that drives ``main``
-    has this one seam and no other. The chain plan is pinned to the built-in default at
-    the same time, because the wrapper is the one reader of the machine's plan file and a
-    test must not depend on what that machine happens to hold.
+    has this one seam and no other.
+
+    The chain plan is pinned to the built-in default at the same time. That pin changes
+    nothing for the callers below, because every one of them passes ``--no-options`` and
+    the plan is read only on the options branch. It is here for the first options-path
+    test that drives ``main``, since the wrapper is the one reader of the machine's plan
+    file and a test must not depend on what that machine happens to hold.
     """
     import lake.onboard
     import lake.schwab
@@ -1295,11 +1299,20 @@ def test_the_seed_spans_refusal_reaches_the_operator_as_one_line(
             ]
         )
 
+    # The code is compared by type as well as by value. ``SystemExit(2.0)`` satisfies
+    # ``== 2`` and exits the real process 1, printing a stray ``2.0``, so the value alone
+    # holds nothing here.
     assert exit_info.value.code == 2
-    printed = capsys.readouterr().err
-    assert printed.startswith("onboard: ")
-    assert "python -m lake.seed_spans" in printed
-    assert "Traceback" not in printed
+    assert type(exit_info.value.code) is int
+    captured = capsys.readouterr()
+    # The whole line, rather than a prefix and a substring. This is the message the issue
+    # exists for, and an exact compare is what refuses a repr-wrapped exception, a missing
+    # newline, and a second line printed beside it.
+    assert captured.err == (
+        "onboard: capture spans are missing but the security master already has "
+        "instruments; run `python -m lake.seed_spans` before onboarding\n"
+    )
+    assert captured.out == ""
     assert not tickers_path.exists()
 
 
@@ -1331,9 +1344,12 @@ def test_a_delayed_feed_refused_through_the_command_prints_the_not_trusted_line(
         )
 
     assert exit_info.value.code == 2
-    printed = capsys.readouterr().err
-    assert printed.startswith("onboard: ")
-    assert "ticker not trusted" in printed
+    assert type(exit_info.value.code) is int
+    captured = capsys.readouterr()
+    assert captured.err == (
+        "onboard: quote for SPY is not real-time: realtime=False; ticker not trusted\n"
+    )
+    assert captured.out == ""
     assert not tickers_path.exists()
 
 
@@ -1357,21 +1373,44 @@ def test_an_onboarding_that_succeeds_still_returns_zero(lake_root, tmp_path, mon
     )
 
     assert code == 0
-    printed = capsys.readouterr()
-    assert printed.err == ""
-    assert "SPY" in printed.out
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    # The rendered sign-off, not merely a string with the ticker in it. Printing
+    # ``report.ticker`` alone would satisfy a substring check and lose the whole block.
+    assert captured.out.startswith("Onboarded SPY\n")
+    assert f"  tickers.yaml:    {tickers_path}" in captured.out
     assert load_tickers(tickers_path).get("SPY").options is False
 
 
+def _drive_main(tmp_path, config_path, tickers_path):
+    """Run the command the way the boundary tests below run it."""
+    return main(
+        [
+            "SPY",
+            "--no-options",
+            "--config",
+            str(config_path),
+            "--tickers",
+            str(tickers_path),
+            "--token",
+            str(tmp_path / "token.json"),
+        ]
+    )
+
+
 def test_a_corrupt_master_still_reaches_the_operator_as_a_traceback(
-    lake_root, tmp_path, monkeypatch
+    lake_root, tmp_path, monkeypatch, capsys
 ):
-    """The catch is bounded to ``OnboardError``, and this holds the boundary from outside.
+    """The catch is bounded to ``OnboardError``, and this covers the boundary from outside.
 
     A refused onboarding is a normal outcome of the command, so it gets a line. A master
     that cannot be read is a corrupt lake, which is a bug, and the stack names where the
     corruption was found. Widening the catch to the lake-state errors would pass every
     other test in this file and turn that stack into one line that hides the frame.
+
+    The empty stderr is asserted beside the exception. An added handler that prints the
+    refusal line and re-raises would satisfy the exception check on its own, and it would
+    put a line reading exactly like an operator refusal above a corruption stack.
     """
     path = master_path(lake_root)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1381,15 +1420,59 @@ def test_a_corrupt_master_still_reaches_the_operator_as_a_traceback(
     _stub_the_vendor(monkeypatch, _quote_vendor("SPY", realtime=True))
 
     with pytest.raises(SecurityMasterError):
-        main(
-            [
-                "SPY",
-                "--no-options",
-                "--config",
-                str(config_path),
-                "--tickers",
-                str(tickers_path),
-                "--token",
-                str(tmp_path / "token.json"),
-            ]
-        )
+        _drive_main(tmp_path, config_path, tickers_path)
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == ""
+
+
+def test_an_unreadable_spans_file_still_reaches_the_operator_as_a_traceback(
+    lake_root, tmp_path, monkeypatch, capsys
+):
+    """The second of the three classes the boundary names, covered the same way.
+
+    The design doc's considered-and-rejected entry names a master that cannot be read, a
+    spans file that will not parse, and a manifest that refuses an append. One test for
+    the master leaves the other two free: widening the catch to ``CaptureSpansError``
+    passes a suite that covers only the first.
+    """
+    path = spans_path(lake_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"this is not a parquet file")
+    tickers_path = tmp_path / "tickers.yaml"
+    config_path = _write_config(tmp_path / "config.yaml", lake_root=lake_root)
+    _stub_the_vendor(monkeypatch, _quote_vendor("SPY", realtime=True))
+
+    with pytest.raises(CaptureSpansError):
+        _drive_main(tmp_path, config_path, tickers_path)
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == ""
+
+
+def test_a_refused_manifest_append_still_reaches_the_operator_as_a_traceback(
+    lake_root, tmp_path, monkeypatch, capsys
+):
+    """The third class the boundary names. A manifest that will not take an append.
+
+    The manifest is reached from ``record_partition``, past every refusal, so the seam is
+    that call rather than a file written ahead of the run. A lake whose manifest refuses
+    an append is a lake that cannot record what it just wrote, and the frame that failed
+    is what a reader needs.
+    """
+    import lake.onboard
+
+    def _refuse(*args, **kwargs):
+        raise ManifestError("manifest append refused")
+
+    monkeypatch.setattr(lake.onboard, "record_partition", _refuse)
+    tickers_path = tmp_path / "tickers.yaml"
+    config_path = _write_config(tmp_path / "config.yaml", lake_root=lake_root)
+    _stub_the_vendor(monkeypatch, _quote_vendor("SPY", realtime=True))
+
+    with pytest.raises(ManifestError):
+        _drive_main(tmp_path, config_path, tickers_path)
+
+    assert capsys.readouterr().err == ""
