@@ -13,9 +13,9 @@ Three terms recur, defined here at first use.
 - A *surface* is one kind of measurement with its own pinned schema. This module
   writes two: ``chains`` (full option chains) and ``quotes`` (batched equity
   quotes). Arrow IPC fixes one schema per file, so the surface axis is load-bearing.
-  One segment can never hold both. It pins a third, ``bars``, and writes none of it.
-  The evening sweep lands bars straight in a Parquet partition, so no segment here
-  ever holds one.
+  One segment can never hold both. It pins a third, ``bars``, and builds its rows
+  without ever writing a segment of them. The evening sweep lands bars straight in a
+  Parquet partition, so no segment here ever holds one.
 - A *segment* is one Arrow IPC file, created by exactly one writer session and never
   re-opened for append. An Arrow IPC stream cannot be resumed by a later writer. A
   clean close writes an *end-of-stream* marker, the EOS, that readers stop at. Rows
@@ -365,10 +365,12 @@ QUOTES_SCHEMA = pa.schema(
 # stamp, which ``tests/cassettes/spy_minimal.json`` records and ``python -m
 # lake.inspect_cassette <path> --surface bars`` dumps.
 #
-# Nothing in this module builds a bars row. The row builder and every rule about what the
-# writer does with a payload are marketlake #280's. What is pinned here is what a bars row
-# *is*, because two deliverables wait on that answer rather than one, and because the
-# version ledger, the fingerprint and the vendor maps all read this module.
+# The row builder is ``bars_rows`` below, which marketlake #280 added beside the two capture
+# builders because the stamp transform it consumes is private to this module. What is pinned
+# here is what a bars row *is*, because two deliverables wait on that answer rather than one,
+# and because the version ledger, the fingerprint and the vendor maps all read this module.
+# What the sweep does with the rows, which ones the partition holds and what gates them, is
+# #280's and lives in ``lake.bars``.
 
 # The fetch provenance a bars row carries, which is what makes the fetch window reversible.
 # ``window_start`` and ``window_end`` are the bounds the request asked for, ISO-8601 like
@@ -462,10 +464,38 @@ _BARS_CANDLE_MAP = {
 # is non-null and ``pq.write_table`` refuses a table rather than a row, so one candle written
 # with a null stamp would cost the whole partition's write. So the refused candle does not
 # become a row at all, and what #280 does with it, drop it or fail the fetch, is the rule
-# that issue takes. Naming it here is what the constraint below is for.
-# The set of candle fields the parser recognizes is the row builder's, so it is #280's
-# rather than a constant here with nothing reading it.
+# that issue takes. The rule it took is to drop the candle, which ``bars_rows`` below
+# implements. Naming it here is what the constraint below is for.
 _BARS_CANDLE_TS_FIELD = "datetime"
+_BARS_CANDLE_CONSUMED = frozenset({_BARS_CANDLE_TS_FIELD})
+
+# Every per-candle field the row builder recognizes. A field outside this set overflows into
+# ``extra``, which is the fail-open rule ``_CHAINS_CONTRACT_KNOWN`` already states one surface
+# over. The consumed stamp is known, so a fully-populated candle leaves ``extra`` empty.
+#
+# A refused stamp does not widen this set the way chains' does. There the refusal keeps the
+# row and lets the raw value overflow under its own name, and here the row is dropped
+# altogether, so there is no row left for the value to overflow onto.
+_BARS_CANDLE_KNOWN = set(_BARS_CANDLE_MAP) | _BARS_CANDLE_CONSUMED
+
+# The response-level fields the row builder recognizes. ``candles`` is the list the rows are
+# built from, so it is recognized here and consumed rather than dropped. The other four are
+# dropped: ``symbol`` repeats the ticker the request named, ``empty`` restates that list's own
+# length, and ``previousClose`` with ``previousCloseDate`` are the pair ``need_previous_close``
+# adds. None of the four is a property of a candle, so none takes a column.
+#
+# They are named here rather than simply ignored, because ignoring the whole response level
+# would mean a field Schwab adds there is captured nowhere at all. An unrecognized one
+# overflows onto every row instead, which is loud: ``extra`` non-null on a whole partition is
+# the schema-drift signature, where a silent drop is nothing anyone would ever see. The four
+# below are the ones known to arrive, so in steady state ``extra`` stays null.
+_BARS_BODY_KNOWN = frozenset({"candles", "symbol", "empty", "previousClose", "previousCloseDate"})
+
+# The two known-sets stay separate rather than being unioned into one. Unioning them reads
+# as the same rule and is not: a candle carrying a field named ``symbol``, ``empty``,
+# ``candles`` or either previous-close key would be measured against the response's set and
+# dropped silently, and that is exactly the drift the overflow exists to make loud. So each
+# level's fields are measured against its own set and the two overflows are merged.
 
 # The bars capture schema. Each row is one candle.
 #
@@ -508,8 +538,9 @@ _BARS_CANDLE_TS_FIELD = "datetime"
 #    pair as what ``need_previous_close`` adds.
 #
 # None is a property of a candle, so none is captured, which is the rule the chains header
-# already follows for ``strategy``, ``interval`` and the rest of its body. What the writer
-# does with them is #280's, and #280 carries this as the rule to implement.
+# already follows for ``strategy``, ``interval`` and the rest of its body. ``bars_rows``
+# implements it through ``_BARS_BODY_KNOWN``, which names these four beside ``candles`` so they
+# are recognized and dropped rather than overflowed onto every row.
 BARS_SCHEMA = pa.schema(
     [
         pa.field("bar_ts", pa.string(), nullable=False),
@@ -1142,10 +1173,11 @@ def _int_column(values: Sequence[object]) -> pa.Array:
 
     Building an integer column straight from Python objects coerces a fractional float to
     its truncated value and hands it back with no error, so a vendor ``3.7`` lands as
-    ``3``. Among the two journaled surfaces' 29 integer columns that is the conversion
-    which changes a value without raising, so only they take this route and the other 119
-    keep the direct build. The counts are the two surfaces this module builds rows for.
-    ``bars`` is pinned and has no row builder here, so its columns reach neither path yet.
+    ``3``. Among the three pinned surfaces' 32 integer columns that is the conversion which
+    changes a value without raising, so only they take this route and the other 132 keep the
+    direct build. The counts cover every surface this module builds rows for, which is all
+    three now that ``bars_rows`` ships. Bars add three of the 32: ``volume`` from the candle,
+    ``instrument_id`` resolved per ticker-day, and ``schema_version``.
 
     Inferring the column's type first and then casting to ``int64`` moves the check into
     Arrow, which refuses a float it cannot represent exactly and still passes a lossless
@@ -1847,6 +1879,116 @@ def quotes_data_batch(
     row.update(columns)
     row[EXTRA_COLUMN] = extra
     return _batch(QUOTES_SURFACE, [row])
+
+
+def bars_rows(
+    body: Mapping[str, object],
+    *,
+    ticker: str,
+    freq: str,
+    instrument_id: int | None,
+    fetch_ts: str | datetime,
+    fetch_end_ts: str | datetime | None,
+    window_start: str | datetime,
+    window_end: str | datetime,
+    extended_hours: bool | None,
+) -> list[dict[str, object]]:
+    """One row mapping per candle the response carries, with the refused stamps dropped.
+
+    This is the row builder the bars schema above was pinned for. It stops one step short of
+    a record batch, because what the partition holds is decided between the two: the sweep
+    drops the candles that belong to another session, measures the span the survivors cover,
+    and only then asks :func:`bars_data_batch` for the batch. A builder that went straight to
+    a batch would put the gate after the table it is meant to keep from being written.
+
+    **A candle whose stamp the epoch transform refuses does not become a row.** ``bar_ts`` is
+    the one non-null column in this module, and ``pq.write_table`` refuses a table rather than
+    a row, so a single null stamp would cost the whole partition's write. The chains trade of
+    nulling the stamp and overflowing the raw value under its vendor name is unavailable here
+    for that reason, which the comment above ``_BARS_CANDLE_TS_FIELD`` states. The candle is
+    dropped instead.
+
+    The price is named rather than hidden. A candle at an edge of the window takes that
+    minute's coverage with it, and the span check that runs next reads short coverage without
+    being able to say the cause was an unreadable stamp. Failing the whole fetch on one
+    refused stamp was the alternative, and it costs a session's bars to save a minute of them.
+
+    **The response's own fields take no column and none overflows.** ``symbol``, ``empty``,
+    ``previousClose`` and ``previousCloseDate`` are response-level rather than per-candle, so
+    ``_BARS_BODY_KNOWN`` names them and they are dropped. A response-level field outside that
+    set overflows onto every row, which is the fail-open rule the other two surfaces follow,
+    and it is the loud outcome: ``extra`` non-null across a whole partition is the drift
+    signature, where a silent drop is nothing a reader could ever notice.
+
+    A name used at both levels overflows under the candle's value, because the row is a
+    candle's row. Each level is still measured against its own known-set, so a response-level
+    ``volume`` and a candle-level ``symbol`` both overflow rather than one of them being read
+    against the wrong set and dropped.
+
+    Every other value is the caller's. ``instrument_id`` is resolved per ticker-day and stays
+    nullable, so a row whose ticker the master cannot place still lands. The window pair and
+    the flag are the request's, recorded so the fetch is reversible.
+    """
+    candles = body.get("candles")
+    listed = (
+        list(candles)
+        if isinstance(candles, Sequence) and not isinstance(candles, (str, bytes))
+        else []
+    )
+    response = {key: value for key, value in body.items() if key != "candles"}
+    stamps: dict[str, object] = {
+        "fetch_ts": _iso(fetch_ts),
+        "fetch_end_ts": _iso(fetch_end_ts),
+        "ticker": ticker,
+        "instrument_id": instrument_id,
+        "freq": freq,
+        "window_start": _iso(window_start),
+        "window_end": _iso(window_end),
+        "extended_hours": extended_hours,
+        "schema_version": SCHEMA_VERSION,
+    }
+    rows: list[dict[str, object]] = []
+    for candle in listed:
+        if not isinstance(candle, Mapping):
+            continue
+        try:
+            bar_ts = _epoch_ms_to_iso(candle.get(_BARS_CANDLE_TS_FIELD))
+        except UnfitEpochError:
+            continue
+        if bar_ts is None:
+            # An absent stamp is the vendor sending nothing rather than sending something
+            # unusable, and it costs the row for the same reason a refused one does.
+            continue
+        row: dict[str, object] = dict(stamps)
+        row["bar_ts"] = bar_ts
+        for vendor, column in _BARS_CANDLE_MAP.items():
+            if vendor in candle:
+                row[column] = candle[vendor]
+        # Each level is measured against its own known-set. The response's unrecognized
+        # fields land first and the candle's overwrite them on a name collision, because the
+        # row is a candle's row and the collision would otherwise report the response's value
+        # under a name the candle also used.
+        overflow = {key: value for key, value in response.items() if key not in _BARS_BODY_KNOWN}
+        overflow.update(
+            {key: value for key, value in candle.items() if key not in _BARS_CANDLE_KNOWN}
+        )
+        row[EXTRA_COLUMN] = json.dumps(overflow, sort_keys=True) if overflow else None
+        rows.append(row)
+    return rows
+
+
+def bars_data_batch(rows: Sequence[Mapping[str, object]]) -> pa.RecordBatch:
+    """One bars record batch from the rows the sweep decided to land.
+
+    Separate from :func:`bars_rows` so the gate sits between the two. Bars carry no
+    ``row_kind``, so no row here is a data row by ``_batch``'s reckoning and nothing routes
+    into ``extra``: a candle field whose value its column refuses fails the batch rather than
+    landing nulled. That is the right refusal on this surface. Routing exists to keep a
+    perishable capture minute when a vendor retypes a field, and a bars partition is
+    re-fetchable from a ~30-day lookback, so the loud failure costs a re-run rather than the
+    measurement.
+    """
+    return _batch(BARS_SURFACE, list(rows))
 
 
 def gap_batch(

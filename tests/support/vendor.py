@@ -242,15 +242,40 @@ def bars_candle(
     }
 
 
-def price_history_body(symbol: str, candles: Sequence[Mapping[str, object]] = ()) -> dict:
+def price_history_body(
+    symbol: str,
+    candles: Sequence[Mapping[str, object]] = (),
+    *,
+    previous_close: float | None = None,
+    previous_close_date: int | None = None,
+) -> dict:
     """A price-history body, shaped the way Schwab shapes one.
 
     Schwab answers a window it has no candles for with an empty list and ``empty`` true,
     never with an error. So the two payload shapes a test needs are one call apart: pass
     candles for a populated window and pass none for an empty one.
+
+    ``previousClose`` and ``previousCloseDate`` are the pair ``need_previous_close`` adds,
+    and they are the reason this takes two more arguments than the body has fixed keys. The
+    row builder must recognize all four response-level fields and drop them, and two of the
+    four could not be put in front of it until this builder emitted them. Nothing under
+    ``tests/`` carried either one, and no live recording carries them, because ``record.py``'s
+    ``--bars`` takes four fields with no flag arguments and so is always taken with the flag
+    unset. A test of the drop rule that could only show two of the four would pass while
+    covering half of what it claimed.
+
+    Both default to ``None`` and are omitted when left there, matching the request: the flag
+    left unset means Schwab sends neither key. ``previousCloseDate`` is an epoch in
+    milliseconds like the candle stamp, which is the shape ``lake.inspect_cassette`` reports
+    for any key whose name carries ``date``.
     """
     listed = list(candles)
-    return {"candles": listed, "symbol": symbol, "empty": not listed}
+    body: dict = {"candles": listed, "symbol": symbol, "empty": not listed}
+    if previous_close is not None:
+        body["previousClose"] = previous_close
+    if previous_close_date is not None:
+        body["previousCloseDate"] = previous_close_date
+    return body
 
 
 def bars_interactions(
@@ -260,6 +285,8 @@ def bars_interactions(
     *,
     extended_hours: bool | None = None,
     previous_close: bool | None = None,
+    body_previous_close: float | None = None,
+    body_previous_close_date: int | None = None,
 ) -> tuple[Interaction, ...]:
     """Record one price-history interaction per window.
 
@@ -270,6 +297,12 @@ def bars_interactions(
     Every interaction is keyed through ``lake.vendor.bars_params``, the same function the
     replay below looks a request up by, so a fixture cannot key a window the lookup would
     then miss.
+
+    ``previous_close`` keys the recording on the request flag. ``body_previous_close`` and
+    ``body_previous_close_date`` put the pair that flag adds into every window's body. They
+    are separate arguments because the two are separate facts: a recording can be keyed on
+    the flag while its body carries nothing the flag adds, which is exactly what the live
+    recorder produces today.
     """
     return tuple(
         Interaction(
@@ -283,7 +316,12 @@ def bars_interactions(
                 previous_close=previous_close,
             ),
             status=200,
-            body=price_history_body(symbol, candles),
+            body=price_history_body(
+                symbol,
+                candles,
+                previous_close=body_previous_close,
+                previous_close_date=body_previous_close_date,
+            ),
         )
         for start, end, candles in windows
     )

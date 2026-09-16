@@ -32,6 +32,8 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from lake.paths import DATE_PARTITIONED
+
 # A fixture schema for chains rows. Provenance columns plus a few vendor columns.
 #
 # Seven of the vendor columns are here for the split detector, which reads a corporate
@@ -223,7 +225,43 @@ class FixtureLake:
     # -- paths ---------------------------------------------------------------
 
     def partition_path(self, surface: str, ticker: str, day: date | str) -> Path:
+        """The partition for a ticker-day on a surface keyed by ticker and date alone.
+
+        It refuses every other surface, which is the refusal ``LakePaths.partition_path``
+        already gives and this builder used to lack. Without it the generic method built
+        ``bars/ticker=T/date=D.parquet``, a path with no ``freq=`` level that production
+        refuses to build and no real lake holds, so a test written against it proved nothing
+        about the code under it. ``actions`` was the same class: the fixture would have built
+        ``actions/ticker=T/date=D.parquet`` where production writes one all-ticker JSONL.
+
+        The refusal is spelled here rather than delegated, because this builder writes paths
+        under its own root and takes no ``LakePaths``. What matters is that the two agree on
+        which surfaces take this shape, and they read one set to decide it:
+        ``paths.DATE_PARTITIONED``, which :mod:`tests.unit.test_paths` parametrizes over rather
+        than restating a list in either place.
+        """
+        if surface not in DATE_PARTITIONED:
+            raise ValueError(
+                f"partition_path is for {sorted(DATE_PARTITIONED)}, not {surface!r}. "
+                "Use bars_partition_path, or the actions ledger, which is one all-ticker file "
+                "this builder does not write."
+            )
         return self.root / surface / f"ticker={ticker}" / f"date={_day_str(day)}.parquet"
+
+    def bars_partition_path(self, ticker: str, freq: str, day: date | str) -> Path:
+        """The bars partition for a ticker, bar frequency, and day.
+
+        Bars carry an extra ``freq=`` level, like ``freq=1m`` or ``freq=1d``, because one
+        ticker has bars at several frequencies on the same day. This is the shape
+        ``LakePaths.bars_partition_path`` builds, spelled the same way.
+        """
+        return (
+            self.root
+            / "bars"
+            / f"ticker={ticker}"
+            / f"freq={freq}"
+            / f"date={_day_str(day)}.parquet"
+        )
 
     def segment_path(
         self, surface: str, ticker: str, day: date | str, start_ts: str, pid: int
@@ -298,6 +336,27 @@ class FixtureLake:
         self, ticker: str, day: date | str, table: pa.Table | None = None, **kwargs
     ) -> FixtureLake:
         return self.with_partition("quotes", ticker, day, table or sample_quotes_table(), **kwargs)
+
+    def with_bars(
+        self,
+        ticker: str,
+        freq: str,
+        day: date | str,
+        table: pa.Table,
+        *,
+        source: str = "sweep",
+        fetched_at: str | None = None,
+    ) -> FixtureLake:
+        """One sealed bars partition, at the path production builds for it.
+
+        Separate from :meth:`with_partition` for the reason production keeps
+        ``bars_partition_path`` separate: the frequency is a path level, so a builder that
+        took it through the generic method would have nowhere to put it and would silently
+        write a path no reader looks at. ``source`` defaults to the sweep's, which is what
+        writes a real one.
+        """
+        rel = self.bars_partition_path(ticker, freq, day).relative_to(self.root)
+        return self._write_parquet(rel, table, source, fetched_at)
 
     def with_reference(
         self, name: str, table: pa.Table, *, fetched_at: str | None = None

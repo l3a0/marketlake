@@ -38,12 +38,13 @@ That is the design's term for each top-level directory. The surfaces are ``chain
 identity tables, not measurements.
 
 The path conventions here match the fixture-lake builder used across the test suite
-(``tests/support/lake.py``) exactly. That builder is the agreed contract, and other
-deliverables read paths built here. Two surfaces do not share the flat
-``ticker=.../date=....parquet`` shape. ``bars`` adds a ``freq=...`` level, because one
-ticker has bars at several frequencies on the same day. ``actions`` is a single
-all-ticker file. Each gets its own method, so a caller cannot build a wrong path by
-passing its surface name to the generic partition method.
+(``tests/support/lake.py``) exactly, and the two now share the set that decides it rather
+than each restating it. That builder is the agreed contract, and other deliverables read
+paths built here. Two surfaces do not share the flat ``ticker=.../date=....parquet``
+shape. ``bars`` adds a ``freq=...`` level, because one ticker has bars at several
+frequencies on the same day. ``actions`` is a single all-ticker file. Each gets its own
+method, so a caller cannot build a wrong path by passing its surface name to the generic
+partition method, and the fixture builder refuses the same way for the same reason.
 
 One more path shape lives here, the temp file an atomic write uses. It is not a lake
 location, so it takes its target as an argument rather than hanging off ``LakePaths``.
@@ -80,7 +81,13 @@ SURFACES = (CHAINS, QUOTES, BARS, ACTIONS)
 
 # The surfaces whose partition is keyed by ticker and date alone. ``bars`` adds a freq
 # level and ``actions`` is a single file, so both are excluded from the generic method.
-_DATE_PARTITIONED = frozenset({CHAINS, QUOTES})
+#
+# It is public because the fixture-lake builder reads it. The docstring above promises the
+# two agree on which surfaces take this shape, and for ``bars`` they did not: the fixture's
+# generic method took any surface string and built a path with no ``freq=`` level, which
+# production refuses and no real lake holds. A set restated in both places is how that
+# happened, so there is one set and both read it.
+DATE_PARTITIONED = frozenset({CHAINS, QUOTES})
 
 # The journal top-level directory, the reference directory, the reports directory,
 # and the two lake-root ledgers. ``reports/`` holds one dated file per night, written by
@@ -186,9 +193,9 @@ class LakePaths:
         date. ``bars`` and ``actions`` have their own shapes and their own methods, so
         passing either here raises rather than building a wrong path.
         """
-        if surface not in _DATE_PARTITIONED:
+        if surface not in DATE_PARTITIONED:
             raise ValueError(
-                f"partition_path is for {sorted(_DATE_PARTITIONED)}, not {surface!r}. "
+                f"partition_path is for {sorted(DATE_PARTITIONED)}, not {surface!r}. "
                 "Use bars_partition_path or actions_path."
             )
         return (
@@ -373,7 +380,7 @@ def parse_partition_rel(rel: str) -> PartitionRef | None:
     date directory are read by one rule rather than two.
     """
     parts = rel.split("/")
-    if len(parts) != 3 or parts[0] not in _DATE_PARTITIONED:
+    if len(parts) != 3 or parts[0] not in DATE_PARTITIONED:
         return None
     surface, ticker_part, filename = parts
     if not ticker_part.startswith(TICKER_PREFIX) or not filename.endswith(PARQUET_SUFFIX):
@@ -496,6 +503,7 @@ __all__ = [
     "CONFIG_FILE",
     "CONTRACTS",
     "CORPORATE_ACTIONS_FILE",
+    "DATE_PARTITIONED",
     "DATE_PREFIX",
     "JOURNAL_DIR",
     "JOURNAL_METADATA_FILE",
