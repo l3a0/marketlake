@@ -1,0 +1,1136 @@
+"""The evening bar fetch: one session's equity bars, gated before they land.
+
+Bars are the one surface this lake fetches rather than derives. Every option expiration
+settles against the official daily close, and the read layer's adjusted views have nothing
+to adjust until a bars partition exists. So this is the job that turns a lake of captured
+chains into one a reader can ask about prices.
+
+The shape is **gate-before-land**, which the design pins for the vendor-sweep surfaces. A
+partition is validated before it is written, so a failure means the partition never lands
+rather than landing with a flag on it. The capture surfaces work the other way round, sealing
+first and quarantining later, because a capture minute is perishable and a bar is not: Schwab
+serves a roughly 30-day one-minute lookback and daily bars indefinitely, so a bar refused
+tonight is re-fetchable tomorrow while a chain snapshot missed at 10:31 is gone.
+
+Run it with ``python -m lake.bars``. Nothing schedules it yet. marketlake #281 builds the
+evening sweep that will, and until then this is hand-run.
+
+What one run does, per ticker and per configured frequency, for one session.
+
+1. Skip the ticker-day whose bars partition the manifest already records. A second run lands
+   nothing and says so.
+2. Fetch the window this module names for that frequency, outside the lake lock.
+3. Build the rows, dropping any candle whose stamp the epoch transform refuses and, on
+   ``1d``, any candle belonging to another session.
+4. Run the two gate checks over the rows that survived, the span check first.
+5. Write the partition and append its manifest entry, both inside one lock hold.
+
+**Which ticker-days a run covers is deliberately narrow.** This job fetches one session, named
+by ``--date`` or taken from the clock. marketlake #319 owns whether a run walks a span of
+sessions and what the one-minute lookback floor is, and it takes the fetch-shape question with
+it. Nothing here decides that.
+
+**The scope within the session is the enabled roster.** Each entry's ``bars`` tuple says which
+frequencies that ticker takes, read off the ticker's own settings rather than inferred from
+anything else, and an entry with an empty tuple is passed over. ``Roster.get``'s refusal for a
+ticker outside the roster is unreachable here, because the walk is derived from the roster
+rather than looking tickers up in it. A retired ticker is outside this run: ``retire`` flips
+``enabled`` and preserves ``bars``, so its frequencies survive for the backfill #319 owns,
+while tonight's session holds no quotes to gate its bar against and every run would file the
+same finding for it forever.
+
+**The windows, and why the ``1m`` one is narrow.** ``freq=1m`` is fetched from the session
+open to the equity close, which is 390 minutes on a regular day. ``freq=1d`` is fetched over a
+bracket a day wider on each side, because nobody has yet observed which instant Schwab stamps
+a daily candle at, and a candle stamped at 00:00 UTC is 20:00 Eastern on the previous day, so
+even a whole-Eastern-day window can miss the session it asked for. The selection below reads
+the session off the stamp rather than off the window, so the extra candles a wide bracket
+returns are dropped rather than landed.
+
+The narrow ``1m`` window is a choice, not the obvious default. Both vendor flags are left
+unset, so Schwab decides whether a price-history response covers the regular session or the
+extended one, and nobody has recorded which it picks. With a window at the session's own
+bounds that does not matter, because the request's own bounds clip the response either way and
+the coverage is 390 minutes under both answers. With a wider window it would matter a great
+deal: Schwab answering with the regular session would be correct and short at the same time,
+the span check would refuse it, and by that check's unbounded-repeat rule the run would stall
+with a finding pointing at the wrong cause. The narrow window removes that confound, and
+marketlake #333's own planning loop reached the same conclusion from the other side.
+
+**The two gate checks, in the order they run.** The span check runs first. The close
+cross-check compares the candle whose stamp maps to the session, so on a response that dropped
+that session it has no candle to compare and would file a finding about a comparison that
+never had a bar. Running the span check first refuses the short response under its own name
+instead. Both run *after* the row builder, over the rows that survived it, which is the only
+reading that describes what the partition would actually hold. A span measured over the
+payload would pass while the partition landed short, which is the back door the check exists
+to close.
+
+**The tolerance is measured rather than guessed.** ``CLOSE_CROSS_TOLERANCE`` carries the
+bracket it came from.
+
+**What is not contained per ticker-day.** A dead refresh token fails every remaining
+ticker-day identically, so containing it would turn one auth death into a page of held
+findings and an exit code reading "some findings held" rather than "the token is dead". It
+stops the run. So does a bad argument this job hands the seam, which is its own bug rather
+than a vendor failure. Everything else a ticker-day can raise is contained to that ticker-day
+and the walk goes on, because one unreadable session is not the other tickers' bars to lose.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from lake.actions import (
+    CHECK_INSTRUMENT_RESOLUTION,
+    SWEEP_SOURCE,
+    AmbiguousSymbol,
+    HeldFinding,
+    MasterAbsent,
+    UnresolvedSymbol,
+    resolve_instrument,
+)
+from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
+from lake.clock import Clock, SystemClock
+from lake.journal import bars_data_batch, bars_rows
+from lake.loader import LoadError, load_quotes
+from lake.lock import lake_lock
+from lake.manifest import latest_entries, record_partition
+from lake.paths import LakePaths, temp_write_path
+from lake.report import Withheld, write_withheld
+from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor, VendorAuthError
+from lake.security_master import MasterUnreadable, SecurityMaster, master_path
+from lake.session import SessionClock
+from lake.tickers import Roster, load_tickers
+from lake.vendor import DAILY_FREQ, MINUTE_FREQ, Vendor, VendorError, require_bar_freq
+
+# How the command builds its vendor. ``lake.record`` spells the same alias for the by-hand
+# recorder, and it is restated rather than imported because a capture surface importing the
+# recorder points the dependency the wrong way.
+VendorFactory = Callable[..., Vendor]
+
+# The two checks the gate files under, named the way ``actions`` names its three: a snake_case
+# constant passed as ``check=`` rather than a literal at the filing site, so a test asserts
+# against the constant and a rename moves both ends at once. They live here rather than beside
+# the other three because this module owns them, and ``actions`` has no caller for either.
+CHECK_BAR_SPAN = "bar_span"
+CHECK_BAR_CLOSE = "bar_close"
+
+# The third token, for a fetch that never reached the gate at all. A non-2xx arrives as an
+# ordinary response whose body carries no candles, because the seam returns the vendor's
+# status verbatim and raises on nothing, and bars carry no gap rows for it to land in. So it
+# is refused under its own name before anything tries to read a payload that is not one.
+CHECK_BAR_RESPONSE = "bar_response"
+
+# The ``event`` token a bars finding files under. ``report.Withheld`` names the field for the
+# key a finding recurs under, and it rides in the file name beside the symbol. A bar is not an
+# event, so what goes there is the frequency, which is what says what a finding is about
+# without opening the file. Two frequencies of one ticker-day therefore file under two names
+# rather than colliding on one.
+
+# How far the daily bracket reaches past the session on each side. A daily candle's stamp has
+# not been observed, and 00:00 UTC on the session date is 20:00 Eastern on the day before, so
+# a bracket that only spanned the Eastern day could miss the session it asked for. One day
+# each way covers every spelling anyone has proposed. The extra candles it returns are dropped
+# by the selection below rather than landed, so the width costs nothing but response size.
+DAILY_WINDOW_MARGIN = timedelta(days=1)
+
+# How much the official daily close may differ from the session's own captured quotes before
+# the bar is held out. It is relative, like the sibling's dividend tolerance, and measured
+# from the live lake rather than guessed.
+#
+# The floor is the drift the check has to absorb: the lake's own quotes are still moving after
+# 16:00, by 0.66 basis points on SPY and 1.13 on QQQ between the ``spot_close`` and
+# ``option_close`` cycles on 2026-09-14 and 2026-09-15. That is a lower bound, because capture
+# stops at 16:15 and the closing print can settle later.
+#
+# The ceiling is the smallest adjustment the check has to catch, which is one dividend: the
+# lake's own rows put the per-event figure at 25.13 basis points for SPY and 11.47 for QQQ. So
+# the narrower window is QQQ's, 1.13 to 11.47, and it is ten times wide.
+#
+# Five basis points sits inside it with room at both ends. It absorbs four times the largest
+# drift measured, which leaves margin for a print that settles later than capture watched, and
+# it refuses anything above half of the smallest per-event dividend.
+CLOSE_CROSS_TOLERANCE = 5e-4
+
+# The bars surface's own frequencies, re-exported so a caller naming one does not have to
+# reach past this module into the seam.
+BAR_FREQS = (MINUTE_FREQ, DAILY_FREQ)
+
+
+class BarsError(Exception):
+    """Base class for every bars-sweep error that is the operator's to fix."""
+
+
+class UnsupportedBarFreq(BarsError):
+    """A roster frequency this lake has no vendor call for.
+
+    ``onboard --bars`` takes any string and ``TickerConfig.bars`` stores it unvalidated, so a
+    roster is free to carry a frequency nothing can fetch. ``vendor.require_bar_freq`` refuses
+    one, and this names the same refusal as an operator mistake with one file behind it.
+
+    It is raised before the walk starts rather than when the walk reaches it, and the whole
+    roster is checked at once. A frequency nothing can fetch fails identically for every
+    ticker-day it names, so holding it per ticker-day would file the same finding every night
+    forever, and raising it mid-walk would leave a run half done for a fault nothing in that
+    run caused. Checking up front costs nothing: no vendor call has gone out and no partition
+    has been written when it raises.
+
+    The price is named rather than hidden. A roster cannot carry a frequency ahead of the
+    support for it landing, because tonight's run refuses the file rather than passing over
+    the line it does not recognise. That is the loud direction: the quiet one leaves an
+    operator believing a frequency is being captured while nothing ever fetches it.
+    """
+
+    def __init__(self, ticker: str, freq: str) -> None:
+        super().__init__(f"{ticker}: bar frequency {freq!r} is not one of {list(BAR_FREQS)}")
+        self.ticker = ticker
+        self.freq = freq
+
+
+@dataclass(frozen=True)
+class BarWindow:
+    """The window one fetch asks for, and the session it is asking about."""
+
+    session: date
+    freq: str
+    start: datetime
+    end: datetime
+
+
+@dataclass(frozen=True)
+class SpanCoverage:
+    """What the span check measured, and whether the response covered what was asked for.
+
+    ``covered`` and ``requested`` are the two numbers the finding files, and they ride the
+    verdict rather than being recomposed by the caller, for the reason ``DividendConsistency``
+    gives one surface over: a caller that recomputed them could file a pair the check never
+    saw. They are counted in the frequency's own grain, minutes for ``1m`` and sessions for
+    ``1d``, because a pair of instants does not fit the ``float | None`` fields the record
+    types.
+    """
+
+    covers: bool
+    covered: float
+    requested: float
+
+
+@dataclass(frozen=True)
+class CloseCross:
+    """What the close cross-check compared, and whether the two agreed.
+
+    ``computed`` is the bar's own close and ``against`` is the close the lake settled for that
+    session out of its own captured quotes. Either is ``None`` when the comparison had no such
+    number, and a check missing an input has not agreed, which is what makes a partial payload
+    a held bar rather than a silent one.
+    """
+
+    agrees: bool
+    computed: float | None
+    against: float | None
+
+
+def bar_window(freq: str, bounds, *, margin: timedelta = DAILY_WINDOW_MARGIN) -> BarWindow:
+    """The window one frequency's fetch asks for on one session.
+
+    ``bounds`` is ``SessionClock.bounds(day)``, so every instant here comes from the calendar
+    and none is a wall-clock literal. Both are Eastern-aware, which is what the seam requires:
+    ``require_utc_bound`` refuses a naive bound because ``schwab-py`` would read it in the
+    capture machine's own zone.
+
+    ``1m`` asks for the session itself, open to equity close. That is 390 minutes on a regular
+    day and fewer on an early close, and it stops at the *equity* close where capture's own
+    window runs on to the option close, because an equity bar has nothing to say about the
+    fifteen minutes after the auction.
+
+    ``1d`` asks for a bracket a ``margin`` wider on each side. The module docstring carries
+    why, and the short version is that which instant a daily candle is stamped at has not been
+    observed, so the window is drawn wide enough that no plausible answer falls outside it and
+    the session is read off the stamp instead.
+    """
+    freq = require_bar_freq(freq)
+    if freq == MINUTE_FREQ:
+        return BarWindow(session=bounds.day, freq=freq, start=bounds.open, end=bounds.equity_close)
+    return BarWindow(
+        session=bounds.day,
+        freq=freq,
+        start=bounds.open - margin,
+        end=bounds.equity_close + margin,
+    )
+
+
+def session_of(bar_ts: str) -> date:
+    """The session a bar's own stamp names.
+
+    A bar's session is decided by ``bar_ts``, never by when the sweep fetched it. That is the
+    rule ``journal.py`` pins on the bars schema, and it forecloses the shortcut a builder
+    reaches for when a daily stamp looks ambiguous, which is to take the session from the
+    request window or the clock.
+
+    The stamp is a UTC instant, so the session is its Eastern calendar date. ``MARKET_TZ`` is
+    the calendar module's, which is what keeps this from naming a session time of its own.
+
+    Which session a *daily* stamp names is the one thing here that a live recording settles
+    rather than the code. If Schwab stamps a daily candle somewhere this reading places on the
+    wrong date, the selection below finds no candle for the session, the span check refuses,
+    and nothing lands. That is the fail-closed direction: the run stalls with a finding instead
+    of landing a bar under the wrong day.
+    """
+    return datetime.fromisoformat(bar_ts).astimezone(MARKET_TZ).date()
+
+
+def select_session_rows(rows: Sequence[dict], window: BarWindow) -> list[dict]:
+    """The rows of ``rows`` that belong to the session being fetched.
+
+    On ``1d`` the window is deliberately wider than the session, so a response can carry
+    neighbouring sessions' candles and more than one candle in total. The one that lands is
+    the one whose stamp maps to the session, never the first one the list happens to hold. A
+    response carrying none for that session lands no row for it, and the span check then
+    refuses the fetch.
+
+    On ``1m`` the window is the session itself, so every candle inside it already belongs to
+    that session and this filters nothing. It still runs, because a response carrying a candle
+    from another session is exactly what the span check is there to refuse, and silently
+    keeping it would put another session's minute in this session's partition.
+    """
+    return [row for row in rows if session_of(str(row["bar_ts"])) == window.session]
+
+
+def _instant(row: dict) -> datetime:
+    """One row's stamp as a UTC instant.
+
+    ``bar_ts`` is the ISO string the row builder wrote out of ``journal.epoch_ms_to_utc``, so
+    reading it back is a parse rather than a second transform. The check and the builder must
+    not disagree about which stamps are readable, and they cannot, because only a stamp the
+    builder already accepted ever reaches a row.
+    """
+    return datetime.fromisoformat(str(row["bar_ts"])).astimezone(UTC)
+
+
+def check_bar_span(
+    built: Sequence[dict], selected: Sequence[dict], window: BarWindow
+) -> SpanCoverage:
+    """Whether the rows that survived cover the span the fetch asked for.
+
+    This is marketlake #333's check. ``lake.vendor`` and ``lake.schwab`` return the vendor's
+    body verbatim by design, and ``schwab-py`` sends ``period`` alongside the explicit bounds
+    against its own documented rule, so without this nothing asks whether the candles that
+    came back cover the window that went out. It ships with the first run that writes bars
+    rather than after it, because this job skips a ticker-day whose partition is already
+    manifested, so a check added later would leave short partitions on disk that nothing will
+    ever re-fetch.
+
+    **It is measured over the rows, not over the payload.** ``built`` is what survived the row
+    builder and ``selected`` is what survived the session filter after it. A candle whose
+    stamp the epoch transform refuses never becomes a row, and one at an edge takes that end
+    of the coverage with it. A daily response missing the session being fetched has every
+    candle filtered out, and a check reading the payload would see its neighbours and call
+    that covered. Either way the payload describes a partition that would not be written.
+
+    **The comparison, per frequency.**
+
+    On ``1m`` it is the two ends. ``min`` must equal the window's start and ``max`` must equal
+    its end minus a minute, because a candle is stamped at its minute's open, so a window
+    running to the equity close is fully covered by stamps ending at 15:59. Counting candles
+    or distinct minutes instead would need an answer nobody has: whether a real Schwab 1-min
+    response carries a candle for every minute or omits the minutes that did not trade. The
+    only bars fixture in the tree is synthesized and holds three candles for a 390-minute
+    window, so a count rule would refuse the response the whole suite replays. The ends need
+    no such answer. They are sufficient here because this job fetches one session, which
+    leaves no interior session to lose.
+
+    On ``1d`` it is presence: did the session being fetched come back, one against one. The
+    window is a bracket deliberately wider than the session, so its neighbours are expected
+    rather than wrong, and which instant a daily stamp names is what a live recording still
+    has to settle.
+
+    **Both directions are refused, because the two frequencies fail opposite ways.** The 1-min
+    wrapper sends ``period=1, periodType=day``, narrower than any multi-session window, so its
+    failure is short coverage. The daily wrapper sends ``period=20, periodType=year``, wider
+    than any window this lake will ever ask for, so its failure is a response covering twenty
+    years. A check that only refused short coverage would never see the second. So any row
+    outside the requested bounds refuses the fetch on either frequency.
+
+    The two numbers filed are minutes on ``1m`` and sessions on ``1d``, because
+    ``report.Withheld`` types them as floats and a pair of instants does not fit the field.
+    """
+    minute = timedelta(minutes=1)
+    outside = [row for row in built if not window.start <= _instant(row) < window.end]
+    if window.freq == DAILY_FREQ:
+        covered = 1.0 if selected else 0.0
+        return SpanCoverage(covers=bool(selected) and not outside, covered=covered, requested=1.0)
+    requested = (window.end - window.start) / minute
+    if not selected:
+        return SpanCoverage(covers=False, covered=0.0, requested=requested)
+    stamps = [_instant(row) for row in selected]
+    first, last = min(stamps), max(stamps)
+    covered = (last - first) / minute + 1
+    ends_match = first == window.start and last + minute == window.end
+    return SpanCoverage(covers=ends_match and not outside, covered=covered, requested=requested)
+
+
+def check_close_cross(
+    bar_close: float | None,
+    quote_close: float | None,
+    *,
+    tolerance: float = CLOSE_CROSS_TOLERANCE,
+) -> CloseCross:
+    """Whether the official daily close agrees with the session's own captured quotes.
+
+    This is the design's close cross-check, and it is what catches a vendor that starts
+    serving pre-adjusted prices. Capture seals minutely quotes in real time and a retroactive
+    adjustment cannot change what is already sealed, so an adjusted bar disagrees with the
+    lake's own unadjusted history and a split-sized discontinuity is 2x rather than subtle.
+    The design cut a second vendor for this reason: the lake already holds its own second
+    observation.
+
+    The comparison is relative, at ``tolerance``, whose constant carries the measurement it
+    came from.
+
+    Two edges are decided here rather than left to a division.
+
+    1. A comparison missing either number has nothing to compare, so it does not agree. That
+       is what makes a bar with no readable close a held bar rather than a silent one.
+    2. A settled close of zero has no relative scale, so the two agree only when the bar's own
+       close is zero too. No equity prints a zero close, and a division that returned "agrees"
+       for every bar against a zeroed reference is the one failure nobody would notice.
+    """
+    if bar_close is None or quote_close is None:
+        return CloseCross(agrees=False, computed=bar_close, against=quote_close)
+    if quote_close == 0:
+        return CloseCross(agrees=bar_close == 0, computed=bar_close, against=quote_close)
+    difference = abs(bar_close - quote_close) / abs(quote_close)
+    return CloseCross(agrees=difference <= tolerance, computed=bar_close, against=quote_close)
+
+
+@dataclass(frozen=True)
+class LandedPartition:
+    """One bars partition the run wrote, and the manifest entry it appended for it."""
+
+    ticker: str
+    freq: str
+    session: date
+    partition: str
+    rows: int
+
+
+@dataclass(frozen=True)
+class BarsReport:
+    """What one run of the sweep did, for the sign-off block.
+
+    ``skipped`` counts the ticker-days whose partition the manifest already recorded. It is
+    the number that makes a second run legible: a run that lands nothing and holds nothing has
+    either done the work already or found nothing to walk, and only this tells the two apart.
+    ``ExtractionReport.unchanged`` is the same number one surface over.
+    """
+
+    session: date
+    attempted: int
+    landed: tuple[LandedPartition, ...]
+    held: tuple[HeldFinding, ...]
+    skipped: int
+
+    @property
+    def unfiled(self) -> tuple[HeldFinding, ...]:
+        """Every held finding whose record could not be written down.
+
+        A finding held and filed is a live condition a human can read. A finding held and not
+        filed reads exactly like a run that found nothing, which is the silence the producer
+        exists to break, so it is what the command turns into a non-zero exit code.
+        """
+        return tuple(held for held in self.held if held.filed_at is None)
+
+    def render(self) -> str:
+        """A human-readable sign-off block."""
+        lines = [
+            f"Bar fetch for {self.session.isoformat()} over {self.attempted} ticker-day(s)",
+            f"  landed:  {len(self.landed)}",
+        ]
+        for entry in self.landed:
+            lines.append(
+                f"    - {entry.ticker} {entry.freq} {entry.rows} row(s) at {entry.partition}"
+            )
+        lines.append(f"  held:    {len(self.held)}")
+        for held in self.held:
+            finding = held.finding
+            detail = (
+                f"{finding.symbol} {finding.event} "
+                f"{finding.observed_on.isoformat()} {finding.check}"
+            )
+            if finding.computed is not None or finding.against is not None:
+                detail += f": {finding.computed} against {finding.against}"
+            elif finding.exception:
+                detail += f": {finding.exception}"
+            lines.append(f"    - {detail}")
+            if held.filed_at is None:
+                lines.append(f"      NOT filed: {held.filing_error}")
+            else:
+                lines.append(f"      filed at {held.filed_at}")
+        lines.append(f"  skipped: {self.skipped}")
+        return "\n".join(lines)
+
+
+def _read_master(lake_root: Path) -> SecurityMaster:
+    """The master, read once before anything else, or the reason the run stops.
+
+    ``resolve_instrument`` takes a ``SecurityMaster`` rather than a path, so reading it is a
+    precondition of the walk rather than a step inside it, the way it is in ``actions``.
+    """
+    path = master_path(lake_root)
+    try:
+        return SecurityMaster.read(path)
+    except FileNotFoundError as exc:
+        raise MasterAbsent(path) from exc
+
+
+def _require_supported(roster: Roster) -> None:
+    """Refuse a roster carrying a frequency this lake has no vendor call for.
+
+    Checked over the whole roster before the walk starts, for the reasons
+    :class:`UnsupportedBarFreq` gives. Every entry is checked, enabled or not, so a frequency
+    that would be fetched the moment a ticker came back is named tonight rather than on the
+    night it starts mattering.
+    """
+    for entry in roster:
+        for freq in entry.bars:
+            if freq not in BAR_FREQS:
+                raise UnsupportedBarFreq(entry.ticker, freq)
+
+
+def _ticker_freqs(roster: Roster) -> Iterator[tuple[str, str]]:
+    """Every ticker and frequency this run covers, in roster order then frequency order.
+
+    ``bars`` is read off each ticker's own settings, which is what says whether a ticker takes
+    bars at all and at which frequencies. Enablement is a separate question and scopes the
+    walk, per the module docstring.
+    """
+    for entry in roster.enabled:
+        for freq in entry.bars:
+            yield entry.ticker, freq
+
+
+def _fetch(vendor: Vendor, ticker: str, window: BarWindow):
+    """One price-history response, dispatched onto the seam's per-frequency method.
+
+    Schwab has no frequency-parameterized price-history call, so frequency is the choice of
+    method. The seam declined to own this dispatch, staying a forwarder rather than becoming a
+    dispatcher, so it is restated here rather than lifted. ``lake.record`` carries the same two
+    lines for the by-hand recorder, and pointing either at the other would run a dependency the
+    wrong way: the surface would import the recorder, or the recorder the surface.
+
+    The set of frequencies is spelled once, in ``vendor.BAR_FREQS``, and ``require_bar_freq``
+    has already refused anything outside it by the time a window exists. So a third frequency
+    fails at the seam rather than quietly taking the daily call in one of the two dispatches.
+    """
+    call = vendor.get_minute_bars if window.freq == MINUTE_FREQ else vendor.get_daily_bars
+    return call(ticker, start=window.start, end=window.end)
+
+
+def _write_partition(rows: Sequence[dict], partition: Path) -> int:
+    """Write one bars partition atomically, and hand back the rows it holds.
+
+    A temp file beside the target, a flush, then one rename, which is how ``compact``, the
+    capture spans, the version ledger and the security master each write. A crash mid-write
+    leaves only the temp file, never a torn Parquet at the partition path. The temp path comes
+    from ``paths.temp_write_path``, which owns the marker the backup exclusion matches.
+
+    The parent is created first, and a bars path is one directory level deeper than a chains
+    or quotes one because of its ``freq=`` level.
+    """
+    table = pa.Table.from_batches([bars_data_batch(rows)])
+    partition.parent.mkdir(parents=True, exist_ok=True)
+    tmp = temp_write_path(partition, os.getpid())
+    try:
+        pq.write_table(table, tmp)
+        fd = os.open(tmp, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, partition)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return table.num_rows
+
+
+def _finding(
+    ticker: str,
+    window: BarWindow,
+    check: str,
+    *,
+    computed: float | None = None,
+    against: float | None = None,
+    instrument_id: int | None = None,
+    instrument_ids: Sequence[int] = (),
+    exception: str | None = None,
+) -> Withheld:
+    """One withheld finding, with the bars surface's own reading of the record's fields.
+
+    ``observed_on`` is the session the rows belong to, never the night the sweep ran.
+    ``event`` carries the frequency, because a bar is not an event and the frequency is what
+    says what a finding is about without opening the file. Two frequencies of one ticker-day
+    therefore file under two names rather than colliding on one.
+
+    ``check``, ``computed`` and ``against`` stay three fields rather than one joined string,
+    which is the shape ``write_withheld`` writes and reads back.
+    """
+    return Withheld(
+        symbol=ticker,
+        observed_on=window.session,
+        event=window.freq,
+        check=check,
+        computed=computed,
+        against=against,
+        instrument_id=instrument_id,
+        instrument_ids=tuple(instrument_ids),
+        exception=exception,
+    )
+
+
+def _settled_close(lake_root: Path, ticker: str, session: date, following: date) -> float | None:
+    """The close the lake settled for ``session``, read out of its own captured quotes.
+
+    **The obvious source is the one the design rules out.** ``load_quotes`` with no snap
+    returns the session's own ``spot_close`` cycle, and that is the pre-auction book rather
+    than the closing print: measured on the live lake, ``regular_market_last_price`` is still
+    moving after 16:00, by 0.66 basis points on SPY and 1.13 on QQQ between the two close
+    cycles. What the lake holds settled is the *next* session's ``close_price``, carried on
+    every row of it: 2026-09-15 reads 709.18 for QQQ, matching 2026-09-14's last reading
+    rather than its ``spot_close`` one, and 760.88 for SPY, matching 2026-09-14's
+    ``spot_close`` exactly. So the drift is per-ticker and sometimes zero, and the settled
+    figure is the one to compare against.
+
+    ``following`` is the calendar-next session, never the next session that happens to hold
+    data. ``oi.py`` decided that already and refuses to read past a session holding nothing,
+    because the figure it would find settled after some later session's trading and belongs to
+    somebody else. A bar compared against such a close is the same error.
+
+    The read goes through the loader, so the quarantine guard and the overflow projection are
+    asked rather than skipped by a second path that would then keep skipping them forever.
+
+    A close of record whose rows disagree about ``close_price`` raises rather than taking the
+    first, because taking the first lets the file's own row order decide what the bar is
+    judged against, silently. The caller holds and files what this raises.
+    """
+    table = load_quotes(ticker, following, lake_root=lake_root)
+    if "close_price" not in table.column_names:
+        return None
+    values = {value for value in table.column("close_price").to_pylist()}
+    if len(values) > 1:
+        raise ValueError(
+            f"the {following.isoformat()} close of record disagrees about close_price, "
+            f"among {sorted(str(value) for value in values)}, so the "
+            f"{session.isoformat()} bar has no one figure to be judged against"
+        )
+    return values.pop() if values else None
+
+
+def _calendar_next_session(market: Calendar, session: date, *, horizon: int = 10) -> date | None:
+    """The first trading session strictly after ``session``.
+
+    Calendar-next, never the next session that happens to hold data, for the reason
+    :func:`_settled_close` gives. ``Calendar`` offers no next-session helper, so this steps
+    forward a day at a time. ``None`` means the search ran past its guard, which a real
+    calendar never does: the longest run of consecutive non-sessions the US market produces is
+    four days.
+
+    This is the third private spelling of one step. ``oi._calendar_next_session`` and
+    ``control_plane._first_session_on_or_after`` are the other two, with different bounds.
+    marketlake #334 counts them and says a fourth is where this stops being a smell, so this
+    copy is written to be repointed at the shared helper that issue lands rather than to
+    survive.
+    """
+    for step in range(1, horizon + 1):
+        candidate = session + timedelta(days=step)
+        if market.is_session(candidate):
+            return candidate
+    return None
+
+
+def fetch_session_bars(
+    *,
+    lake_root: Path | str,
+    vendor: Vendor,
+    clock: Clock,
+    calendar: Calendar,
+    roster: Roster,
+    session: date | None = None,
+) -> BarsReport:
+    """Fetch, gate and land one session's bars for every ticker and frequency the roster names.
+
+    Every dependency is injected and nothing here reads config, the way ``extract_dividends``
+    and ``seed_spans`` are built. ``fetch_session_bars_from_config`` is the wiring.
+
+    ``session`` defaults to the Eastern calendar date of ``clock.now()``, which is the session
+    the evening run is fetching. A day the calendar says is not a session raises
+    ``NotASession``: there is nothing to fetch, and an empty response from the vendor cannot
+    tell a holiday apart from a session that yielded nothing.
+
+    **The order of the steps is the whole design.** Each ticker-day is skipped if its partition
+    is manifested, fetched outside the lock, built into rows, gated over those rows, and only
+    then written. Every one of those has a reason the module docstring or the step's own
+    helper carries.
+
+    **The manifested skip is built, never parsed.** ``paths.parse_partition_rel`` returns
+    ``None`` for every bars key by design, on both its length check and its membership check,
+    and widening that set would let ``partition_path`` build a bars path with no ``freq=``
+    level. ``bars_partition_path`` composes the key and membership in ``latest_entries``
+    answers the question with no parser.
+
+    Quarantine does not reach that skip, deliberately. A quarantined bars partition is still
+    manifested, so the job passes over it and never re-fetches. Nothing writes a verdict until
+    marketlake #138's battery does, so the condition has arisen zero times and widening it
+    later is a one-line change rather than a second read path.
+
+    **A held bar repeats, and the repeat is bounded differently per cause.** A close
+    cross-check with no source because tonight's session has no next partition yet settles
+    itself: tomorrow's compaction seals that partition and the next run lands the bar. A
+    session whose quotes carry gap rows and no data row repeats until someone repairs it, and
+    the pile of findings is the record of that. A span refusal repeats without bound on
+    purpose, which is marketlake #333's own rule: if the vendor is honouring ``period``, every
+    request is short, and stalling is better than landing a wrong answer quietly.
+
+    **Two failures are not contained per ticker-day**, and the catch below is narrow rather
+    than broad for exactly that reason. ``VendorAuthError`` is a dead refresh token and is not
+    a ``VendorError`` subclass, so a broad catch would have to name it to swallow it: every
+    remaining ticker-day fails it identically, and containing it would turn one auth death
+    into a page of held findings under an exit code reading "some findings held". And
+    ``require_utc_bound`` and ``require_bar_freq`` raise plain ``ValueError``, which is this
+    job handing the seam a bad argument. Its own bug must not be absorbed into a nightly held
+    finding.
+    """
+    root = Path(lake_root)
+    paths = LakePaths(root)
+    master = _read_master(root)
+    _require_supported(roster)
+    recorded_at = clock.now()
+    session = session or recorded_at.astimezone(MARKET_TZ).date()
+    if not calendar.is_session(session):
+        raise NotASession(session)
+    bounds = SessionClock(clock, calendar).bounds(session)
+    following = _calendar_next_session(calendar, session)
+    # Read once for the run, so every ticker-day is asked against one snapshot of what the
+    # lake already holds, the way the close guard reads the manifest once per run.
+    manifested = latest_entries(root)
+
+    attempted = 0
+    skipped = 0
+    landed: list[LandedPartition] = []
+    held: list[HeldFinding] = []
+
+    def hold(finding: Withheld) -> None:
+        # The sequence is the caller's, because ``report`` has only module functions and a
+        # counter there would be module state no test could drive. One run files under one
+        # injected clock and one pid, so without it two findings on one subject would race for
+        # one name. This walk can produce that race, unlike the sibling's: a ticker-day files
+        # at most one finding per frequency, and the resolution finding rides beside a gate
+        # finding on the same subject.
+        try:
+            filed_at = write_withheld(root, finding, now=recorded_at, sequence=len(held))
+        except OSError as exc:
+            # Named on stderr and carried on the report, the way ``compact`` treats a
+            # schema-drift file it could not write. The walk goes on, because one unwritable
+            # file is not the other tickers' bars to lose.
+            print(
+                f"bars: {finding.symbol} {finding.event} "
+                f"{finding.observed_on.isoformat()} {finding.check} could not be filed: "
+                f"{type(exc).__name__}",
+                file=sys.stderr,
+            )
+            held.append(
+                HeldFinding(finding=finding, filed_at=None, filing_error=type(exc).__name__)
+            )
+            return
+        held.append(HeldFinding(finding=finding, filed_at=filed_at))
+
+    for ticker, freq in _ticker_freqs(roster):
+        partition = paths.bars_partition_path(ticker, freq, session)
+        key = partition.relative_to(root).as_posix()
+        if key in manifested:
+            skipped += 1
+            continue
+        attempted += 1
+        window = bar_window(freq, bounds)
+        try:
+            _land(
+                root=root,
+                vendor=vendor,
+                clock=clock,
+                master=master,
+                ticker=ticker,
+                window=window,
+                following=following,
+                partition=partition,
+                key=key,
+                hold=hold,
+                landed=landed,
+            )
+        except (LoadError, VendorError) as exc:
+            # The blast radius is one ticker-day. A session the lake cannot read and a vendor
+            # that refused this request are both conditions the next run can meet differently,
+            # and neither is the other tickers' bars to lose. ``SnapMalformed`` is a
+            # ``ValueError`` as well as a ``LoadError`` and is caught here on purpose, because
+            # it names a partition this lake wrote rather than an argument this job passed.
+            hold(
+                _finding(ticker, window, CHECK_BAR_CLOSE, exception=f"{type(exc).__name__}: {exc}")
+            )
+
+    return BarsReport(
+        session=session,
+        attempted=attempted,
+        landed=tuple(landed),
+        held=tuple(held),
+        skipped=skipped,
+    )
+
+
+def _land(
+    *,
+    root: Path,
+    vendor: Vendor,
+    clock: Clock,
+    master: SecurityMaster,
+    ticker: str,
+    window: BarWindow,
+    following: date | None,
+    partition: Path,
+    key: str,
+    hold,
+    landed: list[LandedPartition],
+) -> None:
+    """One ticker-day-frequency, from the fetch to the partition, or to a held finding.
+
+    Split out of the walk so the walk reads as the order of its steps rather than as one long
+    body, and so the containment above wraps one call rather than a block.
+    """
+    fetch_ts = clock.now()
+    response = _fetch(vendor, ticker, window)
+    fetch_end_ts = clock.now()
+
+    # A non-2xx arrives as an ordinary response, because the seam returns the vendor's status
+    # verbatim and raises on nothing. Capture's answer is a gap row carrying ``http_<status>``,
+    # and bars have no gap rows, so there is no row for one to land in. It is refused instead,
+    # before anything reads a body that is not a payload.
+    if not 200 <= response.status < 300:
+        hold(
+            _finding(
+                ticker,
+                window,
+                CHECK_BAR_RESPONSE,
+                exception=f"VendorStatus: http_{response.status}",
+            )
+        )
+        return
+
+    # The empty-window rule, picked on purpose out of the two wrong answers a session yielding
+    # no bars has. Landing a zero-row partition is the worse one: it satisfies the manifested
+    # skip forever, so the session's bars are never fetched again and nothing says the file is
+    # empty because the vendor sent nothing. Landing nothing leaves the ticker-day to the next
+    # run, which is the recoverable direction, and the finding is what keeps it from being
+    # silent. This walk only ever fetches sessions, so an empty response here is a session that
+    # traded and came back with nothing, never a holiday: ``Calendar.is_session`` told those
+    # apart before the request went out, which is what the payload cannot do.
+    #
+    # It is decided here rather than falling through to the span check, because that check is
+    # defined over a non-empty candle list. An empty window covers zero of its span, so a span
+    # check reaching it would refuse every empty response as a coverage failure and this rule
+    # would be dead code. The token is the same one a non-2xx files under, because both are one
+    # condition: the fetch produced no candle to gate.
+    candles = response.body.get("candles")
+    if not candles:
+        hold(_finding(ticker, window, CHECK_BAR_RESPONSE, computed=0.0, against=None))
+        return
+
+    # Resolved per ticker-day, never once per ticker, for the reason ``actions._by_ticker``
+    # gives: a symbol handed between two instruments carries each day's own ``instrument_id``.
+    # The resolution date is the observation date, which for a bar is its session. A failure
+    # files and the row still lands with a null id, because the column is nullable and that is
+    # the schema answering what becomes of the bar.
+    instrument_id: int | None = None
+    try:
+        instrument_id = resolve_instrument(master, ticker, window.session)
+    except (UnresolvedSymbol, AmbiguousSymbol) as exc:
+        # Both ways the resolution can fail file a finding and the row still lands.
+        # ``UnresolvedSymbol`` says the master and the capture spans disagree about a ticker,
+        # ``AmbiguousSymbol`` says the master is corrupt, and the plural field files the
+        # several instruments a corrupt master returned for one symbol. The bar is not held
+        # for either, because ``instrument_id`` is nullable and the schema already answers what
+        # becomes of a row whose ticker the master cannot place. The exception is rendered as
+        # its class and then its message, because ``write_withheld`` composes
+        # ``<symbol>: <exception>`` and keeps the first two fields, so a bare message would
+        # file its own first field, which for an ``OSError`` is a path on the capture machine.
+        hold(
+            _finding(
+                ticker,
+                window,
+                CHECK_INSTRUMENT_RESOLUTION,
+                instrument_ids=exc.instrument_ids if isinstance(exc, AmbiguousSymbol) else (),
+                exception=f"{type(exc).__name__}: {exc}",
+            )
+        )
+
+    built = bars_rows(
+        response.body,
+        ticker=ticker,
+        freq=window.freq,
+        instrument_id=instrument_id,
+        fetch_ts=fetch_ts,
+        fetch_end_ts=fetch_end_ts,
+        window_start=window.start,
+        window_end=window.end,
+        extended_hours=None,
+    )
+    selected = select_session_rows(built, window)
+
+    # The span check runs first of the two. The close cross-check compares the candle whose
+    # stamp maps to the session, so on a response that dropped that session it has no candle to
+    # compare, and running it first would file a close-cross-check finding for a comparison
+    # that never had a bar while the real cause, a response short of what was asked for, went
+    # unnamed.
+    span = check_bar_span(built, selected, window)
+    if not span.covers:
+        hold(
+            _finding(
+                ticker,
+                window,
+                CHECK_BAR_SPAN,
+                computed=span.covered,
+                against=span.requested,
+            )
+        )
+        return
+
+    if window.freq == DAILY_FREQ:
+        if following is None:
+            hold(
+                _finding(
+                    ticker,
+                    window,
+                    CHECK_BAR_CLOSE,
+                    exception="NoFollowingSession: the calendar names no session after this one",
+                )
+            )
+            return
+        settled = _settled_close(root, ticker, window.session, following)
+        cross = check_close_cross(_bar_close(selected), settled)
+        if not cross.agrees:
+            hold(
+                _finding(
+                    ticker,
+                    window,
+                    CHECK_BAR_CLOSE,
+                    computed=cross.computed,
+                    against=cross.against,
+                    instrument_id=instrument_id,
+                )
+            )
+            return
+
+    # The write and its manifest entry, inside one lock hold. The fetch above is outside it on
+    # purpose: ``lake_lock`` is a blocking exclusive ``flock`` on the manifest, and a vendor
+    # round trip inside it would put a network call in front of capture's per-minute append.
+    # The 18:30 run sits after the last capture slot, so that contention is unreachable there,
+    # but this command is hand-run until #281 lands and a mid-session hand run is exactly what
+    # ships here. The entry is inside because ``manifest.py`` rests the backup watermark on
+    # every lake write appending its entry under this lock, and an eighth writer outside it
+    # would make that false and set the weekly scrub crying loss over a file the sync had not
+    # reached.
+    with lake_lock(root):
+        rows = _write_partition(selected, partition)
+        record_partition(
+            root,
+            key,
+            source=SWEEP_SOURCE,
+            rows=rows,
+            fetched_at=fetch_ts.isoformat(),
+        )
+    landed.append(
+        LandedPartition(
+            ticker=ticker,
+            freq=window.freq,
+            session=window.session,
+            partition=key,
+            rows=rows,
+        )
+    )
+
+
+def _bar_close(rows: Sequence[dict]) -> float | None:
+    """The close of the session's own bar, or ``None`` when the rows carry none.
+
+    ``selected`` holds the rows for the session being gated, which on ``1d`` is the one candle
+    whose stamp maps to it. The last by stamp is the session's close on either frequency, so
+    the same reading answers a 1-min partition should a check ever want it.
+    """
+    if not rows:
+        return None
+    latest = max(rows, key=lambda row: str(row["bar_ts"]))
+    value = latest.get("close")
+    return None if value is None else float(value)
+
+
+# -- the entry point ---------------------------------------------------------
+
+
+def fetch_session_bars_from_config(
+    *,
+    clock: Clock | None = None,
+    session: date | None = None,
+    config_path: str | Path | None = None,
+    tickers_path: str | Path | None = None,
+    vendor_factory: VendorFactory | None = None,
+    token_path: str | Path = DEFAULT_TOKEN_PATH,
+) -> BarsReport:
+    """The sweep wired from the real config. This is the entry :func:`main` calls.
+
+    **The vendor arrives through a factory**, which is ``record.py``'s shape rather than
+    ``capture``'s. ``capture`` calls ``SchwabVendor.from_token`` inside its production entry
+    and keeps the injected vendor on the core beneath it, which leaves its own ``main``
+    untestable without the network. This command's exit codes are part of its contract, and
+    two of them can only be driven through a vendor: a dead refresh token stops the run, and a
+    finding that could not be filed exits 1. So the factory is the argument, and a test injects
+    one returning a cassette-backed fake.
+
+    ``from_token`` imports ``schwab-py`` lazily either way, which is what keeps the offline
+    suite running without the library installed.
+    """
+    from lake.config import load_config
+
+    config = load_config(config_path)
+    factory = SchwabVendor.from_token if vendor_factory is None else vendor_factory
+    vendor = factory(
+        token_path,
+        api_key=config.schwab_api_key.reveal(),
+        app_secret=config.schwab_app_secret.reveal(),
+    )
+    return fetch_session_bars(
+        lake_root=config.lake_root,
+        vendor=vendor,
+        clock=SystemClock() if clock is None else clock,
+        calendar=ExchangeCalendar(),
+        roster=load_tickers(tickers_path),
+        session=session,
+    )
+
+
+def _build_parser():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m lake.bars",
+        description=(
+            "Fetch one session's equity bars from the vendor, gate them, and land the "
+            "partitions that pass. A failure means the partition never lands."
+        ),
+    )
+    parser.add_argument("--config", help="Path to config.yaml (defaults to the standard location).")
+    parser.add_argument(
+        "--tickers", help="Path to tickers.yaml (defaults to the standard location)."
+    )
+    parser.add_argument(
+        "--date",
+        help="The session to fetch, as YYYY-MM-DD. Defaults to the clock's current session.",
+    )
+    return parser
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    clock: Clock | None = None,
+    vendor_factory: VendorFactory | None = None,
+) -> int:
+    """The ``python -m lake.bars`` entry. Returns a process exit code.
+
+    ``clock`` stays injectable for the reason ``actions.main`` gives: a wall clock never
+    reaches past this process, and what "a second night" means has to be something a test
+    decides.
+
+    Four conditions reach the operator as one line rather than a stack, and each has a fix
+    behind it. An absent master wants the onboarding command and a torn one wants a restore,
+    because an operator told to seed a corrupt file is being told the wrong thing. A roster
+    frequency nothing can fetch wants an edit to ``tickers.yaml``. A dead refresh token wants
+    the reauth command, and it is named rather than contained because every remaining
+    ticker-day would fail it identically.
+
+    **A finding the run could not write down is what the third exit code is for.** The walk
+    contains that failure so one unwritable file does not cost the other tickers their bars,
+    and this is where it stops being silent. A run that held something and filed nothing reads
+    exactly like a run that found nothing.
+    """
+    args = _build_parser().parse_args(argv)
+    session = date.fromisoformat(args.date) if args.date else None
+
+    from lake.config import input_errors_exit
+
+    try:
+        with input_errors_exit("bars"):
+            report = fetch_session_bars_from_config(
+                clock=clock,
+                session=session,
+                config_path=args.config,
+                tickers_path=args.tickers,
+                vendor_factory=vendor_factory,
+            )
+    except MasterAbsent as exc:
+        print(
+            f"bars: {exc}. Onboard a ticker first, with python -m lake.onboard <TICKER>.",
+            file=sys.stderr,
+        )
+        return 2
+    except MasterUnreadable as exc:
+        print(f"bars: {exc}. Restore it from the backup.", file=sys.stderr)
+        return 2
+    except UnsupportedBarFreq as exc:
+        print(f"bars: {exc}. Fix the bars list in tickers.yaml.", file=sys.stderr)
+        return 2
+    except NotASession as exc:
+        print(f"bars: {exc}, so there are no bars to fetch.", file=sys.stderr)
+        return 2
+    except VendorAuthError as exc:
+        print(
+            f"bars: the vendor refused the credentials ({type(exc).__name__}), so the run "
+            "stopped. Mint a new token with python -m lake.reauth.",
+            file=sys.stderr,
+        )
+        return 2
+    print(report.render())
+    return 1 if report.unfiled else 0
+
+
+__all__ = [
+    "BAR_FREQS",
+    "CHECK_BAR_CLOSE",
+    "CHECK_BAR_RESPONSE",
+    "CHECK_BAR_SPAN",
+    "CLOSE_CROSS_TOLERANCE",
+    "DAILY_WINDOW_MARGIN",
+    "BarWindow",
+    "BarsError",
+    "BarsReport",
+    "CloseCross",
+    "LandedPartition",
+    "SpanCoverage",
+    "UnsupportedBarFreq",
+    "bar_window",
+    "check_bar_span",
+    "check_close_cross",
+    "fetch_session_bars",
+    "fetch_session_bars_from_config",
+    "main",
+    "select_session_rows",
+    "session_of",
+]
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised via the console, not in CI
+    raise SystemExit(main())

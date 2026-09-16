@@ -2853,6 +2853,35 @@ STAMPING_BUILDERS = {
         ],
         error_class="daemon_down",
     ),
+    # The bars builder splits in two, because #280's gate sits between the rows and the
+    # batch. Only ``bars_rows`` stamps, so it is the stamp site, and the batch is built here
+    # because the assertion below reads the column off one.
+    "bars_rows": lambda: journal.bars_data_batch(
+        journal.bars_rows(
+            {
+                "candles": [
+                    {
+                        "open": 648.0,
+                        "high": 648.9,
+                        "low": 647.8,
+                        "close": 648.6,
+                        "volume": 1450000,
+                        "datetime": 1787578200000,
+                    }
+                ],
+                "symbol": "SPY",
+                "empty": False,
+            },
+            ticker="SPY",
+            freq="1m",
+            instrument_id=1,
+            fetch_ts=FETCH,
+            fetch_end_ts=None,
+            window_start="2026-08-24T09:30:00-04:00",
+            window_end="2026-08-24T16:00:00-04:00",
+            extended_hours=None,
+        )
+    ),
     "absent_series_rows": lambda: journal.absent_series_rows(
         "chains",
         ticker="SPY",

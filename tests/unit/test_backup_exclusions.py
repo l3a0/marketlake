@@ -199,12 +199,17 @@ def _excluded(rel: str, patterns: tuple[str, ...] = BACKUP_EXCLUSIONS) -> bool:
 
 
 def _full_lake(root: Path) -> Path:
-    """A lake holding one of everything the design's lake tree names."""
+    """A lake holding one of everything the design's lake tree names.
+
+    The bars partition carries its ``freq=`` level, which the generic builder cannot write
+    and production's path builder refuses to. Without it this tree held a bars path no real
+    lake holds, so the exclusion check passed over a shape it would never meet.
+    """
     lake = (
         FixtureLake(root)
         .with_chains("SPY", DAY)
         .with_quotes("SPY", DAY)
-        .with_partition("bars", "SPY", DAY, sample_quotes_table())
+        .with_bars("SPY", "1m", DAY, sample_quotes_table())
         .with_reference("security_master", sample_chains_table())
         .with_reference("contracts", sample_chains_table())
         .with_reference("schema_versions", sample_chains_table())
