@@ -19,12 +19,19 @@ The slice-1 steps, in order.
    coverage and gap accounting clamp to that epoch, so onboarding day reads "onboarded
    11:00," never 40 percent missing.
 2. *Take the first snapshot and assert the real-time entitlement.* For an options
-   ticker this fetches the full chain and asserts the vendor's ``isDelayed`` flag is
-   false. For an equity-only ticker it fetches one quote and asserts the ``realtime``
-   flag is true. Real-time entitlement is a verified precondition, not an assumption. A
-   delayed feed fails onboarding before the ticker is trusted, written, or journaled.
-   The fetch is stamped like a capture cycle: ``snap_ts`` the onboarding minute slot,
-   ``fetch_ts`` before the request, ``fetch_end_ts`` after, all from the injected clock.
+   ticker this fetches the chain by its date-window plan, through the same
+   ``capture.fetch_chain`` the capture loop and the close+5 fill use, and asserts the
+   vendor's ``isDelayed`` flag is false. A whole chain in one request exceeds Schwab's
+   gateway body limit, which Schwab answers with a 502, so the plan's windows are what
+   make a real chain fetchable at all. For an equity-only ticker it fetches one quote
+   and asserts the ``realtime`` flag is true. Real-time entitlement is a verified
+   precondition, not an assumption. A delayed feed fails onboarding before the ticker is
+   trusted, written, or journaled. The fetch is stamped like a capture cycle:
+   ``snap_ts`` the onboarding minute slot, and a ``fetch_ts`` / ``fetch_end_ts`` pair
+   around the request. The chain branch takes that pair from ``fetch_chain``, which
+   stamps it around the whole windowed fetch, so the journaled round trip covers every
+   window. The quote branch stamps its own pair around its one call. Both read the
+   injected clock.
 3. *Write the roster entry.* The command writes the ``tickers.yaml`` entry itself. The
    roster lives in ``~/.config/marketlake/``, outside the repo, so no machine path or
    secret ever lands in a tracked file.
@@ -40,6 +47,26 @@ The slice-1 steps, in order.
 5. *Print a sign-off report.* The report pins the first snapshot's contract count as
    the day-one plausibility anchor. The median-relative battery checks have no anchor
    until history accrues, so this count is the one early sanity number.
+
+A windowed fetch can come back partial. ``fetch_chain`` never raises, so it returns
+whatever the windows that succeeded carried, with absence markers naming the rest. The
+loop journals that partial snapshot as data, and the close+5 fill refuses to land a body
+with no contract in it. Onboarding is a third caller making a third claim, that a ticker
+is trustworthy, so it owes three answers of its own.
+
+1. *A partial chain still proves the entitlement.* One successful window carries the
+   ``isDelayed`` flag, and a real-time flag is real-time whatever else failed. The
+   contract count is then measured on part of the chain, so the report marks the anchor
+   as partial rather than letting a partial chain read as a whole one.
+2. *Every window failing refuses before the entitlement is asked.* There is no body to
+   ask it of. The refusal names the fetch's error class, which is what there is left to
+   name once no single response carries a status.
+3. *A chain that answers and carries no contract refuses too.* This one runs after the
+   entitlement assertion, because a body did come back and it can still prove the feed is
+   real-time. What it cannot do is anchor the sign-off. That count is the day-one
+   plausibility anchor, the one early sanity number, because the median-relative battery
+   checks have nothing to measure against until history accrues. An anchor of zero is
+   worse than no anchor, since every later check measures against it.
 
 The epoch and the stamps are two different facts, and ``--capture-start`` is what
 separates them. A lake can be captured before its master exists, and seeding one
@@ -91,10 +118,12 @@ becomes an added step here without reshaping the flow.
   and fold its verdict into the report. Here only the single real-time entitlement
   precondition is checked, which is the one gate the design names for slice 1.
 
-Every dependency is injected: the clock and the vendor. So the whole flow runs offline
-with no network, no real token, and no wall-clock read. The one exception is the command
-line's own ``--capture-start`` check, which asks what time it is now and so reads the
-real clock before any of this is reached. The thin ``onboard_from_config``
+Every dependency is injected: the clock, the vendor, the chain plan, and the guard
+constants. The plan and the guards default to their own in-memory constants rather than
+to a file read, so a caller naming only the clock and the vendor still runs offline. The
+whole flow therefore needs no network, no real token, and no wall-clock read. The one
+exception is the command line's own ``--capture-start`` check, which asks what time it is
+now and so reads the real clock before any of this is reached. The thin ``onboard_from_config``
 wires the real config and the Schwab-backed vendor around the same core, keeping every
 real construction lazy.
 """
@@ -108,8 +137,9 @@ from pathlib import Path
 
 from lake import capture, capture_spans, journal, security_master
 from lake.calendar import MARKET_TZ
+from lake.chain_plan import DEFAULT_CHAIN_PLAN, ChainPlan, load_chain_plan
 from lake.clock import Clock, SystemClock
-from lake.config import input_errors_exit, load_config
+from lake.config import GuardConstants, input_errors_exit, load_config
 from lake.manifest import record_partition
 from lake.security_master import ID_TYPE_TICKER, KIND_EQUITY, SecurityMaster
 from lake.tickers import upsert_ticker
@@ -146,8 +176,11 @@ class OnboardReport:
 
     ``contract_count`` is the day-one plausibility anchor: the number of contracts in
     the first chain snapshot. It is ``None`` for an equity-only ticker, which takes no
-    chain snapshot. ``already_registered`` is true when the ticker was already in the
-    master, so a re-run reuses its id and capture_start rather than minting new ones.
+    chain snapshot. ``partial_chain`` is true when a window of that chain fetch failed,
+    so the count was measured on part of the chain rather than all of it, and the
+    rendered anchor says so. ``already_registered`` is true when the ticker was already
+    in the master, so a re-run reuses its id and capture_start rather than minting new
+    ones.
     ``snapshot_surface`` is the surface journaled as the first cycle (``chains`` or
     ``quotes``), and ``snapshot_segment`` is that segment's lake-relative path. The
     master's FIGI is deliberately unset here; it backfills later from the captured CUSIP.
@@ -165,6 +198,7 @@ class OnboardReport:
     already_registered: bool
     snapshot_surface: str
     snapshot_segment: str
+    partial_chain: bool = False
     deferred: tuple[str, ...] = (
         "FIGI resolution from the captured CUSIP (deferred enrichment)",
         "corporate-actions history fetch (slice 3, D16)",
@@ -182,7 +216,13 @@ class OnboardReport:
             f"  realtime:        {'verified' if self.realtime_verified else 'not checked'}",
         ]
         if self.contract_count is not None:
-            lines.append(f"  day-one anchor:  {self.contract_count} contracts in first snapshot")
+            # A partial fetch's count describes part of a chain, so the line says which
+            # it is. This takes the same conditional decoration the instrument id above
+            # takes for an already-registered ticker.
+            lines.append(
+                f"  day-one anchor:  {self.contract_count} contracts in first snapshot"
+                + (" (partial chain: a window failed)" if self.partial_chain else "")
+            )
         lines.append(f"  first cycle:     {self.snapshot_surface} segment {self.snapshot_segment}")
         lines.append(f"  tickers.yaml:    {self.tickers_path}")
         lines.append(f"  security master: {self.master_path}")
@@ -347,6 +387,8 @@ def onboard(
     chain_cadence: str | None = DEFAULT_CHAIN_CADENCE,
     bars: Sequence[str] = DEFAULT_BARS,
     capture_start: datetime | None = None,
+    plan: ChainPlan | None = None,
+    guards: GuardConstants | None = None,
     pid: int | None = None,
 ) -> OnboardReport:
     """Onboard one ticker into the lake and return its sign-off report.
@@ -356,7 +398,7 @@ def onboard(
     back under the lake-root lock with a fresh manifest entry. The roster entry and the
     master persist to disk. The first snapshot is fetched to verify the real-time
     entitlement and count contracts, and then, once the ticker is trusted, that same
-    response is journaled as the ticker's first captured cycle through the capture
+    snapshot is journaled as the ticker's first captured cycle through the capture
     primitive's durable path. No second fetch is made. ``pid`` sets the journal segment's
     writer-session id, defaulting to this process, so a caller can force a deterministic
     segment name.
@@ -365,6 +407,15 @@ def onboard(
     reaches the scope record alone, and the module docstring carries the split and the
     three refusals it owes. The command line checks its shape before calling this, and
     the one refusal that needs the master is here.
+
+    ``plan`` and ``guards`` belong to the chain fetch, and each defaults to its in-memory
+    constant, the built-in ``DEFAULT_CHAIN_PLAN`` and the pinned ``GuardConstants``.
+    Neither default reads anything, which is what keeps the claim above true: every
+    dependency is injected and this runs offline. ``fill_option_close`` defaults its plan
+    by reading the machine's plan file instead, and that is right for a function the
+    daemon reaches directly. Doing it here would put a config-directory read inside the
+    one function built to need nothing. ``onboard_from_config`` is where the real plan is
+    loaded and passed in.
     """
     lake_root = Path(lake_root)
     now = clock.now()
@@ -435,25 +486,68 @@ def onboard(
 
     # The first snapshot proves the real-time entitlement before the ticker is trusted.
     # It is stamped like a capture cycle so it can be journaled as the first cycle:
-    # cycle_start floors to snap_ts, fetch_ts is stamped before the request and
-    # fetch_end_ts after, all from the injected clock.
+    # cycle_start floors to snap_ts, and each branch stamps its own round trip from the
+    # injected clock.
     cycle_start = clock.now()
-    fetch_ts = clock.now()
     contract_count: int | None = None
+    partial_chain = False
+    windows: tuple[tuple[date, date | None], ...] = ()
+    absent_markers: tuple[journal.AbsentMarker, ...] = ()
     if options:
-        response = vendor.get_chain(ticker)
-        fetch_end_ts = clock.now()
-        if not _ok(response.status):
-            raise OnboardError(f"first chain snapshot for {ticker} failed: HTTP {response.status}")
-        _assert_chain_realtime(response.body)
-        contract_count = _count_contracts(response.body)
+        # The chain goes through the capture loop's own windowed fetch. One bare request
+        # for a whole chain exceeds Schwab's gateway body limit, which is a 502, so the
+        # anchor tickers could not be onboarded at all until this fetched by the plan.
+        #
+        # ``day`` is the clock's date, never the epoch's. It decides which windows are
+        # planned, and the rows land under ``cycle_start``'s own date because that is
+        # what ``journal_snapshot`` places the segment by. A backdated ``--capture-start``
+        # must not move the windows away from the day being captured.
+        fetched = capture.fetch_chain(
+            clock,
+            vendor,
+            ticker,
+            day=cycle_start.date(),
+            lake_root=lake_root,
+            plan=plan if plan is not None else DEFAULT_CHAIN_PLAN,
+            guards=guards if guards is not None else GuardConstants(),
+        )
+        # The fetch stamps its own pair around every window, so the journaled round trip
+        # covers the whole fetch rather than one call that no longer happens.
+        fetch_ts = fetched.fetch_ts
+        fetch_end_ts = fetched.fetch_end_ts
+        if fetched.body is None:
+            # Every window failed, so nothing came back to prove anything with. There is
+            # no single response left to name a status from, so the refusal names the
+            # first failed window's class instead.
+            raise OnboardError(f"first chain snapshot for {ticker} failed: {fetched.error_class}")
+        body = fetched.body
+        _assert_chain_realtime(body)
+        contract_count = _count_contracts(body)
+        if contract_count == 0:
+            # A body that answered and carried no contract is the second failure shape.
+            # The sign-off pins this count as the day-one plausibility anchor, the one
+            # early sanity number the median-relative battery has no substitute for until
+            # history accrues, and an anchor of zero is worse than no anchor. The check
+            # runs before any write, so no zero-row segment is created to clean up.
+            raise OnboardError(
+                f"first chain snapshot for {ticker} carried no contract, so the day-one "
+                "anchor would be pinned at zero; ticker not trusted"
+            )
+        # A fetch that gave up a window still proves the entitlement, because one
+        # successful window carries the flag. Its count describes part of the chain, so
+        # the report says which it is.
+        partial_chain = fetched.error_class is not None
+        windows = fetched.windows
+        absent_markers = fetched.absent_markers
         snapshot_surface = journal.CHAINS_SURFACE
     else:
+        fetch_ts = clock.now()
         response = vendor.get_quotes([ticker])
         fetch_end_ts = clock.now()
         if not _ok(response.status):
             raise OnboardError(f"first quote for {ticker} failed: HTTP {response.status}")
         _assert_quote_realtime(ticker, response.body)
+        body = response.body
         snapshot_surface = journal.QUOTES_SURFACE
 
     # Only now, past the entitlement gate, write the roster entry.
@@ -500,11 +594,13 @@ def onboard(
         lake_root,
         snapshot_surface,
         ticker,
-        body=response.body,
+        body=body,
         cycle_start=cycle_start,
         fetch_ts=fetch_ts,
         fetch_end_ts=fetch_end_ts,
         pid=pid,
+        windows=windows,
+        absent_markers=absent_markers,
     )
 
     return OnboardReport(
@@ -519,6 +615,7 @@ def onboard(
         already_registered=already_registered,
         snapshot_surface=snapshot_surface,
         snapshot_segment=snapshot.partition,
+        partial_chain=partial_chain,
     )
 
 
@@ -540,6 +637,13 @@ def onboard_from_config(
     config and builds the Schwab-backed vendor from the token file. The Schwab client is
     built lazily, so importing this module and running the offline suite touch neither
     it nor the network. A test drives ``onboard`` directly with a fake vendor instead.
+
+    It reads the chain plan and passes the config's guards, the way
+    ``fill_option_close_from_config`` does, so a nightly plan rewrite reaches the next
+    onboarding rather than the next restart. This is the only place the plan file is
+    read, because ``onboard`` itself takes everything injected and falls back to the
+    built-in plan rather than to a file. ``load_chain_plan`` never raises, so a missing,
+    unreadable, or invalid file lands on that same built-in default.
     """
     from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor
 
@@ -559,6 +663,8 @@ def onboard_from_config(
         chain_cadence=chain_cadence,
         bars=bars,
         capture_start=capture_start,
+        plan=load_chain_plan(),
+        guards=config.guards,
     )
 
 

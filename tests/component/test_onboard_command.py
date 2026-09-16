@@ -16,7 +16,7 @@ refused before anything is written.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -26,6 +26,8 @@ from lake.calendar import MARKET_TZ
 from lake.capture import CAPTURE_SOURCE
 from lake.capture_spans import SPANS_PARTITION, CaptureSpans, spans_path
 from lake.cassette import Cassette, Interaction
+from lake.chain_plan import DEFAULT_CHAIN_PLAN, ChainPlan
+from lake.config import GuardConstants
 from lake.manifest import append_manifest, latest_entries
 from lake.onboard import MASTER_PARTITION, EntitlementError, OnboardError, main, onboard
 from lake.paths import LakePaths
@@ -34,44 +36,71 @@ from lake.session import SessionClock
 from lake.tickers import load_tickers
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
-from tests.support.vendor import CassetteVendor
+from tests.support.config import write_config
+from tests.support.vendor import (
+    CassetteVendor,
+    chain_params,
+    windowed_chain_cassette,
+    windowed_chain_interactions,
+)
 
 # A mid-session instant: 2026-08-27 15:00 UTC is 11:00 ET, the design's "onboarded
 # 11:00" case.
 _MID_SESSION = datetime(2026, 8, 27, 15, 0, tzinfo=UTC)
 
+# The date that instant lands on, which is the date the chain fetch plans its windows
+# against. It is the clock's UTC date, never the epoch's Eastern one, because it is the
+# date the journaled rows land under.
+_MID_SESSION_DAY = _MID_SESSION.date()
+
 
 def _chain_body(*, is_delayed: bool) -> dict:
-    """A minimal SPY chain body with one call and one put."""
+    """A minimal SPY chain body with one call and one put.
+
+    Each contract carries its own ``expirationDate``, the field the row builder reads to
+    decide which plan window fetched it. A contract without one lands with both window
+    columns null whatever the fetch passed, which would leave the fetch provenance
+    untested.
+    """
     return {
         "symbol": "SPY",
         "isDelayed": is_delayed,
         "callExpDateMap": {
             "2026-09-18:25": {
-                "650.0": [{"putCall": "CALL", "symbol": "SPY   260918C00650000", "bid": 4.2}]
+                "650.0": [
+                    {
+                        "putCall": "CALL",
+                        "symbol": "SPY   260918C00650000",
+                        "expirationDate": "2026-09-18T20:00:00.000+00:00",
+                        "bid": 4.2,
+                    }
+                ]
             }
         },
         "putExpDateMap": {
             "2026-09-18:25": {
-                "650.0": [{"putCall": "PUT", "symbol": "SPY   260918P00650000", "bid": 3.8}]
+                "650.0": [
+                    {
+                        "putCall": "PUT",
+                        "symbol": "SPY   260918P00650000",
+                        "expirationDate": "2026-09-18T20:00:00.000+00:00",
+                        "bid": 3.8,
+                    }
+                ]
             }
         },
     }
 
 
-def _chain_vendor(*, is_delayed: bool) -> CassetteVendor:
-    return CassetteVendor(
-        Cassette(
-            interactions=(
-                Interaction(
-                    endpoint="chains",
-                    params={"symbol": "SPY"},
-                    status=200,
-                    body=_chain_body(is_delayed=is_delayed),
-                ),
-            )
-        )
-    )
+def _chain_vendor(*, is_delayed: bool, day: date = _MID_SESSION_DAY) -> CassetteVendor:
+    """A chain vendor recorded window by window, the way onboarding now fetches.
+
+    ``day`` is the date the run's clock lands on, which is what the fetch plans its
+    windows against. A vendor built for the wrong day matches no window at all, and a
+    missed window is quiet: ``_fetch_window`` files the ``CassetteError`` as a failed
+    window rather than as a short recording.
+    """
+    return CassetteVendor(windowed_chain_cassette("SPY", day, _chain_body(is_delayed=is_delayed)))
 
 
 def _quote_vendor(ticker: str, *, realtime: bool) -> CassetteVendor:
@@ -206,7 +235,7 @@ def test_onboard_is_idempotent(lake_root, tmp_path):
     second = onboard(
         "SPY",
         clock=ManualClock(start=later),
-        vendor=_chain_vendor(is_delayed=False),
+        vendor=_chain_vendor(is_delayed=False, day=later.date()),
         lake_root=lake_root,
         tickers_path=tickers_path,
         options=True,
@@ -668,3 +697,536 @@ def test_a_backdated_span_marks_nothing_into_a_sealed_date(lake_root, tmp_path):
     assert _BACKDATED_DAY in marked
     assert sealed_day not in marked
     assert date(2026, 8, 24) not in marked
+
+
+# -- fetching the chain by its date-window plan ---------------------------------------
+#
+# A whole chain in one request exceeds Schwab's gateway body limit, which comes back as a
+# 502. Onboarding used to make exactly that request, so neither anchor ticker could be
+# onboarded against a live chain at all. These run against that.
+
+# The default plan's windows on the onboarding day, the concrete ranges the fetch asks
+# for. Derived rather than typed, so a plan change moves the fixtures with it.
+_WINDOWS = DEFAULT_CHAIN_PLAN.windows_for(_MID_SESSION_DAY)
+
+# The window holding the fixture body's one expiration, 2026-09-18. It is the second, the
+# ten-to-thirty-day range, so failing it is what makes a fetch lose every contract while
+# the other four still answer.
+_CONTRACT_WINDOW = _WINDOWS[1]
+
+
+def _too_big() -> Interaction:
+    """The 502 a bare whole-chain request comes back with, the fault this issue names.
+
+    ``errorcode`` carries ``TooBigBody`` at the top level, the shape the offline fakes
+    use for the gateway's size fault.
+    """
+    return Interaction(
+        endpoint="chains",
+        params=chain_params("SPY"),
+        status=502,
+        body={"errorcode": "protocol.http.TooBigBody"},
+    )
+
+
+def _failed_window(window: tuple[date, date | None], status: int = 502) -> Interaction:
+    """A recorded failure for one window, so the fetch gives it up under ``http_<status>``.
+
+    The status is deliberately not the ``TooBigBody`` fault, which the fetcher would
+    split and refetch instead of giving up on.
+    """
+    from_date, to_date = window
+    return Interaction(
+        endpoint="chains",
+        params=chain_params("SPY", from_date=from_date, to_date=to_date),
+        status=status,
+        body={"error": "refused"},
+    )
+
+
+class _SlowVendor:
+    """Advances the manual clock by a fixed span on every chain call.
+
+    The manual clock only moves when told to, so without this every window's fetch is
+    instantaneous and a round trip spanning five windows reads the same as one spanning
+    a single call.
+    """
+
+    def __init__(self, inner, clock, *, seconds: float) -> None:
+        self._inner = inner
+        self._clock = clock
+        self._seconds = seconds
+
+    def get_chain(self, symbol, *, from_date=None, to_date=None, strike_count=None):
+        self._clock.advance(self._seconds)
+        return self._inner.get_chain(
+            symbol, from_date=from_date, to_date=to_date, strike_count=strike_count
+        )
+
+    def get_quotes(self, symbols):
+        return self._inner.get_quotes(symbols)
+
+
+def test_a_chain_too_big_for_one_request_still_onboards(lake_root, tmp_path):
+    """The case that failed live: the bare whole-chain request 502s, the windows do not.
+
+    Both anchor tickers came back ``HTTP 502`` with errorcode ``protocol.http.TooBigBody``
+    on every onboarding attempt, because the command asked for the whole chain in one
+    request. This vendor answers that request the same way and answers each planned
+    window normally, so a run that still made the bare request cannot pass.
+    """
+    vendor = CassetteVendor(
+        windowed_chain_cassette(
+            "SPY",
+            _MID_SESSION_DAY,
+            _chain_body(is_delayed=False),
+            extra=(_too_big(),),
+        )
+    )
+
+    report = onboard(
+        "SPY",
+        clock=ManualClock(start=_MID_SESSION),
+        vendor=vendor,
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=True,
+    )
+
+    assert report.contract_count == 2
+    assert report.partial_chain is False
+    assert report.realtime_verified is True
+    assert (lake_root / report.snapshot_segment).exists()
+
+
+def test_the_journaled_segment_carries_the_windows_the_fetch_ran(lake_root, tmp_path):
+    """The plan's concrete ranges reach the rows, rather than the empty tuple of before.
+
+    A chains row records which window fetched it. Onboarding passed empty tuples while it
+    fetched bare, so its segments said nothing about how the rows were collected and read
+    differently from every segment the loop writes.
+    """
+    report = onboard(
+        "SPY",
+        clock=ManualClock(start=_MID_SESSION),
+        vendor=_chain_vendor(is_delayed=False),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=True,
+    )
+
+    rows = journal.read_segment(lake_root / report.snapshot_segment).to_pylist()
+    assert rows
+    from_date, to_date = _CONTRACT_WINDOW
+    for row in rows:
+        assert row["window_start"] == from_date.isoformat()
+        assert row["window_end"] == (None if to_date is None else to_date.isoformat())
+
+
+def test_a_partial_chain_proves_the_entitlement_and_says_it_was_partial(lake_root, tmp_path):
+    """One successful window is enough to prove real-time, and the anchor says it is partial.
+
+    A count taken off part of a chain reads exactly like a whole one in the sign-off
+    block, and the anchor is what every later median-relative check measures against. The
+    failed window's absence markers ride the same segment, so the shortfall is on disk
+    as well as in the report.
+    """
+    body = _chain_body(is_delayed=False)
+    # Two expirations, one in each of the first two windows, so one window can fail while
+    # the other still returns a contract.
+    near = _WINDOWS[0][0].isoformat()
+    body["callExpDateMap"][f"{near}:0"] = {
+        "640.0": [
+            {
+                "putCall": "CALL",
+                "symbol": "SPY   260827C00640000",
+                "expirationDate": f"{near}T20:00:00.000+00:00",
+                "bid": 1.5,
+            }
+        ]
+    }
+    vendor = CassetteVendor(
+        windowed_chain_cassette(
+            "SPY", _MID_SESSION_DAY, body, extra=(_failed_window(_CONTRACT_WINDOW),)
+        )
+    )
+
+    report = onboard(
+        "SPY",
+        clock=ManualClock(start=_MID_SESSION),
+        vendor=vendor,
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=True,
+    )
+
+    # The near window's one contract is what came back, not the three the body describes.
+    assert report.realtime_verified is True
+    assert report.contract_count == 1
+    assert report.partial_chain is True
+    assert "(partial chain: a window failed)" in report.render()
+
+    # The failed window's absence marker landed in the same segment, so the segment says
+    # what it missed rather than reading as a whole chain of one contract.
+    rows = journal.read_segment(lake_root / report.snapshot_segment).to_pylist()
+    markers = [row for row in rows if row["row_kind"] != journal.ROW_KIND_DATA]
+    assert [row["error_class"] for row in markers] == ["http_502"]
+    assert markers[0]["window_start"] == _CONTRACT_WINDOW[0].isoformat()
+
+
+def test_every_window_failing_refuses_and_writes_nothing(lake_root, tmp_path):
+    """The whole-chain failure the bare 502 used to be, now named by its error class.
+
+    There is no single response left to read a status off, so the refusal names the first
+    failed window's class. Nothing is written, because the refusal runs ahead of the
+    roster, the master, and the journal, exactly where the bare status check ran.
+    """
+    tickers_path = tmp_path / "tickers.yaml"
+    vendor = CassetteVendor(
+        Cassette(interactions=tuple(_failed_window(window, 401) for window in _WINDOWS))
+    )
+
+    with pytest.raises(OnboardError) as refusal:
+        onboard(
+            "SPY",
+            clock=ManualClock(start=_MID_SESSION),
+            vendor=vendor,
+            lake_root=lake_root,
+            tickers_path=tickers_path,
+            options=True,
+        )
+
+    message = str(refusal.value)
+    assert "first chain snapshot for SPY failed" in message
+    assert "http_401" in message
+
+    assert not tickers_path.exists()
+    assert not master_path(lake_root).exists()
+    assert not (lake_root / "journal").exists()
+
+
+def test_a_chain_with_no_contract_refuses_rather_than_pinning_a_zero_anchor(lake_root, tmp_path):
+    """Every window answers 200 and carries nothing, which is not the same as no body.
+
+    The sign-off pins the first snapshot's contract count as the day-one plausibility
+    anchor, and the median-relative battery has nothing else to measure against until
+    history accrues. An anchor of zero is worse than no anchor. The refusal runs before
+    the write, so no zero-row segment and no ``rows=0`` manifest entry is left behind.
+    """
+    tickers_path = tmp_path / "tickers.yaml"
+    empty = {"symbol": "SPY", "isDelayed": False, "callExpDateMap": {}, "putExpDateMap": {}}
+
+    with pytest.raises(OnboardError) as refusal:
+        onboard(
+            "SPY",
+            clock=ManualClock(start=_MID_SESSION),
+            vendor=CassetteVendor(windowed_chain_cassette("SPY", _MID_SESSION_DAY, empty)),
+            lake_root=lake_root,
+            tickers_path=tickers_path,
+            options=True,
+        )
+
+    assert "carried no contract" in str(refusal.value)
+    assert not tickers_path.exists()
+    assert not master_path(lake_root).exists()
+    assert not (lake_root / "journal").exists()
+
+
+def test_a_backdated_epoch_plans_the_same_windows_as_a_run_without_one(lake_root, tmp_path):
+    """The windows come off the clock's date, never the epoch's.
+
+    ``--capture-start`` can put the epoch a week back, and it is an Eastern date besides,
+    while the rows land under the clock's own UTC date. Planning the windows against the
+    epoch would ask for ranges nothing in the day being captured falls in, and the fetch
+    would answer that as a chain whose every window failed.
+    """
+    report = onboard(
+        "SPY",
+        clock=ManualClock(start=_MID_SESSION),
+        vendor=_chain_vendor(is_delayed=False),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=True,
+        capture_start=_BACKDATED,
+    )
+
+    # The epoch still reaches the scope record, and it reaches the windows nowhere.
+    assert report.capture_start == _BACKDATED
+    assert report.contract_count == 2
+    assert report.partial_chain is False
+
+    from_date, to_date = _CONTRACT_WINDOW
+    rows = journal.read_segment(lake_root / report.snapshot_segment).to_pylist()
+    assert rows
+    for row in rows:
+        assert row["window_start"] == from_date.isoformat()
+        assert row["window_end"] == (None if to_date is None else to_date.isoformat())
+
+
+def test_the_journaled_round_trip_spans_every_window(lake_root, tmp_path):
+    """``fetch_ts`` and ``fetch_end_ts`` come off the fetch, so they cover the whole fetch.
+
+    Onboarding stamped its own pair around one call. Keeping that pair would journal a
+    round trip around a request that no longer happens, and the five windows the fetch
+    really spends would read as an instantaneous fetch.
+    """
+    clock = ManualClock(start=_MID_SESSION)
+    seconds = 3
+    vendor = _SlowVendor(_chain_vendor(is_delayed=False), clock, seconds=seconds)
+
+    report = onboard(
+        "SPY",
+        clock=clock,
+        vendor=vendor,
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=True,
+    )
+
+    rows = journal.read_segment(lake_root / report.snapshot_segment).to_pylist()
+    assert rows
+    for row in rows:
+        fetch_ts = datetime.fromisoformat(row["fetch_ts"])
+        fetch_end_ts = datetime.fromisoformat(row["fetch_end_ts"])
+        # One span per window of the plan, which is more than any single call's.
+        assert (fetch_end_ts - fetch_ts).total_seconds() == seconds * len(_WINDOWS)
+        assert (fetch_end_ts - fetch_ts).total_seconds() > seconds
+
+
+def test_the_equity_only_branch_still_stamps_its_own_round_trip(lake_root, tmp_path):
+    """``--no-options`` is untouched: one quote, its own pair, and no chain call at all.
+
+    The chain branch takes its stamps from the fetch now, so the two branches stamp
+    differently. This is what holds the quote branch where it was.
+    """
+    clock = ManualClock(start=_MID_SESSION)
+    quote_vendor = _quote_vendor("QQQ", realtime=True)
+
+    class _NoChain:
+        def get_chain(self, *args, **kwargs):
+            raise AssertionError("the equity-only path fetched a chain")
+
+        def get_quotes(self, symbols):
+            clock.advance(5)
+            return quote_vendor.get_quotes(symbols)
+
+    report = onboard(
+        "QQQ",
+        clock=clock,
+        vendor=_NoChain(),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=False,
+    )
+
+    assert report.contract_count is None
+    assert report.partial_chain is False
+    assert "day-one anchor" not in report.render()
+
+    row = journal.read_segment(lake_root / report.snapshot_segment).to_pylist()[0]
+    assert row["snap_ts"] == _MID_SESSION.isoformat()
+    assert row["fetch_ts"] == _MID_SESSION.isoformat()
+    assert row["fetch_end_ts"] == (_MID_SESSION + timedelta(seconds=5)).isoformat()
+    # A quote row has no window columns at all, so the quote branch has nothing to name.
+    assert "window_start" not in row
+
+
+def test_the_fixture_builder_refuses_an_expiration_no_window_holds(lake_root):
+    """A short recording reads as a failed fetch, so the builder refuses to make one.
+
+    ``_fetch_window`` catches every raised exception and files it as a failed window, so
+    a ``CassetteError`` for a window a fixture forgot is indistinguishable from a window
+    the vendor refused. An expiration dated before the session date falls in no window,
+    and dropping it quietly would leave a recording holding fewer contracts than the body
+    it was built from.
+    """
+    body = _chain_body(is_delayed=False)
+    body["putExpDateMap"]["2026-08-01:0"] = {
+        "600.0": [
+            {
+                "putCall": "PUT",
+                "symbol": "old",
+                "expirationDate": "2026-08-01T20:00:00.000+00:00",
+            }
+        ]
+    }
+
+    with pytest.raises(ValueError, match="falls in no window"):
+        windowed_chain_interactions("SPY", _MID_SESSION_DAY, body)
+
+
+def test_the_fixture_builder_refuses_a_contract_dated_off_its_map_key(lake_root):
+    """The recording places by map key, production stamps by the contract's own field.
+
+    A body where the two disagree records a contract under one window and journals it
+    under another, and every window assertion in this file would then be checking that
+    the fixture author kept two dates in step by hand.
+    """
+    body = _chain_body(is_delayed=False)
+    body["callExpDateMap"]["2026-09-18:25"]["650.0"][0]["expirationDate"] = (
+        "2026-12-18T21:00:00.000+00:00"
+    )
+
+    with pytest.raises(ValueError, match="not the window it would be journalled under"):
+        windowed_chain_interactions("SPY", _MID_SESSION_DAY, body)
+
+
+def test_the_fixture_builder_refuses_a_contract_with_no_expiration_date(lake_root):
+    """A contract with no ``expirationDate`` journals null window columns, silently.
+
+    The row still lands and the count is still right, so nothing fails. Only the fetch
+    provenance goes missing, which is the column that tells a windowed fetch from the bare
+    one this issue replaced. An integration fixture omitted the field exactly this way.
+    """
+    body = _chain_body(is_delayed=False)
+    del body["callExpDateMap"]["2026-09-18:25"]["650.0"][0]["expirationDate"]
+
+    with pytest.raises(ValueError, match="no expirationDate"):
+        windowed_chain_interactions("SPY", _MID_SESSION_DAY, body)
+
+
+def test_onboard_reads_no_plan_file(lake_root, tmp_path, monkeypatch):
+    """The core takes everything injected, so it never reaches the config directory.
+
+    ``load_chain_plan`` reads the operator's own config directory. ``fill_option_close``
+    defaults its plan that way, which is right for a function the daemon reaches
+    directly, and copying it here would make onboarding's own claim false: every
+    dependency is injected, so the whole flow runs offline. The wrapper is where the real
+    plan is read, so the core falls back to the built-in plan instead.
+    """
+    import lake.onboard
+
+    def _refuse(*args, **kwargs):
+        raise AssertionError("onboard read the machine's chain plan file")
+
+    monkeypatch.setattr(lake.onboard, "load_chain_plan", _refuse)
+
+    report = onboard(
+        "SPY",
+        clock=ManualClock(start=_MID_SESSION),
+        vendor=_chain_vendor(is_delayed=False),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=True,
+    )
+
+    # The built-in plan is what it fell back to, so the fixture's windows still matched.
+    assert report.contract_count == 2
+    assert report.partial_chain is False
+
+
+def test_a_named_plan_overrides_the_built_in_one(lake_root, tmp_path):
+    """The parameter is a real seam, not a value nothing reads.
+
+    A single-window plan asks for one open-ended range instead of the default's five, so a
+    recording made for that plan matches only if the named plan reached the fetch.
+    """
+    one_window = ChainPlan(((0, None),))
+    vendor = CassetteVendor(
+        windowed_chain_cassette(
+            "SPY", _MID_SESSION_DAY, _chain_body(is_delayed=False), plan=one_window
+        )
+    )
+
+    report = onboard(
+        "SPY",
+        clock=ManualClock(start=_MID_SESSION),
+        vendor=vendor,
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=True,
+        plan=one_window,
+    )
+
+    assert report.contract_count == 2
+    assert report.partial_chain is False
+
+    row = journal.read_segment(lake_root / report.snapshot_segment).to_pylist()[0]
+    assert row["window_start"] == _MID_SESSION_DAY.isoformat()
+    assert row["window_end"] is None
+
+
+def test_a_recalibrated_split_depth_reaches_the_fetch(lake_root, tmp_path):
+    """The ``guards`` parameter is a real seam, the way ``plan`` is.
+
+    ``chain_chunk_max_split_depth`` decides how many midpoint splits a too-big window is
+    worth before the range is given up. A machine that tuned it down must get a fetch that
+    gives up where it stands rather than one that halves the window and asks for ranges
+    the vendor was never asked about.
+    """
+    one_window = ChainPlan(((0, None),))
+    too_big = Interaction(
+        endpoint="chains",
+        params=chain_params("SPY", from_date=_MID_SESSION_DAY),
+        status=502,
+        body={"errorcode": "protocol.http.TooBigBody"},
+    )
+
+    with pytest.raises(OnboardError) as refusal:
+        onboard(
+            "SPY",
+            clock=ManualClock(start=_MID_SESSION),
+            vendor=CassetteVendor(Cassette(interactions=(too_big,))),
+            lake_root=lake_root,
+            tickers_path=tmp_path / "tickers.yaml",
+            options=True,
+            plan=one_window,
+            guards=GuardConstants(chain_chunk_max_split_depth=0),
+        )
+
+    # Depth 0 gives the one window up where it stands, under the size class. A depth that
+    # split would ask for halves this cassette has never heard of, and the raised
+    # ``CassetteError`` would come back as ``cassette_error`` instead.
+    assert "chain_chunk_failed" in str(refusal.value)
+
+
+def test_the_wrapper_loads_the_plan_and_passes_the_config_s_guards(
+    lake_root, tmp_path, monkeypatch
+):
+    """``onboard_from_config`` is the only reader of the machine's plan file.
+
+    The core falls back to the built-in plan rather than to a file, so a wrapper that
+    stopped loading the plan would leave a machine whose nightly job re-sized its windows
+    onboarding by the built-in default, and nothing would say so. The guards travel the
+    same way, which is how ``fill_option_close_from_config`` wires its own pair.
+    """
+    import lake.onboard
+    import lake.schwab
+
+    tuned = ChainPlan(((0, None),))
+    vendor = CassetteVendor(
+        windowed_chain_cassette("SPY", _MID_SESSION_DAY, _chain_body(is_delayed=False), plan=tuned)
+    )
+    seen: list[GuardConstants] = []
+
+    class _Stub:
+        @staticmethod
+        def from_token(token_path, *, api_key, app_secret):
+            return vendor
+
+    real_fetch_chain = lake.onboard.capture.fetch_chain
+
+    def _record(*args, **kwargs):
+        seen.append(kwargs["guards"])
+        return real_fetch_chain(*args, **kwargs)
+
+    monkeypatch.setattr(lake.schwab, "SchwabVendor", _Stub)
+    monkeypatch.setattr(lake.onboard, "load_chain_plan", lambda: tuned)
+    monkeypatch.setattr(lake.onboard.capture, "fetch_chain", _record)
+
+    config = write_config(tmp_path, lake_root, guards={"chain_chunk_max_split_depth": 0})
+    report = lake.onboard.onboard_from_config(
+        "SPY",
+        clock=ManualClock(start=_MID_SESSION),
+        config_path=str(config),
+        tickers_path=tmp_path / "tickers.yaml",
+        token_path=tmp_path / "token.json",
+    )
+
+    # The loaded plan reached the fetch: this cassette records one open-ended window, and
+    # the built-in plan's five windows would miss every one of them.
+    assert report.contract_count == 2
+    assert report.partial_chain is False
+
+    # The config's own recalibrated guard reached it too, rather than the pinned default.
+    assert [g.chain_chunk_max_split_depth for g in seen] == [0]

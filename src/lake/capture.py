@@ -6,13 +6,14 @@ segment in the manifest. This module builds that one cycle. The daemon that call
 once a minute is ``lake.daemon``. The market-hours, calendar, and session logic live
 there and in ``lake.session``. Here the cycle runs once and returns.
 
-The cycle's two halves are also exported on their own, because two callers outside the
-loop already hold one half and want the other done the loop's way. ``fetch_chain`` is
-the fetching half: it runs a chain's date-window plan and reassembles one snapshot.
-``journal_snapshot`` is the landing half: it takes a response someone already fetched
-and writes it as a durable cycle. Onboarding uses the landing half alone, and
-``fill_option_close``, the close+5 guard's refetch, uses both. So the fill and the loop
-fetch a chain by one code path rather than two.
+The cycle's two halves are also exported on their own, so a caller outside the loop can
+do either the loop's way. ``fetch_chain`` is the fetching half: it runs a chain's
+date-window plan and reassembles one snapshot. ``journal_snapshot`` is the landing half:
+it takes a response someone already fetched and writes it as a durable cycle. Two callers
+outside the loop use both halves: ``fill_option_close``, the close+5 guard's refetch, and
+onboarding's first chain snapshot. So all three fetch a chain by one code path rather than
+three. Onboarding's equity-only branch is the one caller of the landing half alone, since
+a single quote needs no windowed fetch.
 
 Three terms recur, defined at first use.
 
@@ -441,7 +442,8 @@ class ChainFetch:
 
     This is the fetching half of a chain capture, the part before any row is built. It
     is factored out of the cycle the way ``journal_snapshot`` factored the landing half
-    out, so the loop and the close+5 fill share one code path rather than two.
+    out. Three callers share that one code path: the loop, the close+5 fill, and
+    onboarding's first chain snapshot.
 
     ``body`` is the merged snapshot, in the vendor's own shape, or ``None`` when every
     window failed and nothing was captured. ``windows`` is the concrete plan the fetch
@@ -1220,8 +1222,9 @@ def journal_snapshot(
     ``windows`` and ``absent_markers`` are what a windowed chain fetch produces beside its
     body: the date ranges the rows were fetched by, and what a failed range should have
     carried. A caller holding a ``ChainFetch`` passes both, so the segment it lands is the
-    same shape a loop cycle writes for the same fetch. Onboarding fetches a whole chain in
-    one request, so it passes neither and both columns stay null.
+    same shape a loop cycle writes for the same fetch. Onboarding's chain branch holds one
+    and passes both. A quotes caller leaves both empty, and a quotes row has no window
+    columns to fill in any case, because those two belong to the chains surface alone.
     """
     lake_root = Path(lake_root)
     # The slot a row stands for is not always the minute it was fetched in. The close+5

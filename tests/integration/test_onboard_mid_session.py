@@ -17,41 +17,45 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from lake import journal
-from lake.cassette import Cassette, Interaction
+from lake.chain_plan import DEFAULT_CHAIN_PLAN
 from lake.manifest import latest_entries, scrub
 from lake.onboard import onboard
 from lake.security_master import ID_TYPE_TICKER, SecurityMaster, master_path
 from lake.tickers import load_tickers
 from tests.support.clock import ManualClock
-from tests.support.vendor import CassetteVendor
+from tests.support.vendor import CassetteVendor, windowed_chain_cassette
 
 # 11:00 ET on a session day, expressed in UTC. The design's "onboarded 11:00" moment.
 _MID_SESSION = datetime(2026, 8, 27, 15, 0, tzinfo=UTC)
 
 
 def _chain_vendor(ticker: str) -> CassetteVendor:
-    """A real-time chain vendor for one ticker with a single contract."""
+    """A real-time chain vendor for one ticker with a single contract.
+
+    Onboarding fetches the chain by its date-window plan, so the recording covers every
+    window of the default plan on the onboarding day and the single contract rides the
+    window whose date range holds its expiration.
+    """
     return CassetteVendor(
-        Cassette(
-            interactions=(
-                Interaction(
-                    endpoint="chains",
-                    params={"symbol": ticker},
-                    status=200,
-                    body={
-                        "symbol": ticker,
-                        "isDelayed": False,
-                        "callExpDateMap": {
-                            "2026-09-18:22": {
-                                "650.0": [
-                                    {"putCall": "CALL", "symbol": f"{ticker:<6}260918C00650000"}
-                                ]
+        windowed_chain_cassette(
+            ticker,
+            _MID_SESSION.date(),
+            {
+                "symbol": ticker,
+                "isDelayed": False,
+                "callExpDateMap": {
+                    "2026-09-18:22": {
+                        "650.0": [
+                            {
+                                "putCall": "CALL",
+                                "symbol": f"{ticker:<6}260918C00650000",
+                                "expirationDate": "2026-09-18T20:00:00.000+00:00",
                             }
-                        },
-                        "putExpDateMap": {},
-                    },
-                ),
-            )
+                        ]
+                    }
+                },
+                "putExpDateMap": {},
+            },
         )
     )
 
@@ -98,6 +102,7 @@ def test_onboard_mid_session(lake_root, tmp_path):
     # segments exist, round-trip through the reader, and carry a segment-keyed manifest
     # entry, exactly as a capture cycle would leave them.
     manifest = latest_entries(lake_root)
+    window = DEFAULT_CHAIN_PLAN.windows_for(_MID_SESSION.date())[1]
     for report in (spy, qqq):
         assert report.snapshot_surface == journal.CHAINS_SURFACE
         segment_path = lake_root / report.snapshot_segment
@@ -107,6 +112,13 @@ def test_onboard_mid_session(lake_root, tmp_path):
         assert rows[0]["ticker"] == report.ticker
         assert rows[0]["row_kind"] == journal.ROW_KIND_DATA
         assert report.snapshot_segment in manifest
+        # "Exactly as a capture cycle would leave them" covers the fetch provenance too.
+        # A loop cycle stamps the plan window that holds the contract's expiration, and a
+        # bare onboarding fetch left both columns null, so this is the column that tells
+        # the two apart.
+        assert rows[0]["window_start"] == window[0].isoformat()
+        assert rows[0]["window_end"] == window[1].isoformat()
+        assert report.partial_chain is False
 
     # The two-way integrity scrub is clean: the master's manifest entry and each snapshot
     # segment entry exist and match, and no lake file is left unrecorded. Journal

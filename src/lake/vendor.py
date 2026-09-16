@@ -61,8 +61,9 @@ class Vendor(Protocol):
         expirations, and ``strike_count`` caps the strikes per expiration. A ``None``
         parameter is omitted from the vendor request. The chunker uses ``strike_count=1``
         to discover the expiration list cheaply, then ``from_date`` / ``to_date`` to fetch
-        each expiration range. Onboarding and the recorder still call this with the bare
-        symbol for the whole chain.
+        each expiration range. Onboarding fetches by those same windows, through the
+        chunker itself. The by-hand recorder is the one caller left calling this with the
+        bare symbol for the whole chain.
         """
         ...
 
