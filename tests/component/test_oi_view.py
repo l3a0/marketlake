@@ -35,7 +35,7 @@ import pytest
 
 from lake.calendar import DEFAULT_CALENDAR, MARKET_TZ, ExchangeCalendar
 from lake.capture_spans import CaptureSpans
-from lake.config import GuardConstants
+from lake.config import CONFIG_PATH_ENV, GuardConstants
 from lake.oi import (
     REASON_EXPIRED_OUT,
     REASON_NO_CYCLE_PASSED,
@@ -56,6 +56,8 @@ from lake.oi import (
 )
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
 from lake.security_master import SecurityMaster
+from tests.support.calendar import weekday_sessions
+from tests.support.config import write_config
 from tests.support.lake import FixtureLake
 
 CALENDAR = ExchangeCalendar(DEFAULT_CALENDAR)
@@ -841,6 +843,324 @@ def _by_symbol(answer: pa.Table) -> dict[str, tuple]:
             strict=True,
         )
     )
+
+
+# -- what the mutation lens found unheld ---------------------------------------
+
+# A second refreshed state, so a session can hold two cycles that each qualify on their
+# own and the walk has to say which one it means by "first".
+LATER_REFRESH = {symbol: value + 900 for symbol, value in SET.items()}
+
+
+def test_the_walk_takes_the_first_qualifying_cycle_and_not_the_last(fixture_lake: FixtureLake):
+    """Every earlier fixture had one qualifying cycle, so first and last coincided.
+
+    Two qualify here. Taking the last would report a figure that belongs to trading after
+    the settlement rather than the settlement itself.
+    """
+    root = settled_lake(
+        fixture_lake,
+        [
+            cycle_rows(FOLLOWING, 9, 30, REFRESHED, volumes=VOLUMES),
+            cycle_rows(FOLLOWING, 9, 31, REFRESHED, volumes=VOLUMES),
+            cycle_rows(FOLLOWING, 9, 32, LATER_REFRESH, volumes=VOLUMES),
+            cycle_rows(FOLLOWING, 9, 33, LATER_REFRESH, volumes=VOLUMES),
+        ],
+    )
+
+    answer = view(root, constants=constants())
+
+    assert answer.column("source_snap_ts").to_pylist()[0] == et(FOLLOWING, 9, 30)
+    assert set(answer.column("open_interest").to_pylist()) == set(REFRESHED.values())
+
+
+def test_a_cycle_at_exactly_the_quorum_declares_a_refresh(fixture_lake: FixtureLake):
+    """The quorum is "at least", so the boundary itself passes.
+
+    Four of the eight voters change against a fraction of 0.50. Nothing else in the suite
+    lands on the boundary, so a reader using a strict comparison answered the same as one
+    using the documented inclusive test.
+    """
+    half = dict(SET)
+    for symbol in list(SET)[:4]:
+        half[symbol] = REFRESHED[symbol]
+    root = settled_lake(
+        fixture_lake,
+        [
+            cycle_rows(FOLLOWING, 9, 30, half, volumes=VOLUMES),
+            cycle_rows(FOLLOWING, 9, 31, half, volumes=VOLUMES),
+        ],
+    )
+
+    answer = view(root, constants=constants(oi_refresh_quorum=0.50))
+
+    assert verdicts(answer) == {(VERDICT_SETTLED, None)}
+
+
+def test_a_set_of_exactly_the_floor_is_not_indeterminate(fixture_lake: FixtureLake):
+    """The floor is a minimum, so a set of exactly that size still votes."""
+    four = {symbol: SET[symbol] for symbol in list(SET)[:4]}
+    refreshed_four = {symbol: REFRESHED[symbol] for symbol in four}
+    fixture_lake.with_chains("SPY", SESSION, table(close_rows(SESSION, four, volumes=VOLUMES)))
+    fixture_lake.with_chains(
+        "SPY",
+        FOLLOWING,
+        table(
+            cycle_rows(FOLLOWING, 9, 30, refreshed_four, volumes=VOLUMES)
+            + cycle_rows(FOLLOWING, 9, 31, refreshed_four, volumes=VOLUMES)
+        ),
+    )
+    reference(fixture_lake)
+    root = fixture_lake.build()
+
+    answer = view(root, constants=constants(oi_comparable_set_floor=4))
+
+    assert verdicts(answer) == {(VERDICT_SETTLED, None)}
+
+
+def test_a_span_opening_mid_session_still_covers_that_session(fixture_lake: FixtureLake):
+    """Scope asks about the option close, not the session open, and onboarding is why.
+
+    A ticker onboarded at 11:00 was captured for that session's close of record, which is
+    the cycle a baseline reads. Asking about the open would put its first session out of
+    scope and refuse a verdict the lake can actually give.
+    """
+    midday = datetime(2026, 9, 14, 15, 0, tzinfo=UTC)  # 11:00 ET on the session
+    fixture_lake.with_chains("SPY", SESSION, table(close_rows(SESSION, SET, volumes=VOLUMES)))
+    fixture_lake.with_chains(
+        "SPY",
+        FOLLOWING,
+        table(
+            cycle_rows(FOLLOWING, 9, 30, REFRESHED, volumes=VOLUMES)
+            + cycle_rows(FOLLOWING, 9, 31, REFRESHED, volumes=VOLUMES)
+        ),
+    )
+    reference(fixture_lake, span_start=midday)
+    root = fixture_lake.build()
+
+    answer = view(root, constants=constants())
+
+    assert verdicts(answer) == {(VERDICT_SETTLED, None)}
+
+
+def test_the_configured_set_size_is_what_ranks_the_voters(fixture_lake: FixtureLake):
+    """The size and the volume ranking both decide the verdict here, and neither did before.
+
+    Thirty contracts. The five highest by volume refresh and the other twenty-five do not.
+    A set capped at five is five of five changed, which is a refresh. A set that ignored
+    the cap would be five of thirty, well under the quorum, and a ranking that ignored
+    volume would pick five contracts that never moved.
+    """
+    movers = {occ(200 + index): 100 + index for index in range(5)}
+    quiet = {occ(100 + index): 200 + index for index in range(25)}
+    roster = {**movers, **quiet}
+    # The movers rank top by volume and last by symbol, so only a volume ranking finds them.
+    volumes = {symbol: 9_000 for symbol in movers} | {symbol: 10 for symbol in quiet}
+    refreshed = {**{s: v + 500 for s, v in movers.items()}, **quiet}
+    fixture_lake.with_chains("SPY", SESSION, table(close_rows(SESSION, roster, volumes=volumes)))
+    fixture_lake.with_chains(
+        "SPY",
+        FOLLOWING,
+        table(
+            cycle_rows(FOLLOWING, 9, 30, refreshed, volumes=volumes)
+            + cycle_rows(FOLLOWING, 9, 31, refreshed, volumes=volumes)
+        ),
+    )
+    reference(fixture_lake)
+    root = fixture_lake.build()
+
+    answer = view(root, constants=constants(oi_comparable_set_size=5, oi_comparable_set_floor=4))
+
+    assert (VERDICT_SETTLED, None) in verdicts(answer)
+    assert _by_symbol(answer)[occ(200)][2] == refreshed[occ(200)]
+
+
+def test_cycles_all_too_thin_to_vote_are_indeterminate_from_the_walk(fixture_lake: FixtureLake):
+    """The walk's own floor path, which every earlier fixture reached before the walk ran.
+
+    Both `set_under_floor` answers in the suite came from the early return in `oi_view`.
+    A following session whose every cycle carries too few of the set is the other way in,
+    and it is the one that distinguishes "too thin to judge" from "nothing passed".
+    """
+    two = {symbol: REFRESHED[symbol] for symbol in list(SET)[:2]}
+    root = settled_lake(
+        fixture_lake,
+        [
+            cycle_rows(FOLLOWING, 9, 30, two, volumes=VOLUMES),
+            cycle_rows(FOLLOWING, 9, 31, two, volumes=VOLUMES),
+        ],
+    )
+
+    answer = view(root, constants=constants(oi_comparable_set_floor=4))
+
+    assert verdicts(answer) == {(VERDICT_INDETERMINATE, REASON_SET_UNDER_FLOOR)}
+
+
+def test_a_marked_answer_carries_no_number_and_names_no_source(fixture_lake: FixtureLake):
+    """What a withheld row must not say, which nothing was checking."""
+    fixture_lake.with_chains("SPY", SESSION, table(close_rows(SESSION, SET, volumes=VOLUMES)))
+    reference(fixture_lake)
+    root = fixture_lake.build()
+
+    answer = view(root, constants=constants())
+
+    assert set(answer.column("open_interest").to_pylist()) == {None}
+    assert set(answer.column("source_session").to_pylist()) == {None}
+    assert set(answer.column("source_snap_ts").to_pylist()) == {None}
+    assert set(answer.column("ticker").to_pylist()) == {"SPY"}
+    assert set(answer.column("session").to_pylist()) == {SESSION}
+
+
+def test_a_settled_answer_identifies_itself_and_keeps_the_close_cycle_order(
+    fixture_lake: FixtureLake,
+):
+    """One row per contract, in the close cycle's own order, and saying which session."""
+    root = settled_lake(
+        fixture_lake,
+        [
+            cycle_rows(FOLLOWING, 9, 30, REFRESHED, volumes=VOLUMES),
+            cycle_rows(FOLLOWING, 9, 31, REFRESHED, volumes=VOLUMES),
+        ],
+    )
+
+    answer = view(root, constants=constants())
+
+    assert answer.column("occ_symbol").to_pylist() == list(SET)
+    assert set(answer.column("ticker").to_pylist()) == {"SPY"}
+    assert set(answer.column("session").to_pylist()) == {SESSION}
+    assert set(answer.column("source_session").to_pylist()) == {FOLLOWING}
+
+
+def test_an_absent_session_partition_names_that_as_the_reason(fixture_lake: FixtureLake):
+    """`BaselineAbsent` carries three reason codes and only one was ever asserted."""
+    fixture_lake.with_chains("SPY", FOLLOWING, table(close_rows(FOLLOWING, SET, volumes=VOLUMES)))
+    reference(fixture_lake)
+    root = fixture_lake.build()
+
+    with pytest.raises(BaselineAbsent) as caught:
+        view(root, constants=constants())
+    assert caught.value.reason == REASON_PARTITION_ABSENT
+
+
+def test_a_sidecar_file_is_not_a_sealed_partition(fixture_lake: FixtureLake):
+    """`_sealed_after` reads directory entries, so a checksum sidecar must not count.
+
+    A prefix match would read `date=2026-09-16.parquet.crc` as a sealed session after the
+    one being looked for, and flip a pending verdict to absent on the strength of a file
+    that holds no rows.
+    """
+    fixture_lake.with_chains("SPY", SESSION, table(close_rows(SESSION, SET, volumes=VOLUMES)))
+    reference(fixture_lake)
+    root = fixture_lake.build()
+    sidecar = root / "chains" / "ticker=SPY" / f"date={THIRD}.parquet.crc"
+    sidecar.write_bytes(b"not a partition")
+
+    answer = view(root, constants=constants())
+
+    assert verdicts(answer) == {(VERDICT_PENDING, REASON_NOT_YET_CAPTURED)}
+
+
+def test_omitting_the_root_reads_the_configured_lake(tmp_path: Path, monkeypatch):
+    """`resolve_lake_root` is the read layer's one config read, and this is its second caller.
+
+    The loader's own use is covered by #249's test. Nothing covered the view's, so the
+    extraction's whole justification rested on a call nothing exercised. The other lake
+    holds the same ticker and session with a different answer.
+
+    The calendar is left out here too, for the same reason. Every other test injects one,
+    so nothing was exercising the default the signature promises.
+    """
+    configured = FixtureLake(tmp_path / "configured")
+    configured.with_chains("SPY", SESSION, table(close_rows(SESSION, SET, volumes=VOLUMES)))
+    configured.with_chains(
+        "SPY",
+        FOLLOWING,
+        table(
+            cycle_rows(FOLLOWING, 9, 30, REFRESHED, volumes=VOLUMES)
+            + cycle_rows(FOLLOWING, 9, 31, REFRESHED, volumes=VOLUMES)
+        ),
+    )
+    reference(configured)
+    configured_root = configured.build()
+
+    other = FixtureLake(tmp_path / "other")
+    other.with_chains("SPY", SESSION, table(close_rows(SESSION, SET, volumes=VOLUMES)))
+    reference(other)
+    other.build()
+
+    monkeypatch.setenv(CONFIG_PATH_ENV, str(write_config(tmp_path, configured_root)))
+
+    answer = oi_view("SPY", SESSION, constants=constants())
+
+    assert verdicts(answer) == {(VERDICT_SETTLED, None)}
+    assert answer.column("source_session").to_pylist()[0] == FOLLOWING
+
+
+def test_a_cycle_written_in_two_spellings_names_the_same_source_either_way(tmp_path: Path):
+    """One instant has more than one ISO spelling, and a cycle can carry several.
+
+    SPY's real 2026-09-11 partition holds 408 ``snap_ts`` texts naming 406 instants, so this
+    is a shape the lake writes rather than one invented here. The two lakes below hold the
+    same cycle with its rows in opposite orders, and the provenance a reader is handed must
+    not depend on which row came back first.
+    """
+    eastern = et(FOLLOWING, 9, 30)
+    utc = "2026-09-15T13:30:00+00:00"
+    half = list(REFRESHED.items())
+    east_rows = [row(eastern, s, v, volume=VOLUMES[s]) for s, v in half[:4]]
+    utc_rows = [row(utc, s, v, volume=VOLUMES[s]) for s, v in half[4:]]
+
+    sources = []
+    for name, first in (("east-first", east_rows + utc_rows), ("utc-first", utc_rows + east_rows)):
+        lake = FixtureLake(tmp_path / name)
+        lake.with_chains("SPY", SESSION, table(close_rows(SESSION, SET, volumes=VOLUMES)))
+        lake.with_chains(
+            "SPY",
+            FOLLOWING,
+            table(first + cycle_rows(FOLLOWING, 9, 31, REFRESHED, volumes=VOLUMES)),
+        )
+        reference(lake)
+        answer = oi_view(
+            "SPY", SESSION, lake_root=lake.build(), calendar=CALENDAR, constants=constants()
+        )
+        assert verdicts(answer) == {(VERDICT_SETTLED, None)}
+        sources.append(answer.column("source_snap_ts").to_pylist()[0])
+
+    assert sources[0] == sources[1]
+    assert sources[0] in {eastern, utc}
+
+
+def test_the_injected_calendar_is_what_decides_the_next_session(fixture_lake: FixtureLake):
+    """The `calendar` seam exists so a caller can hand in a calendar, and nothing used it.
+
+    Every other test passes the same calendar the default builds, so a view that ignored
+    the argument answered identically. Here the injected calendar calls 2026-09-15 a
+    holiday, which the real one does not, and the walk has to step over it to 2026-09-16.
+    """
+    fixture_lake.with_chains("SPY", SESSION, table(close_rows(SESSION, SET, volumes=VOLUMES)))
+    fixture_lake.with_chains(
+        "SPY",
+        FOLLOWING,
+        table(cycle_rows(FOLLOWING, 9, 30, LATER_REFRESH, volumes=VOLUMES)),
+    )
+    fixture_lake.with_chains(
+        "SPY",
+        THIRD,
+        table(
+            cycle_rows(THIRD, 9, 30, REFRESHED, volumes=VOLUMES)
+            + cycle_rows(THIRD, 9, 31, REFRESHED, volumes=VOLUMES)
+        ),
+    )
+    reference(fixture_lake)
+    root = fixture_lake.build()
+    without_the_15th = weekday_sessions(date(2026, 9, 14), holidays={date(2026, 9, 15)})
+
+    answer = oi_view(
+        "SPY", SESSION, lake_root=root, calendar=without_the_15th, constants=constants()
+    )
+
+    assert verdicts(answer) == {(VERDICT_SETTLED, None)}
+    assert answer.column("source_session").to_pylist()[0] == THIRD
 
 
 # -- scope, and the refusals that are not markers ------------------------------

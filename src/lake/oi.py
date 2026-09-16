@@ -563,9 +563,15 @@ def _cycle_oi(
         return None
     occs = table.column(_OCC).to_pylist()
     ois = table.column(_OI).to_pylist()
+    # One instant has more than one ISO spelling, and a cycle can carry several of them:
+    # SPY's 2026-09-11 partition holds 408 ``snap_ts`` texts naming 406 instants. They all
+    # name the same minute here, because the loader resolved them together, so which one
+    # rides the answer is a question of being reproducible rather than of being right. The
+    # smallest is taken so a partition written in a different row order reports the same
+    # provenance.
     stamps = table.column(_SNAP_TS).to_pylist()
     return _Cycle(
-        snap_ts=stamps[0] if stamps else None,
+        snap_ts=min(stamps) if stamps else None,
         open_interest=dict(zip(occs, ois, strict=True)),
     )
 
