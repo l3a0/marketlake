@@ -118,7 +118,7 @@ from lake.control_plane import (
 )
 from lake.deadman import CAPTURE_SLUG, DeadMan
 from lake.gap import GapMarker, MarkingReport, surfaces_for
-from lake.journal import ROW_KIND_DATA
+from lake.journal import CHAINS_SURFACE, ROW_KIND_DATA
 from lake.metadata import stamp_assertion_pid, stamp_cycle, stamp_ping
 from lake.report import write_close_guard
 from lake.runner import Pinger, UrllibPinger
@@ -447,6 +447,9 @@ def _close_fill(
     token_path: str | Path | None,
     session_clock: SessionClock,
     clock: Clock,
+    *,
+    observer: SchemaDriftObserver,
+    publisher: Publisher,
 ) -> Callable[[str, datetime], FillResult]:
     """The close+5 guard's fill: refetch one ticker's option close and journal it.
 
@@ -466,11 +469,40 @@ def _close_fill(
     tag is ``option_close`` by definition, stamped by the fill itself. The session phase
     is read off the slot the same way ``_serve_slot`` reads it off a capture minute, so
     the filled row and the cycle it replaces agree.
+
+    The fill's own schema-drift page is sent from here, and the two seams it needs are why
+    this factory takes them. Capture stops at the option close, so the fill writes the
+    session's last segment, and a retype that starts inside the five-minute window reaches
+    nobody until the next session's first cycle. That is about seventeen hours midweek and
+    the whole weekend across a Friday close.
+
+    It pages for itself rather than through ``on_cycle``. That hook feeds three alarms off
+    one ``CycleResult``. The watchdog's per-ticker counters take one, the dead-man takes
+    another through ``landed_data``, and this page is the third. A one-ticker fill result
+    handed to it would charge the watchdog against a roster of one and feed the dead-man a
+    capture at a slot no cycle ran. The drift observer is not that hook's only consumer,
+    so the fill takes the observer alone and calls the pager itself.
+
+    It goes in through ``observe_partial`` rather than through ``observe``, for the reason
+    that method's own docstring gives.
+
+    The page is stamped at ``clock.now()`` rather than at the slot, which is where the
+    guard's own report is stamped too. The slot is the option close and this observation
+    was made about five minutes after it, and the publisher buckets its daily cap by the
+    market date, which both instants share.
+
+    The page is guarded, and the consequence is what makes it worth the branch rather than
+    the odds. ``Publisher.publish`` never raises, so what is left is the two prints to
+    stderr, which under launchd is a captured file that a full disk can refuse. A raise
+    here would leave the guard's own catch to read a fill whose rows are already on disk
+    as a failed one, so it would report the close unfilled and write none of that ticker's
+    absent markers. The cycle hook leaves the same call unguarded because there a raise
+    costs the tick and says so.
     """
 
     def fill(ticker: str, slot: datetime) -> FillResult:
         phase = session_clock.phase_at(slot)
-        return fill_option_close_from_config(
+        result = fill_option_close_from_config(
             ticker,
             slot=slot,
             clock=clock,
@@ -478,6 +510,18 @@ def _close_fill(
             token_path=token_path,
             session_phase=phase.value if phase is SessionPhase.POST_EQUITY_CLOSE else None,
         )
+        try:
+            page_schema_drift(
+                publisher,
+                observer.observe_partial(CHAINS_SURFACE, ticker, result.routed_columns),
+                now=clock.now(),
+            )
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must never cost a fill
+            print(
+                f"capture: schema-drift page failed for {ticker}: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+        return result
 
     return fill
 
@@ -488,6 +532,9 @@ def _close_guard(
     session_clock: SessionClock,
     clock: Clock,
     token_path: str | Path | None = None,
+    *,
+    observer: SchemaDriftObserver,
+    publisher: Publisher,
 ) -> CloseGuard | None:
     """The close+5 guard for this daemon, or ``None`` when it cannot be built.
 
@@ -503,7 +550,9 @@ def _close_guard(
 
     The fill is wired here too. Without it the guard finds a missing option close, says
     "no fill fetcher", and returns, so the five-minute window the whole close+5 rule
-    exists for is watched and never used.
+    exists for is watched and never used. The observer and the publisher pass straight
+    through to it, because the segment a fill writes carries a schema-drift signature that
+    nothing else in this process would ever read.
     """
     try:
         config = load_config(config_path)
@@ -517,7 +566,14 @@ def _close_guard(
         spans=_spans_reader(config.lake_root),
         session_clock=session_clock,
         master=_master_reader(config.lake_root),
-        fill=_close_fill(config_path, token_path, session_clock, clock),
+        fill=_close_fill(
+            config_path,
+            token_path,
+            session_clock,
+            clock,
+            observer=observer,
+            publisher=publisher,
+        ),
     )
 
 
@@ -871,6 +927,22 @@ def run_loop_from_config(
     session_clock = SessionClock(clock, calendar)
 
     hooks = hooks if hooks is not None else DaemonHooks()
+    # Built here, ahead of every hook, because the close+5 guard below needs two of its
+    # four pieces. The guard's fill pages its own schema drift, so it takes the observer
+    # and the publisher at construction. Nothing else moves with it: the three wrappers
+    # that close over a hook still capture it where they are wired, in the order the
+    # comments below give.
+    #
+    # It is also the one loader here that refuses rather than standing down. Every other
+    # config or roster read in this function returns ``None`` and carries on: the
+    # assertion pid stamp, the idle stamp, the gap marker, the guard, and the guard's
+    # reporter. Building the alarm first means a file that will not load raises before any
+    # of them reach it, naming the same reason each of them would have swallowed. Through
+    # ``main`` the move is not even observable, because it wraps this call in
+    # ``input_errors_exit`` and a raise from anywhere inside is one named line and exit 2.
+    watchdog, publisher, deadman, schema_drift = _alarm(
+        config_path, tickers_path, session_clock, transport, pinger
+    )
     holder = AssertionHolder(runner=assertion_runner)
     caller_on_tick = hooks.on_tick
     pid_stamp = _assertion_pid_stamp(config_path)
@@ -922,7 +994,15 @@ def run_loop_from_config(
     # load-bearing. On a post-close restart the guard owns the two close minutes, and it
     # must write them before startup marking walks the day, or the day's 16:00 and 16:15
     # would carry a marker from each writer.
-    guard = _close_guard(config_path, tickers_path, session_clock, clock, token_path)
+    guard = _close_guard(
+        config_path,
+        tickers_path,
+        session_clock,
+        clock,
+        token_path,
+        observer=schema_drift,
+        publisher=publisher,
+    )
     if guard is not None:
         report_guard = _guard_reporter(config_path, clock)
         dispatch = SessionDispatch(
@@ -1011,9 +1091,6 @@ def run_loop_from_config(
     # runs no cycle for a slot it slept through and those are the minutes the daemon was
     # worst off. The dead-man rides the same two plus every tick, so an idle weekday
     # keeps feeding the check that pages on silence.
-    watchdog, publisher, deadman, schema_drift = _alarm(
-        config_path, tickers_path, session_clock, transport, pinger
-    )
     alarm_on_cycle = hooks.on_cycle
     alarm_on_skipped = hooks.on_skipped
     alarm_on_tick = hooks.on_tick

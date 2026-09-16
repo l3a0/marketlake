@@ -352,15 +352,16 @@ class SegmentOutcome:
 
     ``routed_columns`` names the columns whose vendor field arrived at a type the column
     refused, which is the schema-drift signature ``journal.routed_columns`` reads off the
-    batch. It rides the outcome because the batch does not outlive the write, and the
-    daemon's drift observer is what reads it. It is empty on every ordinary segment.
+    batch. It rides the outcome because the batch does not outlive the write, and every
+    reader of the finding takes it from there. It is empty on every ordinary segment.
 
-    The loop's own cycle is what fills it. ``journal_snapshot`` writes the same shape of
-    segment for the close+5 fill and for an onboarding snapshot, and leaves this empty,
-    because neither reaches the drift observer: the fill's outcome is folded into a
-    ``FillResult`` that keeps the path alone, and onboarding runs outside the daemon. So a
-    retype that starts inside the close+5 window is on disk and unpaged until the next
-    session's first cycle, which is marketlake #271.
+    Both writers fill it. The loop's own cycle computes it in ``_write``, and
+    ``journal_snapshot`` computes it for the close+5 fill and for an onboarding snapshot,
+    which write the same shape of segment from outside the loop. Where a finding goes
+    then differs, because the two paths have different readers. A fill's rides its
+    ``FillResult`` back to the daemon, which pages it as a partial observation. An
+    onboarding snapshot's rides the sign-off report, because onboarding runs in its own
+    process and reaches no observer at all.
     """
 
     surface: str
@@ -465,9 +466,10 @@ class ChainFetch:
 
 @dataclass(frozen=True)
 class FillResult:
-    """What one close+5 fill captured, and what it could not.
+    """What one close+5 fill captured, what it could not, and what its payload did.
 
-    The guard needs all three of these and a bare expiration list carries only the first.
+    Four fields answering two readers. The guard needs the first three, and a bare
+    expiration list carries only the first. ``routed_columns`` is not the guard's at all.
 
     ``expirations`` are the series the landed segment holds, empty when nothing landed.
     ``absent`` are the date windows the fetch gave up on, the same markers that rode the
@@ -481,11 +483,18 @@ class FillResult:
     ``landed`` is whether a segment was written. A fill that captured nothing writes no
     row, because the day already holds the gap row from the cycle that failed at the
     close.
+
+    ``routed_columns`` is the drift signature the landed segment carried, the same value
+    ``SegmentOutcome.routed_columns`` holds. It rides here because the fill writes from
+    outside the loop, so the daemon's drift observer never sees the outcome and this
+    result is the only thing that reaches the daemon at all. It is empty on a fill that
+    landed nothing, since there was no payload to read.
     """
 
     expirations: tuple[str, ...] = ()
     absent: tuple[journal.AbsentMarker, ...] = ()
     error_class: str | None = None
+    routed_columns: tuple[str, ...] = ()
 
     @property
     def landed(self) -> bool:
@@ -1208,9 +1217,13 @@ def journal_snapshot(
        is the writer-session stamp. The caller stamps ``cycle_start``, ``fetch_ts``, and
        ``fetch_end_ts`` from the injected clock around its own fetch.
     2. Build the surface's data batch with the D4 journal row builders.
-    3. Open a fresh ``SegmentWriter``, write the one cycle, and close it, which lays down
+    3. Read the schema-drift signature off that batch with ``journal.routed_columns`` and
+       put it on the returned outcome's ``routed_columns``. The cycle's own writer does
+       the same thing on the same terms, before the write and guarded, and the comment at
+       the call below says what each of those two buys here.
+    4. Open a fresh ``SegmentWriter``, write the one cycle, and close it, which lays down
        the end-of-stream marker.
-    4. Append one segment-keyed manifest entry under the lake-root lock, keyed by the
+    5. Append one segment-keyed manifest entry under the lake-root lock, keyed by the
        segment path, ``source`` defaulting to ``capture``, and ``fetched_at`` the
        dispatch time, exactly as the loop records a segment.
 
@@ -1247,6 +1260,20 @@ def journal_snapshot(
         windows=windows,
         absent_markers=absent_markers,
     )
+    # The drift scan, on the same terms the cycle's own writer states. It runs before the
+    # writer opens, so a raise cannot sit between a durable segment and its manifest
+    # entry, and it is guarded because a diagnostic must never cost a capture. The guard
+    # buys more here than it does in the cycle: onboarding calls this last of all, after
+    # the master, the spans and their manifest entries have committed, so an unguarded
+    # raise would leave a registered capturing ticker with no sign-off report at all.
+    try:
+        routed = journal.routed_columns(surface, batch)
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must never cost a minute
+        print(
+            f"capture: schema-drift scan failed on {surface} {ticker}: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        routed = ()
     writer = journal.SegmentWriter.open(lake_root, surface, ticker, day, start_ts, writer_pid)
     with writer:
         writer.write_cycle(batch)
@@ -1273,6 +1300,7 @@ def journal_snapshot(
         # for a segment that does hold a failure would hide it from every caller.
         error_class=absent_markers[0].error_class if absent_markers else None,
         fetched_at=fetched_at,
+        routed_columns=routed,
     )
 
 
@@ -1336,6 +1364,14 @@ def fill_option_close(
     every per-slot completeness read. The guard records the refusal in its own outcome
     instead, naming the error class this result carries.
 
+    The snapshot's schema-drift signature rides the result too. The fill writes the last
+    segment of the session, so a retype that begins inside the close+5 window would
+    otherwise reach nobody until the next session's first cycle. That is about seventeen
+    hours midweek and the whole weekend across a Friday close. Those are also the rows
+    ``load_chain(snap=None)`` resolves to, since the fill tags every one of them
+    ``option_close``. What this returns is the finding alone. It names one ticker, so what
+    may be done with it is settled by the daemon, at ``daemon._close_fill``.
+
     ``guards`` and ``plan`` default the way ``run_cycle`` defaults them, so a caller with
     no config still fetches by the machine's own plan.
     """
@@ -1379,6 +1415,7 @@ def fill_option_close(
         tuple(_landed_expirations(outcome.path)),
         fetched.absent_markers,
         fetched.error_class,
+        outcome.routed_columns,
     )
 
 

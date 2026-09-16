@@ -192,7 +192,7 @@ reaches for config.
 That branch is the only call to ``load_config`` in ``src/lake`` that names no config path
 and does not sit in a ``main``. The other two no-argument calls are ``probe.main`` and
 ``record.main``, and every remaining call in the package is handed a path by its caller,
-the eight ``*_from_config`` wiring functions included. So a reader who expects a config
+the nine ``*_from_config`` wiring functions included. So a reader who expects a config
 path to arrive as an argument finds the one place it does not, written down here rather
 than generalised.
 """

@@ -15,6 +15,10 @@ mapping only (the FIGI is deferred to a CUSIP-keyed backfill), verify the real-t
 entitlement before trusting the ticker, write the roster entry, journal the snapshot,
 and persist the master with a manifest entry so the scrub stays clean. A delayed feed is
 refused before anything is written.
+
+The last group covers the snapshot's own schema-drift signature, on both surfaces, and
+where onboarding sends it. The capture loop pages a phone for a vendor retype. Onboarding
+runs in its own process with no alarm behind it, so the sign-off report is its channel.
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from lake import gap, journal
+from lake import gap, journal, schema_drift
 from lake.calendar import MARKET_TZ
 from lake.capture import CAPTURE_SOURCE
 from lake.capture_spans import SPANS_PARTITION, CaptureSpans, CaptureSpansError, spans_path
@@ -1476,3 +1480,153 @@ def test_a_refused_manifest_append_still_reaches_the_operator_as_a_traceback(
         _drive_main(tmp_path, config_path, tickers_path)
 
     assert capsys.readouterr().err == ""
+
+
+# -- the snapshot's schema-drift signature, on both surfaces ---------------------------
+
+# A vendor field sent at a type its pinned column refuses. ``openInterest`` is ``int64``
+# on chains and ``quote.totalVolume`` is ``int64`` on quotes, so a float refuses on both.
+# Onboarding reaches both surfaces, because ``--no-options`` onboards through the same
+# ``journal_snapshot`` on quotes, while the close+5 fill is chains alone.
+_RETYPED_OPEN_INTEREST = 1234.7
+_RETYPED_TOTAL_VOLUME = 7.5
+
+
+def _drifting_chain_vendor(day: date = _MID_SESSION_DAY) -> CassetteVendor:
+    """A chain vendor whose contracts send ``openInterest`` at a refused type."""
+    body = _chain_body(is_delayed=False)
+    for exp_map in (body["callExpDateMap"], body["putExpDateMap"]):
+        for strikes in exp_map.values():
+            for contracts in strikes.values():
+                for contract in contracts:
+                    contract["openInterest"] = _RETYPED_OPEN_INTEREST
+    return CassetteVendor(windowed_chain_cassette("SPY", day, body))
+
+
+def _drifting_quote_vendor(ticker: str) -> CassetteVendor:
+    """A quote vendor whose quote block sends ``totalVolume`` at a refused type."""
+    return CassetteVendor(
+        Cassette(
+            interactions=(
+                Interaction(
+                    endpoint="quotes",
+                    params={"symbols": [ticker]},
+                    status=200,
+                    body={
+                        ticker: {
+                            "realtime": True,
+                            "reference": {"cusip": "444444444"},
+                            "quote": {"bidPrice": 1.0, "totalVolume": _RETYPED_TOTAL_VOLUME},
+                        }
+                    },
+                ),
+            )
+        )
+    )
+
+
+def test_an_onboarding_chain_snapshot_on_a_drifting_field_says_so(lake_root, tmp_path):
+    """A ticker onboarded onto a drifting field, and where the finding goes.
+
+    The capture loop pages a phone for this. Onboarding runs in its own process with no
+    alarm behind it, so the sign-off report is the operator channel it has, and the
+    deferred half of this was that a snapshot journaled a retype and reported nothing at
+    all. How long that silence lasts is not a minute: #297 seeded the live lake at 03:25
+    UTC, outside any session, so the next ordinary cycle was the following morning's open.
+    """
+    report = onboard(
+        "SPY",
+        clock=ManualClock(start=_MID_SESSION),
+        vendor=_drifting_chain_vendor(),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=True,
+    )
+
+    assert report.routed_columns == ("open_interest",)
+    rendered = report.render()
+    assert "schema drift:    chains open_interest arrived at a type the column refused" in rendered
+
+    # The signature is read off the batch, and the segment is what carries the evidence.
+    row = journal.read_segment(lake_root / report.snapshot_segment).to_pylist()[0]
+    assert row["open_interest"] is None
+    assert "openInterest" in row["extra"]
+
+
+def test_an_onboarding_quote_snapshot_on_a_drifting_field_says_so(lake_root, tmp_path):
+    """The equity-only half, which nothing else here would reach.
+
+    ``journal.routed_columns`` takes the surface and matches against that surface's own
+    ``extra_paths``, so it is not chains-only. ``--no-options`` onboards through the same
+    ``journal_snapshot`` on quotes, and a test that covered the chains half alone would
+    leave the quotes one free to be wired to the wrong surface's paths.
+    """
+    report = onboard(
+        "QQQ",
+        clock=ManualClock(start=_MID_SESSION),
+        vendor=_drifting_quote_vendor("QQQ"),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=False,
+    )
+
+    assert report.snapshot_surface == journal.QUOTES_SURFACE
+    assert report.routed_columns == ("total_volume",)
+    assert "schema drift:    quotes total_volume" in report.render()
+
+    row = journal.read_segment(lake_root / report.snapshot_segment).to_pylist()[0]
+    assert row["total_volume"] is None
+    assert "totalVolume" in row["extra"]
+
+
+def test_an_onboarding_snapshot_that_meets_no_drift_says_nothing(lake_root, tmp_path):
+    """The ordinary onboarding, which is every one this lake has run.
+
+    The report stays silent, so the line an operator has to read means something when it
+    is there. The snapshot itself is unchanged, which is the other half of the claim: the
+    scan is a read of the built batch and must not touch what lands.
+    """
+    report = onboard(
+        "SPY",
+        clock=ManualClock(start=_MID_SESSION),
+        vendor=_chain_vendor(is_delayed=False),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=True,
+    )
+
+    assert report.routed_columns == ()
+    assert "schema drift" not in report.render()
+    rows = journal.read_segment(lake_root / report.snapshot_segment).to_pylist()
+    assert rows
+    assert {row["extra"] for row in rows} == {None}
+
+
+def test_onboarding_on_a_drifting_field_reaches_no_pager(lake_root, tmp_path, monkeypatch):
+    """Why the report is the channel, held by what runs rather than by what is imported.
+
+    The daemon's drift page needs a publisher, and a publisher is built from the two
+    secrets in the machine-local config. Onboarding is a hand-run command in its own
+    process with no alarm behind it, so wiring a page in here would mean a second place
+    that reveals those secrets and a pager whose per-session cap nothing else counts
+    against.
+
+    The recorder goes on ``lake.schema_drift.page`` itself, which is the one object any
+    route to a page has to reach. An earlier version of this asserted three names were
+    absent from ``lake.onboard``, and a function-local import under a fourth name walked
+    straight past it.
+    """
+    called: list[tuple] = []
+    monkeypatch.setattr(schema_drift, "page", lambda *args, **kwargs: called.append(args))
+
+    report = onboard(
+        "SPY",
+        clock=ManualClock(start=_MID_SESSION),
+        vendor=_drifting_chain_vendor(),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=True,
+    )
+
+    assert report.routed_columns == ("open_interest",), "the drifting case did not arise"
+    assert called == [], "onboarding paged"

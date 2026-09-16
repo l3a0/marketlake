@@ -29,7 +29,7 @@ from pathlib import Path
 import pytest
 
 from lake import report
-from lake.actions import UnresolvedSymbol
+from lake.actions import CHECK_DIVIDEND_CONSISTENCY, TYPE_DIVIDEND, UnresolvedSymbol
 from lake.alert import Message, Publisher, undelivered
 from lake.report import Withheld
 from tests.support.calendar import et
@@ -43,8 +43,8 @@ AT = et(2026, 9, 14, 20, 0)
 HELD = Withheld(
     symbol="SPY",
     observed_on=DAY,
-    event="dividend",
-    check="dividend_consistency",
+    event=TYPE_DIVIDEND,
+    check=CHECK_DIVIDEND_CONSISTENCY,
     computed=7.61406,
     against=7.61408,
     instrument_id=42,

@@ -132,11 +132,15 @@ class CloseGuard:
 
     ``fill`` is the injected fetch. It is handed a ticker and the close slot and returns
     a ``capture.FillResult``, which is what the daemon passes and what a fake here has to
-    return too. Three things ride it, and the guard reads every one: the expirations the
-    fill captured, the date windows its fetch gave up on, and the representative error
-    class. A bare expiration list carried only the first, which left a partially failed
-    fill unable to say so and made a series the fetch missed indistinguishable from one
-    the vendor withdrew.
+    return too. Three of its four fields are the guard's, and it reads every one: the
+    expirations the fill captured, the date windows its fetch gave up on, and the
+    representative error class. A bare expiration list carried only the first, which left
+    a partially failed fill unable to say so and made a series the fetch missed
+    indistinguishable from one the vendor withdrew.
+
+    The fourth is ``routed_columns``, the drift signature the landed segment carried, and
+    it is not the guard's at all. The daemon's own fill closure reads it and pages it, so
+    a fake here that returns the three above is still a complete fake for this class.
 
     The fill both fetches and journals, because the row it lands carries the close slot
     rather than its own fetch minute and only the writer can stamp that. Leaving it unset

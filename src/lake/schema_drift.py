@@ -28,6 +28,17 @@ Two rules keep one vendor change to one page, and both are arithmetic rather tha
    page count with the roster while the fact stayed one fact. The page carries how many
    tickers each column drifted on, and the tickers themselves go to stderr.
 
+Not every observation is a whole cycle, which is where that second rule needs care. The
+close+5 fill writes one ticker's segment through ``capture.journal_snapshot``, outside the
+loop, and it carries the same signature. ``observe_partial`` is its way in. The fold still
+holds, because one vendor fact is still one page. What does not hold is the ticker count,
+since a writer that read one ticker can only ever report one, so a partial finding prints
+no count and the page says which ticker was read instead.
+
+An onboarding snapshot writes that same shape of segment and never arrives here at all. It
+runs in its own process with no alarm behind it, so its finding rides its sign-off report,
+at ``onboard.OnboardReport``.
+
 Evidence comes from data segments alone, and it is counted per ticker rather than per
 surface. A gap segment carries no vendor observation, so a ticker that gapped says nothing
 about the payload's shape and a column it was drifting stays drifting until that same
@@ -82,15 +93,20 @@ PAGE_COLUMN_CAP = 12
 
 @dataclass(frozen=True)
 class ColumnDrift:
-    """One column that started drifting this cycle, and the tickers that carried it.
+    """One column that started drifting, and the tickers that carried it.
 
     ``tickers`` is in cycle order, which is roster order, and it is what stderr prints.
     The page prints its length instead, per the collapsing rule.
+
+    ``partial`` says the finding came from an observation of part of the roster rather
+    than a whole cycle, which is what ``observe_partial`` produces. It is what ``_body``
+    reads to decide whether printing a ticker count would be honest.
     """
 
     surface: str
     column: str
     tickers: tuple[str, ...]
+    partial: bool = False
 
 
 class SchemaDriftObserver:
@@ -109,6 +125,12 @@ class SchemaDriftObserver:
     between one page and a page every other minute. Their absence is also what clears a
     retired ticker, since a ticker the cycle no longer names at all is off the roster and
     can never produce the evidence that would clear it.
+
+    There are two ways in, and which one a caller takes is decided by whether it holds a
+    roster. ``observe`` takes a whole cycle and runs both halves, the transitions and the
+    clearance. ``observe_partial`` takes one ticker's segment and runs the transitions
+    alone. A caller holding one ticker must take the second, for the reason that method
+    gives.
     """
 
     def __init__(self) -> None:
@@ -165,13 +187,81 @@ class SchemaDriftObserver:
                 self._routing.pop(surface, None)
         return tuple(started)
 
+    def observe_partial(
+        self, surface: str, ticker: str, columns: Sequence[str]
+    ) -> tuple[ColumnDrift, ...]:
+        """Take one ticker's finding and return the columns that started drifting in it.
+
+        This is the entry for the close+5 fill, which is the one writer that is not a
+        cycle and still reaches a pager. It writes one segment for one ticker through
+        ``capture.journal_snapshot``, and that segment carries the same drift signature a
+        cycle's segment carries. An onboarding snapshot writes the same shape and comes
+        nowhere near here, because it has no publisher to page through.
+
+        It runs the transition half and not the clearance half, which is the whole reason
+        it exists rather than a one-segment ``CycleResult``. Such a result type-checks and
+        reads as a cycle, and the damage is silent. Clearance subtracts the roster, at
+        ``unresolved = (was - observed) & named``, so a roster of one names every other
+        ticker as retired and drops a column they are still drifting. Nothing would be
+        lost on disk and no page would be missed. The cost is the duplicate the state
+        exists to prevent: the next ordinary cycle would find the column absent, read it
+        as a fresh transition, and page a second time for one vendor fact.
+
+        So a partial observation only ever adds. A column it names that the surface was
+        not already drifting is a transition and pages, marked ``partial`` so the page
+        does not present one ticker as the retype's reach. A column it names that was
+        already drifting pages nothing and remembers this ticker beside the others, which
+        is what keeps the next ordinary cycle from re-reading it as new. A partial
+        observation that finds nothing touches no state at all, because absence of
+        evidence from one ticker is not evidence about the rest.
+
+        Two prices come with that, and neither is hidden.
+
+        1. A partial page says the reach is unmeasured, and no later page measures it. The
+           state this writes is what silences the next whole cycle, which is the one
+           observation that could have counted the roster. So the operator's one page for
+           the drift is the one that could not say how far it went, where before this
+           existed the next morning's cycle paged the count. The reach is still on stderr
+           and in the nightly report, and which channel should carry it is marketlake #318.
+        2. ``observe`` prunes only the surfaces a cycle's roster names, so a surface
+           reached by partial observations alone would remember a ticker per call and
+           never drop one. Nothing reaches that today, because the only caller names the
+           chains surface and every cycle names it too. A second caller on another surface
+           is what would make it real.
+        """
+        was = dict(self._routing.get(surface, {}))
+        started: list[ColumnDrift] = []
+        for column in sorted(set(columns)):
+            if column not in was:
+                started.append(ColumnDrift(surface, column, (ticker,), partial=True))
+            held = self._routing.setdefault(surface, {})
+            held[column] = was.get(column, frozenset()) | {ticker}
+        return tuple(started)
+
 
 def _body(drifted: Sequence[ColumnDrift]) -> str:
-    """The page's text: what happened, then each surface's columns and their reach."""
+    """The page's text: what happened, then each surface's columns and their reach.
+
+    A reach is printed only where one was measured. A finding from a whole cycle carries
+    the roster's own answer, so the page prints how many tickers drifted the column. A
+    partial finding carries whatever its one writer looked at, so the count would be one
+    however far the retype actually reaches, and an operator reading "on 1 ticker(s)" at
+    16:20 would take a vendor-wide retype for an isolated one. The count comes off those,
+    and a closing sentence names what was read instead.
+
+    One page's findings all come from one observation, because each caller passes what one
+    call to ``observe`` or ``observe_partial`` returned, and neither ever returns both
+    kinds. So the list is all partial or none of it is. The closing sentence is still
+    written to be true of a mixed list, since what it names is the reach of a column that
+    printed no count.
+    """
     named: dict[str, list[str]] = {}
     for drift in drifted:
-        count = len(drift.tickers)
-        named.setdefault(drift.surface, []).append(f"{drift.column} on {count} ticker(s)")
+        if drift.partial:
+            named.setdefault(drift.surface, []).append(drift.column)
+        else:
+            count = len(drift.tickers)
+            named.setdefault(drift.surface, []).append(f"{drift.column} on {count} ticker(s)")
     parts = []
     for surface in sorted(named):
         columns = named[surface]
@@ -179,10 +269,17 @@ def _body(drifted: Sequence[ColumnDrift]) -> str:
         if len(columns) > len(shown):
             shown.append(f"and {len(columns) - len(shown)} more")
         parts.append(f"{surface}: {', '.join(shown)}")
-    return (
+    body = (
         "The vendor sent a known field at a type its column refused, so the column is null "
         f"on the rows that carried it and the raw value is in extra. {'. '.join(parts)}."
     )
+    looked_at = sorted({ticker for drift in drifted if drift.partial for ticker in drift.tickers})
+    if looked_at:
+        body += (
+            f" Only {', '.join(looked_at)} was read, not a whole cycle, so the reach of a "
+            "column printed without a count is unmeasured."
+        )
+    return body
 
 
 def page(publisher: Publisher, drifted: Sequence[ColumnDrift], *, now: datetime) -> None:
@@ -202,9 +299,11 @@ def page(publisher: Publisher, drifted: Sequence[ColumnDrift], *, now: datetime)
     by the publisher itself, and the reason is named on stderr too.
 
     The publisher is required rather than optional. ``compact._page_drift`` takes one that
-    may be ``None`` because ``recompact_ticker_day`` is a hand run that passes none. This
-    producer has one caller, the daemon's cycle hook, and ``_alarm`` always builds a
-    publisher, so an optional one here would be a branch nothing reaches.
+    may be ``None`` because ``recompact_ticker_day`` is a hand run that passes none. Both
+    callers here are the daemon's, its cycle hook and its close+5 fill, and ``_alarm``
+    always builds a publisher, so an optional one here would be a branch nothing reaches.
+    Onboarding is the producer that has no publisher, and it reaches none of this: it runs
+    in its own process with no alarm behind it, so its finding rides its sign-off report.
     """
     if not drifted:
         return
