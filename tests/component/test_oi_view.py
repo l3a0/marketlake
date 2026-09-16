@@ -285,22 +285,30 @@ def test_1_a_later_untagged_cycle_does_not_become_the_baseline(fixture_lake: Fix
 
 
 def test_2_a_change_under_the_quorum_declares_no_refresh(fixture_lake: FixtureLake):
-    """#137 test 2. One contract moving is noise, not a settlement."""
+    """#137 test 2. One contract moving is noise, not a settlement.
+
+    The one-contract move has to hold across a cycle of its own, or the plateau rejects it
+    and the quorum is never what decided anything. That is the shape a real session takes
+    before the load lands: the number sits still, one contract trades, and the number sits
+    still again. So the first two cycles carry the single move, and the refresh arrives at
+    the third.
+    """
     one_moved = dict(SET)
     one_moved[occ(0)] = SET[occ(0)] + 500
     root = settled_lake(
         fixture_lake,
         [
             cycle_rows(FOLLOWING, 9, 30, one_moved, volumes=VOLUMES),
-            cycle_rows(FOLLOWING, 9, 31, REFRESHED, volumes=VOLUMES),
+            cycle_rows(FOLLOWING, 9, 31, one_moved, volumes=VOLUMES),
             cycle_rows(FOLLOWING, 9, 32, REFRESHED, volumes=VOLUMES),
+            cycle_rows(FOLLOWING, 9, 33, REFRESHED, volumes=VOLUMES),
         ],
     )
 
     answer = view(root, constants=constants())
 
     assert verdicts(answer) == {(VERDICT_SETTLED, None)}
-    assert answer.column("source_snap_ts").to_pylist()[0] == et(FOLLOWING, 9, 31)
+    assert answer.column("source_snap_ts").to_pylist()[0] == et(FOLLOWING, 9, 32)
 
 
 # -- 3. the plateau -----------------------------------------------------------
