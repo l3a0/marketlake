@@ -877,6 +877,79 @@ def test_the_command_against_a_lake_with_no_master_exits_two_with_a_named_line(
     assert "Traceback" not in printed.err
 
 
+def test_the_command_against_a_torn_master_says_something_different(
+    fixture_lake: FixtureLake, tmp_path: Path, capsys
+):
+    """#280 test 14, the other half of the master's two failures.
+
+    An absent master wants the onboarding command and a torn one wants a restore. An operator
+    told to seed a corrupt file is being told the wrong thing, so the two say different things
+    at the same exit code.
+    """
+    root = _lake(fixture_lake)
+    master_path(root).write_bytes(b"not a parquet file")
+    config = write_config(tmp_path, root)
+
+    code = bars.main(
+        ["--config", str(config), "--tickers", str(_tickers_file(tmp_path))],
+        clock=ManualClock(FIRST_NIGHT),
+        vendor_factory=lambda *a, **k: _RecordingVendor(_cassette()),
+    )
+
+    assert code == 2
+    printed = capsys.readouterr()
+    assert "Restore it from the backup" in printed.err
+    assert "python -m lake.onboard" not in printed.err
+    assert "Traceback" not in printed.err
+
+
+def test_the_command_exits_two_on_a_roster_frequency_nothing_can_fetch(
+    fixture_lake: FixtureLake, tmp_path: Path, capsys
+):
+    """The refusal reaches the operator as one line naming the file they have to edit.
+
+    It is tested through ``main`` rather than only through the core, because the exit code is
+    what an operator and a scheduler both read, and the core cannot say what that is.
+    """
+    root = _lake(fixture_lake)
+    config = write_config(tmp_path, root)
+    tickers = _tickers_file(tmp_path, "SPY: {options: true, bars: [5m]}\n")
+
+    code = bars.main(
+        ["--config", str(config), "--tickers", str(tickers)],
+        clock=ManualClock(FIRST_NIGHT),
+        vendor_factory=lambda *a, **k: _RecordingVendor(_cassette()),
+    )
+
+    assert code == 2
+    assert "tickers.yaml" in capsys.readouterr().err
+
+
+def test_the_command_exits_two_when_the_token_is_dead(
+    fixture_lake: FixtureLake, tmp_path: Path, capsys
+):
+    """Auth death names the reauth command rather than filing a page of held findings.
+
+    Every remaining ticker-day fails it identically, so an exit code reading "some findings
+    held" would describe the wrong condition entirely.
+    """
+    root = _lake(fixture_lake)
+    config = write_config(tmp_path, root)
+
+    code = bars.main(
+        ["--config", str(config), "--tickers", str(_tickers_file(tmp_path))],
+        clock=ManualClock(FIRST_NIGHT),
+        vendor_factory=lambda *a, **k: _RecordingVendor(
+            _cassette(), fail_with={"SPY": VendorAuthError("refresh failed")}
+        ),
+    )
+
+    assert code == 2
+    printed = capsys.readouterr()
+    assert "python -m lake.reauth" in printed.err
+    assert "Traceback" not in printed.err
+
+
 def test_the_command_exits_one_when_a_finding_could_not_be_filed(
     fixture_lake: FixtureLake, tmp_path: Path, monkeypatch, capsys
 ):
@@ -1812,10 +1885,13 @@ def test_the_next_session_search_matches_the_bound_oi_already_uses():
     from lake import oi
 
     assert bars.NEXT_SESSION_SEARCH_DAYS == oi._NEXT_SESSION_SEARCH_DAYS
-    calendar = weekday_sessions(MONDAY)
+    calendar = weekday_sessions(MONDAY, MONDAY + timedelta(days=7))
     assert bars._calendar_next_session(calendar, SESSION) == FOLLOWING
-    # The bound is what the search gives up at, so a horizon of one cannot reach past a weekend.
-    assert bars._calendar_next_session(calendar, date(2026, 9, 18), horizon=1) is None
+    # A Friday is what the default bound has to reach past. Monday to Tuesday is one day, so a
+    # horizon of one would serve it and the default would say nothing.
+    friday, monday = date(2026, 9, 18), date(2026, 9, 21)
+    assert bars._calendar_next_session(calendar, friday) == monday
+    assert bars._calendar_next_session(calendar, friday, horizon=1) is None
 
 
 def test_the_daily_margin_is_an_argument_the_window_builder_reads():
@@ -2033,9 +2109,31 @@ def test_a_bar_below_the_settled_close_disagrees_too(fixture_lake: FixtureLake):
     (held,) = result.held
     assert held.finding.check == CHECK_BAR_CLOSE
     assert held.finding.computed == pytest.approx(below)
-    # A disagreement exactly on the tolerance agrees, so the boundary is inclusive.
-    edge = bars.check_close_cross(650.0 * (1 + CLOSE_CROSS_TOLERANCE), 650.0)
-    assert edge.agrees is True
+    # The boundary is inclusive. Multiplying by the tolerance and comparing does not land
+    # exactly on it in binary floating point, so the ratio is computed from the two values
+    # first and handed back as the tolerance. That puts the comparison exactly on the edge by
+    # construction rather than by hope.
+    computed, against = 650.325, 650.0
+    exactly = abs(computed - against) / abs(against)
+    assert bars.check_close_cross(computed, against, tolerance=exactly).agrees is True
+    assert bars.check_close_cross(computed, against, tolerance=exactly / 2).agrees is False
+
+
+def test_the_bar_close_is_the_last_row_by_stamp():
+    """The session's close is its last bar, and file order is not what says which that is.
+
+    The daily selection is one row today, so the ordering has nothing behind it there. It is
+    still the rule the helper states, and a 1-min partition is several rows, so the reading has
+    to be the stamp rather than the position. The rows here are handed over out of order, which
+    is what separates the two.
+    """
+    rows = [
+        {"bar_ts": "2026-09-14T19:59:00+00:00", "close": 651.0},
+        {"bar_ts": "2026-09-14T13:30:00+00:00", "close": 648.0},
+    ]
+    assert bars._bar_close(rows) == 651.0
+    assert bars._bar_close(list(reversed(rows))) == 651.0
+    assert bars._bar_close([]) is None
 
 
 def test_a_minute_partition_consults_no_settled_close(fixture_lake: FixtureLake, monkeypatch):
@@ -2175,10 +2273,13 @@ def test_a_failed_write_leaves_no_temp_file_beside_the_partition(
     """
     root = _lake(fixture_lake)
 
-    def boom(table, where, *args, **kwargs):
+    # The failure lands after the temp file is written, which is the only ordering that can
+    # leave one behind. Failing the write itself creates nothing to clean up, so a test that
+    # patched ``write_table`` would pass with the cleanup deleted.
+    def boom(src, dst):
         raise OSError("disk full")
 
-    monkeypatch.setattr(bars.pq, "write_table", boom)
+    monkeypatch.setattr(bars.os, "replace", boom)
 
     with pytest.raises(OSError):
         _run(root, _RecordingVendor(_cassette()))
