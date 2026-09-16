@@ -75,10 +75,14 @@ SCHEMA_DRIFT_TITLE = "Schema drift in the vendor payload"
 # How many column names the page prints per surface before it stops and says how many are
 # left. The bound is the design's own, which pins every page body at plain text under 1,000
 # bytes. ``extra_paths`` enumerates every column that can ever reach one of these bodies,
-# 119 of them across the two surfaces today, so the widest drift is computable rather than
-# hypothetical. On the 115-ticker roster the design sizes for, every one of them drifting
-# at once runs to 3,867 bytes uncapped and 866 capped. The roster size is part of the
-# measurement, because the body prints a ticker count per column.
+# 119 of them across the two journaled surfaces today, so the widest drift is computable
+# rather than hypothetical. On the 115-ticker roster the design sizes for, every one of them
+# drifting at once runs to 3,867 bytes uncapped and 866 capped. The roster size is part of
+# the measurement, because the body prints a ticker count per column.
+#
+# ``extra_paths`` also covers a third pinned surface, ``bars``, and its five columns are not
+# in that 119. They cannot reach a body either, because this page is built from journal
+# segments and a bar never reaches one.
 #
 # What makes the cap load-bearing rather than defensive is the shape of those two numbers.
 # The capped body is bounded by the cap, and the uncapped one grows with the column count,

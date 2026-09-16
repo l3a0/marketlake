@@ -44,6 +44,14 @@ FETCH = "2026-09-11T15:30:00.400-04:00"
 VENDOR_FIELD = "sigmaScore"
 PROMOTED_COLUMN = "sigma_score"
 
+# The two versions this file's promotion story spans. ``BELOW`` is whatever the source
+# version currently reads, because every segment here is written by the real code, and
+# ``ABOVE`` is the version a promotion mints on top of it. Both are derived rather than
+# spelled, so a later bump to ``journal.SCHEMA_VERSION`` carries this file with it. Spelled
+# as 1 and 2 they went stale the first time the constant moved.
+BELOW = journal.SCHEMA_VERSION
+ABOVE = journal.SCHEMA_VERSION + 1
+
 CHAIN_BODY = {
     "interestRate": 4.25,
     "underlyingPrice": 650.01,
@@ -73,7 +81,7 @@ def _promote(monkeypatch) -> None:
     1. The column joins the schema.
     2. The vendor field joins the contract map, so the parser stops overflowing it.
     3. The known set widens with it.
-    4. ``SCHEMA_VERSION`` goes to 2.
+    4. ``SCHEMA_VERSION`` goes up by one.
 
     Patching ``CHAINS_SCHEMA`` and the schema map is one edit rather than two, because a
     source promotion writes the column into the literal both names.
@@ -89,7 +97,7 @@ def _promote(monkeypatch) -> None:
     monkeypatch.setattr(
         journal, "_CHAINS_CONTRACT_KNOWN", journal._CHAINS_CONTRACT_KNOWN | {VENDOR_FIELD}
     )
-    monkeypatch.setattr(journal, "SCHEMA_VERSION", 2)
+    monkeypatch.setattr(journal, "SCHEMA_VERSION", ABOVE)
 
 
 def _write_segment(lake_root: Path, start: str, pid: int, body: dict | None = None) -> Path:
@@ -124,10 +132,10 @@ def _ledger_off_disk(lake_root: Path) -> SchemaVersionLedger:
 def test_a_field_captured_below_the_promotion_reads_as_its_column_above_it(lake_root, monkeypatch):
     """The whole deliverable, driven end to end.
 
-    Version 1 captures ``sigmaScore`` into ``extra``, because nothing knows the field. The
-    ledger records version 1's shape. Version 2 promotes it. Reading the version-1 segment
-    under version 2's code gives the column, filled off the overflow, with the raw value
-    still in ``extra`` behind it.
+    The version below the promotion captures ``sigmaScore`` into ``extra``, because nothing
+    knows the field. The ledger records that version's shape. The version above promotes it.
+    Reading the lower segment under the higher version's code gives the column, filled off
+    the overflow, with the raw value still in ``extra`` behind it.
     """
     segment = _write_segment(lake_root, "20260911T153000", 4242)
     record_schema_version(clock=ManualClock(NOW), lake_root=lake_root)
@@ -135,7 +143,7 @@ def test_a_field_captured_below_the_promotion_reads_as_its_column_above_it(lake_
     written = journal.read_segment(segment)
     assert PROMOTED_COLUMN not in written.column_names
     assert json.loads(written.column("extra").to_pylist()[0]) == {VENDOR_FIELD: 0.42}
-    assert written.column("schema_version").to_pylist() == [1]
+    assert written.column("schema_version").to_pylist() == [BELOW]
 
     _promote(monkeypatch)
     result = project_extra(
@@ -152,9 +160,9 @@ def test_a_field_captured_below_the_promotion_reads_as_its_column_above_it(lake_
 def test_a_partition_spanning_the_promotion_reads_as_one_shape(lake_root, monkeypatch):
     """Both halves of a real merged partition, read through one column.
 
-    The version-2 segment carries the value in its column and an empty overflow, because
-    the parser now recognises the field. The version-1 segment carries it the other way
-    round. Merged and projected, the column reads the same number on both rows.
+    The upper segment carries the value in its column and an empty overflow, because the
+    parser now recognises the field. The lower segment carries it the other way round.
+    Merged and projected, the column reads the same number on both rows.
     """
     below = journal.read_segment(_write_segment(lake_root, "20260911T153000", 4242))
     record_schema_version(clock=ManualClock(NOW), lake_root=lake_root)
@@ -165,7 +173,7 @@ def test_a_partition_spanning_the_promotion_reads_as_one_shape(lake_root, monkey
 
     assert above.column(PROMOTED_COLUMN).to_pylist() == [0.42]
     assert above.column("extra").to_pylist() == [None]
-    assert above.column("schema_version").to_pylist() == [2]
+    assert above.column("schema_version").to_pylist() == [ABOVE]
 
     merged = pa.concat_tables([below, above], promote_options="default")
     assert merged.column(PROMOTED_COLUMN).to_pylist() == [None, 0.42]
@@ -182,8 +190,9 @@ def test_a_partition_spanning_the_promotion_reads_as_one_shape(lake_root, monkey
 def test_the_ledger_the_projection_reads_is_the_file_the_tool_wrote(lake_root, monkeypatch):
     """The recorded shapes are what decide the projection, not the running code.
 
-    Recording only version 2 and then reading version-1 rows leaves the projection with no
-    shape for those rows, so it fills nothing and says which version it could not place.
+    Recording only the upper version and then reading the lower version's rows leaves the
+    projection with no shape for those rows, so it fills nothing and says which version it
+    could not place.
     The rows are untouched and the value is still in the overflow, which is the condition
     marketlake #130 exists to prevent.
     """
@@ -192,12 +201,12 @@ def test_the_ledger_the_projection_reads_is_the_file_the_tool_wrote(lake_root, m
     _promote(monkeypatch)
     record_schema_version(clock=ManualClock(LATER), lake_root=lake_root)
     ledger = _ledger_off_disk(lake_root)
-    assert ledger.versions() == (2,)
+    assert ledger.versions() == (ABOVE,)
 
     result = project_extra(written, surface=journal.CHAINS_SURFACE, ledger=ledger)
 
     assert PROMOTED_COLUMN not in result.table.column_names
-    assert result.unrecorded_versions == (1,)
+    assert result.unrecorded_versions == (BELOW,)
     assert not result.complete
     assert json.loads(result.table.column("extra").to_pylist()[0]) == {VENDOR_FIELD: 0.42}
 
@@ -207,8 +216,9 @@ def test_a_value_the_column_refused_reads_as_a_retype_rather_than_as_the_column(
 
     The vendor sends ``bid`` as a string. The real row builder writes the raw value into
     ``extra`` and leaves the column null rather than failing the row, which is what keeps
-    the minute. Version 1's recorded shape carries a ``bid`` column, so nothing is lifted,
-    and the value beside the column is the signature that says the column refused it.
+    the minute. That version's recorded shape carries a ``bid`` column, so nothing is
+    lifted, and the value beside the column is the signature that says the column refused
+    it.
     """
     segment = _write_segment(lake_root, "20260911T153000", 4242, body=_retyped_body())
     record_schema_version(clock=ManualClock(NOW), lake_root=lake_root)
@@ -225,7 +235,7 @@ def test_a_value_the_column_refused_reads_as_a_retype_rather_than_as_the_column(
     )
 
     assert result.retyped == (
-        RetypedColumn(column="bid", schema_version=1, recorded_type="double", rows=1),
+        RetypedColumn(column="bid", schema_version=BELOW, recorded_type="double", rows=1),
     )
     assert result.table.column("bid").to_pylist() == [None]
     assert result.filled == {}
@@ -238,8 +248,8 @@ def test_a_retype_read_under_the_version_that_promoted_a_sibling_reports_both_an
 ):
     """One read, one column lifted and another refused, off one real segment.
 
-    ``sigmaScore`` is unrecognised at version 1 and promoted at version 2, so it lifts.
-    ``bid`` was a column at version 1 and the vendor sent a string, so it is refused. A
+    ``sigmaScore`` is unrecognised below the promotion and a column above it, so it lifts.
+    ``bid`` was a column below and the vendor sent a string, so it is refused. A
     detection that keyed on a populated overflow alone would report the promotion too.
     """
     segment = _write_segment(lake_root, "20260911T153000", 4242, body=_retyped_body())
@@ -253,7 +263,7 @@ def test_a_retype_read_under_the_version_that_promoted_a_sibling_reports_both_an
 
     assert result.table.column(PROMOTED_COLUMN).to_pylist() == [0.42]
     assert result.filled == {PROMOTED_COLUMN: 1}
-    assert [(r.column, r.schema_version) for r in result.retyped] == [("bid", 1)]
+    assert [(r.column, r.schema_version) for r in result.retyped] == [("bid", BELOW)]
     assert not result.complete
 
 

@@ -82,6 +82,11 @@ def read_surface_cycles(
     Slice 1 captures through one-off runner invocations, each its own writer session
     and so its own segment. This concatenates them all. A day with no segments reads as
     an empty table in the surface's pinned schema.
+
+    Pass a surface nothing journals and every day reads as that empty table, because a
+    pinned schema is all ``schema_for`` asks for and bars never reach a segment. Both
+    callers pass ``journal.CHAINS_SURFACE``, so nothing reaches it today. A reader wanting
+    bars wants ``lake.loader``, not this.
     """
     schema = journal.schema_for(surface)
     directory = LakePaths(lake_root).segment_dir(surface, ticker, day)

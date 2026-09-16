@@ -41,6 +41,10 @@ pinned surface's column names and types straight off the schema, and this module
 what that returns. A second derivation would be a second source of truth for the same
 fact, which is the failure the whole schema-version line exists to end.
 
+Pinned rather than journaled. ``bars`` never reaches a segment, and its rows carry the same
+version integer as the two surfaces that do, so the ledger describes it under that version
+like any other.
+
 What the tool cannot do is reconstruct a version it was never run for. It records the
 version the running code carries, and it preserves every version already in the file. So a
 bump made without a run leaves that version's shape recorded nowhere, and a later run
@@ -87,7 +91,10 @@ REFERENCE_SOURCE = "reference"
 # The pinned pyarrow schema, one row per journal version, surface, and column.
 #
 # ``journal_schema_version`` is the version being described, the integer stamped on every
-# journal row. ``schema_version`` is this table's own, which is the name every reference
+# journal row and on every row of a pinned surface that never journals. One version line
+# covers both, because the integer names the code shape that wrote a row rather than the
+# file it landed in, and a second line would need a second version column this table does
+# not have. ``schema_version`` is this table's own, which is the name every reference
 # table here uses for that, so the described version needs the longer one. ``column_type``
 # is the type as pyarrow renders it, which is what ``journal.schema_fingerprint`` returns,
 # so ``pa.float64()`` reads as ``double``. ``recorded_at`` is when the version was written
