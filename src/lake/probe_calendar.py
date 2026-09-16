@@ -57,6 +57,18 @@ class ProbeResult:
 
     ``refused`` counts the stamps the epoch transform refuses, so a partly unreadable
     batch says so even on a day that reports no problem.
+
+    ``latest`` is the newest vendor stamp among the trading symbols, ``asked`` how many
+    symbols the request named, and ``answered`` how many of those the vendor came back
+    about. Those three are what the page reports in place of the names. ``answered`` is
+    carried rather than derived, because two of the three counts that sum to it,
+    ``readable`` and ``absent``, do not survive into this result.
+
+    ``run_probe`` fills all three beside ``trading``, so a result it built describes
+    itself. A caller building one by hand owes the same, and owes it for all three rather
+    than for the stamp alone. A missing stamp raises where the body reads it, which is
+    loud. Missing counts do not, and the page then says one symbol quoted out of zero
+    answered.
     """
 
     day: date
@@ -64,6 +76,9 @@ class ProbeResult:
     trading: tuple[str, ...] = ()
     problem: str | None = None
     refused: int = 0
+    latest: datetime | None = None
+    asked: int = 0
+    answered: int = 0
 
     @property
     def pages(self) -> bool:
@@ -78,12 +93,19 @@ class Reading(NamedTuple):
     converted at all, today's and prior sessions' alike. ``refused`` counts the stamps
     the shared epoch transform refuses, and ``absent`` the symbols the vendor sent no
     stamp for. The three counts account for the whole batch, so they sum to its size.
+
+    ``latest`` is the newest of the stamps behind ``trading``, and it is not one of the
+    counts. It takes the maximum rather than the last one seen, because the maximum is the
+    only reading that does not depend on the order the batch is walked. It tracks only the
+    stamps that counted as trading, so a vendor clock running ahead sends a stamp that
+    reads fine, belongs to no session today, and never reaches the page.
     """
 
     trading: tuple[str, ...] = ()
     readable: int = 0
     refused: int = 0
     absent: int = 0
+    latest: datetime | None = None
 
 
 def read_batch(quotes: Mapping[str, object], day: date) -> Reading:
@@ -103,6 +125,7 @@ def read_batch(quotes: Mapping[str, object], day: date) -> Reading:
     is what the probe exists to save.
     """
     trading: list[str] = []
+    latest: datetime | None = None
     readable = 0
     refused = 0
     absent = 0
@@ -118,7 +141,9 @@ def read_batch(quotes: Mapping[str, object], day: date) -> Reading:
         readable += 1
         if stamp.astimezone(MARKET_TZ).date() == day:
             trading.append(symbol)
-    return Reading(tuple(trading), readable=readable, refused=refused, absent=absent)
+            if latest is None or stamp > latest:
+                latest = stamp
+    return Reading(tuple(trading), readable=readable, refused=refused, absent=absent, latest=latest)
 
 
 def _quote_time(envelope: object) -> datetime | None:
@@ -287,6 +312,9 @@ def run_probe(*, calendar, clock, symbols: Sequence[str], fetch) -> ProbeResult:
         trading=reading.trading,
         problem=_unreadable_problem(reading),
         refused=reading.refused,
+        latest=reading.latest,
+        asked=len(symbols),
+        answered=len(quotes),
     )
 
 
@@ -337,6 +365,42 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
 
+def _page_body(result: ProbeResult) -> str:
+    """What the page says on a day the market is trading and the calendar is not.
+
+    Three counts and one stamp, no symbol names: how many quoted, how many the vendor
+    answered about, how many were asked, and the newest stamp among those quoting.
+
+    Size is the reason the names go. The old body joined the roster, and four-character
+    symbols passed the design's under-1,000-byte rule at 156 of them and ntfy's own 4096
+    at 672, where the POST comes back a 400 that ``NtfyTransport`` does not retry. So the
+    page reporting a whole lost session was the one that would fail to send.
+    ``PAGE_COLUMN_CAP`` in ``schema_drift`` carries both bounds and the arithmetic behind
+    them. This body is the same size at any roster, so it needs no cap of its own.
+
+    The names buy nothing anyway. A market that is open quotes all of them, so the list
+    restates the roster, and the Quote sampler's row leaves its names out for that reason.
+
+    The denominator is what the vendor answered rather than what was asked. ``_batch_of``
+    narrows a reply to the symbols the vendor named and ``answered`` counts those. A reply
+    naming three of a hundred and fifteen still reads as a batch rather than a problem, so
+    ``3 of 3 answered`` says the market is open where ``3 of 115 asked`` reads like a
+    glitch, and both are the same reply. The number asked rides beside it, because a wide
+    gap between the two is worth going to look at.
+
+    ``ET`` is a literal rather than ``%Z``, which renders ``EDT`` half the year. The
+    design's body rules ask for the time in ET, and the test push in ``alert.py`` composes
+    its stamp the same way. The stamp arrives as the UTC instant the shared transform
+    returns, so it is converted here rather than only formatted.
+    """
+    when = result.latest.astimezone(MARKET_TZ).strftime("%H:%M:%S")
+    return (
+        f"{result.day.isoformat()}: {len(result.trading)} of {result.answered} answered "
+        f"quoting today, {result.asked} asked, latest {when} ET. "
+        "The daemon is idle. Check the Now panel."
+    )
+
+
 def report(result: ProbeResult, *, publisher, pinger, ping_url: str, slug: str, now) -> int:
     """Feed the check, page if the market is open, and say what happened.
 
@@ -363,10 +427,7 @@ def report(result: ProbeResult, *, publisher, pinger, ping_url: str, slug: str, 
             Message(
                 event="calendar_wrong",
                 title=PAGE_TITLE,
-                body=(
-                    f"{result.day.isoformat()}: {', '.join(result.trading)} quoting today. "
-                    "The daemon is idle. Check the Now panel."
-                ),
+                body=_page_body(result),
                 priority=5,
             ),
             now=now,
