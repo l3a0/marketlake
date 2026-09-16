@@ -85,13 +85,25 @@ This repo is public. Tracked files never carry secrets or machine-specific paths
 
 ## Committing
 
-Do not commit or push without explicit per-change review. Each commit instruction authorizes exactly the changes summarized in the immediately prior turn. Once that commit lands, the authorization is spent. The next change starts fresh. The pattern: make the change, summarize it, wait, then commit exactly what was summarized. If new changes appear between summary and commit, re-summarize and re-confirm. `main` requires a pull request. An active repository ruleset enforces it. Owners can bypass that rule, but do not: branch, push, and open a PR, even for a one-line docs change.
+**Commit, push and open the pull request without waiting (owner directive, 2026-09-16).** A session that has finished the deliverable it was given commits it, pushes the branch, and opens the pull request on its own. It does not stop to ask first.
+
+The earlier rule asked for explicit approval before every commit, and named the summarize-then-wait pattern. The cost was a session idle on finished work whenever the owner was away from the keyboard, and the approval bought nothing the pull request's own diff does not show better and later.
+
+Three things still hold.
+
+1. `main` requires a pull request. An active repository ruleset enforces it. Owners can bypass that rule, but do not: branch, push, and open a PR, even for a one-line docs change.
+2. A commit carries only what the session actually did. Unrelated edits found on the way past are filed as their own issue, per the closing rule below, and never swept into the branch.
+3. Work outside the session's own deliverable still waits for the owner. That covers this file, `~/.config/marketlake/`, and the configured `lake_root`.
 
 ## Pull requests
 
-**Review every PR before the owner does (owner directive, 2026-09-06).** A PR the owner has not seen reviewed is not finished work. This holds whether the PR is yours or someone else's, whether it is one line or a thousand, and whether or not a review was asked for. The review runs before the PR is handed over, not after.
+**Review every PR before the owner does (owner directive, 2026-09-06).** A PR the owner has not seen reviewed is not finished work. This holds whether the PR is yours or someone else's, whether it is one line or a thousand, and whether or not a review was asked for. The owner's time is the scarce thing, so a PR reaches them already checked rather than waiting to be read cold.
 
-The gate is mechanical, because the rule is easy to hold in principle and easy to miss in practice. Opening a PR is not finishing it. A PR link and the result of its review go to the owner in the same message, or neither goes. Reporting the link first puts the review after the handover by construction, which is the failure this rule exists to stop.
+**Send the link as soon as the pull request exists, then review it (owner directive, 2026-09-16).** Opening the pull request and starting the review are one step, and neither waits on the owner. The link is what lets them open the review panel and watch the lenses land, so holding it back leaves them blind to work that is already pushed.
+
+This replaces the earlier gate, which held the link until the review finished. That gate existed to stop a review being skipped once the work had been handed over. The replacement answers the same risk differently: the review starts in the same breath as the pull request, so no window exists in which one has happened and the other has not.
+
+What does not change is that the review runs and that its result reaches the owner. Post the findings on the pull request, and say plainly what the review found and what it refuted, including when it found nothing. A pull request whose review never ran, or ran and never reported, is still unfinished work.
 
 Review by fanning out independent lenses, then verifying each finding adversarially. Several reviewers in parallel, each with one lens and no sight of the others, produce the findings. Verifiers then try to refute each one, and only what survives is acted on. Point one lens at completeness and one at over-reach, which catch the two failures that recur:
 
