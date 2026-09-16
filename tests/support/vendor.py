@@ -14,12 +14,19 @@ open tail leaves ``to_date`` ``None``, so it keys on ``{"symbol": symbol, "from_
 omits it from the request, so a window keyed on ``from_date`` and ``to_date`` matches a
 closed window and one keyed on ``from_date`` alone matches the open tail. ``strike_count``
 is only the by-hand probe's parameter now, never the hot path's. ``get_quotes`` keys on
-``{"symbols": [...]}`` in the order given. A cassette must record the same shapes.
+``{"symbols": [...]}`` in the order given. ``get_minute_bars`` and ``get_daily_bars`` key on
+``{"symbol": ..., "freq": ..., "start": ..., "end": ...}`` plus whichever of
+``extended_hours`` and ``previous_close`` is set, with both bounds rendered as UTC ISO
+strings. A cassette must record the same shapes.
 
 ``chain_params`` builds that chain key, and the replay above calls it, so a fixture and
-the lookup it has to match cannot drift apart. ``windowed_chain_interactions`` builds a
-whole windowed recording from one chain body, which is what a test needs once the code
-under test fetches by a plan rather than by the bare symbol.
+the lookup it has to match cannot drift apart. ``lake.vendor.bars_params`` does the same
+job for price history, and it lives in production rather than here because the recorder
+writes by it too. ``windowed_chain_interactions`` builds a whole windowed recording from
+one chain body, which is what a test needs once the code under test fetches by a plan
+rather than by the bare symbol. ``bars_interactions`` is the price-history counterpart: a
+live recording captures one window, and it builds whatever set of windows a test wants
+from candles the test names.
 """
 
 from __future__ import annotations
@@ -29,7 +36,15 @@ from datetime import date, datetime
 
 from lake.cassette import Cassette, Interaction
 from lake.chain_plan import DEFAULT_CHAIN_PLAN, ChainPlan
-from lake.vendor import VendorError, VendorResponse
+from lake.vendor import (
+    BARS_ENDPOINT,
+    DAILY_FREQ,
+    MINUTE_FREQ,
+    VendorError,
+    VendorResponse,
+    bars_params,
+    require_utc_bound,
+)
 
 # The two expiration maps a chain body carries. Everything else in the body is a
 # chain-level header field the vendor repeats on every window's response.
@@ -199,6 +214,81 @@ def windowed_chain_cassette(
     )
 
 
+def bars_candle(
+    when: datetime,
+    *,
+    open_: float,
+    high: float,
+    low: float,
+    close: float,
+    volume: int = 0,
+) -> dict:
+    """One candle, shaped the way Schwab shapes one.
+
+    ``datetime`` is Schwab's epoch-millisecond stamp rather than an ISO string, which is
+    the whole reason a fixture builder exists for this: a test naming an instant should
+    not have to render that stamp by hand and get the unit wrong. ``when`` must be
+    timezone-aware, so the stamp does not depend on the host's zone.
+
+    The parameter is ``open_`` because ``open`` is a builtin. The rendered key is ``open``.
+    """
+    return {
+        "open": open_,
+        "high": high,
+        "low": low,
+        "close": close,
+        "volume": volume,
+        "datetime": int(require_utc_bound(when, "when").timestamp() * 1000),
+    }
+
+
+def price_history_body(symbol: str, candles: Sequence[Mapping[str, object]] = ()) -> dict:
+    """A price-history body, shaped the way Schwab shapes one.
+
+    Schwab answers a window it has no candles for with an empty list and ``empty`` true,
+    never with an error. So the two payload shapes a test needs are one call apart: pass
+    candles for a populated window and pass none for an empty one.
+    """
+    listed = list(candles)
+    return {"candles": listed, "symbol": symbol, "empty": not listed}
+
+
+def bars_interactions(
+    symbol: str,
+    freq: str,
+    windows: Sequence[tuple[datetime, datetime, Sequence[Mapping[str, object]]]],
+    *,
+    extended_hours: bool | None = None,
+    previous_close: bool | None = None,
+) -> tuple[Interaction, ...]:
+    """Record one price-history interaction per window.
+
+    Each entry in ``windows`` is a start, an end, and the candles that window returns. A
+    window with no candles records the empty shape, which is what a test of the no-candle
+    path needs and what no live recording is worth burning a request on.
+
+    Every interaction is keyed through ``lake.vendor.bars_params``, the same function the
+    replay below looks a request up by, so a fixture cannot key a window the lookup would
+    then miss.
+    """
+    return tuple(
+        Interaction(
+            endpoint=BARS_ENDPOINT,
+            params=bars_params(
+                symbol,
+                freq,
+                start=start,
+                end=end,
+                extended_hours=extended_hours,
+                previous_close=previous_close,
+            ),
+            status=200,
+            body=price_history_body(symbol, candles),
+        )
+        for start, end, candles in windows
+    )
+
+
 class CassetteVendor:
     """A ``Vendor`` fed by a recorded cassette."""
 
@@ -230,6 +320,55 @@ class CassetteVendor:
             body=interaction.body,
             headers=interaction.headers,
         )
+
+    def _bars(
+        self,
+        symbol: str,
+        freq: str,
+        start: datetime,
+        end: datetime,
+        extended_hours: bool | None,
+        previous_close: bool | None,
+    ) -> VendorResponse:
+        """Replay one price-history request, whichever frequency asked for it."""
+        interaction = self._cassette.find(
+            BARS_ENDPOINT,
+            bars_params(
+                symbol,
+                freq,
+                start=start,
+                end=end,
+                extended_hours=extended_hours,
+                previous_close=previous_close,
+            ),
+        )
+        return VendorResponse(
+            status=interaction.status,
+            body=interaction.body,
+            headers=interaction.headers,
+        )
+
+    def get_minute_bars(
+        self,
+        symbol: str,
+        *,
+        start: datetime,
+        end: datetime,
+        extended_hours: bool | None = None,
+        previous_close: bool | None = None,
+    ) -> VendorResponse:
+        return self._bars(symbol, MINUTE_FREQ, start, end, extended_hours, previous_close)
+
+    def get_daily_bars(
+        self,
+        symbol: str,
+        *,
+        start: datetime,
+        end: datetime,
+        extended_hours: bool | None = None,
+        previous_close: bool | None = None,
+    ) -> VendorResponse:
+        return self._bars(symbol, DAILY_FREQ, start, end, extended_hours, previous_close)
 
     def token_mint_time(self) -> datetime:
         if self._cassette.token_mint_time is None:

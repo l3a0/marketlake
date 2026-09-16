@@ -36,7 +36,7 @@ from typing import Protocol, runtime_checkable
 
 from lake.paths import TOKEN_FILE, config_dir
 from lake.token_epoch import epoch_second_to_utc
-from lake.vendor import VendorError, VendorResponse
+from lake.vendor import VendorError, VendorResponse, require_utc_bound
 
 # The standard location of the Schwab token, per the design's Configuration section.
 # It sits outside the repo and outside the backup-synced lake tree. This is a home-
@@ -80,8 +80,10 @@ class HttpResponse(Protocol):
 class SchwabClient(Protocol):
     """What ``SchwabVendor`` needs from a ``schwab-py`` client.
 
-    The real ``schwab.client.Client`` satisfies this. So does a test fake. Two
-    endpoint methods and one nested token attribute is the whole contract.
+    The real ``schwab.client.Client`` satisfies this. So does a test fake. Four
+    endpoint methods and one nested token attribute is the whole contract. Price history
+    is two of the four, because ``schwab-py`` has no frequency-parameterized call: it
+    ships one method per frequency, and this lake captures two.
 
     ``token_metadata`` is ``schwab-py``'s handle on the loaded token. Its
     ``creation_timestamp`` is the epoch second the refresh token was minted. That is
@@ -117,6 +119,36 @@ class SchwabClient(Protocol):
         ``quote,fundamental,reference``. The real client accepts it; a test fake records
         it.
         """
+        ...
+
+    def get_price_history_every_minute(
+        self,
+        symbol: str,
+        *,
+        start_datetime: datetime | None = None,
+        end_datetime: datetime | None = None,
+        need_extended_hours_data: bool | None = None,
+        need_previous_close: bool | None = None,
+    ) -> HttpResponse:
+        """Per-minute candles for one symbol over a window.
+
+        The parameter names are ``schwab-py``'s own, kept verbatim so this protocol reads
+        as the slice of the real client it is. ``SchwabVendor`` always passes both bounds,
+        because ``schwab-py`` substitutes a default window for a missing one rather than
+        omitting it.
+        """
+        ...
+
+    def get_price_history_every_day(
+        self,
+        symbol: str,
+        *,
+        start_datetime: datetime | None = None,
+        end_datetime: datetime | None = None,
+        need_extended_hours_data: bool | None = None,
+        need_previous_close: bool | None = None,
+    ) -> HttpResponse:
+        """Per-day candles for one symbol over a window."""
         ...
 
     @property
@@ -236,6 +268,63 @@ class SchwabVendor:
         with _auth_failures_named():
             return _response_from(
                 self._client.get_quotes(list(symbols), fields=list(QUOTE_FIELD_GROUPS))
+            )
+
+    def get_minute_bars(
+        self,
+        symbol: str,
+        *,
+        start: datetime,
+        end: datetime,
+        extended_hours: bool | None = None,
+        previous_close: bool | None = None,
+    ) -> VendorResponse:
+        """Per-minute candles for one symbol over a window, verbatim.
+
+        Both bounds run through ``require_utc_bound`` before the request goes out, so a
+        missing or naive bound is refused here rather than silently becoming a fifty-five
+        year window or a window in the capture machine's local zone. The seam's own
+        docstring carries the whole reason.
+
+        The two flags follow the seam's ordinary rule and pass straight through, so
+        ``schwab-py`` omits either one left ``None``.
+        """
+        with _auth_failures_named():
+            return _response_from(
+                self._client.get_price_history_every_minute(
+                    symbol,
+                    start_datetime=require_utc_bound(start, "start"),
+                    end_datetime=require_utc_bound(end, "end"),
+                    need_extended_hours_data=extended_hours,
+                    need_previous_close=previous_close,
+                )
+            )
+
+    def get_daily_bars(
+        self,
+        symbol: str,
+        *,
+        start: datetime,
+        end: datetime,
+        extended_hours: bool | None = None,
+        previous_close: bool | None = None,
+    ) -> VendorResponse:
+        """Per-day candles for one symbol over a window, verbatim.
+
+        This is ``get_minute_bars`` against the daily endpoint. They stay two methods
+        because ``schwab-py`` has no frequency-parameterized call, and choosing between
+        two client methods inside one vendor method would make this layer dispatch rather
+        than forward.
+        """
+        with _auth_failures_named():
+            return _response_from(
+                self._client.get_price_history_every_day(
+                    symbol,
+                    start_datetime=require_utc_bound(start, "start"),
+                    end_datetime=require_utc_bound(end, "end"),
+                    need_extended_hours_data=extended_hours,
+                    need_previous_close=previous_close,
+                )
             )
 
     def token_mint_time(self) -> datetime:

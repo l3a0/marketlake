@@ -17,19 +17,32 @@ status. Then it prints one of two things.
    contains ``time`` or ``date`` it also shows the value, so an int epoch in
    milliseconds is told apart from an ISO string.
 
-The dump is shaped per surface. A surface is one captured data kind, either ``chains``
-or ``quotes``. For the quotes surface, per symbol envelope it prints the top-level keys
-and then each block: ``quote``, ``fundamental``, ``regular``, ``extended``, and
-``reference``. For the chains surface it prints the top-level body keys, the
-``underlying`` block, and exactly one contract. That contract is reached by walking
-``callExpDateMap`` to its first expiration, then its first strike, then its first
-contract. All contracts are never dumped.
+The dump is shaped per surface. A surface is one captured data kind. The lake has four,
+listed in ``paths.SURFACES``, and this tool can dump three of them. A cassette records what
+a vendor call returned, and ``actions`` is derived from sealed quotes rather than fetched,
+so no interaction is ever keyed under it.
+
+1. ``quotes``. Per symbol envelope it prints the top-level keys and then each block:
+   ``quote``, ``fundamental``, ``regular``, ``extended``, and ``reference``.
+2. ``chains``. It prints the top-level body keys, the ``underlying`` block, and exactly
+   one contract. That contract is reached by walking ``callExpDateMap`` to its first
+   expiration, then its first strike, then its first contract. All contracts are never
+   dumped.
+3. ``bars``. It prints the top-level body keys, then every top-level field but
+   ``candles``, then exactly one candle, the first in ``candles``. The top level is
+   small enough to dump whole, and it is where the answer to a flagged request shows up:
+   ``need_previous_close`` adds ``previousClose`` and ``previousCloseDate`` outside
+   ``candles``, and a window Schwab had nothing for comes back with ``empty`` true and an
+   empty list rather than with an error. A candle's ``datetime`` is Schwab's
+   epoch-millisecond stamp, and the time-key rule above shows its value, so an epoch is
+   told apart from an ISO string without reading the whole body.
 
 Run it by hand against a recorded cassette::
 
     python -m lake.inspect_cassette path/to/cassette.json
 
-Pass ``--surface chains`` or ``--surface quotes`` to limit the output to one surface.
+Pass ``--surface`` with one of those three names to limit the output to one surface.
+``--surface actions`` is refused, because no cassette holds one.
 """
 
 from __future__ import annotations
@@ -41,6 +54,12 @@ from lake.cassette import Cassette, Interaction, load_cassette
 
 # The quote blocks dumped per symbol envelope, in the order the design pins them.
 QUOTE_BLOCKS = ("quote", "fundamental", "regular", "extended", "reference")
+# Every surface this tool knows how to dump. The --surface filter offers exactly these, so
+# a name the dump has no shape for is refused before any file is read. ``paths.SURFACES`` is
+# wider: it carries ``actions`` too, which is derived rather than fetched and so never
+# appears in a cassette. The narrower name follows ``journal.PINNED_SURFACES`` and
+# ``dashboard.PANEL_SURFACES``, which qualify theirs for the same reason.
+DUMPABLE_SURFACES = ("chains", "quotes", "bars")
 # A key whose name contains one of these has its value shown, so epoch-vs-ISO is visible.
 _TIME_HINTS = ("time", "date")
 
@@ -146,6 +165,39 @@ def _dump_chains(body: Mapping[str, object], indent: str) -> list[str]:
     return lines
 
 
+def _dump_bars(body: Mapping[str, object], indent: str) -> list[str]:
+    """The bars-surface dump: the top-level fields, then exactly one candle.
+
+    The top level is dumped whole rather than listed, unlike the chains dump, because it
+    is small and carries everything that is not a candle. ``empty`` says the window
+    returned nothing, and ``schwab-py``'s ``need_previous_close`` documents a previous
+    close reported outside ``candles``. Dumping the whole top level means a field arriving
+    under a name nobody predicted is visible rather than skipped, which matters because no
+    recording from the real vendor exists yet to check any of these names against.
+
+    The candle is the first in ``candles``. An empty list is reported as such rather than
+    passed over, because an empty window is a real vendor answer this tool has to be able
+    to show: Schwab answers a window it has no candles for with ``candles: []`` and
+    ``empty: true``, never with an error.
+    """
+    lines = [f"{indent}keys: {', '.join(str(key) for key in body)}"]
+    lines.extend(_dump_fields({k: v for k, v in body.items() if k != "candles"}, indent))
+    candles = body.get("candles")
+    if not isinstance(candles, Sequence) or isinstance(candles, (str, bytes)):
+        lines.append(f"{indent}candles: <not a list: {_type_name(candles)}>")
+        return lines
+    if not candles:
+        lines.append(f"{indent}candles: <empty>")
+        return lines
+    lines.append(f"{indent}candle [0 of {len(candles)}]:")
+    first = candles[0]
+    if isinstance(first, Mapping):
+        lines.extend(_dump_fields(first, indent + "  "))
+    else:
+        lines.append(f"{indent}  <not a candle: {_type_name(first)}>")
+    return lines
+
+
 def inspect_interaction(interaction: Interaction, surface: str | None = None) -> list[str]:
     """Diagnose one interaction, or return no lines when a surface filter excludes it."""
     if surface is not None and interaction.endpoint != surface:
@@ -165,6 +217,8 @@ def inspect_interaction(interaction: Interaction, surface: str | None = None) ->
         lines.extend(_dump_quotes(body, "  "))
     elif interaction.endpoint == "chains":
         lines.extend(_dump_chains(body, "  "))
+    elif interaction.endpoint == "bars":
+        lines.extend(_dump_bars(body, "  "))
     else:
         lines.append(f"  <unknown surface: {interaction.endpoint}>")
     return lines
@@ -189,7 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("path", help="Path to the cassette JSON to inspect.")
     parser.add_argument(
         "--surface",
-        choices=("chains", "quotes"),
+        choices=DUMPABLE_SURFACES,
         default=None,
         help="Limit the output to one surface. Defaults to every surface.",
     )
