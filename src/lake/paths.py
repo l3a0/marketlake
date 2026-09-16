@@ -83,7 +83,7 @@ _DATE_PARTITIONED = frozenset({CHAINS, QUOTES})
 
 # The journal top-level directory, the reference directory, the reports directory,
 # and the two lake-root ledgers. ``reports/`` holds one dated file per night, written by
-# the vendor sweep. Three more trees sit under it, each in a subdirectory of its own so a
+# the vendor sweep. Four more trees sit under it, each in a subdirectory of its own so a
 # reader counting one never picks up another.
 #
 # 1. One file per page that never reached the phone, under `reports/alerts/date=D/`.
@@ -95,9 +95,13 @@ _DATE_PARTITIONED = frozenset({CHAINS, QUOTES})
 #    merged segments carried the pinned schema. A ticker-day the merge refused files on
 #    every run the conflict survives, because it has no manifest entry to make a later
 #    silence readable.
+# 4. One file per finding one of the vendor sweep's gates refused to land, under
+#    `reports/withheld/date=D/`, keyed on the ticker-day whose rows produced it. A held
+#    finding never reaches the ledger that would settle it, so it files again on every
+#    night it survives, and that repetition is what says the condition is still live.
 #
 # The tree sits inside the backup sync root, so a restore carries the reports with the
-# data, and outside the manifest, because none of the four is a measurement.
+# data, and outside the manifest, because none of the five is a measurement.
 JOURNAL_DIR = "journal"
 REFERENCE_DIR = "reference"
 REPORTS_DIR = "reports"

@@ -35,8 +35,9 @@ Three rules hold for everything written here, and each has a failure behind it.
 3. **Write-once, named by stamp and pid.** A slot's stamp carries no sub-minute part, so
    the name carries microseconds and the writing process's id instead. That is enough for
    a producer the dispatcher serves once per day, and a restart that serves the day again
-   writes under a new pid. ``alert._record`` needs more and adds a per-message sequence,
-   because one cycle can raise several pages at one instant.
+   writes under a new pid. A producer that writes several findings in one run needs more.
+   ``alert._record`` adds a per-message sequence, because one cycle can raise several pages
+   at one instant, and the withheld producer below adds a subject and a sequence both.
 
 The second producer is compaction's merge. It compares a ticker-day's merged segments to
 the pinned schema at the one moment the segments still exist, and files what moved. A
@@ -46,6 +47,22 @@ has forensic value from the day it lands, because the merged schema is gone the 
 seal unlinks the segments, and it has no reader until D20 renders it. What
 reaches a human in the meantime is compaction's own page, which folds the run's findings
 into one message and sends the reader here for the per-ticker-day detail.
+
+The third producer is the vendor sweep's gates. A check that refuses to land a row holds
+that row out of its ledger, and a fail-closed decision leaving no record reads exactly like
+never having seen the event. So the refusal is filed here. Two callers reach it, the
+dividend extraction and the bars close check, and a held finding appends nothing, so
+neither leaves a manifest entry the way a seal does. A night that learns nothing files
+nothing either, and what says the run happened is the sweep's own ping rather than a marker
+file.
+
+A held finding recurs every night, because nothing settles it, and nothing under
+``reports/`` is ever pruned. So one unresolved disagreement is thirty files in one
+directory after a month, and that repetition is the record rather than a defect to design
+around. Compaction's refused ticker-day already repeats the same way. One file says a
+finding was held at some point and thirty say it was held again last night. What the name
+needs on top of the stamp and the pid is a subject and a sequence, because that producer
+writes several findings at one instant and the clock alone cannot name them apart.
 """
 
 from __future__ import annotations
@@ -67,6 +84,10 @@ CLOSE_GUARD_DIR = "close_guard"
 # Compaction's merge-time schema check. Its own subdirectory, per rule 2 above, so a
 # drifted ticker-day never counts as a page that failed to send.
 SCHEMA_DRIFT_DIR = "schema_drift"
+
+# The vendor sweep's gates. Its own subdirectory, per rule 2 above, so a finding a gate
+# refused never counts as a page that failed to send.
+WITHHELD_DIR = "withheld"
 
 
 @dataclass(frozen=True)
@@ -314,6 +335,162 @@ def write_schema_drift(
     return path
 
 
+@dataclass(frozen=True)
+class Withheld:
+    """One thing a gate refused to land, and enough to say why.
+
+    Two deliverables file through this record and they hold different kinds of thing. One
+    holds a corporate action, the other a bar whose official close disagrees with the
+    session's own captured quotes. So the record is named for the category rather than for
+    either of them, the way ``WITHHELD_DIR`` is. A field called ``ex_date`` would fit the
+    first and mis-describe the second.
+
+    ``symbol`` and ``observed_on`` come first because every finding carries them. Two of the
+    three shapes the dividend extraction files are the resolution itself failing, and
+    ``UnresolvedSymbol`` and ``AmbiguousSymbol`` both carry a symbol and a date. The
+    instrument id is the thing that could not be determined there, so it rides the record
+    when there is one and is left out when there is not, and it stays out of the file name
+    for the same reason. ``AmbiguousSymbol`` carries a third field, the several instruments
+    a corrupt master returned for one symbol, and ``instrument_ids`` files that as the
+    plural it is.
+
+    ``observed_on`` is the ticker-day whose rows produced the finding, never the night the
+    gate ran and never the date the event itself happened.
+
+    ``event`` is the key the finding recurs under, such as the kind of action a held entry
+    would have landed as. It rides in the file name beside the symbol, so it is a plain
+    token rather than a sentence. The two together are the subject, and the subject is what
+    tells one file from another in a directory a month of nights has filled.
+
+    ``check`` names what refused the finding, and ``computed`` and ``against`` are the two
+    numbers that check compared. Those are three fields rather than one joined string
+    because :func:`_redacted` cuts at the second ``": "``, so a finding written as
+    ``instrument 42: 7.61406 against 7.61408: dividend_consistency`` would arrive without
+    the check that refused it, silently.
+
+    ``exception`` carries an exception the caller met, rendered as its class and then its
+    message. What reaches the file is the first two fields of ``<symbol>: <exception>``, so
+    that rendering files the class and drops the message. The rendering is the caller's
+    contract rather than something the writer can enforce, and it is the contract the close+5
+    guard already meets when it composes a problem as a place, a class, and a message.
+    ``_redacted`` keeps two fields, so the second is whatever the caller put first. A caller
+    handing over a bare message files that message's first field, which for an ``OSError`` is
+    a path on the capture machine and is the leak this tree's redaction exists to stop. An
+    empty rendering files no field at all rather than a finding claiming an exception with no
+    class.
+
+    The record carries strings, numbers and one date, which keeps this module writing JSON
+    and nothing else. It lives here rather than beside either of those two exceptions, for
+    the reason ``SchemaDrift`` does, which is the import direction. The extraction imports
+    this module to file its findings, so a record defined in ``actions`` would close the
+    loop. ``security_master`` closes no loop, importing neither this module nor ``actions``,
+    and a record there would sit in the module that knows least about what is being filed.
+    """
+
+    symbol: str
+    observed_on: date
+    event: str
+    check: str
+    computed: float | None = None
+    against: float | None = None
+    instrument_id: int | None = None
+    instrument_ids: tuple[int, ...] = ()
+    exception: str | None = None
+
+
+def withheld_dir(lake_root: Path | str, day: date) -> Path:
+    """Where one ticker-day's withheld findings are filed.
+
+    Keyed on the day the rows belong to, the way :func:`schema_drift_dir` is. SPY's June
+    ex-date sits three months before the lake's first data row, so keying on the event's own
+    date would open a directory for a session the lake never captured. It does not apply
+    uniformly either, since a symbol the master could not place carries no event date at all.
+    """
+    return Path(lake_root) / REPORTS_DIR / WITHHELD_DIR / f"{DATE_PREFIX}{day.isoformat()}"
+
+
+def write_withheld(
+    lake_root: Path | str,
+    finding: Withheld,
+    *,
+    now: datetime,
+    sequence: int,
+    pid: int | None = None,
+) -> Path:
+    """File one withheld finding, and hand back the path it landed at.
+
+    **Only a finding writes anything.** The close+5 guard files on every run, because an
+    absent file there cannot be told from a run that never happened. Compaction files on
+    findings alone and leans on the manifest entry each seal leaves. Neither applies here,
+    because a night that holds nothing appends nothing and so leaves no entry either. What
+    says the run happened is the sweep's own health check.
+
+    **A held finding files again every night, and the repetition is the record.** It never
+    reaches the ledger that would settle it, so the next night re-derives the same
+    disagreement from the same sealed rows. Nothing prunes ``reports/``, so one unresolved
+    disagreement is thirty files in one directory after a month. That is the behaviour rather
+    than a defect, and compaction already does it, filing a refused ticker-day on every run
+    the conflict survives. One file says a finding was held at some point. Thirty say it was
+    held again last night, which is the difference between a live condition and a historical
+    one. A ledger collapses a repeat because its resolution reads the last entry, so a repeat
+    there adds nothing. This directory has no such resolution and every file is one run's
+    verdict, so a repeat is a new observation. Reading the pile is the nightly digest's job.
+
+    **The name carries a sequence.** One run files several findings under one injected clock
+    that does not advance between them, and under one pid, so the stamp and the pid are
+    constant across the run and the subject would be doing all the work. Whether two findings
+    can share a subject is a question about another module's output, and a file name is not
+    the place to rest on it. ``alert._record`` adds a sequence for the same reason and keeps
+    the counter on ``Publisher``. This module has no writer class, only functions, so a
+    counter here would be module state outliving the run that no test could drive. The caller
+    passes it, the way it already passes the pid, and a caller looping over findings holds
+    the index anyway.
+
+    **Raises rather than swallowing.** The caller contains it, for the reason
+    :func:`write_schema_drift` gives, because a raise out of the filing costs the rest of the
+    sweep and the containment belongs where that blast radius is. The hand-run extraction
+    command has no dispatch behind it, so it wraps its own per-finding loop and turns what
+    escapes into an exit code.
+    """
+    pid = os.getpid() if pid is None else pid
+    eastern = now.astimezone(MARKET_TZ)
+    entry: dict[str, object] = {
+        "at": eastern.isoformat(),
+        "day": finding.observed_on.isoformat(),
+        "symbol": finding.symbol,
+        "event": finding.event,
+        "check": finding.check,
+    }
+    if finding.computed is not None:
+        entry["computed"] = finding.computed
+    if finding.against is not None:
+        entry["against"] = finding.against
+    if finding.instrument_id is not None:
+        entry["instrument_id"] = finding.instrument_id
+    if finding.instrument_ids:
+        entry["instrument_ids"] = list(finding.instrument_ids)
+    if finding.exception:
+        # The place, then the class, then whatever the exception chose to say. The place is
+        # composed here rather than by the caller, because the rule keeps the first two
+        # fields and a caller handing over two would have its message kept instead of
+        # dropped. An empty rendering files nothing, rather than a bare place and a colon.
+        entry["exception"] = _redacted(f"{finding.symbol}: {finding.exception}")
+    # A report is written inside a lake that exists, or not at all. The same rule the two
+    # writers above follow, and for the same reason: `parents=True` from a missing root
+    # would create the lake itself and turn "lake root missing" into a green check.
+    root = Path(lake_root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"lake root missing: {root}")
+    directory = withheld_dir(root, finding.observed_on)
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = eastern.strftime("%H%M%S%f")
+    path = directory / f"{stamp}-{finding.symbol}-{finding.event}-{sequence:04d}-{pid}.json"
+    with open(path, "x", encoding="utf-8") as handle:
+        json.dump(entry, handle, sort_keys=True)
+        handle.write("\n")
+    return path
+
+
 def _redacted(problem: str) -> str:
     """One of the guard's problems, with any exception message dropped.
 
@@ -341,9 +518,13 @@ def _redacted(problem: str) -> str:
 __all__ = [
     "CLOSE_GUARD_DIR",
     "SCHEMA_DRIFT_DIR",
+    "WITHHELD_DIR",
     "SchemaDrift",
+    "Withheld",
     "close_guard_dir",
     "schema_drift_dir",
+    "withheld_dir",
     "write_close_guard",
     "write_schema_drift",
+    "write_withheld",
 ]

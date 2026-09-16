@@ -68,13 +68,14 @@ from lake.paths import (
 #
 # 1. The manifest cannot cover itself.
 # 2. Journal segments are manifest-less by rule, so the whole tree is out.
-# 3. ``reports/`` holds the nightly report, one dated file per night, and three trees
+# 3. ``reports/`` holds the nightly report, one dated file per night, and four trees
 #    beside it: one file per page that never reached the phone, one file per close+5
-#    guard run, and one file per ticker-day compaction's merge had something to say
-#    about. The daemon writes the first two and compaction writes the third. The
-#    design puts the tree inside the backup sync root and outside the manifest, and skips
-#    it here by name, so a subdirectory added under it needs nothing added here. None of
-#    the four is a measurement.
+#    guard run, one file per ticker-day compaction's merge had something to say about,
+#    and one file per finding a vendor-sweep gate refused to land. The daemon writes the
+#    first two, compaction writes the third, and the sweep writes the fourth. The design
+#    puts the tree inside the backup sync root and outside the manifest, and skips it here
+#    by name, so a subdirectory added under it needs nothing added here. None of the five
+#    is a measurement.
 #
 # Neither the quarantine ledger nor the corporate-actions ledger is on this list, and
 # both are off it deliberately. Each writer refreshes its own manifest entry in the same
