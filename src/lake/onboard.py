@@ -10,10 +10,11 @@ The slice-1 steps, in order.
 1. *Register the instrument in the security master.* The security master is the
    reference table that assigns every instrument a stable internal ``instrument_id``
    and maps it to the external symbols. Registration stamps a ``capture_start`` epoch,
-   the instant capture begins, taken from the injected clock, and creates the ticker
-   mapping. It does not resolve the FIGI. The FIGI is not capture-critical, and Schwab's
-   own CUSIP is captured raw on the equity quotes, so the FIGI backfills later from that
-   CUSIP in a deferred enrichment pass. Day-one onboarding is kept to the two facts that
+   the instant capture begins, and creates the ticker mapping. The epoch defaults to the
+   injected clock's now, and ``--capture-start`` supplies it outright. It does not
+   resolve the FIGI. The FIGI is not capture-critical, and Schwab's own CUSIP is captured
+   raw on the equity quotes, so the FIGI backfills later from that CUSIP in a deferred
+   enrichment pass. Day-one onboarding is kept to the two facts that
    cannot be redone later: the ``instrument_id`` and the ``capture_start`` epoch. All
    coverage and gap accounting clamp to that epoch, so onboarding day reads "onboarded
    11:00," never 40 percent missing.
@@ -40,6 +41,44 @@ The slice-1 steps, in order.
    the day-one plausibility anchor. The median-relative battery checks have no anchor
    until history accrues, so this count is the one early sanity number.
 
+The epoch and the stamps are two different facts, and ``--capture-start`` is what
+separates them. A lake can be captured before its master exists, and seeding one
+honestly means recording the instant capture actually began rather than the instant the
+command runs. So the epoch reaches three places and nothing else: the master's
+``capture_start``, the ticker mapping's ``valid_from``, and the capture span's start.
+
+Five stamps keep reading the clock, because each records when this command ran.
+
+1. The journaled snapshot's ``cycle_start``.
+2. Its ``fetch_ts``.
+3. Its ``fetch_end_ts``.
+4. The ``fetched_at`` on the master's manifest entry.
+5. The ``fetched_at`` on the spans file's manifest entry.
+
+Threading the epoch into any of the five would write today's chain into a backdated
+partition and corrupt captured data that can never be captured again.
+
+Three refusals guard the option, all of them ahead of the vendor call and ahead of every
+write, so a typo spends neither a request nor a rewritten roster.
+
+1. An instant after the clock's own now is refused. A capture span starting in the
+   future reports out of scope, so the ticker would not be captured until that instant
+   arrived, with nothing said about it. A mistyped year is enough to do that, and a lost
+   minute is gone forever.
+2. A naive instant is refused, and the refusal names the fix. ``datetime.fromisoformat``
+   reads a bare date as a naive midnight, and a bare date is what a person types first.
+3. An explicit epoch is refused outright when the master already maps the ticker on any
+   date. The idempotence check resolves the ticker as of the epoch, so the epoch's own
+   value decides whether a run counts as a re-onboard at all. Running the command again
+   with a corrected epoch is exactly what a person does on noticing the first one was
+   wrong, and that is the run this refusal catches.
+
+The first two are ``argparse``'s, raised from the option's own ``type`` hook, so the
+operator gets one named line and exit 2 with no stack to read past. That is the code and
+the shape ``argparse`` already uses for a bad argument in these entries. The third cannot
+go there, because asking what the master already holds means reading the master, which
+means the lake root from config. It raises ``OnboardError`` from ``onboard`` instead.
+
 Deferred, not faked. Each is a later slice, and this command is structured so each
 becomes an added step here without reshaping the flow.
 
@@ -53,7 +92,9 @@ becomes an added step here without reshaping the flow.
   precondition is checked, which is the one gate the design names for slice 1.
 
 Every dependency is injected: the clock and the vendor. So the whole flow runs offline
-with no network, no real token, and no wall-clock read. The thin ``onboard_from_config``
+with no network, no real token, and no wall-clock read. The one exception is the command
+line's own ``--capture-start`` check, which asks what time it is now and so reads the
+real clock before any of this is reached. The thin ``onboard_from_config``
 wires the real config and the Schwab-backed vendor around the same core, keeping every
 real construction lazy.
 """
@@ -209,6 +250,91 @@ def _market_date(instant: datetime) -> date:
     return instant.astimezone(MARKET_TZ).date()
 
 
+def _parse_capture_start(text: str) -> datetime:
+    """Parse and check the ``--capture-start`` argument. ``argparse`` calls this.
+
+    Three things are refused here, at parse time, so a typo costs neither a vendor call
+    nor a rewritten roster.
+
+    1. A string that does not parse as an ISO-8601 instant.
+    2. A naive instant. The refusal names the fix, because ``datetime.fromisoformat``
+       reads a bare date as a naive midnight and a bare date is what a person types
+       first.
+    3. An instant after now. A span starting in the future reports out of scope, so the
+       ticker is not captured until that instant arrives and nothing says so.
+
+    ``register`` and ``open_span`` both refuse a naive instant themselves, so nothing
+    reaches the master unchecked. They refuse it after the live fetch and after the
+    roster upsert. Refusing here is what saves the vendor call and the rewritten roster.
+
+    Every refusal raises ``ArgumentTypeError``, so the operator gets one named line and
+    exit 2 rather than a stack. The clock is the real one, because this runs before any
+    caller has built a clock and the question is what time it is now.
+    """
+    import argparse
+
+    try:
+        instant = datetime.fromisoformat(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not an ISO-8601 instant, like 2026-09-08T17:07:00+00:00"
+        ) from None
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} carries no UTC offset, so it reads as a naive midnight. Pass an "
+            "offset, like 2026-09-08T17:07:00+00:00 or 2026-09-08T13:07:00-04:00."
+        )
+    now = SystemClock().now()
+    if instant > now:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is after now ({now.isoformat()}). A capture span starting in the "
+            "future reports out of scope, so the ticker is not captured until that "
+            "instant arrives and nothing says so."
+        )
+    return instant
+
+
+def _refuse_a_second_epoch(master: SecurityMaster, ticker: str) -> None:
+    """Refuse an explicit epoch for a ticker the master already maps, on any date.
+
+    The idempotence check resolves the ticker as of the epoch, so the epoch decides
+    whether a run counts as a re-onboard. An epoch earlier than the first run's resolves
+    to nothing, because the first run's mapping begins later. Registration then runs a
+    second time, and ``register`` guards only against a duplicate ``instrument_id``,
+    never against a duplicate symbol. The master would hold two instruments mapping one
+    ticker over overlapping open ranges, and ``resolve`` raises ``AmbiguousSymbol`` on
+    every date they share, which is the signal of a corrupt master. A second span opens
+    at the earlier start too, so the spans file disagrees with itself.
+
+    An epoch later than the first run's fails the other way. Resolution succeeds, nothing
+    is registered, the open span is kept, and the run reports an already-registered
+    ticker while the correction is silently dropped.
+
+    Asking the master what it already holds, rather than what it holds on one date, is
+    what catches both. The refusal cannot tell a second attempt at a different epoch from
+    a re-run after a partial one, so it names the epoch the master already holds and both
+    ways forward. An operator whose epoch matches that value re-runs without the option
+    and takes the idempotent path. One whose epoch differs repairs the recorded value
+    deliberately, which is a decision rather than a second command.
+    """
+    held = [m for m in master.mappings if m.id_type == ID_TYPE_TICKER and m.id_value == ticker]
+    if not held:
+        return
+    ranges = ", ".join(
+        f"instrument_id {m.instrument_id} from {m.valid_from.isoformat()} "
+        + ("(open)" if m.valid_to is None else f"to {m.valid_to.isoformat()}")
+        for m in sorted(held, key=lambda m: (m.instrument_id, m.valid_from))
+    )
+    recorded = sorted({m.capture_start.isoformat() for m in held})
+    raise OnboardError(
+        f"the security master already maps {ticker}, so an explicit capture_start is "
+        f"refused. It holds {', '.join(recorded)} as the capture_start, on {ranges}. "
+        "Re-run without --capture-start if that epoch is the one you wanted, which "
+        "reuses the instrument and its recorded epoch. Repair the recorded epoch "
+        "deliberately if it is not."
+    )
+
+
 def onboard(
     ticker: str,
     *,
@@ -220,6 +346,7 @@ def onboard(
     options: bool = True,
     chain_cadence: str | None = DEFAULT_CHAIN_CADENCE,
     bars: Sequence[str] = DEFAULT_BARS,
+    capture_start: datetime | None = None,
     pid: int | None = None,
 ) -> OnboardReport:
     """Onboard one ticker into the lake and return its sign-off report.
@@ -233,10 +360,18 @@ def onboard(
     primitive's durable path. No second fetch is made. ``pid`` sets the journal segment's
     writer-session id, defaulting to this process, so a caller can force a deterministic
     segment name.
+
+    ``capture_start`` is the epoch capture began at, defaulting to the clock's now. It
+    reaches the scope record alone, and the module docstring carries the split and the
+    three refusals it owes. The command line checks its shape before calling this, and
+    the one refusal that needs the master is here.
     """
     lake_root = Path(lake_root)
     now = clock.now()
-    valid_from = _market_date(now)
+    # The epoch the master, the mapping, and the span take. Every other value below is
+    # the clock's.
+    epoch = now if capture_start is None else capture_start
+    valid_from = _market_date(epoch)
 
     master_path = security_master.master_path(lake_root)
     master = SecurityMaster.read(master_path) if master_path.exists() else SecurityMaster()
@@ -259,6 +394,12 @@ def onboard(
         else capture_spans.CaptureSpans()
     )
 
+    # An explicit epoch is what makes the resolution below depend on the caller's value,
+    # so it is what owes the duplicate-symbol guard. An omitted epoch resolves at the
+    # clock's own date and leaves the idempotent re-onboard exactly as it was.
+    if capture_start is not None:
+        _refuse_a_second_epoch(master, ticker)
+
     # Idempotent-friendly: reuse the existing instrument if the ticker is already known.
     existing_id = master.resolve(ticker, valid_from, id_type=ID_TYPE_TICKER)
     already_registered = existing_id is not None
@@ -271,22 +412,26 @@ def onboard(
         # the instrument_id and the capture_start epoch, are what onboarding pins now.
         instrument_id = master.register(
             kind=KIND_EQUITY,
-            capture_start=now,
+            capture_start=epoch,
             valid_from=valid_from,
             ticker=ticker,
         )
 
     # Open a capture span. A new instrument opens its first. A ticker brought back after
-    # retirement, its spans all closed, opens a fresh one at ``now``. A ticker already
-    # capturing keeps its open span, so re-onboarding is idempotent for scope too.
+    # retirement, its spans all closed, opens a fresh one at the clock's now, because
+    # retiring leaves the ticker mapping open and the refusal above turns away a rejoin
+    # carrying an explicit epoch. A ticker already capturing keeps its open span, so
+    # re-onboarding is idempotent for scope too.
     if spans.has_open_span(instrument_id):
         opened_span = False
     else:
-        spans.open_span(instrument_id, now, options)
+        spans.open_span(instrument_id, epoch, options)
         opened_span = True
-    # The report's capture_start is the current span's start: ``now`` for a new or
-    # rejoined ticker, and the existing open span's start for one already capturing.
-    capture_start = next(s.start for s in spans.spans_of(instrument_id) if s.end is None)
+    # The report's capture_start is the current span's start: the epoch for a new or
+    # rejoined ticker, and the existing open span's start for one already capturing. It
+    # takes its own name, because the parameter above is what the caller asked for and
+    # this is what the lake now holds.
+    span_start = next(s.start for s in spans.spans_of(instrument_id) if s.end is None)
 
     # The first snapshot proves the real-time entitlement before the ticker is trusted.
     # It is stamped like a capture cycle so it can be journaled as the first cycle:
@@ -365,7 +510,7 @@ def onboard(
     return OnboardReport(
         ticker=ticker,
         instrument_id=instrument_id,
-        capture_start=capture_start,
+        capture_start=span_start,
         options=options,
         contract_count=contract_count,
         realtime_verified=True,
@@ -387,6 +532,7 @@ def onboard_from_config(
     options: bool = True,
     chain_cadence: str | None = DEFAULT_CHAIN_CADENCE,
     bars: Sequence[str] = DEFAULT_BARS,
+    capture_start: datetime | None = None,
 ) -> OnboardReport:
     """Onboard one ticker wired from the real config and the Schwab-backed vendor.
 
@@ -412,6 +558,7 @@ def onboard_from_config(
         options=options,
         chain_cadence=chain_cadence,
         bars=bars,
+        capture_start=capture_start,
     )
 
 
@@ -438,6 +585,15 @@ def _build_parser():
         help="Chain capture cadence for an options ticker, like 1m.",
     )
     parser.add_argument(
+        "--capture-start",
+        type=_parse_capture_start,
+        help=(
+            "The instant capture began, as an ISO-8601 instant carrying an offset, like "
+            "2026-09-08T17:07:00+00:00. Defaults to now. Pass it to seed a lake that was "
+            "captured before its security master existed."
+        ),
+    )
+    parser.add_argument(
         "--bars",
         nargs="*",
         default=list(DEFAULT_BARS),
@@ -458,6 +614,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             options=args.options,
             chain_cadence=args.chain_cadence,
             bars=args.bars,
+            capture_start=args.capture_start,
         )
     print(report.render())
     return 0
