@@ -60,6 +60,17 @@ off sealed quotes rows the lake already holds, gates each one, and appends what 
 agrees to, under ``python -m lake.actions``. The command a human writes a ``manual`` entry
 with is still #286.
 
+**The split detector is the second writer, and it lives in ``lake.splits``.** It reads a
+different surface, has its own gate, its own report shape and its own subcommand, which is a
+second deliverable's worth of module rather than a section of this one. What it takes from
+here is :func:`append`, the vocabulary above, and four helpers the two walks share:
+:func:`read_master`, :func:`surface_ticker_days`, :func:`by_ticker` and
+:func:`same_but_for_recorded_at`. Those are public for that reason. A second copy of the
+last one in particular could drift from this one silently, and it is what stops either walk
+appending the same entry every night forever. The import direction runs one way, from
+``splits`` to here, and :func:`main` keeps it that way by importing the walk inside the
+branch that runs it.
+
 **The gate lands ahead of the validation battery, and on purpose.** Chains and quotes seal
 first and are flagged afterwards, because a captured minute is unrepeatable and a refusal
 would lose it. A ledger entry is the opposite: it is derived from rows already on disk, so
@@ -488,7 +499,7 @@ def append(
     ``type`` shadows the builtin deliberately. It is the entry's own field name, so a
     call site reads as the record it writes, and nothing here calls the builtin.
     """
-    entry = _build_entry(
+    entry = build_entry(
         instrument_id=instrument_id,
         observed_on=observed_on,
         recorded_at=recorded_at,
@@ -532,7 +543,7 @@ def append(
     return entry
 
 
-def _build_entry(
+def build_entry(
     *,
     instrument_id: int,
     observed_on: date | None,
@@ -549,7 +560,10 @@ def _build_entry(
     """Validate and render one entry without writing it.
 
     :func:`append` is the writer. This is the half that decides what a well-formed entry
-    is, so a caller assembling one can be checked without a lake on disk.
+    is, so a caller assembling one can be checked without a lake on disk. That is also what
+    both walks compare against the ledger before they write: a candidate built here can be
+    read against what :func:`latest` already resolves, and an entry that matches on every
+    field but ``recorded_at`` is one the ledger already holds.
 
     The eleven fields, and what each answers.
 
@@ -805,7 +819,8 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
     since marketlake #17, so the evidence a dividend is derived from is already on disk. Every
     dependency is injected and this reads no config, the way ``seed_spans`` does.
 
-    **The ticker-days come from the manifest.** ``manifest.latest_entries`` returns the
+    **The ticker-days come from the manifest**, through :func:`surface_ticker_days`.
+    ``manifest.latest_entries`` returns the
     current entry per partition path, which is the lake's own record of what it holds.
     Deriving them from the roster and the exchange calendar instead would ask for every
     session the calendar carries, and ``load_quotes`` raises ``PartitionAbsent`` on a session
@@ -864,13 +879,13 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
     containment ``write_withheld`` says belongs to its caller.
     """
     lake_root = Path(lake_root)
-    master = _read_master(lake_root)
+    master = read_master(lake_root)
     recorded_at = clock.now()
     # Read once for the run, so every ticker-day is compared against one snapshot of what the
     # ledger already holds, the way the close guard reads the manifest once per run.
     current = latest(lake_root)
 
-    ticker_days = _quotes_ticker_days(lake_root)
+    ticker_days = surface_ticker_days(lake_root, QUOTES)
     appended: list[Landed] = []
     held: list[HeldFinding] = []
     unchanged = 0
@@ -913,7 +928,7 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
             return
         held.append(HeldFinding(finding=finding, filed_at=filed_at))
 
-    for ticker, days in _by_ticker(ticker_days):
+    for ticker, days in by_ticker(ticker_days):
         # The last value this ticker was observed carrying, and the instrument it was
         # attributed to. Both, because either changing is a new thing to record.
         previous: tuple[int | None, str] | None = None
@@ -989,7 +1004,7 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
                 "provenance": provenance,
             }
             try:
-                candidate = _build_entry(**fields)
+                candidate = build_entry(**fields)
             except ValueError as exc:
                 hold(_payload_finding(ticker, day, exc, instrument_id=instrument_id))
                 continue
@@ -997,7 +1012,7 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
             if key in emitted:
                 continue
             emitted.add(key)
-            if _same_but_for_recorded_at(current.get(key), candidate):
+            if same_but_for_recorded_at(current.get(key), candidate):
                 unchanged += 1
                 continue
             appended.append(Landed(entry=append(lake_root, **fields), symbol=ticker))
@@ -1010,11 +1025,16 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
     )
 
 
-def _read_master(lake_root: Path) -> SecurityMaster:
+def read_master(lake_root: Path) -> SecurityMaster:
     """The master, read once before anything else, or the reason the run stops.
 
     ``resolve_instrument`` takes a ``SecurityMaster`` rather than a path, so reading it is a
     precondition of the walk rather than a step inside it.
+
+    Public because ``lake.splits`` needs the same precondition on the same terms. The
+    separation this encodes is a rule rather than a convenience: an absent master wants the
+    onboarding command and a torn one wants a restore, and a second copy could keep one of
+    the two and drop the other silently.
     """
     path = master_path(lake_root)
     try:
@@ -1023,8 +1043,8 @@ def _read_master(lake_root: Path) -> SecurityMaster:
         raise MasterAbsent(path) from exc
 
 
-def _quotes_ticker_days(lake_root: Path) -> list[tuple[str, date]]:
-    """Every sealed quotes ticker-day the manifest records, in ticker then date order.
+def surface_ticker_days(lake_root: Path, surface: str) -> list[tuple[str, date]]:
+    """Every sealed ticker-day of one surface the manifest records, in ticker then date order.
 
     The keys are read apart by ``paths.parse_partition_rel``, which inverts the builder that
     wrote them. ``paths.py`` is the single home for that, and its reason is the one that
@@ -1032,19 +1052,22 @@ def _quotes_ticker_days(lake_root: Path) -> list[tuple[str, date]]:
     nothing catches it, because this walk passes over a key it cannot read rather than
     raising on one.
 
-    A key naming anything but the quotes surface is passed over, which is every chains
-    ticker-day, both ledgers, and every reference table.
+    A key naming any other surface is passed over, along with both ledgers and every
+    reference table. ``surface`` is a parameter rather than a constant because two walks
+    enumerate this way and they read different surfaces. The dividend extraction below reads
+    quotes and ``lake.splits`` reads chains, and a second copy of this would be a second
+    place the partition-key convention lives.
     """
     found: list[tuple[str, date]] = []
     for partition in latest_entries(lake_root):
         reference = parse_partition_rel(partition)
-        if reference is None or reference.surface != QUOTES:
+        if reference is None or reference.surface != surface:
             continue
         found.append((reference.ticker, reference.day))
     return sorted(found)
 
 
-def _by_ticker(ticker_days: Sequence[tuple[str, date]]) -> Iterator[tuple[str, list[date]]]:
+def by_ticker(ticker_days: Sequence[tuple[str, date]]) -> Iterator[tuple[str, list[date]]]:
     """The same ticker-days grouped by ticker, each ticker's sessions in date order.
 
     The partitions are keyed by ticker, so that is what the sessions arrive grouped by. The
@@ -1053,6 +1076,8 @@ def _by_ticker(ticker_days: Sequence[tuple[str, date]]) -> Iterator[tuple[str, l
     here on the instrument instead would mean resolving before reading, and a master that
     could not place a symbol would then hold one finding per ticker-day for a condition that
     has one action behind it.
+
+    Public because ``lake.splits`` groups the same way over the chains surface.
     """
     grouped: dict[str, list[date]] = {}
     for ticker, day in ticker_days:
@@ -1145,13 +1170,19 @@ def _resolution_finding(
     )
 
 
-def _same_but_for_recorded_at(existing: dict | None, candidate: dict) -> bool:
+def same_but_for_recorded_at(existing: dict | None, candidate: dict) -> bool:
     """Whether the ledger already holds this entry, ignoring when it was written down.
 
     ``recorded_at`` is the clock's answer and moves every night while nothing else does, so
     comparing whole entries would append a dividend the ledger already holds, every night,
     forever. This is the rule marketlake #139 states for the quarantine ledger: read the
     current entry first, and a re-observation of the same finding supersedes nothing.
+
+    Public because ``lake.splits`` needs the same comparison and a second copy of it could
+    drift from this one without anything noticing. What the two writers do differ on is what
+    they stamp into ``observed_on``, and that is theirs rather than this rule's: a split
+    stays visible in sealed chains forever, so a detector stamping the night it ran would
+    fail this comparison every night and append the same split every night.
     """
     if existing is None:
         return False
@@ -1177,17 +1208,55 @@ def extract_dividends_from_config(
     )
 
 
+# The subcommand that reads splits out of sealed chains. ``lake.splits`` owns the walk and
+# this command owns the invocation, so the name is fixed here beside the parser that takes it.
+SPLITS_COMMAND = "splits"
+# The subcommand that names the dividend extraction explicitly. It is what the bare command
+# already does, so this is a name for the default rather than a second behaviour.
+DIVIDENDS_COMMAND = "dividends"
+
+
 def _build_parser():
+    """The parser, with the dividend extraction as the default and no subcommand required.
+
+    Two walks now write this ledger. The dividend extraction reads sealed quotes and
+    ``lake.splits`` reads sealed chains, and marketlake #286's manual entry will be a third.
+    So the command grows subcommands, and which one is the default was a choice with a
+    measured price behind it.
+
+    Requiring one would move seven component call sites of ``main(["--config", ...])`` and a
+    sentence in ``docs/design.md`` that documents the extraction as running as
+    ``python -m lake.actions``. Making the extraction the default moves neither, and it costs
+    nothing a reader can see, because :data:`DIVIDENDS_COMMAND` names the default out loud
+    for anyone who would rather write it than rely on it.
+
+    ``--config`` is accepted on either side of the subcommand. Each subparser declares it
+    with a default of ``argparse.SUPPRESS``, so a subcommand that does not carry the flag
+    sets no attribute and the top-level value survives. Without that, the subparser's own
+    ``None`` default would overwrite a ``--config`` written before the subcommand, silently.
+    """
     import argparse
 
     parser = argparse.ArgumentParser(
         prog="python -m lake.actions",
         description=(
-            "Read dividends out of the lake's sealed quote rows, gate each one, and append "
-            "what lands to the corporate-actions ledger. Nothing here fetches."
+            "Read corporate actions out of rows the lake has already sealed, gate each one, "
+            "and append what lands to the corporate-actions ledger. Nothing here fetches. "
+            "With no subcommand this runs the dividend extraction."
         ),
     )
     parser.add_argument("--config", help="Path to config.yaml (defaults to the standard location).")
+    subcommands = parser.add_subparsers(dest="command")
+    for name, help_text in (
+        (DIVIDENDS_COMMAND, "Read dividends out of the lake's sealed quote rows. The default."),
+        (SPLITS_COMMAND, "Read splits out of the OCC re-symboling in the lake's sealed chains."),
+    ):
+        subcommand = subcommands.add_parser(name, help=help_text, description=help_text)
+        subcommand.add_argument(
+            "--config",
+            default=argparse.SUPPRESS,
+            help="Path to config.yaml (defaults to the standard location).",
+        )
     return parser
 
 
@@ -1197,6 +1266,11 @@ def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> in
     ``clock`` stays injectable, for the reason ``alert.main`` gives: a wall clock never
     reaches past this process. It is also what makes a test of this command writable, since
     what "a second night" means has to be something the test decides.
+
+    **The bare command runs the dividend extraction.** ``splits`` runs the detection over
+    sealed chains instead. The two walks read different surfaces and produce different report
+    shapes, and each renders its own. Everything below is the same for both, because the three
+    exit codes describe the run rather than which walk made it.
 
     **A lake with no security master reaches the operator as one line, not a stack.**
     ``input_errors_exit`` covers the three files in the config directory that are the
@@ -1217,9 +1291,17 @@ def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> in
 
     from lake.config import input_errors_exit
 
+    # Local, so ``lake.splits`` can import this module at its own top level. The walk it
+    # holds reads ``append``, the two vocabulary constants and four helpers from here, and
+    # the import direction only stays one-way because this end of it waits until it runs.
+    if args.command == SPLITS_COMMAND:
+        from lake.splits import detect_splits_from_config as run
+    else:
+        run = extract_dividends_from_config
+
     try:
         with input_errors_exit("actions"):
-            report = extract_dividends_from_config(clock=clock, config_path=args.config)
+            report = run(clock=clock, config_path=args.config)
     except MasterAbsent as exc:
         print(
             f"actions: {exc}. Onboard a ticker first, with python -m lake.onboard <TICKER>.",
@@ -1240,11 +1322,13 @@ __all__ = [
     "CHECK_DIVIDEND_CONSISTENCY",
     "CHECK_DIVIDEND_PAYLOAD",
     "CHECK_INSTRUMENT_RESOLUTION",
+    "DIVIDENDS_COMMAND",
     "DIVIDEND_CONSISTENCY_TOLERANCE",
     "PROVENANCES",
     "PROVENANCE_MANUAL",
     "PROVENANCE_OBSERVED",
     "PROVENANCE_VENDOR_REPORTED",
+    "SPLITS_COMMAND",
     "SWEEP_SOURCE",
     "TYPE_DIVIDEND",
     "TYPE_SPLIT",
@@ -1260,6 +1344,8 @@ __all__ = [
     "actions_path",
     "append",
     "as_of",
+    "build_entry",
+    "by_ticker",
     "check_dividend_consistency",
     "entry_key",
     "entry_line_count",
@@ -1269,7 +1355,10 @@ __all__ = [
     "main",
     "normalize_date",
     "read",
+    "read_master",
     "resolve_instrument",
+    "same_but_for_recorded_at",
+    "surface_ticker_days",
 ]
 
 

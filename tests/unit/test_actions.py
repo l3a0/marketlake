@@ -21,7 +21,7 @@ from lake.actions import (
     TYPE_DIVIDEND,
     TYPE_SPLIT,
     LedgerLineError,
-    _build_entry,
+    build_entry,
     entry_key,
     normalize_date,
 )
@@ -43,7 +43,7 @@ def _dividend(**overrides) -> dict:
         "provenance": PROVENANCE_VENDOR_REPORTED,
     }
     fields.update(overrides)
-    return _build_entry(**fields)
+    return build_entry(**fields)
 
 
 def _split(**overrides) -> dict:
@@ -168,7 +168,7 @@ def test_a_split_fills_the_ratio_and_leaves_the_three_dividend_fields_null():
     # Marketlake #279 writes these entries and should not have to infer what a split
     # leaves empty. A split pays nothing, and Schwab's fundamentals carry no announcement
     # date for one.
-    entry = _build_entry(
+    entry = build_entry(
         instrument_id=1,
         observed_on=date(2026, 9, 14),
         recorded_at=RECORDED,

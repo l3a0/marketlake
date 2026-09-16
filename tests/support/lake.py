@@ -33,6 +33,18 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 # A fixture schema for chains rows. Provenance columns plus a few vendor columns.
+#
+# Six of the vendor columns are here for the split detector, which reads a corporate
+# action out of what a contract delivers rather than out of its price. ``option_root`` is
+# the signal, Schwab's own ``optionRoot``, and the OCC re-symboling that announces a split
+# is a change in it. The four that follow are where the deliverable is written down, and
+# they are what the ratio and its gate are computed from. ``is_chain_truncated`` rides
+# beside ``suspect`` because a thin snapshot carries a thin root set, so both are what say
+# a session cannot bound a boundary.
+#
+# Widening is additive and costs the existing callers nothing. ``_table`` fills each
+# column with ``row.get(name)``, so a row written against the narrower schema still builds
+# and reads ``None`` in every column it does not mention.
 FIXTURE_CHAINS_SCHEMA = pa.schema(
     [
         ("snap_ts", pa.string()),
@@ -44,6 +56,12 @@ FIXTURE_CHAINS_SCHEMA = pa.schema(
         ("ask", pa.float64()),
         ("last", pa.float64()),
         ("open_interest", pa.int64()),
+        ("option_root", pa.string()),
+        ("multiplier", pa.float64()),
+        ("non_standard", pa.bool_()),
+        ("deliverable_note", pa.string()),
+        ("option_deliverables_list", pa.string()),
+        ("is_chain_truncated", pa.bool_()),
         ("row_kind", pa.string()),
         ("error_class", pa.string()),
         ("suspect", pa.bool_()),
@@ -95,6 +113,15 @@ def sample_chains_table(rows: Sequence[dict] | None = None) -> pa.Table:
                 "ask": 4.25,
                 "last": 4.22,
                 "open_interest": 1234,
+                "option_root": "SPY",
+                "multiplier": 100.0,
+                "non_standard": False,
+                "deliverable_note": "100 SPY",
+                "option_deliverables_list": (
+                    '[{"assetType": "STOCK", "currencyType": null, '
+                    '"deliverableUnits": 100.0, "symbol": "SPY"}]'
+                ),
+                "is_chain_truncated": False,
                 "row_kind": "data",
                 "error_class": None,
                 "suspect": False,
