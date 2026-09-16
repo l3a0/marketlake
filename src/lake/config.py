@@ -148,6 +148,15 @@ class GuardConstants:
     oi_refresh_quorum: float = 0.50
     # The number of subsequent stored cycles a refreshed OI must hold to be selected.
     oi_plateau_cycles: int = 1
+    # How many of session S's top-volume contracts rank into the comparable set. The
+    # measurement bounds this from above rather than pinning it. Only 4,443 to 5,287
+    # contracts carried non-zero volume in the four sealed close cycles the lake held on
+    # 2026-09-16, and a zero-volume contract is exactly what a half-loaded vendor cycle
+    # reads as zero, so a set wide enough to admit them is a set the quorum stops
+    # protecting. The same cycle changed 45.6 percent of SPY's whole shared set against a
+    # 0.50 quorum, a four-point margin, while none of the top 200 by volume changed. 200
+    # is that measured margin, not a round number.
+    oi_comparable_set_size: int = 200
     # The chain chunker's one constant. A full SPY chain in one request exceeds Schwab's
     # gateway body limit (a 502 with errorcode protocol.http.TooBigBody), so the chain is
     # fetched in date windows and reassembled. The set of windows is not a guard constant.
