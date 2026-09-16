@@ -139,15 +139,27 @@ class GuardConstants:
     # Median-relative checks with fewer than this many trailing sessions still run but
     # tag their rows *insufficient_history* instead of clean.
     min_trailing_sessions: int = 5
-    # The OI view's freshness test uses the next three. The design names them as guard
-    # constants but pins no number. Slice 1's refresh-moment measurement calibrates
-    # them, so the values here are provisional placeholders, not design-pinned figures.
+    # The OI view's freshness test uses the next four. The design names three of them as
+    # guard constants and pins no number, and marketlake #137 names the fourth. Slice 1's
+    # refresh-moment measurement was meant to calibrate them and cannot: it looks for a
+    # later cycle in a session that differs from that session's first, and open interest
+    # does not move inside a stored session. So these are provisional placeholders waiting
+    # on a calibration that has to come from somewhere else, not design-pinned figures.
     # The minimum comparable-set size below which the OI verdict is *indeterminate*.
     oi_comparable_set_floor: int = 20
     # The fraction of the comparable set that must show changed OI to declare a refresh.
     oi_refresh_quorum: float = 0.50
     # The number of subsequent stored cycles a refreshed OI must hold to be selected.
     oi_plateau_cycles: int = 1
+    # How many of session S's top-volume contracts rank into the comparable set. The
+    # measurement bounds this from above rather than pinning it. Only 4,443 to 5,287
+    # contracts carried non-zero volume in the four sealed close cycles the lake held on
+    # 2026-09-16, and a zero-volume contract is exactly what a half-loaded vendor cycle
+    # reads as zero, so a set wide enough to admit them is a set the quorum stops
+    # protecting. The same cycle changed 45.6 percent of SPY's whole shared set against a
+    # 0.50 quorum, a four-point margin, while none of the top 200 by volume changed. 200
+    # is that measured margin, not a round number.
+    oi_comparable_set_size: int = 200
     # The chain chunker's one constant. A full SPY chain in one request exceeds Schwab's
     # gateway body limit (a 502 with errorcode protocol.http.TooBigBody), so the chain is
     # fetched in date windows and reassembled. The set of windows is not a guard constant.
