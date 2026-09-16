@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timedelta
 from types import MappingProxyType
 from zoneinfo import ZoneInfo
@@ -249,7 +250,9 @@ def test_the_three_counts_account_for_every_symbol_in_the_batch():
     }
     reading = read_batch(quotes, SATURDAY)
     assert reading.readable + reading.refused + reading.absent == len(quotes)
-    assert reading == Reading(trading=("AAA",), readable=2, refused=1, absent=2)
+    assert reading == Reading(
+        trading=("AAA",), readable=2, refused=1, absent=2, latest=et(2026, 9, 5, 9, 34)
+    )
 
 
 def test_a_quote_time_in_float_notation_reads_as_a_stamp():
@@ -562,6 +565,28 @@ class Pings:
         self.urls.append(url)
 
 
+# The stamp every paging fixture carries. `report` takes a result a caller built, and only
+# `run_probe` guarantees a trading symbol arrives with a stamp, so a fixture that pages owes
+# one itself. The body reads it with no fallback.
+PAGE_STAMP = et(2026, 9, 5, 9, 34, 12)
+
+
+def _paged(trading=("SPY",), *, answered=2, asked=2, latest=PAGE_STAMP) -> ProbeResult:
+    """A result the paging branch composes a body from, with every field that body reads."""
+    return ProbeResult(
+        SATURDAY,
+        checked=True,
+        trading=trading,
+        latest=latest,
+        answered=answered,
+        asked=asked,
+    )
+
+
+def _names(size: int) -> tuple[str, ...]:
+    return tuple(f"SYM{index:04d}" for index in range(size))
+
+
 def test_a_market_found_open_is_actually_sent(tmp_path):
     """The page must reach the publisher, not just be decided on.
 
@@ -571,7 +596,7 @@ def test_a_market_found_open_is_actually_sent(tmp_path):
     from lake.probe_calendar import PAGE_TITLE, report
 
     sink, pings = Sink(), Pings()
-    result = ProbeResult(date(2026, 9, 5), checked=True, trading=("SPY",))
+    result = _paged()
     code = report(
         result,
         publisher=sink,
@@ -583,7 +608,12 @@ def test_a_market_found_open_is_actually_sent(tmp_path):
     assert code == 1
     assert [m.title for m in sink.sent] == [PAGE_TITLE]
     assert sink.sent[0].priority == 5
-    assert "SPY" in sink.sent[0].body
+    # This assertion demanded a name before the change and has to say they are gone after.
+    assert "SPY" not in sink.sent[0].body
+    assert sink.sent[0].body == (
+        "2026-09-05: 1 of 2 answered quoting today, 2 asked, latest 09:34:12 ET. "
+        "The daemon is idle. Check the Now panel."
+    )
 
 
 def test_the_check_is_fed_on_the_day_it_pages_too():
@@ -593,7 +623,7 @@ def test_the_check_is_fed_on_the_day_it_pages_too():
 
     pings = Pings()
     report(
-        ProbeResult(date(2026, 9, 5), checked=True, trading=("SPY",)),
+        _paged(),
         publisher=Sink(),
         pinger=pings,
         ping_url="https://x/y",
@@ -629,7 +659,7 @@ def test_a_failing_ping_never_costs_the_page():
 
     sink = Sink()
     code = report(
-        ProbeResult(date(2026, 9, 5), checked=True, trading=("SPY",)),
+        _paged(),
         publisher=sink,
         pinger=Broken(),
         ping_url="https://x/y",
@@ -644,6 +674,244 @@ def test_the_page_title_is_the_one_the_design_pins():
     from lake.probe_calendar import PAGE_TITLE
 
     assert PAGE_TITLE == "Calendar says closed, market looks open"
+
+
+# -- what the page body says ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("size", [1, 6, 600])
+def test_the_body_names_no_symbol_at_any_roster_size(size):
+    """The names grew with the roster, and the design leaves them out.
+
+    A market that is open quotes every symbol, so the list restates the roster. Capping it
+    instead would still put names in the body, which this refuses at any size.
+    """
+    names = _names(size)
+    body = probe_calendar._page_body(_paged(names, answered=size, asked=size))
+
+    assert not any(name in body for name in names)
+
+
+def test_the_body_tells_a_partial_reply_from_a_full_one():
+    """Quoted, answered and asked are three different numbers, and the page carries all three.
+
+    Three quoting symbols read as an open market against what the vendor answered about
+    and as a glitch against what was asked, and both can be the same reply. Reporting one
+    number would pick a reading for the operator.
+    """
+    quoting = ("AAA", "BBB", "CCC")
+    partial = probe_calendar._page_body(_paged(quoting, answered=3, asked=115))
+    full = probe_calendar._page_body(_paged(quoting, answered=115, asked=115))
+
+    assert "3 of 3 answered" in partial
+    assert "115 asked" in partial
+    assert "3 of 115 answered" in full
+    assert partial != full
+
+
+def test_the_quoted_count_is_what_traded_today_rather_than_what_read():
+    """A prior session's stamp reads fine and is not the market quoting now.
+
+    Counting what read would report every symbol the vendor stamped at all, which on a
+    genuinely closed day is the whole roster. The page exists to contradict that reading.
+    """
+    result = _probe(
+        et(2026, 9, 5, 9, 35),
+        {"SPY": _quote(et(2026, 9, 5, 9, 34)), "QQQ": _quote(et(2026, 9, 4, 16, 0))},
+    )
+
+    assert result.trading == ("SPY",)
+    assert (result.answered, result.asked) == (2, 2)
+    assert probe_calendar._page_body(result) == (
+        "2026-09-05: 1 of 2 answered quoting today, 2 asked, latest 09:34:00 ET. "
+        "The daemon is idle. Check the Now panel."
+    )
+
+
+def test_answered_counts_what_the_vendor_named_rather_than_what_read():
+    """The denominator is the whole reply, stamps that would not read included.
+
+    This is the decision the page turns on, and separating it needs a batch where the three
+    outcomes differ. One stamp reads, one is absent, one is refused, and a fourth symbol the
+    vendor stays quiet about entirely never reaches the reader at all. So the four numbers
+    that could stand in for each other come apart: asked is 4, the vendor answered about 3,
+    2 read in some form, and 1 quoted.
+
+    A denominator of what read would report ``1 of 1`` on a vendor going bad one symbol at a
+    time, which says the market is open on the evidence of the symbols that still work.
+    """
+    result = run_probe(
+        calendar=weekday_sessions(WEEK),
+        clock=ManualClock(start=et(2026, 9, 5, 9, 35)),
+        symbols=["AAA", "BBB", "CCC", "DDD"],
+        fetch=lambda symbols: VendorResponse(
+            status=200,
+            body={
+                "AAA": _quote(et(2026, 9, 5, 9, 34)),
+                "BBB": {"quote": {}},
+                "CCC": _stamped(True),
+            },
+            headers={},
+        ),
+    )
+
+    assert result.trading == ("AAA",)
+    assert (result.answered, result.asked, result.refused) == (3, 4, 1)
+    assert probe_calendar._page_body(result) == (
+        "2026-09-05: 1 of 3 answered quoting today, 4 asked, latest 09:34:00 ET. "
+        "The daemon is idle. Check the Now panel."
+    )
+
+
+def test_the_body_carries_the_latest_stamp_on_the_market_clock():
+    """The maximum stamp, and rendered in market time under the literal that says so.
+
+    Three symbols with the maximum on neither end of the walk, because reporting the first
+    and reporting the last are two different mistakes and a two-symbol batch has only those
+    two positions. ``journal.epoch_ms_to_utc`` returns UTC, so a body that formats the
+    stored instant reads four hours out in summer while the literal still says ``ET``.
+    """
+    stamps = {
+        "AAA": et(2026, 9, 5, 9, 31, 5),
+        "MMM": et(2026, 9, 5, 9, 34, 12),
+        "ZZZ": et(2026, 9, 5, 9, 32, 40),
+    }
+    reading = read_batch({name: _quote(at) for name, at in stamps.items()}, SATURDAY)
+    body = probe_calendar._page_body(
+        _paged(reading.trading, answered=3, asked=3, latest=reading.latest)
+    )
+
+    assert "latest 09:34:12 ET" in body
+    assert "09:31:05" not in body
+    assert "09:32:40" not in body
+    # 09:34:12 ET is 13:34:12 UTC, which is what formatting the stored instant would print.
+    assert "13:34:12" not in body
+
+
+def test_the_body_does_not_grow_with_the_roster():
+    """Its length moves by the digits of the counts and by nothing else.
+
+    Asserting only that six hundred symbols fit the design's byte budget would still pass a
+    capped list of names, which grows slowly rather than not at all.
+    """
+    small = probe_calendar._page_body(_paged(_names(6), answered=6, asked=6))
+    large = probe_calendar._page_body(_paged(_names(600), answered=600, asked=600))
+
+    assert re.sub(r"\d", "", small) == re.sub(r"\d", "", large)
+    assert len(large.encode()) - len(small.encode()) == 3 * (len("600") - len("6"))
+
+
+def test_pages_reads_the_names_and_never_the_stamp():
+    """``pages`` is still the trading names, so the new field cannot decide who is paged.
+
+    A result carrying a stamp and no trading symbol is every closed day the vendor answered
+    on, and reading the stamp would page on all of them.
+    """
+    assert ProbeResult(SATURDAY, checked=True, trading=("SPY",)).pages
+    assert not ProbeResult(SATURDAY, checked=True, latest=PAGE_STAMP).pages
+
+
+def test_the_operator_line_names_the_count_and_never_the_roster(capsys):
+    """The launchd log gets the same fold the phone does.
+
+    Nothing above constrains this line, so a roster printed here would put the names back
+    into the one surface the body no longer carries them on.
+    """
+    from lake.probe_calendar import PAGE_TITLE, report
+
+    report(
+        _paged(("SPY", "QQQ")),
+        publisher=Sink(),
+        pinger=Pings(),
+        ping_url="https://x/y",
+        slug=CALENDAR_PROBE_SLUG,
+        now=et(2026, 9, 5, 9, 35),
+    )
+
+    err = capsys.readouterr().err.strip()
+    assert err == f"calendar probe: {PAGE_TITLE} (2 symbols)"
+    assert "SPY" not in err
+
+
+def test_a_batch_that_read_nothing_composes_no_page():
+    """No readable stamp and no trading symbol reaches the publisher at all.
+
+    The body reads a stamp that is not there on such a result, so composing one would raise
+    inside the paging branch, after the ping has already fed the check green.
+    """
+    from lake.probe_calendar import report
+
+    result = _probe(et(2026, 9, 5, 9, 35), {"SPY": _stamped(True), "QQQ": _stamped("junk")})
+    sink = Sink()
+
+    code = report(
+        result,
+        publisher=sink,
+        pinger=Pings(),
+        ping_url="https://x/y",
+        slug=CALENDAR_PROBE_SLUG,
+        now=et(2026, 9, 5, 9, 35),
+    )
+
+    assert code == 0
+    assert sink.sent == []
+
+
+def test_a_readable_stamp_from_another_day_never_becomes_the_latest():
+    """``latest`` is the newest stamp behind ``trading``, not the newest that read.
+
+    A vendor clock running ahead sends a stamp that converts fine and belongs to no
+    session today. Tracking every readable stamp would put it on the page, and the page
+    would then report a time no quoting symbol carried, which is the one fact the body
+    exists to carry.
+    """
+    reading = read_batch(
+        {
+            "AAA": _quote(et(2026, 9, 5, 9, 34)),
+            "ZZZ": _quote(et(2026, 9, 6, 9, 34)),
+        },
+        SATURDAY,
+    )
+
+    assert reading.trading == ("AAA",)
+    assert reading.readable == 2
+    assert reading.latest == et(2026, 9, 5, 9, 34)
+
+
+def test_a_paging_result_with_no_stamp_raises_rather_than_inventing_one():
+    """The body has no fallback, and this is what holds that decision in place.
+
+    ``run_probe`` cannot build this result, so the raise is unreachable from `main`. What
+    it guards is the edit that adds a fallback, which would publish a placeholder where
+    the stamp goes on the one page that reports a whole lost session. A page saying the
+    market is trading and the time is unknown is worse than one that never sends, because
+    the operator acts on it.
+    """
+    from lake.probe_calendar import report
+
+    with pytest.raises(AttributeError):
+        report(
+            ProbeResult(SATURDAY, checked=True, trading=("SPY",), answered=2, asked=2),
+            publisher=Sink(),
+            pinger=Pings(),
+            ping_url="https://x/y",
+            slug=CALENDAR_PROBE_SLUG,
+            now=et(2026, 9, 5, 9, 35),
+        )
+
+
+def test_run_probe_pairs_a_trading_symbol_with_a_stamp():
+    """``run_probe`` pairs a trading symbol with a stamp, which is what the body relies on.
+
+    The branch that fills ``trading`` is reached only from a stamp that read, so the two
+    arrive together. ``ProbeResult`` does not enforce that pairing, which is why every
+    fixture here that pages sets both by hand.
+    """
+    partial = _probe(et(2026, 9, 5, 9, 35), {"SPY": _quote(et(2026, 9, 5, 9, 34))})
+
+    assert partial.trading == ("SPY",)
+    assert partial.latest == et(2026, 9, 5, 9, 34)
+    assert (partial.answered, partial.asked) == (1, 2)
 
 
 # -- what the operator line says -----------------------------------------------------
