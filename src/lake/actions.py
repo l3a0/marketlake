@@ -53,10 +53,20 @@ correction would land beside the original instead of superseding it, silently, i
 ledger every total-return factor reads. Parquet's ``date32`` enforced this for free. Here
 :func:`normalize_date` does.
 
-**Nothing in this module writes an entry of its own.** The dividend extraction and the
-validation that append the first one are marketlake #284, and the command a human writes a
-``manual`` entry with is #286. What ships here is the record format, the writer,
-and the two reads that resolve it.
+**The dividend extraction is the first writer, and it lives here.** Marketlake #282 shipped
+the record format, the writer, and the two reads that resolve it, and said nothing in the
+module wrote an entry of its own. #284 is what changed that. It reads the dividend fields
+off sealed quotes rows the lake already holds, gates each one, and appends what the gate
+agrees to, under ``python -m lake.actions``. The command a human writes a ``manual`` entry
+with is still #286.
+
+**The gate lands ahead of the validation battery, and on purpose.** Chains and quotes seal
+first and are flagged afterwards, because a captured minute is unrepeatable and a refusal
+would lose it. A ledger entry is the opposite: it is derived from rows already on disk, so
+a wrong one can be held today and landed tomorrow at no cost, while a wrong one that lands
+corrupts every adjusted price computed through it. So this surface gates before it writes.
+D20's battery in slice 5 subsumes the check later. Waiting for it would land ungated
+entries for two slices.
 
 ``recorded_at`` is injected, never read from a wall clock. ``manifest.py`` states that rule
 for itself and every writer in the lake follows it. It is what lets the suite run offline
@@ -65,15 +75,20 @@ and deterministically.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import sys
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from math import isfinite
 from pathlib import Path
 
 from lake.calendar import MARKET_TZ
-from lake.manifest import append_line, parse_jsonl, record_partition
-from lake.paths import ACTIONS, CORPORATE_ACTIONS_FILE
-from lake.security_master import SecurityMaster
+from lake.clock import Clock, SystemClock
+from lake.loader import NoSpotClose, load_quotes
+from lake.manifest import append_line, latest_entries, parse_jsonl, record_partition
+from lake.paths import ACTIONS, CORPORATE_ACTIONS_FILE, QUOTES, parse_partition_rel
+from lake.report import Withheld, write_withheld
+from lake.security_master import AmbiguousSymbol, MasterUnreadable, SecurityMaster, master_path
 
 # This module's own schema version, stamped on every entry it writes. It names the shape
 # of a ledger line, not the journal shape a capture row carries, and the two move
@@ -115,6 +130,53 @@ KEY_FIELDS = ("instrument_id", "ex_date", "type")
 # share it, and the last one in the file is the current answer.
 ActionKey = tuple[int, str, str]
 
+# The two gates this module files a refusal under. They name what refused rather than what
+# was refused, because the finding already carries the event.
+CHECK_DIVIDEND_CONSISTENCY = "dividend_consistency"
+CHECK_INSTRUMENT_RESOLUTION = "instrument_resolution"
+# The payload the ledger's own record rules refused: a vendor date that does not name a
+# date, an amount ``append`` will not take, or a close whose rows disagree with each other.
+# Each one used to end the run as a traceback, which is neither fail-closed nor a record.
+CHECK_DIVIDEND_PAYLOAD = "dividend_payload"
+
+# The six quote columns a dividend is read out of. ``div_pay_amount`` is the per-event
+# amount and the one that lands as ``cash_amount``. ``div_amount`` is the annualized
+# trailing figure the vendor's yield keys off, and it is never the amount: QQQ's is exactly
+# four times its per-event amount and SPY's within 0.00002, so reading it would inflate
+# every total-return factor fourfold for a quarterly payer. It is here because the gate
+# below is what compares the two.
+DIV_EX_DATE = "div_ex_date"
+DIV_PAY_AMOUNT = "div_pay_amount"
+DIV_AMOUNT = "div_amount"
+DIV_FREQ = "div_freq"
+DIV_PAY_DATE = "div_pay_date"
+DECLARATION_DATE = "declaration_date"
+DIVIDEND_COLUMNS = (
+    DIV_EX_DATE,
+    DIV_PAY_AMOUNT,
+    DIV_AMOUNT,
+    DIV_FREQ,
+    DIV_PAY_DATE,
+    DECLARATION_DATE,
+)
+
+# How far the vendor's annualized figure may sit from ``div_freq`` times its own per-event
+# amount before the gate holds the dividend out.
+#
+# It is measured rather than guessed, and it is relative rather than absolute. SPY reports
+# 7.61406 against four times 1.90352, which is 7.61408, so the vendor's own arithmetic is
+# off by 0.00002. QQQ is exact. That 0.00002 is 2.6 parts in a million of SPY's figure, and
+# three parts in a million is the whole number that admits it and no more. An absolute
+# 0.00002 would mean something different on every payer: three parts in a million of SPY's
+# annualized figure, and a fifth of a percent of a penny one.
+#
+# The design already says real payloads violate this occasionally, which is why a
+# disagreement files rather than pages. A small payer whose per-event amount the vendor
+# rounds to five decimals carries more relative slack than a large one, so this refuses
+# some correct payloads. A refusal costs a night's entry and a file a human reads. Landing
+# a wrong amount costs every adjusted price computed through it, so the gate is tight.
+DIVIDEND_CONSISTENCY_TOLERANCE = 3e-6
+
 
 class ActionsError(Exception):
     """Base class for every corporate-actions error."""
@@ -150,6 +212,25 @@ class UnresolvedSymbol(ActionsError):
         super().__init__(f"no instrument for {symbol!r} on {on.isoformat()}")
         self.symbol = symbol
         self.on = on
+
+
+class MasterAbsent(ActionsError):
+    """Raised when the lake holds no security master for the extraction to resolve against.
+
+    ``SecurityMaster.read`` reports an absent file as a bare ``FileNotFoundError``, and it
+    keeps the fold into ``MasterUnreadable`` narrow on purpose: an absent master is not a
+    corrupt one, and callers treat the two apart. This is that separation, named, so the
+    command can say which of the two it met. An absent master wants the onboarding command.
+    A torn one wants a restore, and running the onboarding command against it is being told
+    the wrong thing.
+
+    Every other ``OSError`` the read can raise, such as a bad sector, keeps its own class
+    and its traceback. That is a corrupt lake rather than an operator mistake.
+    """
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(f"no security master at {path}")
+        self.path = path
 
 
 # -- paths -------------------------------------------------------------------
@@ -221,8 +302,8 @@ def read(lake_root: Path | str) -> list[dict]:
     """Every entry in file order, with the torn trailing line discarded.
 
     Superseded entries come back too, because the history is the record. A missing ledger
-    reads as no entries, which is what keeps every reader inert until #284 appends the
-    first one.
+    reads as no entries, which is what keeps every reader inert on a lake the extraction
+    below has not yet written to.
 
     This returns each entry as the mapping its writer appended, the way
     ``read_quarantine`` does. Resolution is where a line is read for meaning, so that is
@@ -555,10 +636,611 @@ def _build_entry(
     }
 
 
+# -- the gate ----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DividendConsistency:
+    """What the self-consistency check compared, and whether it agreed.
+
+    ``computed`` is ``div_freq`` times the per-event amount and ``against`` is the vendor's
+    own annualized figure. Both ride the verdict rather than being recomposed by the caller,
+    because they are the two numbers the withheld finding files and a caller that recomputed
+    them could file a pair the check never saw.
+
+    Either is ``None`` when the payload did not carry it. A check missing an input has not
+    agreed, which is what makes a partial payload a held dividend rather than a silent one.
+    """
+
+    agrees: bool
+    computed: float | None
+    against: float | None
+
+
+def check_dividend_consistency(
+    *,
+    div_freq: int | None,
+    div_pay_amount: float | None,
+    div_amount: float | None,
+) -> DividendConsistency:
+    """Whether the vendor's annualized figure agrees with its own per-event amount.
+
+    This is the internal validation a dividend lands through. It catches a drifted or stale
+    fundamental, where one of the two figures moved and the other did not, which is exactly
+    the shape that would put a wrong amount in the ledger while looking well-formed.
+
+    The comparison is relative, at :data:`DIVIDEND_CONSISTENCY_TOLERANCE`, and that constant
+    carries the measurement it came from.
+
+    Three edges are decided here rather than left to a division, and each one is a way the
+    arithmetic stops meaning anything.
+
+    1. A payload missing any of the three inputs has nothing to compare, so it does not
+       agree.
+    2. A frequency of zero or less multiplies the per-event amount out of the comparison
+       entirely, so a vendor reporting a stale amount beside a zeroed frequency would be
+       judged on an equation that no longer mentions the amount. That is the drifted
+       fundamental this check exists to catch, so it does not agree.
+    3. An annualized figure of zero has no relative scale. With a positive frequency the
+       product is zero only when the per-event amount is, so comparing the product to zero
+       still asks about the amount.
+    """
+    if div_freq is None or div_pay_amount is None or div_amount is None:
+        computed = (
+            None if (div_freq is None or div_pay_amount is None) else div_freq * div_pay_amount
+        )
+        return DividendConsistency(agrees=False, computed=computed, against=div_amount)
+
+    computed = div_freq * div_pay_amount
+    if div_freq <= 0:
+        return DividendConsistency(agrees=False, computed=computed, against=div_amount)
+    if div_amount == 0:
+        return DividendConsistency(agrees=computed == 0, computed=computed, against=div_amount)
+    difference = abs(computed - div_amount) / abs(div_amount)
+    return DividendConsistency(
+        agrees=difference <= DIVIDEND_CONSISTENCY_TOLERANCE,
+        computed=computed,
+        against=div_amount,
+    )
+
+
+# -- the extraction ----------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Landed:
+    """One entry the run appended, and the ticker it was read off.
+
+    The entry carries no ``ticker`` field, deliberately: the master exists because tickers
+    change, and a ledger is partitioned by nothing, so a stored ticker would be a mutable key
+    in a record built to avoid them. The report is not the record, though, and an operator
+    reading "instrument 1" has to go and look up who that was. So the symbol the row was read
+    under rides beside the entry, for the render alone.
+    """
+
+    entry: dict
+    symbol: str
+
+
+@dataclass(frozen=True)
+class HeldFinding:
+    """One thing the run refused to land, and what became of the record of it.
+
+    ``filed_at`` is the file it was written down in, so the run's own report can point a
+    reader at it. A held finding recurs every night until something settles it, and a report
+    naming the file is what turns thirty files in one directory into a place to look.
+
+    ``filed_at`` is ``None`` when the write itself failed, and ``filing_error`` then names
+    the class that refused it. The two together are why the failure does not end the run.
+    ``write_withheld`` raises rather than swallowing and says the containment belongs here,
+    because a raise out of the filing costs the rest of the walk, and the rest of the walk is
+    other tickers' dividends. What the failure costs instead is an exit code, which is the
+    same shape ``compact`` gives a schema-drift file it could not write.
+    """
+
+    finding: Withheld
+    filed_at: Path | None
+    filing_error: str | None = None
+
+
+@dataclass(frozen=True)
+class ExtractionReport:
+    """What one run of the extraction did, for the sign-off block.
+
+    ``unchanged`` counts the dividends the walk re-derived and found already in the ledger.
+    It is the number that makes a second run legible: a run that appends nothing and holds
+    nothing has either learned nothing new or read nothing at all, and only this tells the
+    two apart.
+    """
+
+    ticker_days: int
+    appended: tuple[Landed, ...]
+    held: tuple[HeldFinding, ...]
+    unchanged: int
+
+    @property
+    def unfiled(self) -> tuple[HeldFinding, ...]:
+        """Every held finding whose record could not be written down.
+
+        A finding held and filed is a live condition a human can read. A finding held and not
+        filed is the silence the producer exists to break, so it is what the command turns
+        into a non-zero exit code.
+        """
+        return tuple(held for held in self.held if held.filed_at is None)
+
+    def render(self) -> str:
+        """A human-readable sign-off block."""
+        lines = [
+            f"Dividend extraction over {self.ticker_days} sealed quotes ticker-day(s)",
+            f"  appended:  {len(self.appended)}",
+        ]
+        for landed in self.appended:
+            entry = landed.entry
+            lines.append(
+                f"    - {landed.symbol} (instrument {entry['instrument_id']}) {entry['type']} "
+                f"ex {entry['ex_date']} cash {entry['cash_amount']} "
+                f"({entry['provenance']}), observed {entry['observed_on']}"
+            )
+        lines.append(f"  held:      {len(self.held)}")
+        for held in self.held:
+            finding = held.finding
+            detail = f"{finding.symbol} {finding.observed_on.isoformat()} {finding.check}"
+            if finding.computed is not None or finding.against is not None:
+                detail += f": {finding.computed} against {finding.against}"
+            elif finding.exception:
+                detail += f": {finding.exception}"
+            lines.append(f"    - {detail}")
+            if held.filed_at is None:
+                lines.append(f"      NOT filed: {held.filing_error}")
+            else:
+                lines.append(f"      filed at {held.filed_at}")
+        lines.append(f"  unchanged: {self.unchanged}")
+        return "\n".join(lines)
+
+
+def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionReport:
+    """Read every sealed quotes ticker-day, gate what it finds, and append what lands.
+
+    Nothing here fetches. ``QUOTES_SCHEMA`` has carried the vendor's ``fundamental`` block
+    since marketlake #17, so the evidence a dividend is derived from is already on disk. Every
+    dependency is injected and this reads no config, the way ``seed_spans`` does.
+
+    **The ticker-days come from the manifest.** ``manifest.latest_entries`` returns the
+    current entry per partition path, which is the lake's own record of what it holds.
+    Deriving them from the roster and the exchange calendar instead would ask for every
+    session the calendar carries, and ``load_quotes`` raises ``PartitionAbsent`` on a session
+    the lake never captured. Reading the manifest means every enumerated partition exists, so
+    ``NoSpotClose`` is the only absence this walk can meet.
+
+    **The read is one ``load_quotes`` call per ticker-day**, measured at about 10 ms each
+    against the live lake. Reading the partitions directly is a little faster and is refused:
+    every read in the lake goes through the loader, so the quarantine guard and the overflow
+    projection are asked once rather than skipped by a second path that would then keep
+    skipping them forever.
+
+    The walk, per ticker, in date order.
+
+    1. A ticker-day whose session recorded no equity close raises ``NoSpotClose`` and is
+       skipped. That is a gap day with nothing to read, and it is no observation rather than
+       an error. The cost is named rather than hidden: a session that captured hundreds of
+       minutes and missed its close is skipped too, even though the dividend is a property of
+       the session rather than of its final minute. The loader offers one row per call and
+       the close of record is the one row a caller can name without knowing which minutes
+       exist, so the alternative is a second read path.
+    2. A row carrying no ``div_ex_date`` is no observation either. A non-paying instrument
+       reports nothing, and an entry of nulls is not an event. Without an ex-date there is no
+       key, so there is nothing to land and nothing to hold.
+    3. An observation whose instrument and ``div_ex_date`` differ from the previous one emits
+       an entry. It carries provenance ``observed`` when the lake has already watched that
+       instrument carrying a value, and ``vendor_reported`` when it has not, because there
+       the change itself was never seen. The dates are compared normalized, so the vendor
+       writing one date two ways is not a transition. The instrument is half of the
+       comparison because a symbol handed from one instrument to another is a new thing to
+       record, which is what step 4 of the issue means by grouping on the instrument.
+    4. The instrument is resolved at the date of that first observation carrying the new
+       value, and the same date lands in ``observed_on``. They cannot differ: the resolver
+       decides which instrument the action is attributed to, so resolving at one date and
+       recording another attributes it to whoever held the ticker on a different day.
+    5. The gate runs, and a disagreement holds the entry out and files it. So does a payload
+       the ledger's own record rules refuse, rather than ending the run as a traceback.
+    6. A key is emitted once per run, at the first observation carrying its value. An ex-date
+       that moves away and comes back is not a second first, and emitting it twice under two
+       provenances would leave neither matching what ``latest`` resolves, so the ledger would
+       grow by two lines every night forever.
+    7. The entry lands only when it differs from what ``latest`` already resolves on its key,
+       on every field but ``recorded_at``. Comparing whole entries would append every night
+       forever, since ``recorded_at`` is the clock's answer and moves while nothing else does.
+
+    **Both ways the resolution can fail hold the action and file it.** ``UnresolvedSymbol``
+    says the master and the capture spans disagree about a ticker. ``AmbiguousSymbol`` says
+    the master is corrupt. Either way an action held out can be landed later, while one landed
+    under the wrong instrument corrupts every factor that instrument's prices feed.
+
+    **An absent or torn master stops the run instead.** That is one condition a single command
+    fixes, and holding it per ticker-day would file one finding per ticker-day for it.
+
+    **A finding that cannot be written down does not stop the run either.** It is carried on
+    the report as unfiled and the command turns that into an exit code, which is the
+    containment ``write_withheld`` says belongs to its caller.
+    """
+    lake_root = Path(lake_root)
+    master = _read_master(lake_root)
+    recorded_at = clock.now()
+    # Read once for the run, so every ticker-day is compared against one snapshot of what the
+    # ledger already holds, the way the close guard reads the manifest once per run.
+    current = latest(lake_root)
+
+    ticker_days = _quotes_ticker_days(lake_root)
+    appended: list[Landed] = []
+    held: list[HeldFinding] = []
+    unchanged = 0
+
+    # Every instrument this walk has already seen carrying a value, which is what tells a
+    # change the lake watched happen from a value that was already there when it started
+    # looking. It is keyed on the instrument rather than the ticker, so a symbol handed from
+    # one instrument to another gives the incoming one its own first observation.
+    seen: set[int] = set()
+    # Every key this run has already emitted. A key is emitted at the first observation
+    # carrying its value, and an ex-date that moves away and comes back is not a second
+    # first. Without this the walk emits one key twice under two provenances, neither
+    # matches what ``latest`` resolves, and the ledger grows by two lines every night
+    # forever, which is the failure the comparison below exists to prevent.
+    emitted: set[ActionKey] = set()
+
+    def hold(finding: Withheld) -> None:
+        # The sequence is the caller's, because ``report`` has only module functions and a
+        # counter there would be module state no test could drive. One run files under one
+        # injected clock and one pid, so without it two findings on one subject would race
+        # for one name. This walk cannot produce that race today, since it emits at most one
+        # finding per ticker-day and the subject carries the day, so the index is the
+        # contract being met rather than a collision being avoided. Mutating it to a
+        # constant changes nothing any test here can see, and that is why the producer's own
+        # tests are where the rule is held.
+        try:
+            filed_at = write_withheld(lake_root, finding, now=recorded_at, sequence=len(held))
+        except OSError as exc:
+            # Named on stderr and carried on the report, the way ``compact`` treats a
+            # schema-drift file it could not write. The walk goes on, because one unwritable
+            # file is not the other tickers' dividends to lose.
+            print(
+                f"actions: {finding.symbol} {finding.observed_on.isoformat()} "
+                f"{finding.check} could not be filed: {type(exc).__name__}",
+                file=sys.stderr,
+            )
+            held.append(
+                HeldFinding(finding=finding, filed_at=None, filing_error=type(exc).__name__)
+            )
+            return
+        held.append(HeldFinding(finding=finding, filed_at=filed_at))
+
+    for ticker, days in _by_ticker(ticker_days):
+        # The last value this ticker was observed carrying, and the instrument it was
+        # attributed to. Both, because either changing is a new thing to record.
+        previous: tuple[int | None, str] | None = None
+        for day in days:
+            try:
+                observation = _observation(lake_root, ticker, day)
+            except ValueError as exc:
+                hold(_payload_finding(ticker, day, exc))
+                continue
+            if observation is None:
+                continue
+            try:
+                ex_date = normalize_date(observation[DIV_EX_DATE])
+            except ValueError as exc:
+                hold(_payload_finding(ticker, day, exc))
+                continue
+
+            # Resolved before the change test, because the instrument is half of what a
+            # change is. Filing waits until the observation turns out to be one worth
+            # emitting, so a master that cannot place a ticker files once rather than once
+            # per ticker-day.
+            failure: Exception | None = None
+            instrument_id: int | None = None
+            try:
+                instrument_id = resolve_instrument(master, ticker, day)
+            except (UnresolvedSymbol, AmbiguousSymbol) as exc:
+                failure = exc
+
+            mark = (instrument_id, ex_date)
+            if mark == previous:
+                continue
+            previous = mark
+
+            if failure is not None:
+                ids = failure.instrument_ids if isinstance(failure, AmbiguousSymbol) else ()
+                hold(_resolution_finding(ticker, day, failure, instrument_ids=ids))
+                continue
+
+            assert instrument_id is not None
+            provenance = (
+                PROVENANCE_OBSERVED if instrument_id in seen else PROVENANCE_VENDOR_REPORTED
+            )
+            seen.add(instrument_id)
+
+            verdict = check_dividend_consistency(
+                div_freq=observation[DIV_FREQ],
+                div_pay_amount=observation[DIV_PAY_AMOUNT],
+                div_amount=observation[DIV_AMOUNT],
+            )
+            if not verdict.agrees:
+                hold(
+                    Withheld(
+                        symbol=ticker,
+                        observed_on=day,
+                        event=TYPE_DIVIDEND,
+                        check=CHECK_DIVIDEND_CONSISTENCY,
+                        computed=verdict.computed,
+                        against=verdict.against,
+                        instrument_id=instrument_id,
+                    )
+                )
+                continue
+
+            fields = {
+                "instrument_id": instrument_id,
+                "observed_on": day,
+                "recorded_at": recorded_at,
+                "ex_date": observation[DIV_EX_DATE],
+                "type": TYPE_DIVIDEND,
+                "pay_date": observation[DIV_PAY_DATE],
+                "declared_date": observation[DECLARATION_DATE],
+                "cash_amount": observation[DIV_PAY_AMOUNT],
+                "provenance": provenance,
+            }
+            try:
+                candidate = _build_entry(**fields)
+            except ValueError as exc:
+                hold(_payload_finding(ticker, day, exc, instrument_id=instrument_id))
+                continue
+            key = (instrument_id, candidate["ex_date"], TYPE_DIVIDEND)
+            if key in emitted:
+                continue
+            emitted.add(key)
+            if _same_but_for_recorded_at(current.get(key), candidate):
+                unchanged += 1
+                continue
+            appended.append(Landed(entry=append(lake_root, **fields), symbol=ticker))
+
+    return ExtractionReport(
+        ticker_days=len(ticker_days),
+        appended=tuple(appended),
+        held=tuple(held),
+        unchanged=unchanged,
+    )
+
+
+def _read_master(lake_root: Path) -> SecurityMaster:
+    """The master, read once before anything else, or the reason the run stops.
+
+    ``resolve_instrument`` takes a ``SecurityMaster`` rather than a path, so reading it is a
+    precondition of the walk rather than a step inside it.
+    """
+    path = master_path(lake_root)
+    try:
+        return SecurityMaster.read(path)
+    except FileNotFoundError as exc:
+        raise MasterAbsent(path) from exc
+
+
+def _quotes_ticker_days(lake_root: Path) -> list[tuple[str, date]]:
+    """Every sealed quotes ticker-day the manifest records, in ticker then date order.
+
+    The keys are read apart by ``paths.parse_partition_rel``, which inverts the builder that
+    wrote them. ``paths.py`` is the single home for that, and its reason is the one that
+    would bite here: a second reader that re-implements the split drifts from the builder and
+    nothing catches it, because this walk passes over a key it cannot read rather than
+    raising on one.
+
+    A key naming anything but the quotes surface is passed over, which is every chains
+    ticker-day, both ledgers, and every reference table.
+    """
+    found: list[tuple[str, date]] = []
+    for partition in latest_entries(lake_root):
+        reference = parse_partition_rel(partition)
+        if reference is None or reference.surface != QUOTES:
+            continue
+        found.append((reference.ticker, reference.day))
+    return sorted(found)
+
+
+def _by_ticker(ticker_days: Sequence[tuple[str, date]]) -> Iterator[tuple[str, list[date]]]:
+    """The same ticker-days grouped by ticker, each ticker's sessions in date order.
+
+    The partitions are keyed by ticker, so that is what the sessions arrive grouped by. The
+    instrument enters the comparison rather than the grouping, one level down, which is what
+    gives a symbol handed between two instruments a first observation under each. Grouping
+    here on the instrument instead would mean resolving before reading, and a master that
+    could not place a symbol would then hold one finding per ticker-day for a condition that
+    has one action behind it.
+    """
+    grouped: dict[str, list[date]] = {}
+    for ticker, day in ticker_days:
+        grouped.setdefault(ticker, []).append(day)
+    for ticker in sorted(grouped):
+        yield ticker, sorted(grouped[ticker])
+
+
+def _observation(lake_root: Path, ticker: str, day: date) -> dict[str, object] | None:
+    """One ticker-day's dividend fields, or ``None`` when it carries no event.
+
+    The rows are the session's equity close of record. Every data row in a session carries
+    the same fundamentals, so which minute answers decides nothing about the dividend.
+
+    The close of record is one cycle, which the loader enforces, and it is still more than
+    one row when the partition holds two spellings of that one instant. Those rows have to
+    agree about the dividend, and a disagreement raises rather than taking the first one.
+    Taking the first would let the file's own order decide which dividend the ledger gets,
+    silently, and the caller holds and files what this raises.
+
+    A column the partition does not carry reads as null rather than raising, so a session
+    sealed before a dividend column existed is a ticker-day with no event rather than a run
+    that ends.
+    """
+    try:
+        table = load_quotes(ticker, day, lake_root=lake_root)
+    except NoSpotClose:
+        return None
+    present = set(table.column_names)
+    values: dict[str, object] = {}
+    for column in DIVIDEND_COLUMNS:
+        if column not in present:
+            values[column] = None
+            continue
+        spellings = {value for value in table.column(column).to_pylist()}
+        if len(spellings) > 1:
+            raise ValueError(
+                f"the {day.isoformat()} close of record disagrees about {column}, "
+                f"among {sorted(str(value) for value in spellings)}"
+            )
+        values[column] = spellings.pop()
+    return None if values[DIV_EX_DATE] is None else values
+
+
+def _payload_finding(
+    ticker: str,
+    day: date,
+    exc: Exception,
+    *,
+    instrument_id: int | None = None,
+) -> Withheld:
+    """The finding a payload the record rules refuse files.
+
+    Three shapes reach here and each one used to end the run as a traceback: a vendor date
+    that does not name a date, an amount ``append`` will not take such as a negative one, and
+    a close whose rows disagree with each other. None of them is this run's to repair, and a
+    run that dies on one loses every ticker it had not reached yet.
+    """
+    return Withheld(
+        symbol=ticker,
+        observed_on=day,
+        event=TYPE_DIVIDEND,
+        check=CHECK_DIVIDEND_PAYLOAD,
+        instrument_id=instrument_id,
+        exception=f"{type(exc).__name__}: {exc}",
+    )
+
+
+def _resolution_finding(
+    ticker: str,
+    day: date,
+    exc: Exception,
+    *,
+    instrument_ids: Sequence[int] = (),
+) -> Withheld:
+    """The finding a resolution failure files.
+
+    The exception is rendered as its class and then its message, because ``write_withheld``
+    composes ``<symbol>: <exception>`` and keeps the first two fields. Handing over the bare
+    message would file that message's own first field instead, which for an ``OSError`` is a
+    path on the capture machine.
+    """
+    return Withheld(
+        symbol=ticker,
+        observed_on=day,
+        event=TYPE_DIVIDEND,
+        check=CHECK_INSTRUMENT_RESOLUTION,
+        instrument_ids=tuple(instrument_ids),
+        exception=f"{type(exc).__name__}: {exc}",
+    )
+
+
+def _same_but_for_recorded_at(existing: dict | None, candidate: dict) -> bool:
+    """Whether the ledger already holds this entry, ignoring when it was written down.
+
+    ``recorded_at`` is the clock's answer and moves every night while nothing else does, so
+    comparing whole entries would append a dividend the ledger already holds, every night,
+    forever. This is the rule marketlake #139 states for the quarantine ledger: read the
+    current entry first, and a re-observation of the same finding supersedes nothing.
+    """
+    if existing is None:
+        return False
+    fields = set(existing) | set(candidate)
+    return all(existing.get(name) == candidate.get(name) for name in fields - {"recorded_at"})
+
+
+# -- the entry point ---------------------------------------------------------
+
+
+def extract_dividends_from_config(
+    *,
+    clock: Clock | None = None,
+    config_path: str | Path | None = None,
+) -> ExtractionReport:
+    """The extraction wired from the real config. This is the entry :func:`main` calls."""
+    from lake.config import load_config
+
+    config = load_config(config_path)
+    return extract_dividends(
+        lake_root=config.lake_root,
+        clock=SystemClock() if clock is None else clock,
+    )
+
+
+def _build_parser():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m lake.actions",
+        description=(
+            "Read dividends out of the lake's sealed quote rows, gate each one, and append "
+            "what lands to the corporate-actions ledger. Nothing here fetches."
+        ),
+    )
+    parser.add_argument("--config", help="Path to config.yaml (defaults to the standard location).")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> int:
+    """The ``python -m lake.actions`` entry. Returns a process exit code.
+
+    ``clock`` stays injectable, for the reason ``alert.main`` gives: a wall clock never
+    reaches past this process. It is also what makes a test of this command writable, since
+    what "a second night" means has to be something the test decides.
+
+    **A lake with no security master reaches the operator as one line, not a stack.**
+    ``input_errors_exit`` covers the three files in the config directory that are the
+    operator's to edit, and an unseeded lake is the same kind of mistake with a different
+    file behind it. The two ways the master can fail say different things, because an absent
+    master wants the onboarding command and a torn one wants a restore. An operator told to
+    seed a corrupt file is being told the wrong thing.
+
+    **A finding the run could not write down is what the third exit code is for.** The walk
+    contains that failure so one unwritable file does not cost the other tickers their
+    dividends, and this is where it stops being silent. A run that held something and filed
+    it is a live condition a human can go and read. A run that held something and filed
+    nothing reads exactly like a run that found nothing, which is the silence the producer
+    exists to break, so it exits 1. Exit 2 stays what it is everywhere else here, an operator
+    mistake with a fix behind it.
+    """
+    args = _build_parser().parse_args(argv)
+
+    from lake.config import input_errors_exit
+
+    try:
+        with input_errors_exit("actions"):
+            report = extract_dividends_from_config(clock=clock, config_path=args.config)
+    except MasterAbsent as exc:
+        print(
+            f"actions: {exc}. Onboard a ticker first, with python -m lake.onboard <TICKER>.",
+            file=sys.stderr,
+        )
+        return 2
+    except MasterUnreadable as exc:
+        print(f"actions: {exc}. Restore it from the backup.", file=sys.stderr)
+        return 2
+    print(report.render())
+    return 1 if report.unfiled else 0
+
+
 __all__ = [
     "ACTIONS_PARTITION",
     "ACTIONS_SCHEMA_VERSION",
     "ACTION_TYPES",
+    "CHECK_DIVIDEND_CONSISTENCY",
+    "CHECK_DIVIDEND_PAYLOAD",
+    "CHECK_INSTRUMENT_RESOLUTION",
+    "DIVIDEND_CONSISTENCY_TOLERANCE",
     "PROVENANCES",
     "PROVENANCE_MANUAL",
     "PROVENANCE_OBSERVED",
@@ -568,15 +1250,28 @@ __all__ = [
     "TYPE_SPLIT",
     "ActionKey",
     "ActionsError",
+    "DividendConsistency",
+    "ExtractionReport",
+    "HeldFinding",
+    "Landed",
     "LedgerLineError",
+    "MasterAbsent",
     "UnresolvedSymbol",
     "actions_path",
     "append",
     "as_of",
+    "check_dividend_consistency",
     "entry_key",
     "entry_line_count",
+    "extract_dividends",
+    "extract_dividends_from_config",
     "latest",
+    "main",
     "normalize_date",
     "read",
     "resolve_instrument",
 ]
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised via the console, not in CI
+    raise SystemExit(main())

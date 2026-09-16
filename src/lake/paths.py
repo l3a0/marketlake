@@ -55,8 +55,9 @@ This is also the single production home for reading those paths back apart. A jo
 segment path and a ``date=YYYY-MM-DD`` directory name are both parsed by more than one
 module. A second reader that re-implements the split can drift from the builder that
 made the path, and nothing would catch it. So each parser sits beside the builder it
-inverts. ``parse_segment_rel`` inverts ``segment_path``. ``parse_date_dir`` reads the
-``date=`` key that every partition path carries.
+inverts. ``parse_segment_rel`` inverts ``segment_path``. ``parse_partition_rel`` inverts
+``LakePaths.partition_path``. ``parse_date_dir`` reads the ``date=`` key that every
+partition path carries.
 """
 
 from __future__ import annotations
@@ -132,6 +133,8 @@ TICKER_PREFIX = "ticker="
 # working state, never durable data, so the backup's exclusion list names it. A second
 # spelling of the marker would put a temp file outside that exclusion with nothing to
 # say so.
+PARQUET_SUFFIX = ".parquet"
+
 TEMP_MARKER = ".tmp-"
 
 # The first part of a journal segment's filename. A writer-session start stamp and the
@@ -348,6 +351,42 @@ def parse_segment_rel(rel: str) -> SegmentRef | None:
     )
 
 
+@dataclass(frozen=True)
+class PartitionRef:
+    """One sealed date-partitioned partition's path, parsed into its parts."""
+
+    surface: str
+    ticker: str
+    day: date
+
+
+def parse_partition_rel(rel: str) -> PartitionRef | None:
+    """Parse a lake-relative date-partitioned partition path, or return None.
+
+    The inverse of :meth:`LakePaths.partition_path`, and the parser a reader of manifest
+    keys uses. The shape is ``<surface>/ticker=T/date=YYYY-MM-DD.parquet``. Anything else is
+    None, including the two surfaces that do not take this shape: ``bars`` adds a ``freq=``
+    level and ``actions`` is one all-ticker file. The separator is always "/", because these
+    strings are manifest keys and not host paths.
+
+    The date is parsed by :func:`parse_date_dir`, so a partition file name and a journal
+    date directory are read by one rule rather than two.
+    """
+    parts = rel.split("/")
+    if len(parts) != 3 or parts[0] not in _DATE_PARTITIONED:
+        return None
+    surface, ticker_part, filename = parts
+    if not ticker_part.startswith(TICKER_PREFIX) or not filename.endswith(PARQUET_SUFFIX):
+        return None
+    day = parse_date_dir(filename[: -len(PARQUET_SUFFIX)])
+    if day is None:
+        return None
+    ticker = ticker_part[len(TICKER_PREFIX) :]
+    if not ticker:
+        return None
+    return PartitionRef(surface=surface, ticker=ticker, day=day)
+
+
 # A strict ``YYYY-MM-DD``: four digits, two, two, joined by hyphens and nothing else.
 _DATE_SHAPE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
@@ -461,6 +500,7 @@ __all__ = [
     "JOURNAL_DIR",
     "JOURNAL_METADATA_FILE",
     "MANIFEST_FILE",
+    "PARQUET_SUFFIX",
     "QUARANTINE_FILE",
     "QUOTES",
     "REFERENCE_DIR",
@@ -476,9 +516,11 @@ __all__ = [
     "TICKER_PREFIX",
     "TOKEN_FILE",
     "LakePaths",
+    "PartitionRef",
     "SegmentRef",
     "config_dir",
     "parse_date_dir",
+    "parse_partition_rel",
     "parse_segment_rel",
     "temp_write_path",
 ]
