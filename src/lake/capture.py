@@ -103,21 +103,24 @@ _CAMEL_BOUNDARY = re.compile(r"(?<!^)(?=[A-Z])")
 # a raised exception) carries its own class instead, so the failure model keeps those apart.
 CHAIN_CHUNK_FAILED = "chain_chunk_failed"
 
-# The error class stamped on a window whose body would not merge. Two shapes raise inside the
+# The error class stamped on a window whose body would not merge. Two shapes refuse inside the
 # merge, and both are a vendor payload shape change:
 #
 # 1. An expiration whose value is not a strike map, which has no ``items`` to walk.
-# 2. A strike whose value is not iterable, which no contract list can be extended with.
+# 2. A strike whose value is not a contract list, which the merge refuses by type.
 #
-# A strike value that is iterable but wrong, a string or an object where the vendor sends a
-# list of contracts, merges without complaint. It is caught one layer on by the row builder's
-# own fail-open instead, which costs the whole chain rather than one window. Both raising
-# shapes are drift in the sense the design's schema policy uses, where a missing or retyped
-# known field pages. Drift is kept apart from the size class above because a parse failure
-# filed under a size class reads as a chain too big to fetch, which is a chunk-plan problem
-# rather than a vendor problem. The name is recognisable as drift so a reader sweeping the gap
-# classes finds it under one string, and it matches the reason the segment readers are to carry
-# for the same signal (#104), which is not built here.
+# The second is checked by type rather than left to whatever ``list.extend`` happens to accept,
+# and marketlake #305 is why. ``extend`` takes any iterable, so a strike holding a string or a
+# Mapping merged that value's characters or its keys without complaint and handed the row
+# builder things that were never contracts. What refused them was the column build a layer on,
+# which cost the whole chain where this class costs one window, and outside the loop cost the
+# close of record and an onboarding's first segment. Both shapes are drift in the sense the
+# design's schema policy uses, where a missing or retyped known field pages. Drift is kept
+# apart from the size class above because a parse failure filed under a size class reads as a
+# chain too big to fetch, which is a chunk-plan problem rather than a vendor problem. The name
+# is recognisable as drift so a reader sweeping the gap classes finds it under one string, and
+# it matches the reason the segment readers are to carry for the same signal (#104), which is
+# not built here.
 #
 # A retyped known field is not one of those two shapes and never was. It merges cleanly, and
 # what refuses it is the column build a layer on, which is why the gap it used to leave
@@ -172,6 +175,13 @@ def _collect_contracts(
     ranges, so a merge never overwrites, only accretes. The contract dicts are copied by
     reference, untouched, so the calibrated row builder still sees the vendor's payload.
 
+    A strike value is refused by type rather than by whether ``list.extend`` will take it. A
+    JSON array decodes to a ``list`` on every path this runs on, the live ``reply.json()`` and
+    a cassette's ``json.loads`` alike, so ``list`` is the exact test. Anything looser passes a
+    string and a Mapping, which ``extend`` consumes one character or one key at a time, and the
+    vendor's shape change then reaches the row builder disguised as contracts. That is
+    marketlake #305, and the refusal is what turns it into one given-up window.
+
     The walk reads the whole body into scratch maps of its own first and copies them into
     the reassembly maps only once both sides have read cleanly. So a body that raises
     partway leaves the reassembly maps exactly as it found them. Mutating them as the walk
@@ -191,6 +201,11 @@ def _collect_contracts(
         for exp_key, strikes in exp_map.items():
             bucket = scratch.setdefault(str(exp_key), {})
             for strike, contracts in strikes.items():
+                if not isinstance(contracts, list):
+                    raise TypeError(
+                        f"strike {strike!r} of expiration {exp_key!r} carries "
+                        f"{type(contracts).__name__} where a contract list belongs"
+                    )
                 bucket.setdefault(str(strike), []).extend(contracts)
         staged.append((scratch, target))
     for scratch, target in staged:
@@ -535,8 +550,9 @@ def fetch_chain(
     2. **Fetch each window, sequentially.** ``_fetch_window`` fetches the range and merges
        its contracts. Only a genuine size signal, a ``TooBigBody`` 502 or a body flagged
        ``isChainTruncated``, is split at the window's date midpoint and refetched, bounded
-       by ``chain_chunk_max_split_depth``. Any other failure, a non-2xx status or a raised
-       exception, is recorded once with its own error class and never split.
+       by ``chain_chunk_max_split_depth``. Any other failure, a non-2xx status, a raised
+       exception, or a body that will not merge, is recorded once with its own error class
+       and never split.
     3. **Nothing captured.** If no window succeeded, ``body`` is ``None`` and
        ``error_class`` carries the first failed window's class. So an all-401 chain reads
        as ``http_401`` and the failure model still sees auth death on the chain surface.
@@ -663,30 +679,31 @@ def _fetch_window(
        429 in particular would fan out into more throttled requests.
     4. A **successful** 2xx, untruncated response has its contracts merged into the
        reassembly maps and, on the first success, seeds the header source. A body the
-       merge cannot read splits like a too-big window, so the fetch still lands what the
-       readable halves and the other windows returned, and it gives up under
-       ``chain_schema_drift`` rather than the size class.
+       merge cannot read is recorded once under ``chain_schema_drift`` and never split, so
+       the other windows still land and the loss is this one window.
 
-    Splitting is the right answer to a body that will not merge because both shapes that
-    raise there sit inside one expiration or one strike. An expiration whose value is not a
-    strike map raises ``AttributeError``, and a strike whose value is not iterable raises
-    ``TypeError``. A date-keyed split is what isolates damage that narrow. The halves that
-    read cleanly still land, and only the half carrying the bad expiration is given up.
+    **Considered and rejected: splitting a window the merge could not read**, which is what
+    this code did until marketlake #305. A date-keyed split does isolate the damage, because a
+    drifted expiration sits on one date, so splitting cost one day where giving up the window
+    costs the window. What it spent to buy that back is the measurement that retired it. With
+    the default five-window plan and a depth bound of 4, a payload change reaching every
+    expiration walks the full binary tree on each of the four concrete windows: 113 requests
+    for one ticker-minute, against the 5 a healthy one makes. Two option tickers put that past
+    Schwab's 120 req/min ceiling, and past the minute before that, since a healthy SPY chain
+    fetch already takes about nine seconds. A cycle that overruns fires no cycle in the next
+    minute and charges every watched surface, quotes included. So the split traded a fraction
+    of one window for whole minutes on both surfaces, on the one failure no narrower chunk
+    plan fixes anyway.
 
-    What the split costs depends on how wide the drift is, and the depth bound is the only
-    thing that caps it. One bad expiration in a 30-day window costs 9 requests at the
-    default depth of 4, because at each level one half succeeds and stops while only the
-    other recurses. A window whose every expiration drifted fails both halves at every
-    level and walks the full binary tree, 31 requests at that same depth, and it does that
-    every minute for as long as the drift lasts. The depth bound caps that case too, and it
-    is deliberately the only cap. Considered and rejected: a second rule stopping the split
-    once both halves have failed, or bounding drift lower than size. Either buys a smaller
-    number in a case the vendor has never produced, and the price is a second thing to reason
-    about on the split path. One number an operator can read and lower is worth more.
+    The register entry this replaces rejected bounding drift lower than size, on the grounds
+    that it buys a smaller number in a case the vendor has never produced. What answers that
+    is the ceiling rather than the size: past it, and past the minute, the number stops being
+    smaller or larger and becomes a different failure, one that reaches the quote surface a
+    chain fetch cannot otherwise touch. Putting the split back costs nothing later, since the
+    refusal and the class are what a split falls through from.
 
-    The give-up class is decided where the failure is seen, not where the window is given
-    up, because a window split for drift can have a half that is genuinely too big and the
-    reverse. Each recursive call decides its own.
+    The depth bound still caps a too-big window's split, and it is deliberately the only cap
+    there. One number an operator can read and lower is worth more than a second rule.
     """
     try:
         response = vendor.get_chain(ticker, from_date=from_date, to_date=to_date)
@@ -696,7 +713,6 @@ def _fetch_window(
         return
 
     too_big = _is_too_big(response.body)
-    give_up_class = CHAIN_CHUNK_FAILED
     if _ok(response.status) and not too_big:
         try:
             _collect_contracts(response.body, call_map, put_map)
@@ -704,14 +720,15 @@ def _fetch_window(
                 header_holder.append(response.body)
             return
         except Exception:
-            # A body that would not merge falls through to the split below, the same path a
-            # too-big window takes, so the fetch still lands what the other windows
-            # returned. What it is given up under differs: the vendor's payload changed
-            # shape, which is not a chain too big to fetch, and filing one under the other
-            # would send a reader to the chunk plan for a problem the chunk plan cannot fix.
-            # ``too_big`` is deliberately not set here. Nothing reads it past this point,
-            # and setting it would read as meaningful when it decides nothing.
-            give_up_class = CHAIN_SCHEMA_DRIFT
+            # A body that would not merge is recorded once and never split, the same way a
+            # non-2xx status below is. The other windows still land, so the loss is this
+            # window rather than the chain. What it is recorded under differs from the size
+            # class: the vendor's payload changed shape, which is not a chain too big to
+            # fetch, and filing one under the other would send a reader to the chunk plan
+            # for a problem the chunk plan cannot fix. The docstring above carries why the
+            # split this used to fall through to was given up.
+            failed.append((from_date, to_date, CHAIN_SCHEMA_DRIFT))
+            return
     elif not too_big:
         # A non-2xx status that is not the TooBigBody fault is not a size problem. Record
         # it once with its http class and do not split.
@@ -725,10 +742,9 @@ def _fetch_window(
         # An open-ended tail window (``to_date is None``) that comes back too big cannot be
         # midpoint-split, so it is given up as it stands. Far-term sparsity makes that case
         # unreachable in practice: the open tail holds the fewest expirations of any window.
-        # A window given up for drift is the reachable one, since an unreadable expiration
-        # survives every split down to the single day it sits on. The class is whichever of
-        # the two this call saw.
-        failed.append((from_date, to_date, give_up_class))
+        # Size is the only failure that reaches here, since drift is recorded where it is
+        # seen and a non-2xx status returns above, so the class is the size class.
+        failed.append((from_date, to_date, CHAIN_CHUNK_FAILED))
         return
     mid = from_date + timedelta(days=(to_date - from_date).days // 2)
     _fetch_window(

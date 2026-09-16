@@ -721,6 +721,33 @@ def test_a_fill_whose_windows_answered_with_no_contracts_writes_nothing(lake_roo
     assert latest_entries(lake_root) == {}
 
 
+def test_a_fill_whose_chain_drifted_writes_nothing_and_names_the_class(lake_root):
+    """A vendor payload shape change costs the close of record, and reports rather than raises.
+
+    Both windows answer 200 carrying a strike that holds a Mapping where a list of contracts
+    belongs. The merge refuses each by type, so both are given up under ``chain_schema_drift``,
+    nothing is captured, and the fill writes no segment and no manifest entry. The class rides
+    the result, which is what lets the guard tell this from a transient fault.
+
+    Before marketlake #305 that shape merged, because ``list.extend`` takes any iterable, and
+    the Mapping's keys reached the row builder as contracts. This call goes through
+    ``journal_snapshot`` unguarded, so the ``AttributeError`` left the fill entirely and the
+    guard recorded a problem rather than a refusal, with the close lost either way.
+    """
+    drifted = _chain_body([NEAR_EXP])
+    drifted["callExpDateMap"][f"{NEAR_EXP}:7"]["650.0"] = {
+        "symbol": "SPY   260904C00650000",
+        "bid": 1.0,
+    }
+    response = VendorResponse(status=200, body=drifted)
+    result = _fill(lake_root, _WindowVendor(windows={NEAR: response, TAIL: response}))
+
+    assert not result.landed
+    assert result.error_class == capture.CHAIN_SCHEMA_DRIFT
+    assert _rows(lake_root) == []
+    assert latest_entries(lake_root) == {}
+
+
 def test_a_fill_reports_a_window_it_gave_up_even_when_the_baseline_is_blind(lake_root):
     """The membership comparison cannot see a window that failed both times.
 

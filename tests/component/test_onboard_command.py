@@ -30,7 +30,7 @@ import pytest
 
 from lake import gap, journal, schema_drift
 from lake.calendar import MARKET_TZ
-from lake.capture import CAPTURE_SOURCE
+from lake.capture import CAPTURE_SOURCE, CHAIN_SCHEMA_DRIFT
 from lake.capture_spans import SPANS_PARTITION, CaptureSpans, CaptureSpansError, spans_path
 from lake.cassette import Cassette, Interaction
 from lake.chain_plan import DEFAULT_CHAIN_PLAN, ChainPlan
@@ -742,6 +742,27 @@ def _too_big() -> Interaction:
     )
 
 
+def _drifted_window(window: tuple[date, date | None]) -> Interaction:
+    """A 200 whose strikes hold a Mapping where the vendor sends a list of contracts.
+
+    This is the payload shape marketlake #305 is about. It answers, so nothing in the status
+    or the body's own flags says anything is wrong, and the merge is what refuses it.
+    """
+    body = _chain_body(is_delayed=False)
+    for map_key, put_call in (("callExpDateMap", "C"), ("putExpDateMap", "P")):
+        body[map_key]["2026-09-18:25"]["650.0"] = {
+            "putCall": put_call,
+            "symbol": f"SPY   260918{put_call}00650000",
+        }
+    from_date, to_date = window
+    return Interaction(
+        endpoint="chains",
+        params=chain_params("SPY", from_date=from_date, to_date=to_date),
+        status=200,
+        body=body,
+    )
+
+
 def _failed_window(window: tuple[date, date | None], status: int = 502) -> Interaction:
     """A recorded failure for one window, so the fetch gives it up under ``http_<status>``.
 
@@ -916,6 +937,48 @@ def test_every_window_failing_refuses_and_writes_nothing(lake_root, tmp_path):
     assert not tickers_path.exists()
     assert not master_path(lake_root).exists()
     assert not (lake_root / "journal").exists()
+
+
+def test_a_chain_whose_payload_drifted_refuses_before_anything_commits(lake_root, tmp_path):
+    """A vendor payload shape change reaches the operator as a named line, not a traceback.
+
+    Every window answers 200 carrying a strike that holds a Mapping where a list of contracts
+    belongs. The merge refuses each one by type, so every window is given up under
+    ``chain_schema_drift``, no body comes back, and the refusal runs ahead of every durable
+    write.
+
+    Before marketlake #305 that shape merged, because ``list.extend`` takes any iterable, and
+    the Mapping's keys reached the row builder as contracts. The ``AttributeError`` came out of
+    ``journal_snapshot``, which onboarding calls last, so the operator got a traceback after
+    the roster, the master, the spans and their manifest entries had all committed. ``main``
+    catches ``OnboardError`` and nothing wider on purpose, and a vendor payload change is
+    neither of the two categories that decision names.
+    """
+    tickers_path = tmp_path / "tickers.yaml"
+    vendor = CassetteVendor(
+        Cassette(interactions=tuple(_drifted_window(window) for window in _WINDOWS))
+    )
+
+    with pytest.raises(OnboardError) as refusal:
+        onboard(
+            "SPY",
+            clock=ManualClock(start=_MID_SESSION),
+            vendor=vendor,
+            lake_root=lake_root,
+            tickers_path=tickers_path,
+            options=True,
+        )
+
+    message = str(refusal.value)
+    assert "first chain snapshot for SPY failed" in message
+    assert CHAIN_SCHEMA_DRIFT in message
+
+    # Nothing committed: not the roster, not the master, not the spans, not a segment.
+    assert not tickers_path.exists()
+    assert not master_path(lake_root).exists()
+    assert not spans_path(lake_root).exists()
+    assert not (lake_root / "journal").exists()
+    assert latest_entries(lake_root) == {}
 
 
 def test_a_chain_with_no_contract_refuses_rather_than_pinning_a_zero_anchor(lake_root, tmp_path):

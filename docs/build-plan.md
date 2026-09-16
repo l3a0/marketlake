@@ -183,19 +183,28 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
      column refuses is now routed into `extra` and the cycle lands, so what still reaches
      this fail-open is a value with no key in the overflow to land under. The design doc's
      schema-policy section carries the rule and the columns it covers.
-  2. A window body the merge cannot read splits like a too-big window and is given up under
-     `chain_schema_drift`, a class of its own. The shapes that raise there sit inside one
-     expiration or one strike, which is what a date-keyed split isolates, so refusing to
-     split would cost the whole window to save the few requests the split spends. What the
-     split costs depends on how wide the drift is, and the depth bound is the only thing
-     that caps it. One bad expiration in a 30-day window costs 9 requests at the default
-     depth of 4. A window whose every expiration drifted walks the full binary tree at 31,
-     every minute for as long as the drift lasts. The bound caps that case too, and it is
-     deliberately the only cap. **Considered and rejected: a second rule for drift**, either
-     stopping the split once both halves have failed or bounding drift lower than size.
-     Either buys a smaller number in a case the vendor has never produced, and the price is
-     a second thing to reason about on the split path. One number an operator can read and
-     lower is worth more. Filing drift
+  2. A window body the merge cannot read is recorded once under `chain_schema_drift`, a class
+     of its own, and never split. The other windows still land, so the loss is that one
+     window. Two shapes reach it: an expiration whose value is not a strike map, and a strike
+     whose value is not a contract list. The second is checked by type rather than left to
+     what `list.extend` accepts, because a string and a Mapping are both iterable and used to
+     merge as characters or keys and reach the row builder as contracts, which cost the whole
+     chain. That is [#305](https://github.com/l3a0/marketlake/issues/305).
+     **Considered and rejected: splitting a window the merge could not read**, which is what
+     the fetch did until #305. A date-keyed split does isolate the damage to the day the
+     drifted expiration sits on, and what it spends to buy that is the measurement that
+     retired it. With the default five-window plan and a depth bound of 4, a payload change
+     reaching every expiration walks the full binary tree on each of the four concrete
+     windows: 113 requests for one ticker-minute, against the 5 a healthy one makes. Two
+     option tickers put that past Schwab's 120 req/min ceiling, and past the minute before
+     that, since a healthy SPY chain fetch already takes about nine seconds. A cycle that
+     overruns fires no cycle in the next minute and charges every watched surface, quotes
+     included. The entry this replaces rejected bounding drift lower than size because it
+     bought a smaller number in a case the vendor has never produced. What answers that is the
+     ceiling rather than the size: past it the number stops being smaller or larger and
+     becomes a different failure, one reaching the quote surface a chain fetch cannot
+     otherwise touch. The depth bound still caps a too-big window's split and is deliberately
+     the only cap there. Filing drift
      under the size class would send a reader to the chunk plan for a problem no chunk plan
      fixes. The class is named to read as drift, so a reader sweeping the gap classes finds
      it under one string, and it matches the reason the segment readers are to carry for the
