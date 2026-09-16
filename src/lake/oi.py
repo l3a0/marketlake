@@ -76,12 +76,13 @@ which is a caller typo, and two unnamed refusals about a corrupt partition. Turn
 those into a marker would hide a defect behind something that looks legitimate.
 
 A marker carries its reason, the way the journal pairs a row kind with an ``error_class``
-rather than leaving a reader to infer why a value is missing. This view has eight reasons
-and the loader hands most of them over already, so one undifferentiated marker would
-throw away what it was given. ``NoCloseOfRecord`` goes further and carries
-``tagged_gaps``, which separates a close cycle that never ran from one that ran and
-failed. That distinction is worth keeping, because eight of the thirteen sealed chains
-partitions the lake held on 2026-09-16 were in the second case.
+rather than leaving a reader to infer why a value is missing. This view has eight reasons a
+row can carry and the loader hands most of them over already, so one undifferentiated
+marker would throw away what it was given. A session whose own close cannot be read carries
+a ninth, and it refuses rather than returning rows, so ``BaselineAbsent`` carries the reason
+and the close-of-record gap count with it. That count separates a close cycle that never ran
+from one that ran and failed, which is worth keeping because eight of the thirteen sealed
+chains partitions the lake held on 2026-09-16 were in the second case.
 
 Nothing here writes, fetches, or reads a clock. The lake root resolves through
 ``loader.resolve_lake_root``, which is the read layer's one config read, and every path
@@ -119,9 +120,13 @@ VERDICT_ABSENT = "absent"
 VERDICT_PENDING = "pending"
 VERDICT_INDETERMINATE = "indeterminate"
 
-# Why a value is withheld. Seven of these are properties of the ticker-session and ride
-# every row of the answer. ``expired_out`` is the one that varies per contract, because a
-# contract that expires on S leaves the chain while its neighbours stay.
+# Why a value is withheld. Six of these are properties of the ticker-session and ride every
+# row of the answer. The last two vary per contract. ``expired_out`` is decided by the
+# contract's own expiration and never by whether the selected cycle happens to list it, so a
+# vendor that keeps an expired contract listed for another session cannot turn an
+# unobservable figure into a settled one. ``no_value_in_cycle`` is the other direction: the
+# contract survives S and the selected cycle carries no number for it, either because the
+# cycle does not list it or because it lists it null.
 REASON_PARTITION_ABSENT = "partition_absent"
 REASON_NOT_YET_CAPTURED = "not_yet_captured"
 REASON_NO_DATA_CYCLES = "no_data_cycles"
@@ -130,13 +135,14 @@ REASON_NO_CLOSE_OF_RECORD = "no_close_of_record"
 REASON_SET_UNDER_FLOOR = "set_under_floor"
 REASON_NO_CYCLE_PASSED = "no_cycle_passed"
 REASON_EXPIRED_OUT = "expired_out"
+REASON_NO_VALUE_IN_CYCLE = "no_value_in_cycle"
 
 # The answer's shape. ``open_interest`` is null on every row that is not ``settled``, and
 # ``reason`` is null on every row that is. ``source_session`` and ``source_snap_ts`` name
-# the cycle a settled figure came from, so a reader can go back to the rows it was
-# derived from. ``tagged_gaps`` is filled only when the reason is
-# ``no_close_of_record``, where the loader hands over the count of absence markers that
-# carried the tag, which says whether the close cycle never ran or ran and failed.
+# the cycle a settled figure came from, so a reader can go back to the rows it was derived
+# from. There is no column for the close-of-record gap count, because the only reason that
+# would fill one is a session whose own close cannot be read, and that refuses rather than
+# returning rows. ``BaselineAbsent.tagged_gaps`` carries it instead.
 OI_VIEW_SCHEMA = pa.schema(
     [
         ("ticker", pa.string()),
@@ -147,7 +153,6 @@ OI_VIEW_SCHEMA = pa.schema(
         ("reason", pa.string()),
         ("source_session", pa.string()),
         ("source_snap_ts", pa.string()),
-        ("tagged_gaps", pa.int64()),
     ]
 )
 
@@ -226,6 +231,13 @@ class BaselineAbsent(OiViewError):
         self.day = day
         self.reason = reason
         self.cause = cause
+        # The count of absence markers that carried the close tag, when the loader supplied
+        # one. Zero means the close-of-record cycle never ran and a positive count means it
+        # ran and failed, which is the majority path: eight of the thirteen sealed chains
+        # partitions the lake held on 2026-09-16 raised ``NoOptionClose``, each carrying
+        # exactly one tagged gap row. It rides the refusal rather than a column, because a
+        # session with no close has no rows to carry a column at all.
+        self.tagged_gaps = getattr(cause, "tagged_gaps", None)
 
 
 @dataclass(frozen=True)
@@ -479,13 +491,25 @@ def _walk(
     # so it is not a candidate. The window is the session's cycles less its last few.
     window = len(cycles) - plateau
     reached_floor = False
+    # Counted apart from ``reached_floor`` because no cycle examined and every cycle too
+    # thin are different answers. A session holding one stored cycle against the default
+    # plateau of one leaves the window empty, and reporting that as a set under the floor
+    # described the comparable set, which had nothing to do with it.
+    examined = 0
 
     for index in range(max(window, 0)):
         cycle = _cycle_oi(ticker, following_text, cycles[index], root, include_quarantined)
         if cycle is None:
             continue
-        voters = {occ: oi for occ, oi in cycle.open_interest.items() if occ in baseline}
-        if len(voters) < guards.oi_comparable_set_floor:
+        # A null OI is the vendor declining to say, not a changed figure. Counting one as
+        # changed let a cycle that carried null on every contract pass the quorum against a
+        # real baseline and then pass the plateau against itself, and be returned as a
+        # settlement whose every value was null.
+        voters = {
+            occ: oi for occ, oi in cycle.open_interest.items() if occ in baseline and oi is not None
+        }
+        examined += 1
+        if not voters or len(voters) < guards.oi_comparable_set_floor:
             continue
         reached_floor = True
         changed = sum(1 for occ, oi in voters.items() if oi != baseline[occ])
@@ -508,7 +532,7 @@ def _walk(
             open_interest=cycle.open_interest,
         )
 
-    if not reached_floor:
+    if examined and not reached_floor:
         return _Outcome(verdict=VERDICT_INDETERMINATE, reason=REASON_SET_UNDER_FLOOR)
     return _Outcome(verdict=VERDICT_ABSENT, reason=REASON_NO_CYCLE_PASSED)
 
@@ -619,7 +643,6 @@ def _marked(
     roster: tuple[_Contract, ...],
     verdict: str,
     reason: str | None,
-    tagged_gaps: int | None = None,
 ) -> pa.Table:
     """The whole roster under one verdict, which is what a session-wide marker is."""
     count = len(roster)
@@ -633,7 +656,6 @@ def _marked(
             "reason": [reason] * count,
             "source_session": [None] * count,
             "source_snap_ts": [None] * count,
-            "tagged_gaps": [tagged_gaps] * count,
         },
         schema=OI_VIEW_SCHEMA,
     )
@@ -644,25 +666,40 @@ def _settled(
 ) -> pa.Table:
     """The roster against the selected cycle, contract by contract.
 
-    A contract the selected cycle does not carry is marked rather than dropped, because
-    completeness is counted from rows and never inferred from holes. The contracts that
-    land there are the ones that expired on S: SPY's 2026-09-14 close held 12,956
-    contracts, 310 of them expiring that day, and those 310 are exactly what 2026-09-15
-    no longer carried.
+    A contract with no settled figure is marked rather than dropped, because completeness is
+    counted from rows and never inferred from holes, and the two reasons it can carry are
+    kept apart on purpose.
+
+    *It expired on S.* Decided from the contract's own expiration and never from whether the
+    selected cycle lists it. Expiry-day final OI is unobservable under any design, so a
+    vendor that keeps an expired contract listed for one more session must not be able to
+    turn that into a settled number. On the live lake the two tests agree, because SPY's
+    2026-09-14 close held 12,956 contracts, 310 of them expiring that day, and those 310 are
+    exactly what 2026-09-15 no longer carried. They agree there and they are not the same
+    test, and the expiration is the one that is true by construction.
+
+    *The selected cycle carries no number for it.* A contract that survives past S and is
+    missing from the cycle, or listed in it with a null OI. A partial or truncated cycle
+    produces that, and calling it an expiry would be a false statement about the contract.
     """
     found = outcome.open_interest or {}
     verdicts: list[str] = []
     reasons: list[str | None] = []
     values: list[int | None] = []
     for row in roster:
-        if row.occ_symbol in found:
-            verdicts.append(VERDICT_SETTLED)
-            reasons.append(None)
-            values.append(found[row.occ_symbol])
-        else:
+        value = found.get(row.occ_symbol)
+        if not row.expires_after_session:
             verdicts.append(VERDICT_ABSENT)
             reasons.append(REASON_EXPIRED_OUT)
             values.append(None)
+        elif value is None:
+            verdicts.append(VERDICT_ABSENT)
+            reasons.append(REASON_NO_VALUE_IN_CYCLE)
+            values.append(None)
+        else:
+            verdicts.append(VERDICT_SETTLED)
+            reasons.append(None)
+            values.append(value)
     count = len(roster)
     return pa.table(
         {
@@ -674,7 +711,6 @@ def _settled(
             "reason": reasons,
             "source_session": [outcome.source_session] * count,
             "source_snap_ts": [outcome.source_snap_ts] * count,
-            "tagged_gaps": [None] * count,
         },
         schema=OI_VIEW_SCHEMA,
     )
@@ -687,6 +723,7 @@ __all__ = [
     "REASON_NO_CLOSE_OF_RECORD",
     "REASON_NO_CYCLE_PASSED",
     "REASON_NO_DATA_CYCLES",
+    "REASON_NO_VALUE_IN_CYCLE",
     "REASON_PARTITION_ABSENT",
     "REASON_PARTITION_QUARANTINED",
     "REASON_SET_UNDER_FLOOR",

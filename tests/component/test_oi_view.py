@@ -40,6 +40,7 @@ from lake.oi import (
     REASON_EXPIRED_OUT,
     REASON_NO_CYCLE_PASSED,
     REASON_NO_DATA_CYCLES,
+    REASON_NO_VALUE_IN_CYCLE,
     REASON_NOT_YET_CAPTURED,
     REASON_PARTITION_ABSENT,
     REASON_PARTITION_QUARANTINED,
@@ -467,18 +468,7 @@ def test_8_a_contract_expiring_on_s_is_marked_rather_than_carried(fixture_lake: 
 
     answer = view(root, constants=constants())
 
-    rows = dict(
-        zip(
-            answer.column("occ_symbol").to_pylist(),
-            zip(
-                answer.column("verdict").to_pylist(),
-                answer.column("reason").to_pylist(),
-                answer.column("open_interest").to_pylist(),
-                strict=True,
-            ),
-            strict=True,
-        )
-    )
+    rows = _by_symbol(answer)
     assert rows[expiring] == (VERDICT_ABSENT, REASON_EXPIRED_OUT, None)
     assert rows[occ(0)] == (VERDICT_SETTLED, None, REFRESHED[occ(0)])
 
@@ -665,6 +655,192 @@ def _reason_for(root: Path, scenario: str) -> str | None:
     reasons = set(answer.column("reason").to_pylist())
     assert len(reasons) == 1, (scenario, reasons)
     return reasons.pop()
+
+
+# -- what the review found -----------------------------------------------------
+
+
+def test_a_contract_expiring_on_s_is_marked_even_when_the_next_chain_lists_it(
+    fixture_lake: FixtureLake,
+):
+    """Expiry-day final OI is unobservable, and the vendor is not what decides that.
+
+    Test 8 removes the expiring contract from the next chain, so it passed while the code
+    was deciding by cycle membership rather than by the expiration. A vendor that keeps an
+    expired contract listed for one more session would have turned an unobservable figure
+    into a settled number carrying the S-close value forward, which is #137's mutation 12
+    arriving through the data instead of through an edit.
+    """
+    expiring = occ(99, SESSION)
+    roster = {**SET, expiring: 4242}
+    volumes = {**VOLUMES, expiring: 5000}
+    expirations = {symbol: LATER for symbol in SET} | {expiring: SESSION}
+    still_listed = {**REFRESHED, expiring: 4242}
+    fixture_lake.with_chains(
+        "SPY",
+        SESSION,
+        table(close_rows(SESSION, roster, volumes=volumes, expirations=expirations)),
+    )
+    fixture_lake.with_chains(
+        "SPY",
+        FOLLOWING,
+        table(
+            cycle_rows(FOLLOWING, 9, 30, still_listed, volumes=volumes)
+            + cycle_rows(FOLLOWING, 9, 31, still_listed, volumes=volumes)
+        ),
+    )
+    reference(fixture_lake)
+    root = fixture_lake.build()
+
+    answer = view(root, constants=constants())
+
+    rows = _by_symbol(answer)
+    assert rows[expiring] == (VERDICT_ABSENT, REASON_EXPIRED_OUT, None)
+    assert rows[occ(0)] == (VERDICT_SETTLED, None, REFRESHED[occ(0)])
+
+
+def test_a_surviving_contract_the_cycle_drops_is_not_called_an_expiry(
+    fixture_lake: FixtureLake,
+):
+    """A partial cycle is not an expiration, and saying so would be a false statement."""
+    dropped = occ(77)
+    roster = {**SET, dropped: 1111}
+    volumes = {**VOLUMES, dropped: 1}
+    fixture_lake.with_chains("SPY", SESSION, table(close_rows(SESSION, roster, volumes=volumes)))
+    fixture_lake.with_chains(
+        "SPY",
+        FOLLOWING,
+        table(
+            cycle_rows(FOLLOWING, 9, 30, REFRESHED, volumes=VOLUMES)
+            + cycle_rows(FOLLOWING, 9, 31, REFRESHED, volumes=VOLUMES)
+        ),
+    )
+    reference(fixture_lake)
+    root = fixture_lake.build()
+
+    rows = _by_symbol(view(root, constants=constants()))
+
+    assert rows[dropped] == (VERDICT_ABSENT, REASON_NO_VALUE_IN_CYCLE, None)
+
+
+def test_a_cycle_carrying_null_open_interest_is_not_a_settlement(fixture_lake: FixtureLake):
+    """A null OI is the vendor declining to say, not a changed figure.
+
+    Counting one as changed let a cycle null on every contract clear the quorum against a
+    real baseline, then clear the plateau against itself, and be selected. The first two
+    cycles here are null on every contract and the refresh arrives at the third, so a
+    reader that treats null as a change selects the first and answers with nulls where the
+    settled figures were two minutes away.
+    """
+    blank = dict.fromkeys(SET)
+    root = settled_lake(
+        fixture_lake,
+        [
+            cycle_rows(FOLLOWING, 9, 30, blank, volumes=VOLUMES),
+            cycle_rows(FOLLOWING, 9, 31, blank, volumes=VOLUMES),
+            cycle_rows(FOLLOWING, 9, 32, REFRESHED, volumes=VOLUMES),
+            cycle_rows(FOLLOWING, 9, 33, REFRESHED, volumes=VOLUMES),
+        ],
+    )
+
+    answer = view(root, constants=constants())
+
+    assert verdicts(answer) == {(VERDICT_SETTLED, None)}
+    assert answer.column("source_snap_ts").to_pylist()[0] == et(FOLLOWING, 9, 32)
+    assert set(answer.column("open_interest").to_pylist()) == set(REFRESHED.values())
+
+
+def test_a_session_holding_one_cycle_is_absent_rather_than_indeterminate(
+    fixture_lake: FixtureLake,
+):
+    """No cycle examined and every cycle too thin are different answers.
+
+    One stored cycle against the default plateau of one leaves the window empty. Reporting
+    that as a set under the floor described the comparable set, which had nothing to do
+    with it, and the set here is eight against a floor of four.
+    """
+    root = settled_lake(fixture_lake, [cycle_rows(FOLLOWING, 9, 30, REFRESHED, volumes=VOLUMES)])
+
+    answer = view(root, constants=constants())
+
+    assert verdicts(answer) == {(VERDICT_ABSENT, REASON_NO_CYCLE_PASSED)}
+
+
+def test_a_quarantined_session_of_its_own_refuses_the_baseline(fixture_lake: FixtureLake):
+    """The exclusion is carried at both reads, and test 9 only ever held the other one."""
+    fixture_lake.with_chains("SPY", SESSION, table(close_rows(SESSION, SET, volumes=VOLUMES)))
+    fixture_lake.with_chains(
+        "SPY",
+        FOLLOWING,
+        table(
+            cycle_rows(FOLLOWING, 9, 30, REFRESHED, volumes=VOLUMES)
+            + cycle_rows(FOLLOWING, 9, 31, REFRESHED, volumes=VOLUMES)
+        ),
+    )
+    fixture_lake.with_quarantine(
+        {
+            "partition": f"chains/ticker=SPY/date={SESSION}.parquet",
+            "quarantined": True,
+            "reason": "row count out of band",
+        }
+    )
+    reference(fixture_lake)
+    root = fixture_lake.build()
+
+    with pytest.raises(BaselineAbsent) as caught:
+        view(root, constants=constants())
+    assert caught.value.reason == REASON_PARTITION_QUARANTINED
+
+
+def test_a_voter_the_plateau_cycle_drops_fails_the_hold(fixture_lake: FixtureLake):
+    """A contract leaving the chain a minute later is the shape of a half-written load.
+
+    Reading a voter's absence as agreement would let exactly that cycle be selected.
+    """
+    thinned = {symbol: REFRESHED[symbol] for symbol in list(SET)[:4]}
+    root = settled_lake(
+        fixture_lake,
+        [
+            cycle_rows(FOLLOWING, 9, 30, REFRESHED, volumes=VOLUMES),
+            cycle_rows(FOLLOWING, 9, 31, thinned, volumes=VOLUMES),
+        ],
+    )
+
+    answer = view(root, constants=constants())
+
+    assert verdicts(answer) == {(VERDICT_ABSENT, REASON_NO_CYCLE_PASSED)}
+
+
+def test_a_floor_of_zero_does_not_divide_by_zero(fixture_lake: FixtureLake):
+    """``GuardConstants`` accepts it, so a calibration run turning the floor off must not crash."""
+    strangers = {occ(50 + index): 77 for index in range(6)}
+    stranger_volumes = dict.fromkeys(strangers, 10)
+    root = settled_lake(
+        fixture_lake,
+        [
+            cycle_rows(FOLLOWING, 9, 30, strangers, volumes=stranger_volumes),
+            cycle_rows(FOLLOWING, 9, 31, strangers, volumes=stranger_volumes),
+        ],
+    )
+
+    answer = view(root, constants=constants(oi_comparable_set_floor=0))
+
+    assert VERDICT_SETTLED not in answer.column("verdict").to_pylist()
+
+
+def _by_symbol(answer: pa.Table) -> dict[str, tuple]:
+    return dict(
+        zip(
+            answer.column("occ_symbol").to_pylist(),
+            zip(
+                answer.column("verdict").to_pylist(),
+                answer.column("reason").to_pylist(),
+                answer.column("open_interest").to_pylist(),
+                strict=True,
+            ),
+            strict=True,
+        )
+    )
 
 
 # -- scope, and the refusals that are not markers ------------------------------

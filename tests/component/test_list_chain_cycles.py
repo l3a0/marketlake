@@ -22,7 +22,13 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
-from lake.loader import PartitionAbsent, PartitionQuarantined, list_chain_cycles, load_chain
+from lake.loader import (
+    LoadError,
+    PartitionAbsent,
+    PartitionQuarantined,
+    list_chain_cycles,
+    load_chain,
+)
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
 from tests.support.lake import FixtureLake, sample_chains_table
 
@@ -42,7 +48,7 @@ def ledger_table() -> pa.Table:
     return SchemaVersionLedger([entry]).to_table()
 
 
-def data(snap: str, occ: str = "SPY   260918C00650000", row_kind: str = "data") -> dict:
+def data(snap: str, occ: str = "SPY   260918C00650000", row_kind: str | None = "data") -> dict:
     return {
         "snap_ts": snap,
         "fetch_ts": snap,
@@ -153,6 +159,26 @@ def test_an_unreadable_stamp_is_skipped_rather_than_refusing_the_session(
     )
 
     assert list_chain_cycles("SPY", DAY, lake_root=root) == ("09:31",)
+
+
+def test_a_null_row_kind_refuses_the_whole_listing(fixture_lake: FixtureLake):
+    """A row that is neither an observation nor an absence marker is not skippable.
+
+    Arrow's filter drops it from both sides, so listing the rest would hand a walker a
+    shorter cycle list and it would vote on a session it cannot see whole. The sibling read
+    paths refuse on this and are tested for it four times over; this path carried the rule
+    and none of the coverage.
+    """
+    root = lake(
+        fixture_lake,
+        [
+            data("2026-09-14T09:30:00-04:00"),
+            data("2026-09-14T09:31:00-04:00", row_kind=None),
+        ],
+    )
+
+    with pytest.raises(LoadError, match="row_kind"):
+        list_chain_cycles("SPY", DAY, lake_root=root)
 
 
 def test_an_absent_partition_refuses(fixture_lake: FixtureLake):

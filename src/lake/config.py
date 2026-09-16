@@ -139,9 +139,12 @@ class GuardConstants:
     # Median-relative checks with fewer than this many trailing sessions still run but
     # tag their rows *insufficient_history* instead of clean.
     min_trailing_sessions: int = 5
-    # The OI view's freshness test uses the next three. The design names them as guard
-    # constants but pins no number. Slice 1's refresh-moment measurement calibrates
-    # them, so the values here are provisional placeholders, not design-pinned figures.
+    # The OI view's freshness test uses the next four. The design names three of them as
+    # guard constants and pins no number, and marketlake #137 names the fourth. Slice 1's
+    # refresh-moment measurement was meant to calibrate them and cannot: it looks for a
+    # later cycle in a session that differs from that session's first, and open interest
+    # does not move inside a stored session. So these are provisional placeholders waiting
+    # on a calibration that has to come from somewhere else, not design-pinned figures.
     # The minimum comparable-set size below which the OI verdict is *indeterminate*.
     oi_comparable_set_floor: int = 20
     # The fraction of the comparable set that must show changed OI to declare a refresh.

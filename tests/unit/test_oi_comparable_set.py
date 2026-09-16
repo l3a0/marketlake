@@ -12,7 +12,9 @@ set sized anywhere near there lands on one without trying.
 
 from __future__ import annotations
 
-from lake.oi import _comparable_set, _Contract
+from datetime import date
+
+from lake.oi import _comparable_set, _Contract, _expires_after
 
 
 def contract(symbol: str, volume: int, *, survives: bool = True) -> _Contract:
@@ -81,3 +83,18 @@ def test_the_set_is_capped_at_the_configured_size():
     assert len(_comparable_set(roster, 10)) == 10
     assert len(_comparable_set(roster, 50)) == 50
     assert len(_comparable_set(roster, 500)) == 50
+
+
+def test_an_unreadable_expiration_keeps_a_contract_out_of_the_set():
+    """A value that cannot be read as a date has not been shown to survive the session.
+
+    The contract stays in the roster, where it can still take a settled figure, and out of
+    the set, where it would be a voter nothing has shown will be there to vote.
+    """
+    session = date(2026, 9, 14)
+
+    assert _expires_after("2026-09-18T20:00:00.000+00:00", session) is True
+    assert _expires_after("2026-09-14T20:00:00.000+00:00", session) is False
+    assert _expires_after("not a date", session) is False
+    assert _expires_after(None, session) is False
+    assert _expires_after(20260918, session) is False
