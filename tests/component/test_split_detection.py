@@ -25,6 +25,7 @@ import json
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 
 from lake import actions, report
@@ -34,16 +35,26 @@ from lake.actions import (
     TYPE_SPLIT,
 )
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
-from lake.security_master import KIND_EQUITY, SecurityMaster, master_path
+from lake.security_master import (
+    ID_TYPE_TICKER,
+    KIND_EQUITY,
+    Mapping,
+    SecurityMaster,
+    master_path,
+)
 from lake.splits import (
     CHECK_SPLIT_BOUNDARY,
     CHECK_SPLIT_CONSISTENCY,
     CHECK_SPLIT_DELIVERABLE,
     CHECK_SPLIT_PAYLOAD,
+    REASON_DELIVERABLE_UNCHANGED,
     REASON_NO_OPTION_CLOSE,
     REASON_OUT_OF_SCOPE,
     REASON_PARTIAL_READ,
+    REASON_PARTITION_ABSENT,
     REASON_QUARANTINED,
+    REASON_ROOT_RETURNED,
+    REASON_STANDARD_SERIES,
     REASON_THIN,
     detect_splits,
 )
@@ -118,6 +129,7 @@ def _row(
     note: str | None = NOTE,
     multiplier: float | None = 100.0,
     non_standard: bool | None = False,
+    mini: bool | None = False,
     close_tag: str | None = "option_close",
     row_kind: str = "data",
     suspect: bool = False,
@@ -138,6 +150,7 @@ def _row(
         "option_root": option_root,
         "multiplier": multiplier,
         "non_standard": non_standard,
+        "mini": mini,
         "deliverable_note": note,
         "option_deliverables_list": deliverables,
         "is_chain_truncated": truncated,
@@ -165,6 +178,7 @@ def _gap_day_row(day: date, ticker: str = "SPY") -> dict:
         note=None,
         multiplier=None,
         non_standard=None,
+        mini=None,
         ticker=ticker,
     )
 
@@ -185,6 +199,30 @@ def _ledger_table():
     """The schema-version ledger recording version 1 at the shape the running code writes."""
     entry = RecordedVersion(version=1, recorded_at=RECORDED_AT, fingerprints=running_fingerprints())
     return SchemaVersionLedger([entry]).to_table()
+
+
+def _mapping(
+    instrument_id: int,
+    ticker: str,
+    *,
+    valid_from: date = date(2026, 9, 8),
+    valid_to: date | None = None,
+) -> Mapping:
+    """One master row, built directly.
+
+    ``register`` opens an unbounded mapping and ``remap`` closes the one it replaces, so
+    neither can express a symbol two instruments hold over different ranges, nor one
+    instrument holding two symbols at once. Both are shapes the walk has to answer for.
+    """
+    return Mapping(
+        instrument_id=instrument_id,
+        id_type=ID_TYPE_TICKER,
+        id_value=ticker,
+        valid_from=valid_from,
+        valid_to=valid_to,
+        kind=KIND_EQUITY,
+        capture_start=datetime(2026, 9, 8, 17, 7, tzinfo=UTC),
+    )
 
 
 def _master(*, valid_from: date = date(2026, 9, 8), tickers: tuple[str, ...] = ("SPY",)):
@@ -256,6 +294,11 @@ def _findings(root: Path, day: date) -> list[dict]:
 
 def _reasons(report_out) -> list[str]:
     return sorted(skip.reason for skip in report_out.skipped)
+
+
+def _not_splits(report_out) -> list[str]:
+    """Why each root change the run met had no corporate action behind it."""
+    return sorted(mark.reason for mark in report_out.not_adjustments)
 
 
 # -- the boundary and the ratio ---------------------------------------------------------
@@ -372,6 +415,7 @@ def test_new_strikes_under_the_unchanged_root_are_not_a_boundary(fixture_lake: F
 
     assert _entries(root) == []
     assert report_out.appended == () and report_out.held == ()
+    assert report_out.not_adjustments == (), "a new strike was read as a root change"
 
 
 def test_the_vendor_respelling_every_symbol_is_not_a_boundary(fixture_lake: FixtureLake):
@@ -397,6 +441,9 @@ def test_the_vendor_respelling_every_symbol_is_not_a_boundary(fixture_lake: Fixt
 
     assert _entries(root) == []
     assert report_out.appended == () and report_out.held == ()
+    assert report_out.not_adjustments == (), (
+        "the root came off the symbol whole, so every respelled contract was a new root"
+    )
 
 
 def test_the_same_deliverable_under_a_new_root_is_a_rename_and_not_a_split(
@@ -412,7 +459,7 @@ def test_the_same_deliverable_under_a_new_root_is_a_rename_and_not_a_split(
         fixture_lake,
         {
             ("SPY", DAY_ONE): [_row(DAY_ONE)],
-            ("SPY", DAY_TWO): [_row(DAY_TWO, option_root=ADJUSTED_ROOT)],
+            ("SPY", DAY_TWO): [_row(DAY_TWO, option_root=ADJUSTED_ROOT, non_standard=True)],
         },
     )
 
@@ -420,7 +467,7 @@ def test_the_same_deliverable_under_a_new_root_is_a_rename_and_not_a_split(
 
     assert _entries(root) == [], "a rename landed a no-op factor"
     assert report_out.held == ()
-    assert report_out.unchanged_deliverable == 1
+    assert _not_splits(report_out) == [REASON_DELIVERABLE_UNCHANGED]
 
 
 # -- the five skips ---------------------------------------------------------------------
@@ -645,13 +692,14 @@ def test_a_deliverable_carrying_cash_is_held_rather_than_flattened(
     objecting, which is the number that reads like a whole-ratio split and is not one. #136
     asks for the event to be surfaced instead of faked, so it is held.
     """
-    root = _two_sessions(fixture_lake, deliverables=_with_cash(150.0, 25.0))
+    root = _two_sessions(fixture_lake, deliverables=_deliverables(150.0, currency="USD"))
 
     report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
 
     assert _entries(root) == []
     (held,) = report_out.held
     assert held.finding.check == CHECK_SPLIT_DELIVERABLE
+    assert "cash" in str(held.finding.exception)
     (filed,) = _findings(root, DAY_TWO)
     assert filed["exception"] == "SPY: NonScalarDeliverable"
 
@@ -681,33 +729,41 @@ def test_a_moved_contract_multiplier_is_held(fixture_lake: FixtureLake):
     assert held.finding.check == CHECK_SPLIT_DELIVERABLE
 
 
-def test_a_standard_flag_beside_a_moved_deliverable_is_held(fixture_lake: FixtureLake):
-    """Two vendor fields disagreeing rather than a split.
+def test_a_gained_root_whose_contracts_are_standard_is_a_new_series(
+    fixture_lake: FixtureLake,
+):
+    """An OCC adjustment turns standard contracts into non-standard ones.
 
-    The OCC re-symbols when the adjustment makes the contract non-standard, so a gained root
-    whose contracts the vendor still flags standard, while their deliverable moved, is the
-    vendor contradicting itself.
+    So a chain that begins listing a fresh standard series under a second root has gained a
+    root and had no corporate action. This is the ordinary state of a ticker in the weeks
+    after a real adjustment, when a new standard series lists beside the adjusted one, and
+    reading it as a boundary lands the first split's own ratio inverted.
     """
     root = _two_sessions(fixture_lake, non_standard=False)
 
     report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
 
-    assert _entries(root) == []
-    (held,) = report_out.held
-    assert held.finding.check == CHECK_SPLIT_DELIVERABLE
+    assert _entries(root) == [], "a newly listed standard series landed as a split"
+    assert report_out.held == ()
+    assert _not_splits(report_out) == [REASON_STANDARD_SERIES]
 
 
-def test_a_null_standard_flag_is_unknown_rather_than_false(fixture_lake: FixtureLake):
-    """A partition sealed before the column existed is not refused for a column it lacks.
+def test_a_gained_root_that_does_not_say_whether_it_is_standard_is_held(
+    fixture_lake: FixtureLake,
+):
+    """Unknown is read as neither, because the two want opposite treatments.
 
-    The lake's own 2026-09-02 partition carries ``non_standard`` null on both its rows.
+    Without the flag nothing separates a newly listed series from an adjustment, so this
+    fails closed the way every other unanswerable question here does. Landing is the one
+    outcome the ledger's key cannot take back.
     """
     root = _two_sessions(fixture_lake, non_standard=None)
 
-    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
 
-    (entry,) = _entries(root)
-    assert entry["split_ratio"] == 1.5
+    assert _entries(root) == []
+    (held,) = report_out.held
+    assert held.finding.check == CHECK_SPLIT_PAYLOAD
 
 
 # -- payloads the record rules refuse ---------------------------------------------------
@@ -927,3 +983,447 @@ def test_the_detection_reads_no_config(fixture_lake: FixtureLake, monkeypatch):
     detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
 
     assert len(_entries(root)) == 1
+
+
+# -- the three other things that change a root set --------------------------------------
+
+
+def test_a_mini_option_listing_is_not_a_corporate_action(fixture_lake: FixtureLake):
+    """A mini contract is a tenth-size contract under its own root.
+
+    So the first one to list gains a root and delivers a tenth of what a standard contract
+    does, which is the exact shape of an adjustment. Reading the rows lands a fabricated
+    ten-for-one reverse split in an append-only ledger. ``mini`` is ``False`` on all
+    19,799,808 data rows the lake holds, so excluding them drops nothing today.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_TWO): [
+                _row(DAY_TWO),
+                _row(
+                    DAY_TWO,
+                    occ_symbol="SPY7  260918C00650000",
+                    option_root="SPY7",
+                    deliverables=_deliverables(10.0),
+                    note="10 SPY",
+                    non_standard=True,
+                    mini=True,
+                ),
+            ],
+        },
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert _entries(root) == [], "a mini listing landed a ten-for-one reverse split"
+    assert report_out.held == ()
+    assert report_out.not_adjustments == ()
+
+
+def test_a_root_returning_to_the_chain_is_not_a_gain(fixture_lake: FixtureLake):
+    """A set difference has no direction, and that is how the ratio gets computed backwards.
+
+    A root whose contracts all expire out of one session and list again in the next reads as
+    an adjustment. Every guard can be armed and the entry still lands, under a date the
+    ledger's key cannot correct.
+    """
+    adjusted = dict(
+        option_root=ADJUSTED_ROOT,
+        occ_symbol="SPY1  260918C00433330",
+        deliverables=ADJUSTED,
+        note=ADJUSTED_NOTE,
+        non_standard=True,
+    )
+    root = _lake(
+        fixture_lake,
+        {
+            # Day one carries both. Day two's response omits the adjusted expiry. Day three
+            # carries it again, which is not a second adjustment.
+            ("SPY", DAY_ONE): [_row(DAY_ONE), _row(DAY_ONE, **adjusted)],
+            ("SPY", DAY_TWO): [_row(DAY_TWO)],
+            ("SPY", DAY_THREE): [_row(DAY_THREE), _row(DAY_THREE, **adjusted)],
+        },
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert _entries(root) == [], "a returning root landed a phantom inverse split"
+    assert report_out.held == ()
+    assert _not_splits(report_out) == [REASON_ROOT_RETURNED]
+
+
+def test_a_real_split_still_lands_when_the_previous_session_carries_two_roots(
+    fixture_lake: FixtureLake,
+):
+    """The ordinary state of a ticker from the day after any adjustment onwards.
+
+    Reading the previous session whole raises the moment it carries two roots, because its
+    contracts disagree about what they deliver. The prior side reads the standard contracts
+    instead, which is what the adjustment was made from.
+    """
+    legacy = dict(
+        option_root=ADJUSTED_ROOT,
+        occ_symbol="SPY1  260918C00433330",
+        deliverables=ADJUSTED,
+        note=ADJUSTED_NOTE,
+        non_standard=True,
+    )
+    second = dict(
+        option_root="SPY2",
+        occ_symbol="SPY2  260918C00325000",
+        deliverables=_deliverables(200.0),
+        note="200 SPY",
+        non_standard=True,
+    )
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE), _row(DAY_ONE, **legacy)],
+            ("SPY", DAY_TWO): [_row(DAY_TWO), _row(DAY_TWO, **legacy), _row(DAY_TWO, **second)],
+        },
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    (entry,) = _entries(root)
+    assert entry["split_ratio"] == 2.0, "the prior side was not read off the standard series"
+    assert report_out.held == ()
+
+
+def test_the_prior_side_falls_back_to_the_previous_session(fixture_lake: FixtureLake):
+    """The boundary where every contract was re-symboled at once.
+
+    The boundary session then carries no standard series, so there is no contract still
+    naming the old count beside one naming the new, and the previous session is what has it.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_TWO): [_adjusted_row(DAY_TWO)],
+        },
+    )
+
+    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    (entry,) = _entries(root)
+    assert entry["split_ratio"] == 1.5
+
+
+def test_a_split_and_then_a_fresh_standard_series_files_nothing_false(
+    fixture_lake: FixtureLake,
+):
+    """The whole post-adjustment lifecycle, which is where the false findings used to be.
+
+    Day two adjusts every contract. Day three lists a standard series beside the adjusted
+    one, which is a gained root with no corporate action. A held finding never clears, so one
+    false finding here is one file a night forever.
+
+    The root day three gains is ``SPY``, which day one carried, so it is the returning-root
+    rule that answers rather than the standard-series one. Both reach the same place. The
+    other is driven by :func:`test_a_gained_root_whose_contracts_are_standard_is_a_new_series`,
+    where the gained root is one the ticker never carried.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_TWO): [_adjusted_row(DAY_TWO)],
+            ("SPY", DAY_THREE): [_adjusted_row(DAY_THREE), _row(DAY_THREE)],
+        },
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    (entry,) = _entries(root)
+    assert entry["split_ratio"] == 1.5 and entry["ex_date"] == DAY_TWO.isoformat()
+    assert report_out.held == (), "the re-listed standard series filed a finding"
+    assert _not_splits(report_out) == [REASON_ROOT_RETURNED]
+
+
+# -- the run survives what it cannot read -----------------------------------------------
+
+
+def test_a_note_of_zero_shares_holds_and_the_next_ticker_still_lands_its_split(
+    fixture_lake: FixtureLake,
+):
+    """The gate divides by the note ratio, so a zero on the new side reaches the division.
+
+    ``ZeroDivisionError`` is not a ``SplitError``, so it escapes the walk and ends the run.
+    QQQ sorts before SPY, so the second ticker's genuine split is what a dying run costs.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("QQQ", DAY_ONE): [_row(DAY_ONE, ticker="QQQ")],
+            ("QQQ", DAY_TWO): [
+                _row(DAY_TWO, ticker="QQQ"),
+                _adjusted_row(DAY_TWO, note="0 SPY", ticker="QQQ"),
+            ],
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_TWO): [_row(DAY_TWO), _adjusted_row(DAY_TWO)],
+        },
+        master=_master(tickers=("SPY", "QQQ")),
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    (entry,) = _entries(root)
+    assert entry["split_ratio"] == 1.5, "the dying run cost the second ticker its split"
+    (held,) = report_out.held
+    assert held.finding.check == CHECK_SPLIT_CONSISTENCY
+    assert held.finding.against is None
+
+
+def test_a_manifested_partition_whose_file_is_gone_is_skipped(fixture_lake: FixtureLake):
+    """The manifest records what the lake sealed, not that the file is still on disk."""
+    root = _lake(
+        fixture_lake,
+        {("SPY", DAY_ONE): [_row(DAY_ONE)], ("SPY", DAY_TWO): [_row(DAY_TWO)]},
+    )
+    fixture_lake.partition_path("chains", "SPY", DAY_TWO).unlink()
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert _reasons(report_out) == [REASON_PARTITION_ABSENT]
+    assert report_out.held == ()
+
+
+def test_a_partition_missing_a_column_reads_it_as_null_rather_than_raising(
+    fixture_lake: FixtureLake,
+):
+    """A session sealed before a column existed has nothing to say about it.
+
+    ``actions._observation`` reads its own columns the same way and for the same reason. A
+    ``KeyError`` here would end the whole run rather than skipping one session.
+    """
+    narrow = pa.schema(
+        [f for f in sample_chains_table().schema if f.name not in {"option_root", "mini"}]
+    )
+    rows = [_row(DAY_ONE)]
+    table = pa.table({n: [r.get(n) for r in rows] for n in narrow.names}, schema=narrow)
+    fixture_lake.with_chains("SPY", DAY_ONE, table)
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    root = fixture_lake.build()
+    _master().write(master_path(root))
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert report_out.ticker_days == 1
+    assert report_out.held == () and report_out.skipped == ()
+
+
+def test_contracts_naming_no_root_at_all_are_held(fixture_lake: FixtureLake):
+    """A row with neither root column is a damaged row, not a root of its own.
+
+    Left alone it contributes an empty-string root that the boundary rule reads as a gain,
+    and a split lands under a root that names nothing.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_TWO): [
+                _row(DAY_TWO),
+                _adjusted_row(DAY_TWO, option_root=None, occ_symbol=None),
+            ],
+        },
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert _entries(root) == []
+    (held,) = report_out.held
+    assert held.finding.check == CHECK_SPLIT_PAYLOAD
+
+
+# -- the walk's own state ---------------------------------------------------------------
+
+
+def test_a_skip_does_not_deafen_the_ticker_for_the_rest_of_the_walk(
+    fixture_lake: FixtureLake,
+):
+    """``skipped_since`` counts sessions since the last readable one, and resets on each.
+
+    Left unreset, one skipped session holds every later boundary of that ticker forever. The
+    live lake's SPY has an out-of-scope day and four gap days before its first data day, so
+    that ticker would never land a split again.
+    """
+    day_four = date(2026, 9, 17)
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_TWO): [_gap_day_row(DAY_TWO)],
+            ("SPY", DAY_THREE): [_row(DAY_THREE)],
+            ("SPY", day_four): [_row(day_four), _adjusted_row(day_four)],
+        },
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    (entry,) = _entries(root)
+    assert entry["ex_date"] == day_four.isoformat()
+    assert report_out.held == (), "an earlier skip held a boundary nothing had widened"
+
+
+def test_a_shrinking_root_set_is_not_a_boundary(fixture_lake: FixtureLake):
+    """Contracts under an old root all expiring is an ordinary session, not an event.
+
+    A symmetric difference would read it as a boundary and then file a payload finding an
+    operator has to triage, because the lost root has no rows to read a deliverable from.
+    """
+    adjusted = dict(
+        option_root=ADJUSTED_ROOT,
+        occ_symbol="SPY1  260918C00433330",
+        deliverables=ADJUSTED,
+        note=ADJUSTED_NOTE,
+        non_standard=True,
+    )
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE), _row(DAY_ONE, **adjusted)],
+            ("SPY", DAY_TWO): [_row(DAY_TWO)],
+        },
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert _entries(root) == []
+    assert report_out.held == () and report_out.not_adjustments == ()
+
+
+def test_a_symbol_handed_between_two_instruments_starts_fresh(fixture_lake: FixtureLake):
+    """Two sessions describing different securities have incomparable root sets.
+
+    Diffing them would compute a ratio across two unrelated companies.
+    """
+    master = SecurityMaster(
+        [
+            _mapping(1, "SPY", valid_to=DAY_TWO),
+            _mapping(2, "SPY", valid_from=DAY_TWO),
+        ]
+    )
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_TWO): [_adjusted_row(DAY_TWO)],
+        },
+        master=master,
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert _entries(root) == [], "a ratio was computed across two instruments"
+    assert report_out.held == () and report_out.not_adjustments == ()
+
+
+def test_two_tickers_on_one_instrument_hold_the_second_boundary(fixture_lake: FixtureLake):
+    """A master mapping two symbols to one instrument is one the master calls corrupt.
+
+    The second boundary is refused rather than passed over, because the two can disagree
+    about the ratio and a run that dropped one in silence would report a ledger it does not
+    describe.
+    """
+    master = SecurityMaster([_mapping(1, "SPY"), _mapping(1, "SPZ")])
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_TWO): [_row(DAY_TWO), _adjusted_row(DAY_TWO)],
+            ("SPZ", DAY_ONE): [_row(DAY_ONE, ticker="SPZ")],
+            ("SPZ", DAY_TWO): [
+                _row(DAY_TWO, ticker="SPZ"),
+                _adjusted_row(
+                    DAY_TWO, deliverables=_deliverables(400.0), note="400 SPY", ticker="SPZ"
+                ),
+            ],
+        },
+        master=master,
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert len(_entries(root)) == 1
+    assert len(report_out.appended) == 1
+    (held,) = report_out.held
+    assert held.finding.check == CHECK_INSTRUMENT_RESOLUTION
+
+
+def test_an_ambiguous_master_holds_once_and_does_not_lose_the_ticker(
+    fixture_lake: FixtureLake,
+):
+    """``AmbiguousSymbol`` says the master is corrupt, and a corrupt master is one condition.
+
+    One finding per ticker rather than one per ticker-day, the same reason ``by_ticker`` lets
+    the instrument enter one level down.
+    """
+    master = SecurityMaster()
+    for _ in range(2):
+        master.register(
+            kind=KIND_EQUITY,
+            capture_start=datetime(2026, 9, 8, 17, 7, tzinfo=UTC),
+            valid_from=date(2026, 9, 8),
+            ticker="SPY",
+        )
+    root = _lake(
+        fixture_lake,
+        {("SPY", DAY_ONE): [_row(DAY_ONE)], ("SPY", DAY_TWO): [_row(DAY_TWO)]},
+        master=master,
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    (held,) = report_out.held
+    assert held.finding.check == CHECK_INSTRUMENT_RESOLUTION
+    (filed,) = _findings(root, DAY_ONE)
+    assert filed["exception"] == "SPY: AmbiguousSymbol"
+    assert filed["instrument_ids"] == [1, 2]
+
+
+def test_the_prior_side_reads_the_standard_series_of_the_boundary_session(
+    fixture_lake: FixtureLake,
+):
+    """Not the previous session's, which can be missing the standard series entirely.
+
+    The two agree whenever both sessions carry the standard root, which is almost always. They
+    part when the standard series was absent from the session before and lists again on the
+    boundary day, and then only the boundary session names what a standard contract delivers.
+    Reading the previous session instead takes the ratio off the *adjusted* series, which is
+    the wrong denominator and lands a wrong factor rather than a finding.
+    """
+    day_four = date(2026, 9, 17)
+    legacy = dict(
+        option_root=ADJUSTED_ROOT,
+        occ_symbol="SPY1  260918C00433330",
+        deliverables=ADJUSTED,
+        note=ADJUSTED_NOTE,
+        non_standard=True,
+    )
+    second = dict(
+        option_root="SPY2",
+        occ_symbol="SPY2  260918C00216660",
+        deliverables=_deliverables(300.0),
+        note="300 SPY",
+        non_standard=True,
+    )
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_TWO): [_row(DAY_TWO), _row(DAY_TWO, **legacy)],
+            # The standard series is not listed this session, so it cannot answer from here.
+            ("SPY", DAY_THREE): [_row(DAY_THREE, **legacy)],
+            ("SPY", day_four): [_row(day_four, **legacy), _row(day_four), _row(day_four, **second)],
+        },
+    )
+
+    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    (entry,) = _entries(root)
+    assert entry["split_ratio"] == 3.0, (
+        "the ratio was taken against the adjusted series rather than the standard one"
+    )

@@ -545,20 +545,21 @@ for the ones that need no real process to die partway. Test 4 is the first test 
 tier to kill a running process, and the child it kills is
 `tests/support/compaction_child.py`. The five split into two kinds.
 
-Three are buildable now, and each covers a failure the unit and component suites cannot
+Four are buildable now, and each covers a failure the unit and component suites cannot
 reach:
 
 1. 6, overnight death,
 2. 7, fully dark session,
-3. 14, restore from backup.
+3. 13, synthetic split replay,
+4. 14, restore from backup.
+
+Test 13 joined that list when [#279](https://github.com/l3a0/marketlake/issues/279) shipped
+the detector it replays against. The fixture builder can express a split now that
+`tests/support/lake.py` carries `option_root`, the four deliverable columns, `mini` and
+`is_chain_truncated`.
 
 One is blocked on work that does not exist yet, because its subject is slice 3's: 12, the
 nightly sweep chain, which waits on [#281](https://github.com/l3a0/marketlake/issues/281).
-
-Test 13, the synthetic split replay, is no longer among them.
-[#279](https://github.com/l3a0/marketlake/issues/279) shipped the detector it replays
-against, and the fixture builder can express a split now that
-`tests/support/lake.py` carries `option_root` and the four deliverable columns.
 
 ## The 7 live checks
 

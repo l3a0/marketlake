@@ -41,6 +41,28 @@ before an entry is built, because ``actions.append`` accepts a ``split_ratio`` o
 without complaint, and a rename mis-read as a split would land a no-op factor that every
 adjusted view then reads as a real corporate action.
 
+**Three other things also change a root set and are not splits either**, and each would land
+a fabricated factor that the ledger's key cannot take back.
+
+1. *A newly listed standard series.* An OCC adjustment turns standard contracts into
+   non-standard ones, so a gained root whose contracts the vendor still calls standard has no
+   adjustment behind it. This is the ordinary state of a ticker in the weeks after a real
+   adjustment, when a fresh standard series lists beside the adjusted one, and reading it as a
+   boundary lands the first split's own ratio inverted.
+2. *A root returning.* A set difference has no direction. A root whose contracts all expire
+   out of one session and list again in the next reads as a gain, and the ratio is then
+   computed backwards. So every root the walk has watched an instrument carry is remembered,
+   and a root coming back is counted rather than compared.
+3. *A mini option listing.* A mini contract is a tenth-size contract under its own root, so
+   the first one to list gains a root and delivers a tenth of what a standard contract does,
+   which is the exact shape of an adjustment. ``mini`` is the vendor's flag for it and it is
+   ``False`` on all 19,799,808 data rows the lake holds, so reading it drops nothing today
+   and is what keeps a ten-for-one reverse split out of the ledger the day that changes.
+
+None of the three is a finding. Nothing was refused, so there is nothing for a human to
+resolve, and a held finding never clears. They are counted on the report instead, which is
+what tells a run that met one from a run that read nothing at all.
+
 **Where the ratio comes from.** ``actions.append`` refuses an entry whose ``split_ratio`` is
 null, and a root change is a boolean: it says a split happened and carries no number. Four
 more captured columns are the evidence and none of them needs a vendor call.
@@ -61,6 +83,14 @@ typed ``deliverableUnits`` produces has to agree with the ratio the note's share
 produce. That is the shape ``actions.check_dividend_consistency`` already has, where the
 vendor's annualized figure is read against its own per-event amount, and it catches the same
 class of defect: one of two fields carrying an adjustment the other does not.
+
+**The prior side of a ratio comes from the standard contracts.** An adjustment is a change
+*from* something, and the standard series is what names that something. Reading the previous
+session whole instead works only until that session carries two roots, which is the ordinary
+state from the day after any adjustment onwards, and ``deliverable_of`` then refuses because
+the session's contracts disagree about what they deliver. Usually both sides sit in the
+boundary session itself, which is what #279 means by a contract still naming 100 units beside
+one naming another number.
 
 **A non-standard adjustment is held rather than flattened.** #136 states the constraint. A
 whole-ratio split maps exactly, because strikes scale by the ratio and the contract count
@@ -86,7 +116,10 @@ for five reasons, and each one widens that window:
    precedent for catching it rather than letting it end the walk on the first one.
 3. A partition the overflow projection could not present whole, which raises ``PartialRead``.
    The table is readable and incomplete and the exception refuses a bypass, so a comparison
-   made across it would be a comparison against contents nobody saw in full.
+   made across it would be a comparison against contents nobody saw in full. A manifested
+   partition whose file is gone raises ``PartitionAbsent`` and is skipped beside it, because
+   the manifest is the lake's record of what it sealed rather than a guarantee the file is
+   still there.
 4. A ticker-day outside the instrument's capture span. ``capture_spans.py`` has already
    decided what such a day is: before a first span, after a closed span's end, and between
    two spans are out of scope, never gaps.
@@ -161,6 +194,7 @@ from lake.clock import Clock, SystemClock
 from lake.loader import (
     NoOptionClose,
     PartialRead,
+    PartitionAbsent,
     PartitionQuarantined,
     _occ_root,
     load_chain,
@@ -179,6 +213,7 @@ OPTION_DELIVERABLES_LIST = "option_deliverables_list"
 DELIVERABLE_NOTE = "deliverable_note"
 MULTIPLIER = "multiplier"
 NON_STANDARD = "non_standard"
+MINI = "mini"
 SUSPECT = "suspect"
 IS_CHAIN_TRUNCATED = "is_chain_truncated"
 CHAINS_COLUMNS = (
@@ -188,6 +223,7 @@ CHAINS_COLUMNS = (
     DELIVERABLE_NOTE,
     MULTIPLIER,
     NON_STANDARD,
+    MINI,
     SUSPECT,
     IS_CHAIN_TRUNCATED,
 )
@@ -266,9 +302,17 @@ class BoundaryUnbounded(SplitError):
 REASON_NO_OPTION_CLOSE = "no option close"
 REASON_QUARANTINED = "quarantined"
 REASON_PARTIAL_READ = "partial read"
+REASON_PARTITION_ABSENT = "manifested partition absent"
 REASON_OUT_OF_SCOPE = "outside the capture span"
 REASON_THIN = "suspect or truncated"
 REASON_UNRESOLVED = "unresolved symbol"
+
+# Why a session gained a root with no corporate action behind it. Each of these appends
+# nothing and holds nothing, and each is counted, because a run that met one would otherwise
+# read exactly like a run that met nothing at all.
+REASON_DELIVERABLE_UNCHANGED = "the deliverable did not move"
+REASON_STANDARD_SERIES = "the gained contracts are standard"
+REASON_ROOT_RETURNED = "the root had been carried before"
 
 
 @dataclass(frozen=True)
@@ -278,6 +322,35 @@ class Skip:
     ticker: str
     day: date
     reason: str
+
+
+@dataclass(frozen=True)
+class NotAnAdjustment:
+    """One root a session gained with no corporate action behind it, and which kind.
+
+    A root change is not a split on its own, and three separate things produce one. The
+    ledger records none of them, so what this exists for is the report: a counter is what
+    tells a run that met a root change and correctly declined to record it from a run that
+    read nothing at all.
+    """
+
+    ticker: str
+    day: date
+    reason: str
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """What one session against the one before it came to.
+
+    A session can produce a landed entry and a non-adjustment at once, because a chain can
+    gain a returning root beside a genuinely new one, so this carries both rather than being
+    one of several sentinels.
+    """
+
+    landed: Landed | None = None
+    unchanged: bool = False
+    not_adjustments: tuple[NotAnAdjustment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -307,9 +380,14 @@ class Deliverable:
         """Whether two deliverables are the same thing written twice.
 
         A rename carries the same deliverable under a new symbol, so this is what tells one
-        from a split. Every field is compared rather than ``units`` alone, because a note
+        from a split. Six fields are compared rather than ``units`` alone, because a note
         that moved while the typed count did not is a vendor contradiction rather than a
-        rename, and it belongs at the gate below instead of being called a non-event here.
+        rename, and it belongs at the gate instead of being called a non-event here.
+
+        ``non_standard`` is the one field left out, and deliberately. It classifies the
+        contract rather than describing what the contract delivers, and this asks only
+        whether the deliverable moved. The flag has its own two jobs, on
+        :meth:`Session.standard` and :meth:`Session.standard_roots`.
         """
         return (
             self.units == other.units
@@ -351,10 +429,10 @@ class SplitReport:
     ``actions.Landed`` and ``actions.HeldFinding``.
 
     ``unchanged`` counts the splits the walk re-derived and found already in the ledger, and
-    it is what makes a second run legible. ``unchanged_deliverable`` counts the root changes
-    whose deliverable did not move, which is a rename rather than a split. Those append
-    nothing and hold nothing, so without a counter a run that met one would read exactly like
-    a run that met nothing at all.
+    it is what makes a second run legible. ``not_adjustments`` counts the root changes with no
+    corporate action behind them, each keeping the reason it was one, because those append
+    nothing and hold nothing and a run that met one would otherwise read exactly like a run
+    that met nothing at all.
 
     ``skipped`` carries every ticker-day the walk did not read, because each one widens the
     window a boundary can sit in and the render is where an operator sees how wide the lake's
@@ -365,7 +443,7 @@ class SplitReport:
     appended: tuple[Landed, ...]
     held: tuple[HeldFinding, ...]
     unchanged: int
-    unchanged_deliverable: int
+    not_adjustments: tuple[NotAnAdjustment, ...]
     skipped: tuple[Skip, ...]
 
     @property
@@ -405,11 +483,10 @@ class SplitReport:
             else:
                 lines.append(f"      filed at {held.filed_at}")
         lines.append(f"  unchanged: {self.unchanged}")
-        lines.append(f"  deliverable unchanged: {self.unchanged_deliverable}")
+        lines.append(f"  not a split: {len(self.not_adjustments)}")
+        lines.extend(_by_reason(self.not_adjustments))
         lines.append(f"  skipped:   {len(self.skipped)}")
-        for reason in sorted({skip.reason for skip in self.skipped}):
-            count = sum(1 for skip in self.skipped if skip.reason == reason)
-            lines.append(f"    - {reason}: {count}")
+        lines.extend(_by_reason(self.skipped))
         return "\n".join(lines)
 
 
@@ -435,6 +512,33 @@ class Session:
     instrument_id: int
     roots: frozenset[str]
     rows: tuple[tuple[str, dict[str, object]], ...]
+
+    def standard_roots(self) -> frozenset[str]:
+        """The roots whose contracts the vendor flags standard.
+
+        This is where the prior side of a ratio comes from. An OCC adjustment turns standard
+        contracts into non-standard ones, so the standard series is what the adjusted
+        contracts were adjusted *from*, and it is the only side of the comparison the data
+        names rather than leaves to be guessed. Reading the previous session whole instead
+        works only until that session carries two roots, which is the ordinary state from the
+        day after any adjustment onwards.
+        """
+        return frozenset(root for root, row in self.rows if row.get(NON_STANDARD) is False)
+
+    def standard(self, roots: frozenset[str]) -> bool | None:
+        """Whether the contracts under ``roots`` are standard, or ``None`` when unsaid.
+
+        ``False`` on every one of them is standard and ``True`` on every one is adjusted.
+        Anything else, a null flag or two roots disagreeing, is unknown, and unknown is not
+        read as either. A partition sealed before the column existed carries null on every
+        row, and the live lake's own 2026-09-02 partition is one.
+        """
+        values = {row.get(NON_STANDARD) for root, row in self.rows if root in roots}
+        if values == {False}:
+            return False
+        if values == {True}:
+            return True
+        return None
 
 
 def _column(table, name: str) -> list[object]:
@@ -464,16 +568,26 @@ def read_session(lake_root: Path, ticker: str, day: date, instrument_id: int) ->
     ``False`` and ``CLAUDE.md`` names that exclusion as a guard whose price is paid by
     building it late.
 
-    Enumerating from the manifest bounds what absence can look like. Every partition the walk
-    names exists, so ``PartitionAbsent`` cannot occur. Three refusals remain and each returns
-    a reason rather than raising, because each is one session the walk cannot use rather than
-    a run that has to end. ``lake.oi`` is the precedent for the quarantine one: it catches
-    ``PartitionQuarantined`` in two places and turns it into an absence verdict that keeps
-    its own reason rather than dropping it.
+    Enumerating from the manifest bounds what absence can look like, and it does not remove
+    absence. The manifest is the lake's record of what was sealed rather than a guarantee the
+    file is still on disk, so ``PartitionAbsent`` is caught here like the rest. Four refusals
+    return a reason rather than raising, because each is one session the walk cannot use
+    rather than a run that has to end. ``lake.oi`` is the precedent for two of them, catching
+    ``PartitionAbsent`` and ``PartitionQuarantined`` and turning each into an absence verdict
+    that keeps its own reason rather than dropping it.
 
-    A thin snapshot is the fourth refusal and it is not an absence either. A response far
+    A thin snapshot is the fifth refusal and it is not an absence either. A response far
     under its trailing-median contract count is journaled and tagged rather than discarded,
     and a thin chain carries a thin root set, so it cannot bound a boundary.
+
+    **A mini contract is not part of any root set here.** A mini option is a tenth-size
+    contract listed under its own root, so a chain that begins listing them gains a root and
+    changes what a contract under it delivers, which is the exact shape of an adjustment and
+    is not one. Reading the rows would land a fabricated ten-for-one reverse split in an
+    append-only ledger. ``mini`` is the vendor's own flag for the contract size and is
+    ``False`` on all 19,799,808 data rows the lake holds, so this drops nothing today and is
+    what keeps the first mini listing from being recorded as a corporate action. A null flag
+    is unknown rather than mini, so a row is dropped only when the vendor says so.
     """
     try:
         table = load_chain(ticker, day, lake_root=lake_root)
@@ -483,6 +597,8 @@ def read_session(lake_root: Path, ticker: str, day: date, instrument_id: int) ->
         return REASON_QUARANTINED
     except PartialRead:
         return REASON_PARTIAL_READ
+    except PartitionAbsent:
+        return REASON_PARTITION_ABSENT
 
     columns = {name: _column(table, name) for name in CHAINS_COLUMNS}
     if any(columns[SUSPECT]) or any(columns[IS_CHAIN_TRUNCATED]):
@@ -491,6 +607,8 @@ def read_session(lake_root: Path, ticker: str, day: date, instrument_id: int) ->
     rows: list[tuple[str, dict[str, object]]] = []
     for index in range(table.num_rows):
         row = {name: columns[name][index] for name in CHAINS_COLUMNS}
+        if row[MINI] is True:
+            continue
         rows.append((_root_of(row), row))
     return Session(
         day=day,
@@ -635,24 +753,49 @@ def check_split_consistency(prior: Deliverable, new: Deliverable) -> SplitConsis
     other, which is exactly the shape that would put a wrong ratio in a ledger entry while
     looking well-formed.
 
-    Two edges are decided here rather than left to a division.
+    Three edges are decided here rather than left to a division, and each one is a way the
+    arithmetic stops meaning anything.
 
     1. A note either side that does not name a plain share count leaves the gate with one
        number, so it has nothing to compare and does not agree.
-    2. A prior note of zero has no relative scale and no ratio, so it does not agree either.
-       The typed side cannot reach zero, because :func:`_deliverable` already refuses a unit
-       count that is not positive and finite.
+    2. A note either side that is not a positive finite share count is refused the same way,
+       and *both* sides are checked rather than the prior alone. The comparison below divides
+       by the note ratio, so a zero on the **new** side is what reaches the division, and a
+       guard reading only the prior would let it through. The typed counts cannot reach zero,
+       because :func:`_deliverable` already refuses a unit count that is not positive and
+       finite, but nothing refuses a free-text note reading ``0 SPY``.
+    3. A ratio the typed counts cannot represent raises rather than riding a finding. A
+       denormal prior overflows the division to infinity, and ``json.dumps`` writes that into
+       the withheld record as a bare ``Infinity`` that no strict JSON reader accepts, which is
+       the same hazard ``actions.build_entry`` refuses for the ledger.
     """
     computed = new.units / prior.units
-    if prior.note_units is None or new.note_units is None or prior.note_units <= 0:
+    if not isfinite(computed) or computed <= 0:
+        raise DeliverableUnreadable(
+            f"{prior.units!r} units before and {new.units!r} after produce no ratio a "
+            f"reader can represent"
+        )
+    if not _usable_note(prior.note_units) or not _usable_note(new.note_units):
         return SplitConsistency(agrees=False, computed=computed, against=None)
+    assert prior.note_units is not None and new.note_units is not None
     against = new.note_units / prior.note_units
+    if not isfinite(against) or against <= 0:
+        return SplitConsistency(agrees=False, computed=computed, against=None)
     difference = abs(computed - against) / abs(against)
     return SplitConsistency(
         agrees=difference <= SPLIT_CONSISTENCY_TOLERANCE,
         computed=computed,
         against=against,
     )
+
+
+def _usable_note(note_units: float | None) -> bool:
+    """Whether a note's share count can be one side of a ratio.
+
+    A note that named no plain share count is ``None`` by now. One that named zero, or a
+    figure so long it overflows to infinity, parsed and still cannot be divided by or into.
+    """
+    return note_units is not None and isfinite(note_units) and note_units > 0
 
 
 def require_scalar(prior: Deliverable, new: Deliverable) -> None:
@@ -674,12 +817,26 @@ def require_scalar(prior: Deliverable, new: Deliverable) -> None:
     4. The contract multiplier did not move. A ratio scales what the contract delivers, and
        a moved multiplier scales what the contract *is*, which no ``split_ratio`` records.
 
-    A fifth reads ``non_standard`` and refuses only the vendor contradicting itself. The OCC
-    re-symbols when the adjustment makes the contract non-standard, so a gained root whose
-    contracts the vendor still flags standard, while their deliverable moved, is two vendor
-    fields disagreeing rather than a split. A null flag is unknown rather than false and
-    passes, which is what keeps a partition sealed before the column existed from being
-    refused for a column it never carried.
+    **An unrecorded value is refused, and it is refused for what it is.** The last two
+    conditions compare a value that can be absent, from a partition sealed before the column
+    existed or a vendor row carrying null, and the live lake's own 2026-09-02 partition
+    carries null in both. Absent is not equal and it is not different either: nothing says
+    the value moved and nothing says it held. Landing on no evidence is the one outcome the
+    ledger cannot take back, so it is refused, and the message says the value is not recorded
+    rather than claiming a move nobody observed. Two absent values are refused for the same
+    reason rather than passing on the strength of comparing equal to each other.
+
+    **What is not here is the vendor's ``non_standard`` flag.** An earlier draft refused a
+    gained root whose contracts the vendor still called standard, on the argument that the
+    OCC re-symbols only when the adjustment makes a contract non-standard. That is a claim
+    about the OCC's concept rather than about Schwab's boolean, which sits in
+    ``journal.CHAINS_SCHEMA`` beside ``mini`` and ``penny_pilot`` as a classification flag,
+    and the lake holds no adjusted contract to measure it on. As a refusal it would hold a
+    clean two-for-one that one float describes perfectly, under a check name saying the
+    opposite, and a held split never clears. The flag is read, and it is read where it says
+    something the data does not otherwise name: :meth:`Session.standard` uses it to tell a
+    newly listed standard series from an adjustment, and :meth:`Session.standard_roots` uses
+    it to find the contracts an adjustment was made *from*.
     """
     if prior.cash or new.cash:
         raise NonScalarDeliverable(
@@ -690,24 +847,38 @@ def require_scalar(prior: Deliverable, new: Deliverable) -> None:
             f"the deliverable holds {prior.entries} entries before and {new.entries} after, "
             f"so no single ratio describes it"
         )
-    if prior.symbol != new.symbol:
+    _require_unmoved(prior.symbol, new.symbol, "the security the deliverable names")
+    _require_unmoved(prior.multiplier, new.multiplier, "the contract multiplier")
+
+
+def _require_unmoved(before: object, after: object, what: str) -> None:
+    """Refuse a value that moved, and one the vendor did not record either side.
+
+    The two are refused apart because they are different things to tell an operator. One says
+    the vendor wrote down a change no ``split_ratio`` can carry. The other says the vendor
+    wrote nothing, so nothing here can say whether it changed.
+    """
+    if before is None or after is None:
         raise NonScalarDeliverable(
-            f"the deliverable names {prior.symbol!r} before and {new.symbol!r} after, "
-            f"so it is not the same security scaled"
+            f"{what} is not recorded on both sides, {before!r} before and {after!r} after, "
+            f"so nothing says it did not move"
         )
-    if prior.multiplier != new.multiplier:
+    if before != after:
         raise NonScalarDeliverable(
-            f"the contract multiplier moved from {prior.multiplier!r} to {new.multiplier!r}, "
-            f"which no split_ratio records"
-        )
-    if new.non_standard is False:
-        raise NonScalarDeliverable(
-            "the vendor flags the re-symboled contracts standard while their deliverable "
-            "moved, so the two fields disagree"
+            f"{what} moved from {before!r} to {after!r}, which no split_ratio records"
         )
 
 
 # -- the walk ----------------------------------------------------------------
+
+
+def _by_reason(items: Sequence[Skip | NotAnAdjustment]) -> list[str]:
+    """One line per distinct reason, with its count. Counts rather than a line each, so a
+    lake whose every session is a gap day still renders on one screen."""
+    lines = []
+    for reason in sorted({item.reason for item in items}):
+        lines.append(f"    - {reason}: {sum(1 for i in items if i.reason == reason)}")
+    return lines
 
 
 def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
@@ -779,8 +950,8 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
     appended: list[Landed] = []
     held: list[HeldFinding] = []
     skipped: list[Skip] = []
+    not_adjustments: list[NotAnAdjustment] = []
     unchanged = 0
-    unchanged_deliverable = 0
     # Every key this run has already emitted. One ticker has at most one boundary a day, so
     # this cannot collide today. It is still read, because two tickers resolving to one
     # instrument would otherwise emit one key twice and neither line would match what
@@ -808,6 +979,10 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
 
     for ticker, days in by_ticker(ticker_days):
         previous: Session | None = None
+        # Every root the walk has watched this instrument carry. A set difference has no
+        # direction, so without this a root that expires out of one session and lists again
+        # in the next reads as an adjustment and lands the ratio backwards.
+        seen: frozenset[str] = frozenset()
         # How many of this ticker's sealed sessions the walk has skipped since ``previous``.
         # A boundary is only as narrow as this is zero.
         skipped_since = 0
@@ -836,9 +1011,10 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
                 skipped_since += 1
                 continue
 
-            landed = _examine(
+            outcome = _examine(
                 ticker=ticker,
                 previous=previous,
+                seen=seen,
                 session=session,
                 skipped_since=skipped_since,
                 recorded_at=recorded_at,
@@ -847,12 +1023,16 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
                 emitted=emitted,
                 hold=hold,
             )
-            if landed is _RENAME:
-                unchanged_deliverable += 1
-            elif landed is _UNCHANGED:
-                unchanged += 1
-            elif isinstance(landed, Landed):
-                appended.append(landed)
+            if outcome.landed is not None:
+                appended.append(outcome.landed)
+            unchanged += outcome.unchanged
+            not_adjustments.extend(outcome.not_adjustments)
+            # The instrument's own history, so a root is remembered across a session it
+            # happens to be absent from. It resets with ``previous`` when the instrument
+            # changes, because a different security's roots are a different history.
+            if previous is not None and previous.instrument_id != session.instrument_id:
+                seen = frozenset()
+            seen |= session.roots
             previous, skipped_since = session, 0
 
     return SplitReport(
@@ -860,22 +1040,16 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
         appended=tuple(appended),
         held=tuple(held),
         unchanged=unchanged,
-        unchanged_deliverable=unchanged_deliverable,
+        not_adjustments=tuple(not_adjustments),
         skipped=tuple(skipped),
     )
-
-
-# What :func:`_examine` says when a boundary resolved to something other than an appended
-# entry. Sentinels rather than booleans, because the caller counts three outcomes apart and a
-# boolean would need two of them.
-_RENAME = object()
-_UNCHANGED = object()
 
 
 def _examine(
     *,
     ticker: str,
     previous: Session | None,
+    seen: frozenset[str],
     session: Session,
     skipped_since: int,
     recorded_at: datetime,
@@ -883,25 +1057,79 @@ def _examine(
     current: dict[ActionKey, dict],
     emitted: set[ActionKey],
     hold,
-) -> object:
-    """One session against the one before it. Returns what became of the boundary, if any.
+) -> Outcome:
+    """One session against the one before it, and what became of any boundary in it.
 
     Split out of the walk because the walk's own job is the skipping and the grouping, and
     because what a boundary *is* is the part with the findings in it.
     """
-    if previous is None:
-        return None
-    # A symbol handed from one instrument to another is not a boundary, it is a new thing to
-    # record. The two sessions describe different instruments, so their root sets are not
-    # comparable and the incoming one starts fresh.
-    if previous.instrument_id != session.instrument_id:
-        return None
+    if previous is None or previous.instrument_id != session.instrument_id:
+        # A symbol handed from one instrument to another is not a boundary, it is a new thing
+        # to record. The two sessions describe different securities, so their root sets are
+        # not comparable and the incoming one starts fresh.
+        return Outcome()
 
-    gained = session.roots - previous.roots
+    appeared = session.roots - previous.roots
+    if not appeared:
+        return Outcome()
+
+    # **A root the walk has already watched this instrument carry is not a gain.** The set
+    # difference alone has no direction: a root whose contracts all expired out of one
+    # session and list again in the next reads as an adjustment, and the ratio is then
+    # computed backwards, landing a phantom inverse split under a date the key cannot
+    # correct. Every root the walk has seen is remembered for exactly this, and a root
+    # returning is counted rather than passed over in silence.
+    returned = appeared & seen
+    gained = appeared - seen
+    marks = [NotAnAdjustment(ticker, session.day, REASON_ROOT_RETURNED) for _ in sorted(returned)]
     if not gained:
-        return None
+        return Outcome(not_adjustments=tuple(marks))
 
     day = session.day
+    if any(not root for root in gained):
+        hold(
+            _finding(
+                ticker,
+                day,
+                CHECK_SPLIT_PAYLOAD,
+                DeliverableUnreadable(
+                    f"{day.isoformat()} holds contracts naming no root at all, under neither "
+                    f"{OPTION_ROOT} nor {OCC_SYMBOL}"
+                ),
+                session.instrument_id,
+            )
+        )
+        return Outcome(not_adjustments=tuple(marks))
+
+    # **A gained root whose contracts are standard is a newly listed series, not an
+    # adjustment.** An OCC adjustment turns standard contracts into non-standard ones, so a
+    # chain that begins listing a fresh standard series under a second root has gained a root
+    # and had no corporate action. That shape is the ordinary state of a ticker in the weeks
+    # after an adjustment, when a new standard series lists beside the adjusted one, and
+    # reading it as a boundary lands the first split's ratio inverted.
+    standard = session.standard(gained)
+    if standard is False:
+        marks.append(NotAnAdjustment(ticker, day, REASON_STANDARD_SERIES))
+        return Outcome(not_adjustments=tuple(marks))
+    if standard is None:
+        # Unknown is read as neither. Without the flag nothing here separates a new series
+        # from an adjustment, and the two want opposite treatments, so this fails closed the
+        # way every other unanswerable question in this module does.
+        hold(
+            _finding(
+                ticker,
+                day,
+                CHECK_SPLIT_PAYLOAD,
+                DeliverableUnreadable(
+                    f"the {day.isoformat()} contracts under {sorted(gained)} do not say "
+                    f"whether they are standard, so nothing separates an adjustment from a "
+                    f"newly listed series"
+                ),
+                session.instrument_id,
+            )
+        )
+        return Outcome(not_adjustments=tuple(marks))
+
     try:
         if skipped_since:
             raise BoundaryUnbounded(
@@ -909,27 +1137,28 @@ def _examine(
                 f"{skipped_since} session(s) since {previous.day.isoformat()} were skipped, "
                 f"so the boundary's own date is not bounded to one session"
             )
-        prior = deliverable_of(previous, previous.roots)
+        prior = _prior_deliverable(previous, session, gained)
         new = deliverable_of(session, gained)
+        verdict = check_split_consistency(prior, new)
     except BoundaryUnbounded as exc:
         hold(_finding(ticker, day, CHECK_SPLIT_BOUNDARY, exc, session.instrument_id))
-        return None
+        return Outcome(not_adjustments=tuple(marks))
     except DeliverableUnreadable as exc:
         hold(_finding(ticker, day, CHECK_SPLIT_PAYLOAD, exc, session.instrument_id))
-        return None
+        return Outcome(not_adjustments=tuple(marks))
 
     if new.same_as(prior):
         # A rename carries the same deliverable under a new symbol. Nothing to land and
         # nothing to hold, the way a quote row carrying no ex-date is no observation.
-        return _RENAME
+        marks.append(NotAnAdjustment(ticker, day, REASON_DELIVERABLE_UNCHANGED))
+        return Outcome(not_adjustments=tuple(marks))
 
     try:
         require_scalar(prior, new)
     except NonScalarDeliverable as exc:
         hold(_finding(ticker, day, CHECK_SPLIT_DELIVERABLE, exc, session.instrument_id))
-        return None
+        return Outcome(not_adjustments=tuple(marks))
 
-    verdict = check_split_consistency(prior, new)
     if not verdict.agrees:
         hold(
             Withheld(
@@ -942,7 +1171,7 @@ def _examine(
                 instrument_id=session.instrument_id,
             )
         )
-        return None
+        return Outcome(not_adjustments=tuple(marks))
 
     fields = {
         "instrument_id": session.instrument_id,
@@ -969,15 +1198,61 @@ def _examine(
         candidate = build_entry(**fields)
     except ValueError as exc:
         hold(_finding(ticker, day, CHECK_SPLIT_PAYLOAD, exc, session.instrument_id))
-        return None
+        return Outcome(not_adjustments=tuple(marks))
 
     key = (session.instrument_id, candidate["ex_date"], TYPE_SPLIT)
     if key in emitted:
-        return None
+        # Two tickers resolving to one instrument, which the master calls corrupt. The second
+        # boundary is refused rather than passed over, because the two can disagree about the
+        # ratio and a run that dropped one in silence would report a ledger it does not
+        # describe.
+        hold(
+            _finding(
+                ticker,
+                day,
+                CHECK_INSTRUMENT_RESOLUTION,
+                DeliverableUnreadable(
+                    f"instrument {session.instrument_id} already had a split recorded on "
+                    f"{candidate['ex_date']} in this run, under another ticker"
+                ),
+                session.instrument_id,
+            )
+        )
+        return Outcome(not_adjustments=tuple(marks))
     emitted.add(key)
     if same_but_for_recorded_at(current.get(key), candidate):
-        return _UNCHANGED
-    return Landed(entry=append(lake_root, **fields), symbol=ticker)
+        return Outcome(unchanged=True, not_adjustments=tuple(marks))
+    return Outcome(
+        landed=Landed(entry=append(lake_root, **fields), symbol=ticker),
+        not_adjustments=tuple(marks),
+    )
+
+
+def _prior_deliverable(previous: Session, session: Session, gained: frozenset[str]) -> Deliverable:
+    """What a contract delivered before the adjustment, read from the standard series.
+
+    The prior side is the contracts the adjustment was made *from*, and an OCC adjustment
+    turns standard contracts into non-standard ones, so the standard series is what names
+    them. Three places are asked in order, and the first that answers wins.
+
+    1. The standard contracts of the boundary session itself, which is #279's own
+       prescription: "A contract still naming 100 units beside one naming another number is
+       the ratio." An adjustment re-symbols the open contracts while newly listed standard
+       ones keep the original root, so both sides of the ratio usually sit in one session.
+    2. The standard contracts of the previous session, for the boundary where every contract
+       was re-symboled at once and the session carries no standard series at all.
+    3. The previous session whole, for a partition that records no ``non_standard`` flag to
+       select on. Reading it whole is what fails when that session carries two roots with
+       different deliverables, which is the ordinary state after any adjustment, and
+       :func:`deliverable_of` then refuses rather than picking one.
+    """
+    carried = session.standard_roots() - gained
+    if carried:
+        return deliverable_of(session, carried)
+    standard = previous.standard_roots()
+    if standard:
+        return deliverable_of(previous, standard)
+    return deliverable_of(previous, previous.roots)
 
 
 def _in_master(master: SecurityMaster, symbol: str) -> bool:
@@ -1046,16 +1321,28 @@ def detect_splits_from_config(
 
 
 __all__ = [
+    "BoundaryUnbounded",
     "CHAINS_COLUMNS",
     "CHECK_SPLIT_BOUNDARY",
     "CHECK_SPLIT_CONSISTENCY",
     "CHECK_SPLIT_DELIVERABLE",
     "CHECK_SPLIT_PAYLOAD",
-    "SPLIT_CONSISTENCY_TOLERANCE",
-    "BoundaryUnbounded",
     "Deliverable",
     "DeliverableUnreadable",
     "NonScalarDeliverable",
+    "NotAnAdjustment",
+    "Outcome",
+    "REASON_DELIVERABLE_UNCHANGED",
+    "REASON_NO_OPTION_CLOSE",
+    "REASON_OUT_OF_SCOPE",
+    "REASON_PARTIAL_READ",
+    "REASON_PARTITION_ABSENT",
+    "REASON_QUARANTINED",
+    "REASON_ROOT_RETURNED",
+    "REASON_STANDARD_SERIES",
+    "REASON_THIN",
+    "REASON_UNRESOLVED",
+    "SPLIT_CONSISTENCY_TOLERANCE",
     "Session",
     "Skip",
     "SplitConsistency",

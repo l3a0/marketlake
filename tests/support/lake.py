@@ -34,13 +34,15 @@ import pyarrow.parquet as pq
 
 # A fixture schema for chains rows. Provenance columns plus a few vendor columns.
 #
-# Six of the vendor columns are here for the split detector, which reads a corporate
+# Seven of the vendor columns are here for the split detector, which reads a corporate
 # action out of what a contract delivers rather than out of its price. ``option_root`` is
 # the signal, Schwab's own ``optionRoot``, and the OCC re-symboling that announces a split
 # is a change in it. The four that follow are where the deliverable is written down, and
-# they are what the ratio and its gate are computed from. ``is_chain_truncated`` rides
-# beside ``suspect`` because a thin snapshot carries a thin root set, so both are what say
-# a session cannot bound a boundary.
+# they are what the ratio and its gate are computed from. ``mini`` is there because a mini
+# contract is a tenth-size contract under its own root, so the first one to list looks
+# exactly like an adjustment and is not one. ``is_chain_truncated`` rides beside ``suspect``
+# because a thin snapshot carries a thin root set, so both are what say a session cannot
+# bound a boundary.
 #
 # Widening is additive and costs the existing callers nothing. ``_table`` fills each
 # column with ``row.get(name)``, so a row written against the narrower schema still builds
@@ -59,6 +61,7 @@ FIXTURE_CHAINS_SCHEMA = pa.schema(
         ("option_root", pa.string()),
         ("multiplier", pa.float64()),
         ("non_standard", pa.bool_()),
+        ("mini", pa.bool_()),
         ("deliverable_note", pa.string()),
         ("option_deliverables_list", pa.string()),
         ("is_chain_truncated", pa.bool_()),
@@ -116,6 +119,7 @@ def sample_chains_table(rows: Sequence[dict] | None = None) -> pa.Table:
                 "option_root": "SPY",
                 "multiplier": 100.0,
                 "non_standard": False,
+                "mini": False,
                 "deliverable_note": "100 SPY",
                 "option_deliverables_list": (
                     '[{"assetType": "STOCK", "currencyType": null, '

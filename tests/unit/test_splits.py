@@ -120,9 +120,14 @@ def test_one_stock_deliverable_scaled_is_what_a_ratio_describes():
 
 
 def test_cash_beside_shares_is_refused():
-    """#136's own example. A contract delivering shares plus cash has no valid multiplier."""
+    """#136's own example. A contract delivering shares plus cash has no valid multiplier.
+
+    One entry carrying a currency rather than two, so the cash clause is what answers. A
+    two-entry deliverable is refused by the clause after it whether or not this one is
+    there, which is how a test of the cash rule passes without exercising it.
+    """
     with pytest.raises(NonScalarDeliverable, match="cash"):
-        require_scalar(_deliverable(), _deliverable(150.0, entries=2, cash=True))
+        require_scalar(_deliverable(), _deliverable(150.0, cash=True))
 
 
 def test_two_deliverables_are_refused():
@@ -133,7 +138,7 @@ def test_two_deliverables_are_refused():
 
 def test_a_different_security_is_refused():
     """The same count of a different security is not a split at all."""
-    with pytest.raises(NonScalarDeliverable, match="same security"):
+    with pytest.raises(NonScalarDeliverable, match="moved from 'SPY' to 'XYZ'"):
         require_scalar(_deliverable(), _deliverable(150.0, symbol="XYZ"))
 
 
@@ -143,15 +148,36 @@ def test_a_moved_multiplier_is_refused():
         require_scalar(_deliverable(), _deliverable(150.0, multiplier=150.0))
 
 
-def test_a_standard_flag_beside_a_moved_deliverable_is_refused():
-    """The OCC re-symbols when the adjustment makes the contract non-standard."""
-    with pytest.raises(NonScalarDeliverable, match="disagree"):
-        require_scalar(_deliverable(), _deliverable(150.0, non_standard=False))
+def test_the_standard_flag_is_not_one_of_the_conditions():
+    """It classifies the contract rather than describing what the contract delivers.
+
+    An earlier draft refused a gained root the vendor still called standard, on the argument
+    that the OCC re-symbols only when the adjustment makes a contract non-standard. That is a
+    claim about the OCC's concept rather than about Schwab's boolean, and as a refusal it
+    held a clean two-for-one that one float describes perfectly, under a check name saying
+    the opposite. The flag's real jobs are on :class:`Session`, tested below.
+    """
+    for flag in (True, False, None):
+        require_scalar(_deliverable(), _deliverable(200.0, note_units=200.0, non_standard=flag))
 
 
-def test_a_null_standard_flag_is_unknown_rather_than_false():
-    """A partition sealed before the column existed carries null, not false."""
-    require_scalar(_deliverable(), _deliverable(150.0, non_standard=None))
+@pytest.mark.parametrize("field", ["symbol", "multiplier"])
+@pytest.mark.parametrize("side", ["prior", "new", "both"])
+def test_a_value_the_vendor_did_not_record_is_refused_for_what_it_is(field: str, side: str):
+    """Absent is not equal, and it is not different either.
+
+    Nothing says the value moved and nothing says it held, and landing on no evidence is the
+    one outcome the ledger cannot take back. Two absent values are refused for the same
+    reason rather than passing on the strength of comparing equal to each other, and the
+    message says the value is not recorded rather than claiming a move nobody observed.
+    """
+    prior = _deliverable(**({field: None} if side in ("prior", "both") else {}))
+    new = _deliverable(
+        150.0, note_units=150.0, **({field: None} if side in ("new", "both") else {})
+    )
+
+    with pytest.raises(NonScalarDeliverable, match="not recorded on both sides"):
+        require_scalar(prior, new)
 
 
 # -- reading the deliverable off rows ---------------------------------------------------
@@ -164,6 +190,7 @@ def _row(
     note: str | None = "100 SPY",
     multiplier: float | None = 100.0,
     non_standard: bool | None = False,
+    mini: bool | None = False,
     encoded: str | None = _DEFAULT,
 ) -> tuple[str, dict]:
     if encoded is _DEFAULT:
@@ -187,6 +214,7 @@ def _row(
             "deliverable_note": note,
             "multiplier": multiplier,
             "non_standard": non_standard,
+            "mini": mini,
             "suspect": False,
             "is_chain_truncated": False,
         },
@@ -241,6 +269,17 @@ def test_a_root_with_no_rows_raises():
         ('[{"assetType": "STOCK", "deliverableUnits": true}]', "not a number"),
         ('[{"assetType": "STOCK", "deliverableUnits": 0}]', "positive finite"),
         ('[{"assetType": "STOCK", "deliverableUnits": -100.0}]', "positive finite"),
+        # ``json.loads`` accepts bare ``NaN`` and ``Infinity``, and ``NaN <= 0`` is False, so
+        # a positivity test alone lets both through.
+        ('[{"assetType": "STOCK", "deliverableUnits": NaN}]', "positive finite"),
+        ('[{"assetType": "STOCK", "deliverableUnits": Infinity}]', "positive finite"),
+        # Two stock entries carry no single unit count, and taking the first would let the
+        # payload's own order decide the ratio.
+        (
+            '[{"assetType": "STOCK", "deliverableUnits": 100.0},'
+            ' {"assetType": "STOCK", "deliverableUnits": 50.0}]',
+            "2 stock deliverables",
+        ),
     ],
 )
 def test_a_payload_carrying_no_usable_unit_count_raises(encoded: str | None, match: str):
@@ -323,3 +362,88 @@ def test_any_field_moving_means_it_is_not_a_rename(changed: dict):
     at the gate rather than being called a non-event here.
     """
     assert not _deliverable(**changed).same_as(_deliverable())
+
+
+# -- the standard flag's two real jobs --------------------------------------------------
+
+
+def test_the_standard_roots_are_what_the_prior_side_is_read_from():
+    """An adjustment is a change *from* something, and the standard series names it."""
+    session = _session(_row("SPY"), _row("SPY1", 150.0, note="150 SPY", non_standard=True))
+
+    assert session.standard_roots() == frozenset({"SPY"})
+    assert deliverable_of(session, session.standard_roots()).units == 100.0
+
+
+def test_reading_a_two_root_session_whole_refuses_rather_than_picking_one():
+    """Which is why the prior side selects rather than taking the previous session whole.
+
+    A ticker carries a standard series beside an adjusted one from the day after any
+    adjustment onwards, so this is the ordinary state rather than an edge.
+    """
+    session = _session(_row("SPY"), _row("SPY1", 150.0, note="150 SPY", non_standard=True))
+
+    with pytest.raises(DeliverableUnreadable, match="disagree"):
+        deliverable_of(session, session.roots)
+
+
+@pytest.mark.parametrize(
+    "flags, expected",
+    [
+        ((False,), False),
+        ((True,), True),
+        ((None,), None),
+        ((False, False), False),
+        ((True, True), True),
+        ((True, False), None),
+        ((True, None), None),
+    ],
+)
+def test_a_root_set_is_standard_adjusted_or_unsaid(flags, expected):
+    """Unknown is read as neither, because the two want opposite treatments.
+
+    A gained root whose contracts are standard is a newly listed series and no corporate
+    action. One whose contracts are adjusted is the split this module records. Without the
+    flag nothing separates them, and a mixed or null answer is not evidence for either.
+    """
+    rows = [_row(f"SPY{i}", non_standard=flag) for i, flag in enumerate(flags)]
+    session = _session(*rows)
+
+    assert session.standard(session.roots) is expected
+
+
+# -- the gate's three edges -------------------------------------------------------------
+
+
+def test_a_new_note_of_zero_shares_does_not_divide_by_zero():
+    """The comparison divides by the note ratio, so a zero on the NEW side reaches it.
+
+    A guard reading only the prior note lets it through, and ``ZeroDivisionError`` is not a
+    ``SplitError``, so it escapes the walk and ends the run. ``_NOTE`` matches ``0 SPY`` and
+    only the typed count is checked for positivity, so nothing upstream refuses it.
+    """
+    verdict = check_split_consistency(_deliverable(), _deliverable(150.0, note_units=0.0))
+
+    assert not verdict.agrees
+    assert verdict.against is None
+
+
+def test_a_note_that_overflowed_to_infinity_does_not_reach_the_division():
+    """A share count of 309 digits parses and then cannot be divided by or into."""
+    verdict = check_split_consistency(
+        _deliverable(note_units=float("inf")), _deliverable(150.0, note_units=150.0)
+    )
+
+    assert not verdict.agrees
+    assert verdict.against is None
+
+
+def test_a_ratio_the_counts_cannot_represent_raises_rather_than_riding_a_finding():
+    """``json.dumps`` writes a non-finite number as a bare ``Infinity``.
+
+    No strict JSON reader accepts that, which is the same hazard ``actions.build_entry``
+    refuses for the ledger. A ratio is a division, so this branch is reachable where the
+    dividend gate's multiplication is not.
+    """
+    with pytest.raises(DeliverableUnreadable, match="no ratio a reader can represent"):
+        check_split_consistency(_deliverable(units=5e-324), _deliverable(150.0, note_units=150.0))
