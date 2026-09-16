@@ -537,12 +537,12 @@ def test_10_a_partial_cycle_votes_with_what_it_carries(fixture_lake: FixtureLake
     """#137 test 10. The set is S's, and the candidate supplies voters rather than members.
 
     The next session's cycle carries four of S's eight set members, all refreshed, plus
-    four contracts S never ranked whose OI never moves. Re-ranking off the candidate would
-    pull those four in, halve the changed fraction to the quorum's edge, and answer that
-    nothing refreshed.
+    eight contracts S never ranked whose OI never moves. Voting over the set members the
+    cycle carries makes that four of four. Re-ranking off the candidate would make it four
+    of twelve, a third, which is under the quorum and answers that nothing refreshed.
     """
     partial = {symbol: REFRESHED[symbol] for symbol in list(SET)[:4]}
-    strangers = {occ(50 + index): 77 for index in range(4)}
+    strangers = {occ(50 + index): 77 for index in range(8)}
     stranger_volumes = {symbol: 10_000 for symbol in strangers}
     first = cycle_rows(FOLLOWING, 9, 30, partial, volumes=VOLUMES) + cycle_rows(
         FOLLOWING, 9, 30, strangers, volumes=stranger_volumes
