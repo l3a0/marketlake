@@ -219,9 +219,10 @@ class SchemaDriftObserver:
 
         1. A partial page says the reach is unmeasured, and no later page measures it. The
            state this writes is what silences the next whole cycle, which is the one
-           observation that could have counted the roster. That is the fold rule working,
-           and the operator's one page for the drift is the one that could not say how far
-           it went. The ticker list on stderr is what there is.
+           observation that could have counted the roster. So the operator's one page for
+           the drift is the one that could not say how far it went, where before this
+           existed the next morning's cycle paged the count. The reach is still on stderr
+           and in the nightly report, and which channel should carry it is marketlake #318.
         2. ``observe`` prunes only the surfaces a cycle's roster names, so a surface
            reached by partial observations alone would remember a ticker per call and
            never drop one. Nothing reaches that today, because the only caller names the
