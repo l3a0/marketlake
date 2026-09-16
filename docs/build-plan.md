@@ -185,35 +185,46 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
      schema-policy section carries the rule and the columns it covers.
   2. A window body the merge cannot read is recorded once under `chain_schema_drift`, a class
      of its own, and never split. The other windows still land, so the loss is that one
-     window. Two shapes reach it: an expiration whose value is not a strike map, and a strike
-     whose value is not a contract list. The second is checked by type rather than left to
-     what `list.extend` accepts, because a string and a Mapping are both iterable and used to
-     merge as characters or keys and reach the row builder as contracts, which cost the whole
-     chain. That is [#305](https://github.com/l3a0/marketlake/issues/305).
+     window. Two shapes reach it.
+     1. An expiration whose value is not a strike map, which has no `items` to walk.
+     2. A strike whose value is not a contract list, which the merge refuses by type.
+
+     The second is a type test rather than an attempt, because a string and a Mapping are both
+     iterable. `list.extend` used to consume one a character or a key at a time, and the row
+     builder met those where contract dicts belong, which cost the whole chain. That is
+     [#305](https://github.com/l3a0/marketlake/issues/305).
      **Considered and rejected: splitting a window the merge could not read**, which is what
-     the fetch did until #305. A date-keyed split does isolate the damage to the day the
-     drifted expiration sits on, and what it spends to buy that is the measurement that
-     retired it. With the default five-window plan and a depth bound of 4, a payload change
-     reaching every expiration walks the full binary tree on each of the four concrete
-     windows: 113 requests for one ticker-minute, against the 5 a healthy one makes. Two
-     option tickers put that past Schwab's 120 req/min ceiling, and past the minute before
-     that, since a healthy SPY chain fetch already takes about nine seconds. A cycle that
-     overruns fires no cycle in the next minute and charges every watched surface, quotes
-     included. The entry this replaces rejected bounding drift lower than size because it
-     bought a smaller number in a case the vendor has never produced. What answers that is the
-     ceiling rather than the size: past it the number stops being smaller or larger and
-     becomes a different failure, one reaching the quote surface a chain fetch cannot
-     otherwise touch. The depth bound still caps a too-big window's split and is deliberately
-     the only cap there. Filing drift
-     under the size class would send a reader to the chunk plan for a problem no chunk plan
-     fixes. The class is named to read as drift, so a reader sweeping the gap classes finds
+     the fetch did until #305. A date-keyed split does narrow the damage, because a drifted
+     expiration sits on one date, and the depth bound is where the narrowing stops. Against the
+     default plan at a bound of 4 the narrowest sub-range a split reaches is 1 day inside the
+     ten-day window, 1 inside the twenty-one-day, 3 inside the sixty-day, and 17 inside the
+     two-hundred-and-seventy-five-day one, so the far term gave up a fortnight rather than a
+     day. What the split spends to buy that is the measurement that retired it. A payload
+     change reaching every expiration costs 113 requests for one ticker-minute against the 5 a
+     healthy one makes: 19 for the ten-day window, which bottoms out on single days before the
+     bound and so never walks a full tree, 31 for each of the other three, and 1 for the open
+     tail. The minute goes first and one ticker is enough, since a healthy SPY chain fetch
+     already takes about nine seconds for its five windows. The 120 req/min ceiling goes next,
+     at two option tickers. A cycle that overruns fires no cycle in the next minute and charges
+     every watched surface, quotes included. The entry this replaces rejected two proposals,
+     stopping the split once both halves have failed and bounding drift lower than size,
+     because either bought a smaller number in a case the vendor has never produced. What
+     answers that is the ceiling rather than the size: past it the number stops being smaller
+     or larger and becomes a different failure, one reaching the quote surface a chain fetch
+     cannot otherwise touch. Giving up the window is neither proposal, because it leaves no
+     split for a second rule to govern. The depth bound still caps a too-big window's split and
+     is deliberately the only cap there. Filing drift under the size class would send a reader
+     to the chunk plan for a problem no chunk plan fixes. The class is named to read as drift, so a reader sweeping the gap classes finds
      it under one string, and it matches the reason the segment readers are to carry for the
      same signal in [#104](https://github.com/l3a0/marketlake/issues/104), which is not built
      here. The parser's schema-drift page shipped in
      [#197](https://github.com/l3a0/marketlake/issues/197) reads a different signal, a known
      field's name sitting in `extra` on a chain the parser could read, so it subscribes to no
-     gap class. A window body that would not merge gaps the ticker, and the watchdog is what
-     speaks for a ticker that stopped producing data.
+     gap class. Who hears about a given-up window depends on what else landed. A chain whose
+     every window drifted is a whole-chain gap, and the watchdog is what speaks for a ticker
+     that stopped producing data. A chain that lost one window lands as data carrying that
+     window's absence marker, which resets the watchdog rather than tripping it, so the marker
+     rows are what a reader has.
      The merge itself reads a whole body into scratch maps and copies them into the
      reassembly maps only on success. So a window given up carries no data rows beside the
      absence marker saying it was never collected, which is the double-record the markers

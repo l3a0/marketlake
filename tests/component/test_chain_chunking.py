@@ -22,8 +22,8 @@ They cover the chunker's contract:
    window's class.
 6. The midpoint-split recursion honours the depth bound.
 7. A body the merge cannot read is given up under its own drift class rather than the size
-   class, leaves nothing half-merged behind it, and costs only the sub-range holding the
-   unreadable expiration. A reassembled body the row builder rejects fails open to a
+   class, leaves nothing half-merged behind it, and costs the whole window it arrived in
+   because it is never split. A reassembled body the row builder rejects fails open to a
    whole-chain gap carrying that failure's own class, rather than leaving the cycle.
 """
 
@@ -698,6 +698,48 @@ def _drifted_response(
     return VendorResponse(status=200, body=_drifted_body(good, drifted, shape, map_key))
 
 
+@pytest.mark.parametrize(
+    "value",
+    [1.0, "SPY   260918C00650000", {"symbol": "SPY", "bid": 1.0}, ({"symbol": "SPY"},)],
+    ids=["number", "string", "mapping", "tuple"],
+)
+def test_the_merge_refuses_a_strike_value_that_is_not_a_contract_list(value):
+    """The merge's contract, tested directly rather than through what a cycle makes of it.
+
+    The shapes above are what a payload change can put where a JSON array belongs, and the
+    tuple is the one no cycle test can reach: no production path builds one, because
+    ``reply.json()`` and a cassette's ``json.loads`` both yield a ``list``. It is here because
+    the rule is the exact type rather than the three shapes the parametrized cycle tests
+    happen to name. A check widened to accept a tuple passes the whole suite otherwise, and
+    the next hand-built fixture or normalising adapter that hands the merge one would reopen
+    marketlake #305 with nothing to say so.
+
+    The class and the message are asserted because ``_fetch_window`` catches with a bare
+    ``except Exception`` and reads neither, so this is the only place either is observed. A
+    later refactor narrowing that catch has something to check itself against.
+    """
+    body = {"callExpDateMap": {"2026-09-18:7": {"650.0": value}}, "putExpDateMap": {}}
+    with pytest.raises(TypeError, match="where a contract list belongs"):
+        capture._collect_contracts(body, {}, {})
+
+
+def test_the_merge_keys_the_reassembly_maps_by_string():
+    """Both maps are keyed by ``str``, whatever the vendor's JSON decoded to.
+
+    The reassembly maps are typed ``dict[str, dict[str, list]]`` and every reader downstream
+    assumes it. A numeric strike landing beside its own string spelling would split one
+    strike's contracts across two buckets, so the coercion is compared by type rather than by
+    value: ``650.0`` and ``"650.0"`` are already unequal, and what matters is that neither
+    key arrives as a number.
+    """
+    body = {"callExpDateMap": {20260918: {650.0: [{"symbol": "SPY"}]}}, "putExpDateMap": {}}
+    call_map: dict = {}
+    capture._collect_contracts(body, call_map, {})
+
+    assert [type(k) for k in call_map] == [str]
+    assert [type(k) for k in call_map["20260918"]] == [str]
+
+
 @pytest.mark.parametrize("shape", list(_DRIFT_SHAPES))
 def test_an_unreadable_body_gives_up_its_window_under_the_drift_class(lake_root, shape):
     # A ten-day near window, splittable at its midpoint, holding one well-formed expiration
@@ -768,6 +810,46 @@ def test_a_window_that_raised_mid_merge_leaves_nothing_half_written(lake_root, s
     # not the four a half-merge would have left.
     assert {r["number_of_contracts"] for r in data_rows} == {2}
     assert {r["is_chain_truncated"] for r in data_rows} == {True}
+
+
+@pytest.mark.parametrize("shape", list(_DRIFT_SHAPES))
+def test_a_half_that_drifts_after_a_size_split_is_given_up_where_it_is_seen(lake_root, shape):
+    """Drift below the top level, which is the live mixture of the two failures.
+
+    A window comes back too big and splits for size, and one half then answers 200 with a body
+    the merge cannot read. The drifted half is recorded at the depth it was seen, under its own
+    class rather than the size class of the split that produced it, and it recurses no further
+    even though the bound would allow it. The other half still lands.
+
+    Every other drift test here runs at depth 0, so without this one the class and the refusal
+    below the top level are unconstrained: stamping the size class at ``depth > 0`` passes the
+    whole suite otherwise.
+    """
+    plan = ChainPlan(((0, 30), (31, None)))
+    vendor = _WindowVendor(
+        windows={
+            (_d(0), _d(30)): _TOO_BIG,
+            (_d(0), _d(15)): _drifted_response(["2026-08-24"], "2026-10-16", shape),
+            (_d(16), _d(30)): _chain_response(["2026-09-15"]),
+            (_d(31), None): _chain_response(["2026-09-18"]),
+        },
+    )
+    result = _run(vendor, lake_root, plan, guards=GuardConstants(chain_chunk_max_split_depth=4))
+
+    gap_rows = [r for r in _chain_rows(result) if r["row_kind"] == journal.ROW_KIND_GAP]
+    # The drifted half, whole, under the drift class and not the size class it split out of.
+    assert [(r["window_start"], r["window_end"], r["error_class"]) for r in gap_rows] == [
+        (_d(0), _d(15), capture.CHAIN_SCHEMA_DRIFT)
+    ]
+    # It was seen at depth 1 and never recursed, though the bound of 4 left room.
+    assert _calls_for(vendor, _d(0), _d(7)) == 0
+    assert _calls_for(vendor, _d(8), _d(15)) == 0
+    # The readable half and the tail both landed.
+    data_rows = [r for r in _chain_rows(result) if r["row_kind"] == journal.ROW_KIND_DATA]
+    assert {r["expiration_date"] for r in data_rows} == {
+        "2026-09-15T20:00:00.000+00:00",
+        "2026-09-18T20:00:00.000+00:00",
+    }
 
 
 @pytest.mark.parametrize("shape", list(_DRIFT_SHAPES))
@@ -1087,10 +1169,14 @@ def test_a_row_builder_failure_that_is_not_a_type_error_fails_open_too(lake_root
 
 
 def test_an_expiration_map_that_is_not_a_mapping_is_skipped_rather_than_given_up(lake_root):
-    # The merge skips an expiration map that is not a mapping instead of raising on it. That
-    # guard is what keeps whole-envelope drift away from the drift handler, and so away from
-    # the split, where every half would fail identically and the recursion would walk the
-    # full tree. The window merges the side that is still readable and lands as data.
+    # The merge skips an expiration map that is not a mapping instead of raising on it, so the
+    # window merges the side that is still readable and lands as data. What that guard was for
+    # is gone: it kept whole-envelope drift away from the split, where every half would have
+    # failed identically and the recursion would have walked the full tree, and marketlake #305
+    # retired the split. Refusing the envelope would now cost one window and one request. What
+    # the skip still buys is the readable side of a half-retyped body, and what it still leaves
+    # is a body whose two sides both drifted landing as a segment with no row in it, which is
+    # marketlake #326.
     body = _chain_body(["2026-08-28"])
     body["callExpDateMap"] = "not a mapping at all"
     plan = ChainPlan(((0, 9), (10, None)))

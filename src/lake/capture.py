@@ -103,8 +103,8 @@ _CAMEL_BOUNDARY = re.compile(r"(?<!^)(?=[A-Z])")
 # a raised exception) carries its own class instead, so the failure model keeps those apart.
 CHAIN_CHUNK_FAILED = "chain_chunk_failed"
 
-# The error class stamped on a window whose body would not merge. Two shapes refuse inside the
-# merge, and both are a vendor payload shape change:
+# The error class stamped on a window whose body would not merge. The merge refuses two
+# shapes, and both are a vendor payload shape change:
 #
 # 1. An expiration whose value is not a strike map, which has no ``items`` to walk.
 # 2. A strike whose value is not a contract list, which the merge refuses by type.
@@ -112,9 +112,9 @@ CHAIN_CHUNK_FAILED = "chain_chunk_failed"
 # The second is checked by type rather than left to whatever ``list.extend`` happens to accept,
 # and marketlake #305 is why. ``extend`` takes any iterable, so a strike holding a string or a
 # Mapping merged that value's characters or its keys without complaint and handed the row
-# builder things that were never contracts. What refused them was the column build a layer on,
-# which cost the whole chain where this class costs one window, and outside the loop cost the
-# close of record and an onboarding's first segment. Both shapes are drift in the sense the
+# builder things that were never contracts. Nothing refused them until the typed columns were
+# built, which cost the whole chain where this class costs one window, and outside the loop
+# cost the close of record and an onboarding's first segment. Both shapes are drift in the sense the
 # design's schema policy uses, where a missing or retyped known field pages. Drift is kept
 # apart from the size class above because a parse failure filed under a size class reads as a
 # chain too big to fetch, which is a chunk-plan problem rather than a vendor problem. The name
@@ -129,8 +129,11 @@ CHAIN_CHUNK_FAILED = "chain_chunk_failed"
 # class still means one thing, a window body that would not merge, and it means exactly what
 # it meant before that change. So the parser's schema-drift page shipped in #197 reads the
 # routing's own signature instead, a known field's name sitting in ``extra``, and subscribes to
-# no gap class at all. A window body that would not merge gaps the ticker, and the watchdog is
-# what speaks for a ticker that stopped producing data.
+# no gap class at all. Who hears about a given-up window depends on what else landed. A chain
+# whose every window drifted is a whole-chain gap, and the watchdog is what speaks for a ticker
+# that stopped producing data. A chain that lost one window lands as data carrying that
+# window's absence marker, which resets the watchdog rather than tripping it, so the marker
+# rows are what a reader has. That was true before marketlake #305 and is unchanged by it.
 CHAIN_SCHEMA_DRIFT = "chain_schema_drift"
 
 # The two chain maps every window response nests contracts under.
@@ -177,10 +180,12 @@ def _collect_contracts(
 
     A strike value is refused by type rather than by whether ``list.extend`` will take it. A
     JSON array decodes to a ``list`` on every path this runs on, the live ``reply.json()`` and
-    a cassette's ``json.loads`` alike, so ``list`` is the exact test. Anything looser passes a
-    string and a Mapping, which ``extend`` consumes one character or one key at a time, and the
-    vendor's shape change then reaches the row builder disguised as contracts. That is
-    marketlake #305, and the refusal is what turns it into one given-up window.
+    a cassette's ``json.loads`` alike, so ``list`` is the exact test. Testing for an iterable
+    instead passes both a string and a Mapping, which ``extend`` consumes one character or one
+    key at a time, and the vendor's shape change then reaches the row builder disguised as
+    contracts. That is marketlake #305. Testing for a ``Sequence`` and excluding ``Mapping``
+    is the near miss worth naming, because it reads as careful and still passes the string.
+    The refusal is what turns either into one given-up window.
 
     The walk reads the whole body into scratch maps of its own first and copies them into
     the reassembly maps only once both sides have read cleanly. So a body that raises
@@ -683,27 +688,35 @@ def _fetch_window(
        the other windows still land and the loss is this one window.
 
     **Considered and rejected: splitting a window the merge could not read**, which is what
-    this code did until marketlake #305. A date-keyed split does isolate the damage, because a
-    drifted expiration sits on one date, so splitting cost one day where giving up the window
-    costs the window. What it spent to buy that back is the measurement that retired it. With
-    the default five-window plan and a depth bound of 4, a payload change reaching every
-    expiration walks the full binary tree on each of the four concrete windows: 113 requests
-    for one ticker-minute, against the 5 a healthy one makes. Two option tickers put that past
-    Schwab's 120 req/min ceiling, and past the minute before that, since a healthy SPY chain
-    fetch already takes about nine seconds. A cycle that overruns fires no cycle in the next
-    minute and charges every watched surface, quotes included. So the split traded a fraction
-    of one window for whole minutes on both surfaces, on the one failure no narrower chunk
-    plan fixes anyway.
+    this code did until marketlake #305. A date-keyed split does narrow the damage, because a
+    drifted expiration sits on one date, and the depth bound is where the narrowing stops. Run
+    against the default plan at a bound of 4, the narrowest sub-range a split reaches is 1 day
+    inside the ten-day window, 1 inside the twenty-one-day, 3 inside the sixty-day, and 17
+    inside the two-hundred-and-seventy-five-day one. So the far term gave up a fortnight, not
+    a day.
 
-    The register entry this replaces rejected bounding drift lower than size, on the grounds
-    that it buys a smaller number in a case the vendor has never produced. What answers that
-    is the ceiling rather than the size: past it, and past the minute, the number stops being
-    smaller or larger and becomes a different failure, one that reaches the quote surface a
-    chain fetch cannot otherwise touch. Putting the split back costs nothing later, since the
-    refusal and the class are what a split falls through from.
+    What the split spent to buy that is the measurement that retired it. A payload change
+    reaching every expiration costs 113 requests for one ticker-minute against the 5 a healthy
+    one makes, measured over the same plan and bound: 19 for the ten-day window, which bottoms
+    out on single days before the bound and so never walks a full tree, 31 for each of the
+    other three, and 1 for the open tail. The minute goes first and one ticker is enough,
+    since a healthy SPY chain fetch already takes about nine seconds for its five windows and
+    113 requests do not fit in sixty. The 120 req/min ceiling goes next, at two option
+    tickers. A cycle that overruns fires no cycle in the next minute and charges every watched
+    surface, quotes included. So the split traded a narrower loss inside one window for whole
+    minutes on both surfaces, on the one failure no narrower chunk plan fixes anyway.
+
+    The register entry this replaces rejected two proposals, stopping the split once both
+    halves have failed and bounding drift lower than size, on the grounds that either buys a
+    smaller number in a case the vendor has never produced. What answers that is the ceiling
+    rather than the size: past it, and past the minute, the number stops being smaller or
+    larger and becomes a different failure, one that reaches the quote surface a chain fetch
+    cannot otherwise touch. Giving up the window is neither proposal, because it leaves no
+    split for a second rule to govern. Putting the split back costs nothing later: it is added
+    on top of the refusal rather than woven through it.
 
     The depth bound still caps a too-big window's split, and it is deliberately the only cap
-    there. One number an operator can read and lower is worth more than a second rule.
+    there. One number an operator can read and lower is worth more than a rule beside it.
     """
     try:
         response = vendor.get_chain(ticker, from_date=from_date, to_date=to_date)
