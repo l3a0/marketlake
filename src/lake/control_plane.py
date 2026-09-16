@@ -197,7 +197,7 @@ CALENDAR_PROBE_SLUG = "calendar-probe"
 PRE_OPEN_SLUG = "pre-open"
 SUNDAY_SLUG = "sunday"
 
-# The slug of the dead-man check the daemon feeds. It sits here with its three siblings
+# The slug of the dead-man check the daemon feeds. It sits here with its four siblings
 # rather than in ``lake.deadman`` because the install renderer names it too, and
 # ``lake.deadman`` imports this module. Reaching the other way would load a second copy
 # of this module under ``python -m lake.control_plane``. ``lake.deadman`` re-exports it,
@@ -2797,25 +2797,28 @@ def _arm_checks_step_lines() -> list[str]:
     Every live check is named, because what arms a row is its first ping rather than its
     first run. healthchecks keeps a check that has never been pinged in a ``new`` state,
     which never goes down and never sends, so a job that fails every run leaves its row
-    silent instead of paging. The five differ only in how long that silence lasts when
+    silent instead of paging. What separates the five is what arms each of them when
     nobody presses.
 
-    1. ``capture`` is fed by the daemon's idle heartbeat outside the capture window, and
-       by a durable cycle inside it. An install made inside the window whose cycles all
-       fail leaves the row reading ``Never``.
-    2. ``pre-open`` is armed by ``RunAtLoad`` on the self-check job on an install made
-       outside every window, which ``self_check_job`` sets for that reason. An install
+    1. ``capture`` takes the daemon's tagged idle heartbeat through the weekday envelope
+       and a durable cycle inside the capture window. An install made inside the window
+       whose cycles all fail leaves the row reading ``Never``, and so does one made
+       outside the envelope until the next weekday wake.
+    2. ``pre-open`` takes ``RunAtLoad`` on the self-check job, which ``self_check_job``
+       sets so an install made outside every window pings once on the spot. An install
        made inside a window, or with the daemon down, still withholds that first ping.
-    3. ``sunday`` and ``compaction`` have no install-time path of any kind. The Sunday
-       plist carries ``RunAtLoad`` as false and compaction has no plist at all, so a job
-       failing every run leaves its row reading ``Never`` at any hour and in any week.
-    4. ``calendar-probe`` pings on every answer, so it arms itself by the next weekday
-       09:35. It is pressed with the rest because it reads ``Never`` until then, and
-       because leaving one member of a roster out is how the roster comes back.
+    3. ``sunday`` has no install-time path. Its plist carries ``RunAtLoad`` as false, so
+       nothing runs it before the next Sunday, at any hour and in any week.
+    4. ``compaction`` has none either, and has no plist at all to carry one. The daemon
+       spawns it at close+15, so a run that fails every day never reaches its ping.
+    5. ``calendar-probe`` pings on every answer, so it arms itself at the next weekday
+       09:35 on any install whose config and token file load. It is pressed with the rest
+       because it reads ``Never`` until then, and because leaving one member of a roster
+       out is how the gap comes back.
 
-    Running the jobs instead arms nothing. ``self-check`` exits 1 when it did not ping,
-    and the script runs under ``set -e``, so the one install where arming matters is the
-    one it would stop.
+    Running the jobs instead does not arm the install that needs arming. ``self-check``
+    exits 1 when it did not ping, and the script runs under ``set -e``, so the one
+    install where the press matters is the one running the job would stop.
 
     Every line is a comment. Pressing a button on a web page needs a browser and a
     person, so the install points at the step rather than takes it. That is also what
@@ -2844,14 +2847,15 @@ def _arm_checks_step_lines() -> list[str]:
         "# healthchecks keeps a check that has never been pinged in a new state, which",
         "# never goes down and never sends. What arms a row is its first ping rather than",
         "# its first run, so a job that fails every run stays silent instead of paging.",
-        "# Arming is once per row forever, so this is a step of the first install and of",
-        "# nothing after it.",
-        f"# Press {CAPTURE_SLUG} first. Its grace is five minutes, while the others measure",
-        "# theirs in hours or days. Inside the capture window no idle heartbeat is owed, so",
-        "# an install whose every cycle fails leaves that row reading Never. That is what",
-        "# happened on 2026-09-08, when the jobs came up at 13:06 ET against a token that",
-        "# had expired three days earlier. One press turns that silence into a page inside",
-        "# the grace period.",
+        "# A row that has been pinged does not go back to that state on its own, so this",
+        "# is a step of the first install rather than of every one.",
+        f"# Press {CAPTURE_SLUG} first. Inside the capture window its deadline is five",
+        "# minutes away, while every other deadline here is hours or days out, so a bad",
+        "# install is reported soonest through that row. No idle heartbeat is owed in that",
+        "# window, so an install whose every cycle fails leaves the row reading Never.",
+        "# That is what happened on 2026-09-08, when the jobs came up at 13:06 ET against",
+        "# a token that had expired three days earlier. One press turns that silence into",
+        "# a page inside the grace period.",
     ]
 
 

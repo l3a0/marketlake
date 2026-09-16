@@ -94,11 +94,12 @@ launchctl print system/com.marketlake.daemon
 # healthchecks keeps a check that has never been pinged in a new state, which
 # never goes down and never sends. What arms a row is its first ping rather than
 # its first run, so a job that fails every run stays silent instead of paging.
-# Arming is once per row forever, so this is a step of the first install and of
-# nothing after it.
-# Press capture first. Its grace is five minutes, while the others measure
-# theirs in hours or days. Inside the capture window no idle heartbeat is owed, so
-# an install whose every cycle fails leaves that row reading Never. That is what
-# happened on 2026-09-08, when the jobs came up at 13:06 ET against a token that
-# had expired three days earlier. One press turns that silence into a page inside
-# the grace period.
+# A row that has been pinged does not go back to that state on its own, so this
+# is a step of the first install rather than of every one.
+# Press capture first. Inside the capture window its deadline is five
+# minutes away, while every other deadline here is hours or days out, so a bad
+# install is reported soonest through that row. No idle heartbeat is owed in that
+# window, so an install whose every cycle fails leaves the row reading Never.
+# That is what happened on 2026-09-08, when the jobs came up at 13:06 ET against
+# a token that had expired three days earlier. One press turns that silence into
+# a page inside the grace period.

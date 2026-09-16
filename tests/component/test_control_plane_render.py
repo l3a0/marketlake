@@ -1266,6 +1266,31 @@ def _arming_block(text: str) -> list[str]:
     return lines[start : start + len(cp._arm_checks_step_lines())]
 
 
+def _press_instruction(block: list[str]) -> str:
+    """The one sentence telling the operator to press the button, unwrapped.
+
+    Read as a sentence rather than as the line the button falls on, because the renderer
+    wraps and the slugs spill onto the lines under it. A test that asked only whether the
+    five appear somewhere in the block would pass an install that named one check to press
+    and said the other four arm themselves, which is the claim this whole step exists to
+    undo.
+    """
+    prose = " ".join(line.removeprefix("#").strip() for line in block)
+    hits = [s.strip() for s in prose.split(". ") if PING_NOW in s]
+    assert len(hits) == 1, hits
+    return hits[0]
+
+
+def _checks_named(instruction: str) -> list[str]:
+    """The checks the press instruction names, read off the list it introduces."""
+    _, colon, listed = instruction.partition(":")
+    assert colon, instruction
+    names = []
+    for part in listed.strip().rstrip(".").split(","):
+        names += [name.strip() for name in part.split(" and ")]
+    return [name for name in names if name]
+
+
 def test_both_renderings_carry_one_arming_step(tmp_path, capsys):
     """The same block, whole and contiguous, in the script and in the pasted text.
 
@@ -1309,6 +1334,7 @@ def test_the_step_reads_every_slug_rather_than_spelling_it(tmp_path, capsys):
             for text in _rendered_install(tmp_path, capsys):
                 block = "\n".join(_arming_block(text))
                 assert monkey in block, (name, block)
+                assert block.count(CAPTURE_AS_ENGLISH) == 1, block
                 remaining = block.replace(CAPTURE_AS_ENGLISH, "<window>")
                 assert original not in remaining, (name, remaining)
         finally:
@@ -1378,36 +1404,37 @@ def test_the_arming_step_comes_after_the_jobs_are_bootstrapped(tmp_path, capsys)
         assert max(bootstraps) < read_back[0] < _pressed(text), text
 
 
-def test_the_arming_step_names_every_check_by_its_slug(tmp_path, capsys):
-    """The step says which rows to press the button on, and leaves none of them out.
+def test_the_arming_step_asks_for_a_press_on_every_check_and_on_no_other(tmp_path, capsys):
+    """The instruction names every row to press the button on, and names nothing else.
 
     Healthchecks shows one row per check, and a row nobody presses stays in the state
-    where it cannot page. Naming every row is the whole instruction. The install used to
-    name one, ``capture``, on the reasoning that an idle heartbeat armed the rest. The
-    daemon builds one dead-man and feeds ``capture`` with it, so that reasoning covered
-    nothing else.
+    where it cannot page. The install used to name one, ``capture``, and said nothing
+    about the other four. The daemon builds one dead-man and feeds ``capture`` with it,
+    so nothing was arming them.
 
-    The slugs are also all the step may carry: a ping URL is a secret and the renderer's
-    output is tracked.
+    Read off the instruction rather than off the block, and compared as a set rather than
+    as a search. Presence alone would pass an install that named ``capture`` to press and
+    said the rest arm themselves, and a one-way search would pass one that sent the
+    operator hunting for a sixth row no job pings. The quantifier is asserted for the same
+    reason: an instruction to press one of five is not an instruction to press five.
 
-    Read through ``lake.deadman`` and ``lake.compact`` rather than through the renderer's
-    own module, so the check is against what each job actually pings. A renderer naming a
-    row no job feeds would pass a comparison against itself.
+    The slugs are also all the step may carry, because a ping URL is a secret and the
+    renderer's output is tracked.
+
+    ``lake.control_plane`` defines all five, so the two read through ``lake.deadman`` and
+    ``lake.compact`` assert that the job re-exports the same constant the renderer names
+    rather than a second spelling of it.
     """
     from lake.compact import COMPACTION_SLUG
     from lake.control_plane import CALENDAR_PROBE_SLUG, PRE_OPEN_SLUG, SUNDAY_SLUG
     from lake.deadman import CAPTURE_SLUG
 
-    slugs = (CAPTURE_SLUG, PRE_OPEN_SLUG, SUNDAY_SLUG, COMPACTION_SLUG, CALENDAR_PROBE_SLUG)
+    slugs = [CAPTURE_SLUG, PRE_OPEN_SLUG, SUNDAY_SLUG, COMPACTION_SLUG, CALENDAR_PROBE_SLUG]
     assert len(set(slugs)) == len(slugs), slugs
     for text in _rendered_install(tmp_path, capsys):
-        block = "\n".join(_arming_block(text))
-        for slug in slugs:
-            assert re.search(rf"\b{re.escape(slug)}\b", block), (slug, block)
-        # The press line is one instruction rather than five, and it is the line that
-        # names the checks, so the slugs sit with the button rather than a screen away.
-        press = _arming_block(text)[_pressed_offset()]
-        assert PING_NOW in press and CAPTURE_SLUG in press, press
+        instruction = _press_instruction(_arming_block(text))
+        assert sorted(_checks_named(instruction)) == sorted(slugs), instruction
+        assert "each" in instruction, instruction
 
 
 def test_every_line_of_the_arming_step_is_a_comment(tmp_path, capsys):
