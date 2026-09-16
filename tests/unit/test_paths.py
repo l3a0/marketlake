@@ -1,9 +1,10 @@
 """Lake paths, built from values alone, and read back apart the same way.
 
-The builders match the fixture-lake builder exactly. The two parsers invert them.
-``parse_segment_rel`` takes a journal segment path apart, and ``parse_date_dir`` reads
-the ``date=`` key a partition path carries. Both are pure functions over strings, so
-every test here decides from values alone and the tier is unit.
+The builders match the fixture-lake builder exactly. The three parsers invert them.
+``parse_segment_rel`` takes a journal segment path apart, ``parse_partition_rel`` takes a
+sealed date-partitioned partition path apart, and ``parse_date_dir`` reads the ``date=``
+key a partition path carries. All three are pure functions over strings, so every test
+here decides from values alone and the tier is unit.
 """
 
 from __future__ import annotations
@@ -33,9 +34,11 @@ from lake.paths import (
     TICKERS_FILE,
     TOKEN_FILE,
     LakePaths,
+    PartitionRef,
     SegmentRef,
     config_dir,
     parse_date_dir,
+    parse_partition_rel,
     parse_segment_rel,
 )
 from lake.schwab import DEFAULT_TOKEN_PATH
@@ -213,6 +216,58 @@ def test_a_built_segment_path_parses_back_to_the_parts_it_was_built_from(paths: 
 )
 def test_a_malformed_segment_path_parses_to_none(rel: str):
     assert parse_segment_rel(rel) is None
+
+
+def test_a_well_formed_partition_path_splits_into_its_three_parts():
+    assert parse_partition_rel("quotes/ticker=SPY/date=2026-09-14.parquet") == PartitionRef(
+        surface="quotes", ticker="SPY", day=date(2026, 9, 14)
+    )
+
+
+def test_a_built_partition_path_parses_back_to_the_parts_it_was_built_from(paths: LakePaths):
+    # The same round trip the segment parser takes, for the same reason. A reader of manifest
+    # keys decides which sessions exist from this, and it passes over a key it cannot read
+    # rather than raising, so a parser that drifted from its builder would answer that the
+    # lake holds nothing rather than failing.
+    built = paths.partition_path(QUOTES, "BRK.B", DAY)
+    ref = parse_partition_rel(built.relative_to(ROOT).as_posix())
+    assert ref == PartitionRef(surface=QUOTES, ticker="BRK.B", day=DAY)
+    assert paths.partition_path(ref.surface, ref.ticker, ref.day) == built
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        # The part count is exact. Two parts is one short, four is one long.
+        "quotes/date=2026-09-14.parquet",
+        "quotes/ticker=SPY/extra/date=2026-09-14.parquet",
+        # Only the two flat-shaped surfaces take this shape. ``bars`` adds a ``freq=`` level
+        # and ``actions`` is one all-ticker file, so each has its own builder and neither
+        # comes apart here.
+        "bars/ticker=SPY/freq=1m/date=2026-09-14.parquet",
+        "reference/ticker=SPY/date=2026-09-14.parquet",
+        # The ticker key is matched as a literal prefix, and a wrong separator is the harder
+        # case, since a parser slicing by length would hand back a value that looks right.
+        "quotes/SPY/date=2026-09-14.parquet",
+        "quotes/ticker:SPY/date=2026-09-14.parquet",
+        # An empty ticker is not a ticker.
+        "quotes/ticker=/date=2026-09-14.parquet",
+        # The date is read by ``parse_date_dir``, so the same strictness applies.
+        "quotes/ticker=SPY/date=20260914.parquet",
+        "quotes/ticker=SPY/date=2026-09-14.parquet.tmp-1",
+        "quotes/ticker=SPY/2026-09-14.parquet",
+        # The suffix is matched too. A journal segment is not a sealed partition.
+        "quotes/ticker=SPY/date=2026-09-14.arrows",
+    ],
+)
+def test_a_malformed_partition_path_parses_to_none(rel: str):
+    assert parse_partition_rel(rel) is None
+
+
+def test_a_journal_segment_never_parses_as_a_partition():
+    # The mirror of the check below. The manifest holds neither shape by accident, and a
+    # reader enumerating sealed ticker-days must not be handed a segment.
+    assert parse_partition_rel(SEGMENT_REL) is None
 
 
 def test_a_compacted_partition_never_parses_as_a_segment(paths: LakePaths):
