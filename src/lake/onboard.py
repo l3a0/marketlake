@@ -104,7 +104,9 @@ The first two are ``argparse``'s, raised from the option's own ``type`` hook, so
 operator gets one named line and exit 2 with no stack to read past. That is the code and
 the shape ``argparse`` already uses for a bad argument in these entries. The third cannot
 go there, because asking what the master already holds means reading the master, which
-means the lake root from config. It raises ``OnboardError`` from ``onboard`` instead.
+means the lake root from config. It raises ``OnboardError`` from ``onboard`` instead, and
+``main`` turns that into the same named line and the same exit 2, so all three read alike.
+Every other ``OnboardError`` the flow raises arrives the same way.
 
 Deferred, not faked. Each is a later slice, and this command is structured so each
 becomes an added step here without reshaping the flow.
@@ -130,6 +132,7 @@ real construction lazy.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -709,19 +712,37 @@ def _build_parser():
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """The ``python -m lake.onboard`` entry. Returns a process exit code."""
+    """The ``python -m lake.onboard`` entry. Returns a process exit code.
+
+    A refusal prints one line and exits 2, the same shape ``input_errors_exit`` uses and
+    the code the sibling commands use for an operator mistake. Every refusal message here
+    is written for a person, and one of them names the exact command to run next, so a
+    stack above it is a stack to read past. The catch sits beside ``input_errors_exit``
+    rather than inside it, the way ``retire`` and ``reauth`` both do, because that helper
+    means the three operator-editable files in the config directory and a refused
+    precondition is a different category.
+
+    It catches ``OnboardError`` and nothing wider. The master's own errors, the spans
+    file's, and the manifest's keep their tracebacks on purpose. A refused onboarding is a
+    normal outcome of the command, while a master that fails to resolve is a bug or a
+    corrupt lake, and there the stack is what a reader needs.
+    """
     args = _build_parser().parse_args(argv)
-    with input_errors_exit("onboard"):
-        report = onboard_from_config(
-            args.ticker,
-            config_path=args.config,
-            tickers_path=args.tickers,
-            token_path=args.token,
-            options=args.options,
-            chain_cadence=args.chain_cadence,
-            bars=args.bars,
-            capture_start=args.capture_start,
-        )
+    try:
+        with input_errors_exit("onboard"):
+            report = onboard_from_config(
+                args.ticker,
+                config_path=args.config,
+                tickers_path=args.tickers,
+                token_path=args.token,
+                options=args.options,
+                chain_cadence=args.chain_cadence,
+                bars=args.bars,
+                capture_start=args.capture_start,
+            )
+    except OnboardError as exc:
+        print(f"onboard: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
     print(report.render())
     return 0
 

@@ -2,10 +2,13 @@
 
 These run the onboarding core against a throwaway lake and a throwaway tickers.yaml,
 with a cassette-backed vendor and a manual clock. No network and no token are crossed.
-The three tests that drive the command line cross the real clock, because the option's
-own check asks what time it is now, and each of them uses an instant far enough from now
-that the answer cannot change the outcome. The tier is component: onboarding writes and
-reads real files, with the clock and vendor still fake.
+The tests that drive the command line cross the real clock, because the command builds its
+own rather than taking one. Three of them pass ``--capture-start`` and use an instant far
+enough from now that the answer cannot change the outcome. The four that drive a refusal
+or a sign-off through ``main`` assert nothing that a date decides, and they reach the
+recorded vendor through the one seam the command has, which is where it builds the
+Schwab-backed one. The tier is component: onboarding writes and reads real files, with the
+clock and vendor still fake.
 
 They cover the slice-1 contract: register with a stamped capture_start and a ticker
 mapping only (the FIGI is deferred to a CUSIP-keyed backfill), verify the real-time
@@ -31,7 +34,13 @@ from lake.config import GuardConstants
 from lake.manifest import append_manifest, latest_entries
 from lake.onboard import MASTER_PARTITION, EntitlementError, OnboardError, main, onboard
 from lake.paths import LakePaths
-from lake.security_master import ID_TYPE_FIGI, ID_TYPE_TICKER, SecurityMaster, master_path
+from lake.security_master import (
+    ID_TYPE_FIGI,
+    ID_TYPE_TICKER,
+    SecurityMaster,
+    SecurityMasterError,
+    master_path,
+)
 from lake.session import SessionClock
 from lake.tickers import load_tickers
 from tests.support.calendar import et, weekday_sessions
@@ -1230,3 +1239,157 @@ def test_the_wrapper_loads_the_plan_and_passes_the_config_s_guards(
 
     # The config's own recalibrated guard reached it too, rather than the pinned default.
     assert [g.chain_chunk_max_split_depth for g in seen] == [0]
+
+
+def _stub_the_vendor(monkeypatch, vendor) -> None:
+    """Hand ``onboard_from_config`` a recorded vendor instead of the Schwab-backed one.
+
+    ``main`` builds its own vendor from the token file, so a test that drives ``main``
+    has this one seam and no other. The chain plan is pinned to the built-in default at
+    the same time, because the wrapper is the one reader of the machine's plan file and a
+    test must not depend on what that machine happens to hold.
+    """
+    import lake.onboard
+    import lake.schwab
+
+    class _Stub:
+        @staticmethod
+        def from_token(token_path, *, api_key, app_secret):
+            return vendor
+
+    monkeypatch.setattr(lake.schwab, "SchwabVendor", _Stub)
+    monkeypatch.setattr(lake.onboard, "load_chain_plan", lambda: DEFAULT_CHAIN_PLAN)
+
+
+def test_the_seed_spans_refusal_reaches_the_operator_as_one_line(
+    lake_root, tmp_path, monkeypatch, capsys
+):
+    """The refusal that names the next command to run must not arrive under a stack.
+
+    This message is the one that tells an operator to run ``python -m lake.seed_spans``.
+    A traceback puts the frames of this module between that sentence and the prompt, so
+    the line that matters is the line read past.
+    """
+    from lake.security_master import KIND_EQUITY
+
+    master = SecurityMaster()
+    master.register(
+        kind=KIND_EQUITY, capture_start=_MID_SESSION, valid_from=_MID_SESSION.date(), ticker="SPY"
+    )
+    master.write(master_path(lake_root))
+    tickers_path = tmp_path / "tickers.yaml"
+    config_path = _write_config(tmp_path / "config.yaml", lake_root=lake_root)
+    _stub_the_vendor(monkeypatch, _quote_vendor("SPY", realtime=True))
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(
+            [
+                "SPY",
+                "--no-options",
+                "--config",
+                str(config_path),
+                "--tickers",
+                str(tickers_path),
+                "--token",
+                str(tmp_path / "token.json"),
+            ]
+        )
+
+    assert exit_info.value.code == 2
+    printed = capsys.readouterr().err
+    assert printed.startswith("onboard: ")
+    assert "python -m lake.seed_spans" in printed
+    assert "Traceback" not in printed
+    assert not tickers_path.exists()
+
+
+def test_a_delayed_feed_refused_through_the_command_prints_the_not_trusted_line(
+    lake_root, tmp_path, monkeypatch, capsys
+):
+    """``EntitlementError`` is an ``OnboardError``, so the subclass exits the same way.
+
+    A catch written against ``EntitlementError`` alone would pass this test and fail the
+    one above, and a catch written against the base class passes both. This is the one
+    that says the subclass is covered.
+    """
+    tickers_path = tmp_path / "tickers.yaml"
+    config_path = _write_config(tmp_path / "config.yaml", lake_root=lake_root)
+    _stub_the_vendor(monkeypatch, _quote_vendor("SPY", realtime=False))
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(
+            [
+                "SPY",
+                "--no-options",
+                "--config",
+                str(config_path),
+                "--tickers",
+                str(tickers_path),
+                "--token",
+                str(tmp_path / "token.json"),
+            ]
+        )
+
+    assert exit_info.value.code == 2
+    printed = capsys.readouterr().err
+    assert printed.startswith("onboard: ")
+    assert "ticker not trusted" in printed
+    assert not tickers_path.exists()
+
+
+def test_an_onboarding_that_succeeds_still_returns_zero(lake_root, tmp_path, monkeypatch, capsys):
+    """The catch must not swallow the happy path, which is what a bare ``except`` would do."""
+    tickers_path = tmp_path / "tickers.yaml"
+    config_path = _write_config(tmp_path / "config.yaml", lake_root=lake_root)
+    _stub_the_vendor(monkeypatch, _quote_vendor("SPY", realtime=True))
+
+    code = main(
+        [
+            "SPY",
+            "--no-options",
+            "--config",
+            str(config_path),
+            "--tickers",
+            str(tickers_path),
+            "--token",
+            str(tmp_path / "token.json"),
+        ]
+    )
+
+    assert code == 0
+    printed = capsys.readouterr()
+    assert printed.err == ""
+    assert "SPY" in printed.out
+    assert load_tickers(tickers_path).get("SPY").options is False
+
+
+def test_a_corrupt_master_still_reaches_the_operator_as_a_traceback(
+    lake_root, tmp_path, monkeypatch
+):
+    """The catch is bounded to ``OnboardError``, and this holds the boundary from outside.
+
+    A refused onboarding is a normal outcome of the command, so it gets a line. A master
+    that cannot be read is a corrupt lake, which is a bug, and the stack names where the
+    corruption was found. Widening the catch to the lake-state errors would pass every
+    other test in this file and turn that stack into one line that hides the frame.
+    """
+    path = master_path(lake_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"this is not a parquet file")
+    tickers_path = tmp_path / "tickers.yaml"
+    config_path = _write_config(tmp_path / "config.yaml", lake_root=lake_root)
+    _stub_the_vendor(monkeypatch, _quote_vendor("SPY", realtime=True))
+
+    with pytest.raises(SecurityMasterError):
+        main(
+            [
+                "SPY",
+                "--no-options",
+                "--config",
+                str(config_path),
+                "--tickers",
+                str(tickers_path),
+                "--token",
+                str(tmp_path / "token.json"),
+            ]
+        )
