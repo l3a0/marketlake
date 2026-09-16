@@ -1838,6 +1838,397 @@ def test_the_close_cross_check_reads_the_tolerance_it_is_handed():
     assert bars.check_close_cross(650.0 * 1.01, 650.0, tolerance=1e-6).agrees is False
 
 
+# -- the mutation pass's survivors, each now held ---------------------------------------
+
+
+def test_the_candle_values_land_in_their_own_columns(fixture_lake: FixtureLake):
+    """Every mapped candle field reaches its column, read back off the written partition.
+
+    Asserting the schema alone says the columns exist, not that the builder put the vendor's
+    numbers in them. A map that sent four of the five fields nowhere would leave four null
+    columns on every bars row in the lake, and the schema assertion would still pass.
+    """
+    root = _lake(fixture_lake)
+    candle = bars_candle(
+        datetime.fromisoformat("2026-09-14T00:00:00-04:00"),
+        open_=645.5,
+        high=651.25,
+        low=644.75,
+        close=SETTLED_CLOSE,
+        volume=70_000_001,
+    )
+
+    _run(root, _RecordingVendor(_cassette(daily={"candles": [candle]})))
+
+    row = pa.parquet.read_table(_partition(root, "SPY", DAILY_FREQ)).to_pylist()[0]
+    assert row["open"] == 645.5
+    assert row["high"] == 651.25
+    assert row["low"] == 644.75
+    assert row["close"] == SETTLED_CLOSE
+    assert row["volume"] == 70_000_001
+    # The volume column is an integer one, so a float that is not lossless refuses rather than
+    # landing truncated. That is ``_int_column``'s rule, and bars reach it now.
+    assert isinstance(row["volume"], int) and not isinstance(row["volume"], bool)
+
+
+def test_a_candle_omitting_a_mapped_field_leaves_that_column_null(fixture_lake: FixtureLake):
+    """An absent field stays absent rather than being written as an explicit null.
+
+    Both land null in the column, so the difference is invisible there. What it changes is the
+    overflow: a builder writing ``candle.get(vendor)`` for every mapped name would also stop
+    distinguishing a field the vendor omitted from one it sent as null.
+    """
+    root = _lake(fixture_lake)
+    partial = {key: value for key, value in _daily_candle().items() if key != "volume"}
+
+    _run(root, _RecordingVendor(_cassette(daily={"candles": [partial]})))
+
+    row = pa.parquet.read_table(_partition(root, "SPY", DAILY_FREQ)).to_pylist()[0]
+    assert row["volume"] is None
+    assert row["close"] == SETTLED_CLOSE
+    assert row["extra"] is None
+
+
+def test_the_row_carries_the_frequency_and_the_resolved_instrument(fixture_lake: FixtureLake):
+    """Both repeat something the row could otherwise only get from its path or the master.
+
+    ``freq`` repeats a path level so two frequencies read out and concatenated stay apart, and
+    ``instrument_id`` is the corporate-actions join key, resolved per ticker-day. A test that
+    only ever asserts the unresolved case leaves the resolved one saying nothing.
+    """
+    root = _lake(fixture_lake)
+
+    _run(root, _RecordingVendor(_cassette()), roster=_roster({"SPY": ["1m", "1d"]}))
+
+    minute = pa.parquet.read_table(_partition(root, "SPY", MINUTE_FREQ)).to_pylist()
+    daily = pa.parquet.read_table(_partition(root, "SPY", DAILY_FREQ)).to_pylist()
+    assert {row["freq"] for row in minute} == {MINUTE_FREQ}
+    assert {row["freq"] for row in daily} == {DAILY_FREQ}
+    assert {row["instrument_id"] for row in daily} == {1}
+    assert {row["instrument_id"] for row in minute} == {1}
+
+
+def test_an_unrecognized_candle_field_overflows(fixture_lake: FixtureLake):
+    """The fail-open rule on the level the row is actually built from.
+
+    The response-level half had a test and this one did not, so a builder that stopped reading
+    the candle's own unrecognized fields would have gone unnoticed, which is the level most
+    likely to gain a vendor field.
+    """
+    root = _lake(fixture_lake)
+    odd = dict(_daily_candle(), newCandleStat=3)
+
+    _run(root, _RecordingVendor(_cassette(daily={"candles": [odd]})))
+
+    table = pa.parquet.read_table(_partition(root, "SPY", DAILY_FREQ))
+    assert json.loads(table.column("extra").to_pylist()[0]) == {"newCandleStat": 3}
+
+
+def test_an_ambiguous_symbol_is_contained_and_files_the_instruments_it_found(
+    fixture_lake: FixtureLake,
+):
+    """A corrupt master costs one ticker-day, and the finding names what it resolved to.
+
+    ``AmbiguousSymbol`` is neither a ``LoadError`` nor a ``VendorError``, so a catch naming
+    only ``UnresolvedSymbol`` lets it escape ``_land`` and kill the whole run. The plural field
+    is what files the several instruments one symbol claimed, and without it the operator is
+    told the master is corrupt but not how.
+    """
+    # SPY registered twice over one date range is what a corrupt master looks like. QQQ is
+    # registered once, so it resolves cleanly and the run continuing past SPY is visible.
+    master = SecurityMaster()
+    for ticker in ("SPY", "SPY", "QQQ"):
+        master.register(
+            kind=KIND_EQUITY,
+            capture_start=datetime(2026, 9, 8, 17, 7, tzinfo=UTC),
+            valid_from=date(2026, 9, 8),
+            ticker=ticker,
+        )
+    root = _lake(
+        fixture_lake,
+        quotes={
+            ("SPY", FOLLOWING): [_quote_row(FOLLOWING)],
+            ("QQQ", FOLLOWING): [_quote_row(FOLLOWING, ticker="QQQ")],
+        },
+        master=master,
+    )
+
+    result = _run(
+        root,
+        _RecordingVendor(_cassette(tickers=("SPY", "QQQ"))),
+        roster=_roster({"SPY": ["1d"], "QQQ": ["1d"]}),
+    )
+
+    resolution = [h for h in result.held if h.finding.check == CHECK_INSTRUMENT_RESOLUTION]
+    assert len(resolution) == 1, "an ambiguous symbol escaped the walk"
+    assert "AmbiguousSymbol" in (resolution[0].finding.exception or "")
+    assert len(resolution[0].finding.instrument_ids) == 2
+    filed = [f for f in _findings(root) if f["check"] == CHECK_INSTRUMENT_RESOLUTION]
+    assert filed[0]["instrument_ids"] == list(resolution[0].finding.instrument_ids)
+    # The run went on, which is the containment the catch exists for.
+    assert "QQQ" in [landed.ticker for landed in result.landed]
+
+
+def test_a_quotes_partition_with_no_close_price_column_is_an_absence(fixture_lake: FixtureLake):
+    """A session sealed before the column existed holds the bar rather than ending the run.
+
+    Reading the column anyway raises ``KeyError``, which the walk's catch does not name, so one
+    old partition would cost every ticker after it.
+    """
+    schema = pa.schema(
+        [
+            (name, QUOTES_SCHEMA.field(name).type)
+            for name in QUOTES_SCHEMA.names
+            if name != "close_price"
+        ]
+    )
+    rows = [{k: v for k, v in _quote_row(FOLLOWING).items() if k != "close_price"}]
+    table = pa.table(
+        {name: [row.get(name) for row in rows] for name in schema.names}, schema=schema
+    )
+    fixture_lake.with_quotes("SPY", FOLLOWING, table)
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    root = fixture_lake.build()
+    _master().write(master_path(root))
+
+    result = _run(root, _RecordingVendor(_cassette()))
+
+    assert result.landed == ()
+    (held,) = result.held
+    assert held.finding.check == CHECK_BAR_CLOSE
+    assert held.finding.against is None
+
+
+def test_a_minute_response_starting_late_is_refused(fixture_lake: FixtureLake):
+    """The near end of the span, which the short-response tests only reach from the far one.
+
+    A vendor that dropped the session's opening minutes covers as many minutes as it likes
+    afterwards, and a check comparing only the far end would land it.
+    """
+    root = _lake(fixture_lake)
+    late = {"candles": _minute_candles(first=OPEN_ET + timedelta(minutes=30))}
+
+    result = _run(root, _RecordingVendor(_cassette(minute=late)), roster=_roster({"SPY": ["1m"]}))
+
+    assert result.landed == ()
+    (held,) = result.held
+    assert held.finding.check == CHECK_BAR_SPAN
+    assert held.finding.computed == 360.0 and held.finding.against == 390.0
+
+
+def test_a_bar_below_the_settled_close_disagrees_too(fixture_lake: FixtureLake):
+    """The comparison is absolute, so a bar under the close is as wrong as one over it.
+
+    A split or a pre-adjustment moves the price down, which is the direction that matters most
+    here, and a check that dropped the absolute value would pass every one of them.
+    """
+    root = _lake(fixture_lake)
+    below = SETTLED_CLOSE * (1 - PER_EVENT_DIVIDEND)
+
+    result = _run(
+        root, _RecordingVendor(_cassette(daily={"candles": [_daily_candle(close=below)]}))
+    )
+
+    assert result.landed == ()
+    (held,) = result.held
+    assert held.finding.check == CHECK_BAR_CLOSE
+    assert held.finding.computed == pytest.approx(below)
+    # A disagreement exactly on the tolerance agrees, so the boundary is inclusive.
+    edge = bars.check_close_cross(650.0 * (1 + CLOSE_CROSS_TOLERANCE), 650.0)
+    assert edge.agrees is True
+
+
+def test_a_minute_partition_consults_no_settled_close(fixture_lake: FixtureLake, monkeypatch):
+    """The close cross-check speaks to ``1d`` alone, and this is what says so.
+
+    A single minute has no closing-auction print, so comparing one against the session's
+    settled close would judge it on a figure that does not describe it. Nothing else in the
+    suite would notice the gate running on both frequencies.
+    """
+    root = _lake(fixture_lake)
+    calls: list = []
+    real = bars._settled_close
+
+    def spy(lake_root, ticker, session, following):
+        calls.append((ticker, session))
+        return real(lake_root, ticker, session, following)
+
+    monkeypatch.setattr(bars, "_settled_close", spy)
+
+    result = _run(root, _RecordingVendor(_cassette()), roster=_roster({"SPY": ["1m"]}))
+
+    assert len(result.landed) == 1
+    assert calls == [], "a 1m partition was judged against a daily close"
+
+
+def test_two_findings_on_one_subject_file_two_files(fixture_lake: FixtureLake):
+    """The sequence in the withheld file name is what keeps one run's findings apart.
+
+    A run files under one injected clock and one pid, so the stamp and the pid are constant
+    across it and the subject would be doing all the work. This walk can produce two findings
+    on one subject: a resolution finding rides beside a gate finding for the same ticker, day
+    and frequency. Without the sequence the second write raises ``FileExistsError``.
+    """
+    root = _lake(fixture_lake, master=_master(("QQQ",)))
+    drifted = SETTLED_CLOSE * (1 + PER_EVENT_DIVIDEND)
+
+    result = _run(
+        root, _RecordingVendor(_cassette(daily={"candles": [_daily_candle(close=drifted)]}))
+    )
+
+    assert len(result.held) == 2, "one subject did not produce the two findings this needs"
+    assert {h.finding.check for h in result.held} == {CHECK_INSTRUMENT_RESOLUTION, CHECK_BAR_CLOSE}
+    filed = _findings(root)
+    assert len(filed) == 2, "two findings on one subject collided on one file name"
+    assert len({h.filed_at for h in result.held}) == 2
+
+
+def test_the_instrument_resolves_at_the_session_rather_than_the_night_of_the_run(
+    fixture_lake: FixtureLake,
+):
+    """A bar's observation date is its session, never when the sweep happened to fetch it.
+
+    Resolving at the fetch date attributes the bar to whoever held the ticker that night. The
+    master here opens the day after the session, so resolving at the session fails and
+    resolving at the run's own date would succeed, which is what separates the two.
+    """
+    root = _lake(fixture_lake, master=_master(valid_from=FOLLOWING))
+
+    result = _run(root, _RecordingVendor(_cassette()))
+
+    (held,) = [h for h in result.held if h.finding.check == CHECK_INSTRUMENT_RESOLUTION]
+    assert "UnresolvedSymbol" in (held.finding.exception or "")
+    assert SESSION.isoformat() in (held.finding.exception or ""), (
+        "the resolution ran at a date other than the session"
+    )
+
+
+def test_the_fetch_stamps_are_the_two_ends_of_the_vendor_call(fixture_lake: FixtureLake):
+    """``fetch_ts`` and ``fetch_end_ts`` are the pair around the request, not one instant twice.
+
+    They are the sweep's only per-row record of how long the vendor took, and a frozen fixture
+    clock hides the difference entirely. This one advances during the call, the way a real
+    round trip does.
+    """
+    root = _lake(fixture_lake)
+    clock = ManualClock(FIRST_NIGHT)
+
+    class _SlowVendor(_RecordingVendor):
+        def get_daily_bars(self, symbol, **kwargs):
+            clock.advance(0.4)
+            return super().get_daily_bars(symbol, **kwargs)
+
+    fetch = _SlowVendor(_cassette())
+    fetch_session_bars(
+        lake_root=root,
+        vendor=fetch,
+        clock=clock,
+        calendar=weekday_sessions(MONDAY),
+        roster=_roster({"SPY": ["1d"]}),
+        session=SESSION,
+    )
+
+    row = pa.parquet.read_table(_partition(root, "SPY", DAILY_FREQ)).to_pylist()[0]
+    started = datetime.fromisoformat(row["fetch_ts"])
+    ended = datetime.fromisoformat(row["fetch_end_ts"])
+    assert ended > started, "the two stamps read one instant twice"
+    assert (ended - started).total_seconds() == pytest.approx(0.4)
+    # The manifest entry stamps the request's start, so a re-fetch is dated when it was asked
+    # for rather than when it came back.
+    rel = _partition(root, "SPY", DAILY_FREQ).relative_to(root).as_posix()
+    assert _entries(root, rel)[0]["fetched_at"] == started.isoformat()
+
+
+def test_a_session_the_calendar_cannot_follow_holds_the_bar(fixture_lake: FixtureLake):
+    """The last session a calendar knows about has no next partition to be judged against.
+
+    A real calendar always has one, so this is the branch nothing reaches in production and
+    everything reaches on a fake. It still has to hold rather than land ungated, because
+    gate-before-land is the whole shape.
+    """
+    root = _lake(fixture_lake)
+    only_monday = weekday_sessions(MONDAY)
+    only_monday._sessions = {SESSION: only_monday._sessions[SESSION]}
+
+    result = fetch_session_bars(
+        lake_root=root,
+        vendor=_RecordingVendor(_cassette()),
+        clock=ManualClock(FIRST_NIGHT),
+        calendar=only_monday,
+        roster=_roster({"SPY": ["1d"]}),
+        session=SESSION,
+    )
+
+    assert result.landed == ()
+    (held,) = result.held
+    assert held.finding.check == CHECK_BAR_CLOSE
+    assert "NoFollowingSession" in (held.finding.exception or "")
+
+
+def test_a_failed_write_leaves_no_temp_file_beside_the_partition(
+    fixture_lake: FixtureLake, monkeypatch
+):
+    """The temp file is the write in flight, so a failure must not leave one behind.
+
+    A leftover temp is not a torn partition, which is the point of writing through one, but it
+    is an orphan the Sunday scrub reports and a file the backup carries for nothing.
+    """
+    root = _lake(fixture_lake)
+
+    def boom(table, where, *args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(bars.pq, "write_table", boom)
+
+    with pytest.raises(OSError):
+        _run(root, _RecordingVendor(_cassette()))
+
+    partition = _partition(root, "SPY", DAILY_FREQ)
+    assert not partition.exists()
+    leftovers = list(partition.parent.glob("*")) if partition.parent.is_dir() else []
+    assert leftovers == [], f"a temp file outlived the failed write: {leftovers}"
+
+
+def test_the_window_builder_refuses_a_frequency_the_seam_cannot_fetch():
+    """``bar_window`` is exported, so its own refusal is not the sweep's to provide.
+
+    On the sweep path the roster check refuses first, which leaves this one reachable only by a
+    direct call. That is exactly the caller marketlake #319 will be.
+    """
+    from lake.session import SessionClock
+
+    bounds = SessionClock(ManualClock(FIRST_NIGHT), weekday_sessions(MONDAY)).bounds(SESSION)
+    with pytest.raises(ValueError, match="5m"):
+        bar_window("5m", bounds)
+
+
+def test_the_report_renders_a_run_that_both_landed_and_held(fixture_lake: FixtureLake):
+    """The sign-off block is what an operator reads, so both halves have to appear in it.
+
+    Every other render assertion sits on a run where landed equals attempted and where one
+    finding carries numbers. This one lands one partition, holds another finding whose detail
+    comes from its exception rather than from a pair, and reads both back.
+    """
+    root = _lake(
+        fixture_lake,
+        quotes={("QQQ", FOLLOWING): [_quote_row(FOLLOWING, ticker="QQQ")]},
+        master=_master(("SPY", "QQQ")),
+    )
+
+    result = _run(
+        root,
+        _RecordingVendor(_cassette(tickers=("SPY", "QQQ"))),
+        roster=_roster({"SPY": ["1d"], "QQQ": ["1d"]}),
+    )
+
+    rendered = result.render()
+    assert "landed:  1" in rendered and "held:    1" in rendered
+    assert result.attempted == 2, "the landed count would read the same as attempted"
+    assert "PartitionAbsent" in rendered, "a finding with no pair rendered no detail"
+    assert "SPY" in rendered and "QQQ 1d" in rendered
+    assert "filed at" in rendered
+
+
 # -- the two check functions on their own -----------------------------------------------
 
 

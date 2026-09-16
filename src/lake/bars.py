@@ -676,6 +676,10 @@ def _settled_close(lake_root: Path, ticker: str, session: date, following: date)
     """
     table = load_quotes(ticker, following, lake_root=lake_root)
     if "close_price" not in table.column_names:
+        # A session sealed before the column existed has no figure to compare against, which
+        # is an absence rather than an error. Reading the column anyway would raise
+        # ``KeyError``, which the walk's catch does not name, so one old partition would end
+        # the run.
         return None
     # A null is an absence rather than a competing answer, so it is dropped before the rows are
     # compared. A partition sealed before the column carried a value would otherwise read as a
