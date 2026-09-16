@@ -17,8 +17,10 @@ status. Then it prints one of two things.
    contains ``time`` or ``date`` it also shows the value, so an int epoch in
    milliseconds is told apart from an ISO string.
 
-The dump is shaped per surface. A surface is one captured data kind, and there are three
-of them.
+The dump is shaped per surface. A surface is one captured data kind. The lake has four,
+listed in ``paths.SURFACES``, and this tool can dump three of them. A cassette records what
+a vendor call returned, and ``actions`` is derived from sealed quotes rather than fetched,
+so no interaction is ever keyed under it.
 
 1. ``quotes``. Per symbol envelope it prints the top-level keys and then each block:
    ``quote``, ``fundamental``, ``regular``, ``extended``, and ``reference``.
@@ -40,6 +42,7 @@ Run it by hand against a recorded cassette::
     python -m lake.inspect_cassette path/to/cassette.json
 
 Pass ``--surface`` with one of those three names to limit the output to one surface.
+``--surface actions`` is refused, because no cassette holds one.
 """
 
 from __future__ import annotations
@@ -51,9 +54,12 @@ from lake.cassette import Cassette, Interaction, load_cassette
 
 # The quote blocks dumped per symbol envelope, in the order the design pins them.
 QUOTE_BLOCKS = ("quote", "fundamental", "regular", "extended", "reference")
-# Every surface this tool knows how to dump. The --surface filter offers exactly these,
-# so a name the dump has no shape for is refused before any file is read.
-SURFACES = ("chains", "quotes", "bars")
+# Every surface this tool knows how to dump. The --surface filter offers exactly these, so
+# a name the dump has no shape for is refused before any file is read. ``paths.SURFACES`` is
+# wider: it carries ``actions`` too, which is derived rather than fetched and so never
+# appears in a cassette. The narrower name follows ``journal.PINNED_SURFACES`` and
+# ``dashboard.PANEL_SURFACES``, which qualify theirs for the same reason.
+DUMPABLE_SURFACES = ("chains", "quotes", "bars")
 # A key whose name contains one of these has its value shown, so epoch-vs-ISO is visible.
 _TIME_HINTS = ("time", "date")
 
@@ -163,9 +169,11 @@ def _dump_bars(body: Mapping[str, object], indent: str) -> list[str]:
     """The bars-surface dump: the top-level fields, then exactly one candle.
 
     The top level is dumped whole rather than listed, unlike the chains dump, because it
-    is three or five keys and it carries everything that is not a candle. That is where
-    ``previousClose`` and ``previousCloseDate`` land when a request asked for them, and
-    where ``empty`` says the window returned nothing.
+    is small and carries everything that is not a candle. ``empty`` says the window
+    returned nothing, and ``schwab-py``'s ``need_previous_close`` documents a previous
+    close reported outside ``candles``. Dumping the whole top level means a field arriving
+    under a name nobody predicted is visible rather than skipped, which matters because no
+    recording from the real vendor exists yet to check any of these names against.
 
     The candle is the first in ``candles``. An empty list is reported as such rather than
     passed over, because an empty window is a real vendor answer this tool has to be able
@@ -235,7 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("path", help="Path to the cassette JSON to inspect.")
     parser.add_argument(
         "--surface",
-        choices=SURFACES,
+        choices=DUMPABLE_SURFACES,
         default=None,
         help="Limit the output to one surface. Defaults to every surface.",
     )

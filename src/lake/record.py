@@ -102,9 +102,16 @@ class BarRequest:
     end: datetime
 
     def __post_init__(self) -> None:
+        if not self.symbol.strip():
+            raise ValueError("symbol is empty")
         require_bar_freq(self.freq)
-        require_utc_bound(self.start, "start")
-        require_utc_bound(self.end, "end")
+        start = require_utc_bound(self.start, "start")
+        end = require_utc_bound(self.end, "end")
+        if start >= end:
+            # Schwab answers a backwards window with the empty shape rather than an error,
+            # so a transposed pair would spend a live request and record "no candles" as
+            # the answer for a window nobody asked for.
+            raise ValueError(f"start {start.isoformat()} is not before end {end.isoformat()}")
 
 
 def record_cassette(
@@ -173,8 +180,14 @@ def build_parser() -> argparse.ArgumentParser:
     request needs a symbol, a frequency and two bounds, and neither bound may be omitted.
     The convention the other flags set, one repeatable flag per endpoint whose value
     encodes the request, extends by making the value comma-separated the way ``--quotes``
-    already is. An ISO instant carries colons and no commas, so the four fields split
-    unambiguously.
+    already is.
+
+    One ISO spelling collides with that separator. ISO 8601 allows a comma as the
+    fractional-second marker and ``datetime.fromisoformat`` accepts it, so
+    ``2026-09-14T09:30:00,500-04:00`` splits into two fields. The refusal names that case
+    rather than only counting fields, because a bound written that way is a real spelling
+    and not a typo. A session bound carries no fractional seconds, so nothing on the
+    intended path meets it.
     """
     parser = argparse.ArgumentParser(
         prog="python -m lake.record",
@@ -241,9 +254,15 @@ def _parse_bar_requests(raw_requests: Sequence[str]) -> list[BarRequest]:
     for raw in raw_requests:
         fields = [field.strip() for field in raw.split(",")]
         if len(fields) != 4:
+            hint = (
+                ". An ISO instant may use a comma for fractional seconds, which splits "
+                "here. Write it with a period, like 2026-09-14T09:30:00.500-04:00."
+                if len(fields) > 4
+                else ""
+            )
             raise ValueError(
                 f"--bars {raw!r} needs four comma-separated fields, SYMBOL,FREQ,START,END, "
-                f"and carries {len(fields)}"
+                f"and carries {len(fields)}{hint}"
             )
         symbol, freq, start_text, end_text = fields
         try:
@@ -265,8 +284,21 @@ def check_out_path(path: str | Path, *, force: bool = False) -> Path:
     ``dump_cassette`` writes whatever path it is given, so a second run against the same
     ``--out`` used to replace the first silently. Refusing by default makes overwriting a
     thing the operator asks for, and ``--force`` is how they ask.
+
+    The directory is checked for the same reason, and it is the half that costs more.
+    ``dump_cassette`` is a plain ``write_text``, so a missing parent raises only once the
+    fetch has already happened. That loses the recording the request just paid for, which
+    is the exact loss the overwrite refusal exists to prevent, arriving through a door the
+    overwrite check does not cover.
     """
     resolved = Path(path)
+    parent = resolved.parent
+    if not parent.is_dir():
+        raise ValueError(
+            f"--out {resolved} names a directory that does not exist, {parent}. "
+            "Create it first, because a recording that cannot be written is a live "
+            "request already spent."
+        )
     if resolved.exists() and not force:
         raise ValueError(
             f"--out {resolved} already exists. A recording costs a live request, so it is "

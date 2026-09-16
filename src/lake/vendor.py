@@ -29,10 +29,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import Protocol, runtime_checkable
 
-# The two bar frequencies the lake captures, spelled the way the roster and the lake
-# layout already spell them. ``onboard.DEFAULT_BARS`` is ``("1m", "1d")`` and
-# ``LakePaths.bars_partition_path`` builds a ``freq=`` level from the same string, so a
-# request, a cassette key, and a partition all name a frequency identically.
+# The two frequencies this seam has a vendor call for, spelled the way the roster and the
+# lake layout already spell them. This is not the set of frequencies the lake supports.
+# ``onboard --bars`` accepts any string and ``TickerConfig.bars`` stores it unvalidated, so
+# a roster is free to carry a frequency nothing here can fetch. What happens to one is the
+# surface's question rather than the seam's.
 MINUTE_FREQ = "1m"
 DAILY_FREQ = "1d"
 BAR_FREQS = (MINUTE_FREQ, DAILY_FREQ)
@@ -66,9 +67,9 @@ def require_utc_bound(when: datetime | None, label: str) -> datetime:
     Every other parameter on this seam follows one rule: a ``None`` is omitted from the
     vendor request. A price-history window cannot follow it, because ``schwab-py``
     substitutes rather than omits. Its ``__normalize_start_and_end_datetimes`` defaults a
-    missing start to 1971-01-01 and a missing end to seven days from now, so a caller
-    passing ``None`` asks for a fifty-five year window instead of asking for nothing. Both
-    bounds are therefore required here.
+    missing start to 1971-01-01 and a missing end to a naive ``utcnow()`` plus seven days,
+    so a caller passing ``None`` asks for a fifty-five year window instead of asking for
+    nothing. Both bounds are therefore required here.
 
     A naive bound is refused for a second reason. ``schwab-py`` converts a bound with
     ``dt.timestamp() * 1000``, which reads a naive datetime in the host's local zone, so
@@ -81,6 +82,11 @@ def require_utc_bound(when: datetime | None, label: str) -> datetime:
     """
     if when is None:
         raise ValueError(f"{label} is required, because the vendor substitutes a window for None")
+    if not isinstance(when, datetime):
+        # A ``date`` has no ``tzinfo``, so reading one would raise ``AttributeError`` and
+        # bury the refusal this function exists to give. ``get_chain``'s bounds on this
+        # same seam are dates, which is exactly the mistake worth naming.
+        raise ValueError(f"{label} must be a datetime, not {type(when).__name__}")
     if when.tzinfo is None or when.utcoffset() is None:
         raise ValueError(f"{label} must be timezone-aware")
     return when.astimezone(UTC)
@@ -99,6 +105,19 @@ def require_bar_freq(freq: str) -> str:
     return freq
 
 
+def _key_instant(when: datetime | None, label: str) -> str:
+    """One bound, rendered for the cassette key at the resolution the wire carries.
+
+    ``schwab-py`` sends a bound as ``int(dt.timestamp() * 1000)``, so the request cannot
+    tell two instants apart below a millisecond. Rendering the key any finer would key two
+    interactions for one request: a bound carrying 400 microseconds and the same bound
+    without them produce the identical ``startDate`` and would still miss each other's
+    recording. Truncating here keeps the key exactly as discriminating as the request.
+    """
+    stamped = require_utc_bound(when, label)
+    return stamped.replace(microsecond=stamped.microsecond // 1000 * 1000).isoformat()
+
+
 def bars_params(
     symbol: str,
     freq: str,
@@ -114,8 +133,9 @@ def bars_params(
     request up by it and the recorder in ``lake.record`` writes by it, so a recording
     cannot key a request the lookup would then miss.
 
-    Both bounds run through ``require_utc_bound``, so they are refused when missing or
-    naive and rendered in UTC when present. Without that normalization
+    Both bounds run through ``_key_instant``, so they are refused when missing or naive,
+    rendered in UTC, and truncated to the millisecond the vendor request carries.
+    Without that normalization
     ``datetime(2026, 9, 14, 13, 30, tzinfo=UTC)`` renders ``2026-09-14T13:30:00+00:00``
     while the identical moment in Eastern renders ``2026-09-14T09:30:00-04:00``. The two
     compare equal as instants and differ as strings, so two callers naming one moment
@@ -128,13 +148,17 @@ def bars_params(
     params: dict = {
         "symbol": symbol,
         "freq": require_bar_freq(freq),
-        "start": require_utc_bound(start, "start").isoformat(),
-        "end": require_utc_bound(end, "end").isoformat(),
+        "start": _key_instant(start, "start"),
+        "end": _key_instant(end, "end"),
     }
+    # Each flag is keyed exactly as given, never coerced. The vendor methods forward it
+    # unchanged, and ``True`` and ``1`` reach Schwab as different query values, so
+    # collapsing them here would let a recording's key assert something its own request
+    # did not ask for.
     if extended_hours is not None:
-        params["extended_hours"] = bool(extended_hours)
+        params["extended_hours"] = extended_hours
     if previous_close is not None:
-        params["previous_close"] = bool(previous_close)
+        params["previous_close"] = previous_close
     return params
 
 

@@ -12,7 +12,7 @@ Both are silent, so both are refused here instead.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 
 import pytest
 
@@ -49,8 +49,20 @@ BARS_BODY = price_history_body("SPY", CANDLES)
 EMPTY_BODY = price_history_body("SPY")
 
 
+# A second symbol, used wherever the forwarding is asserted. With only one symbol in the
+# file, a method that ignored its argument and hardcoded "SPY" would pass every test.
+OTHER_SYMBOL = "QQQ"
+
+_BOTH_FREQS = {
+    ("SPY", MINUTE_FREQ): FakeResponse(200, BARS_BODY),
+    ("SPY", DAILY_FREQ): FakeResponse(200, BARS_BODY),
+    (OTHER_SYMBOL, MINUTE_FREQ): FakeResponse(200, BARS_BODY),
+    (OTHER_SYMBOL, DAILY_FREQ): FakeResponse(200, BARS_BODY),
+}
+
+
 def _client(**kwargs) -> FakeSchwabClient:
-    bars = kwargs.pop("bars", {("SPY", MINUTE_FREQ): FakeResponse(200, BARS_BODY)})
+    bars = kwargs.pop("bars", dict(_BOTH_FREQS))
     return FakeSchwabClient(bars=bars, **kwargs)
 
 
@@ -66,7 +78,7 @@ def test_a_missing_bound_is_refused_rather_than_passed_as_none(label):
     other parameter on this seam does, asks for every candle Schwab holds rather than
     asking for nothing.
     """
-    with pytest.raises(ValueError, match="is required"):
+    with pytest.raises(ValueError, match=f"{label} is required"):
         require_utc_bound(None, label)
 
 
@@ -77,7 +89,7 @@ def test_a_naive_bound_is_refused_rather_than_converted_in_the_host_zone(label):
     A naive bound would therefore mean whatever timezone the capture machine sits in, and
     nothing in the response would say so.
     """
-    with pytest.raises(ValueError, match="timezone-aware"):
+    with pytest.raises(ValueError, match=f"{label} must be timezone-aware"):
         require_utc_bound(datetime(2026, 9, 14, 9, 30), label)
 
 
@@ -116,16 +128,15 @@ def test_both_bounds_are_required_arguments():
 # -- the frequency contract -----------------------------------------------------
 
 
-def test_the_two_frequencies_are_the_ones_the_lake_already_spells():
-    """These strings key a cassette, a roster entry, and a ``freq=`` partition level.
+def test_the_two_frequencies_are_spelled_the_way_the_lake_spells_them():
+    """The two this seam has a call for, pinned by their literal spelling.
 
-    ``onboard.DEFAULT_BARS`` and ``LakePaths.bars_partition_path`` use the same two, so a
-    rename here that missed them would key a request one way and a partition another.
+    This does not claim to be the set of frequencies the lake supports. ``onboard --bars``
+    accepts any string and ``TickerConfig.bars`` stores it unvalidated, so a roster may
+    carry one nothing here can fetch. What happens to such a frequency belongs to whoever
+    builds the surface, not here.
     """
-    from lake.onboard import DEFAULT_BARS
-
     assert BAR_FREQS == (MINUTE_FREQ, DAILY_FREQ) == ("1m", "1d")
-    assert set(BAR_FREQS) == set(DEFAULT_BARS)
 
 
 def test_an_unknown_frequency_is_refused_by_name():
@@ -148,9 +159,50 @@ def test_minute_bars_reach_the_per_minute_client_method():
 
 
 def test_daily_bars_reach_the_per_day_client_method():
-    client = _client(bars={("SPY", DAILY_FREQ): FakeResponse(200, BARS_BODY)})
-    SchwabVendor(client).get_daily_bars("SPY", start=OPEN_ET, end=CLOSE_ET)
+    client = _client()
+    response = SchwabVendor(client).get_daily_bars("SPY", start=OPEN_ET, end=CLOSE_ET)
+    assert client.bar_calls == ["SPY"]
     assert client.bar_freqs == [DAILY_FREQ]
+    assert client.bar_start == [OPEN_UTC]
+    assert client.bar_end == [CLOSE_UTC]
+    assert response.status == 200
+    assert response.body is BARS_BODY
+
+
+@pytest.mark.parametrize("method", ["get_minute_bars", "get_daily_bars"])
+def test_the_symbol_reaches_the_client_rather_than_a_hardcoded_one(method):
+    client = _client()
+    getattr(SchwabVendor(client), method)(OTHER_SYMBOL, start=OPEN_ET, end=CLOSE_ET)
+    assert client.bar_calls == [OTHER_SYMBOL]
+
+
+@pytest.mark.parametrize("method", ["get_minute_bars", "get_daily_bars"])
+def test_the_bounds_reach_the_client_in_utc_not_merely_at_the_right_instant(method):
+    """Two aware datetimes compare equal when they name one instant.
+
+    So asserting ``client.bar_start == OPEN_UTC`` passes for an Eastern-aware value and
+    proves nothing about the conversion. The offset is what has to be asserted.
+    """
+    client = _client()
+    getattr(SchwabVendor(client), method)("SPY", start=OPEN_ET, end=CLOSE_ET)
+    assert client.bar_start[0].utcoffset() == timedelta(0)
+    assert client.bar_end[0].utcoffset() == timedelta(0)
+
+
+@pytest.mark.parametrize("method", ["get_minute_bars", "get_daily_bars"])
+def test_the_window_reaches_the_client_the_way_round_it_was_given(method):
+    """Both methods, because a transposed pair does not raise anywhere.
+
+    Schwab answers a backwards window with the empty shape rather than an error, so a
+    method that swapped its bounds would record "no candles" for every window a caller
+    asked for and nothing would go red. Asserting the frequency alone does not catch it,
+    which is how this went missing on the daily side.
+    """
+    client = _client()
+    getattr(SchwabVendor(client), method)("SPY", start=OPEN_ET, end=CLOSE_ET)
+    assert client.bar_start == [OPEN_UTC]
+    assert client.bar_end == [CLOSE_UTC]
+    assert client.bar_start[0] < client.bar_end[0]
 
 
 def test_neither_flag_is_sent_unless_asked_for():
@@ -166,11 +218,12 @@ def test_neither_flag_is_sent_unless_asked_for():
     assert client.bar_previous_close == [None]
 
 
+@pytest.mark.parametrize("method", ["get_minute_bars", "get_daily_bars"])
 @pytest.mark.parametrize("extended", [True, False])
 @pytest.mark.parametrize("previous", [True, False])
-def test_both_flags_are_forwarded_when_set(extended, previous):
+def test_both_flags_are_forwarded_when_set(method, extended, previous):
     client = _client()
-    SchwabVendor(client).get_minute_bars(
+    getattr(SchwabVendor(client), method)(
         "SPY",
         start=OPEN_ET,
         end=CLOSE_ET,
@@ -179,6 +232,26 @@ def test_both_flags_are_forwarded_when_set(extended, previous):
     )
     assert client.bar_extended_hours == [extended]
     assert client.bar_previous_close == [previous]
+
+
+def test_the_fake_serves_a_response_keyed_by_the_exact_window():
+    """Per-window canned replies, the way the chain fake already keys its narrowing.
+
+    A test driving two windows apart needs distinct bodies for them. The pair key serves
+    every window and the full request tuple serves one, and the tuple is tried first.
+    """
+    first = FakeResponse(200, price_history_body("SPY", CANDLES))
+    second = FakeResponse(200, EMPTY_BODY)
+    client = FakeSchwabClient(
+        bars={
+            ("SPY", MINUTE_FREQ, OPEN_UTC, CLOSE_UTC): first,
+            ("SPY", MINUTE_FREQ): second,
+        }
+    )
+    vendor = SchwabVendor(client)
+    assert vendor.get_minute_bars("SPY", start=OPEN_ET, end=CLOSE_ET).body["empty"] is False
+    later = CLOSE_ET + timedelta(hours=1)
+    assert vendor.get_minute_bars("SPY", start=CLOSE_ET, end=later).body["empty"] is True
 
 
 def test_the_body_comes_back_verbatim():
@@ -241,6 +314,58 @@ def test_the_same_window_named_in_two_zones_keys_one_interaction():
     assert eastern["start"] == "2026-09-14T13:30:00+00:00"
 
 
+def test_two_bounds_the_request_cannot_tell_apart_key_one_interaction():
+    """``schwab-py`` sends ``int(dt.timestamp() * 1000)``, so the wire carries milliseconds.
+
+    A key rendered finer than the request would split one interaction in two: the same
+    bound with and without 400 microseconds produces the identical ``startDate`` and would
+    still miss the other's recording.
+    """
+    coarse = bars_params("SPY", MINUTE_FREQ, start=OPEN_ET, end=CLOSE_ET)
+    fine = bars_params("SPY", MINUTE_FREQ, start=OPEN_ET.replace(microsecond=400), end=CLOSE_ET)
+    assert int(OPEN_ET.timestamp() * 1000) == int(
+        OPEN_ET.replace(microsecond=400).timestamp() * 1000
+    )
+    assert coarse == fine
+
+
+def test_a_millisecond_the_request_can_tell_apart_still_keys_its_own_interaction():
+    """The truncation goes exactly as far as the wire does and no further."""
+    base = bars_params("SPY", MINUTE_FREQ, start=OPEN_ET, end=CLOSE_ET)
+    shifted = bars_params("SPY", MINUTE_FREQ, start=OPEN_ET.replace(microsecond=7000), end=CLOSE_ET)
+    assert base != shifted
+    assert shifted["start"].endswith(".007000+00:00")
+
+
+def test_a_flag_is_keyed_exactly_as_given_never_coerced():
+    """The request forwards the flag unchanged, so the key must not normalize it.
+
+    ``httpx`` renders ``True`` as ``true`` and ``1`` as ``1``, so the two are different
+    requests. Collapsing them in the key would let one recording answer for a request it
+    never made, and a string flag would key the opposite of what it sent.
+    """
+    keyed = bars_params("SPY", MINUTE_FREQ, start=OPEN_ET, end=CLOSE_ET, extended_hours=1)
+    # ``bool(1) == 1`` is True, so equality alone cannot see a coercion. The type has to be
+    # compared too, or putting a ``bool()`` back here would pass every assertion.
+    assert keyed["extended_hours"] == 1
+    assert type(keyed["extended_hours"]) is int
+    flagged = bars_params("SPY", MINUTE_FREQ, start=OPEN_ET, end=CLOSE_ET, extended_hours=True)
+    assert flagged["extended_hours"] is True
+    assert type(flagged["extended_hours"]) is bool
+
+
+@pytest.mark.parametrize("bad", [date(2026, 9, 14), "2026-09-14T09:30:00-04:00"])
+def test_a_bound_that_is_not_a_datetime_is_refused_by_name(bad):
+    """A ``date`` has no ``tzinfo``, and reading one would bury the refusal.
+
+    ``get_chain``'s bounds on this same seam are dates, so handing one to a fixture
+    builder here is the plausible mistake. It reads as a named refusal rather than as an
+    attribute error on a type nobody mentioned.
+    """
+    with pytest.raises(ValueError, match="must be a datetime"):
+        bars_params("SPY", MINUTE_FREQ, start=bad, end=CLOSE_ET)
+
+
 def test_a_flag_left_unset_is_omitted_from_the_key():
     bare = bars_params("SPY", MINUTE_FREQ, start=OPEN_ET, end=CLOSE_ET)
     assert set(bare) == {"symbol", "freq", "start", "end"}
@@ -250,6 +375,8 @@ def test_a_flag_left_unset_is_omitted_from_the_key():
     ("kwargs", "expected"),
     [
         ({"extended_hours": True}, {"extended_hours": True}),
+        ({"extended_hours": False}, {"extended_hours": False}),
+        ({"previous_close": True}, {"previous_close": True}),
         ({"previous_close": False}, {"previous_close": False}),
     ],
 )
@@ -262,8 +389,56 @@ def test_a_flag_that_is_set_keys_its_own_interaction(kwargs, expected):
 
 
 def test_the_key_refuses_a_bad_bound_the_same_way_the_request_does():
-    with pytest.raises(ValueError, match="timezone-aware"):
+    with pytest.raises(ValueError, match="start must be timezone-aware"):
         bars_params("SPY", MINUTE_FREQ, start=datetime(2026, 9, 14, 9, 30), end=CLOSE_ET)
+
+
+def test_the_key_names_whichever_bound_was_bad():
+    """A refusal that named the wrong bound would send an operator to the good one."""
+    with pytest.raises(ValueError, match="end must be timezone-aware"):
+        bars_params("SPY", MINUTE_FREQ, start=OPEN_ET, end=datetime(2026, 9, 14, 16, 0))
+
+
+def test_the_key_refuses_a_frequency_it_has_no_call_for():
+    """``require_bar_freq`` is called here as well as on the request, and both matter.
+
+    A key minted for an unknown frequency records nothing and reaches the replay as a
+    missing recording rather than as a bad argument, which is the outcome the guard's own
+    docstring names.
+    """
+    with pytest.raises(ValueError, match="not one of"):
+        bars_params("SPY", "5m", start=OPEN_ET, end=CLOSE_ET)
+
+
+def test_the_key_keeps_the_seconds_the_caller_named():
+    """The truncation stops at the millisecond, so a window is not rounded to the minute.
+
+    Every bound in this file otherwise lands on a whole minute, which would let a coarser
+    truncation key two genuinely different windows as one.
+    """
+    keyed = bars_params("SPY", MINUTE_FREQ, start=OPEN_ET.replace(second=37), end=CLOSE_ET)["start"]
+    assert keyed == "2026-09-14T13:30:37+00:00"
+
+
+def test_a_tzinfo_that_reports_no_offset_is_refused():
+    """``tzinfo is None`` is only half the check, and the other half had nothing behind it.
+
+    A tzinfo object whose ``utcoffset`` returns ``None`` is aware by the first test and
+    unusable by every later one, including ``astimezone``.
+    """
+
+    class _NoOffset(tzinfo):
+        def utcoffset(self, dt):
+            return None
+
+        def dst(self, dt):
+            return None
+
+        def tzname(self, dt):
+            return "nowhere"
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        require_utc_bound(datetime(2026, 9, 14, 9, 30, tzinfo=_NoOffset()), "start")
 
 
 # -- replay ---------------------------------------------------------------------
@@ -346,6 +521,38 @@ def test_the_cassette_vendor_still_satisfies_the_widened_protocol():
 
 def test_the_schwab_vendor_still_satisfies_the_widened_protocol():
     assert isinstance(SchwabVendor(_client()), Vendor)
+
+
+@pytest.mark.parametrize(
+    ("freq", "method"), [(MINUTE_FREQ, "get_minute_bars"), (DAILY_FREQ, "get_daily_bars")]
+)
+def test_the_replay_serves_each_frequency_from_its_own_recording(freq, method):
+    """The daily replay had no positive test at all, only one asserting it raises."""
+    cassette = Cassette(interactions=bars_interactions("SPY", freq, [(OPEN_ET, CLOSE_ET, CANDLES)]))
+    response = getattr(CassetteVendor(cassette), method)("SPY", start=OPEN_ET, end=CLOSE_ET)
+    assert response.body == BARS_BODY
+
+
+@pytest.mark.parametrize("method", ["get_minute_bars", "get_daily_bars"])
+def test_the_replay_carries_both_flags_into_its_lookup(method):
+    """A flagged recording must answer only a request that asked for the same flags.
+
+    Without this, a replay that dropped the flags from its lookup would serve an
+    extended-hours recording to a caller who asked for the regular session, and the
+    fixture builder's own key would be the thing proving it correct.
+    """
+    freq = MINUTE_FREQ if method == "get_minute_bars" else DAILY_FREQ
+    cassette = Cassette(
+        interactions=bars_interactions(
+            "SPY", freq, [(OPEN_ET, CLOSE_ET, CANDLES)], extended_hours=True
+        )
+    )
+    vendor = CassetteVendor(cassette)
+    served = getattr(vendor, method)("SPY", start=OPEN_ET, end=CLOSE_ET, extended_hours=True)
+    assert served.body == BARS_BODY
+    # The same window without the flag is a different request and must not be served.
+    with pytest.raises(CassetteError):
+        getattr(vendor, method)("SPY", start=OPEN_ET, end=CLOSE_ET)
 
 
 def test_the_cassette_endpoint_name_is_the_lake_surface_name():

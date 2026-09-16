@@ -11,7 +11,7 @@ trip lives in the component tier.
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -235,11 +235,14 @@ def test_a_price_history_request_is_recorded_after_the_chains_and_quotes():
 
 
 @pytest.mark.parametrize("bound", [datetime(2026, 9, 14, 9, 30), None], ids=["naive", "missing"])
-def test_a_bad_bound_is_refused_when_the_request_is_built(bound):
-    # The refusal lands on the request object, before the recorder is called at all, so
-    # a mistyped window never costs a live request.
-    with pytest.raises(ValueError):
-        BarRequest(symbol="SPY", freq="1m", start=bound, end=CLOSE_ET)
+@pytest.mark.parametrize("which", ["start", "end"])
+def test_a_bad_bound_is_refused_when_the_request_is_built(bound, which):
+    # The refusal lands on the request object, before the recorder is called at all, so a
+    # mistyped window never costs a live request. Both bounds are exercised: checking only
+    # `start` would leave a missing or duplicated `end` check invisible.
+    window = {"start": OPEN_ET, "end": CLOSE_ET} | {which: bound}
+    with pytest.raises(ValueError, match=which):
+        BarRequest(symbol="SPY", freq="1m", **window)
 
 
 def test_an_unknown_frequency_is_refused_when_the_request_is_built():
@@ -342,3 +345,141 @@ def test_main_refuses_an_existing_out_path_before_it_loads_any_credentials(tmp_p
     assert "already exists" in capsys.readouterr().err
     # The recording that was already there is untouched.
     assert existing.read_text() == "{}"
+
+
+def test_an_inverted_window_is_refused_when_the_request_is_built():
+    # Schwab answers a backwards window with the empty shape rather than an error, so a
+    # transposed pair spends a live request and records "no candles" for a window nobody
+    # asked for. Neither bound is wrong on its own, so only their order catches it.
+    with pytest.raises(ValueError, match="is not before end"):
+        BarRequest(symbol="SPY", freq="1m", start=CLOSE_ET, end=OPEN_ET)
+
+
+def test_a_zero_length_window_is_refused_too():
+    with pytest.raises(ValueError, match="is not before end"):
+        BarRequest(symbol="SPY", freq="1m", start=OPEN_ET, end=OPEN_ET)
+
+
+@pytest.mark.parametrize("symbol", ["", "   "], ids=["empty", "blank"])
+def test_an_empty_symbol_is_refused_when_the_request_is_built(symbol):
+    with pytest.raises(ValueError, match="symbol is empty"):
+        BarRequest(symbol=symbol, freq="1m", start=OPEN_ET, end=CLOSE_ET)
+
+
+def test_a_transposed_window_on_the_command_line_is_refused_by_name():
+    with pytest.raises(ValueError, match="is not before end"):
+        _parse_bar_requests(["SPY,1m,2026-09-14T16:00:00-04:00,2026-09-14T09:30:00-04:00"])
+
+
+def test_a_comma_written_fractional_second_is_named_rather_than_only_counted():
+    # ISO 8601 allows a comma as the fractional-second marker and fromisoformat accepts
+    # it, so the value splits into five fields. Counting them blames the wrong thing.
+    assert datetime.fromisoformat("2026-09-14T09:30:00,500-04:00").microsecond == 500_000
+    with pytest.raises(ValueError, match="comma for fractional seconds"):
+        _parse_bar_requests(["SPY,1m,2026-09-14T09:30:00,500-04:00,2026-09-14T16:00:00-04:00"])
+
+
+def test_an_out_path_whose_directory_is_missing_is_refused_before_the_request(tmp_path):
+    # dump_cassette is a plain write_text, so a missing parent raises only after the fetch
+    # has happened. That loses the recording the live request just paid for, which is the
+    # same loss the overwrite refusal exists to prevent.
+    with pytest.raises(ValueError, match="directory that does not exist"):
+        check_out_path(tmp_path / "recordings" / "spy.json")
+
+
+def test_force_does_not_conjure_a_missing_directory(tmp_path):
+    # --force answers "replace what is there", never "write somewhere that cannot hold it".
+    with pytest.raises(ValueError, match="directory that does not exist"):
+        check_out_path(tmp_path / "recordings" / "spy.json", force=True)
+
+
+def test_a_checked_out_path_is_one_dump_cassette_can_actually_write(tmp_path):
+    # The property the refusal exists for, asserted by executing the write rather than by
+    # reading the check.
+    from lake.cassette import Cassette, dump_cassette
+
+    target = check_out_path(tmp_path / "spy.json")
+    dump_cassette(Cassette(interactions=()), target)
+    assert target.exists()
+
+
+def test_main_refuses_a_missing_out_directory_before_it_loads_any_credentials(tmp_path, capsys):
+    with pytest.raises(SystemExit) as caught:
+        main(["--out", str(tmp_path / "recordings" / "spy.json")])
+    assert caught.value.code == 2
+    assert "directory that does not exist" in capsys.readouterr().err
+
+
+def test_the_recorder_asks_the_vendor_for_the_window_it_records(tmp_path):
+    """The round trip through the replay only proves the key matches the key.
+
+    If the fetch swapped its bounds while the key kept them the way round the caller named
+    them, the cassette would answer for a window the vendor was never asked about, and the
+    replay would agree with itself forever. The fake client's own record is the only thing
+    that sees it.
+    """
+    client = _bars_client()
+    record_cassette(
+        FAKE_KEY, FAKE_SECRET, bar_requests=[_minute_request()], vendor_factory=_factory(client)
+    )
+    assert client.bar_start == [OPEN_ET.astimezone(UTC)]
+    assert client.bar_end == [CLOSE_ET.astimezone(UTC)]
+    assert client.bar_start[0] < client.bar_end[0]
+
+
+def test_a_daily_recording_replays_through_the_daily_method():
+    """A recording keyed with the wrong frequency can never be found again.
+
+    The daily test asserted only which client method was reached and threw the cassette
+    away, so a recorder that keyed every window as ``1m`` looked correct.
+    """
+    cassette = record_cassette(
+        FAKE_KEY,
+        FAKE_SECRET,
+        bar_requests=[BarRequest(symbol="SPY", freq="1d", start=OPEN_ET, end=CLOSE_ET)],
+        vendor_factory=_factory(_bars_client()),
+    )
+    assert (
+        CassetteVendor(cassette).get_daily_bars("SPY", start=OPEN_ET, end=CLOSE_ET).body
+        == BARS_BODY
+    )
+
+
+def test_every_requested_window_is_recorded_not_only_the_first():
+    # A recorder that dropped windows after the first would spend the operator's requests
+    # and silently return a short cassette, which is the same loss the --out refusal exists
+    # to prevent.
+    later = BarRequest(symbol="SPY", freq="1m", start=CLOSE_ET, end=CLOSE_ET + timedelta(hours=1))
+    cassette = record_cassette(
+        FAKE_KEY,
+        FAKE_SECRET,
+        bar_requests=[_minute_request(), later],
+        vendor_factory=_factory(_bars_client()),
+    )
+    assert [i.endpoint for i in cassette.interactions] == ["bars", "bars"]
+    assert cassette.interactions[0].params["start"] != cassette.interactions[1].params["start"]
+
+
+def test_every_bars_value_on_the_command_line_is_parsed_not_only_the_first():
+    parsed = _parse_bar_requests(
+        [
+            "SPY,1m,2026-09-14T09:30:00-04:00,2026-09-14T16:00:00-04:00",
+            "QQQ,1d,2026-09-14T09:30:00-04:00,2026-09-14T16:00:00-04:00",
+        ]
+    )
+    assert [(r.symbol, r.freq) for r in parsed] == [("SPY", "1m"), ("QQQ", "1d")]
+
+
+def test_a_bars_value_is_trimmed_the_way_a_quotes_value_is():
+    # --quotes trims its symbols and has a test for it. Without the same here, an operator
+    # writing "SPY, 1m, ..." gets " 1m" refused as an unknown frequency.
+    assert _parse_bar_requests(
+        [" SPY , 1m , 2026-09-14T09:30:00-04:00 , 2026-09-14T16:00:00-04:00 "]
+    ) == [_minute_request()]
+
+
+def test_a_value_with_too_many_fields_is_refused_by_the_named_line():
+    # A `< 4` check would let five fields reach the unpack and raise a bare "too many
+    # values to unpack", which names neither the flag nor the value.
+    with pytest.raises(ValueError, match="four comma-separated fields"):
+        _parse_bar_requests(["SPY,1m,2026-09-14T09:30:00-04:00,2026-09-14T16:00:00-04:00,extra"])

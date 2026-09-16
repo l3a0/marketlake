@@ -2,8 +2,8 @@
 
 Every test here builds a synthetic cassette or reuses the checked-in minimal one. The
 inspector runs fully offline, so no network and no ``schwab-py`` are involved. The
-fixtures cover the three cases the tool must handle: a quotes interaction, a chains
-interaction, and a gateway fault.
+fixtures cover the four cases the tool must handle: a quotes interaction, a chains
+interaction, a bars interaction, and a gateway fault.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import pytest
 
 from lake import inspect_cassette as inspect_module
 from lake.cassette import Cassette, Interaction, dump_cassette
-from lake.inspect_cassette import SURFACES, inspect_cassette, main
+from lake.inspect_cassette import DUMPABLE_SURFACES, inspect_cassette, main
 
 CASSETTES = Path(__file__).resolve().parents[1] / "cassettes"
 
@@ -231,6 +231,48 @@ def test_the_command_line_still_refuses_a_name_the_dump_has_no_shape_for(tmp_pat
 def test_the_offered_surfaces_are_the_ones_the_dump_can_shape():
     # A name in the choices with no dump behind it would print <unknown surface: ...>,
     # which is exactly the failure this issue closed for bars.
-    assert set(SURFACES) == {"chains", "quotes", "bars"}
-    for surface in SURFACES:
+    assert set(DUMPABLE_SURFACES) == {"chains", "quotes", "bars"}
+    for surface in DUMPABLE_SURFACES:
         assert f"``{surface}``" in inspect_module.__doc__
+
+
+def test_the_dumpable_surfaces_are_narrower_than_the_lakes_own_list():
+    """``actions`` is a lake surface and never a cassette interaction.
+
+    It is derived from sealed quotes rather than fetched, so no vendor call keys one. The
+    narrower name says which surfaces this tool can dump rather than how many exist,
+    following ``journal.PINNED_SURFACES`` and ``dashboard.PANEL_SURFACES``.
+    """
+    from lake.paths import ACTIONS, SURFACES
+
+    assert set(DUMPABLE_SURFACES) < set(SURFACES)
+    assert set(SURFACES) - set(DUMPABLE_SURFACES) == {ACTIONS}
+
+
+def test_a_candle_that_is_not_a_mapping_is_reported_rather_than_crashing():
+    output = inspect_cassette(_bars_cassette({"candles": ["not-a-candle"], "symbol": "SPY"}))
+    assert "<not a candle: str>" in output
+
+
+def test_a_string_candles_value_is_reported_rather_than_walked_character_by_character():
+    # A str is a Sequence, so without the explicit exclusion its first character would be
+    # dumped as if it were a candle.
+    output = inspect_cassette(_bars_cassette({"candles": "nope", "symbol": "SPY"}))
+    assert "<not a list: str>" in output
+
+
+def test_the_candle_list_is_not_repeated_in_the_top_level_dump():
+    # The top level is everything that is not a candle, so a `candles: list` line there
+    # would say nothing and would contradict what the dump promises.
+    output = inspect_cassette(_bars_cassette())
+    assert "candles: list" not in output
+    assert "keys: candles, symbol, empty" in output
+
+
+def test_the_candle_fields_are_nested_under_the_candle_header():
+    # A flat dump would read as if the candle's fields were top-level body fields.
+    lines = inspect_cassette(_bars_cassette()).splitlines()
+    header = next(i for i, line in enumerate(lines) if line.strip().startswith("candle ["))
+    field = next(i for i, line in enumerate(lines) if line.strip().startswith("open:"))
+    indent = lambda i: len(lines[i]) - len(lines[i].lstrip())  # noqa: E731
+    assert indent(field) > indent(header)

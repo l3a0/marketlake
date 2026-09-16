@@ -260,7 +260,6 @@ def bars_interactions(
     *,
     extended_hours: bool | None = None,
     previous_close: bool | None = None,
-    status: int = 200,
 ) -> tuple[Interaction, ...]:
     """Record one price-history interaction per window.
 
@@ -283,7 +282,7 @@ def bars_interactions(
                 extended_hours=extended_hours,
                 previous_close=previous_close,
             ),
-            status=status,
+            status=200,
             body=price_history_body(symbol, candles),
         )
         for start, end, candles in windows
