@@ -41,7 +41,14 @@ from __future__ import annotations
 import pyarrow as pa
 import pytest
 
-from lake import journal
+from lake import journal, paths
+
+# A surface the lake lays out a directory for and this module pins no capture schema for,
+# which is what these tests need a stand-in for. It was ``bars`` until marketlake #336
+# pinned one. ``actions`` is a single append-only ledger rather than a measurement, so it
+# has no capture schema to pin, but the right response to this going stale again is to
+# repoint it rather than to assume it cannot.
+UNPINNED_SURFACE = paths.ACTIONS
 
 # The column-name-to-type mapping of every pinned surface, per schema version. Types are
 # spelled the way pyarrow renders them, so ``pa.float64()`` reads as ``double``. Each
@@ -204,6 +211,183 @@ RECORDED_FINGERPRINTS: dict[int, dict[str, dict[str, str]]] = {
             "extra": "string",
         },
     },
+    # Version 2 pins ``bars``. Chains and quotes are version 1's entries copied verbatim,
+    # which is what this file's own note says a bump that leaves a surface's columns alone
+    # calls for. ``test_the_bump_that_pinned_bars_left_the_capture_surfaces_alone`` below
+    # compares the two copies, so a typo in one of them fails rather than passing as a
+    # shape change nobody made.
+    2: {
+        journal.CHAINS_SURFACE: {
+            "snap_ts": "string",
+            "fetch_ts": "string",
+            "fetch_end_ts": "string",
+            "vendor_quote_ts": "string",
+            "ticker": "string",
+            "occ_symbol": "string",
+            "put_call": "string",
+            "bid": "double",
+            "ask": "double",
+            "last": "double",
+            "bid_size": "int64",
+            "ask_size": "int64",
+            "last_size": "int64",
+            "bid_ask_size": "string",
+            "open_interest": "int64",
+            "volume": "int64",
+            "open_price": "double",
+            "high_price": "double",
+            "low_price": "double",
+            "close_price": "double",
+            "mark": "double",
+            "mark_change": "double",
+            "mark_percent_change": "double",
+            "net_change": "double",
+            "percent_change": "double",
+            "volatility": "double",
+            "delta": "double",
+            "gamma": "double",
+            "theta": "double",
+            "vega": "double",
+            "rho": "double",
+            "theoretical_option_value": "double",
+            "theoretical_volatility": "double",
+            "intrinsic_value": "double",
+            "extrinsic_value": "double",
+            "time_value": "double",
+            "break_even": "double",
+            "high_52_week": "double",
+            "low_52_week": "double",
+            "strike_price": "double",
+            "multiplier": "double",
+            "days_to_expiration": "int64",
+            "expiration_date": "string",
+            "expiration_type": "string",
+            "exercise_type": "string",
+            "settlement_type": "string",
+            "option_root": "string",
+            "deliverable_note": "string",
+            "description": "string",
+            "exchange_name": "string",
+            "option_deliverables_list": "string",
+            "in_the_money": "bool",
+            "non_standard": "bool",
+            "mini": "bool",
+            "penny_pilot": "bool",
+            "ssid": "int64",
+            "last_trading_day": "int64",
+            "trade_time": "int64",
+            "interest_rate": "double",
+            "underlying_price": "double",
+            "dividend_yield": "double",
+            "is_delayed": "bool",
+            "is_chain_truncated": "bool",
+            "number_of_contracts": "int64",
+            "row_kind": "string",
+            "error_class": "string",
+            "suspect": "bool",
+            "close_tag": "string",
+            "session_phase": "string",
+            "schema_version": "int64",
+            "extra": "string",
+            "window_start": "string",
+            "window_end": "string",
+        },
+        journal.QUOTES_SURFACE: {
+            "snap_ts": "string",
+            "fetch_ts": "string",
+            "fetch_end_ts": "string",
+            "vendor_quote_ts": "string",
+            "ticker": "string",
+            "bid": "double",
+            "ask": "double",
+            "last": "double",
+            "bid_size": "int64",
+            "ask_size": "int64",
+            "last_size": "int64",
+            "bid_mic_id": "string",
+            "ask_mic_id": "string",
+            "last_mic_id": "string",
+            "bid_time": "int64",
+            "ask_time": "int64",
+            "trade_time": "int64",
+            "high_price": "double",
+            "low_price": "double",
+            "open_price": "double",
+            "close_price": "double",
+            "mark": "double",
+            "mark_change": "double",
+            "mark_percent_change": "double",
+            "net_change": "double",
+            "net_percent_change": "double",
+            "post_market_change": "double",
+            "post_market_percent_change": "double",
+            "total_volume": "int64",
+            "volatility": "double",
+            "week_52_high": "double",
+            "week_52_low": "double",
+            "security_status": "string",
+            "realtime": "bool",
+            "cusip": "string",
+            "div_pay_amount": "double",
+            "div_ex_date": "string",
+            "div_amount": "double",
+            "div_freq": "int64",
+            "declaration_date": "string",
+            "next_div_ex_date": "string",
+            "next_div_pay_date": "string",
+            "div_pay_date": "string",
+            "div_yield": "double",
+            "pe_ratio": "double",
+            "eps": "double",
+            "high_52": "double",
+            "low_52": "double",
+            "avg_10_days_volume": "double",
+            "avg_1_year_volume": "double",
+            "last_earnings_date": "string",
+            "fund_leverage_factor": "double",
+            "shares_outstanding": "int64",
+            "regular_market_last_price": "double",
+            "regular_market_last_size": "int64",
+            "regular_market_net_change": "double",
+            "regular_market_percent_change": "double",
+            "regular_market_trade_time": "int64",
+            "extended_last_price": "double",
+            "extended_bid_price": "double",
+            "extended_ask_price": "double",
+            "extended_bid_size": "int64",
+            "extended_ask_size": "int64",
+            "extended_last_size": "int64",
+            "extended_mark": "double",
+            "extended_quote_time": "int64",
+            "extended_trade_time": "int64",
+            "extended_total_volume": "int64",
+            "row_kind": "string",
+            "error_class": "string",
+            "suspect": "bool",
+            "close_tag": "string",
+            "session_phase": "string",
+            "schema_version": "int64",
+            "extra": "string",
+        },
+        journal.BARS_SURFACE: {
+            "bar_ts": "string",
+            "fetch_ts": "string",
+            "fetch_end_ts": "string",
+            "ticker": "string",
+            "instrument_id": "int64",
+            "freq": "string",
+            "open": "double",
+            "high": "double",
+            "low": "double",
+            "close": "double",
+            "volume": "int64",
+            "window_start": "string",
+            "window_end": "string",
+            "extended_hours": "bool",
+            "schema_version": "int64",
+            "extra": "string",
+        },
+    },
 }
 
 
@@ -259,20 +443,107 @@ def test_recorded_versions_are_positive_and_start_at_one():
     assert sorted(RECORDED_FINGERPRINTS) == list(range(1, len(RECORDED_FINGERPRINTS) + 1))
 
 
-def test_every_recorded_version_covers_every_pinned_surface():
-    """The set covered is enumerated, so a surface added to one half and not the other fails.
+def test_the_pinned_set_is_enumerated_rather_than_assumed():
+    """A surface added to one half and not the other fails here.
 
-    ``journal.PINNED_SURFACES`` is the module's own schema map, so this compares the
-    record against the code rather than against a second hand-written list.
+    The tuple goes against the module's own schema map first, so a surface added to the map
+    and not to the tuple fails. Then the tuple is spelled out, so the set is enumerated
+    rather than assumed. The first alone would pass a hand-written tuple that happens to
+    match, and the second alone would pass a surface added to neither.
     """
-    # The tuple against the module's own schema map, so a surface added to the map and not
-    # to the tuple fails. Then the tuple spelled out, so the set covered is enumerated
-    # rather than assumed. The first alone would pass a hand-written tuple that happens to
-    # match, and the second alone would pass a surface added to neither.
     assert journal.PINNED_SURFACES == tuple(journal._SCHEMAS)
-    assert journal.PINNED_SURFACES == (journal.CHAINS_SURFACE, journal.QUOTES_SURFACE)
+    assert journal.PINNED_SURFACES == (
+        journal.CHAINS_SURFACE,
+        journal.QUOTES_SURFACE,
+        journal.BARS_SURFACE,
+    )
+
+
+def test_the_newest_version_covers_every_pinned_surface():
+    """The running shape is recorded in full, so no pinned surface is recorded nowhere.
+
+    Only the newest version is held to this. An older version covers the surfaces that
+    existed when it was minted, which is what makes the record an honest history rather
+    than a running total. Version 1 knew two surfaces and version 2 knows three.
+    """
+    newest = max(RECORDED_FINGERPRINTS)
+    assert tuple(RECORDED_FINGERPRINTS[newest]) == journal.PINNED_SURFACES
+
+
+# The version each surface was first recorded under. Spelled out, because it is the one
+# fact about the record's history that nothing else can derive: the schemas say what a
+# surface is now, and the growth rule below says the set never shrinks, but neither can tell
+# a surface added at version N from one silently deleted from N-1.
+FIRST_RECORDED_AT = {
+    journal.CHAINS_SURFACE: 1,
+    journal.QUOTES_SURFACE: 1,
+    journal.BARS_SURFACE: 2,
+}
+
+
+def test_each_surface_first_appears_at_the_version_that_pinned_it():
+    """A surface's debut is fixed, so an earlier version's entry cannot be edited out.
+
+    The growth rule below is not enough on its own once a third version exists. Deleting
+    bars from version 2 while version 3 carries them leaves every set still growing pairwise
+    and every other rule here satisfied, and it is a false history: rows stamped 2 would read
+    back through a ledger with no version-2 bars shape, so the projection fills nothing and
+    the loader refuses. Pinning the debut is what catches that, and it is the assertion this
+    file's own "do not edit the entry of a version already recorded here" needs to mean
+    something.
+    """
+    assert set(FIRST_RECORDED_AT) == set(journal.PINNED_SURFACES)
+    for surface, first in FIRST_RECORDED_AT.items():
+        debut = min(
+            version for version, surfaces in RECORDED_FINGERPRINTS.items() if surface in surfaces
+        )
+        assert debut == first, (surface, debut, first)
+
+
+def test_a_version_never_drops_a_surface_an_earlier_one_recorded():
+    """The surface set grows up the sequence and never shrinks.
+
+    This is what the old whole-sequence rule was really protecting. A surface recorded at
+    version N and missing at N+1 would leave rows at N+1 with no recorded shape while the
+    surface plainly still exists, and ``has_column`` would answer false for every column of
+    it. Growth is checked pair by pair rather than against the newest, so a surface dropped
+    in the middle of the sequence and restored at the top still fails.
+    """
+    versions = sorted(RECORDED_FINGERPRINTS)
+    for lower, upper in zip(versions, versions[1:], strict=False):
+        below = set(RECORDED_FINGERPRINTS[lower])
+        above = set(RECORDED_FINGERPRINTS[upper])
+        assert below <= above, (lower, upper, sorted(below - above))
+
+
+def test_no_version_records_a_surface_the_code_no_longer_pins():
+    """A recorded surface that is not pinned would be a shape nothing can derive again."""
+    pinned = set(journal.PINNED_SURFACES)
     for version, surfaces in RECORDED_FINGERPRINTS.items():
-        assert tuple(surfaces) == journal.PINNED_SURFACES, version
+        assert set(surfaces) <= pinned, (version, sorted(set(surfaces) - pinned))
+
+
+def test_version_one_does_not_claim_it_captured_bars():
+    """The retroactive claim this file's own note refuses, stated as an assertion.
+
+    Adding bars to version 1's entry would make every row already written at version 1 say
+    the code that wrote it knew a surface that did not exist. The entry cannot be read back
+    off anything, so nothing else in the suite would notice.
+    """
+    assert journal.BARS_SURFACE not in RECORDED_FINGERPRINTS[1]
+    assert tuple(RECORDED_FINGERPRINTS[1]) == (journal.CHAINS_SURFACE, journal.QUOTES_SURFACE)
+
+
+def test_the_bump_that_pinned_bars_left_the_capture_surfaces_alone():
+    """Version 2's chains and quotes are version 1's, copied verbatim.
+
+    The copy is what this file's own note calls for when a bump leaves a surface's columns
+    alone. Comparing the two copies is what keeps the duplication honest: a typo in either
+    one reads as a shape change nobody made, and version 1 is compared against nothing else
+    in the suite.
+    """
+    for surface in (journal.CHAINS_SURFACE, journal.QUOTES_SURFACE):
+        assert RECORDED_FINGERPRINTS[2][surface] == RECORDED_FINGERPRINTS[1][surface], surface
 
 
 @pytest.mark.parametrize("surface", journal.PINNED_SURFACES)
@@ -376,8 +647,8 @@ def test_the_drift_report_says_none_rather_than_an_empty_list():
 
 def test_unknown_surface_raises():
     """The fingerprint inherits the loud failure ``schema_for`` already gives."""
-    with pytest.raises(ValueError, match="unknown surface 'bars'"):
-        journal.schema_fingerprint("bars")
+    with pytest.raises(ValueError, match=f"unknown surface '{UNPINNED_SURFACE}'"):
+        journal.schema_fingerprint(UNPINNED_SURFACE)
 
 
 # -- what counts as a change, defined once ------------------------------------

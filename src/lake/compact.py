@@ -1174,7 +1174,10 @@ def _seal(
     #
     # ``schema_for`` raises on a surface it does not know, and that raise is reachable
     # from neither caller. Both build the partition path first, and ``partition_path``
-    # refuses exactly the surfaces the schemas have no entry for.
+    # accepts a narrower set than the schemas do: it takes chains and quotes, and the
+    # schemas cover those two plus ``bars``, which is pinned and never journaled. So a
+    # surface that gets past the path always has a schema. The two sets were equal until
+    # bars were pinned, which is why this now names the direction rather than an equality.
     pinned = journal.schema_for(surface)
     merged = _pinned_order(merged, pinned)
     carries_pinned = merged.schema.equals(pinned)

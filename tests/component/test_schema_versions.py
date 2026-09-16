@@ -21,7 +21,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from lake import journal
+from lake import journal, paths
 from lake.lock import lake_lock
 from lake.manifest import latest_entries, read_manifest, scrub
 from lake.paths import TEMP_MARKER
@@ -47,6 +47,10 @@ from tests.support.config import write_config
 
 NOW = datetime(2026, 9, 13, 15, 0, tzinfo=UTC)  # 11:00 ET
 LATER = datetime(2026, 10, 1, 15, 0, tzinfo=UTC)
+
+# A surface the lake lays out a directory for and ``journal`` pins no capture schema for,
+# so the ledger can never hold a shape for it.
+UNPINNED_SURFACE = paths.ACTIONS
 
 
 def _record(lake_root: Path, when: datetime = NOW):
@@ -125,6 +129,64 @@ def test_the_first_run_writes_one_row_per_surface_column_derived_from_the_schema
     assert report.rows == len(rows)
 
 
+def test_the_running_version_records_a_shape_for_the_surface_nothing_journals(lake_root):
+    """Bars are pinned and never journaled, and the ledger records them anyway.
+
+    ``journal_schema_version`` names the version the code was running, and ``bars`` rows
+    stamp that same integer despite never reaching a segment. So the ledger has to carry the
+    bars shape under it, or a bars row's own version would point at a record that does not
+    describe its surface and ``project_extra`` would have nothing to lift against.
+    """
+    _record(lake_root)
+
+    recorded = SchemaVersionLedger.read(ledger_path(lake_root)).get(journal.SCHEMA_VERSION)
+    assert recorded is not None
+    assert set(recorded.fingerprints) == set(journal.PINNED_SURFACES)
+    assert recorded.fingerprints[journal.BARS_SURFACE] == journal.schema_fingerprint(
+        journal.BARS_SURFACE
+    )
+    assert recorded.has_column(journal.BARS_SURFACE, "bar_ts") is True
+    assert recorded.has_column(journal.BARS_SURFACE, "open") is True
+    assert recorded.has_column(journal.BARS_SURFACE, "row_kind") is False
+
+
+def test_the_ledger_a_journal_bump_writes_keeps_the_earlier_version_two_surfaces_wide(
+    lake_root, monkeypatch
+):
+    """A bump moves the recorded surface set forward without rewriting what came before.
+
+    This is the live shape of the version line this surface joined. The version below knows
+    the surfaces that existed when it was minted, and the version above knows one more. A
+    reader asking whether a row's own version carried a column gets the right answer on both
+    sides, which is the whole reason bars were not recorded under the earlier version.
+    """
+    base = journal.SCHEMA_VERSION
+    narrowed = {
+        surface: schema
+        for surface, schema in journal._SCHEMAS.items()
+        if surface != journal.BARS_SURFACE
+    }
+    monkeypatch.setattr(journal, "_SCHEMAS", narrowed)
+    monkeypatch.setattr(journal, "PINNED_SURFACES", tuple(narrowed))
+    monkeypatch.setattr(journal, "SCHEMA_VERSION", base - 1)
+    _record(lake_root)
+    monkeypatch.undo()
+
+    report = _record(lake_root, LATER)
+
+    assert report.already_recorded is False
+    assert report.versions == (base - 1, base)
+    ledger = SchemaVersionLedger.read(ledger_path(lake_root))
+    below, above = ledger.get(base - 1), ledger.get(base)
+    assert below is not None and above is not None
+    assert set(below.fingerprints) == {journal.CHAINS_SURFACE, journal.QUOTES_SURFACE}
+    assert set(above.fingerprints) == set(journal.PINNED_SURFACES)
+    assert below.has_column(journal.BARS_SURFACE, "bar_ts") is False
+    assert above.has_column(journal.BARS_SURFACE, "bar_ts") is True
+    assert below.fingerprints[journal.CHAINS_SURFACE] == above.fingerprints[journal.CHAINS_SURFACE]
+    assert scrub(lake_root).ok
+
+
 def test_the_ledger_answers_whether_a_version_carried_a_column(lake_root):
     # This is the question the ledger exists for. A null under a column the version never
     # had was never observed, where a null under a column it did have is a vendor null.
@@ -133,7 +195,11 @@ def test_the_ledger_answers_whether_a_version_carried_a_column(lake_root):
     assert recorded is not None
     assert recorded.has_column(journal.CHAINS_SURFACE, "bid") is True
     assert recorded.has_column(journal.CHAINS_SURFACE, "no_such_column") is False
-    assert recorded.has_column("bars", "bid") is False
+    # A surface the running version covers where the column does not belong to it, and a
+    # surface the version does not cover at all. Both read false, and each asks a different
+    # question: the first is a column bars never had, the second a surface nothing pins.
+    assert recorded.has_column(journal.BARS_SURFACE, "bid") is False
+    assert recorded.has_column(UNPINNED_SURFACE, "bid") is False
 
 
 def test_a_reader_answers_the_same_question_in_plain_sql(lake_root):

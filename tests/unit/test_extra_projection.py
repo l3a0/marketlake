@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 import pyarrow as pa
 import pytest
 
-from lake import journal
+from lake import journal, paths
 from lake.extra_projection import (
     EXTRA_COLUMN,
     VERSION_COLUMN,
@@ -28,6 +28,13 @@ from lake.extra_projection import (
     project_extra,
 )
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger
+
+# A surface the lake lays out a directory for and this module pins no capture schema for,
+# which is what these tests need a stand-in for. It was ``bars`` until marketlake #336
+# pinned one. ``actions`` is a single append-only ledger rather than a measurement, so it
+# has no capture schema to pin, but the right response to this going stale again is to
+# repoint it rather than to assume it cannot.
+UNPINNED_SURFACE = paths.ACTIONS
 
 RECORDED_AT = datetime(2026, 9, 13, 15, 0, tzinfo=UTC)
 
@@ -1349,4 +1356,76 @@ def test_an_unknown_surface_refuses():
     table = _rows(_row(1, None))
 
     with pytest.raises(ValueError, match="unknown surface"):
-        project_extra(table, surface="bars", ledger=SchemaVersionLedger())
+        project_extra(table, surface=UNPINNED_SURFACE, ledger=SchemaVersionLedger())
+
+
+# -- the bars surface ---------------------------------------------------------
+
+# A bars row narrowed the same way ``ROW_SCHEMA`` narrows a journal row: the two columns
+# the projection reads, plus whichever one it is filling.
+BARS_ROW_SCHEMA = pa.schema(
+    [
+        ("ticker", pa.string()),
+        (VERSION_COLUMN, pa.int64()),
+        (EXTRA_COLUMN, pa.string()),
+    ]
+)
+
+
+def _bars_shape_without(*columns: str) -> dict[str, dict[str, str]]:
+    """The running shape with ``columns`` gone from bars, which is a version below a promotion."""
+    return _shape_without(journal.BARS_SURFACE, *columns)
+
+
+def test_a_bars_table_projects_a_candle_field_out_of_the_overflow():
+    """The ``extra`` decision, exercised rather than asserted.
+
+    Carrying the column is what makes a vendor map that turns out short recoverable. A
+    field captured into the overflow below a promotion reads as its column above it, on
+    this surface exactly as on the two capture surfaces.
+    """
+    table = _rows(_row(1, {"volume": 1450000}), schema=BARS_ROW_SCHEMA)
+    assert "volume" not in table.column_names
+
+    result = project_extra(
+        table, surface=journal.BARS_SURFACE, ledger=_ledger((1, _bars_shape_without("volume")))
+    )
+
+    assert result.table.column("volume").to_pylist() == [1450000]
+    assert result.table.schema.field("volume").type == pa.int64()
+    assert result.filled == {"volume": 1}
+    assert result.complete
+
+
+def test_a_bars_table_reports_a_candle_field_its_column_refused():
+    """The retype signature reads the same on bars, which is the other half of the column.
+
+    A value beside a column the row's own version already carried says the parser routed
+    it there after the column refused it. Nothing is lifted and the read says so.
+    """
+    table = _rows(_row(2, {"volume": "n/a"}), schema=BARS_ROW_SCHEMA)
+
+    result = project_extra(table, surface=journal.BARS_SURFACE, ledger=_ledger((2, _shape())))
+
+    assert [(r.column, r.schema_version) for r in result.retyped] == [("volume", 2)]
+    assert result.filled == {}
+    assert not result.complete
+
+
+def test_a_bars_table_lifts_nothing_into_a_column_no_vendor_field_reaches():
+    """A key naming a fetch-provenance column is not lifted, because no path names one.
+
+    ``extended_hours`` is a request parameter rather than a vendor field, so a key of that
+    name in an overflow is not a value the vendor sent and the projection leaves it there.
+    A path to it would manufacture one.
+    """
+    table = _rows(_row(1, {"extended_hours": True}), schema=BARS_ROW_SCHEMA)
+
+    result = project_extra(
+        table,
+        surface=journal.BARS_SURFACE,
+        ledger=_ledger((1, _bars_shape_without("extended_hours"))),
+    )
+
+    assert "extended_hours" not in result.table.column_names
+    assert result.filled == {}

@@ -8,14 +8,24 @@ vendor-field mapping, the fail-open overflow, and the gap-row nulling.
 from __future__ import annotations
 
 import json
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
-from lake import journal
+from lake import journal, paths
+from lake.vendor import BARS_ENDPOINT
 from tests.support.lake import FixtureLake
+
+# A surface the lake lays out a directory for and this module pins no capture schema for,
+# which is what these tests need a stand-in for. It was ``bars`` until marketlake #336
+# pinned one. ``actions`` is a single append-only ledger rather than a measurement, so it
+# has no capture schema to pin, but the right response to this going stale again is to
+# repoint it rather than to assume it cannot.
+UNPINNED_SURFACE = paths.ACTIONS
 
 # The two synthetic per-contract quote times, as epoch milliseconds. The call and the
 # put carry different stamps so the per-contract derivation is observable. Each row's
@@ -891,7 +901,7 @@ def test_a_caller_editing_the_paths_it_got_back_changes_nothing():
 
 def test_extra_paths_rejects_an_unknown_surface():
     with pytest.raises(ValueError, match="unknown surface"):
-        journal.extra_paths("bars")
+        journal.extra_paths(UNPINNED_SURFACE)
 
 
 def test_a_surface_pinned_without_vendor_maps_refuses_by_name(monkeypatch):
@@ -901,10 +911,10 @@ def test_a_surface_pinned_without_vendor_maps_refuses_by_name(monkeypatch):
     to come from here, and it has to name the surface rather than surfacing a bare
     ``KeyError`` from a lookup the caller cannot see.
     """
-    monkeypatch.setitem(journal._SCHEMAS, "bars", journal.QUOTES_SCHEMA)
+    monkeypatch.setitem(journal._SCHEMAS, UNPINNED_SURFACE, journal.QUOTES_SCHEMA)
 
-    with pytest.raises(ValueError, match="bars.*no vendor maps"):
-        journal.extra_paths("bars")
+    with pytest.raises(ValueError, match=f"{UNPINNED_SURFACE}.*no vendor maps"):
+        journal.extra_paths(UNPINNED_SURFACE)
 
 
 def test_a_vendor_field_added_to_a_map_is_projectable_with_no_second_edit(monkeypatch):
@@ -919,6 +929,228 @@ def test_a_vendor_field_added_to_a_map_is_projectable_with_no_second_edit(monkey
 
     assert journal.extra_paths("chains")["sigma_score"] == journal.ExtraPath(None, "sigmaScore")
     assert journal.extra_paths("quotes")["sigma_score"] == journal.ExtraPath("quote", "sigmaScore")
+
+
+# -- the bars surface --------------------------------------------------------
+
+
+def test_bars_are_pinned_and_reachable_by_name():
+    """The surface has a schema and joins the pinned tuple, which is what everything reads.
+
+    ``PINNED_SURFACES`` is derived from the schema map, so this is one fact seen from two
+    sides rather than two facts. What it adds is the constant: the tuple would carry the
+    string either way, and a caller reaching for ``journal.BARS_SURFACE`` needs the name.
+    """
+    assert journal.BARS_SURFACE == "bars"
+    assert journal.schema_for(journal.BARS_SURFACE) is journal.BARS_SCHEMA
+    assert journal.BARS_SURFACE in journal.PINNED_SURFACES
+
+
+def test_the_bars_surface_name_matches_every_other_spelling_of_it():
+    """One surface, three modules, one string.
+
+    The storage tree names it, ``lake.vendor`` names it for a cassette interaction, and
+    this module names it for a schema. A second spelling would leave a partition, a
+    recording and a fingerprint that never meet.
+    """
+    assert journal.BARS_SURFACE == paths.BARS == BARS_ENDPOINT
+
+
+def test_the_bars_schema_carries_exactly_the_columns_this_surface_decided_on():
+    """The whole column list, spelled out, because the list is the deliverable.
+
+    Deriving the expected list from the schema would compare the schema to itself. Spelling
+    it means a column added or dropped fails here beside the fingerprint, and the message
+    names the column rather than a shape that moved.
+    """
+    assert journal.BARS_SCHEMA.names == [
+        "bar_ts",
+        "fetch_ts",
+        "fetch_end_ts",
+        "ticker",
+        "instrument_id",
+        "freq",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "window_start",
+        "window_end",
+        "extended_hours",
+        "schema_version",
+        "extra",
+    ]
+
+
+def test_bars_carry_two_of_the_seven_provenance_columns_and_no_others():
+    """The provenance decision, stated against the seven rather than against a literal list.
+
+    Both sides are derived from ``_PROVENANCE_FIELDS``, so a column added to the shared
+    list lands in the difference here rather than passing unexamined. The five absent ones
+    are named individually, because dropping one from the set on either side of the
+    comparison would otherwise pass.
+    """
+    every = {name for name, _ in journal._PROVENANCE_FIELDS}
+    carried = every & set(journal.BARS_SCHEMA.names)
+    assert carried == {"schema_version", journal.EXTRA_COLUMN}
+    for absent in ("row_kind", "error_class", "suspect", "close_tag", "session_phase"):
+        assert absent in every, absent
+        assert absent not in journal.BARS_SCHEMA.names, absent
+
+
+def test_a_provenance_column_bars_share_keeps_the_type_the_capture_surfaces_give_it():
+    """The two carried columns are selected from the shared list, not restated beside it.
+
+    A second literal would let ``schema_version`` be an ``int64`` on chains and an
+    ``int32`` here, and the version ledger reads the same integer off both.
+    """
+    for column in ("schema_version", journal.EXTRA_COLUMN):
+        assert (
+            journal.BARS_SCHEMA.field(column).type
+            == journal.CHAINS_SCHEMA.field(column).type
+            == journal.QUOTES_SCHEMA.field(column).type
+        ), column
+
+
+def test_a_stamp_bars_share_with_the_capture_surfaces_carries_the_same_type():
+    """Every stamp on every surface is a string, so one reader reads them all one way."""
+    for column in ("fetch_ts", "fetch_end_ts", "ticker"):
+        assert journal.BARS_SCHEMA.field(column).type == journal.CHAINS_SCHEMA.field(column).type, (
+            column
+        )
+    for column in ("bar_ts", "window_start", "window_end"):
+        assert journal.BARS_SCHEMA.field(column).type == pa.string(), column
+
+
+def test_bar_ts_is_the_one_non_null_column_and_a_null_refuses_at_the_write():
+    """The constraint, and the moment it bites.
+
+    A bars row with no ``bar_ts`` has no identity, so the schema refuses one rather than
+    leaving the rule to the writer's good behaviour. ``pa.Table`` construction does not
+    check nullability, which is why the null below builds, and ``pq.write_table`` does,
+    which is the call that lands a bars partition.
+
+    The fingerprint records a column's name and type and not its nullability, so nothing
+    else in the suite would notice this being relaxed.
+    """
+    assert journal.BARS_SCHEMA.field("bar_ts").nullable is False
+    for name in journal.BARS_SCHEMA.names:
+        if name != "bar_ts":
+            assert journal.BARS_SCHEMA.field(name).nullable is True, name
+
+    row = dict.fromkeys(journal.BARS_SCHEMA.names)
+    table = pa.Table.from_pylist([{**row, "bar_ts": None}], schema=journal.BARS_SCHEMA)
+    assert table.column("bar_ts").null_count == 1
+
+    with pytest.raises(pa.ArrowInvalid, match="bar_ts.*non-nullable"):
+        pq.write_table(table, Path(tempfile.mkdtemp()) / "bars.parquet")
+
+
+def test_a_bars_row_with_a_stamp_writes_where_one_without_refuses():
+    """The other side of the constraint, so the test above is not passing on a broken write."""
+    row = dict.fromkeys(journal.BARS_SCHEMA.names)
+    table = pa.Table.from_pylist(
+        [{**row, "bar_ts": "2026-09-14T13:30:00+00:00"}], schema=journal.BARS_SCHEMA
+    )
+
+    target = Path(tempfile.mkdtemp()) / "bars.parquet"
+    pq.write_table(table, target)
+    assert pq.read_table(target).column("bar_ts").to_pylist() == ["2026-09-14T13:30:00+00:00"]
+
+
+def test_the_bars_vendor_maps_name_the_five_columns_copied_from_a_candle():
+    """The vendor maps, which pinning obliges whether or not the schema carries ``extra``.
+
+    A bars row is built from one candle dict, so every path sits flat. The five are the
+    whole of what a candle copies verbatim, and the map is derived from
+    ``_BARS_CANDLE_MAP`` rather than restated, so promoting a sixth field stays one edit.
+    """
+    paths_for_bars = journal.extra_paths(journal.BARS_SURFACE)
+    assert paths_for_bars == {
+        "open": journal.ExtraPath(None, "open"),
+        "high": journal.ExtraPath(None, "high"),
+        "low": journal.ExtraPath(None, "low"),
+        "close": journal.ExtraPath(None, "close"),
+        "volume": journal.ExtraPath(None, "volume"),
+    }
+    assert set(paths_for_bars) == set(journal._BARS_CANDLE_MAP.values())
+
+
+def test_the_consumed_candle_stamp_has_no_bars_vendor_path():
+    """``bar_ts`` is consumed from ``datetime``, so no key in an overflow feeds it.
+
+    The only value of that field ever reaching ``extra`` is one the epoch transform
+    refused, and projecting it back would need the transform that already said no. This is
+    the rule ``vendor_quote_ts`` already follows on the two capture surfaces.
+    """
+    paths_for_bars = journal.extra_paths(journal.BARS_SURFACE)
+    assert "bar_ts" not in paths_for_bars
+    assert journal._BARS_CANDLE_TS_FIELD == "datetime"
+    assert journal._BARS_CANDLE_TS_FIELD not in journal._BARS_CANDLE_MAP
+    assert "datetime" not in {path.field for path in paths_for_bars.values()}
+
+
+def test_no_bars_vendor_path_names_a_column_that_is_not_a_vendor_field():
+    """The request's own values and the fetch provenance are not candidates for an overflow.
+
+    None of these is a vendor field, so a path to one would claim a key could arrive in
+    ``extra`` and feed it, and a promotion would then lift a value the vendor never sent.
+    """
+    paths_for_bars = journal.extra_paths(journal.BARS_SURFACE)
+    for column in (
+        "bar_ts",
+        "fetch_ts",
+        "fetch_end_ts",
+        "ticker",
+        "instrument_id",
+        "freq",
+        "window_start",
+        "window_end",
+        "extended_hours",
+        "schema_version",
+        journal.EXTRA_COLUMN,
+    ):
+        assert column in journal.BARS_SCHEMA.names, column
+        assert column not in paths_for_bars, column
+
+
+def test_a_candle_field_added_to_the_bars_map_is_projectable_with_no_second_edit(monkeypatch):
+    """Promoting a candle field stays one edit here too, because the paths derive per call.
+
+    The patched pair is deliberately not an identity. All five real candle fields are their
+    own column name, so a map read backwards the wrong way round produces the identical
+    result and every assertion in this file would still pass. A camelCase vendor name
+    against a snake_case column is the first thing that tells the two apart, and it is what
+    a sixth candle field would actually look like.
+    """
+    monkeypatch.setitem(journal._BARS_CANDLE_MAP, "vwapPrice", "vwap")
+    paths_for_bars = journal.extra_paths(journal.BARS_SURFACE)
+    assert paths_for_bars["vwap"] == journal.ExtraPath(None, "vwapPrice")
+    assert "vwapPrice" not in paths_for_bars
+
+
+def test_the_fetch_provenance_bars_carry_records_what_the_request_asked_for():
+    """The three columns that make a ``freq=1m`` partition's meaning readable off its rows.
+
+    ``schema_version`` cannot catch a change to a fetch parameter, because it reads columns
+    and types and a parameter is neither. These three put the parameter on the row.
+    """
+    assert [name for name, _ in journal._BARS_FETCH_FIELDS] == [
+        "window_start",
+        "window_end",
+        "extended_hours",
+    ]
+    assert journal.BARS_SCHEMA.field("extended_hours").type == pa.bool_()
+    # The other flag the seam takes. It adds a field outside ``candles`` and changes no
+    # candle, so it cannot make a partition mean something different.
+    assert "previous_close" not in journal.BARS_SCHEMA.names
+
+
+def test_bars_carry_no_column_for_a_field_outside_the_candle_list():
+    """``symbol``, ``empty`` and the previous close are response-level, not per-candle."""
+    for column in ("symbol", "empty", "previous_close", "previous_close_date"):
+        assert column not in journal.BARS_SCHEMA.names, column
 
 
 def test_chains_suspect_flag_rides_every_row():

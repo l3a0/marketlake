@@ -48,8 +48,10 @@ is rejected outright. The second waits.
 So a promotion splits history in two. The same measurement reads as a column above the
 boundary and as an overflow key below it, and a reader asking for the column sees nulls
 across the older half that look exactly like vendor nulls. This module closes that split at
-read time: given a table of journal rows, it lifts the value out of ``extra`` on the rows
-whose version had no column for it and presents it as that column.
+read time: given a table of rows from a pinned surface, it lifts the value out of ``extra``
+on the rows whose version had no column for it and presents it as that column. Pinned rather
+than journaled, because ``bars`` carries an ``extra`` column and a ``schema_version`` without
+ever reaching a segment.
 
 Read time is the only place this can happen. A compacted partition is immutable, and that
 immutability is what the manifest protocol, the two-way integrity scrub, and the backup all
@@ -71,7 +73,7 @@ when a row actually carries a value for it. Projecting the running schema onto a
 table is the loader's job, in slice 4, and that loader reads through this rather than
 reimplementing it.
 
-The projection is opt-in. Nothing that reads journal rows today calls it, so no existing
+The projection is opt-in. Nothing that reads a captured row today calls it, so no existing
 reader's output moves.
 """
 
@@ -187,7 +189,8 @@ def _overflow(raw: object, row: int) -> Mapping[str, object]:
     """One row's ``extra`` decoded, or an empty mapping when the row has none.
 
     A value that is not JSON raises. ``extra`` is written by ``json.dumps`` of a dict on
-    both surfaces, so a string that will not parse did not come from the parser, and
+    every surface that writes one, so a string that will not parse did not come from the
+    parser, and
     presenting such a row as projected would claim its overflow held nothing when the
     truth is that nothing could read it.
 

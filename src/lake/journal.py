@@ -13,7 +13,9 @@ Three terms recur, defined here at first use.
 - A *surface* is one kind of measurement with its own pinned schema. This module
   writes two: ``chains`` (full option chains) and ``quotes`` (batched equity
   quotes). Arrow IPC fixes one schema per file, so the surface axis is load-bearing.
-  One segment can never hold both.
+  One segment can never hold both. It pins a third, ``bars``, and writes none of it.
+  The evening sweep lands bars straight in a Parquet partition, so no segment here
+  ever holds one.
 - A *segment* is one Arrow IPC file, created by exactly one writer session and never
   re-opened for append. An Arrow IPC stream cannot be resumed by a later writer. A
   clean close writes an *end-of-stream* marker, the EOS, that readers stop at. Rows
@@ -27,6 +29,11 @@ This module owns three jobs: the pinned capture schema for each surface, the row
 builders that turn a vendor payload into a record batch, and the writer that lands
 batches durably. It never reads the wall clock. Every timestamp arrives as an
 argument, stamped by the caller from the injected clock.
+
+The first of those three jobs reaches further than the other two. ``schema_version``,
+``schema_fingerprint`` and ``extra_paths`` are all read off this module, so a surface
+pinned anywhere else would sit inside one of them and outside the others. That is why
+``bars`` is pinned here despite never being journaled here.
 """
 
 from __future__ import annotations
@@ -57,11 +64,27 @@ from lake.paths import LakePaths, parse_segment_rel
 # What is derived instead is the shape, via ``schema_fingerprint`` below, and
 # ``tests/unit/test_schema_fingerprint.py`` compares the two. So a column added, dropped,
 # or retyped without a bump fails the suite.
-SCHEMA_VERSION = 1
+#
+# Version 2 is the version that pins ``bars``. The two capture surfaces carry the same
+# columns at 2 as they did at 1, so a chains or quotes row reads identically either side of
+# the bump. What moved is the set of surfaces a version describes, and that is a shape
+# change like any other: version 1 knew two surfaces and version 2 knows three. Recording
+# bars under version 1 instead would claim version 1 captured a surface that did not exist
+# yet, which is the one edit ``RECORDED_FINGERPRINTS`` refuses.
+SCHEMA_VERSION = 2
 
-# The two surfaces this module writes.
+# The two surfaces this module writes. Both journal, so a cycle appends a record batch to
+# an Arrow IPC segment here and compaction seals the day from those segments.
 CHAINS_SURFACE = "chains"
 QUOTES_SURFACE = "quotes"
+
+# The surface this module pins and never writes. The evening sweep fetches price history
+# and lands it straight in a Parquet partition, so nothing here journals a bar. The schema
+# is pinned here anyway, for the reason the module docstring gives: the version, the
+# fingerprint and the vendor maps are all read off this module. The name matches
+# ``paths.BARS`` and ``vendor.BARS_ENDPOINT``, which spell the same surface for the storage
+# tree and for a cassette.
+BARS_SURFACE = "bars"
 
 # The two kinds of row. A ``data`` row carries a vendor observation. A ``gap`` row is
 # the surface schema with all vendor columns null. It records a minute that was
@@ -83,7 +106,8 @@ F_FULLFSYNC = getattr(fcntl, "F_FULLFSYNC", None)
 
 # -- pinned capture schemas --------------------------------------------------
 
-# The provenance columns every row carries, in every surface. ``row_kind`` is
+# The provenance columns every row of a journaled surface carries. Bars carry two of the
+# seven, for the reasons ``_BARS_PROVENANCE_FIELDS`` gives below. ``row_kind`` is
 # ``data`` or ``gap``. ``error_class`` is null on data rows and names the reason on a
 # gap. ``suspect`` flags a response the validation battery should judge. ``close_tag``
 # is ``option_close``, ``spot_close``, or null, stamped on every row of a tagged cycle.
@@ -118,7 +142,10 @@ _CHAINS_WINDOW_FIELDS = [
     ("window_end", pa.string()),
 ]
 
-# The timestamps plus the ticker every row carries. ``snap_ts`` is the minute slot.
+# The timestamps plus the ticker every row of a journaled surface carries. Bars share none of
+# this list: they carry ``bar_ts`` in place of ``snap_ts`` and ``vendor_quote_ts``, and
+# ``BARS_SCHEMA`` spells its own stamps rather than reusing these. ``snap_ts`` is the minute
+# slot.
 # ``fetch_ts`` and ``fetch_end_ts`` are a pair around the vendor call. ``fetch_ts`` is
 # the dispatch time, the loop's clock just before the request starts. ``fetch_end_ts``
 # is when the response or the failure landed, the request end. So the request
@@ -331,12 +358,203 @@ QUOTES_SCHEMA = pa.schema(
     + _PROVENANCE_FIELDS
 )
 
-_SCHEMAS = {CHAINS_SURFACE: CHAINS_SCHEMA, QUOTES_SURFACE: QUOTES_SCHEMA}
+# -- the bars surface --------------------------------------------------------
 
-# The surfaces this module pins a capture schema for. ``paths.SURFACES`` is wider,
-# because the lake lays out directories for surfaces nothing captures yet. Deriving this
-# from the schema map keeps a third surface from being pinned in one place and forgotten
-# in the other.
+# The evening sweep's price-history surface. A candle carries exactly ``open``, ``high``,
+# ``low``, ``close``, ``volume`` and a ``datetime`` that is Schwab's epoch-millisecond
+# stamp, which ``tests/cassettes/spy_minimal.json`` records and ``python -m
+# lake.inspect_cassette <path> --surface bars`` dumps.
+#
+# Nothing in this module builds a bars row. The row builder and every rule about what the
+# writer does with a payload are marketlake #280's. What is pinned here is what a bars row
+# *is*, because two deliverables wait on that answer rather than one, and because the
+# version ledger, the fingerprint and the vendor maps all read this module.
+
+# The fetch provenance a bars row carries, which is what makes the fetch window reversible.
+# ``window_start`` and ``window_end`` are the bounds the request asked for, ISO-8601 like
+# every other stamp on every surface. ``extended_hours`` is the flag that decides whether a
+# ``freq=1m`` partition holds the regular session or the whole extended one, and it is
+# nullable because the seam omits the flag when it is left unset and lets Schwab pick, which
+# is a third state rather than a false.
+#
+# None of the three is a vendor field, so none counts as a vendor column and none leaks into
+# ``extra``. That is the rule ``_CHAINS_WINDOW_FIELDS`` already states for the chains pair,
+# and the names are reused rather than re-coined because they name the same thing: the range
+# a fetch asked for. The chains pair holds dates and this one holds instants, which is the
+# grain each surface's request carries.
+#
+# Without them a later change to the window or the flag leaves two meanings of ``freq=1m``
+# across history with nothing on the rows saying which. ``schema_version`` cannot catch
+# that, because it reads columns and types off the pinned schema and a fetch parameter is
+# neither. Recording them turns #280's window choice from a decision that has to be right
+# forever into one that can change.
+#
+# The request's other flag, ``previous_close``, is deliberately absent. It adds a field
+# outside ``candles`` and changes no candle, so it cannot make a partition mean something
+# different, which is the whole job of the three above.
+_BARS_FETCH_FIELDS = [
+    ("window_start", pa.string()),
+    ("window_end", pa.string()),
+    ("extended_hours", pa.bool_()),
+]
+
+# The two provenance columns a bars row carries, selected from ``_PROVENANCE_FIELDS`` by
+# name rather than restated, so a type change there moves every surface at once.
+#
+# ``schema_version`` is the integer a read-time projection asks the version ledger about.
+# ``extra`` is what keeps vendor-verbatim structurally true here: a candle field the map
+# below does not name lands there, and a later version promotes it into a column of its own.
+# Without it an unmapped field is simply not captured, and a sealed bars partition is
+# immutable, so the value would be lost rather than recoverable. Its emptiness on the
+# capture surfaces is not an argument against carrying it, because what the column buys is
+# the recovery, and the recovery is only available to a surface that has one.
+#
+# Four reasons cover the other five columns.
+#
+# 1. ``row_kind`` and ``error_class`` mark an absence. Gap rows exist because a missed chain
+#    or quote sample is gone forever. A missed bar is not. Schwab serves a ~30-day
+#    one-minute lookback and daily bars indefinitely, so an absent bars partition is a
+#    re-fetch rather than a hole to mark. ``gap.surfaces_for`` says the same from the other
+#    end: it returns quotes, and chains beside them when the ticker carries options, and
+#    never bars.
+# 2. ``suspect`` flags a response for the validation battery to judge after it lands. The
+#    battery judges bars before they land instead, per the design's split detector "run
+#    before bars land", so there is no later judge for the flag to reach.
+# 3. ``close_tag`` names the cycle a row was captured in. A daily bar is the close and a
+#    minute bar belongs to its own minute, so neither has a cycle to tag.
+# 4. ``session_phase`` tags a row observed after the equity close. A bar's session is decided
+#    by ``bar_ts`` and ``extended_hours``, not by when the sweep fetched it.
+#
+# A later deliverable that wants one of the five mints a version for it. Rows below that
+# version then read back through the ledger's ``has_column``, which answers that the column
+# was never captured rather than that it was captured null. That is the ledger working as
+# built, and it is why the five are declinable where a vendor column would not be.
+_BARS_PROVENANCE_COLUMNS = ("schema_version", EXTRA_COLUMN)
+_BARS_PROVENANCE_FIELDS = [
+    field for field in _PROVENANCE_FIELDS if field[0] in _BARS_PROVENANCE_COLUMNS
+]
+
+# The vendor's per-candle field map, each name to its column. Schwab spells these five in
+# lower case already, so the snake_case column is the vendor's own name unchanged, the same
+# rule that turns ``openPrice`` into ``open_price`` on chains.
+#
+# These five are the whole of what a bars row copies verbatim from a named vendor field, so
+# they are also the whole of the surface's ``extra_paths``. Everything else on the row comes
+# from somewhere other than a candle: ``ticker`` and ``freq`` from the request,
+# ``instrument_id`` resolved from the security master, ``fetch_ts`` and ``fetch_end_ts`` from
+# the clock, the fetch trio from the request, and ``bar_ts`` consumed from the candle's own
+# stamp.
+_BARS_CANDLE_MAP = {
+    "open": "open",
+    "high": "high",
+    "low": "low",
+    "close": "close",
+    "volume": "volume",
+}
+
+# The candle's own stamp, consumed into ``bar_ts`` rather than copied into a column. The
+# raw epoch is not repeated beside it, which is the rule ``quoteTimeInLong`` already follows
+# into ``vendor_quote_ts``.
+#
+# Where bars depart from chains is what a refused stamp costs. On chains the transform's
+# refusal costs the stamp and keeps the row: ``vendor_quote_ts`` goes null and the raw value
+# overflows under its own vendor name. A bars row cannot take that trade, because ``bar_ts``
+# is non-null and ``pq.write_table`` refuses a table rather than a row, so one candle written
+# with a null stamp would cost the whole partition's write. So the refused candle does not
+# become a row at all, and what #280 does with it, drop it or fail the fetch, is the rule
+# that issue takes. Naming it here is what the constraint below is for.
+# The set of candle fields the parser recognizes is the row builder's, so it is #280's
+# rather than a constant here with nothing reading it.
+_BARS_CANDLE_TS_FIELD = "datetime"
+
+# The bars capture schema. Each row is one candle.
+#
+# ``bar_ts`` is the candle's own instant, consumed from the vendor's epoch-millisecond
+# ``datetime`` through the shared transform and stored as an ISO-8601 string, because every
+# stamp on every surface here is a string rather than an Arrow timestamp. It is the one
+# non-null column in this module. A bars row with no ``bar_ts`` has no identity at all,
+# where a chains row missing ``vendor_quote_ts`` still has its ``snap_ts`` slot, so the
+# refusal is worth a constraint rather than a convention. ``pa.Table`` construction does not
+# check nullability, but ``pq.write_table`` does, and a bars row's write to parquet is the
+# moment it lands, so the constraint bites exactly where a bars row becomes durable. What it
+# cannot do is survive into the fingerprint: ``schema_fingerprint`` records a column's name
+# and type, and nullability is neither, so
+# ``test_bar_ts_is_the_one_non_null_column_and_a_null_refuses_at_the_write`` in
+# ``tests/unit/test_journal_schema.py`` is what keeps it from being relaxed silently.
+#
+# ``ticker`` and ``freq`` repeat the two path levels a bars partition is keyed by, the same
+# way ``ticker`` is a column on both capture surfaces despite sitting in the path. A table
+# read out of two frequencies and concatenated keeps them apart only if the row carries the
+# frequency.
+#
+# ``instrument_id`` is the one column no capture surface has. Bars are the surface the
+# corporate-actions adjustment joins against, and ``actions`` is keyed on
+# ``(instrument_id, ex_date, type)``, so the join key belongs on the row rather than being
+# resolved through the date-ranged security master on every read. It is nullable, so a row
+# whose ticker the master cannot resolve still lands.
+#
+# ``fetch_ts`` and ``fetch_end_ts`` are the pair around the vendor call, carrying the same
+# meaning they carry on the capture surfaces: the request round-trip is the difference, and
+# ``fetch_end_ts`` is nullable so a row without it is still valid. They are the sweep's only
+# per-row record of how long the vendor took, and a provenance column added after a partition
+# seals cannot be filled, because it names no vendor field for ``project_extra`` to lift.
+#
+# Four body fields sit outside ``candles`` and none takes a column.
+#
+# 1. ``symbol`` repeats the ticker the request named.
+# 2. ``empty`` restates the candle list's own length.
+# 3. ``previousClose`` describes the prior session rather than this row.
+# 4. ``previousCloseDate`` dates that prior session, and ``lake.inspect_cassette`` names the
+#    pair as what ``need_previous_close`` adds.
+#
+# None is a property of a candle, so none is captured, which is the rule the chains header
+# already follows for ``strategy``, ``interval`` and the rest of its body. What the writer
+# does with them is #280's, and #280 carries this as the rule to implement.
+BARS_SCHEMA = pa.schema(
+    [
+        pa.field("bar_ts", pa.string(), nullable=False),
+        ("fetch_ts", pa.string()),
+        ("fetch_end_ts", pa.string()),
+        ("ticker", pa.string()),
+        ("instrument_id", pa.int64()),
+        ("freq", pa.string()),
+        # the candle, vendor-verbatim
+        ("open", pa.float64()),
+        ("high", pa.float64()),
+        ("low", pa.float64()),
+        ("close", pa.float64()),
+        ("volume", pa.int64()),
+    ]
+    + _BARS_FETCH_FIELDS
+    + _BARS_PROVENANCE_FIELDS
+)
+
+_SCHEMAS = {
+    CHAINS_SURFACE: CHAINS_SCHEMA,
+    QUOTES_SURFACE: QUOTES_SCHEMA,
+    BARS_SURFACE: BARS_SCHEMA,
+}
+
+# The surfaces this module actually journals. Narrower than ``PINNED_SURFACES``, and the
+# difference is load-bearing rather than descriptive.
+#
+# ``SegmentWriter.open`` took its schema from ``schema_for``, so before bars were pinned the
+# unknown-surface refusal was the only thing stopping a bars segment being created. Pinning
+# removed that refusal by making ``schema_for("bars")`` succeed, and a segment under
+# ``journal/date=D/surface=bars/`` is a path compaction walks into and then refuses at
+# ``LakePaths.partition_path``, which has no slot for the ``freq=`` level. So the guard is
+# restated here rather than left to a side effect of what happens to be pinned.
+JOURNALED_SURFACES = (CHAINS_SURFACE, QUOTES_SURFACE)
+
+
+# The surfaces this module pins a capture schema for. ``paths.SURFACES`` is wider by one,
+# ``actions``, which is a single append-only ledger rather than a measurement and so has no
+# capture schema to pin. Deriving this tuple from the schema map keeps a surface from being
+# pinned in one place and forgotten in the other.
+#
+# Pinned is not the same as journaled. Chains and quotes are both, and bars are pinned only.
+# Every reader of this tuple wants the pinned set: the fingerprint, the version ledger, and
+# the vendor maps all describe a shape rather than a segment.
 PINNED_SURFACES = tuple(_SCHEMAS)
 
 
@@ -731,12 +949,32 @@ def _quotes_extra_paths() -> dict[str, ExtraPath]:
     return paths
 
 
+def _bars_extra_paths() -> dict[str, ExtraPath]:
+    """The bars overflow read backwards: the candle map, flat.
+
+    A bars row is built from one candle dict, so its fields have nothing to collide with
+    and sit flat, the same way a chains row's contract fields do.
+
+    Two groups are absent, and each has a rule above it rather than a special case here.
+    The candle's ``datetime`` is consumed into ``bar_ts``, so it holds no vendor value to
+    park. The three body fields outside ``candles`` take no column, so a path to one would
+    point at nothing.
+    """
+    return {column: ExtraPath(None, vendor) for vendor, column in _BARS_CANDLE_MAP.items()}
+
+
 # How each surface's overflow is read backwards. The builders run per call rather than
 # once at import, so a vendor map edited at runtime is reflected rather than snapshotted,
 # and the derivation claim holds for a test that patches a map as well as for source.
+#
+# Every pinned surface needs an entry, whether or not its schema carries an ``extra``
+# column, because ``extra_paths`` looks the surface up here after ``schema_for`` has
+# already said yes. That refusal is what a third pinned surface added in one place and
+# forgotten in the other would hit.
 _EXTRA_PATH_BUILDERS = {
     CHAINS_SURFACE: _chains_extra_paths,
     QUOTES_SURFACE: _quotes_extra_paths,
+    BARS_SURFACE: _bars_extra_paths,
 }
 
 
@@ -755,8 +993,8 @@ def extra_paths(surface: str) -> dict[str, ExtraPath]:
 
     Every column whose value the parser copies verbatim from one named vendor field is
     here, wherever on the payload that field arrives. The contract fields sit flat, the
-    chain-level ones under ``chain``, each quote block's under its own key, and the
-    envelope's ``realtime`` and ``cusip`` under ``envelope``.
+    chain-level ones under ``chain``, each quote block's under its own key, the envelope's
+    ``realtime`` and ``cusip`` under ``envelope``, and a candle's five fields flat.
 
     A column is reachable only if the parser would overflow its vendor field, which is a
     narrower set than the schema. Four groups are deliberately absent.
@@ -769,12 +1007,18 @@ def extra_paths(surface: str) -> dict[str, ExtraPath]:
        known since version 1 and so can never be in ``extra`` to begin with. Projecting a
        value the writer transforms needs the transform, which is a promotion this surface
        has never made.
-    3. ``vendor_quote_ts``, on both surfaces. The vendor quote time is consumed into that
-       stamp rather than stored. The only value of it that reaches ``extra`` is one the
-       epoch transform refused, and projecting that back would need the transform that
-       already said no, so there is nothing for a path here to recover.
-    4. The stamps, the provenance columns, and the chains window pair. None is a vendor
-       field, so none was ever a candidate for the overflow.
+    3. ``vendor_quote_ts`` on the two capture surfaces, and ``bar_ts`` on bars. Each is
+       consumed from a vendor stamp rather than storing one. The only value that reaches
+       ``extra`` is one the epoch transform refused, and projecting that back would need
+       the transform that already said no, so there is nothing for a path here to recover.
+    4. The stamps, the provenance columns, the chains window pair, and the bars fetch trio.
+       None is a vendor field, so none was ever a candidate for the overflow. Bars'
+       ``ticker`` and ``freq`` come from the request and ``instrument_id`` is resolved, so
+       none of those three is one either.
+
+    A bars row's three body fields are absent for a different reason again. ``symbol``,
+    ``empty`` and the previous close are response-level rather than per-candle, so the
+    parser captures none of them and none can reach an overflow to be projected out of.
 
     A surface with no capture schema raises through ``schema_for``. A surface that has one
     and no vendor maps raises here, naming itself, which is what a third pinned surface
@@ -898,8 +1142,10 @@ def _int_column(values: Sequence[object]) -> pa.Array:
 
     Building an integer column straight from Python objects coerces a fractional float to
     its truncated value and hands it back with no error, so a vendor ``3.7`` lands as
-    ``3``. Among the 29 integer columns that is the conversion which changes a value
-    without raising, so only they take this route and the other 119 keep the direct build.
+    ``3``. Among the two journaled surfaces' 29 integer columns that is the conversion
+    which changes a value without raising, so only they take this route and the other 119
+    keep the direct build. The counts are the two surfaces this module builds rows for.
+    ``bars`` is pinned and has no row builder here, so its columns reach neither path yet.
 
     Inferring the column's type first and then casting to ``int64`` moves the check into
     Arrow, which refuses a float it cannot represent exactly and still passes a lossless
@@ -1830,7 +2076,18 @@ class SegmentWriter:
 
         The path comes from ``segment_path`` and the schema from the surface. The
         ``pid`` is the caller's, typically ``os.getpid()``.
+
+        A surface outside ``JOURNALED_SURFACES`` is refused. Pinning a schema says what a
+        row of that surface is, and it does not say the surface reaches a segment. Bars are
+        the case: a bars segment would land under ``journal/date=D/surface=bars/``, which
+        compaction walks and then refuses at ``LakePaths.partition_path``, so the failure
+        would surface in the nightly sweep rather than at the call that caused it.
         """
+        if surface not in JOURNALED_SURFACES:
+            raise ValueError(
+                f"surface {surface!r} is not journaled. This module journals "
+                f"{list(JOURNALED_SURFACES)}."
+            )
         return cls(
             segment_path(lake_root, surface, ticker, day, start_ts, pid),
             schema_for(surface),

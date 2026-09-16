@@ -121,6 +121,38 @@ def test_open_picks_the_schema_from_the_surface(lake_root):
         writer.close()
 
 
+def test_a_pinned_surface_this_module_does_not_journal_cannot_open_a_segment(lake_root):
+    """Pinning a schema says what a row is. It does not say the surface reaches a segment.
+
+    Until bars were pinned, ``schema_for``'s unknown-surface refusal was all that stopped
+    this call, and pinning removed it by making the lookup succeed. What a bars segment
+    would cost is paid somewhere else entirely: compaction walks ``journal/date=D/`` by
+    directory, reaches ``surface=bars``, and refuses at ``LakePaths.partition_path``, which
+    has no slot for the ``freq=`` level. So the nightly sweep would break on a path the
+    design says cannot exist, and nothing would name the call that made it.
+    """
+    assert journal.BARS_SURFACE in journal.PINNED_SURFACES
+    assert journal.BARS_SURFACE not in journal.JOURNALED_SURFACES
+
+    with pytest.raises(ValueError, match="bars.*not journaled"):
+        journal.SegmentWriter.open(lake_root, journal.BARS_SURFACE, "SPY", DAY, START, PID)
+
+    # The refusal comes before anything is created, so no directory is left behind for the
+    # compaction walk to find.
+    assert not (lake_root / "journal" / f"date={DAY}" / "surface=bars").exists()
+
+
+def test_every_journaled_surface_is_also_pinned():
+    """The two sets are nested rather than independent, and the writer needs both.
+
+    A surface that journals and is not pinned would take ``schema_for``'s refusal inside
+    ``open``, which is the failure the explicit guard above is meant to replace rather than
+    hide behind.
+    """
+    assert set(journal.JOURNALED_SURFACES) <= set(journal.PINNED_SURFACES)
+    assert journal.JOURNALED_SURFACES == (journal.CHAINS_SURFACE, journal.QUOTES_SURFACE)
+
+
 # -- exclusive create --------------------------------------------------------
 
 
