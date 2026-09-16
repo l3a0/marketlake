@@ -183,18 +183,22 @@ back quietly wrong rather than loudly refused, and each raises instead.
    the minute asked for. A read that found its minute has no ambiguity to resolve, so one
    unreadable value elsewhere in the day does not take the answer away.
 
-Nothing here reads a clock or the network. One line reads a config file, and it is the
-branch at the top of ``_load_surface``, the body ``load_chain`` and ``load_quotes`` share,
-that resolves ``lake_root=None`` to the configured lake. Every resolution below that line
-takes the root as an argument, so a test points it at a fixture lake and no helper here
-reaches for config.
+Nothing here reads a clock or the network. One line reads a config file, and it is inside
+``resolve_lake_root``, which turns ``lake_root=None`` into the configured lake. Every
+resolution past that call takes the root as an argument, so a test points it at a fixture
+lake and no helper here reaches for config.
 
-That branch is the only call to ``load_config`` in ``src/lake`` that names no config path
+That line is the only call to ``load_config`` in ``src/lake`` that names no config path
 and does not sit in a ``main``. The other two no-argument calls are ``probe.main`` and
 ``record.main``, and every remaining call in the package is handed a path by its caller,
-the nine ``*_from_config`` wiring functions included. So a reader who expects a config
+the ten ``*_from_config`` wiring functions included. So a reader who expects a config
 path to arrive as an argument finds the one place it does not, written down here rather
 than generalised.
+
+It is a named function rather than a branch inside the read because the read layer has a
+second caller now. ``lake.oi`` resolves the same root and then reads the security master,
+the capture spans and the sealed partition list beneath it, so giving it a no-argument
+``load_config`` of its own would have made a second answer to where the lake is.
 """
 
 from __future__ import annotations
@@ -253,9 +257,11 @@ __all__ = [
     "PartitionQuarantined",
     "SnapAbsent",
     "SnapMalformed",
+    "list_chain_cycles",
     "load_chain",
     "load_contract",
     "load_quotes",
+    "resolve_lake_root",
 ]
 
 
@@ -634,6 +640,79 @@ def load_contract(
     return _sorted_by_snap(table, occ_symbol, ticker_used, day_text)
 
 
+def resolve_lake_root(lake_root: Path | str | None) -> Path:
+    """``lake_root`` as a path, resolving ``None`` to the configured lake.
+
+    This is the one place in the read layer that reads a config file, and it is a
+    function rather than a line inside ``_load_surface`` so that it stays one place as
+    the layer grows. ``lake.oi`` needs the same resolution and reads three more files
+    under the root, so a second no-argument ``load_config`` would have been the second
+    source of truth for where the lake is.
+
+    Every resolution past this point takes the root as an argument, so a test points it
+    at a fixture lake and no helper below reaches for config.
+    """
+    return Path(load_config().lake_root if lake_root is None else lake_root)
+
+
+def list_chain_cycles(
+    ticker: str,
+    day: date | str,
+    *,
+    lake_root: Path | str | None = None,
+    include_quarantined: bool = False,
+) -> tuple[str, ...]:
+    """The session's stored chains cycles, as the ET minutes ``load_chain`` can name.
+
+    A reader that walks a session cycle by cycle has to know which cycles it holds, and
+    asking ``load_chain`` minute by minute over a calendar grid would both cost a read
+    per absent minute and answer for minutes no cycle ran in. This is the resolve pass on
+    its own: one read of ``snap_ts`` and ``row_kind`` over the partition, the same path
+    build, spelling check and quarantine guard every other read makes, and the same
+    data-rows-only rule.
+
+    The answer is ``HH:MM`` ET strings in instant order, deduplicated, each of which
+    ``load_chain(ticker, day, snap=...)`` resolves back to the cycle it came from.
+
+    **A cycle whose ET instant falls on another date is not listed.** ``snap`` is a
+    wall-clock minute read against the session date, so an instant on any other date has
+    no ``HH:MM`` that names it and ``load_chain`` cannot return it. Onboarding makes this
+    real rather than hypothetical: it journals its first chain snapshot under the session
+    date at whatever hour it runs, and the live lake holds one stamped 03:25Z under
+    ``date=2026-09-16``, which is 23:25 ET on 2026-09-15. Such a cycle carries the
+    previous session's quotes, so a reader asking what changed during this session is
+    right not to see it, but the reason it does not is this rule rather than that
+    judgement. The count of what was dropped is not returned, because a caller that could
+    act on it would need the instants, which is a door this one is not.
+    """
+    day_text = day.isoformat() if isinstance(day, date) else str(day)
+    _root, path = _open_partition(
+        ticker,
+        day_text,
+        lake_root=lake_root,
+        include_quarantined=include_quarantined,
+        surface=CHAINS,
+    )
+    resolved = _read(path, columns=list(MINUTE_COLUMNS))
+    is_data = pc.equal(resolved.column(ROW_KIND_COLUMN), ROW_KIND_DATA)
+    if is_data.null_count:
+        raise LoadError(
+            f"{ticker} {day_text} holds {is_data.null_count} rows with no "
+            f"{ROW_KIND_COLUMN}, which are neither an observation nor an absence marker."
+        )
+    session = date.fromisoformat(day_text)
+    minutes: dict[datetime, str] = {}
+    for text in pc.unique(resolved.filter(is_data).column(SNAP_TS_COLUMN)).to_pylist():
+        stamped = _instant(text)
+        if stamped is None:
+            continue
+        local = stamped.astimezone(MARKET_TZ)
+        if local.date() != session:
+            continue
+        minutes.setdefault(local, f"{local.hour:02d}:{local.minute:02d}")
+    return tuple(minutes[key] for key in sorted(minutes))
+
+
 def _load_surface(
     ticker: str,
     day: date | str,
@@ -714,7 +793,7 @@ def _open_partition(
     is what lets ``load_contract`` name the OCC root it derived without a second copy of
     the guard that raises it.
     """
-    root = Path(load_config().lake_root if lake_root is None else lake_root)
+    root = resolve_lake_root(lake_root)
     path = LakePaths(root).partition_path(surface, ticker, day_text)
     if not (path.is_file() and _spelled_exactly(root, path)):
         raise PartitionAbsent(
