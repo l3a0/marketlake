@@ -205,13 +205,15 @@ class FixtureLake:
 
         The refusal is spelled here rather than delegated, because this builder writes paths
         under its own root and takes no ``LakePaths``. What matters is that the two agree on
-        which surfaces take this shape, which :mod:`tests.unit.test_paths` now asserts against
-        ``paths._DATE_PARTITIONED`` rather than against a list restated in either place.
+        which surfaces take this shape, and they read one set to decide it:
+        ``paths.DATE_PARTITIONED``, which :mod:`tests.unit.test_paths` parametrizes over rather
+        than restating a list in either place.
         """
         if surface not in DATE_PARTITIONED:
             raise ValueError(
                 f"partition_path is for {sorted(DATE_PARTITIONED)}, not {surface!r}. "
-                "Use with_bars or the actions ledger."
+                "Use bars_partition_path, or the actions ledger, which is one all-ticker file "
+                "this builder does not write."
             )
         return self.root / surface / f"ticker={ticker}" / f"date={_day_str(day)}.parquet"
 

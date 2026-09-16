@@ -258,10 +258,11 @@ def price_history_body(
     ``previousClose`` and ``previousCloseDate`` are the pair ``need_previous_close`` adds,
     and they are the reason this takes two more arguments than the body has fixed keys. The
     row builder must recognize all four response-level fields and drop them, and two of the
-    four could not be put in front of it before: they appear nowhere under ``tests/`` and no
-    live recording carries them, because ``record.py``'s ``--bars`` takes four fields with no
-    flag arguments and so is always taken with the flag unset. A test of the drop rule that
-    could only show two of the four would pass while covering half of what it claimed.
+    four could not be put in front of it until this builder emitted them. Nothing under
+    ``tests/`` carried either one, and no live recording carries them, because ``record.py``'s
+    ``--bars`` takes four fields with no flag arguments and so is always taken with the flag
+    unset. A test of the drop rule that could only show two of the four would pass while
+    covering half of what it claimed.
 
     Both default to ``None`` and are omitted when left there, matching the request: the flag
     left unset means Schwab sends neither key. ``previousCloseDate`` is an epoch in

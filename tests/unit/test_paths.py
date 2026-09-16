@@ -26,6 +26,7 @@ from lake.paths import (
     CONFIG_DIR_ENV,
     CONFIG_DIR_PARTS,
     CONFIG_FILE,
+    DATE_PARTITIONED,
     QUOTES,
     SEGMENT_GLOB,
     SEGMENT_PREFIX,
@@ -122,10 +123,41 @@ def test_surfaces_constant_lists_the_four_surfaces():
     assert SURFACES == (CHAINS, QUOTES, BARS, ACTIONS)
 
 
-@pytest.mark.parametrize("surface", [CHAINS, QUOTES])
+@pytest.mark.parametrize("surface", sorted(DATE_PARTITIONED))
 def test_partition_path_matches_fixture_lake(paths: LakePaths, surface: str):
+    """Parametrized over the set itself, so a third flat surface is covered by adding it there.
+
+    A restated ``[CHAINS, QUOTES]`` would leave a surface added to the set outside this test
+    with nothing to say so, which is the same drift that let the fixture build a bars path
+    production refuses.
+    """
     fixture = FixtureLake(ROOT)
     assert paths.partition_path(surface, "SPY", DAY) == fixture.partition_path(surface, "SPY", DAY)
+
+
+@pytest.mark.parametrize("surface", sorted(set(SURFACES) - DATE_PARTITIONED))
+def test_both_builders_refuse_a_surface_with_its_own_shape(paths: LakePaths, surface: str):
+    """``bars`` adds a ``freq=`` level and ``actions`` is one all-ticker file.
+
+    Production refused these and the fixture builder did not, so the fixture built
+    ``bars/ticker=T/date=D.parquet``, a path no real lake holds. A test written against it
+    would have proved nothing about the paths the code builds. Both refuse now, and this is
+    parametrized over what the set excludes rather than over a list naming the two.
+    """
+    fixture = FixtureLake(ROOT)
+    with pytest.raises(ValueError, match="partition_path is for"):
+        paths.partition_path(surface, "SPY", DAY)
+    with pytest.raises(ValueError, match="partition_path is for"):
+        fixture.partition_path(surface, "SPY", DAY)
+
+
+def test_bars_partition_path_matches_fixture_lake(paths: LakePaths):
+    """The bars path carries its ``freq=`` level, and both builders spell it the same way."""
+    fixture = FixtureLake(ROOT)
+    assert paths.bars_partition_path("SPY", "1m", DAY) == fixture.bars_partition_path(
+        "SPY", "1m", DAY
+    )
+    assert "freq=1m" in paths.bars_partition_path("SPY", "1m", DAY).parts
 
 
 def test_segment_path_matches_fixture_lake(paths: LakePaths):

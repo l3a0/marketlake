@@ -478,10 +478,11 @@ _BARS_CANDLE_CONSUMED = frozenset({_BARS_CANDLE_TS_FIELD})
 # altogether, so there is no row left for the value to overflow onto.
 _BARS_CANDLE_KNOWN = set(_BARS_CANDLE_MAP) | _BARS_CANDLE_CONSUMED
 
-# The response-level fields the row builder recognizes and drops. ``candles`` is the list the
-# rows are built from. ``symbol`` repeats the ticker the request named and ``empty`` restates
-# that list's own length, and ``previousClose`` with ``previousCloseDate`` are the pair
-# ``need_previous_close`` adds. None is a property of a candle, so none takes a column.
+# The response-level fields the row builder recognizes. ``candles`` is the list the rows are
+# built from, so it is recognized here and consumed rather than dropped. The other four are
+# dropped: ``symbol`` repeats the ticker the request named, ``empty`` restates that list's own
+# length, and ``previousClose`` with ``previousCloseDate`` are the pair ``need_previous_close``
+# adds. None of the four is a property of a candle, so none takes a column.
 #
 # They are named here rather than simply ignored, because ignoring the whole response level
 # would mean a field Schwab adds there is captured nowhere at all. An unrecognized one
@@ -490,9 +491,11 @@ _BARS_CANDLE_KNOWN = set(_BARS_CANDLE_MAP) | _BARS_CANDLE_CONSUMED
 # below are the ones known to arrive, so in steady state ``extra`` stays null.
 _BARS_BODY_KNOWN = frozenset({"candles", "symbol", "empty", "previousClose", "previousCloseDate"})
 
-# What one bars row's overflow is measured against: the candle's own recognized fields and
-# the response-level ones the builder drops.
-_BARS_ROW_KNOWN = _BARS_CANDLE_KNOWN | _BARS_BODY_KNOWN
+# The two known-sets stay separate rather than being unioned into one. Unioning them reads
+# as the same rule and is not: a candle carrying a field named ``symbol``, ``empty``,
+# ``candles`` or either previous-close key would be measured against the response's set and
+# dropped silently, and that is exactly the drift the overflow exists to make loud. So each
+# level's fields are measured against its own set and the two overflows are merged.
 
 # The bars capture schema. Each row is one candle.
 #
@@ -536,8 +539,8 @@ _BARS_ROW_KNOWN = _BARS_CANDLE_KNOWN | _BARS_BODY_KNOWN
 #
 # None is a property of a candle, so none is captured, which is the rule the chains header
 # already follows for ``strategy``, ``interval`` and the rest of its body. ``bars_rows``
-# implements it through ``_BARS_BODY_KNOWN``, which names the four so they are recognized and
-# dropped rather than overflowed onto every row.
+# implements it through ``_BARS_BODY_KNOWN``, which names these four beside ``candles`` so they
+# are recognized and dropped rather than overflowed onto every row.
 BARS_SCHEMA = pa.schema(
     [
         pa.field("bar_ts", pa.string(), nullable=False),
@@ -1917,8 +1920,10 @@ def bars_rows(
     and it is the loud outcome: ``extra`` non-null across a whole partition is the drift
     signature, where a silent drop is nothing a reader could ever notice.
 
-    A candle's own field wins a name collision with a response-level one, because the row is a
-    candle's row and the collision would otherwise overwrite the measurement with the header.
+    A name used at both levels overflows under the candle's value, because the row is a
+    candle's row. Each level is still measured against its own known-set, so a response-level
+    ``volume`` and a candle-level ``symbol`` both overflow rather than one of them being read
+    against the wrong set and dropped.
 
     Every other value is the caller's. ``instrument_id`` is resolved per ticker-day and stays
     nullable, so a row whose ticker the master cannot place still lands. The window pair and
@@ -1959,9 +1964,15 @@ def bars_rows(
         for vendor, column in _BARS_CANDLE_MAP.items():
             if vendor in candle:
                 row[column] = candle[vendor]
-        named = dict(response)
-        named.update(candle)
-        row[EXTRA_COLUMN] = _extra_json(named, _BARS_ROW_KNOWN)
+        # Each level is measured against its own known-set. The response's unrecognized
+        # fields land first and the candle's overwrite them on a name collision, because the
+        # row is a candle's row and the collision would otherwise report the response's value
+        # under a name the candle also used.
+        overflow = {key: value for key, value in response.items() if key not in _BARS_BODY_KNOWN}
+        overflow.update(
+            {key: value for key, value in candle.items() if key not in _BARS_CANDLE_KNOWN}
+        )
+        row[EXTRA_COLUMN] = json.dumps(overflow, sort_keys=True) if overflow else None
         rows.append(row)
     return rows
 

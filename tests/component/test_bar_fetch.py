@@ -864,8 +864,6 @@ def test_the_command_against_a_lake_with_no_master_exits_two_with_a_named_line(
             str(config),
             "--tickers",
             str(_tickers_file(tmp_path)),
-            "--date",
-            "2026-09-14",
         ],
         clock=ManualClock(FIRST_NIGHT),
         vendor_factory=lambda *a, **k: _RecordingVendor(_cassette()),
@@ -904,8 +902,6 @@ def test_the_command_exits_one_when_a_finding_could_not_be_filed(
             str(config),
             "--tickers",
             str(_tickers_file(tmp_path)),
-            "--date",
-            "2026-09-14",
         ],
         clock=ManualClock(FIRST_NIGHT),
         vendor_factory=lambda *a, **k: _RecordingVendor(
@@ -932,8 +928,6 @@ def test_the_command_runs_the_sweep_and_reports_what_it_did(
             str(config),
             "--tickers",
             str(_tickers_file(tmp_path)),
-            "--date",
-            "2026-09-14",
         ],
         clock=ManualClock(FIRST_NIGHT),
         vendor_factory=lambda *a, **k: _RecordingVendor(_cassette()),
@@ -954,25 +948,49 @@ def test_the_command_refuses_a_day_that_is_not_a_session(
 
     ``Calendar.is_session`` can, so the refusal happens before the request rather than after
     the payload, which is what makes the empty-window rule above mean a session that traded.
+
+    The session comes from the clock, so a clock sitting on the Sunday is what drives it.
     """
     root = _lake(fixture_lake)
     config = write_config(tmp_path, root)
+    # 20:00 ET on 2026-09-13, a Sunday.
+    sunday_evening = datetime(2026, 9, 14, 0, 0, tzinfo=UTC)
 
     code = bars.main(
-        [
-            "--config",
-            str(config),
-            "--tickers",
-            str(_tickers_file(tmp_path)),
-            "--date",
-            "2026-09-13",
-        ],
-        clock=ManualClock(FIRST_NIGHT),
+        ["--config", str(config), "--tickers", str(_tickers_file(tmp_path))],
+        clock=ManualClock(sunday_evening),
         vendor_factory=lambda *a, **k: _RecordingVendor(_cassette()),
     )
 
     assert code == 2
     assert "is not a session" in capsys.readouterr().err
+
+
+def test_the_command_names_no_session_of_its_own(fixture_lake: FixtureLake, tmp_path: Path):
+    """There is no ``--date``, and its absence is the decision rather than an omission.
+
+    A flag naming the session reads as a convenience and is a backfill selector. Nothing in
+    this job consults a capture-span floor, and the security master is not the barrier it
+    looks like: a session it cannot place files a finding and lands the row anyway with a null
+    ``instrument_id``. So the flag would have let one typo land bars for a session the lake
+    never captured, and the design says there is no backfill anywhere in the implementation.
+    marketlake #319 owns the floor and the span of sessions a run covers.
+    """
+    root = _lake(fixture_lake)
+    config = write_config(tmp_path, root)
+    with pytest.raises(SystemExit):
+        bars.main(
+            [
+                "--config",
+                str(config),
+                "--tickers",
+                str(_tickers_file(tmp_path)),
+                "--date",
+                "2026-09-14",
+            ],
+            clock=ManualClock(FIRST_NIGHT),
+            vendor_factory=lambda *a, **k: _RecordingVendor(_cassette()),
+        )
 
 
 def test_a_day_that_is_not_a_session_raises_from_the_core_too(fixture_lake: FixtureLake):
@@ -1516,6 +1534,308 @@ def test_a_daily_response_carrying_no_candle_for_the_session_lands_no_row(
     assert result.landed == ()
     assert not _partition(root, "SPY", DAILY_FREQ).exists()
     assert result.held[0].finding.check == CHECK_BAR_SPAN
+
+
+# -- the review's findings, each held ---------------------------------------------------
+
+
+def test_a_close_of_record_that_disagrees_is_contained_to_its_ticker(fixture_lake: FixtureLake):
+    """A disagreement holds the bar rather than ending the run.
+
+    The close of record is one cycle and still more than one row when the partition holds two
+    spellings of that instant. Those rows have to agree, and a disagreement raises rather than
+    taking the first, because taking the first lets the file's own row order decide what a bar
+    is judged against. What it must not do is escape: a bare ``ValueError`` falls through the
+    walk's catch, which names only what this job contains, and ends the run on a traceback with
+    no report at all while every later ticker loses its bars.
+    """
+    root = _lake(
+        fixture_lake,
+        quotes={
+            ("SPY", FOLLOWING): [
+                _quote_row(FOLLOWING, close_price=650.0),
+                _quote_row(FOLLOWING, close_price=650.01),
+            ],
+            ("QQQ", FOLLOWING): [_quote_row(FOLLOWING, ticker="QQQ")],
+        },
+        master=_master(("SPY", "QQQ")),
+    )
+
+    result = _run(
+        root,
+        _RecordingVendor(_cassette(tickers=("SPY", "QQQ"))),
+        roster=_roster({"SPY": ["1d"], "QQQ": ["1d"]}),
+    )
+
+    (held,) = result.held
+    assert held.finding.symbol == "SPY"
+    assert "CloseOfRecordDisagrees" in (held.finding.exception or "")
+    assert [landed.ticker for landed in result.landed] == ["QQQ"]
+
+
+def test_a_null_or_nan_close_is_an_absence_rather_than_a_disagreement(fixture_lake: FixtureLake):
+    """A null is not a competing answer, and a NaN is not a figure.
+
+    A partition sealed before ``close_price`` carried a value would otherwise read as a
+    disagreement with the one row that does carry it. A NaN never equals itself, so two rows
+    carrying one would read as two answers. Either way the comparison is left with no number
+    and the bar is held for a missing input, which is what a missing column already gives.
+    """
+    root = _lake(
+        fixture_lake,
+        quotes={
+            ("SPY", FOLLOWING): [
+                _quote_row(FOLLOWING, close_price=None),
+                _quote_row(FOLLOWING, close_price=SETTLED_CLOSE),
+            ]
+        },
+    )
+
+    result = _run(root, _RecordingVendor(_cassette()))
+
+    assert len(result.landed) == 1, "a null beside a real figure read as a disagreement"
+    assert result.held == ()
+
+    nan_root = _lake(
+        FixtureLake(root.parent / "nanlake"),
+        quotes={
+            ("SPY", FOLLOWING): [
+                _quote_row(FOLLOWING, close_price=float("nan")),
+                _quote_row(FOLLOWING, close_price=float("nan")),
+            ]
+        },
+    )
+    nan_result = _run(nan_root, _RecordingVendor(_cassette()))
+    assert nan_result.landed == ()
+    (held,) = nan_result.held
+    assert held.finding.check == CHECK_BAR_CLOSE
+    assert held.finding.against is None, "a NaN reached the comparison as a figure"
+
+
+def test_a_retyped_vendor_close_holds_the_bar_rather_than_ending_the_run(
+    fixture_lake: FixtureLake,
+):
+    """Reading a retyped close is not this job handing the seam a bad argument.
+
+    So it reads as no figure and the check holds the bar for a missing input, rather than
+    ending the run on a traceback and costing every ticker after it.
+    """
+    root = _lake(fixture_lake)
+    retyped = dict(_daily_candle(), close="n/a")
+
+    result = _run(root, _RecordingVendor(_cassette(daily={"candles": [retyped]})))
+
+    assert result.landed == ()
+    (held,) = result.held
+    assert held.finding.check == CHECK_BAR_CLOSE
+    assert held.finding.computed is None
+
+
+def test_a_retyped_candle_field_is_contained_to_its_ticker(fixture_lake: FixtureLake):
+    """A vendor retyping a candle field costs one ticker-day, not the rest of the run.
+
+    The batch build refuses the value, which is the right refusal on this surface: routing
+    exists to keep a perishable capture minute, and a bars partition is re-fetchable. But the
+    refusal has to be contained, or the loud failure costs every ticker after it rather than
+    costing a re-run, which is the opposite of what the module promises.
+    """
+    root = _lake(
+        fixture_lake,
+        quotes={
+            ("SPY", FOLLOWING): [_quote_row(FOLLOWING)],
+            ("QQQ", FOLLOWING): [_quote_row(FOLLOWING, ticker="QQQ")],
+        },
+        master=_master(("SPY", "QQQ")),
+    )
+    retyped = dict(_daily_candle(), volume="70000000")
+    start, end = _daily_window()
+    from lake.cassette import Interaction
+
+    interactions = [
+        Interaction(
+            endpoint="bars",
+            params=bars_params("SPY", DAILY_FREQ, start=start, end=end),
+            status=200,
+            body={"candles": [retyped], "symbol": "SPY", "empty": False},
+        ),
+        *bars_interactions("QQQ", DAILY_FREQ, [(start, end, [_daily_candle()])]),
+    ]
+
+    result = _run(
+        root,
+        _RecordingVendor(Cassette(interactions=tuple(interactions))),
+        roster=_roster({"SPY": ["1d"], "QQQ": ["1d"]}),
+    )
+
+    assert [landed.ticker for landed in result.landed] == ["QQQ"], "one retyped field ended the run"
+    (held,) = result.held
+    assert held.finding.symbol == "SPY"
+
+
+def test_a_candle_field_sharing_a_response_level_name_still_overflows(
+    fixture_lake: FixtureLake,
+):
+    """Each level is measured against its own known-set, not against one union of the two.
+
+    Unioning them reads as the same rule and is not. A candle carrying ``symbol`` would be
+    measured against the response's set and dropped silently, and a response carrying
+    ``volume`` would be measured against the candle's set and dropped too. Those are the names
+    most likely to signal a real vendor change, so they are exactly the ones that must not go
+    quiet.
+    """
+    root = _lake(fixture_lake)
+    odd_candle = dict(_daily_candle(), symbol="XYZ")
+    start, end = _daily_window()
+    from lake.cassette import Interaction
+
+    cassette = Cassette(
+        interactions=(
+            Interaction(
+                endpoint="bars",
+                params=bars_params("SPY", DAILY_FREQ, start=start, end=end),
+                status=200,
+                body={
+                    "candles": [odd_candle],
+                    "symbol": "SPY",
+                    "empty": False,
+                    "volume": 999,
+                },
+            ),
+        )
+    )
+
+    _run(root, _RecordingVendor(cassette))
+
+    table = pa.parquet.read_table(_partition(root, "SPY", DAILY_FREQ))
+    overflow = json.loads(table.column("extra").to_pylist()[0])
+    assert overflow == {"symbol": "XYZ", "volume": 999}
+
+
+def test_a_refused_daily_fetch_files_a_pair_that_is_not_full_coverage(
+    fixture_lake: FixtureLake,
+):
+    """A held fetch must not file "1.0 against 1.0".
+
+    The typed pair exists to say what the check measured. Setting covered from the selected
+    rows alone would report full coverage on a bar that never landed, and a reader could not
+    tell a bounds violation from a coverage failure.
+    """
+    root = _lake(fixture_lake)
+    far_past = _daily_candle(date(2026, 8, 14), close=600.0)
+
+    result = _run(root, _RecordingVendor(_cassette(daily={"candles": [far_past, _daily_candle()]})))
+
+    (held,) = result.held
+    assert held.finding.check == CHECK_BAR_SPAN
+    assert held.finding.against == 1.0
+    assert held.finding.computed is not None and held.finding.computed > 1.0
+
+
+def test_one_frequency_named_twice_is_fetched_once(fixture_lake: FixtureLake):
+    """A roster is free to name a frequency twice, and the run must not spend two requests.
+
+    The manifest is read once before the walk, so the second pass would not see the first
+    one's entry: the partition would be written twice and manifested twice for one path.
+    """
+    root = _lake(fixture_lake)
+    vendor = _RecordingVendor(_cassette())
+
+    result = _run(root, vendor, roster=_roster({"SPY": ["1d", "1d"]}))
+
+    assert len(vendor.calls) == 1
+    assert len(result.landed) == 1
+    rel = _partition(root, "SPY", DAILY_FREQ).relative_to(root).as_posix()
+    assert len(_entries(root, rel)) == 1
+
+
+def test_a_bad_frequency_on_a_disabled_ticker_does_not_halt_the_run(
+    fixture_lake: FixtureLake,
+):
+    """The refusal covers exactly the entries the walk would fetch, and no more.
+
+    Checking the whole roster reaches past this run's scope: a stale ``bars:`` line on a
+    retired ticker, which nothing here would ever fetch, would halt the nightly run every
+    night until someone edited a file for a ticker that is not being captured.
+    """
+    root = _lake(fixture_lake)
+    roster = _roster({"SPY": ["1d"], "OLD": ["5m"]}, enabled={"OLD": False})
+
+    result = _run(root, _RecordingVendor(_cassette()), roster=roster)
+
+    assert len(result.landed) == 1
+    # An enabled ticker carrying the same frequency is still refused, so the narrowing did not
+    # delete the rule.
+    with pytest.raises(UnsupportedBarFreq):
+        _run(root, _RecordingVendor(_cassette()), roster=_roster({"SPY": ["1d"], "NEW": ["5m"]}))
+
+
+def test_a_vendor_failure_files_under_the_response_token_not_the_close_one(
+    fixture_lake: FixtureLake,
+):
+    """The token follows the cause rather than being one name for every contained failure.
+
+    A vendor that refused the request never reached the gate, so filing it under the close
+    cross-check would tell an operator the close disagreed when no close was ever read.
+    """
+    root = _lake(fixture_lake)
+    vendor = _RecordingVendor(_cassette(), fail_with={"SPY": VendorError("refused")})
+
+    result = _run(root, vendor)
+
+    (held,) = result.held
+    assert held.finding.check == CHECK_BAR_RESPONSE
+    assert held.finding.check != CHECK_BAR_CLOSE
+
+
+def test_the_span_check_refuses_to_answer_for_an_empty_candle_list():
+    """The check is defined over a non-empty list, which is #333's own rule.
+
+    An empty window covers zero of its span, so a check reaching one would refuse every empty
+    response as a coverage failure and the empty-window rule that owns that case would be dead
+    code. The caller refuses an empty response first, and this refuses loudly rather than
+    quietly answering for a case it does not decide.
+    """
+    from lake.session import SessionClock
+
+    bounds = SessionClock(ManualClock(FIRST_NIGHT), weekday_sessions(MONDAY)).bounds(SESSION)
+    with pytest.raises(ValueError, match="non-empty"):
+        bars.check_bar_span([], [], bar_window(MINUTE_FREQ, bounds))
+
+
+def test_the_next_session_search_matches_the_bound_oi_already_uses():
+    """A third spelling of one step, with its bound deliberately not chosen again.
+
+    ``oi`` and ``control_plane`` already disagree, 30 against 14, and marketlake #334 owns
+    collapsing the three. A third number would have left that issue two values to settle
+    instead of one.
+    """
+    from lake import oi
+
+    assert bars.NEXT_SESSION_SEARCH_DAYS == oi._NEXT_SESSION_SEARCH_DAYS
+    calendar = weekday_sessions(MONDAY)
+    assert bars._calendar_next_session(calendar, SESSION) == FOLLOWING
+    # The bound is what the search gives up at, so a horizon of one cannot reach past a weekend.
+    assert bars._calendar_next_session(calendar, date(2026, 9, 18), horizon=1) is None
+
+
+def test_the_daily_margin_is_an_argument_the_window_builder_reads():
+    """The bracket's width is a parameter rather than a literal, so a recording can narrow it.
+
+    marketlake #362 is what narrows it once a live daily recording says which instant Schwab
+    stamps a candle at.
+    """
+    from lake.session import SessionClock
+
+    bounds = SessionClock(ManualClock(FIRST_NIGHT), weekday_sessions(MONDAY)).bounds(SESSION)
+    narrowed = bar_window(DAILY_FREQ, bounds, margin=timedelta(hours=6))
+    assert narrowed.start == OPEN_ET - timedelta(hours=6)
+    assert narrowed.end == CLOSE_ET + timedelta(hours=6)
+
+
+def test_the_close_cross_check_reads_the_tolerance_it_is_handed():
+    """The tolerance is an argument, so the battery in #138 can ask the same question wider."""
+    assert bars.check_close_cross(650.0 * 1.01, 650.0, tolerance=0.05).agrees is True
+    assert bars.check_close_cross(650.0 * 1.01, 650.0, tolerance=1e-6).agrees is False
 
 
 # -- the two check functions on their own -----------------------------------------------
