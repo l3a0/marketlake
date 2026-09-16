@@ -129,6 +129,13 @@ from lake.calendar import Calendar, ExchangeCalendar
 from lake.chain_plan import DEFAULT_CHAIN_PLAN_PATH, ChainPlan, Window, load_chain_plan
 from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants, input_errors_exit, load_config
+
+# The health-check slug this job pings. It is the compaction-plus-backup check from the
+# design's steady-state set. Log the slug, never the ping URL, which carries the secret
+# ping key. It is defined beside its four sibling slugs in ``lake.control_plane``, which
+# the install renderer reads to name every check the operator has to arm, and re-exported
+# here so every consumer still reads it from the job that pings it.
+from lake.control_plane import COMPACTION_SLUG
 from lake.journal import ROW_KIND_DATA, ShadowAppendError
 from lake.lock import lake_lock
 from lake.manifest import (
@@ -159,11 +166,6 @@ from lake.runner import (
     escalate_ping_failure,
 )
 from lake.session import SessionClock
-
-# The health-check slug the compaction job pings. It is the compaction-plus-backup check
-# from the design's steady-state set. Log the slug, never the ping URL, which carries the
-# secret ping key.
-COMPACTION_SLUG = "compaction"
 
 # The manifest ``source`` for a compacted partition entry.
 COMPACTION_SOURCE = "compaction"

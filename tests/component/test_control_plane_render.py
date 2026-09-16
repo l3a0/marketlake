@@ -1207,16 +1207,39 @@ def test_the_rendered_reauth_script_runs_and_forwards_its_arguments(tmp_path):
     ]
 
 
-# -- arming the capture check --------------------------------------------------
+# -- arming the live checks ----------------------------------------------------
 
 # The button the operator presses. Every test below finds the step by this phrase rather
-# than by the slug, so a rendering that dropped the slug is still found and still fails
-# the test that asks for it.
+# than by a slug, so a rendering that dropped a slug is still found and still fails the
+# test that asks for it.
 PING_NOW = "Ping Now"
+
+# Every check the install tells the operator to arm, read from the renderer's own
+# constants rather than spelled here. Four of the five ping only when their own job
+# succeeds, so a failing install leaves each row in the never-pinged state where it
+# cannot page. ``calendar-probe`` arms itself by the next weekday 09:35 and is in the
+# list anyway, because a roster with one member left out is how the gap comes back.
+ARMED_SLUGS = (
+    "CAPTURE_SLUG",
+    "PRE_OPEN_SLUG",
+    "SUNDAY_SLUG",
+    "COMPACTION_SLUG",
+    "CALENDAR_PROBE_SLUG",
+)
+
+# The one place the block uses the word capture as English rather than as the slug. The
+# rename check below exempts it by name, so every other occurrence has to have moved.
+CAPTURE_AS_ENGLISH = "capture window"
 
 
 def _pressed(text: str) -> int:
-    """The index of the one rendered line telling the operator to press the button."""
+    """The index of the one rendered line telling the operator to press the button.
+
+    One line, not five. The step names five checks and asks for a press on each of them
+    in a single instruction, which is the shape ``uninstall_script`` already uses to name
+    four slugs to the operator. A second press line would be a second instruction to
+    read, and a step the operator gives up on is the same as no step.
+    """
     hits = [i for i, line in enumerate(text.splitlines()) if PING_NOW in line]
     assert len(hits) == 1, hits
     return hits[0]
@@ -1237,10 +1260,10 @@ def _arming_block(text: str) -> list[str]:
     length the renderer produced.
     """
     lines = text.splitlines()
-    start = _pressed(text) - cp._arm_capture_step_lines().index(
-        next(line for line in cp._arm_capture_step_lines() if PING_NOW in line)
+    start = _pressed(text) - cp._arm_checks_step_lines().index(
+        next(line for line in cp._arm_checks_step_lines() if PING_NOW in line)
     )
-    return lines[start : start + len(cp._arm_capture_step_lines())]
+    return lines[start : start + len(cp._arm_checks_step_lines())]
 
 
 def test_both_renderings_carry_one_arming_step(tmp_path, capsys):
@@ -1252,19 +1275,26 @@ def test_both_renderings_carry_one_arming_step(tmp_path, capsys):
     stop, and only the golden files caught it. A golden carries a documented way to
     regenerate, so a drift blessed by a refresh left nothing red.
     """
-    step = cp._arm_capture_step_lines()
+    step = cp._arm_checks_step_lines()
     assert step, step
     for text in _rendered_install(tmp_path, capsys):
         assert _arming_block(text) == step, text
 
 
-def test_the_step_reads_the_slug_rather_than_spelling_it(tmp_path, capsys):
-    """Renaming the check moves the rendering, rather than leaving it pointing nowhere.
+def test_the_step_reads_every_slug_rather_than_spelling_it(tmp_path, capsys):
+    """Renaming a check moves the rendering, rather than leaving it pointing nowhere.
 
-    Comparing the rendering against the constant's current value cannot tell a real read
+    Comparing the rendering against a constant's current value cannot tell a real read
     from the same word typed twice. Both agree either way. Renaming the check under the
     test is what separates them, and it is the rename that would otherwise ship an
     install pointing the operator at a row that no longer exists.
+
+    Every one of the five is renamed, one at a time, because a block that reads one slug
+    and spells the other four is the half-fix this section exists to stop. The original
+    has to be gone from the block afterwards, so a renderer that read the constant and
+    spelled the word beside it fails too. ``capture`` is the one exception, and it is
+    named rather than waived: the block also says *capture window*, which is the session
+    term and not the check.
     """
     monkey = "sentinel-slug"
     for text in _rendered_install(tmp_path, capsys):
@@ -1272,29 +1302,32 @@ def test_the_step_reads_the_slug_rather_than_spelling_it(tmp_path, capsys):
 
     import lake.control_plane
 
-    original = lake.control_plane.CAPTURE_SLUG
-    try:
-        lake.control_plane.CAPTURE_SLUG = monkey
-        for text in _rendered_install(tmp_path, capsys):
-            line = text.splitlines()[_pressed(text)]
-            assert monkey in line, line
-            assert original not in _arming_block(text)[_pressed_offset()], line
-    finally:
-        lake.control_plane.CAPTURE_SLUG = original
+    for name in ARMED_SLUGS:
+        original = getattr(lake.control_plane, name)
+        setattr(lake.control_plane, name, monkey)
+        try:
+            for text in _rendered_install(tmp_path, capsys):
+                block = "\n".join(_arming_block(text))
+                assert monkey in block, (name, block)
+                remaining = block.replace(CAPTURE_AS_ENGLISH, "<window>")
+                assert original not in remaining, (name, remaining)
+        finally:
+            setattr(lake.control_plane, name, original)
 
 
 def _pressed_offset() -> int:
     """Where the press line sits inside the step, so the rename check reads that line."""
-    step = cp._arm_capture_step_lines()
+    step = cp._arm_checks_step_lines()
     return next(i for i, line in enumerate(step) if PING_NOW in line)
 
 
 def test_the_arming_step_closes_the_rendered_install(tmp_path, capsys):
     """Both renderings end their install on it, because it is the last step of installing.
 
-    The check the daemon feeds never goes down until something pings it, so an install
-    whose every cycle fails leaves that row silent. Arming it is the step that turns the
-    silence into a page, and a step the operator never reaches is the same as no step.
+    A check that has never been pinged never goes down until something pings it, so an
+    install whose jobs all fail leaves every one of those rows silent. Arming them is the
+    step that turns the silence into a page, and a step the operator never reaches is the
+    same as no step.
 
     Both renderings are checked, because the same install is rendered twice. A step
     added to the script and not to the pasted text is the half-fix this guards.
@@ -1309,7 +1342,7 @@ def test_the_arming_step_closes_the_rendered_install(tmp_path, capsys):
     # The step's own last line is the file's last line. Compared against the step rather
     # than against the words it happens to use, so rewording the block is free and
     # appending anything after it is not.
-    assert lines[-1] == cp._arm_capture_step_lines()[-1]
+    assert lines[-1] == cp._arm_checks_step_lines()[-1]
     token = next(i for i, line in enumerate(lines) if line.startswith("# The token."))
     assert token < press
 
@@ -1345,18 +1378,36 @@ def test_the_arming_step_comes_after_the_jobs_are_bootstrapped(tmp_path, capsys)
         assert max(bootstraps) < read_back[0] < _pressed(text), text
 
 
-def test_the_arming_step_names_the_check_by_its_slug(tmp_path, capsys):
-    """The line saying which button to press says which row to press it on.
+def test_the_arming_step_names_every_check_by_its_slug(tmp_path, capsys):
+    """The step says which rows to press the button on, and leaves none of them out.
 
-    Healthchecks shows one row per job, and the install has just loaded five. Naming the
-    row is the whole instruction. The slug is also all the step may carry: a ping URL is
-    a secret and the renderer's output is tracked.
+    Healthchecks shows one row per check, and a row nobody presses stays in the state
+    where it cannot page. Naming every row is the whole instruction. The install used to
+    name one, ``capture``, on the reasoning that an idle heartbeat armed the rest. The
+    daemon builds one dead-man and feeds ``capture`` with it, so that reasoning covered
+    nothing else.
+
+    The slugs are also all the step may carry: a ping URL is a secret and the renderer's
+    output is tracked.
+
+    Read through ``lake.deadman`` and ``lake.compact`` rather than through the renderer's
+    own module, so the check is against what each job actually pings. A renderer naming a
+    row no job feeds would pass a comparison against itself.
     """
+    from lake.compact import COMPACTION_SLUG
+    from lake.control_plane import CALENDAR_PROBE_SLUG, PRE_OPEN_SLUG, SUNDAY_SLUG
     from lake.deadman import CAPTURE_SLUG
 
+    slugs = (CAPTURE_SLUG, PRE_OPEN_SLUG, SUNDAY_SLUG, COMPACTION_SLUG, CALENDAR_PROBE_SLUG)
+    assert len(set(slugs)) == len(slugs), slugs
     for text in _rendered_install(tmp_path, capsys):
-        line = text.splitlines()[_pressed(text)]
-        assert re.search(rf"\b{re.escape(CAPTURE_SLUG)}\b", line), line
+        block = "\n".join(_arming_block(text))
+        for slug in slugs:
+            assert re.search(rf"\b{re.escape(slug)}\b", block), (slug, block)
+        # The press line is one instruction rather than five, and it is the line that
+        # names the checks, so the slugs sit with the button rather than a screen away.
+        press = _arming_block(text)[_pressed_offset()]
+        assert PING_NOW in press and CAPTURE_SLUG in press, press
 
 
 def test_every_line_of_the_arming_step_is_a_comment(tmp_path, capsys):

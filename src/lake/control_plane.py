@@ -206,6 +206,14 @@ SUNDAY_SLUG = "sunday"
 # for a job that no longer runs, so deleting it is an operator step.
 CAPTURE_SLUG = "capture"
 
+# The slug of the check the nightly compaction-plus-backup run pings. It sits here for
+# the reason above rather than in ``lake.compact``, because the install renderer names
+# it too. Reaching into ``lake.compact`` from here would make every process that imports
+# this module load the compaction engine, the daemon included, and the daemon spawns
+# compaction as a separate process on purpose. ``lake.compact`` imports it back and
+# re-exports it, so every consumer still reads it from there.
+COMPACTION_SLUG = "compaction"
+
 # The system PATH a LaunchDaemon gets. launchd gives a job a minimal environment, so
 # the plist restores the OS tool directories the jobs shell out to: pmset, launchctl,
 # tmutil, caffeinate, and rsync. These are OS locations, not machine-specific paths.
@@ -2374,10 +2382,10 @@ def install_script(host: LaunchdHost) -> str:
     # because a machine with no jobs installed has nothing for a token to feed.
     body += _token_step_lines()
 
-    # Arming the check closes the script. It is comment-only for the same reason the
+    # Arming the checks closes the script. It is comment-only for the same reason the
     # token pointer is, and it is last because it is the last step of the first install
     # and must not run before the bootstrap above.
-    body += _arm_capture_step_lines()
+    body += _arm_checks_step_lines()
 
     # Counted from the body rather than written down, so the header cannot drift from
     # what the script actually runs.
@@ -2779,12 +2787,35 @@ def _token_step_lines() -> list[str]:
     ]
 
 
-def _arm_capture_step_lines() -> list[str]:
-    """Arming the capture check, as comment lines, for both renderings of the install.
+def _arm_checks_step_lines() -> list[str]:
+    """Arming the live checks, as comment lines, for both renderings of the install.
 
     One source for two renderings, the same reason ``_first_install_lines`` is one. The
     install script closes on these lines and the install text prints the same block, so
-    the two cannot drift about whether the check gets armed.
+    the two cannot drift about whether the checks get armed.
+
+    Every live check is named, because what arms a row is its first ping rather than its
+    first run. healthchecks keeps a check that has never been pinged in a ``new`` state,
+    which never goes down and never sends, so a job that fails every run leaves its row
+    silent instead of paging. The five differ only in how long that silence lasts when
+    nobody presses.
+
+    1. ``capture`` is fed by the daemon's idle heartbeat outside the capture window, and
+       by a durable cycle inside it. An install made inside the window whose cycles all
+       fail leaves the row reading ``Never``.
+    2. ``pre-open`` is armed by ``RunAtLoad`` on the self-check job on an install made
+       outside every window, which ``self_check_job`` sets for that reason. An install
+       made inside a window, or with the daemon down, still withholds that first ping.
+    3. ``sunday`` and ``compaction`` have no install-time path of any kind. The Sunday
+       plist carries ``RunAtLoad`` as false and compaction has no plist at all, so a job
+       failing every run leaves its row reading ``Never`` at any hour and in any week.
+    4. ``calendar-probe`` pings on every answer, so it arms itself by the next weekday
+       09:35. It is pressed with the rest because it reads ``Never`` until then, and
+       because leaving one member of a roster out is how the roster comes back.
+
+    Running the jobs instead arms nothing. ``self-check`` exits 1 when it did not ping,
+    and the script runs under ``set -e``, so the one install where arming matters is the
+    one it would stop.
 
     Every line is a comment. Pressing a button on a web page needs a browser and a
     person, so the install points at the step rather than takes it. That is also what
@@ -2795,26 +2826,32 @@ def _arm_capture_step_lines() -> list[str]:
     pins. A check armed before the jobs are loaded makes the page that follows about the
     install order rather than about the daemon.
 
-    It names the check by its slug and carries no URL. A healthchecks ping URL is a
+    It names each check by its slug and carries no URL. A healthchecks ping URL is a
     secret, and a rendered directory has to stay safe to paste into a bug report. The
     slug is what the operator has to read, because healthchecks lists a check under its
     name and the retired slice-1 row's name also carries the word capture.
     """
     return [
-        f"# Arming the {CAPTURE_SLUG} check. This is the last step of the first install,",
-        "# and it happens after the bootstrap above and never before. A check armed ahead",
-        "# of the jobs makes the page that follows about the install order rather than",
-        "# about the daemon.",
-        f"# Open healthchecks.io and press Ping Now on the {CAPTURE_SLUG} check, the one",
-        "# the daemon feeds every cycle. The list shows a check by name rather than by",
-        "# slug, and a retired slice-1 row can still be sitting beside it, so read the",
-        "# slug before pressing.",
+        "# Arming the checks. This is the last step of the first install, and it happens",
+        "# after the bootstrap above and never before. A check armed ahead of the jobs",
+        "# makes the page that follows about the install order rather than about the",
+        "# daemon.",
+        f"# Open healthchecks.io and press Ping Now on each of these checks: {CAPTURE_SLUG},",
+        f"# {PRE_OPEN_SLUG}, {SUNDAY_SLUG}, {COMPACTION_SLUG} and {CALENDAR_PROBE_SLUG}. The"
+        " list shows a check by name",
+        "# rather than by slug, and a retired slice-1 row can still be sitting beside it,",
+        "# so read the slug before pressing.",
         "# healthchecks keeps a check that has never been pinged in a new state, which",
-        "# never goes down and never sends. Inside the capture window no idle heartbeat",
-        f"# is owed, so an install whose every cycle fails leaves the {CAPTURE_SLUG} row",
-        "# reading Never. That is what happened on 2026-09-08, when the jobs came up at",
-        "# 13:06 ET against a token that had expired three days earlier. One press turns",
-        "# that silence into a page inside the grace period.",
+        "# never goes down and never sends. What arms a row is its first ping rather than",
+        "# its first run, so a job that fails every run stays silent instead of paging.",
+        "# Arming is once per row forever, so this is a step of the first install and of",
+        "# nothing after it.",
+        f"# Press {CAPTURE_SLUG} first. Its grace is five minutes, while the others measure",
+        "# theirs in hours or days. Inside the capture window no idle heartbeat is owed, so",
+        "# an install whose every cycle fails leaves that row reading Never. That is what",
+        "# happened on 2026-09-08, when the jobs came up at 13:06 ET against a token that",
+        "# had expired three days earlier. One press turns that silence into a page inside",
+        "# the grace period.",
     ]
 
 
@@ -2926,7 +2963,7 @@ def install_commands(out_dir: Path, host: LaunchdHost) -> str:
     ):
         lines.append(f"{item[0]} && {item[1]}" if isinstance(item, tuple) else item)
     lines += _token_step_lines()
-    lines += _arm_capture_step_lines()
+    lines += _arm_checks_step_lines()
     lines += [
         "# 6. Set the Sunday one-shot. The slice-3 vendor sweep will do this every Friday.",
         "# Until that sweep lands, run this line each Friday and run the second command it",
@@ -3210,6 +3247,7 @@ def _exchange_calendar() -> Calendar:
 __all__ = [
     "CANARY_DEADLINE",
     "CAPTURE_SLUG",
+    "COMPACTION_SLUG",
     "CANARY_RETRY",
     "CANARY_SYMBOL",
     "DAEMON_LABEL",

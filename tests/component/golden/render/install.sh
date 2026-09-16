@@ -83,17 +83,22 @@ launchctl print system/com.marketlake.daemon
 # Run ./reauth.sh beside this file, as the owner, at a terminal on a
 # machine with a browser. It reads schwab_callback_url from config.yaml, which must
 # match the callback registered on the Schwab app.
-# Arming the capture check. This is the last step of the first install,
-# and it happens after the bootstrap above and never before. A check armed ahead
-# of the jobs makes the page that follows about the install order rather than
-# about the daemon.
-# Open healthchecks.io and press Ping Now on the capture check, the one
-# the daemon feeds every cycle. The list shows a check by name rather than by
-# slug, and a retired slice-1 row can still be sitting beside it, so read the
-# slug before pressing.
+# Arming the checks. This is the last step of the first install, and it happens
+# after the bootstrap above and never before. A check armed ahead of the jobs
+# makes the page that follows about the install order rather than about the
+# daemon.
+# Open healthchecks.io and press Ping Now on each of these checks: capture,
+# pre-open, sunday, compaction and calendar-probe. The list shows a check by name
+# rather than by slug, and a retired slice-1 row can still be sitting beside it,
+# so read the slug before pressing.
 # healthchecks keeps a check that has never been pinged in a new state, which
-# never goes down and never sends. Inside the capture window no idle heartbeat
-# is owed, so an install whose every cycle fails leaves the capture row
-# reading Never. That is what happened on 2026-09-08, when the jobs came up at
-# 13:06 ET against a token that had expired three days earlier. One press turns
-# that silence into a page inside the grace period.
+# never goes down and never sends. What arms a row is its first ping rather than
+# its first run, so a job that fails every run stays silent instead of paging.
+# Arming is once per row forever, so this is a step of the first install and of
+# nothing after it.
+# Press capture first. Its grace is five minutes, while the others measure
+# theirs in hours or days. Inside the capture window no idle heartbeat is owed, so
+# an install whose every cycle fails leaves that row reading Never. That is what
+# happened on 2026-09-08, when the jobs came up at 13:06 ET against a token that
+# had expired three days earlier. One press turns that silence into a page inside
+# the grace period.
