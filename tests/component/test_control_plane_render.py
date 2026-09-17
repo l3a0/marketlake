@@ -2028,6 +2028,43 @@ def test_the_restart_offers_exactly_the_jobs_that_can_go_stale(tmp_path):
         assert label not in script, label
 
 
+def test_both_staleness_sentences_count_the_calendar_jobs_from_the_roster(tmp_path, capsys):
+    """The count an operator reads is derived, so a seventh job cannot leave it behind.
+
+    Two sentences answer "does this job need a restart", one in ``restart.sh`` and one in
+    the install text. Both said three while the roster held four, because the 18:30 sweep
+    shipped after they were written and neither was a number the commit that added it
+    could sweep. So the word is read from ``all_jobs`` here rather than compared to a
+    literal, which is the same thing the sentence itself now does.
+    """
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    install_text = capsys.readouterr().out
+    transient = [job for job in cp.all_jobs(_host()) if not job.keep_alive]
+    word = cp._spelled(len(transient))
+    restart = (out / cp.RESTART_SCRIPT_FILE).read_text()
+    assert f"The other {word} jobs exec fresh on every" in restart, restart
+    assert f"The other {word} jobs exec fresh every fire" in install_text, install_text
+
+
+def test_the_restart_docstring_names_no_calendar_job(tmp_path):
+    """Prose cannot read the roster, so it is allowed to name neither side of it.
+
+    The docstring named three of the four calendar jobs for as long as there were four.
+    Naming a subset is the failure, and prose has no way to name the whole set correctly
+    for longer than the next job takes to land. So it states the rule by shape and names
+    none of them, and this is what refuses the next hand-written list.
+    """
+    doc = cp.restart_script.__doc__
+    assert doc is not None
+    transient = [job for job in cp.all_jobs(_host()) if not job.keep_alive]
+    assert transient, "a roster with no calendar jobs would make this test vacuous"
+    for job in transient:
+        slug = job.label.rsplit(".", 1)[-1]
+        for spelling in (slug, slug.replace("-", " ")):
+            assert spelling not in doc, (spelling, doc)
+
+
 def test_the_restart_defaults_to_the_dashboard(tmp_path):
     """Restarting the daemon costs the in-flight cycle, so it has to be asked for.
 

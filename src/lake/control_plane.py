@@ -265,13 +265,13 @@ _NUMBER_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven", 
 def _spelled(count: int) -> str:
     """``count`` as an English word, or as a numeral when there is no word for it.
 
-    It falls back rather than refusing, and that is the whole of the reasoning. The only
-    callers are two sentences inside ``uninstall_script``, which ``render_all`` calls, so
-    raising here would take the entire install and uninstall rendering down over the
-    spelling of one word. The design's own budget is not nine: it puts the per-job check
-    pattern "well inside the free tier's 20-check allowance". A tenth check is a thing
-    this project expects to have one day, and reading "Pause all 10 from healthchecks" is
-    a smaller cost than a renderer that will not run.
+    It falls back rather than refusing, and that is the whole of the reasoning. Every
+    caller is a sentence inside a rendered script or the install text, all of which
+    ``render_all`` calls, so raising here would take the entire install and uninstall
+    rendering down over the spelling of one word. The design's own budget is not nine: it
+    puts the per-job check pattern "well inside the free tier's 20-check allowance". A
+    tenth check is a thing this project expects to have one day, and reading "Pause all 10
+    from healthchecks" is a smaller cost than a renderer that will not run.
     """
     if 0 <= count < len(_NUMBER_WORDS):
         return _NUMBER_WORDS[count]
@@ -2801,15 +2801,20 @@ def uninstall_script(host: LaunchdHost) -> str:
 def restart_script(host: LaunchdHost) -> str:
     """Restart a resident job so it picks up new code. The renderer never runs it.
 
-    Only two of the six jobs can go stale, and the reason is the shape of the job rather
-    than anything about the code. The daemon and the dashboard are resident: launchd
-    starts each once and ``KeepAlive`` relaunches it if it exits, so each holds the Python
-    it imported at start. The venv is an editable install whose path entry is the absolute
+    Only a resident job can go stale, and the reason is the shape of the job rather than
+    anything about the code. The daemon and the dashboard are resident: launchd starts
+    each once and ``KeepAlive`` relaunches it if it exits, so each holds the Python it
+    imported at start. The venv is an editable install whose path entry is the absolute
     ``src`` directory, so editing that tree changes what a *new* process imports and
-    nothing about one already running. The self-check, the calendar probe and the Sunday
-    job exec fresh on every fire, so they always run current code and never need this. The
-    pair is derived from ``keep_alive``, so a third resident job is covered by adding the
-    job and nothing else.
+    nothing about one already running. Every other job runs on a calendar and execs fresh
+    on every fire, so it always runs current code and never needs this.
+
+    Neither side is counted here, and the rendered text counts neither by hand either.
+    Both are derived from ``keep_alive``, so a third resident job is covered by adding the
+    job and nothing else, and so is a seventh calendar one. A number typed into prose is
+    what left the 18:30 sweep out of both lists once it shipped. The commit that added it
+    swept every "five" in this file to "six" and never reached the one sentence that
+    spelled the exec-fresh jobs by name instead of counting them.
 
     ``launchctl kickstart -k`` runs the service immediately whatever its launch conditions
     say, killing the running instance first if there is one. That is right when the code
@@ -2842,6 +2847,10 @@ def restart_script(host: LaunchdHost) -> str:
     command that takes capture down, so the daemon has to be named.
     """
     residents = [job.label for job in all_jobs(host) if job.keep_alive]
+    # Counted rather than named. The labels in this script are the arguments it takes, so
+    # a calendar job's label appearing anywhere in the file would read as one more job the
+    # operator can restart.
+    transient = [job.label for job in all_jobs(host) if not job.keep_alive]
     short = {label.rsplit(".", 1)[-1]: label for label in residents}
     # The default is the dashboard, because restarting it costs open connections while
     # restarting the daemon costs the in-flight cycle. Derived from the label rather than
@@ -2869,7 +2878,8 @@ def restart_script(host: LaunchdHost) -> str:
         "# launchd starts each once and KeepAlive relaunches it if it exits, so each holds",
         "# the Python it imported at start. The venv is an editable install pointing at an",
         "# absolute src directory, so editing that tree changes what a NEW process imports",
-        "# and nothing about one already running. The other three jobs exec fresh on every",
+        f"# and nothing about one already running. The other {_spelled(len(transient))} jobs"
+        " exec fresh on every",
         "# fire, so they always run current code and never need this.",
         "#",
         "# `launchctl kickstart -k` runs the service immediately whatever its launch",
@@ -3248,11 +3258,16 @@ def install_commands(out_dir: Path, host: LaunchdHost) -> str:
     ]
     for job in all_jobs(host):
         lines.append(f"# sudo launchctl bootout {LAUNCHD_DOMAIN}/{job.label}")
+    # Derived for the same reason ``restart_script`` derives it: the sentence below is
+    # the one an operator reads to decide whether a job needs restarting, and typing the
+    # number is what left the 18:30 sweep out of it.
+    transient = [job for job in all_jobs(host) if not job.keep_alive]
     lines += [
         "# Restarting. New code does not reach a running job. The daemon and the",
         "# dashboard are resident, so each holds the Python it imported at start. After",
         f"# pulling code with no plist change, run ./{RESTART_SCRIPT_FILE} beside this file.",
-        "# The other three jobs exec fresh every fire and never need it. A re-render that",
+        f"# The other {_spelled(len(transient))} jobs exec fresh every fire and never need"
+        " it. A re-render that",
         "# changed a plist is the other case, and it needs the reinstall above.",
         f"# Uninstalling. Run ./{UNINSTALL_SCRIPT_FILE} beside this file. It undoes steps",
         "# 5, 3, 2 and 1, in that order. Read its header before running it. It lists what",
