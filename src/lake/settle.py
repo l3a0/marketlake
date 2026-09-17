@@ -46,13 +46,17 @@ be compared over, 760.88 and 757.39 on SPY and 709.18 and 704.54 on QQQ. A numbe
 that agrees four times out of four is a good check and still not the source, because the
 ``bars/`` close has passed gate-before-land and this one has passed nothing.
 
-**Nothing here waits on marketlake #362**, which asks which session a daily stamp names. This
-read asks for the close of a *named* session, and a bars partition is addressed by its
+**Which session a daily stamp names does not reach this read**, and it is now settled anyway.
+This read asks for the close of a *named* session, and a bars partition is addressed by its
 ``date=`` path level. ``bars.select_session_rows`` filters every landed row through
 ``session_of``, and two gates run before a candle lands: the span check refuses a daily fetch
-whose selection came back empty, and ``check_close_cross`` compares the landed close against
-the close the lake settled from its own captured quotes. So a wrong convention costs this view
-a ``BarsAbsent`` and never a wrong close.
+whose selection came back empty, and ``check_close_cross`` compares the landed close against the
+close the lake settled from its own captured quotes. So even a wrong convention would cost this
+view a ``BarsAbsent`` rather than a wrong close.
+
+It is not wrong. marketlake #362 was open on a fixture convention when this was written, and the
+owner's live SPY recording closed it: a daily candle is stamped on the session's own Eastern date,
+at or shortly after midnight, which is the date ``session_of`` already reads.
 
 **The threshold is compared in whole cents.** Intrinsic per share is the close minus the
 strike for a call and the strike minus the close for a put, floored at zero, and
