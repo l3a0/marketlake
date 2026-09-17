@@ -26,7 +26,7 @@ the verdict about it is not.
 
 **The entry's five fields, and why four of them were decided elsewhere.**
 ``manifest.is_quarantined`` ships and fails closed, so a verdict it cannot read withholds its
-partition forever, and marketlake #139 states a precedence rule before its own tool is built.
+partition forever, and marketlake #139 states a precedence rule its own tool later builds on.
 Between them they decide four of the five.
 
 1. ``partition``, the first half of the key the reader resolves on.
@@ -56,7 +56,8 @@ per-check answer and the ledger carries the partition's readability, and only a 
 else, and the comment above it says each ledger writer refreshes its own manifest entry in the
 same locked invocation that appends the row, because that is the check which catches a verdict
 written without its entry. ``quarantine.jsonl`` is not excluded, so an unmanifested ledger is an
-orphan to the Sunday scrub. #139 requires the same of the sign-off tool. ``actions.append`` is
+orphan to the Sunday scrub. #139 requires the same of the sign-off tool, and ``lake.signoff``
+meets it at :func:`append_verdict` rather than at the bare append. ``actions.append`` is
 the worked precedent and :func:`append_verdict` follows it, down to counting the file's lines
 rather than the entries a read returns, so a damaged ledger cannot stop the writer.
 
@@ -65,8 +66,10 @@ that check's own current entry for the partition. If a human wrote it, a verdict
 *same* check never supersedes it, and the run says "re-observed, human precedence stands" in
 the nightly report. Reading the check's own entry rather than the partition's last line is
 marketlake #426: a later entry from any other check used to hide the sign-off entirely.
-#139 depends on this deliverable and ships after it, so a rule built there would arrive too
-late: the sign-off tool would ship with its sign-offs undone by the next nightly run.
+#139 depended on this deliverable and shipped after it, so a rule built there would have
+arrived too late: the sign-off tool would have shipped with its sign-offs undone by the next
+nightly run. ``lake.signoff`` is that tool, and it writes its sign-off under the check named on
+the entry it supersedes, which is the token this function compares.
 
 **Append on transition only, per check.** A sealed partition is immutable, so the same check
 against the same partition is the same finding every night. A check with no entry has said
@@ -180,6 +183,12 @@ SEALED_SURFACES: tuple[str, ...] = (CHAINS, QUOTES)
 # ``SWEEP_SOURCE`` on its own. It names the producer rather than the job, so a hand run and the
 # 18:30 run leave the same entry.
 BATTERY_SOURCE = "battery"
+
+# The same, for the ledger's other writer. ``lake.signoff`` is the sign-off tool and it passes
+# this to :func:`append_verdict`, so the manifest entry names which of the two writers refreshed
+# the ledger. It is pinned here rather than there because ``append_verdict``'s default is the
+# battery's and the pair only means anything read together.
+SIGNOFF_SOURCE = "signoff"
 
 # What a ledger entry says about who wrote it. #139's human-precedence rule turns on this, so
 # the two spellings are pinned here and the sign-off tool reads them rather than minting a third.
@@ -395,7 +404,13 @@ def entry_line_count(lake_root: Path | str) -> int:
     return sum(1 for line in path.read_text().splitlines() if line.strip())
 
 
-def append_verdict(lake_root: Path | str, entry: dict, *, observed_at: datetime) -> dict:
+def append_verdict(
+    lake_root: Path | str,
+    entry: dict,
+    *,
+    observed_at: datetime,
+    source: str = BATTERY_SOURCE,
+) -> dict:
     """Append one verdict and refresh the ledger's manifest entry, inside one lock hold.
 
     Both writes happen inside one hold of the lake-root ``flock``, which this takes itself.
@@ -408,6 +423,11 @@ def append_verdict(lake_root: Path | str, entry: dict, *, observed_at: datetime)
     scrub-exclusion comment says is not enough for a ledger. Marketlake #139's sign-off tool is
     the other writer and owes the same two writes, so both meet at this function rather than at
     the bare append.
+
+    ``source`` is what the refreshed manifest entry records about who wrote the ledger line,
+    and it defaults to this module so the nightly run needs nothing. ``lake.signoff`` passes
+    :data:`SIGNOFF_SOURCE`, because a human sign-off refreshed by a writer stamped ``battery``
+    names the wrong producer, and every other writer in the lake stamps its own.
     """
     root = Path(lake_root)
     target = quarantine_path(root)
@@ -422,7 +442,7 @@ def append_verdict(lake_root: Path | str, entry: dict, *, observed_at: datetime)
         record_partition(
             root,
             QUARANTINE_FILE,
-            source=BATTERY_SOURCE,
+            source=source,
             rows=entry_line_count(root),
             fetched_at=observed_at.astimezone(MARKET_TZ).isoformat(),
         )
@@ -1388,6 +1408,7 @@ __all__ = [
     "PROVENANCE_HUMAN",
     "QUARANTINED_VERDICT",
     "SEALED_SURFACES",
+    "SIGNOFF_SOURCE",
     "VERDICTS",
     "BatteryError",
     "BatteryReport",
