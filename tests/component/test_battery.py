@@ -43,6 +43,7 @@ from lake.battery import (
     judge_entitlement,
     page_delayed_feed,
     read_entitlement,
+    render,
     sealed_partitions,
 )
 from lake.capture_spans import CaptureSpan
@@ -1037,6 +1038,109 @@ def test_the_loader_refuses_a_partition_this_run_quarantined(lake: Path):
     assert caught.value.entry["verdict"] == QUARANTINED_VERDICT
 
 
+def test_the_refusal_names_every_check_withholding_the_partition(lake: Path):
+    """Signing one off leaves the other standing, so a refusal naming one misleads.
+
+    The second check is seeded through ``append_verdict`` rather than produced by a run,
+    because one check exists. What is asserted is the loader's own reading of the ledger.
+    """
+    from lake.loader import PartitionQuarantined, load_chain
+
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
+    _seed_spans(lake)
+    append_verdict(
+        lake,
+        build_entry(
+            partition="chains/ticker=SPY/date=2026-09-16.parquet",
+            verdict=QUARANTINED_VERDICT,
+            check="row_count_band",
+            observed_at=NOW,
+        ),
+        observed_at=NOW,
+    )
+
+    judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    with pytest.raises(PartitionQuarantined) as caught:
+        load_chain("SPY", DAY, lake_root=lake)
+
+    held = [entry["check"] for entry in caught.value.entries]
+    assert held == ["row_count_band", CHECK_ENTITLEMENT]
+    assert "row_count_band" in str(caught.value)
+    assert CHECK_ENTITLEMENT in str(caught.value)
+    assert caught.value.entry is caught.value.entries[0]
+
+
+def test_a_partition_another_check_withholds_is_refused_after_this_one_clears(lake: Path):
+    """Marketlake #426 through the reader that pays for it.
+
+    The entitlement check quarantines, a second check quarantines beside it, and the
+    entitlement check then passes. Its ``clean`` was the ledger's last line, so the partition
+    read while the other check's fault stood.
+    """
+    from lake.loader import PartitionQuarantined, load_chain
+
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
+    _seed_spans(lake)
+    judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+    append_verdict(
+        lake,
+        build_entry(
+            partition="chains/ticker=SPY/date=2026-09-16.parquet",
+            verdict=QUARANTINED_VERDICT,
+            check="row_count_band",
+            observed_at=NOW,
+        ),
+        observed_at=NOW,
+    )
+
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=-1.7))
+    report = judge(lake, calendar=CALENDAR, now=NOW + timedelta(days=1), guards=GuardConstants())
+
+    assert report.released == 0, "the row-count check still withholds it"
+    assert report.withheld == 1
+    assert report.deferred == 0, "a sibling check's deferral is not a human sign-off"
+    with pytest.raises(PartitionQuarantined):
+        load_chain("SPY", DAY, lake_root=lake)
+
+
+def test_a_release_is_counted_and_reported_when_the_last_check_clears(lake: Path):
+    """A partition rejoining the readable set looks exactly like one nothing ever withheld."""
+    from lake.loader import PartitionQuarantined, load_chain
+
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
+    _seed_spans(lake)
+    judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=-1.7))
+    report = judge(lake, calendar=CALENDAR, now=NOW + timedelta(days=1), guards=GuardConstants())
+
+    assert report.released == 1
+    assert report.withheld == 0
+    assert any("now reads, no check withholds it" in line for line in report.report)
+    assert "released:             1" in render(report)
+    # The quarantine guard runs before the read, so its silence is the claim. This file's
+    # minimal rows carry no close-tagged cycle, which is a later refusal and a different one.
+    with pytest.raises(Exception) as caught:  # noqa: B017 - the type is the assertion
+        load_chain("SPY", DAY, lake_root=lake)
+    assert not isinstance(caught.value, PartitionQuarantined)
+
+
+def test_a_dry_run_reports_the_release_the_real_run_would_produce(lake: Path):
+    """Two walks would drift, and the counts before deciding must be the counts after."""
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
+    _seed_spans(lake)
+    judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=-1.7))
+
+    later = NOW + timedelta(days=1)
+    dry = judge(lake, calendar=CALENDAR, now=later, guards=GuardConstants(), dry_run=True)
+    real = judge(lake, calendar=CALENDAR, now=later, guards=GuardConstants())
+
+    assert dry.released == real.released == 1
+    assert dry.appended == ()
+
+
 def test_include_quarantined_reads_past_a_verdict_this_writer_wrote(fixture_lake):
     """The opt-in half of the same guard, so a verdict is never a one-way door.
 
@@ -1470,21 +1574,26 @@ def test_transition_compares_the_check_directly(lake: Path):
     Through ``judge`` the clause is unreachable, so deleting it changes nothing a run can see.
     What it guards is the day a second check finds a different fault on a partition the first
     already quarantined: without it that finding is never recorded and never pages.
+
+    Since marketlake #426 the entry handed over is that check's own, so the case is a check
+    with nothing recorded against it meeting a partition another check already withholds.
     """
     from lake.battery import _entitlement_finding, _transition
 
-    quarantined_by_a = {
+    quarantined_by_b = {
         "partition": "chains/ticker=SPY/date=2026-09-16.parquet",
         "verdict": QUARANTINED_VERDICT,
-        "check": "row_count_band",
+        "check": CHECK_ENTITLEMENT,
         "provenance": PROVENANCE_BATTERY,
     }
     fails_under_b = _entitlement_finding(
         _partition(lake), QUARANTINED_VERDICT, "the feed is delayed"
     )
 
-    assert _transition(quarantined_by_a, fails_under_b) is True
-    assert _transition(quarantined_by_a, replace(fails_under_b, check="row_count_band")) is False
+    # Nothing recorded under this check, and it now fails: news, whatever else withholds.
+    assert _transition(None, fails_under_b) is True
+    # Its own entry already says so: the same news a second time.
+    assert _transition(quarantined_by_b, fails_under_b) is False
 
 
 def test_the_manifest_entry_and_the_ledger_line_agree_on_the_clock(lake: Path):

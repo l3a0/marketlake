@@ -2607,13 +2607,60 @@ def test_an_open_quarantine_is_listed_with_its_verdict(fixture_lake: FixtureLake
     )
     payload = service_over(fixture_lake.build()).run_query("history", {})
     assert payload["quarantine_count"] == 1
+    # ``checks`` carries a null for an entry with no ``check``, which the page renders the
+    # way it renders a null verdict. Every entry ``battery.build_entry`` assembles has one.
     assert payload["quarantines"] == [
-        {"partition": "chains/ticker=SPY/date=2026-08-24.parquet", "verdict": "held"}
+        {
+            "partition": "chains/ticker=SPY/date=2026-08-24.parquet",
+            "verdict": "held",
+            "checks": [None],
+        }
     ]
     assert payload["quarantine_unreadable"] is None
     # The sign-off runs marketlake #139, which is unbuilt and is authoritative for the
     # entry's shape. A command printed here would invent an interface on its behalf.
-    assert set(payload["quarantines"][0]) == {"partition", "verdict"}
+    assert set(payload["quarantines"][0]) == {"partition", "verdict", "checks"}
+
+
+def test_a_partition_withheld_by_two_checks_names_both(fixture_lake: FixtureLake):
+    """Signing one off leaves the other standing, so a row naming one is a row that misleads.
+
+    It is also how a stranded token shows. A check that quarantined and then stopped judging
+    holds its partition until a human signs that token off, and the token is the only thing
+    on the page that says which one.
+    """
+    build_lake(fixture_lake)
+    partition = "chains/ticker=SPY/date=2026-08-24.parquet"
+    for check in ("row_count_band", "realtime_entitlement"):
+        fixture_lake.with_quarantine(
+            {"partition": partition, "verdict": "quarantined", "check": check}
+        )
+
+    payload = service_over(fixture_lake.build()).run_query("history", {})
+
+    assert payload["quarantine_count"] == 1
+    assert payload["quarantines"][0]["checks"] == ["row_count_band", "realtime_entitlement"]
+
+
+def test_a_check_that_cleared_drops_out_of_the_row_while_the_other_holds(
+    fixture_lake: FixtureLake,
+):
+    """The panel reads each check's current verdict, not the partition's last line."""
+    build_lake(fixture_lake)
+    partition = "chains/ticker=SPY/date=2026-08-24.parquet"
+    for verdict, check in (
+        ("quarantined", "row_count_band"),
+        ("quarantined", "realtime_entitlement"),
+        ("clean", "realtime_entitlement"),
+    ):
+        fixture_lake.with_quarantine(
+            {"partition": partition, "verdict": verdict, "check": check}
+        )
+
+    payload = service_over(fixture_lake.build()).run_query("history", {})
+
+    assert payload["quarantine_count"] == 1, "the last line was clean, the partition is not"
+    assert payload["quarantines"][0]["checks"] == ["row_count_band"]
 
 
 def test_a_damaged_quarantine_ledger_is_reported_and_never_raised(fixture_lake: FixtureLake):

@@ -778,7 +778,13 @@
     }
     var list = el("ul", null, "ledger");
     history.quarantines.forEach(function (entry) {
-      var text = entry.partition + "  " + (entry.verdict === null ? DASH : entry.verdict);
+      // Every check still withholding, because signing one off leaves the rest standing
+      // and a row saying only "quarantined" cannot say which sign-off would change it.
+      var checks = (entry.checks || []).map(function (c) {
+        return c === null || c === undefined ? DASH : c;
+      }).join(", ");
+      var text = entry.partition + "  " + (entry.verdict === null ? DASH : entry.verdict) +
+        (checks === "" ? "" : "  " + checks);
       list.appendChild(el("li", text));
     });
     box.appendChild(list);

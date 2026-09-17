@@ -60,16 +60,24 @@ orphan to the Sunday scrub. #139 requires the same of the sign-off tool. ``actio
 the worked precedent and :func:`append_verdict` follows it, down to counting the file's lines
 rather than the entries a read returns, so a damaged ledger cannot stop the writer.
 
-**Human precedence, which #139 states and this builds.** Before appending, the battery reads the
-partition's current last entry. If a human wrote it, a verdict from the *same* check never
-supersedes it, and the run says "re-observed, human precedence stands" in the nightly report.
+**Human precedence, which #139 states and this builds.** Before appending, the battery reads
+that check's own current entry for the partition. If a human wrote it, a verdict from the
+*same* check never supersedes it, and the run says "re-observed, human precedence stands" in
+the nightly report. Reading the check's own entry rather than the partition's last line is
+marketlake #426: a later entry from any other check used to hide the sign-off entirely.
 #139 depends on this deliverable and ships after it, so a rule built there would arrive too
 late: the sign-off tool would ship with its sign-offs undone by the next nightly run.
 
-**Append on transition only.** A sealed partition is immutable, so the same check against the
-same partition is the same finding every night. A partition with no entry already reads, so
-writing ``clean`` for a passing partition would cost a line and change nothing, and doing it
-nightly would grow the ledger by the roster times the retention forever.
+**Append on transition only, per check.** A sealed partition is immutable, so the same check
+against the same partition is the same finding every night. A check with no entry has said
+nothing yet, so writing ``clean`` for a partition it passes would cost a line and change
+nothing, and doing it nightly would grow the ledger by the roster times the retention forever.
+
+The transition is measured against that check's own verdict rather than against the
+partition's readability, which is marketlake #426. A check that passes while another still
+withholds does record its pass, and the partition stays withheld because the other check's
+verdict stands. Measuring against the partition instead would either lose that pass, leaving
+the partition withheld forever once the other check cleared, or take it as a release.
 
 **What this reads, and what it refuses to read.** It reads Parquet directly rather than through
 the loader, for two reasons. ``load_chain(ticker, day, snap=None)`` returns one minute's
@@ -156,9 +164,10 @@ from lake.manifest import (
     VERDICT_FIELD,
     append_line,
     is_quarantined,
-    latest_quarantine,
+    latest_quarantine_by_check,
     quarantine_path,
     record_partition,
+    withholding,
 )
 from lake.paths import CHAINS, DATE_PREFIX, QUARANTINE_FILE, QUOTES, TICKER_PREFIX
 from lake.security_master import ID_TYPE_TICKER, SecurityMaster, SecurityMasterError, master_path
@@ -284,7 +293,14 @@ class BatteryReport:
     happened. These names say what a battery does instead.
 
     ``deferred`` counts the human sign-offs this run re-observed and left standing, which is
-    #139's rule producing a number rather than only a log line.
+    #139's rule producing a number rather than only a log line. It counts those alone.
+    A check that passed into another check's standing quarantine is ``withheld``, which was
+    folded into ``deferred`` until marketlake #426 and printed under a heading that named a
+    human, so a sibling check's deferral inflated a number about sign-offs.
+
+    ``released`` counts the partitions that rejoined the readable set this run, which is the
+    one thing about a battery run that is otherwise invisible: a partition that reads again
+    looks exactly like a partition nothing ever withheld.
     """
 
     judged: int = 0
@@ -293,6 +309,8 @@ class BatteryReport:
     insufficient_history: int = 0
     out_of_scope: int = 0
     deferred: int = 0
+    withheld: int = 0
+    released: int = 0
     unreadable: int = 0
     scope_unknown: int = 0
     appended: tuple[str, ...] = ()
@@ -428,50 +446,111 @@ def human_precedence(current: dict | None, check: str) -> bool:
 
 
 def _transition(current: dict | None, finding: Finding) -> bool:
-    """Whether this finding changes the partition's readability, so the ledger takes a line.
+    """Whether this finding changes **this check's** verdict on the partition.
 
-    A partition with no entry already reads, so a ``clean`` verdict for one is a line that
-    changes nothing. A partition whose current entry already says what this finding says, under
-    the same check, is the same news a second time. Everything else is a transition.
+    A check with no entry has said nothing yet, so a ``clean`` finding for one is a line that
+    changes nothing. A check whose current entry already says what this finding says is the
+    same news a second time. Everything else is a transition.
 
     The comparison is on the readability the reader computes rather than on the entry's whole
-    shape, because ``manifest.is_quarantined`` is what a partition's readability actually
-    depends on, and an entry whose spelling drifted while its effect did not is still the same
-    news.
+    shape, because ``manifest.is_quarantined`` is what a verdict's effect actually depends on,
+    and an entry whose spelling drifted while its effect did not is still the same news.
 
-    **A pass never clears a verdict it did not write.** The ledger resolves by last entry per
-    partition, which the design pins, so a ``clean`` line appended over another check's
-    quarantine un-quarantines the partition outright. One check passing says nothing about
-    another check's finding, and it says nothing at all about a human's. So a ``clean`` finding
-    is a transition only against an entry from its own check, while a quarantine may always
-    supersede. :func:`clears_another_check` is the case, and :func:`judge` reports it rather
-    than passing over it in silence.
+    **The rule is per check rather than per partition, and that is marketlake #426.** The
+    ledger resolves last entry wins within each check, so a ``clean`` line under one check can
+    no longer bury another check's quarantine. #406 held that with a writer-side guard against
+    the ledger's last entry, which covered two entries and not three: a third entry buried the
+    second, and the second to clear released the partition with the first still failing.
 
-    The price is named rather than hidden. Two checks withholding one partition leave one
-    entry, so the second to clear un-quarantines it while the first still fails. That cannot
-    arise yet, because one check exists. Marketlake #426 carries it, and it has to be settled
-    before #407 lands the next three.
+    Structure replaced the guard rather than joining it. A guard that also *suppressed* the
+    write, which is what #406's did, would now strand the partition: the passing check's own
+    quarantine would stand forever with nothing able to clear it, so the partition would be
+    withheld while no check failed.
+
+    What a passing check owes instead is a report line, because the partition it just passed
+    may still be withheld by somebody else. :func:`decide_partition` is where that is decided
+    and ``judge`` is what prints it.
     """
     if current is None:
         return finding.withholds
-    if clears_another_check(current, finding):
-        return False
-    if current.get("check") != finding.check:
-        return True
     return is_quarantined(current) != finding.withholds
 
 
-def clears_another_check(current: dict | None, finding: Finding) -> bool:
-    """Whether appending this finding would clear a quarantine some other check wrote.
+@dataclass(frozen=True)
+class Decision:
+    """What one finding does to the ledger, and what still withholds its partition.
 
-    The shape that makes this load-bearing: a human quarantines a partition for a missing
-    expiry, tonight's entitlement check finds the feed real-time, and a ``clean`` line under
-    ``realtime_entitlement`` becomes the last entry. The reader then reads the partition,
-    because the reader honours the last entry and nothing else.
+    ``wrote`` and ``deferred_to_human`` are exclusive. ``holders`` is filled for a finding that
+    did not withhold, and names every check still holding the partition after this finding is
+    applied, so a line that cleared its own check can still say the partition does not read.
     """
-    if current is None or finding.withholds:
-        return False
-    return is_quarantined(current) and current.get("check") != finding.check
+
+    finding: Finding
+    wrote: bool = False
+    deferred_to_human: bool = False
+    holders: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PartitionOutcome:
+    """Every decision for one partition in one run, and whether the partition was released."""
+
+    decisions: tuple[Decision, ...] = ()
+    released: bool = False
+
+
+def decide_partition(
+    by_check: dict[str, dict] | None, findings: Sequence[Finding]
+) -> PartitionOutcome:
+    """Every finding's fate for one partition, decided from values alone.
+
+    ``by_check`` is this partition's entry per check, which is what
+    ``manifest.latest_quarantine_by_check`` returns for it. The findings are what this run's
+    checks answered about it.
+
+    **The state is carried forward as lines land, rather than read once.** Two checks clearing
+    in one walk both change what withholds the partition, so a decision made against the state
+    the walk started from would report the partition still withheld by a check that cleared a
+    moment earlier, and the release would never be reported at all.
+
+    This is a pure function for a reason that is not tidiness. One check exists, so no run can
+    yet produce two findings for one partition, and the cases this exists to get right cannot
+    be driven through ``judge`` at all. A unit test drives them here with as many checks as it
+    likes. It is also the seam marketlake #407's three checks plug into, rather than a seam
+    invented for a test.
+    """
+    state = dict(by_check or {})
+    held_before = bool(withholding(state))
+    decisions: list[Decision] = []
+
+    for finding in findings:
+        if not finding.judged:
+            continue
+        current = state.get(finding.check)
+        if human_precedence(current, finding.check):
+            decisions.append(Decision(finding, deferred_to_human=True))
+            continue
+        wrote = _transition(current, finding)
+        if wrote:
+            # The projection carries the two fields resolution reads, and no stamp. A stamp
+            # here would be a second clock beside the one ``judge`` writes with, and nothing
+            # downstream of this function reads one: ``holders`` hands back check names.
+            state[finding.check] = {
+                "partition": finding.partition,
+                VERDICT_FIELD: finding.verdict,
+                "check": finding.check,
+            }
+        holders = (
+            ()
+            if finding.withholds
+            else tuple(str(entry.get("check")) for entry in withholding(state))
+        )
+        decisions.append(Decision(finding, wrote=wrote, holders=holders))
+
+    return PartitionOutcome(
+        decisions=tuple(decisions),
+        released=held_before and not withholding(state),
+    )
 
 
 # -- scope -------------------------------------------------------------------
@@ -968,6 +1047,11 @@ def judge(
     withhold would send an operator to a sign-off command that answers nothing, and
     ``Publisher.publish`` never raises, so the page cannot cost a verdict that is already on
     disk either way.
+
+    **A release is reported and never paged.** A page reaches a phone and asks for action, and
+    a partition rejoining the readable set asks for none. What a release does owe is to be
+    visible at all, because it looks from the outside exactly like a partition that was never
+    withheld. :attr:`BatteryReport.released` is the count and the report carries the line.
     """
     root = Path(lake_root)
     guards = GuardConstants() if guards is None else guards
@@ -980,12 +1064,15 @@ def judge(
         # command exits non-zero on this for the same reason it does on an unreadable
         # partition: the lake's health is unknown rather than good.
         return BatteryReport(scope_unknown=len(partitions), report=(f"battery: {exc}",))
-    current = latest_quarantine(root)
+    current = latest_quarantine_by_check(root)
 
     findings: list[Finding] = []
+    written: list[Finding] = []
     appended: list[str] = []
     report: list[str] = []
     deferred = 0
+    withheld = 0
+    released = 0
     unreadable = 0
 
     for partition in partitions:
@@ -1018,42 +1105,54 @@ def judge(
         finding = judge_entitlement(partition, evidence, guards)
         findings.append(finding)
 
-        entry = current.get(finding.partition)
-        if human_precedence(entry, finding.check):
-            deferred += 1
-            report.append(
-                f"battery: {finding.partition} re-observed, human precedence stands "
-                f"({finding.reason})"
-            )
-            continue
-        if clears_another_check(entry, finding):
-            deferred += 1
-            report.append(
-                f"battery: {finding.partition} passes {finding.check} and stays quarantined "
-                f"under {entry.get('check')!r}"
-            )
-            continue
-        if not _transition(entry, finding):
-            continue
-        if dry_run:
-            report.append(f"battery: would write {finding.verdict} for {finding.partition}")
-            continue
-        append_verdict(
-            root,
-            build_entry(
-                partition=finding.partition,
-                verdict=finding.verdict,
-                check=finding.check,
+        # One check exists, so this is one finding. The decision is taken over a sequence
+        # anyway, because #407's checks land on this call and the cases that need the
+        # carried-forward state are the ones with more than one finding in hand.
+        outcome = decide_partition(current.get(finding.partition), [finding])
+        for decision in outcome.decisions:
+            if decision.deferred_to_human:
+                deferred += 1
+                report.append(
+                    f"battery: {decision.finding.partition} re-observed, human precedence "
+                    f"stands ({decision.finding.reason})"
+                )
+                continue
+            if decision.holders:
+                withheld += 1
+                named = ", ".join(repr(check) for check in decision.holders)
+                report.append(
+                    f"battery: {decision.finding.partition} passes {decision.finding.check} "
+                    f"and stays quarantined under {named}"
+                )
+            if not decision.wrote:
+                continue
+            if dry_run:
+                report.append(
+                    f"battery: would write {decision.finding.verdict} for "
+                    f"{decision.finding.partition}"
+                )
+                continue
+            append_verdict(
+                root,
+                build_entry(
+                    partition=decision.finding.partition,
+                    verdict=decision.finding.verdict,
+                    check=decision.finding.check,
+                    observed_at=now,
+                    reason=decision.finding.reason,
+                ),
                 observed_at=now,
-                reason=finding.reason,
-            ),
-            observed_at=now,
-        )
-        appended.append(finding.partition)
+            )
+            appended.append(decision.finding.partition)
+            written.append(decision.finding)
+        if outcome.released:
+            released += 1
+            report.append(f"battery: {finding.partition} now reads, no check withholds it")
 
-    quarantined = tuple(
-        f for f in findings if f.verdict == QUARANTINED_VERDICT and f.partition in appended
-    )
+    # The findings this run actually wrote a line for, rather than every quarantining finding
+    # whose partition appears in ``appended``. Once a partition carries two checks those differ:
+    # one check's line would page the other check's unchanged finding.
+    quarantined = tuple(f for f in written if f.verdict == QUARANTINED_VERDICT)
     paged = page_delayed_feed(publisher, quarantined, now=now) if publisher and not dry_run else ()
 
     return BatteryReport(
@@ -1063,6 +1162,8 @@ def judge(
         insufficient_history=sum(1 for f in findings if f.verdict == INSUFFICIENT_HISTORY),
         out_of_scope=sum(1 for f in findings if f.verdict == OUT_OF_SCOPE),
         deferred=deferred,
+        withheld=withheld,
+        released=released,
         unreadable=unreadable,
         appended=tuple(appended),
         paged=paged,
@@ -1076,9 +1177,12 @@ def page_delayed_feed(
 ) -> tuple[str, ...]:
     """Page once for the run, naming the partitions this run newly quarantined.
 
-    The transition is the ledger's own. ``judge`` passes only the findings it appended a line
-    for, so a partition already quarantined under this check does not page again: its existing
-    entry is what says the operator was already told. That is the same once-on-the-transition
+    The transition is the ledger's own. ``judge`` passes the findings it appended a line for
+    and no others, so a partition already quarantined under this check does not page again:
+    its existing entry is what says the operator was already told. It passes them as the
+    findings it wrote rather than by filtering on the partitions it wrote, because those two
+    differ as soon as a partition carries two checks: one check's line would page the other
+    check's unchanged finding. That is the same once-on-the-transition
     rule the auth path, the watchdog and both schema-drift producers carry, expressed in the
     record that already exists rather than in a counter this module would have to keep.
 
@@ -1202,6 +1306,8 @@ def render(report: BatteryReport) -> str:
         f"  out of scope:         {report.out_of_scope}",
         f"  insufficient history: {report.insufficient_history}",
         f"  human precedence:     {report.deferred}",
+        f"  still withheld:       {report.withheld}",
+        f"  released:             {report.released}",
         f"  unreadable:           {report.unreadable}",
         f"  scope unknown:        {report.scope_unknown}",
         f"  ledger lines written: {len(report.appended)}",
@@ -1276,15 +1382,17 @@ __all__ = [
     "VERDICTS",
     "BatteryError",
     "BatteryReport",
+    "Decision",
     "Entitlement",
     "Finding",
+    "PartitionOutcome",
     "PartitionUnreadable",
     "ScopeUnknown",
     "SealedPartition",
     "append_verdict",
     "build_entry",
     "capture_spans_by_ticker",
-    "clears_another_check",
+    "decide_partition",
     "entry_line_count",
     "human_precedence",
     "in_scope",
