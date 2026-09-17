@@ -12,7 +12,10 @@ What one run does, in the design's own order.
 
 1. The corporate-actions poll, so today's split flags before bars land. Two walks over sealed
    rows: ``actions.extract_dividends`` reads quotes and ``splits.detect_splits`` reads chains.
-2. The bar fetch, ``bars.fetch_session_bars``. The close cross-check is inside it.
+2. The bar walk, ``bars.backfill_bars``. The close cross-check is inside it, and the
+   walk covers every session the capture spans still hold unlanded rather than only
+   the one the clock is in, because a daily bar cannot pass that check on the night
+   it is fetched. Marketlake #422.
 3. The validation battery, ``battery.judge``, which judges the sealed chains and quotes
    partitions and writes a quarantine verdict for what fails. The design places it between the
    bar fetch and the Friday branch, which is where this list puts it.
@@ -55,8 +58,9 @@ whose close has not happened. Every ticker would fail the bar span check and the
 green while the missed evening's bars stayed missing forever. So the bar fetch runs only once
 the session's equity close has passed, and a run that skipped it for that reason stays silent.
 The guard cannot refuse a real run, because the job fires at 18:30 against a 16:00 close, or
-13:00 on an early close. Recovering the evening that was missed is marketlake #319's, which
-owns a walk over more than one session.
+13:00 on an early close. Recovering the evening that was missed is the walk's own doing now:
+marketlake #422 pointed this job at #319's span walk, so the next run that does fire reaches
+every session still unlanded rather than only the one its clock sits on.
 
 **A holiday runs none of the data work.** The launchd interval is Monday through Friday, so a
 non-session weekday is a holiday, and the design has "compaction and the sweep no-op on an
@@ -85,13 +89,17 @@ from pathlib import Path
 from lake.actions import ExtractionReport, MasterAbsent, extract_dividends
 from lake.alert import Message, NtfyTransport, Publisher, undelivered
 from lake.bars import (
+    BackfillReport,
     BarsReport,
+    SpansAbsent,
     StampNotAnInstant,
     UnsupportedBarFreq,
-    fetch_session_bars,
+    backfill_bars,
+    read_capture_spans,
 )
 from lake.battery import BatteryReport, judge
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
+from lake.capture_spans import CaptureSpansError
 from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants
 from lake.control_plane import (
@@ -153,9 +161,18 @@ ScheduleSetter = Callable[[date], None]
 # command turns into one line and an exit code, so the sweep says what the command would have
 # said instead of handing the operator a stack trace in the job's error log.
 _LEDGER_REFUSALS = (MasterAbsent, MasterUnreadable)
+# ``CaptureSpansError`` as the class rather than one of its members, which is the lesson
+# ``bars.main`` already wrote down for itself: naming ``SpansUnreadable`` alone left its sibling
+# ``UnsupportedSpansSchemaVersion`` reaching the operator as a stack, and a spans file from a
+# newer version of this code is the one shape of it a person actually meets. The 18:30 job reads
+# that file for the first time under marketlake #422, so it inherits the lesson rather than
+# rediscovering it. Escaping here would cost the battery, the report file, the digest, the ping
+# and, on a Friday, the Sunday wake.
 _BARS_REFUSALS = (
     MasterAbsent,
     MasterUnreadable,
+    SpansAbsent,
+    CaptureSpansError,
     StampNotAnInstant,
     UnsupportedBarFreq,
     NotASession,
@@ -255,19 +272,36 @@ def _subjects(held: Sequence) -> tuple[str, ...]:
 
 
 def _ledger_outcome(report: ExtractionReport | SplitReport) -> PieceOutcome:
-    """One corporate-actions walk's result, reduced to the plain values the file carries."""
+    """One corporate-actions walk's result, reduced to the plain values the file carries.
+
+    ``skipped`` is read as a field on both reports. It used to be read through a ``getattr``
+    default, because only ``SplitReport`` carried it and ``ExtractionReport`` did not, which
+    meant the dividends piece reported zero skips on every night by construction. Marketlake
+    #352 gave the dividend walk the same record, so the default has nothing left to cover and
+    a defensive one that cannot fire is a line the next reader has to reason about.
+    """
     return PieceOutcome(
         landed=len(report.appended),
         held=len(report.held),
         unfiled=len(report.unfiled),
         unchanged=report.unchanged,
-        skipped=len(getattr(report, "skipped", ())),
+        skipped=len(report.skipped),
         subjects=_subjects(report.held),
     )
 
 
-def _bars_outcome(report: BarsReport) -> PieceOutcome:
-    """The bar fetch's result, reduced the same way."""
+def _bars_outcome(report: BarsReport | BackfillReport) -> PieceOutcome:
+    """The bar walk's result, reduced the same way.
+
+    Either report shape answers, because the four values read here are named the same on both.
+    The nightly run hands it a ``BackfillReport`` and a by-hand single-session fetch still hands
+    it a ``BarsReport``, and neither spelling is this function's to choose.
+
+    ``unwalked`` is the one field only the backfill carries and it is deliberately not folded in.
+    It names a ticker-day the plan could not resolve, which is reference data disagreeing rather
+    than a walk that did not finish, so it belongs on the report's detail lines and not in a count
+    that decides whether the piece refused.
+    """
     return PieceOutcome(
         landed=len(report.landed),
         held=len(report.held),
@@ -562,27 +596,81 @@ def sweep(
             except _LEDGER_REFUSALS as exc:
                 pieces.append((name, _refused(exc)))
         if closed:
+            # **The walk is the backfill, not a single session, and marketlake #422 is why.**
+            # A daily bar is judged against the calendar-next session's settled close, which at
+            # 18:30 on session S has not been captured, so every daily bar is held on the night
+            # it is fetched. ``fetch_session_bars`` says that settles itself because "the next
+            # run lands the bar", and it did not: the next run fetched the *next* session and
+            # met the same absence for it, and nothing scheduled ever came back. So the nightly
+            # job landed no daily bar at all, and the docstring's own promise is what this makes
+            # true.
+            #
+            # ``backfill_bars`` is the walk that already existed, marketlake #319, and it
+            # subsumes the single-session fetch rather than running beside it: ``_span_sessions``
+            # puts a session in range once its equity close has arrived, so at 18:30 today is in
+            # range along with every earlier session still unlanded. Yesterday's held daily bar
+            # is reached with its following quotes now sealed.
+            #
+            # Its cost is measured on its own docstring rather than assumed here. The manifested
+            # skip avoids the vendor call as well as the write, so every ticker-day that already
+            # landed costs nothing, and a run at the 1-minute lookback deadline is 88 requests
+            # against a ceiling of 120 a minute of which the capture loop spends 3.
+            #
+            # A date flag is not the alternative. ``bars._build_parser`` records one written and
+            # removed before merge, because it is a backfill selector with no capture-span floor
+            # and one typo would land bars for a session the lake never captured. This walk takes
+            # no date at all.
             try:
-                pieces.append(
-                    (
-                        BARS_PIECE,
-                        _bars_outcome(
-                            fetch_session_bars(
-                                lake_root=root,
-                                vendor=vendor_source(),
-                                clock=clock,
-                                calendar=calendar,
-                                roster=roster,
-                                session=day,
-                            )
-                        ),
-                    )
+                walked = backfill_bars(
+                    lake_root=root,
+                    vendor=vendor_source(),
+                    clock=clock,
+                    calendar=calendar,
+                    # **Enabled only, which is the nightly's own scope rather than the walk's.**
+                    # ``_require_supported_plan`` checks every ticker-day the plan holds, retired
+                    # ones included, because a by-hand recovery run fetches those on purpose. Its
+                    # docstring says ``_require_supported``'s narrower rule "stops holding" for
+                    # that reason. Pointing the nightly job at this walk makes it hold again: a
+                    # stale ``bars:`` line on a retired ticker would raise ``UnsupportedBarFreq``,
+                    # end the bars piece and withhold the ping every night, for a ticker nothing
+                    # captures. That is the exact harm ``_require_supported`` exists to prevent.
+                    #
+                    # Filtering restores the scope the nightly had before marketlake #422, so a
+                    # retired ticker's unlanded bars stay the by-hand backfill's to recover, which
+                    # is where they already were.
+                    roster=Roster(roster.enabled),
+                    spans=read_capture_spans(root),
                 )
+                pieces.append((BARS_PIECE, _bars_outcome(walked)))
+                # A ticker-day the plan could not resolve, which is the master and the spans
+                # disagreeing. It is not a refusal, so it does not withhold the ping, and it is
+                # not a held finding, so no withheld file carries it. Without a line here it
+                # would reach nobody.
+                #
+                # **One line, counted, rather than one line each.** The list is the plan's, so it
+                # repeats every night and grows by a ticker-day per trading day: ``retire
+                # --remove`` drops the roster entry and leaves the closed span, so every session
+                # that span covered is unresolvable for ever. Rendered in full it walks the
+                # nightly report into ``digest_body``'s 1000-byte cap and truncates it, and what
+                # falls off the end first is the battery's own census, which is appended after
+                # these. A line that silences the check above it is worse than no line, so this
+                # one is bounded and the full list stays in the by-hand ``--backfill`` run.
+                if walked.unwalked:
+                    report.append(
+                        f"bars unwalked: {len(walked.unwalked)} ticker-day(s), "
+                        f"first: {walked.unwalked[0]}"
+                    )
             except _BARS_REFUSALS as exc:
                 pieces.append((BARS_PIECE, _refused(exc)))
         else:
             # A catch-up run, fired by launchd on the next wake for an 18:30 the machine
             # slept through. Fetching now would ask for a session still in progress.
+            #
+            # The guard stays although the walk above now applies its own per-session ceiling and
+            # would simply leave today out. What it costs is the earlier sessions that run could
+            # still have recovered, and that costs nothing lasting: this day's own 18:30 fires
+            # later and walks them. Dropping it would be a second behaviour change riding on
+            # #422's, and the count of runs that have met this branch is zero.
             close = calendar.session_close(day)
             pieces.append(
                 (

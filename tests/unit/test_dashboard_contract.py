@@ -141,17 +141,26 @@ def test_host_allowed(host: str | None, allowed: bool):
 # -- the registry and the routes ---------------------------------------------
 
 
-def test_the_registry_is_exactly_the_two_panels():
-    assert set(NAMED_QUERIES) == {"now", "today"}
+def test_the_registry_is_exactly_the_three_panels():
+    assert set(NAMED_QUERIES) == {"now", "today", "history"}
     assert NAMED_QUERIES["now"].parameters == frozenset()
     assert NAMED_QUERIES["today"].parameters == frozenset({"date", "ticker"})
+    # History takes none. The module docstring's rule 2 allows a request a ticker and a
+    # date, and ``validate_parameters`` builds exactly those two keyword arguments, so a
+    # third name declared here would pass the unknown-field check and then be dropped on
+    # the floor. The window's width and the report count are module constants instead.
+    assert NAMED_QUERIES["history"].parameters == frozenset()
     for name, query in NAMED_QUERIES.items():
         assert query.name == name
         assert callable(query.run)
 
 
 def test_every_route_maps_to_a_registered_query():
-    assert ROUTES == {"/api/now": "now", "/api/today": "today"}
+    assert ROUTES == {
+        "/api/now": "now",
+        "/api/today": "today",
+        "/api/history": "history",
+    }
     assert set(ROUTES.values()) <= set(NAMED_QUERIES)
 
 
@@ -225,8 +234,10 @@ ICON_LINK = re.compile(
 def test_the_status_page_ships_in_the_package_and_is_self_contained():
     page = dashboard.load_status_page()
     assert b"<title>" in page
-    assert b"/api/now" in page
-    assert b"/api/today" in page
+    # Every route the service serves, named in the page that fetches them. A route the
+    # page does not name is a panel that never loads.
+    for route in ROUTES:
+        assert route.encode() in page
     # The page declares exactly one resource: its own tab icon, on its own origin.
     rest, found = ICON_LINK.subn(b"", page)
     assert found == 1, "the page declares the tab icon exactly once"

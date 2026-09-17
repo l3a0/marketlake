@@ -5,8 +5,20 @@ itself in data the lake already holds. Recording it needs no vendor call, only a
 sealed chains. Nothing here fetches.
 
 ``docs/design.md`` names two split signals in one sentence. The strike-vs-spot scale guard
-trips, and the OCC re-symbols the chain. The guard belongs to the validation battery, which
-is marketlake #138, and this module takes the other signal.
+trips, and the OCC re-symbols the chain. Both are here. The re-symboling is marketlake #279's
+and the scale guard is #408's, and they sit together because they answer one question off one
+read of one surface.
+
+**They are not two ways of seeing the same split.** The re-symboling signal lands an entry
+only when the deliverable moved, which :meth:`Deliverable.same_as` decides over six fields. A
+whole-ratio split moves none of them, because strikes scale by the ratio and the contract
+count absorbs the rest, so a 2:1 reaches ``REASON_DELIVERABLE_UNCHANGED``, is counted as a
+rename and appends nothing. Everything smaller than a whole ratio changes what a contract
+delivers and is already this walk's. What is left over is the whole-ratio family alone, and
+the scale guard is the only signal the lake has for it. That gap reaches a shipped consumer:
+``continuity_view`` takes its cumulative ratio from ``load_bars``'s two answers, and
+``load_bars`` builds its split view by dividing each close by the ledger's ``split_ratio``,
+so with no entry both reads agree and nothing is normalized.
 
 **The signal is the root, and the vendor supplies it as a column.** ``CHAINS_SCHEMA``
 carries ``option_root``, Schwab's own ``optionRoot``, and a session reduces to the *set* of
@@ -74,15 +86,15 @@ arrives as JSON in a string column and has to be parsed. An OCC adjustment is a 
 the deliverable, so the ratio is the vendor's own statement of the adjustment rather than
 something inferred from prices.
 
-**The gate compares the vendor against itself.** No gate existed to inherit. A second vendor
-was considered and rejected, and ``docs/design.md`` pins the cut. What replaced it is the
-lake's own second observation, and the strike ladder against spot is #138's rather than this
-module's. So corroboration here comes from the one other place the deliverable is written
-down: ``deliverable_note``, the vendor's free-text spelling of the same fact. The ratio the
-typed ``deliverableUnits`` produces has to agree with the ratio the note's share counts
-produce. That is the shape ``actions.check_dividend_consistency`` already has, where the
-vendor's annualized figure is read against its own per-event amount, and it catches the same
-class of defect: one of two fields carrying an adjustment the other does not.
+**The gate compares the vendor against itself.** No gate existed to inherit. A second vendor was
+considered and rejected, and ``docs/design.md`` pins the cut. What replaced it is the lake's own
+second observation, and the strike ladder against spot is :func:`check_strike_scale` below rather
+than this gate's. So corroboration here comes from the one other place the deliverable is written
+down: ``deliverable_note``, the vendor's free-text spelling of the same fact. The ratio the typed
+``deliverableUnits`` produces has to agree with the ratio the note's share counts produce. That is
+the shape ``actions.check_dividend_consistency`` already has, where the vendor's annualized figure
+is read against its own per-event amount, and it catches the same class of defect: one of two
+fields carrying an adjustment the other does not.
 
 **The prior side of a ratio comes from the standard contracts.** An adjustment is a change
 *from* something, and the standard series is what names that something. Reading the previous
@@ -176,14 +188,19 @@ from pathlib import Path
 from lake.actions import (
     CHECK_INSTRUMENT_RESOLUTION,
     PROVENANCE_OBSERVED,
+    REASON_PARTIAL_READ,
+    REASON_PARTITION_ABSENT,
+    REASON_QUARANTINED,
     TYPE_SPLIT,
     ActionKey,
     HeldFinding,
     Landed,
     MasterAbsent,
+    Skip,
     UnresolvedSymbol,
     append,
     build_entry,
+    by_reason,
     by_ticker,
     latest,
     read_master,
@@ -216,12 +233,13 @@ from lake.security_master import (
     SecurityMasterError,
 )
 
-# The ten chains columns this module reads. ``option_root`` is the signal and ``occ_symbol``
+# The twelve chains columns this module reads. ``option_root`` is the signal and ``occ_symbol``
 # is the fallback the root is derived from where the column is null. ``ssid`` is Schwab's own
 # contract identifier, and it is what pairs a re-symboled contract's old symbol to its new one
 # in ``lake.occ_mapping``, since the symbol is the thing that moves. The four after it are
 # where the deliverable is written down. ``mini`` marks a tenth-size contract under its own
 # root. ``suspect`` and ``is_chain_truncated`` are what say a session cannot bound a boundary.
+# The last two are the scale guard's whole input: the strike ladder and the session's spot.
 OPTION_ROOT = "option_root"
 OCC_SYMBOL = "occ_symbol"
 SSID = "ssid"
@@ -232,6 +250,8 @@ NON_STANDARD = "non_standard"
 MINI = "mini"
 SUSPECT = "suspect"
 IS_CHAIN_TRUNCATED = "is_chain_truncated"
+STRIKE_PRICE = "strike_price"
+UNDERLYING_PRICE = "underlying_price"
 CHAINS_COLUMNS = (
     OPTION_ROOT,
     OCC_SYMBOL,
@@ -243,6 +263,8 @@ CHAINS_COLUMNS = (
     MINI,
     SUSPECT,
     IS_CHAIN_TRUNCATED,
+    STRIKE_PRICE,
+    UNDERLYING_PRICE,
 )
 
 # The three gates this module files a refusal under. They name what refused rather than what
@@ -252,6 +274,18 @@ CHAINS_COLUMNS = (
 CHECK_SPLIT_CONSISTENCY = "split_consistency"
 CHECK_SPLIT_DELIVERABLE = "split_deliverable"
 CHECK_SPLIT_BOUNDARY = "split_boundary"
+# The scale guard's own. It is spelled for the operator rather than for this module, because
+# ``sweep._subjects`` renders it into the nightly report file as ``<symbol> <day> <check>`` and
+# ``write_withheld`` writes it into the finding's JSON, and those two are where it is read.
+CHECK_STRIKE_SCALE = "strike_scale"
+# The three that describe a corporate action on the session rather than a failure to read one.
+# Only these suppress the scale guard, because only these tell an operator that the walk already
+# has something to say about an adjustment here. ``CHECK_SPLIT_PAYLOAD`` and
+# ``CHECK_OCC_MAPPING`` say a read came apart, which is not an answer to whether a whole-ratio
+# split happened, and suppressing on one hides the split behind an unrelated unreadable row.
+BOUNDARY_CHECKS = frozenset(
+    {CHECK_SPLIT_CONSISTENCY, CHECK_SPLIT_DELIVERABLE, CHECK_SPLIT_BOUNDARY}
+)
 # The payload the read's own rules refused: a deliverable the columns do not agree about, or
 # one they carry no usable number for. Each one would otherwise end the run as a traceback,
 # which is neither fail-closed nor a record.
@@ -268,6 +302,44 @@ CHECK_SPLIT_PAYLOAD = "split_payload"
 # constant sits seven orders of magnitude above the first and seven below the second, so
 # nothing about where it lands in that gap is doing work.
 SPLIT_CONSISTENCY_TOLERANCE = 1e-9
+
+# The scale guard's three constants. Measured against the live lake at 16949e2 rather than
+# chosen, and marketlake #408 carries the measurement in full.
+#
+# A session pair names a candidate ratio only when its spot moved by at least this much, up or
+# down. Every whole ratio is 2 or more, so 1.5 is the midpoint below the smallest one, and the
+# four adjacent pairs the lake holds sit at 0.999745 to 1.006586, nowhere near it.
+WHOLE_RATIO_GATE = 1.5
+# How far the spot ratio may sit from the candidate, relatively. The candidate is rounded to
+# one whole ratio rather than matched against bands, and that is not a style choice. Bands of
+# plus or minus 10% around 2, 3 and 4 are disjoint, then 5's runs to 5.500 while 6's starts at
+# 5.400, and from there every ratio falls inside some band and the test stops saying anything.
+# The reverse side breaks in the same place, with 1/5's bottom at 0.1800 under 1/6's top at
+# 0.1833. Rounding leaves exactly one candidate, so no overlap is possible at any ratio, and
+# this then answers only whether the move is close enough to it. It filters through 9 and meets
+# the rounding boundary at 10, where the confirmation below carries the decision alone.
+WHOLE_RATIO_TOLERANCE = 0.05
+# How much of the previous session's ladder has to follow the candidate before the guard trips.
+#
+# A real adjustment confirms at 1.000000, because dividing every open contract's strike is what
+# the adjustment does, and a standard series listing beside it only adds rungs. So the number
+# worth measuring is the other side: what a *stationary* ladder confirms when spot moves by that
+# ratio anyway, which is the crash this must not read as a split. Measured on the live ladders,
+# across ratios of 2, 3, 4 and 10 in both directions, the highest is SPY's 0.287785 and QQQ's is
+# 0.135755. This sits 0.212215 above that and 0.50 below what a real adjustment gives.
+SCALE_CONFIRMATION_FLOOR = 0.50
+# Where a strike is rounded, both on the ladder and on the rescaled value looked for in it.
+#
+# **It is the vendor's own precision, and one decimal more silently breaks the odd ratios.** The
+# OCC symbol carries the strike in an eight-digit thousandths field, so a 3-for-1 rescaling of a
+# 205 strike can only be listed as 68.333. Rounding the rescaled value to four places asks for
+# 68.3333 instead, which no rung matches, and the confirmation collapses. Measured against the
+# live ladders, with each rung divided by the ratio and written at three decimals, four places
+# confirms 3:1 at 0.333, 6:1 at 0.333, 7:1 at 0.143 and 9:1 at 0.110, every one of them under
+# the floor and read as an ordinary day. At three places all nine ratios confirm at 1.000.
+# Rounding this far merges no rung either: SPY's 483 and QQQ's 523 stay distinct, and the vendor
+# uses at most two decimals.
+_STRIKE_PLACES = 3
 
 # What ``deliverable_note`` looks like when it names a plain share count of one security.
 # The live lake's is ``100 SPY`` on every row of both tickers. A note this does not match is
@@ -316,13 +388,23 @@ class BoundaryUnbounded(SplitError):
 
 
 # Why a ticker-day was not read, and each reason widens a boundary's window by one session.
+# Three of them are ``lake.actions``' above, imported rather than restated, because the
+# dividend walk meets the same three and one reason has to have one spelling. The rest are
+# this surface's own, the close-of-record one included, because each names the tag its walk
+# resolved against. This one is ``option_close`` and ``actions.REASON_NO_SPOT_CLOSE`` is
+# ``spot_close``.
 REASON_NO_OPTION_CLOSE = "no option close"
-REASON_QUARANTINED = "quarantined"
-REASON_PARTIAL_READ = "partial read"
-REASON_PARTITION_ABSENT = "manifested partition absent"
 REASON_OUT_OF_SCOPE = "outside the capture span"
 REASON_THIN = "suspect or truncated"
 REASON_UNRESOLVED = "unresolved symbol"
+
+# Why the scale guard could not compare a pair of sessions. None of these is a finding. A pair
+# it could not read is a pair nobody judged, which is a different thing from one it judged and
+# passed, and the report keeps them apart for the reason :class:`NotAnAdjustment` gives.
+REASON_SCALE_WINDOW = "a skipped session sits between the pair"
+REASON_NO_LADDER = "a session lists no strike"
+REASON_NO_UNDERLYING = "a session names no single underlying price"
+REASON_INSTRUMENT_CHANGED = "the pair spans two instruments"
 
 # Why a session gained a root with no corporate action behind it. Each of these appends
 # nothing and holds nothing, and each is counted, because a run that met one would otherwise
@@ -330,15 +412,6 @@ REASON_UNRESOLVED = "unresolved symbol"
 REASON_DELIVERABLE_UNCHANGED = "the deliverable did not move"
 REASON_STANDARD_SERIES = "the gained contracts are standard"
 REASON_ROOT_RETURNED = "the root had been carried before"
-
-
-@dataclass(frozen=True)
-class Skip:
-    """One ticker-day the walk did not read, and why."""
-
-    ticker: str
-    day: date
-    reason: str
 
 
 @dataclass(frozen=True)
@@ -354,6 +427,43 @@ class NotAnAdjustment:
     ticker: str
     day: date
     reason: str
+
+
+@dataclass(frozen=True)
+class ScaleUnread:
+    """One adjacent session pair the scale guard could not compare, and why."""
+
+    ticker: str
+    day: date
+    reason: str
+
+
+@dataclass(frozen=True)
+class ScaleVerdict:
+    """What the scale guard read off one pair of sessions.
+
+    ``spot_ratio`` is the raw move, ``spot_prev / spot_now``, which runs the same way round as
+    the ledger's own ratio: :func:`check_split_consistency` computes ``new.units /
+    prior.units``, so a 3-for-2 reads 1.5 and a 2:1 would read 2.0.
+
+    ``ratio`` is the whole ratio that move names, or ``None`` when it names none, which is what
+    an ordinary session pair produces. ``confirmed`` is then the fraction of the previous
+    session's ladder that followed it, and it is 0.0 rather than undefined when there was no
+    candidate to follow.
+
+    Both numbers ride the verdict rather than being recomposed by the caller, for the reason
+    :class:`SplitConsistency` gives: they are what the withheld finding files, and a caller that
+    recomputed them could file a pair the guard never saw.
+    """
+
+    ratio: float | None
+    spot_ratio: float
+    confirmed: float
+
+    @property
+    def holds(self) -> bool:
+        """Whether this pair is a whole-ratio split the ladder agrees with."""
+        return self.ratio is not None and self.confirmed >= SCALE_CONFIRMATION_FLOOR
 
 
 @dataclass(frozen=True)
@@ -468,6 +578,12 @@ class SplitReport:
     reported rather than inferred from ``appended``, because the two fire on different things:
     a rename writes mappings and appends nothing, and a run that rewrote the reference table
     every consumer resolves through should say so on its own sign-off block.
+
+    The last three are the scale guard's. ``scale_pairs`` counts the adjacent session pairs it
+    compared, ``scale_covered`` the pairs where it found a whole-ratio split the ledger already
+    describes, and ``scale_unread`` the pairs it refused to judge with each one's reason. All
+    three are on the block for one reason: a run that met something must not read like a run
+    that met nothing, which is what ``not_adjustments`` already exists to keep apart.
     """
 
     ticker_days: int
@@ -477,6 +593,9 @@ class SplitReport:
     not_adjustments: tuple[NotAnAdjustment, ...]
     skipped: tuple[Skip, ...]
     mapped: tuple[Remapped, ...] = ()
+    scale_pairs: int = 0
+    scale_covered: int = 0
+    scale_unread: tuple[ScaleUnread, ...] = ()
 
     @property
     def unfiled(self) -> tuple[HeldFinding, ...]:
@@ -523,9 +642,13 @@ class SplitReport:
             )
         lines.append(f"  unchanged: {self.unchanged}")
         lines.append(f"  not a split: {len(self.not_adjustments)}")
-        lines.extend(_by_reason(self.not_adjustments))
+        lines.extend(by_reason(self.not_adjustments))
         lines.append(f"  skipped:   {len(self.skipped)}")
-        lines.extend(_by_reason(self.skipped))
+        lines.extend(by_reason(self.skipped))
+        lines.append(f"  scale compared: {self.scale_pairs}")
+        lines.append(f"  scale already recorded: {self.scale_covered}")
+        lines.append(f"  scale not compared: {len(self.scale_unread)}")
+        lines.extend(by_reason(self.scale_unread))
         return "\n".join(lines)
 
 
@@ -545,12 +668,33 @@ class Session:
     the deliverable can be read back for a subset of the roots. The prior side of a ratio is
     read over the whole previous session and the new side over the gained roots alone, and
     without the per-root rows the second of those could not be asked for.
+
+    ``strikes`` and ``spot`` are the scale guard's whole input and they default to empty, so a
+    caller building a session to exercise the boundary rules says nothing about the ladder
+    rather than having to furnish one.
+
+    ``spot`` is the chains row's own ``underlying_price`` at the option close, and never the
+    quotes surface's ``spot_close``. The two are different readings of the underlying and the
+    loader says so: chains resolve against ``option_close`` and quotes against ``spot_close``,
+    and ``spot_close`` is the pre-auction book rather than the price a contract was quoted
+    against. Reading the chains column keeps a strike and the underlying it was quoted against
+    on one row of one surface, out of one read.
+
+    It is the one distinct value the session's rows carry, and ``None`` when they carry
+    none or several. **A null is not a value and not a disagreement.** A row saying nothing
+    about the underlying does not contradict a row that names it, which is how :func:`_column`
+    already treats a column a partition never carried. Measured on the live lake, the
+    option-close snapshot carries exactly one distinct ``underlying_price`` on all seven
+    readable partitions, against 166 to 278 across a whole partition's minutes, which is why
+    this is read off the snapshot and not off the file.
     """
 
     day: date
     instrument_id: int
     roots: frozenset[str]
     rows: tuple[tuple[str, dict[str, object]], ...]
+    strikes: frozenset[float] = frozenset()
+    spot: float | None = None
 
     def standard_roots(self) -> frozenset[str]:
         """The roots whose contracts the vendor flags standard.
@@ -654,7 +798,47 @@ def read_session(lake_root: Path, ticker: str, day: date, instrument_id: int) ->
         instrument_id=instrument_id,
         roots=frozenset(root for root, _ in rows),
         rows=tuple(rows),
+        strikes=frozenset(_ladder(row for _, row in rows)),
+        spot=_spot(row for _, row in rows),
     )
+
+
+def _ladder(rows) -> list[float]:
+    """Every distinct strike the session lists, rounded to the ladder's own precision.
+
+    Built off the rows that survived the ``mini`` filter, so the ladder is read from the same
+    contracts the root set is. A mini contract lists at the same strike a standard one does, so
+    dropping it removes a rung only where no standard contract carries it, and ``mini`` is
+    ``False`` on every data row the lake holds. The count of those rows is marketlake #367's to
+    sweep, so it is not restated here.
+    """
+    return [
+        round(value, _STRIKE_PLACES)
+        for value in {
+            row.get(STRIKE_PRICE)
+            for row in rows
+            if isinstance(row.get(STRIKE_PRICE), int | float)
+            and not isinstance(row.get(STRIKE_PRICE), bool)
+        }
+        if isfinite(value) and value > 0
+    ]
+
+
+def _spot(rows) -> float | None:
+    """The one underlying price the session names, or ``None`` when it names none or several.
+
+    A session whose rows disagree about the underlying has no single spot, and taking the first
+    would let the file's own order decide what the guard compares, which is the refusal
+    :func:`deliverable_of` already makes about its own reading.
+    """
+    values = {
+        row.get(UNDERLYING_PRICE)
+        for row in rows
+        if isinstance(row.get(UNDERLYING_PRICE), int | float)
+        and not isinstance(row.get(UNDERLYING_PRICE), bool)
+    }
+    usable = {value for value in values if isfinite(value) and value > 0}
+    return usable.pop() if len(usable) == 1 else None
 
 
 def _root_of(row: dict[str, object]) -> str:
@@ -803,7 +987,8 @@ def check_split_consistency(prior: Deliverable, new: Deliverable) -> SplitConsis
     This is the internal validation a split lands through, and it is this module's own rather
     than something inherited. A second vendor was considered and rejected, and the two checks
     that replaced it, the dividend self-consistency rule and the official close against the
-    session's own quotes, judge neither a split. The strike ladder against spot is #138's. So
+    session's own quotes, judge neither a split. The strike ladder against spot is
+    :func:`check_strike_scale`, which answers a different question and lands no ratio. So
     corroboration comes from the one other place the deliverable is written down.
 
     ``computed`` reads the typed ``deliverableUnits``, which is what the ratio itself is
@@ -846,6 +1031,104 @@ def check_split_consistency(prior: Deliverable, new: Deliverable) -> SplitConsis
         computed=computed,
         against=against,
     )
+
+
+def check_strike_scale(
+    previous: Session, session: Session, *, skipped_since: int
+) -> ScaleVerdict | str:
+    """Whether a whole-ratio split sits between two sessions, or why they cannot be compared.
+
+    **The two signals this module carries are not two views of one event.** The re-symboling
+    signal lands an entry only when the deliverable moved, and a whole-ratio split moves no part
+    of it. So a 2:1 is invisible to that walk, and everything smaller than a whole ratio is
+    already visible to it. What is left over is the whole-ratio family, whose smallest factor is
+    2, and that is not a chosen scope. It is the complement of the signal already shipped.
+
+    **One hypothesis, tested from both sides.** A whole-ratio split does two things on one day:
+    the OCC divides every open contract's strike by the ratio, and the market marks the
+    underlying down by the same ratio. So the spot move names a candidate and the ladder either
+    followed it or did not.
+
+    1. ``spot_prev / spot_now`` of 1.5 or more names ``round`` of it, and of ``1 / 1.5`` or less
+       names ``round`` of its reciprocal. Between those two gates it names nothing, which is
+       where every ordinary session pair sits: the lake's four adjacent pairs run 0.999745 to
+       1.006586.
+    2. The candidate holds only within :data:`WHOLE_RATIO_TOLERANCE` of the move, relatively.
+    3. The confirmation is the fraction of the previous session's ladder whose rescaling by the
+       candidate is listed today, and it trips at :data:`SCALE_CONFIRMATION_FLOOR`.
+
+    **The confirmation runs at the candidate, never at the raw move.** An ex-date carries
+    overnight drift, so the move is 2.000637 rather than 2, and dividing a rung by it lands
+    between rungs while dividing by 2 lands on the rung the OCC created.
+
+    **Ladder survival was measured and refused.** Asking instead what fraction of yesterday's
+    rungs is still listed reads 1.000000 on every clean pair and is blind to new listings, which
+    is why marketlake #408 carried it for three audit passes. A standard series listing at the
+    new scale relists old grid points, and that only pushes survival up: modelled at its worst
+    on the live ladders, a 1-for-2 reverse leaves SPY at 0.9793 and a 5:4 at 0.9379, both above
+    any usable floor. That is a miss rather than a false alarm. Confirmation cannot fail that
+    way, because a fresh series only adds rungs to a number a real adjustment already puts at 1.
+    The half that needed survival, a ladder rescaling while spot holds still, is #418's.
+
+    **Pairing on ``ssid`` was refused by ``lake.occ_mapping`` first.** That module says whether
+    the vendor carries the identifier through an adjustment cannot be measured here, because the
+    lake holds no adjusted contract, and :class:`~lake.occ_mapping.SymbolHistory` fails closed
+    rather than guessing. A guard keyed on it would go silent on exactly the boundary it exists
+    for. So the ladder is compared by strike.
+
+    **Four reasons refuse the pair rather than judging it**, each returned as a string the way
+    :func:`read_session` returns its own. A skipped session between the two ends leaves ladder
+    attrition unmeasured across the window, and a finding filed on that guess would never clear,
+    since :func:`~lake.report.write_withheld` files a held finding again every night and nothing
+    prunes ``reports/``. Two sessions of different instruments are two securities. A session with
+    no ladder has no denominator and one with no spot has no ratio to round.
+    """
+    if previous.instrument_id != session.instrument_id:
+        return REASON_INSTRUMENT_CHANGED
+    if skipped_since:
+        return REASON_SCALE_WINDOW
+    if not previous.strikes or not session.strikes:
+        return REASON_NO_LADDER
+    if previous.spot is None or session.spot is None:
+        return REASON_NO_UNDERLYING
+
+    spot_ratio = previous.spot / session.spot
+    ratio = _whole_ratio(spot_ratio)
+    if ratio is None:
+        return ScaleVerdict(ratio=None, spot_ratio=spot_ratio, confirmed=0.0)
+    followed = sum(
+        1 for strike in previous.strikes if round(strike / ratio, _STRIKE_PLACES) in session.strikes
+    )
+    return ScaleVerdict(
+        ratio=ratio, spot_ratio=spot_ratio, confirmed=followed / len(previous.strikes)
+    )
+
+
+def _whole_ratio(spot_ratio: float) -> float | None:
+    """The whole ratio a spot move names, or ``None`` when it names none.
+
+    ``round`` leaves one candidate rather than several bands, so two ratios can never both claim
+    one move. A move landing exactly halfway rounds to even and then fails the tolerance either
+    way, which is why the tie-breaking rule does not matter here.
+    """
+    if not isfinite(spot_ratio) or spot_ratio <= 0:
+        return None
+    if spot_ratio >= WHOLE_RATIO_GATE:
+        candidate = float(round(spot_ratio))
+    elif spot_ratio <= 1.0 / WHOLE_RATIO_GATE:
+        # A subnormal ratio overflows its own reciprocal to infinity, and ``round`` of that
+        # raises rather than answering. ``check_split_consistency`` refuses the same hazard by
+        # name for the ledger's ratio, and a raise here would end the walk for every ticker it
+        # had not reached rather than declining one pair.
+        reciprocal = 1.0 / spot_ratio
+        if not isfinite(reciprocal):
+            return None
+        candidate = 1.0 / round(reciprocal)
+    else:
+        return None
+    if abs(spot_ratio - candidate) / candidate > WHOLE_RATIO_TOLERANCE:
+        return None
+    return candidate
 
 
 def _usable_note(note_units: float | None) -> bool:
@@ -931,15 +1214,6 @@ def _require_unmoved(before: object, after: object, what: str) -> None:
 # -- the walk ----------------------------------------------------------------
 
 
-def _by_reason(items: Sequence[Skip | NotAnAdjustment]) -> list[str]:
-    """One line per distinct reason, with its count. Counts rather than a line each, so a
-    lake whose every session is a gap day still renders on one screen."""
-    lines = []
-    for reason in sorted({item.reason for item in items}):
-        lines.append(f"    - {reason}: {sum(1 for i in items if i.reason == reason)}")
-    return lines
-
-
 def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
     """Read every sealed chains ticker-day, gate what it finds, and append what lands.
 
@@ -997,6 +1271,13 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
     **A finding that cannot be written down does not stop the run either.** It is carried on
     the report as unfiled and the command turns that into an exit code, which is the
     containment ``write_withheld`` says belongs to its caller.
+
+    **The scale guard runs on each adjacent pair, after the examination and suppressed by it.**
+    :func:`check_strike_scale` answers the split this walk structurally cannot see, so it fires
+    only where this walk produced nothing: no entry landed, none matched what ``latest``
+    resolves, ``_examine`` filed no finding, and the ledger holds no split on that key already.
+    The last of the four is what lets marketlake #286's manual entry clear it, since such an
+    entry never reaches ``_examine`` at all.
     """
     lake_root = Path(lake_root)
     master = read_master(lake_root)
@@ -1011,7 +1292,10 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
     skipped: list[Skip] = []
     not_adjustments: list[NotAnAdjustment] = []
     mapped: list[Remapped] = []
+    scale_unread: list[ScaleUnread] = []
     unchanged = 0
+    scale_pairs = 0
+    scale_covered = 0
     # Every key this run has already emitted. One ticker has at most one boundary a day, so
     # this cannot collide today. It is still read, because two tickers resolving to one
     # instrument would otherwise emit one key twice and neither line would match what
@@ -1075,6 +1359,10 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
                 skipped_since += 1
                 continue
 
+            # Read before the examination so the scale guard below can tell whether that
+            # examination filed anything for this session. Its own findings go through ``hold``
+            # rather than riding on ``Outcome``, so the list's length is what says so.
+            filed_before = len(held)
             outcome = _examine(
                 ticker=ticker,
                 previous=previous,
@@ -1093,6 +1381,54 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
             unchanged += outcome.unchanged
             not_adjustments.extend(outcome.not_adjustments)
             mapped.extend(outcome.mapped)
+
+            # **After the examination, and suppressed by whatever it produced.** On an uneven
+            # adjustment both signals can fire at once, and a held finding never clears, so a
+            # correctly landed 3-for-2 would otherwise file the same line every night forever
+            # for an event the ledger already holds. The ledger is asked directly too, through
+            # the snapshot this run already read: a manual entry never passes through
+            # ``_examine`` at all, because no root appeared, so without that read marketlake
+            # #286's entry could not clear this finding either.
+            if previous is not None:
+                scale = check_strike_scale(previous, session, skipped_since=skipped_since)
+                if isinstance(scale, str):
+                    scale_unread.append(ScaleUnread(ticker, day, scale))
+                else:
+                    scale_pairs += 1
+                    if scale.holds:
+                        # What ``_examine`` filed, rather than whether it filed at all. A
+                        # payload finding about some other root's unreadable row is not an
+                        # answer to this question, and treating it as one hides a real split
+                        # behind it for as long as the unreadable row survives.
+                        examined = {
+                            entry.finding.check for entry in held[filed_before:]
+                        } & BOUNDARY_CHECKS
+                        # ``outcome.unchanged`` is deliberately not a fifth term. It is true
+                        # only where ``same_but_for_recorded_at`` matched an entry, which
+                        # refuses a ``None``, so it already implies the ledger read below on
+                        # the same key. The review that found this proved the term could not
+                        # change an answer, and a condition nothing can reach reads as a rule.
+                        recorded = (
+                            outcome.landed is not None
+                            or bool(examined)
+                            # ``normalize_date`` renders the key's date, so the ledger's key
+                            # carries it as text and a ``date`` here would never match.
+                            or (session.instrument_id, day.isoformat(), TYPE_SPLIT) in current
+                        )
+                        if recorded:
+                            scale_covered += 1
+                        else:
+                            hold(
+                                Withheld(
+                                    symbol=ticker,
+                                    observed_on=day,
+                                    event=TYPE_SPLIT,
+                                    check=CHECK_STRIKE_SCALE,
+                                    computed=scale.ratio,
+                                    against=scale.spot_ratio,
+                                    instrument_id=session.instrument_id,
+                                )
+                            )
             # The instrument's own history, so a root is remembered across a session it
             # happens to be absent from. It resets with ``previous`` when the instrument
             # changes, because a different security's roots are a different history. The
@@ -1114,6 +1450,9 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
         not_adjustments=tuple(not_adjustments),
         skipped=tuple(skipped),
         mapped=tuple(mapped),
+        scale_pairs=scale_pairs,
+        scale_covered=scale_covered,
+        scale_unread=tuple(scale_unread),
     )
 
 
@@ -1434,29 +1773,42 @@ __all__ = [
     "CHECK_SPLIT_CONSISTENCY",
     "CHECK_SPLIT_DELIVERABLE",
     "CHECK_SPLIT_PAYLOAD",
+    "CHECK_STRIKE_SCALE",
     "Deliverable",
     "DeliverableUnreadable",
     "NonScalarDeliverable",
     "NotAnAdjustment",
     "Outcome",
     "REASON_DELIVERABLE_UNCHANGED",
+    "REASON_INSTRUMENT_CHANGED",
+    "REASON_NO_LADDER",
     "REASON_NO_OPTION_CLOSE",
+    "REASON_NO_UNDERLYING",
     "REASON_OUT_OF_SCOPE",
     "REASON_PARTIAL_READ",
     "REASON_PARTITION_ABSENT",
     "REASON_QUARANTINED",
     "REASON_ROOT_RETURNED",
+    "REASON_SCALE_WINDOW",
     "REASON_STANDARD_SERIES",
     "REASON_THIN",
     "REASON_UNRESOLVED",
-    "SSID",
+    "SCALE_CONFIRMATION_FLOOR",
     "SPLIT_CONSISTENCY_TOLERANCE",
+    "SSID",
+    "STRIKE_PRICE",
+    "ScaleUnread",
+    "ScaleVerdict",
     "Session",
     "Skip",
     "SplitConsistency",
     "SplitError",
     "SplitReport",
+    "UNDERLYING_PRICE",
+    "WHOLE_RATIO_GATE",
+    "WHOLE_RATIO_TOLERANCE",
     "check_split_consistency",
+    "check_strike_scale",
     "deliverable_of",
     "deliverable_of_row",
     "detect_splits",
