@@ -1,11 +1,11 @@
-"""The validation battery's spine: the quarantine writer and the real-time entitlement check.
+"""The validation battery: the quarantine writer and the four seal-then-flag checks.
 
 The lake has had a quarantine reader since marketlake #241 and no writer. ``load_chain`` and
 ``load_bars`` already refuse a partition the ledger withholds, ``manifest.is_quarantined`` is
 already the one definition both sides resolve at, and ``sweep.count_quarantined`` already feeds
 the nightly report. Every one of those has read zero because nothing has ever written a verdict.
 
-This writes the first one.
+This writes them.
 
 Run it with ``python -m lake.battery``. ``lake.sweep`` is what schedules it: the design places
 the battery in the 18:30 vendor sweep between the bar fetch and the Friday branch, and this
@@ -89,6 +89,24 @@ states that precedent for the same reason. And the loader refuses a quarantined 
 default, so a battery reading through it would be blind to every partition it had itself
 flagged, which is exactly the set human precedence needs it to re-observe.
 
+**The four checks, and what each one answers.** Marketlake #406 built the spine and the first.
+#407 added the other three, which is what makes the per-check ledger resolution #426 shipped do
+any work: until a second check existed, no partition could be withheld by two.
+
+1. :data:`CHECK_ENTITLEMENT`, the vendor's own real-time flags and the session-median staleness.
+   It is the one whose failure the design says corrupts every row silently, and the only one of
+   the four that pages.
+2. :data:`CHECK_CALENDAR_COVERAGE`, no silently missing sessions, clamped per ticker to its
+   capture spans. It is the odd one: it judges the sessions that have *no* partition, so it
+   writes no ledger line, ignores the run's ``day``, and enumerates instruments rather than the
+   directories the walk found. :func:`coverage` carries the second and third reasons and
+   :data:`MISSING_SESSION` carries the first.
+3. :data:`CHECK_QUOTE_SANITY`, ``bid <= mark <= ask`` at a rate within a measured tolerance.
+   Crossed quotes are real and :data:`QUOTE_SANITY_TOLERANCE` carries the measurement that says
+   so.
+4. :data:`CHECK_ROW_COUNT_BAND`, every session snapshot inside a band of the trailing median,
+   which catches a truncated fetch. It is the options-only one of the four.
+
 **Two classes of partition are out of scope for every check, and the lake holds both today.**
 
 1. A partition outside the ticker's capture spans. Capture was not running, so nothing about
@@ -101,8 +119,24 @@ flagged, which is exactly the set human precedence needs it to re-observe.
    lake's 29 sealed partitions are exactly this, 2026-09-08 through 2026-09-11 on both tickers
    and both surfaces.
 
-Neither is a pass. An out-of-scope partition is not judged at all, so it gets no verdict, no
-finding and no ledger line.
+Neither is a pass. An out-of-scope partition is not judged at all, so it gets no verdict and no
+ledger line. It gets one finding, carrying :data:`CHECK_SCOPE`, because scope is a property of the
+partition and every check would answer it from the same two facts. A judged chains partition
+carries three findings and a quotes partition two. Never four: calendar coverage only ever
+speaks about sessions that have no partition at all.
+
+**A partition's findings are decided in one call.** :func:`decide_partition` carries the ledger
+state forward as lines land, so two checks clearing in one walk both change what withholds the
+partition. Deciding each finding on its own would report the second check's partition as still
+held by the first, and the release would never be reported at all. :func:`judge` gathers a
+partition's findings and hands them over together, which is the seam that function's docstring
+was written for.
+
+**Each of the other three reports and never pages.** The design's message table gives the
+battery two pages: the delayed feed here, and its own nightly schema drift, which is #427. So
+:func:`page_delayed_feed` is filtered to :data:`CHECK_ENTITLEMENT` rather than to every verdict
+this run wrote. Without that filter a crossed quote reaches a phone titled ``Delayed feed``
+with its rate rendered as a staleness in seconds.
 
 **The entitlement check, and the two things measuring it changed.** The design: the vendor's own
 entitlement flags must show real-time on every snapshot, ``isDelayed`` false on chain responses
@@ -153,6 +187,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Iterable, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -208,12 +243,29 @@ VERDICTS: tuple[str, ...] = (CLEAN_VERDICT, QUARANTINED_VERDICT)
 # ``manifest.is_quarantined`` withholds a partition on any value that is not ``clean``.
 INSUFFICIENT_HISTORY = "insufficient_history"
 OUT_OF_SCOPE = "out_of_scope"
-NON_VERDICTS: tuple[str, ...] = (INSUFFICIENT_HISTORY, OUT_OF_SCOPE)
 
-# The entitlement check's token, snake_case, named the way ``bars.CHECK_BAR_SPAN`` and
-# ``actions.CHECK_DIVIDEND_CONSISTENCY`` are named. It rides every entry this check writes, and
+# The third, and the one with no partition behind it. A session the lake never captured has no
+# file to withhold, and ``loader._clear_partition`` raises ``PartitionAbsent`` before it
+# consults the ledger, so a verdict written for that path would change no read. It could also
+# never be cleared: there is no backfill, so the partition can never land and no later ``clean``
+# can supersede the line, which would then sit in ``sweep.count_quarantined`` and
+# ``dashboard._open_quarantines`` until a human signed off a file that does not exist.
+MISSING_SESSION = "missing_session"
+NON_VERDICTS: tuple[str, ...] = (INSUFFICIENT_HISTORY, OUT_OF_SCOPE, MISSING_SESSION)
+
+# The checks' tokens, snake_case, named the way ``bars.CHECK_BAR_SPAN`` and
+# ``actions.CHECK_DIVIDEND_CONSISTENCY`` are named. Each rides every entry its check writes, and
 # #139's precedence rule compares it.
 CHECK_ENTITLEMENT = "realtime_entitlement"
+CHECK_CALENDAR_COVERAGE = "calendar_coverage"
+CHECK_QUOTE_SANITY = "quote_sanity"
+CHECK_ROW_COUNT_BAND = "row_count_band"
+
+# What a partition-level answer carries instead of a check's name. Scope is a property of the
+# partition rather than of any one check: capture either was running that day or it was not, and
+# every check would give the same answer from the same two facts. So one finding carries it, and
+# this token says so rather than naming whichever check happened to be asked first.
+CHECK_SCOPE = "partition_scope"
 
 # The delayed-feed page, from the design's message table. The event is the producer's name in
 # front of the condition, matching ``compaction_schema_drift`` and ``parser_schema_drift``.
@@ -240,6 +292,43 @@ ENTITLEMENT_FLAGS: dict[str, tuple[str, bool]] = {
 SNAP_TS = "snap_ts"
 FETCH_TS = "fetch_ts"
 VENDOR_QUOTE_TS = "vendor_quote_ts"
+
+# The three the quote-sanity check orders, in the order the design writes them. Both surfaces
+# carry all three in the pinned capture schema, so the check needs no per-surface mapping the
+# way the entitlement flag does.
+BID = "bid"
+MARK = "mark"
+ASK = "ask"
+ORDERED_COLUMNS: tuple[str, ...] = (BID, MARK, ASK)
+
+# The share of a partition's data rows that may fail ``bid <= mark <= ask`` before the partition
+# is quarantined. The design says "rates within tolerance" rather than absence, and this is the
+# number behind that wording.
+#
+# It is measured rather than guessed, and it is the *partition's* rate rather than a snapshot's.
+# Crossed quotes are real and the rate moves by a factor of about 7,800 between sessions. The
+# lake holds twelve in-scope data partitions, six chains and six quotes. The worst is SPY's
+# 2026-09-16 chains at 7,909 rows of 5,307,030, which is 0.149 percent, against 1 row, 0 rows,
+# 1 row and 50 rows on the other five chains partitions and 0 on all six quotes partitions. A
+# check refusing any crossed quote would quarantine the lake's most recent complete session.
+#
+# A per-snapshot rate is what the measurement rules out, and it is the shape a reader reaches
+# for first. SPY's worst single minute on 2026-09-16 is 1,753 crossed rows of 13,040, which is
+# 13.4 percent, on a session whose own rate is 0.149 percent. Any per-snapshot threshold under
+# that quarantines a session nothing is wrong with.
+#
+# Five percent is what that leaves, and the headroom it buys depends on how much of a session
+# the partition holds. Crossing is concentrated at the close, so the cumulative rate on that
+# same SPY partition climbs as the start moves later: 0.149 percent over the whole session,
+# 1.96 percent from 19:45Z, 2.86 percent from 19:55Z and 3.87 percent from 20:10Z. Against a
+# full session the margin is about thirty-three times. Against a partition that starts ten
+# minutes before the close, which is what an afternoon onboarding produces, it is about 1.3
+# times, so a close with twice this session's crossing quarantines that one partition. The
+# price is named rather than hidden: one partition, once per ticker, cleared by a sign-off,
+# against a threshold loose enough to admit the fault this exists to catch. That fault is not
+# near five percent. A feed delivering bid and ask transposed reads near 100 percent, because
+# an option quoted 0.00 by 0.05 crosses the moment the two are swapped.
+QUOTE_SANITY_TOLERANCE = 0.05
 
 
 class BatteryError(Exception):
@@ -303,13 +392,23 @@ class BatteryReport:
 
     ``deferred`` counts the human sign-offs this run re-observed and left standing, which is
     #139's rule producing a number rather than only a log line. It counts those alone.
-    ``withheld`` counts the passes recorded while another check still withholds the
-    partition. Until marketlake #426 those counted as ``deferred`` and printed under a heading
-    naming a human, so another check's hold inflated the sign-off count.
+    ``withheld`` counts the **partitions** this run passed a check on that no read returns
+    afterwards. The hold is the walk's end state rather than the ledger's opening one, so it
+    covers a partition another check has withheld since last night and one this same run just
+    quarantined under a second check. It counts partitions rather than passes, because two
+    checks passing one partition a third holds is one fact rather than two. Until #426 these
+    counted
+    as ``deferred`` and printed under a heading naming a human, so another check's hold inflated
+    the sign-off count.
 
     ``released`` counts the partitions that rejoined the readable set this run. A release is
     otherwise invisible: a partition that reads again looks exactly like a partition nothing
     ever withheld.
+
+    ``sessions_owed`` and ``sessions_missing`` are the coverage check's pair, and they are the
+    one pair here not scoped by ``day``. :func:`coverage` says why. The denominator is carried
+    because the check's correct answer against today's lake is that it found nothing, and a
+    count of misses alone cannot tell that from a check that did not run.
     """
 
     judged: int = 0
@@ -322,6 +421,8 @@ class BatteryReport:
     released: int = 0
     unreadable: int = 0
     scope_unknown: int = 0
+    sessions_owed: int = 0
+    sessions_missing: int = 0
     appended: tuple[str, ...] = ()
     paged: tuple[str, ...] = ()
     report: tuple[str, ...] = ()
@@ -517,10 +618,18 @@ class Decision:
 
 @dataclass(frozen=True)
 class PartitionOutcome:
-    """Every decision for one partition in one run, and whether the partition was released."""
+    """Every decision for one partition in one run, and where the partition ended up.
+
+    ``holders`` names every check still withholding the partition once every finding has been
+    applied. It is not :attr:`Decision.holders` under another name: that one is the state as
+    each finding landed, which is what a per-finding answer needs, and this one is the state at
+    the end of the walk. They differ the moment a later check quarantines what an earlier one
+    passed, and only this one can say so.
+    """
 
     decisions: tuple[Decision, ...] = ()
     released: bool = False
+    holders: tuple[str | None, ...] = ()
 
 
 def decide_partition(
@@ -537,11 +646,14 @@ def decide_partition(
     the walk started from would report the partition still withheld by a check that cleared a
     moment earlier, and the release would never be reported at all.
 
-    This is a pure function for a reason that is not tidiness. One check exists, so no run can
-    yet produce two findings for one partition, and the cases this exists to get right cannot
-    be driven through ``judge`` at all. A unit test drives them here with as many checks as it
-    likes. It is also the seam marketlake #407's three checks plug into, rather than a seam
-    invented for a test.
+    This is a pure function for a reason that is not tidiness. ``judge`` hands it one
+    partition's findings, which is two on a quotes partition and three on a chains one, and a
+    unit test drives it here with as many checks as it likes and with ledger states a lake
+    would take a fixture to build. Marketlake #407 is what made the second finding real: this
+    said "one check exists, so no run can yet produce two findings for one partition" until
+    that landed, and ``judge`` carried the same sentence as a comment. One of the two was
+    corrected and this one was not, which is the failure a completeness review exists to
+    catch.
     """
     state = dict(by_check or {})
     held_before = bool(withholding(state))
@@ -570,9 +682,11 @@ def decide_partition(
         )
         decisions.append(Decision(finding, wrote=wrote, holders=holders))
 
+    held_after = withholding(state)
     return PartitionOutcome(
         decisions=tuple(decisions),
-        released=held_before and not withholding(state),
+        released=held_before and not held_after,
+        holders=tuple(entry.get("check") for entry in held_after),
     )
 
 
@@ -597,20 +711,22 @@ class SealedPartition:
         with. ``loader.PartitionAbsent`` says why that matters: on macOS a case-mismatched
         spelling opens the partition while the quarantine lookup misses, which turns the guard
         from fail closed into fail open.
+
+        It calls :func:`partition_key`, which is the same spelling built for a partition that
+        does not exist. Two f-strings sharing the constants agree until somebody edits one, and
+        that function's docstring claims they cannot drift.
         """
-        return (
-            f"{self.surface}/{TICKER_PREFIX}{self.ticker}/"
-            f"{DATE_PREFIX}{self.day.isoformat()}.parquet"
-        )
+        return partition_key(self.surface, self.ticker, self.day)
 
 
 def sealed_partitions(lake_root: Path | str, *, day: date | None = None) -> list[SealedPartition]:
     """Every sealed chains and quotes partition, or one day's, in a stable order.
 
     ``day=None`` walks the whole lake, which is what a first run and a hand run both want. The
-    18:30 job passes the session it is about, because re-judging a partition sealed months ago
-    against a trailing median that has moved since would produce a verdict about the median
-    rather than about the partition.
+    18:30 job passes the session it is about, because a night's run is about that night and
+    walking the rest costs the whole lake's Parquet for verdicts that cannot have changed. They
+    cannot: a sealed partition is immutable, there is no backfill, and :func:`trailing_medians`
+    takes only sessions before the one it judges, so a whole-lake re-run is deterministic.
 
     A name that does not parse as a date is skipped rather than raising. The walk is over a
     directory the operator can put a file in, and one stray name must not cost the run.
@@ -641,8 +757,55 @@ class ScopeUnknown(BatteryError):
     """
 
 
+@dataclass(frozen=True)
+class Reference:
+    """The two reference files every scope question resolves against, read once per run.
+
+    ``judge`` reads them and hands them down. Two readings of the same file inside one run can
+    disagree, and they answer different questions from the same rows, so the second reading is
+    the one that would be wrong without anything saying so.
+
+    The two questions are not the same shape, which is why both halves are here.
+    :func:`capture_spans_by_ticker` asks which spans a partition *directory* falls under, keyed
+    by the spelling the walk found on disk. :func:`coverage` asks the opposite question, which
+    sessions an *instrument* was owed a partition for, and a ticker that captured nothing at all
+    has no directory to be found under. That is marketlake #431's class of miss, stated from the
+    other side: an enumeration that starts from what the lake holds cannot see what it never
+    wrote.
+    """
+
+    master: SecurityMaster
+    spans: CaptureSpans
+
+
+def read_reference(lake_root: Path | str) -> Reference:
+    """Both reference files, or :class:`ScopeUnknown` naming which one could not be read.
+
+    A missing or unreadable file raises rather than returning an empty mapping, for the reason
+    :func:`capture_spans_by_ticker` gives: an empty one reaches :func:`in_scope` as "capture was
+    not running", which is a fact this run does not have.
+    """
+    root = Path(lake_root)
+    try:
+        master = SecurityMaster.read(master_path(root))
+    except FileNotFoundError as exc:
+        raise ScopeUnknown(f"no security master at {master_path(root)}") from exc
+    except SecurityMasterError as exc:
+        raise ScopeUnknown(f"security master unreadable: {exc}") from exc
+    try:
+        spans = CaptureSpans.read(spans_path(root))
+    except FileNotFoundError as exc:
+        raise ScopeUnknown(f"no capture spans at {spans_path(root)}") from exc
+    except CaptureSpansError as exc:
+        raise ScopeUnknown(f"capture spans unreadable: {exc}") from exc
+    return Reference(master=master, spans=spans)
+
+
 def capture_spans_by_ticker(
-    lake_root: Path | str, tickers: Iterable[str]
+    lake_root: Path | str,
+    tickers: Iterable[str],
+    *,
+    reference: Reference | None = None,
 ) -> dict[str, tuple[CaptureSpan, ...]]:
     """Each partition directory's capture spans, keyed by the directory's own ticker spelling.
 
@@ -668,21 +831,11 @@ def capture_spans_by_ticker(
     **A reference file that is missing or unreadable raises.** It does not return an empty
     mapping. An empty mapping reaches :func:`in_scope` as "capture was not running", which is a
     fact this function does not have, and a delayed feed would then pass under a reason that
-    says something untrue.
+    says something untrue. ``reference`` is the run's own read, and leaving it out takes one
+    here, which is what a caller with no run behind it wants.
     """
-    root = Path(lake_root)
-    try:
-        master = SecurityMaster.read(master_path(root))
-    except FileNotFoundError as exc:
-        raise ScopeUnknown(f"no security master at {master_path(root)}") from exc
-    except SecurityMasterError as exc:
-        raise ScopeUnknown(f"security master unreadable: {exc}") from exc
-    try:
-        spans = CaptureSpans.read(spans_path(root))
-    except FileNotFoundError as exc:
-        raise ScopeUnknown(f"no capture spans at {spans_path(root)}") from exc
-    except CaptureSpansError as exc:
-        raise ScopeUnknown(f"capture spans unreadable: {exc}") from exc
+    reference = read_reference(lake_root) if reference is None else reference
+    master, spans = reference.master, reference.spans
 
     by_spelling: dict[str, set[int]] = {}
     for mapping in master.mappings:
@@ -759,6 +912,30 @@ def _overlaps(span: CaptureSpan, start: datetime, end: datetime) -> bool:
 
 
 # -- the real-time entitlement check -----------------------------------------
+
+
+@contextmanager
+def _contained(partition: SealedPartition):
+    """Turn any failure reading one partition into :class:`PartitionUnreadable`.
+
+    **A column's type is not checked by reading its schema.** Every read here guards
+    ``pq.read_schema`` and ``pq.read_table`` and then hands the columns to an Arrow kernel,
+    which raises ``ArrowNotImplementedError`` when a pinned column arrives retyped: a ``bid``
+    the vendor started sending as a string has no ``less_equal`` against a ``mark`` that is
+    still a double. That raise is outside the walk's per-partition containment, so one drifted
+    column on one partition costs every partition's verdict for the whole lake that night.
+
+    Retyping a pinned column is drift, which is the condition the battery exists to notice, so
+    the partitions most likely to raise here are the ones that most need judging. That is
+    :class:`PartitionUnreadable`'s own argument for being contained rather than fatal, and this
+    is what puts the kernels inside it.
+    """
+    try:
+        yield
+    except PartitionUnreadable:
+        raise
+    except Exception as exc:  # noqa: BLE001 - one damaged partition must not cost the run
+        raise PartitionUnreadable(f"{partition.relative}: {type(exc).__name__}: {exc}") from exc
 
 
 @dataclass(frozen=True)
@@ -844,8 +1021,8 @@ def read_entitlement(
     violations = 0
     if flag_present:
         _, wanted_value = ENTITLEMENT_FLAGS[partition.surface]
-        column = table[flag]
-        agreeing = pc.sum(pc.equal(column, wanted_value)).as_py() or 0
+        with _contained(partition):
+            agreeing = pc.sum(pc.equal(table[flag], wanted_value)).as_py() or 0
         violations = rows - agreeing
 
     in_session = _within(table, partition, bounds)
@@ -1010,6 +1187,33 @@ def judge_entitlement(
     )
 
 
+def _finding(
+    partition: SealedPartition,
+    check: str,
+    verdict: str,
+    reason: str,
+    *,
+    computed: float | None = None,
+    against: float | None = None,
+) -> Finding:
+    """One finding, with the partition's four identifying fields spliced in.
+
+    Every check builds its findings here, so the partition's spelling reaches the ledger one way
+    and the ``check`` token is never left to a default.
+    """
+    return Finding(
+        partition=partition.relative,
+        surface=partition.surface,
+        ticker=partition.ticker,
+        day=partition.day,
+        check=check,
+        verdict=verdict,
+        reason=reason,
+        computed=computed,
+        against=against,
+    )
+
+
 def _entitlement_finding(
     partition: SealedPartition,
     verdict: str,
@@ -1018,16 +1222,552 @@ def _entitlement_finding(
     computed: float | None = None,
     against: float | None = None,
 ) -> Finding:
-    """One entitlement finding, with the partition's four identifying fields spliced in."""
-    return Finding(
-        partition=partition.relative,
-        surface=partition.surface,
-        ticker=partition.ticker,
-        day=partition.day,
-        check=CHECK_ENTITLEMENT,
-        verdict=verdict,
-        reason=reason,
-        computed=computed,
+    """One entitlement finding."""
+    return _finding(
+        partition, CHECK_ENTITLEMENT, verdict, reason, computed=computed, against=against
+    )
+
+
+# -- trading-calendar coverage -----------------------------------------------
+
+
+@dataclass(frozen=True)
+class Coverage:
+    """What the coverage check asked and what it found.
+
+    ``owed`` is the denominator: every surface, ticker and session a capture span says a
+    partition was owed for. It is carried beside the misses because the check's correct answer
+    against today's lake is that it found nothing, and a report that printed only misses would
+    render "it found nothing" and "it did not run" the same way. :func:`render` already prints
+    every count including the zeroes for that reason.
+
+    ``missing`` holds one finding per owed partition the lake does not have. Each carries
+    :data:`MISSING_SESSION`, which is not a verdict, so none of them reaches the ledger.
+
+    ``unnamed`` holds one sentence per instrument whose owed sessions could not be named,
+    because the capture spans and the security master disagree about it. It is reported and
+    counted rather than raised. Raising took the whole run down: every other ticker's partitions
+    went unjudged and the delayed-feed page could not fire, over an instrument that owns no
+    partition and changes no read. ``capture_spans.build_from_master`` reaches this state on
+    purpose, opening a span for every instrument in the master when the roster cannot be read,
+    and ``SecurityMaster.register`` takes no ticker at all.
+    """
+
+    owed: int = 0
+    missing: tuple[Finding, ...] = ()
+    unnamed: tuple[str, ...] = ()
+
+
+def coverage(
+    lake_root: Path | str,
+    reference: Reference,
+    calendar: Calendar,
+    *,
+    now: datetime,
+) -> Coverage:
+    """Every session a capture span owed a partition for, and the ones with no partition.
+
+    **This walks the whole span and ignores the run's ``day``.** ``sweep`` calls :func:`judge`
+    with tonight's session, which is right for a check that reads a partition's rows. It is
+    exactly wrong here: a session with no partition is a session on which nothing ran, so a
+    coverage check scoped to tonight can never see the night it missed. The widening is free,
+    because this stats the filesystem and opens no Parquet.
+
+    **It enumerates instruments, not partition directories.** A ticker that captured nothing at
+    all has no ``ticker=`` directory, so a walk of the lake cannot see it. That is marketlake
+    #431's class of miss from the other side. :class:`Reference` carries both halves and its
+    docstring gives the reason.
+
+    **A session is owed a partition when the span covers part of the session**, rather than part
+    of the calendar day. :func:`in_scope` deliberately widens to the whole day, because the rows
+    an existing partition holds are the ones capture wrote and the onboarding day's morning
+    falls outside the span. The question here is the other one, whether capture could have
+    written anything at all, and a span opening after the option close covers none of the
+    session while still touching the day.
+
+    **And only once compaction has run.** ``session.COMPACTION_DELAY`` is the fifteen minutes
+    past the option close at which the partition is written, so a session whose file is still
+    being built is not yet missing. The moment is derived from the calendar and that constant
+    rather than pinned here, because ``tests/unit/test_seam_calendar.py`` fails the build on a
+    session-time literal anywhere under ``src/lake`` outside ``calendar.py``.
+
+    **A ticker is looked for under every spelling it ever carried.** Resolving as of the judged
+    day loses the ticker before the master's ``valid_from``, which is marketlake #405, and
+    resolving as of the run date loses it after a rename. Either way a partition that exists
+    would be reported missing. The name the finding is written under is the spelling valid on
+    that day, falling back to the first the instrument ever had.
+    """
+    from lake.session import COMPACTION_DELAY
+
+    root = Path(lake_root)
+    master, spans = reference.master, reference.spans
+
+    spellings: dict[int, tuple[str, ...]] = {}
+    unnamed: list[str] = []
+    for instrument_id in sorted(spans.instrument_ids()):
+        found = sorted(
+            {
+                mapping.id_value
+                for mapping in master.mappings
+                if mapping.id_type == ID_TYPE_TICKER and mapping.instrument_id == instrument_id
+            }
+        )
+        if not found:
+            unnamed.append(
+                f"battery: instrument {instrument_id} has a capture span and no ticker in "
+                "the master, so the sessions it owed cannot be named"
+            )
+            continue
+        spellings[instrument_id] = tuple(found)
+
+    # Keyed so two spans covering one day owe one partition rather than two.
+    owed: set[tuple[str, int, date]] = set()
+    for span in spans:
+        if span.instrument_id not in spellings:
+            continue
+        horizon = now if span.end is None else min(span.end, now)
+        day = span.start.astimezone(MARKET_TZ).date()
+        last = horizon.astimezone(MARKET_TZ).date()
+        while day <= last:
+            bounds = _session_bounds(calendar, day)
+            if bounds is not None:
+                opened, closed = bounds
+                if _overlaps(span, opened, closed) and closed + COMPACTION_DELAY <= now:
+                    surfaces = SEALED_SURFACES if span.options else (QUOTES,)
+                    for surface in surfaces:
+                        owed.add((surface, span.instrument_id, day))
+            day += timedelta(days=1)
+
+    missing: list[Finding] = []
+    for surface, instrument_id, day in sorted(owed, key=lambda key: (key[0], key[1], key[2])):
+        names = spellings[instrument_id]
+        if any(_partition_file(root, surface, name, day).is_file() for name in names):
+            continue
+        named = master.symbol_at(instrument_id, day) or names[0]
+        missing.append(
+            Finding(
+                partition=partition_key(surface, named, day),
+                surface=surface,
+                ticker=named,
+                day=day,
+                check=CHECK_CALENDAR_COVERAGE,
+                verdict=MISSING_SESSION,
+                reason=(
+                    f"{day.isoformat()} is a session inside {named}'s capture span and the "
+                    f"lake holds no {surface} partition for it"
+                ),
+            )
+        )
+    return Coverage(owed=len(owed), missing=tuple(missing), unnamed=tuple(unnamed))
+
+
+def _partition_file(root: Path, surface: str, ticker: str, day: date) -> Path:
+    """Where a sealed partition would be, built the way the ledger's key is built."""
+    return root / partition_key(surface, ticker, day)
+
+
+def partition_key(surface: str, ticker: str, day: date) -> str:
+    """The lake-relative path a partition is keyed under, from its three parts.
+
+    :attr:`SealedPartition.relative` builds the same string for a partition the walk found. This
+    is the version for one that does not exist, so the two spellings cannot drift apart.
+    """
+    return f"{surface}/{TICKER_PREFIX}{ticker}/{DATE_PREFIX}{day.isoformat()}.parquet"
+
+
+def coverage_line(found: Coverage) -> str:
+    """The one line coverage puts in the nightly report, whatever it found.
+
+    **One line, counted, and it names no partition.** Three rules meet here and each rules out
+    a shape a reader reaches for first.
+
+    1. *Never one line per miss.* A missing session is permanent, so this repeats every night
+       for ever. ``sweep`` already decided that case in writing for the bars walk's
+       unresolvable ticker-days: rendered in full they walk the nightly report into
+       ``digest_body``'s 1000-byte cap, "and what falls off the end first is the battery's own
+       census", and a line that silences the check above it is worse than no line.
+    2. *No partition names, not even a capped list.* ``sweep``'s own digest test pins the
+       contract: the digest carries counts and never a list of findings, because a digest that
+       listed them "would sit under the cap on every night anyone tested it and over the cap on
+       the night that mattered". The report list is what the digest is built from, so a name here
+       reaches it. The dates are what an operator needs to act, and :func:`render` names each
+       missing partition on the job's own stdout.
+    3. *No second ``": "``.* ``report.redacted`` drops everything past a line's second field
+       before it reaches the report file or the digest, so that an exception's message cannot
+       carry an absolute path off the capture machine. A line spelled
+       ``battery: coverage: 3 of 27`` arrives as ``battery: coverage`` with every number gone.
+
+    It prints on a night it finds nothing, because the battery's census is on stdout and not in
+    the report file, so a check reporting only misses cannot be told from one that did not run.
+    """
+    if not found.missing:
+        return f"battery: calendar coverage, {found.owed} owed sessions, all present"
+    days = sorted({finding.day for finding in found.missing})
+    span = (
+        days[0].isoformat()
+        if len(days) == 1
+        else f"{days[0].isoformat()} to {days[-1].isoformat()}"
+    )
+    return (
+        f"battery: calendar coverage, {len(found.missing)} of {found.owed} owed sessions have "
+        f"no partition, over {len(days)} session{'s' if len(days) != 1 else ''}, {span}"
+    )
+
+
+# -- quote sanity ------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class QuoteOrder:
+    """What one partition's rows say about ``bid <= mark <= ask``.
+
+    ``rows`` counts data rows. ``unordered`` counts the ones that do not satisfy it, which
+    includes every row where any of the three is null: a comparison against null is null, and a
+    row whose ordering cannot be evaluated has not passed it. That is the same reading
+    :class:`Entitlement` gives a null flag, and it costs nothing today, because ``bid``, ``ask``
+    and ``mark`` are never null on a data row inside a capture span. The only nulls in the lake
+    are the two rows of SPY's 2026-09-02 chains partition, which :func:`in_scope` already
+    refuses to judge.
+
+    ``absent`` names the columns the partition does not carry. All three are in the pinned
+    capture schema for both surfaces, so a missing one is drift rather than an old partition,
+    and the check answers it the way the entitlement flag's absence is answered.
+    """
+
+    rows: int
+    unordered: int
+    absent: tuple[str, ...] = ()
+
+    @property
+    def rate(self) -> float:
+        """The share of data rows that are not ordered, or 0.0 for a partition with none."""
+        return self.unordered / self.rows if self.rows else 0.0
+
+
+def read_quote_order(partition: SealedPartition) -> QuoteOrder:
+    """Read one partition's ordering evidence, three columns plus the row kind.
+
+    **The two halves of the design's wording are one predicate.** "Bid ≤ mid ≤ ask" fails on a
+    row whose mark sits outside the spread and on a crossed quote alike, because a crossed
+    quote's interval is empty and admits no mark at all. The lake says the two are the same
+    rows in both directions: across all thirteen of the lake's partitions holding data rows,
+    the count of crossed rows that are not mark-outside is zero, and so is the count of
+    mark-outside rows that are not crossed. So this is one measurement and one finding rather
+    than two.
+
+    **It reads every data row rather than the session's.** The entitlement check's staleness
+    half is session-only because a vendor's last-quote stamp freezes overnight while the fetch
+    clock keeps moving. An ordering carries no such drift: a quote taken at 03:25 is as ordered
+    or as crossed as one taken at noon, and the measurement behind the tolerance was taken over
+    every data row.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    try:
+        available = set(pq.read_schema(partition.path).names)
+    except Exception as exc:  # noqa: BLE001 - one damaged file must not cost the run
+        raise PartitionUnreadable(f"{partition.relative}: {type(exc).__name__}: {exc}") from exc
+
+    if ROW_KIND_COLUMN not in available:
+        raise PartitionUnreadable(f"{partition.relative}: missing {ROW_KIND_COLUMN}")
+    absent = tuple(name for name in ORDERED_COLUMNS if name not in available)
+    wanted = [ROW_KIND_COLUMN, *(name for name in ORDERED_COLUMNS if name in available)]
+
+    try:
+        table = pq.read_table(partition.path, columns=wanted)
+    except Exception as exc:  # noqa: BLE001 - same reason as above
+        raise PartitionUnreadable(f"{partition.relative}: {type(exc).__name__}: {exc}") from exc
+
+    table = table.filter(pc.equal(table[ROW_KIND_COLUMN], ROW_KIND_DATA))
+    rows = table.num_rows
+    if absent or rows == 0:
+        return QuoteOrder(rows=rows, unordered=0, absent=absent)
+
+    with _contained(partition):
+        ordered = pc.and_(
+            pc.less_equal(table[BID], table[MARK]), pc.less_equal(table[MARK], table[ASK])
+        )
+        # ``pc.sum`` skips nulls, so a row whose comparison is null counts as unordered rather
+        # than as agreeing. A null in any of the three is the vendor declining to say, and a
+        # check that answers "declined to say" with a pass is not failing closed.
+        agreeing = pc.sum(pc.cast(ordered, pa.int64())).as_py() or 0
+    return QuoteOrder(rows=rows, unordered=rows - agreeing)
+
+
+def judge_quote_order(partition: SealedPartition, evidence: QuoteOrder) -> Finding:
+    """One partition's quote-sanity verdict, from the evidence and the measured tolerance.
+
+    Two conditions quarantine.
+
+    1. The partition does not carry ``bid``, ``ask`` or ``mark``. All three are in the pinned
+       capture schema for both surfaces, so an absence is drift, and answering drift with a pass
+       is what fail closed exists to prevent. That is the entitlement flag's rule applied to the
+       columns this check is about, rather than ``PartitionUnreadable``, which is what the two
+       stamps get because they support a measurement instead of being its subject.
+    2. The unordered rate is over :data:`QUOTE_SANITY_TOLERANCE`.
+
+    The rate is the partition's, which the constant's own comment argues for against the
+    alternative of a per-snapshot rate.
+    """
+    if evidence.absent:
+        return _finding(
+            partition,
+            CHECK_QUOTE_SANITY,
+            QUARANTINED_VERDICT,
+            f"{partition.surface} carries no {', '.join(evidence.absent)} column, so "
+            "bid, mark and ask cannot be ordered",
+        )
+    rate = evidence.rate
+    if rate > QUOTE_SANITY_TOLERANCE:
+        return _finding(
+            partition,
+            CHECK_QUOTE_SANITY,
+            QUARANTINED_VERDICT,
+            f"{evidence.unordered} of {evidence.rows} data rows are not ordered "
+            f"bid <= mark <= ask, a rate of {rate:.4%} over the {QUOTE_SANITY_TOLERANCE:.0%} "
+            "tolerance",
+            computed=rate,
+            against=QUOTE_SANITY_TOLERANCE,
+        )
+    return _finding(
+        partition,
+        CHECK_QUOTE_SANITY,
+        CLEAN_VERDICT,
+        f"{evidence.unordered} of {evidence.rows} data rows are not ordered "
+        f"bid <= mark <= ask, a rate of {rate:.4%} within the "
+        f"{QUOTE_SANITY_TOLERANCE:.0%} tolerance",
+        computed=rate,
+        against=QUOTE_SANITY_TOLERANCE,
+    )
+
+
+# -- the snapshot row-count band ---------------------------------------------
+
+
+def session_snapshot_counts(
+    partition: SealedPartition, bounds: tuple[datetime, datetime] | None
+) -> tuple[int, ...]:
+    """How many data rows each of the partition's session snapshots holds.
+
+    A snapshot is one ``snap_ts``, which is the minute slot a cycle fired for. Two columns are
+    read, so the file's size barely reaches the cost: on SPY's 307 MB 2026-09-16 chains
+    partition the read itself is 0.04 seconds, and the filter and the group-by over 5,307,030
+    rows take the call to 0.28.
+
+    ``bounds`` filters to the session for the reason :func:`_within` gives and one more of its
+    own. The 03:25 overnight cycle on each of the lake's 2026-09-16 chain partitions carries
+    about two percent fewer contracts than the session's own snapshots, and a median built from
+    session snapshots is the wrong thing to measure an overnight chain against.
+    """
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    try:
+        available = set(pq.read_schema(partition.path).names)
+    except Exception as exc:  # noqa: BLE001 - one damaged file must not cost the run
+        raise PartitionUnreadable(f"{partition.relative}: {type(exc).__name__}: {exc}") from exc
+    missing = [name for name in (ROW_KIND_COLUMN, SNAP_TS) if name not in available]
+    if missing:
+        raise PartitionUnreadable(f"{partition.relative}: missing {', '.join(sorted(missing))}")
+    try:
+        table = pq.read_table(partition.path, columns=[ROW_KIND_COLUMN, SNAP_TS])
+    except Exception as exc:  # noqa: BLE001 - same reason as above
+        raise PartitionUnreadable(f"{partition.relative}: {type(exc).__name__}: {exc}") from exc
+
+    with _contained(partition):
+        table = table.filter(pc.equal(table[ROW_KIND_COLUMN], ROW_KIND_DATA))
+        if table.num_rows == 0:
+            return ()
+        table = _within(table, partition, bounds)
+        if table.num_rows == 0:
+            return ()
+        counted = table.group_by(SNAP_TS).aggregate([(SNAP_TS, "count")])
+        return tuple(sorted(counted[f"{SNAP_TS}_count"].to_pylist()))
+
+
+def median(values: Sequence[float]) -> float:
+    """The midpoint of a sorted copy, averaging the middle pair on an even count.
+
+    Written here rather than taken from ``statistics`` so the interpolation matches
+    ``pc.quantile(..., interpolation="midpoint")``, which :func:`_median_staleness` uses. Two
+    medians in one module answering the same question two ways is the kind of drift the
+    module's own constants exist to prevent.
+    """
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[middle])
+    return (float(ordered[middle - 1]) + float(ordered[middle])) / 2
+
+
+def trailing_medians(
+    lake_root: Path | str,
+    partition: SealedPartition,
+    *,
+    calendar: Calendar,
+    spans: tuple[CaptureSpan, ...],
+    guards: GuardConstants,
+    memo: dict[str, float] | None = None,
+) -> tuple[float, ...]:
+    """Each trailing session's median snapshot row count, newest first.
+
+    **The window is the ``trailing_median_sessions`` calendar sessions before this one, and
+    every one of them enters it.** ``docs/design.md`` states the rule for median-relative checks
+    and it is not this module's to reinterpret: "Median-relative checks compute over whatever
+    trailing sessions exist. All sessions enter the window, and the median's robustness is the
+    outlier defense."
+
+    So the walk counts sessions rather than answers. A session the lake has no partition for, or
+    one holding gap rows alone, occupies its slot in the window and contributes nothing to the
+    median. It is not counted as zero, which would invent a snapshot count nobody captured and
+    drag the median toward zero. Nor does the window reach past it for a replacement, which is
+    the reading this first shipped with and which ``docs/design.md`` rules out.
+
+    The difference is what happens after an outage. Reaching back for a full twenty answers
+    builds a median out of sessions months older than the one being judged, and the drift
+    measured to justify ``config.battery_row_count_band`` is drift across *consecutive*
+    sessions. The first sessions back would then be measured against a stale roster and
+    quarantined, which fails closed on good new data. Counting sessions instead leaves the
+    window mostly empty, the contributing count falls under ``config.min_trailing_sessions`` and
+    the check reports ``insufficient_history``, which fails open and says so.
+
+    **Prior sessions only.** A statistic that includes its own subject cannot say the subject is
+    unusual, and "trailing" is what the config field is called. The measurement is worth stating
+    because it bounds the claim rather than supporting it: at the configured five, including the
+    judged session would not by itself let a wholly truncated session pass, because the median
+    of one zero and four full sessions is still a full session. The rule is about what the
+    statistic means, not about a case anyone has observed.
+
+    **A trailing session another check quarantined is admitted.** Excluding it would make the
+    band depend on the ledger this same run is writing. The design's own sentence above is the
+    warrant: all sessions enter the window and the median's robustness is the defense.
+
+    ``memo`` is the run's cache of one median per partition. A whole-lake run otherwise reads
+    each partition's trailing window once per partition, which is twenty times the reads for the
+    same answer.
+    """
+    root = Path(lake_root)
+    directory = root / partition.surface / f"{TICKER_PREFIX}{partition.ticker}"
+    found: list[float] = []
+    when = partition.day
+    sessions = 0
+
+    while sessions < guards.trailing_median_sessions:
+        when -= timedelta(days=1)
+        bounds = _session_bounds(calendar, when)
+        if bounds is None:
+            continue
+        earlier = SealedPartition(
+            path=directory / f"{DATE_PREFIX}{when.isoformat()}.parquet",
+            surface=partition.surface,
+            ticker=partition.ticker,
+            day=when,
+        )
+        if not in_scope(earlier, spans):
+            # Outside every capture span there is no session to have captured, so this is the
+            # end of the window rather than an empty slot in it. Walking on would count the
+            # days before onboarding against a roster that did not exist.
+            break
+        sessions += 1
+        if memo is not None and earlier.relative in memo:
+            found.append(memo[earlier.relative])
+            continue
+        if not earlier.path.exists():
+            continue
+        try:
+            counts = session_snapshot_counts(earlier, bounds)
+        except PartitionUnreadable:
+            # A trailing partition that will not read contributes no median. It is not reported
+            # here, because the walk reports it under its own verdict when it reaches it, and
+            # because a session the run was not asked about is not this check's to announce.
+            continue
+        if not counts:
+            continue
+        computed = median(counts)
+        if memo is not None:
+            memo[earlier.relative] = computed
+        found.append(computed)
+    return tuple(found)
+
+
+def judge_row_count(
+    partition: SealedPartition,
+    counts: Sequence[int],
+    trailing: Sequence[float],
+    guards: GuardConstants,
+) -> Finding:
+    """One partition's row-count verdict, from its snapshots and the trailing median.
+
+    Three answers before the band is applied.
+
+    1. No session snapshot at all, which is out of scope. A day of overnight cycles recorded no
+       session rather than a bad one, and it is the same answer :func:`judge_entitlement` gives
+       the same partition.
+    2. Fewer trailing sessions than ``config.min_trailing_sessions``, which is
+       ``insufficient_history``. The design says a median-relative check with a thin history
+       still runs and tags its rows rather than passing them, and that tag is a finding and
+       never a verdict because ``manifest.is_quarantined`` fails closed on anything but
+       ``clean``.
+    3. Otherwise the band, ``config.battery_row_count_band`` either side of the trailing median.
+
+    **The threshold is one snapshot rather than a rate**, which is what "catches truncated
+    fetches" asks for: a truncated fetch is one cycle, and a check tolerating some would not
+    catch them. The lake says the band has room for it. Inside a session the per-snapshot count
+    is exactly constant on all six of its chains data partitions. Two of them carry one
+    overnight cycle each, 1.9 percent short on SPY and 2.5 percent short on QQQ, and the session
+    filter drops both. Across sessions the count moves about one percent, against a band of
+    thirty.
+
+    ``computed`` differs by branch, because what an operator deciding whether to sign off wants
+    differs by branch. On a quarantine it is the snapshot furthest from the median, which is the
+    number that caused the verdict, and ``against`` is the median. On a pass it is the judged
+    session's own median against the trailing one, which is the comparison that passed. On
+    ``insufficient_history`` it is how many trailing sessions carried a median against how many
+    the check needs, because there is no row count to report.
+    """
+    if not counts:
+        return _finding(
+            partition,
+            CHECK_ROW_COUNT_BAND,
+            OUT_OF_SCOPE,
+            "no data row falls inside the session, so the partition carries no snapshot to "
+            "measure against the trailing median",
+        )
+    if not trailing or len(trailing) < guards.min_trailing_sessions:
+        return _finding(
+            partition,
+            CHECK_ROW_COUNT_BAND,
+            INSUFFICIENT_HISTORY,
+            f"{len(trailing)} trailing session{'s' if len(trailing) != 1 else ''} carry a "
+            f"median, below the {guards.min_trailing_sessions} a median-relative check needs",
+            computed=float(len(trailing)),
+            against=float(guards.min_trailing_sessions),
+        )
+    against = median(trailing)
+    band = float(guards.battery_row_count_band)
+    low, high = against * (1 - band), against * (1 + band)
+    outside = [count for count in counts if count < low or count > high]
+    if outside:
+        worst = max(outside, key=lambda count: abs(count - against))
+        return _finding(
+            partition,
+            CHECK_ROW_COUNT_BAND,
+            QUARANTINED_VERDICT,
+            f"{len(outside)} of {len(counts)} session snapshots fall outside "
+            f"{low:.0f} to {high:.0f} rows, the worst holding {worst} against a trailing "
+            f"median of {against:.0f} over {len(trailing)} sessions",
+            computed=float(worst),
+            against=against,
+        )
+    return _finding(
+        partition,
+        CHECK_ROW_COUNT_BAND,
+        CLEAN_VERDICT,
+        f"all {len(counts)} session snapshots fall inside {low:.0f} to {high:.0f} rows, "
+        f"against a trailing median of {against:.0f} over {len(trailing)} sessions",
+        computed=float(median([float(count) for count in counts])),
         against=against,
     )
 
@@ -1048,7 +1788,10 @@ def judge(
     """Judge the lake's sealed partitions, write what changed, and page a delayed feed.
 
     ``day=None`` judges every sealed partition, which is what a first run wants. The 18:30 job
-    passes the session it is about.
+    passes the session it is about. **Trading-calendar coverage is outside that scoping** and
+    always walks the whole capture span, for the reason :func:`coverage` gives: a session with
+    no partition is a session on which nothing ran, so a check scoped to tonight can never see
+    the night it missed.
 
     The order inside one partition is scope first, then read, then judge, then write. Scope
     comes first because both out-of-scope classes are cheap to answer and neither needs the
@@ -1079,7 +1822,9 @@ def judge(
     guards = GuardConstants() if guards is None else guards
     partitions = sealed_partitions(root, day=day)
     try:
-        spans = capture_spans_by_ticker(root, {p.ticker for p in partitions})
+        reference = read_reference(root)
+        spans = capture_spans_by_ticker(root, {p.ticker for p in partitions}, reference=reference)
+        found = coverage(root, reference, calendar, now=now)
     except ScopeUnknown as exc:
         # Not a silent pass. Every partition would otherwise take the out-of-scope path, whose
         # reason says capture was not running, which is a fact this run does not have. The
@@ -1091,46 +1836,48 @@ def judge(
     findings: list[Finding] = []
     written: list[Finding] = []
     appended: list[str] = []
-    report: list[str] = []
+    report: list[str] = list(found.unnamed)
+    medians: dict[str, float] = {}
     deferred = 0
     withheld = 0
     released = 0
     unreadable = 0
 
     for partition in partitions:
-        if not in_scope(partition, spans.get(partition.ticker, ())):
+        its_spans = spans.get(partition.ticker, ())
+        if not in_scope(partition, its_spans):
             findings.append(
-                _entitlement_finding(
+                _finding(
                     partition,
+                    CHECK_SCOPE,
                     OUT_OF_SCOPE,
                     "the day lies outside every capture span, so capture was not running",
                 )
             )
             continue
+        bounds = _session_bounds(calendar, partition.day)
         try:
-            evidence = read_entitlement(partition, _session_bounds(calendar, partition.day))
+            judged = _judge_partition(
+                root,
+                partition,
+                bounds=bounds,
+                calendar=calendar,
+                spans=its_spans,
+                guards=guards,
+                medians=medians,
+            )
         except PartitionUnreadable as exc:
             unreadable += 1
             report.append(f"battery: {exc}")
             continue
-        if evidence.rows == 0:
-            findings.append(
-                _entitlement_finding(
-                    partition,
-                    OUT_OF_SCOPE,
-                    "the partition holds no data row, so its gap rows record a missed "
-                    "session rather than a bad one",
-                )
-            )
-            continue
+        findings.extend(judged)
 
-        finding = judge_entitlement(partition, evidence, guards)
-        findings.append(finding)
-
-        # One check exists, so this is one finding. The decision is taken over a sequence
-        # anyway, because #407's checks land on this call and the cases that need the
-        # carried-forward state are the ones with more than one finding in hand.
-        outcome = decide_partition(current.get(finding.partition), [finding])
+        # **One call for the partition, not one per finding.** ``decide_partition`` carries the
+        # ledger state forward as lines land, and two checks clearing in one walk both change
+        # what withholds the partition. Called once per finding that state never accumulates:
+        # the second check would report the partition still held by the first, and the release
+        # would go unreported. This is the seam that function's docstring names.
+        outcome = decide_partition(current.get(partition.relative), judged)
         for decision in outcome.decisions:
             if decision.deferred_to_human:
                 deferred += 1
@@ -1139,22 +1886,12 @@ def judge(
                     f"stands ({decision.finding.reason})"
                 )
                 continue
-            if decision.holders:
-                withheld += 1
-                named = ", ".join(
-                    repr(check) if check is not None else "an unnamed check"
-                    for check in decision.holders
-                )
-                report.append(
-                    f"battery: {decision.finding.partition} passes {decision.finding.check} "
-                    f"and stays quarantined under {named}"
-                )
             if not decision.wrote:
                 continue
             if dry_run:
                 report.append(
                     f"battery: would write {decision.finding.verdict} for "
-                    f"{decision.finding.partition}"
+                    f"{decision.finding.partition} under {decision.finding.check}"
                 )
                 continue
             append_verdict(
@@ -1170,19 +1907,56 @@ def judge(
             )
             appended.append(decision.finding.partition)
             written.append(decision.finding)
+        # **One line for the partition, not one per passing check.** Two checks pass a
+        # partition a third withholds, and a line each says the same fact twice, in a list
+        # ``sweep`` puts through ``digest_body``'s 1000-byte cap. The holders
+        # are the walk's final state rather than any one decision's, so a check that
+        # quarantined after another passed is named too.
+        passed = [
+            decision.finding.check
+            for decision in outcome.decisions
+            if not decision.deferred_to_human and not decision.finding.withholds
+        ]
+        if passed and outcome.holders:
+            withheld += 1
+            named = ", ".join(
+                repr(check) if check is not None else "an unnamed check"
+                for check in outcome.holders
+            )
+            report.append(
+                f"battery: {partition.relative} passes {', '.join(passed)} "
+                f"and stays quarantined under {named}"
+            )
         if outcome.released:
             released += 1
             report.append(
-                f"battery: {finding.partition} would now read, no check would withhold it"
+                f"battery: {partition.relative} would now read, no check would withhold it"
                 if dry_run
-                else f"battery: {finding.partition} now reads, no check withholds it"
+                else f"battery: {partition.relative} now reads, no check withholds it"
             )
 
-    # The findings this run actually wrote a line for, rather than every quarantining finding
-    # whose partition appears in ``appended``. Once a partition carries two checks those differ:
-    # one check's line would page the other check's unchanged finding.
-    quarantined = tuple(f for f in written if f.verdict == QUARANTINED_VERDICT)
+    # **The page is one check's, and it is filtered to that check.** ``written`` is every
+    # finding this run appended a line for, which is the right set for the transition rule and
+    # the wrong set for this page: from #407 onwards a crossed quote or a truncated fetch would
+    # otherwise reach a phone titled ``Delayed feed`` with its rate rendered as a staleness in
+    # seconds. The design gives the battery two pages and the other one is #427, so nothing here
+    # adds a third: the other two checks report and never page.
+    quarantined = tuple(
+        f for f in written if f.verdict == QUARANTINED_VERDICT and f.check == CHECK_ENTITLEMENT
+    )
     paged = page_delayed_feed(publisher, quarantined, now=now) if publisher and not dry_run else ()
+
+    # The findings about partitions that exist come first, in walk order, and the ones about
+    # partitions that do not come last. Coverage answers a question about the whole lake rather
+    # than about anything the walk opened, so it does not interleave with the walk.
+    findings.extend(found.missing)
+
+    # **The census goes last.** ``sweep.digest_body`` truncates the tail at 1000 bytes, and the
+    # comment this line's reasoning comes from assumed "what falls off the end first is the
+    # battery's own census". Put in front it would be the last thing to fall off instead, and
+    # the lines it would push out are the actionable ones: a release, a partition another check
+    # still withholds, a partition that would not read.
+    report.append(coverage_line(found))
 
     return BatteryReport(
         judged=sum(1 for f in findings if f.judged),
@@ -1194,11 +1968,113 @@ def judge(
         withheld=withheld,
         released=released,
         unreadable=unreadable,
+        scope_unknown=len(found.unnamed),
+        sessions_owed=found.owed,
+        sessions_missing=len(found.missing),
         appended=tuple(appended),
         paged=paged,
         report=tuple(report),
         findings=tuple(findings),
     )
+
+
+def _judge_partition(
+    root: Path,
+    partition: SealedPartition,
+    *,
+    bounds: tuple[datetime, datetime] | None,
+    calendar: Calendar,
+    spans: tuple[CaptureSpan, ...],
+    guards: GuardConstants,
+    medians: dict[str, float],
+) -> list[Finding]:
+    """Every check's answer about one in-scope partition, in one list.
+
+    **Both out-of-scope classes are answered once for the partition**, carrying
+    :data:`CHECK_SCOPE`, and no check runs against such a partition. Scope is a property of the
+    partition and every check would answer it from the same two facts.
+
+    The second class is the design's own wording, "a partition holding no data row **inside the
+    session**", rather than the narrower "no data row at all". The difference is a partition
+    holding only overnight cycles, and it is not hypothetical: both of the lake's 2026-09-16
+    chain partitions carry such a cycle, and a night the machine woke only for that cycle would
+    be a partition of nothing else. A closed options book is where a vendor is most likely to
+    return a zero bid against a zero ask with the mark at the last trade, which is unordered on
+    every row, so quote sanity would quarantine a partition the design says nothing should
+    judge.
+
+    **The row-count band is the options-only check of the three**, and it is also the only one
+    that needs a session. ``docs/design.md`` names the equity-only subset as "calendar coverage,
+    quote sanity, cross-check", and on quotes a snapshot is one row, so the band would compare
+    one against a trailing median of one for ever. It returns no finding on quotes rather than
+    an ``out_of_scope`` one, whose meaning is that capture was not running.
+
+    On a day the calendar calls no session it returns ``out_of_scope`` instead, and that is a
+    different answer from the one it gives quotes. ``_session_bounds`` answers ``None`` there,
+    which widens :func:`_within` to every row, so the band would count overnight cycles as
+    session snapshots and measure them against a median :func:`trailing_medians` builds from
+    real sessions alone. The entitlement check's flag half still runs on such a day, which is
+    the half that could see a delayed feed, and ``_session_bounds`` gives that reason.
+    """
+    evidence = read_entitlement(partition, bounds)
+    if evidence.rows == 0:
+        return [
+            _finding(
+                partition,
+                CHECK_SCOPE,
+                OUT_OF_SCOPE,
+                "the partition holds no data row, so its gap rows record a missed "
+                "session rather than a bad one",
+            )
+        ]
+
+    if bounds is not None and evidence.session_rows == 0:
+        return [
+            _finding(
+                partition,
+                CHECK_SCOPE,
+                OUT_OF_SCOPE,
+                "no data row falls inside the session, so a day of overnight cycles "
+                "recorded no session rather than a bad one",
+            )
+        ]
+
+    judged = [
+        judge_entitlement(partition, evidence, guards),
+        judge_quote_order(partition, read_quote_order(partition)),
+    ]
+    if partition.surface != CHAINS:
+        return judged
+    if bounds is None:
+        judged.append(
+            _finding(
+                partition,
+                CHECK_ROW_COUNT_BAND,
+                OUT_OF_SCOPE,
+                "the calendar calls the day no session, so there is neither a session to "
+                "count snapshots over nor a comparable median to count them against",
+            )
+        )
+        return judged
+    counts = session_snapshot_counts(partition, bounds)
+    if counts:
+        medians[partition.relative] = median(counts)
+    judged.append(
+        judge_row_count(
+            partition,
+            counts,
+            trailing_medians(
+                root,
+                partition,
+                calendar=calendar,
+                spans=spans,
+                guards=guards,
+                memo=medians,
+            ),
+            guards,
+        )
+    )
+    return judged
 
 
 def page_delayed_feed(
@@ -1311,7 +2187,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--session",
         metavar="YYYY-MM-DD",
         default=None,
-        help="judge one session. The default judges every sealed partition.",
+        help=(
+            "judge one session's partitions. The default judges every sealed partition. "
+            "Trading-calendar coverage ignores this and always walks the whole capture span, "
+            "because a session with no partition is a session on which nothing ran."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -1326,7 +2206,8 @@ def render(report: BatteryReport) -> str:
 
     Every count is printed including the zeroes, because a run that judged nothing and a run
     that judged everything cleanly are different answers and a report that printed only
-    non-zero counts would render them the same.
+    non-zero counts would render them the same. That rule is what the coverage pair leans on:
+    zero missing sessions out of a stated number owed says the check ran and found nothing.
     """
     lines = [
         f"  judged:               {report.judged}",
@@ -1339,12 +2220,21 @@ def render(report: BatteryReport) -> str:
         f"  released:             {report.released}",
         f"  unreadable:           {report.unreadable}",
         f"  scope unknown:        {report.scope_unknown}",
+        f"  sessions owed:        {report.sessions_owed}",
+        f"  sessions missing:     {report.sessions_missing}",
         f"  ledger lines written: {len(report.appended)}",
     ]
     lines.extend(f"  {line}" for line in report.report)
     for finding in report.findings:
         if finding.verdict == QUARANTINED_VERDICT:
             lines.append(f"  quarantined {finding.partition}: {finding.reason}")
+    # The missing sessions by name, which :func:`coverage_line` deliberately leaves out. This is
+    # the job's own stdout rather than the nightly report, so it is under neither the digest's
+    # byte cap nor the rule that keeps a list of findings out of it, and it is uncapped for the
+    # same reason the quarantined findings above it are.
+    for finding in report.findings:
+        if finding.verdict == MISSING_SESSION:
+            lines.append(f"  missing {finding.partition}: {finding.reason}")
     return "\n".join(lines)
 
 
@@ -1398,30 +2288,42 @@ if __name__ == "__main__":  # pragma: no cover - the module entry
 
 __all__ = [
     "BATTERY_SOURCE",
+    "CHECK_CALENDAR_COVERAGE",
     "CHECK_ENTITLEMENT",
+    "CHECK_QUOTE_SANITY",
+    "CHECK_ROW_COUNT_BAND",
+    "CHECK_SCOPE",
     "DELAYED_FEED_EVENT",
     "DELAYED_FEED_TITLE",
     "INSUFFICIENT_HISTORY",
+    "MISSING_SESSION",
     "NON_VERDICTS",
+    "ORDERED_COLUMNS",
     "OUT_OF_SCOPE",
     "PROVENANCE_BATTERY",
     "PROVENANCE_HUMAN",
     "QUARANTINED_VERDICT",
+    "QUOTE_SANITY_TOLERANCE",
     "SEALED_SURFACES",
     "SIGNOFF_SOURCE",
     "VERDICTS",
     "BatteryError",
     "BatteryReport",
+    "Coverage",
     "Decision",
     "Entitlement",
     "Finding",
     "PartitionOutcome",
     "PartitionUnreadable",
+    "QuoteOrder",
+    "Reference",
     "ScopeUnknown",
     "SealedPartition",
     "append_verdict",
     "build_entry",
     "capture_spans_by_ticker",
+    "coverage",
+    "coverage_line",
     "decide_partition",
     "entry_line_count",
     "human_precedence",
@@ -1429,8 +2331,16 @@ __all__ = [
     "judge",
     "judge_entitlement",
     "judge_from_config",
+    "judge_quote_order",
+    "judge_row_count",
     "main",
+    "median",
     "page_delayed_feed",
+    "partition_key",
     "read_entitlement",
+    "read_quote_order",
+    "read_reference",
     "sealed_partitions",
+    "session_snapshot_counts",
+    "trailing_medians",
 ]

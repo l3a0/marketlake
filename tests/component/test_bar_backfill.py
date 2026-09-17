@@ -36,6 +36,7 @@ import pytest
 from lake import bars, journal, report
 from lake.bars import (
     CHECK_BAR_CLOSE,
+    MINUTE_EXTENDED_HOURS,
     SpansAbsent,
     TickerDay,
     UnsupportedBarFreq,
@@ -243,7 +244,12 @@ def _cassette(
             if MINUTE_FREQ in freqs:
                 interactions.extend(
                     bars_interactions(
-                        ticker, MINUTE_FREQ, [(open_et, close_et, _minute_candles(day))]
+                        ticker,
+                        MINUTE_FREQ,
+                        [(open_et, close_et, _minute_candles(day))],
+                        # Keyed on the flag the minute fetch sets. The daily interactions below
+                        # key on none, matching the daily call, which leaves it unset.
+                        extended_hours=MINUTE_EXTENDED_HOURS,
                     )
                 )
             if DAILY_FREQ in freqs:
