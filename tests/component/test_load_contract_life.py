@@ -3,9 +3,9 @@
 ``load_contract`` and ``load_contract_life`` share every guard the other doors have, and
 ``tests/component/test_load_chain.py`` and ``tests/component/test_load_contract.py`` already
 exercise those against the chains surface. This file exercises what the threading adds: the
-symbol resolved per session out of the master's OCC mappings, the ticker settled once out of
-the thread's earliest symbol, the sessions a range steps over, and the four ways the master
-itself can refuse or say nothing.
+selection widened to every spelling the master says the contract has worn, the ticker settled
+once out of the thread's earliest symbol, the sessions a range steps over, the stitch and the
+order a range owes, and the ways the master itself can refuse or say nothing.
 
 The numbered tests carry the numbering marketlake #135 asks for, so a mutation the issue names
 points at the test the issue names.
@@ -19,9 +19,11 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
+from lake import journal
 from lake.loader import (
     ContractAbsent,
     ContractAmbiguous,
+    LoadError,
     PartitionAbsent,
     PartitionQuarantined,
     load_contract,
@@ -143,6 +145,11 @@ def _life_rows() -> dict[str, list[dict]]:
     }
 
 
+def _without(row: dict, column: str) -> dict:
+    """``row`` without one column, which is what a narrower partition holds."""
+    return {name: value for name, value in row.items() if name != column}
+
+
 def _symbols(table: pa.Table) -> list[str]:
     return table.column("occ_symbol").to_pylist()
 
@@ -171,8 +178,8 @@ def test_1_a_contract_no_mapping_names_reads_the_same_with_a_master_and_without_
 def test_2_an_absent_master_threads_nothing_and_raises_nothing(fixture_lake: FixtureLake):
     """#135 test 2. The rule ``load_bars`` gives an absent actions ledger, unchanged.
 
-    Every other loader test file writes no master at all, so this is also what keeps the
-    129 shipped ones reading exactly as they did.
+    The five shipped loader test files write no master at all, so this is also what keeps
+    their 151 tests reading exactly as they did.
     """
     root = _lake(fixture_lake)
     assert not master_path(root).exists()
@@ -216,13 +223,31 @@ def test_4_the_post_adjustment_symbol_reads_a_session_before_the_boundary(
 def test_5_a_two_symbol_life_comes_back_as_one_table_in_instant_order(
     fixture_lake: FixtureLake,
 ):
-    """#135 test 5. Both halves in one read, and the rows say which half they came from."""
-    root = _lake(fixture_lake, master=_master())
+    """#135 test 5. Both halves in one read, and the rows say which half they came from.
+
+    The order is asserted *within* a session as well as across them. Sessions arrive from
+    ``_sessions_in`` in date order already, so a life read that never sorted would still put
+    the days right, and only rows whose stamps disagree with their text order catch it. The
+    first session carries three: an Eastern spelling of 10:33 written after a ``+00:00``
+    spelling of 10:32, which sorts the wrong way as text.
+    """
+    days = _life_rows()
+    days[SEALED[0]] = [
+        _data(SEALED[0], "10:31", OLD),
+        {**_data(SEALED[0], "10:33", OLD), "snap_ts": f"{SEALED[0]}T10:33:00-04:00"},
+        {**_data(SEALED[0], "10:32", OLD), "snap_ts": f"{SEALED[0]}T14:32:00+00:00"},
+    ]
+    root = _lake(fixture_lake, master=_master(), days=days)
 
     table = load_contract_life(OLD, lake_root=root)
 
-    assert _days(table) == SEALED
-    assert _symbols(table) == [OLD, OLD, OLD, ADJUSTED]
+    assert _days(table) == [SEALED[0], SEALED[0], SEALED[0], *SEALED[1:]]
+    assert _symbols(table) == [OLD, OLD, OLD, OLD, OLD, ADJUSTED]
+    assert table.column("snap_ts").to_pylist()[:3] == [
+        f"{SEALED[0]}T10:31:00-04:00",
+        f"{SEALED[0]}T14:32:00+00:00",
+        f"{SEALED[0]}T10:33:00-04:00",
+    ]
 
 
 def test_6_a_session_the_contract_is_absent_from_is_stepped_over_and_an_empty_range_raises(
@@ -442,3 +467,56 @@ def test_15_the_selection_keeps_every_row_the_door_returned_before_the_master_ex
             except ContractAbsent:
                 with_master = []
             assert set(without) <= set(with_master), (symbol, day, without, with_master)
+
+
+# -- what a range read owes that a single session does not --------------------
+
+
+def test_16_two_sessions_whose_columns_differ_stitch_rather_than_raising(
+    fixture_lake: FixtureLake,
+):
+    """#135 test 16. The overflow projection makes a column set a property of the session.
+
+    It adds a promoted column only when a row it is handed carries a value for it, so two
+    sessions at two schema versions come back with different column sets and a plain
+    ``pa.concat_tables`` raises on that. ``load_bars`` met this first and named
+    ``promote_options='permissive'``; this is the same rule at the second range door.
+    """
+    narrow = pa.schema([f for f in journal.CHAINS_SCHEMA if f.name != "bid"])
+    for day in SEALED:
+        rows = [_data(day, "10:31", OLD if date.fromisoformat(day) < BOUNDARY else ADJUSTED)]
+        if day == SEALED[1]:
+            fixture_lake.with_chains(
+                "SPY", day, pa.Table.from_pylist([_without(rows[0], "bid")], schema=narrow)
+            )
+        else:
+            fixture_lake.with_chains("SPY", day, sample_chains_table(rows))
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    fixture_lake.with_reference("security_master", _master().to_table())
+    root = fixture_lake.build()
+
+    table = load_contract_life(OLD, lake_root=root)
+
+    assert _days(table) == SEALED
+    assert table.column("bid").to_pylist() == [4.20, None, 4.20, 4.20]
+
+
+def test_17_a_stamp_that_cannot_be_read_as_an_instant_refuses_the_life(
+    fixture_lake: FixtureLake,
+):
+    """#135 test 17. A range read owes an order, so it cannot set a row aside to give one.
+
+    ``load_chain`` excuses an unreadable ``snap_ts`` that sits beside the minute answering its
+    read. Every row here is already part of the answer, selected by symbol and by the session
+    its partition is keyed under, so there is nothing to excuse it from.
+    """
+    days = _life_rows()
+    naive = _data(SEALED[1], "10:31", OLD)
+    naive["snap_ts"] = f"{SEALED[1]}T10:31:00"
+    days[SEALED[1]] = [naive]
+    root = _lake(fixture_lake, master=_master(), days=days)
+
+    with pytest.raises(LoadError) as raised:
+        load_contract_life(OLD, lake_root=root)
+    assert "cannot be read as an instant" in str(raised.value)
+    assert f"{SEALED[1]}T10:31:00" in str(raised.value)

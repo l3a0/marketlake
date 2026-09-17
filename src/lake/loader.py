@@ -1788,11 +1788,12 @@ def _fetch_selection(
 ) -> pa.Table:
     """The fetch pass, the overflow projection, and the final filter, shared by every read.
 
-    ``check_row_kind`` is the one difference among the three callers. ``load_chain`` and
-    ``load_quotes`` already rule out a null ``row_kind`` over the whole partition during
-    their resolve pass, before this ever runs. ``load_contract`` supplies its selection
-    directly and has no resolve pass to catch it there, so this checks the rows the
-    fetch actually reads instead. That refuses only the reads whose fetched rows include
+    ``check_row_kind`` is the one difference among the callers, and it splits them two ways
+    rather than by door. ``load_chain`` and ``load_quotes`` reach this through
+    ``_load_surface`` and have already ruled out a null ``row_kind`` over the whole partition
+    in their resolve pass, before this ever runs. The two contract doors supply their
+    selection directly and have no resolve pass to catch it there, so this checks the rows
+    the fetch actually reads instead. That refuses only the reads whose fetched rows include
     the damaged one, the same scoping #251 already chose for a row's own schema version,
     rather than every read of the day.
     """
@@ -1977,12 +1978,18 @@ _OCC_ROOT_WIDTH = 6
 
 
 def _occ_root(occ_symbol: str) -> str:
-    """The ticker ``load_contract`` derives from an OCC symbol when none is given.
+    """The ticker the contract doors derive from an OCC symbol when none is given.
 
-    This matches every row of the live lake and is still a guess rather than a
-    guarantee. An index root like ``SPXW``, or a symbol a corporate action rewrote, can
-    differ from the ticker the partition is keyed by, which is what ``ticker=`` on
-    ``load_contract`` is for.
+    Both of them reach this through ``_thread_ticker``, which hands it the *earliest* symbol
+    on the master's thread rather than the caller's, because an adjusted root like ``SPY1``
+    is not a ticker. ``lake.splits`` imports it too, for the roots it compares between
+    sessions.
+
+    This matches every row of the live lake and is still a guess rather than a guarantee.
+    Two cases differ from the ticker the partition is keyed by and the thread covers neither.
+    An index root like ``SPXW`` is one. An underlying a *rename* moved to another ticker is
+    the other, which is marketlake #388 and a gap under every door here. ``ticker=`` is what
+    they take.
     """
     return occ_symbol[:_OCC_ROOT_WIDTH].strip()
 
