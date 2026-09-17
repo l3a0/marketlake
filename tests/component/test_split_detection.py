@@ -74,7 +74,7 @@ from lake.splits import (
     REASON_NO_LADDER,
     REASON_NO_OPTION_CLOSE,
     REASON_NO_UNDERLYING,
-    REASON_NOT_CAPTURED,
+    REASON_NOT_SEALED,
     REASON_OUT_OF_SCOPE,
     REASON_PARTIAL_READ,
     REASON_PARTITION_ABSENT,
@@ -1903,7 +1903,7 @@ def test_a_session_the_lake_never_captured_is_not_a_pair(fixture_lake: FixtureLa
 
     report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
-    assert _reasons(report_out) == [REASON_NOT_CAPTURED]
+    assert _reasons(report_out) == [REASON_NOT_SEALED]
     assert [skip.day for skip in report_out.skipped] == [DAY_TWO]
     assert _scale_unread(report_out) == [REASON_SCALE_WINDOW]
     assert report_out.scale_pairs == 0
@@ -2077,6 +2077,80 @@ def test_a_stretch_below_the_first_readable_session_is_not_reported_as_uncapture
     assert _reasons(report_out) == [REASON_OUT_OF_SCOPE]
 
 
+def test_a_session_the_master_places_out_of_scope_is_not_reported_as_unsealed(
+    fixture_lake: FixtureLake,
+):
+    """Step 1 already decides this for a manifested day, and a day with no partition is owed it.
+
+    A ticker handed from one instrument to another leaves the sessions below the second one's
+    first valid mapping placed outside it. The master calls such a day out of scope rather than
+    a gap, and without the same question here the walk reports three capture shortfalls a night
+    on a window the instrument change already refuses to judge.
+    """
+    early, late = date(2026, 9, 15), date(2026, 9, 21)
+    master = SecurityMaster(
+        [
+            _mapping(1, "SPY", valid_to=date(2026, 9, 16)),
+            _mapping(2, "SPY", valid_from=late),
+        ]
+    )
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", early): _ladder_rows(early, LADDER, 700.0),
+            ("SPY", late): _ladder_rows(late, LADDER, 700.0),
+        },
+        master=master,
+    )
+
+    report_out = detect_splits(
+        lake_root=root,
+        clock=ManualClock(FIRST_NIGHT),
+        calendar=weekday_sessions(date(2026, 9, 14), date(2026, 9, 21)),
+    )
+
+    assert {skip.reason for skip in report_out.skipped} == {REASON_OUT_OF_SCOPE}
+    assert [skip.day for skip in report_out.skipped] == [
+        date(2026, 9, 16),
+        date(2026, 9, 17),
+        date(2026, 9, 18),
+    ]
+
+
+def test_a_session_out_of_scope_still_widens_the_window(fixture_lake: FixtureLake):
+    """What the master decides is the label an operator reads, never whether the pair is judged.
+
+    The manifested out-of-scope branch increments the same counter, and it has to: a ticker
+    retired and brought back has an away period the lake holds nothing across, and a split
+    inside it is exactly the boundary whose ``ex_date`` cannot be guessed. So a day the master
+    places out of scope is reported as out of scope and refuses the pair all the same.
+    """
+    away = date(2026, 9, 16)
+    master = SecurityMaster(
+        [
+            _mapping(1, "SPY", valid_to=away),
+            _mapping(1, "SPY", valid_from=date(2026, 9, 17)),
+        ]
+    )
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_TWO): [_row(DAY_TWO)],
+            ("SPY", date(2026, 9, 17)): [
+                _row(date(2026, 9, 17), occ_symbol=CARRIED_OCC),
+                _adjusted_row(date(2026, 9, 17)),
+            ],
+        },
+        master=master,
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
+
+    assert _reasons(report_out) == [REASON_OUT_OF_SCOPE]
+    assert _entries(root) == [], "a boundary landed across a window nothing read"
+    assert [entry.finding.check for entry in report_out.held] == [CHECK_SPLIT_BOUNDARY]
+
+
 def test_an_uncaptured_session_does_not_deafen_the_ticker_for_the_rest_of_the_walk(
     fixture_lake: FixtureLake,
 ):
@@ -2125,7 +2199,7 @@ def test_a_session_the_lake_never_captured_is_reported_by_its_own_reason(
         lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR
     ).render()
 
-    assert f"    - {REASON_NOT_CAPTURED}: 1" in rendered
+    assert f"    - {REASON_NOT_SEALED}: 1" in rendered
     assert "  skipped:   1" in rendered
 
 

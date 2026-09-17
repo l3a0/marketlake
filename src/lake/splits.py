@@ -139,13 +139,15 @@ for six reasons, and each one widens that window:
    trailing-median contract count is journaled anyway and tagged, and a thin chain carries a
    thin root set, so a truncated *previous* session makes the next ordinary one look like it
    gained a root.
-6. A session the lake never captured, which the manifest cannot report because there is no
-   entry to report. The other five all start from a sealed partition, so a walk that
-   enumerates the manifest alone reads the two sessions either side of an uncaptured one as
-   consecutive. That is marketlake #431, and the machine being off for a day is enough to
-   produce it. The exchange calendar is what closes it: the sessions between one read session
-   and the next are the calendar's answer, and any of them the manifest does not hold was
-   captured by nobody.
+6. A session the manifest seals no chain for. The other five all start from a sealed
+   partition, so a walk that enumerates the manifest alone reads the two sessions either side
+   of one as consecutive. That is marketlake #431, and the machine being off for a day is
+   enough to produce it. So is a ticker sitting between two capture spans, and so is a
+   compaction that never sealed rows already on disk. All three leave the same hole and all
+   three widen the window the same way, which is why the reason names the hole rather than
+   guessing which one made it. The exchange calendar is what closes it: the sessions between
+   one read session and the next are the calendar's answer, and any of them the manifest does
+   not hold, nobody read.
 
 So a boundary lands only when no session at all sits between the two either side of it. That
 is the exchange calendar's question rather than the manifest's, because the manifest can only
@@ -417,9 +419,16 @@ REASON_OUT_OF_SCOPE = "outside the capture span"
 REASON_THIN = "suspect or truncated"
 REASON_UNRESOLVED = "unresolved symbol"
 # The one reason that names no partition at all. Every other reason above starts from a
-# manifest entry, so a session the lake never captured is the one the manifest cannot report
-# and the exchange calendar has to. marketlake #431 is why it exists.
-REASON_NOT_CAPTURED = "the lake captured nothing that session"
+# manifest entry, so a session with none is the one the manifest cannot report and the exchange
+# calendar has to. marketlake #431 is why it exists.
+#
+# **It names what was measured and not why.** The walk establishes one fact here, that the
+# manifest seals no chain for that session, and at least three things produce it: the machine
+# was off, the ticker sat between two capture spans, or the rows landed and compaction never
+# sealed them. Only the first is a capture shortfall. A reason claiming one of the three would
+# send an operator looking for an outage on a ticker they retired on purpose, and this string
+# reaches the phone through ``sweep.digest_body``.
+REASON_NOT_SEALED = "no sealed chain for the session"
 
 # Why the scale guard could not compare a pair of sessions. None of these is a finding. A pair
 # it could not read is a pair nobody judged, which is a different thing from one it judged and
@@ -1288,6 +1297,14 @@ def _why_unread(master: SecurityMaster, ticker: str, day: date) -> str:
 
     The ticker is in the master by construction, because this runs only once a session has been
     read and reading one means it resolved.
+
+    **The master answers for its own mappings and not for the capture spans**, and the two part
+    on one case. ``lake.retire`` closes a span and leaves ``valid_to`` alone, so a ticker
+    retired and brought back still resolves across its away period and is reported here as
+    unsealed rather than out of scope. Reading the spans would settle it and would give this
+    walk a fourth dependency, so it is marketlake #456 rather than this change. Nothing is
+    mis-judged meanwhile: the window widens either way and the reason names the hole rather
+    than a cause.
     """
     try:
         resolve_instrument(master, ticker, day)
@@ -1298,7 +1315,7 @@ def _why_unread(master: SecurityMaster, ticker: str, day: date) -> str:
         # corrupt master rather than a window nothing was owed in. The manifested path files a
         # finding for it off the rows it could not attribute, and there are no rows here.
         pass
-    return REASON_NOT_CAPTURED
+    return REASON_NOT_SEALED
 
 
 def detect_splits(*, lake_root: Path | str, clock: Clock, calendar: Calendar) -> SplitReport:
@@ -1916,7 +1933,7 @@ __all__ = [
     "Outcome",
     "REASON_DELIVERABLE_UNCHANGED",
     "REASON_INSTRUMENT_CHANGED",
-    "REASON_NOT_CAPTURED",
+    "REASON_NOT_SEALED",
     "REASON_NO_LADDER",
     "REASON_NO_OPTION_CLOSE",
     "REASON_NO_UNDERLYING",
