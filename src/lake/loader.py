@@ -842,8 +842,9 @@ def load_bars(
     Three conditions raise something other than a ``LoadError``, for the reason ``load_chain``
     gives for its own three: each says a file contradicts its writer, so it raises the error of
     the module that owns that file. A machine with no ``config.yaml`` raises ``ConfigError``. A
-    damaged ``corporate_actions.jsonl`` raises ``actions.LedgerLineError``, which is the ledger
-    resolving a line rather than this door reading a partition. And a damaged
+    damaged ``corporate_actions.jsonl`` raises ``actions.LedgerLineError`` for a line it cannot
+    resolve and ``actions.LedgerNotUtf8`` for bytes that will not decode, each the ledger
+    answering about itself rather than this door reading a partition. And a damaged
     ``quarantine.jsonl`` raises ``ManifestError``, reached through the same ``_clear_partition``
     guard ``load_chain`` goes through, so both doors answer the same way about it. An absent
     ledger is not one of them: it adjusts nothing and raises nothing, which is what keeps every

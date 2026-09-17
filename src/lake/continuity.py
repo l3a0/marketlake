@@ -414,8 +414,10 @@ def continuity_view(
     ``PartitionAbsent`` and ``PartitionQuarantined`` for either surface, ``BarsAbsent`` for a
     span holding no daily partition at all, ``PartialRead`` for a projection that could not
     complete, ``InstrumentUnknown`` and ``AdjustmentIncomplete`` for a split view the bars
-    cannot support. A torn security master raises ``MasterUnreadable`` and a damaged actions
-    ledger raises ``actions.LedgerLineError``, each the error of the module that owns the file.
+    cannot support. A torn security master raises ``MasterUnreadable``, and a damaged actions
+    ledger raises ``actions.LedgerLineError`` for a line it cannot resolve or
+    ``actions.LedgerNotUtf8`` for bytes that will not decode, each the error of the module that
+    owns the file.
     This view adds the three under ``ContinuityError``.
     """
     root = resolve_lake_root(lake_root)

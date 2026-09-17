@@ -166,14 +166,20 @@ class LedgerNotUtf8(ManifestError):
     situation and says so: there the damage is a prefix split mid-character, which sits in the
     torn tail ``parse_jsonl`` discards anyway.
 
-    **It is a ``ManifestError`` so that it needs no new containment anywhere.** Four consumers
-    already state in writing what a damaged one raises: ``loader.load_chain`` and
+    **It is a ``ManifestError`` so that the quarantine ledger needs no new containment.** Four
+    consumers already state in writing what a damaged one raises: ``loader.load_chain`` and
     ``loader.load_bars`` both name ``ManifestError``, ``sweep._LEDGER_REFUSALS`` names it as
     the class, and ``lake.battery``'s command catches it to print a line instead of a stack.
     ``lake.dashboard`` is a fifth reader and states nothing, because it catches bare
     ``Exception`` and reports whatever class it met. Marketlake #469 built that containment for
-    ``TornLedger``, and this inherits all of it rather than widening a tuple to reach a
-    ``ValueError``.
+    ``TornLedger``, and the quarantine ledger inherits all of it rather than widening a tuple to
+    reach a ``ValueError``.
+
+    **The manifest ledger raises this too, since marketlake #499, and it is not contained.**
+    ``sweep._BARS_REFUSALS`` names no ``ManifestError`` and the bar walk resolves the manifest,
+    so a damaged one still ends the 18:30 run. ``control_plane.sunday_maintenance`` calls
+    ``scrub`` with no ``try`` around it. Marketlake #517 carries the tuple, and until it lands
+    the sentence above is true of one of the two ledgers this class now covers.
     """
 
 
@@ -309,12 +315,18 @@ def _read_jsonl(path: Path) -> list[dict]:
     ``OSError``, and it landed in none of the tuples a damaged ledger is meant to be caught by.
     What changes is where it lands rather than whether it raises.
 
-    **It moves one step from ending the 18:30 run to reporting a refusal, and no more.**
-    ``sweep._LEDGER_REFUSALS`` names ``ManifestError``, and the dividend and split walks resolve
-    this file through ``actions.surface_ticker_days``, so those two now file a refused piece
-    where they used to take the whole run down. ``sweep._BARS_REFUSALS`` names no
-    ``ManifestError``, so the bar walk still ends the run, on a named class instead of a bare
-    ``ValueError``. Marketlake #517 carries that half and this change does not do it.
+    **What an operator sees does not change, and marketlake #517 is the whole reason.**
+    ``sweep._LEDGER_REFUSALS`` names ``ManifestError``, so the dividend and split walks now
+    collect a refused piece where they used to take the run down. Those pieces are then
+    discarded, because ``sweep._BARS_REFUSALS`` names no ``ManifestError`` and the bar walk runs
+    after them, resolving this file through ``bars.backfill_bars``. Executed end to end on the
+    sweep fixture with one damaged byte in this ledger: the run raises ``LedgerNotUtf8`` out of
+    ``sweep`` entirely and writes **zero** report files, which is byte for byte what it did
+    before this change. No record, no report, no ping.
+
+    So this names the failure and does not yet save the run. #517 is what turns the collected
+    refusals into a filed record, and until it lands the gain here is a named class in a
+    traceback rather than anything the 18:30 job survives.
 
     :func:`_backup_scrub` is deliberately not routed through this. It reads the manifest's bytes
     itself and decodes them with a replacement, so the Sunday backup canary keeps answering on a

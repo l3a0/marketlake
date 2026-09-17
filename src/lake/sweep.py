@@ -283,10 +283,15 @@ ScheduleSetter = Callable[[date], None]
 # The members are replaced rather than joined. ``except`` treats every entry identically, so a
 # subclass beside its base buys nothing, and a redundant name reads as though it did.
 #
-# **Two families still escape this tuple and neither is one of these.** A ledger byte that is not
-# UTF-8 raises ``UnicodeDecodeError``, a ``ValueError``, which is marketlake #495 and #499, and
-# ``SchemaVersionsError`` is marketlake #494. Both are named so this entry is not read as
-# covering every way a ledger can fail.
+# **One family still escapes this tuple and it is not one of these.** ``SchemaVersionsError`` is
+# marketlake #494. It is named so this entry is not read as covering every way a ledger can fail.
+#
+# A ledger byte that is not UTF-8 used to escape here too, as a ``ValueError``, and no longer
+# does. Marketlake #495 closed that for the quarantine ledger and #499 for the manifest and the
+# corporate-actions ledger, each refusing as its own module's class, so ``ManifestError`` and
+# ``ActionsError`` above already carry them. What that does not buy is the run: the bar walk
+# below reads the manifest too and ``_BARS_REFUSALS`` names no ``ManifestError``, so a damaged
+# manifest ledger is collected here and still ends the job there. Marketlake #517 is that half.
 #
 # The level below sorts these same two families by member rather than by class, at
 # ``splits.py``'s mapping write, so a sibling lands in the per-boundary arm the re-raise exists

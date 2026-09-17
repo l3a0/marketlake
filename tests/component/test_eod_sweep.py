@@ -41,8 +41,8 @@ from lake.capture_spans import SPANS_SCHEMA_VERSION, CaptureSpan, CaptureSpans
 from lake.cassette import Cassette
 from lake.config import GuardConstants
 from lake.control_plane import EOD_SWEEP_SLUG, SUNDAY_WAKE, pmset_schedule_args
-from lake.manifest import append_quarantine
-from lake.paths import CHAINS, QUOTES, LakePaths
+from lake.manifest import LedgerNotUtf8, append_quarantine
+from lake.paths import CHAINS, QUOTES, REPORTS_DIR, LakePaths
 from lake.schema_versions import (
     LEDGER_PARTITION,
     LedgerUnreadable,
@@ -2765,3 +2765,44 @@ def test_an_unreadable_ledger_reaches_the_report_on_a_holiday_and_nowhere_else_y
     with pytest.raises(LedgerUnreadable):
         _run(root)
     assert len(_filed(root)) == before, "the run that raised must not have filed a report"
+
+
+def test_a_damaged_manifest_ledger_is_named_and_still_ends_the_run(fixture_lake: FixtureLake):
+    """Marketlake #499's manifest half, end to end, and the half it deliberately does not fix.
+
+    The sibling above holds the quarantine ledger's shape, where the run survives and files its
+    record. This one does not survive, and the difference is one tuple. ``_LEDGER_REFUSALS``
+    names ``ManifestError``, so the dividend and split walks collect a refused piece. The bar
+    walk reads the manifest after them through ``bars.backfill_bars`` and ``_BARS_REFUSALS``
+    names no ``ManifestError``, so it raises out of the whole job and those pieces are thrown
+    away with it.
+
+    **This pins the shortfall rather than the fix, on purpose.** Marketlake #499's own docstring
+    and ``docs/design.md`` both claim the class changes and the outcome does not, and nothing
+    held that claim, so a reader had only prose telling them the 18:30 job still dies here. A
+    review lens found the claim overstated in an earlier draft, where it read as though the walks
+    reporting a refusal were something an operator would see.
+
+    Marketlake #517 is what flips this. When it lands, this test fails, and the assertions below
+    are written so that failing is the signal rather than a puzzle: #517 should replace them with
+    the sibling's, a filed record naming ``LedgerNotUtf8``.
+    """
+    from lake.manifest import manifest_path
+
+    root = _lake(fixture_lake)
+    ledger = manifest_path(root)
+    raw = ledger.read_bytes()
+    assert raw.count(b"capture") >= 1, "the fixture no longer says what it meant to"
+    ledger.write_bytes(raw.replace(b"capture", b"captur\xff", 1))
+
+    with pytest.raises(LedgerNotUtf8) as refusal:
+        _run(root)
+
+    # The name is the whole of what this change buys here. Before it, this was a bare
+    # ``UnicodeDecodeError`` carrying no path and naming no repair.
+    assert str(ledger) in str(refusal.value)
+    assert "human's job under the lock" in str(refusal.value)
+
+    # And the run filed nothing, which is what marketlake #517 is for.
+    reports = sorted((root / REPORTS_DIR).rglob("*")) if (root / REPORTS_DIR).exists() else []
+    assert reports == [], "the run filed a record, so #517 has landed and this test is stale"
