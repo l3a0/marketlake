@@ -663,3 +663,44 @@ def test_both_actions_reads_pin_utf8_rather_than_the_locales_encoding(lake_root,
     monkeypatch.setattr(Path, "read_text", refuse)
     assert actions.read(lake_root)[0]["note"] == "café"
     assert actions.entry_line_count(lake_root) == 1
+
+
+def test_the_actions_refusal_names_the_lead_byte_of_a_truncated_sequence(lake_root):
+    """The sibling of the manifest decoder's own test, on the second implementation of the rule.
+
+    Every other fixture here damages with ``0xff``, an invalid start byte, where
+    ``UnicodeDecodeError`` reports ``start`` and ``end`` one apart, so the lead byte and the last
+    byte of the bad run are the same byte and the two candidate indices cannot be told apart. A
+    truncated sequence separates them.
+
+    ``manifest`` has held this since #495 and this decoder is a second implementation of the same
+    rule, so a mutation review found ``raw[exc.end - 1]`` surviving here while the identical
+    mutation died there. That is the guarantee held on one of two twins.
+    """
+    _dividend(lake_root, cash_amount=1.60, recorded_at=RECORDED)
+    _damage(actions_path(lake_root), b'"dividend"', b'"dividen\xe0\xa0"')
+
+    with pytest.raises(actions.LedgerNotUtf8) as refusal:
+        actions.read(lake_root)
+
+    message = str(refusal.value)
+    assert "0xe0" in message, message
+    assert "0xa0" not in message, message
+
+
+def test_the_actions_count_skips_a_blank_line_a_hand_edit_left(lake_root):
+    """A blank line is not an entry, and the count is the manifest's row count.
+
+    No writer here makes one, so a file holding one is hand edited, which is the repair path
+    every message about a damaged ledger names. Counting it would inflate what the manifest says
+    the ledger holds. A mutation review found the filter removable with nothing failing.
+    """
+    _dividend(lake_root, cash_amount=1.60, recorded_at=RECORDED)
+    _dividend(lake_root, cash_amount=1.65, recorded_at=CORRECTED, ex_date="2026-06-19")
+    path = actions_path(lake_root)
+    lines = path.read_bytes().splitlines(keepends=True)
+    assert len(lines) == 2, "the fixture no longer says what it meant to"
+    path.write_bytes(lines[0] + b"\n" + b"   \n" + lines[1])
+
+    assert len(path.read_bytes().splitlines()) == 4
+    assert actions.entry_line_count(lake_root) == 2

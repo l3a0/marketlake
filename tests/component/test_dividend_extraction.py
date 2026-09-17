@@ -1511,3 +1511,33 @@ def test_the_command_against_an_undecodable_actions_ledger_is_a_line_and_not_a_s
     assert str(ledger) in printed, "the line does not say which file to open"
     assert "not valid UTF-8" in printed
     assert "Repair it by hand under the lake-root lock" in printed
+
+
+def test_the_command_still_shows_a_stack_for_a_ledger_line_it_cannot_resolve(
+    fixture_lake: FixtureLake, tmp_path: Path, capsys
+):
+    """The negative half of the arm above, which decides how wide that ``except`` may be.
+
+    ``actions.main`` catches ``LedgerNotUtf8`` alone rather than ``ActionsError``, because the
+    family's other members are not run-ending conditions. ``LedgerLineError`` names one entry
+    rather than the file, so a reader meeting it wants the frames that say which entry, and the
+    ledger's repair sentence would be the wrong advice about the wrong scope.
+
+    A mutation review widened that arm to ``ActionsError`` and the whole suite stayed green,
+    because the sibling above asserts only the positive case. A test that pins what a handler
+    catches and never what it declines holds half a boolean.
+    """
+    root = _lake(fixture_lake, {("SPY", DAY_ONE): [_row(DAY_ONE)]})
+    ledger = actions.actions_path(root)
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    # Decodable, parses as JSON, and names no usable key. That is ``LedgerLineError``, not this
+    # change's class, and it must keep its stack.
+    ledger.write_bytes(b'{"instrument_id": "not-an-int"}\n')
+    config = write_config(tmp_path, root)
+
+    with pytest.raises(actions.LedgerLineError):
+        actions.main(["--config", str(config)], clock=ManualClock(FIRST_NIGHT))
+
+    assert isinstance(actions.LedgerLineError("x", 1, "y"), actions.ActionsError), (
+        "the premise of this test is that both classes share a base"
+    )

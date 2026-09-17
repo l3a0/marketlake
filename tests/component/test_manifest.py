@@ -791,17 +791,33 @@ def test_the_backup_canary_still_answers_on_a_manifest_every_other_reader_refuse
     append_manifest(
         lake_root, partition="a", source="capture", sha256="s1", rows=1, fetched_at=None
     )
-    target = lake_root.parent / "backup"
-    target.mkdir()
-    manifest_path(target).write_bytes(manifest_path(lake_root).read_bytes())
-
     path = manifest_path(lake_root)
     path.write_bytes(path.read_bytes().replace(b"capture", b"captur\xff"))
 
+    # **The backup carries the damage too, and that is what makes this test reach the decode.**
+    # ``_backup_scrub`` returns at its divergence branch unless the source starts with the
+    # backup's bytes, so copying a clean manifest and damaging only the source short-circuits
+    # before the line under test. A mutation review found exactly that: with the clean copy,
+    # narrowing the decode to strict left every assertion here passing.
+    target = lake_root.parent / "backup"
+    target.mkdir()
+    manifest_path(target).write_bytes(path.read_bytes())
+
     with pytest.raises(LedgerNotUtf8):
         read_manifest(lake_root)
+
     result = manifest.backup_scrub(lake_root, target)
     assert result.unreadable is None, result
+    assert result.manifest_diverged_at is None, (
+        "the read stopped at the prefix check, so the decode below it never ran"
+    )
+    # **The walk resolved the entry out of the replaced text**, which is the stronger half: the
+    # damaged bytes sit in ``source`` rather than in ``partition``, so a replacement leaves the
+    # key intact and the canary still knows which partition the backup owes. It reports that file
+    # missing because this fixture writes no partition beside the manifest, and reporting is what
+    # the canary is for.
+    assert result.missing == ("a",), result
+    assert result.sha_mismatches == (), result
 
 
 def test_a_hand_repaired_manifest_may_hold_non_ascii_and_still_reads(lake_root):
@@ -1149,3 +1165,23 @@ def test_a_manifest_ledger_carrying_a_mark_still_reads_short_rather_than_refusin
 
     assert read_manifest(lake_root) == []
     assert latest_entries(lake_root) == {}
+
+
+def test_the_quarantine_refusal_says_what_that_ledger_loses_rather_than_the_manifest(lake_root):
+    """The mirror of the manifest's sibling above, and the half a mutation review found open.
+
+    Splitting the message into two per-ledger constants is the whole reason ``_decode_utf8``
+    takes a ``consequence``. Only the manifest half was held, so swapping this call site to
+    ``_MANIFEST_CONSEQUENCE`` passed the full suite and told an operator repairing
+    ``quarantine.jsonl`` about checksums it does not carry.
+    """
+    append_quarantine(lake_root, _verdict("chains/ticker=SPY/date=2026-09-16.parquet"))
+    _flip(lake_root, b'"quarantined"', b'"quarantin\xffd"')
+
+    with pytest.raises(LedgerNotUtf8) as refusal:
+        read_quarantine(lake_root)
+
+    message = str(refusal.value)
+    assert "which partitions it withholds" in message, message
+    assert "what its checksum was" not in message, message
+    assert "how many rows each one has" not in message, message
