@@ -561,9 +561,14 @@ reach:
 5. 14, restore from backup.
 
 Test 13 joined that list when [#279](https://github.com/l3a0/marketlake/issues/279) shipped
-the detector it replays against. The fixture builder can express a split now that
-`tests/support/lake.py` carries `option_root`, the four deliverable columns, `mini` and
-`is_chain_truncated`. [#353](https://github.com/l3a0/marketlake/issues/353) added `ssid`
+the detector it replays against. The fixture builder can express the re-symboling half of one now
+that `tests/support/lake.py` carries `option_root`, the four deliverable columns, `mini` and
+`is_chain_truncated`. It cannot express the other half. A whole-ratio 2-for-1 re-symbols
+nothing and moves no deliverable, so the signal for it is the strike ladder against the
+session's spot, which
+[#408](https://github.com/l3a0/marketlake/issues/408) built and which reads `strike_price` and
+`underlying_price`. The shared schema carries neither, so a replay of the design's fabricated
+2:1 brings its own chains schema, as `tests/component/test_split_detection.py` does. [#353](https://github.com/l3a0/marketlake/issues/353) added `ssid`
 beside them, which is what lets a fixture say *which* contract was re-symboled into which
 rather than only that a root changed, so the replay can assert the master's mapping rows and
 not just the ledger's entry. Test 12 joined the list when
