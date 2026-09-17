@@ -2761,6 +2761,32 @@ def test_every_kernel_the_checks_run_is_contained_the_same_way(lake: Path, colum
     assert report.appended == ()
 
 
+def test_the_coverage_census_is_the_last_report_line(lake: Path):
+    """``sweep.digest_body`` truncates the tail at 1000 bytes, and the comment this line's
+    reasoning is borrowed from assumed "what falls off the end first is the battery's own
+    census". Put in front, the census would be the last thing to fall off and the lines it
+    pushed past the cap would be the actionable ones.
+    """
+    partition = f"chains/ticker=SPY/date={DAY.isoformat()}.parquet"
+    append_quarantine(
+        lake,
+        build_entry(
+            partition=partition,
+            verdict=QUARANTINED_VERDICT,
+            check=CHECK_ENTITLEMENT,
+            observed_at=NOW - timedelta(days=1),
+        ),
+    )
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains"))
+    _seed_spans(lake)
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert len(report.report) > 1, "there is something for the census to sit behind"
+    assert "calendar coverage" in report.report[-1]
+    assert not any("calendar coverage" in line for line in report.report[:-1])
+
+
 def test_a_configured_floor_of_zero_does_not_crash_the_median(lake: Path):
     """``GuardConstants`` validates no range, and a median of nothing has no midpoint."""
     finding = judge_row_count(_partition(lake), (100,), (), GuardConstants(min_trailing_sessions=0))

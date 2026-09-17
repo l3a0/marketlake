@@ -25,8 +25,11 @@ What one run does, in the design's own order.
 7. The digest, at priority 2.
 
 The battery is ``lake.battery``, at step 3 above. Marketlake #406 built its spine and the
-real-time entitlement check. The other seal-then-flag checks are its siblings under #138 and plug
-into the same writer, so nothing here changes when they land.
+real-time entitlement check, and marketlake #407 added the other three to the same module. The
+job scopes the run to the session it is about, and trading-calendar coverage is outside that
+scoping on purpose: it walks the whole capture span, because a session with no partition is a
+session on which nothing ran, so a check scoped to tonight could never see the night it missed.
+Its census is one line in ``report`` whatever it finds.
 
 **Its failure does not withhold the ping, and that is a decision rather than the default.** The
 ``eod-sweep`` row says a missed ping means the day's official bars or actions are missing, and a
@@ -448,9 +451,12 @@ class SweepOutcome:
             lines.append(
                 f"  battery: judged {self.battery.judged}"
                 f" quarantined {self.battery.quarantined} clean {self.battery.cleared}"
+                f" insufficient_history {self.battery.insufficient_history}"
                 f" out_of_scope {self.battery.out_of_scope}"
                 f" scope_unknown {self.battery.scope_unknown}"
                 f" unreadable {self.battery.unreadable}"
+                f" sessions_owed {self.battery.sessions_owed}"
+                f" sessions_missing {self.battery.sessions_missing}"
                 f" wrote {len(self.battery.appended)}"
             )
         lines.append(

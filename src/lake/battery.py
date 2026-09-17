@@ -96,7 +96,8 @@ any work: until a second check existed, no partition could be withheld by two.
 2. :data:`CHECK_CALENDAR_COVERAGE`, no silently missing sessions, clamped per ticker to its
    capture spans. It is the odd one: it judges the sessions that have *no* partition, so it
    writes no ledger line, ignores the run's ``day``, and enumerates instruments rather than the
-   directories the walk found. :func:`coverage` carries all three reasons.
+   directories the walk found. :func:`coverage` carries the second and third reasons and
+   :data:`MISSING_SESSION` carries the first.
 3. :data:`CHECK_QUOTE_SANITY`, ``bid <= mark <= ask`` at a rate within a measured tolerance.
    Crossed quotes are real and :data:`QUOTE_SANITY_TOLERANCE` carries the measurement that says
    so.
@@ -116,8 +117,10 @@ any work: until a second check existed, no partition could be withheld by two.
    and both surfaces.
 
 Neither is a pass. An out-of-scope partition is not judged at all, so it gets no verdict and no
-ledger line. It gets one finding rather than four, carrying :data:`CHECK_SCOPE`, because scope
-is a property of the partition and every check would answer it from the same two facts.
+ledger line. It gets one finding, carrying :data:`CHECK_SCOPE`, because scope is a property of the
+partition and every check would answer it from the same two facts. A judged chains partition
+carries three findings and a quotes partition two. Never four: calendar coverage only ever
+speaks about sessions that have no partition at all.
 
 **A partition's findings are decided in one call.** :func:`decide_partition` carries the ledger
 state forward as lines land, so two checks clearing in one walk both change what withholds the
@@ -233,7 +236,7 @@ INSUFFICIENT_HISTORY = "insufficient_history"
 OUT_OF_SCOPE = "out_of_scope"
 
 # The third, and the one with no partition behind it. A session the lake never captured has no
-# file to withhold, and ``loader._guard_partition`` raises ``PartitionAbsent`` before it
+# file to withhold, and ``loader._clear_partition`` raises ``PartitionAbsent`` before it
 # consults the ledger, so a verdict written for that path would change no read. It could also
 # never be cleared: there is no backfill, so the partition can never land and no later ``clean``
 # can supersede the line, which would then sit in ``sweep.count_quarantined`` and
@@ -294,22 +297,28 @@ ORDERED_COLUMNS: tuple[str, ...] = (BID, MARK, ASK)
 # number behind that wording.
 #
 # It is measured rather than guessed, and it is the *partition's* rate rather than a snapshot's.
-# Crossed quotes are real and the rate moves by three orders of magnitude between sessions. Over
-# the lake's seven data partitions the worst is SPY's 2026-09-16 chains at 7,909 rows of
-# 5,307,030, which is 0.149 percent, against 1 row, 0 rows, 0 rows, 1 row, 50 rows and 0 rows on
-# the other six. A check refusing any crossed quote would quarantine the lake's most recent
-# complete session.
+# Crossed quotes are real and the rate moves by a factor of about 7,800 between sessions. The
+# lake holds twelve in-scope data partitions, six chains and six quotes. The worst is SPY's
+# 2026-09-16 chains at 7,909 rows of 5,307,030, which is 0.149 percent, against 1 row, 0 rows,
+# 1 row and 50 rows on the other five chains partitions and 0 on all six quotes partitions. A
+# check refusing any crossed quote would quarantine the lake's most recent complete session.
 #
 # A per-snapshot rate is what the measurement rules out, and it is the shape a reader reaches
 # for first. SPY's worst single minute on 2026-09-16 is 1,753 crossed rows of 13,040, which is
 # 13.4 percent, on a session whose own rate is 0.149 percent. Any per-snapshot threshold under
 # that quarantines a session nothing is wrong with.
 #
-# Five percent is what that leaves. It is about thirty-three times the worst healthy session
-# measured, and it is what a partition absorbs before roughly twenty of its 406 session minutes
-# would have to arrive wholly crossed. The faults this exists to catch are not near it: a feed
-# delivering bid and ask transposed reads near 100 percent, because an option quoted 0.00 by
-# 0.05 crosses the moment the two are swapped.
+# Five percent is what that leaves, and the headroom it buys depends on how much of a session
+# the partition holds. Crossing is concentrated at the close, so the cumulative rate on that
+# same SPY partition climbs as the start moves later: 0.149 percent over the whole session,
+# 1.96 percent from 19:45Z, 2.86 percent from 19:55Z and 3.87 percent from 20:10Z. Against a
+# full session the margin is about thirty-three times. Against a partition that starts ten
+# minutes before the close, which is what an afternoon onboarding produces, it is about 1.3
+# times, so a close with twice this session's crossing quarantines that one partition. The
+# price is named rather than hidden: one partition, once per ticker, cleared by a sign-off,
+# against a threshold loose enough to admit the fault this exists to catch. That fault is not
+# near five percent. A feed delivering bid and ask transposed reads near 100 percent, because
+# an option quoted 0.00 by 0.05 crosses the moment the two are swapped.
 QUOTE_SANITY_TOLERANCE = 0.05
 
 
@@ -374,9 +383,12 @@ class BatteryReport:
 
     ``deferred`` counts the human sign-offs this run re-observed and left standing, which is
     #139's rule producing a number rather than only a log line. It counts those alone.
-    ``withheld`` counts the **partitions** this run passed a check on while another check still
-    withholds them. It counts partitions rather than passes, because three checks passing one
-    partition a fourth holds is one fact rather than three. Until marketlake #426 these counted
+    ``withheld`` counts the **partitions** this run passed a check on that no read returns
+    afterwards. The hold is the walk's end state rather than the ledger's opening one, so it
+    covers a partition another check has withheld since last night and one this same run just
+    quarantined under a second check. It counts partitions rather than passes, because two
+    checks passing one partition a third holds is one fact rather than two. Until #426 these
+    counted
     as ``deferred`` and printed under a heading naming a human, so another check's hold inflated
     the sign-off count.
 
@@ -614,11 +626,14 @@ def decide_partition(
     the walk started from would report the partition still withheld by a check that cleared a
     moment earlier, and the release would never be reported at all.
 
-    This is a pure function for a reason that is not tidiness. One check exists, so no run can
-    yet produce two findings for one partition, and the cases this exists to get right cannot
-    be driven through ``judge`` at all. A unit test drives them here with as many checks as it
-    likes. It is also the seam marketlake #407's three checks plug into, rather than a seam
-    invented for a test.
+    This is a pure function for a reason that is not tidiness. ``judge`` hands it one
+    partition's findings, which is two on a quotes partition and three on a chains one, and a
+    unit test drives it here with as many checks as it likes and with ledger states a lake
+    would take a fixture to build. Marketlake #407 is what made the second finding real: this
+    said "one check exists, so no run can yet produce two findings for one partition" until
+    that landed, and ``judge`` carried the same sentence as a comment. One of the two was
+    corrected and this one was not, which is the failure a completeness review exists to
+    catch.
     """
     state = dict(by_check or {})
     held_before = bool(withholding(state))
@@ -676,20 +691,22 @@ class SealedPartition:
         with. ``loader.PartitionAbsent`` says why that matters: on macOS a case-mismatched
         spelling opens the partition while the quarantine lookup misses, which turns the guard
         from fail closed into fail open.
+
+        It calls :func:`partition_key`, which is the same spelling built for a partition that
+        does not exist. Two f-strings sharing the constants agree until somebody edits one, and
+        that function's docstring claims they cannot drift.
         """
-        return (
-            f"{self.surface}/{TICKER_PREFIX}{self.ticker}/"
-            f"{DATE_PREFIX}{self.day.isoformat()}.parquet"
-        )
+        return partition_key(self.surface, self.ticker, self.day)
 
 
 def sealed_partitions(lake_root: Path | str, *, day: date | None = None) -> list[SealedPartition]:
     """Every sealed chains and quotes partition, or one day's, in a stable order.
 
     ``day=None`` walks the whole lake, which is what a first run and a hand run both want. The
-    18:30 job passes the session it is about, because re-judging a partition sealed months ago
-    against a trailing median that has moved since would produce a verdict about the median
-    rather than about the partition.
+    18:30 job passes the session it is about, because a night's run is about that night and
+    walking the rest costs the whole lake's Parquet for verdicts that cannot have changed. They
+    cannot: a sealed partition is immutable, there is no backfill, and :func:`trailing_medians`
+    takes only sessions before the one it judges, so a whole-lake re-run is deterministic.
 
     A name that does not parse as a date is skipped rather than raising. The walk is over a
     directory the operator can put a file in, and one stray name must not cost the run.
@@ -1351,8 +1368,8 @@ def coverage_line(found: Coverage) -> str:
        census", and a line that silences the check above it is worse than no line.
     2. *No partition names, not even a capped list.* ``sweep``'s own digest test pins the
        contract: the digest carries counts and never a list of findings, because a digest that
-       listed them "would be under the cap on every night anyone tested and over it on the
-       night that mattered". The report list is what the digest is built from, so a name here
+       listed them "would sit under the cap on every night anyone tested it and over the cap on
+       the night that mattered". The report list is what the digest is built from, so a name here
        reaches it. The dates are what an operator needs to act, and :func:`render` names each
        missing partition on the job's own stdout.
     3. *No second ``": "``.* ``report.redacted`` drops everything past a line's second field
@@ -1413,9 +1430,10 @@ def read_quote_order(partition: SealedPartition) -> QuoteOrder:
     **The two halves of the design's wording are one predicate.** "Bid ≤ mid ≤ ask" fails on a
     row whose mark sits outside the spread and on a crossed quote alike, because a crossed
     quote's interval is empty and admits no mark at all. The lake says the two are the same
-    rows in both directions: across all seven of its data partitions, the count of crossed rows
-    that are not mark-outside is zero, and so is the count of mark-outside rows that are not
-    crossed. So this is one measurement and one finding rather than two.
+    rows in both directions: across all thirteen of the lake's partitions holding data rows,
+    the count of crossed rows that are not mark-outside is zero, and so is the count of
+    mark-outside rows that are not crossed. So this is one measurement and one finding rather
+    than two.
 
     **It reads every data row rather than the session's.** The entitlement check's staleness
     half is session-only because a vendor's last-quote stamp freezes overnight while the fetch
@@ -1514,7 +1532,9 @@ def session_snapshot_counts(
     """How many data rows each of the partition's session snapshots holds.
 
     A snapshot is one ``snap_ts``, which is the minute slot a cycle fired for. Two columns are
-    read, so a 300 MB partition answers in about a hundredth of a second.
+    read, so the file's size barely reaches the cost: on SPY's 307 MB 2026-09-16 chains
+    partition the read itself is 0.04 seconds, and the filter and the group-by over 5,307,030
+    rows take the call to 0.28.
 
     ``bounds`` filters to the session for the reason :func:`_within` gives and one more of its
     own. The 03:25 overnight cycle on each of the lake's 2026-09-16 chain partitions carries
@@ -1582,8 +1602,8 @@ def trailing_medians(
     So the walk counts sessions rather than answers. A session the lake has no partition for, or
     one holding gap rows alone, occupies its slot in the window and contributes nothing to the
     median. It is not counted as zero, which would invent a snapshot count nobody captured and
-    drag the median toward zero; and the window does not reach past it for a replacement, which
-    is the reading this first shipped with and which ``docs/design.md`` rules out.
+    drag the median toward zero. Nor does the window reach past it for a replacement, which is
+    the reading this first shipped with and which ``docs/design.md`` rules out.
 
     The difference is what happens after an outage. Reaching back for a full twenty answers
     builds a median out of sessions months older than the one being judged, and the drift
@@ -1675,12 +1695,17 @@ def judge_row_count(
     **The threshold is one snapshot rather than a rate**, which is what "catches truncated
     fetches" asks for: a truncated fetch is one cycle, and a check tolerating some would not
     catch them. The lake says the band has room for it. Inside a session the per-snapshot count
-    is exactly constant on five of the six data partitions, and the sixth differs only on its
-    overnight cycle, which the session filter drops. Across sessions the count moves about one
-    percent, against a band of thirty.
+    is exactly constant on all six of its chains data partitions. Two of them carry one
+    overnight cycle each, 1.9 percent short on SPY and 2.5 percent short on QQQ, and the session
+    filter drops both. Across sessions the count moves about one percent, against a band of
+    thirty.
 
-    ``computed`` is the snapshot furthest from the median, which is the number an operator
-    deciding whether to sign off wants, and ``against`` is the median itself.
+    ``computed`` differs by branch, because what an operator deciding whether to sign off wants
+    differs by branch. On a quarantine it is the snapshot furthest from the median, which is the
+    number that caused the verdict, and ``against`` is the median. On a pass it is the judged
+    session's own median against the trailing one, which is the comparison that passed. On
+    ``insufficient_history`` it is how many trailing sessions carried a median against how many
+    the check needs, because there is no row count to report.
     """
     if not counts:
         return _finding(
@@ -1862,9 +1887,9 @@ def judge(
             )
             appended.append(decision.finding.partition)
             written.append(decision.finding)
-        # **One line for the partition, not one per passing check.** Three checks pass a
-        # partition a fourth withholds, and three lines saying so are the same fact three
-        # times, in a list ``sweep`` puts through ``digest_body``'s 1000-byte cap. The holders
+        # **One line for the partition, not one per passing check.** Two checks pass a
+        # partition a third withholds, and a line each says the same fact twice, in a list
+        # ``sweep`` puts through ``digest_body``'s 1000-byte cap. The holders
         # are the walk's final state rather than any one decision's, so a check that
         # quarantined after another passed is named too.
         passed = [
