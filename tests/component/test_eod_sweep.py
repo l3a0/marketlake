@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -30,9 +31,11 @@ from lake import journal, report, sweep
 from lake.alert import Publisher
 from lake.bars import CHECK_BAR_CLOSE
 from lake.calendar import NotASession
+from lake.capture_spans import CaptureSpan, CaptureSpans
 from lake.cassette import Cassette
 from lake.control_plane import EOD_SWEEP_SLUG, SUNDAY_WAKE, pmset_schedule_args
-from lake.paths import CHAINS, QUOTES
+from lake.manifest import append_quarantine
+from lake.paths import CHAINS, QUOTES, LakePaths
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
 from lake.schwab import VendorAuthError
 from lake.security_master import KIND_EQUITY, SecurityMaster, master_path
@@ -211,7 +214,13 @@ def _lake(
     quotes: dict[tuple[str, date], list[dict]] | None = None,
     chains: dict[tuple[str, date], pa.Table] | None = None,
 ) -> Path:
-    """A lake holding the next session's sealed quotes, the ledger and the master."""
+    """A lake holding the next session's sealed quotes, the ledger, the master and the spans.
+
+    The capture spans are here so the battery at step 2.5 judges rather than reporting that it
+    could not tell whether capture was running. A fixture without them exercises the wiring
+    only in the mode where the battery judges nothing, which is the one mode that cannot show
+    the wiring working.
+    """
     if quotes is None:
         quotes = {("SPY", FOLLOWING): [_quote_row(FOLLOWING)]}
     for (ticker, day), rows in quotes.items():
@@ -219,9 +228,25 @@ def _lake(
     for (ticker, day), table in (chains or {}).items():
         fixture_lake.with_chains(ticker, day, table)
     fixture_lake.with_reference("schema_versions", _ledger_table())
+    fixture_lake.with_reference("capture_spans", _spans().to_table())
     root = fixture_lake.build()
     _master().write(master_path(root))
     return root
+
+
+def _spans(instrument_ids: tuple[int, ...] = (1,)) -> CaptureSpans:
+    """One open capture span per instrument, opening when ``_master`` says capture began."""
+    return CaptureSpans(
+        [
+            CaptureSpan(
+                instrument_id=instrument_id,
+                start=datetime(2026, 9, 8, 17, 7, tzinfo=UTC),
+                end=None,
+                options=True,
+            )
+            for instrument_id in instrument_ids
+        ]
+    )
 
 
 def _run(
@@ -874,6 +899,43 @@ def test_the_file_carries_the_counts_and_the_detail_the_digest_dropped(
     assert filed["disagreements"] == outcome.nightly.disagreements
 
 
+def test_a_quarantined_quotes_partition_does_not_take_the_whole_sweep(
+    fixture_lake: FixtureLake,
+):
+    """Marketlake #352, at the scale that made it worth fixing before #406 ships.
+
+    The corporate-actions poll is step 1 of this job. Before the dividend walk contained the
+    loader's refusals, ``PartitionQuarantined`` left ``extract_dividends`` and
+    ``_LEDGER_REFUSALS`` did not cover it, so the night after the validation battery wrote its
+    first verdict the poll raised before the bar fetch, before the ping and before the report
+    file. Executed against this fixture on the code before the fix, the run died with
+    ``reports/`` empty.
+
+    ``_LEDGER_REFUSALS`` is deliberately left alone. A refusal caught here ends the walk, and
+    the walk is ordered by ticker, so containing it at this level would cost every ticker
+    after the quarantined one its dividends, which is the same defect one level up.
+    """
+    root = _lake(fixture_lake)
+    partition = (
+        LakePaths(root).partition_path(QUOTES, "SPY", FOLLOWING).relative_to(root).as_posix()
+    )
+    append_quarantine(root, {"partition": partition, "verdict": "suspect", "check": "delayed_feed"})
+
+    outcome, pinger, _ = _run(root)
+
+    dividends = dict(outcome.nightly.pieces)["dividends"]
+    assert dividends.finished, "the quarantined partition was reported as a refused walk"
+    assert dividends.skipped == 1, "the skip reached the nightly file as a count"
+    assert outcome.nightly.quarantined == 1
+    assert pinger.urls, "the ping was lost with the raise"
+    assert outcome.filed_at is not None, "the report file was lost with the raise"
+    # The digest goes to a phone and the block goes to the job's own stdout. They are two
+    # separate compositions of the same counts, so each is asserted rather than one standing
+    # in for the other.
+    assert "dividends: landed 0, held 0, unchanged 0, skipped 1" in outcome.digest.body
+    assert "dividends: landed 0 held 0 unchanged 0 skipped 1" in outcome.render()
+
+
 def test_a_report_file_that_could_not_be_written_does_not_withhold_the_ping(
     fixture_lake: FixtureLake, monkeypatch
 ):
@@ -1247,3 +1309,162 @@ def test_a_digest_that_never_left_is_not_a_clean_run(fixture_lake: FixtureLake):
     assert outcome.ok is False
     # Recorded like any other lost page, and counted by no run, which is why ok carries it.
     assert list((root / "reports" / "alerts").glob("date=*/*.json"))
+
+
+# -- the validation battery, step 2.5 ---------------------------------------------------
+
+
+def test_the_battery_runs_on_a_session_and_its_counts_reach_the_outcome(
+    fixture_lake: FixtureLake,
+):
+    """The design places it between the bar fetch and the Friday branch, and this is it.
+
+    The fixture lake carries the master and the spans, so the battery judges rather than
+    reporting that it could not tell whether capture was running. The sealed quotes partition
+    is the one it judges, and the fixture's rows are real-time and in-session, so it comes back
+    clean and the ledger stays empty.
+    """
+    root = _lake(fixture_lake)
+
+    outcome, _, _ = _run(root)
+
+    assert outcome.battery is not None
+    assert outcome.battery.scope_unknown == 0
+    assert outcome.battery.appended == ()
+
+
+def test_a_holiday_runs_no_battery_at_all(fixture_lake: FixtureLake):
+    """The design has compaction and the sweep no-op on an empty journal, and this follows it."""
+    root = _lake(fixture_lake)
+
+    outcome, _, _ = _run(root, holidays=(EVENING.date(),))
+
+    assert outcome.battery is None
+
+
+def test_a_battery_that_raises_costs_the_run_nothing_and_says_so(
+    fixture_lake: FixtureLake, monkeypatch
+):
+    """The containment #352 describes from the other side.
+
+    An uncontained raise at step 2.5 would leave ``sweep.sweep`` entirely and cost the Friday
+    wake, the ping and the report file, on exactly the night the battery had something to say.
+    """
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("the ledger is on fire")
+
+    monkeypatch.setattr(sweep, "judge", explode)
+    root = _lake(fixture_lake)
+
+    outcome, pinger, _ = _run(root)
+
+    assert outcome.battery is None
+    assert pinger.urls == [PING_URL]
+    assert outcome.filed_at is not None
+    assert any("battery did not run: RuntimeError" in line for line in outcome.nightly.report)
+
+
+def test_a_battery_that_raises_does_not_withhold_the_ping(fixture_lake: FixtureLake, monkeypatch):
+    """Named as a decision rather than left as a default.
+
+    The ``eod-sweep`` row says a missed ping means the day's official bars or actions are
+    missing. A battery that could not run leaves the day *unjudged* instead, which is
+    ``_counted``'s line: the work the check watches did happen.
+    """
+
+    def explode(*args, **kwargs):
+        raise OSError("no")
+
+    monkeypatch.setattr(sweep, "judge", explode)
+    root = _lake(fixture_lake)
+
+    outcome, _, _ = _run(root)
+
+    assert outcome.nightly.pinged is True
+    assert not any("battery" in problem for problem in outcome.nightly.problems)
+
+
+def test_a_quarantine_the_battery_wrote_is_reported_and_still_pings(fixture_lake: FixtureLake):
+    """A quarantine is the run working. It withholds nothing and it reaches the record."""
+    from lake.battery import BatteryReport
+
+    root = _lake(fixture_lake)
+    written = BatteryReport(judged=1, quarantined=1, appended=("chains/x.parquet",))
+
+    with _battery_returning(written):
+        outcome, pinger, _ = _run(root)
+
+    assert outcome.nightly.pinged is True
+    assert pinger.urls == [PING_URL]
+    assert any("battery wrote 1 quarantine line" in line for line in outcome.nightly.report)
+
+
+def test_the_quarantine_count_on_the_file_is_this_evenings_not_last_evenings(
+    fixture_lake: FixtureLake,
+):
+    """``count_quarantined`` is read after the battery ran, so the number includes tonight."""
+    fixture_lake.with_quarantine(
+        {"partition": "chains/ticker=SPY/date=2026-08-24.parquet", "verdict": "quarantined"}
+    )
+    root = _lake(fixture_lake)
+
+    outcome, _, _ = _run(root)
+
+    assert outcome.nightly.quarantined == 1
+    assert _filed(root)[0]["quarantined"] == 1
+
+
+@contextmanager
+def _battery_returning(report):
+    """Replace the battery with one that returns ``report``, for the wiring's own assertions."""
+    import lake.battery
+
+    original = sweep.judge
+    sweep.judge = lambda *args, **kwargs: report
+    try:
+        yield
+    finally:
+        sweep.judge = original
+        assert lake.battery.judge is not None
+
+
+def test_the_command_hands_the_batterys_threshold_to_the_battery(
+    fixture_lake: FixtureLake, capsys, monkeypatch, tmp_path
+):
+    """A recalibrated guard constant has to survive the whole wiring, not just ``judge``.
+
+    ``judge`` reading the guards it is handed is held elsewhere. What this holds is the link
+    between them: ``sweep_from_config`` passing the config's guards rather than letting
+    ``judge`` fall back to the pinned defaults. Without it an operator's tuned
+    ``staleness_page_seconds`` is silently ignored and the run looks exactly the same.
+    """
+    from tests.support.config import write_config
+
+    root = _lake(fixture_lake)
+    config = write_config(tmp_path, lake_root=root, guards={"staleness_page_seconds": 7})
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("SPY:\n  options: true\n  bars:\n  - 1d\n")
+
+    seen: list[int] = []
+    real = sweep.judge
+
+    def recording(*args, **kwargs):
+        seen.append(kwargs["guards"].staleness_page_seconds)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(sweep, "judge", recording)
+    monkeypatch.setattr(sweep, "UrllibPinger", FakePinger)
+    monkeypatch.setattr(sweep, "NtfyTransport", lambda topic: FakeTransport())
+    monkeypatch.setattr(sweep, "ExchangeCalendar", lambda: weekday_sessions(MONDAY, NEXT_MONDAY))
+
+    sweep.main(
+        ["--config", str(config), "--tickers", str(tickers)],
+        clock=ManualClock(EVENING),
+        vendor_source=_CountingVendorSource(),
+        schedule_setter=_RecordingSetter(),
+        schedule_reader=lambda: _schedule_text(),
+    )
+    capsys.readouterr()
+
+    assert seen == [7], "the battery was handed the pinned default, not the config's"

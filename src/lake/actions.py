@@ -63,9 +63,10 @@ with is still #286.
 **The split detector is the second writer, and it lives in ``lake.splits``.** It reads a
 different surface, has its own gate, its own report shape and its own subcommand, which is a
 second deliverable's worth of module rather than a section of this one. What it takes from
-here is :func:`append`, the vocabulary above, and four helpers the two walks share:
-:func:`read_master`, :func:`surface_ticker_days`, :func:`by_ticker` and
-:func:`same_but_for_recorded_at`. Those are public for that reason. A second copy of the
+here is :func:`append`, the vocabulary above, :class:`Skip` and the three reasons both walks
+meet, and five helpers they share: :func:`read_master`, :func:`surface_ticker_days`,
+:func:`by_ticker`, :func:`by_reason` and :func:`same_but_for_recorded_at`. Those are public
+for that reason. A second copy of the
 last one in particular could drift from this one silently, and it is what stops either walk
 appending the same entry every night forever. The import direction runs one way, from
 ``splits`` to here, and :func:`main` keeps it that way by importing the walk inside the
@@ -92,10 +93,11 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from math import isfinite
 from pathlib import Path
+from typing import Any
 
 from lake.calendar import MARKET_TZ
 from lake.clock import Clock, SystemClock
-from lake.loader import NoSpotClose, load_quotes
+from lake.loader import NoSpotClose, PartialRead, PartitionAbsent, PartitionQuarantined, load_quotes
 from lake.manifest import append_line, latest_entries, parse_jsonl, record_partition
 from lake.paths import ACTIONS, CORPORATE_ACTIONS_FILE, QUOTES, parse_partition_rel
 from lake.report import Withheld, write_withheld
@@ -757,6 +759,42 @@ class HeldFinding:
     filing_error: str | None = None
 
 
+# Why a ticker-day was not read. Each is one session a ledger walk could not use, and each
+# costs that ticker-day rather than the ticker's walk or the run.
+#
+# The three below the first are here rather than in ``lake.splits`` because both walks meet
+# them and one reason has to have one spelling. A second copy could drift without anything
+# noticing, which is the reason :func:`same_but_for_recorded_at` gives for living here too.
+# The close-of-record reason stays per surface, since each names the tag it resolved against:
+# this one is ``spot_close`` and ``splits.REASON_NO_OPTION_CLOSE`` is ``option_close``.
+REASON_NO_SPOT_CLOSE = "no spot close"
+REASON_QUARANTINED = "quarantined"
+REASON_PARTIAL_READ = "partial read"
+REASON_PARTITION_ABSENT = "manifested partition absent"
+
+
+@dataclass(frozen=True)
+class Skip:
+    """One ticker-day the walk did not read, and why."""
+
+    ticker: str
+    day: date
+    reason: str
+
+
+def by_reason(items: Sequence[Any]) -> list[str]:
+    """One line per distinct reason, with its count.
+
+    Counts rather than a line each, so a lake whose every session is a gap day still renders
+    on one screen. ``items`` is anything carrying a ``reason``, which is :class:`Skip` here
+    and ``splits.NotAnAdjustment`` beside it.
+    """
+    lines = []
+    for reason in sorted({item.reason for item in items}):
+        lines.append(f"    - {reason}: {sum(1 for i in items if i.reason == reason)}")
+    return lines
+
+
 @dataclass(frozen=True)
 class ExtractionReport:
     """What one run of the extraction did, for the sign-off block.
@@ -765,12 +803,19 @@ class ExtractionReport:
     It is the number that makes a second run legible: a run that appends nothing and holds
     nothing has either learned nothing new or read nothing at all, and only this tells the
     two apart.
+
+    ``skipped`` carries every ticker-day the walk could not read, each keeping its reason.
+    Catching a refusal without counting it would trade one silence for another: the run would
+    survive and report nothing about the partitions it was refused. The cost is real rather
+    than nominal, because a skipped session moves ``observed_on`` to the next one the walk
+    reads, and a value that moves and moves back across the skip is not recorded at all.
     """
 
     ticker_days: int
     appended: tuple[Landed, ...]
     held: tuple[HeldFinding, ...]
     unchanged: int
+    skipped: tuple[Skip, ...]
 
     @property
     def unfiled(self) -> tuple[HeldFinding, ...]:
@@ -809,6 +854,8 @@ class ExtractionReport:
             else:
                 lines.append(f"      filed at {held.filed_at}")
         lines.append(f"  unchanged: {self.unchanged}")
+        lines.append(f"  skipped:   {len(self.skipped)}")
+        lines.extend(by_reason(self.skipped))
         return "\n".join(lines)
 
 
@@ -824,8 +871,19 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
     current entry per partition path, which is the lake's own record of what it holds.
     Deriving them from the roster and the exchange calendar instead would ask for every
     session the calendar carries, and ``load_quotes`` raises ``PartitionAbsent`` on a session
-    the lake never captured. Reading the manifest means every enumerated partition exists, so
-    ``NoSpotClose`` is the only absence this walk can meet.
+    the lake never captured.
+
+    **Reading the manifest bounds what a refusal can be, and it does not remove refusals.**
+    This sentence used to say that every enumerated partition exists, so ``NoSpotClose`` was
+    the only absence the walk could meet. That was the argument for catching one exception
+    and no others, and it is wrong three ways.
+
+    1. ``load_quotes`` is ``_load_surface`` pointed at the quotes surface, so it carries every
+       guard ``load_chain`` carries, and four named ``LoadError`` subclasses reach a caller.
+    2. The manifest is the lake's record of what it sealed rather than a guarantee the file is
+       still on disk.
+    3. ``lake.splits`` caught those four from the day it shipped, over the same manifest and
+       the sibling surface, so the shape was never in doubt.
 
     **The read is one ``load_quotes`` call per ticker-day**, measured at about 10 ms each
     against the live lake. Reading the partitions directly is a little faster and is refused:
@@ -835,13 +893,39 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
 
     The walk, per ticker, in date order.
 
-    1. A ticker-day whose session recorded no equity close raises ``NoSpotClose`` and is
-       skipped. That is a gap day with nothing to read, and it is no observation rather than
-       an error. The cost is named rather than hidden: a session that captured hundreds of
-       minutes and missed its close is skipped too, even though the dividend is a property of
-       the session rather than of its final minute. The loader offers one row per call and
-       the close of record is the one row a caller can name without knowing which minutes
-       exist, so the alternative is a second read path.
+    1. A ticker-day the loader refuses is skipped, counted, and keeps its reason. Four named
+       refusals are contained, and each costs that ticker-day rather than the ticker's walk or
+       the run. :func:`_observation` names what is deliberately left to escape and why.
+
+       - ``NoSpotClose``, the gap day, with nothing to read.
+       - ``PartitionQuarantined``, a partition the validation battery withheld, where the
+         rows exist and the verdict says not to read them.
+       - ``PartitionAbsent``, a manifested partition whose file is gone.
+       - ``PartialRead``, one the overflow projection could not present whole, where reading
+         on would be a comparison against contents nobody saw in full.
+
+       **A skip is repairable, which is what settles this against holding a finding.**
+       ``lake.splits`` cannot say the same about its own walk: there ``ex_date`` is derived
+       from a boundary and sits in the ledger's key, so a date a skip made the detector guess
+       lands under a second key and every adjusted price applies the split twice. Here
+       ``ex_date`` is read off the row. What a skip moves is ``observed_on``, which is no part
+       of the key, and :func:`same_but_for_recorded_at` compares it, so the run after a
+       verdict clears appends the corrected entry once and every run after that reads
+       unchanged. A ``Withheld`` finding would instead be filed again every night a verdict
+       stood, while ``sweep.count_quarantined`` already carries that count to the same reader.
+
+       Two costs are named rather than hidden.
+
+       1. A session that captured hundreds of minutes and missed its close is skipped too,
+          even though the dividend is a property of the session rather than of its final
+          minute. The loader offers one row per call and the close of record is the one row a
+          caller can name without knowing which minutes exist, so the alternative is a second
+          read path.
+       2. A value that moves and moves back across a skipped session leaves ``previous``
+          matching the session after it, so that middle value is never recorded at all rather
+          than recorded a day late.
+
+       The count on the report is what an operator reads either cost off.
     2. A row carrying no ``div_ex_date`` is no observation either. A non-paying instrument
        reports nothing, and an entry of nulls is not an event. Without an ex-date there is no
        key, so there is nothing to land and nothing to hold.
@@ -888,6 +972,7 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
     ticker_days = surface_ticker_days(lake_root, QUOTES)
     appended: list[Landed] = []
     held: list[HeldFinding] = []
+    skipped: list[Skip] = []
     unchanged = 0
 
     # Every instrument this walk has already seen carrying a value, which is what tells a
@@ -937,6 +1022,9 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
                 observation = _observation(lake_root, ticker, day)
             except ValueError as exc:
                 hold(_payload_finding(ticker, day, exc))
+                continue
+            if isinstance(observation, str):
+                skipped.append(Skip(ticker, day, observation))
                 continue
             if observation is None:
                 continue
@@ -1022,6 +1110,7 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
         appended=tuple(appended),
         held=tuple(held),
         unchanged=unchanged,
+        skipped=tuple(skipped),
     )
 
 
@@ -1086,8 +1175,9 @@ def by_ticker(ticker_days: Sequence[tuple[str, date]]) -> Iterator[tuple[str, li
         yield ticker, sorted(grouped[ticker])
 
 
-def _observation(lake_root: Path, ticker: str, day: date) -> dict[str, object] | None:
-    """One ticker-day's dividend fields, or ``None`` when it carries no event.
+def _observation(lake_root: Path, ticker: str, day: date) -> dict[str, object] | str | None:
+    """One ticker-day's dividend fields, ``None`` when it carries no event, or the reason it
+    was not read.
 
     The rows are the session's equity close of record. Every data row in a session carries
     the same fundamentals, so which minute answers decides nothing about the dividend.
@@ -1101,11 +1191,48 @@ def _observation(lake_root: Path, ticker: str, day: date) -> dict[str, object] |
     A column the partition does not carry reads as null rather than raising, so a session
     sealed before a dividend column existed is a ticker-day with no event rather than a run
     that ends.
+
+    **The four named refusals return a reason and the caller counts them**, which is the
+    shape ``splits.read_session`` already has over the sibling surface. A reason rather than
+    ``None`` because the caller has to tell them apart: a ticker-day carrying no ex-date is a
+    non-paying instrument reporting nothing, and a ticker-day the battery withheld is a
+    session the run could not see. Collapsing the two would file a withheld partition under
+    the count that means the instrument pays no dividend.
+
+    The containment is here rather than in the caller's loop or in ``lake.sweep``. A refusal
+    caught at the sweep ends the walk, and the walk is ordered by ticker, so it would cost
+    every ticker after the refused one its dividends. ``actions.main`` has no catch for a
+    ``LoadError`` either, so an escaping refusal reaches the operator as a traceback and
+    takes the sign-off block for every ticker that did land with it.
+
+    **What is deliberately not caught here, so nothing reads this list as exhaustive.**
+    ``LoadError`` has twelve direct subclasses. Most belong to doors this never opens, and two
+    of them, ``SnapMalformed`` and ``SnapAbsent``, come from resolving a ``snap`` argument,
+    which this passes none of because it resolves at the close of record.
+
+    ``LoadError`` itself is the one that matters, and ``_load_surface`` raises it bare at
+    three sites a snapless read reaches: rows carrying no ``row_kind``, a ``spot_close`` row
+    whose ``snap_ts`` cannot be read as an instant, and ``spot_close`` tagged on more than one
+    cycle. Each escapes this walk today, and each takes the 18:30 job with it, which is the
+    same cost marketlake #352 was opened for.
+
+    It is left rather than folded in, because it is a different statement. The four above say
+    a session cannot be read, which costs one ticker-day. These three say the lake's own files
+    contradict their writers, which is something a person has to go and look at, so the answer
+    is a held finding rather than a counted skip. Marketlake #365 owns that decision for both
+    walks, holds the same shape for ``ExtraProjectionError`` and ``ArrowInvalid``, and
+    ``lake.bars`` is its precedent, catching ``LoadError`` by the base and filing.
     """
     try:
         table = load_quotes(ticker, day, lake_root=lake_root)
     except NoSpotClose:
-        return None
+        return REASON_NO_SPOT_CLOSE
+    except PartitionQuarantined:
+        return REASON_QUARANTINED
+    except PartialRead:
+        return REASON_PARTIAL_READ
+    except PartitionAbsent:
+        return REASON_PARTITION_ABSENT
     present = set(table.column_names)
     values: dict[str, object] = {}
     for column in DIVIDEND_COLUMNS:
@@ -1292,7 +1419,7 @@ def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> in
     from lake.config import input_errors_exit
 
     # Local, so ``lake.splits`` can import this module at its own top level. The walk it
-    # holds reads ``append``, the two vocabulary constants and four helpers from here, and
+    # holds reads ``append``, the vocabulary constants, ``Skip`` and five helpers from here, and
     # the import direction only stays one-way because this end of it waits until it runs.
     if args.command == SPLITS_COMMAND:
         from lake.splits import detect_splits_from_config as run
@@ -1328,6 +1455,10 @@ __all__ = [
     "PROVENANCE_MANUAL",
     "PROVENANCE_OBSERVED",
     "PROVENANCE_VENDOR_REPORTED",
+    "REASON_NO_SPOT_CLOSE",
+    "REASON_PARTIAL_READ",
+    "REASON_PARTITION_ABSENT",
+    "REASON_QUARANTINED",
     "SPLITS_COMMAND",
     "SWEEP_SOURCE",
     "TYPE_DIVIDEND",
@@ -1340,11 +1471,13 @@ __all__ = [
     "Landed",
     "LedgerLineError",
     "MasterAbsent",
+    "Skip",
     "UnresolvedSymbol",
     "actions_path",
     "append",
     "as_of",
     "build_entry",
+    "by_reason",
     "by_ticker",
     "check_dividend_consistency",
     "entry_key",
