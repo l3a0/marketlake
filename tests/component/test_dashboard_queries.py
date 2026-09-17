@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import shutil
 from collections.abc import Callable
 from dataclasses import replace
@@ -65,6 +66,7 @@ from lake.metadata import stamp_cycle, stamp_ping
 from lake.paths import DATE_PREFIX, JOURNAL_DIR, SEGMENT_GLOB
 from lake.report import Nightly, PieceOutcome, write_nightly
 from lake.security_master import (
+    ID_TYPE_FIGI,
     ID_TYPE_TICKER,
     KIND_EQUITY,
     MASTER_SCHEMA,
@@ -2425,6 +2427,112 @@ def test_a_recycled_ticker_unions_both_instruments_spans(root: Path):
     # Friday sits between the two spans, which is the away period neither covers.
     friday = service.run_query("today", {"date": "2026-08-21", "ticker": "SPY"})["strips"][0]
     assert friday["counts"]["out_of_scope"] == len(friday["slots"])
+
+
+def test_a_non_ticker_mapping_of_the_same_spelling_stays_out_of_the_union(root: Path):
+    # The clamp asks the master for ticker mappings alone. ``occ_mapping`` writes
+    # ``ID_TYPE_OCC`` rows into this same table on a contract re-symboling, so a lookup
+    # matching a spelling across every kind would pull another instrument's spans into
+    # an equity ticker's clamp. Instrument 2 carries the spelling under a different kind
+    # and a Thursday span. Let it into the union and Thursday's morning becomes owed,
+    # which is 390 minutes of `missing` on a day that is entirely out of scope.
+    SecurityMaster(
+        [
+            Mapping(
+                instrument_id=1,
+                id_type=ID_TYPE_TICKER,
+                id_value="SPY",
+                valid_from=date(2026, 1, 2),
+                valid_to=None,
+                kind=KIND_EQUITY,
+                capture_start=et(MONDAY, 9, 36).astimezone(UTC),
+            ),
+            Mapping(
+                instrument_id=2,
+                id_type=ID_TYPE_FIGI,
+                id_value="SPY",
+                valid_from=date(2026, 1, 2),
+                valid_to=None,
+                kind=KIND_EQUITY,
+                capture_start=et(THURSDAY, 9, 30).astimezone(UTC),
+            ),
+        ]
+    ).write(master_path(root))
+    CaptureSpans(
+        [
+            CaptureSpan(1, et(MONDAY, 9, 36).astimezone(UTC), None, False),
+            CaptureSpan(
+                2, et(THURSDAY, 9, 30).astimezone(UTC), et(THURSDAY, 16, 0).astimezone(UTC), False
+            ),
+        ]
+    ).write(spans_path(root))
+    thursday = service_over(root).run_query("today", {"date": "2026-08-20", "ticker": "SPY"})[
+        "strips"
+    ][0]
+    assert thursday["counts"]["missing"] == 0
+    assert thursday["counts"]["out_of_scope"] == len(thursday["slots"])
+
+
+def test_the_broad_guard_still_serves_a_panel_when_the_clamp_raises(root: Path, monkeypatch):
+    # ``_capture_spans`` catches everything on purpose, and its comment says not to
+    # narrow it back to a list of error types. Both file reads inside it have their own
+    # narrow guards, so nothing a reference file can hold reaches the broad one any
+    # more. This drives it directly, because a backstop no test reaches is a backstop
+    # nothing would notice the loss of.
+    write_master(root, "SPY", et(MONDAY, 9, 36))
+
+    def boom(span):
+        raise RuntimeError("neither a master nor a spans read error")
+
+    monkeypatch.setattr(dashboard, "_valid_span", boom)
+    chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
+        "strips"
+    ][0]
+    # The panel is served, unclamped, rather than the request becoming a 500.
+    assert chains["capture_start"] is None
+    assert chains["counts"]["out_of_scope"] == 0
+    assert chains["counts"]["gap"] == 1
+
+
+def test_the_unusable_span_warning_counts_spans_rather_than_tickers(root: Path, caplog):
+    # The count is the whole content of that line, and it is what an operator reads to
+    # size the drift. One instrument with two unusable spans must say two.
+    master = SecurityMaster()
+    instrument_id = master.register(
+        kind=KIND_EQUITY,
+        capture_start=et(MONDAY, 9, 36),
+        valid_from=date(2026, 1, 2),
+        ticker="SPY",
+    )
+    master.write(master_path(root))
+    table = CaptureSpans(
+        [
+            CaptureSpan(
+                instrument_id,
+                et(THURSDAY, 9, 30).astimezone(UTC),
+                et(THURSDAY, 16, 0).astimezone(UTC),
+                False,
+            ),
+            CaptureSpan(
+                instrument_id,
+                et(FRIDAY, 9, 30).astimezone(UTC),
+                et(FRIDAY, 16, 0).astimezone(UTC),
+                False,
+            ),
+        ]
+    ).to_table()
+    path = spans_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(_retype(table, {"span_end": pa.string()}), path)
+
+    with caplog.at_level(logging.WARNING, logger="lake.dashboard"):
+        chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
+            "strips"
+        ][0]
+    assert chains["capture_start"] is None
+    assert "capture spans: 2 span(s) carry an unusable end" in caplog.text
+    # The ticker is never in the line, because a ticker can arrive as a request field.
+    assert "SPY" not in caplog.text
 
 
 # -- a security master or a spans file whose types drifted -------------------
