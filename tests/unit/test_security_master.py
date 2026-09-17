@@ -191,6 +191,55 @@ def test_resolve_raises_on_an_ambiguous_symbol():
         master.resolve("DUP", on=date(2020, 1, 2))
 
 
+def test_instruments_named_ignores_dates_where_resolve_honors_them():
+    # "SPY" named instrument 1 until 2020-01-02 and instrument 2 from then on, which is
+    # an ordinary recycled ticker rather than a corrupt master. ``resolve`` answers one
+    # instrument per date and nothing at all before either mapping opens.
+    master = SecurityMaster(
+        [
+            Mapping(1, ID_TYPE_TICKER, "SPY", date(2019, 1, 2), date(2020, 1, 2), "equity", EPOCH),
+            Mapping(2, ID_TYPE_TICKER, "SPY", date(2020, 1, 2), None, "equity", EPOCH),
+        ]
+    )
+    assert master.resolve("SPY", on=date(2019, 6, 1), id_type=ID_TYPE_TICKER) == 1
+    assert master.resolve("SPY", on=date(2021, 6, 1), id_type=ID_TYPE_TICKER) == 2
+    assert master.resolve("SPY", on=date(2018, 6, 1), id_type=ID_TYPE_TICKER) is None
+
+    # The spelling question has one answer, on every one of those dates and on no date
+    # at all, and it never raises the way an as-of resolution would here.
+    assert master.instruments_named("SPY", id_type=ID_TYPE_TICKER) == {1, 2}
+    assert master.instruments_named("NOPE", id_type=ID_TYPE_TICKER) == set()
+
+
+def test_instruments_named_does_not_raise_where_resolve_calls_the_master_corrupt():
+    # Two instruments valid on one date is the corrupt master ``AmbiguousSymbol`` names.
+    # The spelling question still answers, because widening or refusing is the caller's
+    # decision and this one hands back both.
+    master = SecurityMaster(
+        [
+            Mapping(1, ID_TYPE_TICKER, "DUP", date(2019, 1, 2), None, "equity", EPOCH),
+            Mapping(2, ID_TYPE_TICKER, "DUP", date(2019, 1, 2), None, "equity", EPOCH),
+        ]
+    )
+    with pytest.raises(AmbiguousSymbol):
+        master.resolve("DUP", on=date(2020, 1, 2))
+    assert master.instruments_named("DUP", id_type=ID_TYPE_TICKER) == {1, 2}
+
+
+def test_instruments_named_filters_on_id_type():
+    # A re-symboled contract puts ``ID_TYPE_OCC`` rows in the same table, so a spelling
+    # match across every kind could cross an option contract with an equity ticker.
+    master = SecurityMaster(
+        [
+            Mapping(1, ID_TYPE_TICKER, "SPY", date(2019, 1, 2), None, "equity", EPOCH),
+            Mapping(2, ID_TYPE_OCC, "SPY", date(2019, 1, 2), None, "option", EPOCH),
+        ]
+    )
+    assert master.instruments_named("SPY", id_type=ID_TYPE_TICKER) == {1}
+    assert master.instruments_named("SPY", id_type=ID_TYPE_OCC) == {2}
+    assert master.instruments_named("SPY") == {1, 2}
+
+
 def test_capture_start_clamping_at_the_epoch_boundary():
     master = SecurityMaster()
     iid = master.register(

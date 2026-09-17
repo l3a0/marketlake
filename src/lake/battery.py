@@ -813,8 +813,9 @@ def capture_spans_by_ticker(
     Two failures sit on either side of a point-in-time lookup and this avoids both.
 
     1. Resolving as of the judged day loses the clamp on any day before the master's
-       ``valid_from``, which is marketlake #405 on the dashboard: the ticker drops out of the
-       mapping and every minute renders as missing.
+       ``valid_from``. That was marketlake #405 on the dashboard: the ticker dropped out of the
+       mapping and every minute rendered as missing. The dashboard's clamp asks the same
+       spelling question this one does now, through ``SecurityMaster.instruments_named``.
     2. Resolving as of the run date loses it after a rename. ``SecurityMaster.remap`` closes the
        old mapping, so every partition still sitting under the old ``ticker=`` directory
        resolves to nothing and goes unjudged, silently and permanently.
@@ -1292,7 +1293,7 @@ def coverage(
     session-time literal anywhere under ``src/lake`` outside ``calendar.py``.
 
     **A ticker is looked for under every spelling it ever carried.** Resolving as of the judged
-    day loses the ticker before the master's ``valid_from``, which is marketlake #405, and
+    day loses the ticker before the master's ``valid_from``, which was marketlake #405, and
     resolving as of the run date loses it after a rename. Either way a partition that exists
     would be reported missing. The name the finding is written under is the spelling valid on
     that day, falling back to the first the instrument ever had.

@@ -820,9 +820,7 @@ def _dates_desc(paths: LakePaths, surface: str, ticker: str) -> list[date]:
 # -- the capture_start clamp -------------------------------------------------
 
 
-def _capture_spans(
-    paths: LakePaths, tickers: Iterable[str], on: date
-) -> dict[str, tuple[CaptureSpan, ...]]:
+def _capture_spans(paths: LakePaths, tickers: Iterable[str]) -> dict[str, tuple[CaptureSpan, ...]]:
     """Each ticker's capture spans, read once from the master and the spans file.
 
     A *capture span* is a window ``[start, end)`` during which the ticker was captured.
@@ -835,13 +833,20 @@ def _capture_spans(
     rejoin render out of scope rather than as gaps.
 
     Both files are read once per query, not once per ticker. Either is optional here. An
-    absent file, an unreadable one, an ambiguous symbol, or a ticker that does not
-    resolve leaves that ticker out of the mapping, and a ticker outside the mapping gets
-    no clamp at all. A missing reference table must never break a panel, so nothing here
-    raises out of the query.
+    absent file, an unreadable one, or a spelling the master has never held leaves that
+    ticker out of the mapping, and a ticker outside the mapping gets no clamp at all. A
+    missing reference table must never break a panel, so nothing here raises out of the
+    query.
+
+    **There is no as-of date, and that is the fix for marketlake #405.** The spans
+    themselves bound the window in time, so a date handed to the master does no work
+    they are not already doing, and it does real harm: a master row carries
+    ``valid_from``, so every day before a ticker's onboarding resolved to nothing, the
+    ticker fell out of this mapping, and every slot of a pre-onboarding session rendered
+    ``missing``. That is the one status the promise above exists to prevent.
     """
     try:
-        return _read_capture_spans(paths, tickers, on)
+        return _read_capture_spans(paths, tickers)
     except Exception:
         # The guard is broad here, and only here. The master and the spans file are
         # optional reference files read off disk, so their contents are data that may be
@@ -857,14 +862,40 @@ def _capture_spans(
 
 
 def _read_capture_spans(
-    paths: LakePaths, tickers: Iterable[str], on: date
+    paths: LakePaths, tickers: Iterable[str]
 ) -> dict[str, tuple[CaptureSpan, ...]]:
     """Resolve each ticker against the master and its spans. The caller owns the failure path.
 
-    Every span taken from the file is validated before it is kept. A span clamps by
-    comparison against aware instants, so one whose ends are not both timezone-aware
-    datetimes is dropped. A dropped span costs a ticker its clamp, the same answer an
-    absent spans file gives, rather than a wrong one.
+    The master is asked which instruments a spelling has ever named, never which one it
+    named on a given day, per ``_capture_spans`` above.
+
+    A spelling naming several instruments **unions their spans** rather than refusing. A
+    spelling recycled onto a second instrument is the case, and lake partitions are keyed
+    by ticker rather than by instrument, so one ``ticker=`` directory really does hold
+    both instruments' rows and the honest scope for it covers both. The union also errs
+    the way the rest of this module errs. It is narrower than the no-clamp answer given
+    for an unreadable file, and wider than picking one instrument, so it reports a gap
+    rather than hiding one.
+
+    **The union is all of it or none of it.** A span clamps by comparison against aware
+    instants, so one whose ends are not both timezone-aware datetimes cannot be used, and
+    an instrument can carry no span row at all. Either way, an instrument the spelling
+    names that contributes no usable span costs the *whole ticker* its clamp, which is
+    the answer an absent spans file gives.
+
+    A partial union is the one way this function can return something *narrower* than the
+    truth, which is why it is refused outright. The surviving instrument's spans get
+    applied to days they never owned, so a minute reads out of scope when the missing
+    span is what would have shown it was owed. Measured: a recycled ticker whose closed
+    span is dropped by a drifted ``span_end`` while its open one survives turned two
+    recorded ``daemon_dead`` gap rows into out-of-scope minutes and took the day out of
+    the History panel's denominator. An instrument registered with no span row reaches
+    the same state by a different route.
+
+    Order is not relied on anywhere. ``CaptureSpans.spans_of`` returns insertion order
+    and the union concatenates per instrument, so the tuple's order is an accident of two
+    files. ``_epoch_at`` picks the epoch by comparing instants rather than by position,
+    which is what makes that safe.
     """
     try:
         master = SecurityMaster.read(master_path(paths.root))
@@ -885,17 +916,17 @@ def _read_capture_spans(
     result: dict[str, tuple[CaptureSpan, ...]] = {}
     unusable = 0
     for ticker in tickers:
-        try:
-            instrument_id = master.resolve(ticker, on=on, id_type=ID_TYPE_TICKER)
-        except SecurityMasterError:
-            continue
-        if instrument_id is None:
-            continue
-        ticker_spans = tuple(s for s in spans.spans_of(instrument_id) if _valid_span(s))
-        dropped = len(spans.spans_of(instrument_id)) - len(ticker_spans)
-        unusable += dropped
-        if ticker_spans:
-            result[ticker] = ticker_spans
+        ticker_spans: list[CaptureSpan] = []
+        complete = True
+        for instrument_id in sorted(master.instruments_named(ticker, id_type=ID_TYPE_TICKER)):
+            found = spans.spans_of(instrument_id)
+            kept = [span for span in found if _valid_span(span)]
+            unusable += len(found) - len(kept)
+            if not kept:
+                complete = False
+            ticker_spans.extend(kept)
+        if ticker_spans and complete:
+            result[ticker] = tuple(ticker_spans)
     if unusable:
         # The count alone, never the ticker. A ticker can arrive as a request parameter,
         # and nothing a client sent is written to a log line.
@@ -920,6 +951,31 @@ def _valid_span(span: CaptureSpan) -> bool:
 def _in_scope(instant: datetime, spans: tuple[CaptureSpan, ...]) -> bool:
     """Whether ``instant`` falls inside any of a ticker's capture spans."""
     return any(span.contains(instant) for span in spans)
+
+
+def _epoch_at(spans: tuple[CaptureSpan, ...], instant: datetime) -> datetime | None:
+    """The ``capture_start`` epoch to report beside a reading taken at ``instant``.
+
+    A ticker has one span in the ordinary case and the answer is that span's start. It
+    has several after a retirement and a rejoin, or after a ticker spelling is recycled
+    onto a second instrument, and then "the instant capture began" depends on when the
+    question is asked. This returns the start of the latest span that had already opened
+    by ``instant``, falling back to the earliest start when none had.
+
+    Asking per instant is what keeps the answer from contradicting the panel it sits on.
+    ``_strip`` renders a named past day and asks about that day's last slot, so a strip
+    for a day inside an earlier span reports that span's start rather than one from a
+    span that opens days later. ``_latest_cycle`` asks about the last minute a cycle was
+    owed, which is the minute ``_surface_stale`` judges against, so a ticker that went
+    dark inside an earlier span is not excused by a span that opened after the close.
+
+    The fallback carries the onboarding-day reading. A day before every span reports the
+    first span's start, which is the "onboarded 11:00" the clamp exists to render.
+    """
+    if not spans:
+        return None
+    started = [span.start for span in spans if span.start <= instant]
+    return max(started) if started else min(span.start for span in spans)
 
 
 # -- time helpers ------------------------------------------------------------
@@ -1218,7 +1274,7 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
     anything has ever been stamped. The owed-through instant is null only where no
     session has closed yet, which is a lake younger than its first close.
     """
-    spans_by_ticker = _capture_spans(ctx.paths, ctx.roster, ctx.session.session_date())
+    spans_by_ticker = _capture_spans(ctx.paths, ctx.roster)
     owed_through = _capture_owed_through(ctx)
     surfaces: list[dict[str, object]] = []
     for ticker, present in ctx.roster.items():
@@ -1308,7 +1364,7 @@ def _latest_cycle(
     minutes_since: float | None = None
     if last_data_ms is not None:
         minutes_since = round((_slot_ms(ctx.now) - last_data_ms) / 60_000, 1)
-    capture_start = spans[-1].start if spans else None
+    capture_start = _epoch_at(spans, owed_through if owed_through is not None else ctx.now)
     in_scope = not spans or _in_scope(ctx.now, spans)
     return {
         "ticker": ticker,
@@ -1374,7 +1430,7 @@ def query_today(
         raise QueryParameterError("date outside the calendar's range") from None
     slots = session_slots(bounds)
     tickers = [ticker] if ticker is not None else list(ctx.roster)
-    spans_by_ticker = _capture_spans(ctx.paths, tickers, session_day)
+    spans_by_ticker = _capture_spans(ctx.paths, tickers)
     strips: list[dict[str, object]] = []
     for symbol in tickers:
         for surface in ctx.roster.get(symbol, ()):
@@ -1478,7 +1534,7 @@ def _strip(
                 "error_class_count": len(error_classes),
             }
         )
-    capture_start = spans[-1].start if spans else None
+    capture_start = _epoch_at(spans, slots[-1]) if slots else _epoch_at(spans, now)
     return {
         "ticker": ticker,
         "surface": surface,
@@ -1891,19 +1947,18 @@ def query_history(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str
     the rule ``_capture_spans``, ``_slot_aggregates`` and ``undelivered`` each already
     keep.
 
-    The scope clamp is resolved **once, at the window's end**, not once per day.
-    ``_capture_spans`` resolves each ticker through the master as of the date it is
-    given, and the live master's rows begin on the onboarding day, so a per-day
-    resolution returns nothing for every earlier day, leaves those tickers unclamped,
-    and renders a wall of ``missing`` for minutes nothing was owed. The spans themselves
-    already bound the window, so the resolution date does no work they are not doing.
-    What this reading does not cover is a symbol the master no longer maps today, after
-    a retirement or an OCC re-symboling. That is marketlake #405's and stays there.
+    The scope clamp is read once for the whole window rather than once per day, and
+    ``_capture_spans`` takes no date at all, so every day in the window is clamped by
+    the same spans. This panel used to resolve the clamp at the window's end on purpose,
+    to keep a per-day resolution from returning nothing for every pre-onboarding day and
+    rendering a wall of ``missing``. Marketlake #405 took the date out of the clamp
+    entirely, which covers that and the symbol the as-of-today reading could not: one
+    the master no longer maps today, after a retirement or an OCC re-symboling.
     """
     end = ctx.session.session_date()
     sessions = _window_sessions(ctx, end)
     tickers = sorted(ctx.roster)
-    spans_by_ticker = _capture_spans(ctx.paths, tickers, end)
+    spans_by_ticker = _capture_spans(ctx.paths, tickers)
     days = [day for day, _ in sessions]
     cells: list[dict[str, object]] = []
     for surface in PANEL_SURFACES:
