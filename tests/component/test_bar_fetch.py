@@ -44,6 +44,7 @@ from lake.bars import (
     CHECK_BAR_RESPONSE,
     CHECK_BAR_SPAN,
     CLOSE_CROSS_TOLERANCE,
+    MINUTE_EXTENDED_HOURS,
     UnsupportedBarFreq,
     bar_window,
     fetch_session_bars,
@@ -184,14 +185,51 @@ def _minute_candles(
 ) -> list[dict]:
     """A minute response's candles: the window's first minute and its last.
 
-    Two candles, not 390. A real Schwab response's density is unknown, which is why the span
-    check compares the ends rather than counting, and the committed cassette carries three
-    candles for the same 390-minute window.
+    Two candles, not 390, and that is deliberate rather than a stand-in for a dense response.
+    The span check compares the ends rather than counting, so two candles at the right instants
+    exercise it exactly as 390 would, and the committed cassette carries three for the same
+    390-minute window.
+
+    #421's flagged recording measured the real density: 390 candles for a 390-minute window with
+    nothing missing inside it. ``_dense_minute_candles`` below builds that shape for the one test
+    that asserts against it. Every other test here stays on two, because a fixture that only
+    passes at full density would hide which property the check is actually reading.
     """
     return [
         bars_candle(first, open_=648.0, high=649.0, low=647.5, close=648.5, volume=1_400_000),
         bars_candle(last, open_=649.5, high=650.5, low=649.0, close=close, volume=2_100_000),
     ]
+
+
+def _dense_minute_candles(
+    start: datetime = OPEN_ET, end: datetime = CLOSE_ET, *, close: float = SETTLED_CLOSE
+) -> list[dict]:
+    """One candle per minute of the window, the shape #421's flagged recording measured.
+
+    That recording asked for 09:30 to 16:00 Eastern with ``extended_hours=false`` and received
+    390 candles, first stamped 09:30:00 and last 15:59:00, with nothing before the open and
+    nothing after 15:59. This synthesizes that shape rather than committing the recording, which
+    carries real market data from a real account and is what ``lake.record``'s own module
+    docstring keeps out of the repo.
+
+    The last candle takes the settled close so the daily cross-check has the same number to
+    compare against, matching ``_minute_candles``.
+    """
+    minutes = int((end - start) / timedelta(minutes=1))
+    candles = []
+    for index in range(minutes):
+        last = index == minutes - 1
+        candles.append(
+            bars_candle(
+                start + timedelta(minutes=index),
+                open_=648.0,
+                high=650.5,
+                low=647.5,
+                close=close if last else 648.5,
+                volume=1_400_000,
+            )
+        )
+    return candles
 
 
 def _daily_candle(session: date = SESSION, *, close: float = SETTLED_CLOSE) -> dict:
@@ -235,6 +273,10 @@ def _cassette(
                 ticker,
                 MINUTE_FREQ,
                 [(OPEN_ET, CLOSE_ET, minute["candles"])],
+                # Keyed on the flag the minute fetch sets, because ``bars_params`` keys a
+                # recording on it and a fetch that sets it misses one recorded without it.
+                # The daily interactions below key on no flag, matching the daily call.
+                extended_hours=MINUTE_EXTENDED_HOURS,
                 **{k: v for k, v in minute.items() if k != "candles"},
             )
         )
@@ -268,11 +310,15 @@ class _RecordingVendor:
         self.calls: list[dict] = []
         self.lock_free: list[bool] = []
 
-    def _record(self, symbol: str, freq: str, start, end, root: Path | None = None) -> None:
-        self.calls.append(bars_params(symbol, freq, start=start, end=end))
+    def _record(
+        self, symbol: str, freq: str, start, end, extended_hours, root: Path | None = None
+    ) -> None:
+        self.calls.append(
+            bars_params(symbol, freq, start=start, end=end, extended_hours=extended_hours)
+        )
 
     def get_minute_bars(self, symbol, *, start, end, extended_hours=None, previous_close=None):
-        self._record(symbol, MINUTE_FREQ, start, end)
+        self._record(symbol, MINUTE_FREQ, start, end, extended_hours)
         if symbol in self._fail_with:
             raise self._fail_with[symbol]
         return self._replay.get_minute_bars(
@@ -284,7 +330,7 @@ class _RecordingVendor:
         )
 
     def get_daily_bars(self, symbol, *, start, end, extended_hours=None, previous_close=None):
-        self._record(symbol, DAILY_FREQ, start, end)
+        self._record(symbol, DAILY_FREQ, start, end, extended_hours)
         if symbol in self._fail_with:
             raise self._fail_with[symbol]
         return self._replay.get_daily_bars(
@@ -1122,18 +1168,21 @@ def test_a_minute_partition_is_judged_by_the_span_check_and_not_the_daily_verdic
 def test_each_frequency_asks_for_exactly_the_window_this_issue_names(fixture_lake: FixtureLake):
     """#280 test 16, asserted off the vendor's recorded request.
 
-    The ``1m`` window is the session itself. That is a choice rather than a default: both
-    vendor flags are left unset, so Schwab decides whether a price-history response covers the
-    regular session or the extended one, and nobody has recorded which it picks. The reason that
-    was thought safe, that the request's bounds clip the response either way, is measured false:
-    marketlake #416's first live run asked this exact window and received 780 minutes. What the
-    narrow window still buys is the rest of it, that a wider one would let Schwab answer with the
-    regular session, correct and short at once, and stall the run pointing at the wrong cause.
-    #421 owns setting the flag. This asserts the window the request carries either way.
+    The ``1m`` window is the session itself, and the request asks for that session by name.
+    Leaving the flag unset was measured false twice over. #416's first live run asked this exact
+    window and received 780 minutes, and #421 then recorded the window both ways: unset it comes
+    back 07:00 to 19:59 Eastern, set false it comes back 09:30 to 15:59. So the request carries
+    three things and this asserts all three, the two bounds and the flag.
 
-    The ``1d`` window is a day wider on each side, because #362's recording put the daily stamp
-    at midnight Eastern of its session and at 01:00, both ahead of the 09:30 open a bracket
-    spanning only the session would start at.
+    The ``1d`` request carries the two bounds and no flag. The flag decides what a ``freq=1m``
+    partition holds and means nothing on a daily one, so setting it there would re-key every
+    daily recording for no change. The window is a day wider on each side, because #362's
+    recording put the daily stamp at midnight Eastern of its session and at 01:00, both ahead of
+    the 09:30 open a bracket spanning only the session would start at.
+
+    **The two halves are asserted the same way and cannot be swapped.** A key with the flag and a
+    key without it are different keys, so asserting only that the minute key holds the flag would
+    pass if the daily one held it too and the daily fixtures had been re-keyed to match.
     """
     root = _lake(fixture_lake)
     vendor = _RecordingVendor(_cassette())
@@ -1144,13 +1193,19 @@ def test_each_frequency_asks_for_exactly_the_window_this_issue_names(fixture_lak
     assert minute["freq"] == MINUTE_FREQ
     assert minute["start"] == OPEN_ET.astimezone(UTC).isoformat()
     assert minute["end"] == CLOSE_ET.astimezone(UTC).isoformat()
-    # Both flags are omitted from the key, exactly as the real vendor omits them from the
-    # request, so the recording a live run takes replays for this fetch.
-    assert set(minute) == {"symbol", "freq", "start", "end"}
+    # The flag is in the key because the request sends it, and ``previous_close`` is not because
+    # the request still omits that one. ``is False`` rather than ``== False``: ``bars_params``
+    # keys the value as given and never coerces it, so a ``0`` reaching here would compare equal
+    # while keying a different query value than the request carried.
+    assert set(minute) == {"symbol", "freq", "start", "end", "extended_hours"}
+    assert minute["extended_hours"] is False
+    assert minute["extended_hours"] is MINUTE_EXTENDED_HOURS
     start, end = _daily_window()
     assert daily["freq"] == DAILY_FREQ
     assert daily["start"] == start.astimezone(UTC).isoformat()
     assert daily["end"] == end.astimezone(UTC).isoformat()
+    # The daily request leaves it unset, so the key omits it exactly as the request does.
+    assert set(daily) == {"symbol", "freq", "start", "end"}
 
 
 def test_the_window_builder_names_the_same_two_windows(fixture_lake: FixtureLake):
@@ -2246,6 +2301,117 @@ def test_the_row_carries_the_frequency_and_the_resolved_instrument(fixture_lake:
     assert {row["freq"] for row in daily} == {DAILY_FREQ}
     assert {row["instrument_id"] for row in daily} == {1}
     assert {row["instrument_id"] for row in minute} == {1}
+
+
+def test_the_landed_minute_row_records_the_flag_its_request_carried(fixture_lake: FixtureLake):
+    """#421. The row says which extent the partition holds, and the daily row still says nothing.
+
+    ``journal._BARS_FETCH_FIELDS`` gives this column its job: without it "a later change to the
+    window or the flag leaves two meanings of ``freq=1m`` across history with nothing on the rows
+    saying which". The sibling test above asserts the daily row's ``None`` and reads the daily
+    partition only, so nothing read a landed minute row's flag.
+
+    That gap is what makes this worth its own test rather than an extra line there. The request
+    and the row are two readers of one value, and only the request is keyed into the cassette. So
+    a row builder handed a literal ``None`` on the minute path still replays every fixture, still
+    lands every partition and still passes every other assertion, while writing a flag the request
+    did not send.
+
+    Both frequencies in one run, because the pair is the assertion: ``False`` on the minute row
+    and ``None`` on the daily one. A change setting the flag everywhere would satisfy either half
+    alone.
+    """
+    root = _lake(fixture_lake)
+
+    _run(root, _RecordingVendor(_cassette()), roster=_roster({"SPY": ["1m", "1d"]}))
+
+    minute = pa.parquet.read_table(_partition(root, "SPY", MINUTE_FREQ)).to_pylist()
+    daily = pa.parquet.read_table(_partition(root, "SPY", DAILY_FREQ)).to_pylist()
+    # ``is False`` rather than ``== False``, because the column is a nullable boolean and a row
+    # written ``0`` would compare equal to ``False`` while meaning a value the request never
+    # carried. The same reason ``bars_params`` refuses to coerce its own key.
+    assert [row["extended_hours"] for row in minute] == [False] * len(minute)
+    assert all(row["extended_hours"] is False for row in minute)
+    assert all(row["extended_hours"] is None for row in daily)
+
+
+def test_the_regular_session_response_covers_the_window_end_to_end(fixture_lake: FixtureLake):
+    """#421. The flagged fetch satisfies the ends rule exactly, not by less.
+
+    The recording measured 390 candles for a 390-minute window, first at 09:30:00 and last at
+    15:59:00. Both are exact against the window's own bounds, because a candle is stamped at its
+    minute's open, so a window closing at 16:00 is fully covered by a last stamp of 15:59.
+
+    So this asserts equality against the window rather than a tolerance or a count, and it drives
+    a dense response rather than the two-candle fixture. The two are not the same assertion: two
+    candles at the right instants show the ends rule reading the ends, and 390 shows that a real
+    response's interior does not disturb it, which is the shape that will actually arrive.
+
+    ``requested`` and ``covered`` both read 390, so nothing is held.
+    """
+    root = _lake(fixture_lake)
+    dense = {"candles": _dense_minute_candles()}
+
+    result = _run(root, _RecordingVendor(_cassette(minute=dense)), roster=_roster({"SPY": ["1m"]}))
+
+    assert result.held == ()
+    (landed,) = result.landed
+    assert landed.freq == MINUTE_FREQ
+    from lake.session import SessionClock
+
+    rows = pa.parquet.read_table(_partition(root, "SPY", MINUTE_FREQ)).to_pylist()
+    assert len(rows) == 390
+    stamps = sorted(datetime.fromisoformat(str(row["bar_ts"])) for row in rows)
+    bounds = SessionClock(ManualClock(FIRST_NIGHT), weekday_sessions(MONDAY)).bounds(SESSION)
+    window = bar_window(MINUTE_FREQ, bounds)
+    assert stamps[0] == window.start
+    assert stamps[-1] + timedelta(minutes=1) == window.end
+    assert (stamps[-1] - stamps[0]) / timedelta(minutes=1) + 1 == 390.0
+
+
+def test_the_ends_rule_holds_on_an_early_close(fixture_lake: FixtureLake):
+    """#421. A short session shortens the window, and the rule is length-independent.
+
+    ``bar_window`` reads ``bounds.equity_close``, which ``SessionClock.bounds`` takes from
+    ``Calendar.session_close``, so a 13:00 close makes a 210-minute window with no literal
+    anywhere in ``lake.bars``. The ends rule compares two instants against that window's own
+    bounds and never against 390, so nothing in it has to know the session was short.
+
+    **This tests the arithmetic, not the vendor.** Whether Schwab honours an early close under
+    ``extended_hours=false`` is unmeasured, and no early close has been fetched. That direction
+    fails closed: a response reaching past 12:59 lands outside the window and the check refuses.
+    The last half of this test drives exactly that, so the short window is shown to be doing work
+    rather than merely being accepted.
+    """
+    from lake.session import SessionClock
+    from tests.support.calendar import FakeCalendar, SessionTimes
+
+    early_close = datetime.fromisoformat(f"{SESSION.isoformat()}T13:00:00-04:00")
+    calendar = FakeCalendar(
+        {SESSION: SessionTimes(open=OPEN_ET, close=early_close, early_close=True)}
+    )
+    bounds = SessionClock(ManualClock(FIRST_NIGHT), calendar).bounds(SESSION)
+    window = bar_window(MINUTE_FREQ, bounds)
+
+    assert window.end == early_close
+    assert (window.end - window.start) == timedelta(minutes=210)
+    assert window.extended_hours is MINUTE_EXTENDED_HOURS
+
+    def rows(last):
+        return [
+            {"bar_ts": OPEN_ET.isoformat(), "close": 648.5},
+            {"bar_ts": last.isoformat(), "close": SETTLED_CLOSE},
+        ]
+
+    short = rows(early_close - timedelta(minutes=1))
+    covers = bars.check_bar_span(short, short, window)
+    assert covers.covers is True
+    assert (covers.covered, covers.requested) == (210.0, 210.0)
+
+    # A response that ran on to the regular close instead. The extra candle is outside the short
+    # window, so the fetch is refused rather than landing the afternoon the session did not have.
+    overran = rows(CLOSE_ET - timedelta(minutes=1))
+    assert bars.check_bar_span(overran, overran, window).covers is False
 
 
 def test_an_unrecognized_candle_field_overflows(fixture_lake: FixtureLake):

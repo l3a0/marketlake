@@ -61,27 +61,30 @@ margin reached for and then refuses it. ``DAILY_WINDOW_MARGIN`` carries the widt
 measurement and the slack in full. The selection below reads the session off the stamp rather
 than off the window, so the extra candles a wide bracket returns are dropped rather than landed.
 
-The narrow ``1m`` window is a choice, not the obvious default. Both vendor flags are left
-unset, so Schwab decides whether a price-history response covers the regular session or the
-extended one, and nobody has recorded which it picks.
+The narrow ``1m`` window is a choice, not the obvious default, and it asks for the regular
+session by name. ``extended_hours=false`` goes out beside the bounds, which
+``MINUTE_EXTENDED_HOURS`` carries with the recording behind it. The daily fetch leaves the flag
+unset and lets Schwab pick, because the flag decides what a ``freq=1m`` partition holds and
+means nothing on a daily one.
 
-**The reason that was thought safe is measured false.** It ran: with a window at the session's
-own bounds it does not matter, because the request's own bounds clip the response either way
-and the coverage is 390 minutes under both answers. Marketlake #416's first live run asked
-09:30 to 16:00 Eastern and received a response spanning 780 minutes, on all seven sessions and
-both tickers. The request's bounds do not clip the response, so the narrow window did not
-remove the confound it was chosen for.
+**The reason the flag was first left unset is measured false.** It ran: with a window at the
+session's own bounds it does not matter, because the request's own bounds clip the response
+either way and the coverage is 390 minutes under both answers. Marketlake #416's first live run
+asked 09:30 to 16:00 Eastern and received a response spanning 780 minutes, on all seven sessions
+and both tickers. Marketlake #421 then recorded the same window twice and read the ends off both.
+Unset, the response runs 07:00 to 19:59 Eastern, the whole extended session, beginning two and a
+half hours before the requested open and ending four hours after the requested close. Set false,
+it runs 09:30 to 15:59, the regular session and nothing else, with both ends exact against the
+window's own.
 
-What the narrow window does still buy is the rest of that argument, unchanged: a wider one
-would let Schwab answer with the regular session, correct and short at the same time, and by
-the span check's unbounded-repeat rule the run would stall with a finding pointing at the wrong
-cause. Marketlake #333's own planning loop reached that from the other side.
+So the bounds do not clip the response and the flag is what decides its extent. Asking for the
+regular session by name is what makes the fetch reversible too: the flag lands on every row,
+which is what the ``extended_hours`` column was made nullable for.
 
-The remedy is to set the flag rather than leave Schwab picking, which is what the
-``extended_hours`` column on every bars row was made nullable for. Marketlake #421 owns it and
-waits on a live recording, because the response's real ends have never been measured. Until
-then this surface asks for the session and the span check refuses what comes back, which is the
-loud direction.
+What the narrow window buys is unchanged: a wider one would let Schwab answer with the regular
+session, correct and short at the same time, and by the span check's unbounded-repeat rule the
+run would stall with a finding pointing at the wrong cause. Marketlake #333's own planning loop
+reached that from the other side.
 
 **The two gate checks, in the order they run.** The span check runs first. The close
 cross-check compares the candle whose stamp maps to the session, so on a response that dropped
@@ -194,6 +197,25 @@ CHECK_BAR_RESPONSE = "bar_response"
 # The width's cost is response size, three days of candles rather than one. The selection below
 # drops the neighbours.
 DAILY_WINDOW_MARGIN = timedelta(days=1)
+
+# The extended-hours flag a ``freq=1m`` fetch sets, and why it is a false rather than left unset.
+#
+# Left unset, ``schwab-py`` omits the parameter and Schwab picks. Marketlake #421 recorded both
+# answers live, one window, SPY over 2026-09-16 09:30 to 16:00 Eastern.
+#
+#   unset  first 07:00:00-04:00  last 19:59:00-04:00  span 780.0  765 candles
+#   false  first 09:30:00-04:00  last 15:59:00-04:00  span 390.0  390 candles
+#
+# So the request's own bounds do not clip the response. Unset, Schwab answers with the whole
+# extended session, two and a half hours before the requested open and four hours after the
+# requested close, which is the 780.0 that refused every 1-minute ticker-day on #416's first run.
+# Set false, the response is the regular session and nothing else, with both ends landing exactly
+# on the window's own. That is what :func:`check_bar_span`'s ends rule asks for, so this produces
+# a fetch the check passes rather than one that fails by less.
+#
+# The daily fetch leaves it unset. The flag decides what a ``freq=1m`` partition holds, and
+# setting it on the daily call would re-key every daily recording for no change in meaning.
+MINUTE_EXTENDED_HOURS = False
 
 # How much the official daily close may differ from the session's own captured quotes before
 # the bar is held out. It is relative, like the sibling's dividend tolerance, and measured
@@ -363,12 +385,25 @@ class TickerDay:
 
 @dataclass(frozen=True)
 class BarWindow:
-    """The window one fetch asks for, and the session it is asking about."""
+    """The window one fetch asks for, and the session it is asking about.
+
+    ``extended_hours`` is the third thing the request carries, beside the two bounds. It rides
+    here rather than being decided at the call site because two places need it and they must
+    not disagree: :func:`_fetch` sends it to the vendor, and the row builder records it on
+    every row so the fetch is reversible. ``journal._BARS_FETCH_FIELDS`` is where that column's
+    job is written down, and a row recording a flag its own request did not send is the loss
+    that column exists to prevent, written into the column itself.
+
+    ``None`` means the request omits the parameter and lets Schwab pick, which is a third state
+    rather than a false. That is what the daily fetch asks for and what the minute fetch asked
+    for until marketlake #421.
+    """
 
     session: date
     freq: str
     start: datetime
     end: datetime
+    extended_hours: bool | None
 
 
 @dataclass(frozen=True)
@@ -411,15 +446,24 @@ def bar_window(freq: str, bounds, *, margin: timedelta = DAILY_WINDOW_MARGIN) ->
     ``require_utc_bound`` refuses a naive bound because ``schwab-py`` would read it in the
     capture machine's own zone.
 
-    ``1m`` asks for the session itself, open to equity close. That is 390 minutes on a regular
-    day and fewer on an early close, and it stops at the *equity* close where capture's own
-    window runs on to the option close, because an equity bar has nothing to say about the
-    fifteen minutes after the auction.
+    ``1m`` asks for the session itself, open to equity close, and asks for it by name with
+    ``extended_hours=false``. That is 390 minutes on a regular day and fewer on an early close,
+    and it stops at the *equity* close where capture's own window runs on to the option close,
+    because an equity bar has nothing to say about the fifteen minutes after the auction.
+
+    Both ends come from the calendar through ``bounds``, so an early close shortens the window
+    with no literal here, and the span check's ends rule compares against these two instants
+    rather than against 390. Whether the vendor honours an early close under the flag is
+    unmeasured, and no early close has yet been fetched. It fails closed: a response reaching
+    past a short session's close is refused rather than landed.
 
     ``1d`` asks for a bracket a ``margin`` wider on each side. ``DAILY_WINDOW_MARGIN`` carries
     why in full, and the short version is that a daily candle is stamped near midnight Eastern
     of its session rather than inside it, so a bracket spanning only the session would begin
     after the candle it wants.
+
+    ``1d`` leaves the flag unset. It decides what a ``freq=1m`` partition holds, so setting it
+    on the daily call would re-key every daily recording and change no meaning.
 
     **The bracket's ends are instants and what Schwab clips to is their dates**, which is the
     asymmetry marketlake #416 measured. Nothing is done about it here. The window is the request,
@@ -430,12 +474,19 @@ def bar_window(freq: str, bounds, *, margin: timedelta = DAILY_WINDOW_MARGIN) ->
     """
     freq = require_bar_freq(freq)
     if freq == MINUTE_FREQ:
-        return BarWindow(session=bounds.day, freq=freq, start=bounds.open, end=bounds.equity_close)
+        return BarWindow(
+            session=bounds.day,
+            freq=freq,
+            start=bounds.open,
+            end=bounds.equity_close,
+            extended_hours=MINUTE_EXTENDED_HOURS,
+        )
     return BarWindow(
         session=bounds.day,
         freq=freq,
         start=bounds.open - margin,
         end=bounds.equity_close + margin,
+        extended_hours=None,
     )
 
 
@@ -547,13 +598,26 @@ def check_bar_span(
 
     On ``1m`` it is the two ends. ``min`` must equal the window's start and ``max`` must equal
     its end minus a minute, because a candle is stamped at its minute's open, so a window
-    running to the equity close is fully covered by stamps ending at 15:59. Counting candles
-    or distinct minutes instead would need an answer nobody has: whether a real Schwab 1-min
-    response carries a candle for every minute or omits the minutes that did not trade. The
-    only bars fixture in the tree is synthesized and holds three candles for a 390-minute
-    window, so a count rule would refuse the response the whole suite replays. The ends need
-    no such answer. They are sufficient here because this job fetches one session, which
+    running to the equity close is fully covered by stamps ending at 15:59.
+
+    **Counting candles instead was rejected for want of an answer, and the answer has since
+    arrived without changing the verdict.** The question was whether a real Schwab 1-min
+    response carries a candle for every minute or omits the minutes that did not trade.
+    Marketlake #421's unflagged recording returned 765 candles across a 780-minute span, so it
+    omits them, fifteen of them on that session and every one outside the regular hours. The
+    flagged recording of the same window returned 390 for 390 with none missing.
+
+    That is one session rather than a rule. A ticker thinner than SPY can skip a minute inside
+    the regular session too, so a count rule would refuse a response that is complete as far as
+    the vendor is concerned, and it would still refuse the synthesized fixtures this suite
+    replays, which hold two and three candles for a 390-minute window. The ends need no such
+    answer either way. They are sufficient here because this job fetches one session, which
     leaves no interior session to lose.
+
+    The ends rule has its own edge, which the same measurement makes visible: a ticker that does
+    not trade in the session's first or last minute returns no candle at that end and is refused
+    every night. Marketlake #461 owns it, deferred at zero observations on a roster of SPY and
+    QQQ.
 
     On ``1d`` it is presence: did the session being fetched come back, one against one. The
     window is a bracket deliberately wider than the session, so a neighbouring session whose
@@ -821,7 +885,7 @@ def _fetch(vendor: Vendor, ticker: str, window: BarWindow):
     fails at the seam rather than quietly taking the daily call in one of the two dispatches.
     """
     call = vendor.get_minute_bars if window.freq == MINUTE_FREQ else vendor.get_daily_bars
-    return call(ticker, start=window.start, end=window.end)
+    return call(ticker, start=window.start, end=window.end, extended_hours=window.extended_hours)
 
 
 def _write_partition(rows: Sequence[dict], partition: Path) -> int:
@@ -1269,7 +1333,9 @@ def _land(
         fetch_end_ts=fetch_end_ts,
         window_start=window.start,
         window_end=window.end,
-        extended_hours=None,
+        # The window's own flag, never a second literal. The row's job is to say what the
+        # request asked for, and reading it from anywhere else lets the two drift.
+        extended_hours=window.extended_hours,
     )
     selected = select_session_rows(built, window)
 
