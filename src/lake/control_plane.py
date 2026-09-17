@@ -200,7 +200,7 @@ CALENDAR_PROBE_SLUG = "calendar-probe"
 PRE_OPEN_SLUG = "pre-open"
 SUNDAY_SLUG = "sunday"
 
-# The slug of the dead-man check the daemon feeds. It sits here with its four siblings
+# The slug of the dead-man check the daemon feeds. It sits here with its five siblings
 # rather than in ``lake.deadman`` because the install renderer names it too, and
 # ``lake.deadman`` imports this module. Reaching the other way would load a second copy
 # of this module under ``python -m lake.control_plane``. ``lake.deadman`` re-exports it,
@@ -263,10 +263,19 @@ _NUMBER_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven", 
 
 
 def _spelled(count: int) -> str:
-    """``count`` as an English word, for prose in a rendered script."""
-    if not 0 <= count < len(_NUMBER_WORDS):
-        raise ValueError(f"no spelling for {count}")
-    return _NUMBER_WORDS[count]
+    """``count`` as an English word, or as a numeral when there is no word for it.
+
+    It falls back rather than refusing, and that is the whole of the reasoning. The only
+    callers are two sentences inside ``uninstall_script``, which ``render_all`` calls, so
+    raising here would take the entire install and uninstall rendering down over the
+    spelling of one word. The design's own budget is not nine: it puts the per-job check
+    pattern "well inside the free tier's 20-check allowance". A tenth check is a thing
+    this project expects to have one day, and reading "Pause all 10 from healthchecks" is
+    a smaller cost than a renderer that will not run.
+    """
+    if 0 <= count < len(_NUMBER_WORDS):
+        return _NUMBER_WORDS[count]
+    return str(count)
 
 
 def _listed(items: Sequence[str]) -> str:
@@ -2580,7 +2589,8 @@ def install_script(host: LaunchdHost) -> str:
 
     Paths resolve from the script's own directory rather than from a baked absolute
     path, so moving the rendered directory does not break it. Step 6 is deliberately
-    absent. It is the standing Friday task, not part of the first install.
+    absent. It is run once from the install text, and the 18:30 sweep sets the one-shot
+    every Friday from then on, so it is not a step this script should re-run.
     """
     body: list[str] = []
     for item in _first_install_lines(
@@ -2631,8 +2641,9 @@ def install_script(host: LaunchdHost) -> str:
         "# reaches the install that would place it. Every command is echoed before it runs.",
         "# The last command reads back whether the daemon came up.",
         "#",
-        "# Step 6, the standing Friday one-shot, is not here. It is not part of the first",
-        "# install. Run it from the install text.",
+        "# Step 6, the Sunday one-shot, is not here. Run it once from the install text.",
+        f"# From then on the 18:30 {EOD_SWEEP_LABEL} job sets it every",
+        "# Friday and reads it back.",
         "#",
         "# To reinstall after a re-render, run the uninstall first and this second:",
         "#",
@@ -2797,7 +2808,7 @@ def restart_script(host: LaunchdHost) -> str:
     ``src`` directory, so editing that tree changes what a *new* process imports and
     nothing about one already running. The self-check, the calendar probe and the Sunday
     job exec fresh on every fire, so they always run current code and never need this. The
-    pair is derived from ``keep_alive``, so a sixth resident job is covered by adding the
+    pair is derived from ``keep_alive``, so a third resident job is covered by adding the
     job and nothing else.
 
     ``launchctl kickstart -k`` runs the service immediately whatever its launch conditions

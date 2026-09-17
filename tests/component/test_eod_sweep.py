@@ -28,6 +28,7 @@ import pytest
 
 from lake import journal, report, sweep
 from lake.alert import Publisher
+from lake.bars import CHECK_BAR_CLOSE
 from lake.calendar import NotASession
 from lake.cassette import Cassette
 from lake.control_plane import EOD_SWEEP_SLUG, SUNDAY_WAKE, pmset_schedule_args
@@ -1051,3 +1052,165 @@ def test_a_frequency_the_lake_cannot_fetch_ends_the_bar_fetch_alone(fixture_lake
     assert "UnsupportedBarFreq" in bars_piece.refusal
     assert dict(outcome.nightly.pieces)["splits"].finished is True
     assert pinger.urls == []
+
+
+# -- what the review's mutation lens found unheld ---------------------------------------
+
+
+def test_the_digest_never_carries_an_exception_message(fixture_lake: FixtureLake):
+    """The redaction boundary is held on the file and was not held on the digest.
+
+    ``PieceOutcome.refusal_class``'s own docstring names the phone as the reason it exists,
+    and the digest is the more exposed of the two readers. Both halves of the digest are
+    covered here: a piece refusal, and a report-tier line, which went out raw. An
+    ``OSError`` says the filename it failed on, which is an absolute path on the capture
+    machine.
+    """
+    secret = "/Users/someone/private"
+    root = _lake(fixture_lake)
+    source = _CountingVendorSource(raises=VendorAuthError(f"[Errno 13] {secret}/token.json"))
+    _, _, transport = _run(
+        root,
+        now=FRIDAY_EVENING,
+        vendor_source=source,
+        reader=lambda: (_ for _ in ()).throw(FileNotFoundError(f"[Errno 2] {secret}/pmset")),
+    )
+
+    body = transport.messages[0].body
+    assert secret not in body, body
+    # The class still reaches the reader, because it is what says what to do next.
+    assert "VendorAuthError" in body
+    assert "FileNotFoundError" in body
+
+
+def test_a_finding_that_could_not_be_filed_reaches_the_count_and_the_exit_code(
+    fixture_lake: FixtureLake, monkeypatch
+):
+    """``unfiled`` was derived, carried and read, and no test drove any of the three.
+
+    A finding held and filed is a live condition a human can go and read. A finding held
+    and not filed reads exactly like a run that found nothing, which is the silence the
+    producer exists to break. It does not withhold the ping, because the run itself
+    worked, and it is what the non-zero exit code is for.
+    """
+    from lake import bars as bars_module
+
+    root = _lake(fixture_lake)
+    # Patched where it is used rather than where it is defined: ``lake.bars`` binds
+    # ``write_withheld`` at import, so patching ``lake.report`` would not reach the walk.
+    monkeypatch.setattr(
+        bars_module,
+        "write_withheld",
+        lambda *a, **k: (_ for _ in ()).throw(PermissionError("read-only")),
+    )
+    source = _CountingVendorSource(_cassette(close=SETTLED_CLOSE * 1.05))
+    outcome, pinger, _ = _run(root, vendor_source=source)
+
+    assert dict(outcome.nightly.pieces)["bars"].held == 1
+    assert dict(outcome.nightly.pieces)["bars"].unfiled == 1
+    assert outcome.nightly.unfiled == 1
+    assert pinger.urls == [PING_URL], "an unfiled finding silenced the check"
+    assert outcome.ok is False
+
+
+def test_the_quarantine_count_reads_the_ledger_rather_than_answering_zero(
+    fixture_lake: FixtureLake,
+):
+    """A lake with no ledger cannot tell a real read from a hardcoded zero.
+
+    Two entries, and only one of them withholds its partition. ``is_quarantined`` clears a
+    partition on a ``clean`` verdict and withholds it on every other, so a count that
+    dropped the filter would answer two.
+    """
+    root = _lake(fixture_lake)
+    (root / "quarantine.jsonl").write_text(
+        '{"partition": "chains/ticker=SPY/date=2026-09-14.parquet", "verdict": "stale"}\n'
+        '{"partition": "chains/ticker=QQQ/date=2026-09-14.parquet", "verdict": "clean"}\n'
+    )
+    assert sweep.count_quarantined(root) == 1
+
+    outcome, _, transport = _run(root)
+    assert outcome.nightly.quarantined == 1
+    assert "quarantined 1" in transport.messages[0].body
+
+
+def test_a_held_findings_subject_names_the_day_its_own_file_is_keyed_on(
+    fixture_lake: FixtureLake,
+):
+    """The three fields are what make a finding findable, so the format is pinned exactly.
+
+    ``withheld_dir`` keys the path on ``observed_on``, so a subject without it sends a
+    reader to a pile with no way to pick the file out.
+    """
+    root = _lake(fixture_lake)
+    source = _CountingVendorSource(_cassette(close=SETTLED_CLOSE * 1.05))
+    outcome, _, _ = _run(root, vendor_source=source)
+
+    (subject,) = dict(outcome.nightly.pieces)["bars"].subjects
+    assert subject == f"SPY {SESSION.isoformat()} {CHECK_BAR_CLOSE}"
+    # The day in the subject is the one the finding's own file is filed under.
+    assert list(report.withheld_dir(root, SESSION).glob("*.json"))
+
+
+def test_the_wire_shape_matches_the_designs_message_table_literally():
+    """Compared against the literals, because the constants cannot check themselves.
+
+    Every other test here imports the constant and compares it to itself, which passes
+    whatever the constant says. These four are the design's message table, and the
+    priority has teeth: 2 is the silent notification-drawer tier that makes one message
+    every weekday evening a liveness signal, and 5 would page the operator nightly.
+    """
+    assert sweep.NIGHTLY_EVENT == "nightly_summary"
+    assert sweep.NIGHTLY_PRIORITY == 2
+    assert sweep.DIGEST_BYTE_CAP == 1000
+    assert sweep.HOLIDAY_BODY == "Holiday, no session"
+
+
+def test_a_summary_count_that_cannot_be_read_keeps_the_record_and_the_digest(
+    fixture_lake: FixtureLake, monkeypatch
+):
+    """The three counts sit between the work and the ping, and an uncontained raise lost both.
+
+    A corrupt partition or a torn quarantine ledger would take the report file and the
+    digest down on a night the check had already gone green, which is the silence
+    ``report.py`` exists to end. The count is a summary of the run rather than the run, so
+    it is report-tier: the record survives and the ping is not withheld.
+    """
+    root = _lake(fixture_lake)
+    monkeypatch.setattr(
+        sweep,
+        "count_gaps",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("Parquet magic bytes not found")),
+    )
+    outcome, pinger, transport = _run(root)
+
+    assert pinger.urls == [PING_URL]
+    assert outcome.nightly.gaps is None
+    assert any("gap count unreadable" in line for line in outcome.nightly.report)
+    assert outcome.filed_at is not None, "the record was lost"
+    assert any("gap count unreadable" in line for line in _filed(root)[0]["report"])
+    assert transport.messages, "the digest was lost"
+
+
+def test_a_digest_that_never_left_is_not_a_clean_run(fixture_lake: FixtureLake):
+    """It is the one failure this job can have that no count anywhere reaches.
+
+    ``undelivered`` is read before the digest is published, so this run cannot see its own
+    loss, and it is keyed on the day the page failed, so the next evening reads a different
+    directory. A topic quiet because nothing broke looks exactly like a dead subscription,
+    and this message is the answer to that.
+    """
+
+    class _Down:
+        def send(self, message):
+            raise OSError("ntfy down")
+
+    root = _lake(fixture_lake)
+    publisher = Publisher(lake_root=root, transport=_Down())
+    outcome, pinger, _ = _run(root, publisher=publisher)
+
+    assert pinger.urls == [PING_URL], "a lost digest silenced the check"
+    assert outcome.delivered is False
+    assert outcome.ok is False
+    # Recorded like any other lost page, and counted by no run, which is why ok carries it.
+    assert list((root / "reports" / "alerts").glob("date=*/*.json"))

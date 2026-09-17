@@ -96,6 +96,7 @@ from lake.report import (
     SPLITS_PIECE,
     Nightly,
     PieceOutcome,
+    redacted,
     write_nightly,
 )
 from lake.runner import PING_FAILURES, Pinger, UrllibPinger, escalate_ping_failure
@@ -244,6 +245,26 @@ def _bars_outcome(report: BarsReport) -> PieceOutcome:
     )
 
 
+def _counted(what: str, read: Callable[[], int | None], report: list[str]) -> int | None:
+    """One summary count, or ``None`` with a line saying why it could not be read.
+
+    The three counts are a summary of the run rather than the run itself, so a failure
+    here must not cost the record. They sit between the work and the ping, and an
+    uncontained raise would take the report file and the digest with it while the check
+    read green, which is the silence ``report.py`` exists to end. The partitions most
+    likely to be unreadable are the ones a battery would quarantine, and
+    :func:`count_gaps` opens every one of them on purpose.
+
+    The failure is report-tier rather than a problem. The work the check watches did
+    happen, so a count nobody could take must not withhold the ping.
+    """
+    try:
+        return read()
+    except Exception as exc:  # noqa: BLE001 - a summary must not cost the record
+        report.append(f"{what} unreadable: {type(exc).__name__}: {exc}")
+        return None
+
+
 def _refused(exc: BaseException) -> PieceOutcome:
     """A walk that stopped on one of its named conditions."""
     return PieceOutcome(refusal=f"{type(exc).__name__}: {exc}")
@@ -259,8 +280,18 @@ class SweepOutcome:
     digest, which is the shape ``compact`` gives a schema-drift file it could not write.
 
     ``digest`` is the message that was built, whether or not it was sent, and ``delivered``
-    says which. A digest the publisher refused or capped is recorded under
-    ``reports/alerts/``, where tomorrow's run counts it as a page that failed to send.
+    says which. A digest that did not go is recorded under ``reports/alerts/`` like any other
+    lost page, and **no run ever counts it**. ``undelivered`` is read before the digest is
+    published, so this run cannot see its own loss, and it is keyed on the day the page
+    failed, so the next evening reads a different directory. Every other page this job can
+    raise is counted, because the refused-ping escalation happens before that read. The
+    digest is the one message whose own failure no count reaches, which is why ``ok`` has to
+    carry it.
+
+    That matters more here than the arithmetic suggests. A topic quiet for weeks because
+    nothing broke looks exactly like a dead subscription, and this message is the design's
+    answer to that. A night where it silently did not go is the night the answer stops
+    working.
     """
 
     nightly: Nightly
@@ -271,12 +302,17 @@ class SweepOutcome:
 
     @property
     def ok(self) -> bool:
-        """Whether nothing about this run needs a person to look at it."""
+        """Whether nothing about this run needs a person to look at it.
+
+        Five conditions, and ``delivered`` is here for the reason the class docstring
+        gives: it is the only failure this job can have that no count anywhere reaches.
+        """
         return (
             not self.nightly.problems
             and self.nightly.pinged
             and self.nightly.unfiled == 0
             and self.filed_at is not None
+            and self.delivered
         )
 
     def render(self) -> str:
@@ -352,7 +388,11 @@ def digest_body(nightly: Nightly) -> str:
     if not nightly.pinged:
         lines.append("ping did not land")
     for line in nightly.report:
-        lines.append(f"report: {line}")
+        # Redacted for the reason ``PieceOutcome.refusal_class`` gives, which names the
+        # digest explicitly. A report-tier line is composed as a place and then an
+        # exception, so ``redacted``'s keep-two-fields rule is the one that fits it,
+        # and it is the same rule the report file applies to the same list.
+        lines.append(f"report: {redacted(line)}")
     body = "\n".join(lines)
     # The cap is the design's, and a body over it is truncated rather than dropped. A digest
     # that did not arrive is indistinguishable from a dead subscription, which is the one
@@ -390,11 +430,25 @@ def _friday_wake(
     problems: list[str] = []
     report: list[str] = []
 
-    sunday = next_sunday_wake(now, calendar)
+    try:
+        sunday = next_sunday_wake(now, calendar)
+    except Exception as exc:  # noqa: BLE001 - a calendar that cannot answer is the same failure
+        # Inside the ``try`` because the docstring above promises containment and this
+        # call can raise too. ``next_sunday_wake`` walks forward for the next session and
+        # gives up after fourteen days, and the calendar package refuses a date past its
+        # own right bound. Either way nothing set the wake, which is what the message says.
+        problems.append(f"sunday one-shot wake not set: {type(exc).__name__}: {exc}")
+        return problems, report
+
     try:
         schedule_setter(sunday)
     except Exception as exc:  # noqa: BLE001 - every failure here is the operator's to see
+        # ``stderr`` is text under the real setter, which passes ``text=True``, and bytes
+        # under a caller that does not. Decoding rather than interpolating is what keeps a
+        # ``b'...'`` repr out of the operator's line.
         detail = getattr(exc, "stderr", None) or ""
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", "replace")
         problems.append(
             f"sunday one-shot wake not set for {sunday.isoformat()}: "
             f"{type(exc).__name__}: {detail.strip() or exc}"
@@ -505,6 +559,13 @@ def sweep(
         if outcome.refusal is not None:
             problems.append(f"{name} did not run: {outcome.refusal}")
 
+    # Read before the ping, and each one contained. These are a summary of the run, and
+    # an uncontained raise between the ping and the file would lose the record and the
+    # digest on a night the check had already gone green.
+    gaps = _counted("gap count", lambda: count_gaps(root, day), report) if session else None
+    quarantined = _counted("quarantine count", lambda: count_quarantined(root), report)
+    pages_lost = _counted("lost-page count", lambda: undelivered(root, day), report)
+
     pinged = False
     if not problems:
         try:
@@ -521,9 +582,9 @@ def sweep(
         day=day,
         session=session,
         pinged=pinged,
-        gaps=count_gaps(root, day) if session else None,
-        quarantined=count_quarantined(root),
-        pages_lost=undelivered(root, day),
+        gaps=gaps,
+        quarantined=quarantined,
+        pages_lost=pages_lost,
         pieces=tuple(pieces),
         problems=tuple(problems),
         report=tuple(report),

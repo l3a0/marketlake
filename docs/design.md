@@ -357,7 +357,7 @@ Seven places in the code ping a check today, and six of them page when the ping 
 
 The seventh place in the code is `slice1-capture` below, and it is excluded on purpose. Its row was deleted when the slice-2 checks superseded it, so a refusal there is the expected answer, and paging would announce on every run that a retired check is missing.
 
-Where the once-per-slug guard lives follows from how long its site lives. A site that runs once per process pages at most once per run by construction and needs no state at all, which is compaction, the calendar probe, and the pre-open self-check. Two sites outlive a single ping, and each keeps a guard of its own.
+Where the once-per-slug guard lives follows from how long its site lives. A site that runs once per process pages at most once per run by construction and needs no state at all, which is compaction, the calendar probe, the pre-open self-check, and the vendor sweep. Two sites outlive a single ping, and each keeps a guard of its own.
 
 1. The capture dead-man pings roughly 390 times a session inside a daemon that outlives every one-shot job, so it keeps the guard in memory keyed by slug for as long as it lives.
 2. The Sunday job's own retry loop re-runs it every half hour until the canary deadline, which is seven attempts on an evening that starts at 20:00. So its guard lives in the loop, beside the reminder's own once-an-hour state, rather than inside the attempt.

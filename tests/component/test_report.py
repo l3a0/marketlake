@@ -610,7 +610,7 @@ def test_two_runs_on_one_night_both_survive(lake_root):
 def test_an_exception_message_stops_at_the_boundary(lake_root):
     """Two redactions, because the two fields carry a message in different shapes.
 
-    ``problems`` is a place and then an exception, so ``_redacted``'s keep-two-fields rule
+    ``problems`` is a place and then an exception, so ``redacted``'s keep-two-fields rule
     cuts it. A refusal is the exception alone, which is exactly two fields, so that rule
     would pass it through whole and ``refusal_class`` keeps the class instead. An
     ``OSError`` says the filename it failed on, which is an absolute path on the capture

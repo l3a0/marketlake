@@ -380,14 +380,14 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
      line and a golden, if a reinstall ever earns a step of its own.
 
   `render` also writes `restart.sh`, which restarts a resident job so it picks up new
-  code. Two of the five jobs can go stale, and the reason is the shape of the job rather
+  code. Two of the six jobs can go stale, and the reason is the shape of the job rather
   than anything about the code. The daemon and the dashboard are resident: launchd starts
   each once and `KeepAlive` relaunches it if it exits, so each holds the Python it
   imported at start. The venv is an editable install whose path entry is the absolute
   `src` directory, so editing that tree changes what a *new* process imports and nothing
-  about one already running. The self-check, the calendar probe and the Sunday job exec
-  fresh on every fire, so they always run current code. The script derives that pair from
-  `keep_alive` rather than listing it.
+  about one already running. The self-check, the calendar probe, the Sunday job and the
+  vendor sweep exec fresh on every fire, so they always run current code. The script
+  derives that pair from `keep_alive` rather than listing it.
 
   `launchctl kickstart -k` runs the service immediately whatever its launch conditions
   say, killing the running instance first if there is one. That is right when the code

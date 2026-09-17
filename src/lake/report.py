@@ -1,11 +1,11 @@
 """The ``reports/`` tree: report-tier findings, written down the minute they happen.
 
 The design gives report-tier findings no message of their own. They ride the nightly
-report, one dated file per night under ``reports/`` in the lake root, which sits inside
-the backup sync root and outside the manifest. D16 writes that file and D20 renders it,
-so the reader arrives later than the producers do. Compaction's finding is the exception,
-and the schema policy is what makes it one. A missing or retyped known field pages, so
-compaction pages once per run on top of filing here.
+report, one dated file per vendor-sweep run under ``reports/`` in the lake root, which
+sits inside the backup sync root and outside the manifest. ``lake.sweep`` writes that
+file and D20 renders it, so the reader arrives later than the producers do. Compaction's
+finding is the exception, and the schema policy is what makes it one. A missing or
+retyped known field pages, so compaction pages once per run on top of filing here.
 
 The close+5 guard is one of those producers and it has been finding things with nowhere
 to put them. Three of the design's rules for it end in "flags the nightly report", and
@@ -252,7 +252,7 @@ def write_close_guard(
         "baseline_less": list(outcome.baseline_less),
         "shortfalls": list(outcome.shortfalls),
         "refused": list(outcome.refused),
-        "problems": [_redacted(problem) for problem in outcome.problems],
+        "problems": [redacted(problem) for problem in outcome.problems],
         "spot_owed": list(outcome.spot_owed),
         "option_owed": list(outcome.option_owed),
         "sources_missing": list(outcome.sources_missing),
@@ -387,7 +387,7 @@ class Withheld:
 
     ``check`` names what refused the finding, and ``computed`` and ``against`` are the two
     numbers that check compared. Those are three fields rather than one joined string
-    because :func:`_redacted` cuts at the second ``": "``, so a finding written as
+    because :func:`redacted` cuts at the second ``": "``, so a finding written as
     ``instrument 42: 7.61406 against 7.61408: dividend_consistency`` would arrive without
     the check that refused it, silently.
 
@@ -396,7 +396,7 @@ class Withheld:
     that rendering files the class and drops the message. The rendering is the caller's
     contract rather than something the writer can enforce, and it is the contract the close+5
     guard already meets when it composes a problem as a place, a class, and a message.
-    ``_redacted`` keeps two fields, so the second is whatever the caller put first. A caller
+    ``redacted`` keeps two fields, so the second is whatever the caller put first. A caller
     handing over a bare message files that message's first field, which for an ``OSError`` is
     a path on the capture machine and is the leak this tree's redaction exists to stop. An
     empty rendering files no field at all rather than a finding claiming an exception with no
@@ -497,7 +497,7 @@ def write_withheld(
         # composed here rather than by the caller, because the rule keeps the first two
         # fields and a caller handing over two would have its message kept instead of
         # dropped. An empty rendering files nothing, rather than a bare place and a colon.
-        entry["exception"] = _redacted(f"{finding.symbol}: {finding.exception}")
+        entry["exception"] = redacted(f"{finding.symbol}: {finding.exception}")
     # A report is written inside a lake that exists, or not at all. The same rule the two
     # writers above follow, and for the same reason: `parents=True` from a missing root
     # would create the lake itself and turn "lake root missing" into a green check.
@@ -566,7 +566,7 @@ class PieceOutcome:
         dashboard may read and the digest goes to a phone, so the message stops here and
         the fuller string stays on the job's own stdout for a reader who has the log.
 
-        :func:`_redacted` cannot do it, because it keeps two fields and a refusal has
+        :func:`redacted` cannot do it, because it keeps two fields and a refusal has
         exactly two, so its rule would pass this through whole. Its own docstring names
         that limit: a shape it was not written for loses detail rather than leaking it.
         A refusal carrying no message, like the close guard's, has one field and survives.
@@ -584,7 +584,7 @@ class PieceOutcome:
             "unfiled": self.unfiled,
             "unchanged": self.unchanged,
             "skipped": self.skipped,
-            "subjects": [_redacted(subject) for subject in self.subjects],
+            "subjects": [redacted(subject) for subject in self.subjects],
         }
         if self.refusal is not None:
             entry["refusal"] = self.refusal_class
@@ -606,9 +606,11 @@ class Nightly:
     empty journal, and the one-line digest is what settles it, since a run whose walks found
     something would have nowhere to say so.
 
-    ``gaps`` is ``None`` when the day has no sealed partition to count, which is a different
-    answer from zero and has to stay one. Compaction seals at close+15, so an absent partition
-    at 18:30 says the seal did not happen rather than that the day was clean.
+    All three counts are ``int | None``, and ``None`` means no number rather than zero. For
+    ``gaps`` it also means the day has no sealed partition, which is a different answer from
+    zero and has to stay one: compaction seals at close+15, so an absent partition at 18:30
+    says the seal did not happen rather than that the day was clean. For any of the three it
+    can instead mean the read itself failed, and the ``report`` line beside it says which.
 
     ``problems`` are what withheld the ping. ``report`` are the report-tier findings, which
     ride this file and send no message of their own. ``SundayOutcome`` carries the same split
@@ -620,8 +622,8 @@ class Nightly:
     session: bool
     pinged: bool
     gaps: int | None = None
-    quarantined: int = 0
-    pages_lost: int = 0
+    quarantined: int | None = None
+    pages_lost: int | None = None
     pieces: tuple[tuple[str, PieceOutcome], ...] = ()
     problems: tuple[str, ...] = ()
     report: tuple[str, ...] = ()
@@ -681,8 +683,8 @@ def write_nightly(
         "disagreements": nightly.disagreements,
         "pages_lost": nightly.pages_lost,
         "pieces": {name: outcome.as_entry() for name, outcome in nightly.pieces},
-        "problems": [_redacted(problem) for problem in nightly.problems],
-        "report": [_redacted(line) for line in nightly.report],
+        "problems": [redacted(problem) for problem in nightly.problems],
+        "report": [redacted(line) for line in nightly.report],
     }
     # `parents=True` from a missing lake root would create the lake itself, which
     # `write_close_guard` and `alert._record` both refuse for the reason given there. A
@@ -699,7 +701,7 @@ def write_nightly(
     return path
 
 
-def _redacted(problem: str) -> str:
+def redacted(problem: str) -> str:
     """One of the guard's problems, with any exception message dropped.
 
     The guard composes a problem as a place, then what went wrong there, as in
@@ -736,6 +738,7 @@ __all__ = [
     "SchemaDrift",
     "Withheld",
     "close_guard_dir",
+    "redacted",
     "nightly_path",
     "schema_drift_dir",
     "withheld_dir",

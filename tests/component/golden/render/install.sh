@@ -17,8 +17,9 @@
 # reaches the install that would place it. Every command is echoed before it runs.
 # The last command reads back whether the daemon came up.
 #
-# Step 6, the standing Friday one-shot, is not here. It is not part of the first
-# install. Run it from the install text.
+# Step 6, the Sunday one-shot, is not here. Run it once from the install text.
+# From then on the 18:30 com.marketlake.eod-sweep job sets it every
+# Friday and reads it back.
 #
 # To reinstall after a re-render, run the uninstall first and this second:
 #

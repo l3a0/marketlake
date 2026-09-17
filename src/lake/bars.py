@@ -12,8 +12,9 @@ first and quarantining later, because a capture minute is perishable and a bar i
 serves a roughly 30-day one-minute lookback and daily bars indefinitely, so a bar refused
 tonight is re-fetchable tomorrow while a chain snapshot missed at 10:31 is gone.
 
-Run it with ``python -m lake.bars``. Nothing schedules it yet. marketlake #281 builds the
-evening sweep that will, and until then this is hand-run.
+Run it with ``python -m lake.bars`` to fetch by hand. ``lake.sweep`` is what schedules it:
+its 18:30 weekday job calls :func:`fetch_session_bars_from_config` for the session whose close
+has passed.
 
 What one run does, per ticker and per configured frequency, for one session.
 
@@ -1024,7 +1025,7 @@ def _land(
     # purpose: ``lake_lock`` is a blocking exclusive ``flock`` on the manifest, and a vendor
     # round trip inside it would put a network call in front of capture's per-minute append.
     # The 18:30 run sits after the last capture slot, so that contention is unreachable there,
-    # but this command is hand-run until #281 lands and a mid-session hand run is exactly what
+    # but a mid-session hand run of this command is exactly what
     # ships here. The entry is inside because ``manifest.py`` rests the backup watermark on
     # every lake write appending its entry under this lock, and an eighth writer outside it
     # would make that false and set the weekly scrub crying loss over a file the sync had not

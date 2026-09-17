@@ -991,7 +991,7 @@ def test_the_command_exits_one_when_a_finding_could_not_be_filed(
 def test_the_command_runs_the_sweep_and_reports_what_it_did(
     fixture_lake: FixtureLake, tmp_path: Path, capsys
 ):
-    """The ordinary run, which is the only way to exercise this until #281 schedules it."""
+    """The ordinary run. ``lake.sweep`` drives the same entry from its 18:30 job."""
     root = _lake(fixture_lake)
     config = write_config(tmp_path, root)
 

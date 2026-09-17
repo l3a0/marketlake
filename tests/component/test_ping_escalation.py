@@ -1,15 +1,17 @@
 """Every live producer escalates a refused ping, and every one of them is wired for it.
 
-Five jobs ping a health check. A slug with no row is refused on every one of their runs
+Six jobs ping a health check. A slug with no row is refused on every one of their runs
 forever, and the only symptom is silence, which is the symptom the check exists to
 report. So the page has to come from the producer that made the ping, and each of the
-five is covered here twice.
+six is covered here twice.
 
 1. The producer escalates. Given a publisher and a ping healthchecks refuses, it pages,
    and the page names the slug it pinged.
 2. The composition root hands it a real publisher. A seam that only tests reach is a
-   seam that silently goes unwired, and four of these five gained the seam in this
-   change.
+   seam that silently goes unwired, and four of the first five gained the seam in the
+   change that added it. The sixth, the vendor sweep, arrived already wired and is
+   covered in ``tests/component/test_eod_sweep.py`` rather than here, because its
+   composition root builds a whole run rather than one producer.
 
 The dead-man's root is the daemon's own wiring, so its case lives beside the other
 loop bindings in ``test_daemon_wiring.py``.
@@ -111,7 +113,7 @@ def _refused_pages(transport: FakeTransport) -> list[Message]:
     return [m for m in transport.messages if m.event == PING_REFUSED_EVENT]
 
 
-# -- 1. the five producers ----------------------------------------------------
+# -- 1. the producers ---------------------------------------------------------
 
 
 def test_the_compaction_job_escalates_a_refused_ping(tmp_path):
