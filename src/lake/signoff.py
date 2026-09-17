@@ -126,9 +126,10 @@ deliberate three ways.
 There is no confirmation prompt, because nothing in ``src/lake`` calls ``input()``.
 
 A lake-state failure keeps its traceback on purpose. ``manifest.latest_quarantine`` raises on a
-body line that parses and names no partition, and on a read that stopped with whole lines
-behind it, which is ``manifest.TornLedger``. Both are a corrupt ledger rather than an operator
-mistake, so the stack is what a reader needs. Both refuse the listing as well as the write,
+body line that parses and names no partition, on a read that stopped with whole lines
+behind it, which is ``manifest.TornLedger``, and on bytes that are not valid UTF-8, which is
+``manifest.LedgerNotUtf8``. All three are a corrupt ledger rather than an operator
+mistake, so the stack is what a reader needs. All three refuse the listing as well as the write,
 which is correct rather than an oversight: repairing a ledger is a hand edit under the lock,
 never an invocation of this tool. An entry that parses and names a
 partition while carrying no ``check`` is different: the reader resolves it without complaint,

@@ -715,9 +715,10 @@ def load_chain(
     1. A machine with no ``config.yaml`` raises ``ConfigError`` out of the resolution
        above. That says the machine is unconfigured.
     2. An overflow value that is not JSON raises ``ExtraProjectionError``.
-    3. A damaged ledger raises ``ManifestError``: a line naming no partition, or a
+    3. A damaged ledger raises ``ManifestError``: a line naming no partition, a
        quarantine ledger whose read stops with verdicts written behind it, which is
-       ``manifest.TornLedger``. The second refuses rather than admitting the partitions
+       ``manifest.TornLedger``, or one whose bytes are not valid UTF-8, which is
+       ``manifest.LedgerNotUtf8``. Those two refuse rather than admitting the partitions
        those verdicts withhold, which is what fail closed means for data already sealed.
 
     The last two say the lake's own files contradict their writers, so each raises the
