@@ -24,12 +24,19 @@ partition is refused by default and ``include_quarantined=True`` reads it anyway
 is that a bad partition stays on disk, which is deliberate: a capture minute is perishable and
 the verdict about it is not.
 
-**The entry's five fields, and why the reader pinned three of them.** ``manifest.is_quarantined``
-ships and fails closed, so a verdict it cannot read withholds its partition forever. The reader
-therefore decides ``partition`` and ``verdict``, and marketlake #139's human-precedence rule
-decides ``check`` and ``provenance`` before that tool is built. ``observed_at`` is the run's own
-stamp. :func:`build_entry` is the only place an entry is assembled, so a malformed one cannot
-be written by hand.
+**The entry's five fields, and why four of them were decided elsewhere.**
+``manifest.is_quarantined`` ships and fails closed, so a verdict it cannot read withholds its
+partition forever, and marketlake #139 states a precedence rule before its own tool is built.
+Between them they decide four of the five.
+
+1. ``partition``, which the reader keys on.
+2. ``verdict``, which the reader resolves.
+3. ``check``, which #139's rule compares.
+4. ``provenance``, which #139's rule reads to tell a human's row from the battery's.
+5. ``observed_at``, the run's own stamp, which is the one this module chose.
+
+:func:`build_entry` is the only place an entry is assembled, so a malformed one cannot be
+written by hand.
 
 ``partition`` is the lake-relative path, spelled exactly as ``LakePaths.partition_path``
 produces it. Case is load-bearing rather than cosmetic. ``loader.PartitionAbsent`` says why: on
@@ -75,11 +82,11 @@ flagged, which is exactly the set human precedence needs it to re-observe.
 
 1. A partition outside the ticker's capture spans. Capture was not running, so nothing about
    that partition is evidence about the feed. SPY's 2026-09-02 chains partition is the live
-   case: two rows with null ``bid`` and null ``ask``, and a staleness of 1,380,301 seconds,
-   which is 16 days. Both capture spans start 2026-09-08T17:07:00Z. Without this rule the first
+   case: two rows carrying a null ``ask``, at a staleness of 1,380,301 seconds, which is 16
+   days. Both capture spans start 2026-09-08T17:07:00Z. Without this rule the first
    run quarantines the lake's oldest partition and pages about a day-one probe.
 2. A partition holding no data rows. A gap row is the design's record that a minute was missed,
-   so a day of them is a correctly-recorded outage rather than a truncated fetch. Eight of the
+   so a day of them is a correctly-recorded outage rather than a truncated fetch. Sixteen of the
    lake's 29 sealed partitions are exactly this, 2026-09-08 through 2026-09-11 on both tickers
    and both surfaces.
 
@@ -98,14 +105,16 @@ silently, so the partition is quarantined and the run pages.
    60, so ``median > 60`` could never fire against this feed, and a 15-minute delay arriving
    under the same skew would read as -900 rather than +900.
 2. *The check is median-only and never judges a row.* The per-row maximum on QQQ 2026-09-14 is
-   1,789,392,600 seconds, about 56 years, and the other sessions top out between 22,674 and
+   1,789,392,600 seconds, which is 56.7 years, and the other sessions top out between 22,674 and
    87,263 seconds. The design says session-median for this reason, and the tail is why that
    wording is load-bearing. Quotes are clean by comparison, median 0.0 seconds over a -1.2 to
    +2.5 range.
 
-The flags themselves pass everywhere today. ``is_delayed`` is false on all 29,718,244 chain data
-rows with no nulls and ``realtime`` is true on all 2,436 quote data rows, so the staleness half
-carries the whole risk. ``onboard`` asserts both flags once, at onboarding, and nothing has
+The flags themselves pass everywhere today. ``is_delayed`` is false on all 29,715,426 chain data
+rows with no nulls, and ``realtime`` is true on all 2,436 quote data rows, so the staleness half
+carries the whole risk. The partitions hold 29,718,244 rows in all, and the 2,818 that make up
+the difference are gap rows, which carry a null flag because they carry no vendor observation.
+``onboard`` asserts both flags once, at onboarding, and nothing has
 watched them since.
 
 **A missing signal is not a passing one.** A partition whose surface should carry the flag and
@@ -114,13 +123,18 @@ pinned schema for both surfaces, so its absence is drift rather than an old part
 answering drift with a pass is what fail-closed exists to prevent. ``schema_versions`` is the
 ledger that says a column was never captured, and nothing in the lake's sealed rows reaches it.
 
-**One page class ships here, not two.** The design's message table gives the battery one row,
+**One page ships here, and the design gives the battery two.** This one is
 ``Delayed feed: partitions quarantined`` at priority 5, carrying the session-median staleness
-and the partitions quarantined. Schema drift's row names the parser and compaction as its
-producers and both already ship. The page follows the once-on-the-transition rule the auth path,
-the watchdog and both schema-drift producers already carry, and the transition here is the
-ledger's own: a partition already quarantined under this check does not page again, because its
-entry is what says the operator was already told.
+and the partitions quarantined. The other is the battery's own nightly schema drift, which the
+message table lists beside the parser's and compaction's and gives its own title,
+``Schema drift: <field> missing`` or ``retyped``, fired once per field per day. That one belongs
+to the schema-drift check rather than to this one, and marketlake #427 carries it, because
+nothing here reads a payload's key set.
+
+The page follows the once-on-the-transition rule the auth path, the watchdog and both shipped
+schema-drift producers already carry. The transition here is the ledger's own: a partition
+already quarantined under this check does not page again, because its entry is what says the
+operator was already told.
 """
 
 from __future__ import annotations
@@ -133,8 +147,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from lake.alert import REFUSED, Message, Publisher
-from lake.calendar import MARKET_TZ
-from lake.capture_spans import CaptureSpan, CaptureSpans, spans_path
+from lake.calendar import MARKET_TZ, Calendar, NotASession
+from lake.capture_spans import CaptureSpan, CaptureSpans, CaptureSpansError, spans_path
 from lake.config import GuardConstants
 from lake.journal import ROW_KIND_COLUMN, ROW_KIND_DATA
 from lake.manifest import (
@@ -205,6 +219,7 @@ ENTITLEMENT_FLAGS: dict[str, tuple[str, bool]] = {
 
 # The two stamps staleness is the difference of. Both are ISO-8601 strings on every row rather
 # than timestamps, so the read parses them.
+SNAP_TS = "snap_ts"
 FETCH_TS = "fetch_ts"
 VENDOR_QUOTE_TS = "vendor_quote_ts"
 
@@ -279,6 +294,7 @@ class BatteryReport:
     out_of_scope: int = 0
     deferred: int = 0
     unreadable: int = 0
+    scope_unknown: int = 0
     appended: tuple[str, ...] = ()
     paged: tuple[str, ...] = ()
     report: tuple[str, ...] = ()
@@ -422,12 +438,40 @@ def _transition(current: dict | None, finding: Finding) -> bool:
     shape, because ``manifest.is_quarantined`` is what a partition's readability actually
     depends on, and an entry whose spelling drifted while its effect did not is still the same
     news.
+
+    **A pass never clears a verdict it did not write.** The ledger resolves by last entry per
+    partition, which the design pins, so a ``clean`` line appended over another check's
+    quarantine un-quarantines the partition outright. One check passing says nothing about
+    another check's finding, and it says nothing at all about a human's. So a ``clean`` finding
+    is a transition only against an entry from its own check, while a quarantine may always
+    supersede. :func:`clears_another_check` is the case, and :func:`judge` reports it rather
+    than passing over it in silence.
+
+    The price is named rather than hidden. Two checks withholding one partition leave one
+    entry, so the second to clear un-quarantines it while the first still fails. That cannot
+    arise yet, because one check exists. Marketlake #426 carries it, and it has to be settled
+    before #407 lands the next three.
     """
     if current is None:
         return finding.withholds
+    if clears_another_check(current, finding):
+        return False
     if current.get("check") != finding.check:
         return True
     return is_quarantined(current) != finding.withholds
+
+
+def clears_another_check(current: dict | None, finding: Finding) -> bool:
+    """Whether appending this finding would clear a quarantine some other check wrote.
+
+    The shape that makes this load-bearing: a human quarantines a partition for a missing
+    expiry, tonight's entitlement check finds the feed real-time, and a ``clean`` line under
+    ``realtime_entitlement`` becomes the last entry. The reader then reads the partition,
+    because the reader honours the last entry and nothing else.
+    """
+    if current is None or finding.withholds:
+        return False
+    return is_quarantined(current) and current.get("check") != finding.check
 
 
 # -- scope -------------------------------------------------------------------
@@ -486,41 +530,78 @@ def sealed_partitions(lake_root: Path | str, *, day: date | None = None) -> list
     return found
 
 
+class ScopeUnknown(BatteryError):
+    """Raised when the reference files cannot say whether capture was running.
+
+    It is not the same answer as out of scope and must never be reported as one. Out of scope
+    is a fact about the lake: capture was not running, so nothing in the partition is evidence.
+    This is the absence of that fact, and a delayed feed passing under it would pass in silence.
+    """
+
+
 def capture_spans_by_ticker(
-    lake_root: Path | str, tickers: Iterable[str], *, on: date
+    lake_root: Path | str, tickers: Iterable[str]
 ) -> dict[str, tuple[CaptureSpan, ...]]:
-    """Each ticker's capture spans, resolved through the master as of ``on``.
+    """Each partition directory's capture spans, keyed by the directory's own ticker spelling.
 
-    ``on`` is the run's own date rather than the judged day, and that is deliberate. It is
-    passed in rather than read off a wall clock, which is ``clock.py``'s rule for every module
-    but that one. Marketlake #405 is the
-    dashboard resolving the same lookup as of the queried day, where a day before the master's
-    ``valid_from`` resolves nothing and the ticker silently loses its clamp. Resolving as of now
-    cannot fail that way, and the spans themselves already bound the window, so the resolution
-    date is doing no work the spans are not.
+    **The instrument is found across every spelling it ever carried, not at a point in time.**
+    Two failures sit on either side of a point-in-time lookup and this avoids both.
 
-    A missing master or a missing spans file leaves the mapping empty. What that means here is
-    the opposite of what it means on the dashboard, and :func:`in_scope` is where the difference
-    lives: a panel without a clamp renders one day unclamped, while a battery without a clamp
-    would judge partitions capture was never running for.
+    1. Resolving as of the judged day loses the clamp on any day before the master's
+       ``valid_from``, which is marketlake #405 on the dashboard: the ticker drops out of the
+       mapping and every minute renders as missing.
+    2. Resolving as of the run date loses it after a rename. ``SecurityMaster.remap`` closes the
+       old mapping, so every partition still sitting under the old ``ticker=`` directory
+       resolves to nothing and goes unjudged, silently and permanently.
+
+    The second is not hypothetical here. ``continuity`` states the same rule for the OCC side,
+    "Not ``SecurityMaster.resolve``", and ``b21edfb`` shipped that fix for the OI view this
+    week. A directory name is a spelling the lake once wrote, so the question it asks is which
+    instrument ever went by it, and that is answered from the mapping rows rather than from a
+    date.
+
+    A spelling two instruments have both carried is disambiguated by the day, because then the
+    directory alone genuinely does not say which. That case raises rather than guessing.
+
+    **A reference file that is missing or unreadable raises.** It does not return an empty
+    mapping. An empty mapping reaches :func:`in_scope` as "capture was not running", which is a
+    fact this function does not have, and a delayed feed would then pass under a reason that
+    says something untrue.
     """
     root = Path(lake_root)
     try:
         master = SecurityMaster.read(master_path(root))
+    except FileNotFoundError as exc:
+        raise ScopeUnknown(f"no security master at {master_path(root)}") from exc
+    except SecurityMasterError as exc:
+        raise ScopeUnknown(f"security master unreadable: {exc}") from exc
+    try:
         spans = CaptureSpans.read(spans_path(root))
-    except FileNotFoundError:
-        return {}
+    except FileNotFoundError as exc:
+        raise ScopeUnknown(f"no capture spans at {spans_path(root)}") from exc
+    except CaptureSpansError as exc:
+        raise ScopeUnknown(f"capture spans unreadable: {exc}") from exc
+
+    by_spelling: dict[str, set[int]] = {}
+    for mapping in master.mappings:
+        if mapping.id_type != ID_TYPE_TICKER:
+            continue
+        by_spelling.setdefault(mapping.id_value, set()).add(mapping.instrument_id)
+
     result: dict[str, tuple[CaptureSpan, ...]] = {}
     for ticker in tickers:
-        try:
-            instrument_id = master.resolve(ticker, on=on, id_type=ID_TYPE_TICKER)
-        except SecurityMasterError:
-            continue
-        if instrument_id is None:
-            continue
-        found = tuple(spans.spans_of(instrument_id))
-        if found:
-            result[ticker] = found
+        instruments = by_spelling.get(ticker, set())
+        if not instruments:
+            raise ScopeUnknown(f"the security master knows no instrument spelled {ticker!r}")
+        if len(instruments) > 1:
+            raise ScopeUnknown(
+                f"{ticker!r} names {len(instruments)} instruments in the master, so the "
+                "partition directory does not say which"
+            )
+        found = tuple(spans.spans_of(next(iter(instruments))))
+        if not found:
+            raise ScopeUnknown(f"{ticker!r} resolves to an instrument with no capture span")
+        result[ticker] = found
     return result
 
 
@@ -546,6 +627,20 @@ def in_scope(partition: SealedPartition, spans: tuple[CaptureSpan, ...]) -> bool
     start = datetime.combine(partition.day, datetime.min.time(), tzinfo=MARKET_TZ)
     end = start + timedelta(days=1)
     return any(_overlaps(span, start, end) for span in spans)
+
+
+def _session_bounds(calendar: Calendar, day: date) -> tuple[datetime, datetime] | None:
+    """The session's open and option close for ``day``, or ``None`` off a session.
+
+    ``None`` widens the staleness median to every data row. A sealed partition on a day the
+    calendar calls closed has no session to take a median over, and the alternative, refusing
+    it, would quarantine a partition for a calendar disagreement rather than for a feed fault.
+    The flag half still runs, which is the half that could see a delayed feed on such a day.
+    """
+    try:
+        return calendar.session_open(day), calendar.option_close(day)
+    except NotASession:
+        return None
 
 
 def _overlaps(span: CaptureSpan, start: datetime, end: datetime) -> bool:
@@ -576,27 +671,44 @@ class Entitlement:
     for both surfaces, so a null in it is the vendor declining to say, and a check that answers
     "declined to say" with a pass is not failing closed.
 
-    ``median_staleness`` is fetch time minus vendor quote time, in seconds, across the
-    partition's data rows. ``None`` means no row carried both stamps.
+    ``session_rows`` counts the data rows whose ``snap_ts`` falls inside the trading session.
+    ``median_staleness`` is fetch time minus vendor quote time, in seconds, across those rows
+    alone. ``None`` means none of them carried both stamps.
+
+    **The staleness half is session-only and the flag half is not**, which is the design's own
+    split: the flags "must show real-time on every snapshot", while staleness is the *session*
+    median. The reason is mechanical. A vendor's last-quote stamp freezes when the market is
+    closed while ``fetch_ts`` keeps moving, so an overnight cycle carries hours of staleness on
+    a feed that is real-time by every other measure. Both 2026-09-16 chain partitions in the
+    live lake hold such rows, about 12,000 each at 03:25 UTC, which is 0.24 percent of the
+    partition today. A session that captured only an overnight cycle would be all of it, and
+    the check would quarantine a partition whose feed was fine.
     """
 
     rows: int
     flag_present: bool
     flag_violations: int
     median_staleness: float | None
+    session_rows: int = 0
 
 
-def read_entitlement(partition: SealedPartition) -> Entitlement:
+def read_entitlement(
+    partition: SealedPartition, bounds: tuple[datetime, datetime] | None = None
+) -> Entitlement:
     """Read one partition's entitlement evidence, two columns plus the flag.
 
-    Only three columns are read, so the cost is the parse rather than the file. Through duckdb
-    at the dashboard's own settings the whole-lake staleness scan took 3.2 seconds against
-    29,718,244 chain rows, and the two stamps being ISO strings rather than timestamps is where
-    that time goes.
+    Only four columns are read, so the cost is the parse rather than the file. The two stamps
+    are ISO strings rather than timestamps, and that parse is where the time goes: a whole-lake
+    duckdb scan of the difference over 29,718,244 chain rows took about 4 seconds unconstrained
+    and about 11 at ``dashboard.open_lake_connection``'s ``threads=2`` and ``memory_limit=2GB``.
+    This module is not the dashboard and takes neither cap.
 
-    The median is taken over the whole partition rather than per snapshot. The design says
-    session-median and the reason is the tail: the per-row maximum on QQQ 2026-09-14 is
-    1,789,392,600 seconds, so any per-row rule would quarantine a healthy feed.
+    The median is taken over the session's rows rather than per snapshot. The design says
+    session-median and the tail is why per-row would not do: the maximum on QQQ 2026-09-14 is
+    1,789,392,600 seconds, 56.7 years, so any per-row rule would quarantine a healthy feed.
+    ``bounds`` is
+    that session, open through option close, and ``None`` widens the median to every data row,
+    which only a caller that has no calendar should pass.
     """
     import pyarrow.compute as pc
     import pyarrow.parquet as pq
@@ -607,7 +719,7 @@ def read_entitlement(partition: SealedPartition) -> Entitlement:
     except Exception as exc:  # noqa: BLE001 - one damaged file must not cost the run
         raise PartitionUnreadable(f"{partition.relative}: {type(exc).__name__}: {exc}") from exc
 
-    wanted = [ROW_KIND_COLUMN, FETCH_TS, VENDOR_QUOTE_TS]
+    wanted = [ROW_KIND_COLUMN, SNAP_TS, FETCH_TS, VENDOR_QUOTE_TS]
     flag_present = flag in available
     if flag_present:
         wanted.append(flag)
@@ -634,12 +746,41 @@ def read_entitlement(partition: SealedPartition) -> Entitlement:
         agreeing = pc.sum(pc.equal(column, wanted_value)).as_py() or 0
         violations = rows - agreeing
 
+    in_session = _within(table, partition, bounds)
     return Entitlement(
         rows=rows,
         flag_present=flag_present,
         flag_violations=violations,
-        median_staleness=_median_staleness(table, partition),
+        median_staleness=_median_staleness(in_session, partition),
+        session_rows=in_session.num_rows,
     )
+
+
+def _within(table, partition: SealedPartition, bounds: tuple[datetime, datetime] | None):
+    """The data rows whose ``snap_ts`` falls inside the session, or all of them without bounds.
+
+    ``snap_ts`` is the minute slot a cycle fired for, which is the lake's own statement of when
+    the row was taken. ``fetch_ts`` would answer nearly the same question and is the wrong one:
+    it is the clock this check is measuring against, so filtering on it would let a skewed
+    clock decide which rows judge the skew.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    if bounds is None:
+        return table
+    opened, closed = bounds
+    try:
+        taken = pc.cast(table[SNAP_TS], pa.timestamp("us", tz="UTC"))
+    except pa.ArrowInvalid as exc:
+        raise PartitionUnreadable(
+            f"{partition.relative}: {SNAP_TS} will not parse as a zone-aware timestamp: {exc}"
+        ) from exc
+    inside = pc.and_(
+        pc.greater_equal(taken, pa.scalar(opened, type=taken.type)),
+        pc.less_equal(taken, pa.scalar(closed, type=taken.type)),
+    )
+    return table.filter(inside)
 
 
 def _median_staleness(table, partition: SealedPartition) -> float | None:
@@ -701,7 +842,9 @@ def judge_entitlement(
        be that strict because it is the vendor's own statement rather than a measurement:
        ``is_delayed`` is false on all 29,718,244 chain data rows the lake holds with no nulls,
        and ``realtime`` is true on all 2,436 quote data rows.
-    3. No row carried both stamps, so the staleness half could not run at all.
+    3. No *session* row carried both stamps, so the staleness half could not run at all. A
+       partition with no session row at all is a different answer and comes back out of scope,
+       because a day of overnight cycles recorded no session rather than a bad one.
     4. The session-median staleness exceeds ``staleness_page_seconds`` in **magnitude**. The
        comparison is on magnitude because the real median is negative, -0.7 to -2.1 seconds on
        chains, from ordinary clock skew between the vendor's clock and this machine's. A signed
@@ -710,6 +853,9 @@ def judge_entitlement(
 
     A partition with no data rows never reaches here. :func:`judge` returns it out of scope
     first, because a day of gap rows is a correctly-recorded outage.
+
+    The flag half reads every data row and the staleness half reads only the session's, which
+    is the design's own split and :class:`Entitlement` carries the reason.
     """
     flag, wanted = ENTITLEMENT_FLAGS[partition.surface]
     limit = float(guards.staleness_page_seconds)
@@ -729,11 +875,18 @@ def judge_entitlement(
             computed=float(evidence.flag_violations),
             against=0.0,
         )
+    if evidence.session_rows == 0:
+        return _entitlement_finding(
+            partition,
+            OUT_OF_SCOPE,
+            "no data row falls inside the session, so the partition carries no session "
+            "observation to take a median over",
+        )
     if evidence.median_staleness is None:
         return _entitlement_finding(
             partition,
             QUARANTINED_VERDICT,
-            f"no data row carries both {FETCH_TS} and {VENDOR_QUOTE_TS}, "
+            f"no session data row carries both {FETCH_TS} and {VENDOR_QUOTE_TS}, "
             "so staleness cannot be measured",
         )
     if abs(evidence.median_staleness) > limit:
@@ -784,6 +937,7 @@ def judge(
     lake_root: Path | str,
     *,
     now: datetime,
+    calendar: Calendar,
     day: date | None = None,
     guards: GuardConstants | None = None,
     publisher: Publisher | None = None,
@@ -818,9 +972,14 @@ def judge(
     root = Path(lake_root)
     guards = GuardConstants() if guards is None else guards
     partitions = sealed_partitions(root, day=day)
-    spans = capture_spans_by_ticker(
-        root, {p.ticker for p in partitions}, on=now.astimezone(MARKET_TZ).date()
-    )
+    try:
+        spans = capture_spans_by_ticker(root, {p.ticker for p in partitions})
+    except ScopeUnknown as exc:
+        # Not a silent pass. Every partition would otherwise take the out-of-scope path, whose
+        # reason says capture was not running, which is a fact this run does not have. The
+        # command exits non-zero on this for the same reason it does on an unreadable
+        # partition: the lake's health is unknown rather than good.
+        return BatteryReport(scope_unknown=len(partitions), report=(f"battery: {exc}",))
     current = latest_quarantine(root)
 
     findings: list[Finding] = []
@@ -840,7 +999,7 @@ def judge(
             )
             continue
         try:
-            evidence = read_entitlement(partition)
+            evidence = read_entitlement(partition, _session_bounds(calendar, partition.day))
         except PartitionUnreadable as exc:
             unreadable += 1
             report.append(f"battery: {exc}")
@@ -865,6 +1024,13 @@ def judge(
             report.append(
                 f"battery: {finding.partition} re-observed, human precedence stands "
                 f"({finding.reason})"
+            )
+            continue
+        if clears_another_check(entry, finding):
+            deferred += 1
+            report.append(
+                f"battery: {finding.partition} passes {finding.check} and stays quarantined "
+                f"under {entry.get('check')!r}"
             )
             continue
         if not _transition(entry, finding):
@@ -983,6 +1149,7 @@ def judge_from_config(
     The guard constants come from the same config, so a recalibrated
     ``staleness_page_seconds`` takes effect on the next run rather than at the next release.
     """
+    from lake.calendar import ExchangeCalendar
     from lake.clock import SystemClock
     from lake.config import load_config
 
@@ -991,6 +1158,7 @@ def judge_from_config(
     return judge(
         config.lake_root,
         now=clock.now(),
+        calendar=ExchangeCalendar(),
         day=day,
         guards=config.guards,
         publisher=publisher,
@@ -1035,6 +1203,7 @@ def render(report: BatteryReport) -> str:
         f"  insufficient history: {report.insufficient_history}",
         f"  human precedence:     {report.deferred}",
         f"  unreadable:           {report.unreadable}",
+        f"  scope unknown:        {report.scope_unknown}",
         f"  ledger lines written: {len(report.appended)}",
     ]
     lines.extend(f"  {line}" for line in report.report)
@@ -1054,9 +1223,10 @@ def main(argv: Sequence[str] | None = None, *, clock=None) -> int:
     different repairs.
 
     **A quarantine is not an error.** A run that found a delayed feed did its job, so it exits
-    0. What exits 1 is a run that could not judge something it was asked to judge, which is the
-    unreadable count, because that is the case where the lake's health is unknown rather than
-    bad.
+    0. What exits 1 is a run that could not judge something it was asked to judge: the
+    unreadable count and the scope-unknown count, because those are the cases where the lake's
+    health is unknown rather than bad. A run that judged nothing because the reference files
+    could not be read must not read like a clean night.
     """
     args = _build_parser().parse_args(argv)
 
@@ -1084,7 +1254,7 @@ def main(argv: Sequence[str] | None = None, *, clock=None) -> int:
 
     print("battery:")
     print(render(report))
-    return 1 if report.unreadable else 0
+    return 1 if report.unreadable or report.scope_unknown else 0
 
 
 if __name__ == "__main__":  # pragma: no cover - the module entry
@@ -1109,10 +1279,12 @@ __all__ = [
     "Entitlement",
     "Finding",
     "PartitionUnreadable",
+    "ScopeUnknown",
     "SealedPartition",
     "append_verdict",
     "build_entry",
     "capture_spans_by_ticker",
+    "clears_another_check",
     "entry_line_count",
     "human_precedence",
     "in_scope",

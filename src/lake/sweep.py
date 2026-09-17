@@ -14,16 +14,16 @@ What one run does, in the design's own order.
    rows: ``actions.extract_dividends`` reads quotes and ``splits.detect_splits`` reads chains.
 2. The bar fetch, ``bars.fetch_session_bars``. The close cross-check is inside it.
 3. The validation battery, ``battery.judge``, which judges the sealed chains and quotes
-   partitions and writes a quarantine verdict for what fails.
+   partitions and writes a quarantine verdict for what fails. The design places it between the
+   bar fetch and the Friday branch, which is where this list puts it.
 4. The Friday branch, which sets the Sunday one-shot wake and reads it back.
 5. The ping.
 6. The dated report file under ``reports/``.
 7. The digest, at priority 2.
 
-The battery the design names between steps 2 and 3 is ``lake.battery``, and step 2.5 below is
-where it runs. Marketlake #406 built its spine and the real-time entitlement check. The other
-seal-then-flag checks are its siblings under #138 and plug into the same writer, so nothing here
-changes when they land.
+The battery is ``lake.battery``, at step 3 above. Marketlake #406 built its spine and the
+real-time entitlement check. The other seal-then-flag checks are its siblings under #138 and plug
+into the same writer, so nothing here changes when they land.
 
 **Its failure does not withhold the ping, and that is a decision rather than the default.** The
 ``eod-sweep`` row says a missed ping means the day's official bars or actions are missing, and a
@@ -202,8 +202,8 @@ def count_gaps(lake_root: Path | str, day: date) -> int | None:
 
     A quarantined partition is counted like any other. Quarantine is a verdict about whether
     data can be trusted, and this is a count of minutes capture missed, which a later verdict
-    does not change. Nothing writes a verdict until marketlake #138's battery does, so the
-    condition has arisen zero times either way.
+    does not change. ``lake.battery`` runs earlier in this same invocation, so the condition can
+    now arise on a night the battery quarantines something, and the answer is unchanged by it.
     """
     import pyarrow.compute as pc
     import pyarrow.parquet as pq
@@ -233,7 +233,8 @@ def count_quarantined(lake_root: Path | str) -> int:
     This is the whole ledger's open count rather than tonight's new findings. From the first
     verdict until a human signs it off, every night's file carries a standing non-zero number.
     That is quarantine being loud on purpose. What separates a new finding from an old one is
-    ``battery_appended`` beside it, which counts the lines this run wrote.
+    :attr:`lake.battery.BatteryReport.appended`, which this run reports as the line
+    ``battery wrote N quarantine lines`` under ``Nightly.report``.
     """
     root = Path(lake_root)
     return sum(1 for entry in latest_quarantine(root).values() if is_quarantined(entry))
@@ -325,8 +326,10 @@ class SweepOutcome:
     working.
 
     ``battery`` is what :func:`lake.battery.judge` returned, or ``None`` on a holiday and on a
-    run whose battery refused. Its counts reach the report file through ``report`` too, and
-    this is where the command's sign-off block reads them from.
+    run whose battery refused. :meth:`render` prints its census, because a night that judged
+    nothing and a night that judged the lake and found it clean are different answers and a
+    block that printed neither would render them the same. ``lake.battery.render`` states that
+    rule for the hand run and this is the same rule for the job's own block.
     """
 
     nightly: Nightly
@@ -366,6 +369,17 @@ class SweepOutcome:
                     f"  {name}: landed {outcome.landed} held {outcome.held}"
                     f" unchanged {outcome.unchanged} skipped {outcome.skipped}"
                 )
+        if self.battery is None:
+            lines.append("  battery: did not run")
+        else:
+            lines.append(
+                f"  battery: judged {self.battery.judged}"
+                f" quarantined {self.battery.quarantined} clean {self.battery.cleared}"
+                f" out_of_scope {self.battery.out_of_scope}"
+                f" scope_unknown {self.battery.scope_unknown}"
+                f" unreadable {self.battery.unreadable}"
+                f" wrote {len(self.battery.appended)}"
+            )
         lines.append(
             f"  gaps={'unsealed' if nightly.gaps is None else nightly.gaps}"
             f" quarantined={nightly.quarantined}"
@@ -582,7 +596,7 @@ def sweep(
                 )
             )
 
-    # Step 2.5, the design's own placement: after the bar fetch and before the Friday branch.
+    # Step 3, the design's own placement: after the bar fetch and before the Friday branch.
     # Contained in its own tuple for the reason ``_LEDGER_REFUSALS`` exists, and with a broad
     # catch under it. The partitions most likely to make this raise are the ones a battery would
     # quarantine, and it opens every one of them on purpose, so an uncontained raise here would
@@ -593,6 +607,7 @@ def sweep(
             battery = judge(
                 root,
                 now=now,
+                calendar=calendar,
                 day=day,
                 guards=guards,
                 publisher=publisher,

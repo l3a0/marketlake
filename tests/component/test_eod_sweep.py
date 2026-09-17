@@ -31,6 +31,7 @@ from lake import journal, report, sweep
 from lake.alert import Publisher
 from lake.bars import CHECK_BAR_CLOSE
 from lake.calendar import NotASession
+from lake.capture_spans import CaptureSpan, CaptureSpans
 from lake.cassette import Cassette
 from lake.control_plane import EOD_SWEEP_SLUG, SUNDAY_WAKE, pmset_schedule_args
 from lake.paths import CHAINS, QUOTES
@@ -212,7 +213,13 @@ def _lake(
     quotes: dict[tuple[str, date], list[dict]] | None = None,
     chains: dict[tuple[str, date], pa.Table] | None = None,
 ) -> Path:
-    """A lake holding the next session's sealed quotes, the ledger and the master."""
+    """A lake holding the next session's sealed quotes, the ledger, the master and the spans.
+
+    The capture spans are here so the battery at step 2.5 judges rather than reporting that it
+    could not tell whether capture was running. A fixture without them exercises the wiring
+    only in the mode where the battery judges nothing, which is the one mode that cannot show
+    the wiring working.
+    """
     if quotes is None:
         quotes = {("SPY", FOLLOWING): [_quote_row(FOLLOWING)]}
     for (ticker, day), rows in quotes.items():
@@ -220,9 +227,25 @@ def _lake(
     for (ticker, day), table in (chains or {}).items():
         fixture_lake.with_chains(ticker, day, table)
     fixture_lake.with_reference("schema_versions", _ledger_table())
+    fixture_lake.with_reference("capture_spans", _spans().to_table())
     root = fixture_lake.build()
     _master().write(master_path(root))
     return root
+
+
+def _spans(instrument_ids: tuple[int, ...] = (1,)) -> CaptureSpans:
+    """One open capture span per instrument, opening when ``_master`` says capture began."""
+    return CaptureSpans(
+        [
+            CaptureSpan(
+                instrument_id=instrument_id,
+                start=datetime(2026, 9, 8, 17, 7, tzinfo=UTC),
+                end=None,
+                options=True,
+            )
+            for instrument_id in instrument_ids
+        ]
+    )
 
 
 def _run(
@@ -1258,15 +1281,17 @@ def test_the_battery_runs_on_a_session_and_its_counts_reach_the_outcome(
 ):
     """The design places it between the bar fetch and the Friday branch, and this is it.
 
-    The fixture lake has no capture spans, so every partition is out of scope and the run
-    judges nothing. That is the right answer rather than a gap in the test: what it asserts is
-    that the battery ran at all, which is what nothing in this module could assert before.
+    The fixture lake carries the master and the spans, so the battery judges rather than
+    reporting that it could not tell whether capture was running. The sealed quotes partition
+    is the one it judges, and the fixture's rows are real-time and in-session, so it comes back
+    clean and the ledger stays empty.
     """
     root = _lake(fixture_lake)
 
     outcome, _, _ = _run(root)
 
     assert outcome.battery is not None
+    assert outcome.battery.scope_unknown == 0
     assert outcome.battery.appended == ()
 
 

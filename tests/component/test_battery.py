@@ -47,7 +47,20 @@ from lake.battery import (
 )
 from lake.capture_spans import CaptureSpan
 from lake.config import GuardConstants
-from lake.manifest import CLEAN_VERDICT, latest_quarantine, read_quarantine, scrub
+from lake.manifest import (
+    CLEAN_VERDICT,
+    is_quarantined,
+    latest_quarantine,
+    read_quarantine,
+    scrub,
+)
+from tests.support.calendar import weekday_sessions
+
+# The weeks these tests judge in. A regular session opens 09:30 and closes 16:00 Eastern, so
+# the option close lands at 16:15 and every row ``_row`` builds falls inside it.
+CALENDAR = weekday_sessions(
+    date(2026, 8, 17), date(2026, 8, 24), date(2026, 8, 31), date(2026, 9, 14)
+)
 
 NOW = datetime(2026, 9, 16, 22, 30, tzinfo=UTC)
 DAY = date(2026, 9, 16)
@@ -366,7 +379,7 @@ def test_the_run_leaves_a_human_sign_off_standing_and_says_so(lake: Path):
     append_verdict(lake, signed_off, observed_at=NOW)
     before = read_quarantine(lake)
 
-    report = judge(lake, now=NOW, guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     assert report.deferred == 1
     assert report.appended == ()
@@ -382,7 +395,7 @@ def test_a_clean_verdict_for_an_unjudged_partition_writes_nothing(lake: Path):
     _write(lake, "chains", "SPY", DAY, _clean_rows("chains"))
     _seed_spans(lake)
 
-    report = judge(lake, now=NOW, guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     assert report.cleared == 1
     assert report.appended == ()
@@ -394,11 +407,11 @@ def test_the_second_run_against_an_unchanged_lake_appends_nothing(lake: Path):
     _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
     _seed_spans(lake)
 
-    first = judge(lake, now=NOW, guards=GuardConstants())
+    first = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
     assert len(first.appended) == 1
     after_first = read_quarantine(lake)
 
-    second = judge(lake, now=NOW + timedelta(days=1), guards=GuardConstants())
+    second = judge(lake, calendar=CALENDAR, now=NOW + timedelta(days=1), guards=GuardConstants())
 
     assert second.quarantined == 1
     assert second.appended == ()
@@ -409,10 +422,10 @@ def test_a_partition_that_recovers_gets_a_superseding_clean_line(lake: Path):
     """The other direction of the same transition rule, which is what un-quarantines."""
     _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
     _seed_spans(lake)
-    judge(lake, now=NOW, guards=GuardConstants())
+    judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=-1.7))
-    report = judge(lake, now=NOW + timedelta(days=1), guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW + timedelta(days=1), guards=GuardConstants())
 
     assert len(report.appended) == 1
     entries = read_quarantine(lake)
@@ -454,7 +467,7 @@ def test_a_day_before_every_capture_span_is_out_of_scope(lake: Path):
     _write(lake, "chains", "SPY", early, _clean_rows("chains", staleness=1_380_301.0))
     _seed_spans(lake, start=SPAN_START)
 
-    report = judge(lake, now=NOW, guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     assert report.out_of_scope == 1
     assert report.quarantined == 0
@@ -471,7 +484,7 @@ def test_a_day_inside_a_span_is_judged_even_when_the_span_opens_mid_session(lake
     _write(lake, "chains", "SPY", DAY, _clean_rows("chains"))
     _seed_spans(lake, start=datetime(2026, 9, 16, 17, 0, tzinfo=UTC))
 
-    report = judge(lake, now=NOW, guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     assert report.judged == 1
     assert report.out_of_scope == 0
@@ -487,26 +500,60 @@ def test_a_partition_of_gap_rows_alone_is_out_of_scope_not_a_failure(lake: Path)
     _write(lake, "chains", "SPY", DAY, rows)
     _seed_spans(lake)
 
-    report = judge(lake, now=NOW, guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     assert report.out_of_scope == 1
     assert report.quarantined == 0
     assert report.appended == ()
 
 
-def test_a_ticker_with_no_span_is_out_of_scope_rather_than_judged_unclamped(lake: Path):
-    """The battery makes the opposite call from the dashboard, and on purpose.
+def test_a_ticker_the_master_does_not_know_is_scope_unknown_rather_than_out_of_scope(
+    lake: Path,
+):
+    """The two answers are opposites and must never be spelled the same.
 
-    A panel refusing to render is worse than one rendering without a clamp. A verdict written
-    without a clamp is worse than no verdict, because the loader then refuses real data.
+    Out of scope is a fact: capture was not running, so nothing in the partition is evidence.
+    This is the absence of that fact. Reporting it as out of scope would let a delayed feed
+    pass under a reason that says something untrue, with no page and a zero exit code.
     """
     _write(lake, "chains", "QQQ", DAY, _clean_rows("chains", staleness=900.0))
     _seed_spans(lake)
 
-    report = judge(lake, now=NOW, guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
-    assert report.out_of_scope == 1
+    assert report.scope_unknown == 1
+    assert report.out_of_scope == 0
     assert report.quarantined == 0
+    assert report.appended == ()
+    assert any("knows no instrument spelled 'QQQ'" in line for line in report.report)
+
+
+@pytest.mark.parametrize("missing", ["security_master", "capture_spans"])
+def test_a_reference_file_that_cannot_be_read_judges_nothing_and_says_so(lake: Path, missing: str):
+    """A delayed feed must not pass because the clamp could not be read."""
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
+    _seed_spans(lake)
+    (lake / "reference" / f"{missing}.parquet").unlink()
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert report.scope_unknown == 1
+    assert report.quarantined == 0
+    assert report.appended == ()
+    assert any(missing.replace("_", " ") in line or missing in line for line in report.report)
+
+
+def test_a_scope_that_could_not_be_read_exits_non_zero(lake: Path, monkeypatch, capsys):
+    """A run that judged nothing because the clamp was unreadable must not read as a clean
+    night. Exit 0 is what an operator and a wrapper script both take for one."""
+    from lake.battery import BatteryReport, main
+
+    monkeypatch.setattr(
+        "lake.battery.judge_from_config",
+        lambda **kwargs: BatteryReport(scope_unknown=4, report=("battery: no security master",)),
+    )
+    assert main([]) == 1
+    assert "scope unknown:        4" in capsys.readouterr().out
 
 
 def test_a_closed_span_puts_a_later_day_out_of_scope(lake: Path):
@@ -514,7 +561,7 @@ def test_a_closed_span_puts_a_later_day_out_of_scope(lake: Path):
     _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
     _seed_spans(lake, start=SPAN_START, end=datetime(2026, 9, 10, 20, 0, tzinfo=UTC))
 
-    report = judge(lake, now=NOW, guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     assert report.out_of_scope == 1
     assert report.quarantined == 0
@@ -524,20 +571,62 @@ def test_in_scope_answers_false_for_an_empty_span_tuple():
     assert in_scope(_partition(Path("/nowhere")), ()) is False
 
 
-def test_capture_spans_resolve_as_of_the_run_not_the_judged_day(lake: Path, tmp_path: Path):
-    """Marketlake #405's shape, refused here.
+def test_a_renamed_tickers_old_partitions_are_still_judged(lake: Path):
+    """The failure a point-in-time lookup produces, in the direction that fails open.
 
-    The dashboard resolves the master as of the queried day, so a day before ``valid_from``
-    resolves nothing and the ticker silently loses its clamp. This resolves as of the run, and
-    the spans themselves already bound the window.
+    ``SecurityMaster.remap`` closes the old mapping, so resolving the directory name as of the
+    run date returns nothing after a rename and every partition still sitting under the old
+    ``ticker=`` directory goes unjudged. Silently, permanently, on real captured data.
     """
+    from lake.security_master import ID_TYPE_TICKER, SecurityMaster, master_path
+
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
+    _seed_spans(lake)
+    master = SecurityMaster.read(master_path(lake))
+    master.remap(1, ID_TYPE_TICKER, "SPYZ", date(2026, 9, 16))
+    pa_pq.write_table(master.to_table(), lake / "reference" / "security_master.parquet")
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert report.judged == 1
+    assert report.quarantined == 1
+    assert report.scope_unknown == 0
+
+
+def test_a_day_before_the_masters_valid_from_still_resolves_its_clamp(lake: Path):
+    """The other direction, which is marketlake #405's failure on the dashboard.
+
+    Resolving as of the judged day loses the clamp on any day before ``valid_from``. The
+    partition then has no span, and the out-of-scope rule that should protect it never runs.
+    """
+    early = date(2026, 8, 20)
+    _write(lake, "chains", "SPY", early, _clean_rows("chains", staleness=900.0))
     _seed_spans(lake, start=SPAN_START)
-    spans = capture_spans_by_ticker(lake, ["SPY"], on=date(2026, 9, 16))
+
+    spans = capture_spans_by_ticker(lake, ["SPY"])
     assert "SPY" in spans
 
-    # The judged day predates the master's ``valid_from``, and the clamp still resolves.
-    early = capture_spans_by_ticker(lake, ["SPY"], on=date(2026, 9, 16))
-    assert early == spans
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+    assert report.out_of_scope == 1
+    assert report.scope_unknown == 0
+
+
+def test_one_spelling_two_instruments_refuses_rather_than_guessing(lake: Path):
+    """A directory name two instruments have both carried genuinely does not say which."""
+    from lake.security_master import SecurityMaster, master_path
+
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains"))
+    _seed_spans(lake)
+    master = SecurityMaster.read(master_path(lake))
+    master.register(
+        kind="equity", capture_start=SPAN_START, valid_from=date(2026, 9, 10), ticker="SPY"
+    )
+    pa_pq.write_table(master.to_table(), lake / "reference" / "security_master.parquet")
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert report.scope_unknown == 1
+    assert any("names 2 instruments" in line for line in report.report)
 
 
 # -- the entitlement check ---------------------------------------------------
@@ -548,7 +637,7 @@ def test_a_negative_median_staleness_passes_because_the_live_feed_carries_one(la
     _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=-1.7))
     _seed_spans(lake)
 
-    report = judge(lake, now=NOW, guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     assert report.cleared == 1
     assert report.quarantined == 0
@@ -564,7 +653,7 @@ def test_a_large_negative_median_quarantines_because_the_comparison_is_on_magnit
     _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=-900.0))
     _seed_spans(lake)
 
-    report = judge(lake, now=NOW, guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     assert report.quarantined == 1
     assert report.cleared == 0
@@ -579,7 +668,7 @@ def test_a_large_positive_median_quarantines_too(lake: Path):
     _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
     _seed_spans(lake)
 
-    report = judge(lake, now=NOW, guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     assert report.quarantined == 1
 
@@ -588,14 +677,14 @@ def test_a_large_positive_median_quarantines_too(lake: Path):
 def test_a_median_inside_the_limit_passes_in_either_sign(lake: Path, staleness: float):
     _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=staleness))
     _seed_spans(lake)
-    assert judge(lake, now=NOW, guards=GuardConstants()).cleared == 1
+    assert judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants()).cleared == 1
 
 
 @pytest.mark.parametrize("staleness", [60.1, -60.1])
 def test_a_median_outside_the_limit_quarantines_in_either_sign(lake: Path, staleness: float):
     _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=staleness))
     _seed_spans(lake)
-    assert judge(lake, now=NOW, guards=GuardConstants()).quarantined == 1
+    assert judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants()).quarantined == 1
 
 
 def test_the_limit_comes_from_config_rather_than_from_a_constant_here(lake: Path):
@@ -603,8 +692,12 @@ def test_the_limit_comes_from_config_rather_than_from_a_constant_here(lake: Path
     _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=-90.0))
     _seed_spans(lake)
 
-    strict = judge(lake, now=NOW, guards=GuardConstants(staleness_page_seconds=60))
-    loose = judge(lake, now=NOW, guards=GuardConstants(staleness_page_seconds=120))
+    strict = judge(
+        lake, calendar=CALENDAR, now=NOW, guards=GuardConstants(staleness_page_seconds=60)
+    )
+    loose = judge(
+        lake, calendar=CALENDAR, now=NOW, guards=GuardConstants(staleness_page_seconds=120)
+    )
 
     assert strict.quarantined == 1
     assert loose.cleared == 1
@@ -621,7 +714,7 @@ def test_one_row_with_the_wrong_flag_quarantines_the_partition(lake: Path):
     _write(lake, "chains", "SPY", DAY, rows)
     _seed_spans(lake)
 
-    report = judge(lake, now=NOW, guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     assert report.quarantined == 1
     finding = next(f for f in report.findings if f.verdict == QUARANTINED_VERDICT)
@@ -636,7 +729,7 @@ def test_a_null_flag_counts_as_a_violation_rather_than_being_skipped(lake: Path)
     _write(lake, "chains", "SPY", DAY, rows)
     _seed_spans(lake)
 
-    assert judge(lake, now=NOW, guards=GuardConstants()).quarantined == 1
+    assert judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants()).quarantined == 1
 
 
 def test_quotes_are_checked_against_realtime_true_not_is_delayed_false(lake: Path):
@@ -646,7 +739,7 @@ def test_quotes_are_checked_against_realtime_true_not_is_delayed_false(lake: Pat
     _write(lake, "quotes", "SPY", DAY, rows)
     _seed_spans(lake)
 
-    report = judge(lake, now=NOW, guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     assert report.quarantined == 1
     assert "realtime=True" in report.findings[0].reason
@@ -655,7 +748,7 @@ def test_quotes_are_checked_against_realtime_true_not_is_delayed_false(lake: Pat
 def test_a_clean_quotes_partition_passes(lake: Path):
     _write(lake, "quotes", "SPY", DAY, _clean_rows("quotes"))
     _seed_spans(lake)
-    assert judge(lake, now=NOW, guards=GuardConstants()).cleared == 1
+    assert judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants()).cleared == 1
 
 
 def test_a_missing_flag_column_quarantines_rather_than_passing(lake: Path):
@@ -663,7 +756,7 @@ def test_a_missing_flag_column_quarantines_rather_than_passing(lake: Path):
     _write(lake, "chains", "SPY", DAY, _clean_rows("chains"), drop="is_delayed")
     _seed_spans(lake)
 
-    report = judge(lake, now=NOW, guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     assert report.quarantined == 1
     assert "carries no is_delayed column" in report.findings[0].reason
@@ -677,7 +770,7 @@ def test_rows_with_no_vendor_stamp_leave_the_median_undefined_and_quarantine(lak
     _write(lake, "chains", "SPY", DAY, rows)
     _seed_spans(lake)
 
-    report = judge(lake, now=NOW, guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     assert report.quarantined == 1
     assert "staleness cannot be measured" in report.findings[0].reason
@@ -691,7 +784,7 @@ def test_some_rows_missing_a_stamp_leave_the_median_to_the_rows_that_have_one(la
     _write(lake, "chains", "SPY", DAY, rows)
     _seed_spans(lake)
 
-    report = judge(lake, now=NOW, guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     assert report.quarantined == 1
     assert report.findings[0].computed == pytest.approx(900.0)
@@ -704,7 +797,7 @@ def test_a_stamp_that_will_not_parse_reports_the_partition_unreadable(lake: Path
     _write(lake, "chains", "SPY", DAY, rows)
     _seed_spans(lake)
 
-    report = judge(lake, now=NOW, guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     assert report.unreadable == 1
     assert report.judged == 0
@@ -726,7 +819,7 @@ def test_the_median_is_exact_rather_than_approximate(lake: Path):
     _write(lake, "chains", "SPY", DAY, rows)
     _seed_spans(lake)
 
-    report = judge(lake, now=NOW, guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     assert report.findings[0].computed == pytest.approx(15.0)
 
@@ -754,7 +847,7 @@ def test_one_page_for_the_run_names_every_partition_it_quarantined(lake: Path):
     _seed_spans_for(lake, "QQQ", instrument_id=2)
     publisher, transport = _publisher(lake)
 
-    report = judge(lake, now=NOW, guards=GuardConstants(), publisher=publisher)
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants(), publisher=publisher)
 
     assert report.quarantined == 2
     assert len(transport.messages) == 1
@@ -778,10 +871,16 @@ def test_the_page_fires_once_on_the_transition_and_not_again(lake: Path):
     _seed_spans(lake)
     publisher, transport = _publisher(lake)
 
-    judge(lake, now=NOW, guards=GuardConstants(), publisher=publisher)
+    judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants(), publisher=publisher)
     assert len(transport.messages) == 1
 
-    judge(lake, now=NOW + timedelta(days=1), guards=GuardConstants(), publisher=publisher)
+    judge(
+        lake,
+        calendar=CALENDAR,
+        now=NOW + timedelta(days=1),
+        guards=GuardConstants(),
+        publisher=publisher,
+    )
     assert len(transport.messages) == 1
 
 
@@ -791,11 +890,23 @@ def test_a_feed_that_recovers_and_fails_again_pages_twice(lake: Path):
     publisher, transport = _publisher(lake)
 
     _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
-    judge(lake, now=NOW, guards=GuardConstants(), publisher=publisher)
+    judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants(), publisher=publisher)
     _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=-1.7))
-    judge(lake, now=NOW + timedelta(days=1), guards=GuardConstants(), publisher=publisher)
+    judge(
+        lake,
+        calendar=CALENDAR,
+        now=NOW + timedelta(days=1),
+        guards=GuardConstants(),
+        publisher=publisher,
+    )
     _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
-    judge(lake, now=NOW + timedelta(days=2), guards=GuardConstants(), publisher=publisher)
+    judge(
+        lake,
+        calendar=CALENDAR,
+        now=NOW + timedelta(days=2),
+        guards=GuardConstants(),
+        publisher=publisher,
+    )
 
     assert len(transport.messages) == 2
 
@@ -805,7 +916,7 @@ def test_a_clean_run_pages_nothing(lake: Path):
     _seed_spans(lake)
     publisher, transport = _publisher(lake)
 
-    judge(lake, now=NOW, guards=GuardConstants(), publisher=publisher)
+    judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants(), publisher=publisher)
 
     assert transport.messages == []
 
@@ -816,7 +927,9 @@ def test_a_dry_run_writes_no_line_and_sends_no_page(lake: Path):
     _seed_spans(lake)
     publisher, transport = _publisher(lake)
 
-    dry = judge(lake, now=NOW, guards=GuardConstants(), publisher=publisher, dry_run=True)
+    dry = judge(
+        lake, calendar=CALENDAR, now=NOW, guards=GuardConstants(), publisher=publisher, dry_run=True
+    )
 
     assert dry.quarantined == 1
     assert dry.appended == ()
@@ -824,7 +937,7 @@ def test_a_dry_run_writes_no_line_and_sends_no_page(lake: Path):
     assert not (lake / "quarantine.jsonl").exists()
     assert any("would write" in line for line in dry.report)
 
-    wet = judge(lake, now=NOW, guards=GuardConstants(), publisher=publisher)
+    wet = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants(), publisher=publisher)
     assert wet.quarantined == dry.quarantined
     assert len(wet.appended) == 1
 
@@ -916,7 +1029,7 @@ def test_the_loader_refuses_a_partition_this_run_quarantined(lake: Path):
     _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
     _seed_spans(lake)
 
-    judge(lake, now=NOW, guards=GuardConstants())
+    judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     with pytest.raises(PartitionQuarantined) as caught:
         load_chain("SPY", DAY, lake_root=lake)
@@ -974,7 +1087,7 @@ def test_a_clean_run_leaves_the_ledger_empty_so_every_partition_still_reads(lake
     _write(lake, "quotes", "SPY", DAY, _clean_rows("quotes"))
     _seed_spans(lake)
 
-    report = judge(lake, now=NOW, guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     assert report.cleared == 2
     assert latest_quarantine(lake) == {}
@@ -990,7 +1103,7 @@ def test_the_ledger_key_is_the_spelling_the_loader_looks_up(lake: Path):
     _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
     _seed_spans(lake)
 
-    judge(lake, now=NOW, guards=GuardConstants())
+    judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     assert set(latest_quarantine(lake)) == {"chains/ticker=SPY/date=2026-09-16.parquet"}
 
@@ -1020,7 +1133,7 @@ def test_one_session_can_be_named_so_the_evening_run_judges_only_tonight(lake: P
     _seed_spans(lake)
 
     assert len(sealed_partitions(lake)) == 2
-    assert judge(lake, now=NOW, day=DAY, guards=GuardConstants()).judged == 1
+    assert judge(lake, calendar=CALENDAR, now=NOW, day=DAY, guards=GuardConstants()).judged == 1
 
 
 def test_one_unreadable_partition_costs_its_own_verdict_and_not_the_run(lake: Path):
@@ -1032,7 +1145,7 @@ def test_one_unreadable_partition_costs_its_own_verdict_and_not_the_run(lake: Pa
     _seed_spans(lake)
     _seed_spans_for(lake, "QQQ", instrument_id=2)
 
-    report = judge(lake, now=NOW, guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
     assert report.unreadable == 1
     assert report.quarantined == 1
@@ -1048,7 +1161,9 @@ def test_read_entitlement_reports_a_partition_missing_a_stamp_column(lake: Path)
 
 def test_judge_entitlement_is_callable_on_evidence_alone(lake: Path):
     """The check's arithmetic, separable from the read, so a caller can hand it numbers."""
-    evidence = Entitlement(rows=10, flag_present=True, flag_violations=0, median_staleness=-1.7)
+    evidence = Entitlement(
+        rows=10, flag_present=True, flag_violations=0, median_staleness=-1.7, session_rows=10
+    )
     finding = judge_entitlement(_partition(lake), evidence, GuardConstants())
     assert finding.verdict == CLEAN_VERDICT
     assert finding.judged is True
@@ -1120,3 +1235,180 @@ def test_the_report_names_each_quarantined_partition_with_its_reason():
 
     assert "quarantined chains/ticker=SPY/date=2026-09-16.parquet" in printed
     assert "session-median staleness is 900.0s" in printed
+
+
+# -- a pass never clears a verdict it did not write ---------------------------
+
+
+def test_a_clean_entitlement_verdict_does_not_clear_a_humans_quarantine(lake: Path):
+    """The defect this rule exists for, in the shape an operator actually produces.
+
+    A human quarantines the day for a missing expiry. Tonight the feed is real-time, so the
+    entitlement check passes. Without the rule, a `clean` line under `realtime_entitlement`
+    becomes the last entry and the reader hands back a partition a human refused.
+    """
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains"))
+    _seed_spans(lake)
+    partition = "chains/ticker=SPY/date=2026-09-16.parquet"
+    append_verdict(
+        lake,
+        build_entry(
+            partition=partition,
+            verdict=QUARANTINED_VERDICT,
+            check="strike_grid_completeness",
+            observed_at=NOW,
+            provenance=PROVENANCE_HUMAN,
+            reason="the 09-16 chain is missing the whole 07-17 expiry",
+        ),
+        observed_at=NOW,
+    )
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert report.cleared == 1
+    assert report.appended == ()
+    assert latest_quarantine(lake)[partition]["check"] == "strike_grid_completeness"
+    assert is_quarantined(latest_quarantine(lake)[partition]) is True
+    assert any("stays quarantined under" in line for line in report.report)
+
+
+def test_a_clean_verdict_does_not_clear_a_sibling_checks_quarantine(lake: Path):
+    """The same rule against the shape #407 lands: another automated check on this spine."""
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains"))
+    _seed_spans(lake)
+    partition = "chains/ticker=SPY/date=2026-09-16.parquet"
+    append_verdict(
+        lake,
+        build_entry(
+            partition=partition,
+            verdict=QUARANTINED_VERDICT,
+            check="row_count_band",
+            observed_at=NOW,
+        ),
+        observed_at=NOW,
+    )
+
+    judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert is_quarantined(latest_quarantine(lake)[partition]) is True
+
+
+def test_a_quarantine_still_supersedes_another_checks_verdict(lake: Path):
+    """The rule is one-way. A fresh fault is news whatever wrote the entry before it."""
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
+    _seed_spans(lake)
+    partition = "chains/ticker=SPY/date=2026-09-16.parquet"
+    append_verdict(
+        lake,
+        build_entry(
+            partition=partition, verdict=CLEAN_VERDICT, check="row_count_band", observed_at=NOW
+        ),
+        observed_at=NOW,
+    )
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert len(report.appended) == 1
+    assert latest_quarantine(lake)[partition]["check"] == CHECK_ENTITLEMENT
+    assert is_quarantined(latest_quarantine(lake)[partition]) is True
+
+
+def test_a_clean_verdict_still_clears_its_own_checks_quarantine(lake: Path):
+    """The rule must not freeze the ledger. Its own earlier verdict is still supersedable."""
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
+    _seed_spans(lake)
+    judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=-1.7))
+    report = judge(lake, calendar=CALENDAR, now=NOW + timedelta(days=1), guards=GuardConstants())
+
+    assert len(report.appended) == 1
+    partition = "chains/ticker=SPY/date=2026-09-16.parquet"
+    assert is_quarantined(latest_quarantine(lake)[partition]) is False
+
+
+# -- the staleness median is the session's ------------------------------------
+
+
+def _off_session_row(minute: int, *, staleness: float, surface: str = "chains") -> dict:
+    """A row captured at 23:25 Eastern the night before, which the live lake carries.
+
+    Both 2026-09-16 chain partitions hold about 12,000 such rows at 03:25 UTC. The vendor's
+    last-quote stamp freezes when the market is closed while ``fetch_ts`` keeps moving, so the
+    row is hours stale on a feed that is real-time by every other measure.
+    """
+    row = _row(minute, staleness=staleness, flag=False, surface=surface)
+    snap = datetime(2026, 9, 16, 3, 25, tzinfo=UTC) + timedelta(minutes=minute)
+    fetch = snap + timedelta(milliseconds=400)
+    row["snap_ts"] = snap.isoformat()
+    row["fetch_ts"] = fetch.isoformat()
+    row["vendor_quote_ts"] = (fetch - timedelta(seconds=staleness)).isoformat()
+    return row
+
+
+def test_an_overnight_cycle_does_not_drag_the_session_median(lake: Path):
+    """The live shape: a healthy session with an off-session cycle sitting beside it."""
+    rows = _clean_rows("chains", staleness=-1.7, count=5)
+    rows += [_off_session_row(i, staleness=25_817.0) for i in range(5)]
+    _write(lake, "chains", "SPY", DAY, rows)
+    _seed_spans(lake)
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert report.cleared == 1
+    assert report.quarantined == 0
+    assert report.findings[0].computed == pytest.approx(-1.7)
+
+
+def test_a_partition_of_overnight_rows_alone_is_out_of_scope_not_quarantined(lake: Path):
+    """A day that captured only an overnight cycle recorded no session, so it judges none.
+
+    Without this the check reads 25,817 seconds of staleness and quarantines a partition whose
+    feed was real-time on every row. The lake already holds four gap-only sessions from a
+    machine that was down, so this is one landed cycle away from real.
+    """
+    _write(lake, "chains", "SPY", DAY, [_off_session_row(i, staleness=25_817.0) for i in range(5)])
+    _seed_spans(lake)
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert report.out_of_scope == 1
+    assert report.quarantined == 0
+    assert report.appended == ()
+    assert "no data row falls inside the session" in report.findings[0].reason
+
+
+def test_an_off_session_row_still_counts_against_the_entitlement_flag(lake: Path):
+    """The split the design draws: flags on every snapshot, staleness on the session's.
+
+    A delayed flag is the vendor's own statement and does not depend on the hour.
+    """
+    rows = _clean_rows("chains", staleness=-1.7, count=5)
+    delayed = _off_session_row(0, staleness=1.0)
+    delayed["is_delayed"] = True
+    rows.append(delayed)
+    _write(lake, "chains", "SPY", DAY, rows)
+    _seed_spans(lake)
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert report.quarantined == 1
+    assert "do not carry is_delayed=False" in report.findings[0].reason
+
+
+def test_a_sealed_partition_on_a_non_session_day_keeps_the_flag_half(lake: Path):
+    """No session means no median to take, and refusing it would quarantine a calendar
+    disagreement rather than a feed fault. The flag half is what can still speak."""
+    saturday = date(2026, 9, 19)
+    rows = _clean_rows("chains", staleness=-1.7)
+    for index, row in enumerate(rows):
+        snap = datetime(2026, 9, 19, 13, 30, tzinfo=UTC) + timedelta(minutes=index)
+        row["snap_ts"] = snap.isoformat()
+        row["is_delayed"] = True
+    _write(lake, "chains", "SPY", saturday, rows)
+    _seed_spans(lake)
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert report.quarantined == 1
+    assert "do not carry is_delayed=False" in report.findings[0].reason

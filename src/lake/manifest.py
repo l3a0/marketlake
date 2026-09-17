@@ -221,8 +221,9 @@ def is_quarantined(entry: dict | None) -> bool:
     """Whether a partition's current quarantine entry withholds it from a read.
 
     ``entry`` is what ``latest_quarantine`` returns for one partition, or ``None`` when
-    the ledger holds no entry for it. A partition nothing has judged reads, which is what
-    keeps the guard inert until marketlake #138's battery writes the first verdict.
+    the ledger holds no entry for it. A partition nothing has judged reads, which is what kept
+    the guard inert until marketlake #406's battery wrote the first verdict. ``lake.battery``
+    is that writer and it runs nightly inside the 18:30 sweep.
 
     An entry clears its partition by carrying ``verdict: "clean"``. Every other entry
     withholds it, including one whose shape this does not recognise, because fail closed
@@ -340,6 +341,16 @@ def append_quarantine(lake_root: Path, entry: dict) -> dict:
 
     The entry is keyed by ``partition`` like the manifest. Last entry wins, so an
     un-quarantine is a superseding row, never a deletion of history.
+
+    **This is the line and nothing else. A writer wants ``battery.append_verdict``.** This takes
+    no lock and refreshes no manifest entry, so a verdict written through it alone leaves
+    ``quarantine.jsonl`` an orphan to the Sunday scrub, which the comment above
+    :data:`SCRUB_EXCLUSIONS` says is exactly the check that catches one. It also accepts any
+    mapping, including a verdict spelling ``is_quarantined`` refuses to clear, where
+    ``battery.build_entry`` is the one place an entry is assembled and checked.
+
+    It stays public because the two ledgers' line rules live here and a test writing a
+    deliberately malformed entry needs a way past the checked builder.
     """
     append_line(quarantine_path(lake_root), entry)
     return entry
