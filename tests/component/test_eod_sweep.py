@@ -1906,7 +1906,8 @@ def test_a_torn_ledger_is_contained_and_reaches_the_record_rather_than_killing_t
 
     This lake also carries the case the count is the only witness for: no partition is in
     scope, so ``judge`` never reaches its per-partition ledger read and finishes normally.
-    ``count_quarantined`` reports the damage in the same run regardless.
+    ``count_quarantined`` still reports the damage, into the nightly report rather than into
+    ``problems``, so on a night with no session that report file is the only carrier.
     """
     from lake.manifest import append_line, quarantine_path
 
@@ -1931,6 +1932,31 @@ def test_a_torn_ledger_is_contained_and_reaches_the_record_rather_than_killing_t
     )
     assert outcome.nightly.pinged is False
     assert pinger.urls == []
+
+
+def test_the_containment_is_the_error_class_and_not_the_one_shape(fixture_lake: FixtureLake):
+    """``_LEDGER_REFUSALS`` names ``ManifestError``, and this is what makes that the right word.
+
+    The sibling shape is a quarantine line that parses and names no partition, which
+    ``manifest.latest_quarantine_by_check`` raises plain ``ManifestError`` on. It reaches the
+    walks by the identical path and predates marketlake #469 entirely: executed against
+    `8fb1fda`, this lake took the whole run down, report file and Friday wake included.
+
+    Narrowing the tuple to ``TornLedger`` alone passes every other test in this file, so
+    without this one the comment there argues for a class the suite only holds at a member.
+    """
+    from lake.manifest import append_line, quarantine_path
+
+    root = _lake(fixture_lake)
+    append_line(quarantine_path(root), {"verdict": "clean", "check": "e"})
+    append_line(quarantine_path(root), {"partition": "x", "verdict": "clean", "check": "e"})
+
+    outcome, _, _ = _run(root)
+
+    assert outcome.filed_at is not None, "the run died instead of filing its record"
+    assert any(
+        "dividends did not run: ManifestError" in problem for problem in outcome.nightly.problems
+    ), outcome.nightly.problems
 
 
 def test_a_quarantine_the_battery_wrote_is_reported_and_still_pings(fixture_lake: FixtureLake):

@@ -49,6 +49,7 @@ from lake.actions import (
     check_dividend_consistency,
     extract_dividends,
 )
+from lake.manifest import append_line, quarantine_path
 from lake.paths import QUOTES, LakePaths
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
 from lake.security_master import ID_TYPE_TICKER, KIND_EQUITY, SecurityMaster, master_path
@@ -1345,6 +1346,39 @@ def test_the_command_against_a_lake_with_no_master_exits_two_with_a_named_line(
     assert printed.err.startswith("actions: no security master at")
     assert "python -m lake.onboard" in printed.err
     assert "Traceback" not in printed.err
+
+
+def test_the_command_against_a_torn_quarantine_ledger_is_a_line_and_not_a_stack(
+    fixture_lake: FixtureLake, tmp_path: Path, capsys
+):
+    """Marketlake #469. The walk reads sealed partitions through ``lake.loader``.
+
+    That reader resolves the quarantine ledger on every partition it opens, so a ledger the
+    walk does not write and never reads by name is still what stops this command. The two
+    refusals above say a lake fault reaches the operator as one line, and a damaged ledger is
+    the same kind of mistake with a different file behind it. Uncaught it arrived as ten
+    frames around one sentence.
+
+    The repair named is a hand edit under the lock or a restore, deliberately not this
+    command's sibling ``lake.signoff``: an append-only ledger has no rollback, and the
+    sign-off tool cannot read a torn ledger either.
+    """
+    root = _lake(fixture_lake, {("SPY", DAY_ONE): [_row(DAY_ONE)]})
+    ledger = quarantine_path(root)
+    with ledger.open("a") as handle:
+        handle.write('{"partition": "quotes/ticker=SPY/date=2026-09-14.parq')
+    append_line(ledger, {"partition": "fused", "verdict": "clean", "check": "e"})
+    append_line(ledger, {"partition": "hidden", "verdict": "clean", "check": "e"})
+    config = write_config(tmp_path, root)
+
+    code = actions.main(["--config", str(config)], clock=ManualClock(FIRST_NIGHT))
+
+    assert code == 2
+    printed = capsys.readouterr().err
+    assert "Traceback" not in printed
+    assert printed.startswith("actions: ")
+    assert "unreachable" in printed
+    assert "Repair it by hand under the lake-root lock" in printed
 
 
 def test_the_command_against_a_torn_master_says_something_different(

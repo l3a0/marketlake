@@ -70,6 +70,7 @@ from lake.capture_spans import CaptureSpan
 from lake.config import GuardConstants
 from lake.manifest import (
     CLEAN_VERDICT,
+    ManifestError,
     TornLedger,
     append_line,
     append_quarantine,
@@ -941,6 +942,34 @@ def test_a_scope_that_could_not_be_read_exits_non_zero(lake: Path, monkeypatch, 
     )
     assert main([]) == 1
     assert "scope unknown:        4" in capsys.readouterr().out
+
+
+def test_a_damaged_ledger_reaches_the_operator_as_a_line_and_not_a_stack(monkeypatch, capsys):
+    """This module's own stated policy: every refusal is a line, never a wall of frames.
+
+    ``docs/design.md`` names ``python -m lake.battery`` as the command an operator runs when
+    the nightly digest carries only counts, so a ledger this walk cannot read sends them here
+    on purpose. Uncaught, the one sentence they need arrives wrapped in eight frames, in a
+    launchd log. Marketlake #469 made that likely rather than hypothetical, because a crash
+    mid-append needs no hand-malformed line.
+
+    Exit 2 rather than 1, because the lake's own file contradicts its writer and the repair is
+    a hand edit, not a night that happened to judge nothing.
+    """
+    from lake.battery import main
+
+    def _raise(**kwargs):
+        raise ManifestError("/lake/quarantine.jsonl: the read stopped at line 2")
+
+    monkeypatch.setattr("lake.battery.judge_from_config", _raise)
+
+    assert main([]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.err.strip().splitlines() == [
+        "battery: /lake/quarantine.jsonl: the read stopped at line 2"
+    ]
+    assert "Traceback" not in captured.err
 
 
 def test_a_closed_span_puts_a_later_day_out_of_scope(lake: Path):
