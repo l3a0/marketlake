@@ -2011,14 +2011,20 @@ def test_a_ledger_that_is_not_utf8_is_contained_and_the_run_still_files(
     it: no record, no report, no ping, and on a Friday no Sunday wake.
 
     **The damage is one flipped byte in a line that is otherwise whole**, which is the shape
-    bit rot and a hand edit saved in another encoding both produce. It is deliberately not a
-    torn write: no writer here can make one of these, because ``append_line`` emits pure ASCII
-    and every prefix of a written line is valid UTF-8.
+    bit rot produces, and a re-encoding that leaves bytes outside UTF-8. It is deliberately not
+    a torn write: no writer here can make one of these, because ``append_line`` emits pure
+    ASCII and every prefix of a written line is valid UTF-8.
+
+    Not every hand edit lands here. A byte-order mark is valid UTF-8, so it decodes and never
+    reaches this refusal, and on a one-entry ledger it reads as a torn tail and lifts the
+    quarantine. That is marketlake #506, and it behaves identically on the code before this.
 
     The count is the second witness and it comes through a different door.
-    ``sweep._counted`` catches bare ``Exception``, so the count reported the damage even before
-    this fix, into the report file rather than into ``problems``. What it reports now is the
-    class rather than a ``UnicodeDecodeError`` nothing had a name for.
+    ``sweep._counted`` catches bare ``Exception``, so that door was never the one that failed.
+    It is asserted here because it is a report-tier line rather than a problem, which is where
+    a summary nobody could take belongs. Before this fix it reported nothing at all: the bar
+    walk at ``sweep.py:761`` ended the run long before ``_counted`` ran at ``sweep.py:961``,
+    which is why no report file existed to carry it.
     """
     from lake.manifest import append_line, quarantine_path
 

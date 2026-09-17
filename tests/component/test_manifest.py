@@ -487,11 +487,63 @@ def test_a_damaged_byte_in_the_last_line_refuses_rather_than_reading_as_a_torn_t
     write, and reading it as a tail would drop a whole verdict silently.
     """
     append_quarantine(lake_root, _verdict("kept"))
-    append_quarantine(lake_root, _verdict("last"))
-    _flip(lake_root, b'"last"', b'"la\xfft"')
+    # Written without a terminating newline, which is what a crash mid-append leaves. A
+    # newline-terminated last line is not a torn tail at all, so a fixture built that way
+    # cannot tell refusing apart from discarding, and the decision this test exists to hold
+    # would be held by nothing. The review lens found exactly that.
+    with quarantine_path(lake_root).open("ab") as handle:
+        handle.write(b'{"partition": "la\xfft", "verdict": "quarantined", "check": "e"}')
 
+    assert not quarantine_path(lake_root).read_bytes().endswith(b"\n"), (
+        "the fixture stopped being a torn tail"
+    )
     with pytest.raises(LedgerNotUtf8):
         read_quarantine(lake_root)
+
+
+def test_a_hand_repaired_ledger_may_hold_non_ascii_and_still_reads(lake_root):
+    """The accepting side of the boundary, which is where narrowing it would do the damage.
+
+    No writer here emits a byte outside ASCII, and the test below holds that. The tempting next
+    step is to decode as ASCII, since nothing the tree writes would notice. It would be wrong.
+    Repairing this file is a hand edit under the lock, which every message about a damaged
+    ledger says, and a person writing a reason by hand writes the characters their language
+    has. Decoding as ASCII would refuse the ledger a human had just fixed.
+
+    The review lens found this by mutation: ``decode("utf-8")`` narrowed to ``decode("ascii")``
+    passed all 4,241 tests in the suite.
+    """
+    reason = "vendor said \u201chalt\u201d for C\u00e9line"
+    entry = {"partition": "p", "check": "e", "verdict": "quarantined", "reason": reason}
+    raw = json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n"
+    quarantine_path(lake_root).write_bytes(raw.encode("utf-8"))
+
+    assert max(quarantine_path(lake_root).read_bytes()) > 127, "the fixture stopped being the case"
+    assert read_quarantine(lake_root)[0]["reason"] == reason
+
+
+def test_the_refusal_names_the_lead_byte_of_a_truncated_sequence(lake_root):
+    """A multi-byte sequence cut short, where the offending byte is not the last one.
+
+    Every other case here damages a byte with ``0xff``, an invalid start byte, and for those
+    ``UnicodeDecodeError`` reports ``start`` and ``end`` one apart, so the lead byte and the
+    last byte of the bad run are the same byte. A truncated three-byte sequence separates
+    them: ``b"\xe0\xa0"`` reports ``start=0`` and ``end=2``, so a message reading ``end - 1``
+    would name ``0xa0`` while the byte that actually refused is ``0xe0``. The number's job is
+    to send a person to a byte, and naming the wrong one sends them to the wrong byte.
+
+    The review lens found this by mutation: with only the ``0xff`` cases here, indexing at
+    ``end - 1`` passed all 115 tests in the two files this change touches.
+    """
+    append_quarantine(lake_root, _verdict("kept"))
+    _flip(lake_root, b'"quarantined"', b'"quarantin\xe0\xa0"')
+
+    with pytest.raises(LedgerNotUtf8) as refusal:
+        read_quarantine(lake_root)
+
+    message = str(refusal.value)
+    assert "0xe0" in message, message
+    assert "0xa0" not in message, message
 
 
 def test_every_quarantine_reader_funnels_through_the_decode_refusal_too(lake_root):
@@ -532,13 +584,17 @@ def test_the_refusal_is_not_a_replacement_because_replacing_inverts_the_guard(la
     assert json.loads(replaced.splitlines()[0])["verdict"] == "quarantined"
 
 
-def test_no_writer_in_the_tree_can_put_a_byte_outside_ascii_in_a_ledger(lake_root):
+def test_append_line_emits_pure_ascii_and_every_prefix_of_it_decodes(lake_root):
     """What the refusal's own message tells the operator, held as a test.
 
     The message says these bytes were changed by something other than a writer, and the
     reachability argument on marketlake #495 rests on the same fact. ``json.dumps`` runs with
     ``ensure_ascii`` at its default, and flipping that default is a one-word edit in
     ``append_line`` that nothing else would notice.
+
+    This holds the one writer rather than the claim that it is the only one. Every writer above
+    it funnels here, through ``manifest.append_quarantine``, ``battery.write_verdict`` and
+    ``lake.signoff``, and that funnel is a fact about call sites that no test can keep true.
 
     The second half is what rules out a torn write: ``os.write`` can stop between bytes but
     never inside one, so if every prefix of a written line decodes then no crash mid-append can
