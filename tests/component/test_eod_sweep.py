@@ -1084,23 +1084,66 @@ def test_the_command_has_no_date_flag(capsys):
 def test_a_lake_with_no_security_master_ends_each_walk_rather_than_the_run(
     fixture_lake: FixtureLake,
 ):
-    """One condition, one command fixes it, and all three walks meet it identically.
+    """All three walks refuse, and each names its own condition rather than a shared one.
 
     Each one names itself, so the digest says three pieces refused rather than handing the
     operator a stack trace in the job's error log.
+
+    **The three no longer meet one condition, and the refusal classes are asserted for that
+    reason.** This fixture has neither reference file, and marketlake #422 put a capture-spans
+    read in front of the bars walk's master read. So the ledger walks still refuse on
+    ``MasterAbsent``, which ``python -m lake.onboard`` fixes, while the bars walk refuses first on
+    ``SpansAbsent``, which ``python -m lake.seed_spans`` fixes. Asserting ``finished`` alone let
+    that difference arrive silently, and a reader of the old sentence would have gone to the wrong
+    command.
     """
     fixture_lake.with_quotes("SPY", FOLLOWING, _quotes_table([_quote_row(FOLLOWING)]))
     fixture_lake.with_reference("schema_versions", _ledger_table())
     root = fixture_lake.build()
 
     outcome, pinger, transport = _run(root)
-    assert [name for name, piece in outcome.nightly.pieces if not piece.finished] == [
-        "dividends",
-        "splits",
-        "bars",
-    ]
+    refused = {name: piece.refusal for name, piece in outcome.nightly.pieces if not piece.finished}
+    assert list(refused) == ["dividends", "splits", "bars"]
+    assert refused["dividends"].startswith("MasterAbsent")
+    assert refused["splits"].startswith("MasterAbsent")
+    assert refused["bars"].startswith("SpansAbsent")
     assert pinger.urls == []
     assert "did not run" in transport.messages[0].body
+
+
+def test_the_bars_walk_names_a_missing_master_once_its_spans_are_there(
+    fixture_lake: FixtureLake,
+):
+    """The master refusals the bars walk can still meet, now that a spans read runs in front.
+
+    Marketlake #422 put ``read_capture_spans`` before the walk's own ``_read_master``, so the one
+    test that used to cover ``MasterAbsent`` for this piece refuses earlier and never reaches it.
+    Removing ``MasterAbsent`` or ``MasterUnreadable`` from ``_BARS_REFUSALS`` left the suite green,
+    which is how that gap was found. This fixture has the spans and no master, so the walk reaches
+    the condition those two names are in the tuple for.
+    """
+    fixture_lake.with_quotes("SPY", FOLLOWING, _quotes_table([_quote_row(FOLLOWING)]))
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    fixture_lake.with_reference("capture_spans", _spans().to_table())
+    root = fixture_lake.build()
+
+    outcome, pinger, _ = _run(root)
+
+    bars_piece = dict(outcome.nightly.pieces)["bars"]
+    assert bars_piece.refusal is not None, "a missing master escaped the bars walk"
+    assert bars_piece.refusal.startswith("MasterAbsent")
+    assert pinger.urls == [], "a refused piece must withhold the ping"
+
+    # The sibling condition, which is the file being there and unreadable rather than absent. The
+    # two are separate names because the fixes differ, a rebuild against a restore, and each needs
+    # its own fixture to be held at all.
+    master_path(root).write_bytes(b"not a parquet file")
+    torn, torn_pinger, _ = _run(root)
+
+    torn_piece = dict(torn.nightly.pieces)["bars"]
+    assert torn_piece.refusal is not None, "an unreadable master escaped the bars walk"
+    assert torn_piece.refusal.startswith("MasterUnreadable")
+    assert torn_pinger.urls == []
 
 
 def test_a_holiday_never_touches_the_vendor_even_when_building_one_would_raise(
@@ -1204,6 +1247,42 @@ def test_a_spans_file_from_a_newer_writer_refuses_the_piece_not_the_evening(
     assert outcome.nightly.report is not None
     assert pinger.urls == [], "a refused piece must withhold the ping"
     assert transport.messages, "the digest never went out"
+
+
+def test_the_walk_reaches_back_further_than_one_session(fixture_lake: FixtureLake):
+    """How far back the walk goes, which the one-night-later case cannot say.
+
+    ``test_a_daily_bar_held_tonight_is_reached_again_tomorrow`` needs a reach-back of exactly one
+    session, so a walk bounded to a short lookback window satisfies it and the sessions further
+    back are never recovered. Clamping each span's start to two days before the run left the whole
+    suite green, which is how that gap was found.
+
+    Here the quotes that unhold 2026-09-14's bar do not seal until three sessions later, which is
+    the shape a repair takes: someone fixes the gap rows days after the outage. The walk has to
+    still be asking about that session.
+    """
+    root = _lake(fixture_lake, quotes={})
+    partition = LakePaths(root).bars_partition_path("SPY", DAILY_FREQ, SESSION)
+
+    first, _, _ = _run(
+        root, now=EVENING, vendor_source=_CountingVendorSource(_cassette(session=SESSION))
+    )
+    assert dict(first.nightly.pieces)["bars"].landed == 0
+    assert not partition.exists()
+
+    # Three sessions pass before anything seals the close of record SESSION is judged against.
+    late = date(2026, 9, 17)
+    fixture_lake.with_quotes("SPY", FOLLOWING, _quotes_table([_quote_row(FOLLOWING)]))
+
+    fourth, _, _ = _run(
+        root,
+        now=EVENING + timedelta(days=3),
+        vendor_source=_CountingVendorSource(_cassette(session=late)),
+    )
+
+    assert partition.exists(), "the walk stopped short of the session it held three nights before"
+    table = pa.parquet.read_table(partition)
+    assert table.column("bar_ts").to_pylist() == [f"{SESSION.isoformat()}T04:00:00+00:00"]
 
 
 def test_a_stale_frequency_on_a_retired_ticker_does_not_withhold_the_ping(
