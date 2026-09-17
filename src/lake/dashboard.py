@@ -1,4 +1,4 @@
-"""The read-only query service: the dashboard's Now and Today panels.
+"""The read-only query service: the dashboard's Now, Today and History panels.
 
 Failures push alerts. Progress needs a pull surface. This module is that surface. It is
 a small read-only query service on localhost that answers a fixed set of named queries
@@ -41,11 +41,15 @@ here.
 Read-only is by construction, with one caveat. The sandbox blocks every path outside
 ``lake_root`` but does let DuckDB write inside it. So read-only rests on the named
 queries, which are ``SELECT`` statements only, and on the connection never being handed
-to anything else. A test asserts the lake tree is byte-identical after both panels run.
+to anything else. A test asserts the lake tree is byte-identical after every panel runs. The History
+panel reads three things that are not surface rows, and none of them goes through SQL:
+the quarantine ledger and the nightly report files are read off the filesystem, which is
+``alert.undelivered``'s rule, and the window aggregate is the same ``SELECT`` the Today
+strip runs, keyed by file.
 
 Three terms recur, glossed at first use.
 
-1. A *surface* is one kind of measurement with its own pinned schema. The two panels
+1. A *surface* is one kind of measurement with its own pinned schema. All three panels
    read the two minute-cadence surfaces, ``chains`` and ``quotes``.
 2. A *slot* is one minute of the session, the ``snap_ts`` a capture cycle fires for. The
    Today strip has one cell per slot from the session open through the option close, so
@@ -96,11 +100,13 @@ from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants, input_errors_exit, load_config
 from lake.control_plane import assertion_window, sunday_canary_due
 from lake.deadman import in_envelope
+from lake.manifest import VERDICT_FIELD, is_quarantined, latest_quarantine
 from lake.metadata import read_metadata
 from lake.paths import (
     CHAINS,
     DATE_PREFIX,
     QUOTES,
+    REPORTS_DIR,
     SEGMENT_GLOB,
     SURFACE_PREFIX,
     TICKER_PREFIX,
@@ -1375,6 +1381,35 @@ def query_today(
     return payload
 
 
+def _slot_status(
+    agg: SlotAggregate | None,
+    slot: datetime,
+    judgeable_ms: int,
+    spans: tuple[CaptureSpan, ...],
+) -> tuple[str, int, tuple[str, ...]]:
+    """One slot's status, its data-row count, and every reason it carried.
+
+    This is the five-step ladder, and it is the only copy. :func:`_strip` renders it per
+    minute for the Today panel and :func:`_day_counts` totals it per ticker-day for the
+    History heatmap, so the two panels cannot drift into disagreeing about what a minute
+    is. The ladder itself is documented on :func:`_strip`, where the strip that shows it
+    lives.
+
+    ``judgeable_ms`` is the last slot key a verdict is owed for. ``spans`` empty means no
+    scope clamp, so every slot is in scope.
+    """
+    rows = 0 if agg is None else agg.data_rows
+    error_classes: tuple[str, ...] = () if agg is None else agg.error_classes
+    if agg is not None and agg.data_rows > 0:
+        return agg.status, rows, error_classes
+    if spans and not _in_scope(slot, spans):
+        return STATUS_OUT_OF_SCOPE, 0, ()
+    if agg is not None:
+        return agg.status, rows, error_classes
+    pending = _slot_ms(slot) > judgeable_ms
+    return (STATUS_PENDING if pending else STATUS_MISSING), rows, error_classes
+
+
 def _strip(
     ticker: str,
     surface: str,
@@ -1411,17 +1446,7 @@ def _strip(
     counts = dict.fromkeys(STATUSES, 0)
     for slot in slots:
         key = _slot_ms(slot)
-        agg = by_slot.get(key)
-        rows = 0 if agg is None else agg.data_rows
-        error_classes: tuple[str, ...] = () if agg is None else agg.error_classes
-        if agg is not None and agg.data_rows > 0:
-            status = agg.status
-        elif spans and not _in_scope(slot, spans):
-            status, rows, error_classes = STATUS_OUT_OF_SCOPE, 0, ()
-        elif agg is not None:
-            status = agg.status
-        else:
-            status = STATUS_PENDING if key > judgeable_ms else STATUS_MISSING
+        status, rows, error_classes = _slot_status(by_slot.get(key), slot, judgeable_ms, spans)
         counts[status] += 1
         cells.append(
             {
@@ -1440,6 +1465,389 @@ def _strip(
         "counts": counts,
         **health.payload(),
         "slots": cells,
+    }
+
+
+# -- the History panel -------------------------------------------------------
+
+# How far back the window reaches, its end included. Calendar days, not sessions: the
+# window is a span of wall time a reader names, and the calendar decides how many
+# sessions fall in it. Thirty days over the live calendar is twenty-one.
+#
+# This is a module constant rather than a request field, and so is the report count
+# below. Rule 2 above allows a request exactly two parameters, a ticker and a date, and
+# ``validate_parameters`` builds exactly those two keyword arguments. A third name
+# declared in ``NamedQuery.parameters`` would pass the unknown-field check and then be
+# dropped on the floor, because nothing builds a keyword for it.
+HISTORY_WINDOW_DAYS = 30
+
+# How many nightly report files the panel reads, newest first. ``report.py`` pins the
+# growth rule this answers: a held finding recurs every night because nothing settles
+# it, and nothing under ``reports/`` is ever pruned, so one unresolved disagreement is
+# thirty files in one directory after a month. The panel is served per request, so it
+# reads a bounded tail rather than the directory.
+HISTORY_REPORTS = 10
+
+# The window aggregate: the same per-slot grouping ``_SLOT_SELECT`` makes, keyed by the
+# file each row came from so one query covers every ticker-day on a surface. The
+# filename is mapped back to its ticker and day in Python, against the very paths this
+# query was handed, so no pattern here has to agree with the lake's directory layout.
+#
+# Only the sealed partitions come through here. A ticker-day with journal segments goes
+# to ``_slot_aggregates`` instead, which is the one reader that knows the durability
+# rules and re-checks the partition after reading them.
+_WINDOW_SELECT = """
+SELECT filename,
+       slot_ms,
+       count(*) FILTER (WHERE row_kind = $data_kind) AS data_rows,
+       count(*) FILTER (WHERE row_kind = $gap_kind) AS gap_rows,
+       count(*) FILTER (
+           WHERE row_kind IS DISTINCT FROM $data_kind
+             AND row_kind IS DISTINCT FROM $gap_kind
+       ) AS other_rows,
+       bool_or(coalesce(suspect, false)) AS suspect,
+       list_sort(
+           array_agg(DISTINCT error_class) FILTER (WHERE error_class IS NOT NULL)
+       ) AS error_classes
+FROM (
+    SELECT filename,
+           epoch_ms(TRY_CAST(snap_ts AS TIMESTAMPTZ)) AS slot_ms,
+           row_kind, error_class, suspect
+    FROM read_parquet($partitions, union_by_name = true, filename = true)
+)
+GROUP BY filename, slot_ms
+ORDER BY filename, slot_ms NULLS LAST
+"""
+
+
+def _window_sessions(ctx: QueryContext, end: date) -> list[tuple[date, list[datetime]]]:
+    """Every session in the window ending at ``end``, oldest first, with its own slots.
+
+    The window is ``HISTORY_WINDOW_DAYS`` calendar days wide with ``end`` inside it, and
+    the calendar decides which of them are sessions. Thirty days over the live calendar
+    is twenty-one. Each session carries its own slot list, from the open through the
+    option close, so an early close is a short full day here exactly as it is on the
+    Today strip.
+
+    A day the calendar cannot judge at all is left out rather than refused. These dates
+    are computed here and no client sent them, so there is no bad request to report.
+    ``query_today`` turns that same condition into a 400 precisely because there the
+    date did come from the client.
+    """
+    sessions: list[tuple[date, list[datetime]]] = []
+    day = end - timedelta(days=HISTORY_WINDOW_DAYS - 1)
+    while day <= end:
+        try:
+            sessions.append((day, session_slots(ctx.session.bounds(day))))
+        except (NotASession, *_CALENDAR_RANGE_ERRORS):
+            pass
+        day += timedelta(days=1)
+    return sessions
+
+
+def _window_aggregates(
+    con: duckdb.DuckDBPyConnection,
+    paths: LakePaths,
+    surface: str,
+    tickers: Sequence[str],
+    sessions: Sequence[date],
+) -> dict[tuple[str, date], tuple[list[SlotAggregate], SegmentHealth]]:
+    """Every ticker-day's slot aggregates for one surface across the window.
+
+    The sealed partitions are read in one query and the rest per ticker-day, which is
+    what keeps the window's cost growing with bytes rather than with days. A ticker-day
+    holding journal segments never joins the bulk read. It goes through
+    ``_slot_aggregates``, because that is the reader that unions the journal with the
+    partition and re-checks the partition after the segments are read, "so a seal that
+    landed in between does not render a fully captured day as entirely missing."
+
+    The bulk read is all-or-nothing, which is the price of one query. A partition listed
+    and then gone, from a restore or a repair, raises out of ``read_parquet`` and would
+    take every ticker-day on the surface with it. So that failure falls back to reading
+    each of them the per-day way, and the loss is counted in ``unreadable_partitions``
+    rather than dropping the window.
+    """
+    result: dict[tuple[str, date], tuple[list[SlotAggregate], SegmentHealth]] = {}
+    bulk: dict[str, tuple[str, date]] = {}
+    for ticker in tickers:
+        for day in sessions:
+            if _journal_segments(paths, surface, ticker, day):
+                result[(ticker, day)] = _slot_aggregates(con, paths, surface, ticker, day)
+                continue
+            partition = paths.partition_path(surface, ticker, day)
+            if partition.is_file():
+                bulk[str(partition)] = (ticker, day)
+    if not bulk:
+        return result
+    params = {
+        "data_kind": journal.ROW_KIND_DATA,
+        "gap_kind": journal.ROW_KIND_GAP,
+        "partitions": sorted(bulk),
+    }
+    try:
+        rows = con.execute(_WINDOW_SELECT, params).fetchall()
+    except _PARTITION_READ_ERRORS:
+        for key in bulk.values():
+            ticker, day = key
+            placed, health = _slot_aggregates(con, paths, surface, ticker, day)
+            result[key] = (placed, health + SegmentHealth(unreadable_partitions=1))
+        return result
+    grouped: dict[tuple[str, date], list[tuple]] = {key: [] for key in bulk.values()}
+    for row in rows:
+        key = bulk.get(row[0])
+        if key is not None:
+            grouped[key].append(row[1:])
+    for key, group in grouped.items():
+        placed, unparseable_rows = _placed_aggregates(group)
+        health = SegmentHealth().with_row_counts(
+            drifted_rows=sum(agg.other_rows for agg in placed),
+            unparseable_stamp_rows=unparseable_rows,
+        )
+        result[key] = ([agg for agg in placed if agg.has_bound_rows], health)
+    return result
+
+
+def _history_cell(
+    ticker: str,
+    surface: str,
+    day: date,
+    slots: Sequence[datetime],
+    aggregates: Sequence[SlotAggregate],
+    health: SegmentHealth,
+    now: datetime,
+    spans: tuple[CaptureSpan, ...],
+) -> dict[str, object]:
+    """One heatmap cell: a ticker-day's slot counts, and a percent where one is honest.
+
+    The counts come off ``_slot_status``, the same ladder the Today strip renders per
+    minute, so the two panels cannot disagree about what a minute is. They are keyed by
+    the six statuses, which is what keeps this cell inside the vocabulary the page
+    already renders.
+
+    **A percent alone would collapse three different answers into zero.** Measured
+    against the live lake, the window's cells include days entirely out of scope, where
+    nothing was owed, days entirely gap-marked, where the minutes were owed and missed
+    and the miss is recorded, and an onboarding day that is part of each. A percent
+    renders all three as zero, which is the reading ``_capture_spans`` exists to
+    prevent: "Onboarding day renders 'onboarded 11:00,' not 40 percent missing." So the
+    counts are the cell and the percent rides beside them.
+
+    ``judged`` is the denominator: the day's slots less the out-of-scope ones, which
+    were never owed, and less the pending ones, whose verdict is not yet due. A day with
+    no judged minute carries ``None`` rather than zero, because no number is a different
+    answer from zero. That is ``Nightly``'s own rule for its three counts.
+    """
+    by_slot = {agg.slot_ms: agg for agg in aggregates}
+    judgeable_ms = _slot_ms(now - SLOT_VERDICT_GRACE)
+    counts = dict.fromkeys(STATUSES, 0)
+    for slot in slots:
+        status, _, _ = _slot_status(by_slot.get(_slot_ms(slot)), slot, judgeable_ms, spans)
+        counts[status] += 1
+    judged = len(slots) - counts[STATUS_OUT_OF_SCOPE] - counts[STATUS_PENDING]
+    captured = counts[STATUS_CAPTURED] + counts[STATUS_SUSPECT]
+    return {
+        "ticker": ticker,
+        "surface": surface,
+        "date": day.isoformat(),
+        "slot_count": len(slots),
+        "judged": judged,
+        "captured_pct": None if judged <= 0 else round(100.0 * captured / judged, 1),
+        "counts": counts,
+        **health.payload(),
+    }
+
+
+def _open_quarantines(root: Path) -> tuple[list[dict[str, object]], str | None]:
+    """Every partition the quarantine ledger currently withholds, and what refused a read.
+
+    Contained, and deliberately not where the ledger throws. ``_latest_by_partition``
+    raises on a body line that parses and names no partition, and it names the only two
+    callers allowed to survive that: "the close+5 guard's prologue and the marking pass.
+    Every other caller is a place where stopping is correct." Stopping is not correct
+    here, because the heatmap and the nightly reports have nothing to do with the
+    ledger, and ``_serve``'s blanket catch would turn one damaged line into a 500 for
+    the whole panel.
+
+    Catching at this boundary rather than widening the ledger's rule leaves that rule and
+    its docstring true. ``_capture_spans`` already keeps the same promise for the same
+    reason: one panel served without a clamp rather than a panel not served at all.
+
+    The entry's shape is marketlake #139's and #139 is unbuilt, so only the partition
+    path and the ``verdict`` field are read, both defensively. The panel prints no
+    sign-off command, because the tool that would run it does not exist and its spelling
+    is not settled.
+    """
+    try:
+        ledger = latest_quarantine(root)
+    except Exception as exc:  # noqa: BLE001 - a summary must not cost the panel
+        log.exception("quarantine ledger unreadable, so the panel reports it instead")
+        return [], type(exc).__name__
+    open_entries = [
+        {"partition": partition, "verdict": entry.get(VERDICT_FIELD)}
+        for partition, entry in sorted(ledger.items())
+        if is_quarantined(entry)
+    ]
+    return open_entries, None
+
+
+def _nightly_reports(root: Path, limit: int) -> tuple[list[dict[str, object]], int, str | None]:
+    """The last ``limit`` nightly report files, newest first, with what would not read.
+
+    Counted off the filesystem rather than queried, which is ``undelivered``'s rule:
+    "the ordinary day has none and a SQL read over an empty glob raises rather than
+    returning zero." An absent ``reports/`` directory is a true zero here for the same
+    reason, and today it is the true answer, because the first ``eod-sweep`` run has not
+    happened.
+
+    ``nightly_path`` names a file ``{day}-{stamp}-{pid}.json``, so the day sorts first
+    and the newest files are the tail of a name sort. Only ``limit`` of them are opened.
+    The glob is on the ``reports/`` root, so the four producers' own subdirectories are
+    not matched, which is the naming rule ``report.py`` chose a reader for.
+
+    Every field is read with ``.get``. The lake's own report tree already carries two key
+    sets from one writer at two versions, so a reader spelling a key outright would break
+    on the older file. An absent count renders as no number rather than zero, which is
+    ``Nightly``'s own rule.
+    """
+    directory = root / REPORTS_DIR
+    try:
+        files = sorted(directory.glob("*.json"))[-limit:]
+    except OSError as exc:
+        log.warning("reports directory unlistable: %s", type(exc).__name__)
+        return [], 0, type(exc).__name__
+    reports: list[dict[str, object]] = []
+    unreadable = 0
+    for path in reversed(files):
+        try:
+            entry = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - one bad file must not cost the others
+            log.exception("nightly report unreadable, so the panel counts it instead")
+            unreadable += 1
+            continue
+        if not isinstance(entry, dict):
+            unreadable += 1
+            continue
+        reports.append(_nightly_payload(entry))
+    return reports, unreadable, None
+
+
+def _nightly_payload(entry: Mapping[str, object]) -> dict[str, object]:
+    """One nightly file as the panel renders it, every field taken defensively.
+
+    ``unfiled`` is summed off the pieces rather than read: ``Nightly.unfiled`` is a
+    property and ``write_nightly`` puts eleven keys in the file without it.
+
+    ``problems`` withheld the run's ping and ``report`` are the report-tier findings,
+    which "send no message of their own." The second is why this panel reads these files
+    at all: the design names the disk runway, ``pmset`` drift and a suspected unscheduled
+    closure as the three that ride here, and this panel is their reader. It renders the
+    lines the file carries and computes none of them.
+
+    ``day`` and ``at`` both ride along, because the design pins the nightly report as
+    "the one pre-written thing the dashboard shows, and it is dated, so a stale one never
+    reads as now."
+    """
+    pieces = entry.get("pieces")
+    pieces = pieces if isinstance(pieces, Mapping) else {}
+    unfiled = 0
+    for outcome in pieces.values():
+        if isinstance(outcome, Mapping) and isinstance(outcome.get("unfiled"), int):
+            unfiled += outcome["unfiled"]
+    return {
+        "day": entry.get("day"),
+        "at": entry.get("at"),
+        "session": entry.get("session"),
+        "pinged": entry.get("pinged"),
+        "gaps": entry.get("gaps"),
+        "quarantined": entry.get("quarantined"),
+        "disagreements": entry.get("disagreements"),
+        "pages_lost": entry.get("pages_lost"),
+        "unfiled": unfiled,
+        "pieces": {
+            name: outcome.get("refusal")
+            for name, outcome in pieces.items()
+            if isinstance(outcome, Mapping)
+        },
+        "problems": _lines(entry.get("problems")),
+        "report": _lines(entry.get("report")),
+    }
+
+
+def _lines(value: object) -> list[str]:
+    """A report file's string list, or an empty one for anything else it holds."""
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
+def query_history(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, object]:
+    """The History panel: the completeness window, the quarantines, and the last nights.
+
+    One named query rather than three, which is what the design pins: "The History panel
+    renders it through one named query." It takes no request parameter, so the window's
+    end is the clock's session date and its width is ``HISTORY_WINDOW_DAYS``.
+
+    **Nothing here may raise.** ``_serve`` turns any escape into a 500 for the whole
+    panel, and ``status.html`` paints nothing until every payload lands, so one bad file
+    would blank the Now and Today panels beside this one. Each of the three reads is
+    contained at its own boundary and reports its failure as a value: the window read
+    counts an unreadable partition, ``_open_quarantines`` names the class that refused
+    the ledger, and ``_nightly_reports`` counts the files that would not parse. That is
+    the rule ``_capture_spans``, ``_slot_aggregates`` and ``undelivered`` each already
+    keep.
+
+    The scope clamp is resolved **once, at the window's end**, not once per day.
+    ``_capture_spans`` resolves each ticker through the master as of the date it is
+    given, and the live master's rows begin on the onboarding day, so a per-day
+    resolution returns nothing for every earlier day, leaves those tickers unclamped,
+    and renders a wall of ``missing`` for minutes nothing was owed. The spans themselves
+    already bound the window, so the resolution date does no work they are not doing.
+    What this reading does not cover is a symbol the master no longer maps today, after
+    a retirement or an OCC re-symboling. That is marketlake #405's and stays there.
+    """
+    end = ctx.session.session_date()
+    sessions = _window_sessions(ctx, end)
+    tickers = sorted(ctx.roster)
+    spans_by_ticker = _capture_spans(ctx.paths, tickers, end)
+    days = [day for day, _ in sessions]
+    cells: list[dict[str, object]] = []
+    for surface in PANEL_SURFACES:
+        present = [t for t in tickers if surface in ctx.roster.get(t, ())]
+        if not present:
+            continue
+        window = _window_aggregates(con, ctx.paths, surface, present, days)
+        for day, slots in sessions:
+            for ticker in present:
+                aggregates, health = window.get((ticker, day), ([], SegmentHealth()))
+                cells.append(
+                    _history_cell(
+                        ticker,
+                        surface,
+                        day,
+                        slots,
+                        aggregates,
+                        health,
+                        ctx.now,
+                        spans_by_ticker.get(ticker, ()),
+                    )
+                )
+    quarantines, ledger_unreadable = _open_quarantines(ctx.paths.root)
+    reports, reports_unreadable, reports_error = _nightly_reports(ctx.paths.root, HISTORY_REPORTS)
+    return {
+        "as_of": _iso(ctx.now),
+        "window_days": HISTORY_WINDOW_DAYS,
+        "window_start": (end - timedelta(days=HISTORY_WINDOW_DAYS - 1)).isoformat(),
+        "window_end": end.isoformat(),
+        "sessions": [day.isoformat() for day in days],
+        "tickers": tickers,
+        "cells": cells,
+        "quarantines": quarantines,
+        "quarantine_count": len(quarantines),
+        "quarantine_unreadable": ledger_unreadable,
+        "reports_read": HISTORY_REPORTS,
+        "reports": reports,
+        "reports_unreadable": reports_unreadable,
+        "reports_error": reports_error,
     }
 
 
@@ -1462,10 +1870,15 @@ class NamedQuery:
 NAMED_QUERIES: Mapping[str, NamedQuery] = {
     "now": NamedQuery("now", query_now, frozenset()),
     "today": NamedQuery("today", query_today, frozenset({"date", "ticker"})),
+    "history": NamedQuery("history", query_history, frozenset()),
 }
 
 # The route table: request path to query name. A path not here is a 404.
-ROUTES: Mapping[str, str] = {"/api/now": "now", "/api/today": "today"}
+ROUTES: Mapping[str, str] = {
+    "/api/now": "now",
+    "/api/today": "today",
+    "/api/history": "history",
+}
 
 
 def validate_parameters(

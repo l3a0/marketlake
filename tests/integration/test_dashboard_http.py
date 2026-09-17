@@ -225,6 +225,31 @@ def test_api_today_returns_json(served):
     assert today["strips"][0]["slots"][0]["status"] == "captured"
 
 
+def test_api_history_returns_json(served):
+    server, _root = served
+    status, _headers, body = _request(server, "/api/history", host="localhost:1")
+    assert status == 200
+    history = json.loads(body)
+    assert history["window_end"] == "2026-08-24"
+    # This calendar declares one session, so thirty days hold exactly one.
+    assert history["sessions"] == ["2026-08-24"]
+    assert {cell["date"] for cell in history["cells"]} == {"2026-08-24"}
+    assert history["quarantines"] == []
+    assert history["reports"] == []
+
+
+@pytest.mark.parametrize("query", ["date=2026-08-24", "ticker=SPY", "sql=SELECT+1"])
+def test_history_takes_no_parameter_at_all(served, query: str):
+    # It is registered with an empty parameter set, so every field is unknown to it.
+    # That is what keeps the window's width a module constant: a name declared here
+    # would pass the unknown-field check and then be dropped, because
+    # ``validate_parameters`` only ever builds a date and a ticker.
+    server, _root = served
+    status, _headers, body = _request(server, f"/api/history?{query}", host="localhost")
+    assert status == 400
+    assert json.loads(body) == {"error": "unknown parameter"}
+
+
 @pytest.mark.parametrize(
     "query",
     [
@@ -248,7 +273,7 @@ def test_a_bad_parameter_is_a_400(served, query: str):
     [
         "/nope",
         "/api/now/",
-        "/api/history",
+        "/api/history/",
         "/api",
         "/status.html",
         # The icon path is matched whole. A prefix, a trailing slash or a different
@@ -289,7 +314,15 @@ def test_no_response_carries_the_lake_path(served):
     server, root = served
     # The icon is swept here too. It is the one binary body, so the comparison runs over
     # raw bytes rather than decoded text, which is the same check for every other path.
-    paths = ("/api/now", "/api/today", "/api/today?ticker=NOPE", "/nope", "/", "/favicon.ico")
+    paths = (
+        "/api/now",
+        "/api/today",
+        "/api/today?ticker=NOPE",
+        "/api/history",
+        "/nope",
+        "/",
+        "/favicon.ico",
+    )
     for path in paths:
         _status, headers, body = _request(server, path, host="localhost")
         assert str(root).encode() not in body
@@ -429,7 +462,9 @@ def served_broken(fixture_lake: FixtureLake) -> Iterator[tuple[ThreadingHTTPServ
         yield server, root
 
 
-@pytest.mark.parametrize("path", ["/api/now", "/api/today?date=2026-08-24&ticker=SPY"])
+@pytest.mark.parametrize(
+    "path", ["/api/now", "/api/today?date=2026-08-24&ticker=SPY", "/api/history"]
+)
 def test_a_failed_query_is_a_500_that_leaks_nothing(served_broken, path: str, caplog):
     server, root = served_broken
     status, headers, body = _request(server, path, host="localhost")
