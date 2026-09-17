@@ -705,3 +705,94 @@ def test_a_symlink_counts_itself_and_never_what_it_points_at(tmp_path: Path):
     assert usage.total <= 2 * frsize
     # The symlinked directory is not descended, so it contributes no entry at all.
     assert {entry.name for entry in usage.entries} == {"chains"}
+
+
+# -- a refusal must not take the rest of its directory with it ----------------
+
+
+def test_every_unreadable_file_in_a_directory_is_counted_not_just_the_first(tmp_path: Path):
+    """The per-file skip continues the listing. Breaking out of it loses the rest silently.
+
+    The earlier refusal test put one file in the locked directory, so continuing and
+    breaking were the same thing and the mutation survived. A real ticker directory holds
+    one partition per day, so breaking on the first refusal drops every later day's bytes
+    with no refusal recorded for any of them. Bytes missing understates growth, which
+    lengthens the runway, which is the direction that keeps the alarm quiet.
+    """
+    locked = tmp_path / "chains" / "ticker=SPY"
+    for day in range(10, 16):
+        _write(tmp_path, f"chains/ticker=SPY/date=2026-09-{day}.parquet", 50_000)
+    locked.chmod(0o644)
+    try:
+        usage = walk(tmp_path)
+    finally:
+        locked.chmod(0o755)
+    assert usage.refused == 6
+    assert usage.files == 0
+
+
+def test_every_vanished_file_in_a_directory_is_skipped_without_losing_its_siblings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # The mirror. Compaction can prune more than one file from a directory between the
+    # listing and the stat, and the ones it did not prune still have to be counted.
+    for day in range(10, 16):
+        _write(tmp_path, f"chains/ticker=SPY/date=2026-09-{day}.parquet", 50_000)
+    real = Path.stat
+    gone = {"date=2026-09-10.parquet", "date=2026-09-11.parquet"}
+
+    def vanishing(self: Path, *args: object, **kwargs: object):
+        if self.name in gone:
+            raise FileNotFoundError(2, "No such file or directory", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", vanishing)
+    usage = walk(tmp_path)
+    assert usage.refused == 0
+    assert usage.files == 4
+
+
+# -- the payload's types and its no-runway shape ------------------------------
+
+
+def test_the_mean_is_a_whole_number_of_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # ``//`` rather than ``/``. A float reaches the page as ``212483584.0`` and is not a
+    # count of bytes. ``==`` alone would not notice, because ``4096 == 4096.0``, so the
+    # type is asserted beside the value.
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 40_000)
+    _write(tmp_path, "chains/ticker=QQQ/date=2026-09-15.parquet", 30_000)
+    _stub_space(monkeypatch, free=1 << 40)
+    result = assess(tmp_path, today=date(2026, 9, 17), calendar=_weekday_calendar(MONDAY, 400))
+    assert isinstance(result.mean, int)
+    assert not isinstance(result.mean, bool)
+    assert isinstance(result.peak, int)
+    assert isinstance(result.capture_days_left, int)
+
+
+def test_a_lake_with_no_growth_says_so_on_every_field_not_just_the_runway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # ``beyond_horizon`` defaults to False and is only set by the forward walk, which does
+    # not run when there is no rate. Defaulting it True would tell a reader the runway
+    # outran the calendar when nothing was measured at all.
+    _write(tmp_path, "manifest.jsonl", 10)
+    _stub_space(monkeypatch, free=1 << 40)
+    result = assess(tmp_path, today=date(2026, 9, 17), calendar=_weekday_calendar(MONDAY, 400))
+    assert result.capture_days_left is None
+    assert result.beyond_horizon is False
+    assert result.space_error is None
+    assert isinstance(result.free, int)
+
+
+def test_a_device_that_will_not_read_leaves_both_of_its_figures_unset(tmp_path: Path):
+    # The device-error path sets ``space_error`` and leaves ``free`` and ``capacity``
+    # alone. An empty string in either would be falsy on the page and wrong in the payload,
+    # which is the kind of drift a contract test exists to stop.
+    usage = assess(
+        tmp_path / "not-a-lake",
+        today=date(2026, 9, 17),
+        calendar=_weekday_calendar(MONDAY, 400),
+    )
+    assert usage.free is None
+    assert usage.capacity is None
+    assert usage.space_error == "FileNotFoundError"
