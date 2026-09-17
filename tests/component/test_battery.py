@@ -2793,3 +2793,249 @@ def test_a_configured_floor_of_zero_does_not_crash_the_median(lake: Path):
 
     assert finding.verdict == INSUFFICIENT_HISTORY
     assert finding.computed == 0.0
+
+
+# -- what the mutation lens found unheld ------------------------------------
+#
+# Each of these was a mutation the suite did not notice. They are grouped because they share a
+# cause: the band's tests all measured a count *below* the median, the ordering's tests never
+# put a mark on a boundary, and the rename test happened to pick a new spelling that sorts
+# after the old one.
+
+
+def test_a_snapshot_above_the_band_quarantines_too(lake: Path):
+    """Every other band test measures a count below the median, so dropping the upper half of
+    the comparison changed nothing the suite could see. A doubled chain is as much a fault as a
+    halved one: a vendor returning two expirations where it returned one is not a session the
+    lake should read as ordinary."""
+    _history(lake)
+    rows = _snapshots(DAY, count=2, rows_each=100) + _snapshots(
+        DAY, count=1, rows_each=200, first=2
+    )
+    _write(lake, "chains", "SPY", DAY, rows)
+    _seed_spans(lake)
+
+    finding = _answer(judge(lake, calendar=CALENDAR, now=NOW), CHECK_ROW_COUNT_BAND, JUDGED)
+
+    assert finding.verdict == QUARANTINED_VERDICT
+    assert finding.computed == 200.0
+    assert finding.against == 100.0
+
+
+@pytest.mark.parametrize(
+    ("rows_each", "verdict"),
+    [
+        (70, CLEAN_VERDICT),
+        (69, QUARANTINED_VERDICT),
+        (130, CLEAN_VERDICT),
+        (131, QUARANTINED_VERDICT),
+    ],
+)
+def test_the_band_includes_its_own_edges(lake: Path, rows_each: int, verdict: str):
+    """Thirty percent either side of a median of 100 is 70 to 130, and both ends are inside.
+    The tolerance has had an edge test since it shipped; the band had none, so an inclusive
+    boundary and an exclusive one were the same suite."""
+    _history(lake)
+    _write(lake, "chains", "SPY", DAY, _snapshots(DAY, count=3, rows_each=rows_each))
+    _seed_spans(lake)
+
+    assert (
+        _answer(judge(lake, calendar=CALENDAR, now=NOW), CHECK_ROW_COUNT_BAND, JUDGED).verdict
+        == verdict
+    )
+
+
+def test_the_quarantine_names_the_snapshot_furthest_from_the_median(lake: Path):
+    """``computed`` is what an operator reads when deciding whether to sign off, so naming the
+    nearest of several out-of-band snapshots would understate the fault."""
+    _history(lake)
+    rows = _snapshots(DAY, count=1, rows_each=100)
+    rows += _snapshots(DAY, count=1, rows_each=60, first=1)
+    rows += _snapshots(DAY, count=1, rows_each=30, first=2)
+    _write(lake, "chains", "SPY", DAY, rows)
+    _seed_spans(lake)
+
+    finding = _answer(judge(lake, calendar=CALENDAR, now=NOW), CHECK_ROW_COUNT_BAND, JUDGED)
+
+    assert finding.computed == 30.0
+    assert "2 of 3 session snapshots" in finding.reason
+
+
+def test_a_pass_reports_the_judged_sessions_own_median(lake: Path):
+    """The clean branch's ``computed`` is the comparison that passed, not the extreme of it."""
+    _history(lake)
+    _write(lake, "chains", "SPY", DAY, _snapshots(DAY, count=3, rows_each=75))
+    _seed_spans(lake)
+
+    finding = _answer(judge(lake, calendar=CALENDAR, now=NOW), CHECK_ROW_COUNT_BAND, JUDGED)
+
+    assert finding.verdict == CLEAN_VERDICT
+    assert finding.computed == 75.0
+    assert finding.against == 100.0
+
+
+def test_no_session_snapshot_is_out_of_scope_and_never_a_pass(lake: Path):
+    """``judge`` answers this at the partition level before the band runs, so this drives the
+    judgment directly. It matters because a clean verdict here fails open: a partition already
+    withheld under this check would be released on the strength of zero snapshots."""
+    finding = judge_row_count(_partition(lake), (), (100.0,) * 5, GuardConstants())
+
+    assert finding.verdict == OUT_OF_SCOPE
+    assert not finding.judged
+
+
+@pytest.mark.parametrize("mark", [1.0, 1.05])
+def test_a_mark_on_either_boundary_is_ordered(lake: Path, mark: float):
+    """The design writes it ``bid <= mid <= ask``, and both ends are inside. A mark sitting
+    exactly at the bid is an ordinary quote on an illiquid contract, so narrowing either
+    comparison would quarantine a healthy feed the moment more than five percent of its rows
+    quoted there."""
+    rows = _ordered_rows("chains", count=10)
+    for row in rows:
+        row["mark"] = mark
+
+    _write(lake, "chains", "SPY", DAY, rows)
+    _seed_spans(lake)
+
+    evidence = read_quote_order(_partition(lake))
+
+    assert evidence.unordered == 0
+    assert _answer(judge(lake, calendar=CALENDAR, now=NOW), CHECK_QUOTE_SANITY).verdict == (
+        CLEAN_VERDICT
+    )
+
+
+def test_a_non_session_day_takes_no_slot_in_the_trailing_window(lake: Path):
+    """The window counts sessions, and a day the calendar calls closed is not one. Letting it
+    in would contribute a median taken over every row it holds, with no session filter, which
+    is the asymmetry the band's own non-session rule exists to close."""
+    _history(lake)
+    saturday = date(2026, 9, 12)
+    _write(lake, "chains", "SPY", saturday, _snapshots(DAY, count=3, rows_each=10, day=saturday))
+    _write(lake, "chains", "SPY", DAY, _snapshots(DAY, count=3, rows_each=100))
+    _seed_spans(lake)
+
+    trailing = trailing_medians(
+        lake, _partition(lake), calendar=CALENDAR, spans=(_span(),), guards=GuardConstants()
+    )
+
+    assert not CALENDAR.is_session(saturday)
+    assert trailing == (100.0,) * 6, "the Saturday's ten-row snapshots are not in it"
+
+
+def test_a_rename_is_found_under_the_spelling_the_lake_wrote(lake: Path):
+    """The earlier rename test picked a new spelling that sorts after the old one, so looking
+    only at the alphabetically first name happened to find the partitions. This renames the
+    other way, so the first spelling sorted is the one nothing is written under."""
+    from lake.security_master import ID_TYPE_TICKER, SecurityMaster, master_path
+
+    _seed_spans(lake)
+    _cover_all(lake)
+    master = SecurityMaster.read(master_path(lake))
+    master.remap(1, ID_TYPE_TICKER, "AAA", date(2026, 9, 16))
+    pa_pq.write_table(master.to_table(), lake / "reference" / "security_master.parquet")
+
+    found = _coverage(lake)
+
+    assert found.missing == (), "every partition is still under ticker=SPY, which sorts second"
+    assert found.owed == 14
+
+
+def test_a_missing_session_is_named_under_the_spelling_valid_that_day(lake: Path):
+    """An operator reads the finding and goes looking for the path it names. After a rename the
+    sessions on either side belong to different directories, and naming both under one spelling
+    sends half of them to a path the lake would never have written."""
+    from lake.security_master import ID_TYPE_TICKER, SecurityMaster, master_path
+
+    _seed_spans(lake)
+    _cover_all(lake, days=[day for day in COVERED_SESSIONS if day not in (date(2026, 9, 2), DAY)])
+    master = SecurityMaster.read(master_path(lake))
+    master.remap(1, ID_TYPE_TICKER, "SPYX", date(2026, 9, 14))
+    pa_pq.write_table(master.to_table(), lake / "reference" / "security_master.parquet")
+
+    named = {
+        (finding.surface, finding.day): finding.partition for finding in _coverage(lake).missing
+    }
+
+    assert named["chains", date(2026, 9, 2)] == "chains/ticker=SPY/date=2026-09-02.parquet"
+    assert named["chains", DAY] == "chains/ticker=SPYX/date=2026-09-16.parquet"
+    assert named["quotes", DAY] == "quotes/ticker=SPYX/date=2026-09-16.parquet"
+
+
+def test_a_check_deferred_to_a_human_is_not_reported_as_a_pass(lake: Path):
+    """The line says which checks passed, and a deferral is not a pass: the run re-observed the
+    partition and applied nothing. Listing it claims a verdict the run never wrote."""
+    partition = f"chains/ticker=SPY/date={DAY.isoformat()}.parquet"
+    append_quarantine(
+        lake,
+        build_entry(
+            partition=partition,
+            verdict=CLEAN_VERDICT,
+            check=CHECK_ENTITLEMENT,
+            observed_at=NOW - timedelta(days=1),
+            provenance=PROVENANCE_HUMAN,
+        ),
+    )
+    append_quarantine(
+        lake,
+        build_entry(
+            partition=partition,
+            verdict=QUARANTINED_VERDICT,
+            check="strike_grid_completeness",
+            observed_at=NOW - timedelta(days=1),
+        ),
+    )
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains"))
+    _seed_spans(lake)
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert report.deferred == 1
+    (line,) = [ln for ln in report.report if "stays quarantined under" in ln]
+    assert CHECK_ENTITLEMENT not in line, "the entitlement check deferred rather than passing"
+    assert CHECK_QUOTE_SANITY in line
+
+
+def test_the_line_names_a_check_that_quarantined_after_another_passed(lake: Path):
+    """``PartitionOutcome.holders`` is the walk's end state and ``Decision.holders`` is the
+    state as each finding landed. Nothing told them apart until this. The last decision here is
+    the quarantining one, whose own holders are empty because it withholds, so a line sourced
+    from it would say nothing at all about a partition that no longer reads."""
+    _write(lake, "chains", "SPY", DAY, _ordered_rows("chains", count=100, crossed=100))
+    _seed_spans(lake)
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert report.withheld == 1
+    (line,) = [ln for ln in report.report if "stays quarantined under" in ln]
+    assert CHECK_ENTITLEMENT in line, "it passed"
+    assert f"'{CHECK_QUOTE_SANITY}'" in line, "and this one withholds it, decided after"
+
+
+def test_a_transition_is_measured_on_readability_rather_than_on_the_spelling(lake: Path):
+    """``decide_partition``'s docstring: "an entry whose spelling drifted while its effect did
+    not is still the same news". ``manifest.is_quarantined`` withholds on any verdict that is
+    not ``clean``, so an entry spelled ``held`` already withholds, and a fresh ``quarantined``
+    finding changes nothing. Comparing the two spellings instead appends a line every night for
+    ever, which is what append-on-transition exists to prevent.
+    """
+    from lake.battery import _transition
+
+    held = {"verdict": "held", "check": CHECK_ENTITLEMENT}
+    fails = _entitlement_finding_for(QUARANTINED_VERDICT)
+    passes = _entitlement_finding_for(CLEAN_VERDICT)
+
+    assert _transition(held, fails) is False, "already withheld, so this is the same news"
+    assert _transition(held, passes) is True, "and this is the news that it now reads"
+
+
+def _entitlement_finding_for(verdict: str) -> Finding:
+    return Finding(
+        partition=JUDGED,
+        surface="chains",
+        ticker="SPY",
+        day=DAY,
+        check=CHECK_ENTITLEMENT,
+        verdict=verdict,
+        reason="",
+    )
