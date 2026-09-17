@@ -626,10 +626,15 @@ def check_bar_span(
     The ends need no such answer either way. They are sufficient here because this job fetches
     one session, which leaves no interior session to lose.
 
-    The ends rule has its own edge, which the same measurement makes visible: a ticker that does
-    not trade in the session's first or last minute returns no candle at that end and is refused
-    every night. Marketlake #461 owns it, deferred at zero observations on a roster of SPY and
-    QQQ.
+    **The ends rule has two edges, and they fail opposite ways.** Both are deferred at zero
+    observations on a roster of SPY and QQQ, and both are named here rather than left for a reader
+    to rediscover.
+
+    1. A ticker that does not trade in the session's first or last minute returns no candle at
+       that end, so the rule refuses and nothing lands, every night. Marketlake #461 owns it.
+    2. A response missing a stretch out of the *middle* of the session satisfies both ends, so it
+       lands short while ``covered`` reports the full span. The manifested skip then never
+       re-fetches it. Marketlake #466 owns it.
 
     On ``1d`` it is presence: did the session being fetched come back, one against one. The
     window is a bracket deliberately wider than the session, so a neighbouring session whose
