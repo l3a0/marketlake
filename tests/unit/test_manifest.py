@@ -381,10 +381,18 @@ def test_a_manifest_partition_that_cannot_be_a_key_names_itself(tmp_path, partit
 def test_a_manifest_partition_that_can_be_a_key_still_passes_through(tmp_path):
     """The guard refuses what cannot be keyed, never what merely is not a string.
 
-    A hand-repaired ledger holding an integer key is damage nothing here can decide about, and
-    ``signoff.open_quarantines`` prints it on purpose so the human can find what to repair.
-    Refusing it would take that listing away and turn a repairable ledger into an unreadable
-    one, which is the guard inverted.
+    A hand-repaired ledger holding an integer key is damage this reader cannot decide about.
+    Refusing it here would turn a repairable ledger into an unreadable one, which is the guard
+    inverted, and on the quarantine side it would take away the listing
+    ``signoff.open_quarantines`` prints on purpose so the human can see the key they need to
+    repair.
+
+    **This holds what this reader returns and nothing about what a caller then does with it.**
+    Two callers on, ``actions.surface_ticker_days`` hands the key to
+    ``paths.parse_partition_rel``, which raises ``AttributeError`` on a non-string against its
+    own stated contract that anything unparseable is ``None``. That escapes every refusal tuple
+    and is marketlake #525, filed rather than absorbed: it is the shape that *can* be keyed and
+    cannot be parsed, where this guard covers the shape that cannot be keyed at all.
     """
     manifest_path(tmp_path).write_text(
         "".join(

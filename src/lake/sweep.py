@@ -209,10 +209,11 @@ ScheduleSetter = Callable[[date], None]
 # they belong is marketlake #446.
 # ``ManifestError`` as the class rather than one of its members, the lesson ``_BARS_REFUSALS``
 # below already writes down. Both walks read through ``lake.loader``, which resolves the
-# quarantine ledger on every partition it opens and publishes a damaged one as this error. Four
-# shapes reach here, two from each layer of that read. ``manifest.read_quarantine`` refuses the
-# whole file, as ``manifest.TornLedger`` for a read that stopped with verdicts written behind it
-# and as ``manifest.LedgerNotUtf8`` for bytes that do not decode.
+# quarantine ledger on every partition it opens and publishes a damaged one as this error. Five
+# shapes reach here, two from the lower layer of that read and three from the upper.
+# ``manifest.read_quarantine`` refuses the whole file, as ``manifest.TornLedger`` for a read that
+# stopped with verdicts written behind it and as ``manifest.LedgerNotUtf8`` for bytes that do not
+# decode.
 # ``manifest.latest_quarantine_by_check`` refuses one entry above it, three ways: a line that
 # parses and names no partition, one whose ``partition`` cannot be a dict key, and one whose
 # ``check`` cannot be. Executed against
