@@ -336,6 +336,7 @@ def test_slice1_segment_entry_is_superseded_by_its_compacted_partition(fixture_l
 
 
 def test_quarantine_appends_and_last_verdict_wins(lake_root):
+    """Two entries naming no check resolve in one bucket, so the later verdict wins."""
     append_quarantine(lake_root, {"partition": CHAINS_REL, "verdict": "suspect"})
     append_quarantine(lake_root, {"partition": CHAINS_REL, "verdict": "clean"})
     assert len(read_quarantine(lake_root)) == 2

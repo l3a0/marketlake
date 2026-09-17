@@ -385,8 +385,10 @@ def _latest_by_key(numbered: Sequence[tuple[int, dict]], path: Path) -> dict[Act
 def latest(lake_root: Path | str) -> dict[ActionKey, dict]:
     """The current answer per key: the last entry on it in file order.
 
-    This is the shape ``manifest._latest_by_partition`` already implements, and the way
-    ``loader.py`` consults ``quarantine.jsonl`` at read time.
+    Two ledgers resolve this way on a composite key: this one, and the quarantine ledger
+    through ``manifest.latest_quarantine_by_check``, which keys on the partition and the
+    check. ``manifest._latest_by_partition`` is the single-field form, and the manifest is
+    now its only user.
     """
     return _latest_by_key(list(enumerate(read(lake_root), start=1)), actions_path(lake_root))
 

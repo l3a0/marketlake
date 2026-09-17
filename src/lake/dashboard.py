@@ -101,7 +101,7 @@ from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants, input_errors_exit, load_config
 from lake.control_plane import assertion_window, sunday_canary_due
 from lake.deadman import in_envelope
-from lake.manifest import VERDICT_FIELD, is_quarantined, latest_quarantine
+from lake.manifest import VERDICT_FIELD, latest_quarantine_by_check, withholding
 from lake.metadata import read_metadata
 from lake.paths import (
     CHAINS,
@@ -1698,20 +1698,48 @@ def _open_quarantines(root: Path) -> tuple[list[dict[str, object]], str | None]:
     reason: one panel served without a clamp rather than a panel not served at all.
 
     The entry's shape is marketlake #139's and #139 is unbuilt, so only the partition
-    path and the ``verdict`` field are read, both defensively. The panel prints no
-    sign-off command, because the tool that would run it does not exist and its spelling
-    is not settled.
+    path, the ``verdict`` field and the ``check`` field are read, all defensively. The panel
+    prints no sign-off command, because the tool that would run it does not exist and its
+    spelling is not settled.
+
+    **Every withholding check is named, each with its own verdict.** Each check keeps its own
+    current verdict, so a partition can be withheld by more than one at a time and signing one
+    off leaves the rest standing. A row saying only "quarantined" cannot tell an operator that.
+    The verdicts are carried per check rather than once for the row, because two checks
+    withhold under two different spellings and one of them printed beside both check names
+    says the wrong thing about the other.
+
+    It is also how a stranded token shows: a check that quarantined and then stopped judging,
+    because it was renamed or it now answers ``insufficient_history`` forever, holds its
+    partition until a human signs that token off, and the token is the only thing that says so.
+
+    The row's own ``verdict`` stays, and it is the deciding entry's, which is what
+    ``manifest.latest_quarantine`` would return.
     """
     try:
-        ledger = latest_quarantine(root)
+        ledger = latest_quarantine_by_check(root)
     except Exception as exc:  # noqa: BLE001 - a summary must not cost the panel
         log.exception("quarantine ledger unreadable, so the panel reports it instead")
         return [], type(exc).__name__
-    open_entries = [
-        {"partition": partition, "verdict": entry.get(VERDICT_FIELD)}
-        for partition, entry in sorted(ledger.items())
-        if is_quarantined(entry)
-    ]
+    open_entries = []
+    for partition, by_check in sorted(ledger.items()):
+        held = withholding(by_check)
+        if not held:
+            continue
+        open_entries.append(
+            {
+                "partition": partition,
+                "verdict": held[0].get(VERDICT_FIELD),
+                # ``check`` is read defensively like ``verdict`` beside it. Every entry
+                # ``battery.build_entry`` assembles carries one, so a missing check means a
+                # hand-written or damaged line, and the page shows it the way it shows a
+                # missing verdict rather than printing the word "None".
+                "checks": [
+                    {"check": entry.get("check"), "verdict": entry.get(VERDICT_FIELD)}
+                    for entry in held
+                ],
+            }
+        )
     return open_entries, None
 
 
