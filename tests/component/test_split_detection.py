@@ -1497,6 +1497,41 @@ def test_the_render_says_what_the_scale_guard_did(fixture_lake: FixtureLake):
     assert "  scale not compared: 0" in rendered
 
 
+def test_the_render_names_each_skip_and_each_non_adjustment_under_its_own_heading(
+    fixture_lake: FixtureLake,
+):
+    """The two by-reason blocks are a shared renderer now, so both surfaces need holding.
+
+    ``by_reason`` moved out of this module into ``lake.actions`` when the dividend walk grew
+    the same record, which means a change made for that walk's block silently changes this
+    one. This walk asserted its skips and non-adjustments as objects and never as the text an
+    operator reads, so the two blocks could swap contents or print under one heading and
+    nothing here would notice.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_TWO): [
+                _row(DAY_TWO, occ_symbol=CARRIED_OCC),
+                _adjusted_row(DAY_TWO, non_standard=False),
+            ],
+            ("SPY", DAY_THREE): [_gap_day_row(DAY_THREE)],
+        },
+    )
+
+    rendered = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT)).render()
+
+    not_a_split = rendered.index("  not a split: 1")
+    skipped = rendered.index("  skipped:   1")
+    assert not_a_split < skipped, "the two blocks are in the order render declares"
+    assert f"    - {REASON_STANDARD_SERIES}: 1" in rendered
+    assert f"    - {REASON_NO_OPTION_CLOSE}: 1" in rendered
+    # Each line sits under its own heading rather than both under one.
+    assert rendered.index(f"    - {REASON_STANDARD_SERIES}: 1") < skipped
+    assert rendered.index(f"    - {REASON_NO_OPTION_CLOSE}: 1") > skipped
+
+
 def test_the_subcommand_inherits_the_three_code_contract(
     fixture_lake: FixtureLake, tmp_path: Path, capsys
 ):

@@ -495,7 +495,13 @@ Slice 4 is pure derivation over sealed partitions. It fetches nothing. Its test 
 
 Slice 5 adds the validation battery, the rest of the dashboard, and the quarantine sign-off tool.
 
-- **D20** validation battery plus the History and Lake panels. Scope in [#138](https://github.com/l3a0/marketlake/issues/138).
+- **D20** validation battery plus the History and Lake panels. Scope in [#138](https://github.com/l3a0/marketlake/issues/138), which split into six sub-issues rather than shipping as one.
+  - **D20a** the battery's spine, the quarantine writer, and the real-time entitlement check. [#406](https://github.com/l3a0/marketlake/issues/406).
+  - **D20b** trading-calendar coverage, quote sanity, and the snapshot row-count band. [#407](https://github.com/l3a0/marketlake/issues/407).
+  - **D20c** the strike-vs-spot scale guard. [#408](https://github.com/l3a0/marketlake/issues/408).
+  - **D20d** quote-quality drift against a trailing band. [#409](https://github.com/l3a0/marketlake/issues/409).
+  - **D20e** the dashboard's History panel. [#410](https://github.com/l3a0/marketlake/issues/410).
+  - **D20f** the dashboard's Lake panel. [#411](https://github.com/l3a0/marketlake/issues/411).
 - **D21** the quarantine sign-off tool, the flock-guarded CLI that resolves quarantines, placed beside the panel that surfaces them. Scope in [#139](https://github.com/l3a0/marketlake/issues/139).
 
 Computed greeks stay deferred beyond the build, per the design doc.
@@ -598,7 +604,7 @@ Each healthchecks.io check is created by hand, in the session that first makes i
 3. **D13**, `capture`, and the daemon's own pages. The per-cycle dead-man. Delete the `slice1-capture` row in the same session, because `capture` supersedes it. Ship every daemon page path through one publisher: auth death, sustained 429s, the watchdog, and the sampler collapse. The parser's schema-drift page carries the retype half, and the half a vanished field leaves no trace of is tracked in [#265](https://github.com/l3a0/marketlake/issues/265) above. The auth-gap reminder that #92 also carried is considered and rejected, in the design's auth-death bullet. Rehearse the topic rotation once, end to end. The 09:35 calendar probe ships here too, with its page and its `calendar-probe` check.
 4. **D14**, `pre-open` and `sunday`, and the Sunday reminder. D14 renders the launchd jobs and the wake schedules those two checks watch. The Sunday job sends the re-auth reminder on its 20:00, 21:00, and 22:00 canary runs only, while the throwaway call or the coverage assertion still fails, reading the token's mint time from `token.json` itself.
 5. **D16**, `eod-sweep`, and the nightly summary. `lake.sweep` ships the producer, so this row is owed on the next weekday its 18:30 job runs through. Create the check and confirm ntfy and email both read on for it. Until the row exists the ping goes to a slug healthchecks does not know, and the job pages once to say so, which is the refused-ping page working rather than a fault. That page is the one [#213](https://github.com/l3a0/marketlake/issues/213) could not wire, because no code pinged this slug when it shipped. The report channel is created here too: the sweep's own ping lands before the digest it sends. Scope in [#281](https://github.com/l3a0/marketlake/issues/281).
-6. **D20**, the battery's pages, delayed feed and nightly schema drift.
+6. **D20a**, the battery's delayed-feed page. The battery's second page, its own nightly schema drift, is [#427](https://github.com/l3a0/marketlake/issues/427) and does not ship with it. The message table's schema-drift row names four producers, and the parser's and compaction's are the two that already ship.
 
 ## Discipline rules
 

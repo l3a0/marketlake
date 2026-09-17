@@ -188,14 +188,19 @@ from pathlib import Path
 from lake.actions import (
     CHECK_INSTRUMENT_RESOLUTION,
     PROVENANCE_OBSERVED,
+    REASON_PARTIAL_READ,
+    REASON_PARTITION_ABSENT,
+    REASON_QUARANTINED,
     TYPE_SPLIT,
     ActionKey,
     HeldFinding,
     Landed,
     MasterAbsent,
+    Skip,
     UnresolvedSymbol,
     append,
     build_entry,
+    by_reason,
     by_ticker,
     latest,
     read_master,
@@ -383,10 +388,12 @@ class BoundaryUnbounded(SplitError):
 
 
 # Why a ticker-day was not read, and each reason widens a boundary's window by one session.
+# Three of them are ``lake.actions``' above, imported rather than restated, because the
+# dividend walk meets the same three and one reason has to have one spelling. The rest are
+# this surface's own, the close-of-record one included, because each names the tag its walk
+# resolved against. This one is ``option_close`` and ``actions.REASON_NO_SPOT_CLOSE`` is
+# ``spot_close``.
 REASON_NO_OPTION_CLOSE = "no option close"
-REASON_QUARANTINED = "quarantined"
-REASON_PARTIAL_READ = "partial read"
-REASON_PARTITION_ABSENT = "manifested partition absent"
 REASON_OUT_OF_SCOPE = "outside the capture span"
 REASON_THIN = "suspect or truncated"
 REASON_UNRESOLVED = "unresolved symbol"
@@ -405,15 +412,6 @@ REASON_INSTRUMENT_CHANGED = "the pair spans two instruments"
 REASON_DELIVERABLE_UNCHANGED = "the deliverable did not move"
 REASON_STANDARD_SERIES = "the gained contracts are standard"
 REASON_ROOT_RETURNED = "the root had been carried before"
-
-
-@dataclass(frozen=True)
-class Skip:
-    """One ticker-day the walk did not read, and why."""
-
-    ticker: str
-    day: date
-    reason: str
 
 
 @dataclass(frozen=True)
@@ -644,13 +642,13 @@ class SplitReport:
             )
         lines.append(f"  unchanged: {self.unchanged}")
         lines.append(f"  not a split: {len(self.not_adjustments)}")
-        lines.extend(_by_reason(self.not_adjustments))
+        lines.extend(by_reason(self.not_adjustments))
         lines.append(f"  skipped:   {len(self.skipped)}")
-        lines.extend(_by_reason(self.skipped))
+        lines.extend(by_reason(self.skipped))
         lines.append(f"  scale compared: {self.scale_pairs}")
         lines.append(f"  scale already recorded: {self.scale_covered}")
         lines.append(f"  scale not compared: {len(self.scale_unread)}")
-        lines.extend(_by_reason(self.scale_unread))
+        lines.extend(by_reason(self.scale_unread))
         return "\n".join(lines)
 
 
@@ -1214,15 +1212,6 @@ def _require_unmoved(before: object, after: object, what: str) -> None:
 
 
 # -- the walk ----------------------------------------------------------------
-
-
-def _by_reason(items: Sequence[Skip | NotAnAdjustment | ScaleUnread]) -> list[str]:
-    """One line per distinct reason, with its count. Counts rather than a line each, so a
-    lake whose every session is a gap day still renders on one screen."""
-    lines = []
-    for reason in sorted({item.reason for item in items}):
-        lines.append(f"    - {reason}: {sum(1 for i in items if i.reason == reason)}")
-    return lines
 
 
 def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
