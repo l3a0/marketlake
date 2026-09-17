@@ -5,7 +5,7 @@ Those carry no ``is_delayed`` and no ``realtime``, and widening them is not free
 ``test_load_quotes.py`` proves the overflow projection lifts ``realtime`` out of ``extra``, and
 its setup edits only the schema-version ledger, so it depends on the fixture schema's not
 carrying the column. Adding it there makes the real column shadow the overflow and the test
-reads ``None``. Marketlake #412 carries that fragility.
+reads ``None``. Marketlake #415 carries that fragility.
 """
 
 from __future__ import annotations
