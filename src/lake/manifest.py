@@ -436,11 +436,13 @@ def latest_quarantine_by_check(lake_root: Path) -> dict[str, dict[str, dict]]:
     root, so a reader that stepped over damage in it would make every check downstream weaker
     than it reads.
 
-    The ``partition`` guard is marketlake #514 and it is the one that had to exist for any of
-    the containment around this ledger to hold. Until it did, that shape raised a bare
+    The ``partition`` guard is marketlake #514. Until it existed, that shape raised a bare
     ``TypeError``, which is neither a ``ManifestError`` nor an ``OSError``, so it reached
     none of the tuples a damaged ledger is meant to land in and ended the whole 18:30 run.
-    That is the same escape marketlake #495 closed for a ledger whose bytes do not decode.
+    The containment held for this reader's other shapes throughout, which is the point: four
+    of them already landed as a ``ManifestError`` and the fifth walked past every one of
+    their catches. That is the same escape marketlake #495 closed for a ledger whose bytes do
+    not decode.
     """
     path = quarantine_path(lake_root)
     latest: dict[str, dict[str, dict]] = {}
