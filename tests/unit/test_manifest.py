@@ -568,6 +568,31 @@ def test_a_quarantine_partition_that_cannot_be_a_key_names_this_ledger(tmp_path,
     )
 
 
+def test_a_quarantine_partition_that_can_be_a_key_still_reaches_every_reader(tmp_path):
+    """The guard refuses what cannot be keyed, never what merely is not a string.
+
+    ``signoff.open_quarantines`` sorts with ``key=str`` precisely so a hand-repaired ledger
+    holding an integer key still lists, and its docstring names these four as the ones that
+    reach it. A guard written as ``isinstance(partition, str)`` would look like the same fix,
+    pass every refusal test beside this one, and take that listing away: the operator loses the
+    damaged key that was the only thing telling them what to repair.
+
+    Found by mutation. Without this, replacing the ``except TypeError`` arm with an
+    ``isinstance`` refusal survived the whole file. Its twin on the manifest half was caught,
+    which is the instance-not-the-class shape from one function away.
+    """
+    _ledger(
+        tmp_path,
+        *(
+            {"partition": key, "verdict": "quarantined", "check": "row_count_band"}
+            for key in (7, 1.5, None, True, CHAINS)
+        ),
+    )
+
+    assert set(latest_quarantine_by_check(tmp_path)) == {7, 1.5, None, True, CHAINS}
+    assert set(latest_quarantine(tmp_path)) == {7, 1.5, None, True, CHAINS}
+
+
 def test_latest_quarantine_inherits_the_refusal_rather_than_repeating_it(tmp_path):
     """``latest_quarantine`` resolves through ``latest_quarantine_by_check`` and adds no guard.
 
