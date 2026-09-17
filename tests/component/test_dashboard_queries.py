@@ -1,7 +1,7 @@
-"""The three named queries over a real fixture lake.
+"""The four named queries over a real fixture lake.
 
 These lay down journal segments in the pinned capture schemas and sealed partitions in
-the fixture schema, then run the Now, Today and History queries against them through the real
+the fixture schema, then run the Now, Today, History and Lake queries against them through the real
 sandboxed connection. The clock and the calendar are fakes, so the one real boundary is
 the filesystem and the tier is component.
 
@@ -39,6 +39,7 @@ import hashlib
 import json
 import shutil
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -1332,6 +1333,7 @@ def test_the_panels_leave_the_lake_byte_identical(service: DashboardService, roo
     service.run_query("today", {})
     service.run_query("today", {"date": "2026-08-21", "ticker": "QQQ"})
     service.run_query("history", {})
+    service.run_query("lake", {})
     assert _tree_digest(root) == before
 
 
@@ -2573,8 +2575,8 @@ def test_a_column_no_partition_carries_does_not_raise_out_of_the_panel(root: Pat
     # The bulk read unions every partition in the window by name and has no journal view
     # beside it, so what it can bind depends on the data. A column that no partition in
     # the union carries raises ``BinderException``, which is not a partition-read error.
-    # It must not escape: ``_serve`` turns an escape into a 500, and a drifted partition
-    # thirty days back would take the Now and Today panels down with this one.
+    # It must not escape: ``_serve`` turns an escape into a 500, and a 500 throws away
+    # every finding this payload was going to carry, the counts and the reports included.
     #
     # Every partition in the surface's bulk set loses the column, because ``union_by_name``
     # fills it from any sibling that still has it and the error would not fire.
@@ -2999,3 +3001,203 @@ def test_the_panel_names_its_tickers_and_orders_the_ledger(fixture_lake: Fixture
     assert [entry["partition"] for entry in payload["quarantines"]] == [
         f"chains/ticker=SPY/date={day.isoformat()}.parquet" for day in (THURSDAY, FRIDAY, MONDAY)
     ]
+
+
+# -- the Lake panel ----------------------------------------------------------
+
+
+def test_the_lake_panel_reports_every_entry_and_names_the_surfaces_never_written(root: Path):
+    # Four surfaces in three layouts plus the root ledgers, and the fixture lake holds two
+    # of the surfaces. ``actions`` and ``bars`` have never been written to it, and the
+    # panel says so rather than leaving them off a list, because absence is the ordinary
+    # case here: ``bars/`` did not exist on the live lake the day this panel was specified
+    # and ``actions/`` still does not.
+    payload = service_over(root).run_query("lake", {})
+    assert payload["error"] is None
+    names = [entry["name"] for entry in payload["entries"]]
+    assert "chains" in names
+    assert set(payload["absent_surfaces"]) >= {"actions", "bars"}
+    assert all(name not in names for name in payload["absent_surfaces"])
+    # Biggest first, because the question the panel answers is what is filling the disk.
+    sizes = [entry["bytes"] for entry in payload["entries"]]
+    assert sizes == sorted(sizes, reverse=True)
+    assert payload["lake_bytes"] == payload["dated_bytes"] + payload["undated_bytes"]
+
+
+def test_the_lake_panel_takes_no_parameter(root: Path):
+    # Rule 2 allows a request a ticker and a date, and ``validate_parameters`` builds
+    # exactly those two keyword arguments, so a third declared name would pass the
+    # unknown-field check and be dropped on the floor. This panel is about the whole lake,
+    # so there is nothing a request could narrow anyway.
+    with pytest.raises(dashboard.QueryParameterError):
+        service_over(root).run_query("lake", {"ticker": "SPY"})
+    with pytest.raises(dashboard.QueryParameterError):
+        service_over(root).run_query("lake", {"date": "2026-08-24"})
+
+
+def test_the_lake_panel_reports_a_refused_read_rather_than_raising(root: Path):
+    # ``_serve`` turns any escape into a 500, and a 500 says only "query failed". This
+    # payload's whole job on a bad day is naming what would not read, so a raise would
+    # throw away the one thing worth having.
+    # ``reports/`` rather than a surface or the journal, because ``lake_roster`` walks
+    # those two on every request and ``_children`` does not contain a ``PermissionError``,
+    # so an unreadable one takes down all four panels before this one is reached. That is
+    # marketlake #449 and not this panel's to fix.
+    locked = root / "reports"
+    locked.mkdir(exist_ok=True)
+    (locked / "a.json").write_text("{}")
+    locked.chmod(0o000)
+    try:
+        payload = service_over(root).run_query("lake", {})
+    finally:
+        locked.chmod(0o755)
+    assert payload["error"] is None
+    assert payload["refused"] >= 1
+    assert payload["refusals"]
+    # And the rest of the lake still reports, rather than the whole panel failing.
+    assert payload["entries"]
+
+
+def test_a_lake_root_that_is_not_there_reports_a_refusal_and_not_an_empty_lake(tmp_path: Path):
+    # An absent ``reports/`` is a true zero: no nightly run filed anything. An absent root
+    # is a panel pointed at nothing, and reporting it as an empty lake would say the disk
+    # is fine when nothing was read at all.
+    payload = service_over(tmp_path / "gone").run_query("lake", {})
+    assert payload["error"] is None
+    assert payload["refused"] >= 1
+    assert payload["lake_bytes"] == 0
+    # The device read fails too, and it is contained beside the walk rather than
+    # discarding it. A payload that dropped the refusal would say only that something went
+    # wrong, where the refusal says which path.
+    assert payload["space_error"] == "FileNotFoundError"
+    assert payload["free"] is None
+    assert payload["capture_days_left"] is None
+
+
+def test_the_lake_panel_runs_no_sql_at_all(root: Path):
+    # The sizes are a walk and the free space is a ``shutil.disk_usage`` call, which is the
+    # one thing any panel reports from outside ``lake_root``. It could not have gone
+    # through DuckDB: the sandbox sets ``allowed_directories`` to exactly the root. A
+    # connection that refuses every statement proves the query never reaches one.
+    class RefusingCursor:
+        def execute(self, *args: object, **kwargs: object) -> object:
+            raise AssertionError("the Lake panel must run no SQL")
+
+        def close(self) -> None:
+            return None
+
+    class RefusingConnection(RefusingCursor):
+        def cursor(self) -> RefusingCursor:
+            return RefusingCursor()
+
+    service = DashboardService(
+        root,
+        clock=ManualClock(NOW.astimezone(UTC)),
+        calendar=CALENDAR,
+        connection=RefusingConnection(),
+        page=b"<!doctype html>",
+        icon=b"",
+    )
+    assert service.run_query("lake", {})["error"] is None
+
+
+def test_the_growth_rate_is_the_busiest_day_and_the_mean_rides_beside_it(root: Path):
+    # The finding the module exists around. The mean is denominated by the days that wrote
+    # bytes rather than by the window's width, and the runway is taken off the peak,
+    # because every way of understating the rate lengthens the runway and a check that
+    # flags short headroom never fires if its rate is too low.
+    payload = service_over(root).run_query("lake", {})
+    days = payload["days"]
+    assert days
+    assert payload["peak_bytes"] == max(day["bytes"] for day in days)
+    assert payload["capture_days"] == sum(1 for day in days if day["bytes"] > 0)
+    assert payload["mean_bytes"] <= payload["peak_bytes"]
+    assert payload["capture_days_left"] == payload["free"] // payload["peak_bytes"]
+
+
+def test_a_journal_day_is_flagged_unsealed_on_the_panel(fixture_lake: FixtureLake):
+    # A day's bytes are not stable: mid-session a day is Arrow IPC segments and after
+    # close+15 it is one compressed partition. The page explains a growth figure that
+    # drops at 16:30 rather than leaving a reader to distrust it.
+    root = one_segment_lake(
+        fixture_lake, [_chains("SPY", et(MONDAY, 9, 30), occ_symbol="A")], day=MONDAY
+    )
+    days = {day["day"]: day for day in service_over(root).run_query("lake", {})["days"]}
+    assert days[MONDAY.isoformat()]["unsealed"] is True
+
+
+def test_a_lake_with_no_growth_in_the_window_reports_no_runway(fixture_lake: FixtureLake):
+    # A runway goes unbounded exactly when capture has stopped, so a large number there
+    # would go quiet at the one moment something is wrong. It is also the division by zero.
+    root = fixture_lake.build()
+    (root / "manifest.jsonl").write_text("")
+    payload = service_over(root).run_query("lake", {})
+    assert payload["capture_days_left"] is None
+    assert payload["exhausts_on"] is None
+    assert payload["mean_bytes"] is None
+    assert payload["short"] is False
+
+
+def test_the_panel_forwards_the_alarm_flag_it_was_given(root: Path, monkeypatch):
+    """The unit tests hold ``Runway.short``. Nothing held the panel passing it on.
+
+    ``status.html`` keys the alarm styling off exactly this field, so a wiring slip here
+    silences the headroom warning on the one page an operator opens to ask whether the disk
+    is filling. The same goes for ``beyond_horizon``, which the page branches on to decide
+    whether to print a date at all.
+    """
+    real = dashboard.assess
+
+    def short_runway(*args: object, **kwargs: object):
+        result = real(*args, **kwargs)
+        return replace(
+            result,
+            capture_days_left=1,
+            exhausts_on=result.window_end,
+            beyond_horizon=False,
+        )
+
+    # Unpatched first. The fixture lake's runway outruns the calendar, so this is the
+    # ``True`` side of the flag, and asserting only the ``False`` side below would let a
+    # literal ``False`` sit in the payload undetected.
+    plain = service_over(root).run_query("lake", {})
+    assert plain["beyond_horizon"] is True
+    assert plain["exhausts_on"] is None
+    assert plain["short"] is False
+
+    monkeypatch.setattr(dashboard, "assess", short_runway)
+    payload = service_over(root).run_query("lake", {})
+    assert payload["short"] is True
+    assert payload["beyond_horizon"] is False
+    assert payload["exhausts_on"] == payload["window_end"]
+
+
+def test_the_panel_advertises_the_window_it_actually_measured(root: Path):
+    # ``window_days`` is a separate literal from the argument ``assess`` is called with, so
+    # the two can drift and the payload would keep claiming thirty days while measuring
+    # three. A narrowed window drops the busiest day and lengthens the runway.
+    payload = service_over(root).run_query("lake", {})
+    start = date.fromisoformat(payload["window_start"])
+    end = date.fromisoformat(payload["window_end"])
+    assert payload["window_days"] == 30
+    assert (end - start).days == payload["window_days"] - 1
+    assert all(start <= date.fromisoformat(day["day"]) <= end for day in payload["days"])
+
+
+def test_the_panel_advertises_the_headroom_threshold_it_flags_at(root: Path):
+    # The page prints this number to the reader, so it has to be the one the flag uses.
+    payload = service_over(root).run_query("lake", {})
+    assert payload["headroom_weeks"] == 3
+
+
+def test_a_reading_that_raises_reaches_the_reader_as_a_line(root: Path, monkeypatch):
+    # The backstop the query's docstring names. ``lake.runway`` contains both of its own
+    # readings, so this catches only a class neither expected, and the point of catching it
+    # is that a blank page says less than a named class does.
+    def boom(*args: object, **kwargs: object):
+        raise OSError("the device fell over")
+
+    monkeypatch.setattr(dashboard, "assess", boom)
+    payload = service_over(root).run_query("lake", {})
+    assert payload["error"] == "OSError"
+    assert payload["as_of"]
