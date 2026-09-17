@@ -61,6 +61,12 @@ meets it at :func:`append_verdict` rather than at the bare append. ``actions.app
 the worked precedent and :func:`append_verdict` follows it, down to counting the file's lines
 rather than the entries a read returns, so a damaged ledger cannot stop the writer.
 
+The pair sits at two levels rather than one. :func:`append_verdict` takes the lock and is what
+``lake.signoff`` and any other caller holding none wants. :func:`write_verdict` is the same two
+writes for a caller already inside the hold, which is :func:`judge`, because it has to read the
+ledger and append under one hold and ``lake_lock`` blocks forever on re-entry.
+``lake.occ_mapping`` splits its own writer the same way and for the same reason.
+
 **Human precedence, which #139 states and this builds.** Before appending, the battery reads
 that check's own current entry for the partition. If a human wrote it, a verdict from the
 *same* check never supersedes it, and the run says "re-observed, human precedence stands" in
@@ -514,10 +520,13 @@ def append_verdict(
 ) -> dict:
     """Append one verdict and refresh the ledger's manifest entry, inside one lock hold.
 
-    Both writes happen inside one hold of the lake-root ``flock``, which this takes itself.
-    ``manifest.py`` does not take it for a caller, and every other writer in the lake takes it
-    at its own call site. The ledger line and the refreshed manifest entry go together, so a
-    weekend verdict never leaves the Sunday scrub facing a sha nothing has caught up to.
+    This is the writer for a caller holding no lock, and it takes the lake-root ``flock``
+    itself. ``manifest.py`` does not take it for a caller, and every other writer in the lake
+    takes it at its own call site. The ledger line and the refreshed manifest entry go
+    together, so a weekend verdict never leaves the Sunday scrub facing a sha nothing has
+    caught up to. :func:`write_verdict` is the same pair of writes for a caller that already
+    holds the lock, which is what :func:`judge` is, and the two levels are kept apart because
+    ``lake.lock.lake_lock`` is a plain blocking ``LOCK_EX`` that blocks forever on re-entry.
 
     ``manifest.append_quarantine`` is deliberately not called here. It appends the line and
     returns, taking no lock and refreshing nothing, which is the shape ``manifest.py``'s own
@@ -531,22 +540,50 @@ def append_verdict(
     names the wrong producer, and every other writer in the lake stamps its own.
     """
     root = Path(lake_root)
-    target = quarantine_path(root)
-    target.parent.mkdir(parents=True, exist_ok=True)
 
     # Local to keep this module free of the lock unless it writes, the same reason
     # ``actions``, ``onboard``, ``retire`` and ``schema_versions`` import it at the call site.
     from lake.lock import lake_lock
 
     with lake_lock(root):
-        append_line(target, entry)
-        record_partition(
-            root,
-            QUARANTINE_FILE,
-            source=source,
-            rows=entry_line_count(root),
-            fetched_at=observed_at.astimezone(MARKET_TZ).isoformat(),
-        )
+        return write_verdict(root, entry, observed_at=observed_at, source=source)
+
+
+def write_verdict(
+    lake_root: Path | str,
+    entry: dict,
+    *,
+    observed_at: datetime,
+    source: str = BATTERY_SOURCE,
+) -> dict:
+    """The same two writes, for a caller already holding the lake-root lock.
+
+    :func:`append_verdict` is this function under the lock and is what a caller holding none
+    wants. This one exists because ``lake.lock.lake_lock`` is not re-entrant, verified by
+    executing: a nested acquire in one process blocks forever. So a caller that has to read the
+    ledger and append under one hold, which is :func:`judge`, cannot reach the pair through the
+    locking wrapper.
+
+    ``lake.occ_mapping`` is the worked precedent and the two levels here are its shape.
+    ``write_mappings`` takes the lock itself, re-reads the master inside it, and calls the
+    non-locking ``manifest.record_partition`` rather than the locking ``actions.append``, for
+    the reason its docstring gives: the walk's own snapshot is as old as the walk.
+
+    The pair stays in one function rather than being inlined at the second call site. The
+    ledger line and its manifest entry going together is the rule, and a third place writing
+    them is a third place that can write one without the other.
+    """
+    root = Path(lake_root)
+    target = quarantine_path(root)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    append_line(target, entry)
+    record_partition(
+        root,
+        QUARANTINE_FILE,
+        source=source,
+        rows=entry_line_count(root),
+        fetched_at=observed_at.astimezone(MARKET_TZ).isoformat(),
+    )
     return entry
 
 
@@ -1793,10 +1830,20 @@ def judge(
     no partition is a session on which nothing ran, so a check scoped to tonight can never see
     the night it missed.
 
-    The order inside one partition is scope first, then read, then judge, then write. Scope
-    comes first because both out-of-scope classes are cheap to answer and neither needs the
-    file's rows, and because judging an out-of-scope partition is the failure this deliverable's
-    audit found would quarantine the lake's oldest data on the first run.
+    The order inside one partition is scope first, then read, then judge, then decide and
+    write under the lake-root lock. Scope comes first because both out-of-scope classes are
+    cheap to answer and neither needs the file's rows, and because judging an out-of-scope
+    partition is the failure this deliverable's audit found would quarantine the lake's oldest
+    data on the first run.
+
+    **The ledger is read inside the hold that appends, one hold per partition.** The
+    alternative is one read before the walk, and that snapshot is as old as the walk. Marketlake
+    #470 is that defect, and the comment at the hold carries what it cost. The hold is per
+    partition rather than around the whole walk because the walk is seconds, the sweep's other
+    pieces want the lake, and ``append_verdict`` taking the lock under a caller that already
+    holds it deadlocks. Measured, the hold is cheap: acquiring and releasing the lock is 20
+    microseconds, and reading the ledger is 0.03 ms while it is empty and 1.4 ms at a thousand
+    lines.
 
     **One partition's failure costs its own verdict and not the run.** ``PartitionUnreadable`` is
     contained here and counted, for ``sweep._counted``'s reason stated from the other side: the
@@ -1831,7 +1878,9 @@ def judge(
         # command exits non-zero on this for the same reason it does on an unreadable
         # partition: the lake's health is unknown rather than good.
         return BatteryReport(scope_unknown=len(partitions), report=(f"battery: {exc}",))
-    current = latest_quarantine_by_check(root)
+
+    # Local, the same reason :func:`append_verdict` gives for the same import.
+    from lake.lock import lake_lock
 
     findings: list[Finding] = []
     written: list[Finding] = []
@@ -1872,41 +1921,58 @@ def judge(
             continue
         findings.extend(judged)
 
-        # **One call for the partition, not one per finding.** ``decide_partition`` carries the
-        # ledger state forward as lines land, and two checks clearing in one walk both change
-        # what withholds the partition. Called once per finding that state never accumulates:
-        # the second check would report the partition still held by the first, and the release
-        # would go unreported. This is the seam that function's docstring names.
-        outcome = decide_partition(current.get(partition.relative), judged)
-        for decision in outcome.decisions:
-            if decision.deferred_to_human:
-                deferred += 1
-                report.append(
-                    f"battery: {decision.finding.partition} re-observed, human precedence "
-                    f"stands ({decision.finding.reason})"
-                )
-                continue
-            if not decision.wrote:
-                continue
-            if dry_run:
-                report.append(
-                    f"battery: would write {decision.finding.verdict} for "
-                    f"{decision.finding.partition} under {decision.finding.check}"
-                )
-                continue
-            append_verdict(
-                root,
-                build_entry(
-                    partition=decision.finding.partition,
-                    verdict=decision.finding.verdict,
-                    check=decision.finding.check,
-                    observed_at=now,
-                    reason=decision.finding.reason,
-                ),
-                observed_at=now,
+        # **The ledger is read inside the hold this partition's lines are appended under,
+        # and that is marketlake #470.** Read once before the walk, the snapshot is as old as
+        # the walk, and ``lake.signoff`` is the ledger's second writer: a sign-off landing in
+        # that window is invisible to ``human_precedence``, so the battery appends its own
+        # verdict after the human's and the next night's run, seeing ``provenance: battery`` on
+        # the entry it compares, re-quarantines what a person cleared on purpose. Two runs of
+        # this walk overlapping used to append the identical line twice for the same reason.
+        # ``lake.occ_mapping`` states the same rule for the security master.
+        #
+        # The hold covers ledger work alone. Reading and judging the partition is seconds and
+        # stays above this line, which is the rule ``bars`` states for its vendor round trip.
+        # A dry run takes the hold too, so the counts an operator reads before deciding are
+        # produced the way the real run produces them.
+        with lake_lock(root):
+            # **One call for the partition, not one per finding.** ``decide_partition`` carries
+            # the ledger state forward as lines land, and two checks clearing in one walk both
+            # change what withholds the partition. Called once per finding that state never
+            # accumulates: the second check would report the partition still held by the first,
+            # and the release would go unreported. This is the seam that function's docstring
+            # names.
+            outcome = decide_partition(
+                latest_quarantine_by_check(root).get(partition.relative), judged
             )
-            appended.append(decision.finding.partition)
-            written.append(decision.finding)
+            for decision in outcome.decisions:
+                if decision.deferred_to_human:
+                    deferred += 1
+                    report.append(
+                        f"battery: {decision.finding.partition} re-observed, human precedence "
+                        f"stands ({decision.finding.reason})"
+                    )
+                    continue
+                if not decision.wrote:
+                    continue
+                if dry_run:
+                    report.append(
+                        f"battery: would write {decision.finding.verdict} for "
+                        f"{decision.finding.partition} under {decision.finding.check}"
+                    )
+                    continue
+                write_verdict(
+                    root,
+                    build_entry(
+                        partition=decision.finding.partition,
+                        verdict=decision.finding.verdict,
+                        check=decision.finding.check,
+                        observed_at=now,
+                        reason=decision.finding.reason,
+                    ),
+                    observed_at=now,
+                )
+                appended.append(decision.finding.partition)
+                written.append(decision.finding)
         # **One line for the partition, not one per passing check.** Two checks pass a
         # partition a third withholds, and a line each says the same fact twice, in a list
         # ``sweep`` puts through ``digest_body``'s 1000-byte cap. The holders
@@ -2343,4 +2409,5 @@ __all__ = [
     "sealed_partitions",
     "session_snapshot_counts",
     "trailing_medians",
+    "write_verdict",
 ]
