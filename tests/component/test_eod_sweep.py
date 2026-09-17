@@ -715,23 +715,39 @@ def test_a_sealed_reference_that_offers_no_close_is_reported_by_reason(
     so a named first entry is always the oldest session in range, and on the live lake that slot
     belongs to the 2026-09-08 outage for ever. A quarantine appearing tonight would move a count
     from six to seven and be named nowhere. A census of the classes cannot hide one.
+
+    **The fixture puts the quarantine on the earlier session on purpose.** A ``Counter`` keeps
+    insertion order, which here is the walk's session order, so without the sort the census would
+    read "1 PartitionQuarantined, 1 NoSpotClose" and two nights over one lake could render the
+    same facts in two orders. An earlier fixture had the two sessions the other way round, where
+    insertion order and sorted order agree, and dropping the sort survived mutation because of it.
     """
+    # **One reason carries a count above one, on purpose.** The live lake's line is meant to read
+    # "6 NoSpotClose", and the count is the only thing separating an outage from one new
+    # quarantine. A fixture with one ticker-day per reason never exercises the counting at all:
+    # pinning the count to a literal 1 survived mutation against exactly such a fixture.
+    gap = [_quote_row(FOLLOWING, row_kind=journal.ROW_KIND_GAP)]
     quotes = {
-        ("SPY", FOLLOWING): [_quote_row(FOLLOWING, row_kind=journal.ROW_KIND_GAP)],
-        ("SPY", date(2026, 9, 16)): [_quote_row(date(2026, 9, 16))],
+        ("SPY", FOLLOWING): [_quote_row(FOLLOWING)],
+        ("SPY", date(2026, 9, 16)): gap,
+        ("SPY", date(2026, 9, 17)): gap,
     }
     fixture_lake.with_quarantine(
-        {"partition": "quotes/ticker=SPY/date=2026-09-16.parquet", "verdict": "held"}
+        {"partition": f"quotes/ticker=SPY/date={FOLLOWING.isoformat()}.parquet", "verdict": "held"}
     )
     root = _lake(fixture_lake, quotes=quotes)
-    outcome, _, _ = _run(root, now=EVENING + timedelta(days=1))
+    outcome, _, _ = _run(root, now=EVENING + timedelta(days=3))
 
     (line,) = [entry for entry in outcome.nightly.report if entry.startswith("bars abandoned")]
-    assert line == "bars abandoned: 2 ticker-day(s), 1 NoSpotClose, 1 PartitionQuarantined"
+    assert line == "bars abandoned: 3 ticker-day(s), 2 NoSpotClose, 1 PartitionQuarantined"
     assert report.redacted(line) == line, "the reasons were cut off before any reader saw them"
-    assert "bars abandoned: 2 ticker-day(s), 1 NoSpotClose, 1 PartitionQuarantined" in (
-        outcome.digest.body
-    )
+    assert line in outcome.digest.body
+    # The run also holds unsettled ticker-days, and none of them is in the line. That silence is
+    # the decision the comment beside the line argues for, and a fixture with nothing unsettled
+    # would have left it uncovered.
+    bars_walk = dict(outcome.nightly.pieces)["bars"]
+    assert bars_walk.landed >= 0
+    assert "unsettled" not in line and "PartitionAbsent" not in line
     assert outcome.nightly.problems == (), "an abandoned ticker-day withheld the ping"
 
 

@@ -46,6 +46,7 @@ from lake.bars import (
     CLOSE_CROSS_TOLERANCE,
     CLOSE_VALUE_ABSENT,
     MINUTE_EXTENDED_HOURS,
+    GateSkip,
     UnsupportedBarFreq,
     bar_window,
     fetch_session_bars,
@@ -605,7 +606,7 @@ def test_a_session_whose_quotes_have_no_spot_close_never_reaches_the_vendor(
 
     result = _run(root, vendor, roster=_roster({"SPY": ["1d"], "QQQ": ["1d"]}))
 
-    assert result.abandoned == (f"SPY 1d {SESSION.isoformat()}: NoSpotClose",)
+    assert result.abandoned == (GateSkip("SPY", DAILY_FREQ, SESSION, "NoSpotClose"),)
     assert result.unsettled == ()
     assert result.held == ()
     assert _findings(root) == [], "a skipped ticker-day filed a withheld finding"
@@ -640,7 +641,7 @@ def test_a_session_with_no_sealed_quotes_partition_is_contained_the_same_way(
 
     result = _run(root, vendor, roster=_roster({"SPY": ["1d"], "QQQ": ["1d"]}))
 
-    assert result.unsettled == (f"SPY 1d {SESSION.isoformat()}: PartitionAbsent",)
+    assert result.unsettled == (GateSkip("SPY", DAILY_FREQ, SESSION, "PartitionAbsent"),)
     assert result.abandoned == (), "a session the lake never sealed was called abandoned"
     assert result.held == ()
     assert [call["symbol"] for call in vendor.calls] == ["QQQ"]
@@ -1861,7 +1862,11 @@ def test_a_null_or_nan_close_is_an_absence_rather_than_a_disagreement(fixture_la
     # Two NaNs leave the set empty rather than holding two answers, so the read returns ``None``
     # and raises nothing. That is the outcome with no exception class to name, which is what
     # ``CLOSE_VALUE_ABSENT`` is the token for.
-    assert nan_result.abandoned == (f"SPY 1d {SESSION.isoformat()}: {CLOSE_VALUE_ABSENT}",)
+    assert nan_result.abandoned == (GateSkip("SPY", DAILY_FREQ, SESSION, CLOSE_VALUE_ABSENT),)
+    # Spelled out once rather than imported. Every other assertion compares the constant against
+    # itself, so renaming it would have moved the token that reaches the nightly file, the digest
+    # and the dashboard without failing anything.
+    assert str(nan_result.abandoned[0]) == f"SPY 1d {SESSION.isoformat()}: CloseValueAbsent"
     assert nan_vendor.calls == [], "a NaN reached the comparison as a figure"
 
 
@@ -2549,7 +2554,7 @@ def test_a_quotes_partition_with_no_close_price_column_is_an_absence(fixture_lak
 
     assert result.landed == ()
     assert result.held == ()
-    assert result.abandoned == (f"SPY 1d {SESSION.isoformat()}: {CLOSE_VALUE_ABSENT}",)
+    assert result.abandoned == (GateSkip("SPY", DAILY_FREQ, SESSION, CLOSE_VALUE_ABSENT),)
     assert vendor.calls == [], "a column the walk can miss before the fetch still spent one"
 
 

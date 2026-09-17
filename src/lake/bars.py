@@ -810,7 +810,32 @@ def _render_held(held: Sequence[HeldFinding]) -> list[str]:
     return lines
 
 
-def _render_gate_skips(unsettled: Sequence[str], abandoned: Sequence[str]) -> list[str]:
+@dataclass(frozen=True)
+class GateSkip:
+    """One daily ticker-day the walk did not fetch, and the reason its gate had no close.
+
+    A record rather than a formatted line, because ``lake.sweep`` counts these by reason and a
+    line would make it parse prose this module wrote. Those two spellings agreed only by
+    coincidence: the reason is a class name today, so it carries no ``": "`` of its own and a
+    parser splitting on the first separator and one splitting on the last returned the same
+    answer. Nothing pinned that. A reason that ever carried a colon would have moved the count
+    onto the wrong key, silently, in a module that cannot see how the string was built.
+
+    ``__str__`` is the one spelling of the line, so the reports render it and nobody rebuilds
+    it, which is :func:`_render_held`'s argument for a shared renderer applied to a shorter
+    string.
+    """
+
+    ticker: str
+    freq: str
+    session: date
+    reason: str
+
+    def __str__(self) -> str:
+        return f"{self.ticker} {self.freq} {self.session.isoformat()}: {self.reason}"
+
+
+def _render_gate_skips(unsettled: Sequence[GateSkip], abandoned: Sequence[GateSkip]) -> list[str]:
     """The two gate-skip blocks of a sign-off report, spelled once for both reports.
 
     One spelling rather than two, which is :func:`_render_held`'s argument beside it: the two
@@ -873,8 +898,8 @@ class BarsReport:
     landed: tuple[LandedPartition, ...]
     held: tuple[HeldFinding, ...]
     skipped: int
-    unsettled: tuple[str, ...] = ()
-    abandoned: tuple[str, ...] = ()
+    unsettled: tuple[GateSkip, ...] = ()
+    abandoned: tuple[GateSkip, ...] = ()
 
     @property
     def unfiled(self) -> tuple[HeldFinding, ...]:
@@ -1268,8 +1293,8 @@ class _WalkResult:
     skipped: int
     landed: tuple[LandedPartition, ...]
     held: tuple[HeldFinding, ...]
-    unsettled: tuple[str, ...]
-    abandoned: tuple[str, ...]
+    unsettled: tuple[GateSkip, ...]
+    abandoned: tuple[GateSkip, ...]
 
 
 def _walk(
@@ -1322,8 +1347,8 @@ def _walk(
     skipped = 0
     landed: list[LandedPartition] = []
     held: list[HeldFinding] = []
-    unsettled: list[str] = []
-    abandoned: list[str] = []
+    unsettled: list[GateSkip] = []
+    abandoned: list[GateSkip] = []
 
     def hold(finding: Withheld) -> None:
         # The sequence is the caller's, because ``report`` has only module functions and a
@@ -1437,7 +1462,7 @@ def _walk(
                 )
                 continue
             if gate_close.reason is not None:
-                entry = f"{ticker} {freq} {session.isoformat()}: {gate_close.reason}"
+                entry = GateSkip(ticker, freq, session, gate_close.reason)
                 following_key = (
                     paths.quotes_partition_path(ticker, following).relative_to(root).as_posix()
                 )
@@ -1983,8 +2008,8 @@ class BackfillReport:
     held: tuple[HeldFinding, ...]
     skipped: int
     unwalked: tuple[str, ...]
-    unsettled: tuple[str, ...] = ()
-    abandoned: tuple[str, ...] = ()
+    unsettled: tuple[GateSkip, ...] = ()
+    abandoned: tuple[GateSkip, ...] = ()
 
     @property
     def unfiled(self) -> tuple[HeldFinding, ...]:
@@ -2321,6 +2346,7 @@ __all__ = [
     "BarsError",
     "BarsReport",
     "CloseCross",
+    "GateSkip",
     "LandedPartition",
     "SpanCoverage",
     "SpansAbsent",
