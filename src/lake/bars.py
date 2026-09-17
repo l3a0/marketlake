@@ -51,19 +51,34 @@ which that function's docstring explains at its own site.
 open to the equity close, which is 390 minutes on a regular day. ``freq=1d`` is fetched over a
 bracket a day wider on each side, because marketlake #362's live recording measured the daily
 stamp at midnight Eastern and at 01:00, both ahead of the 09:30 open the bracket would otherwise
-start at. ``DAILY_WINDOW_MARGIN`` carries the widths and the slack in full. The selection
-below reads the session off the stamp rather than off the window, so the extra candles a wide
-bracket returns are dropped rather than landed.
+start at. That bracket is day-aligned, running from the start of its first Eastern date to the
+end of its last, because marketlake #416 measured that Schwab clips a daily response to the dates
+its bounds fall on rather than to the instants: an unaligned bracket receives the candle its own
+margin reached for and then refuses it. ``DAILY_WINDOW_MARGIN`` carries the widths, the
+measurement and the slack in full. The selection below reads the session off the stamp rather
+than off the window, so the extra candles a wide bracket returns are dropped rather than landed.
 
 The narrow ``1m`` window is a choice, not the obvious default. Both vendor flags are left
 unset, so Schwab decides whether a price-history response covers the regular session or the
-extended one, and nobody has recorded which it picks. With a window at the session's own
-bounds that does not matter, because the request's own bounds clip the response either way and
-the coverage is 390 minutes under both answers. With a wider window it would matter a great
-deal: Schwab answering with the regular session would be correct and short at the same time,
-the span check would refuse it, and by that check's unbounded-repeat rule the run would stall
-with a finding pointing at the wrong cause. The narrow window removes that confound, and
-marketlake #333's own planning loop reached the same conclusion from the other side.
+extended one, and nobody has recorded which it picks.
+
+**The reason that was thought safe is measured false.** It ran: with a window at the session's
+own bounds it does not matter, because the request's own bounds clip the response either way
+and the coverage is 390 minutes under both answers. Marketlake #416's first live run asked
+09:30 to 16:00 Eastern and received a response spanning 780 minutes, on all seven sessions and
+both tickers. The request's bounds do not clip the response, so the narrow window did not
+remove the confound it was chosen for.
+
+What the narrow window does still buy is the rest of that argument, unchanged: a wider one
+would let Schwab answer with the regular session, correct and short at the same time, and by
+the span check's unbounded-repeat rule the run would stall with a finding pointing at the wrong
+cause. Marketlake #333's own planning loop reached that from the other side.
+
+The remedy is to set the flag rather than leave Schwab picking, which is what the
+``extended_hours`` column on every bars row was made nullable for. Marketlake #421 owns it and
+waits on a live recording, because the response's real ends have never been measured. Until
+then this surface asks for the session and the span check refuses what comes back, which is the
+loud direction.
 
 **The two gate checks, in the order they run.** The span check runs first. The close
 cross-check compares the candle whose stamp maps to the session, so on a response that dropped
@@ -158,22 +173,23 @@ CHECK_BAR_RESPONSE = "bar_response"
 # after the stamp it is looking for.
 #
 # Marketlake #362 recorded ``freq=1d`` live and measured two stamps, at midnight Eastern of
-# their sessions and at 01:00. A midnight stamp needs 9:30:00 of margin to fall inside the
-# bracket and an 01:00 one needs 8:30:00, so 9:30:00 is the floor the observations support.
+# their sessions and at 01:00. Marketlake #416's landed partition measured a third at 01:00.
 #
-# It stays at a day anyway, and the reason is slack rather than neighbour handling. Narrowing
-# to the floor changes nothing about which neighbouring candles are refused, measured: at a day
-# and at 9:30:00 alike, the previous session's stamp is outside the bracket and the next
-# session's is inside it. What narrowing removes is room for a stamp that lands before the
-# floor. The two recorded stamps are both local midnight under *different* UTC offsets, one
-# standard and one daylight, in a month that is daylight throughout, so the vendor's offset is
-# not dependable and a bracket sized to the floor would refuse the first stamp that slips under
-# it. Marketlake #380 owns that anomaly.
+# It stays at a day, and the reason is slack. The two #362 stamps are both local midnight under
+# *different* UTC offsets, one standard and one daylight, in a month that is daylight
+# throughout, so the vendor's offset is not dependable. Marketlake #380 owns that anomaly.
 #
-# The width's cost is response size. The bracket starts at the previous day's 09:30 Eastern,
-# which is already past that session's own stamp, so the previous session's candle falls outside
-# the request rather than coming back to be dropped. The next session's candle does come back
-# when it exists, and the selection below drops it.
+# **What #416 changed is not this width.** The span check used to read these two instants back
+# as instants, and the vendor clips to the calendar dates they fall on, so the previous
+# session's candle came back inside the requested dates and landed outside the bracket the
+# check tested. Five of seven ticker-days refused that way. :func:`check_bar_span` carries the
+# measurement and the fix. Narrowing or widening this constant was measured against the same
+# evidence and fixes nothing: at 6, 9, 12 and 24 hours the fetch refuses, at 48 and 72 it
+# covers, at 96 it refuses again, because a wide bracket passes only when its start date
+# happens to land on a non-session. That is the luck 2026-09-14 had.
+#
+# The width's cost is response size, three days of candles rather than one. The selection below
+# drops the neighbours.
 DAILY_WINDOW_MARGIN = timedelta(days=1)
 
 # How much the official daily close may differ from the session's own captured quotes before
@@ -400,7 +416,14 @@ def bar_window(freq: str, bounds, *, margin: timedelta = DAILY_WINDOW_MARGIN) ->
     ``1d`` asks for a bracket a ``margin`` wider on each side. ``DAILY_WINDOW_MARGIN`` carries
     why in full, and the short version is that a daily candle is stamped near midnight Eastern
     of its session rather than inside it, so a bracket spanning only the session would begin
-    after the candle it wants. The session is read off the stamp rather than off the window.
+    after the candle it wants.
+
+    **The bracket's ends are instants and what Schwab clips to is their dates**, which is the
+    asymmetry marketlake #416 measured. Nothing is done about it here. The window is the request,
+    and the request is right. What was wrong was the span check reading these instants back as
+    instants, and that is where the fix went.
+
+    The session is read off the stamp rather than off the window.
     """
     freq = require_bar_freq(freq)
     if freq == MINUTE_FREQ:
@@ -533,10 +556,21 @@ def check_bar_span(
     window is a bracket deliberately wider than the session, so a neighbouring session whose
     stamp falls *inside* that bracket is expected rather than wrong and is dropped by the
     selection. One outside it is not expected, because the request's own bounds are what the
-    vendor clips to, so a candle beyond them means the bounds were ignored. #362's recording is
-    the first evidence that Schwab does clip a daily response: the session before the requested
-    start did not come back, though ``period=20, periodType=year`` went out beside the bounds.
-    One observation is not a reason to retire this check.
+    vendor clips to, so a candle beyond them means the bounds were ignored.
+
+    **What "the bounds" means there was measured wrong, and #416 corrected it.** Schwab clips a
+    daily response to the *calendar dates* the bounds fall on, not to the instants. Session
+    2026-09-09 asked from 09:30 Eastern on 09-08 and received 09-08's own candle, stamped 01:00,
+    on the same date and hours before the requested instant. Seven sessions fit that rule with no
+    residual. #362's single observation, the session before the requested start not coming back,
+    is the same rule seen from the side where the date differs too, which is why one observation
+    could not tell the two apart.
+
+    So the check is unchanged and its premise is narrower: a candle outside the bracket's *days*
+    means the bounds were ignored. :func:`bar_window` day-aligns the bracket to those days, which
+    is what stops this refusing the candle the margin reached for. The failure the check was built
+    for is untouched, because ``period=20, periodType=year`` still goes out beside the bounds and
+    a twenty-year response still lands thousands of sessions outside a three-day bracket.
 
     **Both directions are refused, because the two frequencies fail opposite ways.** The 1-min
     wrapper sends ``period=1, periodType=day``, narrower than any multi-session window, so its
@@ -557,8 +591,29 @@ def check_bar_span(
         # that skipped that rule cannot silently contradict it.
         raise ValueError("the span check is defined over a non-empty candle list")
     minute = timedelta(minutes=1)
-    outside = [row for row in built if not window.start <= _instant(row) < window.end]
     if window.freq == DAILY_FREQ:
+        # Daily containment is measured in Eastern dates, never in instants, because dates are
+        # what the vendor clips to and the bracket's own ends are instants that happen to sit
+        # inside a day. Reading them back as instants is what refused 5 of 7 ticker-days on
+        # marketlake #416's first live run: the bracket started 09:30 into its first date, the
+        # vendor returned that date's candle stamped near Eastern midnight, and the check called
+        # the candle the margin had reached for an error.
+        #
+        # **Aligning the bracket to midnight instead was tried and is the weaker fix.** It leaves
+        # the comparison an instant one and moves the start onto a day boundary, which is exactly
+        # where the vendor's own boundary has to be guessed. The seven observations do not
+        # identify that boundary: a date-clipping vendor reproduces all seven at every offset
+        # from UTC-5 through UTC+3, because the old bracket started far enough inside its date
+        # that no offset could reach it. Measured over those nine, an aligned bracket read on
+        # instants covers all seven under one of them and four of seven under the other eight.
+        # This comparison covers all seven under all nine, and asks the vendor for nothing it was
+        # not already asked for.
+        #
+        # The bound dates are read in ``MARKET_TZ`` through the same rule ``session_of`` uses, so
+        # the window and the candle are placed by one clock rather than by the process's own.
+        first = window.start.astimezone(MARKET_TZ).date()
+        last = window.end.astimezone(MARKET_TZ).date()
+        outside = [row for row in built if not first <= session_of(str(row["bar_ts"])) <= last]
         # Covered counts the sessions the response actually carried, not just the one that was
         # wanted, so a response reaching outside the bracket files a pair that says so. Setting
         # it from ``selected`` alone would file "1.0 against 1.0" on a refused fetch, and an
@@ -567,6 +622,7 @@ def check_bar_span(
         sessions = {session_of(str(row["bar_ts"])) for row in built}
         covered = float(len(sessions)) if outside else (1.0 if selected else 0.0)
         return SpanCoverage(covers=bool(selected) and not outside, covered=covered, requested=1.0)
+    outside = [row for row in built if not window.start <= _instant(row) < window.end]
     requested = (window.end - window.start) / minute
     if not selected:
         return SpanCoverage(covers=False, covered=0.0, requested=requested)
