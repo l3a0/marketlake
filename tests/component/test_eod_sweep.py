@@ -19,6 +19,7 @@ Three properties of the fixtures are worth naming before the tests.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
@@ -923,6 +924,61 @@ def test_the_file_carries_the_counts_and_the_detail_the_digest_dropped(
         "unfiled",
     ]
     assert filed["disagreements"] == outcome.nightly.disagreements
+
+
+@pytest.mark.parametrize(
+    ("reference", "refused"),
+    [
+        ("security_master.parquet", ("dividends", "splits", "bars")),
+        ("capture_spans.parquet", ("bars",)),
+    ],
+)
+def test_an_unreadable_reference_file_refuses_its_walks_and_keeps_the_evening(
+    fixture_lake: FixtureLake, reference: str, refused: tuple[str, ...]
+):
+    """Marketlake #435. The one failure that cannot be deferred on evidence, because it eats it.
+
+    Every walk opens a reference file before it walks anything, and both readers catch
+    ``FileNotFoundError`` alone on purpose: reporting a permission failure as "no capture spans"
+    would send an operator to the seeder, which reads the same file and fails the same way. That
+    is right for a command, where a person is watching a terminal, and wrong for a job that runs
+    unattended at 18:30.
+
+    Measured before the fix: ``chmod 000`` on the master made ``sweep()`` raise
+    ``PermissionError``, and the run wrote no report file and sent no ping.
+
+    **What a person sees the next morning is the whole point here**, because the failure mode is
+    silence. The piece refuses and says which class refused it, the report file and the digest
+    both carry that, and the refusal withholds the ping so the ``eod-sweep`` check pages rather
+    than the run simply going quiet. Everything after the pieces block still happens.
+
+    The digest carries the class without the message, which is not this change's doing:
+    ``PieceOutcome.refusal_class`` already reasoned about an ``OSError`` reaching it and drops the
+    message because "an ``OSError`` says the filename it failed on, which is an absolute path on
+    the capture machine". The refusal simply never used to arrive.
+    """
+    root = _lake(fixture_lake)
+    target = root / "reference" / reference
+    assert target.exists(), "the fixture stopped carrying the file this locks"
+    os.chmod(target, 0o000)
+    try:
+        outcome, pinger, transport = _run(root)
+    finally:
+        os.chmod(target, 0o644)
+
+    pieces = dict(outcome.nightly.pieces)
+    for name in refused:
+        assert pieces[name].refusal is not None, f"{name} escaped rather than refusing"
+        assert pieces[name].refusal.startswith(("PermissionError", "OSError"))
+    # The evening survives: the record is written, the digest goes out, and the ping is withheld
+    # so the check pages rather than the run going quiet.
+    assert outcome.filed_at is not None, "no report file was written"
+    assert transport.messages, "no digest went out"
+    assert pinger.urls == [], "a refused piece must withhold the ping"
+    # The digest names the class and never the capture machine's path.
+    body = transport.messages[0].body
+    assert "did not run" in body
+    assert str(root) not in body, "the digest leaked an absolute path"
 
 
 def test_a_quarantined_quotes_partition_does_not_take_the_whole_sweep(

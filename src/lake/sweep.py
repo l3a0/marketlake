@@ -160,7 +160,37 @@ ScheduleSetter = Callable[[date], None]
 # The conditions that end one walk rather than the run. Each is the same set that walk's own
 # command turns into one line and an exit code, so the sweep says what the command would have
 # said instead of handing the operator a stack trace in the job's error log.
-_LEDGER_REFUSALS = (MasterAbsent, MasterUnreadable)
+#
+# **``OSError`` is in both tuples although no command names it, and marketlake #435 is why.**
+# Every walk opens a reference file before it walks anything, and both readers deliberately catch
+# ``FileNotFoundError`` alone: ``bars.read_capture_spans`` says so in its own words, because
+# reporting a permission failure as "no capture spans" would send an operator to the seeder, which
+# reads the same file and fails the same way. That reasoning is right for a command, where a
+# person is watching a terminal, and wrong here. Measured: ``chmod 000`` on the master makes
+# ``sweep()`` raise, and the run writes no report file and sends no ping.
+#
+# What makes that the one failure that cannot be deferred on evidence is that it destroys the
+# evidence. The escape costs the battery, the report file, the digest and the ping, and on a
+# Friday the Sunday one-shot wake, so the canary and the weekly scrub do not run either. The ping
+# is the alarm, and this silences the alarm and then silences the thing that would have noticed
+# the alarm stopped. ``CLAUDE.md`` puts the dead-man, the watchdog, the canary and the backup
+# outside its zero-count rule for exactly this shape.
+#
+# The record surface was already built for this refusal. ``PieceOutcome.refusal_class`` reasons
+# about an ``OSError`` reaching it and drops the message, "because an ``OSError`` says the
+# filename it failed on, which is an absolute path on the capture machine". So the digest carries
+# the class and the path stays on the job's own stdout. Nothing there needed changing; the
+# refusal simply never arrived.
+#
+# **The price is named rather than hidden.** A refusal caught here ends the whole walk, and the
+# ledger walks are ordered by ticker, so an ``OSError`` raised deep in one costs every ticker
+# after it. That is the objection marketlake #352's own test records against widening this tuple,
+# and it answered a per-ticker condition at the per-ticker level instead. This is a net under
+# that, not a replacement for it: a reference-file read happens before any ticker is walked, so
+# its blast radius is the whole walk however it is caught, and for anything raised deeper a
+# refused piece is still strictly better than a lost evening. Containing the deeper ones where
+# they belong is marketlake #446.
+_LEDGER_REFUSALS = (MasterAbsent, MasterUnreadable, OSError)
 # ``CaptureSpansError`` as the class rather than one of its members, which is the lesson
 # ``bars.main`` already wrote down for itself: naming ``SpansUnreadable`` alone left its sibling
 # ``UnsupportedSpansSchemaVersion`` reaching the operator as a stack, and a spans file from a
@@ -177,6 +207,7 @@ _BARS_REFUSALS = (
     UnsupportedBarFreq,
     NotASession,
     VendorAuthError,
+    OSError,
 )
 
 
