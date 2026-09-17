@@ -929,7 +929,11 @@ def test_a_quarantined_quotes_partition_does_not_take_the_whole_sweep(
     assert outcome.nightly.quarantined == 1
     assert pinger.urls, "the ping was lost with the raise"
     assert outcome.filed_at is not None, "the report file was lost with the raise"
+    # The digest goes to a phone and the block goes to the job's own stdout. They are two
+    # separate compositions of the same counts, so each is asserted rather than one standing
+    # in for the other.
     assert "dividends: landed 0, held 0, unchanged 0, skipped 1" in outcome.digest.body
+    assert "dividends: landed 0 held 0 unchanged 0 skipped 1" in outcome.render()
 
 
 def test_a_report_file_that_could_not_be_written_does_not_withhold_the_ping(

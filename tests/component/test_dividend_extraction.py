@@ -26,6 +26,7 @@ drive is a fixture rather than something captured.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -195,7 +196,7 @@ def _lake(
     *,
     master: SecurityMaster | None = None,
     chains: tuple[str, date] | None = None,
-    quarantined: tuple[str, date] | None = None,
+    quarantined: tuple[str, date] | Sequence[tuple[str, date]] | None = None,
     ledger: bool = True,
 ) -> Path:
     """A lake holding one quotes partition per session, plus the ledger and the master.
@@ -212,15 +213,17 @@ def _lake(
     if ledger:
         fixture_lake.with_reference("schema_versions", _ledger_table())
     if quarantined is not None:
-        partition = (
-            LakePaths(fixture_lake.root)
-            .partition_path(QUOTES, quarantined[0], quarantined[1])
-            .relative_to(fixture_lake.root)
-            .as_posix()
-        )
-        fixture_lake.with_quarantine(
-            {"partition": partition, "verdict": "suspect", "check": "delayed_feed"}
-        )
+        withheld = [quarantined] if isinstance(quarantined[0], str) else list(quarantined)
+        for ticker, day in withheld:
+            partition = (
+                LakePaths(fixture_lake.root)
+                .partition_path(QUOTES, ticker, day)
+                .relative_to(fixture_lake.root)
+                .as_posix()
+            )
+            fixture_lake.with_quarantine(
+                {"partition": partition, "verdict": "suspect", "check": "delayed_feed"}
+            )
     root = fixture_lake.build()
     (master if master is not None else _master()).write(master_path(root))
     return root
@@ -1205,6 +1208,75 @@ def test_a_skipped_session_can_lose_a_transition_rather_than_delay_it(
     landed = [entry["ex_date"] for entry in _entries(root)]
     assert landed == ["2026-06-18"], "only the value either side of the skip landed"
     assert [skip.reason for skip in result.skipped] == [REASON_QUARANTINED]
+
+
+def test_several_skips_are_counted_each_and_grouped_by_reason(fixture_lake: FixtureLake):
+    """The count is the deliverable, so more than one of it has to survive.
+
+    Every other test here refuses exactly one ticker-day, which leaves a walk that recorded
+    only the first skip, or counted every reason as the whole total, indistinguishable from
+    this one. Two reasons with different counts is what separates them, and the rendered block
+    is where an operator reads both.
+
+    The reasons sort, so the lines arrive in one order rather than the order the walk met
+    them. A run whose reasons moved between nights would read as a changed lake.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_TWO): [_row(DAY_TWO)],
+            ("SPY", DAY_THREE): [_row(DAY_THREE)],
+        },
+        quarantined=[("SPY", DAY_ONE), ("SPY", DAY_TWO)],
+    )
+    LakePaths(root).partition_path(QUOTES, "SPY", DAY_THREE).unlink()
+
+    result = extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert [(skip.day, skip.reason) for skip in result.skipped] == [
+        (DAY_ONE, REASON_QUARANTINED),
+        (DAY_TWO, REASON_QUARANTINED),
+        (DAY_THREE, REASON_PARTITION_ABSENT),
+    ], "the walk recorded fewer skips than it made, or lost their order"
+
+    rendered = result.render()
+    assert "  skipped:   3" in rendered
+    absent = rendered.index("    - manifested partition absent: 1")
+    quarantined = rendered.index("    - quarantined: 2")
+    assert absent < quarantined, "the reasons are sorted, so this pair has one order"
+
+
+def test_the_reason_an_operator_reads_is_the_text_and_not_the_constant(fixture_lake: FixtureLake):
+    """Every other assertion compares the walk's answer against the imported constant.
+
+    That holds the walk against itself and holds the words against nothing, so renaming a
+    reason changes the nightly sign-off block and the digest an operator reads while the
+    suite stays green. These are the strings, written out once.
+    """
+    assert REASON_NO_SPOT_CLOSE == "no spot close"
+    assert REASON_QUARANTINED == "quarantined"
+    assert REASON_PARTIAL_READ == "partial read"
+    assert REASON_PARTITION_ABSENT == "manifested partition absent"
+
+
+def test_both_walks_spell_a_shared_reason_one_way(fixture_lake: FixtureLake):
+    """The reason ``Skip`` and three constants moved into ``lake.actions``.
+
+    ``lake.splits`` imports them rather than declaring its own, so one reason has one
+    spelling. A local re-declaration in either module would shadow the import and drift
+    silently, which is the failure the move exists to prevent, so identity is what is
+    asserted rather than equality.
+    """
+    from lake import splits
+
+    assert splits.REASON_QUARANTINED is REASON_QUARANTINED
+    assert splits.REASON_PARTIAL_READ is REASON_PARTIAL_READ
+    assert splits.REASON_PARTITION_ABSENT is REASON_PARTITION_ABSENT
+    assert splits.Skip is actions.Skip
+    # The close-of-record reason is per surface, because each names its own tag.
+    assert splits.REASON_NO_OPTION_CLOSE == "no option close"
+    assert splits.REASON_NO_OPTION_CLOSE != REASON_NO_SPOT_CLOSE
 
 
 # -- 8 and 9. the entry point -------------------------------------------------------------
