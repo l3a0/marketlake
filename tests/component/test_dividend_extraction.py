@@ -1160,7 +1160,7 @@ def test_a_verdict_that_clears_lands_the_entry_the_skip_delayed(fixture_lake: Fi
     (delayed,) = _entries(root)
     assert delayed["observed_on"] == DAY_TWO.isoformat()
 
-    # The sign-off tool clears the verdict, the way marketlake #139 will.
+    # The sign-off tool clears the verdict, the way ``lake.signoff`` does.
     _clear_quarantine(root, "SPY", DAY_ONE)
 
     second = extract_dividends(lake_root=root, clock=ManualClock(SECOND_NIGHT))

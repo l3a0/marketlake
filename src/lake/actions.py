@@ -777,7 +777,12 @@ REASON_PARTITION_ABSENT = "manifested partition absent"
 
 @dataclass(frozen=True)
 class Skip:
-    """One ticker-day the walk did not read, and why."""
+    """One ticker-day the walk did not read, and why.
+
+    Not every one names a sealed partition. ``lake.splits`` records a session the lake captured
+    nothing for this way, which has no manifest entry at all, because such a session widens the
+    window a split boundary can sit in exactly as a skipped ticker-day does.
+    """
 
     ticker: str
     day: date

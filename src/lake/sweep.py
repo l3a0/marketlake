@@ -12,6 +12,8 @@ What one run does, in the design's own order.
 
 1. The corporate-actions poll, so today's split flags before bars land. Two walks over sealed
    rows: ``actions.extract_dividends`` reads quotes and ``splits.detect_splits`` reads chains.
+   The split walk takes the calendar as well, because whether two sealed sessions are adjacent
+   is the calendar's answer and not the manifest's. Marketlake #431.
 2. The bar walk, ``bars.backfill_bars``. The close cross-check is inside it, and the
    walk covers every session the capture spans still hold unlanded rather than only
    the one the clock is in, because a daily bar cannot pass that check on the night
@@ -87,6 +89,7 @@ import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
+from functools import partial
 from pathlib import Path
 
 from lake.actions import ExtractionReport, MasterAbsent, extract_dividends
@@ -635,9 +638,20 @@ def sweep(
 
     if session:
         closed = calendar.session_close(day) <= now
-        for name, walk in ((DIVIDENDS_PIECE, extract_dividends), (SPLITS_PIECE, detect_splits)):
+        # **Each walk carries its own arguments, because the two no longer take the same ones.**
+        # ``detect_splits`` takes the calendar under marketlake #431: it decides whether two
+        # sealed sessions are adjacent, and the manifest cannot answer that for a session the
+        # lake never captured. ``extract_dividends`` reads ``ex_date`` off the row rather than
+        # deriving it from a pair, so an uncaptured session cannot move its key and it needs no
+        # calendar. The loop stays, because what it holds is the refusal containment and the
+        # piece naming, which are still one rule for both.
+        walks = (
+            (DIVIDENDS_PIECE, partial(extract_dividends, lake_root=root, clock=clock)),
+            (SPLITS_PIECE, partial(detect_splits, lake_root=root, clock=clock, calendar=calendar)),
+        )
+        for name, walk in walks:
             try:
-                pieces.append((name, _ledger_outcome(walk(lake_root=root, clock=clock))))
+                pieces.append((name, _ledger_outcome(walk())))
             except _LEDGER_REFUSALS as exc:
                 pieces.append((name, _refused(exc)))
         if closed:
