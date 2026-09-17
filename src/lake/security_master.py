@@ -397,9 +397,10 @@ class SecurityMaster:
         **This never raises ``AmbiguousSymbol``, and the difference is deliberate.**
         ``resolve`` raises it for several instruments valid *on one date*, which is a
         master that contradicts itself, and the repo reads the class that way
-        everywhere. Several instruments across *disjoint* ranges is an ordinary recycled
-        ticker instead. Returning the set hands that distinction to the caller, which is
-        the only place that knows whether widening or refusing is the safe answer.
+        everywhere. A spelling naming several instruments across *disjoint* ranges is
+        an ordinary recycled ticker instead. Returning the set hands that distinction
+        to the caller, which is the only place that knows whether widening or refusing
+        is the safe answer.
 
         ``id_type`` filters as it does on ``resolve``, and a caller asking about a ticker
         should pass ``ID_TYPE_TICKER``. A re-symboled option contract puts
