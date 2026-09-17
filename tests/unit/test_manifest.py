@@ -364,18 +364,33 @@ def test_a_manifest_partition_that_cannot_be_a_key_names_itself(tmp_path, partit
     operator sent to look for a missing field finds a present one and the real damage keeps its
     hiding place.
     """
-    manifest_path(tmp_path).write_text(json.dumps({"partition": partition, "rows": 1}) + "\n")
+    manifest_path(tmp_path).write_text(
+        json.dumps({"partition": "first.parquet", "rows": 1})
+        + "\n"
+        + json.dumps({"partition": "second.parquet", "rows": 1})
+        + "\n"
+        + json.dumps({"partition": partition, "rows": 1})
+        + "\n"
+    )
 
     with pytest.raises(ManifestError) as raised:
         latest_entries(tmp_path)
 
     message = str(raised.value)
     assert str(manifest_path(tmp_path)) in message, message
-    assert "entry 1" in message, message
-    assert repr(partition) in message, "the operator cannot see which key refused"
+    # The damage sits at entry 3 rather than entry 1, so the position has to be derived from
+    # something. A test that puts it first passes against a hard-coded ``1`` and sends the
+    # operator to the top of a long ledger.
+    assert "entry 3" in message, message
+    assert "partition that cannot be a key" in message, message
     assert "names no partition" not in message, (
         "an entry carrying a partition was reported as carrying none"
     )
+    # ``endswith`` rather than ``in``: ``repr(entry)`` contains ``repr(partition)``, so a
+    # containment check passes while the message prints the whole ledger line, which then
+    # reaches the nightly report and the push digest.
+    assert message.endswith(f"key: {partition!r}"), message
+    assert isinstance(raised.value.__cause__, TypeError), "the TypeError was dropped"
 
 
 def test_a_manifest_partition_that_can_be_a_key_still_passes_through(tmp_path):
@@ -561,6 +576,7 @@ def test_a_quarantine_partition_that_cannot_be_a_key_names_this_ledger(tmp_path,
     """
     _ledger(
         tmp_path,
+        _verdict(CHAINS, "clean", "row_count_band"),
         {"partition": partition, "verdict": "quarantined", "check": "row_count_band"},
     )
 
@@ -569,11 +585,13 @@ def test_a_quarantine_partition_that_cannot_be_a_key_names_this_ledger(tmp_path,
 
     message = str(raised.value)
     assert str(quarantine_path(tmp_path)) in message
-    assert "entry 1" in message, message
-    assert repr(partition) in message, "the operator cannot see which key refused"
+    assert "entry 2" in message, message
+    assert "partition that cannot be a key" in message, message
     assert "names no partition" not in message, (
         "an entry carrying a partition was reported as carrying none"
     )
+    assert message.endswith(f"key: {partition!r}"), message
+    assert isinstance(raised.value.__cause__, TypeError), "the TypeError was dropped"
 
 
 def test_a_quarantine_partition_that_can_be_a_key_still_reaches_every_reader(tmp_path):
@@ -599,6 +617,33 @@ def test_a_quarantine_partition_that_can_be_a_key_still_reaches_every_reader(tmp
 
     assert set(latest_quarantine_by_check(tmp_path)) == {7, 1.5, None, True, CHAINS}
     assert set(latest_quarantine(tmp_path)) == {7, 1.5, None, True, CHAINS}
+
+
+@pytest.mark.parametrize(
+    "line", ["[1, 2, 3]", '"a bare string"', "42"], ids=["list", "string", "number"]
+)
+def test_a_quarantine_line_that_is_not_an_object_raises_the_same_way(tmp_path, line):
+    """The twin of the manifest test at the top of this file, which this ledger lacked.
+
+    Found by mutation. Narrowing this reader's ``except (KeyError, TypeError)`` to ``KeyError``
+    alone passed all 384 tests over the four files this change touches and all 4,296 in the
+    tree, while three ledger shapes went back to escaping as a bare ``TypeError``:
+
+        [1, 2, 3]       TypeError: list indices must be integers or slices, not str
+        "a bare string" TypeError: string indices must be integers, not 'str'
+        42              TypeError: 'int' object is not subscriptable
+
+    That is marketlake #514's own class reopened one arm above the guard #514 added, on the
+    ledger whose damage ends the 18:30 run. The manifest half was held by
+    ``test_a_line_that_is_not_an_object_raises_the_same_way`` and this half by nothing, because
+    ``_ledger`` takes dicts and no test anywhere wrote a non-object line into this file.
+    """
+    quarantine_path(tmp_path).write_text(f"{line}\n")
+
+    with pytest.raises(ManifestError) as raised:
+        latest_quarantine_by_check(tmp_path)
+
+    assert "names no partition" in str(raised.value), str(raised.value)
 
 
 def test_latest_quarantine_inherits_the_refusal_rather_than_repeating_it(tmp_path):
