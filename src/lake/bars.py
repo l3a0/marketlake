@@ -42,8 +42,8 @@ same finding for it forever.
 **The windows, and why the ``1m`` one is narrow.** ``freq=1m`` is fetched from the session
 open to the equity close, which is 390 minutes on a regular day. ``freq=1d`` is fetched over a
 bracket a day wider on each side, because marketlake #362's live recording measured the daily
-stamp at midnight Eastern of its session and at 01:00, ahead of the 09:30 open the bracket
-would otherwise start at. ``DAILY_WINDOW_MARGIN`` carries the widths in full. The selection
+stamp at midnight Eastern and at 01:00, both ahead of the 09:30 open the bracket would otherwise
+start at. ``DAILY_WINDOW_MARGIN`` carries the widths and the slack in full. The selection
 below reads the session off the stamp rather than off the window, so the extra candles a wide
 bracket returns are dropped rather than landed.
 
@@ -142,19 +142,23 @@ CHECK_BAR_RESPONSE = "bar_response"
 # so the start side is what binds: a bracket that only spanned the session itself would begin
 # after the stamp it is looking for.
 #
-# Marketlake #362 recorded ``freq=1d`` live and measured the stamp. It falls on the session's
-# Eastern date, at or shortly after midnight, which needs 9:30:00 of margin at midnight and
-# 8:30:00 at 01:00. Two reasons keep this at a day rather than at that floor.
+# Marketlake #362 recorded ``freq=1d`` live and measured two stamps, at midnight Eastern of
+# their sessions and at 01:00. A midnight stamp needs 9:30:00 of margin to fall inside the
+# bracket and an 01:00 one needs 8:30:00, so 9:30:00 is the floor the observations support.
 #
-# 1. The stamp wanders. The two candles the recording caught were 23 hours apart, one at
-#    midnight Eastern and one at 01:00, so a margin sized to an exact instant would be sized
-#    to something the vendor does not do.
-# 2. Narrowing costs more than it saves. ``check_bar_span`` refuses the fetch when any built
-#    row falls outside the window, so a tighter bracket turns a neighbouring session's candle
-#    from a row the selection drops into a refusal of the whole fetch.
+# It stays at a day anyway, and the reason is slack rather than neighbour handling. Narrowing
+# to the floor changes nothing about which neighbouring candles are refused, measured: at a day
+# and at 9:30:00 alike, the previous session's stamp is outside the bracket and the next
+# session's is inside it. What narrowing removes is room for a stamp that lands before the
+# floor. The two recorded stamps are both local midnight under *different* UTC offsets, one
+# standard and one daylight, in a month that is daylight throughout, so the vendor's offset is
+# not dependable and a bracket sized to the floor would refuse the first stamp that slips under
+# it. Marketlake #380 owns that anomaly.
 #
-# The extra candles the width returns are dropped by the selection below rather than landed,
-# so it costs nothing but response size.
+# The width's cost is response size. The bracket starts at the previous day's 09:30 Eastern,
+# which is already past that session's own stamp, so the previous session's candle falls outside
+# the request rather than coming back to be dropped. The next session's candle does come back
+# when it exists, and the selection below drops it.
 DAILY_WINDOW_MARGIN = timedelta(days=1)
 
 # How much the official daily close may differ from the session's own captured quotes before
@@ -319,16 +323,25 @@ def session_of(bar_ts: str) -> date:
     The stamp is a UTC instant, so the session is its Eastern calendar date. ``MARKET_TZ`` is
     the calendar module's, which is what keeps this from naming a session time of its own.
 
-    Marketlake #362 settled this reading against a live recording rather than leaving it
-    assumed. Schwab stamps a daily candle on the session's own Eastern date, at or shortly
-    after midnight, and the two candles recorded were 23 hours apart at 00:00 and 01:00
-    Eastern. The Eastern-date reading gives the right session at either hour, which is why it
-    is the reading to keep rather than anything tied to an exact instant.
+    Marketlake #362 measured this against a live recording rather than leaving it assumed. Two
+    daily stamps came back, at 00:00 and 01:00 Eastern, and this reading names the right session
+    for both.
 
-    It still fails closed if that ever stops holding. A stamp this reading places on the wrong
-    date leaves the selection below with no candle for the session, the span check refuses, and
-    nothing lands. The ticker-day is held with a finding instead of landing a bar under the
-    wrong day.
+    **Which session each stamp names was fixed from outside the recording.** The stamps alone do
+    not settle it: two candles are equally consistent with a stamp naming the session it opens
+    and with one naming the session before it, because the neighbour that would tell them apart
+    fell outside the requested bracket either way. What decided it was crossing the first
+    candle's values against a second vendor's SPY daily bar, which agrees to every decimal and
+    stamps it on 2026-09-15. That cross-check is recorded on #362.
+
+    **It is not settled for standard-time season.** The two stamps are both local midnight under
+    different UTC offsets, one standard and one daylight, in a month that is daylight throughout.
+    Mirrored into winter the same slip crosses the date backwards: 04:00 UTC in January is 23:00
+    Eastern on the previous day, and this returns that previous date. Marketlake #380 owns it.
+
+    That direction fails closed. A stamp this reading places on the wrong date leaves the
+    selection below with no candle for the session, the span check refuses, and nothing lands.
+    The ticker-day is held with a finding instead of landing a bar under the wrong day.
     """
     return datetime.fromisoformat(bar_ts).astimezone(MARKET_TZ).date()
 

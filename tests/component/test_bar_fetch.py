@@ -1597,9 +1597,19 @@ def test_the_recorded_daily_stamps_each_name_their_own_eastern_session():
 
     1. Each stamp's Eastern date names its own session, so ``session_of`` is right on real
        stamps and not only on the fixture's.
-    2. The two stamps are 23 hours apart, not 24, and only one of them is midnight. A daily
-       stamp's time of day is not fixed, so a comparison tightened from dates to instants
-       would break on the 01:00 candle. Marketlake #380 owns that gap.
+    2. The two stamps are 23 hours apart, not 24, and only one of them is midnight. Both are
+       local midnight under *different* UTC offsets, one standard and one daylight, in a month
+       that is daylight throughout, so the vendor's offset is not dependable. Mirrored into
+       standard-time season the same slip would cross the date backwards and this reading would
+       return the wrong one. Marketlake #380 owns that.
+
+    **Which session each stamp names came from outside the recording, and the expectation below
+    is not read off ``session_of``.** Two candles alone do not separate a stamp naming the
+    session it opens from one naming the session before it, because the neighbour that would
+    tell them apart fell outside the requested bracket under either reading. The first candle's
+    values were crossed against a second vendor's SPY daily bar, which agrees to every decimal
+    and stamps it on 2026-09-15, and that cross-check is recorded on #362. The prices here are
+    synthesized, so this test cannot redo that cross-check and does not claim to.
 
     **This test cannot catch a reading that took the UTC date, and no daily recording could.**
     A stamp at 00:00 or 01:00 Eastern is 04:00 or 05:00 the same day in UTC, so both readings
