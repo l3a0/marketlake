@@ -131,8 +131,10 @@ from lake.manifest import (
     VERDICT_FIELD,
     is_quarantined,
     latest_quarantine,
+    latest_quarantine_by_check,
     quarantine_path,
     read_quarantine,
+    withholding,
 )
 
 
@@ -310,6 +312,28 @@ def _superseded_entry(lake_root: Path, partition: str, check: str | None, *, rev
     return entry
 
 
+def _projected(lake_root: Path, partition: str, entry: dict) -> dict:
+    """The entry that would decide the partition once ``entry`` is appended.
+
+    A dry run has to answer the question the real run answers, and on a partition several
+    checks withhold the answer is not the entry being written. Signing off one check leaves the
+    others holding, so ``entry`` alone reports "would be: readable" while the real run leaves
+    the partition withheld. That was the first draft's bug in a second form: the first showed
+    the state before the write, this one showed a write with nothing else in view.
+
+    The projection goes through ``manifest.withholding`` rather than around it, so the rule
+    that decides readability is still the ledger's own. ``latest_quarantine_by_check`` pops a
+    check before re-inserting it, so that a check re-stating a verdict moves to the back of the
+    order, and a sign-off is exactly such a re-statement. This mirrors that rather than
+    assuming the position is kept.
+    """
+    projected = dict(latest_quarantine_by_check(lake_root).get(partition) or {})
+    projected.pop(entry["check"], None)
+    projected[entry["check"]] = entry
+    held = withholding(projected)
+    return held[0] if held else entry
+
+
 def signoff(
     partition: str,
     *,
@@ -353,7 +377,7 @@ def signoff(
     )
 
     if dry_run:
-        after = entry
+        after = _projected(root, partition, entry)
     else:
         append_verdict(root, entry, observed_at=now, source=SIGNOFF_SOURCE)
         if entry not in read_quarantine(root):

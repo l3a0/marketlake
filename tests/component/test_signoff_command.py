@@ -320,7 +320,70 @@ def test_check_confirms_the_deciding_entry_and_cannot_select_a_sibling(tmp_path:
     assert "carries 'realtime_entitlement'" in message
     assert "cannot select a different one" in message
     assert "Re-run without --check" in message
+    # The readability word in the same sentence, which is free to lie while the check name
+    # beside it is held. Inverting it tells an operator a withheld partition reads.
+    assert "the partition is withheld under 'realtime_entitlement'" in message
     assert len(read_quarantine(tmp_path)) == 2
+
+
+def test_the_check_refusal_says_cleared_when_the_partition_reads(tmp_path: Path):
+    """The other half of the pair. Only both together pin the word rather than a constant."""
+    _quarantine(tmp_path, check="realtime_entitlement")
+    signoff(PARTITION, reason="verified", clock=_clock(), lake_root=tmp_path)
+
+    with pytest.raises(SignoffError) as refusal:
+        signoff(
+            PARTITION,
+            reason="x",
+            clock=_clock(),
+            lake_root=tmp_path,
+            revoke=True,
+            check="quote_sanity",
+        )
+
+    assert "the partition is cleared under 'realtime_entitlement'" in str(refusal.value)
+
+
+def test_check_is_confirmed_on_the_revoke_direction_too(tmp_path: Path):
+    """Every other `--check` test runs the sign-off direction, so the revoke one was free.
+
+    Narrowing the guard to fire only when the partition is withheld left `--revoke --check`
+    writing under a check the operator did not name, and reporting success.
+    """
+    _quarantine(tmp_path, check="realtime_entitlement")
+    signoff(PARTITION, reason="verified", clock=_clock(), lake_root=tmp_path)
+
+    with pytest.raises(SignoffError):
+        signoff(
+            PARTITION,
+            reason="x",
+            clock=_clock(),
+            lake_root=tmp_path,
+            revoke=True,
+            check="quote_sanity",
+        )
+
+    assert len(read_quarantine(tmp_path)) == 2
+
+
+def test_a_dry_run_names_a_sibling_that_would_still_withhold(tmp_path: Path):
+    """The dry run must answer the question the real run answers, not a simpler one.
+
+    Reporting the appended entry alone says "would be: readable" on a partition another check
+    withholds, while the real run leaves it withheld. That is the first draft's bug in a second
+    form: the first showed the state before the write, this one showed the write with nothing
+    else in view.
+    """
+    _quarantine(tmp_path, check="realtime_entitlement")
+    _quarantine(tmp_path, check="quote_sanity")
+
+    dry = signoff(PARTITION, reason="preview", clock=_clock(), lake_root=tmp_path, dry_run=True)
+    real = signoff(PARTITION, reason="preview", clock=_clock(), lake_root=tmp_path)
+
+    assert dry.still_withheld is True
+    assert dry.still_withheld == real.still_withheld
+    assert "would be:        withheld" in dry.render()
+    assert "still withheld under: 'quote_sanity'" in dry.render()
 
 
 # -- the refusals ------------------------------------------------------------
