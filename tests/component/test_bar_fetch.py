@@ -1127,9 +1127,9 @@ def test_each_frequency_asks_for_exactly_the_window_this_issue_names(fixture_lak
     correct and short at once, and the span check would stall the run pointing at the wrong
     cause.
 
-    The ``1d`` window is a day wider on each side, because a daily candle stamped at 00:00 UTC
-    is 20:00 Eastern on the previous day, so even a whole-Eastern-day window can miss the
-    session it asked for.
+    The ``1d`` window is a day wider on each side, because #362's recording put the daily stamp
+    at midnight Eastern of its session and at 01:00, both ahead of the 09:30 open a bracket
+    spanning only the session would start at.
     """
     root = _lake(fixture_lake)
     vendor = _RecordingVendor(_cassette())
@@ -1581,9 +1581,11 @@ def test_a_candle_with_no_stamp_at_all_lands_no_row_either(fixture_lake: Fixture
 def test_the_recorded_daily_stamps_each_name_their_own_eastern_session():
     """Marketlake #362: the daily convention, held against a recording rather than a guess.
 
-    Every other daily fixture in this module stamps an exact Eastern midnight, which was a
-    fixture choice made before any ``freq=1d`` response had been seen. This one replays the
-    recording that settled it, so the convention the suite rests on is an observed fact.
+    Nearly every daily fixture in this module stamps an exact Eastern midnight, through
+    ``_daily_candle``, which was a fixture choice made before any ``freq=1d`` response had been
+    seen. The one exception is the 22:00 Eastern candle named below, which exists to separate
+    the Eastern date from the UTC one. This test replays the recording that settled the
+    convention, so what the suite rests on is an observed fact.
 
     ``tests/cassettes/spy_daily.json`` is sanitized rather than raw, which is the rule
     ``lake.record`` states twice: a recording from a real account is not committed, and a
@@ -1964,10 +1966,14 @@ def test_the_next_session_search_matches_the_bound_oi_already_uses():
 
 
 def test_the_daily_margin_is_an_argument_the_window_builder_reads():
-    """The bracket's width is a parameter rather than a literal, so a recording can narrow it.
+    """The bracket's width is a parameter rather than a literal, so a caller can vary it.
 
-    marketlake #362 is what narrows it once a live daily recording says which instant Schwab
-    stamps a candle at.
+    marketlake #362 recorded the daily stamp and decided against narrowing the default, for the
+    two reasons ``DAILY_WINDOW_MARGIN`` gives: the stamp wanders by an hour between sessions,
+    and ``check_bar_span`` refuses on any row outside the bracket, so a tighter one turns a
+    neighbour's candle into a refused fetch. The parameter stays because the validation battery
+    asks the same question at other widths, the way the close tolerance below is an argument
+    for the same reason.
     """
     from lake.session import SessionClock
 

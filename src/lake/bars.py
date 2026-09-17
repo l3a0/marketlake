@@ -41,11 +41,11 @@ same finding for it forever.
 
 **The windows, and why the ``1m`` one is narrow.** ``freq=1m`` is fetched from the session
 open to the equity close, which is 390 minutes on a regular day. ``freq=1d`` is fetched over a
-bracket a day wider on each side, because nobody has yet observed which instant Schwab stamps
-a daily candle at, and a candle stamped at 00:00 UTC is 20:00 Eastern on the previous day, so
-even a whole-Eastern-day window can miss the session it asked for. The selection below reads
-the session off the stamp rather than off the window, so the extra candles a wide bracket
-returns are dropped rather than landed.
+bracket a day wider on each side, because marketlake #362's live recording measured the daily
+stamp at midnight Eastern of its session and at 01:00, ahead of the 09:30 open the bracket
+would otherwise start at. ``DAILY_WINDOW_MARGIN`` carries the widths in full. The selection
+below reads the session off the stamp rather than off the window, so the extra candles a wide
+bracket returns are dropped rather than landed.
 
 The narrow ``1m`` window is a choice, not the obvious default. Both vendor flags are left
 unset, so Schwab decides whether a price-history response covers the regular session or the
