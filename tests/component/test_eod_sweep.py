@@ -30,6 +30,7 @@ import pyarrow as pa
 import pytest
 
 from lake import journal, report, sweep
+from lake.actions import ActionsError, actions_path
 from lake.alert import Publisher
 from lake.bars import CHECK_BAR_CLOSE
 from lake.calendar import NotASession
@@ -47,7 +48,13 @@ from lake.schema_versions import (
     running_fingerprints,
 )
 from lake.schwab import VendorAuthError
-from lake.security_master import KIND_EQUITY, SecurityMaster, master_path
+from lake.security_master import (
+    KIND_EQUITY,
+    MASTER_SCHEMA_VERSION,
+    SecurityMaster,
+    SecurityMasterError,
+    master_path,
+)
 from lake.sweep import DIGEST_BYTE_CAP, HOLIDAY_BODY, NIGHTLY_EVENT, NIGHTLY_PRIORITY
 from lake.tickers import Roster
 from lake.vendor import DAILY_FREQ, MINUTE_FREQ
@@ -1160,6 +1167,146 @@ def test_a_walk_refuses_the_whole_os_error_class_and_never_an_ordinary_bug(
         _run(root)
 
 
+def _bump_master_schema_version(root: Path) -> None:
+    """Stamp the master with a version this code does not read, leaving it valid parquet.
+
+    A newer version of this code is the one shape of this a person actually meets, which is the
+    sentence ``_BARS_REFUSALS`` already carries about the spans file. Writing bytes that are not
+    parquet would test ``MasterUnreadable``, whose class both tuples already name.
+    """
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(master_path(root))
+    index = table.schema.get_field_index("schema_version")
+    pq.write_table(
+        table.set_column(index, "schema_version", [[MASTER_SCHEMA_VERSION + 1] * table.num_rows]),
+        master_path(root),
+    )
+
+
+@pytest.mark.parametrize(
+    ("seam", "piece"), [("extract_dividends", "dividends"), ("backfill_bars", "bars")]
+)
+@pytest.mark.parametrize(
+    ("family", "raised"),
+    [("ActionsError", ActionsError), ("SecurityMasterError", SecurityMasterError)],
+)
+def test_a_walk_refuses_each_master_family_by_its_class(
+    fixture_lake: FixtureLake, monkeypatch, seam: str, piece: str, family: str, raised: type
+):
+    """Marketlake #497 chose the class over its members, and this is what fails if that choice
+    is undone.
+
+    The two tests below drive the two siblings that actually escaped, so they cover the fix and
+    not the reasoning behind it. Measured: replacing both classes with the four members those
+    tests reach leaves the whole suite green, so nothing would have noticed the tuples going
+    back to a list of names.
+
+    Raising each base class at the seam is how that breadth is witnessed without inventing a
+    reachable case for a member that has none. It is the device the ``OSError`` width test above
+    already uses one family over, where an ``errno.EIO`` stands in for a bad sector.
+
+    A member reaching here is not the point and could not be driven honestly. ``UnknownInstrument``
+    is raised only by ``remap`` and ``capture_start_of``, which no walk calls, and
+    ``UnresolvedSymbol`` and ``AmbiguousSymbol`` are contained per ticker-day in both walks. What
+    this checks is that the entry stays a family rather than shrinking back to the members
+    somebody happened to meet.
+    """
+    root = _lake(fixture_lake)
+
+    def refuse(*args, **kwargs):
+        raise raised(f"a {family} this walk did not name")
+
+    monkeypatch.setattr(sweep, seam, refuse)
+    outcome, pinger, _ = _run(root)
+
+    refusal = dict(outcome.nightly.pieces)[piece].refusal
+    assert refusal is not None, f"a bare {family} escaped the {piece} walk"
+    assert refusal.startswith(family), refusal
+    assert outcome.filed_at is not None, "the report file was lost with the raise"
+    assert pinger.urls == [], "a refused piece must withhold the ping"
+
+
+def test_a_malformed_ledger_line_refuses_the_two_ledger_walks_and_keeps_the_evening(
+    fixture_lake: FixtureLake,
+):
+    """Marketlake #497, and the reachable half of it.
+
+    Both walks read the actions ledger once for the run, through ``actions.latest``, so
+    ``entry_key`` raises ``LedgerLineError`` on the first entry carrying no key. It is an
+    ``ActionsError`` and the tuple used to name ``MasterAbsent`` alone out of that family, so it
+    escaped. Measured against `9e767ab`, one line naming no ``type`` raised out of ``sweep()``
+    and the run wrote no report file and sent no ping, on a lake whose only fault was one line
+    in a ledger the lake did not carry the night before.
+
+    **The test asserts that the bar walk lands its bar, not merely that it was not refused**,
+    because landing it is what the containment is for. A tuple that refused all three would pass
+    an assertion about the two ledger pieces alone and still cost the night's bars.
+    """
+    root = _lake(fixture_lake)
+    ledger = actions_path(root)
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text(json.dumps({"instrument_id": 1, "ex_date": SESSION.isoformat()}) + "\n")
+
+    outcome, pinger, transport = _run(root, vendor_source=_CountingVendorSource(_cassette()))
+
+    pieces = dict(outcome.nightly.pieces)
+    for name in ("dividends", "splits"):
+        assert pieces[name].refusal is not None, f"a malformed ledger line escaped the {name} walk"
+        assert pieces[name].refusal.startswith("LedgerLineError")
+    assert pieces["bars"].finished, "the bar walk refused although it reads no actions ledger"
+    assert pieces["bars"].landed == 1, "the night's bar was lost with the ledger walks"
+
+    assert outcome.filed_at is not None, "the report file was lost with the raise"
+    assert transport.messages, "the digest was lost with the raise"
+    assert pinger.urls == [], "a refused piece must withhold the ping"
+
+    # ``LedgerLineError`` says the file it failed on, which is an absolute path on the capture
+    # machine. ``refusal_class`` and ``redacted`` both cut by rule rather than by listing
+    # classes, so this arrives covered, and the assertion is what says it stays covered.
+    body = transport.messages[0].body
+    assert "dividends: did not run, LedgerLineError" in body
+    assert str(root) not in body, "the digest leaked an absolute path"
+    filed = outcome.filed_at.read_text()
+    assert str(root) not in filed, "the report file leaked an absolute path"
+    assert json.loads(filed)["pieces"]["splits"]["refusal"] == "LedgerLineError"
+
+
+def test_a_master_from_a_newer_version_refuses_every_walk_rather_than_ending_the_run(
+    fixture_lake: FixtureLake,
+):
+    """Marketlake #497 at the other tuple, which is what makes this two changes rather than one.
+
+    ``SecurityMaster.read`` folds a torn file into ``MasterUnreadable`` and leaves
+    ``UnsupportedSchemaVersion`` alone, and neither ``actions.read_master`` nor
+    ``bars._read_master`` folds it either, since both keep their ``FileNotFoundError`` arm narrow
+    on purpose. So the sibling of a name both tuples already carried ended the whole run.
+
+    **All three pieces are asserted, and the bar walk is the half the ledger tuple cannot
+    reach.** Measured with only ``_LEDGER_REFUSALS`` widened, the two ledger walks refused and
+    the run still died on this raise coming out of ``backfill_bars``. The bar walk gets there
+    because marketlake #422 put ``read_capture_spans`` in front of its master read and this
+    fixture carries the spans.
+    """
+    root = _lake(fixture_lake)
+    _bump_master_schema_version(root)
+
+    outcome, pinger, transport = _run(root)
+
+    pieces = dict(outcome.nightly.pieces)
+    for name in ("dividends", "splits", "bars"):
+        assert pieces[name].refusal is not None, f"a newer master escaped the {name} walk"
+        assert pieces[name].refusal.startswith("UnsupportedSchemaVersion")
+
+    assert outcome.filed_at is not None, "the report file was lost with the raise"
+    assert transport.messages, "the digest was lost with the raise"
+    assert pinger.urls == [], "a refused piece must withhold the ping"
+
+    said = [line for line in outcome.nightly.problems if "did not run" in line]
+    assert len(said) == 3, f"three pieces refused and {len(said)} were recorded"
+    assert "bars: did not run, UnsupportedSchemaVersion" in transport.messages[0].body
+
+
 def test_a_quarantined_quotes_partition_does_not_take_the_whole_sweep(
     fixture_lake: FixtureLake,
 ):
@@ -1361,8 +1508,9 @@ def test_the_bars_walk_names_a_missing_master_once_its_spans_are_there(
     Marketlake #422 put ``read_capture_spans`` before the walk's own ``_read_master``, so the one
     test that used to cover ``MasterAbsent`` for this piece refuses earlier and never reaches it.
     Removing ``MasterAbsent`` or ``MasterUnreadable`` from ``_BARS_REFUSALS`` left the suite green,
-    which is how that gap was found. This fixture has the spans and no master, so the walk reaches
-    the condition those two names are in the tuple for.
+    which is how that gap was found. Marketlake #497 then replaced both with ``ActionsError`` and
+    ``SecurityMasterError``, so the tuple names their classes rather than the two names above.
+    This fixture has the spans and no master, so the walk reaches the condition they cover.
     """
     fixture_lake.with_quotes("SPY", FOLLOWING, _quotes_table([_quote_row(FOLLOWING)]))
     fixture_lake.with_reference("schema_versions", _ledger_table())
