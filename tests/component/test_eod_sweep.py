@@ -673,7 +673,11 @@ def test_the_friday_run_sets_the_sunday_one_shot_and_reads_it_back(fixture_lake:
     )
 
     assert setter.sundays == [SUNDAY]
-    assert outcome.nightly.report == ()
+    # The battery's coverage census prints on every session run, including one that found
+    # nothing wrong, because it is the only thing in the report file that says the check ran.
+    # The fixture lake is one sealed session against a span covering five, so it finds nine.
+    (census,) = outcome.nightly.report
+    assert census.startswith("battery: calendar coverage,")
     assert outcome.nightly.problems == ()
     assert pinger.urls == [PING_URL]
 
