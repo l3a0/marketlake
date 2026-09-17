@@ -180,6 +180,7 @@ from lake.actions import (
     ActionKey,
     HeldFinding,
     Landed,
+    MasterAbsent,
     UnresolvedSymbol,
     append,
     build_entry,
@@ -199,16 +200,32 @@ from lake.loader import (
     _occ_root,
     load_chain,
 )
+from lake.manifest import RowCountRegression
+from lake.occ_mapping import (
+    CHECK_OCC_MAPPING,
+    MappingRefused,
+    Remapped,
+    SymbolHistory,
+    write_mappings,
+)
 from lake.paths import CHAINS
 from lake.report import Withheld, write_withheld
-from lake.security_master import AmbiguousSymbol, SecurityMaster
+from lake.security_master import (
+    AmbiguousSymbol,
+    MasterUnreadable,
+    SecurityMaster,
+    SecurityMasterError,
+)
 
-# The eight chains columns this module reads. ``option_root`` is the signal and
-# ``occ_symbol`` is the fallback the root is derived from where the column is null. The four
-# in the middle are where the deliverable is written down. ``suspect`` and
-# ``is_chain_truncated`` are what say a session cannot bound a boundary.
+# The ten chains columns this module reads. ``option_root`` is the signal and ``occ_symbol``
+# is the fallback the root is derived from where the column is null. ``ssid`` is Schwab's own
+# contract identifier, and it is what pairs a re-symboled contract's old symbol to its new one
+# in ``lake.occ_mapping``, since the symbol is the thing that moves. The four after it are
+# where the deliverable is written down. ``mini`` marks a tenth-size contract under its own
+# root. ``suspect`` and ``is_chain_truncated`` are what say a session cannot bound a boundary.
 OPTION_ROOT = "option_root"
 OCC_SYMBOL = "occ_symbol"
+SSID = "ssid"
 OPTION_DELIVERABLES_LIST = "option_deliverables_list"
 DELIVERABLE_NOTE = "deliverable_note"
 MULTIPLIER = "multiplier"
@@ -219,6 +236,7 @@ IS_CHAIN_TRUNCATED = "is_chain_truncated"
 CHAINS_COLUMNS = (
     OPTION_ROOT,
     OCC_SYMBOL,
+    SSID,
     OPTION_DELIVERABLES_LIST,
     DELIVERABLE_NOTE,
     MULTIPLIER,
@@ -345,12 +363,15 @@ class Outcome:
 
     A session can produce a landed entry and a non-adjustment at once, because a chain can
     gain a returning root beside a genuinely new one, so this carries both rather than being
-    one of several sentinels.
+    one of several sentinels. ``mapped`` rides beside them for the same reason: the master
+    write fires on four of the five outcomes a confirmed boundary can reach, so it is not any
+    one of them.
     """
 
     landed: Landed | None = None
     unchanged: bool = False
     not_adjustments: tuple[NotAnAdjustment, ...] = ()
+    mapped: tuple[Remapped, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -437,6 +458,11 @@ class SplitReport:
     ``skipped`` carries every ticker-day the walk did not read, because each one widens the
     window a boundary can sit in and the render is where an operator sees how wide the lake's
     windows currently are.
+
+    ``mapped`` counts the OCC mapping rows the run wrote into the security master. It is
+    reported rather than inferred from ``appended``, because the two fire on different things:
+    a rename writes mappings and appends nothing, and a run that rewrote the reference table
+    every consumer resolves through should say so on its own sign-off block.
     """
 
     ticker_days: int
@@ -445,6 +471,7 @@ class SplitReport:
     unchanged: int
     not_adjustments: tuple[NotAnAdjustment, ...]
     skipped: tuple[Skip, ...]
+    mapped: tuple[Remapped, ...] = ()
 
     @property
     def unfiled(self) -> tuple[HeldFinding, ...]:
@@ -482,6 +509,13 @@ class SplitReport:
                 lines.append(f"      NOT filed: {held.filing_error}")
             else:
                 lines.append(f"      filed at {held.filed_at}")
+        lines.append(f"  mapped:    {len(self.mapped)}")
+        for remap in self.mapped:
+            lines.append(
+                f"    - {remap.ticker} (instrument {remap.instrument_id}) "
+                f"{remap.old_symbol!r} [{remap.valid_from.isoformat()} -> "
+                f"{remap.effective.isoformat()}) becomes {remap.new_symbol!r}"
+            )
         lines.append(f"  unchanged: {self.unchanged}")
         lines.append(f"  not a split: {len(self.not_adjustments)}")
         lines.extend(_by_reason(self.not_adjustments))
@@ -951,6 +985,7 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
     held: list[HeldFinding] = []
     skipped: list[Skip] = []
     not_adjustments: list[NotAnAdjustment] = []
+    mapped: list[Remapped] = []
     unchanged = 0
     # Every key this run has already emitted. One ticker has at most one boundary a day, so
     # this cannot collide today. It is still read, because two tickers resolving to one
@@ -979,6 +1014,10 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
 
     for ticker, days in by_ticker(ticker_days):
         previous: Session | None = None
+        # Each contract's current symbol and the session it was first read under it. This is
+        # what pairs a re-symboled contract's old symbol to its new one, and what dates the
+        # old mapping's range. It is per instrument and resets with ``previous``.
+        history = SymbolHistory()
         # Every root the walk has watched this instrument carry. A set difference has no
         # direction, so without this a root that expires out of one session and lists again
         # in the next reads as an adjustment and lands the ratio backwards.
@@ -1021,18 +1060,25 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
                 lake_root=lake_root,
                 current=current,
                 emitted=emitted,
+                history=history,
                 hold=hold,
             )
             if outcome.landed is not None:
                 appended.append(outcome.landed)
             unchanged += outcome.unchanged
             not_adjustments.extend(outcome.not_adjustments)
+            mapped.extend(outcome.mapped)
             # The instrument's own history, so a root is remembered across a session it
             # happens to be absent from. It resets with ``previous`` when the instrument
-            # changes, because a different security's roots are a different history.
+            # changes, because a different security's roots are a different history. The
+            # symbol history resets with it, for the same reason.
             if previous is not None and previous.instrument_id != session.instrument_id:
                 seen = frozenset()
+                history.reset()
             seen |= session.roots
+            # After the examination rather than before it, so a boundary is judged against
+            # the history as it stood before this session, the way ``seen`` is.
+            history.observe(session.day, [row for _, row in session.rows])
             previous, skipped_since = session, 0
 
     return SplitReport(
@@ -1042,6 +1088,7 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
         unchanged=unchanged,
         not_adjustments=tuple(not_adjustments),
         skipped=tuple(skipped),
+        mapped=tuple(mapped),
     )
 
 
@@ -1056,6 +1103,7 @@ def _examine(
     lake_root: Path,
     current: dict[ActionKey, dict],
     emitted: set[ActionKey],
+    history: SymbolHistory,
     hold,
 ) -> Outcome:
     """One session against the one before it, and what became of any boundary in it.
@@ -1147,17 +1195,53 @@ def _examine(
         hold(_finding(ticker, day, CHECK_SPLIT_PAYLOAD, exc, session.instrument_id))
         return Outcome(not_adjustments=tuple(marks))
 
+    # **The mapping is written here, before the ledger decides anything.** Everything past
+    # this point is a confirmed re-symboling: the session gained a root the instrument has
+    # never carried, the vendor calls its contracts non-standard, the boundary is bounded to
+    # one session, and both sides of the deliverable read. What the ledger does with it
+    # differs after this and the master's answer does not, because the master records which
+    # contract is which and records no ratio at all. A rename, an adjustment one float cannot
+    # describe, a ratio the gate refuses and a landed split all re-symboled the contracts.
+    mapped: tuple[Remapped, ...] = ()
+    try:
+        mapped = write_mappings(
+            lake_root,
+            ticker=ticker,
+            instrument_id=session.instrument_id,
+            effective=day,
+            pairing=history.inspect(row for root, row in session.rows if root in gained),
+            recorded_at=recorded_at,
+        )
+    except (MasterAbsent, MasterUnreadable):
+        # The one condition a single command fixes, and it stays true for every remaining
+        # boundary, so it ends the run the way the walk's own first read of the master does.
+        # ``main`` turns each into its own line naming the fix.
+        raise
+    except (
+        MappingRefused,
+        SecurityMasterError,
+        RowCountRegression,
+        ValueError,
+        OSError,
+    ) as exc:
+        # Five classes rather than two, and ``RowCountRegression`` is the one a catch on the
+        # master's own errors would miss: it is a bare ``Exception``. This write can never
+        # cause it, since registering and remapping only grow the row list, and a restore from
+        # backup makes it reachable anyway. A refusal here costs this boundary its mapping and
+        # not the run, because the ledger entry below is a separate record.
+        hold(_finding(ticker, day, CHECK_OCC_MAPPING, exc, session.instrument_id))
+
     if new.same_as(prior):
         # A rename carries the same deliverable under a new symbol. Nothing to land and
         # nothing to hold, the way a quote row carrying no ex-date is no observation.
         marks.append(NotAnAdjustment(ticker, day, REASON_DELIVERABLE_UNCHANGED))
-        return Outcome(not_adjustments=tuple(marks))
+        return Outcome(not_adjustments=tuple(marks), mapped=mapped)
 
     try:
         require_scalar(prior, new)
     except NonScalarDeliverable as exc:
         hold(_finding(ticker, day, CHECK_SPLIT_DELIVERABLE, exc, session.instrument_id))
-        return Outcome(not_adjustments=tuple(marks))
+        return Outcome(not_adjustments=tuple(marks), mapped=mapped)
 
     if not verdict.agrees:
         hold(
@@ -1171,7 +1255,7 @@ def _examine(
                 instrument_id=session.instrument_id,
             )
         )
-        return Outcome(not_adjustments=tuple(marks))
+        return Outcome(not_adjustments=tuple(marks), mapped=mapped)
 
     fields = {
         "instrument_id": session.instrument_id,
@@ -1198,7 +1282,7 @@ def _examine(
         candidate = build_entry(**fields)
     except ValueError as exc:
         hold(_finding(ticker, day, CHECK_SPLIT_PAYLOAD, exc, session.instrument_id))
-        return Outcome(not_adjustments=tuple(marks))
+        return Outcome(not_adjustments=tuple(marks), mapped=mapped)
 
     key = (session.instrument_id, candidate["ex_date"], TYPE_SPLIT)
     if key in emitted:
@@ -1218,13 +1302,14 @@ def _examine(
                 session.instrument_id,
             )
         )
-        return Outcome(not_adjustments=tuple(marks))
+        return Outcome(not_adjustments=tuple(marks), mapped=mapped)
     emitted.add(key)
     if same_but_for_recorded_at(current.get(key), candidate):
-        return Outcome(unchanged=True, not_adjustments=tuple(marks))
+        return Outcome(unchanged=True, not_adjustments=tuple(marks), mapped=mapped)
     return Outcome(
         landed=Landed(entry=append(lake_root, **fields), symbol=ticker),
         not_adjustments=tuple(marks),
+        mapped=mapped,
     )
 
 
@@ -1342,6 +1427,7 @@ __all__ = [
     "REASON_STANDARD_SERIES",
     "REASON_THIN",
     "REASON_UNRESOLVED",
+    "SSID",
     "SPLIT_CONSISTENCY_TOLERANCE",
     "Session",
     "Skip",

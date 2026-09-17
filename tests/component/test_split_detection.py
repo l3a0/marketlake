@@ -22,6 +22,7 @@ like, and the three readings that fail on real data are each driven here:
 from __future__ import annotations
 
 import json
+import zlib
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -34,10 +35,15 @@ from lake.actions import (
     PROVENANCE_OBSERVED,
     TYPE_SPLIT,
 )
+from lake.manifest import record_partition, scrub
+from lake.occ_mapping import CHECK_OCC_MAPPING
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
 from lake.security_master import (
+    ID_TYPE_OCC,
     ID_TYPE_TICKER,
     KIND_EQUITY,
+    MASTER_FILENAME,
+    REFERENCE_DIR,
     Mapping,
     SecurityMaster,
     master_path,
@@ -120,10 +126,32 @@ STANDARD = _deliverables(100.0)
 ADJUSTED = _deliverables(150.0)
 
 
+# The default contract, and a second standard one that lists beside it. An adjustment
+# re-symbols the open contracts while newly listed standard ones keep the original root, so a
+# session on the far side of a boundary carries both and they are different contracts.
+DEFAULT_OCC = "SPY   260918C00650000"
+CARRIED_OCC = "SPY   260918C00700000"
+
+
+def _ssid(occ_symbol: str) -> int:
+    """A fixture's stable contract id for one symbol, the way Schwab's ``ssid`` is stable.
+
+    Derived from the symbol so two rows in one session never share an id by accident, which
+    the live lake bears out: every ``ssid`` is distinct within each of SPY's and QQQ's
+    2026-09-14, 09-15 and 09-16 sessions. A re-symboling is the one case where the id has to
+    be carried across a symbol change by hand, which is what ``_adjusted_row`` does.
+    """
+    return zlib.crc32(occ_symbol.encode())
+
+
+_DERIVE = object()
+
+
 def _row(
     day: date,
     *,
-    occ_symbol: str = "SPY   260918C00650000",
+    occ_symbol: str = DEFAULT_OCC,
+    ssid: int | None | object = _DERIVE,
     option_root: str | None = ROOT,
     deliverables: str | None = STANDARD,
     note: str | None = NOTE,
@@ -136,13 +164,21 @@ def _row(
     truncated: bool = False,
     ticker: str = "SPY",
 ) -> dict:
-    """One chains row at the session's option close, carrying the deliverable columns."""
+    """One chains row at the session's option close, carrying the deliverable columns.
+
+    ``ssid`` defaults to the one ``_ssid`` derives from the symbol, so a contract keeps its id
+    across sessions and two symbols never collide. Pass it to say that a row is the same
+    contract as one spelled differently, which is what a re-symboling is.
+    """
+    if ssid is _DERIVE:
+        ssid = _ssid(occ_symbol)
     return {
         "snap_ts": f"{day.isoformat()}T20:15:00+00:00",
         "fetch_ts": f"{day.isoformat()}T20:15:00.400+00:00",
         "vendor_quote_ts": f"{day.isoformat()}T20:15:00+00:00",
         "ticker": ticker,
         "occ_symbol": occ_symbol,
+        "ssid": ssid,
         "bid": 4.20,
         "ask": 4.25,
         "last": 4.22,
@@ -173,6 +209,7 @@ def _gap_day_row(day: date, ticker: str = "SPY") -> dict:
     return _row(
         day,
         row_kind="gap",
+        ssid=None,
         option_root=None,
         deliverables=None,
         note=None,
@@ -184,8 +221,13 @@ def _gap_day_row(day: date, ticker: str = "SPY") -> dict:
 
 
 def _adjusted_row(day: date, **kwargs) -> dict:
-    """One row of the re-symboled contracts: the gained root and the moved deliverable."""
+    """One row of the re-symboled contracts: the gained root and the moved deliverable.
+
+    It carries the default contract's ``ssid``, so it is that contract wearing a new symbol.
+    That is what a re-symboling is, and it is what ``lake.occ_mapping`` pairs on.
+    """
     defaults = {
+        "ssid": _ssid(DEFAULT_OCC),
         "occ_symbol": "SPY1  260918C00433330",
         "option_root": ADJUSTED_ROOT,
         "deliverables": ADJUSTED,
@@ -275,7 +317,10 @@ def _two_sessions(fixture_lake: FixtureLake, **kwargs) -> Path:
         fixture_lake,
         {
             ("SPY", DAY_ONE): [_row(DAY_ONE)],
-            ("SPY", DAY_TWO): [_row(DAY_TWO), _adjusted_row(DAY_TWO, **kwargs)],
+            ("SPY", DAY_TWO): [
+                _row(DAY_TWO, occ_symbol=CARRIED_OCC),
+                _adjusted_row(DAY_TWO, **kwargs),
+            ],
         },
     )
 
@@ -550,9 +595,12 @@ def test_a_thin_snapshot_cannot_bound_a_boundary(fixture_lake: FixtureLake, flag
     root = _lake(
         fixture_lake,
         {
-            ("SPY", DAY_ONE): [_row(DAY_ONE), _adjusted_row(DAY_ONE)],
+            ("SPY", DAY_ONE): [_row(DAY_ONE, occ_symbol=CARRIED_OCC), _adjusted_row(DAY_ONE)],
             ("SPY", DAY_TWO): [_row(DAY_TWO, **{flag: True})],
-            ("SPY", DAY_THREE): [_row(DAY_THREE), _adjusted_row(DAY_THREE)],
+            ("SPY", DAY_THREE): [
+                _row(DAY_THREE, occ_symbol=CARRIED_OCC),
+                _adjusted_row(DAY_THREE),
+            ],
         },
     )
 
@@ -628,7 +676,10 @@ def test_a_skipped_session_holds_the_boundary_rather_than_guessing_its_date(
         {
             ("SPY", DAY_ONE): [_row(DAY_ONE)],
             ("SPY", DAY_TWO): [_gap_day_row(DAY_TWO)],
-            ("SPY", DAY_THREE): [_row(DAY_THREE), _adjusted_row(DAY_THREE)],
+            ("SPY", DAY_THREE): [
+                _row(DAY_THREE, occ_symbol=CARRIED_OCC),
+                _adjusted_row(DAY_THREE),
+            ],
         },
     )
 
@@ -1072,6 +1123,9 @@ def test_a_real_split_still_lands_when_the_previous_session_carries_two_roots(
     )
     second = dict(
         option_root="SPY2",
+        # The standard contract, re-symboled again. An adjustment renames a contract the
+        # chain already carried rather than listing one out of nowhere.
+        ssid=_ssid(DEFAULT_OCC),
         occ_symbol="SPY2  260918C00325000",
         deliverables=_deliverables(200.0),
         note="200 SPY",
@@ -1081,7 +1135,11 @@ def test_a_real_split_still_lands_when_the_previous_session_carries_two_roots(
         fixture_lake,
         {
             ("SPY", DAY_ONE): [_row(DAY_ONE), _row(DAY_ONE, **legacy)],
-            ("SPY", DAY_TWO): [_row(DAY_TWO), _row(DAY_TWO, **legacy), _row(DAY_TWO, **second)],
+            ("SPY", DAY_TWO): [
+                _row(DAY_TWO, occ_symbol=CARRIED_OCC),
+                _row(DAY_TWO, **legacy),
+                _row(DAY_TWO, **second),
+            ],
         },
     )
 
@@ -1131,7 +1189,10 @@ def test_a_split_and_then_a_fresh_standard_series_files_nothing_false(
         {
             ("SPY", DAY_ONE): [_row(DAY_ONE)],
             ("SPY", DAY_TWO): [_adjusted_row(DAY_TWO)],
-            ("SPY", DAY_THREE): [_adjusted_row(DAY_THREE), _row(DAY_THREE)],
+            ("SPY", DAY_THREE): [
+                _adjusted_row(DAY_THREE),
+                _row(DAY_THREE, occ_symbol=CARRIED_OCC),
+            ],
         },
     )
 
@@ -1163,7 +1224,10 @@ def test_a_note_of_zero_shares_holds_and_the_next_ticker_still_lands_its_split(
                 _adjusted_row(DAY_TWO, note="0 SPY", ticker="QQQ"),
             ],
             ("SPY", DAY_ONE): [_row(DAY_ONE)],
-            ("SPY", DAY_TWO): [_row(DAY_TWO), _adjusted_row(DAY_TWO)],
+            ("SPY", DAY_TWO): [
+                _row(DAY_TWO, occ_symbol=CARRIED_OCC),
+                _adjusted_row(DAY_TWO),
+            ],
         },
         master=_master(tickers=("SPY", "QQQ")),
     )
@@ -1258,7 +1322,10 @@ def test_a_skip_does_not_deafen_the_ticker_for_the_rest_of_the_walk(
             ("SPY", DAY_ONE): [_row(DAY_ONE)],
             ("SPY", DAY_TWO): [_gap_day_row(DAY_TWO)],
             ("SPY", DAY_THREE): [_row(DAY_THREE)],
-            ("SPY", day_four): [_row(day_four), _adjusted_row(day_four)],
+            ("SPY", day_four): [
+                _row(day_four, occ_symbol=CARRIED_OCC),
+                _adjusted_row(day_four),
+            ],
         },
     )
 
@@ -1334,7 +1401,10 @@ def test_two_tickers_on_one_instrument_hold_the_second_boundary(fixture_lake: Fi
         fixture_lake,
         {
             ("SPY", DAY_ONE): [_row(DAY_ONE)],
-            ("SPY", DAY_TWO): [_row(DAY_TWO), _adjusted_row(DAY_TWO)],
+            ("SPY", DAY_TWO): [
+                _row(DAY_TWO, occ_symbol=CARRIED_OCC),
+                _adjusted_row(DAY_TWO),
+            ],
             ("SPZ", DAY_ONE): [_row(DAY_ONE, ticker="SPZ")],
             ("SPZ", DAY_TWO): [
                 _row(DAY_TWO, ticker="SPZ"),
@@ -1406,6 +1476,8 @@ def test_the_prior_side_reads_the_standard_series_of_the_boundary_session(
     )
     second = dict(
         option_root="SPY2",
+        # The standard contract, re-symboled again, the same as the fixture above.
+        ssid=_ssid(DEFAULT_OCC),
         occ_symbol="SPY2  260918C00216660",
         deliverables=_deliverables(300.0),
         note="300 SPY",
@@ -1417,7 +1489,11 @@ def test_the_prior_side_reads_the_standard_series_of_the_boundary_session(
             ("SPY", DAY_TWO): [_row(DAY_TWO), _row(DAY_TWO, **legacy)],
             # The standard series is not listed this session, so it cannot answer from here.
             ("SPY", DAY_THREE): [_row(DAY_THREE, **legacy)],
-            ("SPY", day_four): [_row(day_four, **legacy), _row(day_four), _row(day_four, **second)],
+            ("SPY", day_four): [
+                _row(day_four, **legacy),
+                _row(day_four, occ_symbol=CARRIED_OCC),
+                _row(day_four, **second),
+            ],
         },
     )
 
@@ -1427,3 +1503,218 @@ def test_the_prior_side_reads_the_standard_series_of_the_boundary_session(
     assert entry["split_ratio"] == 3.0, (
         "the ratio was taken against the adjusted series rather than the standard one"
     )
+
+
+# -- the OCC mapping rows the boundary writes -------------------------------------------
+
+
+def _mappings(root: Path) -> list[tuple[str, date, date | None]]:
+    """Every OCC mapping row the master carries, as symbol and half-open range."""
+    master = SecurityMaster.read(master_path(root))
+    return [
+        (m.id_value, m.valid_from, m.valid_to) for m in master.mappings if m.id_type == ID_TYPE_OCC
+    ]
+
+
+def test_a_landed_split_also_threads_its_contracts_through_the_master(
+    fixture_lake: FixtureLake,
+):
+    """The two outputs share a trigger and nothing else.
+
+    The ledger records the ratio and the master records which contract is which, so one run
+    writes both and neither is derivable from the other.
+    """
+    root = _two_sessions(fixture_lake)
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    (entry,) = _entries(root)
+    assert entry["split_ratio"] == 1.5
+    (remap,) = report_out.mapped
+    assert (remap.old_symbol, remap.new_symbol) == (DEFAULT_OCC, "SPY1  260918C00433330")
+    assert _mappings(root) == [
+        (DEFAULT_OCC, DAY_ONE, DAY_TWO),
+        ("SPY1  260918C00433330", DAY_TWO, None),
+    ]
+    master = SecurityMaster.read(master_path(root))
+    assert master.resolve(DEFAULT_OCC, DAY_ONE, id_type=ID_TYPE_OCC) == remap.instrument_id
+    assert (
+        master.resolve("SPY1  260918C00433330", DAY_TWO, id_type=ID_TYPE_OCC) == remap.instrument_id
+    )
+
+
+def test_a_rename_writes_the_mapping_and_appends_no_ledger_entry(fixture_lake: FixtureLake):
+    """``remap``'s docstring says a rename and an OCC re-symboling are one operation.
+
+    The deliverable is what separates a rename from a split for the *ledger*, and it separates
+    nothing for the master, which records no ratio at all. So this is the case where the two
+    writes come apart completely.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_TWO): [
+                _row(DAY_TWO, occ_symbol=CARRIED_OCC),
+                _row(
+                    DAY_TWO,
+                    ssid=_ssid(DEFAULT_OCC),
+                    occ_symbol="SPY1  260918C00650000",
+                    option_root=ADJUSTED_ROOT,
+                    non_standard=True,
+                ),
+            ],
+        },
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert _entries(root) == [], "a rename landed a no-op factor"
+    assert _not_splits(report_out) == [REASON_DELIVERABLE_UNCHANGED]
+    assert [remap.new_symbol for remap in report_out.mapped] == ["SPY1  260918C00650000"]
+
+
+def test_an_adjustment_no_float_describes_is_held_and_still_mapped(
+    fixture_lake: FixtureLake,
+):
+    """#136 says such an event is surfaced rather than faked, and identity is not the ratio.
+
+    The contracts were re-symboled whether or not the ledger can carry what they now deliver,
+    and both consumers of these rows break on a re-symboling the master does not record.
+    """
+    root = _two_sessions(fixture_lake, deliverables=_with_cash(150.0, 25.0), note="150 SPY")
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert _entries(root) == []
+    (held,) = report_out.held
+    assert held.finding.check == CHECK_SPLIT_DELIVERABLE
+    assert len(report_out.mapped) == 1
+
+
+def test_a_ratio_the_gate_refuses_is_still_mapped(fixture_lake: FixtureLake):
+    """The gate judges the vendor's two spellings of the deliverable against each other.
+
+    A disagreement makes the *ratio* untrustworthy. It says nothing about which contract is
+    which, and the pairing does not read either field.
+    """
+    root = _two_sessions(fixture_lake, note="175 SPY")
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert _entries(root) == []
+    (held,) = report_out.held
+    assert held.finding.check == CHECK_SPLIT_CONSISTENCY
+    assert len(report_out.mapped) == 1
+
+
+def test_a_boundary_the_walk_cannot_date_writes_no_mapping(fixture_lake: FixtureLake):
+    """``effective`` is the field a guessed boundary would get wrong.
+
+    A mapping dated to the wrong session threads a contract's history across a day it did not
+    change on, and every read through the master then answers from the wrong side.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_TWO): [_gap_day_row(DAY_TWO)],
+            ("SPY", DAY_THREE): [
+                _row(DAY_THREE, occ_symbol=CARRIED_OCC),
+                _adjusted_row(DAY_THREE),
+            ],
+        },
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    (held,) = report_out.held
+    assert held.finding.check == CHECK_SPLIT_BOUNDARY
+    assert report_out.mapped == ()
+    assert _mappings(root) == []
+
+
+def test_a_second_night_rewrites_neither_the_ledger_nor_the_master(
+    fixture_lake: FixtureLake,
+):
+    """Sealed chains never change, so a second night re-derives the same boundary.
+
+    The mapping write cannot ride the ledger's guard, because a run that landed the entry and
+    failed the master write would never come back to it.
+    """
+    root = _two_sessions(fixture_lake)
+    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    before = master_path(root).read_bytes()
+    entries_before = _entries(root)
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+
+    assert _entries(root) == entries_before
+    assert report_out.unchanged == 1
+    assert report_out.mapped == ()
+    assert master_path(root).read_bytes() == before
+
+
+def test_a_refused_mapping_files_a_finding_and_the_split_still_lands(
+    fixture_lake: FixtureLake,
+):
+    """A refusal here costs this boundary its mapping and not the run.
+
+    The adjusted contract carries an ``ssid`` the walk has never read, which is what a vendor
+    dropping the identifier through a re-symboling looks like. The ledger entry is a separate
+    record and lands anyway.
+    """
+    root = _two_sessions(fixture_lake, ssid=999_000_001)
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    (entry,) = _entries(root)
+    assert entry["split_ratio"] == 1.5
+    (held,) = report_out.held
+    assert held.finding.check == CHECK_OCC_MAPPING
+    assert "MappingRefused" in held.finding.exception
+    assert report_out.mapped == ()
+    (filed,) = _findings(root, DAY_TWO)
+    assert filed["check"] == CHECK_OCC_MAPPING
+
+
+def test_a_newly_listed_standard_series_maps_nothing(fixture_lake: FixtureLake):
+    """An adjustment turns standard contracts into non-standard ones.
+
+    A gained root the vendor still calls standard has no adjustment behind it, so it never
+    reaches the mapping write at all.
+    """
+    root = _two_sessions(fixture_lake, non_standard=False, deliverables=STANDARD, note=NOTE)
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert _not_splits(report_out) == [REASON_STANDARD_SERIES]
+    assert report_out.mapped == () and _mappings(root) == []
+
+
+def test_the_render_names_the_mapping_it_wrote(fixture_lake: FixtureLake):
+    """A run that rewrote the reference table every consumer resolves through says so."""
+    root = _two_sessions(fixture_lake)
+
+    rendered = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT)).render()
+
+    assert "  mapped:    1" in rendered
+    assert f"{DEFAULT_OCC!r} [{DAY_ONE.isoformat()} -> {DAY_TWO.isoformat()})" in rendered
+    assert "becomes 'SPY1  260918C00433330'" in rendered
+
+
+def test_the_master_the_write_touches_stays_manifested(fixture_lake: FixtureLake):
+    """A rewrite that records no entry fails the integrity scrub's forward pass."""
+    root = _two_sessions(fixture_lake)
+    record_partition(
+        root,
+        f"{REFERENCE_DIR}/{MASTER_FILENAME}",
+        source="reference",
+        rows=2,
+        fetched_at=RECORDED_AT.isoformat(),
+    )
+    assert scrub(root).ok
+
+    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert scrub(root).ok, "the master was rewritten without recording its new sha"
