@@ -654,18 +654,13 @@ def test_an_unrelated_entry_does_not_refuse_the_read(fixture_lake: FixtureLake):
     every ticker in the lake.
     """
     root = _three_daily_sessions(fixture_lake)
-    _split(root)
-    actions.append(
-        root,
-        instrument_id=INSTRUMENT + 900,
-        observed_on=date.fromisoformat(BEFORE),
-        recorded_at=RECORDED_AT,
-        ex_date=BEFORE,
-        type=actions.TYPE_DIVIDEND,
-        cash_amount=0.0,
-        provenance=actions.PROVENANCE_OBSERVED,
-    )
+    _raw_ledger(root, {}, {**_UNREADABLE_DIVIDEND, "instrument_id": INSTRUMENT + 900})
     assert _closes(load_bars(TICKER, DAILY, lake_root=root, adjust=ADJUST_SPLIT)) == [
+        300.0,
+        300.0,
+        310.0,
+    ]
+    assert _closes(load_bars(TICKER, DAILY, lake_root=root, adjust=ADJUST_TOTAL)) == [
         300.0,
         300.0,
         310.0,
@@ -689,6 +684,24 @@ def test_a_dividend_that_paid_nothing_adjusts_nothing_and_raises_nothing(
         300.0,
         310.0,
     ]
+
+
+def test_the_split_view_reads_no_dividend_at_all(fixture_lake: FixtureLake):
+    """A view that folds no dividend in checks none, even for the instrument it is adjusting.
+
+    The dividend below is unreadable and belongs to the very instrument being adjusted, so the
+    only thing that keeps the split view answering is that it never reads a dividend. The total
+    view reads the same file and refuses, which is what says the entry really is unreadable.
+    """
+    root = _three_daily_sessions(fixture_lake)
+    _raw_ledger(root, {}, _UNREADABLE_DIVIDEND)
+    assert _closes(load_bars(TICKER, DAILY, lake_root=root, adjust=ADJUST_SPLIT)) == [
+        300.0,
+        300.0,
+        310.0,
+    ]
+    with pytest.raises(AdjustmentIncomplete):
+        load_bars(TICKER, DAILY, lake_root=root, adjust=ADJUST_TOTAL)
 
 
 def test_a_negative_amount_refuses(fixture_lake: FixtureLake):
@@ -862,27 +875,43 @@ def test_an_empty_prior_partition_refuses(fixture_lake: FixtureLake):
         load_bars(TICKER, MINUTE, lake_root=root, adjust=ADJUST_TOTAL)
 
 
-def _raw_ledger(root: Path, **fields) -> None:
-    """One ledger line written by hand, which is the only way to produce what the writer refuses.
+def _raw_ledger(root: Path, *overrides: dict) -> None:
+    """Ledger lines written by hand, the only way to produce what the writer refuses.
 
     ``actions.append`` validates every field on the way in, so the guards that exist for a
-    hand-edited `corporate_actions.jsonl` are unreachable through it. This is that file.
+    hand-edited `corporate_actions.jsonl` are unreachable through it. This is that file. Each
+    argument overrides a valid split for the default instrument, and no argument writes that
+    split alone.
     """
-    entry = {
-        "instrument_id": INSTRUMENT,
-        "ex_date": EX,
-        "type": actions.TYPE_SPLIT,
-        "cash_amount": None,
-        "split_ratio": 2.0,
-        "observed_on": EX,
-        "recorded_at": RECORDED_AT.isoformat(),
-        "provenance": actions.PROVENANCE_OBSERVED,
-        "schema_version": actions.ACTIONS_SCHEMA_VERSION,
-    }
-    entry.update(fields)
+    lines = []
+    for fields in overrides or ({},):
+        entry = {
+            "instrument_id": INSTRUMENT,
+            "ex_date": EX,
+            "type": actions.TYPE_SPLIT,
+            "cash_amount": None,
+            "split_ratio": 2.0,
+            "observed_on": EX,
+            "recorded_at": RECORDED_AT.isoformat(),
+            "provenance": actions.PROVENANCE_OBSERVED,
+            "schema_version": actions.ACTIONS_SCHEMA_VERSION,
+        }
+        entry.update(fields)
+        lines.append(json.dumps(entry))
     path = root / "actions" / "corporate_actions.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(entry) + chr(10))
+    path.write_text(chr(10).join(lines) + chr(10))
+
+
+# A dividend line no writer would produce: the amount is a string. It is the entry used below to
+# show that a read checks what it uses, because an entry this malformed refuses wherever it is
+# read and so says plainly whether it was read at all.
+_UNREADABLE_DIVIDEND = {
+    "type": actions.TYPE_DIVIDEND,
+    "ex_date": AFTER,
+    "split_ratio": None,
+    "cash_amount": "3.00",
+}
 
 
 @pytest.mark.parametrize(
@@ -907,7 +936,7 @@ def test_a_ledger_entry_this_cannot_read_refuses_rather_than_being_stepped_over(
     ``float(True)`` is ``1.0`` and would pass as a ratio that adjusts nothing.
     """
     root = _three_daily_sessions(fixture_lake)
-    _raw_ledger(root, **fields)
+    _raw_ledger(root, fields)
     with pytest.raises(AdjustmentIncomplete):
         load_bars(TICKER, DAILY, lake_root=root, adjust=ADJUST_SPLIT)
 
