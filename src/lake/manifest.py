@@ -273,10 +273,14 @@ def _refuse_hidden_entries(path: Path, text: str, entries: Sequence[dict]) -> No
     What sits behind the stop is counted as lines rather than entries, because damage does not
     have to be well formed. They are whole written lines no reader reaches, and on any ledger a
     writer produced they are verdicts.
+
+    ``hidden`` is the only guard the index needs, so no length check sits above it.
+    ``parse_jsonl`` yields at most one entry per non-blank line, so the entries never outnumber
+    the positions, and a positive ``hidden`` is exactly the statement that ``len(entries)`` is a
+    position this list holds. A length check there was tried and the mutation review found it
+    inert: every input it would have returned on, ``hidden <= 0`` returns on first.
     """
     positions = [number for number, line in enumerate(text.splitlines(), start=1) if line.strip()]
-    if len(positions) <= len(entries):
-        return
     hidden = len(positions) - len(entries) - 1
     if hidden <= 0:
         return
