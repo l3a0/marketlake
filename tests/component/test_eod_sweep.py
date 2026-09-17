@@ -2086,3 +2086,31 @@ def test_an_unbounded_evening_writes_no_deferred_line(fixture_lake: FixtureLake)
     spent = dict(outcome.nightly.pieces)["bars"].landed
     bounded, _, _ = _run(root, guards=GuardConstants(bars_request_budget=max(spent, 1)))
     assert [line for line in bounded.nightly.report if line.startswith("bars deferred")] == []
+
+
+def test_the_nightly_reports_a_run_that_deferred_exactly_one_ticker_day(
+    fixture_lake: FixtureLake,
+):
+    """The smallest non-zero case, which is the silence the line exists to break.
+
+    The two tests beside this one pin three deferred and zero deferred, so the boundary between
+    them is never exercised and ``if walked.deferred:`` can become ``len(...) > 1`` with the whole
+    suite still green. One deferred ticker-day is the case that matters most: it is the first
+    evening a backfill starts falling behind, and a run that reports nothing on it looks exactly
+    like a run that finished.
+    """
+    later = EVENING + timedelta(days=3)
+    walked = _walked(later.date())
+    quotes = {("SPY", day): [_quote_row(day)] for day in (*walked, walked[-1] + timedelta(days=1))}
+    root = _lake(fixture_lake, quotes=quotes)
+    outcome, pinger, _ = _run(
+        root,
+        now=later,
+        vendor_source=_CountingVendorSource(_cassette(session=later.date())),
+        guards=GuardConstants(bars_request_budget=len(walked) - 1),
+    )
+
+    (line,) = [entry for entry in outcome.nightly.report if entry.startswith("bars deferred")]
+    assert line == f"bars deferred: 1 ticker-day(s), {len(walked) - 1} request(s) spent"
+    assert line in outcome.digest.body
+    assert pinger.urls == [PING_URL]

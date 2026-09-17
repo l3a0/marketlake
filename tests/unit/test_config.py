@@ -180,6 +180,11 @@ def test_the_bar_request_budget_is_pinned_and_overridable():
     """
     assert GuardConstants().bars_request_budget == 100
     assert GuardConstants.from_mapping({"bars_request_budget": 40}).bars_request_budget == 40
+    # **The boundary is on the accepted side, and it is asserted here.** The refusal test below
+    # parametrises 0, -1 and -100, all below the bound, so a check that drifted to ``<= 1`` would
+    # refuse the minimum its own message promises and stay green. The message would then read
+    # "must be a whole number of at least 1, got 1", which contradicts itself.
+    assert GuardConstants.from_mapping({"bars_request_budget": 1}).bars_request_budget == 1
 
 
 @pytest.mark.parametrize("budget", [0, -1, -100])

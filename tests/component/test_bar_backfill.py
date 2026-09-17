@@ -1769,3 +1769,118 @@ def test_the_single_session_fetch_is_not_bounded_by_the_budget(fixture_lake: Fix
     assert report.attempted == 2
     assert len(vendor.calls) == 2
     assert not hasattr(report, "deferred")
+
+
+def test_the_backfill_command_hands_the_walk_the_config_s_budget(
+    fixture_lake: FixtureLake, tmp_path: Path
+):
+    """The one line connecting `config.yaml` to the by-hand command, driven end to end.
+
+    ``backfill_bars_from_config`` passes `guards=config.guards`, and dropping that kwarg leaves
+    every other test here green: they call ``backfill_bars`` directly and hand it guards
+    themselves, so none of them crosses the wiring. The operator who recalibrates the budget is
+    the whole argument for the constant living in ``config.yaml`` rather than in this module, and
+    without this test their edit is silently ignored by ``--backfill``.
+
+    The budget is set to 2 against a seven-session plan, so the assertion is on requests that did
+    not go out rather than on a report field. Only the recorded calls can tell a budget that was
+    read from one that was defaulted.
+    """
+    root = _lake(fixture_lake)
+    config = write_config(tmp_path, root, guards={"bars_request_budget": 2})
+    vendor = RecordingVendor(_cassette(freqs=(MINUTE_FREQ,)))
+    code = bars.main(
+        ["--backfill", "--config", str(config), "--tickers", str(_tickers_file(tmp_path))],
+        clock=ManualClock(TONIGHT),
+        vendor_factory=lambda *a, **k: vendor,
+    )
+    assert code == 0
+    assert len(vendor.calls) == 2, "the config's budget never reached the walk"
+    # The two it reached are the newest, and the five it did not are still unmanifested, so
+    # tomorrow's run picks them up. ``SESSIONS`` is ascending, so this compares as a set.
+    landed = {day for day in SESSIONS if _partition(root, "SPY", MINUTE_FREQ, day).exists()}
+    assert landed == {SESSIONS[-1], SESSIONS[-2]}
+
+
+def test_the_pinned_default_binds_a_plan_larger_than_it(fixture_lake: FixtureLake):
+    """``None`` resolves to the pinned 100, proven by a plan that 100 is smaller than.
+
+    This is the half a seven-session fixture cannot show. With the plan below the budget, a run
+    that resolved ``None`` to the pinned default and a run that walked unbounded report the same
+    four numbers, so a test built on it passes whether the resolution is there or not. The
+    resolution is what ``lake.sweep`` depends on, because it forwards whatever it holds and the
+    callee decides, so a missing one walks the nightly job unbounded.
+
+    Fifteen tickers over seven sessions is 105 ticker-days at one frequency, which is the
+    cheapest plan larger than the pinned budget. ``1m`` carries it because that half runs no close
+    cross-check and so needs no quotes seeded per ticker.
+    """
+    tickers = tuple(f"T{index:02d}" for index in range(15))
+    root = _lake(fixture_lake, master=_master(tickers), spans=_open_span(*range(1, 16)))
+    vendor = RecordingVendor(_cassette(tickers=tickers, freqs=(MINUTE_FREQ,)))
+    result = _run(
+        root,
+        vendor,
+        roster=_roster({ticker: [MINUTE_FREQ] for ticker in tickers}),
+        spans=_open_span(*range(1, 16)),
+        guards=None,
+    )
+
+    assert len(tickers) * len(SESSIONS) == 105, "the plan has to be larger than the budget"
+    assert result.attempted == GuardConstants().bars_request_budget == 100
+    assert len(vendor.calls) == 100
+    assert len(result.deferred) == 5
+
+
+def test_the_deferred_block_renders_before_the_unwalked_one(fixture_lake: FixtureLake):
+    """The sign-off block's order is pinned, not just its contents.
+
+    ``test_the_two_gate_skip_blocks_are_rendered_in_the_backfill_block`` makes this argument for
+    its own pair and its comment says why: "swapping the blocks... changed nothing any of them
+    could see." The deferred block arrived without that treatment, and moving it below
+    ``unwalked`` left every assertion about it green, because the one test that reads it locates
+    its line by index and slices forward from there.
+
+    A reader meets the run's own remainder before the reference data it could not name, which is
+    the order the two mean something in: one is work this run left, the other is work no run can
+    do.
+    """
+    root = _lake(fixture_lake, master=_master(("SPY", "QQQ")))
+    result = _run(
+        root,
+        RecordingVendor(_cassette(freqs=(MINUTE_FREQ,))),
+        roster=_roster({"SPY": [MINUTE_FREQ]}),
+        spans=_open_span(1, 2),
+        guards=_budget(2),
+    )
+    rendered = result.render().splitlines()
+    # QQQ has a span and no roster entry, so the plan cannot name its frequencies.
+    assert result.unwalked, "the fixture must produce both blocks for the order to mean anything"
+    assert result.deferred
+    assert rendered.index(f"  deferred: {len(result.deferred)}") < rendered.index(
+        f"  unwalked: {len(result.unwalked)}"
+    )
+
+
+def test_the_plan_orders_by_the_whole_date_across_a_month_boundary():
+    """The outer sort key is the session, not a field of it.
+
+    Every other ordering test here lives inside September, so a key that agrees with the true date
+    only within one month sorts them all correctly. ``day.session.day`` is such a key: over
+    2026-08-31 to 2026-09-04 it ranks the 31st above the 4th and puts the oldest session back at
+    the front, which is the exact failure the inversion exists to prevent.
+
+    The fixture calendar's ``WEEK_ZERO`` is what makes this cost a span start and a clock.
+    """
+    first, last = WEEK_ZERO, date(2026, 9, 4)
+    plan = _plan(
+        spans=_open_span(1, start=datetime(2026, 8, 31, 12, 0, tzinfo=UTC)),
+        master=_master(valid_from=first),
+        now=datetime(2026, 9, 4, 22, 0, tzinfo=UTC),
+    )
+    sessions = [day.session for day in plan.days]
+    assert sessions == sorted(sessions, reverse=True)
+    assert sessions[0] == last and sessions[-1] == first
+    # The range's own ends are unmoved by the inversion, and they straddle the boundary.
+    assert plan.floor == first
+    assert plan.ceiling == last
