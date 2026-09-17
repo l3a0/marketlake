@@ -83,9 +83,13 @@ ends and a subtraction, so it does not say which end lost its minute, and the re
 Schwab omitting a minute that did not trade. Neither number changes what the flag does, because
 both are the extended session against a request for the regular one.
 
-So the bounds do not clip the response and the flag is what decides its extent. Asking for the
-regular session by name is what makes the fetch reversible too: the flag lands on every row,
-which is what the ``extended_hours`` column was made nullable for.
+So on a 1-minute request the bounds do not clip the response, and the flag is what decides its
+extent. That is this frequency's own answer and not the vendor's everywhere: #416 measured the
+*daily* response clipped to the calendar dates its bounds fall on, which is why the daily bracket
+is day-aligned. :func:`check_bar_span` carries that measurement.
+
+Asking for the regular session by name is what makes the fetch reversible too: the flag lands on
+every row, which is what the ``extended_hours`` column was made nullable for.
 
 What the narrow window buys is unchanged: a wider one would let Schwab answer with the regular
 session, correct and short at the same time, and by the span check's unbounded-repeat rule the
