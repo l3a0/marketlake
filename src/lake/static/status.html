@@ -778,7 +778,16 @@
     }
     var list = el("ul", null, "ledger");
     history.quarantines.forEach(function (entry) {
-      var text = entry.partition + "  " + (entry.verdict === null ? DASH : entry.verdict);
+      // Every check still withholding, each with its own verdict, because signing one off
+      // leaves the rest standing and two checks can withhold under two different spellings.
+      var checks = (entry.checks || []).map(function (c) {
+        var name = c.check === null || c.check === undefined ? DASH : c.check;
+        var said = c.verdict === null || c.verdict === undefined ? DASH : c.verdict;
+        return name + " " + said;
+      }).join(", ");
+      var text = checks === ""
+        ? entry.partition + "  " + (entry.verdict === null ? DASH : entry.verdict)
+        : entry.partition + "  " + checks;
       list.appendChild(el("li", text));
     });
     box.appendChild(list);

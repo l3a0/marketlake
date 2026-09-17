@@ -39,8 +39,10 @@ from lake.manifest import (
     is_quarantined,
     latest_entries,
     latest_quarantine,
+    latest_quarantine_by_check,
     quarantine_path,
     read_quarantine,
+    withholding,
 )
 from lake.signoff import (
     SignoffError,
@@ -59,6 +61,11 @@ OTHER = "quotes/ticker=QQQ/date=2026-09-14.parquet"
 
 def _clock() -> ManualClock:
     return ManualClock(NOW)
+
+
+def _holders(lake: Path, partition: str = PARTITION) -> tuple[dict, ...]:
+    """Every check currently withholding the partition, through the ledger's own primitive."""
+    return withholding(latest_quarantine_by_check(lake).get(partition))
 
 
 def _quarantine(lake: Path, partition: str = PARTITION, check: str = CHECK_ENTITLEMENT) -> dict:
@@ -250,6 +257,65 @@ def test_a_reason_carrying_newlines_stays_one_entry_on_one_line(tmp_path: Path):
     assert len(quarantine_path(tmp_path).read_text().splitlines()) == 2
     assert [entry["partition"] for entry in entries] == [PARTITION, PARTITION]
     assert entries[1]["reason"] == nasty
+
+
+# -- two checks on one partition, which #426 made real -----------------------
+
+
+def test_signing_off_one_check_leaves_a_sibling_standing(tmp_path: Path):
+    """The case that decides whether this tool is safe now that the ledger resolves per check.
+
+    Before marketlake #426 a `clean` line under one check released the partition outright while
+    another check still failed. The ledger now resolves last entry wins per `(partition,
+    check)`, and this tool signs off the deciding entry, so the sibling keeps holding it.
+    """
+    _quarantine(tmp_path, check="realtime_entitlement")
+    _quarantine(tmp_path, check="quote_sanity")
+    assert [entry["check"] for entry in _holders(tmp_path)] == [
+        "realtime_entitlement",
+        "quote_sanity",
+    ]
+
+    report = signoff(PARTITION, reason="feed re-read by hand", clock=_clock(), lake_root=tmp_path)
+
+    assert report.check == "realtime_entitlement"
+    assert report.still_withheld is True
+    assert [entry["check"] for entry in _holders(tmp_path)] == ["quote_sanity"]
+    assert "still withheld under: 'quote_sanity'" in report.render()
+
+
+def test_a_run_for_each_check_clears_the_partition(tmp_path: Path):
+    """One check per run, longest-standing first, until nothing holds it."""
+    _quarantine(tmp_path, check="realtime_entitlement")
+    _quarantine(tmp_path, check="quote_sanity")
+
+    first = signoff(PARTITION, reason="one", clock=_clock(), lake_root=tmp_path)
+    second = signoff(PARTITION, reason="two", clock=_clock(), lake_root=tmp_path)
+
+    assert [first.check, second.check] == ["realtime_entitlement", "quote_sanity"]
+    assert second.still_withheld is False
+    assert _holders(tmp_path) == ()
+    assert is_quarantined(latest_quarantine(tmp_path)[PARTITION]) is False
+
+
+def test_check_confirms_the_deciding_entry_and_cannot_select_a_sibling(tmp_path: Path):
+    """The flag is a confirmation, and its refusal says only what the reader can know.
+
+    A selector is marketlake #456. Shipping one against a reader that hands back a single
+    deciding entry produced a refusal that asserted the ledger carried no such check while an
+    entry carried it, so the flag was narrowed to what it can actually hold.
+    """
+    _quarantine(tmp_path, check="realtime_entitlement")
+    _quarantine(tmp_path, check="quote_sanity")
+
+    with pytest.raises(SignoffError) as refusal:
+        signoff(PARTITION, reason="x", clock=_clock(), lake_root=tmp_path, check="quote_sanity")
+
+    message = str(refusal.value)
+    assert "carries 'realtime_entitlement'" in message
+    assert "cannot select a different one" in message
+    assert "Re-run without --check" in message
+    assert len(read_quarantine(tmp_path)) == 2
 
 
 # -- the refusals ------------------------------------------------------------

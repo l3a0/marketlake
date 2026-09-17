@@ -102,8 +102,10 @@ a second read path that the other skips.
 
 1. *Quarantine.* The validation battery seals chains and quotes first and flags them
    after, so a bad partition is marked rather than rewritten. ``quarantine.jsonl`` carries
-   those verdicts under the manifest's own rules, last entry per partition wins, and
-   un-quarantine is a superseding entry rather than a deletion. A partition the ledger
+   those verdicts under the manifest's own rules, last entry wins within each check, and
+   un-quarantine is a superseding entry rather than a deletion. The key carries the check
+   because several checks judge one partition, and resolving on the partition alone let one
+   check's pass bury another's quarantine, which is marketlake #426. A partition the ledger
    withholds is refused, and ``include_quarantined=True`` reads it anyway. That is what
    fail closed means for data already sealed. What a verdict means is
    ``manifest.is_quarantined``, beside the ledger rather than inside this reader, so the
@@ -279,7 +281,7 @@ from lake import journal
 from lake.calendar import MARKET_TZ
 from lake.config import load_config
 from lake.extra_projection import EXTRA_COLUMN, ExtraProjection, project_extra
-from lake.manifest import is_quarantined, latest_quarantine
+from lake.manifest import latest_quarantine_by_check, withholding
 from lake.occ_mapping import instruments_holding
 from lake.paths import BARS, CHAINS, PARQUET_SUFFIX, QUOTES, LakePaths, parse_date_dir
 from lake.schema_versions import SchemaVersionLedger, ledger_path
@@ -387,19 +389,39 @@ class PartitionAbsent(LoadError):
 
 
 class PartitionQuarantined(LoadError):
-    """Raised when the partition's current quarantine verdict withholds it.
+    """Raised when a check's current quarantine verdict withholds the partition.
 
-    ``include_quarantined=True`` reads it anyway. The entry rides on the exception, so the
+    ``include_quarantined=True`` reads it anyway. The entries ride on the exception, so the
     refusal says what the battery found rather than only that it found something.
+
+    **Every withholding check is named, not just one.** Several checks judge one partition and
+    each keeps its own current verdict, so signing one off can leave the partition withheld by
+    another. A refusal naming one entry would send an operator to a sign-off that changes
+    nothing they can see.
+
+    ``entries`` holds them in the order ``manifest.withholding`` gives, which is where each
+    check's current entry sits in the file. ``entry`` stays as the first of those. No module
+    reads it: ``actions``, ``oi`` and ``splits`` all catch this exception without touching its
+    attributes, and the readers are assertions in ``test_load_chain`` and ``test_battery``. It
+    is kept because a single-entry refusal is the ordinary case and a caller reaching for one
+    entry should not have to index a tuple.
     """
 
-    def __init__(self, partition: str, entry: dict) -> None:
+    def __init__(self, partition: str, entries: Sequence[dict]) -> None:
+        held = tuple(entries)
+        if not held:
+            raise ValueError(
+                f"{partition}: a quarantine refusal needs the entries that withhold it"
+            )
+        named = ", ".join(repr(e) for e in held)
         super().__init__(
-            f"{partition} is quarantined: {entry!r}. "
+            f"{partition} is quarantined by {len(held)} "
+            f"check{'' if len(held) == 1 else 's'}: {named}. "
             "Pass include_quarantined=True to read it anyway."
         )
         self.partition = partition
-        self.entry = entry
+        self.entries = held
+        self.entry = held[0]
 
 
 class SnapMalformed(LoadError, ValueError):
@@ -1773,9 +1795,9 @@ def _clear_partition(
 
     partition = path.relative_to(root).as_posix()
     if not include_quarantined:
-        entry = latest_quarantine(root).get(partition)
-        if is_quarantined(entry):
-            raise PartitionQuarantined(partition, entry)
+        held = withholding(latest_quarantine_by_check(root).get(partition))
+        if held:
+            raise PartitionQuarantined(partition, held)
 
 
 def _fetch_selection(

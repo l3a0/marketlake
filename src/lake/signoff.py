@@ -33,15 +33,20 @@ partition's readability, and ``manifest.is_quarantined``'s docstring says why bo
 meet there: "reader and writer have to meet at one definition or the exclusion silently
 inverts."
 
-**This tool addresses the deciding entry and nothing beside it.** That is one entry per
-partition, because ``manifest._latest_by_partition`` keys on the partition alone. So ``--check``
-confirms the check about to be written and cannot select a different one, and a partition two
-checks withhold is outside what the shipped reader can express. Marketlake #426 moves the
-ledger to last entry wins per ``(partition, check)`` and adds ``latest_quarantine_by_check`` and
-``withholding`` for exactly that case. Marketlake #456 is this tool's half of it and depends on
-#426. Until then the limit is named rather than papered over, and it costs nothing today:
-``battery.CHECK_ENTITLEMENT`` is the only token any writer emits, so no partition has ever
-carried two.
+**This tool addresses the deciding entry and nothing beside it.** Marketlake #426 moved the
+ledger to last entry wins per ``(partition, check)``, so several checks can withhold one
+partition at once, and ``manifest.latest_quarantine`` hands back the one that decides
+readability, which is the longest-standing unresolved one. This signs that one off. A partition
+two checks withhold therefore takes one run per check, oldest first, and the report names what
+still holds it after each.
+
+``--check`` confirms the check about to be written and cannot select a different one, because
+the entry this reads is the deciding entry rather than a chosen one. A selector was tried
+against the per-check resolution and refused with "no entry carries check X" while an entry did
+carry it, which is a refusal that lies about the ledger. Marketlake #456 carries the selector,
+built on ``manifest.latest_quarantine_by_check`` and ``manifest.withholding``, along with the
+one case a run-per-check cannot reach: revoking a sign-off while a sibling check still
+withholds the partition.
 
 **Both directions exist, because one alone is a one-way door.** Signing off appends a ``clean``
 entry under the withholding check. ``--revoke`` appends a ``quarantined`` one. Without the

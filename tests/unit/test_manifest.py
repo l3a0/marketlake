@@ -19,11 +19,14 @@ from lake.manifest import (
     _compacted_partition_for_segment,
     _is_excluded,
     _latest_by_partition,
+    is_quarantined,
     latest_entries,
     latest_quarantine,
+    latest_quarantine_by_check,
     manifest_path,
     parse_jsonl,
     quarantine_path,
+    withholding,
 )
 
 
@@ -218,3 +221,150 @@ def test_the_quarantine_ledger_names_itself_rather_than_the_manifest(tmp_path):
     # tmp_path is derived from the test's own name. It passed with the manifest's path
     # substituted, which is the mutation it existed to catch.
     assert str(quarantine_path(tmp_path)) in str(raised.value), str(raised.value)
+
+
+# -- the quarantine ledger resolves per check --------------------------------
+
+
+def _verdict(partition: str, verdict: str, check: str | None = "realtime_entitlement") -> dict:
+    entry = {"partition": partition, "verdict": verdict}
+    if check is not None:
+        entry["check"] = check
+    return entry
+
+
+def _ledger(tmp_path: Path, *entries: dict) -> Path:
+    quarantine_path(tmp_path).write_text("".join(json.dumps(e) + "\n" for e in entries))
+    return tmp_path
+
+
+CHAINS = "chains/ticker=SPY/date=2026-09-16.parquet"
+
+
+def test_each_check_keeps_its_own_current_verdict(tmp_path):
+    """Marketlake #426. Resolving on the partition alone kept whichever line landed last."""
+    _ledger(
+        tmp_path,
+        _verdict(CHAINS, "quarantined", "row_count_band"),
+        _verdict(CHAINS, "quarantined", "realtime_entitlement"),
+        _verdict(CHAINS, "clean", "realtime_entitlement"),
+    )
+
+    by_check = latest_quarantine_by_check(tmp_path)[CHAINS]
+
+    assert by_check["row_count_band"]["verdict"] == "quarantined"
+    assert by_check["realtime_entitlement"]["verdict"] == "clean"
+    assert [e["check"] for e in withholding(by_check)] == ["row_count_band"]
+
+
+def test_the_partition_reads_only_when_every_check_clears(tmp_path):
+    _ledger(
+        tmp_path,
+        _verdict(CHAINS, "quarantined", "row_count_band"),
+        _verdict(CHAINS, "quarantined", "realtime_entitlement"),
+        _verdict(CHAINS, "clean", "realtime_entitlement"),
+        _verdict(CHAINS, "clean", "row_count_band"),
+    )
+
+    assert withholding(latest_quarantine_by_check(tmp_path)[CHAINS]) == ()
+    assert is_quarantined(latest_quarantine(tmp_path)[CHAINS]) is False
+
+
+def test_the_deciding_entry_is_the_longest_standing_one_still_withholding(tmp_path):
+    """Not the last line. The last line here is a pass from a check that saw no fault."""
+    _ledger(
+        tmp_path,
+        _verdict(CHAINS, "quarantined", "row_count_band"),
+        _verdict(CHAINS, "quarantined", "realtime_entitlement"),
+        _verdict(CHAINS, "clean", "realtime_entitlement"),
+    )
+
+    deciding = latest_quarantine(tmp_path)[CHAINS]
+
+    assert deciding["check"] == "row_count_band"
+    assert is_quarantined(deciding) is True
+
+
+def test_the_order_follows_each_checks_current_entry_not_its_first(tmp_path):
+    """A plain reassignment keeps the position a key was first seen at, which differs."""
+    _ledger(
+        tmp_path,
+        _verdict(CHAINS, "quarantined", "a"),
+        _verdict(CHAINS, "quarantined", "b"),
+        _verdict(CHAINS, "clean", "a"),
+        _verdict(CHAINS, "quarantined", "a"),
+    )
+
+    assert [e["check"] for e in withholding(latest_quarantine_by_check(tmp_path)[CHAINS])] == [
+        "b",
+        "a",
+    ]
+
+
+def test_a_partition_with_no_entry_withholds_nothing(tmp_path):
+    assert withholding(None) == ()
+    assert withholding({}) == ()
+    assert latest_quarantine_by_check(tmp_path) == {}
+
+
+def test_a_clean_entry_naming_no_check_clears_only_its_own_bucket(tmp_path):
+    """Fail closed gets stronger, not weaker.
+
+    Under per-partition resolution this line was the last one and released the partition
+    outright. It now clears the bucket for an unnamed check, which nothing withheld.
+    """
+    _ledger(
+        tmp_path,
+        _verdict(CHAINS, "quarantined", "row_count_band"),
+        _verdict(CHAINS, "clean", None),
+    )
+
+    assert [e["check"] for e in withholding(latest_quarantine_by_check(tmp_path)[CHAINS])] == [
+        "row_count_band"
+    ]
+
+
+def test_an_entry_naming_no_check_still_withholds_on_a_bad_verdict(tmp_path):
+    _ledger(tmp_path, _verdict(CHAINS, "stale", None))
+
+    assert is_quarantined(latest_quarantine(tmp_path)[CHAINS]) is True
+
+
+def test_a_check_that_cannot_be_a_key_names_this_ledger_and_its_position(tmp_path):
+    """Damage this reader cannot key answers the way a missing partition already does."""
+    _ledger(
+        tmp_path,
+        _verdict(CHAINS, "clean", "row_count_band"),
+        {"partition": CHAINS, "verdict": "quarantined", "check": ["not", "a", "key"]},
+    )
+
+    with pytest.raises(ManifestError) as raised:
+        latest_quarantine_by_check(tmp_path)
+
+    assert str(quarantine_path(tmp_path)) in str(raised.value)
+    assert "entry 2" in str(raised.value), str(raised.value)
+
+
+def test_the_deciding_entry_is_the_earlier_of_two_still_withholding(tmp_path):
+    """With one holder left, ``held[0]`` and ``held[-1]`` are the same entry and prove nothing."""
+    _ledger(
+        tmp_path,
+        _verdict(CHAINS, "quarantined", "row_count_band"),
+        _verdict(CHAINS, "quarantined", "realtime_entitlement"),
+    )
+
+    assert latest_quarantine(tmp_path)[CHAINS]["check"] == "row_count_band"
+
+
+def test_a_partition_every_check_cleared_reports_the_last_line_written(tmp_path):
+    """Nothing withholds, so the deciding entry is the newest rather than the oldest."""
+    _ledger(
+        tmp_path,
+        _verdict(CHAINS, "clean", "row_count_band"),
+        _verdict(CHAINS, "clean", "realtime_entitlement"),
+    )
+
+    deciding = latest_quarantine(tmp_path)[CHAINS]
+
+    assert deciding["check"] == "realtime_entitlement"
+    assert is_quarantined(deciding) is False

@@ -236,8 +236,10 @@ def _entries(root: Path) -> list[dict]:
 def _clear_quarantine(root: Path, ticker: str, day: date) -> None:
     """Append the sign-off row that clears one partition's verdict.
 
-    Resolution reads the last entry on a partition in file order, so a clearing row supersedes
-    the withholding one rather than replacing it.
+    Resolution reads the last entry per ``(partition, check)`` in file order, so a clearing
+    row supersedes the withholding one rather than replacing it. The ``check`` here has to
+    match the withholding row's, or it clears a different check and the partition stays
+    withheld.
     """
     partition = LakePaths(root).partition_path(QUOTES, ticker, day).relative_to(root).as_posix()
     line = json.dumps(

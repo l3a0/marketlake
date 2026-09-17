@@ -101,7 +101,7 @@ from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants, input_errors_exit, load_config
 from lake.control_plane import assertion_window, sunday_canary_due
 from lake.deadman import in_envelope
-from lake.manifest import VERDICT_FIELD, is_quarantined, latest_quarantine
+from lake.manifest import VERDICT_FIELD, latest_quarantine_by_check, withholding
 from lake.metadata import read_metadata
 from lake.paths import (
     CHAINS,
@@ -1697,26 +1697,54 @@ def _open_quarantines(root: Path) -> tuple[list[dict[str, object]], str | None]:
     its docstring true. ``_capture_spans`` already keeps the same promise for the same
     reason: one panel served without a clamp rather than a panel not served at all.
 
-    Only the partition path and the ``verdict`` field are read, and both defensively. The
-    entry's shape is ``battery.build_entry``'s, which marketlake #406 pinned, and reading no
-    more than these two keeps the panel working against an entry a later check extends.
+    Only the partition path, the ``verdict`` field and the ``check`` field are read, all
+    defensively. The entry's shape is ``battery.build_entry``'s, which marketlake #406 pinned,
+    and reading no more than these keeps the panel working against an entry a later check
+    extends.
 
     The panel prints no sign-off command. Marketlake #139 shipped the tool as ``lake.signoff``,
-    so the original reason is spent, and ``docs/design.md``'s register carries the one that
-    replaced it: a partition several checks withhold owes one command per check, and the panel
-    cannot name them until marketlake #426 resolves the ledger per check. Marketlake #445
+    so the original reason, that the tool did not exist and its spelling was unsettled, is
+    spent. ``docs/design.md``'s register carries the one that replaced it, and marketlake #445
     carries the command.
+
+    **Every withholding check is named, each with its own verdict.** Each check keeps its own
+    current verdict, so a partition can be withheld by more than one at a time and signing one
+    off leaves the rest standing. A row saying only "quarantined" cannot tell an operator that.
+    The verdicts are carried per check rather than once for the row, because two checks
+    withhold under two different spellings and one of them printed beside both check names
+    says the wrong thing about the other.
+
+    It is also how a stranded token shows: a check that quarantined and then stopped judging,
+    because it was renamed or it now answers ``insufficient_history`` forever, holds its
+    partition until a human signs that token off, and the token is the only thing that says so.
+
+    The row's own ``verdict`` stays, and it is the deciding entry's, which is what
+    ``manifest.latest_quarantine`` would return.
     """
     try:
-        ledger = latest_quarantine(root)
+        ledger = latest_quarantine_by_check(root)
     except Exception as exc:  # noqa: BLE001 - a summary must not cost the panel
         log.exception("quarantine ledger unreadable, so the panel reports it instead")
         return [], type(exc).__name__
-    open_entries = [
-        {"partition": partition, "verdict": entry.get(VERDICT_FIELD)}
-        for partition, entry in sorted(ledger.items())
-        if is_quarantined(entry)
-    ]
+    open_entries = []
+    for partition, by_check in sorted(ledger.items()):
+        held = withholding(by_check)
+        if not held:
+            continue
+        open_entries.append(
+            {
+                "partition": partition,
+                "verdict": held[0].get(VERDICT_FIELD),
+                # ``check`` is read defensively like ``verdict`` beside it. Every entry
+                # ``battery.build_entry`` assembles carries one, so a missing check means a
+                # hand-written or damaged line, and the page shows it the way it shows a
+                # missing verdict rather than printing the word "None".
+                "checks": [
+                    {"check": entry.get("check"), "verdict": entry.get(VERDICT_FIELD)}
+                    for entry in held
+                ],
+            }
+        )
     return open_entries, None
 
 
