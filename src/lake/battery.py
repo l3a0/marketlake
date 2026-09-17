@@ -172,6 +172,12 @@ SEALED_SURFACES: tuple[str, ...] = (CHAINS, QUOTES)
 # 18:30 run leave the same entry.
 BATTERY_SOURCE = "battery"
 
+# The same, for the ledger's other writer. ``lake.signoff`` is the sign-off tool and it passes
+# this to :func:`append_verdict`, so the manifest entry names which of the two writers refreshed
+# the ledger. It is pinned here rather than there because ``append_verdict``'s default is the
+# battery's and the pair only means anything read together.
+SIGNOFF_SOURCE = "signoff"
+
 # What a ledger entry says about who wrote it. #139's human-precedence rule turns on this, so
 # the two spellings are pinned here and the sign-off tool reads them rather than minting a third.
 PROVENANCE_BATTERY = "battery"
@@ -377,7 +383,13 @@ def entry_line_count(lake_root: Path | str) -> int:
     return sum(1 for line in path.read_text().splitlines() if line.strip())
 
 
-def append_verdict(lake_root: Path | str, entry: dict, *, observed_at: datetime) -> dict:
+def append_verdict(
+    lake_root: Path | str,
+    entry: dict,
+    *,
+    observed_at: datetime,
+    source: str = BATTERY_SOURCE,
+) -> dict:
     """Append one verdict and refresh the ledger's manifest entry, inside one lock hold.
 
     Both writes happen inside one hold of the lake-root ``flock``, which this takes itself.
@@ -390,6 +402,11 @@ def append_verdict(lake_root: Path | str, entry: dict, *, observed_at: datetime)
     scrub-exclusion comment says is not enough for a ledger. Marketlake #139's sign-off tool is
     the other writer and owes the same two writes, so both meet at this function rather than at
     the bare append.
+
+    ``source`` is what the refreshed manifest entry records about who wrote the ledger line,
+    and it defaults to this module so the nightly run needs nothing. ``lake.signoff`` passes
+    :data:`SIGNOFF_SOURCE`, because a human sign-off refreshed by a writer stamped ``battery``
+    names the wrong producer, and every other writer in the lake stamps its own.
     """
     root = Path(lake_root)
     target = quarantine_path(root)
@@ -404,7 +421,7 @@ def append_verdict(lake_root: Path | str, entry: dict, *, observed_at: datetime)
         record_partition(
             root,
             QUARANTINE_FILE,
-            source=BATTERY_SOURCE,
+            source=source,
             rows=entry_line_count(root),
             fetched_at=observed_at.astimezone(MARKET_TZ).isoformat(),
         )
@@ -1273,6 +1290,7 @@ __all__ = [
     "PROVENANCE_HUMAN",
     "QUARANTINED_VERDICT",
     "SEALED_SURFACES",
+    "SIGNOFF_SOURCE",
     "VERDICTS",
     "BatteryError",
     "BatteryReport",
