@@ -487,6 +487,32 @@ class SweepOutcome:
                 f" quarantined {self.battery.quarantined} clean {self.battery.cleared}"
                 f" insufficient_history {self.battery.insufficient_history}"
                 f" out_of_scope {self.battery.out_of_scope}"
+                # **The three counts that say what happened to the ledger**, rather than what
+                # the checks answered. The docstring above claims this block follows "the same
+                # rule" as ``battery.render``, and while the block printed ten of that
+                # function's thirteen counts the claim was not true. Marketlake #477 made it
+                # true.
+                #
+                # **What they add is the zero.** ``judge`` appends one report line per
+                # deferred, per withheld and per released partition, and the loop below prints
+                # every one of them, so a night that honoured a sign-off already said so by
+                # name here, in the report file and in the push. What no line can say is that
+                # nothing happened, because an absent line reads the same whether the run
+                # looked or not. That is this block's own rule one field along.
+                # ``quarantined`` cannot stand in for ``deferred``: it counts quarantined
+                # findings, which read the same whether or not a sign-off held.
+                #
+                # ``released`` is additionally the one no later run reproduces.
+                # ``decide_partition`` computes it as ``held_before and not held_after``, and
+                # ``held_before`` is the ledger as this run found it, so a hand run tomorrow
+                # reads a ledger already showing the partition readable and reports zero. Its
+                # line survives in the report file and its count does not.
+                #
+                # This spends no digest bytes. ``digest_body`` takes ``Nightly``, which carries
+                # no battery field, so the 1000-byte cap is untouched by anything added here.
+                f" deferred {self.battery.deferred}"
+                f" withheld {self.battery.withheld}"
+                f" released {self.battery.released}"
                 f" scope_unknown {self.battery.scope_unknown}"
                 f" unreadable {self.battery.unreadable}"
                 f" sessions_owed {self.battery.sessions_owed}"

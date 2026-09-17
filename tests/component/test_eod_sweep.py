@@ -21,8 +21,10 @@ from __future__ import annotations
 import errno
 import json
 import os
+import re
 import subprocess
 from contextlib import contextmanager
+from dataclasses import fields
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -32,6 +34,7 @@ import pytest
 from lake import journal, report, sweep
 from lake.alert import Publisher
 from lake.bars import CHECK_BAR_CLOSE
+from lake.battery import BatteryReport
 from lake.calendar import NotASession
 from lake.capture_spans import SPANS_SCHEMA_VERSION, CaptureSpan, CaptureSpans
 from lake.cassette import Cassette
@@ -57,6 +60,21 @@ from tests.support.lake import FixtureLake
 from tests.support.pinger import FakePinger
 from tests.support.transport import FakeTransport
 from tests.support.vendor import CassetteVendor, bars_candle, bars_interactions
+
+# The census's own spelling for the two ``BatteryReport`` counts it does not render under the
+# field's name. Shared by the two census tests so the line has one description rather than two.
+CENSUS_RENAMED = {"cleared": "clean", "appended": "wrote"}
+# The ``BatteryReport`` fields that are not counts. ``report`` is the run's report-tier lines,
+# which the block prints under the census, and ``findings`` its per-partition verdicts, which the
+# block does not print at all. Neither is a number. ``paged`` is a tuple naming the partitions one
+# delayed-feed page covered, so it is not a number either, and it is left out deliberately rather
+# than missed. ``judge`` runs in-process inside the sweep, so ``page_delayed_feed``'s prints land
+# in the nightly job's own log rather than a hand run's, and it prints on every delivery path, the
+# refused one and the unsent one included. A page that was written down is filed under
+# ``reports/alerts/`` and counted as ``pages_lost``, which the report file and the dashboard both
+# carry. That in-process asymmetry is what separates it from the three counts marketlake #477
+# added, which reached the hand run alone.
+CENSUS_NOT_COUNTS = {"report", "findings", "paged"}
 
 # The week the fixture calendar serves. 2026-09-14 is a Monday, so the sessions run Monday
 # through Friday and the second Monday gives the Friday branch a next week to wake before.
@@ -1847,31 +1865,127 @@ def test_the_battery_runs_on_a_session_and_its_counts_reach_the_outcome(
 
 
 def test_the_sweeps_census_carries_every_count_the_battery_produces(fixture_lake: FixtureLake):
-    """``Nightly.render``'s own rule: a night that judged nothing and a night that judged the
-    lake and found it clean are different answers.
+    """``SweepOutcome.render``'s own rule: a night that judged nothing and a night that judged
+    the lake and found it clean are different answers.
 
     ``insufficient_history`` was structurally zero while one check existed, so the census could
     omit it and stay true. It reads six against the live lake now, and the two coverage counts
     are the only place a permanently missing session reaches this block at all.
+
+    **The expectation is derived from ``BatteryReport``, not listed here.** Marketlake #477 is
+    why. This test hand-listed ten names while the dataclass carried thirteen, so ``deferred``,
+    ``withheld`` and ``released`` reached the census's absence without ever failing the test
+    that claims in its own name to carry every count. A list written beside the thing it
+    describes is a second source for one fact, and this is what that costs. Read off the
+    fields, the next count added and not rendered fails here.
+
+    Both collections below fail closed. A new field named in neither one is treated as a count
+    and asserted, so adding a field to ``BatteryReport`` forces a decision here rather than
+    slipping past. The two assertions above the loop are the other direction: an entry naming a
+    field that no longer exists is a stale map, which is the same drift one layer along.
+
+    **The match is on the token and its number, not on the token alone.** A bare ``name in
+    line`` is not the guard it reads as, because a field whose name is a substring of a token
+    the census already prints passes without being rendered at all. A field named ``owed``
+    rides ``sessions_owed``, ``held`` rides ``withheld``, ``scope`` rides both ``out_of_scope``
+    and ``scope_unknown``, and ``missing`` rides ``sessions_missing``. Requiring a space, the
+    name, and a number closes that family and holds the value's presence at the same time.
+
+    **What deriving gives up.** The ten hand-written strings were a second source, and a second
+    source is what catches a rename. Spelled off the fields, the census token and the field name
+    cannot disagree, so renaming a field and its token together now passes here where the old
+    list failed. That is accepted rather than unnoticed. Restoring the pin means restoring the
+    list this test exists to delete, and the two the census deliberately spells differently are
+    pinned anyway, in ``renamed`` below.
     """
+    named = {field.name for field in fields(BatteryReport)}
+    assert CENSUS_RENAMED.keys() <= named, f"stale rename: {CENSUS_RENAMED.keys() - named}"
+    assert CENSUS_NOT_COUNTS <= named, f"stale exclusion: {CENSUS_NOT_COUNTS - named}"
+
     root = _lake(fixture_lake)
 
     outcome, _, _ = _run(root)
     (line,) = [ln for ln in outcome.render().splitlines() if "battery: judged" in ln]
 
-    for name in (
-        "judged",
-        "quarantined",
-        "clean",
-        "insufficient_history",
-        "out_of_scope",
-        "scope_unknown",
-        "unreadable",
-        "sessions_owed",
-        "sessions_missing",
-        "wrote",
-    ):
-        assert name in line, f"{name} missing from the census: {line}"
+    for field in fields(BatteryReport):
+        if field.name in CENSUS_NOT_COUNTS:
+            continue
+        name = CENSUS_RENAMED.get(field.name, field.name)
+        assert re.search(rf"(?:^|\s){re.escape(name)} -?\d+", line), (
+            f"{name} is missing from the census, or carries no number: {line}"
+        )
+
+
+def test_each_census_count_carries_its_own_number():
+    """Every count in the census reads its own field, and not the one beside it.
+
+    **Distinct values are the whole test.** The fixture lake judges nothing, so every count the
+    sweep renders is zero there and the derived test above cannot tell one field from another:
+    cross-wiring ``deferred`` to ``withheld`` in the census line leaves that test, and the whole
+    suite, green. Marketlake #477's own review found that by mutation. Thirteen different
+    numbers are what separate a census that reads its fields from one that reads a neighbour's.
+
+    ``tests/component/test_battery.py``'s ``test_every_census_line_carries_its_own_number`` is
+    this test for the hand run's block. The sweep's block is a second composition of the same
+    counts, so it is asserted rather than left to stand on the first.
+
+    **The expectation is read back off the record, not written out here.** Each token's number is
+    parsed out of the line and compared to the field it claims to carry, so the assertion covers
+    a field added to ``BatteryReport`` later without anyone editing this test. Thirteen literals
+    would have held today's counts and let the fourteenth through, which is the shape of the
+    defect this whole change exists to fix.
+
+    This builds the outcome rather than running a sweep, for the reason
+    ``battery.decide_partition``'s docstring gives for being a pure function: a lake fixture
+    that produced thirteen distinct counts would take more setup than the property is worth,
+    and the property is about the rendering rather than the walk.
+    """
+    from lake.alert import Message
+
+    battery = BatteryReport(
+        judged=1,
+        quarantined=2,
+        cleared=3,
+        insufficient_history=4,
+        out_of_scope=5,
+        deferred=6,
+        withheld=7,
+        released=8,
+        unreadable=9,
+        scope_unknown=10,
+        sessions_owed=11,
+        sessions_missing=12,
+        appended=("a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m"),
+    )
+    outcome = sweep.SweepOutcome(
+        nightly=report.Nightly(day=SESSION, session=True, pinged=True),
+        digest=Message(event=NIGHTLY_EVENT, title="t", body="b"),
+        delivered=True,
+        battery=battery,
+    )
+
+    (line,) = [ln for ln in outcome.render().splitlines() if "battery: judged" in ln]
+
+    seen = set()
+    for field in fields(BatteryReport):
+        if field.name in CENSUS_NOT_COUNTS:
+            continue
+        token = CENSUS_RENAMED.get(field.name, field.name)
+        held = getattr(battery, field.name)
+        # ``appended`` is the ledger lines themselves and the census prints how many, which is
+        # the one count whose field is not already the number.
+        expected = len(held) if isinstance(held, tuple) else held
+        printed = re.search(rf"(?:^|\s){re.escape(token)} (-?\d+)", line)
+        assert printed, f"{token} is missing from the census, or carries no number: {line}"
+        assert int(printed.group(1)) == expected, (
+            f"the census prints {token} {printed.group(1)} where {field.name} is {expected}: {line}"
+        )
+        seen.add(expected)
+
+    # Every count distinct, which is what makes the loop above able to tell one field from the
+    # one beside it. A fixture that repeated a value would pass a census reading the wrong field
+    # for that pair, so this holds the fixture rather than the code.
+    assert len(seen) == 13, f"the fixture must give each count its own value: {sorted(seen)}"
 
 
 def test_a_holiday_runs_no_battery_at_all(fixture_lake: FixtureLake):
