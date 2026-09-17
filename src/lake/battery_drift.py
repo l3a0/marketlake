@@ -7,7 +7,7 @@ it refetched. Compaction's compares a ticker-day's merged segment schema against
 pinned one, at the merge, which is the last moment the segments exist. This one reads
 sealed partitions at night, and it is the only one of the four that sees a whole day at
 once. Marketlake #427 is the issue, and it exists because #138's split distributed the
-schema-drift check across five sub-issues and this page was in none of them.
+schema-drift check across six sub-issues, #406 to #411, and this page was in none of them.
 
 **Two halves, and both are day-over-day transitions.** ``docs/design.md`` says "A missing
 or retyped known field pages", and the two need different evidence.
@@ -74,7 +74,9 @@ run that finds it again". launchd cannot cause it: ``com.marketlake.eod-sweep`` 
 **A day with no readable baseline reports and does not page.** With no baseline there is no
 way to separate a field that stopped arriving from one that never arrived, which is the
 false-positive class #265 measured. The row-count band already names this shape
-``insufficient_history`` and the design says it "fails open and says so".
+``insufficient_history``. ``docs/design.md`` puts it as the check reporting
+``insufficient_history``, "which fails open", where reaching back further would measure
+against a roster that has since moved.
 
 **The missing half owes a rotation guard, and the design says why.** A column this
 project's own release rotation dropped is filled with nulls at the merge, and after the
@@ -115,6 +117,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from lake import journal
@@ -141,10 +144,10 @@ RETYPED = "retyped"
 #
 # The number is ``schema_drift.PAGE_COLUMN_CAP``'s, borrowed rather than invented, and the
 # arithmetic that says a cap is owed at all is this surface's own. ``docs/design.md`` pins
-# every body at plain text under 1,000 bytes. Measured, a body naming every field of a
-# whole-surface drift runs to 792 bytes on chains and 1,048 on quotes, so the widest drift
-# is the one that would not reach the phone. At this cap the same two bodies are 231 and
-# 221 bytes.
+# every body at plain text under 1,000 bytes. Measured through :func:`body` itself, a body
+# naming every field of a whole-surface drift runs to 866 bytes on chains and 1,122 on
+# quotes, so the widest drift is the one that would not reach the phone. At this cap the
+# same two bodies are 305 and 295 bytes.
 #
 # The count survives the cut for that module's stated reason: it is what separates one
 # moved field from a wholesale rotation. The nightly report's line names every field
@@ -177,10 +180,17 @@ class SurfaceDay:
     ``retyped`` is a union. One ticker routing a field is evidence the vendor sent it at a
     type the column refused, and the other tickers' silence does not contradict it.
 
-    ``absent`` is an intersection. A field still arriving on one ticker is a field the
-    vendor is still sending, so a fold that unioned would page for a ticker whose own
-    payload was short rather than for a vendor change. ``schema_drift`` counts its
-    evidence per ticker for the mirror of this reason.
+    ``absent_by_ticker`` is kept per ticker rather than folded here, and
+    :func:`newly_absent` folds it against the baseline day over the tickers the two days
+    share. Folding to one set on each day and subtracting them compares two intersections
+    taken over different rosters, which pages the moment a ticker drops out: a field
+    already absent on the surviving ticker on both days enters the intersection today and
+    was kept out of it yesterday by the ticker that has since gone. An ordinary dead-daemon
+    day on one ticker is enough to produce it.
+
+    The fold itself is still an intersection, because a field still arriving on one ticker
+    is a field the vendor is still sending. ``schema_drift`` counts its evidence per ticker
+    for the mirror of this reason.
 
     ``versions`` carries every ``schema_version`` the day's rows hold. More than one means
     the day spans a rotation, which is compaction's fact and not this check's, and the
@@ -194,7 +204,9 @@ class SurfaceDay:
     surface: str
     day: date
     retyped: frozenset[str]
-    absent: frozenset[str]
+    absent_by_ticker: Mapping[str, frozenset[str]]
+    lacked_by_ticker: Mapping[str, frozenset[str]]
+    unreadable: tuple[str, ...]
     versions: frozenset[int]
     first_cycle: str | None
     tickers: tuple[str, ...]
@@ -229,10 +241,16 @@ class DriftFinding:
     def title(self) -> str:
         """The design's title, which names the field when there is one to name.
 
-        The message table writes it ``Schema drift: <field> missing``, or ``retyped``, from
-        a time when the page was one per field. The fold across fields is arithmetic the
-        cap forced, so the placeholder cannot always hold one name. One field still reads
-        exactly as the table writes it, and several say how many rather than picking one.
+        The message table writes it ``Schema drift: <field> missing``, or ``retyped``, and
+                says the page fires "once per field per day". That is a rate per field rather than a
+                page each, which is what the fold delivers: a field pages at most once on
+                the day it transitions, and the fields that transition together share one
+                page. Paging per field instead would spend the day's cap on one vendor
+                change, which is the arithmetic ``schema_drift`` and ``compact`` both
+                already settled the same way.
+
+                So the placeholder cannot always hold one name. One field still reads exactly as the
+                table writes it, and several say how many rather than picking one.
         """
         if len(self.fields) == 1:
             return f"Schema drift: {self.fields[0]} {self.kind}"
@@ -268,8 +286,8 @@ class _Footer:
     29 sealed partitions it is empty everywhere, so it is a guard rather than a path the
     ordinary night takes.
 
-    ``unheld`` is a column the partition does not carry at all. Reading it raises, and
-    counting it as wholly null would page for the shape it cannot be about: a column a
+    ``absent_column`` is a column the partition does not carry at all. Reading it raises,
+    and counting it as wholly null would page for the shape it cannot be about: a column a
     partition lacks outright is a rotation's doing, not a vendor's, and the version guard
     is what speaks to that. So it leaves the missing half's candidate set entirely.
     """
@@ -338,18 +356,22 @@ def read_surface_day(partitions: Sequence, surface: str, day: date) -> SurfaceDa
     paths = journal.extra_paths(surface)
     columns = sorted(paths)
     retyped: set[str] = set()
-    absent: set[str] | None = None
+    absent: dict[str, frozenset[str]] = {}
+    lacked: dict[str, frozenset[str]] = {}
     versions: set[int] = set()
     first: str | None = None
     tickers: list[str] = []
+    unreadable: list[str] = []
 
     for partition in partitions:
         try:
             footer = _footer_null_counts(partition.path, [*columns, EXTRA_COLUMN, ROW_KIND_COLUMN])
         except OSError as exc:
-            raise DriftUnreadable(f"{partition.relative} did not open: {exc}") from exc
+            unreadable.append(f"{partition.relative} did not open: {exc}")
+            continue
         except Exception as exc:  # noqa: BLE001 - pyarrow raises several unrelated types
-            raise DriftUnreadable(f"{partition.relative} has no readable footer: {exc}") from exc
+            unreadable.append(f"{partition.relative} has no readable footer: {exc}")
+            continue
 
         rows = footer.rows
         if rows == 0:
@@ -369,21 +391,57 @@ def read_surface_day(partitions: Sequence, surface: str, day: date) -> SurfaceDa
 
         table = None
         if needs_rows:
-            table = _read_partition(partition, surface)
             try:
-                retyped.update(journal.routed_columns(surface, table.to_batches()[0]))
+                table = _read_partition(partition, surface)
+                # **Every batch, not the first.** ``pq.read_table`` chunks a table by row
+                # group, and the lake's chains partitions carry five and six of them:
+                # SPY 2026-09-16 is 5,307,030 rows across six, whose first covers
+                # 03:25 to 14:49 UTC. Asking only ``to_batches()[0]`` therefore reads
+                # pre-market to 10:49 ET and calls the rest of the session clean, so a
+                # retype that starts mid-day is silent on both halves at once: the column
+                # is non-null on the morning rows, so it never reaches ``absent`` either,
+                # and the night's report line says nothing drifted.
+                #
+                # That is the failure this producer exists to prevent. The parser's page
+                # fires per response and this one is "the only one of the four that sees a
+                # whole day at once", which it does not do by reading a fifth of the day.
+                #
+                # Folding rather than ``combine_chunks`` is deliberate. Combining would
+                # materialise 5.3 million rows across 73 columns to answer a question each
+                # batch answers on its own, and ``routed_columns``'s two gates make a batch
+                # with an all-null overflow cost almost nothing.
+                for batch in table.to_batches():
+                    retyped.update(journal.routed_columns(surface, batch))
+            except DriftUnreadable as exc:
+                unreadable.append(str(exc))
+                continue
             except KeyError as exc:
                 # ``routed_columns`` asks every column in ``extra_paths`` for its null
                 # count, so a partition short of one raises rather than answering. A
                 # partition that does not carry the running schema's columns is
                 # compaction's fact, per ``docs/design.md``'s schema policy, and it is
                 # reported rather than guessed at.
-                raise DriftUnreadable(
-                    f"{partition.relative} does not carry the running schema: {exc}"
-                ) from exc
+                unreadable.append(f"{partition.relative} does not carry the running schema: {exc}")
+                continue
+            except ValueError as exc:
+                # ``routed_columns`` decodes each populated overflow with a bare
+                # ``json.loads``, so one cell of unparseable JSON raises out of it.
+                # Unconverted, that escapes :func:`judge_day` past the per-surface
+                # containment, and one bad cell on chains takes the quotes comparison down
+                # with it on the same night. ``JSONDecodeError`` subclasses ``ValueError``,
+                # which is what this catches, because the raise is the standard library's
+                # rather than this project's and naming the subclass would bind to it.
+                unreadable.append(
+                    f"{partition.relative} carries an overflow that does not decode: {exc}"
+                )
+                continue
 
-        data_rows = _data_row_count(partition, surface, table)
-        if data_rows == 0:
+        try:
+            data = _data_rows(partition, surface, table)
+        except DriftUnreadable as exc:
+            unreadable.append(str(exc))
+            continue
+        if data.num_rows == 0:
             continue
         tickers.append(partition.ticker)
 
@@ -393,25 +451,33 @@ def read_surface_day(partitions: Sequence, surface: str, day: date) -> SurfaceDa
         resolved = dict(footer.counts)
         unmeasured = footer.unmeasured & set(columns)
         if unmeasured:
-            resolved.update(_null_counts_by_read(partition, surface, sorted(unmeasured)))
+            try:
+                resolved.update(_null_counts_by_read(partition, surface, sorted(unmeasured)))
+            except DriftUnreadable as exc:
+                unreadable.append(str(exc))
+                tickers.pop()
+                continue
 
         here = {
             column
             for column in columns
             if column not in footer.absent_column and resolved.get(column) == rows
         }
-        absent = here if absent is None else (absent & here)
+        absent[partition.ticker] = frozenset(here)
+        lacked[partition.ticker] = frozenset(footer.absent_column & set(columns))
 
-        stamps, seen_versions = _stamps_and_versions(partition, surface, table)
+        stamp, seen_versions = _stamps_and_versions(data)
         versions.update(seen_versions)
-        if stamps and (first is None or stamps < first):
-            first = stamps
+        if stamp and (first is None or stamp < first):
+            first = stamp
 
     return SurfaceDay(
         surface=surface,
         day=day,
         retyped=frozenset(retyped),
-        absent=frozenset(absent or ()),
+        absent_by_ticker=absent,
+        lacked_by_ticker=lacked,
+        unreadable=tuple(unreadable),
         versions=frozenset(versions),
         first_cycle=first,
         tickers=tuple(tickers),
@@ -421,14 +487,33 @@ def read_surface_day(partitions: Sequence, surface: str, day: date) -> SurfaceDa
 def _read_partition(partition, surface: str):
     """The whole partition at the surface's full schema.
 
-    ``journal.routed_columns`` refuses a narrower read. Measured against a batch pruned to
-    ``extra`` and ``row_kind`` it raises ``KeyError: 'Field "occ_symbol" does not exist in
-    schema'``, because it asks every column in ``extra_paths`` for its null count. So the
-    saving is in not reaching this function, which the overflow gate above does on every
-    partition the lake holds today.
+    ``journal.routed_columns`` refuses a narrower read, though only once it has something to
+        look for. Its first gate returns on an all-null overflow before touching another column,
+        so a pruned batch from a healthy partition answers ``()``. On a batch whose overflow is
+        populated, which is the only kind that reaches here, it asks every column in
+        ``extra_paths`` for its null count: measured against a batch pruned to ``extra`` and
+        ``row_kind`` it raises ``KeyError: 'Field "occ_symbol" does not exist in schema'``.
+
+        So the saving is in not reaching this function, which the overflow gate above does on
+        every partition the lake holds today.
     """
     try:
         return pq.read_table(partition.path)
+    except Exception as exc:  # noqa: BLE001 - pyarrow raises several unrelated types
+        raise DriftUnreadable(f"{partition.relative} did not read: {exc}") from exc
+
+
+def _read_overflow(partition):
+    """The three columns the first-cycle pass reads, and not the other seventy.
+
+    ``_read_partition`` exists because ``journal.routed_columns`` refuses a narrow batch.
+    Nothing here goes through that function: the question is which rows carry a key inside
+    their own overflow, which ``extra``, ``snap_ts`` and ``row_kind`` answer between them.
+    Reading the whole partition again for it is a second full read of a 307 MB file to look
+    at three columns of it.
+    """
+    try:
+        return pq.read_table(partition.path, columns=[EXTRA_COLUMN, "snap_ts", ROW_KIND_COLUMN])
     except Exception as exc:  # noqa: BLE001 - pyarrow raises several unrelated types
         raise DriftUnreadable(f"{partition.relative} did not read: {exc}") from exc
 
@@ -444,25 +529,17 @@ def _null_counts_by_read(partition, surface: str, columns: Sequence[str]) -> dic
     return {name: table.column(name).null_count for name in table.column_names}
 
 
-def _data_row_count(partition, surface: str, table) -> int:
-    """How many data rows the partition carries.
+def _data_rows(partition, surface: str, table):
+    """The partition's data rows alone, as an Arrow table.
 
-    Read off the table when the overflow gate already opened one, and off the
-    ``row_kind`` column alone otherwise. The column is one string per row against the
-    surface's seventy-odd, so the ordinary night pays a fraction of a partition to answer
-    the question that keeps an all-gap day from reading as a wholesale disappearance.
+    Read off the table when the overflow gate already opened one, and off three columns
+    otherwise. **The filter and the aggregates stay in Arrow**, because a chains partition
+    is millions of rows and ``to_pylist`` on one is not a fraction of the read: measured on
+    SPY 2026-09-16, reading ``row_kind`` costs 35 ms and materialising it as a Python list
+    costs a further 150 ms, against 780 ms for the whole partition. Three columns pulled
+    that way cost about 0.6 s, which is most of a full read to answer three cheap
+    questions.
     """
-    if table is None:
-        try:
-            table = pq.read_table(partition.path, columns=[ROW_KIND_COLUMN])
-        except Exception as exc:  # noqa: BLE001 - pyarrow raises several unrelated types
-            raise DriftUnreadable(f"{partition.relative} did not read: {exc}") from exc
-    kinds = table.column(ROW_KIND_COLUMN).to_pylist()
-    return sum(1 for kind in kinds if kind == ROW_KIND_DATA)
-
-
-def _stamps_and_versions(partition, surface: str, table) -> tuple[str | None, set[int]]:
-    """The partition's earliest data ``snap_ts`` and every ``schema_version`` it carries."""
     if table is None:
         try:
             table = pq.read_table(
@@ -470,17 +547,18 @@ def _stamps_and_versions(partition, surface: str, table) -> tuple[str | None, se
             )
         except Exception as exc:  # noqa: BLE001 - pyarrow raises several unrelated types
             raise DriftUnreadable(f"{partition.relative} did not read: {exc}") from exc
-    kinds = table.column(ROW_KIND_COLUMN).to_pylist()
-    stamps = table.column("snap_ts").to_pylist()
-    versions = table.column("schema_version").to_pylist()
-    seen = {version for version, kind in zip(versions, kinds, strict=True) if kind == ROW_KIND_DATA}
-    seen.discard(None)
-    data_stamps = [
-        stamp
-        for stamp, kind in zip(stamps, kinds, strict=True)
-        if kind == ROW_KIND_DATA and stamp is not None
-    ]
-    return (min(data_stamps) if data_stamps else None), seen
+    return table.filter(pc.equal(table.column(ROW_KIND_COLUMN), ROW_KIND_DATA))
+
+
+def _stamps_and_versions(data) -> tuple[str | None, set[int]]:
+    """The earliest ``snap_ts`` and every ``schema_version`` among a table's data rows."""
+    if data.num_rows == 0:
+        return None, set()
+    earliest = pc.min(data.column("snap_ts")).as_py()
+    column = data.column("schema_version").combine_chunks()
+    versions = {value.as_py() for value in pc.unique(column)}
+    versions.discard(None)
+    return earliest, versions
 
 
 def first_cycle_of(partition, surface: str, field: str, table=None) -> str | None:
@@ -495,10 +573,14 @@ def first_cycle_of(partition, surface: str, field: str, table=None) -> str | Non
     if path is None:
         return None
     if table is None:
-        table = _read_partition(partition, surface)
-    overflows = table.column(EXTRA_COLUMN).to_pylist()
-    stamps = table.column("snap_ts").to_pylist()
-    kinds = table.column(ROW_KIND_COLUMN).to_pylist()
+        table = _read_overflow(partition)
+    # Only the rows that carry an overflow can carry the key, and on a drifting partition
+    # that is a fraction of the day. Filtering in Arrow first keeps ``to_pylist`` off every
+    # row whose overflow is null, which is the ordinary row even here.
+    populated = table.filter(pc.is_valid(table.column(EXTRA_COLUMN)))
+    overflows = populated.column(EXTRA_COLUMN).to_pylist()
+    stamps = populated.column("snap_ts").to_pylist()
+    kinds = populated.column(ROW_KIND_COLUMN).to_pylist()
     earliest: str | None = None
     for raw, stamp, kind in zip(overflows, stamps, kinds, strict=True):
         if raw is None or stamp is None or kind != ROW_KIND_DATA:
@@ -564,9 +646,13 @@ def read_ledger(lake_root) -> SchemaVersionLedger | None:
     """The schema-version ledger, or ``None`` when it cannot be read.
 
     ``None`` is not "no rotation happened". It is "this run cannot tell a rotation from a
-    vendor drop", and :func:`judge_day` answers it by reporting the missing half rather
-    than paging it. Marketlake #493 is why the unreadable case is not hypothetical: the
-    running version was 2 and the ledger held version 1 alone until 2026-09-17.
+        vendor drop", and :func:`judge_day` answers it by reporting the missing half rather
+        than paging it.
+
+        This is the absent or unparseable ledger alone. A ledger that reads but records no shape
+        for the running version is the other refusal, which :func:`judge_day` takes on
+        ``ledger.get(version)``, and that one is the shape marketlake #493 shipped a page for:
+        the running version was 2 while the ledger held version 1 alone, until 2026-09-17.
     """
     try:
         return SchemaVersionLedger.read(ledger_path(lake_root))
@@ -607,9 +693,13 @@ def judge_day(
     that reaches every row nulls the column on all of them, so the two halves would both
     fire on one fact. The docstring of ``journal.routed_columns`` says which reading wins.
 
-    **A surface's failure costs that surface and not the night.** ``DriftUnreadable`` is
-    contained per surface, for ``battery.trailing_medians``'s reason: a session the run was
-    not asked about is not this check's to announce.
+    **A partition's failure costs that partition and not the surface.** That is
+    ``battery.trailing_medians``'s containment and its reason, "a session the run was not
+    asked about is not this check's to announce", applied at the same grain. Contained per
+    surface instead, one unreadable file on one ticker takes the whole surface's alarm down,
+    so a genuine vendor drop on every other ticker goes unpaged on the night a file was also
+    corrupt. The skipped partition leaves the fold, which the shared-roster comparison in
+    :func:`newly_absent` already handles, and its reason reaches the nightly report.
     """
     ledger = read_ledger(lake_root)
     by_surface: dict[str, list] = {surface: [] for surface in surfaces}
@@ -625,11 +715,11 @@ def judge_day(
         today_parts = by_surface[surface]
         if not today_parts:
             continue
-        try:
-            today = read_surface_day(today_parts, surface, day)
-        except DriftUnreadable as exc:
-            report.append(f"battery: schema drift on {surface} not judged: {exc}")
-            continue
+        today = read_surface_day(today_parts, surface, day)
+        report.extend(
+            f"battery: schema drift on {surface} skipped a partition: {line}"
+            for line in today.unreadable
+        )
         if not today.judged:
             continue
 
@@ -639,11 +729,11 @@ def judge_day(
                 "insufficient_history, no earlier sealed day to compare"
             )
             continue
-        try:
-            before = read_surface_day(baseline_partitions.get(surface, ()), surface, baseline)
-        except DriftUnreadable as exc:
-            report.append(f"battery: schema drift on {surface} not judged: {exc}")
-            continue
+        before = read_surface_day(baseline_partitions.get(surface, ()), surface, baseline)
+        report.extend(
+            f"battery: schema drift on {surface} skipped a baseline partition: {line}"
+            for line in before.unreadable
+        )
         if not before.judged:
             report.append(
                 f"battery: schema drift on {surface} {day.isoformat()}: "
@@ -667,7 +757,7 @@ def judge_day(
 
         # The missing half's candidates, with the retype half's claim subtracted. A column
         # both halves would name is a retype, per ``routed_columns``'s own reading.
-        candidates = (today.absent - before.absent) - today.retyped
+        candidates = newly_absent(today, before) - today.retyped
         if not candidates:
             continue
         if ledger is None or len(today.versions) != 1:
@@ -708,12 +798,49 @@ def judge_day(
     #
     # It is a line on ``report`` and never a count on ``BatteryReport``. ``battery.render``
     # pins the rule that every count prints including the zeroes, so a count here would be a
-    # change to that function and to ``sweep.Nightly.render``, and marketlake #477 holds both.
+    # change to that function and to ``sweep.SweepOutcome.render``, and marketlake #477 holds
+    # both.
     if judged_surfaces:
         moved = len(findings)
         verdict = f"{moved} drifted" if moved else "nothing drifted"
         report.append(f"battery: schema drift judged {', '.join(judged_surfaces)}, {verdict}")
     return DriftReport(findings=tuple(findings), report=tuple(report))
+
+
+def newly_absent(today: SurfaceDay, before: SurfaceDay) -> set[str]:
+    """Fields absent on every shared ticker today and arriving on one of them before.
+
+    **The two days are compared over the tickers they share.** A ticker judged on one day
+    and not the other says nothing about a transition, because there is no before-and-after
+    for it, and letting it into either side is what turns a ticker going quiet into a page
+    about the vendor. The live shape: a field already absent on SPY on both days, with QQQ
+    carrying it yesterday and all-gap today, is absent on every ticker judged today and was
+    not absent on every ticker judged yesterday, so a straight subtraction calls it newly
+    missing when nothing about it changed.
+
+    Measured against the lake, the two tickers agree exactly: chains has no all-null vendor
+    column on either day and quotes has the same three, so today's roster cannot produce
+    that page. It becomes reachable the day a ticker with a different payload shape joins.
+    """
+    shared = set(today.absent_by_ticker) & set(before.absent_by_ticker)
+    if not shared:
+        return set()
+    absent_now = set.intersection(*(set(today.absent_by_ticker[t]) for t in shared))
+    # **A column the baseline did not carry was never arriving.** ``read_surface_day``
+    # leaves a column the partition lacks out of ``absent``, which is right on today's side
+    # and inverts on the baseline's: a column that did not exist yesterday then reads as one
+    # the vendor was sending. A version that *adds* a vendor column the vendor has not begun
+    # filling is exactly that shape, and it pages on the new version's first night. That is
+    # the #265 false-positive class the missing half was restated to avoid, reached from the
+    # other direction, and the rotation guard cannot see it because it asks only what
+    # today's version dropped.
+    not_arriving = set.intersection(
+        *(
+            set(before.absent_by_ticker[ticker]) | set(before.lacked_by_ticker.get(ticker, ()))
+            for ticker in shared
+        )
+    )
+    return absent_now - not_arriving
 
 
 def _version_reason(ledger: SchemaVersionLedger | None, versions: frozenset[int]) -> str:
@@ -737,7 +864,15 @@ def _retype_first_cycle(partitions: Sequence, surface: str, fields: Sequence[str
         table = None
         for field_name in fields:
             if table is None:
-                table = _read_partition(partition, surface)
+                try:
+                    table = _read_overflow(partition)
+                except DriftUnreadable:
+                    # **A partition this cannot read must not cost the page.** The drift is
+                    # already established by the evidence gathered above, and the first cycle
+                    # is a detail of the body. ``read_surface_day`` has already reported the
+                    # partition as skipped, so the failure is on the record rather than
+                    # swallowed, and a page naming the drift with no stamp beats no page.
+                    break
             stamp = first_cycle_of(partition, surface, field_name, table=table)
             if stamp is not None and (earliest is None or stamp < earliest):
                 earliest = stamp
@@ -816,6 +951,7 @@ __all__ = [
     "eastern",
     "first_cycle_of",
     "judge_day",
+    "newly_absent",
     "page",
     "read_ledger",
     "read_surface_day",

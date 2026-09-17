@@ -2564,7 +2564,7 @@ def test_an_instrument_coverage_cannot_name_costs_its_own_answer_and_not_the_run
     roster cannot be read, and `SecurityMaster.register` takes no ticker at all, so the state is
     reachable by the design's own widening. The refusal is a third answer, not out of scope, so
     it is reported and exits non-zero. What it must not do is silence every other ticker's
-    verdict and the one page the battery sends.
+    verdict and the pages the battery sends.
     """
     from lake.capture_spans import CaptureSpans
     from lake.security_master import SecurityMaster, master_path
@@ -3517,7 +3517,7 @@ def test_a_schema_drift_failure_does_not_cost_the_delayed_feed_page(lake: Path, 
     ``sweep`` wraps the whole of ``judge`` in ``except Exception`` because "the battery must
     not cost the record", so a raise reaches the nightly report either way. What that
     containment cannot give back is the delayed-feed page, which fires inside this function.
-    Run before the page, a drift check that raises costs the battery's one shipped page on a
+    Run before the page, a drift check that raises costs the delayed-feed page on a
     night whose delayed feed is exactly what it was for.
     """
     rows = _clean_rows("chains", staleness=-900.0)

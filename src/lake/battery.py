@@ -142,9 +142,10 @@ partition's findings and hands them over together, which is the seam that functi
 was written for.
 
 **Each of the other three reports and never pages.** The design's message table gives the
-battery two pages: the delayed feed here, and its own nightly schema drift, which is #427. So
-:func:`page_delayed_feed` is filtered to :data:`CHECK_ENTITLEMENT` rather than to every verdict
-this run wrote. Without that filter a crossed quote reaches a phone titled ``Delayed feed``
+battery two pages: the delayed feed here, and its own nightly schema drift, which
+:mod:`lake.battery_drift` carries. So :func:`page_delayed_feed` is filtered to
+:data:`CHECK_ENTITLEMENT` rather than to every verdict this run wrote. Without that filter a
+crossed quote reaches a phone titled ``Delayed feed``
 with its rate rendered as a staleness in seconds.
 
 **The entitlement check, and the two things measuring it changed.** The design: the vendor's own
@@ -177,16 +178,17 @@ pinned schema for both surfaces, so its absence is drift rather than an old part
 answering drift with a pass is what fail-closed exists to prevent. ``schema_versions`` is the
 ledger that says a column was never captured, and nothing in the lake's sealed rows reaches it.
 
-**One page ships here, and the design gives the battery two.** This one is
+**Two pages ship, and this file holds one of them.** This one is
 ``Delayed feed: partitions quarantined`` at priority 5, carrying the session-median staleness
 and the partitions quarantined. The other is the battery's own nightly schema drift, which the
 message table lists beside the parser's and compaction's and gives its own title,
-``Schema drift: <field> missing`` or ``retyped``, fired once per field per day. That one belongs
-to the schema-drift check rather than to this one, and marketlake #427 carries it, because
-nothing here reads a payload's key set.
+``Schema drift: <field> missing`` or ``retyped``. That one belongs to the schema-drift check
+rather than to this one, because nothing here reads a payload's key set, and
+:mod:`lake.battery_drift` is where it lives. :func:`_judge_drift` is the seam, and it runs after
+:func:`page_delayed_feed` so that a failure in the newer page cannot cost the older one.
 
-The page follows the once-on-the-transition rule the auth path, the watchdog and both shipped
-schema-drift producers already carry. The transition here is the ledger's own: a partition
+The page follows the once-on-the-transition rule the auth path, the watchdog and all three
+shipped schema-drift producers already carry. The transition here is the ledger's own: a partition
 already quarantined under this check does not page again, because its entry is what says the
 operator was already told.
 """
@@ -421,7 +423,8 @@ class BatteryReport:
     page's unit is a surface and a half, so appending to it would put two kinds of string in one
     tuple. Neither render prints it, which is deliberate: :func:`render` states the rule that
     every count prints including the zeroes, so a *count* here would be a change to that function
-    and to ``sweep.Nightly.render``. The finding reaches both through ``report`` instead.
+    and to ``sweep.SweepOutcome.render``. The finding reaches both through ``report``
+    instead.
 
     ``sessions_owed`` and ``sessions_missing`` are the coverage check's pair, and they are the
     one pair here not scoped by ``day``. :func:`coverage` says why. The denominator is carried
@@ -2036,8 +2039,9 @@ def judge(
     # finding this run appended a line for, which is the right set for the transition rule and
     # the wrong set for this page: from #407 onwards a crossed quote or a truncated fetch would
     # otherwise reach a phone titled ``Delayed feed`` with its rate rendered as a staleness in
-    # seconds. The design gives the battery two pages and the other one is #427, so nothing here
-    # adds a third: the other two checks report and never page.
+    # seconds. The design gives the battery two pages and the other one is the schema-drift
+    # page ``_judge_drift`` sends below, so nothing here adds a third: the other two checks
+    # report and never page.
     quarantined = tuple(
         f for f in written if f.verdict == QUARANTINED_VERDICT and f.check == CHECK_ENTITLEMENT
     )
@@ -2049,7 +2053,7 @@ def judge(
     # whole function in ``except Exception`` because "the battery must not cost the record", so a
     # raise reaches the nightly report either way. Inside here the verdicts are already on disk,
     # written under the lock per partition, and ``page_delayed_feed`` has already fired. A raise
-    # before that line would cost the battery's one shipped page on a night whose delayed feed is
+    # before that line would cost the delayed-feed page on a night whose delayed feed is
     # exactly what it was for.
     drift_paged: tuple[str, ...] = ()
     try:

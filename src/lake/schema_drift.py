@@ -65,8 +65,9 @@ from lake.capture import CycleResult
 from lake.journal import ROW_KIND_DATA
 
 # The event and title on the parser's schema-drift page. ``compact.SCHEMA_DRIFT_EVENT`` is
-# ``compaction_schema_drift``, so the convention is the producer's name in front of the
-# condition, and a reader of ``reports/alerts/`` can tell the two apart without opening a
+# ``compaction_schema_drift`` and ``battery_drift.SCHEMA_DRIFT_EVENT`` is
+# ``battery_schema_drift``, so the convention is the producer's name in front of the
+# condition, and a reader of ``reports/alerts/`` can tell them apart without opening a
 # file. The title says where the drift was seen, which is the other half of the same
 # distinction: two events that read alike on a phone would be worse than one.
 SCHEMA_DRIFT_EVENT = "parser_schema_drift"

@@ -426,7 +426,7 @@ def test_an_unreadable_partition_does_not_cost_the_night(tmp_path: Path):
     report = _judge(tmp_path, today, before)
 
     assert _kinds(report) == {(battery_drift.RETYPED, "open_interest")}
-    assert any("not judged" in line for line in report.report)
+    assert any("skipped a partition" in line for line in report.report)
 
 
 def test_a_column_with_no_footer_statistics_is_read_rather_than_assumed(tmp_path: Path):
@@ -500,3 +500,221 @@ def test_a_partition_short_of_extra_is_not_asked_the_retype_question(tmp_path: P
     report = _judge(tmp_path, today, before)
 
     assert report.findings == ()
+
+
+def test_a_retype_after_the_first_batch_is_seen(tmp_path: Path):
+    """The read is folded over every batch, and a real partition has many.
+
+    ``pq.read_table`` chunks at 131,072 rows whatever the row-group layout, and the lake's
+    chains partitions carry five and six row groups besides: SPY 2026-09-16 is 5,307,030
+    rows whose first batch ends at 09:39 ET. Asking only ``to_batches()[0]`` therefore reads
+    the open and calls the rest of the session clean.
+
+    It is the worst shape an alarm can take, because both halves go quiet together. The
+    column is non-null on the morning rows, so it never reaches ``absent`` either, and the
+    night's report line affirmatively says nothing drifted.
+    """
+    _ledger(tmp_path)
+    before = [_seal(tmp_path, "chains", "SPY", BEFORE, _table("chains", BEFORE, count=8))]
+    late = _table("chains", DAY, count=8).to_pydict()
+    paths = journal.extra_paths("chains")
+    late["open_interest"] = [10, 10, 10, 10, None, None, None, None]
+    late[journal.EXTRA_COLUMN] = [None] * 4 + [
+        json.dumps({paths["open_interest"].field: "raw"})
+    ] * 4
+    path = tmp_path / "chains" / "ticker=SPY" / f"date={DAY.isoformat()}.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table(late, schema=journal.schema_for("chains")), path, row_group_size=2)
+    today = [SealedPartition(path=path, surface="chains", ticker="SPY", day=DAY)]
+
+    assert pq.read_metadata(path).num_row_groups > 1, "the fixture must span several batches"
+    report = _judge(tmp_path, today, before)
+
+    assert _kinds(report) == {(battery_drift.RETYPED, "open_interest")}
+
+
+def test_an_overflow_that_does_not_decode_costs_its_surface_and_not_the_night(tmp_path: Path):
+    """``journal.routed_columns`` decodes a populated overflow with a bare ``json.loads``,
+    so one unparseable cell raises out of it. Unconverted it escapes ``judge_day`` past the
+    per-surface containment, and one bad cell on chains takes quotes down with it."""
+    _ledger(tmp_path)
+    before = [
+        _seal(tmp_path, "chains", "SPY", BEFORE, _table("chains", BEFORE)),
+        _seal(tmp_path, "quotes", "SPY", BEFORE, _table("quotes", BEFORE)),
+    ]
+    torn = _table("chains", DAY).to_pydict()
+    torn[journal.EXTRA_COLUMN] = ["{not json"] * 3
+    path = tmp_path / "chains" / "ticker=SPY" / f"date={DAY.isoformat()}.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table(torn, schema=journal.schema_for("chains")), path)
+    today = [
+        SealedPartition(path=path, surface="chains", ticker="SPY", day=DAY),
+        _seal(tmp_path, "quotes", "SPY", DAY, _table("quotes", DAY)),
+    ]
+
+    report = _judge(tmp_path, today, before)
+
+    assert any("does not decode" in line for line in report.report)
+    assert any("judged quotes" in line for line in report.report), "quotes still answered"
+
+
+def test_a_ticker_going_quiet_does_not_page_the_other_tickers_standing_absence(tmp_path: Path):
+    """The two days are compared over the tickers they share.
+
+    ``high_52`` is absent on SPY on both days and nothing about it changed. QQQ carried it
+    yesterday and is all-gap today, which is an ordinary dead-daemon day. Folded to one set
+    per day and subtracted, QQQ keeps ``high_52`` out of yesterday's intersection and is
+    not there to keep it out of today's, so a field nothing touched pages as newly missing.
+    """
+    _ledger(tmp_path)
+    before = [
+        _seal(tmp_path, "quotes", "SPY", BEFORE, _table("quotes", BEFORE, drop=("high_52",))),
+        _seal(tmp_path, "quotes", "QQQ", BEFORE, _table("quotes", BEFORE)),
+    ]
+    today = [
+        _seal(tmp_path, "quotes", "SPY", DAY, _table("quotes", DAY, drop=("high_52",))),
+        _seal(tmp_path, "quotes", "QQQ", DAY, _table("quotes", DAY, kind=journal.ROW_KIND_GAP)),
+    ]
+
+    assert _judge(tmp_path, today, before).findings == ()
+
+
+def test_the_measured_body_sizes_are_the_ones_the_module_states(tmp_path: Path):
+    """The cap's arithmetic is load-bearing, so the numbers behind it are held rather than
+    quoted from a estimate made before the body existed."""
+    sizes = {}
+    for surface in SEALED_SURFACES:
+        fields = tuple(sorted(journal.extra_paths(surface)))
+        finding = battery_drift.DriftFinding(
+            surface=surface,
+            day=DAY,
+            kind=battery_drift.MISSING,
+            fields=fields,
+            first_cycle="2026-09-16T09:30:00-04:00",
+        )
+        sizes[surface] = len(battery_drift.body(finding).encode())
+
+    assert all(size < 1000 for size in sizes.values()), sizes
+    assert sizes == {"chains": 305, "quotes": 295}
+
+
+def test_one_unreadable_ticker_does_not_silence_the_others_drift(tmp_path: Path):
+    """Containment is per partition, not per surface.
+
+    Contained per surface, one corrupt file on one ticker takes the whole surface's alarm
+    down, so a genuine vendor drop on every other ticker goes unpaged on the night a file
+    was also corrupt. On the 115-ticker roster the design sizes for, that is one file
+    silencing 114.
+    """
+    _ledger(tmp_path)
+    before = [
+        _seal(tmp_path, "chains", t, BEFORE, _table("chains", BEFORE)) for t in ("QQQ", "SPY")
+    ]
+    today = [
+        _seal(tmp_path, "chains", "QQQ", DAY, _table("chains", DAY)),
+        _seal(tmp_path, "chains", "SPY", DAY, _table("chains", DAY, route=("open_interest",))),
+    ]
+    today[0].path.write_bytes(b"not parquet")
+
+    report = _judge(tmp_path, today, before)
+
+    assert _kinds(report) == {(battery_drift.RETYPED, "open_interest")}
+    assert any("skipped a partition" in line for line in report.report)
+
+
+def test_a_column_the_baseline_never_carried_does_not_page(tmp_path: Path):
+    """A version that adds a vendor column the vendor has not begun filling.
+
+    The baseline partition lacks the column outright, so it never enters that day's
+    ``absent`` set and reads as a field that was arriving. Today's partition carries it and
+    the vendor sends nothing, so it is null on every data row. Subtracted naively that is a
+    page saying a field stopped arriving on the first night it existed, which is the #265
+    false-positive class reached from the other direction. The rotation guard cannot see it,
+    because it asks only what today's version dropped.
+    """
+    _ledger(tmp_path)
+    full = _table("chains", BEFORE)
+    without = full.select([n for n in full.column_names if n != "volume"])
+    path = tmp_path / "chains" / "ticker=SPY" / f"date={BEFORE.isoformat()}.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(without, path)
+    before = [SealedPartition(path=path, surface="chains", ticker="SPY", day=BEFORE)]
+    today = [_seal(tmp_path, "chains", "SPY", DAY, _table("chains", DAY, drop=("volume",)))]
+
+    assert _judge(tmp_path, today, before).findings == ()
+
+
+def test_a_refused_page_does_not_undo_its_own_redaction(tmp_path: Path, capsys):
+    """The publisher found one of its own secrets in the body and redacted its record for
+    that reason, so stderr must not print the body anyway.
+
+    Every sibling producer pins this: ``test_schema_drift``, ``test_compaction_schema`` and
+    ``page_delayed_feed``'s own test in ``test_battery``. This producer copied the code.
+    """
+    from lake.alert import Publisher
+
+    class _Transport:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, message):
+            self.sent.append(message)
+
+    secret = "ntfy-topic-abcdef"
+    transport = _Transport()
+    publisher = Publisher(lake_root=tmp_path, transport=transport, secrets=(secret,))
+    finding = battery_drift.DriftFinding(
+        surface="chains",
+        day=DAY,
+        kind=battery_drift.RETYPED,
+        fields=(secret,),
+        first_cycle=None,
+    )
+
+    titles = battery_drift.page(publisher, [finding], now=datetime(2026, 9, 16, 22, 30, tzinfo=UTC))
+
+    assert transport.sent == [], "a body carrying a secret never reaches the transport"
+    assert titles == (finding.title,)
+    err = capsys.readouterr().err
+    assert "refused" in err
+    assert secret not in err, "stderr must not undo the publisher's redaction"
+
+
+def test_a_version_the_ledger_records_no_shape_for_refuses_the_missing_half(tmp_path: Path):
+    """The shape #493 shipped a page for: the ledger reads, and holds no entry for the
+    running version. Without a recorded shape there is nothing to ask ``has_column``, so a
+    rotation cannot be told from a vendor drop."""
+    _ledger(tmp_path)
+    before = [_seal(tmp_path, "chains", "SPY", BEFORE, _table("chains", BEFORE))]
+    later = _table("chains", DAY, drop=("volume",)).to_pydict()
+    later["schema_version"] = [7, 7, 7]
+    path = tmp_path / "chains" / "ticker=SPY" / f"date={DAY.isoformat()}.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table(later, schema=journal.schema_for("chains")), path)
+    today = [SealedPartition(path=path, surface="chains", ticker="SPY", day=DAY)]
+
+    report = _judge(tmp_path, today, before)
+
+    assert report.findings == ()
+    assert any("records no shape for schema_version 7" in line for line in report.report)
+
+
+def test_an_all_gap_baseline_day_refuses_the_comparison(tmp_path: Path):
+    """The lake holds 16 partitions of exactly this shape, 2026-09-08 to 09-11.
+
+    A baseline whose every row is a gap carries a null on every vendor column by
+    construction, so without the guard every field on the surface reads as newly missing at
+    once.
+    """
+    _ledger(tmp_path)
+    before = [
+        _seal(
+            tmp_path, "chains", "SPY", BEFORE, _table("chains", BEFORE, kind=journal.ROW_KIND_GAP)
+        )
+    ]
+    today = [_seal(tmp_path, "chains", "SPY", DAY, _table("chains", DAY))]
+
+    report = _judge(tmp_path, today, before)
+
+    assert report.findings == ()
+    assert any("carried no data row" in line for line in report.report)
