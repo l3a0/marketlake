@@ -1302,7 +1302,7 @@ def _why_unread(master: SecurityMaster, ticker: str, day: date) -> str:
     on one case. ``lake.retire`` closes a span and leaves ``valid_to`` alone, so a ticker
     retired and brought back still resolves across its away period and is reported here as
     unsealed rather than out of scope. Reading the spans would settle it and would give this
-    walk a fourth dependency, so it is marketlake #456 rather than this change. Nothing is
+    walk a fourth dependency, so it is marketlake #457 rather than this change. Nothing is
     mis-judged meanwhile: the window widens either way and the reason names the hole rather
     than a cause.
     """
