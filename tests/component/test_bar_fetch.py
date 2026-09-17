@@ -2347,7 +2347,9 @@ def test_the_regular_session_response_covers_the_window_end_to_end(fixture_lake:
     candles at the right instants show the ends rule reading the ends, and 390 shows that a real
     response's interior does not disturb it, which is the shape that will actually arrive.
 
-    ``requested`` and ``covered`` both read 390, so nothing is held.
+    The verdict's own pair is asserted rather than described. Recomputing 390 from the test's
+    own stamps would be arithmetic on the fixture, and both of `covered`'s mutations survive
+    that, so the check is asked for its numbers directly the way the early-close test asks.
     """
     root = _lake(fixture_lake)
     dense = {"candles": _dense_minute_candles()}
@@ -2366,7 +2368,9 @@ def test_the_regular_session_response_covers_the_window_end_to_end(fixture_lake:
     window = bar_window(MINUTE_FREQ, bounds)
     assert stamps[0] == window.start
     assert stamps[-1] + timedelta(minutes=1) == window.end
-    assert (stamps[-1] - stamps[0]) / timedelta(minutes=1) + 1 == 390.0
+    span = bars.check_bar_span(rows, bars.select_session_rows(rows, window), window)
+    assert span.covers is True
+    assert (span.covered, span.requested) == (390.0, 390.0)
 
 
 def test_the_ends_rule_holds_on_an_early_close(fixture_lake: FixtureLake):
