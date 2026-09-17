@@ -1381,6 +1381,28 @@ def test_the_command_against_a_torn_quarantine_ledger_is_a_line_and_not_a_stack(
     assert "Repair it by hand under the lake-root lock" in printed
 
 
+def test_the_command_answers_the_damaged_ledger_class_and_not_the_one_shape(
+    fixture_lake: FixtureLake, tmp_path: Path, capsys
+):
+    """The sibling shape, and why the handler names ``ManifestError`` rather than a member.
+
+    A quarantine line that parses and names no partition raises plain ``ManifestError`` from
+    ``manifest.latest_quarantine_by_check``. It reaches this command by the identical path and
+    it predates marketlake #469 entirely, so a handler narrowed to ``TornLedger`` would leave
+    the older shape arriving as a stack while the newer one got a line.
+    """
+    root = _lake(fixture_lake, {("SPY", DAY_ONE): [_row(DAY_ONE)]})
+    append_line(quarantine_path(root), {"verdict": "clean", "check": "e"})
+    config = write_config(tmp_path, root)
+
+    code = actions.main(["--config", str(config)], clock=ManualClock(FIRST_NIGHT))
+
+    assert code == 2
+    printed = capsys.readouterr().err
+    assert "Traceback" not in printed
+    assert "names no partition" in printed
+
+
 def test_the_command_against_a_torn_master_says_something_different(
     fixture_lake: FixtureLake, tmp_path: Path, capsys
 ):

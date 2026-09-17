@@ -114,6 +114,12 @@ def test_one_entry_behind_the_fused_line_is_refused_and_counted():
     assert "the read stopped at line 1" in message
     assert str(_LEDGER) in message
     assert "human's job under the lock" in message
+    # The sentence that says what the count means. Without it the message names a line and a
+    # number and never says the verdicts behind them are the reason a read cannot be trusted.
+    assert (
+        "Every verdict behind that line is invisible, so this ledger cannot say which "
+        "partitions it withholds." in message
+    )
 
 
 def test_two_entries_behind_it_are_counted_and_read_as_plural():
@@ -163,6 +169,24 @@ def test_blank_lines_are_not_counted_as_hidden_entries():
     """A blank line is skipped by the parser, so counting it would refuse a clean ledger."""
     text = _line("a") + "\n\n" + _line("b") + "\n\n"
     assert _refuse_hidden_entries(_LEDGER, text, parse_jsonl(text)) is None
+
+
+@pytest.mark.parametrize("filler", ["   ", "\t", " \t "])
+def test_a_whitespace_only_line_is_blank_to_both_sides_of_the_count(filler: str):
+    """The two sides have to agree on what a blank line is, or the guard inverts.
+
+    ``parse_jsonl`` strips a line before testing it, so a line of spaces or tabs is invisible
+    to the parse. A count that tested the raw line instead would see lines the parse never
+    consumed, read them as written entries hiding behind the stop, and refuse a ledger nothing
+    is wrong with. Every reader funnels through here, so that would lock ``load_chain``, the
+    battery, the dashboard and the sign-off tool out of a healthy lake.
+
+    An empty line cannot catch it, because it is falsy under both spellings. These have to be
+    lines that are truthy and blank, and they have to outnumber what parsed.
+    """
+    text = _line("a") + filler + "\n" + filler + "\n"
+    assert _refuse_hidden_entries(_LEDGER, text, parse_jsonl(text)) is None
+    assert _refuse_hidden_entries(_LEDGER, filler + "\n" + filler + "\n", []) is None
 
 
 def test_the_refusal_is_a_manifest_error():
