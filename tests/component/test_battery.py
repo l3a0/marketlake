@@ -24,6 +24,7 @@ from lake.battery import (
     CHECK_ENTITLEMENT,
     CHECK_QUOTE_SANITY,
     CHECK_ROW_COUNT_BAND,
+    CHECK_SCOPE,
     DELAYED_FEED_EVENT,
     DELAYED_FEED_TITLE,
     INSUFFICIENT_HISTORY,
@@ -1626,10 +1627,18 @@ def test_a_partition_of_overnight_rows_alone_is_out_of_scope_not_quarantined(lak
 
     report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
-    assert _answer(report).verdict == OUT_OF_SCOPE
+    # One finding for the partition, carrying the partition's own token rather than any
+    # check's. The review that restored this assertion caught the weakened version: asking
+    # only what the entitlement check said is asking the one thing this change did not alter,
+    # while quote sanity was quietly returning a real verdict on a partition the design says
+    # nothing should judge.
+    (finding,) = [f for f in report.findings if f.partition == JUDGED]
+    assert finding.check == CHECK_SCOPE
+    assert report.out_of_scope == 1
+    assert report.judged == 0
     assert report.quarantined == 0
     assert report.appended == ()
-    assert "no data row falls inside the session" in _answer(report).reason
+    assert "no data row falls inside the session" in finding.reason
 
 
 def test_an_off_session_row_still_counts_against_the_entitlement_flag(lake: Path):
@@ -2089,21 +2098,46 @@ def test_render_names_each_missing_session_that_the_report_line_does_not(lake: P
     assert "missing chains/ticker=SPY/date=2026-09-01.parquet" in printed
 
 
-def test_an_instrument_with_a_span_and_no_ticker_is_scope_unknown(lake: Path):
-    """Not out of scope, which would say capture was not running. The reference files
-    disagreeing is a third answer and the run exits non-zero on it."""
+def test_an_instrument_coverage_cannot_name_costs_its_own_answer_and_not_the_run(lake: Path):
+    """Raising here took the whole battery down over an instrument that owns no partition.
+
+    `capture_spans.build_from_master` opens a span for every instrument in the master when the
+    roster cannot be read, and `SecurityMaster.register` takes no ticker at all, so the state is
+    reachable by the design's own widening. The refusal is a third answer, not out of scope, so
+    it is reported and exits non-zero. What it must not do is silence every other ticker's
+    verdict and the one page the battery sends.
+    """
     from lake.capture_spans import CaptureSpans
-    from lake.security_master import SecurityMaster
+    from lake.security_master import SecurityMaster, master_path
 
-    (lake / "reference").mkdir(parents=True, exist_ok=True)
-    pa_pq.write_table(SecurityMaster().to_table(), lake / "reference" / "security_master.parquet")
-    spans = CaptureSpans([CaptureSpan(instrument_id=7, start=SPAN_START, end=None, options=True)])
-    pa_pq.write_table(spans.to_table(), lake / "reference" / "capture_spans.parquet")
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=-900.0))
+    _seed_spans(lake)
+    master = SecurityMaster.read(master_path(lake))
+    orphan = master.register(
+        kind="equity",
+        capture_start=SPAN_START,
+        valid_from=SPAN_START.date(),
+        figi="BBG000BDTBL9",
+    )
+    pa_pq.write_table(master.to_table(), lake / "reference" / "security_master.parquet")
+    spans = CaptureSpans.read(lake / "reference" / "capture_spans.parquet")
+    pa_pq.write_table(
+        CaptureSpans(
+            [
+                *spans.spans,
+                CaptureSpan(instrument_id=orphan, start=SPAN_START, end=None, options=True),
+            ]
+        ).to_table(),
+        lake / "reference" / "capture_spans.parquet",
+    )
+    publisher, transport = _publisher(lake)
 
-    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants(), publisher=publisher)
 
-    assert report.sessions_owed == 0
+    assert report.scope_unknown == 1
     assert any("has a capture span and no ticker" in line for line in report.report)
+    assert _answer(report).verdict == QUARANTINED_VERDICT, "SPY is still judged"
+    assert len(transport.messages) == 1, "and the delayed feed still pages"
 
 
 # -- quote sanity ------------------------------------------------------------
@@ -2249,15 +2283,36 @@ def test_judge_quote_order_is_callable_on_evidence_alone(lake: Path):
 # -- the snapshot row-count band ---------------------------------------------
 
 
-def _snapshots(day: date, *, count: int, rows_each: int, first: int = 0) -> list[dict]:
-    """``count`` session snapshots on ``day``, each holding ``rows_each`` data rows."""
+def _snapshots(
+    on: date, *, count: int, rows_each: int, first: int = 0, day: date | None = None
+) -> list[dict]:
+    """``count`` session snapshots, each holding ``rows_each`` data rows.
+
+    ``day`` moves them to another session; without it they land on ``on``.
+    """
     rows: list[dict] = []
     for index in range(count):
         rows.extend(
             _row(first + index, staleness=-1.7, flag=False, surface="chains")
             for _ in range(rows_each)
         )
-    return _shift(rows, day)
+    return _shift(rows, on if day is None else day)
+
+
+def _gap_row() -> dict:
+    """One gap row, the design's record that a minute was missed."""
+    return _row(0, staleness=-1.7, flag=None, surface="chains", kind="gap")
+
+
+def _sessions_before(calendar, day: date, count: int) -> list[date]:
+    """The ``count`` sessions immediately before ``day``, newest first."""
+    found: list[date] = []
+    when = day
+    while len(found) < count:
+        when -= timedelta(days=1)
+        if calendar.is_session(when):
+            found.append(when)
+    return found
 
 
 def _history(lake: Path, *, rows_each: int = 100, sessions=None) -> None:
@@ -2520,3 +2575,195 @@ def test_a_delayed_feed_still_pages_while_another_check_quarantines_beside_it(la
     assert report.paged == (f"chains/ticker=SPY/date={DAY.isoformat()}.parquet",)
     assert len(transport.messages) == 1
     assert "staleness" in transport.messages[0].body
+
+
+# -- what the review found, held so it cannot come back ----------------------
+
+
+def _long_calendar(weeks: int = 8):
+    """A run of ordinary weeks ending in ``DAY``'s, for the windowing tests."""
+    mondays = [date(2026, 9, 14) - timedelta(weeks=index) for index in range(weeks)]
+    return weekday_sessions(*reversed(mondays))
+
+
+def test_the_band_does_not_judge_a_day_the_calendar_calls_no_session(lake: Path):
+    """The asymmetry the review found. ``trailing_medians`` skips a day with no session, and
+    the band was handed that same day's ``None`` bounds, which widen ``_within`` to every row.
+    Every overnight cycle then became a session snapshot measured against a median built from
+    real sessions alone, and a partition was quarantined for a calendar disagreement rather
+    than a truncated fetch.
+
+    ``test_a_sealed_partition_on_a_non_session_day_keeps_the_flag_half`` already stated the
+    rule for the entitlement check. This is the same rule for the band.
+    """
+    saturday = date(2026, 9, 19)
+    rows = _snapshots(DAY, count=3, rows_each=100)
+    rows.extend(_off_session_row(index, staleness=25_817.0) for index in range(40))
+    _write(lake, "chains", "SPY", saturday, _shift(rows, saturday))
+    _history(lake)
+    _seed_spans(lake)
+
+    report = judge(lake, calendar=CALENDAR, now=NOW + timedelta(days=4), guards=GuardConstants())
+    partition = f"chains/ticker=SPY/date={saturday.isoformat()}.parquet"
+    band = _answer(report, CHECK_ROW_COUNT_BAND, partition)
+
+    assert not CALENDAR.is_session(saturday)
+    assert band.verdict == OUT_OF_SCOPE
+    assert "calls the day no session" in band.reason
+    assert partition not in report.appended
+    assert _answer(report, CHECK_ENTITLEMENT, partition).judged, "the flag half still runs"
+
+
+def test_the_window_counts_sessions_rather_than_answers(lake: Path):
+    """``docs/design.md``: "All sessions enter the window, and the median's robustness is the
+    outlier defense."
+
+    The first shipped reading skipped a session that carried no median and reached further back
+    for a replacement, which has no recency bound at all. This is the case that separates them:
+    twenty sessions of history, all but two of them dark. Counting answers reaches past the
+    darkness and judges against months-old sessions. Counting sessions leaves the window mostly
+    empty and says the history is thin.
+    """
+    calendar = _long_calendar()
+    sessions = [day for day in _sessions_before(calendar, DAY, 24)]
+    for day in sessions[2:]:
+        _write(lake, "chains", "SPY", day, _shift([_gap_row()], day))
+    for day in sessions[:2]:
+        _write(lake, "chains", "SPY", day, _snapshots(DAY, count=3, rows_each=100, day=day))
+    _write(lake, "chains", "SPY", DAY, _snapshots(DAY, count=3, rows_each=100))
+    _seed_spans(lake, start=datetime(2026, 6, 1, 13, 30, tzinfo=UTC))
+
+    trailing = trailing_medians(
+        lake,
+        _partition(lake),
+        calendar=calendar,
+        spans=(_span(start=datetime(2026, 6, 1, 13, 30, tzinfo=UTC)),),
+        guards=GuardConstants(),
+    )
+
+    assert trailing == (100.0, 100.0), "eighteen dark sessions fill the rest of the window"
+    finding = judge_row_count(_partition(lake), (100, 100, 100), trailing, GuardConstants())
+    assert finding.verdict == INSUFFICIENT_HISTORY, "thin history fails open, not closed"
+
+
+def test_the_window_is_bounded_by_trailing_median_sessions(lake: Path):
+    """The mutation the review found surviving: replacing the window with 99,999 left the
+    whole suite green, because no fixture had more than twenty prior sessions."""
+    calendar = _long_calendar()
+    sessions = _sessions_before(calendar, DAY, 24)
+    for index, day in enumerate(sessions):
+        # The sessions inside a twenty-session window hold 100 rows a snapshot. The ones past
+        # it hold 10, so a window that does not stop lets them move the median.
+        _write(
+            lake,
+            "chains",
+            "SPY",
+            day,
+            _snapshots(DAY, count=3, rows_each=100 if index < 20 else 10, day=day),
+        )
+    _seed_spans(lake, start=datetime(2026, 6, 1, 13, 30, tzinfo=UTC))
+
+    trailing = trailing_medians(
+        lake,
+        _partition(lake),
+        calendar=calendar,
+        spans=(_span(start=datetime(2026, 6, 1, 13, 30, tzinfo=UTC)),),
+        guards=GuardConstants(),
+    )
+
+    assert len(trailing) == GuardConstants().trailing_median_sessions == 20
+    assert set(trailing) == {100.0}, "the four older sessions are outside the window"
+    assert (
+        trailing_medians(
+            lake,
+            _partition(lake),
+            calendar=calendar,
+            spans=(_span(start=datetime(2026, 6, 1, 13, 30, tzinfo=UTC)),),
+            guards=GuardConstants(trailing_median_sessions=24),
+        )
+        != trailing
+    ), "and the window is the config's, not a constant here"
+
+
+def test_a_quarantined_trailing_session_still_enters_the_median(lake: Path):
+    """The claim the review found held by nothing. Excluding a withheld trailing session would
+    make the band depend on the ledger this same run is writing, and ``docs/design.md`` says
+    all sessions enter the window with the median's robustness as the defense."""
+    _history(lake)
+    _write(lake, "chains", "SPY", DAY, _snapshots(DAY, count=3, rows_each=100))
+    _seed_spans(lake)
+    for day in COVERED_SESSIONS[:-1]:
+        append_quarantine(
+            lake,
+            build_entry(
+                partition=f"chains/ticker=SPY/date={day.isoformat()}.parquet",
+                verdict=QUARANTINED_VERDICT,
+                check="strike_grid_completeness",
+                observed_at=NOW - timedelta(days=30),
+            ),
+        )
+
+    trailing = trailing_medians(
+        lake,
+        _partition(lake),
+        calendar=CALENDAR,
+        spans=(_span(),),
+        guards=GuardConstants(),
+    )
+
+    assert trailing == (100.0,) * 6, "every one of them is withheld, and every one counts"
+
+
+def test_a_retyped_column_reports_the_partition_unreadable_rather_than_escaping(lake: Path):
+    """An Arrow kernel has no ``less_equal`` for a string bid against a double mark, and the
+    raise sat outside the walk's containment. One drifted column on one partition cost every
+    partition's verdict for the whole lake that night, on exactly the night that mattered:
+    retyping a pinned column is the drift the battery exists to notice.
+    """
+    rows = _clean_rows("chains")
+    table = (
+        _table("chains", rows)
+        .drop_columns(["bid"])
+        .append_column("bid", pa.array(["1.0"] * len(rows), pa.string()))
+    )
+    path = lake / "chains" / "ticker=SPY" / f"date={DAY.isoformat()}.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pa_pq.write_table(table, path)
+    _write(lake, "quotes", "SPY", DAY, _clean_rows("quotes"))
+    _seed_spans(lake)
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert report.unreadable == 1
+    assert any("ArrowNotImplementedError" in line for line in report.report)
+    assert _answer(report, CHECK_QUOTE_SANITY, "quotes/ticker=SPY/date=2026-09-16.parquet").judged
+
+
+@pytest.mark.parametrize("column", ["bid", "is_delayed"])
+def test_every_kernel_the_checks_run_is_contained_the_same_way(lake: Path, column: str):
+    """The class, not the instance. The entitlement flag's comparison had the identical hole
+    and predates these checks, so containing one and not the other leaves the same night's
+    verdicts resting on which column the vendor happened to retype."""
+    rows = _clean_rows("chains")
+    table = (
+        _table("chains", rows)
+        .drop_columns([column])
+        .append_column(column, pa.array(["x"] * len(rows), pa.string()))
+    )
+    path = lake / "chains" / "ticker=SPY" / f"date={DAY.isoformat()}.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pa_pq.write_table(table, path)
+    _seed_spans(lake)
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert report.unreadable == 1
+    assert report.appended == ()
+
+
+def test_a_configured_floor_of_zero_does_not_crash_the_median(lake: Path):
+    """``GuardConstants`` validates no range, and a median of nothing has no midpoint."""
+    finding = judge_row_count(_partition(lake), (100,), (), GuardConstants(min_trailing_sessions=0))
+
+    assert finding.verdict == INSUFFICIENT_HISTORY
+    assert finding.computed == 0.0

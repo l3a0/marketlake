@@ -181,6 +181,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Iterable, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -876,6 +877,30 @@ def _overlaps(span: CaptureSpan, start: datetime, end: datetime) -> bool:
 # -- the real-time entitlement check -----------------------------------------
 
 
+@contextmanager
+def _contained(partition: SealedPartition):
+    """Turn any failure reading one partition into :class:`PartitionUnreadable`.
+
+    **A column's type is not checked by reading its schema.** Every read here guards
+    ``pq.read_schema`` and ``pq.read_table`` and then hands the columns to an Arrow kernel,
+    which raises ``ArrowNotImplementedError`` when a pinned column arrives retyped: a ``bid``
+    the vendor started sending as a string has no ``less_equal`` against a ``mark`` that is
+    still a double. That raise is outside the walk's per-partition containment, so one drifted
+    column on one partition costs every partition's verdict for the whole lake that night.
+
+    Retyping a pinned column is drift, which is the condition the battery exists to notice, so
+    the partitions most likely to raise here are the ones that most need judging. That is
+    :class:`PartitionUnreadable`'s own argument for being contained rather than fatal, and this
+    is what puts the kernels inside it.
+    """
+    try:
+        yield
+    except PartitionUnreadable:
+        raise
+    except Exception as exc:  # noqa: BLE001 - one damaged partition must not cost the run
+        raise PartitionUnreadable(f"{partition.relative}: {type(exc).__name__}: {exc}") from exc
+
+
 @dataclass(frozen=True)
 class Entitlement:
     """What one partition's rows say about the feed's entitlement.
@@ -959,8 +984,8 @@ def read_entitlement(
     violations = 0
     if flag_present:
         _, wanted_value = ENTITLEMENT_FLAGS[partition.surface]
-        column = table[flag]
-        agreeing = pc.sum(pc.equal(column, wanted_value)).as_py() or 0
+        with _contained(partition):
+            agreeing = pc.sum(pc.equal(table[flag], wanted_value)).as_py() or 0
         violations = rows - agreeing
 
     in_session = _within(table, partition, bounds)
@@ -1181,10 +1206,19 @@ class Coverage:
 
     ``missing`` holds one finding per owed partition the lake does not have. Each carries
     :data:`MISSING_SESSION`, which is not a verdict, so none of them reaches the ledger.
+
+    ``unnamed`` holds one sentence per instrument whose owed sessions could not be named,
+    because the capture spans and the security master disagree about it. It is reported and
+    counted rather than raised. Raising took the whole run down: every other ticker's partitions
+    went unjudged and the delayed-feed page could not fire, over an instrument that owns no
+    partition and changes no read. ``capture_spans.build_from_master`` reaches this state on
+    purpose, opening a span for every instrument in the master when the roster cannot be read,
+    and ``SecurityMaster.register`` takes no ticker at all.
     """
 
     owed: int = 0
     missing: tuple[Finding, ...] = ()
+    unnamed: tuple[str, ...] = ()
 
 
 def coverage(
@@ -1232,6 +1266,7 @@ def coverage(
     master, spans = reference.master, reference.spans
 
     spellings: dict[int, tuple[str, ...]] = {}
+    unnamed: list[str] = []
     for instrument_id in sorted(spans.instrument_ids()):
         found = sorted(
             {
@@ -1241,15 +1276,18 @@ def coverage(
             }
         )
         if not found:
-            raise ScopeUnknown(
-                f"instrument {instrument_id} has a capture span and no ticker in the master, "
-                "so the sessions it owed cannot be named"
+            unnamed.append(
+                f"battery: instrument {instrument_id} has a capture span and no ticker in "
+                "the master, so the sessions it owed cannot be named"
             )
+            continue
         spellings[instrument_id] = tuple(found)
 
     # Keyed so two spans covering one day owe one partition rather than two.
     owed: set[tuple[str, int, date]] = set()
     for span in spans:
+        if span.instrument_id not in spellings:
+            continue
         horizon = now if span.end is None else min(span.end, now)
         day = span.start.astimezone(MARKET_TZ).date()
         last = horizon.astimezone(MARKET_TZ).date()
@@ -1283,7 +1321,7 @@ def coverage(
                 ),
             )
         )
-    return Coverage(owed=len(owed), missing=tuple(missing))
+    return Coverage(owed=len(owed), missing=tuple(missing), unnamed=tuple(unnamed))
 
 
 def _partition_file(root: Path, surface: str, ticker: str, day: date) -> Path:
@@ -1409,13 +1447,14 @@ def read_quote_order(partition: SealedPartition) -> QuoteOrder:
     if absent or rows == 0:
         return QuoteOrder(rows=rows, unordered=0, absent=absent)
 
-    ordered = pc.and_(
-        pc.less_equal(table[BID], table[MARK]), pc.less_equal(table[MARK], table[ASK])
-    )
-    # ``pc.sum`` skips nulls, so a row whose comparison is null counts as unordered rather than
-    # as agreeing. A null in any of the three is the vendor declining to say, and a check that
-    # answers "declined to say" with a pass is not failing closed.
-    agreeing = pc.sum(pc.cast(ordered, pa.int64())).as_py() or 0
+    with _contained(partition):
+        ordered = pc.and_(
+            pc.less_equal(table[BID], table[MARK]), pc.less_equal(table[MARK], table[ASK])
+        )
+        # ``pc.sum`` skips nulls, so a row whose comparison is null counts as unordered rather
+        # than as agreeing. A null in any of the three is the vendor declining to say, and a
+        # check that answers "declined to say" with a pass is not failing closed.
+        agreeing = pc.sum(pc.cast(ordered, pa.int64())).as_py() or 0
     return QuoteOrder(rows=rows, unordered=rows - agreeing)
 
 
@@ -1497,14 +1536,15 @@ def session_snapshot_counts(
     except Exception as exc:  # noqa: BLE001 - same reason as above
         raise PartitionUnreadable(f"{partition.relative}: {type(exc).__name__}: {exc}") from exc
 
-    table = table.filter(pc.equal(table[ROW_KIND_COLUMN], ROW_KIND_DATA))
-    if table.num_rows == 0:
-        return ()
-    table = _within(table, partition, bounds)
-    if table.num_rows == 0:
-        return ()
-    counted = table.group_by(SNAP_TS).aggregate([(SNAP_TS, "count")])
-    return tuple(sorted(counted[f"{SNAP_TS}_count"].to_pylist()))
+    with _contained(partition):
+        table = table.filter(pc.equal(table[ROW_KIND_COLUMN], ROW_KIND_DATA))
+        if table.num_rows == 0:
+            return ()
+        table = _within(table, partition, bounds)
+        if table.num_rows == 0:
+            return ()
+        counted = table.group_by(SNAP_TS).aggregate([(SNAP_TS, "count")])
+        return tuple(sorted(counted[f"{SNAP_TS}_count"].to_pylist()))
 
 
 def median(values: Sequence[float]) -> float:
@@ -1533,46 +1573,52 @@ def trailing_medians(
 ) -> tuple[float, ...]:
     """Each trailing session's median snapshot row count, newest first.
 
-    **Prior sessions only.** A window including the judged session lets a wholly truncated
-    session drag its own median down and pass itself, and at exactly
-    ``config.min_trailing_sessions`` of five it is one fifth of the median it is compared
-    against.
+    **The window is the ``trailing_median_sessions`` calendar sessions before this one, and
+    every one of them enters it.** ``docs/design.md`` states the rule for median-relative checks
+    and it is not this module's to reinterpret: "Median-relative checks compute over whatever
+    trailing sessions exist. All sessions enter the window, and the median's robustness is the
+    outlier defense."
 
-    **A session that contributed no snapshot is skipped rather than counted as zero.** Sixteen
-    of the lake's 29 sealed partitions hold gap rows alone. Counting one as zero would drag the
-    median toward zero and put every later session above the band, which is the opposite of what
-    the band is for.
+    So the walk counts sessions rather than answers. A session the lake has no partition for, or
+    one holding gap rows alone, occupies its slot in the window and contributes nothing to the
+    median. It is not counted as zero, which would invent a snapshot count nobody captured and
+    drag the median toward zero; and the window does not reach past it for a replacement, which
+    is the reading this first shipped with and which ``docs/design.md`` rules out.
 
-    The walk takes the ``trailing_median_sessions`` most recent sessions that *have* a median,
-    rather than the most recent that many partitions. The two differ after a dark stretch. The
-    second keeps the window recent and lets an outage silently thin the history until the check
-    goes quiet on ``insufficient_history``; the first reaches further back for a stable median,
-    which is what a median-relative band needs and what ``config.suspect_contract_ratio``'s own
-    trailing median already does.
+    The difference is what happens after an outage. Reaching back for a full twenty answers
+    builds a median out of sessions months older than the one being judged, and the drift
+    measured to justify ``config.battery_row_count_band`` is drift across *consecutive*
+    sessions. The first sessions back would then be measured against a stale roster and
+    quarantined, which fails closed on good new data. Counting sessions instead leaves the
+    window mostly empty, the contributing count falls under ``config.min_trailing_sessions`` and
+    the check reports ``insufficient_history``, which fails open and says so.
+
+    **Prior sessions only.** A statistic that includes its own subject cannot say the subject is
+    unusual, and "trailing" is what the config field is called. The measurement is worth stating
+    because it bounds the claim rather than supporting it: at the configured five, including the
+    judged session would not by itself let a wholly truncated session pass, because the median
+    of one zero and four full sessions is still a full session. The rule is about what the
+    statistic means, not about a case anyone has observed.
 
     **A trailing session another check quarantined is admitted.** Excluding it would make the
-    band depend on the ledger this same run is writing. A median is what makes that safe: a
-    minority of bad sessions does not move it.
+    band depend on the ledger this same run is writing. The design's own sentence above is the
+    warrant: all sessions enter the window and the median's robustness is the defense.
 
     ``memo`` is the run's cache of one median per partition. A whole-lake run otherwise reads
-    each partition's twenty predecessors once per partition, which is twenty times the reads for
-    the same answer.
+    each partition's trailing window once per partition, which is twenty times the reads for the
+    same answer.
     """
     root = Path(lake_root)
     directory = root / partition.surface / f"{TICKER_PREFIX}{partition.ticker}"
     found: list[float] = []
-    days: list[date] = []
-    for path in directory.glob(f"{DATE_PREFIX}*.parquet"):
-        try:
-            when = date.fromisoformat(path.stem[len(DATE_PREFIX) :])
-        except ValueError:
-            continue
-        if when < partition.day:
-            days.append(when)
+    when = partition.day
+    sessions = 0
 
-    for when in sorted(days, reverse=True):
-        if len(found) >= guards.trailing_median_sessions:
-            break
+    while sessions < guards.trailing_median_sessions:
+        when -= timedelta(days=1)
+        bounds = _session_bounds(calendar, when)
+        if bounds is None:
+            continue
         earlier = SealedPartition(
             path=directory / f"{DATE_PREFIX}{when.isoformat()}.parquet",
             surface=partition.surface,
@@ -1580,12 +1626,15 @@ def trailing_medians(
             day=when,
         )
         if not in_scope(earlier, spans):
-            continue
-        bounds = _session_bounds(calendar, when)
-        if bounds is None:
-            continue
+            # Outside every capture span there is no session to have captured, so this is the
+            # end of the window rather than an empty slot in it. Walking on would count the
+            # days before onboarding against a roster that did not exist.
+            break
+        sessions += 1
         if memo is not None and earlier.relative in memo:
             found.append(memo[earlier.relative])
+            continue
+        if not earlier.path.exists():
             continue
         try:
             counts = session_snapshot_counts(earlier, bounds)
@@ -1641,7 +1690,7 @@ def judge_row_count(
             "no data row falls inside the session, so the partition carries no snapshot to "
             "measure against the trailing median",
         )
-    if len(trailing) < guards.min_trailing_sessions:
+    if not trailing or len(trailing) < guards.min_trailing_sessions:
         return _finding(
             partition,
             CHECK_ROW_COUNT_BAND,
@@ -1742,7 +1791,7 @@ def judge(
     findings: list[Finding] = []
     written: list[Finding] = []
     appended: list[str] = []
-    report: list[str] = [coverage_line(found)]
+    report: list[str] = list(found.unnamed)
     medians: dict[str, float] = {}
     deferred = 0
     withheld = 0
@@ -1857,6 +1906,13 @@ def judge(
     # than about anything the walk opened, so it does not interleave with the walk.
     findings.extend(found.missing)
 
+    # **The census goes last.** ``sweep.digest_body`` truncates the tail at 1000 bytes, and the
+    # comment this line's reasoning comes from assumed "what falls off the end first is the
+    # battery's own census". Put in front it would be the last thing to fall off instead, and
+    # the lines it would push out are the actionable ones: a release, a partition another check
+    # still withholds, a partition that would not read.
+    report.append(coverage_line(found))
+
     return BatteryReport(
         judged=sum(1 for f in findings if f.judged),
         quarantined=sum(1 for f in findings if f.verdict == QUARANTINED_VERDICT),
@@ -1867,6 +1923,7 @@ def judge(
         withheld=withheld,
         released=released,
         unreadable=unreadable,
+        scope_unknown=len(found.unnamed),
         sessions_owed=found.owed,
         sessions_missing=len(found.missing),
         appended=tuple(appended),
@@ -1888,16 +1945,31 @@ def _judge_partition(
 ) -> list[Finding]:
     """Every check's answer about one in-scope partition, in one list.
 
-    A partition holding no data row is the second out-of-scope class, and it is answered once
-    for the partition rather than once per check. Scope is a property of the partition: a day of
-    gap rows records a missed session rather than a bad one, and every check would say so from
-    the same two facts.
+    **Both out-of-scope classes are answered once for the partition**, carrying
+    :data:`CHECK_SCOPE`, and no check runs against such a partition. Scope is a property of the
+    partition and every check would answer it from the same two facts.
 
-    The row-count band is the options-only check of the three. ``docs/design.md`` names the
-    equity-only subset as "calendar coverage, quote sanity, cross-check", and on quotes a
-    snapshot is one row, so the band would compare one against a trailing median of one for
-    ever. It returns no finding there rather than an ``out_of_scope`` one, whose meaning is that
-    capture was not running.
+    The second class is the design's own wording, "a partition holding no data row **inside the
+    session**", rather than the narrower "no data row at all". The difference is a partition
+    holding only overnight cycles, and it is not hypothetical: both of the lake's 2026-09-16
+    chain partitions carry such a cycle, and a night the machine woke only for that cycle would
+    be a partition of nothing else. A closed options book is where a vendor is most likely to
+    return a zero bid against a zero ask with the mark at the last trade, which is unordered on
+    every row, so quote sanity would quarantine a partition the design says nothing should
+    judge.
+
+    **The row-count band is the options-only check of the three**, and it is also the only one
+    that needs a session. ``docs/design.md`` names the equity-only subset as "calendar coverage,
+    quote sanity, cross-check", and on quotes a snapshot is one row, so the band would compare
+    one against a trailing median of one for ever. It returns no finding on quotes rather than
+    an ``out_of_scope`` one, whose meaning is that capture was not running.
+
+    On a day the calendar calls no session it returns ``out_of_scope`` instead, and that is a
+    different answer from the one it gives quotes. ``_session_bounds`` answers ``None`` there,
+    which widens :func:`_within` to every row, so the band would count overnight cycles as
+    session snapshots and measure them against a median :func:`trailing_medians` builds from
+    real sessions alone. The entitlement check's flag half still runs on such a day, which is
+    the half that could see a delayed feed, and ``_session_bounds`` gives that reason.
     """
     evidence = read_entitlement(partition, bounds)
     if evidence.rows == 0:
@@ -1911,29 +1983,52 @@ def _judge_partition(
             )
         ]
 
+    if bounds is not None and evidence.session_rows == 0:
+        return [
+            _finding(
+                partition,
+                CHECK_SCOPE,
+                OUT_OF_SCOPE,
+                "no data row falls inside the session, so a day of overnight cycles "
+                "recorded no session rather than a bad one",
+            )
+        ]
+
     judged = [
         judge_entitlement(partition, evidence, guards),
         judge_quote_order(partition, read_quote_order(partition)),
     ]
-    if partition.surface == CHAINS:
-        counts = session_snapshot_counts(partition, bounds)
-        if counts:
-            medians[partition.relative] = median(counts)
+    if partition.surface != CHAINS:
+        return judged
+    if bounds is None:
         judged.append(
-            judge_row_count(
+            _finding(
                 partition,
-                counts,
-                trailing_medians(
-                    root,
-                    partition,
-                    calendar=calendar,
-                    spans=spans,
-                    guards=guards,
-                    memo=medians,
-                ),
-                guards,
+                CHECK_ROW_COUNT_BAND,
+                OUT_OF_SCOPE,
+                "the calendar calls the day no session, so there is neither a session to "
+                "count snapshots over nor a comparable median to count them against",
             )
         )
+        return judged
+    counts = session_snapshot_counts(partition, bounds)
+    if counts:
+        medians[partition.relative] = median(counts)
+    judged.append(
+        judge_row_count(
+            partition,
+            counts,
+            trailing_medians(
+                root,
+                partition,
+                calendar=calendar,
+                spans=spans,
+                guards=guards,
+                memo=medians,
+            ),
+            guards,
+        )
+    )
     return judged
 
 
