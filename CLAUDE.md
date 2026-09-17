@@ -138,23 +138,7 @@ The same applies to an issue a spawned session is told it may file. The instruct
 
 **Close an issue only when nothing is left in it (owner directive, 2026-09-12).** Before a PR closes an issue, move whatever that PR does not do into its own issue. A piece described only inside a body goes when the body closes, and nothing surfaces it again. Two issues have already gone that way, and in both the closing PR's own text named the work it was leaving. #101 was closed by the PR that did half of it. #85 opened with `Closes #77.` and then said a later PR would drop the column, whose remainder survives only because #96 was filed for it afterwards.
 
-While a piece is outstanding, a PR writes `Part of #NN` and the closing keyword waits for the PR that leaves nothing. GitHub reads the keyword only when the number follows it immediately, so Closes #101 closes and "Closes the second half of #101" closes nothing at all. #109 wrote the second form and linked no issue.
-
-**That rule is necessary and not sufficient (owner directive, 2026-09-17).** Sixteen pull requests have lost their issue link, and ten of them wrote the number immediately after the keyword and still closed nothing. Three things break the link, and only the first is the one #109 named.
-
-1. **A code span breaks it even when the number is adjacent.** Ten instances. #306's body wrote the keyword and its number inside backticks, satisfied the rule as written, and parsed nothing. This is the common case, and it is common because the house style reaches for a code span around anything that looks like a token.
-2. **A line break between the keyword and the number breaks it.** Two instances, #364 and #372, each with the keyword ending one line and the link opening the next.
-3. **Reading the body back does not tell you which took.** #377 wrote two keywords identically in one sentence and GitHub parsed one of them.
-
-So write the keyword as plain text with the number immediately after it, no code span and no markdown link, and then ask the API rather than the page:
-
-```bash
-gh pr view <n> --repo l3a0/marketlake --json closingIssuesReferences
-```
-
-That command is ground truth, because it returns what GitHub actually parsed. It lags a push by a second or two, so an empty result immediately after opening a pull request is not an answer; re-read before concluding anything. Three sessions adopted it by hand before it was written down here, which is the evidence it belongs in the file.
-
-The sentence teaching this rule used to illustrate with a code span, which is the typography that loses.
+While a piece is outstanding, a PR writes `Part of #NN` and the closing keyword waits for the PR that leaves nothing. GitHub reads the keyword only when the number follows it immediately, so `Closes #101` closes and `Closes the second half of #101` closes nothing at all. #109 wrote the second form and linked no issue.
 
 An issue whose pieces have all been split has no finishing PR left, so close it by hand and name where each piece went. Do the same when two PRs are open against one issue, because merge order decides which lands last and neither body can know it. The split is the guard that matters here. The keyword discipline only keeps the issue open long enough to make the split.
 

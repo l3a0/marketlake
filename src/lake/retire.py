@@ -8,8 +8,19 @@ what keeps a later rejoin's time away out of scope rather than marked as gaps.
 
 Closing the span comes before the roster change on purpose. Capture only records inside an
 open span, so once the span is closed the ticker is not captured again even if a crash
-leaves it in the roster. The bad state, off or removed with the span still open, cannot
-happen because the roster change is last.
+leaves it in the roster. The bad state is off or removed with the span still open, and what
+keeps it away depends on what is being kept away.
+
+Ordering keeps a *crash* from reaching it, because the roster change is last. That is the
+claim this docstring used to make without qualification, and a crash is the only thing it
+covers. The lake-root lock closes one of the two ways a *second writer* reaches it: the
+spans are read and rewritten under one hold, so a concurrent close is no longer discarded
+by a write of a stale snapshot. Marketlake #481.
+
+The other way is still open and is not this command's to close alone. The roster change
+below runs after the hold is released, so a rejoining onboard landing between the two
+reopens the span and this then turns the entry off on top of it. Executed, that lands the
+bad state with the lock held correctly throughout. Marketlake #491 owns the pair.
 
 Run it as ``python -m lake.retire TICKER``. By default it disables the ticker in place,
 keeping the entry so it is easy to turn back on. Pass ``--remove`` to delete the entry
@@ -99,29 +110,42 @@ def retire(
         raise RetireError(f"ticker not in the security master: {ticker!r}")
 
     spans_file = capture_spans.spans_path(lake_root)
-    if not spans_file.exists() and master.instrument_ids():
-        # See the matching guard in onboard.py: the master already knows this ticker, so
-        # a fresh, empty spans file here would read as "never had an open span," and
-        # retire would silently record no history at all for the time it was captured.
-        raise RetireError(
-            "capture spans are missing but the security master already has instruments; "
-            "run `python -m lake.seed_spans` before retiring"
-        )
-    spans = (
-        capture_spans.CaptureSpans.read(spans_file)
-        if spans_file.exists()
-        else capture_spans.CaptureSpans()
-    )
 
-    already_retired = not spans.has_open_span(instrument_id)
+    # Local to keep this module free of the lock unless it writes, the same reason
+    # onboard.py and seed_spans.py import it here rather than at module scope.
+    from lake.lock import lake_lock
+
     span_end: datetime | None = None
-    if not already_retired:
-        span_end = now
-        spans.close_span(instrument_id, span_end)
-        # Close the span first, under the lock, before the roster change below.
-        from lake.lock import lake_lock
-
-        with lake_lock(lake_root):
+    with lake_lock(lake_root):
+        # The spans are read inside the hold that rewrites them, because every decision
+        # below is taken from that read and the file is rewritten whole rather than
+        # appended to. A span another writer closed in the window would be reopened by a
+        # write of a stale snapshot, and an instrument another writer opened one for
+        # would lose it outright. The second of those costs captured minutes: this
+        # command never writes the master, so that instrument keeps its master row,
+        # ``capture._live_roster`` resolves it and finds no span, and the ticker is
+        # captured by nothing while still enabled in the roster.
+        #
+        # The hold is taken even when nothing is written, because whether anything is
+        # written is itself one of the decisions the read makes.
+        if not spans_file.exists() and master.instrument_ids():
+            # See the matching guard in onboard.py: the master already knows this ticker,
+            # so a fresh, empty spans file here would read as "never had an open span,"
+            # and retire would silently record no history at all for the time it was
+            # captured.
+            raise RetireError(
+                "capture spans are missing but the security master already has instruments; "
+                "run `python -m lake.seed_spans` before retiring"
+            )
+        spans = (
+            capture_spans.CaptureSpans.read(spans_file)
+            if spans_file.exists()
+            else capture_spans.CaptureSpans()
+        )
+        already_retired = not spans.has_open_span(instrument_id)
+        if not already_retired:
+            span_end = now
+            spans.close_span(instrument_id, span_end)
             spans.write(spans_file)
             record_partition(
                 lake_root,

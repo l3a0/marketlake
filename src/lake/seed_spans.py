@@ -72,16 +72,10 @@ def seed_spans(
     lake_root = Path(lake_root)
     on = _market_date(clock)
     target = spans_path(lake_root)
-    if target.exists():
-        existing = CaptureSpans.read(target)
-        return SeedReport(
-            already_seeded=True,
-            instrument_count=len(existing.instrument_ids()),
-            spans_path=target,
-        )
-
     master_file = security_master.master_path(lake_root)
-    master = SecurityMaster.read(master_file) if master_file.exists() else SecurityMaster()
+
+    # The roster is read outside the hold, because it is machine-local config rather than
+    # lake state, the same rule ``lake.gap`` follows for its own roster read.
     try:
         roster = load_tickers(tickers_path, env=tickers_env)
     except Exception:  # noqa: BLE001 - a bad or absent roster still gets a spans file
@@ -92,13 +86,29 @@ def seed_spans(
         roster = None
     roster_options = None if roster is None else {entry.ticker: entry.options for entry in roster}
 
-    spans = build_from_master(master, roster_options, on)
-
     # Local to keep this module free of the lock unless it writes, the same reason
     # onboard.py and retire.py import it here rather than at module scope.
     from lake.lock import lake_lock
 
     with lake_lock(lake_root):
+        # Both reads below decide what this writes, so both are inside the hold that
+        # writes it. The existence check decides whether to write at all: an onboarding
+        # landing between an unlocked check and this write creates the spans file with
+        # its ticker's open span, and this then overwrites that file whole while
+        # reporting that it seeded nothing. The master read decides the rows, and an
+        # instrument registered in the same window would get no span. Neither is
+        # repairable by running the command again, because the second run finds the file
+        # present and returns above.
+        if target.exists():
+            existing = CaptureSpans.read(target)
+            return SeedReport(
+                already_seeded=True,
+                instrument_count=len(existing.instrument_ids()),
+                spans_path=target,
+            )
+
+        master = SecurityMaster.read(master_file) if master_file.exists() else SecurityMaster()
+        spans = build_from_master(master, roster_options, on)
         spans.write(target)
         record_partition(
             lake_root,
