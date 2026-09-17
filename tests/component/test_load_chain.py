@@ -524,9 +524,10 @@ def test_a_superseding_clean_verdict_un_quarantines(fixture_lake: FixtureLake):
 def test_an_entry_the_reader_cannot_recognise_excludes(fixture_lake: FixtureLake):
     """Fail closed for data already sealed means an unreadable verdict refuses.
 
-    #139 owns the entry shape and has not been built, so a writer can land a spelling this
-    read does not know. Admitting one would fail open on exactly the partition the guard
-    exists to withhold.
+    ``battery.build_entry`` owns the entry shape and both writers go through it, so a
+    spelling this read does not know comes from a hand-edited ledger rather than from a
+    writer. Admitting one would fail open on exactly the partition the guard exists to
+    withhold.
     """
     root = _lake(fixture_lake, quarantine=[{"partition": FULL_PARTITION, "note": "unreadable"}])
 

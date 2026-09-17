@@ -328,7 +328,7 @@ def test_the_manifest_row_count_follows_the_file_and_never_shrinks(lake: Path):
 
 
 def test_a_human_sign_off_stands_against_the_same_check_re_observing():
-    """Marketlake #139's rule, built here because #139 ships after this.
+    """Marketlake #139's rule, built here because #139 shipped after this.
 
     A sealed partition is immutable, so the same check finds the same thing every night.
     Without this a sign-off lasts until 18:30.

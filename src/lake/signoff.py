@@ -15,23 +15,33 @@ quarantined the partition, because ``battery.human_precedence`` compares
 ``current["check"]`` against the check being run. A sign-off carrying a token no check emits is
 invisible to it, ``battery._transition`` then sees a different check and appends a fresh
 quarantine, and the sign-off lasts until 18:30. So nothing here mints a check name. The check is
-read off the entry currently withholding the partition, and ``--check`` names one explicitly
-where several withhold.
+read off the entry currently withholding the partition.
 
-**This inherits three rules rather than inventing them.** ``battery.append_verdict`` takes the
-lake-root ``flock`` itself and appends the ledger line beside the refreshed manifest entry
-inside one hold, which is the rule a weekend sign-off needs so the Sunday scrub never faces a
-sha nothing has caught up to. ``battery.build_entry`` is the one place an entry is assembled and
-checked. Un-quarantine as a superseding entry rather than a deletion is the ledger's own rule,
-stated in ``manifest.py``. This module adds none of the three and re-implements none of them.
+**This inherits three rules rather than inventing them.**
+
+1. ``battery.append_verdict`` takes the lake-root ``flock`` itself and appends the ledger line
+   beside the refreshed manifest entry inside one hold, which is the rule a weekend sign-off
+   needs so the Sunday scrub never faces a sha nothing has caught up to.
+2. ``battery.build_entry`` is the one place an entry is assembled and checked.
+3. Un-quarantine as a superseding entry rather than a deletion is the ledger's own rule, stated
+   in ``manifest.py``.
+
+This module adds none of the three and re-implements none of them.
 
 **Resolution is read, never re-derived.** ``manifest.latest_quarantine`` is what decides a
 partition's readability, and ``manifest.is_quarantined``'s docstring says why both sides have to
 meet there: "reader and writer have to meet at one definition or the exclusion silently
-inverts." Marketlake #426 moves the ledger to last entry wins per ``(partition, check)`` and
-keeps ``latest_quarantine`` by name and by shape, so this module needs no change when it lands.
-On a partition two checks withhold it signs off one check per run, and the report names what
-still withholds.
+inverts."
+
+**This tool addresses the deciding entry and nothing beside it.** That is one entry per
+partition, because ``manifest._latest_by_partition`` keys on the partition alone. So ``--check``
+confirms the check about to be written and cannot select a different one, and a partition two
+checks withhold is outside what the shipped reader can express. Marketlake #426 moves the
+ledger to last entry wins per ``(partition, check)`` and adds ``latest_quarantine_by_check`` and
+``withholding`` for exactly that case. Marketlake #456 is this tool's half of it and depends on
+#426. Until then the limit is named rather than papered over, and it costs nothing today:
+``battery.CHECK_ENTITLEMENT`` is the only token any writer emits, so no partition has ever
+carried two.
 
 **Both directions exist, because one alone is a one-way door.** Signing off appends a ``clean``
 entry under the withholding check. ``--revoke`` appends a ``quarantined`` one. Without the
@@ -63,16 +73,23 @@ rollback, and writing one would make this a second writer of history.
 **Where it refuses, and to whom.** Every refusal is one named line on stderr and exit 2, never a
 stack, which is the shape ``lake.onboard`` states and ``retire`` and ``reauth`` both use. A
 cleared partition rejoins every read with nothing announcing it, so the write is made
-deliberate three ways: ``--reason`` is required and rides into the entry, ``--dry-run`` is the
-same work with the writer switched off, and the report names the verdict before and after
-beside what still withholds, so the operator reads the consequence rather than a success line.
+deliberate three ways.
+
+1. ``--reason`` is required and rides into the entry.
+2. ``--dry-run`` is the same work with the writer switched off, and it reports the verdict the
+   write would land rather than the one already there.
+3. The report names the partition's readability before and after, so the operator reads the
+   consequence rather than a success line.
+
 There is no confirmation prompt, because nothing in ``src/lake`` calls ``input()``.
 
 A lake-state failure keeps its traceback on purpose. ``manifest.latest_quarantine`` raises on a
 body line that parses and names no partition, and that is a corrupt ledger rather than an
 operator mistake, so the stack is what a reader needs. An entry that parses and names a
-partition while carrying no ``check`` is different: it is fail closed and still withholds, which
-is the reader working as designed, so it gets a named refusal instead.
+partition while carrying no ``check`` is different: the reader resolves it without complaint,
+since ``manifest.is_quarantined`` reads ``verdict`` alone and never looks at ``check``. It is
+this tool that has nothing to write under, so the refusal is this tool's to make and it gets a
+named line.
 """
 
 from __future__ import annotations
@@ -120,11 +137,16 @@ class SignoffReport:
     """What one run did, for the operator to read the consequence off.
 
     ``before`` and ``after`` are the partition's deciding entry either side of the write, so a
-    racing writer that superseded the sign-off shows up as an ``after`` that is not the entry
-    this run appended. ``still_withheld`` is what ``after`` resolves to, which is the fact that
+    racing writer that superseded the sign-off shows up as an ``after`` that is not
+    ``appended``. ``still_withheld`` is what ``after`` resolves to, which is the fact that
     matters: a partition is readable or it is not.
 
-    ``dry_run`` says the ledger was not touched, and then ``after`` is ``before``.
+    **A dry run reports the consequence, not the state it started from.** ``after`` is the entry
+    the write would land, because the report's whole job is to say what the operator is about
+    to do. Reporting ``before`` there was tried and inverts the line: a dry-run sign-off of a
+    withheld partition printed "partition now: withheld", which reads as a write that would
+    change nothing. ``dry_run`` is what says the ledger was not touched, and the report says so
+    in words rather than by quietly showing the old state.
     """
 
     partition: str
@@ -133,6 +155,7 @@ class SignoffReport:
     reason: str
     before: dict | None
     after: dict | None
+    appended: dict
     dry_run: bool
     ledger_path: Path
 
@@ -144,19 +167,22 @@ class SignoffReport:
         cleared = self.verdict == CLEAN_VERDICT
         if self.dry_run:
             head = "Would sign off" if cleared else "Would revoke"
+            was, now = "partition is:   ", "would be:       "
         else:
             head = "Signed off" if cleared else "Revoked"
-        was = "withheld" if is_quarantined(self.before) else "readable"
-        now = "withheld" if self.still_withheld else "readable"
+            was, now = "partition was:  ", "partition now:  "
         lines = [
             f"{head} {self.partition}",
             f"  check:           {self.check}",
             f"  verdict written: {self.verdict} (provenance {PROVENANCE_HUMAN})",
             f"  reason:          {self.reason}",
-            f"  partition was:   {was}",
-            f"  partition now:   {now}",
+            f"  {was} {'withheld' if is_quarantined(self.before) else 'readable'}",
+            f"  {now} {'withheld' if self.still_withheld else 'readable'}",
         ]
-        if self.still_withheld and self.after is not None:
+        # Only a verdict this run did not write can be a second holder worth naming. The
+        # partition's own new verdict is already on the line above, so printing it here again
+        # would read as a warning about something else.
+        if self.still_withheld and self.after is not None and self.after != self.appended:
             lines.append(f"  still withheld under: {self.after.get('check')!r}")
         lines.append(f"  ledger:          {self.ledger_path}")
         if self.dry_run:
@@ -168,9 +194,19 @@ def open_quarantines(lake_root: Path | str) -> list[OpenQuarantine]:
     """Every partition the ledger currently withholds, in partition order.
 
     This is the tool's own discovery surface. A standing quarantine's partition path reaches an
-    operator from one place otherwise, the History panel: ``battery.render`` prints the path
-    only on the night the verdict was written, and ``sweep.count_quarantined`` puts a bare count
-    in the nightly report. An operator holding the count and not the path cannot act on it.
+    operator from one place otherwise, the History panel. ``battery.render`` prints the path
+    on a hand run of the battery, once per night the check re-finds the fault, which is a
+    console the operator has to go and run rather than a list of what is open.
+    ``sweep.count_quarantined`` puts a bare count in the nightly report, and an operator holding
+    the count and not the path cannot act on it.
+
+    ``key=str`` sorts rather than the values themselves. ``manifest.latest_quarantine`` raises
+    on an entry naming no partition and passes through one whose partition is not a string, so a
+    hand-repaired ledger can hold an integer key. Sorting those against strings raised
+    ``TypeError`` out of the listing, which is a bare traceback on the path three of this
+    module's own refusals send an operator down when they say repairing a ledger is a human's
+    job. The damaged key is printed rather than hidden, because seeing it is how the human finds
+    what to repair.
     """
     ledger = latest_quarantine(Path(lake_root))
     return [
@@ -179,7 +215,7 @@ def open_quarantines(lake_root: Path | str) -> list[OpenQuarantine]:
             check=entry.get("check"),
             verdict=entry.get(VERDICT_FIELD),
         )
-        for partition, entry in sorted(ledger.items())
+        for partition, entry in sorted(ledger.items(), key=lambda item: str(item[0]))
         if is_quarantined(entry)
     ]
 
@@ -191,7 +227,7 @@ def render_open(quarantines: Sequence[OpenQuarantine], ledger_path: Path) -> str
     lines = [f"{len(quarantines)} partition(s) withheld:"]
     for open_one in quarantines:
         check = open_one.check if open_one.check else "(no check named)"
-        lines.append(f"  {open_one.partition}  {open_one.verdict}  under {check}")
+        lines.append(f"  {open_one.partition!s}  {open_one.verdict}  under {check}")
     lines.append(f"  ledger: {ledger_path}")
     return "\n".join(lines)
 
@@ -221,7 +257,7 @@ def _superseded_entry(lake_root: Path, partition: str, check: str | None, *, rev
                 f"nothing to {verb}: the quarantine ledger holds no entry for {partition!r}, "
                 "and it withholds no partition at all."
             )
-        listed = ", ".join(one.partition for one in open_now)
+        listed = ", ".join(str(one.partition) for one in open_now)
         raise SignoffError(
             f"nothing to {verb}: the quarantine ledger holds no entry for {partition!r}. The "
             "partition is the lake-relative path, spelled exactly as the ledger keys it, and "
@@ -249,7 +285,10 @@ def _superseded_entry(lake_root: Path, partition: str, check: str | None, *, rev
     if check is not None and check != written:
         state = "withheld" if withheld else "cleared"
         raise SignoffError(
-            f"no entry for {partition!r} carries check {check!r}. It is {state} under {written!r}."
+            f"--check says {check!r}, and the entry deciding {partition!r} carries {written!r}, "
+            f"so the partition is {state} under {written!r}. Re-run without --check to act on "
+            "that entry. This flag confirms the check about to be written and cannot select a "
+            "different one."
         )
     return entry
 
@@ -297,7 +336,7 @@ def signoff(
     )
 
     if dry_run:
-        after = before
+        after = entry
     else:
         append_verdict(root, entry, observed_at=now, source=SIGNOFF_SOURCE)
         if entry not in read_quarantine(root):
@@ -316,6 +355,7 @@ def signoff(
         reason=reason,
         before=before,
         after=after,
+        appended=entry,
         dry_run=dry_run,
         ledger_path=quarantine_path(root),
     )
@@ -372,7 +412,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--check",
-        help="The check to sign off, where more than one withholds the partition.",
+        help="Confirm the check about to be written. It cannot select a different one.",
     )
     parser.add_argument(
         "--revoke",

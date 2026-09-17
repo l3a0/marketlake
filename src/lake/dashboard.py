@@ -1697,10 +1697,15 @@ def _open_quarantines(root: Path) -> tuple[list[dict[str, object]], str | None]:
     its docstring true. ``_capture_spans`` already keeps the same promise for the same
     reason: one panel served without a clamp rather than a panel not served at all.
 
-    The entry's shape is marketlake #139's and #139 is unbuilt, so only the partition
-    path and the ``verdict`` field are read, both defensively. The panel prints no
-    sign-off command, because the tool that would run it does not exist and its spelling
-    is not settled.
+    Only the partition path and the ``verdict`` field are read, and both defensively. The
+    entry's shape is ``battery.build_entry``'s, which marketlake #406 pinned, and reading no
+    more than these two keeps the panel working against an entry a later check extends.
+
+    The panel prints no sign-off command. Marketlake #139 shipped the tool as ``lake.signoff``,
+    so the original reason is spent, and ``docs/design.md``'s register carries the one that
+    replaced it: a partition several checks withhold owes one command per check, and the panel
+    cannot name them until marketlake #426 resolves the ledger per check. Marketlake #445
+    carries the command.
     """
     try:
         ledger = latest_quarantine(root)

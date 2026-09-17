@@ -108,7 +108,9 @@ a second read path that the other skips.
    fail closed means for data already sealed. What a verdict means is
    ``manifest.is_quarantined``, beside the ledger rather than inside this reader, so the
    battery and the sign-off tool meet this read at one definition. ``lake.battery`` is that
-   battery, and marketlake #406 shipped it, so the ledger has a writer. An absent ledger still
+   battery, and marketlake #406 shipped it, so the ledger has a writer. ``lake.signoff`` is the
+   sign-off tool, shipped by marketlake #139, and it is what clears a verdict this read
+   refuses. An absent ledger still
    excludes nothing and raises nothing, which is what keeps a fresh lake readable. The guard was
    inert until that writer landed and correct from the day it shipped, which is why it was not
    deferred. Building it after #136 and #137 already read through here would have left their

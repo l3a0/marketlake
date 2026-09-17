@@ -229,10 +229,12 @@ def is_quarantined(entry: dict | None) -> bool:
     withholds it, including one whose shape this does not recognise, because fail closed
     for data already sealed means an unreadable verdict refuses rather than admits.
 
-    The rule sits beside the ledger rather than inside its first reader. Marketlake #139
-    is authoritative for the entry shape and has not been built, so reader and writer have
-    to meet at one definition or the exclusion silently inverts. A sign-off tool writing
-    its own spelling of "cleared" would leave a partition it just cleared refused forever.
+    The rule sits beside the ledger rather than inside its first reader, because reader and
+    writer have to meet at one definition or the exclusion silently inverts. A sign-off tool
+    writing its own spelling of "cleared" would leave a partition it just cleared refused
+    forever. Marketlake #139 built that tool as ``lake.signoff``, and it writes
+    :data:`CLEAN_VERDICT` from ``lake.battery`` rather than a spelling of its own, so the
+    hypothesis this paragraph was written against is now settled rather than open.
     """
     return entry is not None and entry.get(VERDICT_FIELD) != CLEAN_VERDICT
 

@@ -26,7 +26,7 @@ the verdict about it is not.
 
 **The entry's five fields, and why four of them were decided elsewhere.**
 ``manifest.is_quarantined`` ships and fails closed, so a verdict it cannot read withholds its
-partition forever, and marketlake #139 states a precedence rule before its own tool is built.
+partition forever, and marketlake #139 states a precedence rule its own tool later builds on.
 Between them they decide four of the five.
 
 1. ``partition``, which the reader keys on.
@@ -56,15 +56,18 @@ per-check answer and the ledger carries the partition's readability, and only a 
 else, and the comment above it says each ledger writer refreshes its own manifest entry in the
 same locked invocation that appends the row, because that is the check which catches a verdict
 written without its entry. ``quarantine.jsonl`` is not excluded, so an unmanifested ledger is an
-orphan to the Sunday scrub. #139 requires the same of the sign-off tool. ``actions.append`` is
+orphan to the Sunday scrub. #139 requires the same of the sign-off tool, and ``lake.signoff``
+meets it at :func:`append_verdict` rather than at the bare append. ``actions.append`` is
 the worked precedent and :func:`append_verdict` follows it, down to counting the file's lines
 rather than the entries a read returns, so a damaged ledger cannot stop the writer.
 
 **Human precedence, which #139 states and this builds.** Before appending, the battery reads the
 partition's current last entry. If a human wrote it, a verdict from the *same* check never
 supersedes it, and the run says "re-observed, human precedence stands" in the nightly report.
-#139 depends on this deliverable and ships after it, so a rule built there would arrive too
-late: the sign-off tool would ship with its sign-offs undone by the next nightly run.
+#139 depended on this deliverable and shipped after it, so a rule built there would have
+arrived too late: the sign-off tool would have shipped with its sign-offs undone by the next
+nightly run. ``lake.signoff`` is that tool, and it writes its sign-off under the check named on
+the entry it supersedes, which is the token this function compares.
 
 **Append on transition only.** A sealed partition is immutable, so the same check against the
 same partition is the same finding every night. A partition with no entry already reads, so

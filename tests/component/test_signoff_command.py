@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from lake.battery import (
+    BATTERY_SOURCE,
     CHECK_ENTITLEMENT,
     CLEAN_VERDICT,
     PROVENANCE_BATTERY,
@@ -26,11 +27,14 @@ from lake.battery import (
     QUARANTINED_VERDICT,
     SIGNOFF_SOURCE,
     Finding,
+    _transition,
     append_verdict,
     build_entry,
     human_precedence,
 )
+from lake.calendar import MARKET_TZ
 from lake.manifest import (
+    ManifestError,
     append_quarantine,
     is_quarantined,
     latest_entries,
@@ -107,7 +111,13 @@ def test_the_sign_off_carries_the_check_that_quarantined_the_partition(tmp_path:
 
 
 def test_the_next_nightly_run_leaves_the_sign_off_standing(tmp_path: Path):
-    """The whole point, driven through the battery's own two decision functions."""
+    """The whole point, driven through the two functions `battery.judge` decides with.
+
+    `judge` consults `human_precedence` first and `_transition` after. Asserting both is what
+    separates "the sign-off survives" from "the sign-off happens to survive": `_transition`
+    returns True on this finding, so a line would be appended and the partition re-quarantined
+    if precedence were not what stops it first.
+    """
     _quarantine(tmp_path)
     signoff(PARTITION, reason="verified", clock=_clock(), lake_root=tmp_path)
 
@@ -125,7 +135,8 @@ def test_the_next_nightly_run_leaves_the_sign_off_standing(tmp_path: Path):
     entry = latest_quarantine(tmp_path)[PARTITION]
 
     assert human_precedence(entry, tonight.check) is True
-    assert is_quarantined(latest_quarantine(tmp_path)[PARTITION]) is False
+    assert _transition(entry, tonight) is True
+    assert is_quarantined(entry) is False
 
 
 def test_a_revoke_withholds_the_partition_again_under_the_same_check(tmp_path: Path):
@@ -142,6 +153,12 @@ def test_a_revoke_withholds_the_partition_again_under_the_same_check(tmp_path: P
     entry = latest_quarantine(tmp_path)[PARTITION]
     assert entry["check"] == CHECK_ENTITLEMENT
     assert entry["provenance"] == PROVENANCE_HUMAN
+    # The report is the only thing an operator reads back, so it must not say "Signed off".
+    rendered = report.render()
+    assert rendered.startswith("Revoked ")
+    assert "partition was:   readable" in rendered
+    assert "partition now:   withheld" in rendered
+    assert "that sign-off was wrong" in rendered
 
 
 def test_a_revoked_partition_can_be_signed_off_again(tmp_path: Path):
@@ -163,6 +180,21 @@ def test_the_reason_rides_into_the_ledger_entry(tmp_path: Path):
     signoff(PARTITION, reason="checked the raw payload by hand", clock=_clock(), lake_root=tmp_path)
 
     assert latest_quarantine(tmp_path)[PARTITION]["reason"] == "checked the raw payload by hand"
+
+
+def test_the_entry_and_its_manifest_row_carry_the_run_clock(tmp_path: Path):
+    """The ledger is where a reader finds out when a human cleared a partition.
+
+    Both stamps come from the same injected clock, and nothing else in the suite reads either,
+    so without this the clock every other test bothers to inject reaches nothing.
+    """
+    _quarantine(tmp_path)
+
+    signoff(PARTITION, reason="verified", clock=_clock(), lake_root=tmp_path)
+
+    stamp = NOW.astimezone(MARKET_TZ).isoformat()
+    assert latest_quarantine(tmp_path)[PARTITION]["observed_at"] == stamp
+    assert latest_entries(tmp_path)["quarantine.jsonl"]["fetched_at"] == stamp
 
 
 # -- the ledger's own rules --------------------------------------------------
@@ -200,7 +232,11 @@ def test_the_manifest_entry_names_the_sign_off_tool_as_its_source(tmp_path: Path
 
     signoff(PARTITION, reason="verified", clock=_clock(), lake_root=tmp_path)
 
-    assert latest_entries(tmp_path)["quarantine.jsonl"]["source"] == SIGNOFF_SOURCE
+    # The literal, not the constant. Comparing the written value against the constant that
+    # wrote it can never fail, and the whole point of the constant is that the two writers
+    # stamp different strings.
+    assert latest_entries(tmp_path)["quarantine.jsonl"]["source"] == "signoff"
+    assert SIGNOFF_SOURCE != BATTERY_SOURCE
 
 
 def test_a_reason_carrying_newlines_stays_one_entry_on_one_line(tmp_path: Path):
@@ -386,16 +422,58 @@ def test_the_read_back_accepts_a_sign_off_a_later_entry_superseded(tmp_path: Pat
 # -- the dry run and the listing ---------------------------------------------
 
 
-def test_a_dry_run_writes_nothing_and_says_so(tmp_path: Path):
+def test_a_dry_run_writes_nothing_and_reports_the_consequence(tmp_path: Path):
+    """A preview that showed the state it started from would read as a write that does nothing.
+
+    The first draft set ``after`` to ``before`` here, so a dry-run sign-off of a withheld
+    partition printed "partition now: withheld". An operator reading that concludes the real
+    run will not clear it, which is the opposite of what happens.
+    """
     _quarantine(tmp_path)
 
     report = signoff(PARTITION, reason="verified", clock=_clock(), lake_root=tmp_path, dry_run=True)
 
     assert report.dry_run is True
-    assert report.still_withheld is True
+    assert report.still_withheld is False
     assert len(read_quarantine(tmp_path)) == 1
-    assert "nothing was written" in report.render()
-    assert "Would sign off" in report.render()
+    assert is_quarantined(latest_quarantine(tmp_path)[PARTITION]) is True
+    rendered = report.render()
+    assert rendered.startswith("Would sign off ")
+    assert "partition is:    withheld" in rendered
+    assert "would be:        readable" in rendered
+    assert "verified" in rendered
+    assert "nothing was written" in rendered
+
+
+def test_a_dry_run_revoke_says_it_would_revoke(tmp_path: Path):
+    """The dry run's other direction, which nothing rendered."""
+    _quarantine(tmp_path)
+    signoff(PARTITION, reason="verified", clock=_clock(), lake_root=tmp_path)
+
+    report = signoff(
+        PARTITION, reason="wrong", clock=_clock(), lake_root=tmp_path, revoke=True, dry_run=True
+    )
+
+    rendered = report.render()
+    assert rendered.startswith("Would revoke ")
+    assert "partition is:    readable" in rendered
+    assert "would be:        withheld" in rendered
+    assert len(read_quarantine(tmp_path)) == 2
+
+
+def test_the_report_names_a_second_holder_and_never_the_verdict_it_just_wrote(tmp_path: Path):
+    """ "still withheld under" must mean something else holds it, or it reads as a false alarm.
+
+    A revoke leaves the partition withheld under the entry the run itself wrote, and naming
+    that check would read as a warning about a second holder where there is none.
+    """
+    _quarantine(tmp_path)
+    signoff(PARTITION, reason="verified", clock=_clock(), lake_root=tmp_path)
+
+    report = signoff(PARTITION, reason="wrong", clock=_clock(), lake_root=tmp_path, revoke=True)
+
+    assert report.still_withheld is True
+    assert "still withheld under:" not in report.render()
 
 
 def test_a_dry_run_refuses_everything_a_real_run_refuses(tmp_path: Path):
@@ -492,6 +570,127 @@ def test_the_command_with_no_partition_lists_and_writes_nothing(tmp_path: Path, 
     assert code == 0
     assert PARTITION in capsys.readouterr().out
     assert len(read_quarantine(lake)) == 1
+
+
+def test_the_command_wires_dry_run_through_to_the_core(tmp_path: Path, capsys):
+    """The flag reaches the core, rather than the core's flag defaulting off underneath it.
+
+    Every other command test passes a partition and a reason, so the whole argparse-to-core
+    wiring for the three behaviour flags was exercised by nothing. Replacing `args.dry_run`
+    with a literal `False` left the suite green while `--dry-run` cleared the partition.
+    """
+    lake = tmp_path / "lake"
+    lake.mkdir()
+    _quarantine(lake)
+    config = _config(tmp_path, lake)
+
+    code = main(
+        [PARTITION, "--reason", "preview", "--dry-run", "--config", str(config)], clock=_clock()
+    )
+
+    assert code == 0
+    assert "Would sign off" in capsys.readouterr().out
+    assert len(read_quarantine(lake)) == 1
+    assert is_quarantined(latest_quarantine(lake)[PARTITION]) is True
+
+
+def test_the_command_wires_revoke_through_to_the_core(tmp_path: Path, capsys):
+    """Without this, `--revoke` signed off instead of withholding and nothing noticed."""
+    lake = tmp_path / "lake"
+    lake.mkdir()
+    _quarantine(lake)
+    signoff(PARTITION, reason="verified", clock=_clock(), lake_root=lake)
+    config = _config(tmp_path, lake)
+
+    code = main(
+        [PARTITION, "--reason", "wrong", "--revoke", "--config", str(config)], clock=_clock()
+    )
+
+    assert code == 0
+    assert "Revoked" in capsys.readouterr().out
+    assert is_quarantined(latest_quarantine(lake)[PARTITION]) is True
+
+
+def test_the_command_wires_check_through_to_the_core(tmp_path: Path, capsys):
+    """Without this, `--check` was discarded and every confirmation silently passed."""
+    lake = tmp_path / "lake"
+    lake.mkdir()
+    _quarantine(lake)
+    config = _config(tmp_path, lake)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(
+            [PARTITION, "--reason", "x", "--check", "quote_sanity", "--config", str(config)],
+            clock=_clock(),
+        )
+
+    assert exit_info.value.code == 2
+    assert "--check says 'quote_sanity'" in capsys.readouterr().err
+    assert len(read_quarantine(lake)) == 1
+
+
+def test_a_corrupt_ledger_keeps_its_traceback(tmp_path: Path):
+    """`main` catches `SignoffError` and nothing wider, which the module docstring states twice.
+
+    Widening the catch to `Exception` left every test green while a corrupt integrity root
+    reached the operator dressed as a typo. `SystemExit` is a `BaseException`, so the
+    bad-config test cannot see the difference.
+    """
+    lake = tmp_path / "lake"
+    lake.mkdir()
+    append_quarantine(lake, {"verdict": QUARANTINED_VERDICT, "check": CHECK_ENTITLEMENT})
+    config = _config(tmp_path, lake)
+
+    with pytest.raises(ManifestError) as raised:
+        main([PARTITION, "--reason", "x", "--config", str(config)], clock=_clock())
+
+    assert "names no partition" in str(raised.value)
+
+
+def test_the_listing_renders_the_count_the_verdict_and_the_check(tmp_path: Path):
+    """`render_open` is what the operator reads, and nothing exercised it on a real ledger."""
+    _quarantine(tmp_path)
+    _quarantine(tmp_path, partition=OTHER, check="quote_sanity")
+
+    rendered = render_open(open_quarantines(tmp_path), quarantine_path(tmp_path))
+
+    assert rendered.startswith("2 partition(s) withheld:")
+    assert f"  {PARTITION}  {QUARANTINED_VERDICT}  under {CHECK_ENTITLEMENT}" in rendered
+    assert f"  {OTHER}  {QUARANTINED_VERDICT}  under quote_sanity" in rendered
+
+
+def test_the_listing_sorts_rather_than_following_the_ledger_order(tmp_path: Path):
+    """Written in reverse order, so following the file would be visible."""
+    _quarantine(tmp_path, partition=OTHER)
+    _quarantine(tmp_path, partition=PARTITION)
+
+    assert [one.partition for one in open_quarantines(tmp_path)] == [PARTITION, OTHER]
+
+
+def test_a_damaged_partition_key_is_listed_rather_than_crashing_the_refusal(tmp_path: Path):
+    """The path three of this module's own refusals send a human down.
+
+    They say repairing a ledger is a human's job under the lock, and a hand-repaired ledger is
+    what the next run reads. A partition key that is not a string used to raise `TypeError` out
+    of the listing, which is a bare traceback on the refusal the docstring calls the common one.
+    """
+    append_quarantine(
+        tmp_path,
+        {"partition": 20260914, "verdict": QUARANTINED_VERDICT, "check": CHECK_ENTITLEMENT},
+    )
+    _quarantine(tmp_path)
+
+    with pytest.raises(SignoffError) as refusal:
+        signoff(
+            "chains/ticker=QQQ/date=2026-09-15.parquet",
+            reason="x",
+            clock=_clock(),
+            lake_root=tmp_path,
+        )
+
+    assert "20260914" in str(refusal.value)
+    assert PARTITION in str(refusal.value)
+    assert "20260914" in render_open(open_quarantines(tmp_path), quarantine_path(tmp_path))
 
 
 def test_a_bad_config_file_refuses_with_one_line_rather_than_a_stack(tmp_path: Path, capsys):
