@@ -3003,7 +3003,7 @@ def test_a_partition_passing_three_checks_under_one_hold_says_so_once(lake: Path
 def test_the_delayed_feed_page_does_not_fire_on_a_crossed_quote(lake: Path):
     """The page belongs to one check. A quote-sanity quarantine reaching a phone titled
     ``Delayed feed`` would render its rate as a staleness in seconds, and the design gives the
-    battery two pages of which the other is #427."""
+    battery two pages of which the other is ``battery_drift``'s schema drift."""
     _write(lake, "chains", "SPY", DAY, _ordered_rows("chains", count=100, crossed=100))
     _seed_spans(lake)
     publisher, transport = _publisher(lake)
@@ -3506,3 +3506,103 @@ def _entitlement_finding_for(verdict: str) -> Finding:
         verdict=verdict,
         reason="",
     )
+
+
+# -- the second page, marketlake #427 ----------------------------------------
+
+
+def test_a_schema_drift_failure_does_not_cost_the_delayed_feed_page(lake: Path, monkeypatch):
+    """Placement is what bounds the blast radius, so the test is about order and not wording.
+
+    ``sweep`` wraps the whole of ``judge`` in ``except Exception`` because "the battery must
+    not cost the record", so a raise reaches the nightly report either way. What that
+    containment cannot give back is the delayed-feed page, which fires inside this function.
+    Run before the page, a drift check that raises costs the battery's one shipped page on a
+    night whose delayed feed is exactly what it was for.
+    """
+    rows = _clean_rows("chains", staleness=-900.0)
+    for row in rows:
+        row["vendor_quote_ts"] = (
+            datetime.fromisoformat(row["fetch_ts"]) - timedelta(seconds=900)
+        ).isoformat()
+    _write(lake, "chains", "SPY", DAY, rows)
+    _seed_spans(lake)
+    publisher, transport = _publisher(lake)
+
+    def _explode(*args, **kwargs):
+        raise RuntimeError("the drift check fell over")
+
+    monkeypatch.setattr("lake.battery._judge_drift", _explode)
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants(), publisher=publisher)
+
+    assert report.paged == (f"chains/ticker=SPY/date={DAY.isoformat()}.parquet",)
+    assert transport.messages[0].title == DELAYED_FEED_TITLE
+    assert report.drift_paged == ()
+    assert any("schema drift did not run: RuntimeError" in line for line in report.report)
+
+
+def test_a_schema_drift_page_does_not_land_in_the_delayed_feeds_tuple(lake: Path, monkeypatch):
+    """``paged`` carries partition paths written by one check. This page's unit is a surface
+    and a half, so appending to it would put two kinds of string in one tuple."""
+    from lake import battery_drift
+
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains"))
+    _seed_spans(lake)
+    publisher, transport = _publisher(lake)
+
+    finding = battery_drift.DriftFinding(
+        surface="chains",
+        day=DAY,
+        kind=battery_drift.RETYPED,
+        fields=("open_interest",),
+        first_cycle="2026-09-16T09:30:00-04:00",
+    )
+    monkeypatch.setattr(
+        "lake.battery._judge_drift",
+        lambda *args, **kwargs: battery_drift.DriftReport(findings=(finding,)),
+    )
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants(), publisher=publisher)
+
+    assert report.paged == ()
+    assert report.drift_paged == ("Schema drift: open_interest retyped",)
+    assert [message.event for message in transport.messages] == ["battery_schema_drift"]
+
+
+def test_a_dry_run_judges_the_drift_and_pages_nothing(lake: Path, monkeypatch):
+    """The dry run is this same walk with the writer switched off, and the page goes off with
+    it. A page about a finding nobody recorded sends an operator to a command that answers
+    nothing, which is ``judge``'s own rule for the delayed-feed page."""
+    from lake import battery_drift
+
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains"))
+    _seed_spans(lake)
+    publisher, transport = _publisher(lake)
+
+    finding = battery_drift.DriftFinding(
+        surface="chains",
+        day=DAY,
+        kind=battery_drift.MISSING,
+        fields=("volume",),
+        first_cycle=None,
+    )
+    monkeypatch.setattr(
+        "lake.battery._judge_drift",
+        lambda *args, **kwargs: battery_drift.DriftReport(
+            findings=(finding,), report=(finding.line,)
+        ),
+    )
+
+    report = judge(
+        lake,
+        calendar=CALENDAR,
+        now=NOW,
+        guards=GuardConstants(),
+        publisher=publisher,
+        dry_run=True,
+    )
+
+    assert report.drift_paged == ()
+    assert transport.messages == []
+    assert any("volume missing" in line for line in report.report)

@@ -201,6 +201,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from lake import battery_drift
 from lake.alert import REFUSED, Message, Publisher
 from lake.calendar import MARKET_TZ, Calendar, NotASession
 from lake.capture_spans import CaptureSpan, CaptureSpans, CaptureSpansError, spans_path
@@ -415,6 +416,13 @@ class BatteryReport:
     otherwise invisible: a partition that reads again looks exactly like a partition nothing
     ever withheld.
 
+    ``drift_paged`` is the schema-drift page's titles, and it is a field of its own rather than
+    an extension of ``paged``. ``paged`` carries partition paths written by one check, and this
+    page's unit is a surface and a half, so appending to it would put two kinds of string in one
+    tuple. Neither render prints it, which is deliberate: :func:`render` states the rule that
+    every count prints including the zeroes, so a *count* here would be a change to that function
+    and to ``sweep.Nightly.render``. The finding reaches both through ``report`` instead.
+
     ``sessions_owed`` and ``sessions_missing`` are the coverage check's pair, and they are the
     one pair here not scoped by ``day``. :func:`coverage` says why. The denominator is carried
     because the check's correct answer against today's lake is that it found nothing, and a
@@ -435,6 +443,7 @@ class BatteryReport:
     sessions_missing: int = 0
     appended: tuple[str, ...] = ()
     paged: tuple[str, ...] = ()
+    drift_paged: tuple[str, ...] = ()
     report: tuple[str, ...] = ()
     findings: tuple[Finding, ...] = field(default=())
 
@@ -2034,6 +2043,24 @@ def judge(
     )
     paged = page_delayed_feed(publisher, quarantined, now=now) if publisher and not dry_run else ()
 
+    # **The battery's second page, and it runs after the first.** Marketlake #427. The design's
+    # message table gives schema drift four producers and names this one beside the parser's and
+    # compaction's. Placement is what bounds what a failure here can cost. ``sweep`` wraps this
+    # whole function in ``except Exception`` because "the battery must not cost the record", so a
+    # raise reaches the nightly report either way. Inside here the verdicts are already on disk,
+    # written under the lock per partition, and ``page_delayed_feed`` has already fired. A raise
+    # before that line would cost the battery's one shipped page on a night whose delayed feed is
+    # exactly what it was for.
+    drift_paged: tuple[str, ...] = ()
+    try:
+        drift = _judge_drift(root, partitions, day=day, surfaces=SEALED_SURFACES)
+    except Exception as exc:  # noqa: BLE001 - a second page must not cost the first
+        report.append(f"battery: schema drift did not run: {type(exc).__name__}: {exc}")
+    else:
+        report.extend(drift.report)
+        if publisher and not dry_run:
+            drift_paged = battery_drift.page(publisher, drift.findings, now=now)
+
     # The findings about partitions that exist come first, in walk order, and the ones about
     # partitions that do not come last. Coverage answers a question about the whole lake rather
     # than about anything the walk opened, so it does not interleave with the walk.
@@ -2061,6 +2088,7 @@ def judge(
         sessions_missing=len(found.missing),
         appended=tuple(appended),
         paged=paged,
+        drift_paged=drift_paged,
         report=tuple(report),
         findings=tuple(findings),
     )
@@ -2165,6 +2193,58 @@ def _judge_partition(
     return judged
 
 
+def _judge_drift(
+    root: Path,
+    partitions: Sequence[SealedPartition],
+    *,
+    day: date | None,
+    surfaces: Sequence[str],
+) -> battery_drift.DriftReport:
+    """The schema-drift comparison for the run's day, against the previous sealed day.
+
+    **The run's day, and what ``day=None`` means here.** The 18:30 job passes the session it is
+    about. A hand run defaults to walking the whole lake, and this check judges the newest sealed
+    day that walk found rather than every day against its predecessor. One comparison answers
+    what an operator ran the command to see, and a comparison per day would open every partition
+    in the lake twice to re-derive transitions that are already in the record.
+
+    **The baseline is the previous day that has sealed partitions**, found by stepping back a day
+    at a time. A day the calendar calls no session has none, and neither does a day the machine
+    was off, so stepping past both is the same step and needs no calendar. The walk is bounded at
+    ``battery_drift.BASELINE_LOOKBACK_DAYS`` because a lake whose earlier days were never sealed
+    must not turn one night's check into a walk over the whole calendar.
+    """
+    judged = day
+    if judged is None:
+        if not partitions:
+            return battery_drift.DriftReport()
+        judged = max(partition.day for partition in partitions)
+    today = [partition for partition in partitions if partition.day == judged]
+    if not today:
+        return battery_drift.DriftReport()
+
+    baseline: date | None = None
+    baseline_parts: dict[str, list[SealedPartition]] = {}
+    for step in range(1, battery_drift.BASELINE_LOOKBACK_DAYS + 1):
+        candidate = judged - timedelta(days=step)
+        found = sealed_partitions(root, day=candidate)
+        if not found:
+            continue
+        baseline = candidate
+        for partition in found:
+            baseline_parts.setdefault(partition.surface, []).append(partition)
+        break
+
+    return battery_drift.judge_day(
+        root,
+        today,
+        day=judged,
+        baseline=baseline,
+        baseline_partitions=baseline_parts or None,
+        surfaces=surfaces,
+    )
+
+
 def page_delayed_feed(
     publisher: Publisher, quarantined: Sequence[Finding], *, now: datetime
 ) -> tuple[str, ...]:
@@ -2176,8 +2256,8 @@ def page_delayed_feed(
     findings it wrote rather than by filtering on the partitions it wrote, because those two
     differ as soon as a partition carries two checks: one check's line would page the other
     check's unchanged finding. That is the same once-on-the-transition
-    rule the auth path, the watchdog and both schema-drift producers carry, expressed in the
-    record that already exists rather than in a counter this module would have to keep.
+    rule the auth path, the watchdog and all three schema-drift producers carry, expressed in
+    the record that already exists rather than in a counter this module would have to keep.
 
     One page for the run, never one per partition. A vendor entitlement change reaches every
     partition on the same evening, so paging per finding would scale the page count with the

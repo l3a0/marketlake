@@ -174,11 +174,11 @@ COMPACTION_SOURCE = "compaction"
 _PROFILE_COLUMNS = ("ticker", "snap_ts", "row_kind", "window_start", "window_end")
 
 # The event and title on compaction's schema-drift page. The design's message table gives
-# schema drift one row and names two producers for it, the parser mid-day and the nightly
-# battery. Compaction is a third, and it reports a different fact. The other two read what
+# schema drift one row and names four producers for it: the parser mid-day, the close+5
+# fill through the same page, the nightly battery, and this one. The other three read what
 # the vendor sent. This one reports what this project's own release shipped mid-session,
 # which is legible at the merge and nowhere after it. The producer is in the event name so
-# a reader of ``reports/alerts/`` can tell the three apart without opening a file.
+# a reader of ``reports/alerts/`` can tell them apart without opening a file.
 SCHEMA_DRIFT_EVENT = "compaction_schema_drift"
 SCHEMA_DRIFT_TITLE = "Schema drift at the merge"
 
