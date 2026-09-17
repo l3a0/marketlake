@@ -93,8 +93,29 @@ class GuardOutcome:
     ``problems`` is the one field that interpolates an exception, and its strings keep the
     fuller message. The file drops it, so a reader with the launchd log gets what the
     exception said and the tree the dashboard may read gets the class alone. The other
-    five fields are composed from tickers, counts, and error classes, so they go down
-    whole. ``report._redacted`` owns that split and says why.
+    eight fields are composed from tickers, counts, error classes, dates, and the two
+    source names, so they go down whole. ``report._redacted`` owns that split and says
+    why.
+
+    ``spot_owed`` and ``option_owed`` are the denominator the six lists are read against,
+    and without them a clean day and a day that examined nobody write the same document.
+    Each is the tickers that owed that close, taken from the ``_covering`` call the run
+    already makes. The two are separate because a ticker onboarded between the closes owes
+    only the later one, and a ticker retired between them owes only the earlier one.
+    Tickers rather than a count, because a file read after the fact wants to know which of
+    the tickers that owed a close is the one sitting in ``unobserved``. The stderr line
+    prints the two lengths instead, since one log line cannot carry a roster.
+
+    A ticker whose day compaction has already sealed stays in the roster it owed. The
+    guard is finished with a sealed day rather than failing to check it, and the roster
+    answers what the spans owed rather than what this run opened.
+
+    ``sources_missing`` names which of the spans and the master did not answer, which is
+    one reason a roster comes back empty. Which of absent and unreadable it was goes
+    unsaid, because the readers answer ``None`` for both. Two other routes reach an empty
+    roster. A lake whose tickers have all been retired answers from both files and owes
+    nobody a close, and a span the master cannot name that day is recorded in ``problems``
+    by ``_covering``.
     """
 
     day: date
@@ -104,10 +125,24 @@ class GuardOutcome:
     shortfalls: tuple[str, ...] = ()
     refused: tuple[str, ...] = ()
     problems: tuple[str, ...] = ()
+    spot_owed: tuple[str, ...] = ()
+    option_owed: tuple[str, ...] = ()
+    sources_missing: tuple[str, ...] = ()
 
     @property
     def reportable(self) -> bool:
-        """Whether anything here belongs in the nightly report."""
+        """Whether anything here belongs in the nightly report.
+
+        A run that owed nothing is reportable too, for the opposite reason to every other
+        field here. The five finding fields say the guard found something. Two empty
+        rosters say it looked at nobody, which is the case where the check is not running
+        at all, and that is worth more attention than a clean day.
+
+        Both rosters have to be empty. A lake of equity-only tickers owes no option close
+        on any day, and calling that reportable would page a healthy lake every session.
+        """
+        if not (self.spot_owed or self.option_owed):
+            return True
         return bool(
             self.unobserved
             or self.baseline_less
@@ -193,6 +228,12 @@ class CloseGuard:
         and mark one retired mid-session. One read per run, so every ticker in a run is
         judged against one snapshot.
 
+        Both rosters go into the outcome, because every other field says what was wrong
+        and none says what was examined. Without them, a day where every close landed for
+        every ticker and a day where the spans file was missing write the same file. That
+        is the ambiguity ``report.write_close_guard`` avoids by filing on a clean day,
+        reappearing inside the document it writes.
+
         Nothing here raises. The guard runs from a hook ``run_loop`` does not wrap, so a
         raise would exit the process, and under ``KeepAlive`` the successor would reach
         the same minute and raise again. Failures resolve into ``problems`` at one of two
@@ -202,17 +243,41 @@ class CloseGuard:
         dispatcher wraps this call too, for whatever a later edit adds that neither grain
         foresees.
         """
-        bounds = self._session_clock.bounds(day)
         found = _Findings()
-        master = self._master() if self._master is not None else None
-        spans = self._spans() if self._spans is not None else None
+        # Neither source has answered yet, and each is struck off as it does. Starting
+        # from the answer rather than arriving at it is what keeps the field honest on
+        # every path out of here. A reader that raises never reaches its own removal, so
+        # it stays named, which is what a reader that did not answer means. Assigning an
+        # empty tuple up front and filling it after both reads would instead claim both
+        # files answered on any failure above the assignment.
+        unanswered = ["spans", "master"]
         try:
+            # Every call the run cannot proceed without sits in here, including the
+            # calendar's. Three of them used to sit above the try while the docstring
+            # above said nothing raises, and a spans reader that raised ``OSError`` came
+            # straight back out of this method. Nothing in production passes a reader that
+            # raises. The guard is worth keeping anyway, because this method runs from a
+            # hook ``run_loop`` does not wrap, so the first reader that does raise takes
+            # the daemon with it.
+            #
+            # The sources are read before the ledger, so a prologue that failed on the
+            # ledger read and stayed silent about a missing spans file would name the
+            # rarer of the two failures and hide the likelier.
+            master = self._master() if self._master is not None else None
+            if master is not None:
+                unanswered.remove("master")
+            spans = self._spans() if self._spans is not None else None
+            if spans is not None:
+                unanswered.remove("spans")
+            bounds = self._session_clock.bounds(day)
             # Read once for the run, like the spans and the master above, so every ticker
             # is judged against one snapshot of what compaction has already sealed, and
             # against one snapshot of who was in scope at each close.
             sealed = latest_entries(self._root)
-            spot_owed = self._covering(spans, master, bounds.equity_close, day)
-            option_owed = self._covering(spans, master, bounds.option_close, day)
+            spot_owed = self._covering(spans, master, bounds.equity_close, day, SPOT_CLOSE, found)
+            option_owed = self._covering(
+                spans, master, bounds.option_close, day, OPTION_CLOSE, found
+            )
         except Exception as exc:  # noqa: BLE001 - the run stops, the daemon does not
             # The prologue answers two questions the run cannot proceed without: which
             # ticker-days are already sealed, and who owed each close. A failure here is
@@ -228,7 +293,9 @@ class CloseGuard:
             # hole with no row naming it. That is a smaller loss than the session's
             # capture, which is what the alternative costs, and it is still a loss.
             found.problems.append(f"prologue: {type(exc).__name__}: {exc}")
-            return GuardOutcome(day, problems=tuple(found.problems))
+            return GuardOutcome(
+                day, problems=tuple(found.problems), sources_missing=tuple(unanswered)
+            )
         for ticker, _ in spot_owed:
             # Per ticker, because one unreadable file is one ticker's loss and not the
             # run's. Marking is the record completeness is counted from, so a drifted
@@ -248,14 +315,20 @@ class CloseGuard:
                 self._check_option_close(ticker, bounds, found)
             except Exception as exc:  # noqa: BLE001 - one ticker, not the run
                 found.problems.append(f"chains/{ticker}: {type(exc).__name__}: {exc}")
+        # Every argument is passed by keyword. The six lists are interchangeable at a
+        # glance, so a field added anywhere but last in a positional call shifts all of
+        # them one place and the suite reads `filled` where it asked for `unobserved`.
         return GuardOutcome(
-            day,
-            tuple(found.filled),
-            tuple(found.unobserved),
-            tuple(found.baseline_less),
-            tuple(found.shortfalls),
-            tuple(found.refused),
-            tuple(found.problems),
+            day=day,
+            filled=tuple(found.filled),
+            unobserved=tuple(found.unobserved),
+            baseline_less=tuple(found.baseline_less),
+            shortfalls=tuple(found.shortfalls),
+            refused=tuple(found.refused),
+            problems=tuple(found.problems),
+            spot_owed=tuple(ticker for ticker, _ in spot_owed),
+            option_owed=tuple(ticker for ticker, options in option_owed if options),
+            sources_missing=tuple(unanswered),
         )
 
     def _is_sealed(self, sealed: dict, surface: str, ticker: str, day: date) -> bool:
@@ -281,20 +354,42 @@ class CloseGuard:
         master: SecurityMaster | None,
         instant: datetime,
         day: date,
+        close_tag: str,
+        found: _Findings,
     ) -> list[tuple[str, bool]]:
         """The (ticker, options) pairs whose capture span covers ``instant``.
 
         Returns nothing when the spans file or the master is missing, which widens to
         checking no ticker rather than raising. That is the safe direction on the daemon's
         unguarded hooks: a missing source records nothing rather than a false marker.
+        The run records which source was missing, so the empty roster that follows reads
+        as a missing source rather than as a lake with no ticker onboarded.
+
+        A span the master cannot name on ``day`` drops out of the roster too, and it is
+        the one drop nothing else would report. Every row this guard writes names a
+        ticker, so such a span is a close that will not be checked and will not be marked.
+        It is recorded as a problem rather than as a field of its own, because it is the
+        two files disagreeing and not a denominator.
+
+        A closed mapping is never the cause, since ``remap`` opens the replacement from
+        the date it closes the old one. What is left is a day before the mapping's
+        ``valid_from``, which is the shape of a lake seeded at an epoch its master does not
+        reach back to, an instrument the master does not hold at all, and one registered
+        with no ticker mapping, which ``register`` allows because it takes any one of
+        three identifier kinds.
         """
         if spans is None or master is None:
             return []
         out: list[tuple[str, bool]] = []
+        unnamed = 0
         for span in spans.spans_covering(instant):
             ticker = master.symbol_at(span.instrument_id, day)
-            if ticker is not None:
-                out.append((ticker, span.options))
+            if ticker is None:
+                unnamed += 1
+                continue
+            out.append((ticker, span.options))
+        if unnamed:
+            found.problems.append(f"spans: {unnamed} covering {close_tag} name no ticker")
         return out
 
     # -- the unrecoverable half ------------------------------------------------
