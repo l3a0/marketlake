@@ -936,7 +936,8 @@ def fetch_session_bars(
 
     Quarantine does not reach that skip, deliberately. A quarantined bars partition is still
     manifested, so the job passes over it and never re-fetches. Nothing writes a verdict until
-    marketlake #138's battery does, so the condition has arisen zero times and widening it
+    marketlake #406's battery does, and it judges chains and quotes rather than bars, so the
+    condition has arisen zero times and widening it
     later is a one-line change rather than a second read path.
 
     **A held bar repeats, and the repeat is bounded differently per cause.** A close

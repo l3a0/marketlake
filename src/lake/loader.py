@@ -107,11 +107,11 @@ a second read path that the other skips.
    withholds is refused, and ``include_quarantined=True`` reads it anyway. That is what
    fail closed means for data already sealed. What a verdict means is
    ``manifest.is_quarantined``, beside the ledger rather than inside this reader, so the
-   battery and the sign-off tool meet this read at one definition. The ledger does not
-   exist in the lake yet, because nothing writes a verdict until marketlake #138's
-   battery, and an absent ledger excludes nothing and raises nothing. The guard is
-   therefore inert today and correct from the day it ships, which is why it is not
-   deferred. Building it after #136 and #137 already read through here would leave their
+   battery and the sign-off tool meet this read at one definition. ``lake.battery`` is that
+   battery, and marketlake #406 shipped it, so the ledger has a writer. An absent ledger still
+   excludes nothing and raises nothing, which is what keeps a fresh lake readable. The guard was
+   inert until that writer landed and correct from the day it shipped, which is why it was not
+   deferred. Building it after #136 and #137 already read through here would have left their
    reads outside it.
 2. *The overflow projection.* A vendor field the pinned schema does not name is
    JSON-encoded into the ``extra`` column rather than dropped. Promoting such a field

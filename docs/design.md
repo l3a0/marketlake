@@ -110,7 +110,7 @@ The token file lives at `~/.config/marketlake/token.json`, `chmod 600`. It sits 
 
 ## Storage: immutable Parquet, DuckDB on top
 
-The quarantine ledger's rules below are carried by [#139](https://github.com/l3a0/marketlake/issues/139), the sign-off tool that writes it, which is authoritative for that scope.
+The quarantine ledger has two writers and its rules are split between them. [#406](https://github.com/l3a0/marketlake/issues/406) built `lake.battery`, which writes the verdicts, and it pins the entry's five fields, the `clean` and `quarantined` vocabulary, the append-on-transition rule, and the rule that a pass never clears a verdict another check wrote. [#139](https://github.com/l3a0/marketlake/issues/139) is the sign-off tool and is authoritative for the human half, including the precedence rule `lake.battery` implements on its behalf.
 
 The lake is Hive-partitioned Parquet with DuckDB as the query engine. Hive partitioning means directory names carry key=value pairs, like `ticker=SPY/date=2026-08-24`, so query engines prune by path without opening files. The format is columnar, so chains compress \~10×. It is append-friendly, offers plain SQL from Python, and needs zero server administration. Each top-level directory below is a **surface**: one kind of measurement with its own pinned schema, partitioning, and capture path. The surfaces are the market's activity observed through distinct faces: what options quoted, what the stock quoted, what traded, what positions stood open, what corporate events occurred. "Surface" throughout this doc means exactly that unit. `reference/` is the one non-surface. It is identity, not measurement.
 
@@ -272,7 +272,20 @@ The consumer contract for any backtest engine reading the lake:
 
 ## Validation: fail closed, quarantine loudly
 
-The battery and its panels are [#138](https://github.com/l3a0/marketlake/issues/138), and the sign-off tool is [#139](https://github.com/l3a0/marketlake/issues/139). Both are authoritative for their own scope.
+The battery and its panels are [#138](https://github.com/l3a0/marketlake/issues/138), and the sign-off tool is [#139](https://github.com/l3a0/marketlake/issues/139). Both are authoritative for their own scope. #138 split into six sub-issues, each authoritative for its own piece, and [#406](https://github.com/l3a0/marketlake/issues/406) built the first: `lake.battery`, which carries the quarantine ledger's writer, the verdict record every other check writes through, and the real-time entitlement check. It runs inside the 18:30 sweep between the bar fetch and the Friday branch, which is where the schedule table below already placed it.
+
+Three things the writer settles, because the reader shipped first in [#241](https://github.com/l3a0/marketlake/issues/241) and fails closed.
+
+1. The entry carries `partition`, `verdict`, `check`, `provenance` and `observed_at`, and only `clean` and `quarantined` ever reach the `verdict` field.
+2. `insufficient_history` is a per-check finding that rides the nightly report, because writing it as a verdict would withhold every partition a thin-history check touched.
+3. A verdict is appended only when it changes a partition's readability, so a nightly run over immutable data does not grow the ledger forever, and a pass never clears a verdict another check wrote.
+
+Two classes of partition are out of scope for every check rather than passing it.
+
+1. One whose day lies outside every capture span, because capture was not running.
+2. One holding no data row inside the session, because a day of gap rows is a correctly-recorded outage and a day of overnight cycles recorded no session.
+
+Both exist in the lake today, and judging either would have quarantined correct data on the first run. A reference file that cannot be read is a third answer again, and it is reported rather than being spelled as either of these.
 
 The battery gates in two modes, matching the schedule. **Gate-before-land** covers the vendor-sweep surfaces: bars and corporate actions are validated inside the sweep before their partitions are written. A failure means the partition never lands. **Seal-then-flag** covers chains and quotes: their partitions compact immutable at close+15. The battery's later failures write entries in the quarantine list. Those entries are metadata beside the sealed partition, never a rewrite or removal. Quarantine has a consumer-side meaning. `load_chain`/`load_bars` exclude quarantined partitions by default, with an explicit opt-in to read them. That is what "fail closed" means for data already sealed. The checks:
 
@@ -332,7 +345,7 @@ All healthchecks.io checks sit in one place: six checks in steady state, well in
 | Capture dead-man | `capture` | `OnCalendar` envelope, Mon–Fri 08:30–18:44. Grace 5 minutes | Every durable capture cycle. Tagged idle heartbeats on the whole weekday envelope, holidays and early-close afternoons included | Machine off/asleep, daemon dead or crash-looping, or capturing nothing. That is the whole-daemon failure family, paged within minutes |
 | Pre-open self-check | `pre-open` | Mon–Fri by 08:35 | One ping at 08:30 after verifying awake, daemon up, and the daemon's own `caffeinate` assertion held | The 08:25 wake failed, the daemon is down, nothing the daemon spawned is holding the machine awake, or the daemon stamped no pid for the check to match. The page lands with a full hour of repair buffer before the bell |
 | Compaction + backup | `compaction` | Weekdays by \~17:00. Half-day runs ping early, and early is always fine. Holiday no-ops ping at the regular \~16:30 run time | One ping after compact → verify → manifest → backup sync completes | The day's capture is journaled but not yet sealed or backed up. The single-copy window is still open |
-| Vendor EOD sweep | `eod-sweep` | Weekdays by \~19:00. Holiday no-ops ping at the regular \~18:30 run time | One ping after actions poll, bar fetch, cross-check, and battery complete. On Fridays this includes the Sunday wake set and read back | Official bars/actions for the day are missing. The battery didn't run |
+| Vendor EOD sweep | `eod-sweep` | Weekdays by \~19:00. Holiday no-ops ping at the regular \~18:30 run time | One ping after the actions poll and the bar fetch complete. On Fridays this includes the Sunday wake set and read back | Official bars or actions for the day are missing. A battery that could not run leaves the day unjudged rather than the data missing, so it rides the nightly report and withholds no ping |
 | Calendar probe | `calendar-probe` | Mon–Fri by \~09:40 | The 09:35 probe result on calendar-closed days. A tagged "session day, probe n/a" no-op on session days | The says-closed-but-open guard didn't run. A stale calendar could be silently skipping a real session |
 | Sunday canary + scrub | `sunday` | Sun by 23:30 | One ping after the canary passes and the weekly integrity scrub finishes. The canary is a throwaway authenticated call **plus a coverage assertion**: the token's mint time + 7 days must clear the coming Friday's option close. A failing canary re-runs every 30 min until pass or 23:00, so a post-20:00 ritual still clears it. The 23:30 deadline is the 23:00 cutoff plus room for that last attempt to finish | No token covering the coming week exists, which puts Monday's capture at risk. Or the scrub didn't run. The coverage assertion catches a *skipped* ritual when last week's late-minted token is still technically valid. Validity is not freshness |
 
