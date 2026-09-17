@@ -2336,7 +2336,7 @@ def test_the_landed_minute_row_records_the_flag_its_request_carried(fixture_lake
 
 
 def test_the_regular_session_response_covers_the_window_end_to_end(fixture_lake: FixtureLake):
-    """#421. The flagged fetch satisfies the ends rule exactly, not by less.
+    """#421. The flagged fetch passes the ends rule rather than failing it by less.
 
     The recording measured 390 candles for a 390-minute window, first at 09:30:00 and last at
     15:59:00. Both are exact against the window's own bounds, because a candle is stamped at its

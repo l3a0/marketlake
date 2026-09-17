@@ -70,12 +70,18 @@ means nothing on a daily one.
 **The reason the flag was first left unset is measured false.** It ran: with a window at the
 session's own bounds it does not matter, because the request's own bounds clip the response
 either way and the coverage is 390 minutes under both answers. Marketlake #416's first live run
-asked 09:30 to 16:00 Eastern and received a response spanning 780 minutes, on all seven sessions
-and both tickers. Marketlake #421 then recorded the same window twice and read the ends off both.
-Unset, the response runs 07:00 to 19:59 Eastern, the whole extended session, beginning two and a
-half hours before the requested open and ending four hours after the requested close. Set false,
-it runs 09:30 to 15:59, the regular session and nothing else, with both ends exact against the
-window's own.
+asked 09:30 to 16:00 Eastern and refused all seven sessions on both tickers, filing 780 minutes
+of span on six of them and 779 on 2026-09-16.
+
+Marketlake #421 then recorded that same 2026-09-16 window twice and read the ends off both.
+Unset, the response runs 07:00 to 19:59 Eastern, the whole extended session, which is 780 minutes
+of span. Set false, it runs 09:30 to 15:59, the regular session and nothing else, with both ends
+exact against the window's own.
+
+**The run and the recording differ by a minute on that session, 779 against 780.** A span is two
+ends and a subtraction, so it does not say which end lost its minute, and the recording shows
+Schwab omitting a minute that did not trade. Neither number changes what the flag does, because
+both are the extended session against a request for the regular one.
 
 So the bounds do not clip the response and the flag is what decides its extent. Asking for the
 regular session by name is what makes the fetch reversible too: the flag lands on every row,
@@ -207,8 +213,10 @@ DAILY_WINDOW_MARGIN = timedelta(days=1)
 #   false  first 09:30:00-04:00  last 15:59:00-04:00  span 390.0  390 candles
 #
 # So the request's own bounds do not clip the response. Unset, Schwab answers with the whole
-# extended session, two and a half hours before the requested open and four hours after the
-# requested close, which is the 780.0 that refused every 1-minute ticker-day on #416's first run.
+# extended session, which begins two and a half hours before the requested open and runs to
+# 19:59, four hours past the requested close counting the last candle's own minute. That is the
+# extent #416's first run refused every 1-minute ticker-day for.
+#
 # Set false, the response is the regular session and nothing else, with both ends landing exactly
 # on the window's own. That is what :func:`check_bar_span`'s ends rule asks for, so this produces
 # a fetch the check passes rather than one that fails by less.
@@ -608,11 +616,11 @@ def check_bar_span(
     flagged recording of the same window returned 390 for 390 with none missing.
 
     That is one session rather than a rule. A ticker thinner than SPY can skip a minute inside
-    the regular session too, so a count rule would refuse a response that is complete as far as
-    the vendor is concerned, and it would still refuse the synthesized fixtures this suite
-    replays, which hold two and three candles for a 390-minute window. The ends need no such
-    answer either way. They are sufficient here because this job fetches one session, which
-    leaves no interior session to lose.
+    the regular session too, so a count rule would refuse a response the vendor considers
+    complete. It would also refuse most of what this suite replays: the minute fixtures carry
+    two candles, the committed cassette three, and only ``_dense_minute_candles`` carries 390.
+    The ends need no such answer either way. They are sufficient here because this job fetches
+    one session, which leaves no interior session to lose.
 
     The ends rule has its own edge, which the same measurement makes visible: a ticker that does
     not trade in the session's first or last minute returns no candle at that end and is refused
