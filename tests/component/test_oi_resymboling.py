@@ -476,6 +476,42 @@ def test_a_contract_remapped_away_and_back_threads_rather_than_refusing(
     assert verdicts(answer) == {(VERDICT_SETTLED, None)}
 
 
+def test_one_instrument_holding_a_symbol_in_two_overlapping_rows_is_not_ambiguous(
+    fixture_lake: FixtureLake,
+):
+    """The refusal counts instruments, not rows, and only a corrupt master can tell them apart.
+
+    ``remap`` writes disjoint ranges, so on any one date a symbol reaches an instrument
+    through at most one row and counting either way gives the same answer. Two overlapping
+    rows for the *same* instrument break that tie, and they are still one contract. Counting
+    rows would refuse a view over a master that says nothing ambiguous at all.
+    """
+    names = list(SET)
+    master = SecurityMaster()
+    equity = master.register(
+        kind="equity", capture_start=EPOCH, valid_from=EPOCH.date(), ticker="SPY"
+    )
+    duplicated = tuple(master.mappings) + tuple(
+        Mapping(
+            instrument_id=99,
+            id_type=ID_TYPE_OCC,
+            id_value=names[0],
+            valid_from=EPOCH.date(),
+            valid_to=None,
+            kind="option",
+            capture_start=EPOCH,
+        )
+        for _ in range(2)
+    )
+    master = SecurityMaster(duplicated)
+    refreshed = {symbol: value + 500 for symbol, value in SET.items()}
+    root = build(fixture_lake, cycles(refreshed), master, equity)
+
+    answer = answer_for(root, constants=constants())
+
+    assert verdicts(answer) == {(VERDICT_SETTLED, None)}
+
+
 def test_both_refusals_are_catchable_as_one_and_carry_their_detail(
     fixture_lake: FixtureLake,
 ):
