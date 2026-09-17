@@ -115,6 +115,23 @@ def test_a_real_run_files_what_it_found(lake_root):
     assert entry["sources_missing"] == []
 
 
+def test_the_file_keeps_a_roster_whole_and_in_order(lake_root):
+    """Two tickers, out of alphabetical order, so the writer cannot quietly reshape them.
+
+    Every other case here files a roster of one or of none, which a writer that truncated,
+    sorted or deduplicated would satisfy. The roster is the surface this change exists
+    for, and its order is the spans file's, which is what a reader comparing two days
+    reads down.
+    """
+    outcome = GuardOutcome(DAY, spot_owed=("OPT", "EQ"), option_owed=("OPT", "EQ"))
+
+    report.write_close_guard(lake_root, outcome, now=AT, pid=11)
+
+    (entry,) = _entries(lake_root)
+    assert entry["spot_owed"] == ["OPT", "EQ"]
+    assert entry["option_owed"] == ["OPT", "EQ"]
+
+
 def test_a_run_that_examined_nobody_files_as_reportable(lake_root):
     """The file this issue exists for. Empty lists, and now a reason for them.
 
@@ -254,7 +271,10 @@ def test_a_file_is_never_written_over(lake_root):
     with pytest.raises(FileExistsError):
         report.write_close_guard(lake_root, GuardOutcome(DAY), now=AT, pid=11)
 
-    assert _entries(lake_root)[0]["reportable"] is True, "the first run's findings were replaced"
+    # Asserted on a field the two documents differ in. ``reportable`` is true for both of
+    # them now, the first through its findings and the second through its empty rosters,
+    # so reading that field would pass whether or not the replacement landed.
+    assert _entries(lake_root)[0]["unobserved"] == ["QQQ"], "the first run's findings were replaced"
 
 
 # -- 5. a write that fails costs the file and nothing else ---------------------------
@@ -429,7 +449,8 @@ def test_any_one_finding_files_the_day_as_reportable(lake_root, field):
     of the nightly report with its ``refused`` list sitting unread in the file.
     """
     # A roster, so this clause is the only thing that can file the day. Without one the
-    # empty-roster rule files it anyway and every clause here could be deleted green.
+    # empty-roster rule files it anyway and every clause here could be deleted with this
+    # case still green.
     outcome = GuardOutcome(DAY, spot_owed=("XYZ",), option_owed=("XYZ",), **{field: ("XYZ",)})
     assert outcome.reportable, f"{field} alone did not count as worth reporting"
 

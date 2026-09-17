@@ -373,7 +373,11 @@ def test_a_day_where_both_closes_landed_reports_nothing(tmp_path, capsys):
 
 
 def test_an_unobserved_close_says_so_on_stderr(tmp_path, capsys):
-    outcome = close_guard.GuardOutcome(DAY, unobserved=("XYZ",))
+    # A roster, so ``unobserved`` is what puts this line on stderr. Without one the
+    # empty-roster rule reports the day and this case stops covering its own name.
+    outcome = close_guard.GuardOutcome(
+        DAY, unobserved=("XYZ",), spot_owed=("XYZ",), option_owed=("XYZ",)
+    )
     daemon._report_guard(outcome)
     assert "unobserved=XYZ" in capsys.readouterr().err
 
@@ -409,7 +413,9 @@ def test_a_field_with_nothing_in_it_is_left_out(capsys):
     Without the filter every reportable day prints all five names with nothing after
     four of them, and the one finding that matters is buried in a row of empty keys.
     """
-    daemon._report_guard(close_guard.GuardOutcome(DAY, unobserved=("XYZ",)))
+    daemon._report_guard(
+        close_guard.GuardOutcome(DAY, unobserved=("XYZ",), spot_owed=("XYZ",), option_owed=("XYZ",))
+    )
 
     reported = capsys.readouterr().err
     assert "unobserved=XYZ" in reported
@@ -430,25 +436,37 @@ def test_the_line_says_how_many_were_owed(capsys):
 
     daemon._report_guard(outcome)
 
-    assert "owed=2/1" in capsys.readouterr().err
+    # Leading, not merely present. The whole reason it is there is the run whose other
+    # five fields are empty, and a part at the tail of that line is a part after nothing.
+    assert capsys.readouterr().err.startswith(f"close+5 {DAY.isoformat()}: owed=2/1")
 
 
-def test_a_run_that_owed_nobody_says_something_after_the_colon(capsys):
-    """The empty-roster run fills none of the five named lists, so the line needs its own.
+def test_a_run_that_owed_nobody_and_read_both_files_still_says_something(capsys):
+    """The bare-colon case, which needs an outcome with nothing else to print.
 
-    Without the ``owed=`` part this prints ``close+5 2026-09-02:`` and stops, which is
-    what the suite captured from the daemon's production entry while this was being
-    built. A reportable run that says nothing is worse than the silence it replaced.
+    A run that owed nobody and read both files fills none of the six lists, so without the
+    ``owed=`` part its line is ``close+5 2026-09-02:`` and nothing else. That line is not
+    hypothetical: the suite captured it from the daemon's production entry while this was
+    being built. A reportable run that says nothing is worse than the silence it replaced.
+
+    The fixture carries no ``sources_missing`` on purpose. With one, the line has text
+    after the colon whatever ``owed=`` does, and the assertion below cannot fail.
     """
-    outcome = close_guard.GuardOutcome(DAY, sources_missing=("spans",))
+    outcome = close_guard.GuardOutcome(DAY)
     assert outcome.reportable
 
     daemon._report_guard(outcome)
 
     reported = capsys.readouterr().err.strip()
     assert reported != f"close+5 {DAY.isoformat()}:", "the line stopped at the colon"
-    assert "owed=0/0" in reported
-    assert "sources-missing=spans" in reported, "the file that did not answer went unnamed"
+    assert reported == f"close+5 {DAY.isoformat()}: owed=0/0"
+
+
+def test_the_source_that_did_not_answer_is_named_on_the_line(capsys):
+    """``sources-missing`` rides the existing loop, so it renders like the five beside it."""
+    daemon._report_guard(close_guard.GuardOutcome(DAY, sources_missing=("spans", "master")))
+
+    assert "sources-missing=spans,master" in capsys.readouterr().err
 
 
 def test_a_config_that_will_not_load_still_reaches_stderr(tmp_path, capsys):
@@ -859,6 +877,40 @@ def test_a_clean_day_says_who_it_checked(tmp_path):
     assert not outcome.reportable, "a day with a ticker in scope and nothing wrong reported"
 
 
+def test_a_lake_whose_tickers_all_retired_reports_with_both_files_readable(tmp_path):
+    """The case that separates the rule from a narrower one that reads only the sources.
+
+    Both files answer, so ``sources_missing`` is empty, and no span covers either close,
+    so both rosters are. A rule keyed on the sources would file this as a clean day, which
+    is a guard checking nobody filing as a guard that found nothing. That is the defect
+    this field exists to end, reached through retirement rather than through a missing
+    file.
+    """
+    outcome = _guard(
+        tmp_path,
+        _clock(et(2026, 9, 2, 16, 18)),
+        [("GONE", False, _OPEN, et(2026, 9, 2, 15, 0))],
+    ).run(DAY)
+
+    assert outcome.sources_missing == (), "a source was named missing in a readable lake"
+    assert outcome.spot_owed == ()
+    assert outcome.option_owed == ()
+    assert outcome.reportable, "a run over a lake that owed nobody filed as a clean day"
+
+
+def test_a_ticker_owing_only_the_option_close_is_not_a_run_that_examined_nobody(tmp_path):
+    """Both rosters have to be empty, and this is the half that says so.
+
+    A span opening at 16:05 covers the option close and not the equity close, so the spot
+    roster is empty while the option roster is not. Judging the run on the spot roster
+    alone would call that healthy day a guard that examined nobody, and the equity-only
+    lake tests cover only the mirror of it.
+    """
+    outcome = close_guard.GuardOutcome(DAY, option_owed=("LATE",))
+
+    assert not outcome.reportable, "a ticker owing the option close counted as nobody"
+
+
 def test_the_option_roster_leaves_out_a_ticker_that_captured_no_options(tmp_path):
     """The two rosters are taken per close, and the option one is not every covering span.
 
@@ -901,18 +953,20 @@ def test_a_span_the_master_cannot_name_is_recorded_rather_than_dropped(tmp_path)
     """
     master = SecurityMaster()
     spans = CaptureSpans()
-    instrument = master.register(
-        kind="equity", capture_start=_OPEN, valid_from=date(2026, 9, 3), ticker="LATE"
-    )
-    spans.open_span(instrument, _OPEN, False)
+    for ticker in ("LATE", "ALSO_LATE"):
+        instrument = master.register(
+            kind="equity", capture_start=_OPEN, valid_from=date(2026, 9, 3), ticker=ticker
+        )
+        spans.open_span(instrument, _OPEN, False)
 
     outcome = _blind(tmp_path, spans=lambda: spans, master=lambda: master).run(DAY)
 
     assert outcome.spot_owed == ()
     assert outcome.sources_missing == ()
+    # Two spans, so the count is asserted above the value a constant would satisfy.
     assert outcome.problems == (
-        f"spans: 1 covering {SPOT_CLOSE} name no ticker",
-        f"spans: 1 covering {OPTION_CLOSE} name no ticker",
+        f"spans: 2 covering {SPOT_CLOSE} name no ticker",
+        f"spans: 2 covering {OPTION_CLOSE} name no ticker",
     )
 
 
@@ -934,6 +988,53 @@ def test_a_source_reader_that_raises_is_a_problem_rather_than_an_exit(tmp_path):
 
     assert outcome.problems == ("prologue: OSError: spans file is unreadable",)
     assert outcome.reportable
+
+
+def test_a_reader_that_raises_leaves_the_other_source_named_too(tmp_path):
+    """The field says which sources did not answer, and a reader that raised did not.
+
+    The spans reader raises and the master file is absent, so neither answered. Building
+    the field by striking each source off as it answers is what gets this right. Filling
+    it in after both reads would name the spans alone, because the raise skips the line
+    that would have named the master, and an empty name for a file that was never there
+    is the field asserting it answered.
+    """
+
+    def unreadable():
+        raise OSError("spans file is unreadable")
+
+    outcome = _blind(tmp_path, spans=unreadable).run(DAY)
+
+    assert outcome.sources_missing == ("spans", "master"), outcome.sources_missing
+
+
+def test_a_calendar_failure_does_not_claim_both_files_answered(tmp_path):
+    """The prologue has calls above the sources and calls below them, and both can raise.
+
+    The calendar is read after the two sources for this reason. A field assembled after
+    every prologue call would come back empty on this path, and empty means both files
+    answered, which is a claim about two files this run never opened.
+    """
+
+    class NoCalendar:
+        def bounds(self, day):
+            raise RuntimeError("calendar unavailable")
+
+        def snap_slot(self):
+            raise RuntimeError("calendar unavailable")
+
+    guard = close_guard.CloseGuard(
+        lake_root=tmp_path,
+        spans=lambda: None,
+        session_clock=NoCalendar(),
+        master=lambda: None,
+        pid=9,
+    )
+
+    outcome = guard.run(DAY)
+
+    assert outcome.problems[0].startswith("prologue: RuntimeError"), outcome.problems
+    assert outcome.sources_missing == ("spans", "master"), outcome.sources_missing
 
 
 def test_a_prologue_failure_still_says_which_source_was_missing(tmp_path):

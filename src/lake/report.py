@@ -220,7 +220,7 @@ def write_close_guard(
     run had to judge. So an empty file meant "every close landed" and "nobody was examined"
     alike, which is this writer's own ambiguity one level further in. ``spot_owed`` and
     ``option_owed`` carry the tickers rather than a count, because a reader holding the
-    file wants to know which of the two that owed a close is the one sitting in
+    file wants to know which of the tickers that owed a close is the one sitting in
     ``unobserved``. They go down whole, like every field but ``problems``: a ticker is not a
     path and carries nothing to redact.
 

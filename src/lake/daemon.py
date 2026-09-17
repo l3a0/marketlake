@@ -307,10 +307,14 @@ def _master_reader(lake_root: Path | str) -> Callable[[], SecurityMaster | None]
     scope clamp exists for, the one onboarded mid-session, so the clamp silently does
     nothing for exactly that case.
 
-    ``None`` means the file is absent or unreadable. Every caller treats that as no
-    clamp, which only ever widens what gets marked or checked, so a missing master never
-    turns into a missing record. The reader never raises, because both callers run from
-    hooks ``run_loop`` does not guard.
+    ``None`` means the file is absent or unreadable, and what a caller does with that
+    differs by caller. Gap marking treats it as no clamp, which only widens what gets
+    marked. The close+5 guard cannot: every row it writes names a ticker, and the master
+    is what turns a span's instrument id into one, so a missing master leaves it checking
+    nobody and writing no marker for a close that was owed. That is a missing record, and
+    it is the failure `close_guard.GuardOutcome.sources_missing` exists to put in the
+    report rather than leave silent. The reader never raises, because both callers run
+    from hooks ``run_loop`` does not guard.
 
     Read per pass rather than per ticker. The callers each read once and hand the result
     down, so one pass judges every ticker against one master.
@@ -399,11 +403,11 @@ def _report_guard(outcome: CloseGuardOutcome) -> None:
     The two rosters print as lengths, ``owed=2/2``, and they print on every line rather
     than only on the line they rescue. One log line cannot carry a hundred symbols, which
     is why the file gets the tickers and this gets the count. It leads the line because a
-    run that owed nobody fills none of the five fields below, and without it that run
-    prints ``close+5 2026-09-16:`` and stops, which is a colon and no sentence.
+    run that owed nobody and read both files fills none of the six lists below, so without
+    it that run prints ``close+5 2026-09-16:`` and stops, which is a colon and no sentence.
 
-    ``sources-missing`` needs no special case. It is a list of strings like the five below
-    and it drops out of the line on an ordinary day, the same as they do.
+    ``sources-missing`` needs no special case. It is a list of strings like the five after
+    it and it drops out of the line on an ordinary day, the same as they do.
     """
     if not outcome.reportable:
         return
