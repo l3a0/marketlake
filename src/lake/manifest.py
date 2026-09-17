@@ -299,16 +299,24 @@ def _read_jsonl(path: Path) -> list[dict]:
 def _latest_by_partition(entries: Sequence[dict], path: Path) -> dict[str, dict]:
     """Resolve last-entry-wins per partition path over entries in file order.
 
-    A line that parses as JSON and names no partition raises ``ManifestError``. Skipping
-    it was considered and rejected. The torn-tail precedent does not carry: a torn
-    trailing line is a write that did not finish, which ``_read_jsonl`` already discards,
-    while a line in the body that parses and names nothing is a record no reader can
-    interpret. This file is the lake's integrity root, so a reader that quietly stepped
+    Two shapes raise ``ManifestError``, and they are deliberately two messages rather than
+    one. A line that parses as JSON and names no partition is the first. A line naming a
+    partition that cannot be a dict key, which is a JSON list or object, is the second, and
+    folding it into the first would tell the person repairing the ledger that an entry
+    carrying a partition carries none.
+
+    Skipping either was considered and rejected. The torn-tail precedent does not carry: a
+    torn trailing line is a write that did not finish, which ``_read_jsonl`` already
+    discards, while a line in the body that parses and names nothing is a record no reader
+    can interpret. This file is the lake's integrity root, so a reader that quietly stepped
     over damage in it would make every check downstream weaker than it reads.
 
     Raising is safe precisely because the two callers that must survive it already catch
-    it: the close+5 guard's prologue and the marking pass. Every other caller is a place
-    where stopping is correct, and the compaction child's own silence pages.
+    it: the close+5 guard's prologue and the marking pass. Both catch bare ``Exception``, so
+    the second shape needs nothing from them that the first did not already have. What it
+    gains them is a message naming this ledger and the entry, where a bare ``TypeError``
+    named neither. Every other caller is a place where stopping is correct, and the
+    compaction child's own silence pages.
     """
     latest: dict[str, dict] = {}
     for position, entry in enumerate(entries, start=1):
@@ -318,7 +326,12 @@ def _latest_by_partition(entries: Sequence[dict], path: Path) -> dict[str, dict]
             # TypeError covers a line that parsed to something other than an object, such
             # as a bare list or string, which indexes differently but is damage the same.
             raise ManifestError(f"{path}: entry {position} names no partition") from exc
-        latest[partition] = entry
+        try:
+            latest[partition] = entry
+        except TypeError as exc:
+            raise ManifestError(
+                f"{path}: entry {position} has a partition that cannot be a key: {partition!r}"
+            ) from exc
     return latest
 
 
@@ -534,10 +547,19 @@ def latest_quarantine_by_check(lake_root: Path) -> dict[str, dict[str, dict]]:
     function's own docstring is where what the order does and does not mean is stated: it is
     where each check's current entry sits, which is not the same as longest-standing first.
 
-    An entry whose ``check`` cannot be a dict key raises ``ManifestError`` naming this ledger
-    and the entry's position, for the reason ``_latest_by_partition`` gives about a missing
-    ``partition``: this file is an integrity root, so a reader that stepped over damage in it
-    would make every check downstream weaker than it reads.
+    An entry whose ``partition`` or whose ``check`` cannot be a dict key raises
+    ``ManifestError`` naming this ledger and the entry's position, for the reason
+    ``_latest_by_partition`` gives about a missing ``partition``: this file is an integrity
+    root, so a reader that stepped over damage in it would make every check downstream weaker
+    than it reads.
+
+    The ``partition`` guard is marketlake #514. Until it existed, that shape raised a bare
+    ``TypeError``, which is neither a ``ManifestError`` nor an ``OSError``, so it reached
+    none of the tuples a damaged ledger is meant to land in and ended the whole 18:30 run.
+    The containment held for this reader's other shapes throughout, which is the point: four
+    of them already landed as a ``ManifestError`` and the fifth walked past every one of
+    their catches. That is the same escape marketlake #495 closed for a ledger whose bytes do
+    not decode.
     """
     path = quarantine_path(lake_root)
     latest: dict[str, dict[str, dict]] = {}
@@ -546,7 +568,12 @@ def latest_quarantine_by_check(lake_root: Path) -> dict[str, dict[str, dict]]:
             partition = entry["partition"]
         except (KeyError, TypeError) as exc:
             raise ManifestError(f"{path}: entry {position} names no partition") from exc
-        bucket = latest.setdefault(partition, {})
+        try:
+            bucket = latest.setdefault(partition, {})
+        except TypeError as exc:
+            raise ManifestError(
+                f"{path}: entry {position} has a partition that cannot be a key: {partition!r}"
+            ) from exc
         check = entry.get("check")
         try:
             bucket.pop(check, None)

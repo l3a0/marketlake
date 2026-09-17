@@ -2324,10 +2324,62 @@ def test_a_ledger_that_is_not_utf8_is_contained_and_the_run_still_files(
     assert pinger.urls == []
 
 
+def test_a_partition_that_cannot_be_a_key_is_contained_and_the_run_still_files(
+    fixture_lake: FixtureLake,
+):
+    """Marketlake #514, end to end, and the fifth shape the three tests above hold four of.
+
+    ``manifest.latest_quarantine_by_check`` hashed the entry's ``partition`` one line under
+    the guard that read it, so a JSON list raised ``TypeError: unhashable type: 'list'``.
+    That is neither a ``ManifestError`` nor an ``OSError``, so it reached neither
+    ``_LEDGER_REFUSALS`` nor any other containment around this ledger, exactly as the
+    non-decodable bytes did before marketlake #495. Executed against `ba348f3` this lake died
+    with no record filed, no report file, no digest, no ping and, on a Friday, no Sunday wake.
+
+    **The damage is a hand edit, and that is the situation the guard exists for rather than an
+    argument against it.** ``manifest.append_line`` is the only writer and
+    ``battery.build_entry`` refuses an entry without a ``check``, so nothing in this lake
+    writes a non-string partition. What remains is a repair under the lock, which is the path
+    ``lake.signoff`` and three of this ledger's own refusal messages send a person down. A
+    guard whose job is to survive a damaged ledger has to survive the damage the person
+    repairing it can introduce.
+
+    The count comes through a different door, ``sweep._counted``, which catches bare
+    ``Exception`` and so was never the door that failed. It is asserted because it is a
+    report-tier line rather than a problem, and before this fix no report file existed to
+    carry it.
+    """
+    from lake.manifest import append_line, quarantine_path
+
+    root = _lake(fixture_lake)
+    ledger = quarantine_path(root)
+    append_line(ledger, {"partition": [], "verdict": "clean", "check": "e"})
+
+    outcome, pinger, _ = _run(root)
+
+    assert outcome.filed_at is not None, "the run died instead of filing its record"
+    assert any(
+        "dividends did not run: ManifestError" in problem for problem in outcome.nightly.problems
+    ), outcome.nightly.problems
+    assert any(
+        "quarantine count unreadable: ManifestError" in line for line in outcome.nightly.report
+    ), outcome.nightly.report
+    assert any("cannot be a key" in problem for problem in outcome.nightly.problems), (
+        "the operator gets the error's name without which entry refused"
+    )
+    assert not any("names no partition" in problem for problem in outcome.nightly.problems), (
+        "an entry carrying a partition was reported as carrying none"
+    )
+
+
 def test_a_ledger_with_a_byte_order_mark_is_contained_and_the_run_still_files(
     fixture_lake: FixtureLake,
 ):
-    """Marketlake #506, end to end, and the fourth shape the three tests above hold three of.
+    """Marketlake #506, end to end, and one more shape than the tests above this one hold.
+
+    The count is written as a relation rather than an ordinal on purpose. Marketlake #515 is the
+    class of passage that goes stale every time a sibling lands, and the four tests above hold
+    four of the six shapes that now reach ``_LEDGER_REFUSALS``, a set that moved twice this week.
 
     A byte-order mark is valid UTF-8, so it decodes and never reaches ``LedgerNotUtf8``. On a
     ledger of two lines or more a leading one still reached ``TornLedger``, because entries sit
