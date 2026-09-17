@@ -73,7 +73,12 @@ from pathlib import Path
 
 from lake.actions import ExtractionReport, MasterAbsent, extract_dividends
 from lake.alert import Message, NtfyTransport, Publisher, undelivered
-from lake.bars import BarsReport, UnsupportedBarFreq, fetch_session_bars
+from lake.bars import (
+    BarsReport,
+    StampNotAnInstant,
+    UnsupportedBarFreq,
+    fetch_session_bars,
+)
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
 from lake.clock import Clock, SystemClock
 from lake.control_plane import (
@@ -135,7 +140,14 @@ ScheduleSetter = Callable[[date], None]
 # command turns into one line and an exit code, so the sweep says what the command would have
 # said instead of handing the operator a stack trace in the job's error log.
 _LEDGER_REFUSALS = (MasterAbsent, MasterUnreadable)
-_BARS_REFUSALS = (MasterAbsent, MasterUnreadable, UnsupportedBarFreq, NotASession, VendorAuthError)
+_BARS_REFUSALS = (
+    MasterAbsent,
+    MasterUnreadable,
+    StampNotAnInstant,
+    UnsupportedBarFreq,
+    NotASession,
+    VendorAuthError,
+)
 
 
 def set_sunday_wake(sunday: date) -> None:

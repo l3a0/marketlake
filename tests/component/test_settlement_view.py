@@ -775,6 +775,27 @@ def test_a_plain_date_expiration_refuses_too(fixture_lake):
         _view(root)
 
 
+def test_an_expiration_that_is_not_a_string_reads_as_unreadable_rather_than_raising():
+    """The type guard is what keeps the refusal in this view's own vocabulary.
+
+    `_expires_on` hands the stamp to `bars.session_of`, which parses it, and
+    `datetime.fromisoformat` raises `TypeError` on a non-string. That is not in the
+    `except (ValueError, StampNotAnInstant)` below it, so without the guard a `date` read back
+    from a schema change would escape as a `TypeError` rather than as the
+    `ExpirationUnreadable` this view documents. Replacing the guard with an `is None` test left
+    the whole suite green, so nothing said which of the two a caller gets.
+    """
+    from datetime import date as _date
+
+    from lake.settle import _expires_on
+
+    assert _expires_on(_date(2026, 9, 18)) is None
+    assert _expires_on(None) is None
+    assert _expires_on(20260918) is None
+    assert _expires_on("not a stamp") is None
+    assert _expires_on(f"{SESSION}T20:00:00.000+00:00") == _date.fromisoformat(SESSION)
+
+
 def test_a_null_settlement_type_is_unreadable_rather_than_am_settled(fixture_lake):
     """A missing settlement code is the absence of a claim, not a claim about the open.
 

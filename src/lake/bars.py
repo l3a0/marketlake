@@ -266,10 +266,11 @@ class StampNotAnInstant(BarsError):
     as 2026-09-15 under ``TZ=UTC``.
 
     Every other stamp reader in this package tests for that before trusting a stamp.
-    ``onboard``, ``vendor``, ``actions``, ``capture_spans``, ``security_master`` and ``settle``
-    each spell the same condition, and ``lake.bars`` was the one that did not. The refusal names
-    the offset form to pass, which is the rule ``docs/design.md`` states for onboarding's own
-    naive-instant refusal.
+    ``onboard``, ``vendor``, ``actions``, ``capture_spans`` and ``security_master`` each spell the
+    same condition, and ``lake.bars`` was the one that did not. ``settle`` spelled it too until
+    this class took the rule over, and it reaches the same refusal now by calling
+    :func:`session_of` rather than by keeping its own copy. The refusal names the offset form to
+    pass, which is the rule ``docs/design.md`` states for onboarding's own naive-instant refusal.
 
     **It stays out of the walk's catch in :func:`fetch_session_bars`.** That tuple names
     ``CloseOfRecordDisagrees`` rather than the ``BarsError`` base precisely so a later subclass
@@ -280,10 +281,21 @@ class StampNotAnInstant(BarsError):
     ticker and still write the run as though it had worked. ``UnsupportedBarFreq`` refuses up
     front for that same reason.
 
-    ``lake.settle`` is the caller that can reach it, on ``expiration_date``, which ``journal``
-    keeps as the vendor's ISO string verbatim rather than minting it. It catches this and reads
-    the stamp as unreadable, which leaves ``ExpirationUnreadable`` as the refusal that view
-    already documents.
+    **It is named at both doors an operator meets, which is the other half of the
+    ``UnsupportedBarFreq`` comparison.** Staying out of the per-ticker-day catch is not a reason
+    to reach a person as a stack trace. ``main`` prints one named line and exits 2, and
+    ``sweep._BARS_REFUSALS`` holds it so the 18:30 job reports a refused bars piece rather than
+    ending mid-run. That second one is what keeps an escape from costing the report file, the
+    digest and the Friday ``pmset`` wake, which are all written after the pieces block.
+    ``docs/design.md`` states the rule: one named line and exit 2 rather than a stack.
+
+    **Two readers outside this module call :func:`session_of`, and only one can reach this.**
+    ``lake.settle`` can, on ``expiration_date``, which ``journal`` keeps as the vendor's ISO
+    string verbatim rather than minting it. It catches this and reads the stamp as unreadable,
+    which leaves ``ExpirationUnreadable`` as the refusal that view already documents.
+    ``loader._in_view`` cannot, and the reason is ordering rather than anything it does:
+    ``load_bars`` runs ``_sorted_by_instant`` over the same table first, which refuses an
+    unreadable stamp in ``LoadError`` vocabulary before ``_in_view`` sees it.
     """
 
     def __init__(self, bar_ts: str) -> None:
@@ -1286,10 +1298,15 @@ def _bar_close(rows: Sequence[dict]) -> float | None:
     instant, and ``lake.settle`` takes the last row of it, so the two readings of one session's
     close now agree by construction rather than by coincidence.
 
-    **The tie is stated rather than inherited.** ``max`` returns the first maximal row, so two
-    candles at one instant resolve to the earlier row here and to the later one through a stable
-    sort in ``load_bars``. Nothing in the lake has ever carried two candles at one instant, and
-    naming the rule is what lets a reader tell a decision from an accident.
+    **The tie is stated rather than inherited, and it is ``load_bars``'s.** Two candles can name
+    one instant while spelling it differently, and the two readings used to split on that:
+    ``max`` returns the first maximal row, where ``load_bars`` sorts stably and ``lake.settle``
+    takes the last. Measured on that pair, the gate read 700.0 and the view read 757.39. Sorting
+    and taking the last row is ``load_bars``'s own rule, so this takes it rather than minting a
+    second one, and the agreement above covers a tie rather than stopping short of it.
+
+    No such pair exists to measure against, because the lake holds no bars at all yet. That is
+    the reason to state the rule now rather than after one arrives.
 
     **Parsing here cannot raise in the sweep, and the order is why.** ``_as_instant`` raises on a
     stamp ``str`` would have swallowed. Every row reaching this has already been parsed twice,
@@ -1300,7 +1317,7 @@ def _bar_close(rows: Sequence[dict]) -> float | None:
     """
     if not rows:
         return None
-    latest = max(rows, key=_instant)
+    latest = sorted(rows, key=_instant)[-1]
     value = latest.get("close")
     if value is None or isinstance(value, bool):
         return None
@@ -1832,6 +1849,13 @@ def main(
         return 2
     except UnsupportedBarFreq as exc:
         print(f"bars: {exc}. Fix the bars list in tickers.yaml.", file=sys.stderr)
+        return 2
+    except StampNotAnInstant as exc:
+        # The refusal reaches a person as one line rather than a stack, which is the treatment
+        # ``UnsupportedBarFreq`` above already gets and the rule ``docs/design.md`` states. No
+        # instruction is invented past the exception's own message, because that message already
+        # names the offset form to pass and a wrong instruction is worse than none.
+        print(f"bars: {exc}", file=sys.stderr)
         return 2
     except NotASession as exc:
         print(f"bars: {exc}, so there are no bars to fetch.", file=sys.stderr)

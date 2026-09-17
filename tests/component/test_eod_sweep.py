@@ -1054,6 +1054,39 @@ def test_a_frequency_the_lake_cannot_fetch_ends_the_bar_fetch_alone(fixture_lake
     assert pinger.urls == []
 
 
+def test_a_naive_bar_stamp_is_a_refused_bars_piece_rather_than_the_end_of_the_run(
+    fixture_lake: FixtureLake, monkeypatch
+):
+    """The refusal reports itself here instead of escaping and taking the evening with it.
+
+    `StampNotAnInstant` deliberately stays out of the per-ticker-day catch inside `lake.bars`,
+    because a stamp it refuses means the row builder's one-offset guarantee has broken for the
+    run. That is a reason to end the bars walk, not a reason to end this job: everything written
+    after the pieces block is lost with it, which is the report file, the digest and the Friday
+    `pmset` wake. `UnsupportedBarFreq` is in the same tuple for the same reason.
+
+    The stamp is forced at the seam rather than in a fixture, because the row builder cannot
+    mint a naive one, which is the guarantee this asserts the breach of.
+    """
+    from lake import bars as bars_module
+
+    root = _lake(fixture_lake)
+
+    def refuse(*args, **kwargs):
+        raise bars_module.StampNotAnInstant("2026-09-14T00:00:00")
+
+    monkeypatch.setattr(sweep, "fetch_session_bars", refuse)
+    outcome, pinger, _ = _run(root)
+
+    bars_piece = dict(outcome.nightly.pieces)["bars"]
+    assert bars_piece.finished is False
+    assert "StampNotAnInstant" in bars_piece.refusal
+    assert "2026-09-14T00:00:00" in bars_piece.refusal
+    assert dict(outcome.nightly.pieces)["splits"].finished is True
+    assert pinger.urls == []
+    assert outcome.filed_at is not None, "the report file was lost with the escaping refusal"
+
+
 # -- what the review's mutation lens found unheld ---------------------------------------
 
 

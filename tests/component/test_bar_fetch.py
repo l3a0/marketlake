@@ -2247,20 +2247,32 @@ def test_the_bar_close_reads_the_last_instant_rather_than_the_last_string():
     )
 
 
-def test_the_bar_close_breaks_a_tie_on_the_first_row_it_was_handed():
-    """The tie rule is stated in the docstring, so it is asserted rather than left to ``max``.
+def test_the_bar_close_breaks_a_tie_the_way_load_bars_does():
+    """Two candles at one instant resolve to the same row here and through the read layer.
 
-    Two candles at one instant resolve to the earlier row here, because ``max`` returns the
-    first maximal one, and to the later row through ``load_bars``, whose sort is stable. Nothing
-    in the lake carries two candles at one instant. This holds the rule so a reader can tell the
-    decision from an accident, and so a change of key that quietly reversed it would fail.
+    The two spellings below name one instant, so nothing about the stamps separates them and
+    only the tie rule decides. ``load_bars`` sorts by instant and ``lake.settle`` takes the last
+    row, and a stable sort leaves the last of an equal group, so the read layer answers with the
+    row handed over last. This takes that rule rather than minting a second one: ``max`` would
+    answer with the first, which is the disagreement measured on #386, gate 700.0 against view
+    757.39.
+
+    Both orderings are driven, because a rule that only holds for one of them is the file's own
+    row order deciding what a bar is judged against.
     """
-    rows = [
-        {"bar_ts": "2026-09-14T20:00:00+00:00", "close": 651.0},
-        {"bar_ts": "2026-09-14T16:00:00-04:00", "close": 652.0},
-    ]
-    assert bars._bar_close(rows) == 651.0
-    assert bars._bar_close(list(reversed(rows))) == 652.0
+    first = {"bar_ts": "2026-09-14T20:00:00+00:00", "close": 651.0}
+    second = {"bar_ts": "2026-09-14T16:00:00-04:00", "close": 652.0}
+    assert bars._instant(first) == bars._instant(second), (
+        "the two stamps stopped naming one instant"
+    )
+
+    assert bars._bar_close([first, second]) == 652.0
+    assert bars._bar_close([second, first]) == 651.0
+
+    # The read layer's own reading, spelled out rather than asserted by reference, so a change
+    # to either side has to face the other.
+    for rows in ([first, second], [second, first]):
+        assert bars._bar_close(rows) == sorted(rows, key=bars._instant)[-1]["close"]
 
 
 def test_a_stamp_carrying_no_offset_is_refused_by_every_reader_in_the_module():
@@ -2287,35 +2299,128 @@ def test_a_stamp_carrying_no_offset_is_refused_by_every_reader_in_the_module():
     assert bars.session_of("2026-09-15T20:00:00.000+00:00") == date(2026, 9, 15)
 
 
-def test_a_candle_stamped_exactly_at_the_window_end_is_outside_and_refuses():
-    """Marketlake #389. The window is half-open and nothing held its end.
+def test_the_refusal_names_the_stamp_it_refused_and_carries_it():
+    """An operator reading the line has to be told which stamp, not only that there was one.
 
-    Widening ``<`` to ``<=`` in ``check_bar_span`` left the whole suite green, so the boundary
-    was correct and unheld. A candle stamped exactly at ``window.end`` is the vendor returning a
-    minute past what was asked for, which is the shape the check exists to refuse: the check's
-    own docstring says a 1-min session's last candle is stamped 15:59, because a candle carries
-    its minute's open.
+    ``docs/design.md`` asks a refusal to name the fix. A message that named the offset form but
+    not the offending value would leave a person grepping a partition for it, and the whole
+    suite stayed green with the value dropped from the message. The attribute is held for the
+    same reason its siblings hold theirs: ``CloseOfRecordDisagrees`` carries ``ticker`` and
+    ``day``, ``UnsupportedBarFreq`` carries ``ticker`` and ``freq``.
+    """
+    naive = "2026-09-16T01:00:00"
+    exc = bars.StampNotAnInstant(naive)
+    assert naive in str(exc)
+    assert exc.bar_ts == naive
+    assert "StampNotAnInstant" in bars.__all__, (
+        "lake.settle imports this by name, so dropping the export breaks a caller"
+    )
 
-    Both frequencies are driven. The daily window is a bracket wider than the session, so its
-    end is a different instant from the minute window's, and a check that refused only one of
-    them would pass a test naming only the other.
+
+def test_a_naive_stamp_ends_the_run_rather_than_being_held_to_its_ticker_day():
+    """The class's own docstring argues this, and nothing held the argument.
+
+    Adding ``StampNotAnInstant`` to the walk's catch left the whole suite green, so the decision
+    read as taste rather than as a rule. It is a rule: every stamp inside this module is minted
+    by ``journal.bars_rows`` at one offset, so one that refuses means that guarantee has broken
+    for the run rather than for the ticker-day being walked. Holding it per ticker-day would
+    file the same finding for every ticker and still report the run as having worked.
+
+    The stamp is forced at the parse rather than in a fixture, because the row builder cannot
+    mint a naive stamp, which is the very guarantee this asserts the breach of.
     """
     from lake.session import SessionClock
 
     bounds = SessionClock(ManualClock(FIRST_NIGHT), weekday_sessions(MONDAY)).bounds(SESSION)
-    for freq in (MINUTE_FREQ, DAILY_FREQ):
-        window = bar_window(freq, bounds)
-        built = [{"bar_ts": window.end.isoformat(), "close": 651.0}]
-        selected = bars.select_session_rows(built, window)
-        assert bars.check_bar_span(built, selected, window).covers is False, (
-            f"a {freq} candle stamped exactly at the window end was counted as inside it"
-        )
+    window = bar_window(DAILY_FREQ, bounds)
+    built = [{"bar_ts": f"{SESSION.isoformat()}T00:00:00-04:00", "close": 651.0}]
 
-    # A candle one minute before the minute window's end is inside, so the assertion above is
-    # about the boundary rather than about the row being refused for some other reason.
+    # Sanity: this shape reads fine while the guarantee holds.
+    assert bars.select_session_rows(built, window)
+
+    broken = [{"bar_ts": f"{SESSION.isoformat()}T00:00:00", "close": 651.0}]
+    with pytest.raises(bars.StampNotAnInstant):
+        bars.select_session_rows(broken, window)
+    with pytest.raises(bars.StampNotAnInstant):
+        bars.check_bar_span(broken, [], window)
+
+    from lake.journal import UNFIT_ERRORS
+    from lake.loader import LoadError
+
+    walk_catches = (LoadError, VendorError, bars.CloseOfRecordDisagrees, *UNFIT_ERRORS)
+    assert not issubclass(bars.StampNotAnInstant, walk_catches), (
+        "the refusal joined the per-ticker-day catch, which contradicts its own docstring"
+    )
+
+
+def test_the_command_turns_a_naive_stamp_into_one_named_line(capsys, monkeypatch):
+    """The refusal reaches a person as a line and exit 2, the way ``UnsupportedBarFreq`` does.
+
+    Staying out of the per-ticker-day catch is not a reason to hand an operator a stack. This is
+    the other half of the comparison the class docstring draws, and without it the analogy was
+    cited and half-applied.
+    """
+    naive = "2026-09-16T01:00:00"
+
+    def refuse(*args, **kwargs):
+        raise bars.StampNotAnInstant(naive)
+
+    monkeypatch.setattr(bars, "fetch_session_bars_from_config", refuse)
+    assert bars.main([]) == 2
+    printed = capsys.readouterr().err
+    assert naive in printed
+    assert "Traceback" not in printed
+
+
+def test_a_candle_stamped_exactly_at_the_window_end_is_counted_outside_the_bracket():
+    """Marketlake #389. The window is half-open and no test covered its end.
+
+    Widening ``<`` to ``<=`` in ``check_bar_span`` left the whole suite green, and the first
+    test written for it stayed green too, because it asserted the right answer through the wrong
+    clause. A lone candle at ``window.end`` is either filtered out of the session, which refuses
+    on ``bool(selected)``, or kept in it, which refuses on ``ends_match``. Neither path ever
+    reads the ``outside`` list, which is the only term the boundary changes.
+
+    **So the shape here is a response that would otherwise land.** One candle inside the session
+    and one stamped exactly at ``window.end``. The selection keeps the first, so ``selected`` is
+    not empty and the daily rule's other term is satisfied, and the verdict rests on whether the
+    second candle counts as outside the bracket. Under ``<`` it does and the fetch is refused.
+    Under ``<=`` it does not and the partition lands, which is the harm #389 names.
+
+    ``covered`` is asserted beside ``covers`` because it is the value that moves, 2.0 against
+    1.0: a response reaching outside the bracket files the sessions it actually carried, so an
+    operator reading the withheld file is not told a refused fetch had full coverage.
+
+    **``1m`` cannot separate the two and this says so rather than pretending otherwise.**
+    ``window.end`` there is the equity close, which is inside the session being fetched, so a
+    candle stamped at it is always selected and always sets ``last`` one minute past what
+    ``ends_match`` accepts. The comparison is refused before ``outside`` is consulted, on either
+    side of the boundary. The daily bracket is wider than its session, which is what puts a
+    candle at ``window.end`` into a neighbour's session and leaves the boundary as the only
+    term left to decide.
+    """
+    from lake.session import SessionClock
+
+    bounds = SessionClock(ManualClock(FIRST_NIGHT), weekday_sessions(MONDAY)).bounds(SESSION)
+    window = bar_window(DAILY_FREQ, bounds)
+
+    in_session = {"bar_ts": f"{SESSION.isoformat()}T00:00:00-04:00", "close": 651.0}
+    at_end = {"bar_ts": window.end.isoformat(), "close": 999.0}
+    built = [in_session, at_end]
+
+    selected = bars.select_session_rows(built, window)
+    assert [row["close"] for row in selected] == [651.0], (
+        "the candle at the window end stopped falling outside the fetched session, so this "
+        "shape no longer leaves the boundary as the deciding term"
+    )
+
+    span = bars.check_bar_span(built, selected, window)
+    assert span.covers is False
+    assert span.covered == 2.0
+
+    # The minute window's end is inside its own session, which is why the case above is daily.
     minute = bar_window(MINUTE_FREQ, bounds)
-    inside = {"bar_ts": (minute.end - timedelta(minutes=1)).isoformat(), "close": 651.0}
-    assert bars._instant(inside) < minute.end
+    assert bars.session_of(minute.end.isoformat()) == minute.session
 
 
 def test_a_minute_partition_consults_no_settled_close(fixture_lake: FixtureLake, monkeypatch):
