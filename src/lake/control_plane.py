@@ -496,11 +496,11 @@ def eod_sweep_job(host: LaunchdHost) -> LaunchdJob:
     exclusion protects, and one derivation for the three is what keeps them from
     splitting. Nothing here needs a second spelling of that path: ``environment`` sets
     ``HOME``, ``schwab.DEFAULT_TOKEN_PATH`` is bound from it at import, and
-    ``bars.fetch_session_bars_from_config`` already defaults to that constant.
+    ``bars`` already defaults to that constant wherever the sweep reaches it.
 
     ``RunAtLoad`` is off, for ``calendar_probe_job``'s reason rather than a new one. A
-    load at any other hour would make vendor calls about a session the run is not in, and
-    ``bars.fetch_session_bars`` raises ``NotASession`` off one. launchd still fires a
+    load at any other hour would make vendor calls about a session the run is not in, which
+    ``lake.sweep`` refuses for itself by asking the calendar before it walks. launchd still fires a
     missed 18:30 occurrence on the next wake, which is a catch-up this job has to refuse
     rather than welcome, and ``lake.sweep`` refuses it by requiring the session's equity
     close to have passed before it fetches.

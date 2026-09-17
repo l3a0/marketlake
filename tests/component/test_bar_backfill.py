@@ -1,6 +1,7 @@
 """The bar backfill: every session the capture spans cover, fetched one ticker-day at a time.
 
-Marketlake #319. The evening fetch beside it lands one session; this walks a range, and what
+Marketlake #319. The by-hand fetch beside it lands one session; this walks a range, and since
+marketlake #422 it is what the 18:30 job runs. What
 decides the range is three rules the tests below drive one at a time. A session is in range when
 the calendar says it traded, when its own window intersects a capture span, and when its equity
 close has already passed.
@@ -862,7 +863,7 @@ def test_the_absent_spans_error_carries_the_path_it_looked_at(fixture_lake: Fixt
     root = _lake(fixture_lake)
     spans_path(root).unlink()
     with pytest.raises(SpansAbsent) as caught:
-        bars._read_spans(root)
+        bars.read_capture_spans(root)
     assert caught.value.path == spans_path(root)
 
 
@@ -1182,7 +1183,7 @@ def test_an_unreadable_spans_file_that_is_present_is_not_reported_as_absent(
     spans_path(root).chmod(0o000)
     try:
         with pytest.raises(PermissionError):
-            bars._read_spans(root)
+            bars.read_capture_spans(root)
     finally:
         spans_path(root).chmod(0o644)
 

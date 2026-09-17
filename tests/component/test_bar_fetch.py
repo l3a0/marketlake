@@ -563,8 +563,11 @@ def test_a_session_with_no_sealed_quotes_partition_is_contained_the_same_way(
 
     Tonight's session has no next partition yet, which this job's first real run meets: the
     following session has not happened, so compaction has sealed nothing for it. The rule is
-    the same one, written once over ``LoadError``, and this is the half that settles itself:
-    tomorrow's seal makes the comparison available and the next run lands the bar.
+    the same one, written once over ``LoadError``, and this is the half that can settle: tomorrow's
+    seal makes the comparison available. What lands the bar is a run that asks about this session
+    again, and this entry point never does, because it fetches the one session it is given.
+    Marketlake #422 moved the evening run to the span walk for that reason, and
+    ``test_a_daily_bar_held_tonight_is_reached_again_tomorrow`` is where the recovery is held.
     """
     root = _lake(
         fixture_lake,
@@ -997,7 +1000,7 @@ def test_the_command_exits_one_when_a_finding_could_not_be_filed(
 def test_the_command_runs_the_sweep_and_reports_what_it_did(
     fixture_lake: FixtureLake, tmp_path: Path, capsys
 ):
-    """The ordinary run. ``lake.sweep`` drives the same entry from its 18:30 job."""
+    """The ordinary by-hand run. ``lake.sweep`` drives the span walk rather than this one."""
     root = _lake(fixture_lake)
     config = write_config(tmp_path, root)
 
@@ -1121,11 +1124,12 @@ def test_each_frequency_asks_for_exactly_the_window_this_issue_names(fixture_lak
 
     The ``1m`` window is the session itself. That is a choice rather than a default: both
     vendor flags are left unset, so Schwab decides whether a price-history response covers the
-    regular session or the extended one, and nobody has recorded which it picks. At the
-    session's own bounds it does not matter, because the request's bounds clip the response
-    either way. Wider, it would matter: Schwab answering with the regular session would be
-    correct and short at once, and the span check would stall the run pointing at the wrong
-    cause.
+    regular session or the extended one, and nobody has recorded which it picks. The reason that
+    was thought safe, that the request's bounds clip the response either way, is measured false:
+    marketlake #416's first live run asked this exact window and received 780 minutes. What the
+    narrow window still buys is the rest of it, that a wider one would let Schwab answer with the
+    regular session, correct and short at once, and stall the run pointing at the wrong cause.
+    #421 owns setting the flag. This asserts the window the request carries either way.
 
     The ``1d`` window is a day wider on each side, because #362's recording put the daily stamp
     at midnight Eastern of its session and at 01:00, both ahead of the 09:30 open a bracket
@@ -1993,6 +1997,181 @@ def test_the_daily_margin_is_an_argument_the_window_builder_reads():
     assert narrowed.end == CLOSE_ET + timedelta(hours=6)
 
 
+def test_the_daily_check_refuses_a_bracket_read_back_as_instants():
+    """marketlake #416, the mechanism, against the shape the first live run measured.
+
+    The bracket for a Tuesday starts a day before the 09:30 open, so it starts at 09:30 on the
+    Monday. Schwab clips a daily response to the calendar dates its bounds fall on rather than to
+    the instants, so Monday's own candle comes back stamped near Eastern midnight, hours before
+    the requested instant and on the same date. Read back as an instant, that candle is outside
+    the bracket and the fetch is refused. Five of seven sessions refused exactly that way on
+    2026-09-16, and the two that passed had a Sunday and Labor Day as their bracket's start date,
+    so no candle existed there to come back.
+
+    The instant comparison is applied inline rather than described, so this asserts the defect
+    rather than asserting around it. Reverting the daily branch of ``check_bar_span`` makes the
+    two verdicts equal and the first assertion fails.
+    """
+    from lake.session import SessionClock
+
+    session = date(2026, 9, 15)
+    bounds = SessionClock(ManualClock(SECOND_NIGHT), weekday_sessions(MONDAY)).bounds(session)
+    window = bar_window(DAILY_FREQ, bounds)
+    # What the run received: the previous session's candle, the session's own, and the next
+    # session's, each stamped at 01:00 Eastern of its own date.
+    built = [
+        {"bar_ts": f"2026-09-{day}T01:00:00-04:00", "close": close}
+        for day, close in (("14", 651.0), ("15", 652.0), ("16", 653.0))
+    ]
+
+    selected = bars.select_session_rows(built, window)
+    span = bars.check_bar_span(built, selected, window)
+    assert span.covers is True, "the daily check still reads its bracket back as instants"
+    assert (span.covered, span.requested) == (1.0, 1.0)
+    assert [row["close"] for row in selected] == [652.0], "the wrong session's candle was kept"
+
+    # The comparison the shipped code made, spelled out. The run filed exactly this pair for SPY
+    # and QQQ on 2026-09-15.
+    outside = [row for row in built if not window.start <= bars._instant(row) < window.end]
+    assert [row["close"] for row in outside] == [651.0]
+    assert float(len({bars.session_of(str(row["bar_ts"])) for row in built})) == 3.0
+
+
+def test_daily_containment_does_not_rest_on_the_vendors_own_day_boundary():
+    """Why the fix is a date comparison rather than a bracket aligned to midnight.
+
+    Aligning the bracket to Eastern midnight would also have covered all seven sessions, and it
+    is the weaker fix. It leaves the comparison an instant one and moves the bracket's start onto
+    a day boundary, which is the one place the vendor's own boundary has to be guessed. The seven
+    observations cannot identify that boundary: a date-clipping vendor reproduces every filed
+    number at any offset from UTC-5 through UTC+3, because the old bracket started far enough
+    inside its first date that no offset could reach it. #362 measured stamps at both 00:00 and
+    01:00 Eastern in a month that is daylight throughout, so the vendor's offset is not
+    dependable, which ``DAILY_WINDOW_MARGIN`` said before this issue and still says.
+
+    Measured over those nine candidate boundaries, an aligned bracket read on instants covers all
+    seven under one and four of seven under the other eight. A date comparison covers all seven
+    under all nine, and asks the vendor for nothing it was not already asked for.
+
+    This holds the property that buys: every candle stamped anywhere within the bracket's first
+    or last Eastern date is contained, whatever hour the vendor chose to stamp it at.
+    """
+    from lake.session import SessionClock
+
+    session = date(2026, 9, 15)
+    bounds = SessionClock(ManualClock(SECOND_NIGHT), weekday_sessions(MONDAY)).bounds(session)
+    window = bar_window(DAILY_FREQ, bounds)
+    own = {"bar_ts": f"{session.isoformat()}T01:00:00-04:00", "close": 652.0}
+
+    for hour in ("00:00:00", "01:00:00", "09:29:59", "13:00:00", "23:59:59"):
+        neighbours = [
+            {"bar_ts": f"2026-09-14T{hour}-04:00", "close": 651.0},
+            {"bar_ts": f"2026-09-16T{hour}-04:00", "close": 653.0},
+        ]
+        built = [neighbours[0], own, neighbours[1]]
+        span = bars.check_bar_span(built, bars.select_session_rows(built, window), window)
+        assert span.covers is True, f"a neighbour stamped at {hour} was counted outside"
+        assert (span.covered, span.requested) == (1.0, 1.0)
+
+
+def test_the_daily_bounds_are_dated_in_the_markets_own_zone():
+    """The zone the bracket's own dates are read in, which nothing else in the suite pins.
+
+    Daily containment compares dates, so which zone dates them decides the verdict. Every bound
+    the shipped margin produces has the same date in Eastern and in UTC, because 09:30 and 16:00
+    Eastern are both mid-afternoon UTC. So reading them in UTC passes the whole suite while
+    meaning something different, which a mutation confirmed.
+
+    The two margins here are chosen to separate the readings, one per bound.
+
+    1. Thirteen hours puts the start at 20:30 Eastern on the day before the session, which is
+       00:30 UTC on the session itself. Dated in Eastern the previous day is inside the bracket.
+       Dated in UTC it is a day early, and the neighbour the margin reached for is refused.
+    2. A day and five hours puts the end at 21:00 Eastern, which is 01:00 UTC on the day after.
+       Dated in Eastern the following day is outside. Dated in UTC it is inside, and a candle
+       from a session the request never asked about would land.
+
+    Eastern is the right reading for the same reason :func:`lake.bars.session_of` gives: the
+    market's own zone is what names a session, and a window dated any other way is dated by
+    something that has nothing to do with the exchange.
+    """
+    from lake.session import SessionClock
+
+    session = date(2026, 9, 15)
+    bounds = SessionClock(ManualClock(SECOND_NIGHT), weekday_sessions(MONDAY)).bounds(session)
+    own = {"bar_ts": f"{session.isoformat()}T01:00:00-04:00", "close": 652.0}
+
+    def verdict(margin, neighbour):
+        window = bar_window(DAILY_FREQ, bounds, margin=margin)
+        built = [{"bar_ts": f"{neighbour}T01:00:00-04:00", "close": 999.0}, own]
+        return window, bars.check_bar_span(built, bars.select_session_rows(built, window), window)
+
+    start_side, covers_early = verdict(timedelta(hours=13), "2026-09-14")
+    assert start_side.start.astimezone(MARKET_TZ).date() == date(2026, 9, 14)
+    assert start_side.start.astimezone(UTC).date() == date(2026, 9, 15), "the zones agree here"
+    assert covers_early.covers is True, "the start bound was dated outside Eastern"
+
+    end_side, refuses_late = verdict(timedelta(days=1, hours=5), "2026-09-17")
+    assert end_side.end.astimezone(MARKET_TZ).date() == date(2026, 9, 16)
+    assert end_side.end.astimezone(UTC).date() == date(2026, 9, 17), "the zones agree here"
+    assert refuses_late.covers is False, "the end bound was dated outside Eastern"
+    assert refuses_late.covered == 2.0
+
+    # **Eastern, not a fixed offset that happens to look like it.** The two margins above
+    # separate Eastern from UTC and from nothing else: they put the bounds at 20:30 and 21:00, and
+    # every zone from roughly UTC-8 to UTC-3 dates those identically. So a bound dated in a
+    # hardcoded -5, which is Eastern with daylight saving dropped, or in America/Chicago, would
+    # pass them both. That is the mistake ``DAILY_WINDOW_MARGIN`` warns about in its own words,
+    # that the vendor's offset is not dependable, and it is worth refusing here rather than
+    # inheriting.
+    #
+    # Nine hours puts the start at 00:30 Eastern on the session's own date, inside the hour where
+    # a daylight offset and a standard one disagree about the date. Under -5 or Central that
+    # instant is 23:30 on the previous date, which would pull the previous session in.
+    zoned, refuses_early = verdict(timedelta(hours=9), "2026-09-14")
+    assert zoned.start.astimezone(MARKET_TZ).date() == date(2026, 9, 15)
+    assert (zoned.start - timedelta(hours=1)).astimezone(MARKET_TZ).date() == date(2026, 9, 14)
+    assert refuses_early.covers is False, "the start bound was dated in a fixed offset"
+    assert refuses_early.covered == 2.0
+
+    # **Closed on the end date, not half-open at the date grain.** The 1-minute branch is
+    # half-open on instants and carrying that convention across is the natural refactor to reach
+    # for, so this states the choice rather than leaving it to be inferred. Eight hours past the
+    # 16:00 close puts the end at exactly Eastern midnight, the one bound where subtracting a
+    # microsecond before dating it would change the answer. No shipped margin reaches it.
+    midnight_end, covers_that_day = verdict(timedelta(hours=8), "2026-09-16")
+    assert midnight_end.end == datetime.fromisoformat("2026-09-16T00:00:00-04:00")
+    assert covers_that_day.covers is True, "the end date was dated half-open"
+
+
+def test_a_refused_daily_fetch_counts_sessions_rather_than_rows():
+    """``covered`` is a session count, which only a duplicated stamp can tell from a row count.
+
+    The comment above it says it counts the sessions the response actually carried, and every
+    other test that reaches the refusing branch feeds one candle per Eastern date, so a row count
+    and a session count agree in all of them. A vendor returning two rows for one session would
+    then file an inflated figure in the withheld report with nothing to catch it, and the whole
+    reason ``covered`` is not taken from ``selected`` is that an operator reading a refused fetch
+    should see what actually came back.
+
+    Three rows across two Eastern dates, one of them twice. The pair filed is 2.0 against 1.0.
+    """
+    from lake.session import SessionClock
+
+    bounds = SessionClock(ManualClock(FIRST_NIGHT), weekday_sessions(MONDAY)).bounds(SESSION)
+    window = bar_window(DAILY_FREQ, bounds)
+    beyond = window.end.astimezone(MARKET_TZ).date() + timedelta(days=1)
+    built = [
+        {"bar_ts": f"{SESSION.isoformat()}T00:00:00-04:00", "close": 651.0},
+        {"bar_ts": f"{beyond.isoformat()}T01:00:00-04:00", "close": 998.0},
+        {"bar_ts": f"{beyond.isoformat()}T02:00:00-04:00", "close": 999.0},
+    ]
+
+    span = bars.check_bar_span(built, bars.select_session_rows(built, window), window)
+    assert span.covers is False
+    assert (span.covered, span.requested) == (2.0, 1.0)
+
+
 def test_the_close_cross_check_reads_the_tolerance_it_is_handed():
     """The tolerance is an argument, so the battery in #138 can ask the same question wider."""
     assert bars.check_close_cross(650.0 * 1.01, 650.0, tolerance=0.05).agrees is True
@@ -2373,7 +2552,7 @@ def test_the_command_turns_a_naive_stamp_into_one_named_line(capsys, monkeypatch
 
 
 def test_a_candle_stamped_exactly_at_the_window_end_is_counted_outside_the_bracket():
-    """Marketlake #389. The window is half-open and no test covered its end.
+    """Marketlake #389's guard, moved by #416 from the instant boundary to the date boundary.
 
     Widening ``<`` to ``<=`` in ``check_bar_span`` left the whole suite green, and the first
     test written for it stayed green too, because it asserted the right answer through the wrong
@@ -2382,10 +2561,18 @@ def test_a_candle_stamped_exactly_at_the_window_end_is_counted_outside_the_brack
     reads the ``outside`` list, which is the only term the boundary changes.
 
     **So the shape here is a response that would otherwise land.** One candle inside the session
-    and one stamped exactly at ``window.end``. The selection keeps the first, so ``selected`` is
-    not empty and the daily rule's other term is satisfied, and the verdict rests on whether the
-    second candle counts as outside the bracket. Under ``<`` it does and the fetch is refused.
-    Under ``<=`` it does not and the partition lands, which is the harm #389 names.
+    and one at the edge. The selection keeps the first, so ``selected`` is not empty and the daily
+    rule's other term is satisfied, and the verdict rests on whether the second candle counts as
+    outside. Under a correct comparison it does and the fetch is refused. Under a widened one it
+    does not and the partition lands, which is the harm #389 names.
+
+    **What #416 changed is the grain, not the guard.** Daily containment is now measured in
+    Eastern dates, because dates are what the vendor clips to, so no half-open instant boundary is
+    left on this path to widen. The harm #389 named survives at the new grain and is asserted at
+    both ends: a candle on the day past ``last`` refuses, and so does one on the day before
+    ``first``. What is no longer a refusal is a candle *on* either bound's own date, which the old
+    comparison counted outside whenever it fell past that bound's time of day. That was the defect
+    #416 measured, and the last three assertions are what say so.
 
     ``covered`` is asserted beside ``covers`` because it is the value that moves, 2.0 against
     1.0: a response reaching outside the bracket files the sessions it actually carried, so an
@@ -2404,19 +2591,32 @@ def test_a_candle_stamped_exactly_at_the_window_end_is_counted_outside_the_brack
     bounds = SessionClock(ManualClock(FIRST_NIGHT), weekday_sessions(MONDAY)).bounds(SESSION)
     window = bar_window(DAILY_FREQ, bounds)
 
-    in_session = {"bar_ts": f"{SESSION.isoformat()}T00:00:00-04:00", "close": 651.0}
-    at_end = {"bar_ts": window.end.isoformat(), "close": 999.0}
-    built = [in_session, at_end]
+    first = window.start.astimezone(MARKET_TZ).date()
+    last = window.end.astimezone(MARKET_TZ).date()
 
-    selected = bars.select_session_rows(built, window)
-    assert [row["close"] for row in selected] == [651.0], (
-        "the candle at the window end stopped falling outside the fetched session, so this "
-        "shape no longer leaves the boundary as the deciding term"
-    )
+    def verdict(*stamps):
+        built = [{"bar_ts": f"{SESSION.isoformat()}T00:00:00-04:00", "close": 651.0}] + [
+            {"bar_ts": f"{stamp.isoformat()}T01:00:00-04:00", "close": 999.0} for stamp in stamps
+        ]
+        selected = bars.select_session_rows(built, window)
+        assert [row["close"] for row in selected] == [651.0], (
+            "the extra candle stopped falling outside the fetched session, so this shape no "
+            "longer leaves containment as the deciding term"
+        )
+        return bars.check_bar_span(built, selected, window)
 
-    span = bars.check_bar_span(built, selected, window)
-    assert span.covers is False
-    assert span.covered == 2.0
+    # Past the last date, and before the first: both refuse, and ``covered`` moves to 2.0.
+    beyond = verdict(last + timedelta(days=1))
+    assert (beyond.covers, beyond.covered) == (False, 2.0)
+    before = verdict(first - timedelta(days=1))
+    assert (before.covers, before.covered) == (False, 2.0)
+
+    # On either bound's own date: expected rather than wrong, and dropped by the selection. This
+    # is the half marketlake #416 changed, and it is what a date comparison has in place of an
+    # instant boundary. A candle at 16:00 on ``last`` used to be counted outside.
+    assert verdict(last).covers is True
+    assert verdict(first).covers is True
+    assert verdict(first, last).covered == 1.0
 
     # The minute window's end is inside its own session, which is why the case above is daily.
     minute = bar_window(MINUTE_FREQ, bounds)

@@ -71,6 +71,26 @@
   .out_of_scope { background: var(--out-of-scope); }
   /* A status the page does not recognize. Drift renders as itself, never as a status. */
   .unknown { background: repeating-linear-gradient(45deg, var(--alarm) 0 2px, transparent 2px 4px); }
+  /* The heatmap. One row per strip, one cell per session in the window. A cell's
+     colour comes from its slot counts, never from its percent: a day nothing was owed
+     and a day every owed minute was missed both read zero percent, and they are
+     opposite facts. The percent rides in the tooltip beside the counts that produced
+     it, and a day that owed nothing has no percent at all. */
+  .heat-row { display: flex; align-items: center; gap: .5rem; margin: .25rem 0; }
+  .heat-name { flex: 0 0 9.5rem; font-variant-numeric: tabular-nums; }
+  .heat { display: flex; gap: 2px; flex: 1 1 auto; height: 20px; }
+  .heat div { flex: 1 1 0; min-width: 2px; border-radius: 2px; }
+  .heat-dates {
+    display: flex; gap: 2px; margin: .1rem 0 0 10rem;
+    font-size: .75rem; opacity: .7;
+  }
+  .heat-dates span { flex: 1 1 0; min-width: 2px; text-align: center; overflow: hidden; }
+  .ledger { margin: .6rem 0 0; padding-left: 1.1rem; }
+  .ledger li { margin: .15rem 0; font-variant-numeric: tabular-nums; }
+  .nightly { margin: .6rem 0 0; padding: 0; list-style: none; }
+  .nightly li { border-top: 1px solid var(--rule); padding: .4rem 0; }
+  .nightly .lines { margin: .2rem 0 0; padding-left: 1.1rem; }
+  .empty { opacity: .7; font-style: italic; }
   .legend { margin: .4rem 0 .6rem; }
   .legend i { display: inline-block; width: 12px; height: 12px; vertical-align: -1px; margin: 0 .3rem 0 .9rem; }
   .legend i:first-child { margin-left: 0; }
@@ -102,6 +122,11 @@
   }
   body.degraded .stale-note { display: block; }
   body.degraded .panel { opacity: .55; filter: grayscale(85%); }
+  /* The degraded wash says "this is not live", and it follows the load that failed. Now
+     and Today share one load, so they wash together. History has its own, so a live
+     History section is not greyed out because the minute above it went stale, and a
+     failed one says so in its own words rather than borrowing that banner. */
+  body.degraded #history-panel { opacity: 1; filter: none; }
   body.degraded #asof { opacity: .5; }
 </style>
 </head>
@@ -150,6 +175,18 @@
   </div>
 </section>
 
+<section>
+  <h2>History <span id="window" class="muted"></span></h2>
+  <div class="panel" id="history-panel">
+    <h3 class="muted">Completeness</h3>
+    <div id="heat"></div>
+    <h3 class="muted">Open quarantines <span id="quarantine-count"></span></h3>
+    <div id="quarantines"></div>
+    <h3 class="muted">Nightly reports <span id="reports-note" class="muted"></span></h3>
+    <div id="reports"></div>
+  </div>
+</section>
+
 <script>
 (function () {
   "use strict";
@@ -183,6 +220,23 @@
   };
   var UNKNOWN_CLASS = "unknown";
   var UNKNOWN_LABEL = "unrecognized status";
+
+  // The four statuses a verdict is owed on. A heatmap cell takes its colour from the
+  // largest of these, so an onboarding day reads as what happened to the minutes that
+  // were owed rather than being dominated by the ones that were not. Pending and
+  // out-of-scope are left out for that reason, and a cell with no judged minute at all
+  // falls back to whichever of the two it is.
+  var JUDGED = ["captured", "suspect", "gap", "missing"];
+
+  // The nightly report's counts, in the order the file writes them. Each is null when
+  // the run could not take it, which is a different answer from zero and renders as one.
+  var NIGHTLY_COUNTS = [
+    {key: "gaps", label: "gaps"},
+    {key: "quarantined", label: "quarantined"},
+    {key: "disagreements", label: "disagreements"},
+    {key: "unfiled", label: "unfiled"},
+    {key: "pages_lost", label: "pages lost"}
+  ];
 
   // The five segment-health counters, each named for what it is. One integer cannot
   // carry these, so the page never sums them. A shadow append leads and is loud: bytes
@@ -633,15 +687,190 @@
     return row;
   }
 
+  // -- the History panel ----------------------------------------------------
+
+  // A cell's colour, from its counts rather than its percent. A day nothing was owed
+  // and a day every owed minute was missed both read zero percent, and they are
+  // opposite facts, so the percent never decides what a cell looks like.
+  function heatStatus(cell) {
+    var counts = cell.counts || {};
+    if (!(cell.judged > 0)) {
+      return counts.pending > 0 ? "pending" : "out_of_scope";
+    }
+    var best = JUDGED[0];
+    JUDGED.forEach(function (status) {
+      if ((counts[status] || 0) > (counts[best] || 0)) { best = status; }
+    });
+    return best;
+  }
+
+  function heatTitle(cell) {
+    var parts = [cell.date + "  " + cell.ticker + " " + cell.surface];
+    parts.push(cell.captured_pct === null
+      ? "no minute was owed, so there is no percent to give"
+      : cell.captured_pct + "% of " + plural(cell.judged, "minute owed", "minutes owed"));
+    STATUSES.forEach(function (status) {
+      var n = (cell.counts || {})[status] || 0;
+      if (n > 0) { parts.push(plural(n, STATUS_LABEL[status], STATUS_LABEL[status])); }
+    });
+    HEALTH.forEach(function (counter) {
+      var n = cell[counter.key] || 0;
+      if (n > 0) { parts.push(plural(n, counter.one, counter.many)); }
+    });
+    return parts.join("\n");
+  }
+
+  function renderHeat(history) {
+    var box = byId("heat");
+    clear(box);
+    if (history.sessions.length === 0) {
+      box.appendChild(el("p", "The window holds no session.", "empty"));
+      return;
+    }
+    var rows = {};
+    var order = [];
+    history.cells.forEach(function (cell) {
+      var key = cell.ticker + " " + cell.surface;
+      if (!rows[key]) { rows[key] = []; order.push(key); }
+      rows[key].push(cell);
+    });
+    order.forEach(function (key) {
+      var row = el("div", null, "heat-row");
+      row.appendChild(el("span", key, "heat-name"));
+      var strip = el("div", null, "heat");
+      rows[key].forEach(function (cell) {
+        var status = heatStatus(cell);
+        var box2 = el("div", null, STATUS_CLASS[status] || UNKNOWN_CLASS);
+        box2.title = heatTitle(cell);
+        strip.appendChild(box2);
+      });
+      row.appendChild(strip);
+      box.appendChild(row);
+    });
+    var dates = el("div", null, "heat-dates");
+    history.sessions.forEach(function (day, index) {
+      // Every session has a cell and only some have room for a label, so the first and
+      // the last are named and the rest are read off a cell's own tooltip.
+      var first = index === 0;
+      var last = index === history.sessions.length - 1;
+      dates.appendChild(el("span", first || last ? day.slice(5) : ""));
+    });
+    box.appendChild(dates);
+  }
+
+  function renderQuarantines(history) {
+    var chip = byId("quarantine-count");
+    var box = byId("quarantines");
+    clear(box);
+    if (history.quarantine_unreadable !== null) {
+      chip.textContent = "";
+      // The ledger raises on a damaged line and the panel reports it rather than dying,
+      // so the reader is told the count is unknown instead of being shown a false zero.
+      box.appendChild(el("p",
+        "The quarantine ledger could not be read: " + history.quarantine_unreadable +
+        ". This list is not a zero, it is unknown.", "alarm"));
+      return;
+    }
+    chip.textContent = "(" + history.quarantine_count + ")";
+    if (history.quarantines.length === 0) {
+      box.appendChild(el("p", "No partition is withheld.", "empty"));
+      return;
+    }
+    var list = el("ul", null, "ledger");
+    history.quarantines.forEach(function (entry) {
+      var text = entry.partition + "  " + (entry.verdict === null ? DASH : entry.verdict);
+      list.appendChild(el("li", text));
+    });
+    box.appendChild(list);
+    // Signing off is a separate flock-guarded tool, so this panel names it and stops.
+    box.appendChild(el("p",
+      "Signing a partition off runs the quarantine sign-off tool. This panel only reads.",
+      "muted"));
+  }
+
+  function renderReports(history) {
+    var note = byId("reports-note");
+    var box = byId("reports");
+    clear(box);
+    var notes = [];
+    if (history.reports_error !== null) {
+      notes.push("the directory could not be listed: " + history.reports_error);
+    }
+    if (history.reports_unreadable > 0) {
+      notes.push(plural(history.reports_unreadable, "file would not parse", "files would not parse"));
+    }
+    note.textContent = notes.length === 0 ? "" : "(" + notes.join("; ") + ")";
+    note.className = notes.length === 0 ? "muted" : "alarm";
+    if (history.reports.length === 0) {
+      box.appendChild(el("p",
+        "No nightly report has been filed yet. The evening sweep writes the first one.",
+        "empty"));
+      return;
+    }
+    var list = el("ul", null, "nightly");
+    history.reports.forEach(function (entry) { list.appendChild(reportItem(entry)); });
+    box.appendChild(list);
+  }
+
+  function reportItem(entry) {
+    var item = el("li");
+    // The report is the one pre-written thing this page shows, so it leads with the day
+    // it is about and the instant it was written. A stale one never reads as now.
+    var head = el("div");
+    head.appendChild(el("strong", entry.day === null ? DASH : entry.day));
+    head.appendChild(el("span", "  filed " + (entry.at === null ? DASH : entry.at), "muted"));
+    if (entry.session === false) { head.appendChild(el("span", "  no session", "muted")); }
+    if (entry.pinged === false) { head.appendChild(el("span", "  did not ping", "alarm")); }
+    item.appendChild(head);
+    var counts = [];
+    NIGHTLY_COUNTS.forEach(function (counter) {
+      var value = entry[counter.key];
+      // Null is no number rather than zero, and the run says so beside it.
+      counts.push(counter.label + " " + (value === null || value === undefined ? DASH : value));
+    });
+    item.appendChild(el("div", counts.join("   "), "muted"));
+    // ``pieces`` is not rendered beside ``problems``. The sweep appends "<walk> did not
+    // run: <refusal>" to its problems for every walk that refused, so a page showing
+    // both prints each refusal twice. The payload keeps the structured form for a
+    // reader that wants the walk rather than the sentence.
+    appendLines(item, entry.problems, "alarm");
+    appendLines(item, entry.report, "note");
+    return item;
+  }
+
+  function appendLines(item, lines, className) {
+    if (!lines || lines.length === 0) { return; }
+    var list = el("ul", null, "lines");
+    lines.forEach(function (line) { list.appendChild(el("li", line, className)); });
+    item.appendChild(list);
+  }
+
+  function renderHistory(history) {
+    byId("window").textContent =
+      history.window_start + " to " + history.window_end + ", " +
+      plural(history.sessions.length, "session", "sessions");
+    renderHeat(history);
+    renderQuarantines(history);
+    renderReports(history);
+  }
+
   // -- the refresh cycle ----------------------------------------------------
 
-  // Both payloads are fetched before either panel is painted. A partial failure would
+  // Now and Today are fetched together and painted together. A partial failure would
   // otherwise leave a fresh Now table beside a Today strip from the previous poll, with
   // the page mixing two instants and saying so nowhere.
+  //
+  // History is deliberately not on that chain. It answers a different question over a
+  // different span, a month of sessions rather than this minute, so it cannot mix two
+  // instants with either of them. Joining it was tried and is wrong: its window reaches
+  // thirty days back, so one drifted partition a month old would take the whole page
+  // down while the two panels reading today were both healthy. It fails into its own
+  // section instead, and the page above it keeps working.
   function refresh() {
     if (inFlight) { return; }
     inFlight = true;
     var pending = null;
+    var history = getJSON("/api/history").then(renderHistory, historyFailed);
     getJSON("/api/now").then(function (now) {
       pending = now;
       return getJSON("/api/today?date=" + encodeURIComponent(now.session_date));
@@ -652,8 +881,24 @@
     }).catch(function (err) {
       markStale(err.message);
     }).then(function () {
+      return history;
+    }).then(function () {
       inFlight = false;
     });
+  }
+
+  // The History section saying its own load failed. It never touches the page-wide
+  // banner, because the panels above it are still live and that banner says they are not.
+  function historyFailed(err) {
+    byId("window").textContent = "";
+    clear(byId("heat"));
+    byId("quarantine-count").textContent = "";
+    clear(byId("quarantines"));
+    byId("reports-note").textContent = "";
+    clear(byId("reports"));
+    byId("heat").appendChild(el("p",
+      "The history query is failing: " + err.message +
+      ". Nothing in this section is live. The panels above it are.", "alarm"));
   }
 
   byId("refresh").addEventListener("click", refresh);
