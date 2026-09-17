@@ -21,8 +21,10 @@ from __future__ import annotations
 import errno
 import json
 import os
+import re
 import subprocess
 from contextlib import contextmanager
+from dataclasses import fields
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -30,8 +32,10 @@ import pyarrow as pa
 import pytest
 
 from lake import journal, report, sweep
+from lake.actions import ActionsError, actions_path
 from lake.alert import Publisher
 from lake.bars import CHECK_BAR_CLOSE
+from lake.battery import BatteryReport
 from lake.calendar import NotASession
 from lake.capture_spans import SPANS_SCHEMA_VERSION, CaptureSpan, CaptureSpans
 from lake.cassette import Cassette
@@ -47,7 +51,13 @@ from lake.schema_versions import (
     running_fingerprints,
 )
 from lake.schwab import VendorAuthError
-from lake.security_master import KIND_EQUITY, SecurityMaster, master_path
+from lake.security_master import (
+    KIND_EQUITY,
+    MASTER_SCHEMA_VERSION,
+    SecurityMaster,
+    SecurityMasterError,
+    master_path,
+)
 from lake.sweep import DIGEST_BYTE_CAP, HOLIDAY_BODY, NIGHTLY_EVENT, NIGHTLY_PRIORITY
 from lake.tickers import Roster
 from lake.vendor import DAILY_FREQ, MINUTE_FREQ
@@ -57,6 +67,21 @@ from tests.support.lake import FixtureLake
 from tests.support.pinger import FakePinger
 from tests.support.transport import FakeTransport
 from tests.support.vendor import CassetteVendor, bars_candle, bars_interactions
+
+# The census's own spelling for the two ``BatteryReport`` counts it does not render under the
+# field's name. Shared by the two census tests so the line has one description rather than two.
+CENSUS_RENAMED = {"cleared": "clean", "appended": "wrote"}
+# The ``BatteryReport`` fields that are not counts. ``report`` is the run's report-tier lines,
+# which the block prints under the census, and ``findings`` its per-partition verdicts, which the
+# block does not print at all. Neither is a number. ``paged`` is a tuple naming the partitions one
+# delayed-feed page covered, so it is not a number either, and it is left out deliberately rather
+# than missed. ``judge`` runs in-process inside the sweep, so ``page_delayed_feed``'s prints land
+# in the nightly job's own log rather than a hand run's, and it prints on every delivery path, the
+# refused one and the unsent one included. A page that was written down is filed under
+# ``reports/alerts/`` and counted as ``pages_lost``, which the report file and the dashboard both
+# carry. That in-process asymmetry is what separates it from the three counts marketlake #477
+# added, which reached the hand run alone.
+CENSUS_NOT_COUNTS = {"report", "findings", "paged"}
 
 # The week the fixture calendar serves. 2026-09-14 is a Monday, so the sessions run Monday
 # through Friday and the second Monday gives the Friday branch a next week to wake before.
@@ -1160,6 +1185,146 @@ def test_a_walk_refuses_the_whole_os_error_class_and_never_an_ordinary_bug(
         _run(root)
 
 
+def _bump_master_schema_version(root: Path) -> None:
+    """Stamp the master with a version this code does not read, leaving it valid parquet.
+
+    A newer version of this code is the one shape of this a person actually meets, which is the
+    sentence ``_BARS_REFUSALS`` already carries about the spans file. Writing bytes that are not
+    parquet would test ``MasterUnreadable``, whose class both tuples already name.
+    """
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(master_path(root))
+    index = table.schema.get_field_index("schema_version")
+    pq.write_table(
+        table.set_column(index, "schema_version", [[MASTER_SCHEMA_VERSION + 1] * table.num_rows]),
+        master_path(root),
+    )
+
+
+@pytest.mark.parametrize(
+    ("seam", "piece"), [("extract_dividends", "dividends"), ("backfill_bars", "bars")]
+)
+@pytest.mark.parametrize(
+    ("family", "raised"),
+    [("ActionsError", ActionsError), ("SecurityMasterError", SecurityMasterError)],
+)
+def test_a_walk_refuses_each_master_family_by_its_class(
+    fixture_lake: FixtureLake, monkeypatch, seam: str, piece: str, family: str, raised: type
+):
+    """Marketlake #497 chose the class over its members, and this is what fails if that choice
+    is undone.
+
+    The two tests below drive the two siblings that actually escaped, so they cover the fix and
+    not the reasoning behind it. Measured: replacing both classes with the four members those
+    tests reach leaves the whole suite green, so nothing would have noticed the tuples going
+    back to a list of names.
+
+    Raising each base class at the seam is how that breadth is witnessed without inventing a
+    reachable case for a member that has none. It is the device the ``OSError`` width test above
+    already uses one family over, where an ``errno.EIO`` stands in for a bad sector.
+
+    A member reaching here is not the point and could not be driven honestly. ``UnknownInstrument``
+    is raised only by ``remap`` and ``capture_start_of``, which no walk calls, and
+    ``UnresolvedSymbol`` and ``AmbiguousSymbol`` are contained per ticker-day in both walks. What
+    this checks is that the entry stays a family rather than shrinking back to the members
+    somebody happened to meet.
+    """
+    root = _lake(fixture_lake)
+
+    def refuse(*args, **kwargs):
+        raise raised(f"a {family} this walk did not name")
+
+    monkeypatch.setattr(sweep, seam, refuse)
+    outcome, pinger, _ = _run(root)
+
+    refusal = dict(outcome.nightly.pieces)[piece].refusal
+    assert refusal is not None, f"a bare {family} escaped the {piece} walk"
+    assert refusal.startswith(family), refusal
+    assert outcome.filed_at is not None, "the report file was lost with the raise"
+    assert pinger.urls == [], "a refused piece must withhold the ping"
+
+
+def test_a_malformed_ledger_line_refuses_the_two_ledger_walks_and_keeps_the_evening(
+    fixture_lake: FixtureLake,
+):
+    """Marketlake #497, and the reachable half of it.
+
+    Both walks read the actions ledger once for the run, through ``actions.latest``, so
+    ``entry_key`` raises ``LedgerLineError`` on the first entry carrying no key. It is an
+    ``ActionsError`` and the tuple used to name ``MasterAbsent`` alone out of that family, so it
+    escaped. Measured against `9e767ab`, one line naming no ``type`` raised out of ``sweep()``
+    and the run wrote no report file and sent no ping, on a lake whose only fault was one line
+    in a ledger the lake did not carry the night before.
+
+    **The test asserts that the bar walk lands its bar, not merely that it was not refused**,
+    because landing it is what the containment is for. A tuple that refused all three would pass
+    an assertion about the two ledger pieces alone and still cost the night's bars.
+    """
+    root = _lake(fixture_lake)
+    ledger = actions_path(root)
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text(json.dumps({"instrument_id": 1, "ex_date": SESSION.isoformat()}) + "\n")
+
+    outcome, pinger, transport = _run(root, vendor_source=_CountingVendorSource(_cassette()))
+
+    pieces = dict(outcome.nightly.pieces)
+    for name in ("dividends", "splits"):
+        assert pieces[name].refusal is not None, f"a malformed ledger line escaped the {name} walk"
+        assert pieces[name].refusal.startswith("LedgerLineError")
+    assert pieces["bars"].finished, "the bar walk refused although it reads no actions ledger"
+    assert pieces["bars"].landed == 1, "the night's bar was lost with the ledger walks"
+
+    assert outcome.filed_at is not None, "the report file was lost with the raise"
+    assert transport.messages, "the digest was lost with the raise"
+    assert pinger.urls == [], "a refused piece must withhold the ping"
+
+    # ``LedgerLineError`` says the file it failed on, which is an absolute path on the capture
+    # machine. ``refusal_class`` and ``redacted`` both cut by rule rather than by listing
+    # classes, so this arrives covered, and the assertion is what says it stays covered.
+    body = transport.messages[0].body
+    assert "dividends: did not run, LedgerLineError" in body
+    assert str(root) not in body, "the digest leaked an absolute path"
+    filed = outcome.filed_at.read_text()
+    assert str(root) not in filed, "the report file leaked an absolute path"
+    assert json.loads(filed)["pieces"]["splits"]["refusal"] == "LedgerLineError"
+
+
+def test_a_master_from_a_newer_version_refuses_every_walk_rather_than_ending_the_run(
+    fixture_lake: FixtureLake,
+):
+    """Marketlake #497 at the other tuple, which is what makes this two changes rather than one.
+
+    ``SecurityMaster.read`` folds a torn file into ``MasterUnreadable`` and leaves
+    ``UnsupportedSchemaVersion`` alone, and neither ``actions.read_master`` nor
+    ``bars._read_master`` folds it either, since both keep their ``FileNotFoundError`` arm narrow
+    on purpose. So the sibling of a name both tuples already carried ended the whole run.
+
+    **All three pieces are asserted, and the bar walk is the half the ledger tuple cannot
+    reach.** Measured with only ``_LEDGER_REFUSALS`` widened, the two ledger walks refused and
+    the run still died on this raise coming out of ``backfill_bars``. The bar walk gets there
+    because marketlake #422 put ``read_capture_spans`` in front of its master read and this
+    fixture carries the spans.
+    """
+    root = _lake(fixture_lake)
+    _bump_master_schema_version(root)
+
+    outcome, pinger, transport = _run(root)
+
+    pieces = dict(outcome.nightly.pieces)
+    for name in ("dividends", "splits", "bars"):
+        assert pieces[name].refusal is not None, f"a newer master escaped the {name} walk"
+        assert pieces[name].refusal.startswith("UnsupportedSchemaVersion")
+
+    assert outcome.filed_at is not None, "the report file was lost with the raise"
+    assert transport.messages, "the digest was lost with the raise"
+    assert pinger.urls == [], "a refused piece must withhold the ping"
+
+    said = [line for line in outcome.nightly.problems if "did not run" in line]
+    assert len(said) == 3, f"three pieces refused and {len(said)} were recorded"
+    assert "bars: did not run, UnsupportedSchemaVersion" in transport.messages[0].body
+
+
 def test_a_quarantined_quotes_partition_does_not_take_the_whole_sweep(
     fixture_lake: FixtureLake,
 ):
@@ -1361,8 +1526,9 @@ def test_the_bars_walk_names_a_missing_master_once_its_spans_are_there(
     Marketlake #422 put ``read_capture_spans`` before the walk's own ``_read_master``, so the one
     test that used to cover ``MasterAbsent`` for this piece refuses earlier and never reaches it.
     Removing ``MasterAbsent`` or ``MasterUnreadable`` from ``_BARS_REFUSALS`` left the suite green,
-    which is how that gap was found. This fixture has the spans and no master, so the walk reaches
-    the condition those two names are in the tuple for.
+    which is how that gap was found. Marketlake #497 then replaced both with ``ActionsError`` and
+    ``SecurityMasterError``, so the tuple names their classes rather than the two names above.
+    This fixture has the spans and no master, so the walk reaches the condition they cover.
     """
     fixture_lake.with_quotes("SPY", FOLLOWING, _quotes_table([_quote_row(FOLLOWING)]))
     fixture_lake.with_reference("schema_versions", _ledger_table())
@@ -1847,31 +2013,127 @@ def test_the_battery_runs_on_a_session_and_its_counts_reach_the_outcome(
 
 
 def test_the_sweeps_census_carries_every_count_the_battery_produces(fixture_lake: FixtureLake):
-    """``Nightly.render``'s own rule: a night that judged nothing and a night that judged the
-    lake and found it clean are different answers.
+    """``SweepOutcome.render``'s own rule: a night that judged nothing and a night that judged
+    the lake and found it clean are different answers.
 
     ``insufficient_history`` was structurally zero while one check existed, so the census could
     omit it and stay true. It reads six against the live lake now, and the two coverage counts
     are the only place a permanently missing session reaches this block at all.
+
+    **The expectation is derived from ``BatteryReport``, not listed here.** Marketlake #477 is
+    why. This test hand-listed ten names while the dataclass carried thirteen, so ``deferred``,
+    ``withheld`` and ``released`` reached the census's absence without ever failing the test
+    that claims in its own name to carry every count. A list written beside the thing it
+    describes is a second source for one fact, and this is what that costs. Read off the
+    fields, the next count added and not rendered fails here.
+
+    Both collections below fail closed. A new field named in neither one is treated as a count
+    and asserted, so adding a field to ``BatteryReport`` forces a decision here rather than
+    slipping past. The two assertions above the loop are the other direction: an entry naming a
+    field that no longer exists is a stale map, which is the same drift one layer along.
+
+    **The match is on the token and its number, not on the token alone.** A bare ``name in
+    line`` is not the guard it reads as, because a field whose name is a substring of a token
+    the census already prints passes without being rendered at all. A field named ``owed``
+    rides ``sessions_owed``, ``held`` rides ``withheld``, ``scope`` rides both ``out_of_scope``
+    and ``scope_unknown``, and ``missing`` rides ``sessions_missing``. Requiring a space, the
+    name, and a number closes that family and holds the value's presence at the same time.
+
+    **What deriving gives up.** The ten hand-written strings were a second source, and a second
+    source is what catches a rename. Spelled off the fields, the census token and the field name
+    cannot disagree, so renaming a field and its token together now passes here where the old
+    list failed. That is accepted rather than unnoticed. Restoring the pin means restoring the
+    list this test exists to delete, and the two the census deliberately spells differently are
+    pinned anyway, in ``renamed`` below.
     """
+    named = {field.name for field in fields(BatteryReport)}
+    assert CENSUS_RENAMED.keys() <= named, f"stale rename: {CENSUS_RENAMED.keys() - named}"
+    assert CENSUS_NOT_COUNTS <= named, f"stale exclusion: {CENSUS_NOT_COUNTS - named}"
+
     root = _lake(fixture_lake)
 
     outcome, _, _ = _run(root)
     (line,) = [ln for ln in outcome.render().splitlines() if "battery: judged" in ln]
 
-    for name in (
-        "judged",
-        "quarantined",
-        "clean",
-        "insufficient_history",
-        "out_of_scope",
-        "scope_unknown",
-        "unreadable",
-        "sessions_owed",
-        "sessions_missing",
-        "wrote",
-    ):
-        assert name in line, f"{name} missing from the census: {line}"
+    for field in fields(BatteryReport):
+        if field.name in CENSUS_NOT_COUNTS:
+            continue
+        name = CENSUS_RENAMED.get(field.name, field.name)
+        assert re.search(rf"(?:^|\s){re.escape(name)} -?\d+", line), (
+            f"{name} is missing from the census, or carries no number: {line}"
+        )
+
+
+def test_each_census_count_carries_its_own_number():
+    """Every count in the census reads its own field, and not the one beside it.
+
+    **Distinct values are the whole test.** The fixture lake judges nothing, so every count the
+    sweep renders is zero there and the derived test above cannot tell one field from another:
+    cross-wiring ``deferred`` to ``withheld`` in the census line leaves that test, and the whole
+    suite, green. Marketlake #477's own review found that by mutation. Thirteen different
+    numbers are what separate a census that reads its fields from one that reads a neighbour's.
+
+    ``tests/component/test_battery.py``'s ``test_every_census_line_carries_its_own_number`` is
+    this test for the hand run's block. The sweep's block is a second composition of the same
+    counts, so it is asserted rather than left to stand on the first.
+
+    **The expectation is read back off the record, not written out here.** Each token's number is
+    parsed out of the line and compared to the field it claims to carry, so the assertion covers
+    a field added to ``BatteryReport`` later without anyone editing this test. Thirteen literals
+    would have held today's counts and let the fourteenth through, which is the shape of the
+    defect this whole change exists to fix.
+
+    This builds the outcome rather than running a sweep, for the reason
+    ``battery.decide_partition``'s docstring gives for being a pure function: a lake fixture
+    that produced thirteen distinct counts would take more setup than the property is worth,
+    and the property is about the rendering rather than the walk.
+    """
+    from lake.alert import Message
+
+    battery = BatteryReport(
+        judged=1,
+        quarantined=2,
+        cleared=3,
+        insufficient_history=4,
+        out_of_scope=5,
+        deferred=6,
+        withheld=7,
+        released=8,
+        unreadable=9,
+        scope_unknown=10,
+        sessions_owed=11,
+        sessions_missing=12,
+        appended=("a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m"),
+    )
+    outcome = sweep.SweepOutcome(
+        nightly=report.Nightly(day=SESSION, session=True, pinged=True),
+        digest=Message(event=NIGHTLY_EVENT, title="t", body="b"),
+        delivered=True,
+        battery=battery,
+    )
+
+    (line,) = [ln for ln in outcome.render().splitlines() if "battery: judged" in ln]
+
+    seen = set()
+    for field in fields(BatteryReport):
+        if field.name in CENSUS_NOT_COUNTS:
+            continue
+        token = CENSUS_RENAMED.get(field.name, field.name)
+        held = getattr(battery, field.name)
+        # ``appended`` is the ledger lines themselves and the census prints how many, which is
+        # the one count whose field is not already the number.
+        expected = len(held) if isinstance(held, tuple) else held
+        printed = re.search(rf"(?:^|\s){re.escape(token)} (-?\d+)", line)
+        assert printed, f"{token} is missing from the census, or carries no number: {line}"
+        assert int(printed.group(1)) == expected, (
+            f"the census prints {token} {printed.group(1)} where {field.name} is {expected}: {line}"
+        )
+        seen.add(expected)
+
+    # Every count distinct, which is what makes the loop above able to tell one field from the
+    # one beside it. A fixture that repeated a value would pass a census reading the wrong field
+    # for that pair, so this holds the fixture rather than the code.
+    assert len(seen) == 13, f"the fixture must give each count its own value: {sorted(seen)}"
 
 
 def test_a_holiday_runs_no_battery_at_all(fixture_lake: FixtureLake):

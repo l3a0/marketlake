@@ -11,10 +11,11 @@ reads ``None``. Marketlake #415 carries that fragility.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -1873,15 +1874,56 @@ def test_the_command_refuses_a_session_that_is_not_a_date(capsys):
 
 def test_the_report_prints_every_count_including_the_zeroes():
     """A run that judged nothing and a run that judged everything cleanly are different
-    answers, and a report printing only non-zero counts would render them the same."""
+    answers, and a report printing only non-zero counts would render them the same.
+
+    **The expectation is derived from ``BatteryReport``, not listed here**, which is marketlake
+    #477's rule applied to the second renderer of this dataclass. This test used to name four
+    of its thirteen counts, so nine could leave the hand run's output without failing anything,
+    and the sweep's census carried the same shape until #477. Fixing one renderer and leaving
+    its sibling is what a completeness review exists to catch, so both are derived.
+
+    The match is on the label and its number together. A bare substring test would let a field
+    whose name rides inside another label pass without being rendered, and these labels are
+    prose, so ``released`` sits inside nothing but ``withheld`` would ride ``still withheld``.
+    """
     from lake.battery import render
+
+    # ``render``'s own spelling for the counts it does not label with the field's name. It
+    # writes prose rather than field names, so this map is longer than the sweep census's.
+    labelled = {
+        "cleared": "clean",
+        "out_of_scope": "out of scope",
+        "insufficient_history": "insufficient history",
+        "deferred": "human precedence",
+        "withheld": "still withheld",
+        "scope_unknown": "scope unknown",
+        "sessions_owed": "sessions owed",
+        "sessions_missing": "sessions missing",
+        "appended": "ledger lines written",
+    }
+    # The fields that are not counts, for the reasons ``tests/component/test_eod_sweep.py``
+    # gives where it draws the same line.
+    not_counts = {"report", "findings", "paged"}
+
+    named = {field.name for field in fields(BatteryReport)}
+    assert labelled.keys() <= named, f"stale label: {labelled.keys() - named}"
+    assert not_counts <= named, f"stale exclusion: {not_counts - named}"
 
     printed = render(BatteryReport(judged=4, cleared=4))
 
-    assert "judged:               4" in printed
+    for field in fields(BatteryReport):
+        if field.name in not_counts:
+            continue
+        label = labelled.get(field.name, field.name)
+        assert re.search(rf"(?:^|\s){re.escape(label)}: +-?\d+", printed), (
+            f"{label} is missing from the census, or carries no number: {printed}"
+        )
+
+    # The zeroes specifically, which is the rule the docstring states. A run given one non-zero
+    # count must still print the rest, so the derived loop above cannot be satisfied by a
+    # renderer that dropped every zero.
     assert "quarantined:          0" in printed
-    assert "human precedence:     0" in printed
-    assert "ledger lines written: 0" in printed
+    assert "judged:               4" in printed
 
 
 def test_the_report_names_each_quarantined_partition_with_its_reason():
