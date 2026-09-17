@@ -1813,15 +1813,24 @@ def test_a_row_count_regression_files_a_finding_and_the_walk_goes_on(
 def test_a_symbol_handed_between_two_instruments_maps_nothing(fixture_lake: FixtureLake):
     """The symbol history resets with the root history, and for the same reason.
 
-    Without it the incoming instrument keeps the retired security's contracts. An ``ssid`` that
-    recurs across the two would pair one company's old symbol to another company's new one and
-    register an option instrument under it, which is the orphaning the master exists to prevent.
+    Without it the incoming instrument keeps the retired security's contracts. The third
+    session is what makes that reachable: the changeover session itself returns early, so a
+    test that stops there passes whether or not the reset ran. Here instrument 2 gains a root
+    a session later, carrying a contract instrument 1 held and instrument 2 never did. With
+    the reset that contract is one the walk cannot place and the boundary is refused. Without
+    it, one company's old symbol is paired to another company's new one and an option
+    instrument is registered under it, which is the orphaning the master exists to prevent.
     """
+    handed = "SPY   260918C00800000"
     root = _lake(
         fixture_lake,
         {
             ("SPY", DAY_ONE): [_row(DAY_ONE)],
-            ("SPY", DAY_TWO): [_row(DAY_TWO, occ_symbol=CARRIED_OCC), _adjusted_row(DAY_TWO)],
+            ("SPY", DAY_TWO): [_row(DAY_TWO, occ_symbol=handed)],
+            ("SPY", DAY_THREE): [
+                _row(DAY_THREE, occ_symbol=handed),
+                _adjusted_row(DAY_THREE),
+            ],
         },
         master=SecurityMaster(
             [
@@ -1833,9 +1842,11 @@ def test_a_symbol_handed_between_two_instruments_maps_nothing(fixture_lake: Fixt
 
     report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
 
-    assert _entries(root) == []
     assert report_out.mapped == (), "the incoming instrument inherited the outgoing one's history"
     assert _mappings(root) == []
+    (held,) = report_out.held
+    assert held.finding.check == CHECK_OCC_MAPPING
+    assert "cannot place 1 of them" in held.finding.exception
 
 
 def test_a_boundary_the_ledger_refuses_for_a_duplicate_instrument_is_still_mapped(
