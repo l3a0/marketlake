@@ -74,6 +74,7 @@ from lake.splits import (
     REASON_NO_LADDER,
     REASON_NO_OPTION_CLOSE,
     REASON_NO_UNDERLYING,
+    REASON_NOT_CAPTURED,
     REASON_OUT_OF_SCOPE,
     REASON_PARTIAL_READ,
     REASON_PARTITION_ABSENT,
@@ -84,6 +85,7 @@ from lake.splits import (
     REASON_THIN,
     detect_splits,
 )
+from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import write_config
 from tests.support.lake import FixtureLake
@@ -134,6 +136,13 @@ def _chains(rows: list[dict] | None = None, schema: pa.Schema | None = None) -> 
 DAY_ONE = date(2026, 9, 14)
 DAY_TWO = date(2026, 9, 15)
 DAY_THREE = date(2026, 9, 16)
+
+# The week those three sit in, Monday 2026-09-14 through Friday 2026-09-18. A real calendar
+# would answer the same for every date this file names, and the fake is used anyway because
+# the seam is what the detection reads and a test decides what a session is. The detection
+# asks it which sessions sit between two sealed days, so a fixture pair that is consecutive
+# here has nothing between it and one that skips a day has exactly the skipped session.
+CALENDAR = weekday_sessions(date(2026, 9, 14))
 
 FIRST_NIGHT = datetime(2026, 9, 16, 0, 0, tzinfo=UTC)  # 20:00 ET on 2026-09-15
 # A minute later in the day rather than the same minute. A withheld file is named by its ET
@@ -483,7 +492,7 @@ def test_a_gained_root_with_a_moved_deliverable_lands_one_split(fixture_lake: Fi
     """
     root = _two_sessions(fixture_lake)
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     (entry,) = _entries(root)
     assert entry["type"] == TYPE_SPLIT
@@ -503,7 +512,7 @@ def test_the_ratio_comes_from_deliverable_units_and_not_from_the_note(
     """
     root = _two_sessions(fixture_lake, deliverables=_deliverables(150.00000001))
 
-    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     (entry,) = _entries(root)
     assert entry["split_ratio"] == pytest.approx(1.5000000001, rel=1e-15)
@@ -518,7 +527,7 @@ def test_a_split_pays_nothing_and_announces_nothing(fixture_lake: FixtureLake):
     """
     root = _two_sessions(fixture_lake)
 
-    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     (entry,) = _entries(root)
     assert entry["cash_amount"] is None
@@ -536,7 +545,7 @@ def test_both_dates_are_the_boundary_session(fixture_lake: FixtureLake):
     """
     root = _two_sessions(fixture_lake)
 
-    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     (entry,) = _entries(root)
     assert entry["observed_on"] == DAY_TWO.isoformat()
@@ -552,9 +561,9 @@ def test_a_second_night_appends_nothing(fixture_lake: FixtureLake):
     same split every night forever.
     """
     root = _two_sessions(fixture_lake)
-    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
-    second = detect_splits(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+    second = detect_splits(lake_root=root, clock=ManualClock(SECOND_NIGHT), calendar=CALENDAR)
 
     assert len(_entries(root)) == 1
     assert second.appended == () and second.held == ()
@@ -582,7 +591,7 @@ def test_new_strikes_under_the_unchanged_root_are_not_a_boundary(fixture_lake: F
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == []
     assert report_out.appended == () and report_out.held == ()
@@ -608,7 +617,7 @@ def test_the_vendor_respelling_every_symbol_is_not_a_boundary(fixture_lake: Fixt
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == []
     assert report_out.appended == () and report_out.held == ()
@@ -634,7 +643,7 @@ def test_the_same_deliverable_under_a_new_root_is_a_rename_and_not_a_split(
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == [], "a rename landed a no-op factor"
     assert report_out.held == ()
@@ -658,7 +667,7 @@ def test_a_gap_day_is_skipped(fixture_lake: FixtureLake):
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _reasons(report_out) == [REASON_NO_OPTION_CLOSE]
     assert report_out.held == ()
@@ -683,7 +692,7 @@ def test_a_quarantined_partition_is_skipped_and_the_walk_goes_on(fixture_lake: F
         ],
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _reasons(report_out) == [REASON_QUARANTINED]
     assert report_out.ticker_days == 3
@@ -701,7 +710,7 @@ def test_a_partial_read_is_skipped_rather_than_read_incomplete(fixture_lake: Fix
     root = fixture_lake.build()
     _master().write(master_path(root))
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _reasons(report_out) == [REASON_PARTIAL_READ]
 
@@ -730,7 +739,7 @@ def test_a_thin_snapshot_cannot_bound_a_boundary(fixture_lake: FixtureLake, flag
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _reasons(report_out) == [REASON_THIN]
     assert _entries(root) == []
@@ -753,7 +762,7 @@ def test_a_ticker_day_before_the_master_knows_the_symbol_is_out_of_scope(
         {("SPY", early): [_row(early)], ("SPY", DAY_ONE): [_row(DAY_ONE)]},
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _reasons(report_out) == [REASON_OUT_OF_SCOPE]
     assert report_out.held == (), "an out-of-scope day filed a reference-data fault"
@@ -778,7 +787,7 @@ def test_a_symbol_the_master_does_not_carry_files_one_finding_for_the_ticker(
         master=_master(tickers=("SPY",)),
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     (held,) = report_out.held
     assert held.finding.check == CHECK_INSTRUMENT_RESOLUTION
@@ -809,7 +818,7 @@ def test_a_skipped_session_holds_the_boundary_rather_than_guessing_its_date(
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == [], "a boundary landed under a date nothing bounded"
     (held,) = report_out.held
@@ -832,7 +841,7 @@ def test_a_note_that_disagrees_with_the_typed_count_holds_the_split(
     """
     root = _two_sessions(fixture_lake, note="200 SPY")
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == []
     (held,) = report_out.held
@@ -849,7 +858,7 @@ def test_a_note_that_names_no_plain_share_count_holds_the_split(fixture_lake: Fi
     """
     root = _two_sessions(fixture_lake, note="150 SPY plus 25.00 USD")
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == []
     (held,) = report_out.held
@@ -871,7 +880,7 @@ def test_a_deliverable_carrying_cash_is_held_rather_than_flattened(
     """
     root = _two_sessions(fixture_lake, deliverables=_deliverables(150.0, currency="USD"))
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == []
     (held,) = report_out.held
@@ -888,7 +897,7 @@ def test_a_deliverable_naming_a_different_security_is_held(fixture_lake: Fixture
     """
     root = _two_sessions(fixture_lake, deliverables=_deliverables(150.0, symbol="XYZ"))
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == []
     (held,) = report_out.held
@@ -899,7 +908,7 @@ def test_a_moved_contract_multiplier_is_held(fixture_lake: FixtureLake):
     """A ratio scales what the contract delivers. A moved multiplier scales what it is."""
     root = _two_sessions(fixture_lake, multiplier=150.0)
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == []
     (held,) = report_out.held
@@ -918,7 +927,7 @@ def test_a_gained_root_whose_contracts_are_standard_is_a_new_series(
     """
     root = _two_sessions(fixture_lake, non_standard=False)
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == [], "a newly listed standard series landed as a split"
     assert report_out.held == ()
@@ -936,7 +945,7 @@ def test_a_gained_root_that_does_not_say_whether_it_is_standard_is_held(
     """
     root = _two_sessions(fixture_lake, non_standard=None)
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == []
     (held,) = report_out.held
@@ -966,7 +975,7 @@ def test_contracts_that_disagree_about_the_deliverable_hold_rather_than_end_the_
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == []
     (held,) = report_out.held
@@ -981,7 +990,7 @@ def test_a_deliverables_column_that_is_not_json_holds_rather_than_ends_the_run(
     """A vendor payload this module cannot parse is not this run's to repair."""
     root = _two_sessions(fixture_lake, deliverables="{not json")
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == []
     (held,) = report_out.held
@@ -1000,7 +1009,7 @@ def test_the_walk_reads_chains_and_passes_over_every_other_surface(
     reference table, which is what ``surface_ticker_days`` takes its surface argument for.
     """
     root = _two_sessions(fixture_lake)
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert report_out.ticker_days == 2, "a non-chains key was counted as a ticker-day"
 
@@ -1013,7 +1022,7 @@ def test_a_quotes_partition_beside_the_chains_is_not_walked(fixture_lake: Fixtur
         quotes=("SPY", DAY_TWO),
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert report_out.ticker_days == 1
 
@@ -1091,7 +1100,9 @@ def test_the_render_says_splits_and_names_the_ratio(fixture_lake: FixtureLake):
     """
     root = _two_sessions(fixture_lake)
 
-    rendered = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT)).render()
+    rendered = detect_splits(
+        lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR
+    ).render()
 
     assert rendered.startswith("Split detection over 2 sealed chains ticker-day(s)")
     assert "ratio 1.5" in rendered
@@ -1110,7 +1121,7 @@ def test_an_ordinary_pair_names_no_ratio_and_files_nothing(fixture_lake: Fixture
     """
     root = _scale_lake(fixture_lake, spot_before=700.0, spot_after=696.5)
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert report_out.scale_pairs == 1
     assert report_out.held == ()
@@ -1132,7 +1143,7 @@ def test_a_whole_ratio_split_the_root_signal_cannot_see_is_filed(fixture_lake: F
         spot_after=349.5,
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == [], "the root signal cannot land a whole-ratio split"
     (held,) = report_out.held
@@ -1155,7 +1166,7 @@ def test_a_reverse_split_is_the_same_test_run_the_other_way(fixture_lake: Fixtur
         spot_after=1398.0,
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     (held,) = report_out.held
     assert held.finding.check == CHECK_STRIKE_SCALE
@@ -1172,7 +1183,7 @@ def test_a_crash_moves_spot_and_leaves_the_ladder_where_it_was(fixture_lake: Fix
     """
     root = _scale_lake(fixture_lake, spot_before=700.0, spot_after=349.5)
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert report_out.scale_pairs == 1
     assert report_out.held == (), "a crash was recorded as a split"
@@ -1205,7 +1216,7 @@ def test_a_split_the_ledger_already_holds_is_counted_and_not_filed(fixture_lake:
         provenance=PROVENANCE_OBSERVED,
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert report_out.scale_covered == 1
     assert report_out.held == (), "a split the ledger already describes was filed again"
@@ -1245,7 +1256,7 @@ def test_a_landed_uneven_split_does_not_file_a_scale_finding_beside_it(
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert len(report_out.appended) == 1, "the root signal did not land its own entry"
     assert report_out.scale_covered == 1
@@ -1269,7 +1280,7 @@ def test_a_skipped_session_between_the_pair_is_not_judged(fixture_lake: FixtureL
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert report_out.scale_pairs == 0
     assert _scale_unread(report_out) == [REASON_SCALE_WINDOW]
@@ -1293,7 +1304,7 @@ def test_a_session_naming_no_single_spot_is_not_judged(fixture_lake: FixtureLake
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _scale_unread(report_out) == [REASON_NO_UNDERLYING]
     assert report_out.scale_pairs == 0
@@ -1316,7 +1327,7 @@ def test_a_null_underlying_beside_a_named_one_is_not_a_disagreement(fixture_lake
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert report_out.scale_unread == ()
     assert [held.finding.check for held in report_out.held] == [CHECK_STRIKE_SCALE]
@@ -1332,7 +1343,7 @@ def test_a_session_listing_no_strike_is_not_judged(fixture_lake: FixtureLake):
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _scale_unread(report_out) == [REASON_NO_LADDER]
     assert report_out.held == ()
@@ -1359,7 +1370,7 @@ def test_a_pair_spanning_two_instruments_is_not_a_pair(fixture_lake: FixtureLake
         master=master,
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _scale_unread(report_out) == [REASON_INSTRUMENT_CHANGED]
     assert report_out.held == ()
@@ -1389,7 +1400,7 @@ def test_a_finding_about_an_unreadable_row_does_not_hide_a_real_split(
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     filed = sorted(held.finding.check for held in report_out.held)
     assert filed == [CHECK_SPLIT_PAYLOAD, CHECK_STRIKE_SCALE]
@@ -1425,7 +1436,7 @@ def test_a_gate_refusing_this_split_does_suppress_the_scale_finding(
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert [held.finding.check for held in report_out.held] == [CHECK_SPLIT_CONSISTENCY]
     assert report_out.scale_covered == 1
@@ -1462,7 +1473,7 @@ def test_a_finding_on_another_ticker_does_not_suppress_this_one(fixture_lake: Fi
         master=SecurityMaster([_mapping(1, "SPY"), _mapping(2, "QQQ")]),
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     filed = sorted(held.finding.check for held in report_out.held)
     assert CHECK_SPLIT_BOUNDARY in filed, "the QQQ boundary should still be held"
@@ -1480,7 +1491,9 @@ def test_the_render_names_each_reason_a_pair_was_not_compared(fixture_lake: Fixt
         },
     )
 
-    rendered = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT)).render()
+    rendered = detect_splits(
+        lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR
+    ).render()
 
     assert "  scale not compared: 1" in rendered
     assert f"    - {REASON_SCALE_WINDOW}: 1" in rendered
@@ -1490,7 +1503,9 @@ def test_the_render_says_what_the_scale_guard_did(fixture_lake: FixtureLake):
     """A run that compared pairs must not read like a run that compared none."""
     root = _scale_lake(fixture_lake, spot_before=700.0, spot_after=696.5)
 
-    rendered = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT)).render()
+    rendered = detect_splits(
+        lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR
+    ).render()
 
     assert "  scale compared: 1" in rendered
     assert "  scale already recorded: 0" in rendered
@@ -1520,7 +1535,9 @@ def test_the_render_names_each_skip_and_each_non_adjustment_under_its_own_headin
         },
     )
 
-    rendered = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT)).render()
+    rendered = detect_splits(
+        lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR
+    ).render()
 
     not_a_split = rendered.index("  not a split: 1")
     skipped = rendered.index("  skipped:   1")
@@ -1591,7 +1608,7 @@ def test_the_detection_reads_no_config(fixture_lake: FixtureLake, monkeypatch):
 
     monkeypatch.setattr("lake.config.load_config", refuse)
 
-    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert len(_entries(root)) == 1
 
@@ -1626,7 +1643,7 @@ def test_a_mini_option_listing_is_not_a_corporate_action(fixture_lake: FixtureLa
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == [], "a mini listing landed a ten-for-one reverse split"
     assert report_out.held == ()
@@ -1658,7 +1675,7 @@ def test_a_root_returning_to_the_chain_is_not_a_gain(fixture_lake: FixtureLake):
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == [], "a returning root landed a phantom inverse split"
     assert report_out.held == ()
@@ -1703,7 +1720,7 @@ def test_a_real_split_still_lands_when_the_previous_session_carries_two_roots(
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     (entry,) = _entries(root)
     assert entry["split_ratio"] == 2.0, "the prior side was not read off the standard series"
@@ -1724,7 +1741,7 @@ def test_the_prior_side_falls_back_to_the_previous_session(fixture_lake: Fixture
         },
     )
 
-    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     (entry,) = _entries(root)
     assert entry["split_ratio"] == 1.5
@@ -1756,7 +1773,7 @@ def test_a_split_and_then_a_fresh_standard_series_files_nothing_false(
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     (entry,) = _entries(root)
     assert entry["split_ratio"] == 1.5 and entry["ex_date"] == DAY_TWO.isoformat()
@@ -1792,7 +1809,7 @@ def test_a_note_of_zero_shares_holds_and_the_next_ticker_still_lands_its_split(
         master=_master(tickers=("SPY", "QQQ")),
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     (entry,) = _entries(root)
     assert entry["split_ratio"] == 1.5, "the dying run cost the second ticker its split"
@@ -1809,7 +1826,7 @@ def test_a_manifested_partition_whose_file_is_gone_is_skipped(fixture_lake: Fixt
     )
     fixture_lake.partition_path("chains", "SPY", DAY_TWO).unlink()
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _reasons(report_out) == [REASON_PARTITION_ABSENT]
     assert report_out.held == ()
@@ -1829,7 +1846,7 @@ def test_a_partition_missing_a_column_reads_it_as_null_rather_than_raising(
     root = fixture_lake.build()
     _master().write(master_path(root))
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert report_out.ticker_days == 1
     assert report_out.held == () and report_out.skipped == ()
@@ -1852,7 +1869,7 @@ def test_contracts_naming_no_root_at_all_are_held(fixture_lake: FixtureLake):
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == []
     (held,) = report_out.held
@@ -1862,10 +1879,260 @@ def test_contracts_naming_no_root_at_all_are_held(fixture_lake: FixtureLake):
 # -- the walk's own state ---------------------------------------------------------------
 
 
+# -- the session the lake never captured ------------------------------------------------
+
+
+def test_a_session_the_lake_never_captured_is_not_a_pair(fixture_lake: FixtureLake):
+    """The reproduction marketlake #431 was filed on.
+
+    The lake holds 2026-09-14 and 2026-09-16 and nothing at all for 2026-09-15, and both the
+    ladder and the spot halve across the gap. Before the calendar reached this walk, the
+    enumeration came off the manifest alone, so the uncaptured session incremented nothing and
+    the pair read as consecutive: the guard judged it, found a whole ratio and filed a finding
+    dated to 2026-09-16 while the split's real ex-date is 2026-09-15.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): _ladder_rows(DAY_ONE, LADDER, 700.0),
+            ("SPY", DAY_THREE): _ladder_rows(
+                DAY_THREE, tuple(strike / 2 for strike in LADDER), 349.5
+            ),
+        },
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
+
+    assert _reasons(report_out) == [REASON_NOT_CAPTURED]
+    assert [skip.day for skip in report_out.skipped] == [DAY_TWO]
+    assert _scale_unread(report_out) == [REASON_SCALE_WINDOW]
+    assert report_out.scale_pairs == 0
+    assert _findings(root, DAY_THREE) == [], "a finding was filed under a date nobody can clear"
+
+
+def test_the_finding_the_gap_used_to_file_does_not_return_on_a_second_night(
+    fixture_lake: FixtureLake,
+):
+    """Nothing filed means nothing to re-file, which is the half of #431 that was permanent.
+
+    ``write_withheld`` files a held finding again every night and nothing prunes ``reports/``,
+    so the finding this used to raise was re-filed under 2026-09-16 for ever while an operator
+    landing the split at its true 2026-09-15 could not clear it. A pair nobody judged files
+    nothing on either night.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): _ladder_rows(DAY_ONE, LADDER, 700.0),
+            ("SPY", DAY_THREE): _ladder_rows(
+                DAY_THREE, tuple(strike / 2 for strike in LADDER), 349.5
+            ),
+        },
+    )
+
+    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
+    detect_splits(lake_root=root, clock=ManualClock(SECOND_NIGHT), calendar=CALENDAR)
+
+    assert _findings(root, DAY_THREE) == []
+    assert _entries(root) == []
+
+
+def test_a_boundary_across_a_session_the_lake_never_captured_is_held(fixture_lake: FixtureLake):
+    """The expensive half. ``ex_date`` sits in the ledger's key and cannot be superseded.
+
+    A root gained across an uncaptured session could be that session's adjustment or the
+    boundary session's own, and the walk has no way to tell. Landing a guess writes an entry a
+    corrected one cannot replace, only join, and every adjusted price then applies both.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_THREE): [
+                _row(DAY_THREE, occ_symbol=CARRIED_OCC),
+                _adjusted_row(DAY_THREE),
+            ],
+        },
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
+
+    assert _entries(root) == []
+    (filed,) = _findings(root, DAY_THREE)
+    assert filed["check"] == CHECK_SPLIT_BOUNDARY
+    assert report_out.held[0].finding.check == CHECK_SPLIT_BOUNDARY
+
+
+def test_the_held_boundary_names_both_ends_of_the_window(fixture_lake: FixtureLake):
+    """A count and a start leave an operator to work out which session the boundary day was.
+
+    Both dates are what say which sessions to go and look at. They reach the run's own render
+    and not the filed record, because ``report.redacted`` keeps two fields and drops whatever
+    the exception chose to say, which for an ``OSError`` would be a path on the capture
+    machine. ``_finding`` already names that split: "The run's own render prints the whole
+    string, so the message reaches the operator there and the class alone reaches the file."
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_THREE): [
+                _row(DAY_THREE, occ_symbol=CARRIED_OCC),
+                _adjusted_row(DAY_THREE),
+            ],
+        },
+    )
+
+    rendered = detect_splits(
+        lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR
+    ).render()
+
+    (line,) = [line for line in rendered.splitlines() if "BoundaryUnbounded" in line]
+    assert f"between {DAY_ONE.isoformat()} and {DAY_THREE.isoformat()}" in line
+    assert "1 of them" in line
+
+
+def test_a_weekend_between_two_sessions_is_not_a_gap(fixture_lake: FixtureLake):
+    """Friday and the Monday after it are consecutive sessions, and a split across them lands.
+
+    This is the case that fails if the walk counts days rather than asking the calendar. Two
+    calendar days sit between them and no session does, so refusing the pair here would refuse
+    one ordinary pair in five for ever.
+    """
+    friday = date(2026, 9, 18)
+    monday = date(2026, 9, 21)
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", friday): [_row(friday)],
+            ("SPY", monday): [
+                _row(monday, occ_symbol=CARRIED_OCC),
+                _adjusted_row(monday),
+            ],
+        },
+    )
+
+    report_out = detect_splits(
+        lake_root=root,
+        clock=ManualClock(FIRST_NIGHT),
+        calendar=weekday_sessions(date(2026, 9, 14), date(2026, 9, 21)),
+    )
+
+    assert _reasons(report_out) == []
+    (entry,) = _entries(root)
+    assert entry["ex_date"] == monday.isoformat()
+
+
+def test_a_holiday_between_two_sessions_is_not_a_gap(fixture_lake: FixtureLake):
+    """A closed market is no session, so the sessions either side of it are adjacent.
+
+    The live lake's own 2026-09-07 is Labor Day, and it sits inside the one manifest gap SPY
+    holds. A walk that treated every absent weekday as uncaptured would report it.
+    """
+    holiday = date(2026, 9, 15)
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_THREE): [
+                _row(DAY_THREE, occ_symbol=CARRIED_OCC),
+                _adjusted_row(DAY_THREE),
+            ],
+        },
+    )
+
+    report_out = detect_splits(
+        lake_root=root,
+        clock=ManualClock(FIRST_NIGHT),
+        calendar=weekday_sessions(date(2026, 9, 14), holidays=[holiday]),
+    )
+
+    assert _reasons(report_out) == []
+    (entry,) = _entries(root)
+    assert entry["ex_date"] == DAY_THREE.isoformat()
+
+
+def test_a_stretch_below_the_first_readable_session_is_not_reported_as_uncaptured(
+    fixture_lake: FixtureLake,
+):
+    """The live lake's own shape, and why the enumeration waits for a session to be read.
+
+    SPY's manifested chains days run 2026-09-02, then 2026-09-08 onward. 2026-09-02 predates
+    the master's ``capture_start``, so it is out of scope rather than a gap, and every session
+    between it and the first readable day is out of scope for the same reason. Reporting those
+    as uncaptured would file skips every night for a window no pair spans.
+    """
+    early = date(2026, 9, 2)
+    root = _lake(
+        fixture_lake,
+        {("SPY", early): [_row(early)], ("SPY", DAY_ONE): [_row(DAY_ONE)]},
+    )
+
+    report_out = detect_splits(
+        lake_root=root,
+        clock=ManualClock(FIRST_NIGHT),
+        calendar=weekday_sessions(date(2026, 8, 31), date(2026, 9, 7), date(2026, 9, 14)),
+    )
+
+    assert _reasons(report_out) == [REASON_OUT_OF_SCOPE]
+
+
+def test_an_uncaptured_session_does_not_deafen_the_ticker_for_the_rest_of_the_walk(
+    fixture_lake: FixtureLake,
+):
+    """``unread_since`` resets on each readable session, whatever widened it.
+
+    Left unreset by the new reason, one day the machine was off would hold every later boundary
+    of that ticker for ever.
+    """
+    day_four = date(2026, 9, 17)
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_THREE): [_row(DAY_THREE)],
+            ("SPY", day_four): [
+                _row(day_four, occ_symbol=CARRIED_OCC),
+                _adjusted_row(day_four),
+            ],
+        },
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
+
+    (entry,) = _entries(root)
+    assert entry["ex_date"] == day_four.isoformat()
+    assert report_out.held == (), "an earlier gap held a boundary nothing had widened"
+
+
+def test_a_session_the_lake_never_captured_is_reported_by_its_own_reason(
+    fixture_lake: FixtureLake,
+):
+    """The render is where an operator reads how wide the lake's windows are.
+
+    ``sweep._ledger_outcome`` counts ``skipped`` and does not read ``scale_unread``, so a pair
+    refused for a window reaches the nightly report through this list and through nothing else.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_THREE): [_row(DAY_THREE)],
+        },
+    )
+
+    rendered = detect_splits(
+        lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR
+    ).render()
+
+    assert f"    - {REASON_NOT_CAPTURED}: 1" in rendered
+    assert "  skipped:   1" in rendered
+
+
 def test_a_skip_does_not_deafen_the_ticker_for_the_rest_of_the_walk(
     fixture_lake: FixtureLake,
 ):
-    """``skipped_since`` counts sessions since the last readable one, and resets on each.
+    """``unread_since`` counts sessions since the last readable one, and resets on each.
 
     Left unreset, one skipped session holds every later boundary of that ticker forever. The
     live lake's SPY has an out-of-scope day and four gap days before its first data day, so
@@ -1885,7 +2152,7 @@ def test_a_skip_does_not_deafen_the_ticker_for_the_rest_of_the_walk(
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     (entry,) = _entries(root)
     assert entry["ex_date"] == day_four.isoformat()
@@ -1913,7 +2180,7 @@ def test_a_shrinking_root_set_is_not_a_boundary(fixture_lake: FixtureLake):
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == []
     assert report_out.held == () and report_out.not_adjustments == ()
@@ -1939,7 +2206,7 @@ def test_a_symbol_handed_between_two_instruments_starts_fresh(fixture_lake: Fixt
         master=master,
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == [], "a ratio was computed across two instruments"
     assert report_out.held == () and report_out.not_adjustments == ()
@@ -1972,7 +2239,7 @@ def test_two_tickers_on_one_instrument_hold_the_second_boundary(fixture_lake: Fi
         master=master,
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert len(_entries(root)) == 1
     assert len(report_out.appended) == 1
@@ -2002,7 +2269,7 @@ def test_an_ambiguous_master_holds_once_and_does_not_lose_the_ticker(
         master=master,
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     (held,) = report_out.held
     assert held.finding.check == CHECK_INSTRUMENT_RESOLUTION
@@ -2053,7 +2320,7 @@ def test_the_prior_side_reads_the_standard_series_of_the_boundary_session(
         },
     )
 
-    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     (entry,) = _entries(root)
     assert entry["split_ratio"] == 3.0, (
@@ -2109,7 +2376,7 @@ def test_a_landed_split_also_threads_its_contracts_through_the_master(
     """
     root = _two_sessions(fixture_lake)
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     (entry,) = _entries(root)
     assert entry["split_ratio"] == 1.5
@@ -2150,7 +2417,7 @@ def test_a_rename_writes_the_mapping_and_appends_no_ledger_entry(fixture_lake: F
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == [], "a rename landed a no-op factor"
     assert _not_splits(report_out) == [REASON_DELIVERABLE_UNCHANGED]
@@ -2167,7 +2434,7 @@ def test_an_adjustment_no_float_describes_is_held_and_still_mapped(
     """
     root = _two_sessions(fixture_lake, deliverables=_with_cash(150.0, 25.0), note="150 SPY")
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == []
     (held,) = report_out.held
@@ -2183,7 +2450,7 @@ def test_a_ratio_the_gate_refuses_is_still_mapped(fixture_lake: FixtureLake):
     """
     root = _two_sessions(fixture_lake, note="175 SPY")
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == []
     (held,) = report_out.held
@@ -2209,7 +2476,7 @@ def test_a_boundary_the_walk_cannot_date_writes_no_mapping(fixture_lake: Fixture
         },
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     (held,) = report_out.held
     assert held.finding.check == CHECK_SPLIT_BOUNDARY
@@ -2226,11 +2493,11 @@ def test_a_second_night_rewrites_neither_the_ledger_nor_the_master(
     failed the master write would never come back to it.
     """
     root = _two_sessions(fixture_lake)
-    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
     before = master_path(root).read_bytes()
     entries_before = _entries(root)
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(SECOND_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == entries_before
     assert report_out.unchanged == 1
@@ -2249,7 +2516,7 @@ def test_a_refused_mapping_files_a_finding_and_the_split_still_lands(
     """
     root = _two_sessions(fixture_lake, ssid=999_000_001)
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     (entry,) = _entries(root)
     assert entry["split_ratio"] == 1.5
@@ -2269,7 +2536,7 @@ def test_a_newly_listed_standard_series_maps_nothing(fixture_lake: FixtureLake):
     """
     root = _two_sessions(fixture_lake, non_standard=False, deliverables=STANDARD, note=NOTE)
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _not_splits(report_out) == [REASON_STANDARD_SERIES]
     assert report_out.mapped == () and _mappings(root) == []
@@ -2279,7 +2546,9 @@ def test_the_render_names_the_mapping_it_wrote(fixture_lake: FixtureLake):
     """A run that rewrote the reference table every consumer resolves through says so."""
     root = _two_sessions(fixture_lake)
 
-    rendered = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT)).render()
+    rendered = detect_splits(
+        lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR
+    ).render()
 
     assert "  mapped:    1" in rendered
     assert f"{DEFAULT_OCC!r} [{DAY_ONE.isoformat()} -> {DAY_TWO.isoformat()})" in rendered
@@ -2298,7 +2567,7 @@ def test_the_master_the_write_touches_stays_manifested(fixture_lake: FixtureLake
     )
     assert scrub(root).ok
 
-    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert scrub(root).ok, "the master was rewritten without recording its new sha"
 
@@ -2324,7 +2593,7 @@ def test_a_master_torn_during_the_walk_ends_the_run_rather_than_filing_per_bound
     monkeypatch.setattr(lake.actions, "read_master", tear)
 
     with pytest.raises(MasterUnreadable):
-        detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+        detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == [], "the run reached the second ticker instead of ending"
 
@@ -2351,7 +2620,7 @@ def test_a_row_count_regression_files_a_finding_and_the_walk_goes_on(
 
     monkeypatch.setattr(lake.manifest, "record_partition", refuse_once)
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     (held,) = report_out.held
     assert held.finding.check == CHECK_OCC_MAPPING and held.finding.symbol == "QQQ"
@@ -2394,7 +2663,7 @@ def test_a_symbol_handed_between_two_instruments_maps_nothing(fixture_lake: Fixt
         ),
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert report_out.mapped == (), "the incoming instrument inherited the outgoing one's history"
     assert _mappings(root) == []
@@ -2433,7 +2702,7 @@ def test_a_boundary_the_ledger_refuses_for_a_duplicate_instrument_is_still_mappe
         master=SecurityMaster([_mapping(1, "QQQ"), _mapping(1, "SPY")]),
     )
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
 
     assert [held.finding.check for held in report_out.held] == [CHECK_INSTRUMENT_RESOLUTION]
     assert len(_entries(root)) == 1, "the second boundary's ledger entry was refused"
@@ -2452,14 +2721,14 @@ def test_a_run_that_landed_the_entry_and_lost_the_master_writes_the_mapping_next
     independently recoverable rather than one silently depending on the other.
     """
     root = _two_sessions(fixture_lake)
-    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
     entries = _entries(root)
     # The ledger keeps its entry and the master loses its rows, which is what a first run that
     # appended and then failed its master write leaves behind.
     _master().write(master_path(root))
     assert _mappings(root) == []
 
-    report_out = detect_splits(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+    report_out = detect_splits(lake_root=root, clock=ManualClock(SECOND_NIGHT), calendar=CALENDAR)
 
     assert _entries(root) == entries and report_out.unchanged == 1
     assert len(report_out.mapped) == 1

@@ -115,11 +115,11 @@ component and an unchanged contract multiplier. Everything else is held as a fin
 reads. Growing the record to carry a deliverable rather than a multiplier is a different
 deliverable and needs its own issue.
 
-**A skipped session widens the window a boundary sits in, and ``ex_date`` cannot be
-repaired.** ``ex_date`` sits in the ledger's key, so a corrected date lands under a new key
-rather than superseding the wrong one, and every adjusted price then applies the split
+**A session the walk did not read widens the window a boundary sits in, and ``ex_date``
+cannot be repaired.** ``ex_date`` sits in the ledger's key, so a corrected date lands under a
+new key rather than superseding the wrong one, and every adjusted price then applies the split
 twice. A corrected *ratio* supersedes cleanly and a corrected date does not. The walk skips
-for five reasons, and each one widens that window:
+for six reasons, and each one widens that window:
 
 1. A gap day, which raises ``NoOptionClose``. The lake's own 2026-09-08 through 2026-09-11
    are four of these per ticker, from a real auth outage, and ``load_chain`` raises it on 8
@@ -139,15 +139,33 @@ for five reasons, and each one widens that window:
    trailing-median contract count is journaled anyway and tagged, and a thin chain carries a
    thin root set, so a truncated *previous* session makes the next ordinary one look like it
    gained a root.
+6. A session the lake never captured, which the manifest cannot report because there is no
+   entry to report. The other five all start from a sealed partition, so a walk that
+   enumerates the manifest alone reads the two sessions either side of an uncaptured one as
+   consecutive. That is marketlake #431, and the machine being off for a day is enough to
+   produce it. The exchange calendar is what closes it: the sessions between one read session
+   and the next are the calendar's answer, and any of them the manifest does not hold was
+   captured by nobody.
 
-So a boundary lands only when the two sessions either side of it are adjacent in the
-manifest, with no sealed ticker-day of that ticker skipped between them. A boundary whose
-window is wider than one session is held and filed, naming both ends, rather than landing an
-unrepairable date the detector guessed. The count of times reason 5 has fired is zero:
-``is_chain_truncated`` and ``suspect`` are ``False`` on all 19,799,808 data rows in the lake.
-It is still not deferred, for the reason ``lake.actions`` gives for gating before the battery
-exists. An entry held today lands tomorrow at no cost, while a wrong one that lands corrupts
-every adjusted price computed through it, and the ledger is append-only.
+So a boundary lands only when no session at all sits between the two either side of it. That
+is the exchange calendar's question rather than the manifest's, because the manifest can only
+speak for the days it holds. A boundary whose window is wider than one session is held and
+filed, naming both ends, rather than landing an unrepairable date the detector guessed. The
+count of times reason 5 has fired is zero: ``is_chain_truncated`` and ``suspect`` are
+``False`` on all 19,799,808 data rows in the lake. Reason 6 has fired zero times on a judged
+pair as well: SPY's manifested chains days run 2026-09-02 then 2026-09-08 onward, leaving the
+sessions of 2026-09-03 and 2026-09-04 uncaptured, and 2026-09-02 predates the master's
+``capture_start`` so it is skipped out of scope and no pair spans that gap. Neither is
+deferred, for the reason ``lake.actions`` gives for gating before the battery exists. An entry
+held today lands tomorrow at no cost, while a wrong one that lands corrupts every adjusted
+price computed through it, and the ledger is append-only.
+
+**The calendar is injected, and its far bound cannot reach this walk.**
+``exchange_calendars`` refuses a date past its last session, which is 365 days past the moment
+the calendar was built. Every day asked about here sits strictly between two sealed
+partitions, both of them in the past, so the refusal marketlake #395 carries has nothing to
+fire on from here. Nothing is guarded against it, because a guard on a condition nothing can
+reach reads as a rule.
 
 **A run's second night appends nothing.** ``observed_on`` and ``ex_date`` are both the
 boundary session itself, never the night the walk ran. A split stays visible in sealed chains
@@ -181,7 +199,7 @@ import re
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from math import isfinite
 from pathlib import Path
 
@@ -208,6 +226,7 @@ from lake.actions import (
     same_but_for_recorded_at,
     surface_ticker_days,
 )
+from lake.calendar import Calendar, ExchangeCalendar
 from lake.clock import Clock, SystemClock
 from lake.loader import (
     NoOptionClose,
@@ -378,7 +397,7 @@ class NonScalarDeliverable(SplitError):
 
 
 class BoundaryUnbounded(SplitError):
-    """Raised when a skipped session leaves the boundary's own date in doubt.
+    """Raised when a session the walk did not read leaves the boundary's own date in doubt.
 
     ``ex_date`` sits in the ledger's key, so a date the detector gets wrong cannot be
     superseded. A corrected entry lands under a second key and every adjusted price then
@@ -387,7 +406,7 @@ class BoundaryUnbounded(SplitError):
     """
 
 
-# Why a ticker-day was not read, and each reason widens a boundary's window by one session.
+# Why a session was not read, and each reason widens a boundary's window by one session.
 # Three of them are ``lake.actions``' above, imported rather than restated, because the
 # dividend walk meets the same three and one reason has to have one spelling. The rest are
 # this surface's own, the close-of-record one included, because each names the tag its walk
@@ -397,11 +416,15 @@ REASON_NO_OPTION_CLOSE = "no option close"
 REASON_OUT_OF_SCOPE = "outside the capture span"
 REASON_THIN = "suspect or truncated"
 REASON_UNRESOLVED = "unresolved symbol"
+# The one reason that names no partition at all. Every other reason above starts from a
+# manifest entry, so a session the lake never captured is the one the manifest cannot report
+# and the exchange calendar has to. marketlake #431 is why it exists.
+REASON_NOT_CAPTURED = "the lake captured nothing that session"
 
 # Why the scale guard could not compare a pair of sessions. None of these is a finding. A pair
 # it could not read is a pair nobody judged, which is a different thing from one it judged and
 # passed, and the report keeps them apart for the reason :class:`NotAnAdjustment` gives.
-REASON_SCALE_WINDOW = "a skipped session sits between the pair"
+REASON_SCALE_WINDOW = "a session the walk did not read sits between the pair"
 REASON_NO_LADDER = "a session lists no strike"
 REASON_NO_UNDERLYING = "a session names no single underlying price"
 REASON_INSTRUMENT_CHANGED = "the pair spans two instruments"
@@ -570,9 +593,12 @@ class SplitReport:
     nothing and hold nothing and a run that met one would otherwise read exactly like a run
     that met nothing at all.
 
-    ``skipped`` carries every ticker-day the walk did not read, because each one widens the
+    ``skipped`` carries every session the walk did not read, because each one widens the
     window a boundary can sit in and the render is where an operator sees how wide the lake's
-    windows currently are.
+    windows currently are. Most are sealed ticker-days it passed over, and one reason names a
+    session with no partition at all, so this can count higher than ``ticker_days``. A lake
+    that captured nothing for a month holds one entry per session of it and one rendered line,
+    because ``actions.by_reason`` counts rather than listing.
 
     ``mapped`` counts the OCC mapping rows the run wrote into the security master. It is
     reported rather than inferred from ``appended``, because the two fire on different things:
@@ -1034,7 +1060,7 @@ def check_split_consistency(prior: Deliverable, new: Deliverable) -> SplitConsis
 
 
 def check_strike_scale(
-    previous: Session, session: Session, *, skipped_since: int
+    previous: Session, session: Session, *, unread_since: int
 ) -> ScaleVerdict | str:
     """Whether a whole-ratio split sits between two sessions, or why they cannot be compared.
 
@@ -1077,15 +1103,23 @@ def check_strike_scale(
     for. So the ladder is compared by strike.
 
     **Four reasons refuse the pair rather than judging it**, each returned as a string the way
-    :func:`read_session` returns its own. A skipped session between the two ends leaves ladder
-    attrition unmeasured across the window, and a finding filed on that guess would never clear,
-    since :func:`~lake.report.write_withheld` files a held finding again every night and nothing
-    prunes ``reports/``. Two sessions of different instruments are two securities. A session with
-    no ladder has no denominator and one with no spot has no ratio to round.
+    :func:`read_session` returns its own. A session between the two ends that the walk did not
+    read leaves ladder attrition unmeasured across the window, and a finding filed on that guess
+    would never clear, since :func:`~lake.report.write_withheld` files a held finding again every
+    night and nothing prunes ``reports/``. Two sessions of different instruments are two
+    securities. A session with no ladder has no denominator and one with no spot has no ratio to
+    round.
+
+    ``unread_since`` counts every session between the pair the walk did not read, which is not
+    the same as every sealed ticker-day it skipped. A session the lake never captured is in no
+    manifest, so a counter built from the manifest alone reads zero across it and this guard
+    judges the pair as consecutive. That was marketlake #431, and what it cost is the finding's
+    date: filed against the later session while the split's real ex-date is the session in
+    between, so the ledger read that suppresses it asks a key an operator can never land.
     """
     if previous.instrument_id != session.instrument_id:
         return REASON_INSTRUMENT_CHANGED
-    if skipped_since:
+    if unread_since:
         return REASON_SCALE_WINDOW
     if not previous.strikes or not session.strikes:
         return REASON_NO_LADDER
@@ -1214,13 +1248,40 @@ def _require_unmoved(before: object, after: object, what: str) -> None:
 # -- the walk ----------------------------------------------------------------
 
 
-def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
+def _uncaptured_sessions(calendar: Calendar, after: date, before: date) -> list[date]:
+    """Every exchange session strictly between two of a ticker's consecutive sealed days.
+
+    The two ends come from the manifest and nothing the manifest holds sits between them, so
+    every session here is one the lake captured nothing for. That is the count
+    :func:`surface_ticker_days` cannot produce: a day with no partition has no manifest entry
+    to be enumerated from, and the walk reads the two sessions either side of it as
+    consecutive.
+
+    **The calendar answers this and weekday arithmetic does not.** A Friday and the Monday
+    after it are consecutive sessions, and so are the Friday and Tuesday around Labor Day.
+    Counting days rather than sessions would refuse every ordinary pair in the lake. This walks
+    the days and asks :meth:`Calendar.is_session`, which is what ``bars._span_sessions`` already
+    does rather than growing the seam a member it can compute.
+    """
+    found, day = [], after + timedelta(days=1)
+    while day < before:
+        if calendar.is_session(day):
+            found.append(day)
+        day += timedelta(days=1)
+    return found
+
+
+def detect_splits(*, lake_root: Path | str, clock: Clock, calendar: Calendar) -> SplitReport:
     """Read every sealed chains ticker-day, gate what it finds, and append what lands.
 
     Nothing here fetches. ``CHAINS_SCHEMA`` has carried ``option_root`` and the four
     deliverable columns since the capture schema was pinned, so the evidence a split is
     derived from is already on disk. Every dependency is injected and this reads no config,
-    the way ``actions.extract_dividends`` does.
+    the way ``actions.extract_dividends`` does. The calendar is one of them, and it is required
+    rather than defaulted for the reason ``tests/unit/test_seam_defaults.py`` gives: an entry
+    that lets a live dependency ride in on a default restores the old bug with every test still
+    green. ``detect_splits_from_config`` is where the real one is built, because a calendar
+    reaches past no process and is a ``main``'s to construct.
 
     The walk, per ticker, in date order.
 
@@ -1238,9 +1299,13 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
        instrument enter one level down.
     3. A session the walk cannot read is skipped, for the four reasons
        :func:`read_session` names. Each skip widens the window a boundary can sit inside.
+       So does a session the lake never captured, which :func:`_uncaptured_sessions` reads off
+       the calendar because the manifest has no entry to report it with. It is enumerated only
+       between two sessions the walk actually read, so a stretch below a ticker's first
+       readable day is not reported as uncaptured when it is merely out of scope.
     4. A session whose root set holds a root the previous readable session lacked is a
        boundary. "The previous session" means the previous one the walk did not skip.
-    5. A boundary with a skipped session between its two ends is held rather than landed.
+    5. A boundary with any unread session between its two ends is held rather than landed.
        ``ex_date`` sits in the ledger's key, so a date the detector gets wrong cannot be
        superseded, and a corrected entry lands under a second key that every adjusted price
        then applies on top of the first.
@@ -1331,17 +1396,38 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
         # direction, so without this a root that expires out of one session and lists again
         # in the next reads as an adjustment and lands the ratio backwards.
         seen: frozenset[str] = frozenset()
-        # How many of this ticker's sealed sessions the walk has skipped since ``previous``.
-        # A boundary is only as narrow as this is zero.
-        skipped_since = 0
+        # How many sessions since ``previous`` the walk did not read. A boundary is only as
+        # narrow as this is zero.
+        unread_since = 0
+        # The manifested day the loop looked at last, whether or not it read it. The gap
+        # enumeration below anchors here rather than on ``previous``, so a session is reported
+        # once and in date order: anchored on ``previous`` it would be re-enumerated on every
+        # iteration until a read advanced it.
+        last_day: date | None = None
         for day in days:
+            # **Every session the lake captured nothing for, between the last manifested day
+            # and this one.** The manifest cannot report these, because a day with no partition
+            # has no entry, and the walk would otherwise read the two sessions either side of
+            # one as consecutive. That is marketlake #431, and both consumers below inherit it
+            # from this one counter.
+            #
+            # **Only once a session has been read.** Below a ticker's first readable day the
+            # lake captured nothing because it was not yet asked to, and the master already
+            # calls such a day out of scope rather than a gap. Reporting it as uncaptured would
+            # file two skips per run for the live lake's 2026-09-03 and 2026-09-04 forever, on
+            # a window no pair spans.
+            if previous is not None and last_day is not None:
+                for missing in _uncaptured_sessions(calendar, last_day, day):
+                    skipped.append(Skip(ticker, missing, REASON_NOT_CAPTURED))
+                    unread_since += 1
+            last_day = day
             try:
                 instrument_id = resolve_instrument(master, ticker, day)
             except UnresolvedSymbol as exc:
                 if _in_master(master, ticker):
                     # Known symbol, no mapping valid that day. Out of scope, never a gap.
                     skipped.append(Skip(ticker, day, REASON_OUT_OF_SCOPE))
-                    skipped_since += 1
+                    unread_since += 1
                     continue
                 hold(_resolution_finding(ticker, day, exc))
                 skipped.append(Skip(ticker, day, REASON_UNRESOLVED))
@@ -1356,7 +1442,7 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
             session = read_session(lake_root, ticker, day, instrument_id)
             if isinstance(session, str):
                 skipped.append(Skip(ticker, day, session))
-                skipped_since += 1
+                unread_since += 1
                 continue
 
             # Read before the examination so the scale guard below can tell whether that
@@ -1368,7 +1454,7 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
                 previous=previous,
                 seen=seen,
                 session=session,
-                skipped_since=skipped_since,
+                unread_since=unread_since,
                 recorded_at=recorded_at,
                 lake_root=lake_root,
                 current=current,
@@ -1390,7 +1476,7 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
             # ``_examine`` at all, because no root appeared, so without that read marketlake
             # #286's entry could not clear this finding either.
             if previous is not None:
-                scale = check_strike_scale(previous, session, skipped_since=skipped_since)
+                scale = check_strike_scale(previous, session, unread_since=unread_since)
                 if isinstance(scale, str):
                     scale_unread.append(ScaleUnread(ticker, day, scale))
                 else:
@@ -1440,7 +1526,7 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
             # After the examination rather than before it, so a boundary is judged against
             # the history as it stood before this session, the way ``seen`` is.
             history.observe(session.day, [row for _, row in session.rows])
-            previous, skipped_since = session, 0
+            previous, unread_since = session, 0
 
     return SplitReport(
         ticker_days=len(ticker_days),
@@ -1462,7 +1548,7 @@ def _examine(
     previous: Session | None,
     seen: frozenset[str],
     session: Session,
-    skipped_since: int,
+    unread_since: int,
     recorded_at: datetime,
     lake_root: Path,
     current: dict[ActionKey, dict],
@@ -1543,11 +1629,15 @@ def _examine(
         return Outcome(not_adjustments=tuple(marks))
 
     try:
-        if skipped_since:
+        if unread_since:
+            # Both ends, rather than a count and a start. An operator meets this under
+            # ``reports/withheld/`` with no other record of the window, and the two dates are
+            # what say which sessions to go and look at.
             raise BoundaryUnbounded(
-                f"{ticker} gained {sorted(gained)} on {day.isoformat()} and "
-                f"{skipped_since} session(s) since {previous.day.isoformat()} were skipped, "
-                f"so the boundary's own date is not bounded to one session"
+                f"{ticker} gained {sorted(gained)} on {day.isoformat()} and the walk read no "
+                f"session between {previous.day.isoformat()} and {day.isoformat()}, "
+                f"{unread_since} of them, so the boundary's own date is not bounded to one "
+                f"session"
             )
         prior = _prior_deliverable(previous, session, gained)
         new = deliverable_of(session, gained)
@@ -1755,14 +1845,27 @@ def _resolution_finding(
 
 
 def detect_splits_from_config(
-    *, clock: Clock | None = None, config_path: str | Path | None = None
+    *,
+    clock: Clock | None = None,
+    calendar: Calendar | None = None,
+    config_path: str | Path | None = None,
 ) -> SplitReport:
-    """The detection wired from the real config. This is what the CLI subcommand calls."""
+    """The detection wired from the real config. This is what the CLI subcommand calls.
+
+    The calendar defaults the way the clock beside it does, and that is sanctioned rather than
+    an exception to the injection rule. ``tests/unit/test_seam_defaults.py`` draws the line at
+    a dependency that reaches past this process: "A system clock and an exchange calendar never
+    reach past this process, so neither is a seam." ``lake.actions``' command also runs both
+    walks through one ``run(clock=clock, config_path=args.config)``, so the default has to live
+    here rather than on a signature that call cannot vary.
+    """
     from lake.config import load_config
 
     config = load_config(config_path)
     return detect_splits(
-        lake_root=config.lake_root, clock=SystemClock() if clock is None else clock
+        lake_root=config.lake_root,
+        clock=SystemClock() if clock is None else clock,
+        calendar=ExchangeCalendar() if calendar is None else calendar,
     )
 
 
@@ -1781,6 +1884,7 @@ __all__ = [
     "Outcome",
     "REASON_DELIVERABLE_UNCHANGED",
     "REASON_INSTRUMENT_CHANGED",
+    "REASON_NOT_CAPTURED",
     "REASON_NO_LADDER",
     "REASON_NO_OPTION_CLOSE",
     "REASON_NO_UNDERLYING",
