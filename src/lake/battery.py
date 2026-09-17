@@ -209,6 +209,7 @@ from lake.journal import ROW_KIND_COLUMN, ROW_KIND_DATA
 from lake.manifest import (
     CLEAN_VERDICT,
     VERDICT_FIELD,
+    ManifestError,
     append_line,
     is_quarantined,
     latest_quarantine_by_check,
@@ -2361,6 +2362,18 @@ def main(argv: Sequence[str] | None = None, *, clock=None) -> int:
     except SystemExit as exit_code:  # noqa: PERF203 - the context manager's own exit
         return int(exit_code.code or 0)
     except FileNotFoundError as exc:
+        print(f"battery: {exc}", file=sys.stderr)
+        return 2
+    except ManifestError as exc:
+        # **A damaged ledger is a line here, like every other refusal.** The walk resolves the
+        # quarantine ledger inside each partition's hold, so a ledger that cannot be read
+        # stops the run, and without this it stopped it as eight frames around one sentence.
+        # ``docs/design.md`` names this command as the one an operator runs when the nightly
+        # digest carries only counts, so a torn ledger sends them here on purpose and a stack
+        # is the worst thing to meet. Marketlake #469 made that likely: a crash mid-append
+        # needs no hand-malformed line. It is exit 2 rather than 1 because the lake's own file
+        # contradicts its writer, which is a repair rather than a night that judged nothing,
+        # and ``lake.signoff`` keeps the traceback for the opposite reason its docstring gives.
         print(f"battery: {exc}", file=sys.stderr)
         return 2
 

@@ -98,7 +98,7 @@ from typing import Any
 from lake.calendar import MARKET_TZ
 from lake.clock import Clock, SystemClock
 from lake.loader import NoSpotClose, PartialRead, PartitionAbsent, PartitionQuarantined, load_quotes
-from lake.manifest import append_line, latest_entries, parse_jsonl, record_partition
+from lake.manifest import ManifestError, append_line, latest_entries, parse_jsonl, record_partition
 from lake.paths import ACTIONS, CORPORATE_ACTIONS_FILE, QUOTES, parse_partition_rel
 from lake.report import Withheld, write_withheld
 from lake.security_master import AmbiguousSymbol, MasterUnreadable, SecurityMaster, master_path
@@ -1449,6 +1449,20 @@ def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> in
         return 2
     except MasterUnreadable as exc:
         print(f"actions: {exc}. Restore it from the backup.", file=sys.stderr)
+        return 2
+    except ManifestError as exc:
+        # Both walks read sealed partitions through ``lake.loader``, which resolves the
+        # quarantine ledger on every one it opens, so a damaged ledger stops this command the
+        # way an unreadable master does. It is the same kind of mistake with a different file
+        # behind it, which is the sentence this docstring already uses, so it gets the same
+        # named line rather than a stack. Marketlake #469 made it likely: a crash mid-append
+        # needs no hand-malformed line. The repair is named rather than guessed at, because
+        # an append-only ledger has no rollback and ``lake.signoff`` cannot read one either.
+        print(
+            f"actions: {exc} Repair it by hand under the lake-root lock, or restore it from "
+            "the backup.",
+            file=sys.stderr,
+        )
         return 2
     print(report.render())
     return 1 if report.unfiled else 0

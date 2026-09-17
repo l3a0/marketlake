@@ -10,8 +10,11 @@ The ledger lives at ``manifest.jsonl`` at the lake root. Its rules are few and e
 1. *One entry is one line.* An entry is appended with a single ``O_APPEND`` write.
    ``O_APPEND`` is the kernel's atomic append mode. Concurrent writers cannot
    interleave within one write, so a line is never half from one writer and half from
-   another. A reader that meets a torn trailing line discards it. A crash can only
-   tear the last line, never an earlier one.
+   another. A reader that meets a torn trailing line discards it. A crash tears the
+   last line, and it stops being the last one as soon as a later append lands: a torn
+   write leaves no terminating newline, so the next entry fuses onto the fragment and
+   the entries behind that line are unreachable. Marketlake #447 carries what that
+   costs the manifest and the corporate-actions ledgers, which still read short.
 2. *Last entry wins*, keyed by the file's path. A re-run legitimately appends a second
    entry for the same path. The current truth is the last entry for that path.
 3. *Two-way scrub.* Every entry's file must exist and match its last recorded sha.
@@ -23,7 +26,14 @@ The quarantine ledger at ``quarantine.jsonl`` follows rules 1 and 3, and resolve
 partition and each keeps its own current verdict. :func:`latest_quarantine_by_check` is that
 resolution and marketlake #426 is why it is not the path alone. It records
 data-quality verdicts per partition. Un-quarantine is a superseding entry, never a
-deletion. This module gives it the same append and read helpers.
+deletion. This module gives it the same append helper and its own reader.
+
+The read is where it parts from rule 1, and marketlake #469 is why. Its entries are a guard,
+so a read that stopped with whole lines behind it would resolve to a ledger missing its own
+verdicts and admit the partitions they withhold. :func:`read_quarantine` refuses that with
+:class:`TornLedger` instead. The manifest's reader keeps the truncating read, because
+:func:`scrub` resolves through it and a Sunday scrub that raised would fail on the very file
+it exists to report.
 
 The corporate-actions ledger at ``actions/corporate_actions.jsonl`` follows them too, and
 it keys on the action rather than on a path, the way the quarantine ledger keys on the
@@ -251,17 +261,30 @@ def _refuse_hidden_entries(path: Path, text: str, entries: Sequence[dict]) -> No
     hidden line and fires a page every night without this.
 
     A fragment whose partial write did end in a newline is its own line rather than a fusion.
-    It costs no entry of its own, and the entries after it are counted here like any others.
+    It costs no entry of its own, and the lines after it are counted here like any others.
+
+    **The number in the message is the line as an editor numbers it**, which is why the
+    positions are collected rather than the non-blank lines counted. The parsed count alone
+    gives the stop's position among non-blank lines, and the two diverge the moment the file
+    holds a blank one. That number's whole job is to send the person repairing the file to the
+    right line, and no writer here makes a blank line, so a file that has one is already a
+    hand-edited file and its reader is exactly the person this addresses.
+
+    What sits behind the stop is counted as lines rather than entries, because damage does not
+    have to be well formed. They are whole written lines no reader reaches, and on any ledger a
+    writer produced they are verdicts.
     """
-    lines = sum(1 for line in text.splitlines() if line.strip())
-    hidden = lines - 1 - len(entries)
+    positions = [number for number, line in enumerate(text.splitlines(), start=1) if line.strip()]
+    if len(positions) <= len(entries):
+        return
+    hidden = len(positions) - len(entries) - 1
     if hidden <= 0:
         return
     raise TornLedger(
-        f"{path}: the read stopped at line {len(entries) + 1} and {hidden} "
-        f"entr{'y is' if hidden == 1 else 'ies are'} written after it that no reader can "
-        "see. Every verdict behind that line is invisible, so this ledger cannot say which "
-        "partitions it withholds. Repairing a ledger is a human's job under the lock."
+        f"{path}: the read stopped at line {positions[len(entries)]} and {hidden} "
+        f"line{'' if hidden == 1 else 's'} after it {'is' if hidden == 1 else 'are'} written "
+        "and unreachable. Every verdict behind that line is invisible, so this ledger cannot "
+        "say which partitions it withholds. Repairing a ledger is a human's job under the lock."
     )
 
 

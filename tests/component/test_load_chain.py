@@ -61,7 +61,7 @@ from lake.loader import (
     _instant,
     load_chain,
 )
-from lake.manifest import TornLedger, append_line, quarantine_path
+from lake.manifest import TornLedger, append_line, parse_jsonl, quarantine_path
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
 from tests.support.config import write_config
 from tests.support.config_guard import is_protected
@@ -511,15 +511,17 @@ def test_a_torn_ledger_refuses_the_read_rather_than_admitting_every_partition(
     than a ``LoadError`` for the reason this module's own contract gives: the read stopped
     before it could establish anything about what matched.
     """
-    root = _lake(
-        fixture_lake,
-        quarantine=[{"partition": FULL_PARTITION, "verdict": "delayed_feed"}],
-    )
+    root = _lake(fixture_lake, quarantine=[{"partition": "chains/other.parquet"}])
     ledger = quarantine_path(root)
     with ledger.open("a") as handle:
         handle.write('{"partition": "chains/ticker=SPY/date=2026-09-16.parquet", "verd')
     append_line(ledger, {"partition": "fused", "verdict": "clean", "check": "e"})
-    append_line(ledger, {"partition": "hidden", "verdict": "clean", "check": "e"})
+    append_line(ledger, {"partition": FULL_PARTITION, "verdict": "delayed_feed", "check": "e"})
+
+    # The verdict that withholds this partition is the hidden one, which is what makes the
+    # short read admit it. Reading in front of the tear would still have refused, so a fixture
+    # with the verdict ahead of the fragment proves the propagation and not the defect.
+    assert FULL_PARTITION not in [e.get("partition") for e in parse_jsonl(ledger.read_text())]
 
     with pytest.raises(TornLedger):
         load_chain("SPY", FULL_DAY, lake_root=root)
@@ -532,15 +534,12 @@ def test_the_opt_in_still_reads_a_lake_whose_ledger_is_torn(fixture_lake: Fixtur
     sanctioned way past the guard is the sanctioned way past a damaged ledger too, and an
     operator is never locked out of their own lake while they repair it.
     """
-    root = _lake(
-        fixture_lake,
-        quarantine=[{"partition": FULL_PARTITION, "verdict": "delayed_feed"}],
-    )
+    root = _lake(fixture_lake, quarantine=[{"partition": "chains/other.parquet"}])
     ledger = quarantine_path(root)
     with ledger.open("a") as handle:
         handle.write('{"partition": "chains/ticker=SPY/date=2026-09-16.parquet", "verd')
     append_line(ledger, {"partition": "fused", "verdict": "clean", "check": "e"})
-    append_line(ledger, {"partition": "hidden", "verdict": "clean", "check": "e"})
+    append_line(ledger, {"partition": FULL_PARTITION, "verdict": "delayed_feed", "check": "e"})
 
     table = load_chain("SPY", FULL_DAY, lake_root=root, include_quarantined=True)
 

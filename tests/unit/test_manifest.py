@@ -110,7 +110,7 @@ def test_a_fusion_with_nothing_behind_it_is_the_cost_append_line_accepts():
 def test_one_entry_behind_the_fused_line_is_refused_and_counted():
     text = '{"partition": "a", "verd' + _line("b") + _line("c")
     message = str(_refuses(text))
-    assert "1 entry is written after it" in message
+    assert "1 line after it is written and unreachable" in message
     assert "the read stopped at line 1" in message
     assert str(_LEDGER) in message
     assert "human's job under the lock" in message
@@ -120,7 +120,7 @@ def test_two_entries_behind_it_are_counted_and_read_as_plural():
     """Three appends behind the fragment hide two, because the first fuses onto it."""
     text = _line("a") + '{"partition": "b", "verd' + _line("c") + _line("d") + _line("e")
     message = str(_refuses(text))
-    assert "2 entries are written after it" in message
+    assert "2 lines after it are written and unreachable" in message
     assert "the read stopped at line 2" in message
 
 
@@ -131,7 +131,32 @@ def test_a_fragment_of_its_own_costs_no_entry_and_still_hides_what_follows():
     is hidden exactly as it is behind a fusion, and is counted the same way.
     """
     text = '{"partition": "a", "verd\n' + _line("b")
-    assert "1 entry is written after it" in str(_refuses(text))
+    assert "1 line after it is written and unreachable" in str(_refuses(text))
+
+
+def test_the_reported_line_is_the_one_an_editor_shows():
+    """The number's whole job is to send a person to the right line in the file.
+
+    Counting the parsed entries gives the stop's position among *non-blank* lines, and the
+    two diverge as soon as the file holds a blank one. No writer here makes a blank line, so
+    a file that has one has already been hand edited, which is exactly the file the person
+    this message addresses is looking at.
+    """
+    text = "\n\n\n" + '{"partition": "a", "verd' + _line("b") + _line("c")
+    assert "the read stopped at line 4" in str(_refuses(text))
+
+    between = _line("a") + "\n\n" + '{"partition": "b", "verd' + _line("c") + _line("d")
+    assert "the read stopped at line 4" in str(_refuses(between))
+
+
+def test_what_sits_behind_the_stop_is_counted_as_lines_not_entries():
+    """Damage does not have to be well formed, so the count says what it measured.
+
+    Every line behind the stop is unreachable whether or not it parses, and on a ledger a
+    writer produced they are verdicts. Calling them entries would be a claim this never
+    checked, in a message written for somebody deciding what to repair.
+    """
+    assert "1 line after it is written and unreachable" in str(_refuses("@@@\n$$$\n"))
 
 
 def test_blank_lines_are_not_counted_as_hidden_entries():

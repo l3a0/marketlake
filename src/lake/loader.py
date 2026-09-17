@@ -836,13 +836,15 @@ def load_bars(
     ``ValueError`` too, because naming a view that does not exist is a bad argument rather than a
     lake that could not answer.
 
-    Two conditions raise something other than a ``LoadError``, for the reason ``load_chain``
+    Three conditions raise something other than a ``LoadError``, for the reason ``load_chain``
     gives for its own three: each says a file contradicts its writer, so it raises the error of
-    the module that owns that file. A machine with no ``config.yaml`` raises ``ConfigError``. And
-    a damaged ``corporate_actions.jsonl`` raises ``actions.LedgerLineError``, which is the ledger
-    resolving a line rather than this door reading a partition. An absent ledger is not one of
-    them: it adjusts nothing and raises nothing, which is what keeps every view inert on a lake
-    the extraction has not written to.
+    the module that owns that file. A machine with no ``config.yaml`` raises ``ConfigError``. A
+    damaged ``corporate_actions.jsonl`` raises ``actions.LedgerLineError``, which is the ledger
+    resolving a line rather than this door reading a partition. And a damaged
+    ``quarantine.jsonl`` raises ``ManifestError``, reached through the same ``_clear_partition``
+    guard ``load_chain`` goes through, so both doors answer the same way about it. An absent
+    ledger is not one of them: it adjusts nothing and raises nothing, which is what keeps every
+    view inert on a lake the extraction has not written to.
 
     **The stitch promotes rather than raising.** The overflow projection adds a promoted column
     only when a row it is handed carries a value for it, so two partitions at two schema

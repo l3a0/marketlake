@@ -383,7 +383,7 @@ def test_a_read_stopping_with_verdicts_behind_it_refuses_and_names_them(lake_roo
         read_quarantine(lake_root)
 
     assert str(quarantine_path(lake_root)) in str(refusal.value)
-    assert "1 entry is written after it" in str(refusal.value)
+    assert "1 line after it is written and unreachable" in str(refusal.value)
 
 
 def test_every_quarantine_reader_funnels_through_the_one_refusal(lake_root):

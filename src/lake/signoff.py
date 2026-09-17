@@ -71,10 +71,18 @@ the same entry to the same key and differ only in the verdict.
 **The write is confirmed, never assumed.** After appending, this re-reads the ledger and raises
 unless its own entry is among the entries a reader sees. A sign-off is a hand operation whose
 whole value is that it landed, and one condition makes a successful append invisible: a torn
-fragment anywhere in the ledger stops ``manifest.parse_jsonl`` at that line, so every entry
-after it is dropped by every reader. Measured on a temp lake, eight lines written and two read,
-with all six sign-offs among them invisible while each writer returned success. Marketlake #447
-carries that class. This carries the guard for its own write.
+fragment stops ``manifest.parse_jsonl`` at that line, so every entry after it is dropped by
+every reader. Measured on a temp lake, eight lines written and two read, with all six sign-offs
+among them invisible while each writer returned success.
+
+Marketlake #469 closed the wider half of that for this ledger. ``manifest.read_quarantine``
+refuses when whole lines sit behind the stop, so a fragment already in the body refuses in
+:func:`_superseded_entry` before this appends anything. What still reaches this guard is the
+one shape that hides nothing: a fragment at the tail, which this tool's own append fuses onto
+and loses. That is the shape ``manifest.append_line`` accepts, and
+``test_a_torn_line_earlier_in_the_ledger_is_caught_rather_than_reported_as_success`` is that
+case. Marketlake #447 carries the manifest and corporate-actions ledgers, which read short
+still.
 
 The check is membership rather than currency, on purpose. A writer superseding the sign-off
 between the append and the read-back is a different outcome from the sign-off never being
@@ -118,8 +126,11 @@ deliberate three ways.
 There is no confirmation prompt, because nothing in ``src/lake`` calls ``input()``.
 
 A lake-state failure keeps its traceback on purpose. ``manifest.latest_quarantine`` raises on a
-body line that parses and names no partition, and that is a corrupt ledger rather than an
-operator mistake, so the stack is what a reader needs. An entry that parses and names a
+body line that parses and names no partition, and on a read that stopped with whole lines
+behind it, which is ``manifest.TornLedger``. Both are a corrupt ledger rather than an operator
+mistake, so the stack is what a reader needs. Both refuse the listing as well as the write,
+which is correct rather than an oversight: repairing a ledger is a hand edit under the lock,
+never an invocation of this tool. An entry that parses and names a
 partition while carrying no ``check`` is different: the reader resolves it without complaint,
 since ``manifest.is_quarantined`` reads ``verdict`` alone and never looks at ``check``. It is
 this tool that has nothing to write under, so the refusal is this tool's to make and it gets a
