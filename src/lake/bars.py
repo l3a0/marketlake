@@ -1913,10 +1913,24 @@ class BackfillPlan:
     whatever sits at the front is what a bounded run spends itself on. Ascending puts the oldest
     session there, and the oldest ``1m`` ticker-days are exactly the ones past Schwab's roughly
     30-day lookback: they can never land, a held ticker-day is never manifested, and so they are
-    asked for again on every later run. A budget taken over that order reaches today's bars on no
-    run at all, while an unbudgeted walk lands them on the first. Simulated over a 259-session
-    rebuilt manifest at a budget of 100, chronological lands 100 of the 560 landable ticker-days
-    and reaches today's on no run, and newest-first lands 184 and reaches today's on run one.
+    asked for again on every later run.
+
+    **The harm arrives at a depth rather than immediately, and the depth is measured.** Simulated
+    on this roster at a budget of 100, with a rebuilt manifest and the permanently-unlandable set
+    growing a session a trading day:
+
+    - to about 25 sessions of range the two orders are indistinguishable, because the budget never
+      binds;
+    - from about 40 to 55, chronological still lands everything and merely reaches today's bars on
+      run two to five instead of run one;
+    - from about 71 the unlandable prefix fills the budget on its own, and chronological reaches
+      today's bars on no run at all, landing 100 of the 560 landable ticker-days at 259 sessions
+      where newest-first lands 184 and reaches today's on run one.
+
+    So the order is not what makes the budget work today. The live lake holds eight sessions and
+    both orders behave identically on it. It is what stops the budget turning into a permanent
+    outage on the freshest sessions once the range grows, and doing it now rather than later is
+    what keeps it from being a second behaviour change layered on a shipped one.
 
     Descending also puts the deadline first, which is the asymmetry this module already records:
     Schwab serves a roughly 30-day one-minute lookback and daily bars indefinitely, so a recent
@@ -2058,14 +2072,15 @@ def _require_supported_plan(plan: BackfillPlan) -> None:
 class BackfillReport:
     """What one backfill run did, for the sign-off block.
 
-    It carries the range as well as the counts, because a run that landed nothing has four
-    different causes an operator has to tell apart. ``sessions`` with ``skipped``, ``held`` and
-    the two gate-skip lists says which.
+    It carries the range as well as the counts, because a run that landed nothing has five
+    different causes an operator has to tell apart. ``sessions`` with ``skipped``, ``held``,
+    ``deferred`` and the two gate-skip lists says which.
 
     1. The range was empty.
     2. Every ticker-day in it was already manifested.
     3. Every ticker-day in it was held.
     4. Its daily half had no close of record to be gated against.
+    5. Its request budget was spent before anything landed, which is marketlake #478's.
 
     ``unsettled`` names a daily ticker-day whose gate has no close of record *yet*, which on a
     healthy
@@ -2162,8 +2177,18 @@ def backfill_bars(
     2026-09-16 holds seven sessions and its floor to the 1-min lookback deadline holds twenty-two,
     so a first run over that range would ask for 28 ticker-days and a run at the deadline 88. The
     gate precondition takes eight off the first of those on the live lake, because those eight
-    are daily ticker-days with no close of record to be compared against. The design's ceiling is
-    120 a minute per app, of which the capture loop spends 3 at this roster.
+    are daily ticker-days with no close of record to be compared against.
+
+    **Those figures describe an intact manifest, and that is no longer what bounds the run.**
+    Comparing a plan of 88 against the design's 120-a-minute ceiling was the safety argument here,
+    and it holds only while the manifested skip is doing the work. A lake whose manifest was
+    rebuilt or restored skips nothing and asks for everything the spans cover, back to back, and
+    nothing paces the loop. ``guards.bars_request_budget`` is what answers that now, which is
+    marketlake #478. One run spends at most its budget and the nightly job fires once a day, so a
+    budget under the ceiling cannot cross it however fast the run fires. ``guards`` is the
+    constant's own home and carries the five measurements that picked it; ``None`` here resolves to
+    the pinned default. What a run does not reach was never fetched and so was never manifested, so
+    the next evening's plan still holds it.
 
     **What the gate cannot judge is skipped rather than fetched, which is marketlake #434.** The
     sessions this recovers are exactly the ones whose quotes hold gap rows and no data row, so
@@ -2267,9 +2292,11 @@ def backfill_bars_from_config(
 ) -> BackfillReport:
     """The backfill wired from the real config, taking the same arguments as its sibling.
 
-    The two wirings differ in one line, the capture spans this one reads from under
-    ``lake_root``, which is what makes ``--backfill`` a flag on one command rather than a second
-    command with its own copy of the vendor factory and the two secrets.
+    The two wirings differ in two lines, the capture spans this one reads from under ``lake_root``
+    and the guards it hands the walk, which is what makes ``--backfill`` a flag on one command
+    rather than a second command with its own copy of the vendor factory and the two secrets.
+    Marketlake #478 added the second: the by-hand backfill takes the same request budget the
+    nightly run does, because the ceiling belongs to the credentials rather than to the caller.
     """
     from lake.config import load_config
 

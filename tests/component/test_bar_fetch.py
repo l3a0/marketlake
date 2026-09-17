@@ -1786,8 +1786,8 @@ def test_a_close_of_record_that_disagrees_is_contained_to_its_ticker(fixture_lak
     it: no battery check covers it and ``lake.bars`` is the only module reading the column for
     consistency. Folded into ``abandoned`` it would have left ``Nightly.disagreements`` reading
     zero on the night it appeared, since that count sums the pieces' held findings, and the
-    sweep's one abandoned line names only its first entry, which sorts oldest first and so is
-    one of the six permanent ones for ever.
+    sweep's one abandoned line counts the reasons rather than naming any entry, so a class
+    appearing for the first time moves a census the reader can see.
 
     The request is still saved, which is all #434 asked for. A gate whose reference is ambiguous
     cannot pass either, so the finding is filed without a fetch.

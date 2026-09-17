@@ -2034,7 +2034,9 @@ def test_the_nightly_reports_a_run_the_request_budget_bounded(fixture_lake: Fixt
     **The line survives redaction, which is the half a substring check would miss.**
     ``report.redacted`` keeps two colon-separated fields and is applied on the way into the
     nightly file and again into the digest, so a line carrying a second ``": "`` would arrive with
-    everything after it gone. This asserts the redacted form equals the line.
+    everything after it gone. This asserts the redacted form equals the line, and it holds for
+    every count the line can carry rather than only this fixture's: measured in digest form it
+    runs 58 bytes at one deferred ticker-day and 63 at five figures of them.
 
     **What was spent is read off the report rather than off the constant.** ``attempted`` is the
     ticker-days that reached the vendor, so a line disagreeing with the walk is impossible. Naming

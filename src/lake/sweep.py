@@ -829,9 +829,10 @@ def sweep(
                 # second source for one number, and this job may hold ``None`` for the guards
                 # while the walk resolved its own default.
                 #
-                # The line carries one ``": "``, so ``report.redacted`` keeps it whole. Measured,
-                # it is 58 bytes in digest form and all three bars lines together are 161 of the
-                # 1000-byte cap.
+                # The line carries one ``": "``, so ``report.redacted`` keeps it whole. Measured
+                # in digest form it runs 58 to 63 bytes across the range of counts it can carry,
+                # from a single deferred ticker-day to five figures of them, against a 1000-byte
+                # cap the three bars lines together reach about a sixth of.
                 if walked.deferred:
                     report.append(
                         f"bars deferred: {len(walked.deferred)} ticker-day(s), "

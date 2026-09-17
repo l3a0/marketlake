@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 
 from lake.config import Config, ConfigError, GuardConstants, Secret
 from lake.paths import LakePaths
@@ -212,3 +213,55 @@ def test_a_valid_budget_leaves_every_other_guard_on_its_pinned_default():
     assert guards.bars_request_budget == 7
     assert guards.watchdog_page_minutes == 9
     assert guards.chain_chunk_max_split_depth == GuardConstants().chain_chunk_max_split_depth
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        'bars_request_budget: "100"',
+        "bars_request_budget:",
+        "bars_request_budget: ~",
+        "bars_request_budget: [1, 2]",
+        "bars_request_budget: {a: 1}",
+        "bars_request_budget: 1.5",
+        "bars_request_budget: 100.0",
+    ],
+)
+def test_a_budget_that_is_not_a_whole_number_is_named_rather_than_crashing(raw: str):
+    """The check must not dereference what it was written to refuse.
+
+    ``replace`` type-checks nothing, so the value reaching this comparison is whatever YAML
+    produced. A bare ``< 1`` raises ``TypeError`` against a string, a list, a mapping and a key
+    written with no value, and ``input_errors_exit`` catches ``ChainPlanError``, ``ConfigError``
+    and ``TickersError`` and not that one. The operator would meet a traceback and exit 1 from the
+    very check written to hand them one line and exit 2.
+
+    The empty-value case is not hypothetical here. ``_optional_text`` records that a key written
+    with no value parses to ``None`` as an operator input this file has to name.
+
+    The parametrisation goes through ``yaml.safe_load`` rather than passing Python values, because
+    what matters is what the operator's own file can produce rather than what a test can construct.
+    """
+    mapping = yaml.safe_load(raw)
+    with pytest.raises(ConfigError) as caught:
+        GuardConstants.from_mapping(mapping)
+    assert "bars_request_budget" in str(caught.value)
+
+
+@pytest.mark.parametrize("raw", ["bars_request_budget: yes", "bars_request_budget: true"])
+def test_a_boolean_budget_is_refused_rather_than_read_as_one(raw: str):
+    """``bool`` is a subclass of ``int``, so a range check alone lets ``True`` through as 1.
+
+    ``bars_request_budget: yes`` parses to ``True``, which passes ``>= 1`` and then bounds the
+    whole nightly walk at a single request. The failure the message names, a run that fetches
+    almost nothing and does not refuse, is exactly what that produces one unit later.
+
+    The assertion is on the type as well as the refusal, because ``True == 1`` and a check written
+    against the value alone would pass while the guard was gone.
+    """
+    mapping = yaml.safe_load(raw)
+    assert mapping["bars_request_budget"] is True
+    with pytest.raises(ConfigError):
+        GuardConstants.from_mapping(mapping)
+    # The pinned default is a real int, not something that merely equals one.
+    assert type(GuardConstants().bars_request_budget) is int

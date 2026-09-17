@@ -248,11 +248,25 @@ class GuardConstants:
         # because ``replace`` does not, and eleven constants carry that gap. Marketlake #487 is the
         # per-field range mechanism for all of them. Reaching for it here would be fixing past the
         # class, so the one field this change adds is checked at its own site instead.
-        if merged.bars_request_budget < 1:
+        #
+        # **The type is checked before the range, and that order is the whole point.** A bare
+        # ``< 1`` dereferences whatever YAML produced, and ``<`` against an ``int`` raises
+        # ``TypeError`` for a string, a list, and a key written with no value. ``input_errors_exit``
+        # catches three named classes and not that one, so the operator would meet a traceback and
+        # exit 1 from the very check written to hand them one line and exit 2. A key written with
+        # no value is not a hypothetical here: ``_optional_text`` below records that exact shape as
+        # an operator input this file has to name.
+        #
+        # ``bool`` is excluded by hand because it is a subclass of ``int``. ``bars_request_budget:
+        # yes`` parses to ``True``, which passes a range check against 1 and then bounds the whole
+        # nightly walk at a single request. ``float`` is refused for the same reason rather than
+        # rounded: a budget is a count of requests, and 1.5 of them is not a quantity the walk can
+        # spend.
+        budget = merged.bars_request_budget
+        if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
             raise ConfigError(
-                "bars_request_budget must be at least 1, got "
-                f"{merged.bars_request_budget!r}: a run that may spend no request never fetches a "
-                "bar and never says so"
+                f"bars_request_budget must be a whole number of at least 1, got {budget!r}: "
+                "a run that may spend no request never fetches a bar and never says so"
             )
         return merged
 
