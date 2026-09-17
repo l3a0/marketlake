@@ -1,7 +1,7 @@
-"""The two named queries over a real fixture lake.
+"""The three named queries over a real fixture lake.
 
 These lay down journal segments in the pinned capture schemas and sealed partitions in
-the fixture schema, then run the Now and Today queries against them through the real
+the fixture schema, then run the Now, Today and History queries against them through the real
 sandboxed connection. The clock and the calendar are fakes, so the one real boundary is
 the filesystem and the tier is component.
 
@@ -53,12 +53,16 @@ from lake.calendar import MARKET_TZ
 from lake.capture_spans import SPANS_SCHEMA, CaptureSpans, spans_path
 from lake.config import GuardConstants
 from lake.dashboard import (
+    HISTORY_REPORTS,
+    HISTORY_WINDOW_DAYS,
     MAX_LOOKBACK_SESSIONS,
+    NAMED_QUERIES,
     DashboardService,
     QueryParameterError,
 )
 from lake.metadata import stamp_cycle, stamp_ping
 from lake.paths import DATE_PREFIX, JOURNAL_DIR, SEGMENT_GLOB
+from lake.report import Nightly, PieceOutcome, write_nightly
 from lake.security_master import (
     KIND_EQUITY,
     MASTER_SCHEMA,
@@ -1306,8 +1310,11 @@ def test_an_unknown_query_name_never_reaches_the_connection(root: Path):
         page=b"",
         icon=b"",
     )
+    # A name no panel will ever take. It used to be "history", which is a real query
+    # now, so the assertion below keeps this case from quietly testing nothing again.
+    assert "not-a-panel" not in NAMED_QUERIES
     with pytest.raises(KeyError):
-        service.run_query("history", {})
+        service.run_query("not-a-panel", {})
     assert spy.calls == []
 
 
@@ -1324,6 +1331,7 @@ def test_the_panels_leave_the_lake_byte_identical(service: DashboardService, roo
     service.run_query("now", {})
     service.run_query("today", {})
     service.run_query("today", {"date": "2026-08-21", "ticker": "QQQ"})
+    service.run_query("history", {})
     assert _tree_digest(root) == before
 
 
@@ -2368,3 +2376,536 @@ def test_every_strip_is_denominated_by_the_full_status_vocabulary(service: Dashb
         assert set(strip["counts"]) == set(dashboard.STATUSES)
         assert sum(strip["counts"].values()) == today["slot_count"]
         assert len(strip["slots"]) == today["slot_count"]
+
+
+# -- history -----------------------------------------------------------------
+
+
+def write_master_valid_from(
+    root: Path, ticker: str, capture_start: datetime, valid_from: date
+) -> Path:
+    """A master whose ticker mapping only becomes valid on ``valid_from``, plus its span.
+
+    ``write_master`` dates its mapping from the start of the year, so every day in the
+    window resolves. This one reproduces the live lake, where the mapping begins on the
+    onboarding day and ``master.resolve`` answers ``None`` for every day before it.
+    """
+    master = SecurityMaster()
+    instrument_id = master.register(
+        kind=KIND_EQUITY, capture_start=capture_start, valid_from=valid_from, ticker=ticker
+    )
+    path = master.write(master_path(root))
+    spans = CaptureSpans()
+    spans.open_span(instrument_id, capture_start, False)
+    spans.write(spans_path(root))
+    return path
+
+
+def _cell(payload: dict, ticker: str, surface: str, day: date) -> dict:
+    """One heatmap cell out of the panel's flat cell list."""
+    for cell in payload["cells"]:
+        if (cell["ticker"], cell["surface"], cell["date"]) == (ticker, surface, day.isoformat()):
+            return cell
+    raise AssertionError(f"no cell for {ticker} {surface} {day}")
+
+
+def _file_nightly(root: Path, day: date, **fields) -> Path:
+    """One nightly report file written by the production writer, never by hand."""
+    nightly = Nightly(
+        day=day,
+        session=fields.pop("session", True),
+        pinged=fields.pop("pinged", True),
+        **fields,
+    )
+    return write_nightly(root, nightly, now=et(day, 18, 30).astimezone(UTC), pid=11)
+
+
+def test_the_window_is_thirty_calendar_days_and_holds_only_its_sessions(
+    service: DashboardService,
+):
+    payload = service.run_query("history", {})
+    assert payload["window_end"] == MONDAY.isoformat()
+    assert payload["window_days"] == HISTORY_WINDOW_DAYS
+    start = date.fromisoformat(payload["window_start"])
+    assert MONDAY - start == timedelta(days=HISTORY_WINDOW_DAYS - 1)
+    # The calendar decides how many of the thirty days are sessions, and the fake one
+    # has three inside the window. The Saturday between Friday and Monday is not one.
+    assert payload["sessions"] == [d.isoformat() for d in (THURSDAY, FRIDAY, MONDAY)]
+    assert SATURDAY.isoformat() not in payload["sessions"]
+    # One cell per session per strip the Today panel shows. The roster is the lake's own
+    # tree, so QQQ carries chains alone here and the count is nine rather than twelve.
+    strips = service.run_query("today", {})["strips"]
+    assert len(payload["cells"]) == len(payload["sessions"]) * len(strips) == 9
+
+
+def test_a_cell_carries_the_slot_counts_and_not_only_a_percent(service: DashboardService):
+    # Monday holds two captured minutes, one suspect and one gap, and the rest of the
+    # session has no row at all. A percent alone could not say which of those it was.
+    cell = _cell(service.run_query("history", {}), "SPY", "chains", MONDAY)
+    assert cell["counts"]["captured"] == 2
+    assert cell["counts"]["suspect"] == 1
+    assert cell["counts"]["gap"] == 1
+    assert cell["counts"]["pending"] > 0
+    assert sum(cell["counts"].values()) == cell["slot_count"]
+
+
+def test_the_percent_is_over_the_minutes_judged_not_the_session_length(
+    service: DashboardService,
+):
+    cell = _cell(service.run_query("history", {}), "SPY", "chains", MONDAY)
+    counts = cell["counts"]
+    assert cell["judged"] == cell["slot_count"] - counts["out_of_scope"] - counts["pending"]
+    # A landed cycle is a landed cycle, so suspect counts toward the numerator beside
+    # captured. What it is suspected of is the battery's question, not the heatmap's.
+    landed = counts["captured"] + counts["suspect"]
+    assert cell["captured_pct"] == round(100.0 * landed / cell["judged"], 1)
+
+
+def test_a_day_that_owed_nothing_carries_no_percent_rather_than_zero(root: Path):
+    # Thursday and Friday sit before this ticker's capture span, so nothing was owed on
+    # either. Zero there would read as "captured nothing" beside a day that really did.
+    write_master(root, "SPY", et(MONDAY, 9, 30))
+    payload = service_over(root).run_query("history", {})
+    for day in (THURSDAY, FRIDAY):
+        cell = _cell(payload, "SPY", "chains", day)
+        assert cell["counts"]["out_of_scope"] == cell["slot_count"]
+        assert cell["judged"] == 0
+        assert cell["captured_pct"] is None
+
+
+def test_a_day_before_the_master_maps_the_ticker_is_out_of_scope_never_missing(root: Path):
+    # The clamp is resolved once, at the window's end, not once per day. Resolved per
+    # day this master answers ``None`` for Thursday and Friday, the ticker gets no clamp
+    # at all, and every one of those minutes renders ``missing``. That is marketlake
+    # #405, and resolving once is what keeps this panel out of it.
+    write_master_valid_from(root, "SPY", et(MONDAY, 9, 30), valid_from=MONDAY)
+    payload = service_over(root).run_query("history", {})
+    for day in (THURSDAY, FRIDAY):
+        cell = _cell(payload, "SPY", "chains", day)
+        assert cell["counts"]["missing"] == 0
+        assert cell["counts"]["out_of_scope"] == cell["slot_count"]
+
+
+def test_a_captured_minute_outranks_the_scope_clamp(root: Path):
+    # The ladder puts data above the clamp so a real cycle is never hidden. QQQ's
+    # Thursday partition holds one minute at the option close, months before the span
+    # this master opens, and it still reads captured with the day out of scope round it.
+    write_master_valid_from(root, "QQQ", et(MONDAY, 9, 30), valid_from=MONDAY)
+    cell = _cell(service_over(root).run_query("history", {}), "QQQ", "chains", THURSDAY)
+    assert cell["counts"]["captured"] == 1
+    assert cell["counts"]["out_of_scope"] == cell["slot_count"] - 1
+    assert cell["counts"]["missing"] == 0
+    assert cell["judged"] == 1
+    assert cell["captured_pct"] == 100.0
+
+
+def test_a_sealed_day_and_an_unsealed_day_land_in_the_same_cell_shape(
+    service: DashboardService, root: Path
+):
+    # QQQ's Thursday is a sealed partition with no journal segment, so it reads through
+    # the bulk window query. SPY's Monday is journal segments with no partition, so it
+    # reads through ``_slot_aggregates``. Neither path may invent a different cell.
+    assert not dashboard.LakePaths(root).partition_path("chains", "SPY", MONDAY).is_file()
+    payload = service.run_query("history", {})
+    sealed = _cell(payload, "QQQ", "chains", THURSDAY)
+    unsealed = _cell(payload, "SPY", "chains", MONDAY)
+    assert sealed["counts"]["captured"] == 1
+    assert unsealed["counts"]["captured"] == 2
+    assert set(sealed) == set(unsealed)
+
+
+def test_the_unsealed_day_still_counts_its_segment_health(service: DashboardService):
+    # ``build_lake`` plants one file that is not an Arrow stream beside Monday's real
+    # segments. The heatmap carries the same health counters the strip does, so a day
+    # whose rows partly would not read is not quietly shown as merely incomplete.
+    cell = _cell(service.run_query("history", {}), "SPY", "chains", MONDAY)
+    assert cell["unreadable_segments"] == 1
+
+
+def test_an_unreadable_partition_degrades_to_the_per_day_read(root: Path):
+    # The bulk read is all-or-nothing, so one file of unreadable bytes takes every
+    # ticker-day on the surface with it. The fallback reads each of them the per-day way.
+    dashboard.LakePaths(root).partition_path("chains", "QQQ", THURSDAY).write_bytes(
+        b"not parquet at all"
+    )
+    payload = service_over(root).run_query("history", {})
+    broken = _cell(payload, "QQQ", "chains", THURSDAY)
+    healthy = _cell(payload, "QQQ", "chains", FRIDAY)
+    # The broken ticker-day holds exactly one partition, so it reports exactly one.
+    # ``_slot_aggregates`` counts it on the cell that holds it, and the fallback adds no
+    # count of its own. A count added there would blame the healthy days for this file
+    # and count this one twice.
+    assert broken["unreadable_partitions"] == 1
+    assert broken["counts"]["captured"] == 0
+    # The healthy ticker-day's rows arrive by the per-day path, and it is blamed for
+    # nothing. Without this the fallback could report a loss on every cell it touched.
+    assert healthy["unreadable_partitions"] == 0
+    assert healthy["counts"]["captured"] == 1
+    assert len(payload["cells"]) == 9
+
+
+def test_a_healthy_window_reads_its_sealed_days_in_one_query(root: Path, monkeypatch):
+    # The sealed partitions are read in one query per surface, which is what keeps the
+    # window's cost growing with bytes rather than with days. Only a ticker-day holding
+    # journal segments takes the per-day reader. Without this the guard that checks the
+    # partition is there could be dropped, every absent ticker-day would reach
+    # ``read_parquet``, the read would raise, and the whole surface would silently fall
+    # back to reading every day one at a time while still rendering correctly.
+    per_day: list[tuple[str, str, date]] = []
+    real = dashboard._slot_aggregates
+
+    def counted(con, paths, surface, ticker, day):
+        per_day.append((surface, ticker, day))
+        return real(con, paths, surface, ticker, day)
+
+    monkeypatch.setattr(dashboard, "_slot_aggregates", counted)
+    payload = service_over(root).run_query("history", {})
+    # The fixture's journal days, and nothing else. QQQ's sealed Thursday and Friday are
+    # not in this list, because the bulk query answered them.
+    assert sorted(per_day) == sorted(
+        [("chains", "QQQ", MONDAY), ("chains", "SPY", MONDAY), ("quotes", "SPY", MONDAY)]
+    )
+    for cell in payload["cells"]:
+        assert cell["unreadable_partitions"] == 0
+
+
+def test_a_column_no_partition_carries_does_not_raise_out_of_the_panel(root: Path):
+    # The bulk read unions every partition in the window by name and has no journal view
+    # beside it, so what it can bind depends on the data. A column that no partition in
+    # the union carries raises ``BinderException``, which is not a partition-read error.
+    # It must not escape: ``_serve`` turns an escape into a 500, and a drifted partition
+    # thirty days back would take the Now and Today panels down with this one.
+    #
+    # Every partition in the surface's bulk set loses the column, because ``union_by_name``
+    # fills it from any sibling that still has it and the error would not fire.
+    paths = dashboard.LakePaths(root)
+    for day in (THURSDAY, FRIDAY):
+        partition = paths.partition_path("chains", "QQQ", day)
+        table = pq.read_table(partition)
+        pq.write_table(table.drop_columns(["row_kind"]), partition)
+    service = service_over(root)
+    payload = service.run_query("history", {})
+    assert len(payload["cells"]) == 9
+    # The per-day fallback registers the journal view and its pinned schema, so a
+    # ticker-day whose own rows are readable still renders them.
+    assert _cell(payload, "SPY", "chains", MONDAY)["counts"]["captured"] == 2
+    # And the panels beside it are untouched, which is the whole point of containing it.
+    assert service.run_query("now", {})["surfaces"]
+    assert service.run_query("today", {})["strips"]
+
+
+# -- history: the quarantine ledger ------------------------------------------
+
+
+def test_an_open_quarantine_is_listed_with_its_verdict(fixture_lake: FixtureLake):
+    build_lake(fixture_lake)
+    fixture_lake.with_quarantine(
+        {"partition": "chains/ticker=SPY/date=2026-08-24.parquet", "verdict": "held"}
+    )
+    fixture_lake.with_quarantine(
+        {"partition": "quotes/ticker=SPY/date=2026-08-24.parquet", "verdict": "clean"}
+    )
+    payload = service_over(fixture_lake.build()).run_query("history", {})
+    assert payload["quarantine_count"] == 1
+    assert payload["quarantines"] == [
+        {"partition": "chains/ticker=SPY/date=2026-08-24.parquet", "verdict": "held"}
+    ]
+    assert payload["quarantine_unreadable"] is None
+    # The sign-off runs marketlake #139, which is unbuilt and is authoritative for the
+    # entry's shape. A command printed here would invent an interface on its behalf.
+    assert set(payload["quarantines"][0]) == {"partition", "verdict"}
+
+
+def test_a_damaged_quarantine_ledger_is_reported_and_never_raised(fixture_lake: FixtureLake):
+    # ``_latest_by_partition`` raises on a body line naming no partition, and names the
+    # only two callers allowed to survive it: the close+5 guard's prologue and the
+    # marking pass. This is neither, and ``_serve`` would turn the raise into a 500 for
+    # the whole panel, so it is caught at this boundary and reported as a value.
+    build_lake(fixture_lake)
+    fixture_lake.with_quarantine({"note": "a line that parses and names no partition"})
+    payload = service_over(fixture_lake.build()).run_query("history", {})
+    assert payload["quarantine_unreadable"] == "ManifestError"
+    assert payload["quarantines"] == []
+    # Everything the ledger has nothing to do with is still served.
+    assert len(payload["cells"]) == 9
+
+
+def test_an_absent_quarantine_ledger_reads_as_no_entries(service: DashboardService, root: Path):
+    assert not (root / "quarantine.jsonl").exists()
+    payload = service.run_query("history", {})
+    assert payload["quarantines"] == []
+    assert payload["quarantine_unreadable"] is None
+
+
+# -- history: the nightly reports --------------------------------------------
+
+
+def test_no_reports_directory_renders_an_empty_list(service: DashboardService, root: Path):
+    # Which is the live lake's answer today: the first ``eod-sweep`` run has not
+    # happened, so ``reports/*.json`` matches nothing.
+    assert not (root / "reports").exists()
+    payload = service.run_query("history", {})
+    assert payload["reports"] == []
+    assert payload["reports_unreadable"] == 0
+    assert payload["reports_error"] is None
+
+
+def test_the_reports_come_back_newest_first_and_each_carries_its_own_date(root: Path):
+    for day in (THURSDAY, FRIDAY, MONDAY):
+        _file_nightly(root, day)
+    payload = service_over(root).run_query("history", {})
+    assert [entry["day"] for entry in payload["reports"]] == [
+        MONDAY.isoformat(),
+        FRIDAY.isoformat(),
+        THURSDAY.isoformat(),
+    ]
+    # The design pins the report as the one pre-written thing the dashboard shows, "and
+    # it is dated, so a stale one never reads as now". Both stamps ride along.
+    assert all(entry["at"] for entry in payload["reports"])
+
+
+def test_only_the_last_nights_are_read(root: Path):
+    for index in range(HISTORY_REPORTS + 4):
+        _file_nightly(root, THURSDAY + timedelta(days=index))
+    payload = service_over(root).run_query("history", {})
+    assert len(payload["reports"]) == HISTORY_REPORTS
+    # The newest, not the first ten written. ``nightly_path`` puts the day first in the
+    # name, so a name sort is a date sort and no file past the bound is opened.
+    newest = THURSDAY + timedelta(days=HISTORY_REPORTS + 3)
+    assert payload["reports"][0]["day"] == newest.isoformat()
+
+
+def test_a_report_missing_a_key_renders_it_as_no_number(root: Path):
+    # The live lake's report tree already carries two key sets from one writer at two
+    # versions, so a reader spelling a key outright breaks on the older file.
+    directory = root / "reports"
+    directory.mkdir()
+    (directory / f"{MONDAY.isoformat()}-183000000000-11.json").write_text(
+        json.dumps({"day": MONDAY.isoformat(), "session": True})
+    )
+    entry = service_over(root).run_query("history", {})["reports"][0]
+    assert entry["day"] == MONDAY.isoformat()
+    for field in ("gaps", "quarantined", "disagreements", "pages_lost", "at", "pinged"):
+        assert entry[field] is None
+    assert entry["problems"] == []
+    assert entry["report"] == []
+
+
+def test_an_unreadable_report_is_counted_and_the_others_still_render(root: Path):
+    _file_nightly(root, MONDAY)
+    (root / "reports" / f"{FRIDAY.isoformat()}-183000000000-12.json").write_text("{not json")
+    payload = service_over(root).run_query("history", {})
+    assert payload["reports_unreadable"] == 1
+    assert [entry["day"] for entry in payload["reports"]] == [MONDAY.isoformat()]
+    assert payload["reports_error"] is None
+
+
+def test_the_report_tier_findings_ride_the_panel(root: Path):
+    # ``report`` is why this panel reads these files: the findings that send no message
+    # of their own, which the design names as the disk runway, pmset drift and a
+    # suspected unscheduled closure. The panel renders the lines and computes none.
+    _file_nightly(
+        root, MONDAY, report=("pmset repeat drifted",), problems=("ping failed: OSError",)
+    )
+    entry = service_over(root).run_query("history", {})["reports"][0]
+    assert entry["report"] == ["pmset repeat drifted"]
+    assert entry["problems"] == ["ping failed: OSError"]
+
+
+def test_unfiled_is_summed_off_the_pieces_because_the_file_does_not_carry_it(root: Path):
+    # ``Nightly.unfiled`` is a property and ``write_nightly`` writes eleven keys without
+    # it, so a reader spelling the key would always read nothing at all.
+    path = _file_nightly(
+        root,
+        MONDAY,
+        pieces=(
+            ("dividends", PieceOutcome(held=2, unfiled=1)),
+            ("splits", PieceOutcome(held=1, unfiled=2, refusal="OSError: denied")),
+        ),
+    )
+    assert "unfiled" not in json.loads(path.read_text())
+    entry = service_over(root).run_query("history", {})["reports"][0]
+    assert entry["unfiled"] == 3
+    assert entry["disagreements"] == 3
+    # A walk that stopped says so, with its exception message already dropped.
+    assert entry["pieces"] == {"dividends": None, "splits": "OSError"}
+
+
+def test_the_reports_glob_skips_the_other_producers_subdirectories(root: Path):
+    # ``report.py`` chose the naming for exactly one reader: "a reader globbing
+    # ``reports/*.json`` picks up the nightly files and nothing else".
+    _file_nightly(root, MONDAY)
+    guard = root / "reports" / "close_guard" / f"{DATE_PREFIX}{MONDAY.isoformat()}"
+    guard.mkdir(parents=True)
+    (guard / "162000000000-11.json").write_text(json.dumps({"day": MONDAY.isoformat()}))
+    payload = service_over(root).run_query("history", {})
+    assert len(payload["reports"]) == 1
+    assert payload["reports_unreadable"] == 0
+
+
+def test_a_cell_judges_a_minute_only_once_its_grace_has_run_out(root: Path):
+    # The heatmap reads the same verdict grace the strip does, against the injected
+    # instant. A slot still inside it is pending, so a cycle that has not finished
+    # running is never counted as an absent minute, and the percent's denominator moves
+    # with that boundary rather than sitting still.
+    #
+    # At 09:40:30 the last judged slot is 09:38, which leaves 09:34 through 09:38
+    # missing. One minute later 09:39 has aged past the grace and joins them.
+    at_now = _cell(service_over(root).run_query("history", {}), "SPY", "chains", MONDAY)
+    assert at_now["counts"]["missing"] == 5
+    assert at_now["counts"]["pending"] == 397
+    assert at_now["judged"] == 9
+    later = service_over(root, now=et(MONDAY, 9, 41, 30)).run_query("history", {})
+    minute_on = _cell(later, "SPY", "chains", MONDAY)
+    assert minute_on["counts"]["missing"] == 6
+    assert minute_on["counts"]["pending"] == 396
+    assert minute_on["judged"] == 10
+    # The numerator did not move, so the percent fell because one more minute came due.
+    assert at_now["captured_pct"] == 33.3
+    assert minute_on["captured_pct"] == 30.0
+
+
+def test_the_window_and_report_bounds_are_the_pinned_values(root: Path):
+    # The tests around these derive their expectations from the constants, so every one
+    # of them holds for any value. These are the literals themselves.
+    assert HISTORY_WINDOW_DAYS == 30
+    assert HISTORY_REPORTS == 10
+    assert dashboard.HISTORY_REPORT_MAX_BYTES == 4 * 1024 * 1024
+
+
+def test_the_windows_first_calendar_day_is_inside_it(root: Path):
+    # The window is thirty calendar days with its end inside, so it opens on the
+    # twenty-ninth day back. The day before that is out. Nothing else pins the scan's
+    # start: `window_start` is computed separately and would still agree if the walk
+    # began a day late.
+    first = MONDAY - timedelta(days=HISTORY_WINDOW_DAYS - 1)
+    before = first - timedelta(days=1)
+    calendar = FakeCalendar(
+        {
+            day: SessionTimes(open=et(day, 9, 30), close=et(day, 16, 0))
+            for day in (before, first, MONDAY)
+        }
+    )
+    service = DashboardService(
+        root, clock=ManualClock(NOW.astimezone(UTC)), calendar=calendar, page=b"", icon=b""
+    )
+    payload = service.run_query("history", {})
+    assert payload["window_start"] == first.isoformat()
+    assert first.isoformat() in payload["sessions"]
+    assert before.isoformat() not in payload["sessions"]
+
+
+def test_a_sealed_partition_reports_its_own_drifted_and_unplaceable_rows(
+    fixture_lake: FixtureLake,
+):
+    # The journal path counts these and the sealed path must too. A row of an
+    # unrecognized kind renders the slot missing rather than an invented gap, and a row
+    # whose stamp will not cast names no minute at all. Both are counted rather than
+    # disappearing quietly, which is what `SegmentHealth` exists for.
+    build_lake(fixture_lake)
+    fixture_lake.with_chains(
+        "QQQ",
+        THURSDAY,
+        sample_chains_table(
+            [
+                _fixture_row("QQQ", et(THURSDAY, 9, 30)),
+                {**_fixture_row("QQQ", et(THURSDAY, 9, 31)), "row_kind": "something_else"},
+                {**_fixture_row("QQQ", et(THURSDAY, 9, 32)), "snap_ts": "not a timestamp"},
+            ]
+        ),
+    )
+    cell = _cell(
+        service_over(fixture_lake.build()).run_query("history", {}), "QQQ", "chains", THURSDAY
+    )
+    assert cell["drifted_rows"] == 1
+    assert cell["unparseable_stamp_rows"] == 1
+    assert cell["counts"]["captured"] == 1
+    # The drifted row's minute holds no bound row, so it reads missing, never a gap.
+    assert cell["counts"]["gap"] == 0
+
+
+def test_an_unlistable_reports_directory_is_reported_and_never_raised(root: Path):
+    # The same rule the quarantine ledger follows. `_serve` would turn an escape into a
+    # 500, and on a page whose other panels are live that is the worst answer available.
+    directory = root / "reports"
+    directory.mkdir()
+    _file_nightly(root, MONDAY)
+    directory.chmod(0o000)
+    try:
+        payload = service_over(root).run_query("history", {})
+    finally:
+        directory.chmod(0o755)
+    assert payload["reports_error"] == "PermissionError"
+    assert payload["reports"] == []
+    # Everything the directory has nothing to do with is still served.
+    assert len(payload["cells"]) == 9
+
+
+def test_a_report_that_is_valid_json_but_not_an_object_is_counted(root: Path):
+    # `json.loads` succeeds on a bare list or string, so the parse guard cannot catch
+    # these. They are records no reader can interpret, and they are counted rather than
+    # reaching `_nightly_payload`, which would raise on them.
+    directory = root / "reports"
+    directory.mkdir()
+    (directory / f"{MONDAY.isoformat()}-183000000000-11.json").write_text("[]")
+    (directory / f"{FRIDAY.isoformat()}-183000000000-12.json").write_text('"a string"')
+    payload = service_over(root).run_query("history", {})
+    assert payload["reports_unreadable"] == 2
+    assert payload["reports"] == []
+
+
+def test_a_report_over_the_size_bound_is_counted_and_never_opened(root: Path):
+    # The count bound says how many files are opened and this says how much is read,
+    # which is a different promise. The read is filesystem I/O, so the connection's own
+    # memory limit does not reach it, and the service runs under `KeepAlive`, so one
+    # oversized file's cost would sit in the process for as long as it lives.
+    _file_nightly(root, MONDAY)
+    oversized = root / "reports" / f"{FRIDAY.isoformat()}-183000000000-12.json"
+    oversized.write_text(
+        json.dumps(
+            {"day": FRIDAY.isoformat(), "problems": ["x" * dashboard.HISTORY_REPORT_MAX_BYTES]}
+        )
+    )
+    assert oversized.stat().st_size > dashboard.HISTORY_REPORT_MAX_BYTES
+    payload = service_over(root).run_query("history", {})
+    assert payload["reports_unreadable"] == 1
+    assert [entry["day"] for entry in payload["reports"]] == [MONDAY.isoformat()]
+
+
+def test_a_report_whose_fields_carry_the_wrong_types_renders_rather_than_raising(root: Path):
+    # The lake's report tree already carries two key sets from one writer at two
+    # versions, so the reader takes every field defensively. Each guard is exercised
+    # here: a non-integer `unfiled`, a `pieces` value that is not a mapping, and a
+    # `problems` list holding something that is not a string.
+    directory = root / "reports"
+    directory.mkdir()
+    (directory / f"{MONDAY.isoformat()}-183000000000-11.json").write_text(
+        json.dumps(
+            {
+                "day": MONDAY.isoformat(),
+                "pieces": {"dividends": {"unfiled": "two"}, "splits": "not a mapping"},
+                "problems": ["a real line", 7, None],
+                "report": "not a list",
+            }
+        )
+    )
+    entry = service_over(root).run_query("history", {})["reports"][0]
+    assert entry["unfiled"] == 0
+    assert entry["pieces"] == {"dividends": None}
+    assert entry["problems"] == ["a real line"]
+    assert entry["report"] == []
+
+
+def test_the_panel_names_its_tickers_and_orders_the_ledger(fixture_lake: FixtureLake):
+    build_lake(fixture_lake)
+    for day in (MONDAY, THURSDAY, FRIDAY):
+        fixture_lake.with_quarantine(
+            {"partition": f"chains/ticker=SPY/date={day.isoformat()}.parquet", "verdict": "held"}
+        )
+    payload = service_over(fixture_lake.build()).run_query("history", {})
+    assert payload["tickers"] == ["QQQ", "SPY"]
+    # Sorted, so the list renders the same way on every request rather than in whatever
+    # order the ledger's entries happened to land.
+    assert [entry["partition"] for entry in payload["quarantines"]] == [
+        f"chains/ticker=SPY/date={day.isoformat()}.parquet" for day in (THURSDAY, FRIDAY, MONDAY)
+    ]
