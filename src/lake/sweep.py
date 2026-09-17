@@ -176,6 +176,14 @@ ScheduleSetter = Callable[[date], None]
 # the alarm stopped. ``CLAUDE.md`` puts the dead-man, the watchdog, the canary and the backup
 # outside its zero-count rule for exactly this shape.
 #
+# **What this does not cover, so the entry is not read as wider than it is.** No httpx exception
+# subclasses ``OSError``, measured across its whole hierarchy, so a refused connection or a read
+# timeout still escapes this. That is the likelier 18:30 failure of the two, and marketlake #450
+# owns it: the fix is to wrap a transport error into ``VendorError`` at the ``SchwabVendor`` seam,
+# where ``bars._walk`` already contains it per ticker-day. What ``OSError`` does catch from the
+# vendor side is the arm that reaches the socket directly, such as ``ssl.SSLError`` and
+# ``ConnectionResetError``, and those are caught here rather than per ticker-day, which is #446.
+#
 # The record surface was already built for this refusal. ``PieceOutcome.refusal_class`` reasons
 # about an ``OSError`` reaching it and drops the message, "because an ``OSError`` says the
 # filename it failed on, which is an absolute path on the capture machine". So the digest carries

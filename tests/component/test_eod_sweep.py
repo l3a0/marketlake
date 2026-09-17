@@ -993,9 +993,16 @@ def test_a_quarantined_quotes_partition_does_not_take_the_whole_sweep(
     file. Executed against this fixture on the code before the fix, the run died with
     ``reports/`` empty.
 
-    ``_LEDGER_REFUSALS`` is deliberately left alone. A refusal caught here ends the walk, and
-    the walk is ordered by ticker, so containing it at this level would cost every ticker
-    after the quarantined one its dividends, which is the same defect one level up.
+    **The level matters, and this is why the fix went into the walk.** A refusal caught at the
+    sweep ends the whole walk, and the walk is ordered by ticker, so containing a per-ticker
+    condition there would cost every ticker after the quarantined one its dividends, which is the
+    same defect one level up.
+
+    ``_LEDGER_REFUSALS`` was left alone for that reason and no longer is: marketlake #435 added
+    ``OSError`` to it, because an unreadable reference file is opened before any ticker is walked
+    and escaped the sweep entirely, costing the report file, the digest and the ping. That is a
+    net under this rule rather than a replacement for it. The sentence above still decides where a
+    *per-ticker* condition belongs, and marketlake #446 owns the ones now caught too high.
     """
     root = _lake(fixture_lake)
     partition = (
