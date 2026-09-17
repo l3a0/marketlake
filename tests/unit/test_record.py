@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 
 from lake.record import (
+    BAR_FLAG_NAME,
     BarRequest,
     _parse_bar_requests,
     _parse_quote_batches,
@@ -621,11 +622,20 @@ def test_the_flag_field_is_trimmed_and_case_folded():
 
 
 def test_an_unknown_named_field_is_refused_by_its_own_name():
-    # previous_close is the seam's other flag and the plausible thing to reach for. The
-    # four-field refusal would blame the field count and name the ISO comma, neither of which
-    # is what happened.
-    with pytest.raises(ValueError, match="previous_close"):
+    """previous_close is the seam's other flag and the plausible thing to reach for.
+
+    The match is on the refusal's own clause, not on `previous_close`. Every refusal here opens
+    by echoing the raw value, and the raw value contains `previous_close=true`, so matching that
+    alone passes whichever refusal fires. Mutation found this: rewriting the message to
+    "carries an unreadable named field" left the test green, and so did a change that sent this
+    value to the four-field refusal instead. The negative assertion is the half that separates
+    them.
+    """
+    with pytest.raises(ValueError, match=r"carries a named field 'previous_close'") as caught:
         _parse_bar_requests([f"{UNFLAGGED},previous_close=true"])
+    message = str(caught.value)
+    assert "four comma-separated fields" not in message
+    assert f"The one name it reads is {BAR_FLAG_NAME}" in message
 
 
 @pytest.mark.parametrize("spelling", ["1", "0", "yes", "no", ""], ids=["1", "0", "yes", "no", ""])
@@ -636,9 +646,33 @@ def test_a_flag_value_that_is_not_true_or_false_is_refused(spelling):
         _parse_bar_requests([f"{UNFLAGGED},extended_hours={spelling}"])
 
 
-def test_a_repeated_flag_field_is_refused():
+@pytest.mark.parametrize(
+    "first,second",
+    [("true", "false"), ("false", "false"), ("false", "true")],
+    ids=["true-false", "false-false", "false-true"],
+)
+def test_a_repeated_flag_field_is_refused(first, second):
+    """Every pairing, because the first value being falsy is the case a truthiness check misses.
+
+    Mutation found it: `if flag is not None` weakened to `if flag` still refuses `true,false` and
+    silently accepts `false,true`, recording whichever came last. An operator who writes two
+    conflicting flags would get a live recording of one of them with no warning.
+    """
     with pytest.raises(ValueError, match="more than once"):
-        _parse_bar_requests([f"{UNFLAGGED},extended_hours=true,extended_hours=false"])
+        _parse_bar_requests([f"{UNFLAGGED},{BAR_FLAG_NAME}={first},{BAR_FLAG_NAME}={second}"])
+
+
+@pytest.mark.parametrize("spelling", ["true", "false"], ids=["true", "false"])
+def test_a_flagged_window_asked_for_twice_is_refused_too(spelling):
+    """The duplicate guard has to cover the shape the flag introduces, not only the old one.
+
+    Mutation found the flagged path untested: narrowing the guard to `extended_hours is None`
+    passed the whole suite while recording two identically keyed flagged interactions, which is
+    the loss the guard exists for and the exact shape #421's run has.
+    """
+    value = f"{UNFLAGGED},{BAR_FLAG_NAME}={spelling}"
+    with pytest.raises(ValueError, match="already asked for"):
+        _parse_bar_requests([value, value])
 
 
 def test_a_split_bound_is_still_named_even_when_a_real_flag_rides_behind_it():
@@ -765,6 +799,65 @@ def test_a_bound_carrying_an_equals_is_read_as_a_bound_and_not_a_flag():
     (parsed,) = _parse_bar_requests(["SPY,1m,2026-09-14T09:30:00-04:00,2026-09-14T16:00:00=-04:00"])
     assert parsed.extended_hours is None
     assert parsed.end == CLOSE_ET
+
+
+@pytest.mark.parametrize(
+    ("raw", "why"),
+    [
+        (f"{BAR_FLAG_NAME}=true", "nothing but a named field"),
+        ("SPY,1m,2026-09-14T09:30:00-04:00,extended_hours=false", "a bound left out"),
+    ],
+    ids=["only-a-flag", "missing-bound"],
+)
+def test_a_value_short_of_four_positional_fields_is_refused_by_the_count(raw, why):
+    """Both are the operator leaving something out, and both must say so.
+
+    Mutation found two ways to lose this. Dropping the pop loop's emptiness test raises
+    `IndexError` on a value that is nothing but a flag, and `IndexError` is not what `main`
+    catches, so it escapes `parser.error` as a stack trace against this module's stated contract.
+    Starting the loop only above four fields sends the missing-bound case to the instant reader
+    instead, telling an operator who forgot a bound that their flag is a bad timestamp.
+    """
+    with pytest.raises(ValueError, match="four comma-separated fields") as caught:
+        _parse_bar_requests([raw])
+    assert "unreadable instant" not in str(caught.value), why
+
+
+def test_an_unknown_name_beside_a_valid_flag_is_blamed_on_the_unknown_one():
+    # Mutation found the three refusals inside _take_bar_flag reorderable. Checking for a repeat
+    # before checking the name reports "extended_hours more than once" for a value where
+    # extended_hours appears exactly once.
+    with pytest.raises(ValueError, match=r"carries a named field 'previous_close'") as caught:
+        _parse_bar_requests([f"{UNFLAGGED},{BAR_FLAG_NAME}=true,previous_close=true"])
+    assert "more than once" not in str(caught.value)
+
+
+def test_named_fields_are_read_left_to_right():
+    # They are popped off the right, so `named.insert(0, ...)` is what puts them back in the
+    # order written. Appending instead reverses them, and the refusal then names the second bad
+    # field rather than the first one the operator's eye reaches.
+    with pytest.raises(ValueError, match=r"spells extended_hours as 'bogus'"):
+        _parse_bar_requests([f"{UNFLAGGED},{BAR_FLAG_NAME}=bogus,previous_close=true"])
+
+
+def test_a_second_equals_belongs_to_the_value():
+    # `partition` splits on the first `=`, so the name is what precedes it and everything after
+    # is the value. `rpartition` would refuse the same value while naming a field the operator
+    # never wrote, which is the wrong sentence for the right verdict.
+    with pytest.raises(ValueError, match=r"spells extended_hours as 'tr=ue'"):
+        _parse_bar_requests([f"{UNFLAGGED},{BAR_FLAG_NAME}=tr=ue"])
+
+
+def test_the_help_shows_the_flag_in_the_only_position_that_works():
+    """The metavar is the operator's one sight of where the flag goes.
+
+    Asserting the spellings alone is not enough, and mutation proved it: deleting the bracketed
+    form from the metavar left the earlier help test green, because the same two strings appear
+    in the help prose. A named field is read in trailing position only, so the metavar showing
+    that position is what makes the restriction fair.
+    """
+    rendered = " ".join(build_parser().format_help().split())
+    assert f"SYMBOL,FREQ,START,END[,{BAR_FLAG_NAME}=true|false]" in rendered
 
 
 def test_two_bars_values_with_one_key_are_refused():
