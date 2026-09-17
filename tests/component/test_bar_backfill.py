@@ -47,6 +47,7 @@ from lake.bars import (
 )
 from lake.capture_spans import SPANS_SCHEMA, SPANS_SCHEMA_VERSION, CaptureSpans, spans_path
 from lake.cassette import Cassette
+from lake.config import GuardConstants
 from lake.extra_projection import ExtraProjection, ExtraProjectionError
 from lake.loader import LoadError, NoSpotClose, PartialRead
 from lake.manifest import ManifestError, read_manifest
@@ -307,8 +308,13 @@ def _run(
     roster: Roster | None = None,
     spans: CaptureSpans | None = None,
     now: datetime = TONIGHT,
+    guards: GuardConstants | None = None,
 ):
-    """One backfill run over a fixture lake, with every seam injected."""
+    """One backfill run over a fixture lake, with every seam injected.
+
+    ``guards`` is left ``None`` by default so the run resolves the design's pinned budget, which
+    is 100 and never binds at these fixture scales. A test about the budget passes its own.
+    """
     return backfill_bars(
         lake_root=root,
         vendor=vendor,
@@ -316,6 +322,7 @@ def _run(
         calendar=_calendar(),
         roster=roster if roster is not None else _roster({"SPY": [MINUTE_FREQ]}),
         spans=spans if spans is not None else _open_span(1),
+        guards=guards,
     )
 
 
@@ -441,14 +448,22 @@ def test_the_window_a_mid_session_floor_fetches_is_the_whole_session(fixture_lak
     skip never re-fetches, with nothing marking it short. The cassette is keyed on the full-session
     window, so a clipped fetch would raise rather than replay, and the recorded call says which
     window went out rather than only that one did.
+
+    **The floor session's call is selected by its bounds rather than taken from the front of the
+    list.** It used to be ``calls[0]``, which held only while the walk ran oldest session first.
+    Marketlake #478 walks newest first, so the floor is the *last* session reached, and a test
+    reading a position would now be asserting about 2026-09-16 while claiming to be about the
+    floor. Selecting it says what the test is about and is indifferent to the order, which is what
+    it was always trying to express.
     """
     root = _lake(fixture_lake)
     vendor = RecordingVendor(_cassette(freqs=(MINUTE_FREQ,)))
     _run(root, vendor)
     open_et, close_et = _bounds(date(2026, 9, 8))
-    first = vendor.calls[0]
-    assert first["start"] == open_et.astimezone(UTC).isoformat()
-    assert first["end"] == close_et.astimezone(UTC).isoformat()
+    start = open_et.astimezone(UTC).isoformat()
+    floor_calls = [call for call in vendor.calls if call["start"] == start]
+    assert len(floor_calls) == 1, "the floor session is fetched exactly once"
+    assert floor_calls[0]["end"] == close_et.astimezone(UTC).isoformat()
 
 
 # -- 3. every span, not only the open one ----------------------------------------------
@@ -605,9 +620,13 @@ def test_a_session_whose_quotes_hold_only_gap_rows_is_abandoned_without_a_reques
 
     # 09-08, 09-09 and 09-10 each read a following session holding only gap rows. 09-11 reads
     # 09-14, which settled, so it lands like every session after it.
+    #
+    # **Newest session first, which is marketlake #478's walk order.** The equality is on the whole
+    # tuple rather than a set on purpose: the order a reader meets these in is the order the walk
+    # produced them, and the sign-off block renders them in exactly this sequence.
     assert result.abandoned == tuple(
         GateSkip("SPY", DAILY_FREQ, day, "NoSpotClose")
-        for day in (date(2026, 9, 8), date(2026, 9, 9), date(2026, 9, 10))
+        for day in (date(2026, 9, 10), date(2026, 9, 9), date(2026, 9, 8))
     )
     # ``skipped`` is the manifested count and nothing else, which is what ``BarsReport`` rests its
     # second-run argument on and what the digest prints. Counting a gate skip there too would read
@@ -1164,11 +1183,22 @@ def test_two_instruments_naming_one_ticker_on_one_day_plan_it_once():
     assert len(plan.days) == len(SESSIONS)
 
 
-def test_the_plan_is_ordered_by_session_then_ticker_then_frequency():
-    """A run reads chronologically, and two runs over one lake produce the same order.
+def test_the_plan_is_ordered_newest_session_first_then_ticker_then_frequency():
+    """The newest session in range is walked first, and two runs produce the same order.
 
     A set is what dedupes and a set has no order, so the sort is what keeps the sign-off block and
-    the recorded calls readable rather than shuffled between runs.
+    the recorded calls readable rather than shuffled between runs. That half is unchanged and is
+    what this test was always protecting.
+
+    **The direction inverted under marketlake #478, and the reason is the budget.** The walk takes
+    this list in order and spends a bounded number of requests over it, so whatever sits at the
+    front is what a bounded run spends itself on. Ascending put the oldest session there, and the
+    oldest ``1m`` ticker-days are the ones past Schwab's lookback, which can never land and are
+    never manifested and so are asked for again on every later run. A budget over that order
+    reaches today's bars on no run at all, while an unbudgeted walk lands them on the first.
+
+    The tie-break inside a session is untouched, and the assertion below is what says so: ticker
+    before frequency, both ascending, so ``QQQ`` at ``1m`` still precedes ``SPY`` at ``1d``.
     """
     plan = _plan(
         spans=_open_span(1, 2),
@@ -1176,13 +1206,21 @@ def test_the_plan_is_ordered_by_session_then_ticker_then_frequency():
         roster=_roster({"SPY": [MINUTE_FREQ, DAILY_FREQ], "QQQ": [MINUTE_FREQ, DAILY_FREQ]}),
     )
     keys = [(day.session, day.ticker, day.freq) for day in plan.days]
-    assert keys == sorted(keys)
+    # Determinism, stated as the property rather than as a literal: sessions descend, and within
+    # one session the pair ascends. A `sorted(keys)` comparison cannot express that, because the
+    # two halves of the key now run in opposite directions.
+    assert keys == sorted(keys, key=lambda key: (-key[0].toordinal(), key[1], key[2]))
     assert keys[:4] == [
-        (date(2026, 9, 8), "QQQ", DAILY_FREQ),
-        (date(2026, 9, 8), "QQQ", MINUTE_FREQ),
-        (date(2026, 9, 8), "SPY", DAILY_FREQ),
-        (date(2026, 9, 8), "SPY", MINUTE_FREQ),
+        (SESSIONS[-1], "QQQ", DAILY_FREQ),
+        (SESSIONS[-1], "QQQ", MINUTE_FREQ),
+        (SESSIONS[-1], "SPY", DAILY_FREQ),
+        (SESSIONS[-1], "SPY", MINUTE_FREQ),
     ]
+    assert keys[-1] == (SESSIONS[0], "SPY", MINUTE_FREQ)
+    # The range's own ends are read off ``sessions``, which keeps its ascending sort, so inverting
+    # ``days`` must not move them. A reversal of the whole sorted list would have.
+    assert plan.floor == SESSIONS[0]
+    assert plan.ceiling == SESSIONS[-1]
 
 
 # -- what one run leaves on disk, and what the report says ------------------------------
@@ -1356,15 +1394,19 @@ def test_the_two_gate_skip_blocks_are_rendered_in_the_backfill_block(fixture_lak
     # **The two blocks are asserted whole, in order.** Substring checks leave the structure
     # unpinned: swapping the blocks, so a reader meets the permanent list before the transient
     # one, changed nothing any of them could see.
+    #
+    # The entries inside a block descend by session under marketlake #478, because the walk
+    # produces them in the order it reaches them and this block renders that order rather than
+    # imposing one of its own.
     rendered = result.render().splitlines()
     first = rendered.index("  unsettled: 1")
     assert rendered[first : first + 6] == [
         "  unsettled: 1",
         "    - SPY 1d 2026-09-16: PartitionAbsent",
         "  abandoned: 3",
-        "    - SPY 1d 2026-09-08: NoSpotClose",
-        "    - SPY 1d 2026-09-09: NoSpotClose",
         "    - SPY 1d 2026-09-10: NoSpotClose",
+        "    - SPY 1d 2026-09-09: NoSpotClose",
+        "    - SPY 1d 2026-09-08: NoSpotClose",
     ]
 
 
@@ -1513,3 +1555,332 @@ def test_the_walk_asks_for_one_window_per_ticker_day(fixture_lake: FixtureLake):
     _run(root, vendor, roster=_roster({"SPY": [MINUTE_FREQ, DAILY_FREQ]}))
     assert len(vendor.calls) == 2 * len(SESSIONS)
     assert {call["freq"] for call in vendor.calls} == {MINUTE_FREQ, DAILY_FREQ}
+
+
+# -- the per-run request budget, marketlake #478 ---------------------------------------
+
+
+def _budget(value: int) -> GuardConstants:
+    """The guards a run takes when only its request budget matters."""
+    return GuardConstants(bars_request_budget=value)
+
+
+def test_the_budget_bounds_what_one_run_spends_at_the_vendor(fixture_lake: FixtureLake):
+    """#478's whole point: a run cannot spend more requests than it was allowed.
+
+    Nothing paces this walk. ``_walk`` loops, ``_fetch`` forwards, and neither ``schwab`` nor
+    ``vendor`` retries or backs off, so an unbounded run over a rebuilt manifest fires everything
+    the spans cover back to back and crosses the vendor's 120-a-minute ceiling inside its first
+    minute. The bound is what makes the crossing arithmetically impossible.
+
+    ``calls`` is the assertion that matters rather than ``attempted``. A counter that stopped
+    incrementing while the requests kept going out would satisfy the report and defeat the guard,
+    and only the recorded vendor calls can tell those apart.
+    """
+    root = _lake(fixture_lake)
+    vendor = RecordingVendor(_cassette(freqs=(MINUTE_FREQ,)))
+    result = _run(root, vendor, guards=_budget(3))
+
+    assert len(vendor.calls) == 3
+    assert result.attempted == 3
+    assert len(result.landed) == 3
+    # Seven sessions were planned and three were fetched, so four are left for the next run.
+    assert len(result.deferred) == len(SESSIONS) - 3
+
+
+def test_the_budget_spends_itself_on_the_newest_sessions_first(fixture_lake: FixtureLake):
+    """The bound is spent at the deadline end of the range, not the oldest end.
+
+    Schwab serves a roughly 30-day one-minute lookback and daily bars indefinitely, so a recent
+    session is the one that stops being fetchable. A budget taken over the old chronological order
+    would spend itself on the oldest sessions, which on a real lake are the ones that can never
+    land, and today's bars would be reached on no run at all.
+
+    This is the assertion that fails if anybody restores the ascending sort. Both halves are
+    checked, because a walk could reach the right sessions and report the wrong remainder.
+    """
+    root = _lake(fixture_lake)
+    vendor = RecordingVendor(_cassette(freqs=(MINUTE_FREQ,)))
+    result = _run(root, vendor, guards=_budget(2))
+
+    assert [entry.session for entry in result.landed] == [SESSIONS[-1], SESSIONS[-2]]
+    assert [day.session for day in result.deferred] == list(reversed(SESSIONS[:-2]))
+
+
+def test_a_budgeted_run_still_counts_every_skip_behind_the_bound(fixture_lake: FixtureLake):
+    """The budget refuses requests. It does not truncate the walk.
+
+    A loop that stopped iterating at exhaustion would stop counting the manifested skips and the
+    gate skips behind the stop point, so ``skipped``, ``unsettled`` and ``abandoned`` would all go
+    partial. ``lake.sweep`` renders its ``bars abandoned:`` census off that last one, and
+    marketlake #434 built the line to surface the permanent gaps an operator has to find, so a
+    truncating budget would move the count for a reason that is not a change in the lake.
+
+    The lake below gaps 09-08 through 09-11, so the three oldest daily ticker-days are abandoned.
+    They sit at the *back* of the newest-first walk, behind a budget of one, and the run has to
+    reach and count them anyway.
+    """
+    quotes = {
+        ("SPY", day): [_gap_row(day)] if day <= date(2026, 9, 11) else [_quote_row(day)]
+        for day in (*SESSIONS, date(2026, 9, 17))
+    }
+    root = _lake(fixture_lake, quotes=quotes)
+    vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,)))
+    result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}), guards=_budget(1))
+
+    assert len(vendor.calls) == 1
+    # Counted in full despite sitting behind an exhausted budget, and in the walk's own order.
+    assert [entry.session for entry in result.abandoned] == [
+        date(2026, 9, 10),
+        date(2026, 9, 9),
+        date(2026, 9, 8),
+    ]
+    # A gate skip costs no request, so it is never deferred: the two records mean different things
+    # and a ticker-day belongs to exactly one of them.
+    deferred = {(day.ticker, day.freq, day.session) for day in result.deferred}
+    abandoned = {(entry.ticker, entry.freq, entry.session) for entry in result.abandoned}
+    assert deferred & abandoned == set()
+
+
+def test_a_budgeted_run_still_counts_a_manifested_skip_behind_the_bound(
+    fixture_lake: FixtureLake,
+):
+    """``skipped`` is complete too, which is the same guarantee from the cheap side.
+
+    A manifested ticker-day costs no vendor call, so a walk that stopped at the bound would report
+    a lake as holding fewer landed partitions than it does. The oldest session's partition is
+    already manifested here and sits behind a budget of one.
+    """
+    landed_day = SESSIONS[0]
+    root = _lake(
+        fixture_lake,
+        bars_partitions=(("SPY", DAILY_FREQ, landed_day, _bars_table(landed_day)),),
+    )
+    result = _run(
+        root,
+        RecordingVendor(_cassette(freqs=(DAILY_FREQ,))),
+        roster=_roster({"SPY": [DAILY_FREQ]}),
+        guards=_budget(1),
+    )
+
+    assert result.skipped == 1
+    assert landed_day not in {day.session for day in result.deferred}
+
+
+def test_the_next_run_picks_up_what_the_budget_deferred(fixture_lake: FixtureLake):
+    """Convergence, as far as a budget alone reaches it, and with no new persistent state.
+
+    A ticker-day the budget did not reach was never fetched, so it was never manifested, so the
+    next run's plan still holds it. That is the whole mechanism: nothing is written down and
+    nothing has to be cleared. What the first run landed is skipped for free the second time, so
+    the second run's budget buys new sessions rather than repeating the first one's.
+    """
+    root = _lake(fixture_lake)
+    cassette = _cassette(freqs=(MINUTE_FREQ,))
+
+    first = _run(root, RecordingVendor(cassette), guards=_budget(2))
+    second_vendor = RecordingVendor(cassette)
+    second = _run(root, second_vendor, guards=_budget(2))
+
+    assert [entry.session for entry in first.landed] == [SESSIONS[-1], SESSIONS[-2]]
+    assert second.skipped == 2
+    # The second run spends its whole budget on ground the first never covered.
+    assert [entry.session for entry in second.landed] == [SESSIONS[-3], SESSIONS[-4]]
+    assert len(second_vendor.calls) == 2
+    assert len(second.deferred) == len(first.deferred) - 2
+
+
+def test_a_budget_the_run_never_reaches_defers_nothing(fixture_lake: FixtureLake):
+    """An ordinary evening is not throttled, and the report says nothing about a bound.
+
+    The pinned budget is 100 against a live plan of a few ticker-days, so the bound is inert on
+    every healthy run. A report that named a budget it never met would put a line in the nightly
+    digest every evening for a condition that had not occurred.
+    """
+    root = _lake(fixture_lake)
+    vendor = RecordingVendor(_cassette(freqs=(MINUTE_FREQ,)))
+    result = _run(root, vendor, guards=_budget(len(SESSIONS)))
+
+    assert len(vendor.calls) == len(SESSIONS)
+    assert result.deferred == ()
+    assert "deferred: 0" in result.render()
+
+
+def test_the_pinned_default_is_what_a_run_takes_when_no_guards_are_passed(
+    fixture_lake: FixtureLake,
+):
+    """``None`` resolves to the design's pinned defaults in the callee, the way ``judge`` does.
+
+    ``lake.sweep`` passes whatever it holds straight through, so the resolution has to happen here
+    or a sweep constructed without guards would walk unbounded.
+    """
+    root = _lake(fixture_lake)
+    assert GuardConstants().bars_request_budget == 100
+    result = _run(root, RecordingVendor(_cassette(freqs=(MINUTE_FREQ,))), guards=None)
+
+    # Seven sessions against a budget of 100, so nothing is deferred and the default was in force
+    # rather than the budget being ignored: the next test's bound proves the argument is read.
+    assert result.deferred == ()
+    assert result.attempted == len(SESSIONS)
+
+
+def test_the_deferred_block_is_rendered_for_the_by_hand_reader(fixture_lake: FixtureLake):
+    """The command's own output names every deferred ticker-day, counted and in full.
+
+    The nightly digest counts instead, because its line repeats every evening inside a byte cap.
+    This is the output somebody ran and is waiting on, and ``_render_gate_skips`` makes the same
+    argument about its own two lists.
+    """
+    root = _lake(fixture_lake)
+    result = _run(root, RecordingVendor(_cassette(freqs=(MINUTE_FREQ,))), guards=_budget(2))
+    rendered = result.render().splitlines()
+    first = rendered.index(f"  deferred: {len(SESSIONS) - 2}")
+    assert rendered[first : first + 3] == [
+        f"  deferred: {len(SESSIONS) - 2}",
+        f"    - SPY 1m {SESSIONS[-3].isoformat()}",
+        f"    - SPY 1m {SESSIONS[-4].isoformat()}",
+    ]
+
+
+def test_the_single_session_fetch_is_not_bounded_by_the_budget(fixture_lake: FixtureLake):
+    """``fetch_session_bars`` reaches the vendor through the same walk and stays unbounded.
+
+    Its scope is one session against the enabled roster, which is a handful of ticker-days, and
+    the runs that have crossed the ceiling through it number zero. The budget is the backfill's,
+    and a test is what says that is deliberate rather than an oversight.
+    """
+    quotes = {
+        (ticker, day): [_quote_row(day, ticker=ticker)]
+        for ticker in ("SPY", "QQQ")
+        for day in (*SESSIONS, date(2026, 9, 17))
+    }
+    root = _lake(fixture_lake, quotes=quotes, master=_master(("SPY", "QQQ")))
+    vendor = RecordingVendor(_cassette(tickers=("SPY", "QQQ"), freqs=(MINUTE_FREQ,)))
+    report = bars.fetch_session_bars(
+        lake_root=root,
+        vendor=vendor,
+        clock=ManualClock(TONIGHT),
+        calendar=_calendar(),
+        roster=_roster({"SPY": [MINUTE_FREQ], "QQQ": [MINUTE_FREQ]}),
+        session=SESSIONS[-1],
+    )
+    # Both tickers reached the vendor. The walk they share carries the budget argument and this
+    # entry point passes none, so nothing here can be bounded by it.
+    assert report.attempted == 2
+    assert len(vendor.calls) == 2
+    assert not hasattr(report, "deferred")
+
+
+def test_the_backfill_command_hands_the_walk_the_config_s_budget(
+    fixture_lake: FixtureLake, tmp_path: Path
+):
+    """The one line connecting `config.yaml` to the by-hand command, driven end to end.
+
+    ``backfill_bars_from_config`` passes `guards=config.guards`, and dropping that kwarg leaves
+    every other test here green: they call ``backfill_bars`` directly and hand it guards
+    themselves, so none of them crosses the wiring. The operator who recalibrates the budget is
+    the whole argument for the constant living in ``config.yaml`` rather than in this module, and
+    without this test their edit is silently ignored by ``--backfill``.
+
+    The budget is set to 2 against a seven-session plan, so the assertion is on requests that did
+    not go out rather than on a report field. Only the recorded calls can tell a budget that was
+    read from one that was defaulted.
+    """
+    root = _lake(fixture_lake)
+    config = write_config(tmp_path, root, guards={"bars_request_budget": 2})
+    vendor = RecordingVendor(_cassette(freqs=(MINUTE_FREQ,)))
+    code = bars.main(
+        ["--backfill", "--config", str(config), "--tickers", str(_tickers_file(tmp_path))],
+        clock=ManualClock(TONIGHT),
+        vendor_factory=lambda *a, **k: vendor,
+    )
+    assert code == 0
+    assert len(vendor.calls) == 2, "the config's budget never reached the walk"
+    # The two it reached are the newest, and the five it did not are still unmanifested, so
+    # tomorrow's run picks them up. ``SESSIONS`` is ascending, so this compares as a set.
+    landed = {day for day in SESSIONS if _partition(root, "SPY", MINUTE_FREQ, day).exists()}
+    assert landed == {SESSIONS[-1], SESSIONS[-2]}
+
+
+def test_the_pinned_default_binds_a_plan_larger_than_it(fixture_lake: FixtureLake):
+    """``None`` resolves to the pinned 100, proven by a plan that 100 is smaller than.
+
+    This is the half a seven-session fixture cannot show. With the plan below the budget, a run
+    that resolved ``None`` to the pinned default and a run that walked unbounded report the same
+    four numbers, so a test built on it passes whether the resolution is there or not. The
+    resolution is what ``lake.sweep`` depends on, because it forwards whatever it holds and the
+    callee decides, so a missing one walks the nightly job unbounded.
+
+    Fifteen tickers over seven sessions is 105 ticker-days at one frequency, which is the
+    cheapest plan larger than the pinned budget. ``1m`` carries it because that half runs no close
+    cross-check and so needs no quotes seeded per ticker.
+    """
+    tickers = tuple(f"T{index:02d}" for index in range(15))
+    root = _lake(fixture_lake, master=_master(tickers), spans=_open_span(*range(1, 16)))
+    vendor = RecordingVendor(_cassette(tickers=tickers, freqs=(MINUTE_FREQ,)))
+    result = _run(
+        root,
+        vendor,
+        roster=_roster({ticker: [MINUTE_FREQ] for ticker in tickers}),
+        spans=_open_span(*range(1, 16)),
+        guards=None,
+    )
+
+    assert len(tickers) * len(SESSIONS) == 105, "the plan has to be larger than the budget"
+    assert result.attempted == GuardConstants().bars_request_budget == 100
+    assert len(vendor.calls) == 100
+    assert len(result.deferred) == 5
+
+
+def test_the_deferred_block_renders_before_the_unwalked_one(fixture_lake: FixtureLake):
+    """The sign-off block's order is pinned, not just its contents.
+
+    ``test_the_two_gate_skip_blocks_are_rendered_in_the_backfill_block`` makes this argument for
+    its own pair and its comment says why: "swapping the blocks... changed nothing any of them
+    could see." The deferred block arrived without that treatment, and moving it below
+    ``unwalked`` left every assertion about it green, because the one test that reads it locates
+    its line by index and slices forward from there.
+
+    A reader meets the run's own remainder before the reference data it could not name, which is
+    the order the two mean something in: one is work this run left, the other is work no run can
+    do.
+    """
+    root = _lake(fixture_lake, master=_master(("SPY", "QQQ")))
+    result = _run(
+        root,
+        RecordingVendor(_cassette(freqs=(MINUTE_FREQ,))),
+        roster=_roster({"SPY": [MINUTE_FREQ]}),
+        spans=_open_span(1, 2),
+        guards=_budget(2),
+    )
+    rendered = result.render().splitlines()
+    # QQQ has a span and no roster entry, so the plan cannot name its frequencies.
+    assert result.unwalked, "the fixture must produce both blocks for the order to mean anything"
+    assert result.deferred
+    assert rendered.index(f"  deferred: {len(result.deferred)}") < rendered.index(
+        f"  unwalked: {len(result.unwalked)}"
+    )
+
+
+def test_the_plan_orders_by_the_whole_date_across_a_month_boundary():
+    """The outer sort key is the session, not a field of it.
+
+    Every other ordering test here lives inside September, so a key that agrees with the true date
+    only within one month sorts them all correctly. ``day.session.day`` is such a key: over
+    2026-08-31 to 2026-09-04 it ranks the 31st above the 4th and puts the oldest session back at
+    the front, which is the exact failure the inversion exists to prevent.
+
+    The fixture calendar's ``WEEK_ZERO`` is what makes this cost a span start and a clock.
+    """
+    first, last = WEEK_ZERO, date(2026, 9, 4)
+    plan = _plan(
+        spans=_open_span(1, start=datetime(2026, 8, 31, 12, 0, tzinfo=UTC)),
+        master=_master(valid_from=first),
+        now=datetime(2026, 9, 4, 22, 0, tzinfo=UTC),
+    )
+    sessions = [day.session for day in plan.days]
+    assert sessions == sorted(sessions, reverse=True)
+    assert sessions[0] == last and sessions[-1] == first
+    # The range's own ends are unmoved by the inversion, and they straddle the boundary.
+    assert plan.floor == first
+    assert plan.ceiling == last

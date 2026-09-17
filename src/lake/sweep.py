@@ -707,10 +707,22 @@ def sweep(
             # range along with every earlier session still unlanded. Yesterday's held daily bar
             # is reached with its following quotes now sealed.
             #
-            # Its cost is measured on its own docstring rather than assumed here. The manifested
-            # skip avoids the vendor call as well as the write, so every ticker-day that already
-            # landed costs nothing, and a run at the 1-minute lookback deadline is 88 requests
-            # against a ceiling of 120 a minute of which the capture loop spends 3.
+            # **Its cost is bounded rather than reasoned about, which is marketlake #478.** This
+            # comment used to argue the walk was safe because a run at the 1-minute lookback
+            # deadline is 88 requests against a ceiling of 120 a minute. That argument holds only
+            # for a lake whose manifest is intact. A rebuilt or restored one skips nothing and
+            # asks for every session the spans cover, back to back, and nothing paces the loop.
+            #
+            # ``guards.bars_request_budget`` is what answers it now. One run spends at most that
+            # many requests and this job fires once a day, so the budget is also the most that can
+            # reach the vendor in any rolling minute, and a budget under the ceiling makes the
+            # crossing arithmetically impossible however fast the run fires. What a run does not
+            # reach is not manifested, so the next evening's plan still holds it. The constant
+            # carries the five measurements that picked it.
+            #
+            # The manifested skip still avoids the vendor call as well as the write, so every
+            # ticker-day that already landed costs nothing and an ordinary evening never comes
+            # near the bound.
             #
             # A date flag is not the alternative. ``bars._build_parser`` records one written and
             # removed before merge, because it is a backfill selector with no capture-span floor
@@ -736,6 +748,10 @@ def sweep(
                     # is where they already were.
                     roster=Roster(roster.enabled),
                     spans=read_capture_spans(root),
+                    # Passed straight through, ``None`` included, because the callee resolves it
+                    # to the design's pinned defaults. That is the shape ``judge`` below already
+                    # takes.
+                    guards=guards,
                 )
                 pieces.append((BARS_PIECE, _bars_outcome(walked)))
                 # A ticker-day the plan could not resolve, which is the master and the spans
@@ -784,10 +800,14 @@ def sweep(
                 # session came first and a reader diffing two nights would see a change that is
                 # not one.
                 #
-                # And the walk takes ``plan.days`` in session order, so the first entry is
-                # always the oldest session in range. The live lake's six permanent ticker-days
-                # from the 2026-09-08 outage would hold that slot for ever, and a quarantine
-                # appearing tonight would move a count from six to seven and be named nowhere.
+                # And the walk takes ``plan.days`` newest session first under marketlake #478, so
+                # the first entry is whichever ticker-day the newest session in range produced.
+                # That changes every evening, so naming it would report a different subject each
+                # night while saying nothing about what moved. The argument was the same before
+                # #478 inverted the order and the reason was the mirror image of this one: the
+                # slot belonged to the live lake's six permanent ticker-days from the 2026-09-08
+                # outage for ever, and a quarantine appearing tonight would move a count from six
+                # to seven and be named nowhere.
                 # Counting the classes is bounded by how many reasons exist, which is four, and
                 # a new class appearing in the line is the signal that something changed.
                 #
@@ -814,6 +834,37 @@ def sweep(
                     )
                     report.append(
                         f"bars abandoned: {len(walked.abandoned)} ticker-day(s), {census}"
+                    )
+                # A ticker-day the run's request budget stopped it from fetching, which is
+                # marketlake #478. It is the only line here that reports no fault: the run spent
+                # what it was allowed and the next evening's plan still holds the remainder,
+                # because a ticker-day that was never fetched was never manifested. So it does not
+                # withhold the ping and it files no withheld record, and without a line here a
+                # bounded run would look exactly like a complete one.
+                #
+                # **Counted, and only when the bound actually bit.** An ordinary evening reaches
+                # nothing like the budget, so the condition is on the list rather than on the
+                # budget being reached, and a run whose last ticker-day was also its last request
+                # reports nothing. The full list stays on the by-hand ``--backfill`` run's own
+                # output, for the reason the two lines above give: rendered whole it would walk
+                # this report into ``digest_body``'s byte cap and truncate the battery's census off
+                # the end.
+                #
+                # **What was spent is read off the report rather than off the constant.**
+                # ``attempted`` is the count of ticker-days that reached the vendor, so on a run
+                # the budget bit it is the budget, and reading it here means the line cannot
+                # disagree with the walk. Naming ``guards.bars_request_budget`` instead would be a
+                # second source for one number, and this job may hold ``None`` for the guards
+                # while the walk resolved its own default.
+                #
+                # The line carries one ``": "``, so ``report.redacted`` keeps it whole. Measured
+                # in digest form it runs 58 to 63 bytes across the range of counts it can carry,
+                # from a single deferred ticker-day to five figures of them, against a 1000-byte
+                # cap the three bars lines together reach about a sixth of.
+                if walked.deferred:
+                    report.append(
+                        f"bars deferred: {len(walked.deferred)} ticker-day(s), "
+                        f"{walked.attempted} request(s) spent"
                     )
             except _BARS_REFUSALS as exc:
                 pieces.append((BARS_PIECE, _refused(exc)))
