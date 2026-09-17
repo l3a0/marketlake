@@ -682,7 +682,8 @@ def test_a_named_field_is_read_in_trailing_position_only():
     sentence attached, because the hint is demonstrated rather than counted, so the operator is
     told what is actually wrong.
 
-    Mutation found the rule unheld: popping named fields from anywhere passed the suite unchanged.
+    Mutation found the rule uncovered: popping named fields from anywhere passed the suite
+    unchanged.
     """
     with pytest.raises(ValueError, match="four comma-separated fields"):
         _parse_bar_requests(
@@ -744,6 +745,26 @@ def test_the_hint_cannot_be_a_pattern_match_on_the_raw_value():
 
     assert re.search(r":\d\d,\d", UNFLAGGED), "the naive pattern matches a perfectly good value"
     _parse_bar_requests([UNFLAGGED])  # and that value parses, so the pattern proves nothing
+
+
+def test_a_bound_carrying_an_equals_is_read_as_a_bound_and_not_a_flag():
+    """An `=` does not make a field a flag, and review is what found that out.
+
+    `datetime.fromisoformat` in 3.12 takes any non-digit as the fractional-second separator when
+    no fractional digits follow and an offset comes next, so `2026-09-14T16:00:00=-04:00` is an
+    instant this tool reads. A parser that popped every `=` field would refuse a window it can
+    perfectly well fetch, and would blame a named field for it.
+
+    This is also why the branch no longer claims the separation is structural. It rests on asking
+    the bound reader, which is a question with an answer, rather than on which characters an
+    instant may hold.
+    """
+    from datetime import datetime
+
+    assert datetime.fromisoformat("2026-09-14T16:00:00=-04:00").utcoffset() is not None
+    (parsed,) = _parse_bar_requests(["SPY,1m,2026-09-14T09:30:00-04:00,2026-09-14T16:00:00=-04:00"])
+    assert parsed.extended_hours is None
+    assert parsed.end == CLOSE_ET
 
 
 def test_two_bars_values_with_one_key_are_refused():

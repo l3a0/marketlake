@@ -18,11 +18,10 @@ keep it testable offline.
 
 Run it by hand to record from the real vendor::
 
-    python -m lake.record --out spy.json --chain SPY --chain QQQ --quotes SPY,QQQ
-    python -m lake.record --out bars.json \
+    uv run python -m lake.record --out spy.json --chain SPY --chain QQQ --quotes SPY,QQQ
+    uv run python -m lake.record --out bars.json \
         --bars SPY,1m,2026-09-14T09:30:00-04:00,2026-09-14T16:00:00-04:00
-    python -m lake.record --out flagged.json \
-        --bars SPY,1m,2026-09-14T09:30:00-04:00,2026-09-14T16:00:00-04:00 \
+    uv run python -m lake.record --out flagged.json \
         --bars SPY,1m,2026-09-14T09:30:00-04:00,2026-09-14T16:00:00-04:00,extended_hours=false
 
 That path builds the real client and reads credentials from ``config.yaml``, so it is
@@ -41,10 +40,18 @@ than a live session is worth burning requests on, so record one and build the re
 ``tests.support.vendor.bars_interactions``. That is the same division the chain recording
 already uses, where one bare-symbol body feeds ``windowed_chain_interactions``.
 
-The third example above is not a second window. It is one window asked twice, differing only in
-``extended_hours``, so the pair reads what Schwab picks when the flag is left unset and what it
-sends when the flag says the regular session. Two answers about one window, which is what a
-recording is for, rather than a fixture set.
+The second and third examples are one window asked twice, differing only in ``extended_hours``,
+so the pair reads what Schwab picks when the flag is left unset and what it sends when the flag
+says the regular session. Two answers about one window, which is what a recording is for, rather
+than a fixture set.
+
+**They are two runs on purpose, and two ``--out`` paths.** ``record_cassette`` accumulates in
+memory and ``main`` writes only after the last request returns, so a vendor failure on the second
+of two windows in one run throws away the first, which is already paid for. #443 carries that.
+Until it is settled, the pair is recorded as two invocations.
+
+Every example carries ``uv run`` because a bare ``python`` is not on the path this is run from. An
+example that cannot be pasted is not an example.
 """
 
 from __future__ import annotations
@@ -244,17 +251,22 @@ def build_parser() -> argparse.ArgumentParser:
     intended path meets it.
 
     A vendor flag rides after the four as a named field, ``extended_hours=false``, rather than
-    as a bare fifth one. No ISO instant carries an ``=``, so a bound that split on its own
-    fractional-second comma can never be read as a flag, and the two halves it left behind
-    still reach the four-field refusal with the sentence naming the case. That separation is a
-    property of the grammar rather than of the data.
+    as a bare fifth one. A field is taken as a flag only when it carries an ``=`` and does not
+    read as an instant, so a bound that split on its own fractional-second comma reaches the
+    four-field refusal with the sentence naming the case.
+
+    Both halves of that test are load-bearing, and review is what found the second one. An ``=``
+    alone does not mean a flag, because ``datetime.fromisoformat`` accepts
+    ``2026-09-14T16:00:00=-04:00``: 3.12 takes any non-digit as the fractional-second separator
+    when no fractional digits follow and an offset comes next. So the separation rests on asking
+    the bound reader, not on a claim about which characters an instant can hold.
 
     A bare fifth field read as the flag whatever it said would lose it. The ISO case would
     arrive as a bad flag value naming the end bound, and the fractional-second sentence would
     never be reached. A bare fifth field popped only when it spells ``true`` or ``false`` would
     in fact keep it, because an ISO fractional part is digits and never spells either word. But
     that rests the guard on a coincidence about the data, and a bare value says nothing at the
-    terminal about what it means. So a bare fifth field is refused, and a test holds it.
+    terminal about what it means. So a bare fifth field is refused, and a test covers it.
 
     The named field is read in trailing position only, so the four positional fields stay
     positional. The ``metavar`` shows that position, because a flag written in the middle falls
@@ -343,6 +355,25 @@ def _splits_an_instant(fields: list[str]) -> bool:
     return False
 
 
+def _names_a_flag(field: str) -> bool:
+    """Whether one field is a ``name=value`` flag rather than a bound.
+
+    An ``=`` alone does not settle it. ``datetime.fromisoformat`` in 3.12 takes any non-digit as
+    the fractional-second separator when no fractional digits follow and an offset comes next, so
+    ``2026-09-14T16:00:00=-04:00`` is a bound this tool reads. Popping that as a flag would refuse
+    a real window while blaming a named field. Asking the bound reader first is the same move the
+    fractional-second refusal makes: demonstrate what a field is rather than guess from a
+    character it happens to carry.
+    """
+    if "=" not in field:
+        return False
+    try:
+        datetime.fromisoformat(field)
+    except ValueError:
+        return True
+    return False
+
+
 def _take_bar_flag(raw: str, fields: list[str]) -> bool | None:
     """Take the named fields off the end of one ``--bars`` value and read the flag.
 
@@ -351,7 +382,7 @@ def _take_bar_flag(raw: str, fields: list[str]) -> bool | None:
     fields is taken, which is what leaves the four positional fields positional.
     """
     named: list[str] = []
-    while fields and "=" in fields[-1]:
+    while fields and _names_a_flag(fields[-1]):
         named.insert(0, fields.pop())
 
     flag: bool | None = None
