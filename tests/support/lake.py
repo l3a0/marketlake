@@ -42,8 +42,9 @@ from lake.paths import DATE_PARTITIONED
 # is a change in it. ``ssid`` is Schwab's own contract identifier, and it is what pairs a
 # re-symboled contract's old symbol to its new one, since the symbol moves and the contract
 # behind it does not. Without it a fixture can express a root that changed and cannot express
-# which contract was re-symboled into which. The four after it are where the deliverable is
-# written down, and they are what the ratio and its gate are computed from. ``mini`` is there
+# which contract was re-symboled into which. ``option_deliverables_list``,
+# ``deliverable_note`` and ``multiplier`` are where the deliverable is written down, and
+# with ``non_standard`` they are what the ratio and its gate are computed from. ``mini`` is there
 # because a mini contract is a tenth-size contract under its own root, so the first one to
 # list looks exactly like an adjustment and is not one. ``is_chain_truncated`` rides beside
 # ``suspect`` because a thin snapshot carries a thin root set, so both are what say a session

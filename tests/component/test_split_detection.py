@@ -45,6 +45,7 @@ from lake.security_master import (
     MASTER_FILENAME,
     REFERENCE_DIR,
     Mapping,
+    MasterUnreadable,
     SecurityMaster,
     master_path,
 )
@@ -131,6 +132,7 @@ ADJUSTED = _deliverables(150.0)
 # session on the far side of a boundary carries both and they are different contracts.
 DEFAULT_OCC = "SPY   260918C00650000"
 CARRIED_OCC = "SPY   260918C00700000"
+QQQ_OCC = "QQQ   260918C00650000"
 
 
 def _ssid(occ_symbol: str) -> int:
@@ -1508,6 +1510,33 @@ def test_the_prior_side_reads_the_standard_series_of_the_boundary_session(
 # -- the OCC mapping rows the boundary writes -------------------------------------------
 
 
+def _two_tickers(fixture_lake: FixtureLake) -> Path:
+    """Two tickers, each with its own boundary and its own contract symbols.
+
+    The symbols have to differ. Two tickers whose contracts share an ``occ_symbol`` would
+    have the second boundary skipped as already written, which reads exactly like the first
+    ticker's failure having cost the second its mapping.
+    """
+    return _lake(
+        fixture_lake,
+        {
+            ("QQQ", DAY_ONE): [_row(DAY_ONE, ticker="QQQ", occ_symbol=QQQ_OCC)],
+            ("QQQ", DAY_TWO): [
+                _row(DAY_TWO, ticker="QQQ", occ_symbol="QQQ   260918C00700000"),
+                _adjusted_row(
+                    DAY_TWO,
+                    ticker="QQQ",
+                    ssid=_ssid(QQQ_OCC),
+                    occ_symbol="QQQ1  260918C00433330",
+                ),
+            ],
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_TWO): [_row(DAY_TWO, occ_symbol=CARRIED_OCC), _adjusted_row(DAY_TWO)],
+        },
+        master=_master(tickers=("QQQ", "SPY")),
+    )
+
+
 def _mappings(root: Path) -> list[tuple[str, date, date | None]]:
     """Every OCC mapping row the master carries, as symbol and half-open range."""
     master = SecurityMaster.read(master_path(root))
@@ -1718,3 +1747,158 @@ def test_the_master_the_write_touches_stays_manifested(fixture_lake: FixtureLake
     detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
 
     assert scrub(root).ok, "the master was rewritten without recording its new sha"
+
+
+def test_a_master_torn_during_the_walk_ends_the_run_rather_than_filing_per_boundary(
+    fixture_lake: FixtureLake, monkeypatch
+):
+    """The walk's opening read covers a master torn before it. This is one torn during it.
+
+    Held per boundary instead, every remaining ticker files an ``occ_mapping`` finding, the
+    run reports success, splits keep landing with no mapping row behind any of them, and the
+    one condition a single command fixes is buried as noise. ``main`` has a line for it.
+    """
+    root = _two_tickers(fixture_lake)
+    import lake.actions
+
+    # ``lake.splits`` binds ``read_master`` at module scope for its own opening read, and
+    # ``occ_mapping`` imports it inside the write. So this tears the master for the write
+    # alone, which is the mid-walk case: the run has already read a whole master once.
+    def tear(lake_root):
+        raise MasterUnreadable(master_path(lake_root))
+
+    monkeypatch.setattr(lake.actions, "read_master", tear)
+
+    with pytest.raises(MasterUnreadable):
+        detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert _entries(root) == [], "the run reached the second ticker instead of ending"
+
+
+def test_a_row_count_regression_files_a_finding_and_the_walk_goes_on(
+    fixture_lake: FixtureLake, monkeypatch
+):
+    """A bare ``Exception`` outside ``SecurityMasterError``, which a narrow catch would miss.
+
+    This write can never cause one, because registering and remapping only grow the row list.
+    A restore from backup makes it reachable, and uncaught it would end the run and cost every
+    ticker the walk had not yet reached.
+    """
+    root = _two_tickers(fixture_lake)
+    import lake.manifest
+
+    real = lake.manifest.record_partition
+
+    def refuse_once(lake_root, partition, **kwargs):
+        if partition.startswith(REFERENCE_DIR) and not getattr(refuse_once, "fired", False):
+            refuse_once.fired = True
+            raise lake.manifest.RowCountRegression(partition, 99, 1)
+        return real(lake_root, partition, **kwargs)
+
+    monkeypatch.setattr(lake.manifest, "record_partition", refuse_once)
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    (held,) = report_out.held
+    assert held.finding.check == CHECK_OCC_MAPPING and held.finding.symbol == "QQQ"
+    assert "were written and the manifest entry was not" in held.finding.exception, (
+        "the finding says the mapping failed when the rows are on disk"
+    )
+    assert [remap.ticker for remap in report_out.mapped] == ["SPY"], (
+        "the second ticker lost its mapping to the first ticker's refusal"
+    )
+    assert len(_entries(root)) == 2
+
+
+def test_a_symbol_handed_between_two_instruments_maps_nothing(fixture_lake: FixtureLake):
+    """The symbol history resets with the root history, and for the same reason.
+
+    Without it the incoming instrument keeps the retired security's contracts. An ``ssid`` that
+    recurs across the two would pair one company's old symbol to another company's new one and
+    register an option instrument under it, which is the orphaning the master exists to prevent.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_TWO): [_row(DAY_TWO, occ_symbol=CARRIED_OCC), _adjusted_row(DAY_TWO)],
+        },
+        master=SecurityMaster(
+            [
+                _mapping(1, "SPY", valid_from=DAY_ONE, valid_to=DAY_TWO),
+                _mapping(2, "SPY", valid_from=DAY_TWO),
+            ]
+        ),
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert _entries(root) == []
+    assert report_out.mapped == (), "the incoming instrument inherited the outgoing one's history"
+    assert _mappings(root) == []
+
+
+def test_a_boundary_the_ledger_refuses_for_a_duplicate_instrument_is_still_mapped(
+    fixture_lake: FixtureLake,
+):
+    """The least obvious of the seven outcomes that reach the write, so it is executed here.
+
+    Two tickers resolving to one instrument is a reference-data fault, and it is a fault about
+    which instrument a *ticker* names. The mapping rows name contracts by their own symbols
+    under their own fresh instrument ids, so holding them would lose a real identity change
+    over a defect in a different row of the same table.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("QQQ", DAY_ONE): [_row(DAY_ONE, ticker="QQQ", occ_symbol=QQQ_OCC)],
+            ("QQQ", DAY_TWO): [
+                _row(DAY_TWO, ticker="QQQ", occ_symbol="QQQ   260918C00700000"),
+                _adjusted_row(
+                    DAY_TWO,
+                    ticker="QQQ",
+                    ssid=_ssid(QQQ_OCC),
+                    occ_symbol="QQQ1  260918C00433330",
+                ),
+            ],
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_TWO): [_row(DAY_TWO, occ_symbol=CARRIED_OCC), _adjusted_row(DAY_TWO)],
+        },
+        # Both tickers on one instrument, which is what the ledger's key guard refuses.
+        master=SecurityMaster([_mapping(1, "QQQ"), _mapping(1, "SPY")]),
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert [held.finding.check for held in report_out.held] == [CHECK_INSTRUMENT_RESOLUTION]
+    assert len(_entries(root)) == 1, "the second boundary's ledger entry was refused"
+    assert sorted(remap.ticker for remap in report_out.mapped) == ["QQQ", "SPY"], (
+        "a fault about which instrument a ticker names lost both contracts their mapping"
+    )
+
+
+def test_a_run_that_landed_the_entry_and_lost_the_master_writes_the_mapping_next_night(
+    fixture_lake: FixtureLake,
+):
+    """The mapping write cannot ride the ledger's guard, and this is the case that proves it.
+
+    ``same_but_for_recorded_at`` suppresses the second append, so the ledger reports the split
+    unchanged. The mapping is written on its own terms, which is what makes the two writes
+    independently recoverable rather than one silently depending on the other.
+    """
+    root = _two_sessions(fixture_lake)
+    detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    entries = _entries(root)
+    # The ledger keeps its entry and the master loses its rows, which is what a first run that
+    # appended and then failed its master write leaves behind.
+    _master().write(master_path(root))
+    assert _mappings(root) == []
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+
+    assert _entries(root) == entries and report_out.unchanged == 1
+    assert len(report_out.mapped) == 1
+    assert _mappings(root) == [
+        (DEFAULT_OCC, DAY_ONE, DAY_TWO),
+        ("SPY1  260918C00433330", DAY_TWO, None),
+    ]

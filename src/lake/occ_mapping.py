@@ -13,8 +13,10 @@ refuses and records nothing the ledger holds.
 
 **The unit is one contract, not one detection.** ``ID_TYPE_OCC`` names one OCC option
 symbol, which names one contract, and both consumers of these rows resolve a contract
-symbol. So a re-symboling of a chain writes two mapping rows per contract it touched: the
-old symbol closed at the boundary and the new one open from it. The detector's own
+symbol. So a re-symboling writes per contract it touched rather than per boundary. A
+contract the master has never held takes two rows, its old symbol closed at the boundary
+and the new one open from it. One the master already holds takes a single row on the end
+of the chain it already has. The detector's own
 ``instrument_id`` is the *equity*, resolved from the partition's ticker, and an OCC mapping
 hung on that would tie a contract symbol to the underlying.
 
@@ -39,10 +41,20 @@ and the refusal is a confirmed boundary that pairs *zero* contracts. A gained ro
 contract carrying a new symbol contradicts the change that confirmed it. Pairing on the
 contract's terms instead, when that refusal arrives, is marketlake #369.
 
-**A contract the history has never seen is a new listing, not a failed pairing.** New
-contracts list under an adjusted root as well as under a standard one. A row carrying no
-``ssid`` is evidence of nothing and is skipped too: it is null on both rows of the lake's
-2026-09-02 partition, the same one ``option_root`` is null on.
+**Every contract under the gained root has to be accounted for.** An OCC adjustment
+re-symbols every open contract at once, so a boundary where only some of them pair is
+evidence that the pairing is wrong rather than a boundary that is partly readable. Executed
+against ten contracts where the vendor carried ``ssid`` for one and minted fresh identifiers
+for the other nine, an earlier draft of this module wrote one mapping row, refused nothing and
+filed nothing, leaving nine contracts orphaned in silence.
+
+The price is named rather than hidden. A contract genuinely listed new under the adjusted root
+*on the boundary session itself* refuses the boundary too, and so does a row carrying no
+``ssid`` at all, which is what the lake's 2026-09-02 partition holds. That is deliberate. A new
+listing and a contract whose identifier the vendor did not carry through look identical from
+here and they want opposite treatments, so this fails closed the way every other unanswerable
+question in this module does. A refused boundary files a finding a human reads. A partly
+written one is silent.
 
 **Almost no contract resolves through the master, and that is the right answer.** Only a
 contract a re-symboling touched gets an instrument here, so an ordinary contract's symbol
@@ -82,10 +94,13 @@ is not free: an OCC symbol the market re-issues gets a second instrument whose b
 range overlaps the first's, and the symbol then resolves to both. The observed first session
 is both true and the tightest honest claim.
 
-**The master is repairable where the ledger is not.** ``ex_date`` sits in the ledger's key,
-so a corrected date lands under a second key rather than superseding, while the master is
-rewritten whole through a temp file and a rename. That is why a boundary the ledger holds out
-is still mapped here.
+**A boundary that lands twice under two different dates is refused rather than repaired.**
+``ex_date`` sits in the ledger's key, so a corrected date there lands under a second key. The
+master is rewritten whole, so in principle a row could be moved, and this does not move one.
+Executed: a first run that dated a boundary 09-16 and a second that re-derived it at 09-15 left
+the ledger holding both dates and the master holding only the first, with nothing saying so and
+``resolve`` answering the old symbol on a day the sealed chains already carried the new one. So
+the second date is refused and filed, naming both, rather than one silently winning.
 """
 
 from __future__ import annotations
@@ -115,11 +130,27 @@ class MappingError(Exception):
 class MappingRefused(MappingError):
     """Raised when a boundary's mapping rows cannot be written from what the data says.
 
-    Every case is a claim the master would carry and nobody observed: contracts that pair to
-    nothing, a symbol two instruments already hold, or a new symbol that already names a
-    different contract. A refused boundary is filed as a finding and the walk goes on. The
-    master is rewritten whole, so a mapping withheld today can be written tomorrow, while a
+    Every case is a claim the master would carry and nobody observed: a contract under the
+    gained root the walk cannot account for, a symbol two instruments already hold, a new
+    symbol that already names a different contract, an instrument that has moved past this
+    boundary already, or one boundary dated two different ways. A refused boundary is filed as
+    a finding and the walk goes on. A mapping withheld today can be written tomorrow, while a
     wrong one is read as truth by every consumer that resolves through it.
+    """
+
+
+class ManifestNotRecorded(MappingError):
+    """Raised when the mapping rows were written and the manifest entry beside them was not.
+
+    This one says the opposite of every other refusal here: the master on disk is correct and
+    the lake's record of it is stale, so the integrity scrub's forward pass reports a sha
+    mismatch. Naming it apart matters because the finding an operator reads would otherwise
+    say the mapping failed, and the repair is the opposite of a retry.
+
+    Nothing here repairs it, and a later run cannot: the pairs are already written, so the
+    idempotence check skips them and the entry is never recorded. ``onboard.py``, ``retire.py``
+    and ``seed_spans.py`` carry the same window, and marketlake #371 owns the repair for all
+    four.
     """
 
 
@@ -137,20 +168,25 @@ class Pair:
 class Pairing:
     """What a boundary session's gained contracts came to against the walk's history.
 
-    ``recognised`` counts the contracts under those roots the walk has read before, and it is
-    what separates two very different zeroes. A gained root none of whose contracts the walk
-    has ever seen leaves the re-symboling unreadable, and that is refused. A gained root whose
-    contracts the walk has seen, all still wearing the symbols it saw, re-symboled nothing and
-    writes nothing without refusing.
+    ``rows`` counts every row under those roots and ``recognised`` counts the ones the walk
+    has read before, and the two together are what separate a boundary this can read from one
+    it cannot. They have to be equal. An OCC adjustment re-symbols every open contract at
+    once, so a contract under the gained root that the walk cannot place is evidence the
+    pairing is wrong rather than one contract to pass over.
 
-    The second case is a root column that moved while the symbols did not. The first is what
-    a vendor re-issuing ``ssid`` through an adjustment would look like, and what a session
-    sealed before the column was populated looks like, which is why it cannot be passed over
-    in silence.
+    With that settled, an empty ``pairs`` means exactly one thing: every contract under the
+    gained root is one the walk knows and none changed its symbol, so the vendor's root column
+    moved and identity did not. Nothing to record, and nothing to refuse either.
     """
 
+    rows: int
     recognised: int
     pairs: tuple[Pair, ...]
+
+    @property
+    def unaccounted(self) -> int:
+        """Contracts under the gained roots the walk cannot place, which must be none."""
+        return self.rows - self.recognised
 
 
 @dataclass(frozen=True)
@@ -205,17 +241,18 @@ class SymbolHistory:
                 self._seen[ssid] = (symbol, day)
 
     def inspect(self, rows: Iterable[dict[str, object]]) -> Pairing:
-        """What ``rows`` carry against this history: how many it knows, and which moved.
+        """What ``rows`` carry against this history: how many, how many it knows, which moved.
 
-        ``rows`` are the boundary session's rows under the roots it gained. A contract the
-        history has not seen is a new listing, which lists under an adjusted root as readily
-        as under a standard one, so it is not a pairing and it is not a failure either. It is
-        counted only by its absence from ``recognised``.
+        ``rows`` are the boundary session's rows under the roots it gained. Every one of them
+        is counted, including a row this cannot read at all, because a row carrying no ``ssid``
+        is a contract the walk cannot place just as surely as one carrying an ``ssid`` it has
+        never seen. :class:`Pairing` is where the two counts are compared.
         """
+        counted = 0
         recognised = 0
         found = []
-        for ssid, symbol in _identified(rows):
-            current = self._seen.get(ssid)
+        for counted, (ssid, symbol) in enumerate(_readable(rows), start=1):  # noqa: B007
+            current = None if ssid is None else self._seen.get(ssid)
             if current is None:
                 continue
             recognised += 1
@@ -225,23 +262,32 @@ class SymbolHistory:
                 Pair(ssid=ssid, old_symbol=current[0], valid_from=current[1], new_symbol=symbol)
             )
         return Pairing(
+            rows=counted,
             recognised=recognised,
             pairs=tuple(sorted(found, key=lambda pair: (pair.old_symbol, pair.new_symbol))),
         )
 
 
 def _identified(rows: Iterable[dict[str, object]]) -> Iterable[tuple[int, str]]:
-    """Every row that names both a contract and a symbol, as the pair of the two.
+    """Every row naming both a contract and a symbol. This is what the history records."""
+    for ssid, symbol in _readable(rows):
+        if ssid is not None:
+            yield ssid, symbol
 
-    A null ``ssid`` says nothing about which contract a row is, and a row with no symbol has
-    nothing to map. Neither is an error, because a partition sealed before a column was
-    populated carries nulls and is a session with nothing to say rather than a run that ends.
+
+def _readable(rows: Iterable[dict[str, object]]) -> Iterable[tuple[int | None, str]]:
+    """Every row naming a symbol, with the contract it names or ``None``.
+
+    A row with no symbol has nothing to map and is not a contract this can count either. A
+    null ``ssid`` is different: the row is a contract and this cannot say which one, which is
+    what :class:`Pairing` counts as unaccounted. The lake's 2026-09-02 partition carries null
+    there on both of its rows, the same partition ``option_root`` is null on.
     """
     for row in rows:
         ssid = row.get(_SSID)
         symbol = row.get(_OCC_SYMBOL)
-        if isinstance(ssid, int) and isinstance(symbol, str) and symbol:
-            yield ssid, symbol
+        if isinstance(symbol, str) and symbol:
+            yield (ssid if isinstance(ssid, int) else None), symbol
 
 
 # The two columns this module reads off a session's rows. ``lake.splits`` owns the list they
@@ -264,6 +310,23 @@ def instruments_holding(master: SecurityMaster, symbol: str) -> set[int]:
         for mapping in master.mappings
         if mapping.id_type == ID_TYPE_OCC and mapping.id_value == symbol
     }
+
+
+def opens_on(master: SecurityMaster, instrument_id: int, symbol: str) -> date | None:
+    """The date this instrument's mapping of ``symbol`` opens on, or ``None`` if it has none.
+
+    Two questions ride on it. A row already opening on this boundary's own date is the write
+    already done, which is what makes a second night a no-op. A row opening on a *different*
+    date is one boundary dated two ways, and nothing here moves a row, so that is refused.
+    """
+    for mapping in master.mappings:
+        if (
+            mapping.instrument_id == instrument_id
+            and mapping.id_type == ID_TYPE_OCC
+            and mapping.id_value == symbol
+        ):
+            return mapping.valid_from
+    return None
 
 
 def open_symbol(master: SecurityMaster, instrument_id: int) -> str | None:
@@ -315,11 +378,24 @@ def write_mappings(
     from lake.onboard import MASTER_PARTITION, REFERENCE_SOURCE
 
     root = Path(lake_root)
-    if not pairing.recognised:
+    if pairing.unaccounted:
         raise MappingRefused(
-            f"{ticker} gained a root on {effective.isoformat()} and the walk has read none "
-            f"of the contracts under it before, so which contract each one used to be "
-            f"cannot be read"
+            f"{ticker} gained a root on {effective.isoformat()} carrying {pairing.rows} "
+            f"contract(s), and the walk cannot place {pairing.unaccounted} of them. An "
+            f"adjustment re-symbols every open contract at once, so a boundary it can only "
+            f"partly read is one it has read wrong"
+        )
+    incoming = [pair.new_symbol for pair in pairing.pairs]
+    if len(set(incoming)) != len(incoming):
+        raise MappingRefused(
+            f"{ticker}'s {effective.isoformat()} boundary re-symbols two contracts onto one "
+            f"symbol, which no instrument can carry"
+        )
+    crossed = sorted(set(incoming) & {pair.old_symbol for pair in pairing.pairs})
+    if crossed:
+        raise MappingRefused(
+            f"{ticker}'s {effective.isoformat()} boundary both opens and closes {crossed}, "
+            f"so one symbol would name two contracts' histories"
         )
     if not pairing.pairs:
         # Every contract under the gained root is one the walk knows and none changed its
@@ -340,11 +416,31 @@ def write_mappings(
                     f"is a master that cannot say which contract it is"
                 )
             owned = next(iter(owners), None)
-            if owned is not None and open_symbol(master, owned) == pair.new_symbol:
-                # Already written, by this run's earlier night or by a run that got this far
-                # and then failed. Skipped rather than remapped, because remapping again at
-                # the same date raises and at a later one duplicates the row in silence.
-                continue
+            if owned is not None:
+                opened = opens_on(master, owned, pair.new_symbol)
+                if opened == effective:
+                    # Already written, by an earlier night or by a run that got this far and
+                    # then failed. Asking for the row rather than for the instrument's *open*
+                    # symbol is what makes this hold on a contract adjusted twice, where the
+                    # first boundary's mapping is no longer the open one. Executed: the
+                    # instrument's-open-symbol form filed a false finding every night forever
+                    # once any contract had two boundaries behind it.
+                    continue
+                if opened is not None:
+                    raise MappingRefused(
+                        f"{pair.new_symbol!r} already opens on {opened.isoformat()} under "
+                        f"instrument {owned} and this boundary dates it "
+                        f"{effective.isoformat()}. Nothing here moves a mapping row, so the "
+                        f"two dates are reported rather than one quietly winning"
+                    )
+                carried = open_symbol(master, owned)
+                if carried != pair.old_symbol:
+                    raise MappingRefused(
+                        f"{pair.old_symbol!r} names instrument {owned}, which now carries "
+                        f"{carried!r}. Either the market re-issued the symbol to another "
+                        f"contract or that instrument has already moved past this boundary, "
+                        f"and the symbol alone cannot tell the two apart"
+                    )
             others = instruments_holding(master, pair.new_symbol) - (
                 set() if owned is None else {owned}
             )
@@ -376,18 +472,28 @@ def write_mappings(
             return ()
 
         master.write(master_path(root))
-        record_partition(
-            root,
-            MASTER_PARTITION,
-            source=REFERENCE_SOURCE,
-            rows=len(master),
-            fetched_at=recorded_at.isoformat(),
-        )
+        try:
+            record_partition(
+                root,
+                MASTER_PARTITION,
+                source=REFERENCE_SOURCE,
+                rows=len(master),
+                fetched_at=recorded_at.isoformat(),
+            )
+        except Exception as exc:
+            # The rows are on disk and the lake's record of them is not, which is the
+            # opposite of every other failure here and wants the opposite of a retry.
+            raise ManifestNotRecorded(
+                f"{ticker}'s {effective.isoformat()} mapping rows were written and the "
+                f"manifest entry was not, so the integrity scrub reports a sha mismatch "
+                f"until one is recorded: {type(exc).__name__}: {exc}"
+            ) from exc
     return tuple(written)
 
 
 __all__ = [
     "CHECK_OCC_MAPPING",
+    "ManifestNotRecorded",
     "MappingError",
     "MappingRefused",
     "Pair",
@@ -396,5 +502,6 @@ __all__ = [
     "SymbolHistory",
     "instruments_holding",
     "open_symbol",
+    "opens_on",
     "write_mappings",
 ]

@@ -12,6 +12,7 @@ pairing key names the contract and the symbol names the spelling.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -19,6 +20,7 @@ import pytest
 
 from lake.manifest import record_partition, scrub
 from lake.occ_mapping import (
+    ManifestNotRecorded,
     MappingRefused,
     Pair,
     SymbolHistory,
@@ -283,7 +285,7 @@ def test_a_root_that_moved_while_no_symbol_did_writes_nothing_and_refuses_nothin
     assert _write(root, equity, history, [_row(1, OLD)]) == ()
 
 
-def test_a_gained_root_the_walk_recognises_nothing_under_is_refused(tmp_path: Path):
+def test_a_gained_root_the_walk_cannot_place_every_contract_under_is_refused(tmp_path: Path):
     """The other zero, and it is the one that cannot be passed over in silence.
 
     It is what a vendor dropping ``ssid`` through a re-symboling would look like, and what a
@@ -295,8 +297,203 @@ def test_a_gained_root_the_walk_recognises_nothing_under_is_refused(tmp_path: Pa
     history = SymbolHistory()
     history.observe(DAY_ONE, [_row(1, OLD)])
 
-    with pytest.raises(MappingRefused, match="read none of the contracts"):
+    with pytest.raises(MappingRefused, match="cannot place 1 of them"):
         _write(root, equity, history, [_row(9, NEW)])
+
+
+def test_a_boundary_only_partly_paired_is_refused_rather_than_partly_written(tmp_path: Path):
+    """An adjustment re-symbols every open contract at once.
+
+    So a boundary where one contract of ten pairs is one the pairing has read wrong, not one
+    that is partly readable. An earlier draft counted any recognised contract as enough and
+    wrote a single row, leaving nine orphaned with no finding and no refusal.
+    """
+    root, equity = _lake(tmp_path)
+    history = SymbolHistory()
+    seen = [_row(i, f"SPY   261218C0050{i:04d}") for i in range(10)]
+    history.observe(DAY_ONE, seen)
+    boundary = [_row(0, NEW)] + [_row(100 + i, f"SPY1  261218C0025{i:04d}") for i in range(1, 10)]
+
+    pairing = history.inspect(boundary)
+    assert (pairing.rows, pairing.recognised, pairing.unaccounted) == (10, 1, 9)
+    with pytest.raises(MappingRefused, match="cannot place 9 of them"):
+        _write(root, equity, history, boundary)
+
+    assert _occ_rows(root) == []
+
+
+def test_a_row_naming_no_symbol_counts_as_neither_placed_nor_paired(tmp_path: Path):
+    """A row with no symbol has nothing to map, and it is not a contract this can count.
+
+    A null ``ssid`` is the other half and they are not the same: that row *is* a contract this
+    cannot place, so it is counted and the boundary refuses. Sorting the pairs would raise a
+    bare ``TypeError`` on a null symbol, which is not in the walk's caught tuple and would end
+    the run.
+    """
+    history = SymbolHistory()
+    history.observe(DAY_ONE, [_row(1, None), _row(2, OLD)])
+
+    assert len(history) == 1
+    pairing = history.inspect([_row(1, None), _row(2, NEW)])
+    assert (pairing.rows, pairing.recognised) == (1, 1)
+    assert [pair.new_symbol for pair in pairing.pairs] == [NEW]
+
+
+def test_a_contract_adjusted_twice_writes_nothing_on_a_later_run(tmp_path: Path):
+    """The idempotence check asks for the row, not for the instrument's open symbol.
+
+    After a second re-symboling the first boundary's new symbol is no longer the open one, so
+    the open-symbol form missed the skip and called ``remap`` with an ``effective`` earlier
+    than the open row's ``valid_from``. Executed, that filed a false ``occ_mapping`` finding
+    every night forever once any contract had two boundaries behind it.
+    """
+    root, equity = _lake(tmp_path)
+    history = SymbolHistory()
+    history.observe(DAY_ONE, [_row(1, OLD)])
+    _write(root, equity, history, [_row(1, NEW)])
+    history.observe(BOUNDARY, [_row(1, NEW)])
+    _write(root, equity, history, [_row(1, NEWER)], day=date(2026, 9, 16))
+    after = master_path(root).read_bytes()
+
+    replay = SymbolHistory()
+    replay.observe(DAY_ONE, [_row(1, OLD)])
+    assert _write(root, equity, replay, [_row(1, NEW)]) == ()
+    replay.observe(BOUNDARY, [_row(1, NEW)])
+    assert _write(root, equity, replay, [_row(1, NEWER)], day=date(2026, 9, 16)) == ()
+    assert master_path(root).read_bytes() == after
+
+
+def test_one_boundary_dated_two_ways_is_refused_and_names_both_dates(tmp_path: Path):
+    """Nothing here moves a mapping row, so the second date cannot quietly win.
+
+    A first run that dated a boundary 09-16 and a second that re-derived it at 09-15 left the
+    ledger holding both dates and the master holding only the first, with nothing saying so
+    and ``resolve`` answering the old symbol on a day the sealed chains already carried the
+    new one.
+    """
+    root, equity = _lake(tmp_path)
+    history = SymbolHistory()
+    history.observe(DAY_ONE, [_row(1, OLD)])
+    _write(root, equity, history, [_row(1, NEW)], day=date(2026, 9, 16))
+
+    corrected = SymbolHistory()
+    corrected.observe(DAY_ONE, [_row(1, OLD)])
+    with pytest.raises(MappingRefused, match="already opens on 2026-09-16"):
+        _write(root, equity, corrected, [_row(1, NEW)], day=BOUNDARY)
+
+
+def test_a_symbol_the_market_re_issued_is_refused_rather_than_hijacked(tmp_path: Path):
+    """The whole-table lookup finds the historical holder, whose open symbol has moved on.
+
+    Remapping it would give the first contract a change that never happened, lose the second
+    contract's real change entirely, and render a line naming a row it did not close.
+    """
+    root, equity = _lake(tmp_path)
+    first = SymbolHistory()
+    first.observe(DAY_ONE, [_row(1, OLD)])
+    _write(root, equity, first, [_row(1, NEW)])
+
+    later = SymbolHistory()
+    later.observe(date(2027, 6, 1), [_row(2, OLD)])
+    with pytest.raises(MappingRefused, match="which now carries"):
+        _write(root, equity, later, [_row(2, NEWER)], day=date(2027, 6, 2))
+
+    assert _occ_rows(root) == [
+        (2, OLD, DAY_ONE, BOUNDARY),
+        (2, NEW, BOUNDARY, None),
+    ]
+
+
+def test_a_boundary_that_both_opens_and_closes_one_symbol_is_refused(tmp_path: Path):
+    """Two contracts cannot be threaded onto one symbol, and the raw failure said nothing.
+
+    Without this the pairs are applied in order and the second hits ``remap``'s own
+    ``effective`` check, whose message names a date rather than the collision.
+    """
+    root, equity = _lake(tmp_path)
+    history = SymbolHistory()
+    history.observe(DAY_ONE, [_row(1, OLD), _row(2, NEW)])
+
+    with pytest.raises(MappingRefused, match="both opens and closes"):
+        _write(root, equity, history, [_row(1, NEW), _row(2, NEWER)])
+
+    assert _occ_rows(root) == []
+
+
+def test_two_contracts_re_symboled_onto_one_symbol_are_refused(tmp_path: Path):
+    """No instrument can carry a symbol another instrument opens on the same day."""
+    root, equity = _lake(tmp_path)
+    history = SymbolHistory()
+    history.observe(DAY_ONE, [_row(1, OLD), _row(2, OTHER)])
+
+    with pytest.raises(MappingRefused, match="onto one symbol"):
+        _write(root, equity, history, [_row(1, NEW), _row(2, NEW)])
+
+
+def test_a_manifest_entry_that_cannot_be_recorded_says_the_rows_were_written(
+    tmp_path: Path, monkeypatch
+):
+    """This failure is the opposite of every other one here and wants the opposite of a retry.
+
+    The master on disk is correct and the lake's record of it is stale, so the scrub reports a
+    sha mismatch. A finding saying the mapping failed would send an operator after the wrong
+    thing. marketlake #371 owns the repair, which a later run cannot do because the pairs are
+    already written and the idempotence check skips them.
+    """
+    import lake.manifest
+
+    def refuse(*args, **kwargs):
+        raise OSError("manifest is read-only")
+
+    monkeypatch.setattr(lake.manifest, "record_partition", refuse)
+    root, equity = _lake(tmp_path)
+    history = SymbolHistory()
+    history.observe(DAY_ONE, [_row(1, OLD)])
+
+    with pytest.raises(ManifestNotRecorded, match="were written and the manifest entry was not"):
+        _write(root, equity, history, [_row(1, NEW)])
+
+    assert scrub(root).sha_mismatches == (MASTER_PARTITION,)
+    assert _occ_rows(root) != [], "the rows are on disk, which is what the finding has to say"
+
+
+def test_the_master_is_read_inside_the_lock_it_writes_under(tmp_path: Path, monkeypatch):
+    """The walk's own snapshot is as old as the walk.
+
+    An onboarding that registers an instrument while the walk runs is discarded by a write of
+    that stale snapshot, with no error anywhere, because the master is rewritten whole. The
+    seam registers a new instrument the moment the lock is taken.
+    """
+    from lake.lock import lake_lock as real_lock
+
+    root, equity = _lake(tmp_path)
+    added = []
+
+    @contextmanager
+    def racing_lock(lake_root):
+        with real_lock(lake_root) as held:
+            if not added:
+                late = SecurityMaster.read(master_path(root))
+                added.append(
+                    late.register(
+                        kind=KIND_EQUITY, capture_start=EPOCH, valid_from=DAY_ONE, ticker="QQQ"
+                    )
+                )
+                late.write(master_path(root))
+            yield held
+
+    # ``write_mappings`` imports the lock inside the function, so patching the module
+    # attribute is what the call resolves against.
+    monkeypatch.setattr("lake.lock.lake_lock", racing_lock)
+    history = SymbolHistory()
+    history.observe(DAY_ONE, [_row(1, OLD)])
+
+    _write(root, equity, history, [_row(1, NEW)])
+
+    master = SecurityMaster.read(master_path(root))
+    assert master.resolve("QQQ", BOUNDARY, id_type="ticker") == added[0], (
+        "the ticker onboarded during the walk was discarded by a stale snapshot"
+    )
 
 
 # -- the two collisions ------------------------------------------------------------------
@@ -356,20 +553,27 @@ def test_a_refused_boundary_leaves_the_master_exactly_as_it_was(tmp_path: Path):
 
 
 def test_nothing_this_writes_can_make_a_symbol_ambiguous(tmp_path: Path):
-    """Both guards together, over a symbol the market re-issued after its first holder left."""
+    """Every guard together, over the sequences that would each corrupt the table.
+
+    ``resolve`` raising here is the failure, so this asks it for every symbol on every date
+    rather than asserting a shape. A refused boundary is the point: the master stays a table
+    where one symbol names one contract.
+    """
     root, equity = _lake(tmp_path)
     history = SymbolHistory()
     history.observe(DAY_ONE, [_row(1, OLD)])
     _write(root, equity, history, [_row(1, NEW)])
-    # The same OCC symbol lists again on a new contract and is itself re-symboled later.
     history.observe(BOUNDARY, [_row(1, NEW)])
-    history.observe(date(2026, 9, 16), [_row(2, OLD)])
 
-    _write(root, equity, history, [_row(2, NEWER)], day=date(2026, 9, 17))
+    # The same OCC symbol lists again on a different contract and is re-symboled later.
+    reissued = SymbolHistory()
+    reissued.observe(date(2026, 9, 16), [_row(2, OLD)])
+    with pytest.raises(MappingRefused):
+        _write(root, equity, reissued, [_row(2, NEWER)], day=date(2026, 9, 17))
 
     master = SecurityMaster.read(master_path(root))
-    for symbol in (OLD, NEW, NEWER):
-        for day in (DAY_TWO, BOUNDARY, date(2026, 9, 18)):
+    for symbol in (OLD, NEW, NEWER, OTHER):
+        for day in (DAY_ONE, DAY_TWO, BOUNDARY, date(2026, 9, 18)):
             master.resolve(symbol, day, id_type=ID_TYPE_OCC)
 
 

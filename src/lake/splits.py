@@ -203,7 +203,7 @@ from lake.loader import (
 from lake.manifest import RowCountRegression
 from lake.occ_mapping import (
     CHECK_OCC_MAPPING,
-    MappingRefused,
+    MappingError,
     Remapped,
     SymbolHistory,
     write_mappings,
@@ -363,9 +363,15 @@ class Outcome:
 
     A session can produce a landed entry and a non-adjustment at once, because a chain can
     gain a returning root beside a genuinely new one, so this carries both rather than being
-    one of several sentinels. ``mapped`` rides beside them for the same reason: the master
-    write fires on four of the five outcomes a confirmed boundary can reach, so it is not any
-    one of them.
+    one of several sentinels. ``mapped`` rides beside them for the same reason, and it is not
+    a fifth sentinel either: the master write fires as soon as the boundary is confirmed, so
+    *every* outcome past that point carries it. That is seven of this function's fifteen
+    exits, and the seventh is worth naming because it is the least obvious. A boundary the
+    ledger refuses because two tickers resolved to one instrument still re-symboled its
+    contracts, and the mapping rows it writes name those contracts by their own symbols under
+    their own fresh instrument ids, so a fault in which instrument a *ticker* names does not
+    make them wrong. Holding them would lose a real identity change over a defect in a
+    different row of the same table.
     """
 
     landed: Landed | None = None
@@ -1218,7 +1224,7 @@ def _examine(
         # ``main`` turns each into its own line naming the fix.
         raise
     except (
-        MappingRefused,
+        MappingError,
         SecurityMasterError,
         RowCountRegression,
         ValueError,
