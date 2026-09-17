@@ -285,7 +285,12 @@ def test_signing_off_one_check_leaves_a_sibling_standing(tmp_path: Path):
 
 
 def test_a_run_for_each_check_clears_the_partition(tmp_path: Path):
-    """One check per run, longest-standing first, until nothing holds it."""
+    """One check per run, in the ledger's own order, until nothing holds it.
+
+    `manifest.withholding` defines that order as where each check's current entry sits in the
+    file, which is not the same as longest-standing first once a check re-states a verdict. No
+    shipped writer does, so here the two coincide.
+    """
     _quarantine(tmp_path, check="realtime_entitlement")
     _quarantine(tmp_path, check="quote_sanity")
 

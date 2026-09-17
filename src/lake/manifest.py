@@ -238,8 +238,9 @@ def latest_quarantine_by_check(lake_root: Path) -> dict[str, dict[str, dict]]:
     Each partition's inner mapping is ordered by where that check's *current* entry sits in the
     file, which is why an existing check is removed before it is re-inserted. A plain
     reassignment keeps the position a key was first seen at, and the two disagree as soon as a
-    check has written twice. The order is what :func:`withholding` hands back, so the
-    longest-standing unresolved verdict comes first.
+    check has written twice. The order is what :func:`withholding` hands back, and that
+    function's own docstring is where what the order does and does not mean is stated: it is
+    where each check's current entry sits, which is not the same as longest-standing first.
 
     An entry whose ``check`` cannot be a dict key raises ``ManifestError`` naming this ledger
     and the entry's position, for the reason ``_latest_by_partition`` gives about a missing

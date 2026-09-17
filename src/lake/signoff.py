@@ -36,9 +36,21 @@ inverts."
 **This tool addresses the deciding entry and nothing beside it.** Marketlake #426 moved the
 ledger to last entry wins per ``(partition, check)``, so several checks can withhold one
 partition at once, and ``manifest.latest_quarantine`` hands back the one that decides
-readability, which is the longest-standing unresolved one. This signs that one off. A partition
-two checks withhold therefore takes one run per check, oldest first, and the report names what
-still holds it after each.
+readability. This signs that one off, so a partition two checks withhold takes one run per
+check, and the report names what still holds it after each.
+
+Which check a run picks is the ledger's order rather than a choice made here, and
+``manifest.withholding`` is where that order is defined: where each check's current entry sits
+in the file. It is deliberately not longest-standing first, because a check that re-states its
+verdict moves to the back. No shipped writer re-states one, since ``battery._transition``
+appends only on a flip and this tool refuses a repeat in the same direction, so today the order
+is the order the checks first withheld. A hand-edited ledger is what separates the two.
+
+**The listing names the deciding check and not every holder.** ``open_quarantines`` reads
+``latest_quarantine``, so a partition two checks withhold prints one line naming one of them.
+``dashboard._open_quarantines`` carries all of them, which marketlake #426 built, and marketlake
+#456 carries the same for this listing. Signing off is not misled by it, because the report
+after the write names what still holds the partition.
 
 ``--check`` confirms the check about to be written and cannot select a different one, because
 the entry this reads is the deciding entry rather than a chosen one. A selector was tried
