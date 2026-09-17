@@ -27,6 +27,10 @@ one chain body, which is what a test needs once the code under test fetches by a
 rather than by the bare symbol. ``bars_interactions`` is the price-history counterpart: a
 live recording captures one window, and it builds whatever set of windows a test wants
 from candles the test names.
+
+``RecordingVendor`` wraps ``CassetteVendor`` and keeps every price-history call it was
+asked for. That is what lets a test assert a ticker-day reached no vendor at all, which
+is the whole value of a skip, and what a run stopped part-way is asserted against.
 """
 
 from __future__ import annotations
@@ -412,3 +416,79 @@ class CassetteVendor:
         if self._cassette.token_mint_time is None:
             raise VendorError("cassette has no token_mint_time")
         return datetime.fromisoformat(self._cassette.token_mint_time)
+
+
+class RecordingVendor:
+    """A ``Vendor`` that replays a cassette and keeps every price-history call it was asked for.
+
+    Two things a bare replay cannot assert need this. A skipped ticker-day has to reach no vendor
+    at all, and "no recorded call" is the only way to say so, since a replay that was never asked
+    raises nothing. And a run that stops part-way has to be shown to have stopped, which is a
+    statement about the calls after the failure rather than about the ones before it.
+
+    The cassette key already carries the window, so a fetch asking for the wrong one raises
+    ``CassetteError`` rather than replaying a neighbour's recording. Keeping the calls turns that
+    precondition into an assertion a test can read: which window, in which order.
+
+    ``fail_with`` raises for a named ticker instead of replaying, which is how an auth death and a
+    vendor refusal are driven. The call is recorded first, so a test can tell a ticker that failed
+    apart from one that was never reached.
+
+    ``tests/component/test_bar_fetch.py`` carries a private twin of this, which predates it and is
+    left alone while marketlake #383 is open against that file.
+    """
+
+    def __init__(self, cassette: Cassette, *, fail_with: Mapping[str, BaseException] | None = None):
+        self._replay = CassetteVendor(cassette)
+        self._fail_with = dict(fail_with or {})
+        self.calls: list[dict] = []
+
+    def _record(self, symbol: str, freq: str, start: datetime, end: datetime) -> None:
+        self.calls.append(bars_params(symbol, freq, start=start, end=end))
+        if symbol in self._fail_with:
+            raise self._fail_with[symbol]
+
+    def get_minute_bars(
+        self,
+        symbol: str,
+        *,
+        start: datetime,
+        end: datetime,
+        extended_hours: bool | None = None,
+        previous_close: bool | None = None,
+    ) -> VendorResponse:
+        self._record(symbol, MINUTE_FREQ, start, end)
+        return self._replay.get_minute_bars(
+            symbol,
+            start=start,
+            end=end,
+            extended_hours=extended_hours,
+            previous_close=previous_close,
+        )
+
+    def get_daily_bars(
+        self,
+        symbol: str,
+        *,
+        start: datetime,
+        end: datetime,
+        extended_hours: bool | None = None,
+        previous_close: bool | None = None,
+    ) -> VendorResponse:
+        self._record(symbol, DAILY_FREQ, start, end)
+        return self._replay.get_daily_bars(
+            symbol,
+            start=start,
+            end=end,
+            extended_hours=extended_hours,
+            previous_close=previous_close,
+        )
+
+    def get_chain(self, *args, **kwargs):  # pragma: no cover - a bar walk never fetches a chain
+        raise AssertionError("a bar walk fetched a chain")
+
+    def get_quotes(self, *args, **kwargs):  # pragma: no cover - nor a quote
+        raise AssertionError("a bar walk fetched a quote")
+
+    def token_mint_time(self):  # pragma: no cover - nor the token
+        raise AssertionError("a bar walk read the token mint time")

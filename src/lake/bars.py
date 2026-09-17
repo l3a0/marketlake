@@ -25,19 +25,26 @@ What one run does, per ticker and per configured frequency, for one session.
 4. Run the two gate checks over the rows that survived, the span check first.
 5. Write the partition and append its manifest entry, both inside one lock hold.
 
-**Which ticker-days a run covers is deliberately narrow.** This job fetches one session, named
-by ``--date`` or taken from the clock. marketlake #319 owns whether a run walks a span of
-sessions and what the one-minute lookback floor is, and it takes the fetch-shape question with
-it. Nothing here decides that.
+**Two entry points, and which ticker-days each covers.** :func:`fetch_session_bars` fetches one
+session, taken from the clock or named by its own ``session`` argument. That is the evening run.
+:func:`backfill_bars` walks every session the capture spans cover, which is marketlake #319
+recovering an outage the lake has already had. Both build a list of :class:`TickerDay` and hand
+it to the same walk, so the gate, the manifested skip and the held findings mean the same thing
+under either.
 
-**The scope within the session is the enabled roster.** Each entry's ``bars`` tuple says which
-frequencies that ticker takes, read off the ticker's own settings rather than inferred from
-anything else, and an entry with an empty tuple is passed over. ``Roster.get``'s refusal for a
-ticker outside the roster is unreachable here, because the walk is derived from the roster
-rather than looking tickers up in it. A retired ticker is outside this run: ``retire`` flips
-``enabled`` and preserves ``bars``, so its frequencies survive for the backfill #319 owns,
-while tonight's session holds no quotes to gate its bar against and every run would file the
-same finding for it forever.
+**What differs is where the scope comes from, and the two readings are not interchangeable.**
+The per-session run takes the enabled roster. Each entry's ``bars`` tuple says which frequencies
+that ticker takes, read off the ticker's own settings rather than inferred from anything else,
+and an entry with an empty tuple is passed over. A retired ticker is outside it: ``retire`` flips
+``enabled`` and preserves ``bars``, and tonight's session holds no quotes to gate its bar
+against, so every run would file the same finding for it forever.
+
+The backfill reads the capture spans instead, which is what ``Roster.enabled``'s own docstring
+asks for: "Scope readers do not use this; they read the capture-spans file instead." A retired
+ticker's closed span is a stretch the lake captured, so its bars are worth what an open span's
+are, and its frequencies are reached through ``Roster.get`` rather than past ``Roster.enabled``.
+That is also why the backfill runs its own frequency check rather than :func:`_require_supported`,
+which that function's docstring explains at its own site.
 
 **The windows, and why the ``1m`` one is narrow.** ``freq=1m`` is fetched from the session
 open to the equity close, which is 390 minutes on a regular day. ``freq=1d`` is fetched over a
@@ -99,6 +106,7 @@ from lake.actions import (
     resolve_instrument,
 )
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
+from lake.capture_spans import CaptureSpan, CaptureSpans, SpansUnreadable, spans_path
 from lake.clock import Clock, SystemClock
 from lake.journal import UNFIT_ERRORS, bars_data_batch, bars_rows
 from lake.loader import LoadError, load_quotes
@@ -108,8 +116,8 @@ from lake.paths import LakePaths, temp_write_path
 from lake.report import Withheld, write_withheld
 from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor, VendorAuthError
 from lake.security_master import MasterUnreadable, SecurityMaster, master_path
-from lake.session import SessionClock
-from lake.tickers import Roster, load_tickers
+from lake.session import SessionBounds, SessionClock
+from lake.tickers import Roster, TickersError, load_tickers
 from lake.vendor import (
     BAR_FREQS,
     DAILY_FREQ,
@@ -239,6 +247,41 @@ class UnsupportedBarFreq(BarsError):
         super().__init__(f"{ticker}: bar frequency {freq!r} is not one of {list(BAR_FREQS)}")
         self.ticker = ticker
         self.freq = freq
+
+
+class SpansAbsent(BarsError):
+    """The lake holds no capture-spans file, so the backfill has no range to walk.
+
+    It is a ``BarsError`` rather than the bare ``OSError`` ``CaptureSpans.read`` raises, for the
+    reason ``MasterAbsent`` is one class over: a reader that has to tell an absent reference file
+    apart from a corrupt one wants two names, and ``main`` turns each into one line naming a
+    different fix. ``MasterAbsent`` lives in ``actions`` rather than in ``security_master`` for
+    the same reason this lives here rather than in ``capture_spans``: the module that reads the
+    file is the one that has to say what an absent one means to its own run.
+
+    A lake with a master and no spans file is a real state rather than a corrupt one. It is what
+    a master from before capture spans existed looks like, and ``python -m lake.seed_spans``
+    is the command that converts it, which is what the refusal names.
+    """
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(f"no capture spans at {path}")
+        self.path = path
+
+
+@dataclass(frozen=True)
+class TickerDay:
+    """One ticker, one frequency, one session: the unit both entry points walk.
+
+    It is a value rather than a tuple because the backfill sorts, dedupes and reports over these,
+    and a three-tuple of two strings and a date reads the same at every call site whichever order
+    it is in. ``_ticker_freqs`` still yields pairs, because within one session the session is not
+    the pair's to carry.
+    """
+
+    ticker: str
+    freq: str
+    session: date
 
 
 @dataclass(frozen=True)
@@ -499,6 +542,19 @@ class LandedPartition:
     rows: int
 
 
+def _unfiled(held: Sequence[HeldFinding]) -> tuple[HeldFinding, ...]:
+    """Every held finding whose record could not be written down.
+
+    A finding held and filed is a live condition a human can read. A finding held and not filed
+    reads exactly like a run that found nothing, which is the silence the producer exists to
+    break, so it is what the command turns into a non-zero exit code.
+
+    Both reports read it through this rather than each spelling it, because the two exit codes
+    are one contract and a second spelling is how the two drift.
+    """
+    return tuple(held for held in held if held.filed_at is None)
+
+
 @dataclass(frozen=True)
 class BarsReport:
     """What one run of the sweep did, for the sign-off block.
@@ -517,13 +573,8 @@ class BarsReport:
 
     @property
     def unfiled(self) -> tuple[HeldFinding, ...]:
-        """Every held finding whose record could not be written down.
-
-        A finding held and filed is a live condition a human can read. A finding held and not
-        filed reads exactly like a run that found nothing, which is the silence the producer
-        exists to break, so it is what the command turns into a non-zero exit code.
-        """
-        return tuple(held for held in self.held if held.filed_at is None)
+        """Every held finding whose record could not be written down."""
+        return _unfiled(self.held)
 
     def render(self) -> str:
         """A human-readable sign-off block."""
@@ -812,18 +863,68 @@ def fetch_session_bars(
     finding.
     """
     root = Path(lake_root)
-    paths = LakePaths(root)
     master = _read_master(root)
     _require_supported(roster)
     recorded_at = clock.now()
     session = session or recorded_at.astimezone(MARKET_TZ).date()
     if not calendar.is_session(session):
         raise NotASession(session)
-    bounds = SessionClock(clock, calendar).bounds(session)
-    following = _calendar_next_session(calendar, session)
+    walk = _walk(
+        root=root,
+        vendor=vendor,
+        clock=clock,
+        calendar=calendar,
+        master=master,
+        days=tuple(TickerDay(ticker, freq, session) for ticker, freq in _ticker_freqs(roster)),
+        recorded_at=recorded_at,
+    )
+    return BarsReport(
+        session=session,
+        attempted=walk.attempted,
+        landed=walk.landed,
+        held=walk.held,
+        skipped=walk.skipped,
+    )
+
+
+@dataclass(frozen=True)
+class _WalkResult:
+    """What one walk over a list of ticker-days did, before a report gives it a shape."""
+
+    attempted: int
+    skipped: int
+    landed: tuple[LandedPartition, ...]
+    held: tuple[HeldFinding, ...]
+
+
+def _walk(
+    *,
+    root: Path,
+    vendor: Vendor,
+    clock: Clock,
+    calendar: Calendar,
+    master: SecurityMaster,
+    days: Sequence[TickerDay],
+    recorded_at: datetime,
+) -> _WalkResult:
+    """Skip, fetch, gate and land every ticker-day in ``days``, in the order given.
+
+    Both entry points reach the vendor through here, so the manifested skip, the gate's blast
+    radius and the two failures that are not contained are decided once. The difference between
+    a nightly run and a backfill is entirely in which ticker-days each hands over.
+
+    **The session's own instants are computed once per session and only when something is
+    attempted.** A backfill walks many sessions, and each needs its bounds and its calendar-next
+    session, which are pure functions of the day. A run that skips every ticker-day asks the
+    calendar nothing at all.
+    """
+    paths = LakePaths(root)
+    session_clock = SessionClock(clock, calendar)
     # Read once for the run, so every ticker-day is asked against one snapshot of what the
     # lake already holds, the way the close guard reads the manifest once per run.
     manifested = latest_entries(root)
+    bounds_of: dict[date, SessionBounds] = {}
+    following_of: dict[date, date | None] = {}
 
     attempted = 0
     skipped = 0
@@ -836,7 +937,10 @@ def fetch_session_bars(
         # injected clock and one pid, so without it two findings on one subject would race for
         # one name. This walk can produce that race, unlike the sibling's: a ticker-day files
         # at most one finding per frequency, and the resolution finding rides beside a gate
-        # finding on the same subject.
+        # finding on the same subject. The counter runs across the whole walk rather than per
+        # session, which a backfill needs: findings for two sessions land in two directories,
+        # so a per-session counter would be correct too, and one counter is one fewer thing to
+        # be right about.
         try:
             filed_at = write_withheld(root, finding, now=recorded_at, sequence=len(held))
         except OSError as exc:
@@ -855,14 +959,18 @@ def fetch_session_bars(
             return
         held.append(HeldFinding(finding=finding, filed_at=filed_at))
 
-    for ticker, freq in _ticker_freqs(roster):
+    for day in days:
+        ticker, freq, session = day.ticker, day.freq, day.session
         partition = paths.bars_partition_path(ticker, freq, session)
         key = partition.relative_to(root).as_posix()
         if key in manifested:
             skipped += 1
             continue
         attempted += 1
-        window = bar_window(freq, bounds)
+        if session not in bounds_of:
+            bounds_of[session] = session_clock.bounds(session)
+            following_of[session] = _calendar_next_session(calendar, session)
+        window = bar_window(freq, bounds_of[session])
         try:
             _land(
                 root=root,
@@ -871,7 +979,7 @@ def fetch_session_bars(
                 master=master,
                 ticker=ticker,
                 window=window,
-                following=following,
+                following=following_of[session],
                 partition=partition,
                 key=key,
                 hold=hold,
@@ -902,13 +1010,7 @@ def fetch_session_bars(
             token = CHECK_BAR_RESPONSE if isinstance(exc, VendorError) else CHECK_BAR_CLOSE
             hold(_finding(ticker, window, token, exception=f"{type(exc).__name__}: {exc}"))
 
-    return BarsReport(
-        session=session,
-        attempted=attempted,
-        landed=tuple(landed),
-        held=tuple(held),
-        skipped=skipped,
-    )
+    return _WalkResult(attempted=attempted, skipped=skipped, landed=tuple(landed), held=tuple(held))
 
 
 def _land(
@@ -1106,6 +1208,321 @@ def _bar_close(rows: Sequence[dict]) -> float | None:
         return None
 
 
+# -- the backfill: every session the capture spans cover ----------------------
+
+
+def _read_spans(lake_root: Path) -> CaptureSpans:
+    """The capture spans, or the reason the backfill stops. Mirrors :func:`_read_master`.
+
+    An absent file and a torn one are told apart, because the fixes differ: one wants
+    ``python -m lake.seed_spans`` and the other wants a restore. ``CaptureSpans.read`` already
+    separates them, raising ``OSError`` for the first and ``SpansUnreadable`` for the second,
+    and this only gives the first a name of its own.
+    """
+    path = spans_path(lake_root)
+    try:
+        return CaptureSpans.read(path)
+    except OSError as exc:
+        raise SpansAbsent(path) from exc
+
+
+def _span_sessions(
+    span: CaptureSpan, session_clock: SessionClock, calendar: Calendar, now: datetime
+) -> Iterator[date]:
+    """Every session in range for one span, in date order.
+
+    A day is in range when three things hold at once, and the three are the floor, the scope and
+    the ceiling in one predicate rather than three rules to keep in step.
+
+    1. **The calendar says it is a session.** A span is continuous time, so which days inside it
+       traded is ``Calendar.is_session``'s answer and never a weekday arithmetic of this
+       module's.
+    2. **The session's own window intersects the span.** The window is ``[open, equity_close]``,
+       which is the window a ``1m`` fetch asks for, and the span is half-open ``[start, end)``.
+       So a span opening at 13:07 Eastern puts that whole session in range and the session
+       before it out of range.
+
+       That is the floor decision, and the alternative was the first *whole* session after the
+       span start. It loses a session the outage covered, and the live lake's span opens
+       mid-session on 2026-09-08, which is one of the four sessions the recovery exists for. The
+       window is not clipped to the span, because a ``1m`` partition trimmed to 13:07 would land
+       short under a manifested entry that the skip never re-fetches, and nothing would mark it
+       short. A bar is the vendor's record of the session rather than the lake's record of its
+       own coverage, and no column on a bars row claims capture was running.
+    3. **The equity close has passed.** That is the ceiling, and it makes a partial session
+       unreachable rather than asking an operator not to run mid-session. ``equity_close`` is
+       where the ``1m`` window ends, so a session past it is complete, and an early close moves
+       the bound without anything here naming a wall-clock time. A run before the close leaves
+       that session to the next run.
+
+    The same predicate answers both ends, so a closed span's final session is decided by the
+    rule that decided an open span's first one.
+    """
+    market_today = now.astimezone(MARKET_TZ).date()
+    first = span.start.astimezone(MARKET_TZ).date()
+    last = market_today
+    if span.end is not None:
+        last = min(span.end.astimezone(MARKET_TZ).date(), market_today)
+    day = first
+    while day <= last:
+        if calendar.is_session(day):
+            bounds = session_clock.bounds(day)
+            covered = bounds.equity_close > span.start and (
+                span.end is None or bounds.open < span.end
+            )
+            if covered and bounds.equity_close <= now:
+                yield day
+        day += timedelta(days=1)
+
+
+@dataclass(frozen=True)
+class BackfillPlan:
+    """Every ticker-day a backfill run would fetch, and what it could not name.
+
+    ``days`` is sorted by session, then ticker, then frequency, so a run reads chronologically
+    and two runs over one lake produce the same order. It is built as a set first, for the
+    reason :func:`_ticker_freqs` gives about a roster naming one frequency twice: one partition
+    fetched twice spends two vendor requests and appends two manifest entries for one path. A
+    span walk reaches that hazard two further ways. An instrument retired mid-session and brought
+    back the same afternoon has two spans that both cover that session, which ``open_span``
+    permits because it refuses only a second *open* span. And two instruments whose mappings name
+    one ticker on one day reach it from the other side.
+
+    ``sessions`` is every session the range covered, including one whose tickers all landed in
+    ``unwalked``, because that is what the range means.
+
+    ``unwalked`` is one line per ticker-day the scope could not name, and the run reports them
+    rather than raising. A span whose instrument the master cannot place on a day has no symbol
+    to ask the vendor for, and a ticker with no roster entry has nothing saying which frequencies
+    it took. Neither is the other tickers' bars to lose, which rules out raising, and a ticker
+    dropping out of a backfill unremarked is the quiet direction, which rules out silence.
+    """
+
+    days: tuple[TickerDay, ...]
+    sessions: tuple[date, ...]
+    unwalked: tuple[str, ...]
+
+    @property
+    def floor(self) -> date | None:
+        """The first session in range, or ``None`` when the range is empty."""
+        return self.sessions[0] if self.sessions else None
+
+    @property
+    def ceiling(self) -> date | None:
+        """The last session in range, or ``None`` when the range is empty."""
+        return self.sessions[-1] if self.sessions else None
+
+
+def plan_backfill(
+    *,
+    spans: CaptureSpans,
+    master: SecurityMaster,
+    roster: Roster,
+    clock: Clock,
+    calendar: Calendar,
+) -> BackfillPlan:
+    """Which ticker-days a backfill run covers, decided before any request goes out.
+
+    It is a pure function of the four references and the clock, which is what lets the range
+    rules be tested without a lake, a vendor or a partition on disk.
+
+    **The ticker comes from the master, per session, and the direction matters.**
+    ``resolve_instrument`` goes ticker to id, which is what ``_land`` does once a ticker-day
+    exists. A span carries an ``instrument_id`` and no ticker, so this goes the other way,
+    through ``SecurityMaster.symbol_at``. Asking per session rather than once per span is what
+    makes a re-symboling inside a span resolve each session to the ticker current on it. A
+    ``None`` is the master's own floor arriving from the other side, since a session inside a
+    span but before the mapping's ``valid_from`` has no symbol to fetch under.
+
+    **The frequencies come from ``Roster.get``, past ``Roster.enabled``.** ``retire`` flips
+    ``enabled`` and preserves ``bars``, so a retired ticker's frequencies survive exactly for
+    this walk. An entry with an empty ``bars`` tuple contributes nothing and is not an error.
+    """
+    session_clock = SessionClock(clock, calendar)
+    now = clock.now()
+    planned: set[TickerDay] = set()
+    sessions: set[date] = set()
+    unwalked: dict[str, None] = {}
+    for span in spans:
+        for day in _span_sessions(span, session_clock, calendar, now):
+            sessions.add(day)
+            ticker = master.symbol_at(span.instrument_id, day)
+            if ticker is None:
+                unwalked[
+                    f"instrument {span.instrument_id} on {day.isoformat()}: "
+                    "the master names no ticker for it on that day"
+                ] = None
+                continue
+            try:
+                entry = roster.get(ticker)
+            except TickersError as exc:
+                unwalked[f"{ticker} on {day.isoformat()}: {exc}"] = None
+                continue
+            for freq in entry.bars:
+                planned.add(TickerDay(ticker=ticker, freq=freq, session=day))
+    return BackfillPlan(
+        days=tuple(sorted(planned, key=lambda day: (day.session, day.ticker, day.freq))),
+        sessions=tuple(sorted(sessions)),
+        unwalked=tuple(unwalked),
+    )
+
+
+def _require_supported_plan(plan: BackfillPlan) -> None:
+    """Refuse a frequency this lake has no vendor call for, over the plan's own ticker-days.
+
+    :func:`_require_supported` cannot answer for this walk, and its docstring says why in its own
+    terms: it checks ``roster.enabled`` because "a stale ``bars:`` line on a retired ticker, which
+    nothing here would ever fetch, would halt the nightly run at exit 2 every night until someone
+    edited a file for a ticker that is not being captured." This walk fetches retired tickers on
+    purpose, so that sentence stops holding and reusing the function would let the frequency
+    through.
+
+    What it would cost is not a held finding. ``bar_window`` calls ``require_bar_freq``, which
+    raises a bare ``ValueError``, and that is raised outside the walk's catch by design, because a
+    ``ValueError`` there is this job handing the seam a bad argument. So the run would end on a
+    traceback with no report at all.
+
+    Checking the plan rather than the roster also keeps :class:`UnsupportedBarFreq`'s own bargain:
+    the check is exactly as wide as what this run would fetch, and it runs before any request has
+    gone out or any partition has been written.
+    """
+    for day in plan.days:
+        if day.freq not in BAR_FREQS:
+            raise UnsupportedBarFreq(day.ticker, day.freq)
+
+
+@dataclass(frozen=True)
+class BackfillReport:
+    """What one backfill run did, for the sign-off block.
+
+    It carries the range as well as the counts, because a run that landed nothing has three
+    different causes an operator has to tell apart: an empty range, a range whose every
+    ticker-day was already manifested, and a range whose every ticker-day was held. ``sessions``
+    with ``skipped`` and ``held`` says which.
+    """
+
+    floor: date | None
+    ceiling: date | None
+    sessions: int
+    attempted: int
+    landed: tuple[LandedPartition, ...]
+    held: tuple[HeldFinding, ...]
+    skipped: int
+    unwalked: tuple[str, ...]
+
+    @property
+    def unfiled(self) -> tuple[HeldFinding, ...]:
+        """Every held finding whose record could not be written down."""
+        return _unfiled(self.held)
+
+    def render(self) -> str:
+        """A human-readable sign-off block."""
+        span = (
+            "no sessions in range"
+            if self.floor is None
+            else f"{self.floor.isoformat()}..{self.ceiling.isoformat()}, {self.sessions} session(s)"
+        )
+        lines = [
+            f"Bar backfill over {span}, {self.attempted} ticker-day(s) attempted",
+            f"  landed:  {len(self.landed)}",
+        ]
+        for entry in self.landed:
+            lines.append(
+                f"    - {entry.ticker} {entry.freq} {entry.session.isoformat()} "
+                f"{entry.rows} row(s) at {entry.partition}"
+            )
+        lines.append(f"  held:    {len(self.held)}")
+        for held in self.held:
+            finding = held.finding
+            detail = (
+                f"{finding.symbol} {finding.event} "
+                f"{finding.observed_on.isoformat()} {finding.check}"
+            )
+            if finding.computed is not None or finding.against is not None:
+                detail += f": {finding.computed} against {finding.against}"
+            elif finding.exception:
+                detail += f": {finding.exception}"
+            lines.append(f"    - {detail}")
+            if held.filed_at is None:
+                lines.append(f"      NOT filed: {held.filing_error}")
+            else:
+                lines.append(f"      filed at {held.filed_at}")
+        lines.append(f"  skipped: {self.skipped}")
+        lines.append(f"  unwalked: {len(self.unwalked)}")
+        for line in self.unwalked:
+            lines.append(f"    - {line}")
+        return "\n".join(lines)
+
+
+def backfill_bars(
+    *,
+    lake_root: Path | str,
+    vendor: Vendor,
+    clock: Clock,
+    calendar: Calendar,
+    roster: Roster,
+    spans: CaptureSpans,
+) -> BackfillReport:
+    """Fetch, gate and land every ticker-day the capture spans cover and the clock allows.
+
+    This is marketlake #319. Every dependency is injected, the way :func:`fetch_session_bars` is
+    built, and :func:`backfill_bars_from_config` is the wiring.
+
+    **One request per ticker-day, per frequency.** Schwab's call takes a window, so one request
+    could ask for a whole span. That shape is refused, and the gate rather than the request count
+    refuses it: ``bar_window``, ``check_bar_span``, ``select_session_rows`` and the close
+    cross-check are each defined over one session, and rewriting all four is not what this adds.
+    It also sidesteps marketlake #333 entirely, where ``schwab-py`` sends
+    ``period=1, periodType=day`` alongside explicit bounds against its own documented rule: a
+    request for one session is what that pair would return anyway. And it makes the manifested
+    skip avoid the vendor call as well as the write, so a second run over the same lake costs
+    zero requests.
+
+    The cost was measured rather than assumed. Against the real calendar the live lake's floor to
+    2026-09-16 holds seven sessions and its floor to the 1-min lookback deadline holds twenty-two,
+    so a first run is 28 requests and a run at the deadline is 88. The design's ceiling is 120 a
+    minute per app, of which the capture loop spends 3 at this roster.
+
+    **What the gate refuses here repeats, and the repeat is the record.** The sessions this
+    recovers are exactly the ones whose quotes hold gap rows and no data row, so the close
+    cross-check has no comparison for them and ``load_quotes`` raises ``NoSpotClose``. That is
+    contained per ticker-day by the walk and files under ``CHECK_BAR_CLOSE``, which is
+    :func:`fetch_session_bars`'s rule rather than a new one, and it means the daily half of those
+    sessions is held until someone repairs the gap rows. The minute half runs no close
+    cross-check at all, and the minute half is the one the roughly 30-day lookback puts a deadline
+    on.
+
+    A session older than that lookback is still asked for on every run, and comes back empty or
+    short and held. That is deliberate. The pile of findings is the record that those minutes are
+    gone, and a horizon that stopped asking would make the loss silent on a figure nobody has
+    measured exactly.
+    """
+    root = Path(lake_root)
+    master = _read_master(root)
+    recorded_at = clock.now()
+    plan = plan_backfill(spans=spans, master=master, roster=roster, clock=clock, calendar=calendar)
+    _require_supported_plan(plan)
+    walk = _walk(
+        root=root,
+        vendor=vendor,
+        clock=clock,
+        calendar=calendar,
+        master=master,
+        days=plan.days,
+        recorded_at=recorded_at,
+    )
+    return BackfillReport(
+        floor=plan.floor,
+        ceiling=plan.ceiling,
+        sessions=len(plan.sessions),
+        attempted=walk.attempted,
+        landed=walk.landed,
+        held=walk.held,
+        skipped=walk.skipped,
+        unwalked=plan.unwalked,
+    )
+
+
 # -- the entry point ---------------------------------------------------------
 
 
@@ -1148,6 +1565,39 @@ def fetch_session_bars_from_config(
     )
 
 
+def backfill_bars_from_config(
+    *,
+    clock: Clock | None = None,
+    config_path: str | Path | None = None,
+    tickers_path: str | Path | None = None,
+    vendor_factory: VendorFactory | None = None,
+    token_path: str | Path = DEFAULT_TOKEN_PATH,
+) -> BackfillReport:
+    """The backfill wired from the real config, taking the same arguments as its sibling.
+
+    The two wirings differ in one line, the capture spans this one reads from under
+    ``lake_root``, which is what makes ``--backfill`` a flag on one command rather than a second
+    command with its own copy of the vendor factory and the two secrets.
+    """
+    from lake.config import load_config
+
+    config = load_config(config_path)
+    factory = SchwabVendor.from_token if vendor_factory is None else vendor_factory
+    vendor = factory(
+        token_path,
+        api_key=config.schwab_api_key.reveal(),
+        app_secret=config.schwab_app_secret.reveal(),
+    )
+    return backfill_bars(
+        lake_root=config.lake_root,
+        vendor=vendor,
+        clock=SystemClock() if clock is None else clock,
+        calendar=ExchangeCalendar(),
+        roster=load_tickers(tickers_path),
+        spans=_read_spans(Path(config.lake_root)),
+    )
+
+
 def _build_parser():
     import argparse
 
@@ -1167,13 +1617,27 @@ def _build_parser():
     # ``--config`` alone.
     #
     # A ``--date`` flag was written and removed before merge. It reads as a convenience and is
-    # a backfill selector: nothing here consults a capture-span floor, and the security master
+    # a backfill selector: nothing consulted a capture-span floor, and the security master
     # is not the barrier it looks like, because a session the master cannot place files a
     # finding and lands the row anyway with a null ``instrument_id``. So the flag would have
     # let one typo land bars for a session the lake never captured.
-    # marketlake #319 owns the floor and the span of sessions a run covers, and the design
-    # says there is no backfill anywhere in the implementation. The session stays injectable
-    # on :func:`fetch_session_bars` for tests and for #319 to drive.
+    #
+    # ``--backfill`` is marketlake #319's answer to the same need, and it is the shape that
+    # objection asked for: it takes no date at all. The range is derived from the capture
+    # spans, the calendar and the clock, so a session the lake never captured cannot be named
+    # by anyone. The session stays injectable on :func:`fetch_session_bars` for tests.
+    #
+    # The design's "there is no backfill anywhere in the implementation" is about pre-capture
+    # history, and the floor is what keeps it true: every session this walks is one a capture
+    # span covers, so the run works forward from capture start and asks for nothing earlier.
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help=(
+            "Walk every session the capture spans cover whose close has passed, instead of "
+            "fetching the session the clock is in. It reaches nothing before capture start."
+        ),
+    )
     return parser
 
 
@@ -1205,9 +1669,10 @@ def main(
 
     from lake.config import input_errors_exit
 
+    run = backfill_bars_from_config if args.backfill else fetch_session_bars_from_config
     try:
         with input_errors_exit("bars"):
-            report = fetch_session_bars_from_config(
+            report = run(
                 clock=clock,
                 config_path=args.config,
                 tickers_path=args.tickers,
@@ -1220,6 +1685,15 @@ def main(
         )
         return 2
     except MasterUnreadable as exc:
+        print(f"bars: {exc}. Restore it from the backup.", file=sys.stderr)
+        return 2
+    except SpansAbsent as exc:
+        print(
+            f"bars: {exc}. Seed them with python -m lake.seed_spans.",
+            file=sys.stderr,
+        )
+        return 2
+    except SpansUnreadable as exc:
         print(f"bars: {exc}. Restore it from the backup.", file=sys.stderr)
         return 2
     except UnsupportedBarFreq as exc:
@@ -1246,19 +1720,26 @@ __all__ = [
     "CHECK_BAR_SPAN",
     "CLOSE_CROSS_TOLERANCE",
     "DAILY_WINDOW_MARGIN",
+    "BackfillPlan",
+    "BackfillReport",
     "BarWindow",
     "BarsError",
     "BarsReport",
     "CloseCross",
     "LandedPartition",
     "SpanCoverage",
+    "SpansAbsent",
+    "TickerDay",
     "UnsupportedBarFreq",
+    "backfill_bars",
+    "backfill_bars_from_config",
     "bar_window",
     "check_bar_span",
     "check_close_cross",
     "fetch_session_bars",
     "fetch_session_bars_from_config",
     "main",
+    "plan_backfill",
     "select_session_rows",
     "session_of",
 ]
