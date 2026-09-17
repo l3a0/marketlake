@@ -520,3 +520,139 @@ def test_17_a_stamp_that_cannot_be_read_as_an_instant_refuses_the_life(
         load_contract_life(OLD, lake_root=root)
     assert "cannot be read as an instant" in str(raised.value)
     assert f"{SEALED[1]}T10:31:00" in str(raised.value)
+
+
+# -- what the thread must not reach past --------------------------------------
+
+
+def test_18_a_second_option_instrument_in_the_master_is_not_threaded_in(
+    fixture_lake: FixtureLake,
+):
+    """#135 test 18. The thread is one contract's mappings, not the master's OCC rows.
+
+    A master holds an instrument for every contract any re-symboling has touched, so on a lake
+    with two adjusted contracts a thread that filtered on ``id_type`` alone would read one
+    contract's sessions under the other's spellings and hand them back as one life.
+    """
+    other_old = "SPY   261218P00300000"
+    other_new = "SPY1  261218P00300000"
+    master = _master()
+    second = master.register(
+        kind=KIND_OPTION,
+        capture_start=CAPTURE_START,
+        valid_from=OPENED,
+        occ_symbol=other_old,
+    )
+    master.remap(second, ID_TYPE_OCC, other_new, effective=BOUNDARY)
+
+    days = _life_rows()
+    for day in SEALED:
+        wore = other_old if date.fromisoformat(day) < BOUNDARY else other_new
+        days[day] = [*days[day], _data(day, "10:33", wore)]
+    root = _lake(fixture_lake, master=master, days=days)
+
+    assert _symbols(load_contract_life(OLD, lake_root=root)) == [OLD, OLD, OLD, ADJUSTED]
+    assert _symbols(load_contract_life(other_new, lake_root=root)) == [
+        other_old,
+        other_old,
+        other_old,
+        other_new,
+    ]
+
+
+def test_19_a_fetched_row_with_no_row_kind_refuses_the_life(fixture_lake: FixtureLake):
+    """#135 test 19. The check is per door, because neither contract door has a resolve pass.
+
+    Without it the damaged row is dropped by the final filter and, since an absent session is
+    stepped over, a corrupt partition reads as a session the contract was simply not listed in.
+    """
+    days = _life_rows()
+    damaged = _data(SEALED[1], "10:31", OLD)
+    damaged["row_kind"] = None
+    days[SEALED[1]] = [damaged]
+    root = _lake(fixture_lake, master=_master(), days=days)
+
+    with pytest.raises(LoadError) as raised:
+        load_contract_life(OLD, lake_root=root)
+    assert "row_kind" in str(raised.value)
+
+
+def test_20_an_explicit_ticker_wins_even_once_a_thread_exists(fixture_lake: FixtureLake):
+    """#135 test 20. The caller's ticker beats the derivation on both readings, not just one.
+
+    Test 8 asserts it on a lake with no master, where there is no thread to lose to. This is
+    the branch that only exists once there is one.
+    """
+    root = _lake(fixture_lake, master=_master())
+
+    with pytest.raises(PartitionAbsent) as raised:
+        load_contract_life(ADJUSTED, lake_root=root, ticker="NOPE")
+    assert "NOPE" in str(raised.value)
+
+    with pytest.raises(PartitionAbsent):
+        load_contract(ADJUSTED, SEALED[0], lake_root=root, ticker="NOPE")
+
+
+# -- the thread's own order, and what a refusal says about it -----------------
+
+# A rename that shortens a root, which `occ_mapping` writes as readily as an adjustment.
+# `'SPX   '` sorts before `'SPXW  '`, because a space is 0x20 and 'W' is 0x57, so this
+# contract's spellings run the opposite way in the alphabet from the way they run in time.
+# An OCC *adjustment* never does that, since `SPY` gains `SPY1` and then `SPY2`.
+INDEX_OLD = "SPXW  261218C06500000"
+INDEX_NEW = "SPX   261218C06500000"
+
+
+def _index_master() -> SecurityMaster:
+    master = SecurityMaster()
+    equity = master.register(
+        kind=KIND_EQUITY, capture_start=CAPTURE_START, valid_from=date(2026, 9, 8), ticker="SPX"
+    )
+    option = master.register(
+        kind=KIND_OPTION,
+        capture_start=master.capture_start_of(equity),
+        valid_from=OPENED,
+        occ_symbol=INDEX_OLD,
+    )
+    master.remap(option, ID_TYPE_OCC, INDEX_NEW, effective=BOUNDARY)
+    return master
+
+
+def test_21_the_thread_is_ordered_by_date_rather_than_by_spelling(fixture_lake: FixtureLake):
+    """#135 test 21. The order decides the ticker, since the earliest symbol is what names it.
+
+    Sorting the thread by ``id_value`` answers the same as sorting it by ``valid_from`` for
+    every OCC adjustment, because an adjusted root sorts after its parent. A rename that
+    shortens a root is what separates the two.
+    """
+    rows = sample_chains_table([_data(SEALED[0], "10:31", INDEX_OLD)])
+    fixture_lake.with_chains("SPXW", SEALED[0], rows)
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    fixture_lake.with_reference("security_master", _index_master().to_table())
+    root = fixture_lake.build()
+
+    # The partition is keyed by the root the contract listed under, so only the date order
+    # reaches it. The spelling order would derive 'SPX' and find no directory.
+    assert _symbols(load_contract(INDEX_NEW, SEALED[0], lake_root=root)) == [INDEX_OLD]
+
+
+def test_22_a_threaded_refusal_says_the_read_followed_a_thread(fixture_lake: FixtureLake):
+    """#135 test 22. A caller relying on the derivation can see which ticker was tried and why.
+
+    The derived ticker comes from a symbol the caller never named, so a refusal that showed
+    only the root would leave them unable to tell a bad derivation from a missing partition.
+    """
+    rows = sample_chains_table([_data(SEALED[0], "10:31", OLD)])
+    fixture_lake.with_chains("SPY", SEALED[0], rows)
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    fixture_lake.with_reference("security_master", _index_master().to_table())
+    root = fixture_lake.build()
+
+    with pytest.raises(PartitionAbsent) as one_day:
+        load_contract(INDEX_NEW, SEALED[0], lake_root=root)
+    assert "threaded from" in str(one_day.value)
+    assert INDEX_OLD in str(one_day.value)
+
+    with pytest.raises(PartitionAbsent) as life:
+        load_contract_life(INDEX_NEW, lake_root=root)
+    assert "threaded from" in str(life.value)
