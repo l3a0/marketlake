@@ -187,6 +187,18 @@
   </div>
 </section>
 
+<section>
+  <h2>Lake <span id="lake-window" class="muted"></span></h2>
+  <div class="panel" id="lake-panel">
+    <h3 class="muted">Runway</h3>
+    <div id="runway"></div>
+    <h3 class="muted">Size <span id="lake-total" class="muted"></span></h3>
+    <div id="lake-entries"></div>
+    <h3 class="muted">Growth <span id="growth-note" class="muted"></span></h3>
+    <div id="growth"></div>
+  </div>
+</section>
+
 <script>
 (function () {
   "use strict";
@@ -778,7 +790,16 @@
     }
     var list = el("ul", null, "ledger");
     history.quarantines.forEach(function (entry) {
-      var text = entry.partition + "  " + (entry.verdict === null ? DASH : entry.verdict);
+      // Every check still withholding, each with its own verdict, because signing one off
+      // leaves the rest standing and two checks can withhold under two different spellings.
+      var checks = (entry.checks || []).map(function (c) {
+        var name = c.check === null || c.check === undefined ? DASH : c.check;
+        var said = c.verdict === null || c.verdict === undefined ? DASH : c.verdict;
+        return name + " " + said;
+      }).join(", ");
+      var text = checks === ""
+        ? entry.partition + "  " + (entry.verdict === null ? DASH : entry.verdict)
+        : entry.partition + "  " + checks;
       list.appendChild(el("li", text));
     });
     box.appendChild(list);
@@ -854,6 +875,181 @@
     renderReports(history);
   }
 
+  // -- the Lake panel -------------------------------------------------------
+
+  // Bytes for a human. Powers of 1024, because the walk reports allocated blocks and a
+  // block is a power of two. One decimal place above kilobytes, which is enough to tell
+  // 1.6G from 1.9G and not enough to suggest the figure is exact.
+  function bytes(n) {
+    if (n === null || n === undefined) { return DASH; }
+    if (n < 1024) { return n + " B"; }
+    var units = ["K", "M", "G", "T", "P"];
+    var value = n / 1024;
+    var index = 0;
+    while (value >= 1024 && index < units.length - 1) { value /= 1024; index += 1; }
+    return value.toFixed(1) + units[index];
+  }
+
+  // The runway line. It is the panel's whole point, so it is first and it is a sentence
+  // rather than a table cell.
+  //
+  // Three readings are not a number and each says something different. No growth measured
+  // is not a long runway, it is a lake that stopped growing, which is a capture failure
+  // the Now panel above is the place to read. A runway past the calendar's horizon has no
+  // date because exchange_calendars knows about a year ahead, and a runway longer than a
+  // year is not the few weeks the headroom test cares about. A failed reading is neither.
+  function renderRunway(lake) {
+    var box = byId("runway");
+    clear(box);
+    if (lake.error) {
+      box.appendChild(el("p",
+        "The lake reading failed: " + lake.error +
+        ". Nothing in this section is live. The panels above it are.", "alarm"));
+      return;
+    }
+    var line;
+    if (lake.space_error) {
+      // The walk's refusals still stand and are printed below, which is the point of
+      // containing the two readings separately: the line naming the path survives the
+      // device read failing.
+      line = el("p",
+        "The device would not read: " + lake.space_error +
+        ". There is no free-space figure and so no runway.", "alarm");
+    } else if (lake.capture_days_left === null) {
+      line = el("p",
+        "No growth measured in the window, so there is no runway to report. " +
+        "That is a lake that stopped growing rather than a disk that will last. " +
+        "Read the Now panel for whether capture is running.", "note");
+    } else if (lake.beyond_horizon) {
+      line = el("p",
+        bytes(lake.free) + " free is " + plural(lake.capture_days_left, "capture day",
+          "capture days") + " at the window's busiest day. That runs past the calendar's " +
+        "horizon, so there is no date for it, and it is not the " +
+        lake.headroom_weeks + " weeks the nightly report flags.");
+    } else {
+      line = el("p",
+        bytes(lake.free) + " free is " + plural(lake.capture_days_left, "capture day",
+          "capture days") + ", exhausted " + lake.exhausts_on + ".",
+        lake.short ? "alarm" : null);
+      if (lake.short) {
+        line.textContent += " That is under " + lake.headroom_weeks +
+          " weeks of headroom, which the nightly report flags.";
+      }
+    }
+    box.appendChild(line);
+    if (!lake.space_error) {
+      box.appendChild(el("p",
+        "Free space is the whole device's, not the lake's allowance: " + bytes(lake.free) +
+        " of " + bytes(lake.capacity) + ", of which the lake is " + bytes(lake.lake_bytes) +
+        ". Anything else on this disk moves the number.", "muted"));
+    }
+    if (lake.refused) {
+      box.appendChild(el("p",
+        plural(lake.refused, "path", "paths") + " would not read, so the size below is a " +
+        "floor: " + lake.refusals.join("; "), "alarm"));
+    }
+  }
+
+  // Size by entry. Sorted biggest first by the query, because the question is what is
+  // filling the disk. The absent surfaces are listed rather than omitted: actions/ has
+  // never been written and bars/ did not exist when this panel was specified, so absence
+  // is the ordinary case and a surface missing from a list reads as an oversight.
+  function renderEntries(lake) {
+    byId("lake-total").textContent =
+      bytes(lake.lake_bytes) + " across " + plural(lake.lake_files, "file", "files");
+    var box = byId("lake-entries");
+    clear(box);
+    var wrap = el("div", null, "table-wrap");
+    var table = el("table");
+    var head = el("tr");
+    ["Entry", "Size", "Files"].forEach(function (name) {
+      head.appendChild(el("th", name));
+    });
+    table.appendChild(head);
+    lake.entries.forEach(function (entry) {
+      var tr = el("tr");
+      tr.appendChild(el("td", entry.name));
+      tr.appendChild(el("td", bytes(entry.bytes), "num"));
+      tr.appendChild(el("td", entry.files, "num"));
+      table.appendChild(tr);
+    });
+    wrap.appendChild(table);
+    box.appendChild(wrap);
+    if (lake.absent_surfaces.length) {
+      box.appendChild(el("p",
+        "Never written: " + lake.absent_surfaces.join(", ") + ".", "muted"));
+    }
+  }
+
+  // Growth per day, and the two rates. The runway is taken off the peak because a mean
+  // over a window that includes days capture did not run understates the rate, and a rate
+  // that is too low lengthens the runway so the flag never fires. Both are shown so the
+  // spread is visible rather than asserted.
+  function renderGrowth(lake) {
+    byId("growth-note").textContent =
+      lake.capture_days ? plural(lake.capture_days, "day", "days") + " with bytes" : "";
+    var box = byId("growth");
+    clear(box);
+    if (!lake.days.length) {
+      box.appendChild(el("p", "No day in the window wrote anything.", "note"));
+      return;
+    }
+    box.appendChild(el("p",
+      "Peak " + bytes(lake.peak_bytes) + " on " + lake.peak_day + ", which sets the " +
+      "runway. Mean " + bytes(lake.mean_bytes) + " over the days that wrote bytes. " +
+      "A mean over all " + lake.window_days + " calendar days would be lower still, and " +
+      "a rate that is too low lengthens the runway rather than shortening it."));
+    var wrap = el("div", null, "table-wrap");
+    var table = el("table");
+    var head = el("tr");
+    ["Day", "Size", ""].forEach(function (name) { head.appendChild(el("th", name)); });
+    table.appendChild(head);
+    lake.days.forEach(function (day) {
+      var tr = el("tr");
+      tr.appendChild(el("td", day.day));
+      tr.appendChild(el("td", bytes(day.bytes), "num"));
+      // An unsealed day is still journal segments, which are uncompressed and larger than
+      // the partition they become at close+15. The figure drops when it seals, and a
+      // number that halves at 16:30 with no explanation is a number a reader distrusts.
+      tr.appendChild(el("td", day.unsealed ? "unsealed, seals at close+15" : "", "muted"));
+      table.appendChild(tr);
+    });
+    wrap.appendChild(table);
+    box.appendChild(wrap);
+  }
+
+  function renderLake(lake) {
+    byId("lake-window").textContent = lake.error
+      ? ""
+      : lake.window_start + " to " + lake.window_end;
+    renderRunway(lake);
+    if (lake.error) {
+      byId("lake-total").textContent = "";
+      clear(byId("lake-entries"));
+      byId("growth-note").textContent = "";
+      clear(byId("growth"));
+      return;
+    }
+    renderEntries(lake);
+    renderGrowth(lake);
+  }
+
+  // The Lake section saying its own load failed. Like History's, it never touches the
+  // page-wide banner, because the panels above it are still live and that banner says
+  // they are not.
+  function lakeFailed(err) {
+    byId("lake-window").textContent = "";
+    byId("lake-total").textContent = "";
+    clear(byId("lake-entries"));
+    byId("growth-note").textContent = "";
+    clear(byId("growth"));
+    var box = byId("runway");
+    clear(box);
+    box.appendChild(el("p",
+      "The lake query is failing: " + err.message +
+      ". Nothing in this section is live. The panels above it are.", "alarm"));
+  }
+
   // -- the refresh cycle ----------------------------------------------------
 
   // Now and Today are fetched together and painted together. A partial failure would
@@ -871,6 +1067,10 @@
     inFlight = true;
     var pending = null;
     var history = getJSON("/api/history").then(renderHistory, historyFailed);
+    // On its own chain for History's reason, which the comment above gives. This panel
+    // walks the whole tree and reads the device, so a slow or refused filesystem must not
+    // reach the two panels reading this minute.
+    var lake = getJSON("/api/lake").then(renderLake, lakeFailed);
     getJSON("/api/now").then(function (now) {
       pending = now;
       return getJSON("/api/today?date=" + encodeURIComponent(now.session_date));
@@ -881,7 +1081,7 @@
     }).catch(function (err) {
       markStale(err.message);
     }).then(function () {
-      return history;
+      return Promise.all([history, lake]);
     }).then(function () {
       inFlight = false;
     });

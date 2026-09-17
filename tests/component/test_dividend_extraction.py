@@ -236,8 +236,10 @@ def _entries(root: Path) -> list[dict]:
 def _clear_quarantine(root: Path, ticker: str, day: date) -> None:
     """Append the sign-off row that clears one partition's verdict.
 
-    Resolution reads the last entry on a partition in file order, so a clearing row supersedes
-    the withholding one rather than replacing it.
+    Resolution reads the last entry per ``(partition, check)`` in file order, so a clearing
+    row supersedes the withholding one rather than replacing it. The ``check`` here has to
+    match the withholding row's, or it clears a different check and the partition stays
+    withheld.
     """
     partition = LakePaths(root).partition_path(QUOTES, ticker, day).relative_to(root).as_posix()
     line = json.dumps(
@@ -1158,7 +1160,7 @@ def test_a_verdict_that_clears_lands_the_entry_the_skip_delayed(fixture_lake: Fi
     (delayed,) = _entries(root)
     assert delayed["observed_on"] == DAY_TWO.isoformat()
 
-    # The sign-off tool clears the verdict, the way marketlake #139 will.
+    # The sign-off tool clears the verdict, the way ``lake.signoff`` does.
     _clear_quarantine(root, "SPY", DAY_ONE)
 
     second = extract_dividends(lake_root=root, clock=ManualClock(SECOND_NIGHT))

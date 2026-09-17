@@ -18,15 +18,19 @@ The ledger lives at ``manifest.jsonl`` at the lake root. Its rules are few and e
    And every data file in the lake must have an entry. The second direction catches a
    crash between writing a file and appending its entry.
 
-The quarantine ledger at ``quarantine.jsonl`` follows the same three rules. It records
+The quarantine ledger at ``quarantine.jsonl`` follows rules 1 and 3, and resolves on
+``(partition, check)`` rather than on the path alone, because several checks judge one
+partition and each keeps its own current verdict. :func:`latest_quarantine_by_check` is that
+resolution and marketlake #426 is why it is not the path alone. It records
 data-quality verdicts per partition. Un-quarantine is a superseding entry, never a
 deletion. This module gives it the same append and read helpers.
 
 The corporate-actions ledger at ``actions/corporate_actions.jsonl`` follows them too, and
-it keys on the action rather than on a path, so ``lake.actions`` resolves its own last
-entry and reuses ``append_line`` and ``parse_jsonl`` for the line rules alone. Those two
-are public for that reason: three ledgers now implement one rule, and a second copy of it
-would be a second answer to what a torn tail is.
+it keys on the action rather than on a path, the way the quarantine ledger keys on the
+partition and the check, so ``lake.actions`` resolves its own last entry and reuses
+``append_line`` and ``parse_jsonl`` for the line rules alone. Those two are public for that
+reason: three ledgers now implement one rule, and a second copy of it would be a second
+answer to what a torn tail is.
 
 The same ledger judges the backup copy. ``backup_scrub`` walks the rsync target and
 checks it against this manifest rather than against the copy of the manifest riding on
@@ -212,9 +216,97 @@ def read_quarantine(lake_root: Path) -> list[dict]:
     return _read_jsonl(quarantine_path(lake_root))
 
 
+def latest_quarantine_by_check(lake_root: Path) -> dict[str, dict[str, dict]]:
+    """Every partition's current verdict per check: last entry wins within each check.
+
+    The ledger records one check's answer about one partition, and several checks judge the
+    same partition. Resolving on the partition alone throws the ``check`` field away and keeps
+    whichever line landed last, so one check's ``clean`` buries another check's quarantine and
+    the partition reads. Marketlake #426 is that defect.
+
+    The composite key is not a departure from last entry wins. ``actions._latest_by_key``
+    already resolves this way on ``(instrument_id, ex_date, type)``, and every quarantine entry
+    already carries ``check``, because ``battery.build_entry`` refuses one without it. On a
+    ledger written by a single check the two resolutions agree entry for entry, so nothing on
+    disk has to change.
+
+    **The key is ``check`` alone, never ``(check, provenance)``.** A human sign-off has to be
+    able to clear the battery's quarantine under the same check, which is the whole of
+    marketlake #139's purpose. Splitting them by provenance would leave the battery's entry
+    standing beside the sign-off and withhold the partition forever.
+
+    Each partition's inner mapping is ordered by where that check's *current* entry sits in the
+    file, which is why an existing check is removed before it is re-inserted. A plain
+    reassignment keeps the position a key was first seen at, and the two disagree as soon as a
+    check has written twice. The order is what :func:`withholding` hands back, and that
+    function's own docstring is where what the order does and does not mean is stated: it is
+    where each check's current entry sits, which is not the same as longest-standing first.
+
+    An entry whose ``check`` cannot be a dict key raises ``ManifestError`` naming this ledger
+    and the entry's position, for the reason ``_latest_by_partition`` gives about a missing
+    ``partition``: this file is an integrity root, so a reader that stepped over damage in it
+    would make every check downstream weaker than it reads.
+    """
+    path = quarantine_path(lake_root)
+    latest: dict[str, dict[str, dict]] = {}
+    for position, entry in enumerate(read_quarantine(lake_root), start=1):
+        try:
+            partition = entry["partition"]
+        except (KeyError, TypeError) as exc:
+            raise ManifestError(f"{path}: entry {position} names no partition") from exc
+        bucket = latest.setdefault(partition, {})
+        check = entry.get("check")
+        try:
+            bucket.pop(check, None)
+            bucket[check] = entry
+        except TypeError as exc:
+            raise ManifestError(
+                f"{path}: entry {position} has a check that cannot be a key: {check!r}"
+            ) from exc
+    return latest
+
+
+def withholding(by_check: dict[str, dict] | None) -> tuple[dict, ...]:
+    """The entries currently withholding one partition, in the ledger's own order.
+
+    The order is where each check's *current* entry sits in the file, so the check that last
+    re-stated its verdict comes last. That is deliberately not "longest-standing first": a
+    check withholding since line 1 that re-wrote at line 3 sorts after one that first withheld
+    at line 2. Readability does not depend on the order, and every consumer that shows it
+    shows all of them.
+
+    ``by_check`` is what :func:`latest_quarantine_by_check` returns for one partition, or
+    ``None`` when the ledger holds no entry for it. An empty result means the partition reads.
+
+    This is :func:`is_quarantined` folded over every check rather than a second definition of
+    what an entry means. One definition is the point: the battery, the sign-off tool and every
+    reader resolve a verdict the same way, and a reader that grew its own spelling would
+    silently invert the exclusion.
+    """
+    if not by_check:
+        return ()
+    return tuple(entry for entry in by_check.values() if is_quarantined(entry))
+
+
 def latest_quarantine(lake_root: Path) -> dict[str, dict]:
-    """The current authoritative quarantine verdict per partition path."""
-    return _latest_by_partition(read_quarantine(lake_root), quarantine_path(lake_root))
+    """The entry that decides each partition's readability.
+
+    That is the first entry :func:`withholding` returns, or the last entry written when none
+    withholds. It is deliberately not the ledger's chronologically last line
+    for the partition: once several checks judge one partition, the last line can be a ``clean``
+    from a check that never saw the fault another check is still holding.
+
+    The shape is unchanged, so ``sweep.count_quarantined`` and ``dashboard._open_quarantines``
+    read it exactly as before and both become correct. A caller that wants each check's own
+    answer, rather than the one that decides the read, wants
+    :func:`latest_quarantine_by_check`. A caller that wants the untouched history wants
+    :func:`read_quarantine`.
+    """
+    decided: dict[str, dict] = {}
+    for partition, by_check in latest_quarantine_by_check(lake_root).items():
+        held = withholding(by_check)
+        decided[partition] = held[0] if held else next(reversed(by_check.values()))
+    return decided
 
 
 def is_quarantined(entry: dict | None) -> bool:
@@ -229,10 +321,16 @@ def is_quarantined(entry: dict | None) -> bool:
     withholds it, including one whose shape this does not recognise, because fail closed
     for data already sealed means an unreadable verdict refuses rather than admits.
 
-    The rule sits beside the ledger rather than inside its first reader. Marketlake #139
-    is authoritative for the entry shape and has not been built, so reader and writer have
-    to meet at one definition or the exclusion silently inverts. A sign-off tool writing
-    its own spelling of "cleared" would leave a partition it just cleared refused forever.
+    This answers about one entry. Several checks judge one partition, so what decides a
+    partition is :func:`withholding` folded over every check's current entry, and
+    :func:`latest_quarantine` hands back the one that decides.
+
+    The rule sits beside the ledger rather than inside its first reader, because reader and
+    writer have to meet at one definition or the exclusion silently inverts. A sign-off tool
+    writing its own spelling of "cleared" would leave a partition it just cleared refused
+    forever. Marketlake #139 built that tool as ``lake.signoff``, and it writes
+    :data:`CLEAN_VERDICT` from ``lake.battery`` rather than a spelling of its own, so the
+    hypothesis this paragraph was written against is now settled rather than open.
     """
     return entry is not None and entry.get(VERDICT_FIELD) != CLEAN_VERDICT
 
@@ -339,8 +437,10 @@ def record_partition(
 def append_quarantine(lake_root: Path, entry: dict) -> dict:
     """Append one quarantine entry as a single ``O_APPEND`` line and return it.
 
-    The entry is keyed by ``partition`` like the manifest. Last entry wins, so an
-    un-quarantine is a superseding row, never a deletion of history.
+    The entry is keyed by ``(partition, check)``, so last entry wins within each check and an
+    un-quarantine is a superseding row rather than a deletion of history.
+    :func:`latest_quarantine_by_check` says why the key carries the check, and marketlake #426
+    is the defect that resolving on the partition alone produced.
 
     **This is the line and nothing else. A writer wants ``battery.append_verdict``.** This takes
     no lock and refreshes no manifest entry, so a verdict written through it alone leaves

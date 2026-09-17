@@ -1,4 +1,4 @@
-"""The read-only query service: the dashboard's Now, Today and History panels.
+"""The read-only query service: the dashboard's Now, Today, History and Lake panels.
 
 Failures push alerts. Progress needs a pull surface. This module is that surface. It is
 a small read-only query service on localhost that answers a fixed set of named queries
@@ -47,10 +47,21 @@ the quarantine ledger and the nightly report files are read off the filesystem, 
 ``alert.undelivered``'s rule, and the window aggregate is the same ``SELECT`` the Today
 strip runs, keyed by file.
 
+The Lake panel adds a fourth such read and is the one panel that reports something from
+outside ``lake_root`` at all: the device's free space. That reading cannot go through
+DuckDB, because rule 4's sandbox refuses every path outside the root. It goes through
+``lake.runway``, which walks the tree and calls ``shutil.disk_usage``, and the sandbox is
+untouched by it. Nothing about rule 4 is relaxed. What crosses that boundary is two
+integers, the device's free bytes and its capacity, and no path outside the root is ever
+opened. A refused path is named relative to the root for the same reason, so a reader who
+cannot read the filesystem does not learn where the lake sits on disk.
+
 Three terms recur, glossed at first use.
 
-1. A *surface* is one kind of measurement with its own pinned schema. All three panels
-   read the two minute-cadence surfaces, ``chains`` and ``quotes``.
+1. A *surface* is one kind of measurement with its own pinned schema. Now, Today and
+   History read the two minute-cadence surfaces, ``chains`` and ``quotes``. The Lake
+   panel reads every surface's bytes and the root ledgers' too, because a panel reporting
+   what fills the disk cannot skip the largest thing on it.
 2. A *slot* is one minute of the session, the ``snap_ts`` a capture cycle fires for. The
    Today strip has one cell per slot from the session open through the option close, so
    it is denominated by the calendar's session length. An early close renders as a short
@@ -101,7 +112,7 @@ from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants, input_errors_exit, load_config
 from lake.control_plane import assertion_window, sunday_canary_due
 from lake.deadman import in_envelope
-from lake.manifest import VERDICT_FIELD, is_quarantined, latest_quarantine
+from lake.manifest import VERDICT_FIELD, latest_quarantine_by_check, withholding
 from lake.metadata import read_metadata
 from lake.paths import (
     CHAINS,
@@ -110,10 +121,13 @@ from lake.paths import (
     REPORTS_DIR,
     SEGMENT_GLOB,
     SURFACE_PREFIX,
+    SURFACES,
     TICKER_PREFIX,
     LakePaths,
     parse_date_dir,
 )
+from lake.runway import GROWTH_WINDOW_DAYS, HEADROOM_WEEKS, assess
+from lake.runway import Usage as RunwayUsage
 from lake.security_master import (
     ID_TYPE_TICKER,
     SecurityMaster,
@@ -1107,12 +1121,18 @@ class QueryContext:
     ``roster`` is the lake's roster, walked once per request and shared with validation,
     because the walk lists the whole journal tree. ``guards`` are the machine's guard
     constants, so the page colours a row stale at the threshold the watchdog pages at.
+
+    ``calendar`` is the same injected calendar ``session`` holds, carried in its own field
+    because ``SessionClock`` keeps its copy private and the Lake panel needs it directly.
+    A runway is counted in capture days, and turning those into a date is a walk over
+    sessions rather than a division by 365.
     """
 
     paths: LakePaths
     now: datetime
     session: SessionClock
     roster: Mapping[str, tuple[str, ...]]
+    calendar: Calendar
     guards: GuardConstants = field(default_factory=GuardConstants)
 
 
@@ -1589,8 +1609,9 @@ def _window_aggregates(
     So the fallback is not a swallow. It is a retreat to the reader that does not union,
     which is the reader that was there before this panel, and a real defect surfaces from
     it exactly as it did. The traceback is logged either way. The cost of narrowing this
-    back is the whole page: ``_serve`` turns an escape into a 500, so one drifted
-    partition thirty days back would blank the Now and Today panels beside this one.
+    back is the whole History section: ``_serve`` turns an escape into a 500, so one
+    drifted partition thirty days back would take down every part of this panel,
+    including the counts and the reports that had nothing to do with it.
     """
     result: dict[tuple[str, date], tuple[list[SlotAggregate], SegmentHealth]] = {}
     bulk: dict[str, tuple[str, date]] = {}
@@ -1697,21 +1718,54 @@ def _open_quarantines(root: Path) -> tuple[list[dict[str, object]], str | None]:
     its docstring true. ``_capture_spans`` already keeps the same promise for the same
     reason: one panel served without a clamp rather than a panel not served at all.
 
-    The entry's shape is marketlake #139's and #139 is unbuilt, so only the partition
-    path and the ``verdict`` field are read, both defensively. The panel prints no
-    sign-off command, because the tool that would run it does not exist and its spelling
-    is not settled.
+    Only the partition path, the ``verdict`` field and the ``check`` field are read, all
+    defensively. The entry's shape is ``battery.build_entry``'s, which marketlake #406 pinned,
+    and reading no more than these keeps the panel working against an entry a later check
+    extends.
+
+    The panel prints no sign-off command. Marketlake #139 shipped the tool as ``lake.signoff``,
+    so the original reason, that the tool did not exist and its spelling was unsettled, is
+    spent. ``docs/design.md``'s register carries the one that replaced it, and marketlake #445
+    carries the command.
+
+    **Every withholding check is named, each with its own verdict.** Each check keeps its own
+    current verdict, so a partition can be withheld by more than one at a time and signing one
+    off leaves the rest standing. A row saying only "quarantined" cannot tell an operator that.
+    The verdicts are carried per check rather than once for the row, because two checks
+    withhold under two different spellings and one of them printed beside both check names
+    says the wrong thing about the other.
+
+    It is also how a stranded token shows: a check that quarantined and then stopped judging,
+    because it was renamed or it now answers ``insufficient_history`` forever, holds its
+    partition until a human signs that token off, and the token is the only thing that says so.
+
+    The row's own ``verdict`` stays, and it is the deciding entry's, which is what
+    ``manifest.latest_quarantine`` would return.
     """
     try:
-        ledger = latest_quarantine(root)
+        ledger = latest_quarantine_by_check(root)
     except Exception as exc:  # noqa: BLE001 - a summary must not cost the panel
         log.exception("quarantine ledger unreadable, so the panel reports it instead")
         return [], type(exc).__name__
-    open_entries = [
-        {"partition": partition, "verdict": entry.get(VERDICT_FIELD)}
-        for partition, entry in sorted(ledger.items())
-        if is_quarantined(entry)
-    ]
+    open_entries = []
+    for partition, by_check in sorted(ledger.items()):
+        held = withholding(by_check)
+        if not held:
+            continue
+        open_entries.append(
+            {
+                "partition": partition,
+                "verdict": held[0].get(VERDICT_FIELD),
+                # ``check`` is read defensively like ``verdict`` beside it. Every entry
+                # ``battery.build_entry`` assembles carries one, so a missing check means a
+                # hand-written or damaged line, and the page shows it the way it shows a
+                # missing verdict rather than printing the word "None".
+                "checks": [
+                    {"check": entry.get("check"), "verdict": entry.get(VERDICT_FIELD)}
+                    for entry in held
+                ],
+            }
+        )
     return open_entries, None
 
 
@@ -1828,9 +1882,10 @@ def query_history(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str
     end is the clock's session date and its width is ``HISTORY_WINDOW_DAYS``.
 
     **Nothing here may raise.** ``_serve`` turns any escape into a 500 for the whole
-    panel, and ``status.html`` paints nothing until every payload lands, so one bad file
-    would blank the Now and Today panels beside this one. Each of the three reads is
-    contained at its own boundary and reports its failure as a value: the window read
+    panel, and a 500 throws away every finding the payload was going to carry, including
+    the ones naming what would not read. ``status.html`` keeps this section off the Now
+    and Today chain, so a failure here paints this section alone and says so. Each of the
+    three reads is contained at its own boundary and reports its failure as a value: the window read
     counts an unreadable partition, ``_open_quarantines`` names the class that refused
     the ledger, and ``_nightly_reports`` counts the files that would not parse. That is
     the rule ``_capture_spans``, ``_slot_aggregates`` and ``undelivered`` each already
@@ -1891,6 +1946,106 @@ def query_history(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str
     }
 
 
+# -- the Lake panel ----------------------------------------------------------
+
+# The refusal a failed reading reports in place of a runway. ``shutil.disk_usage`` raises
+# for a root that is not there, and ``lake.runway.assess`` deliberately lets that through
+# rather than inventing a free-space figure. The containment belongs here, where the rule
+# that nothing may raise lives.
+_RUNWAY_READ_ERRORS = (OSError, ValueError)
+
+
+def _entry_rows(usage: RunwayUsage) -> list[dict[str, object]]:
+    """Every top-level thing in the lake, biggest first, with the absent surfaces beside.
+
+    Sorted by bytes rather than by name, because the question this panel answers is what
+    is filling the disk and the answer is the top row. ``manifest.jsonl`` sorts into the
+    middle of it on the live lake, above the whole ``quotes`` surface, which is the thing
+    a list of ``paths.SURFACES`` alone would have hidden.
+    """
+    return [
+        {"name": entry.name, "bytes": entry.bytes, "files": entry.files}
+        for entry in sorted(usage.entries, key=lambda entry: (-entry.bytes, entry.name))
+    ]
+
+
+def query_lake(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, object]:
+    """The Lake panel: size by surface, growth rate, and the disk runway.
+
+    It runs no SQL. The connection is taken because every named query is called the same
+    way, and it is untouched here: the sizes are a walk over the tree and the free space
+    is a ``shutil.disk_usage`` call, which is the one thing any panel reports from outside
+    ``lake_root``. The sandbox refuses every path outside the root, so that reading could
+    not have gone through DuckDB even if it wanted to.
+
+    The computation is ``lake.runway``'s rather than this module's, because the Sunday
+    run's third duty reads the same answer and marketlake #438 is where that lands. Two
+    independent computations would drift, and a panel and an alarm disagreeing about how
+    long the disk lasts is worse than either being wrong alone. It could not live here:
+    this module already imports ``lake.control_plane``, so a Sunday duty reading back into
+    it would close a cycle.
+
+    **Nothing here may raise**, for the reason ``query_history`` gives one panel over: a
+    500 throws away every finding the payload was going to carry, and this payload's whole
+    job on a bad day is naming what would not read. ``lake.runway`` contains both of its
+    readings for that reason, the walk and the device, and reports each failure as a value.
+    The catch below is the backstop rather than the plan, so a class neither of them
+    expected still reaches a reader as a line rather than as a blank page.
+
+    An absent surface is a true zero and says so. Today ``actions/`` has never been
+    written, and ``bars/`` did not exist the day this panel was specified, so absence is
+    the ordinary case rather than the exotic one.
+    """
+    try:
+        runway = assess(
+            ctx.paths.root,
+            today=ctx.session.session_date(),
+            calendar=ctx.calendar,
+            window_days=GROWTH_WINDOW_DAYS,
+        )
+    except _RUNWAY_READ_ERRORS as exc:
+        log.exception("the lake reading failed, so the panel reports it instead")
+        return {"as_of": _iso(ctx.now), "error": type(exc).__name__}
+
+    usage = runway.usage
+    present = {entry.name for entry in usage.entries}
+    return {
+        "as_of": _iso(ctx.now),
+        "error": None,
+        "window_days": GROWTH_WINDOW_DAYS,
+        "window_start": runway.window_start.isoformat(),
+        "window_end": runway.window_end.isoformat(),
+        "free": runway.free,
+        "capacity": runway.capacity,
+        "space_error": runway.space_error,
+        "lake_bytes": usage.total,
+        "lake_files": usage.files,
+        "dated_bytes": usage.dated,
+        "undated_bytes": usage.undated,
+        "entries": _entry_rows(usage),
+        "absent_surfaces": [name for name in SURFACES if name not in present],
+        "days": [
+            {
+                "day": day.isoformat(),
+                "bytes": size,
+                "unsealed": day in usage.unsealed,
+            }
+            for day, size in runway.window_days
+        ],
+        "peak_day": runway.peak_day.isoformat() if runway.peak_day is not None else None,
+        "peak_bytes": runway.peak,
+        "mean_bytes": runway.mean,
+        "capture_days": runway.capture_days,
+        "capture_days_left": runway.capture_days_left,
+        "exhausts_on": runway.exhausts_on.isoformat() if runway.exhausts_on is not None else None,
+        "beyond_horizon": runway.beyond_horizon,
+        "headroom_weeks": HEADROOM_WEEKS,
+        "short": runway.short,
+        "refusals": list(usage.refusals),
+        "refused": usage.refused,
+    }
+
+
 @dataclass(frozen=True)
 class NamedQuery:
     """One entry in the fixed-query registry.
@@ -1911,6 +2066,7 @@ NAMED_QUERIES: Mapping[str, NamedQuery] = {
     "now": NamedQuery("now", query_now, frozenset()),
     "today": NamedQuery("today", query_today, frozenset({"date", "ticker"})),
     "history": NamedQuery("history", query_history, frozenset()),
+    "lake": NamedQuery("lake", query_lake, frozenset()),
 }
 
 # The route table: request path to query name. A path not here is a 404.
@@ -1918,6 +2074,7 @@ ROUTES: Mapping[str, str] = {
     "/api/now": "now",
     "/api/today": "today",
     "/api/history": "history",
+    "/api/lake": "lake",
 }
 
 
@@ -2017,6 +2174,7 @@ class DashboardService:
             now=self._clock.now(),
             session=SessionClock(self._clock, self._calendar),
             roster=roster,
+            calendar=self._calendar,
             guards=self._guards,
         )
         cursor = self._con.cursor()
@@ -2310,6 +2468,8 @@ __all__ = [
     "make_server",
     "open_lake_connection",
     "parse_date",
+    "query_history",
+    "query_lake",
     "query_now",
     "query_today",
     "session_slots",

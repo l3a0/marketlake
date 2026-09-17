@@ -141,8 +141,8 @@ def test_host_allowed(host: str | None, allowed: bool):
 # -- the registry and the routes ---------------------------------------------
 
 
-def test_the_registry_is_exactly_the_three_panels():
-    assert set(NAMED_QUERIES) == {"now", "today", "history"}
+def test_the_registry_is_exactly_the_four_panels():
+    assert set(NAMED_QUERIES) == {"now", "today", "history", "lake"}
     assert NAMED_QUERIES["now"].parameters == frozenset()
     assert NAMED_QUERIES["today"].parameters == frozenset({"date", "ticker"})
     # History takes none. The module docstring's rule 2 allows a request a ticker and a
@@ -150,6 +150,9 @@ def test_the_registry_is_exactly_the_three_panels():
     # third name declared here would pass the unknown-field check and then be dropped on
     # the floor. The window's width and the report count are module constants instead.
     assert NAMED_QUERIES["history"].parameters == frozenset()
+    # Lake takes none for the same reason, and it has a second one: the panel is about the
+    # whole lake rather than one ticker-day, so there is nothing a request could narrow.
+    assert NAMED_QUERIES["lake"].parameters == frozenset()
     for name, query in NAMED_QUERIES.items():
         assert query.name == name
         assert callable(query.run)
@@ -160,6 +163,7 @@ def test_every_route_maps_to_a_registered_query():
         "/api/now": "now",
         "/api/today": "today",
         "/api/history": "history",
+        "/api/lake": "lake",
     }
     assert set(ROUTES.values()) <= set(NAMED_QUERIES)
 
