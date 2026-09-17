@@ -1598,8 +1598,8 @@ def test_a_finding_that_could_not_be_filed_exits_one(
 def test_the_detection_reads_no_config(fixture_lake: FixtureLake, monkeypatch):
     """Every dependency is injected, the way ``seed_spans`` and the extraction are.
 
-    ``detect_splits`` takes its lake root and its clock, so nothing under it reaches for the
-    machine's own configuration.
+    ``detect_splits`` takes its lake root, its clock and its calendar, so nothing under it
+    reaches for the machine's own configuration.
     """
     root = _two_sessions(fixture_lake)
 

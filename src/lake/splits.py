@@ -1271,6 +1271,36 @@ def _uncaptured_sessions(calendar: Calendar, after: date, before: date) -> list[
     return found
 
 
+def _why_unread(master: SecurityMaster, ticker: str, day: date) -> str:
+    """Whether a session with no partition was out of scope or simply never captured.
+
+    Step 1 of the walk already decides this for a manifested day: a symbol the master knows but
+    has no mapping valid for that day is out of scope, never a gap. A day with no partition is
+    owed the same question, so one condition gets one label. Without it a ticker handed from one
+    instrument to another reports every session below the second one's ``capture_start`` as
+    uncaptured, every night, on a window the instrument change already refuses to judge.
+
+    **The window still widens either way, and that is the existing rule rather than a new one.**
+    The manifested out-of-scope branch increments the same counter. A ticker retired and brought
+    back a year later has an away period the lake holds nothing across, and a split inside it is
+    exactly the boundary whose ``ex_date`` cannot be guessed. So what the master decides here is
+    what an operator reads, and never whether the pair is judged.
+
+    The ticker is in the master by construction, because this runs only once a session has been
+    read and reading one means it resolved.
+    """
+    try:
+        resolve_instrument(master, ticker, day)
+    except UnresolvedSymbol:
+        return REASON_OUT_OF_SCOPE
+    except AmbiguousSymbol:
+        # Not out of scope. The master does carry the symbol that day, ambiguously, which is a
+        # corrupt master rather than a window nothing was owed in. The manifested path files a
+        # finding for it off the rows it could not attribute, and there are no rows here.
+        pass
+    return REASON_NOT_CAPTURED
+
+
 def detect_splits(*, lake_root: Path | str, clock: Clock, calendar: Calendar) -> SplitReport:
     """Read every sealed chains ticker-day, gate what it finds, and append what lands.
 
@@ -1297,7 +1327,7 @@ def detect_splits(*, lake_root: Path | str, clock: Clock, calendar: Calendar) ->
        ticker-day. No day of that ticker will resolve, so the condition has one action behind
        it, which is the same reason ``by_ticker`` groups on the ticker and lets the
        instrument enter one level down.
-    3. A session the walk cannot read is skipped, for the four reasons
+    3. A session the walk cannot read is skipped, for the five reasons
        :func:`read_session` names. Each skip widens the window a boundary can sit inside.
        So does a session the lake never captured, which :func:`_uncaptured_sessions` reads off
        the calendar because the manifest has no entry to report it with. It is enumerated only
@@ -1418,7 +1448,7 @@ def detect_splits(*, lake_root: Path | str, clock: Clock, calendar: Calendar) ->
             # a window no pair spans.
             if previous is not None and last_day is not None:
                 for missing in _uncaptured_sessions(calendar, last_day, day):
-                    skipped.append(Skip(ticker, missing, REASON_NOT_CAPTURED))
+                    skipped.append(Skip(ticker, missing, _why_unread(master, ticker, missing)))
                     unread_since += 1
             last_day = day
             try:
@@ -1630,9 +1660,11 @@ def _examine(
 
     try:
         if unread_since:
-            # Both ends, rather than a count and a start. An operator meets this under
-            # ``reports/withheld/`` with no other record of the window, and the two dates are
-            # what say which sessions to go and look at.
+            # Both ends, rather than a count and a start. This reaches the run's own render
+            # and not the filed record, because ``report.redacted`` keeps two fields and
+            # ``_finding`` says why: the message reaches the operator through the render and the
+            # class alone reaches the file. So the dates are for whoever runs
+            # ``python -m lake.actions splits`` after the nightly names the subject.
             raise BoundaryUnbounded(
                 f"{ticker} gained {sorted(gained)} on {day.isoformat()} and the walk read no "
                 f"session between {previous.day.isoformat()} and {day.isoformat()}, "
