@@ -143,7 +143,7 @@ class BarRequest:
             raise ValueError(f"start {start.isoformat()} is not before end {end.isoformat()}")
 
 
-def bar_request_key(request: BarRequest) -> dict:
+def _bar_request_key(request: BarRequest) -> dict:
     """The cassette key one ``BarRequest`` records under.
 
     Written once and used twice, by the recorder that writes the key and by the duplicate
@@ -211,7 +211,7 @@ def record_cassette(
         interactions.append(
             _interaction(
                 BARS_ENDPOINT,
-                bar_request_key(request),
+                _bar_request_key(request),
                 response,
             )
         )
@@ -316,6 +316,33 @@ def _parse_quote_batches(raw_batches: Sequence[str]) -> list[list[str]]:
     ]
 
 
+def _splits_an_instant(fields: list[str]) -> bool:
+    """Whether two adjacent fields rejoin into one readable instant.
+
+    ISO 8601 allows a comma as the fractional-second marker, so ``2026-09-14T09:30:00,500-04:00``
+    arrives here as two fields. This demonstrates that case rather than guessing at it: the two
+    halves are joined back with the comma that split them and handed to the same parser that reads
+    a bound. Nothing else in a ``--bars`` value does that.
+
+    Counting fields cannot do this job any more. Before the flag existed, more than four fields
+    almost always meant the marker. Now the likelier cause is a mistyped flag, and three of those
+    are realistic: ``extended_hours: false`` with a colon, a bare ``false``, and a trailing comma.
+    Each of them used to collect a sentence telling the operator to go and fix a fractional second
+    they never wrote.
+
+    A pattern match cannot do it either. The obvious one, seconds followed by a comma and a digit,
+    matches every ordinary value, because the field separator is itself a comma and a bound ends
+    in ``:00`` right before it.
+    """
+    for first, second in zip(fields, fields[1:], strict=False):
+        try:
+            datetime.fromisoformat(f"{first},{second}")
+        except ValueError:
+            continue
+        return True
+    return False
+
+
 def _take_bar_flag(raw: str, fields: list[str]) -> bool | None:
     """Take the named fields off the end of one ``--bars`` value and read the flag.
 
@@ -367,7 +394,7 @@ def _parse_bar_requests(raw_requests: Sequence[str]) -> list[BarRequest]:
             hint = (
                 ". An ISO instant may use a comma for fractional seconds, which splits "
                 "here. Write it with a period, like 2026-09-14T09:30:00.500-04:00."
-                if len(fields) > 4
+                if _splits_an_instant(fields)
                 else ""
             )
             raise ValueError(
@@ -391,19 +418,23 @@ def _parse_bar_requests(raw_requests: Sequence[str]) -> list[BarRequest]:
             )
         except ValueError as exc:
             raise ValueError(f"--bars {raw!r}: {exc}") from exc
-        key = bar_request_key(request)
+        key = _bar_request_key(request)
         if key in keys:
-            # Two requests with one key record two interactions the replay cannot tell apart,
-            # and ``Cassette.find`` returns the first, so the second is a live request spent on
-            # something nothing can ever read back. That is the loss the --out refusal exists to
-            # prevent, arriving through a third door. The flag is what makes it likely: one
-            # window recorded twice differing in one field is the shape of the intended run, and
-            # an operator who writes the field once has written two identical values.
+            # ``Cassette.find`` matches on params and returns the first hit, so a second
+            # interaction keyed alike is reachable only by index and never by the replay. The
+            # flag is what makes that the shape of the intended run: one window recorded twice
+            # differing in one field, where an operator who writes the field once has written two
+            # identical values. Recording one window twice on purpose is a real thing to want, so
+            # the message says how, rather than the refusal pretending nobody could mean it.
+            #
+            # Chains and quotes can be duplicated the same way and are not refused here. #442
+            # carries them, because neither reaches a parse step inside the ``try`` that turns a
+            # refusal into one line.
             raise ValueError(
                 f"--bars {raw!r} asks for a window an earlier --bars already asked for. Two "
                 "requests keyed alike record two interactions the replay cannot tell apart, and "
-                "only the first is ever found. Vary the window or the "
-                f"{BAR_FLAG_NAME} flag, or drop one."
+                f"only the first is ever found. Vary the window or the {BAR_FLAG_NAME} flag, "
+                "drop one, or record the pair as two runs with two --out paths."
             )
         keys.append(key)
         requests.append(request)

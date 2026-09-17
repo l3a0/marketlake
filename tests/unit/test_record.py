@@ -672,19 +672,78 @@ def test_a_bare_fifth_field_is_refused_even_when_it_spells_a_flag_value():
 def test_a_named_field_is_read_in_trailing_position_only():
     """The four positional fields stay positional.
 
-    A flag written in the middle falls to the four-field refusal and collects the
-    fractional-second sentence, which blames the wrong thing. That cost is accepted on #437,
-    because making the hint precise means detecting the comma marker in the raw value instead of
-    counting fields, which is a change to the guard this work exists to preserve. The metavar
-    shows the position, so the form the operator is shown is the form that works.
+    The guard does not need this rule. Review measured that popping named fields from anywhere
+    leaves every fractional-second refusal intact, so trailing-only is not what keeps the ISO
+    comma named. What keeps it is the ``=``, which no instant carries.
 
-    Mutation found this unheld: popping named fields from anywhere in the value passed the suite
-    unchanged, and that is a wider grammar than the metavar promises.
+    The rule earns its place for a smaller reason: the metavar promises four positional fields
+    then a named one, and accepting a named field anywhere is a wider grammar than the tool shows
+    anybody. A mid-position flag now reaches the four-field refusal with no fractional-second
+    sentence attached, because the hint is demonstrated rather than counted, so the operator is
+    told what is actually wrong.
+
+    Mutation found the rule unheld: popping named fields from anywhere passed the suite unchanged.
     """
     with pytest.raises(ValueError, match="four comma-separated fields"):
         _parse_bar_requests(
             ["SPY,1m,extended_hours=false,2026-09-14T09:30:00-04:00,2026-09-14T16:00:00-04:00"]
         )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        f"{UNFLAGGED},extended_hours: false",
+        f"{UNFLAGGED},false",
+        f"{UNFLAGGED},",
+        f"{UNFLAGGED},extended_hours=true,",
+        f"{UNFLAGGED},extra",
+        "SPY,1m,extended_hours=false,2026-09-14T09:30:00-04:00,2026-09-14T16:00:00-04:00",
+    ],
+    ids=["colon", "bare", "trailing-comma", "flag-then-comma", "word", "mid-position"],
+)
+def test_a_flag_typo_is_not_blamed_on_a_fractional_second(raw):
+    """Every one of these is refused, and none of them wrote a fractional second.
+
+    Counting fields cannot tell them apart from a split bound. Before the flag existed, more than
+    four fields almost always meant the ISO comma, so the hint was nearly always right. The flag
+    inverted that: the likelier cause is now a mistyped flag, and the sentence sent the operator
+    to check timestamps that were never the problem. On the trailing-comma cases there is nothing
+    to act on at all.
+    """
+    with pytest.raises(ValueError, match="four comma-separated fields") as caught:
+        _parse_bar_requests([raw])
+    assert "fractional seconds" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "SPY,1m,2026-09-14T09:30:00,500-04:00,2026-09-14T16:00:00-04:00",
+        "SPY,1m,2026-09-14T09:30:00-04:00,2026-09-14T16:00:00,500-04:00",
+        "SPY,1m,2026-09-14T09:30:00,500-04:00,2026-09-14T16:00:00-04:00,extended_hours=false",
+    ],
+    ids=["start", "end", "behind-a-real-flag"],
+)
+def test_a_split_bound_is_named_wherever_it_falls(raw):
+    # The refusal demonstrates the case rather than guessing at it: the two halves are rejoined
+    # with the comma that split them and handed to the parser that reads a bound. So it holds on
+    # either bound, and behind a legitimate named field.
+    with pytest.raises(ValueError, match="comma for fractional seconds"):
+        _parse_bar_requests([raw])
+
+
+def test_the_hint_cannot_be_a_pattern_match_on_the_raw_value():
+    """Why the refusal rejoins fields instead of matching seconds-comma-digit.
+
+    That pattern matches every ordinary --bars value, because the field separator is itself a
+    comma and a bound ends in ``:00`` immediately before it. A hint gated on it would fire always,
+    which is what it already did by counting.
+    """
+    import re
+
+    assert re.search(r":\d\d,\d", UNFLAGGED), "the naive pattern matches a perfectly good value"
+    _parse_bar_requests([UNFLAGGED])  # and that value parses, so the pattern proves nothing
 
 
 def test_two_bars_values_with_one_key_are_refused():
