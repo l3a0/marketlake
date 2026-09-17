@@ -31,7 +31,7 @@ from lake import journal, report, sweep
 from lake.alert import Publisher
 from lake.bars import CHECK_BAR_CLOSE
 from lake.calendar import NotASession
-from lake.capture_spans import CaptureSpan, CaptureSpans
+from lake.capture_spans import SPANS_SCHEMA_VERSION, CaptureSpan, CaptureSpans
 from lake.cassette import Cassette
 from lake.control_plane import EOD_SWEEP_SLUG, SUNDAY_WAKE, pmset_schedule_args
 from lake.manifest import append_quarantine
@@ -150,15 +150,39 @@ def _cassette(close: float = SETTLED_CLOSE, *, session: date = SESSION) -> Casse
     window, so a run against another session replays nothing and fails visibly rather than
     reading somebody else's day.
     """
-    session_open, session_close = _bounds(session)
-    start, end = session_open - DAY_MARGIN, session_close + DAY_MARGIN
-    return Cassette(
-        interactions=tuple(
+    interactions: list = []
+    for day in _walked(session):
+        day_open, day_close = _bounds(day)
+        interactions.extend(
             bars_interactions(
-                "SPY", DAILY_FREQ, [(start, end, [_daily_candle(session, close=close)])]
+                "SPY",
+                DAILY_FREQ,
+                [
+                    (
+                        day_open - DAY_MARGIN,
+                        day_close + DAY_MARGIN,
+                        [_daily_candle(day, close=close)],
+                    )
+                ],
             )
         )
-    )
+    return Cassette(interactions=tuple(interactions))
+
+
+def _walked(session: date) -> list[date]:
+    """Every session the nightly walk reaches on a run whose clock sits on ``session``.
+
+    The 18:30 job walks the capture spans rather than the one session the clock is in, which is
+    marketlake #422, so a recording for one day alone replays nothing for the days before it. The
+    span in ``_spans`` opens on 2026-09-08 and the fake calendar's first week opens on ``MONDAY``,
+    so the walk reaches ``MONDAY`` through ``session`` inclusive.
+    """
+    days, day = [], MONDAY
+    while day <= session:
+        if day.weekday() < 5:
+            days.append(day)
+        day += timedelta(days=1)
+    return days
 
 
 class _CountingVendorSource:
@@ -213,6 +237,8 @@ def _lake(
     *,
     quotes: dict[tuple[str, date], list[dict]] | None = None,
     chains: dict[tuple[str, date], pa.Table] | None = None,
+    tickers: tuple[str, ...] = ("SPY",),
+    instrument_ids: tuple[int, ...] = (1,),
 ) -> Path:
     """A lake holding the next session's sealed quotes, the ledger, the master and the spans.
 
@@ -228,9 +254,9 @@ def _lake(
     for (ticker, day), table in (chains or {}).items():
         fixture_lake.with_chains(ticker, day, table)
     fixture_lake.with_reference("schema_versions", _ledger_table())
-    fixture_lake.with_reference("capture_spans", _spans().to_table())
+    fixture_lake.with_reference("capture_spans", _spans(instrument_ids).to_table())
     root = fixture_lake.build()
-    _master().write(master_path(root))
+    _master(tickers).write(master_path(root))
     return root
 
 
@@ -1116,6 +1142,157 @@ def test_a_frequency_the_lake_cannot_fetch_ends_the_bar_fetch_alone(fixture_lake
     assert pinger.urls == []
 
 
+def test_the_unwalked_lines_are_counted_rather_than_listed(fixture_lake: FixtureLake):
+    """One bounded line, because the list grows by a ticker-day per trading day and never shrinks.
+
+    ``retire --remove`` drops the roster entry and leaves the closed span behind, so every session
+    that span covered is unresolvable for ever and the plan reports it again every night. Rendered
+    one line each, that walks the nightly report into ``digest_body``'s byte cap, and what falls
+    off the end first is the battery's own census, which is appended after these lines.
+
+    A line that silences the check above it is worse than no line at all, which is why this one is
+    a count and a sample rather than the list. The full list stays in the by-hand ``--backfill``
+    run, which has no byte budget.
+    """
+    root = _lake(fixture_lake, tickers=("SPY", "QQQ"), instrument_ids=(1, 2))
+    # QQQ is captured and gone from the roster, which is what ``retire --remove`` leaves.
+    roster = Roster.from_mapping({"SPY": {"options": True, "bars": [DAILY_FREQ]}})
+
+    outcome, _, _ = _run(root, roster=roster)
+
+    unwalked = [line for line in outcome.nightly.report if line.startswith("bars unwalked")]
+    assert len(unwalked) == 1, f"one line per ticker-day reached the report: {unwalked}"
+    assert "ticker-day(s)" in unwalked[0]
+    assert "QQQ" in unwalked[0], "the line says nothing about which ticker"
+    # And the bars themselves still landed: an unresolved ticker-day is not a refusal.
+    assert dict(outcome.nightly.pieces)["bars"].refusal is None
+
+
+def test_a_spans_file_from_a_newer_writer_refuses_the_piece_not_the_evening(
+    fixture_lake: FixtureLake,
+):
+    """The 18:30 job reads the capture spans for the first time, so it inherits their failures.
+
+    ``bars.main`` already learned this one and wrote it down: naming ``SpansUnreadable`` alone
+    left its sibling ``UnsupportedSpansSchemaVersion`` reaching the operator as a stack, and a
+    spans file from a newer version of this code is the one shape of it a person actually meets,
+    after a rollback or a half-finished deploy.
+
+    Escaping here costs far more than it costs a command. Everything after the pieces block is
+    lost with it: the battery, the report file, the digest, the ping, and on a Friday the Sunday
+    one-shot wake, so the canary and the scrub do not run either and nothing says why until the
+    23:30 missed check pages.
+
+    So the tuple names ``CaptureSpansError`` rather than one member of it, and the run reports the
+    refusal, withholds the ping because a refusal is a problem, and finishes everything else.
+    """
+    root = _lake(fixture_lake)
+    table = _spans().to_table()
+    bumped = table.set_column(
+        table.schema.get_field_index("schema_version"),
+        "schema_version",
+        pa.array([SPANS_SCHEMA_VERSION + 1] * table.num_rows, type=pa.int32()),
+    )
+    pa.parquet.write_table(bumped, root / "reference" / "capture_spans.parquet")
+
+    outcome, pinger, transport = _run(root, now=FRIDAY_EVENING, setter=_RecordingSetter())
+
+    bars_piece = dict(outcome.nightly.pieces)["bars"]
+    assert bars_piece.refusal is not None, "the spans version escaped and took the evening"
+    assert "SpansSchemaVersion" in bars_piece.refusal or "schema version" in bars_piece.refusal
+    # Everything after the pieces block still happened.
+    assert outcome.nightly.report is not None
+    assert pinger.urls == [], "a refused piece must withhold the ping"
+    assert transport.messages, "the digest never went out"
+
+
+def test_a_stale_frequency_on_a_retired_ticker_does_not_withhold_the_ping(
+    fixture_lake: FixtureLake,
+):
+    """The nightly walk keeps the nightly's own scope, which is the enabled roster.
+
+    ``_require_supported`` checks ``roster.enabled`` and its docstring says exactly why: "a stale
+    ``bars:`` line on a retired ticker, which nothing here would ever fetch, would halt the
+    nightly run at exit 2 every night until someone edited a file for a ticker that is not being
+    captured." ``backfill_bars`` checks the plan instead, retired tickers included, because a
+    by-hand recovery run fetches those on purpose, and ``_require_supported_plan`` records that
+    the narrower sentence "stops holding" for it.
+
+    Pointing the nightly job at that walk makes the sentence hold again, so the roster is filtered
+    to enabled at the call site. Without that filter this run raises ``UnsupportedBarFreq``, ends
+    the bars piece and withholds the ping, for a ticker nothing captures, every night forever.
+
+    QQQ is retired with a frequency the seam has no call for. It has a span and a master entry, so
+    the plan reaches it, which is what makes the unfiltered roster fail rather than simply skip.
+    """
+    root = _lake(fixture_lake, tickers=("SPY", "QQQ"), instrument_ids=(1, 2))
+    roster = Roster.from_mapping(
+        {
+            "SPY": {"options": True, "bars": [DAILY_FREQ], "enabled": True},
+            "QQQ": {"options": True, "bars": ["1w"], "enabled": False},
+        }
+    )
+
+    outcome, pinger, _ = _run(root, roster=roster)
+
+    bars_piece = dict(outcome.nightly.pieces)["bars"]
+    assert bars_piece.refusal is None, "a retired ticker's stale line ended the nightly bars walk"
+    assert bars_piece.landed == 1
+    assert outcome.nightly.problems == ()
+    assert pinger.urls == [PING_URL], "the nightly ping was withheld"
+    assert outcome.nightly.pinged is True
+
+
+def test_a_daily_bar_held_tonight_is_reached_again_tomorrow(fixture_lake: FixtureLake):
+    """Marketlake #422. The defect was that nothing ever came back for a held session.
+
+    A daily bar is judged against the calendar-next session's settled close, and at 18:30 on
+    session S that session has not been captured, so every daily bar is held on the night it is
+    fetched. ``fetch_session_bars`` said that settles itself because "the next run lands the bar".
+    It did not. The next run fetched the *next* session, met the same absence for it, and nothing
+    scheduled ever asked about S again. The nightly job therefore landed no daily bar, ever.
+
+    **This is the test the old shape could not pass.** Two runs a day apart over one lake. The
+    first is the night of ``SESSION`` with no quotes sealed for the session after it, so the bar
+    is held and no partition exists. The second is the following night, by which point that
+    session's quotes are sealed, and it has to reach back and land the bar the first run held.
+
+    The second run is the whole point: under a single-session fetch it would ask only about
+    ``FOLLOWING`` and ``SESSION``'s partition would stay missing forever.
+    """
+    root = _lake(fixture_lake, quotes={})
+    partition = LakePaths(root).bars_partition_path("SPY", DAILY_FREQ, SESSION)
+
+    # Night one, the night of SESSION. The close cross-check reads the calendar-next session's
+    # settled close, and that session has not been captured yet, so the bar is held.
+    first, _, _ = _run(
+        root,
+        now=EVENING,
+        vendor_source=_CountingVendorSource(_cassette(session=SESSION)),
+    )
+    held = dict(first.nightly.pieces)["bars"]
+    assert (held.landed, held.held) == (0, 1), "the bar landed on the night it was fetched"
+    assert not partition.exists()
+
+    # FOLLOWING's quotes seal, which is what its own compaction does the next afternoon.
+    fixture_lake.with_quotes("SPY", FOLLOWING, _quotes_table([_quote_row(FOLLOWING)]))
+
+    # Night two. Under a single-session fetch this asks only about FOLLOWING and SESSION's
+    # partition stays missing forever. It has to reach back.
+    second, _, _ = _run(
+        root,
+        now=EVENING + timedelta(days=1),
+        vendor_source=_CountingVendorSource(_cassette(session=FOLLOWING)),
+    )
+    landed = dict(second.nightly.pieces)["bars"]
+    assert landed.landed == 1, "the run did not reach back to the session it held last night"
+    assert partition.exists(), "SESSION's daily partition never landed"
+
+    # And it is SESSION's bar, not the newer session's.
+    table = pa.parquet.read_table(partition)
+    assert table.column("bar_ts").to_pylist() == [f"{SESSION.isoformat()}T04:00:00+00:00"]
+
+
 def test_a_naive_bar_stamp_is_a_refused_bars_piece_rather_than_the_end_of_the_run(
     fixture_lake: FixtureLake, monkeypatch
 ):
@@ -1137,7 +1314,7 @@ def test_a_naive_bar_stamp_is_a_refused_bars_piece_rather_than_the_end_of_the_ru
     def refuse(*args, **kwargs):
         raise bars_module.StampNotAnInstant("2026-09-14T00:00:00")
 
-    monkeypatch.setattr(sweep, "fetch_session_bars", refuse)
+    monkeypatch.setattr(sweep, "backfill_bars", refuse)
     outcome, pinger, _ = _run(root)
 
     bars_piece = dict(outcome.nightly.pieces)["bars"]

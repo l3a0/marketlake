@@ -563,8 +563,11 @@ def test_a_session_with_no_sealed_quotes_partition_is_contained_the_same_way(
 
     Tonight's session has no next partition yet, which this job's first real run meets: the
     following session has not happened, so compaction has sealed nothing for it. The rule is
-    the same one, written once over ``LoadError``, and this is the half that settles itself:
-    tomorrow's seal makes the comparison available and the next run lands the bar.
+    the same one, written once over ``LoadError``, and this is the half that can settle: tomorrow's
+    seal makes the comparison available. What lands the bar is a run that asks about this session
+    again, and this entry point never does, because it fetches the one session it is given.
+    Marketlake #422 moved the evening run to the span walk for that reason, and
+    ``test_a_daily_bar_held_tonight_is_reached_again_tomorrow`` is where the recovery is held.
     """
     root = _lake(
         fixture_lake,
@@ -997,7 +1000,7 @@ def test_the_command_exits_one_when_a_finding_could_not_be_filed(
 def test_the_command_runs_the_sweep_and_reports_what_it_did(
     fixture_lake: FixtureLake, tmp_path: Path, capsys
 ):
-    """The ordinary run. ``lake.sweep`` drives the same entry from its 18:30 job."""
+    """The ordinary by-hand run. ``lake.sweep`` drives the span walk rather than this one."""
     root = _lake(fixture_lake)
     config = write_config(tmp_path, root)
 

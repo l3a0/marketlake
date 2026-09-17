@@ -12,9 +12,11 @@ first and quarantining later, because a capture minute is perishable and a bar i
 serves a roughly 30-day one-minute lookback and daily bars indefinitely, so a bar refused
 tonight is re-fetchable tomorrow while a chain snapshot missed at 10:31 is gone.
 
-Run it with ``python -m lake.bars`` to fetch by hand. ``lake.sweep`` is what schedules it:
-its 18:30 weekday job calls :func:`fetch_session_bars_from_config` for the session whose close
-has passed.
+Run it with ``python -m lake.bars`` to fetch by hand. ``lake.sweep`` is what schedules it: its
+18:30 weekday job calls :func:`backfill_bars`, walking every session the capture spans still hold
+unlanded rather than the one its clock sits on. Marketlake #422 made that swap, because a daily
+bar is judged against the *next* session's settled close and so cannot pass its own gate on the
+night it is fetched.
 
 What one run does, per ticker and per configured frequency, for one session.
 
@@ -27,7 +29,8 @@ What one run does, per ticker and per configured frequency, for one session.
 5. Write the partition and append its manifest entry, both inside one lock hold.
 
 **Two entry points, and which ticker-days each covers.** :func:`fetch_session_bars` fetches one
-session, taken from the clock or named by its own ``session`` argument. That is the evening run.
+session, taken from the clock or named by its own ``session`` argument. Nothing schedules it: it
+is the by-hand single-session fetch, and marketlake #422 moved the evening run off it.
 :func:`backfill_bars` walks every session the capture spans cover, which is marketlake #319
 recovering an outage the lake has already had. Both build a list of :class:`TickerDay` and hand
 it to the same walk, so the gate, the manifested skip and the held findings mean the same thing
@@ -942,7 +945,11 @@ def fetch_session_bars(
 
     **A held bar repeats, and the repeat is bounded differently per cause.** A close
     cross-check with no source because tonight's session has no next partition yet settles
-    itself: tomorrow's compaction seals that partition and the next run lands the bar. A
+    itself once something comes back for that session. Nothing here does. This function fetches
+    the one session it was given, so a caller that hands it today's date every night never
+    re-attempts yesterday's, and the bar it held is held forever. Marketlake #422 measured that
+    and moved the evening run to :func:`backfill_bars`, whose walk does come back. A caller of
+    this function owns re-attempting what it holds. A
     session whose quotes carry gap rows and no data row repeats until someone repairs it, and
     the pile of findings is the record of that. A span refusal repeats without bound on
     purpose, which is marketlake #333's own rule: if the vendor is honouring ``period``, every
@@ -1336,8 +1343,13 @@ def _bar_close(rows: Sequence[dict]) -> float | None:
 # -- the backfill: every session the capture spans cover ----------------------
 
 
-def _read_spans(lake_root: Path) -> CaptureSpans:
-    """The capture spans, or the reason the backfill stops. Mirrors :func:`_read_master`.
+def read_capture_spans(lake_root: Path) -> CaptureSpans:
+    """The capture spans, or the reason a walk over them stops. Mirrors :func:`_read_master`.
+
+    Public because it has two callers. ``lake.sweep`` reads the spans to hand
+    :func:`backfill_bars` the range the nightly run walks, and it needs the same
+    absent-against-torn distinction this draws rather than a second reading of the same file.
+    Marketlake #422.
 
     An absent file and a torn one are told apart, because the fixes differ: one wants
     ``python -m lake.seed_spans`` and the other wants a restore. ``CaptureSpans.read`` already
@@ -1727,7 +1739,7 @@ def backfill_bars_from_config(
         clock=SystemClock() if clock is None else clock,
         calendar=ExchangeCalendar(),
         roster=load_tickers(tickers_path),
-        spans=_read_spans(Path(config.lake_root)),
+        spans=read_capture_spans(Path(config.lake_root)),
     )
 
 
@@ -1892,6 +1904,7 @@ __all__ = [
     "TickerDay",
     "UnsupportedBarFreq",
     "backfill_bars",
+    "read_capture_spans",
     "backfill_bars_from_config",
     "bar_window",
     "check_bar_span",
