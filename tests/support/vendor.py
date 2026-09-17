@@ -428,7 +428,9 @@ class RecordingVendor:
 
     The cassette key already carries the window, so a fetch asking for the wrong one raises
     ``CassetteError`` rather than replaying a neighbour's recording. Keeping the calls turns that
-    precondition into an assertion a test can read: which window, in which order.
+    precondition into an assertion a test can read: which window, in which order, and under which
+    flag. The flag is recorded through ``bars_params`` like the bounds, so it is omitted from a
+    call that left it unset and present on one that set it, exactly as the request is.
 
     ``fail_with`` raises for a named ticker instead of replaying, which is how a vendor refusal is
     driven. ``fail_after`` raises once that many calls have been recorded, whichever ticker they
@@ -461,8 +463,12 @@ class RecordingVendor:
         self._failure = failure
         self.calls: list[dict] = []
 
-    def _record(self, symbol: str, freq: str, start: datetime, end: datetime) -> None:
-        self.calls.append(bars_params(symbol, freq, start=start, end=end))
+    def _record(
+        self, symbol: str, freq: str, start: datetime, end: datetime, extended_hours: bool | None
+    ) -> None:
+        self.calls.append(
+            bars_params(symbol, freq, start=start, end=end, extended_hours=extended_hours)
+        )
         if self._fail_after is not None and len(self.calls) > self._fail_after:
             if self._failure is None:
                 raise ValueError("fail_after needs a failure to raise")
@@ -479,7 +485,7 @@ class RecordingVendor:
         extended_hours: bool | None = None,
         previous_close: bool | None = None,
     ) -> VendorResponse:
-        self._record(symbol, MINUTE_FREQ, start, end)
+        self._record(symbol, MINUTE_FREQ, start, end, extended_hours)
         return self._replay.get_minute_bars(
             symbol,
             start=start,
@@ -497,7 +503,7 @@ class RecordingVendor:
         extended_hours: bool | None = None,
         previous_close: bool | None = None,
     ) -> VendorResponse:
-        self._record(symbol, DAILY_FREQ, start, end)
+        self._record(symbol, DAILY_FREQ, start, end, extended_hours)
         return self._replay.get_daily_bars(
             symbol,
             start=start,

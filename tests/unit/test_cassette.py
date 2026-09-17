@@ -95,9 +95,20 @@ def test_load_rejects_an_unsupported_version(tmp_path):
 # -- price history on the shared cassette --------------------------------------
 #
 # The checked-in minimal cassette is what ``conftest.cassette_vendor`` hands the whole
-# suite, so a happy-path price-history interaction recorded there reaches every test
-# without a fourth fixture file. The two shapes below are both synthetic. A recording
-# from a real account carries real market data and is never committed.
+# suite. The two shapes below are both synthetic. A recording from a real account
+# carries real market data and is never committed.
+#
+# **Its two ``freq=1m`` interactions are reachable by a direct seam call and not by the
+# bars sweep.** They are keyed without ``extended_hours``, which is what the request that
+# produced them carried. Marketlake #421 made the sweep's minute fetch ask for the regular
+# session by name, so it looks a recording up under ``extended_hours: false`` and misses
+# both of these.
+#
+# Re-keying them to match would be the wrong repair. A cassette key states what its own
+# request asked for, which is why ``bars_params`` keys a flag exactly as given and never
+# coerces one, and a recording taken without the flag does not become one taken with it
+# because a later caller wants the key. A sweep-shaped minute replay needs a recording
+# taken through the flagged recorder, which is a live request and the owner's to make.
 
 
 _ET = timezone(timedelta(hours=-4))

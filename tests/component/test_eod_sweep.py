@@ -673,7 +673,16 @@ def test_the_friday_run_sets_the_sunday_one_shot_and_reads_it_back(fixture_lake:
     )
 
     assert setter.sundays == [SUNDAY]
-    assert outcome.nightly.report == ()
+    # The battery's coverage census prints on every session run, including one that found
+    # nothing wrong, because it is the only thing in the report file that says the check ran.
+    # The fixture lake seals one quotes partition, and by this Friday evening the span has
+    # owed ten partitions across five sessions. The line is asserted whole rather than
+    # described, because a comment describing it cannot be wrong in a way anything catches.
+    (census,) = outcome.nightly.report
+    assert census == (
+        "battery: calendar coverage, 9 of 10 owed sessions have no partition, "
+        "over 5 sessions, 2026-09-14 to 2026-09-18"
+    )
     assert outcome.nightly.problems == ()
     assert pinger.urls == [PING_URL]
 
@@ -1706,9 +1715,15 @@ def test_the_battery_runs_on_a_session_and_its_counts_reach_the_outcome(
     """The design places it between the bar fetch and the Friday branch, and this is it.
 
     The fixture lake carries the master and the spans, so the battery judges rather than
-    reporting that it could not tell whether capture was running. The sealed quotes partition
-    is the one it judges, and the fixture's rows are real-time and in-session, so it comes back
-    clean and the ledger stays empty.
+    reporting that it could not tell whether capture was running.
+
+    **What it judges is nothing, and the assertions say so.** The run passes ``day=MONDAY``
+    while the fixture seals its quotes partition for ``FOLLOWING``, so the walk finds no
+    partition at all. The docstring here used to claim the opposite, that the quotes partition
+    came back clean, and the assertions below it were satisfied by a battery that judged
+    nothing, so nothing caught the claim. What this holds is the wiring: the record reaches the
+    outcome, the scope resolved, and no line was written. The checks themselves are held in
+    ``tests/component/test_battery.py``.
     """
     root = _lake(fixture_lake)
 
@@ -1717,6 +1732,36 @@ def test_the_battery_runs_on_a_session_and_its_counts_reach_the_outcome(
     assert outcome.battery is not None
     assert outcome.battery.scope_unknown == 0
     assert outcome.battery.appended == ()
+    assert outcome.battery.judged == 0, "the sealed partition is not this run's session"
+    assert outcome.battery.sessions_owed > 0, "coverage still walked the span"
+
+
+def test_the_sweeps_census_carries_every_count_the_battery_produces(fixture_lake: FixtureLake):
+    """``Nightly.render``'s own rule: a night that judged nothing and a night that judged the
+    lake and found it clean are different answers.
+
+    ``insufficient_history`` was structurally zero while one check existed, so the census could
+    omit it and stay true. It reads six against the live lake now, and the two coverage counts
+    are the only place a permanently missing session reaches this block at all.
+    """
+    root = _lake(fixture_lake)
+
+    outcome, _, _ = _run(root)
+    (line,) = [ln for ln in outcome.render().splitlines() if "battery: judged" in ln]
+
+    for name in (
+        "judged",
+        "quarantined",
+        "clean",
+        "insufficient_history",
+        "out_of_scope",
+        "scope_unknown",
+        "unreadable",
+        "sessions_owed",
+        "sessions_missing",
+        "wrote",
+    ):
+        assert name in line, f"{name} missing from the census: {line}"
 
 
 def test_a_holiday_runs_no_battery_at_all(fixture_lake: FixtureLake):

@@ -15,7 +15,7 @@
 # launchd starts each once and KeepAlive relaunches it if it exits, so each holds
 # the Python it imported at start. The venv is an editable install pointing at an
 # absolute src directory, so editing that tree changes what a NEW process imports
-# and nothing about one already running. The other three jobs exec fresh on every
+# and nothing about one already running. The other four jobs exec fresh on every
 # fire, so they always run current code and never need this.
 #
 # `launchctl kickstart -k` runs the service immediately whatever its launch
@@ -26,7 +26,7 @@
 #
 #     ./uninstall.sh && ./install.sh
 #
-# That reinstall does restart both residents on the way through, so it is not that
+# That reinstall does restart every resident on the way through, so it is not that
 # this case had no tool. It is that the only tool was one that takes the whole
 # control plane off and puts it back to achieve a process restart.
 #

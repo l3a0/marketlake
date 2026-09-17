@@ -2028,6 +2028,59 @@ def test_the_restart_offers_exactly_the_jobs_that_can_go_stale(tmp_path):
         assert label not in script, label
 
 
+def test_both_staleness_sentences_count_the_calendar_jobs_today(tmp_path, capsys):
+    """The count an operator reads matches the roster the machine actually runs.
+
+    Two sentences answer "does this job need a restart", one in ``restart.sh`` and one in
+    the install text. Both said three while the roster held four, because the 18:30 sweep
+    shipped after they were written. The expected word is written out here rather than
+    read from ``_spelled``, so both sides of the assertion do not come from the same
+    function. Growing the roster is the next test.
+    """
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    install_text = capsys.readouterr().out
+    transient = [job for job in cp.all_jobs(_host()) if not job.keep_alive]
+    assert len(transient) == 4, transient
+    restart = (out / cp.RESTART_SCRIPT_FILE).read_text()
+    assert "The other four jobs exec fresh on every" in restart, restart
+    assert "The other four jobs exec fresh every fire" in install_text, install_text
+
+
+def test_both_staleness_sentences_follow_a_seventh_job_onto_the_machine(tmp_path, monkeypatch):
+    """A number that is right today is what the last job addition left behind.
+
+    Matching the sentence against the roster's current length cannot tell a derived count
+    from a typed one. A typed "four" is right until the seventh job lands. So the roster
+    grows a calendar job here and both sentences have to follow it. A literal passes the
+    test above and fails this one.
+    """
+    grown = cp.all_jobs(_host()) + (
+        _host().job("com.marketlake.seventh", "lake.nothing", calendar={"Hour": 3, "Minute": 0}),
+    )
+    monkeypatch.setattr(cp, "all_jobs", lambda host: grown)
+    assert len([job for job in grown if not job.keep_alive]) == 5
+    restart = cp.restart_script(_host())
+    install_text = cp.install_commands(tmp_path / "out", _host())
+    assert "The other five jobs exec fresh on every" in restart, restart
+    assert "The other five jobs exec fresh every fire" in install_text, install_text
+
+
+def test_the_install_text_names_the_residents_from_the_roster(tmp_path, monkeypatch):
+    """The install text names the residents, so a third one has to reach that sentence.
+
+    ``restart.sh`` derives its residents already, and the install text wrote them out.
+    That is the same gap one file over, and it is the one that made the claim "a third
+    resident job is covered by adding the job and nothing else" false.
+    """
+    grown = cp.all_jobs(_host()) + (
+        _host().job("com.marketlake.third", "lake.nothing", keep_alive=True, run_at_load=True),
+    )
+    monkeypatch.setattr(cp, "all_jobs", lambda host: grown)
+    install_text = cp.install_commands(tmp_path / "out", _host())
+    assert "The daemon, dashboard and third" in install_text, install_text
+
+
 def test_the_restart_defaults_to_the_dashboard(tmp_path):
     """Restarting the daemon costs the in-flight cycle, so it has to be asked for.
 

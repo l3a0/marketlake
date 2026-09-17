@@ -276,12 +276,14 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
 
   A page that never reached the phone is written to a dated directory under `reports/`, one write-once file each, so the count on the Now panel has a source. It also ships the 09:35 says-closed-but-open probe, its page, its plist through D14's renderer, and the `capture` dead-man feed with its idle heartbeats.
 - **[#265](https://github.com/l3a0/marketlake/issues/265).** The half of the parser's schema-drift page a vanished field leaves no trace of. A retype shows as a known field's name sitting in `extra`, the signature [#129](https://github.com/l3a0/marketlake/issues/129) narrowed the class to, and a field that stops arriving shows as nothing at all. So it is a second detection on the producer [#197](https://github.com/l3a0/marketlake/issues/197) builds, reading the same built batch and the same cadence state, which is why it sequences after that producer rather than beside it.
-- **D14** laptop control plane. `render --out DIR` writes every plist and setup file to a directory and prints the install commands. It refuses a system directory, and nothing here runs `sudo`, a `pmset` write, `launchctl bootstrap`, or a `tmutil` write. What does run is read-only and needs no root: `launchctl print` and `pmset -g assertions` from the self-check, `pmset -g sched` and `tmutil isexcluded` from the Sunday job. The token path comes from one rule, so the daemon that rewrites it, the Sunday job that asserts coverage over it, and the exclusion that protects it cannot name different files. `RunAtLoad` is on for the two residents and the self-check. It is off for the Sunday job, which would otherwise scrub the whole lake at every boot. Beside the sudoers drop-in it renders five LaunchDaemons, and it prints the Time Machine exclusion as an install step rather than rendering it:
+- **D14** laptop control plane. `render --out DIR` writes every plist and setup file to a directory and prints the install commands. It refuses a system directory, and nothing here runs `sudo`, a `pmset` write, `launchctl bootstrap`, or a `tmutil` write. What does run is read-only and needs no root: `launchctl print` and `pmset -g assertions` from the self-check, `pmset -g sched` and `tmutil isexcluded` from the Sunday job. The token path comes from one rule, so the daemon that rewrites it, the Sunday job that asserts coverage over it, and the exclusion that protects it cannot name different files. `RunAtLoad` is on for the two residents and the self-check. It is off for the Sunday job, which would otherwise scrub the whole lake at every boot. Beside the sudoers drop-in it renders one LaunchDaemon per job in the roster, five of them when D14 shipped, and it prints the Time Machine exclusion as an install step rather than rendering it:
   1. the capture daemon, resident under `KeepAlive`,
   2. the query service, resident the same way,
   3. the weekday pre-open self-check, on a calendar interval,
   4. the 09:35 calendar probe, the says-closed-but-open guard,
   5. the Sunday maintenance job, on its own.
+
+  The 18:30 vendor sweep joined them later, in [#377](https://github.com/l3a0/marketlake/issues/377), which is why the list above stops at five. The count is written as a rule rather than a number because the earlier wording said five after the sweep had made it six.
 
   `render` also writes an executable `install.sh`, so the privileged half is one command
   the operator runs rather than seventeen lines pasted by hand. The **by-hand paste is
@@ -380,14 +382,15 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
      line and a golden, if a reinstall ever earns a step of its own.
 
   `render` also writes `restart.sh`, which restarts a resident job so it picks up new
-  code. Two of the six jobs can go stale, and the reason is the shape of the job rather
+  code. Only a resident job can go stale, and the reason is the shape of the job rather
   than anything about the code. The daemon and the dashboard are resident: launchd starts
   each once and `KeepAlive` relaunches it if it exits, so each holds the Python it
   imported at start. The venv is an editable install whose path entry is the absolute
   `src` directory, so editing that tree changes what a *new* process imports and nothing
-  about one already running. The self-check, the calendar probe, the Sunday job and the
-  vendor sweep exec fresh on every fire, so they always run current code. The script
-  derives that pair from `keep_alive` rather than listing it.
+  about one already running. Every other job runs on a calendar and execs fresh on every
+  fire, so it always runs current code. The script derives both sides from `keep_alive`
+  rather than writing either out, which [#451](https://github.com/l3a0/marketlake/issues/451)
+  made true of the exec-fresh side after a typed count left the 18:30 sweep out of it.
 
   `launchctl kickstart -k` runs the service immediately whatever its launch conditions
   say, killing the running instance first if there is one. That is right when the code
