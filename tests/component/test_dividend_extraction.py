@@ -1490,10 +1490,11 @@ def test_the_command_against_an_undecodable_actions_ledger_is_a_line_and_not_a_s
     ``MasterAbsent``, ``MasterUnreadable`` and ``ManifestError``, and nothing else from this
     module's family, so the refusal arrived as a stack.
 
-    The handler names the new class alone rather than ``ActionsError``. ``docs/design.md`` says
-    the lake-state errors keep their stack on purpose, because a corrupt lake wants the frames
-    that name where the corruption was found, and widening to the base class here would reverse
-    that quietly.
+    The handler names the new class alone rather than ``ActionsError``, because the family's
+    other members are not run-ending conditions. ``UnresolvedSymbol`` is a per-ticker-day finding
+    the walk already holds, ``LedgerLineError`` names one entry rather than the file, and the two
+    master errors have their own arms with their own repairs. Catching the base class would print
+    one sentence about a ledger for all four.
     """
     root = _lake(fixture_lake, {("SPY", DAY_ONE): [_row(DAY_ONE)]})
     ledger = actions.actions_path(root)

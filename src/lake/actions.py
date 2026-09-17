@@ -371,7 +371,7 @@ def _decode(path: Path, raw: bytes) -> str:
     installed launchd job sets a locale or turns UTF-8 mode off. So pinning the encoding removes
     a dependence on an interpreter flag nobody tracks rather than a failure anything has met.
 
-    ``manifest.decode_utf8`` is not reused, although the rule is identical, because it raises
+    ``manifest._decode_utf8`` is not reused, although the rule is identical, because it raises
     ``manifest.LedgerNotUtf8``. That is a ``ManifestError``, and :func:`main` already prints a
     line for that class about a damaged quarantine ledger. This file wants its own family, so it
     gets its own decoder and the two stay one rule written twice rather than one class raised
@@ -379,7 +379,7 @@ def _decode(path: Path, raw: bytes) -> str:
 
     **The message sends the person repairing the file to the byte and to the line.** The
     exception carries the byte offset alone, which is the wrong unit for an editor, so the line
-    is counted from the newlines in front of it, the same care ``manifest.decode_utf8`` takes
+    is counted from the newlines in front of it, the same care ``manifest._decode_utf8`` takes
     for the same reader.
     """
     try:
@@ -1554,10 +1554,14 @@ def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> in
         # treatment. Caught apart from that arm because the two name different files and the
         # repair is the same sentence about a different one.
         #
-        # This catches the new class alone rather than ``ActionsError`` as a whole.
-        # ``docs/design.md`` says the lake-state errors keep their stack on purpose, because a
-        # corrupt lake wants the frames that name where the corruption was found, and widening
-        # to the base class here would quietly reverse that.
+        # **This catches the new class alone rather than ``ActionsError`` as a whole**, because
+        # the family's other members are not run-ending conditions and do not want this line.
+        # ``UnresolvedSymbol`` is a per-ticker-day finding the walk already holds at
+        # :func:`extract_dividends`, and ``LedgerLineError`` names one entry rather than the
+        # file, so a reader meeting it wants the frames that say which entry. ``MasterAbsent``
+        # and ``MasterUnreadable`` have their own arms above with their own repairs, and
+        # catching the base class here would take all four and print one sentence about a
+        # ledger for every one of them.
         print(
             f"actions: {exc} Repair it by hand under the lake-root lock, or restore it from "
             "the backup.",

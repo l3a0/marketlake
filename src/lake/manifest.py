@@ -214,17 +214,17 @@ def sha256_file(path: Path) -> str:
 # withholds, and the manifest stops being able to say what the lake holds at all. One sentence
 # covering both would name neither, and an operator meeting one of these is reading it to learn
 # which file to open and what repairing it is worth.
-QUARANTINE_CONSEQUENCE = (
+_QUARANTINE_CONSEQUENCE = (
     "Every verdict in this file is unreadable until that byte is repaired, so this ledger "
     "cannot say which partitions it withholds."
 )
-MANIFEST_CONSEQUENCE = (
+_MANIFEST_CONSEQUENCE = (
     "Every entry in this file is unreadable until that byte is repaired, so this ledger cannot "
     "say which partitions the lake holds, how many rows each one has, or what its checksum was."
 )
 
 
-def decode_utf8(path: Path, raw: bytes, *, consequence: str) -> str:
+def _decode_utf8(path: Path, raw: bytes, *, consequence: str) -> str:
     """A ledger's bytes as text, or :class:`LedgerNotUtf8` naming the byte that refused.
 
     ``read_text`` is not used, because its ``UnicodeDecodeError`` reaches none of the tuples
@@ -337,7 +337,7 @@ def _read_jsonl(path: Path) -> list[dict]:
     path = Path(path)
     if not path.exists():
         return []
-    return parse_jsonl(decode_utf8(path, path.read_bytes(), consequence=MANIFEST_CONSEQUENCE))
+    return parse_jsonl(_decode_utf8(path, path.read_bytes(), consequence=_MANIFEST_CONSEQUENCE))
 
 
 def _latest_by_partition(entries: Sequence[dict], path: Path) -> dict[str, dict]:
@@ -447,14 +447,14 @@ def _refuse_hidden_entries(path: Path, text: str, entries: Sequence[dict]) -> No
 def _decode(path: Path, raw: bytes) -> str:
     """The quarantine ledger's bytes as text, or the refusal its damage earns.
 
-    :func:`decode_utf8` is the whole of it today, and the two are kept apart anyway, because
+    :func:`_decode_utf8` is the whole of it today, and the two are kept apart anyway, because
     this is where a rule belonging to this ledger alone goes. Marketlake #506 is adding one, a
     refusal for a byte-order mark, which decodes cleanly and still cannot be read past.
     Marketlake #519 is that same question for the manifest and it is open, so the seam is what
     lets the first land without deciding the second: :func:`_read_jsonl` reads through
-    :func:`decode_utf8` and meets only the shared refusal.
+    :func:`_decode_utf8` and meets only the shared refusal.
     """
-    return decode_utf8(path, raw, consequence=QUARANTINE_CONSEQUENCE)
+    return _decode_utf8(path, raw, consequence=_QUARANTINE_CONSEQUENCE)
 
 
 def read_quarantine(lake_root: Path) -> list[dict]:
