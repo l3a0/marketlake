@@ -477,6 +477,21 @@ def test_the_refusal_names_the_byte_and_the_line_a_repair_has_to_find(lake_root)
     assert "0xff" in message, message
     assert "human's job under the lock" in message, message
 
+    # **The offset is derived from the fixture rather than typed.** A literal would pass a
+    # mutant that hard-codes the number, which is how this assertion was missing in the first
+    # place: the line and the byte value were both held while the offset, the first number in
+    # the sentence, was free to be anything.
+    offset = quarantine_path(lake_root).read_bytes().index(b"\xff")
+    assert f"byte {offset} " in message, message
+
+    # ``reason`` is what separates one rotted byte from a truncated sequence, which is what
+    # tells the repairer how much of the line to rebuild.
+    assert "invalid start byte" in message, message
+
+    # The sentence this test's sibling proves. Holding the fact and not the sentence lets the
+    # sentence be deleted while the fact stays true.
+    assert "writes a byte outside ASCII" in message, message
+
 
 def test_a_damaged_byte_in_the_last_line_refuses_rather_than_reading_as_a_torn_tail(lake_root):
     """A torn tail is discarded on purpose, and this is not one.
