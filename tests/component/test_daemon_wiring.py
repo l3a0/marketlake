@@ -227,7 +227,7 @@ def _rig(
     # A production lake records the running schema version, and the daemon pages at startup
     # when it does not, which is marketlake #130. A rig without one would put that page in
     # front of every case here, so the fixture models the machine rather than the empty
-    # directory. ``test_schema_version_check.py`` drives the lake that has no ledger.
+    # directory. ``test_schema_versions.py`` drives the lake that has no ledger.
     record_running_version(lake_root)
     tickers = tmp_path / "tickers.yaml"
     tickers.write_text(roster)

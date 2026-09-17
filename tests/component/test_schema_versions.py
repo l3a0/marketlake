@@ -12,6 +12,7 @@ the object that wrote it.
 from __future__ import annotations
 
 import hashlib
+import os
 import threading
 import time
 from datetime import UTC, datetime
@@ -790,6 +791,33 @@ def test_an_unreadable_ledger_says_which_file_and_what_refused_it(lake_root):
     assert check.event == UNREADABLE_EVENT
     assert "KeyError" in check.summary
     assert str(ledger_path(lake_root)) in check.detail
+
+
+def test_a_ledger_this_process_may_not_open_is_unreadable_rather_than_unrecorded(lake_root):
+    """A locked ledger is not an absent one, and saying otherwise sends an operator nowhere.
+
+    ``python -m lake.schema_versions`` is the repair a "not recorded" page names, and it opens
+    this same file and dies the same way. The sweep's reference readers were widened for
+    exactly that reason under marketlake #435, whose own test locks this very file.
+
+    ``Path.exists`` answers False on a permission error, so a check that looked before reading
+    would fall into the absent arm. This reads straight through and tells the two apart by
+    class.
+    """
+    _record(lake_root)
+    target = ledger_path(lake_root)
+    os.chmod(target, 0o000)
+    try:
+        check = check_running_version(lake_root)
+    finally:
+        os.chmod(target, 0o644)
+
+    assert check.state == UNREADABLE
+    assert check.event == UNREADABLE_EVENT
+    assert "PermissionError" in check.summary
+    # And the shape really is recorded, so "not recorded" would have been false as well as
+    # useless.
+    assert check_running_version(lake_root).ok
 
 
 def test_a_lake_root_that_does_not_exist_reads_as_unrecorded(tmp_path):

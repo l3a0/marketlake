@@ -538,8 +538,11 @@ UNREADABLE_EVENT = "schema_version_ledger_unreadable"
 # with a 400 and does not retry, so the page saying the most would be the page that never
 # arrives.
 #
-# The number is repeated rather than imported. Reaching ``schema_drift`` from here would pull
-# ``capture`` and the vendor stack in behind it, into a module the daemon reads at startup.
+# The number is repeated rather than imported, and ``compact`` already carries a third copy for
+# the same reason. Reaching ``schema_drift`` from here would pull ``capture`` and the vendor
+# stack in behind it, into a module the read layer imports: ``loader``, ``extra_projection`` and
+# ``battery`` all import this one and none of them imports ``capture`` today. The daemon pays
+# that cost already, so it is the reader this protects rather than the writer.
 PAGE_COLUMN_CAP = 12
 
 
@@ -632,10 +635,18 @@ def check_running_version(lake_root: Path | str) -> RunningVersionCheck:
     under launchd's ``KeepAlive`` the successor reaches the same check and refuses again, so a
     missing row in a reference table would cost a whole session. Every way the read can fail
     becomes ``UNREADABLE`` instead. The guard is broad rather than a list of classes, because
-    the list is not two long: an absent file raises ``OSError``, a torn one
-    ``LedgerUnreadable``, a ledger format this code does not read
-    ``UnsupportedLedgerSchemaVersion``, and some other parquet file at that path a bare
-    ``KeyError``. That is ``sweep._counted``'s rule, that a summary must never cost the record.
+    the list is not two long: a torn file raises ``LedgerUnreadable``, a ledger format this
+    code does not read ``UnsupportedLedgerSchemaVersion``, and some other parquet file at that
+    path a bare ``KeyError``. That is ``sweep._counted``'s rule, that a summary must never cost
+    the record.
+
+    Absent is the one condition that is not unreadable, and it is caught by class rather than
+    by looking first. ``FileNotFoundError`` alone means no ledger. A ``PermissionError`` or an
+    I/O error on a file that is there means the shape is recorded and this process cannot see
+    it, which is a different sentence and a different repair. Reporting that as "not recorded"
+    would send an operator to ``python -m lake.schema_versions``, which opens the same file and
+    dies the same way. The sweep's reference readers were widened for exactly that reason under
+    marketlake #435.
 
     It takes no lock and writes nothing. :meth:`SchemaVersionLedger.write` goes through a temp
     file and a rename, so a lockless read sees the whole old file or the whole new one, and the
@@ -653,10 +664,12 @@ def check_running_version(lake_root: Path | str) -> RunningVersionCheck:
     target = ledger_path(lake_root)
     version = journal.SCHEMA_VERSION
     try:
-        ledger = SchemaVersionLedger.read(target) if target.exists() else SchemaVersionLedger()
-    except OSError:
-        # Present for ``exists`` and gone, or unreadable, by the read. An absent ledger is not
-        # a corrupt one, and ``loader._ledger`` treats the two apart for the same reason.
+        ledger = SchemaVersionLedger.read(target)
+    except FileNotFoundError:
+        # No ledger, which is not a corrupt one. ``loader._ledger`` tells the two apart for the
+        # same reason. Reading straight through rather than asking ``exists`` first is what
+        # keeps a present-but-unreadable file out of this arm: ``Path.exists`` answers False on
+        # a permission error, so looking first would call a locked ledger an absent one.
         ledger = SchemaVersionLedger()
     except Exception as exc:  # noqa: BLE001 - a startup check must never cost the session
         return RunningVersionCheck(
@@ -755,7 +768,6 @@ __all__ = [
     "LEDGER_SCHEMA",
     "LEDGER_SCHEMA_VERSION",
     "LedgerUnreadable",
-    "PAGE_COLUMN_CAP",
     "RECORDED",
     "RecordedVersion",
     "RunningVersionCheck",
