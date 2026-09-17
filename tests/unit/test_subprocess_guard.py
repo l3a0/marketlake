@@ -4,7 +4,7 @@ The guard in ``tests/conftest.py`` is the reason a forgotten seam runs a fake to
 instead of the real ``rsync``, ``launchctl``, ``pmset``, or ``tmutil``. It is autouse,
 so every test depends on it and no test asserts it. These do.
 
-Four properties carry the whole guard, and each is covered below.
+Five properties carry the whole guard, and each is covered below.
 
 1. Each of the four guarded programs is refused, whether it is named through
    ``subprocess.run`` or ``subprocess.Popen``.
@@ -13,14 +13,18 @@ Four properties carry the whole guard, and each is covered below.
    be swallowed and the test would pass.
 3. Every other program still runs for real, which is what lets the four render tests
    in ``tests/component/test_control_plane_render.py`` spawn a rendered script.
-4. The five production seams that forget to fake a guarded program are themselves
+4. The six production seams that forget to fake a guarded program are themselves
    caught, not just a synthetic call naming the program directly.
+5. A guarded program named behind a prefix wrapper is refused too. ``sudo`` is the one
+   this repo uses, and the sixth seam is the only guarded call that writes rather than
+   reads, so the gap sat under exactly the call with the largest blast radius.
 """
 
 from __future__ import annotations
 
 import subprocess
 import sys
+from datetime import date
 
 import pytest
 
@@ -31,7 +35,8 @@ from lake.control_plane import (
     read_pmset_schedule,
 )
 from lake.runner import RsyncBackup
-from tests.conftest import SubprocessAccessInTest
+from lake.sweep import set_sunday_wake
+from tests.conftest import SubprocessAccessInTest, _program_of
 
 GUARDED = ("rsync", "launchctl", "pmset", "tmutil")
 
@@ -130,3 +135,59 @@ def test_a_forgotten_rsync_backup_fake_is_caught(tmp_path):
     target.mkdir()
     with pytest.raises(SubprocessAccessInTest):
         RsyncBackup().sync(source, target)
+
+
+# -- a guarded program behind a prefix wrapper -----------------------------------------
+
+
+def test_a_forgotten_schedule_setter_fake_is_caught():
+    """The sixth seam, and the only guarded call in the repo that writes.
+
+    ``set_sunday_wake`` runs ``sudo -n /usr/bin/pmset schedule wakeorpoweron ...``, so the
+    program at ``argv[0]`` is ``sudo`` and ``pmset`` sits three elements further along.
+    A guard reading the head alone answered ``sudo``, which is guarded nowhere, and let
+    this one through. Every other seam reads; a forgotten fake here would have
+    re-scheduled the developer's own machine to wake on a Sunday.
+    """
+    with pytest.raises(SubprocessAccessInTest, match="pmset"):
+        set_sunday_wake(date(2026, 9, 20))
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["sudo", "-n", "/usr/bin/pmset", "schedule"], "pmset"),
+        (["sudo", "pmset", "-g", "sched"], "pmset"),
+        (["env", "sudo", "pmset", "-g"], "pmset"),
+        # A wrapper with nothing after it runs nothing guarded, so it answers itself.
+        (["sudo", "-l"], "sudo"),
+        (["sudo"], "sudo"),
+        # An ordinary call is unaffected, and so is a program whose name merely starts
+        # with a dash-free wrapper spelling.
+        (["pmset", "-g", "sched"], "pmset"),
+        (["/bin/bash", "./install.sh"], "bash"),
+        ([b"/usr/bin/pmset", b"-g"], "pmset"),
+    ],
+)
+def test_the_wrapper_walk_answers_the_program_that_actually_runs(argv, expected):
+    """Read off ``_program_of`` directly, because the refusal only sees its answer.
+
+    A wrapper's own options are stepped over, since an option is never the program it
+    runs. ``sudo -l`` lists rules and runs nothing, so answering the wrapper is right.
+    """
+    assert _program_of(argv) == expected
+
+
+def test_an_unguarded_program_behind_a_wrapper_still_runs_for_real():
+    """The walk must not turn every wrapped call into a refusal.
+
+    The render tests spawn a rendered script through ``bash``, and a future one wrapped
+    in ``env`` has to keep working. Only the guarded names are refused.
+    """
+    result = subprocess.run(
+        ["env", sys.executable, "-c", "print('wrapped')"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.strip() == "wrapped"

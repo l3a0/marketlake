@@ -117,7 +117,7 @@ def test_run_at_load_is_pinned_per_job(build, run_at_load):
     assert _parsed(build(HOST))["RunAtLoad"] is run_at_load
 
 
-def test_all_jobs_are_the_five_and_carry_no_vendor_sweep():
+def test_all_jobs_are_the_six_and_the_residents_lead():
     labels = [job.label for job in cp.all_jobs(HOST)]
     assert labels == [
         cp.DAEMON_LABEL,
@@ -125,9 +125,26 @@ def test_all_jobs_are_the_five_and_carry_no_vendor_sweep():
         cp.SELF_CHECK_LABEL,
         cp.CALENDAR_PROBE_LABEL,
         cp.SUNDAY_LABEL,
+        cp.EOD_SWEEP_LABEL,
     ]
-    # The 18:30 sweep is slice 3 and is not rendered here.
-    assert not any("sweep" in label for label in labels)
+    # The two KeepAlive residents lead, which is what the docstring promises and what the
+    # install script's bootstrap order then follows.
+    assert labels[:2] == [cp.DAEMON_LABEL, cp.DASHBOARD_LABEL]
+
+
+def test_the_vendor_sweep_runs_on_weekday_evenings_and_not_at_load():
+    (job,) = [j for j in cp.all_jobs(HOST) if j.label == cp.EOD_SWEEP_LABEL]
+    rendered = job.to_dict()
+    assert rendered["ProgramArguments"][-2:] == ["-m", "lake.sweep"]
+    entries = rendered["StartCalendarInterval"]
+    assert [e["Weekday"] for e in entries] == [1, 2, 3, 4, 5]
+    assert {(e["Hour"], e["Minute"]) for e in entries} == {(18, 30)}
+    # A load at any other hour would fetch bars for a session the run is not in, and the
+    # catch-up launchd fires on the next wake is the same failure one step removed.
+    assert rendered["RunAtLoad"] is False
+    # No --token. The Sunday job passes one because three consumers derive that path and
+    # must not split; nothing here needs a second spelling of it.
+    assert "--token" not in rendered["ProgramArguments"]
 
 
 def test_the_calendar_probe_runs_on_weekday_mornings_and_not_at_load():

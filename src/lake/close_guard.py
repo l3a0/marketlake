@@ -85,16 +85,18 @@ _STAMP = "%Y%m%dT%H%M%S%f"
 class GuardOutcome:
     """What the guard did for one session day, and what the nightly report should say.
 
-    Three of the design's rules end in "flags the nightly report", and no report exists
-    yet. Everything it would say is here, so the report reads it rather than the guard
-    guessing where to write. Until D16 writes that report, ``report.write_close_guard``
-    files each run under ``reports/close_guard/`` and the daemon prints it beside.
+    Three of the design's rules end in "flags the nightly report". That report exists now,
+    written by ``lake.sweep``, and it does not carry any of this: the sweep summarises its
+    own three walks and nothing reads the guard's files into it. Everything the report
+    would say is here, so whoever folds it in reads this rather than guessing where to
+    write. Meanwhile ``report.write_close_guard`` files each run under
+    ``reports/close_guard/`` and the daemon prints it beside.
 
     ``problems`` is the one field that interpolates an exception, and its strings keep the
     fuller message. The file drops it, so a reader with the launchd log gets what the
     exception said and the tree the dashboard may read gets the class alone. The other
     eight fields are composed from tickers, counts, error classes, dates, and the two
-    source names, so they go down whole. ``report._redacted`` owns that split and says
+    source names, so they go down whole. ``report.redacted`` owns that split and says
     why.
 
     ``spot_owed`` and ``option_owed`` are the denominator the six lists are read against,
