@@ -483,3 +483,223 @@ def test_a_value_with_too_many_fields_is_refused_by_the_named_line():
     # values to unpack", which names neither the flag nor the value.
     with pytest.raises(ValueError, match="four comma-separated fields"):
         _parse_bar_requests(["SPY,1m,2026-09-14T09:30:00-04:00,2026-09-14T16:00:00-04:00,extra"])
+
+
+# -- the extended-hours flag ---------------------------------------------------------------
+
+
+# One window, spelled both ways. #421 wants exactly this pair recorded: the first reads what
+# Schwab picks when the flag is left unset, the second what it sends for the regular session.
+UNFLAGGED = "SPY,1m,2026-09-14T09:30:00-04:00,2026-09-14T16:00:00-04:00"
+FLAGGED = f"{UNFLAGGED},extended_hours=false"
+
+
+def _flagged_request(flag: bool) -> BarRequest:
+    return BarRequest(symbol="SPY", freq="1m", start=OPEN_ET, end=CLOSE_ET, extended_hours=flag)
+
+
+def test_the_flag_reaches_the_vendor_and_the_key_together():
+    """Asking with the flag and keying without it would record an answer under the wrong question.
+
+    Both halves are asserted with ``is``, never ``==``. A ``0`` compares equal to ``False`` both
+    in the fake's call record and inside the params dict, so an ``==`` assertion here would pass
+    against a value that reaches Schwab as a different query string.
+    """
+    client = _bars_client()
+    cassette = record_cassette(
+        FAKE_KEY,
+        FAKE_SECRET,
+        bar_requests=[_flagged_request(False)],
+        vendor_factory=_factory(client),
+    )
+    assert client.bar_extended_hours[0] is False
+    (interaction,) = cassette.interactions
+    assert interaction.params["extended_hours"] is False
+
+
+def test_a_window_with_no_flag_keys_exactly_as_it_did_before():
+    """The committed cassettes key on these four alone.
+
+    ``tests/cassettes/spy_minimal.json`` holds two ``1m`` bars interactions and
+    ``spy_daily.json`` one ``1d``, all keyed ``{symbol, freq, start, end}``. A recorder that
+    stamped a fifth entry when nothing asked for one would make every one of them unfindable.
+    """
+    cassette = record_cassette(
+        FAKE_KEY,
+        FAKE_SECRET,
+        bar_requests=[_minute_request()],
+        vendor_factory=_factory(_bars_client()),
+    )
+    (interaction,) = cassette.interactions
+    assert set(interaction.params) == {"symbol", "freq", "start", "end"}
+
+
+def test_the_recorded_flag_is_what_the_replay_looks_up_by():
+    from lake.cassette import CassetteError
+
+    cassette = record_cassette(
+        FAKE_KEY,
+        FAKE_SECRET,
+        bar_requests=[_flagged_request(False)],
+        vendor_factory=_factory(_bars_client()),
+    )
+    replay = CassetteVendor(cassette)
+    found = replay.get_minute_bars("SPY", start=OPEN_ET, end=CLOSE_ET, extended_hours=False)
+    assert found.body == BARS_BODY
+    # The miss is the half worth asserting. A recorder that dropped the flag from the key would
+    # still answer the line above, because the lookup would then be keyed the same way twice.
+    with pytest.raises(CassetteError):
+        replay.get_minute_bars("SPY", start=OPEN_ET, end=CLOSE_ET)
+
+
+def test_one_window_recorded_twice_keeps_the_two_answers_apart():
+    """The pair #421 is for, asserted on the keys because the bodies cannot witness it.
+
+    ``FakeSchwabClient`` keys its canned price history on ``(symbol, freq, start, end)`` and
+    leaves the flag out, so both interactions carry the identical body by construction. A test
+    written against the bodies would pass whether or not the key carried the flag at all.
+    """
+    cassette = record_cassette(
+        FAKE_KEY,
+        FAKE_SECRET,
+        bar_requests=[_minute_request(), _flagged_request(False)],
+        vendor_factory=_factory(_bars_client()),
+    )
+    first, second = cassette.interactions
+    assert "extended_hours" not in first.params
+    assert second.params["extended_hours"] is False
+    assert first.params != second.params
+
+
+def test_the_daily_call_carries_the_flag_too():
+    # #421 decides bars.py's daily call stays unset. That is the capture path. This tool is a
+    # pass-through, and refusing the flag on 1d would block measuring what a flagged daily
+    # response holds, which is the kind of thing #421 exists because nobody recorded.
+    client = _bars_client()
+    record_cassette(
+        FAKE_KEY,
+        FAKE_SECRET,
+        bar_requests=[
+            BarRequest(symbol="SPY", freq="1d", start=OPEN_ET, end=CLOSE_ET, extended_hours=True)
+        ],
+        vendor_factory=_factory(client),
+    )
+    assert client.bar_freqs == ["1d"]
+    assert client.bar_extended_hours[0] is True
+
+
+@pytest.mark.parametrize("value", [1, 0, 1.0, "true", "false"], ids=["1", "0", "float", "s", "s2"])
+def test_a_flag_that_is_not_a_bool_is_refused_when_the_request_is_built(value):
+    """``schwab-py`` writes the value straight into ``params["needExtendedHoursData"]``.
+
+    So ``1`` and ``True`` leave as different query values, while the cassette key cannot tell
+    them apart: Python reads ``{"extended_hours": 1} == {"extended_hours": True}`` as equal. A
+    recording taken with ``1`` is found, and answers a request it never made. Refusing the value
+    at the request is what prevents it, and the refusal lands before any live call.
+    """
+    with pytest.raises(ValueError, match="extended_hours"):
+        BarRequest(symbol="SPY", freq="1m", start=OPEN_ET, end=CLOSE_ET, extended_hours=value)
+
+
+def test_a_named_flag_field_parses_into_the_request():
+    (parsed,) = _parse_bar_requests([FLAGGED])
+    assert parsed.extended_hours is False
+    assert parsed == _flagged_request(False)
+
+
+def test_the_flag_field_is_trimmed_and_case_folded():
+    # --bars trims its positional fields and has a test for it. The named field follows the same
+    # convention, so an operator writing "SPY, 1m, ..., Extended_Hours = TRUE" is read rather
+    # than refused on spacing or case.
+    (parsed,) = _parse_bar_requests(
+        [
+            " SPY , 1m , 2026-09-14T09:30:00-04:00 , 2026-09-14T16:00:00-04:00 , "
+            "Extended_Hours = TRUE "
+        ]
+    )
+    assert parsed.extended_hours is True
+
+
+def test_an_unknown_named_field_is_refused_by_its_own_name():
+    # previous_close is the seam's other flag and the plausible thing to reach for. The
+    # four-field refusal would blame the field count and name the ISO comma, neither of which
+    # is what happened.
+    with pytest.raises(ValueError, match="previous_close"):
+        _parse_bar_requests([f"{UNFLAGGED},previous_close=true"])
+
+
+@pytest.mark.parametrize("spelling", ["1", "0", "yes", "no", ""], ids=["1", "0", "yes", "no", ""])
+def test_a_flag_value_that_is_not_true_or_false_is_refused(spelling):
+    # The command line is the other door to the same conversion the request refuses. Reading
+    # "1" as True here would build a legal BarRequest carrying a value nobody typed.
+    with pytest.raises(ValueError, match="spells extended_hours"):
+        _parse_bar_requests([f"{UNFLAGGED},extended_hours={spelling}"])
+
+
+def test_a_repeated_flag_field_is_refused():
+    with pytest.raises(ValueError, match="more than once"):
+        _parse_bar_requests([f"{UNFLAGGED},extended_hours=true,extended_hours=false"])
+
+
+def test_a_split_bound_is_still_named_even_when_a_real_flag_rides_behind_it():
+    """Why the flag spells its own name instead of being a bare fifth field.
+
+    The bound splits into two fields, the named field is taken off the end first, and the five
+    positional fields that remain still reach the four-field refusal with the fractional-second
+    sentence attached. A bare fifth field would have read ``2026-09-14T16:00:00-04:00`` as the
+    flag value and blamed something else entirely.
+    """
+    with pytest.raises(ValueError, match="comma for fractional seconds"):
+        _parse_bar_requests(
+            ["SPY,1m,2026-09-14T09:30:00,500-04:00,2026-09-14T16:00:00-04:00,extended_hours=false"]
+        )
+
+
+def test_two_bars_values_with_one_key_are_refused():
+    # Cassette.find returns the first exact match, so a second interaction keyed alike is a live
+    # request spent on something nothing can ever read back. That is the loss the --out refusal
+    # exists to prevent, arriving through a third door.
+    with pytest.raises(ValueError, match="already asked for"):
+        _parse_bar_requests([UNFLAGGED, UNFLAGGED])
+
+
+def test_two_values_differing_only_in_the_flag_are_both_kept():
+    # The refusal above must not reject the pair the whole change is for.
+    first, second = _parse_bar_requests([UNFLAGGED, FLAGGED])
+    assert first.extended_hours is None
+    assert second.extended_hours is False
+
+
+def test_a_duplicate_is_caught_below_the_millisecond_the_key_carries():
+    """The guard compares keys, not requests.
+
+    ``_key_instant`` truncates each bound to the millisecond ``schwab-py`` puts on the wire, on
+    purpose, so these two values build unequal ``BarRequest`` objects that key identically. A
+    guard written as ``set(bar_requests)`` or a pairwise ``==`` passes both through and records
+    two interactions the replay cannot tell apart.
+    """
+    finer = "SPY,1m,2026-09-14T09:30:00.000400-04:00,2026-09-14T16:00:00-04:00"
+    assert _parse_bar_requests([finer]) != _parse_bar_requests([UNFLAGGED])
+    with pytest.raises(ValueError, match="already asked for"):
+        _parse_bar_requests([UNFLAGGED, finer])
+
+
+def test_main_refuses_a_duplicate_window_as_one_line_and_exit_two(tmp_path, capsys):
+    """Where the refusal surfaces, not just that it is raised.
+
+    ``main`` wraps only ``_parse_bar_requests`` and ``check_out_path`` in the try that hands a
+    ValueError to ``parser.error``. The same refusal raised inside ``record_cassette`` would
+    reach the operator as a stack trace, which is why it lives where it does.
+    """
+    with pytest.raises(SystemExit) as caught:
+        main(["--out", str(tmp_path / "c.json"), "--bars", UNFLAGGED, "--bars", UNFLAGGED])
+    assert caught.value.code == 2
+    assert "already asked for" in capsys.readouterr().err
+
+
+def test_the_help_names_the_flag_the_operator_has_to_spell():
+    # The recording is taken by hand at a terminal. --help is where its spelling is read, and a
+    # named field the help does not name is one nobody can guess.
+    rendered = " ".join(build_parser().format_help().split())
+    assert "extended_hours=true" in rendered
+    assert "extended_hours=false" in rendered

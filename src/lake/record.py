@@ -21,6 +21,9 @@ Run it by hand to record from the real vendor::
     python -m lake.record --out spy.json --chain SPY --chain QQQ --quotes SPY,QQQ
     python -m lake.record --out bars.json \
         --bars SPY,1m,2026-09-14T09:30:00-04:00,2026-09-14T16:00:00-04:00
+    python -m lake.record --out flagged.json \
+        --bars SPY,1m,2026-09-14T09:30:00-04:00,2026-09-14T16:00:00-04:00 \
+        --bars SPY,1m,2026-09-14T09:30:00-04:00,2026-09-14T16:00:00-04:00,extended_hours=false
 
 That path builds the real client and reads credentials from ``config.yaml``, so it is
 a live check, never a continuous-integration step. Credentials come from D1's config
@@ -37,6 +40,11 @@ purpose. This is a decision rather than the default that was there before it.
 than a live session is worth burning requests on, so record one and build the rest with
 ``tests.support.vendor.bars_interactions``. That is the same division the chain recording
 already uses, where one bare-symbol body feeds ``windowed_chain_interactions``.
+
+The third example above is not a second window. It is one window asked twice, differing only in
+``extended_hours``, so the pair reads what Schwab picks when the flag is left unset and what it
+sends when the flag says the regular session. Two answers about one window, which is what a
+recording is for, rather than a fixture set.
 """
 
 from __future__ import annotations
@@ -64,6 +72,18 @@ from lake.vendor import (
 # How the recorder builds a vendor from a token path and resolved credentials. The
 # default is the real factory. A test injects one that returns a fake-client vendor.
 VendorFactory = Callable[..., Vendor]
+
+# The one named field ``--bars`` reads after its four positional ones, spelled the way the vendor
+# seam spells the parameter. ``previous_close`` is the seam's other flag and is deliberately not
+# here, because nothing asks the recorder for it.
+BAR_FLAG_NAME = "extended_hours"
+
+# The only two value spellings. The seam forwards the value to ``schwab-py`` unchanged, which puts
+# it straight into ``params["needExtendedHoursData"]``, so ``1`` and ``True`` leave as different
+# query values. The cassette key cannot tell them apart, because Python reads
+# ``{"extended_hours": 1} == {"extended_hours": True}`` as equal. A recording keyed that way is
+# found, and answers a request it never made. Reading only the two bools is what prevents it.
+BAR_FLAG_VALUES = {"true": True, "false": False}
 
 
 def _interaction(endpoint: str, params: dict, response: VendorResponse) -> Interaction:
@@ -94,17 +114,26 @@ class BarRequest:
     and ``end`` are both required and both timezone-aware, because ``schwab-py``
     substitutes a fifty-five year window for a missing bound and reads a naive one in the
     host's local zone.
+
+    ``extended_hours`` decides whether the response covers the regular session or the whole
+    extended one. Left ``None`` it is omitted from both the request and the cassette key, and
+    Schwab picks, which is the third state rather than a false. It is refused unless it is
+    exactly a ``bool`` or ``None``, for the reason ``BAR_FLAG_VALUES`` carries: the seam forwards
+    it unchanged while the key cannot tell ``1`` from ``True``.
     """
 
     symbol: str
     freq: str
     start: datetime
     end: datetime
+    extended_hours: bool | None = None
 
     def __post_init__(self) -> None:
         if not self.symbol.strip():
             raise ValueError("symbol is empty")
         require_bar_freq(self.freq)
+        if self.extended_hours is not None and not isinstance(self.extended_hours, bool):
+            raise ValueError(f"extended_hours {self.extended_hours!r} is not True, False or None")
         start = require_utc_bound(self.start, "start")
         end = require_utc_bound(self.end, "end")
         if start >= end:
@@ -112,6 +141,26 @@ class BarRequest:
             # so a transposed pair would spend a live request and record "no candles" as
             # the answer for a window nobody asked for.
             raise ValueError(f"start {start.isoformat()} is not before end {end.isoformat()}")
+
+
+def bar_request_key(request: BarRequest) -> dict:
+    """The cassette key one ``BarRequest`` records under.
+
+    Written once and used twice, by the recorder that writes the key and by the duplicate
+    refusal that compares keys. A second spelling could drift from the first and let the guard
+    pass a pair the recording then cannot tell apart.
+
+    It is a key and not the request. ``_key_instant`` truncates each bound to the millisecond
+    ``schwab-py`` puts on the wire, on purpose, so two ``BarRequest`` objects that differ below
+    that are unequal objects with one key.
+    """
+    return bars_params(
+        request.symbol,
+        request.freq,
+        start=request.start,
+        end=request.end,
+        extended_hours=request.extended_hours,
+    )
 
 
 def record_cassette(
@@ -134,7 +183,7 @@ def record_cassette(
     ``quote_batches`` entry is one batched quote request, a list of symbols recorded
     together the way the shared sampler batches them. Each ``bar_requests`` entry is one
     price-history window, recorded through whichever per-frequency vendor method its
-    ``freq`` names.
+    ``freq`` names, carrying whatever ``extended_hours`` it names.
 
     The recorder makes exactly the calls requested, in order, and never reaches past
     them. So the resulting cassette replays deterministically. The token mint time is
@@ -153,11 +202,16 @@ def record_cassette(
         interactions.append(_interaction("quotes", {"symbols": symbols}, response))
     for request in bar_requests:
         fetch = vendor.get_minute_bars if request.freq == MINUTE_FREQ else vendor.get_daily_bars
-        response = fetch(request.symbol, start=request.start, end=request.end)
+        response = fetch(
+            request.symbol,
+            start=request.start,
+            end=request.end,
+            extended_hours=request.extended_hours,
+        )
         interactions.append(
             _interaction(
                 BARS_ENDPOINT,
-                bars_params(request.symbol, request.freq, start=request.start, end=request.end),
+                bar_request_key(request),
                 response,
             )
         )
@@ -188,6 +242,18 @@ def build_parser() -> argparse.ArgumentParser:
     rather than only counting fields, because a bound written that way is a real spelling
     and not a typo. A session bound carries no fractional seconds, so nothing on the
     intended path meets it.
+
+    A vendor flag rides after the four as a named field, ``extended_hours=false``, rather than
+    as a bare fifth one. That is what keeps the refusal above working. No ISO instant carries an
+    ``=``, so a bound that split on its own fractional-second comma can never be read as a flag,
+    and the two halves it left behind still reach the four-field refusal with the sentence
+    naming the case. A bare fifth field would read such a half as a flag whenever its tail
+    happened to spell one, and the field count would no longer detect the marker at all.
+
+    The named field is read in trailing position only, so the four positional fields stay
+    positional. The ``metavar`` shows that position, because a flag written in the middle falls
+    to the four-field refusal and collects the fractional-second sentence, which blames the
+    wrong thing.
     """
     parser = argparse.ArgumentParser(
         prog="python -m lake.record",
@@ -215,11 +281,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         dest="bar_requests",
-        metavar="SYMBOL,FREQ,START,END",
+        metavar=f"SYMBOL,FREQ,START,END[,{BAR_FLAG_NAME}=true|false]",
         help=(
             "Record one price-history window. FREQ is "
             f"{' or '.join(BAR_FREQS)}. START and END are timezone-aware ISO instants, "
-            "both required. Repeatable."
+            f"both required. A trailing {BAR_FLAG_NAME}=true or {BAR_FLAG_NAME}=false sets the "
+            "vendor flag and keys the recording on it. Left off, the flag is omitted from both "
+            "and Schwab picks. Repeatable."
         ),
     )
     parser.add_argument(
@@ -242,17 +310,53 @@ def _parse_quote_batches(raw_batches: Sequence[str]) -> list[list[str]]:
     ]
 
 
+def _take_bar_flag(raw: str, fields: list[str]) -> bool | None:
+    """Take the named fields off the end of one ``--bars`` value and read the flag.
+
+    ``fields`` is shortened in place, so the caller counts positional fields afterwards and its
+    four-field refusal keeps naming the ISO comma case. Only the trailing run of ``name=value``
+    fields is taken, which is what leaves the four positional fields positional.
+    """
+    named: list[str] = []
+    while fields and "=" in fields[-1]:
+        named.insert(0, fields.pop())
+
+    flag: bool | None = None
+    for field in named:
+        name, _, value = field.partition("=")
+        name, value = name.strip().lower(), value.strip().lower()
+        if name != BAR_FLAG_NAME:
+            raise ValueError(
+                f"--bars {raw!r} carries a named field {name!r}. The one name it reads is "
+                f"{BAR_FLAG_NAME}."
+            )
+        if flag is not None:
+            raise ValueError(f"--bars {raw!r} carries {BAR_FLAG_NAME} more than once")
+        if value not in BAR_FLAG_VALUES:
+            raise ValueError(
+                f"--bars {raw!r} spells {BAR_FLAG_NAME} as {value!r}. It spells "
+                f"{' or '.join(BAR_FLAG_VALUES)} and nothing else, because the value reaches "
+                "Schwab exactly as written."
+            )
+        flag = BAR_FLAG_VALUES[value]
+    return flag
+
+
 def _parse_bar_requests(raw_requests: Sequence[str]) -> list[BarRequest]:
     """Split each ``--bars`` value into a ``BarRequest``.
 
     Every refusal here raises ``ValueError`` with a line naming the value and what was
     wrong with it. ``main`` hands that line to ``argparse``, so an operator who mistypes a
     bound reads one sentence and an exit code rather than a stack trace, and reads it
-    before any live request goes out.
+    before any live request goes out. That is also why the duplicate refusal below lives here
+    rather than in ``record_cassette``, which would cover every caller and reach the operator as
+    a stack trace, because ``main`` wraps only this function and ``check_out_path``.
     """
     requests: list[BarRequest] = []
+    keys: list[dict] = []
     for raw in raw_requests:
         fields = [field.strip() for field in raw.split(",")]
+        extended_hours = _take_bar_flag(raw, fields)
         if len(fields) != 4:
             hint = (
                 ". An ISO instant may use a comma for fractional seconds, which splits "
@@ -262,6 +366,7 @@ def _parse_bar_requests(raw_requests: Sequence[str]) -> list[BarRequest]:
             )
             raise ValueError(
                 f"--bars {raw!r} needs four comma-separated fields, SYMBOL,FREQ,START,END, "
+                f"optionally followed by {BAR_FLAG_NAME}=true or {BAR_FLAG_NAME}=false, "
                 f"and carries {len(fields)}{hint}"
             )
         symbol, freq, start_text, end_text = fields
@@ -271,9 +376,31 @@ def _parse_bar_requests(raw_requests: Sequence[str]) -> list[BarRequest]:
         except ValueError as exc:
             raise ValueError(f"--bars {raw!r} has an unreadable instant: {exc}") from exc
         try:
-            requests.append(BarRequest(symbol=symbol, freq=freq, start=start, end=end))
+            request = BarRequest(
+                symbol=symbol,
+                freq=freq,
+                start=start,
+                end=end,
+                extended_hours=extended_hours,
+            )
         except ValueError as exc:
             raise ValueError(f"--bars {raw!r}: {exc}") from exc
+        key = bar_request_key(request)
+        if key in keys:
+            # Two requests with one key record two interactions the replay cannot tell apart,
+            # and ``Cassette.find`` returns the first, so the second is a live request spent on
+            # something nothing can ever read back. That is the loss the --out refusal exists to
+            # prevent, arriving through a third door. The flag is what makes it likely: one
+            # window recorded twice differing in one field is the shape of the intended run, and
+            # an operator who writes the field once has written two identical values.
+            raise ValueError(
+                f"--bars {raw!r} asks for a window an earlier --bars already asked for. Two "
+                "requests keyed alike record two interactions the replay cannot tell apart, and "
+                "only the first is ever found. Vary the window or the "
+                f"{BAR_FLAG_NAME} flag, or drop one."
+            )
+        keys.append(key)
+        requests.append(request)
     return requests
 
 
