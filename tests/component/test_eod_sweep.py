@@ -18,6 +18,7 @@ Three properties of the fixtures are worth naming before the tests.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
@@ -971,15 +972,80 @@ def test_an_unreadable_reference_file_refuses_its_walks_and_keeps_the_evening(
     for name in refused:
         assert pieces[name].refusal is not None, f"{name} escaped rather than refusing"
         assert pieces[name].refusal.startswith(("PermissionError", "OSError"))
+    # Only the walks that read this file refuse. A tuple widened past the class would turn the
+    # others into refusals too, and asserting the refused set alone cannot see that.
+    for name, piece in pieces.items():
+        if name not in refused:
+            assert piece.finished, f"{name} refused although it never reads {reference}"
+
     # The evening survives: the record is written, the digest goes out, and the ping is withheld
     # so the check pages rather than the run going quiet.
     assert outcome.filed_at is not None, "no report file was written"
     assert transport.messages, "no digest went out"
     assert pinger.urls == [], "a refused piece must withhold the ping"
+
+    # Every refusal reaches ``problems``, not just the first. The master case refuses three, and a
+    # loop that stopped at one would still withhold the ping and still render every piece in the
+    # digest, so nothing else here would notice two of them missing from the record.
+    said = [line for line in outcome.nightly.problems if "did not run" in line]
+    assert len(said) == len(refused), f"{len(refused)} pieces refused and {len(said)} were recorded"
+
     # The digest names the class and never the capture machine's path.
     body = transport.messages[0].body
     assert "did not run" in body
     assert str(root) not in body, "the digest leaked an absolute path"
+    # And the report file, which is the half a unit test over a synthetic outcome cannot reach.
+    filed = outcome.filed_at.read_text()
+    assert str(root) not in filed, "the report file leaked an absolute path"
+    assert json.loads(filed)["pieces"][refused[0]]["refusal"].startswith(
+        ("PermissionError", "OSError")
+    )
+
+
+@pytest.mark.parametrize(
+    ("seam", "piece"), [("extract_dividends", "dividends"), ("backfill_bars", "bars")]
+)
+def test_a_walk_refuses_the_whole_os_error_class_and_never_an_ordinary_bug(
+    fixture_lake: FixtureLake, monkeypatch, seam: str, piece: str
+):
+    """The width of what marketlake #435 added, asserted from both sides.
+
+    **Wide enough.** Every reference-file case reaches the tuple as ``PermissionError``, and a
+    corrupt file does not reach it at all, because ``SecurityMaster.read`` and
+    ``CaptureSpans.read`` fold ``ArrowInvalid`` into their own named classes first. So narrowing
+    the entry to ``PermissionError`` passes every one of those cases, and the entry says
+    ``OSError`` on purpose: ``MasterUnreadable``'s own docstring names an on-disk read error, "such
+    as a bad sector, which ``pyarrow`` reports as ``ArrowIOError``", and that is an ``OSError`` and
+    not a ``PermissionError``. Raising ``EIO`` at the seam is how that breadth is witnessed without
+    inventing a bad sector.
+
+    **Narrow enough.** The entry is a named class, not a blanket. Widening either tuple to
+    ``Exception`` passes the whole suite otherwise, which would leave every bug inside a walk
+    reported as a tidy refusal and the run reading as though it had merely been unlucky. An
+    ordinary ``ValueError`` has to come out of :func:`lake.sweep.sweep` and end the job, because
+    that is this code's own bug rather than the machine's.
+    """
+    root = _lake(fixture_lake)
+
+    def io_error(*args, **kwargs):
+        raise OSError(errno.EIO, "input/output error")
+
+    monkeypatch.setattr(sweep, seam, io_error)
+    outcome, pinger, _ = _run(root)
+
+    refusal = dict(outcome.nightly.pieces)[piece].refusal
+    assert refusal is not None, f"a plain OSError escaped the {piece} walk"
+    assert refusal.startswith("OSError"), refusal
+    assert not refusal.startswith("PermissionError"), "the fixture stopped testing the wider class"
+    assert outcome.filed_at is not None
+    assert pinger.urls == []
+
+    def a_bug(*args, **kwargs):
+        raise ValueError("this job handed the seam a bad argument")
+
+    monkeypatch.setattr(sweep, seam, a_bug)
+    with pytest.raises(ValueError):
+        _run(root)
 
 
 def test_a_quarantined_quotes_partition_does_not_take_the_whole_sweep(
