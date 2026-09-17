@@ -1003,7 +1003,7 @@ def test_a_ticker_handed_to_a_second_instrument_lands_that_instrument_its_own_en
 def test_the_command_runs_the_extraction_and_reports_what_it_did(
     fixture_lake: FixtureLake, tmp_path: Path, capsys
 ):
-    """#284 test 8. It is the only way to run or verify this until #281 builds the nightly job."""
+    """#284 test 8. ``lake.sweep`` drives the same walk from its 18:30 job."""
     root = _lake(
         fixture_lake,
         {

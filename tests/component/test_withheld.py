@@ -177,7 +177,7 @@ def test_an_exception_message_never_reaches_the_file(lake_root):
     report.write_withheld(lake_root, unresolved, now=AT, sequence=0, pid=11)
 
     (entry,) = _entries(lake_root)
-    # The place and the class, which is the shape ``_redacted`` was written to leave. The
+    # The place and the class, which is the shape ``redacted`` was written to leave. The
     # symbol is the place, so the two fields it keeps are the place and the class rather
     # than the class and the message.
     assert entry["exception"] == "SPY: UnresolvedSymbol"
@@ -187,7 +187,7 @@ def test_an_exception_message_never_reaches_the_file(lake_root):
 def test_a_caller_that_renders_no_class_files_its_message_instead(lake_root):
     """The rendering is the caller's contract, and this is what breaking it costs.
 
-    ``_redacted`` keeps two fields and the writer supplies the first, so the second is
+    ``redacted`` keeps two fields and the writer supplies the first, so the second is
     whatever the caller put first. A caller handing over a bare message files that message's
     opening field, which for an ``OSError`` is a path on the capture machine. The docstring
     says so rather than promising a guarantee the rule cannot make, and this is the case that

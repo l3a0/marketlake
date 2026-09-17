@@ -700,6 +700,26 @@ def deliverable_of(session: Session, roots: frozenset[str]) -> Deliverable:
     return _deliverable(readings.pop(), session.day)
 
 
+def deliverable_of_row(row: dict[str, object], day: date) -> Deliverable:
+    """What one contract row says it delivers.
+
+    :func:`deliverable_of` is the session-level door and this is the row-level one. They read
+    the same four columns through the same parse, and they differ only in what they are given:
+    that one agrees a whole root's rows first and this one takes a row as it stands.
+
+    It exists because ``lake.settle`` has to decide, contract by contract, whether a settlement
+    at official-close intrinsic describes what the contract actually delivers. Two parsers for
+    one vendor column would be two answers to what a sealed row means, which is the second
+    source of truth this design refuses everywhere else. So the reading is shared and only the
+    policy differs: the gate above lets :class:`DeliverableUnreadable` end the boundary, and the
+    settlement view catches it and marks that one row, because a refusal there would take the
+    rest of the expiry roster away with it.
+
+    ``day`` names the session for the refusal's own message, exactly as it does above.
+    """
+    return _deliverable(_reading(row), day)
+
+
 def _reading(row: dict[str, object]) -> tuple:
     """One row's deliverable columns as a hashable tuple, for the agreement test above."""
     return tuple(
@@ -1438,6 +1458,7 @@ __all__ = [
     "SplitReport",
     "check_split_consistency",
     "deliverable_of",
+    "deliverable_of_row",
     "detect_splits",
     "detect_splits_from_config",
     "read_session",

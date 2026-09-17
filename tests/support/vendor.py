@@ -27,6 +27,10 @@ one chain body, which is what a test needs once the code under test fetches by a
 rather than by the bare symbol. ``bars_interactions`` is the price-history counterpart: a
 live recording captures one window, and it builds whatever set of windows a test wants
 from candles the test names.
+
+``RecordingVendor`` wraps ``CassetteVendor`` and keeps every price-history call it was
+asked for. That is what lets a test assert a ticker-day reached no vendor at all, which
+is the whole value of a skip, and what a run stopped part-way is asserted against.
 """
 
 from __future__ import annotations
@@ -412,3 +416,101 @@ class CassetteVendor:
         if self._cassette.token_mint_time is None:
             raise VendorError("cassette has no token_mint_time")
         return datetime.fromisoformat(self._cassette.token_mint_time)
+
+
+class RecordingVendor:
+    """A ``Vendor`` that replays a cassette and keeps every price-history call it was asked for.
+
+    Two things a bare replay cannot assert need this. A skipped ticker-day has to reach no vendor
+    at all, and "no recorded call" is the only way to say so, since a replay that was never asked
+    raises nothing. And a run that stops part-way has to be shown to have stopped, which is a
+    statement about the calls after the failure rather than about the ones before it.
+
+    The cassette key already carries the window, so a fetch asking for the wrong one raises
+    ``CassetteError`` rather than replaying a neighbour's recording. Keeping the calls turns that
+    precondition into an assertion a test can read: which window, in which order.
+
+    ``fail_with`` raises for a named ticker instead of replaying, which is how a vendor refusal is
+    driven. ``fail_after`` raises once that many calls have been recorded, whichever ticker they
+    were for, which is how a run is made to die *part-way* rather than on its first request.
+
+    The two are not interchangeable, and a test about resuming needs the second. A walk over a
+    range asks for its ticker-days in a sorted order, so a failure keyed on a ticker can land on
+    the very first call and leave nothing behind. A test written that way then asserts that zero
+    partitions were skipped by the next run, which is true and says nothing.
+
+    Either way the call is recorded before the raise, so a test can tell a ticker that failed apart
+    from one that was never reached.
+
+    ``tests/component/test_bar_fetch.py`` carries a private twin of this, which predates it.
+    Repointing its thirty-five call sites is marketlake #396 rather than the backfill's, because
+    it changes no behaviour in either file and would grow a diff that has none of its own there.
+    """
+
+    def __init__(
+        self,
+        cassette: Cassette,
+        *,
+        fail_with: Mapping[str, BaseException] | None = None,
+        fail_after: int | None = None,
+        failure: BaseException | None = None,
+    ):
+        self._replay = CassetteVendor(cassette)
+        self._fail_with = dict(fail_with or {})
+        self._fail_after = fail_after
+        self._failure = failure
+        self.calls: list[dict] = []
+
+    def _record(self, symbol: str, freq: str, start: datetime, end: datetime) -> None:
+        self.calls.append(bars_params(symbol, freq, start=start, end=end))
+        if self._fail_after is not None and len(self.calls) > self._fail_after:
+            if self._failure is None:
+                raise ValueError("fail_after needs a failure to raise")
+            raise self._failure
+        if symbol in self._fail_with:
+            raise self._fail_with[symbol]
+
+    def get_minute_bars(
+        self,
+        symbol: str,
+        *,
+        start: datetime,
+        end: datetime,
+        extended_hours: bool | None = None,
+        previous_close: bool | None = None,
+    ) -> VendorResponse:
+        self._record(symbol, MINUTE_FREQ, start, end)
+        return self._replay.get_minute_bars(
+            symbol,
+            start=start,
+            end=end,
+            extended_hours=extended_hours,
+            previous_close=previous_close,
+        )
+
+    def get_daily_bars(
+        self,
+        symbol: str,
+        *,
+        start: datetime,
+        end: datetime,
+        extended_hours: bool | None = None,
+        previous_close: bool | None = None,
+    ) -> VendorResponse:
+        self._record(symbol, DAILY_FREQ, start, end)
+        return self._replay.get_daily_bars(
+            symbol,
+            start=start,
+            end=end,
+            extended_hours=extended_hours,
+            previous_close=previous_close,
+        )
+
+    def get_chain(self, *args, **kwargs):  # pragma: no cover - a bar walk never fetches a chain
+        raise AssertionError("a bar walk fetched a chain")
+
+    def get_quotes(self, *args, **kwargs):  # pragma: no cover - nor a quote
+        raise AssertionError("a bar walk fetched a quote")
+
+    def token_mint_time(self):  # pragma: no cover - nor the token
+        raise AssertionError("a bar walk read the token mint time")
