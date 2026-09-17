@@ -32,6 +32,7 @@ from lake.oi import (
     VERDICT_ABSENT,
     VERDICT_INDETERMINATE,
     VERDICT_SETTLED,
+    OiViewError,
     ScopeUnreadable,
     SpellingsCollide,
     oi_view,
@@ -398,6 +399,119 @@ def test_a_symbol_two_instruments_hold_refuses_as_unreadable_scope(fixture_lake:
         answer_for(root, constants=constants())
 
     assert adjusted(names[0]) in str(raised.value)
+
+
+def test_a_repeated_spelling_is_not_a_collision_and_the_last_row_wins(
+    fixture_lake: FixtureLake,
+):
+    """The other half of the collision rule, which is what makes it a rule rather than a ban.
+
+    Two rows carrying the *same* spelling are one contract listed twice, not two spellings of
+    one contract. Keying on the symbol already let the last row win, and the threading is not
+    trying to change that, so a repeated spelling must not refuse. Without this the rule reads
+    as "two rows on one key refuse", which would abort a whole view on an ordinary duplicate.
+    """
+    names = list(SET)
+    rows: list[dict] = []
+    for hour, minute in ((9, 35), (9, 36), (9, 37)):
+        cycle = cycle_rows(FOLLOWING, hour, minute, {s: SET[s] + 500 for s in names})
+        # The first contract listed a second time, same spelling, a different figure.
+        cycle.append(cycle_rows(FOLLOWING, hour, minute, {names[0]: SET[names[0]] + 900})[0])
+        rows.extend(cycle)
+    fixture_lake.with_chains(
+        "SPY", SESSION, table(close_rows(SESSION, SET, volumes=VOLUMES)), source="capture"
+    )
+    fixture_lake.with_chains("SPY", FOLLOWING, table(rows), source="capture")
+    master, equity = master_with()
+    spans = CaptureSpans()
+    spans.open_span(equity, EPOCH, True)
+    fixture_lake.with_reference("security_master", master.to_table())
+    fixture_lake.with_reference("capture_spans", spans.to_table())
+    fixture_lake.with_reference("schema_versions", ledger_table())
+
+    answer = answer_for(fixture_lake.build(), constants=constants())
+
+    assert verdicts(answer) == {(VERDICT_SETTLED, None)}
+    settled = dict(
+        zip(
+            answer.column("occ_symbol").to_pylist(),
+            answer.column("open_interest").to_pylist(),
+            strict=True,
+        )
+    )
+    # The duplicate's figure, not the first row's, which is what keying on the symbol did.
+    assert settled[names[0]] == SET[names[0]] + 900
+
+
+def test_a_contract_remapped_away_and_back_threads_rather_than_refusing(
+    fixture_lake: FixtureLake,
+):
+    """One instrument holding one spelling in two mapping rows is not two instruments.
+
+    A contract adjusted twice can return to a spelling it already wore, which leaves the
+    master holding that symbol against the same instrument in two rows. The refusal is for a
+    symbol *two instruments* hold, so counting rows rather than instruments would refuse an
+    ordinary history. The ranges keep the two rows apart on any one date as well.
+    """
+    names = list(SET)
+    master = SecurityMaster()
+    equity = master.register(
+        kind="equity", capture_start=EPOCH, valid_from=EPOCH.date(), ticker="SPY"
+    )
+    instrument = master.register(
+        kind="option", capture_start=EPOCH, valid_from=EPOCH.date(), occ_symbol=names[0]
+    )
+    # Both boundaries sit well before S, so by S the contract is back on its first spelling
+    # and stays there. What the master keeps is that spelling in two rows.
+    master.remap(instrument, ID_TYPE_OCC, adjusted(names[0]), effective=date(2026, 8, 10))
+    master.remap(instrument, ID_TYPE_OCC, names[0], effective=date(2026, 8, 20))
+    held = [m.id_value for m in master.mappings if m.id_value == names[0]]
+    assert len(held) == 2, "the fixture must leave one symbol on one instrument twice"
+
+    refreshed = {symbol: value + 500 for symbol, value in SET.items()}
+    root = build(fixture_lake, cycles(refreshed), master, equity)
+
+    answer = answer_for(root, constants=constants())
+
+    assert verdicts(answer) == {(VERDICT_SETTLED, None)}
+
+
+def test_both_refusals_are_catchable_as_one_and_carry_their_detail(
+    fixture_lake: FixtureLake,
+):
+    """Every refusal here is an ``OiViewError``, and each carries what a caller would act on.
+
+    A caller writes ``except OiViewError`` once. A refusal outside that base escapes it, and
+    a refusal whose attributes are empty leaves the caller parsing a message.
+    """
+    names = list(SET)
+    both = {adjusted(symbol): SET[symbol] + 500 for symbol in names}
+    both[names[0]] = 999
+    master, equity = corrupt_master(names[0], adjusted(names[0]))
+    root = build(fixture_lake, cycles(both), master, equity)
+
+    with pytest.raises(OiViewError) as collided:
+        answer_for(root, constants=constants())
+
+    assert isinstance(collided.value, SpellingsCollide)
+    assert collided.value.ticker == "SPY"
+    assert collided.value.day == FOLLOWING
+    # Reported in the order they were met, so a reader knows which spelling arrived second.
+    assert collided.value.spellings == (adjusted(names[0]), names[0])
+
+    master, equity = master_with(remapped=(names[0],))
+    intruder = master.register(
+        kind="option", capture_start=EPOCH, valid_from=FIRST_SEEN, occ_symbol=names[1]
+    )
+    master.remap(intruder, ID_TYPE_OCC, adjusted(names[0]), effective=BOUNDARY)
+    moved = {adjusted(symbol): SET[symbol] + 500 for symbol in names}
+    root = build(fixture_lake, cycles(moved), master, equity)
+
+    with pytest.raises(OiViewError) as unreadable:
+        answer_for(root, constants=constants())
+
+    assert isinstance(unreadable.value, ScopeUnreadable)
+    assert unreadable.value.ticker == "SPY"
 
 
 def test_an_unthreaded_lake_answers_exactly_as_it_did(fixture_lake: FixtureLake):
