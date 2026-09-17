@@ -36,7 +36,7 @@ from lake.oi import (
     SpellingsCollide,
     oi_view,
 )
-from lake.security_master import ID_TYPE_OCC, SecurityMaster
+from lake.security_master import ID_TYPE_OCC, Mapping, SecurityMaster
 from tests.component.test_oi_view import (
     CALENDAR,
     EPOCH,
@@ -206,15 +206,61 @@ def test_a_contract_that_really_vanished_is_still_absent(fixture_lake: FixtureLa
     assert by_symbol[names[1]] == (VERDICT_SETTLED, None)
 
 
-def test_a_boundary_dated_one_session_late_still_threads(fixture_lake: FixtureLake):
-    """The reason the lookup takes no date.
+def test_a_re_issued_spelling_is_not_merged_with_the_contract_that_wore_it(
+    fixture_lake: FixtureLake,
+):
+    """Why the lookup resolves on a date, which is the whole reason the master carries ranges.
 
-    ``lake.splits`` dates a boundary to the session it happened to read, and it skips
-    sessions for several reasons, so the date can land after the adjustment did. Here S
-    itself already carries the adjusted spellings and the master says the boundary is the
-    session after. A dated resolution would answer nothing for the baseline and the
-    instrument for the cycle, keying the two sides differently and reproducing the defect
-    with the master in the loop.
+    An adjustment frees the original spelling and the market re-lists a different contract
+    under it, which ``docs/design.md`` names where it introduces the master: OCC symbols "are
+    reissued when the OCC adjusts contracts after a corporate action. So no external symbol is
+    the primary key."
+
+    Here the walked session carries both, the adjusted contract under ``SPY1`` and a brand new
+    contract under the freed ``SPY`` spelling. A lookup ignoring the ranges reads the closed
+    mapping as live and keys the new contract onto the adjusted one, so the two share a figure.
+    Resolving on the date each row was written keeps them apart.
+    """
+    names = list(SET)
+    carried, freed = names[0], names[1]
+    master, equity = master_with(remapped=(carried,))
+    walked = {
+        adjusted(symbol) if symbol == carried else symbol: SET[symbol] + 500 for symbol in names
+    }
+    # A different contract, newly listed under the spelling the adjustment freed.
+    walked[carried] = 31337
+    root = build(fixture_lake, cycles(walked), master, equity)
+
+    answer = answer_for(root, constants=constants(oi_comparable_set_floor=2))
+
+    settled = dict(
+        zip(
+            answer.column("occ_symbol").to_pylist(),
+            answer.column("open_interest").to_pylist(),
+            strict=True,
+        )
+    )
+    # S's contract took its own adjusted figure, not the new listing's 31337.
+    assert settled[carried] == SET[carried] + 500
+    assert settled[freed] == SET[freed] + 500
+    assert 31337 not in settled.values()
+
+
+def test_a_boundary_dated_after_the_adjustment_degrades_rather_than_inventing_a_number(
+    fixture_lake: FixtureLake,
+):
+    """The price of resolving on a date, named rather than hidden.
+
+    ``lake.splits`` dates a boundary to the session it happened to read, and it skips sessions
+    for several reasons, so a boundary can land after the adjustment did. Here S already
+    carries the adjusted spellings and the master says the boundary is the session after, so
+    S's rows resolve to nothing and key on themselves while the walked session's resolve to
+    the instrument. The join does not close and the contracts read ``absent``.
+
+    That is the defect this module repairs, still present on a mis-dated boundary. It is the
+    accepted cost of the alternative, which reads every closed mapping as live and merges a
+    re-issued spelling into the contract that used to wear it. This answer withholds a number.
+    That one invents one, and a withheld verdict is recoverable where a wrong figure is not.
     """
     moved_close = {adjusted(symbol): value for symbol, value in SET.items()}
     moved_volumes = {adjusted(symbol): volume for symbol, volume in VOLUMES.items()}
@@ -235,21 +281,58 @@ def test_a_boundary_dated_one_session_late_still_threads(fixture_lake: FixtureLa
 
     answer = answer_for(fixture_lake.build(), constants=constants())
 
-    assert verdicts(answer) == {(VERDICT_SETTLED, None)}
+    assert verdicts(answer) == {(VERDICT_INDETERMINATE, "set_under_floor")}
+    # Nothing was invented. Every figure is withheld rather than borrowed from a neighbour.
+    assert set(answer.column("open_interest").to_pylist()) == {None}
 
 
-def test_one_cycle_carrying_both_spellings_refuses(fixture_lake: FixtureLake):
+def corrupt_master(symbol: str, other: str):
+    """A master mapping two spellings to one instrument on one date.
+
+    ``remap`` cannot build this. It closes the open mapping at the boundary and opens the new
+    one from it, so the two rows share a date and never overlap. These rows are written
+    directly, because a guard against a state the writer cannot produce still has to be
+    reachable to be tested, the way ``SecurityMaster.AmbiguousSymbol`` is.
+    """
+    master = SecurityMaster()
+    equity = master.register(
+        kind="equity", capture_start=EPOCH, valid_from=EPOCH.date(), ticker="SPY"
+    )
+    overlapping = tuple(master.mappings) + (
+        Mapping(
+            instrument_id=99,
+            id_type=ID_TYPE_OCC,
+            id_value=symbol,
+            valid_from=EPOCH.date(),
+            valid_to=None,
+            kind="option",
+            capture_start=EPOCH,
+        ),
+        Mapping(
+            instrument_id=99,
+            id_type=ID_TYPE_OCC,
+            id_value=other,
+            valid_from=EPOCH.date(),
+            valid_to=None,
+            kind="option",
+            capture_start=EPOCH,
+        ),
+    )
+    return SecurityMaster(overlapping), equity
+
+
+def test_one_session_carrying_both_spellings_refuses(fixture_lake: FixtureLake):
     """The failure the threading itself creates, rather than one it inherits.
 
-    Keying on the instrument merges every spelling a contract has worn, so a cycle listing
-    one contract twice would collapse to a single entry and lose the other figure silently.
-    Keying on the spelling could not do that, because two spellings are two keys. So it
-    refuses.
+    On any one date the master maps at most one spelling to a contract, so two spellings
+    reaching one instrument means the rows and the master disagree about what is listed.
+    Reading them would collapse two figures into one. Keying on the spelling could not do
+    that, because two spellings are two keys, so this refuses rather than picking a row.
     """
     names = list(SET)
     both = {adjusted(symbol): SET[symbol] + 500 for symbol in names}
     both[names[0]] = 999
-    master, equity = master_with(remapped=tuple(names))
+    master, equity = corrupt_master(names[0], adjusted(names[0]))
     root = build(fixture_lake, cycles(both), master, equity)
 
     with pytest.raises(SpellingsCollide) as raised:
@@ -257,6 +340,41 @@ def test_one_cycle_carrying_both_spellings_refuses(fixture_lake: FixtureLake):
 
     assert names[0] in str(raised.value)
     assert adjusted(names[0]) in str(raised.value)
+    assert raised.value.day == FOLLOWING
+
+
+def test_the_roster_refuses_a_collision_the_comparable_set_never_sees(
+    fixture_lake: FixtureLake,
+):
+    """The same guard on the answer's own path, where the figure actually lands.
+
+    The comparable set is the top contracts by volume and the roster is the whole close, so a
+    colliding pair ranked out of the set reaches ``_settled`` without passing the map's guard.
+    Answering there would hand two rows one contract's figure, including a row the selected
+    cycle carries nothing for. Whether the same lake refuses or answers would then be decided
+    by a volume rank, which has nothing to do with identity.
+    """
+    names = list(SET)
+    ghost = adjusted(names[0])
+    roster = {**SET, ghost: 4242}
+    volumes = {**VOLUMES, ghost: 0}
+    fixture_lake.with_chains(
+        "SPY", SESSION, table(close_rows(SESSION, roster, volumes=volumes)), source="capture"
+    )
+    refreshed = {symbol: value + 500 for symbol, value in SET.items()}
+    fixture_lake.with_chains("SPY", FOLLOWING, table(cycles(refreshed)), source="capture")
+    master, equity = corrupt_master(names[0], ghost)
+    spans = CaptureSpans()
+    spans.open_span(equity, EPOCH, True)
+    fixture_lake.with_reference("security_master", master.to_table())
+    fixture_lake.with_reference("capture_spans", spans.to_table())
+    fixture_lake.with_reference("schema_versions", ledger_table())
+
+    with pytest.raises(SpellingsCollide) as raised:
+        # A set of 4 keeps the ghost, whose volume is zero, out of the comparable set.
+        answer_for(fixture_lake.build(), constants=constants(oi_comparable_set_size=4))
+
+    assert raised.value.day == SESSION
 
 
 def test_a_symbol_two_instruments_hold_refuses_as_unreadable_scope(fixture_lake: FixtureLake):

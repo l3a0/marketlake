@@ -64,10 +64,15 @@ call a whole session of still-trading contracts indeterminate. So both sides key
 ``instrument_id`` the security master holds for a symbol, and on the raw symbol where it
 holds none. ``lake.occ_mapping`` writes those rows and says what a reader does with them:
 almost no contract resolves through the master, so the symbol is the ordinary key and the
-instrument is the exception that keeps a re-symboled contract readable. The lookup takes no
-date, because the master's validity ranges are drawn by a walk that dates a boundary to the
-session it happened to read, and a boundary dated one session late would split the very join
-this closes. marketlake #351 is the defect this repairs.
+instrument is the exception that keeps a re-symboled contract readable. Each side resolves on
+the date its own rows were written, because an adjustment frees the original spelling and the
+market re-lists a different contract under it. The design says so where it introduces the
+master: OCC symbols are reissued after a corporate action, so no external symbol is the
+primary key, and the master maps its own id to external ones with validity date ranges. Those
+ranges are what keep a re-issued spelling from being read as the contract that used to wear
+it. The price is that a boundary dated after the adjustment landed leaves the join open and
+the contracts absent, which is this defect surviving rather than a figure being invented.
+marketlake #351 is the defect this repairs.
 
 *Pending is not absent.* A verdict withheld because the evidence is not captured yet is a
 different answer from one withheld because the evidence was inconclusive, and the newest
@@ -234,17 +239,19 @@ class SessionOutOfScope(OiViewError):
 
 
 class SpellingsCollide(OiViewError):
-    """Raised when one cycle carries one contract under two of the spellings it has worn.
+    """Raised when one session's rows carry one contract under two spellings at once.
 
     Keying on the instrument is what lets a re-symboled contract be read as renamed rather
-    than as absent, and it merges every spelling that contract has worn. So a cycle listing
-    the same contract twice, once under each spelling, would collapse to one entry and the
-    other figure would be gone with nothing said. That is the failure this threading exists
-    to remove, so it refuses instead of picking whichever row was written last.
+    than as absent, and on any one date the master maps at most one spelling to a contract.
+    So two spellings reaching one instrument means the rows and the master disagree about
+    what is listed, and reading them would either collapse two figures into one or hand two
+    rows the same number. Both are the silently wrong number this threading exists to remove,
+    so it refuses rather than picking whichever row was written last.
 
     Keying on the symbol cannot reach this state, because two spellings are two keys. It
-    arrives with the threading, which is why it is named here rather than left to the
-    silence that keying on the symbol never had.
+    arrives with the threading, which is why it is named here rather than left to a silence
+    that keying on the symbol never had. ``day`` is the session whose rows carry the pair,
+    which is not always the session the view was asked about.
     """
 
     def __init__(self, ticker: str, day: str, spellings: tuple[str, str]) -> None:
@@ -318,7 +325,11 @@ def oi_view(
     master, spans = _require_scope(root, ticker, session, session_text, market)
     # One index per call, built where the master is read. Every join below keys through it,
     # and building it inside the walk instead would rebuild it once per stored cycle.
-    occ_index = _occ_index(master, ticker, session_text)
+    # One index per session the view reads rows from, because a spelling means whatever the
+    # master mapped it to on the date those rows were written. Session S's rows resolve on S
+    # and the walked session's on its own date, which is what keeps an adjusted contract
+    # joined to itself while a re-issued spelling stays a different contract.
+    session_index = _occ_index(master, session)
 
     roster = _read_baseline(ticker, session_text, root, include_quarantined)
     comparable = _comparable_set(roster, guards.oi_comparable_set_size)
@@ -327,8 +338,10 @@ def oi_view(
         return _marked(ticker, session_text, roster, VERDICT_INDETERMINATE, REASON_SET_UNDER_FLOOR)
 
     following = _calendar_next_session(market, session)
+    following_index = {} if following is None else _occ_index(master, following)
     outcome = _walk(
         ticker=ticker,
+        session_text=session_text,
         following=following,
         comparable=comparable,
         root=root,
@@ -337,11 +350,12 @@ def oi_view(
         master=master,
         spans=spans,
         market=market,
-        occ_index=occ_index,
+        session_index=session_index,
+        following_index=following_index,
     )
     if outcome.verdict is not None:
         return _marked(ticker, session_text, roster, outcome.verdict, outcome.reason)
-    return _settled(ticker, session_text, roster, outcome, occ_index)
+    return _settled(ticker, session_text, roster, outcome, session_index, session_text)
 
 
 @dataclass(frozen=True)
@@ -422,71 +436,110 @@ def _covered_with_options(
     return any(span.options and span.contains(close) for span in found)
 
 
-def _occ_index(master: SecurityMaster, ticker: str, session_text: str) -> dict[str, int]:
-    """Every OCC symbol the master holds, to the instrument holding it.
+def _occ_index(master: SecurityMaster, on: date) -> dict[str, tuple[int, ...]]:
+    """Every OCC symbol the master maps on one date, to the instruments holding it then.
 
-    This is the question ``occ_mapping.instruments_holding`` answers, asked for every symbol
-    at once rather than one at a time. The difference is not a preference. ``resolve`` and
-    ``instruments_holding`` both scan the whole table, and a re-symboling writes two rows per
-    contract, so a SPY-sized adjustment leaves a master of about 25,912 rows that the view
-    would otherwise scan once per symbol per cycle. One pass here costs 4.3 ms and every
-    lookup after it is a dict hit.
+    **It is built per date on purpose.** ``docs/design.md`` gives the reason where it
+    introduces the master: OCC symbols "are reissued when the OCC adjusts contracts after a
+    corporate action. So no external symbol is the primary key", and the master "maps that id
+    to external identifiers with validity date ranges". An adjustment frees the original
+    spelling, and the market re-lists a different contract under it. Reading the closed
+    mapping as if it were still open would key that new contract onto the adjusted one, and
+    the two would share a figure. The date is what keeps them apart, so dropping it would
+    throw away the mechanism the design built for exactly this case.
 
-    It takes no date, and that is the load-bearing part. ``load_contract``'s threading gives
-    the reason in ``src/lake/loader.py``: the master's validity ranges are drawn by a walk
-    that skips sessions for seven reasons and dates a boundary to the session it happened to
-    read, so they widen a selection rather than decide one. A boundary dated one session late
-    would leave a dated lookup resolving the baseline and the cycle to different keys, which
-    is the very break this threading exists to close.
+    **It is a dict rather than a call per symbol**, which is the same question
+    ``SecurityMaster.resolve`` answers, asked for every symbol at once. ``resolve`` scans the
+    whole table, and a re-symboling writes two rows per contract, so a SPY-sized adjustment
+    leaves about 25,912 rows that the view would otherwise scan once per symbol per cycle.
+    One pass costs 4.3 ms and every lookup after it is a dict hit.
 
-    A symbol two instruments hold is what ``occ_mapping.write_mappings`` refuses to write,
-    calling it a master that cannot say which contract it is. Nothing here can say either, so
-    it refuses too rather than picking one.
+    The instruments come back as a tuple rather than one id, because a symbol two instruments
+    hold *on one date* is a corrupt master and only the caller looking the symbol up knows
+    whether this view is asking about it.
     """
     holders: dict[str, set[int]] = {}
     for mapping in master.mappings:
-        if mapping.id_type == ID_TYPE_OCC:
+        if mapping.id_type == ID_TYPE_OCC and mapping.valid_on(on):
             holders.setdefault(mapping.id_value, set()).add(mapping.instrument_id)
-    index: dict[str, int] = {}
-    for symbol, owners in holders.items():
-        if len(owners) > 1:
-            raise ScopeUnreadable(
-                ticker,
-                session_text,
-                f"security master, {symbol!r} names instruments {sorted(owners)}, so it "
-                f"cannot say which contract the symbol is",
-            )
-        index[symbol] = next(iter(owners))
-    return index
+    return {symbol: tuple(sorted(owners)) for symbol, owners in holders.items()}
+
+
+def _key(index: dict[str, tuple[int, ...]], symbol: str, ticker: str, day_text: str) -> int | str:
+    """What this contract is called in a join: its instrument, or its own symbol.
+
+    A symbol the master does not map on this date keys on itself, which is every contract no
+    re-symboling has touched. ``lake.occ_mapping`` says that is the ordinary answer rather
+    than a corner: almost no contract resolves through the master, so a reader keys on the
+    instrument where there is one and on the symbol where there is not.
+
+    A symbol two instruments hold on one date is refused rather than resolved to either.
+    ``occ_mapping.write_mappings`` refuses to write that state, calling it a master that
+    cannot say which contract it is, and nothing here can say either. The refusal happens at
+    the lookup rather than when the index is built, so an ambiguity under some other
+    underlying, on some other date, does not take down a view that never asks about it.
+    """
+    owners = index.get(symbol)
+    if not owners:
+        return symbol
+    if len(owners) > 1:
+        raise ScopeUnreadable(
+            ticker,
+            day_text,
+            f"security master, {symbol!r} names instruments {list(owners)} on that date, so "
+            f"it cannot say which contract the symbol is",
+        )
+    return owners[0]
 
 
 def _threaded(
-    index: dict[str, int],
+    index: dict[str, tuple[int, ...]],
     pairs: Iterable[tuple[str, int | None]],
     ticker: str,
     day_text: str,
 ) -> dict[int | str, int | None]:
-    """A contract-to-OI map keyed on the thread rather than on the spelling.
+    """A contract-to-OI map keyed on identity rather than on spelling.
 
-    A symbol the master has never seen keys on itself, which is every contract no
-    re-symboling has touched. That fallback is the ordinary path rather than a corner, and
-    ``occ_mapping`` says so outright: almost no contract resolves through the master, and a
-    reader keys on the instrument where there is one and on the symbol where there is not.
-
-    One contract under two spellings in the same map is refused. A repeated spelling is not,
-    because keying on the symbol already let the last row win and nothing here is trying to
-    change that.
+    One contract under two spellings in the same read is refused. A repeated spelling is not,
+    because keying on the symbol already let the last row win and nothing here is changing
+    that.
     """
     spellings: dict[int | str, str] = {}
     threaded: dict[int | str, int | None] = {}
     for symbol, value in pairs:
-        key = index.get(symbol, symbol)
+        key = _key(index, symbol, ticker, day_text)
         seen = spellings.get(key)
         if seen is not None and seen != symbol:
             raise SpellingsCollide(ticker, day_text, (seen, symbol))
         spellings[key] = symbol
         threaded[key] = value
     return threaded
+
+
+def _keyed_roster(
+    index: dict[str, tuple[int, ...]],
+    roster: tuple[_Contract, ...],
+    ticker: str,
+    day_text: str,
+) -> tuple[int | str, ...]:
+    """Each roster row's key, refusing two spellings of one contract the way a map does.
+
+    The roster is a list and a collision loses no row, so this cannot collapse the way
+    ``_threaded`` can. What it would do instead is hand two rows the same contract's figure,
+    including a row the selected cycle carries nothing for. That is the same wrong number
+    wearing a different shape, and guarding one path while answering in the other would leave
+    which one you get decided by a contract's volume rank.
+    """
+    spellings: dict[int | str, str] = {}
+    keys: list[int | str] = []
+    for row in roster:
+        key = _key(index, row.occ_symbol, ticker, day_text)
+        seen = spellings.get(key)
+        if seen is not None and seen != row.occ_symbol:
+            raise SpellingsCollide(ticker, day_text, (seen, row.occ_symbol))
+        spellings[key] = row.occ_symbol
+        keys.append(key)
+    return tuple(keys)
 
 
 def _read_baseline(
@@ -571,6 +624,7 @@ def _calendar_next_session(market: Calendar, session: date) -> date | None:
 def _walk(
     *,
     ticker: str,
+    session_text: str,
     following: date | None,
     comparable: tuple[_Contract, ...],
     root: Path,
@@ -579,7 +633,8 @@ def _walk(
     master: SecurityMaster,
     spans: CaptureSpans,
     market: Calendar,
-    occ_index: dict[str, int],
+    session_index: dict[str, tuple[int, ...]],
+    following_index: dict[str, tuple[int, ...]],
 ) -> _Outcome:
     """Find the calendar-next session's first cycle that both differs and holds."""
     if following is None:
@@ -603,10 +658,10 @@ def _walk(
     # Keyed on the thread rather than on the spelling, so a contract the OCC re-symbols
     # between S and the session walked here is read as renamed rather than as gone.
     baseline = _threaded(
-        occ_index,
+        session_index,
         ((row.occ_symbol, row.open_interest) for row in comparable),
         ticker,
-        following_text,
+        session_text,
     )
     plateau = guards.oi_plateau_cycles
     # A cycle in the session's final ``plateau`` has no subsequent cycles to hold across,
@@ -621,7 +676,7 @@ def _walk(
 
     for index in range(max(window, 0)):
         cycle = _cycle_oi(
-            ticker, following_text, cycles[index], root, include_quarantined, occ_index
+            ticker, following_text, cycles[index], root, include_quarantined, following_index
         )
         if cycle is None:
             continue
@@ -648,7 +703,7 @@ def _walk(
             voters=voters,
             root=root,
             include_quarantined=include_quarantined,
-            occ_index=occ_index,
+            following_index=following_index,
         ):
             continue
         return _Outcome(
@@ -676,7 +731,7 @@ def _cycle_oi(
     minute: str,
     root: Path,
     include_quarantined: bool,
-    occ_index: dict[str, int],
+    occ_index: dict[str, tuple[int, ...]],
 ) -> _Cycle | None:
     """One cycle's contract-to-OI map, or ``None`` when that minute no longer resolves.
 
@@ -716,7 +771,7 @@ def _holds(
     voters: dict[int | str, int | None],
     root: Path,
     include_quarantined: bool,
-    occ_index: dict[str, int],
+    following_index: dict[str, tuple[int, ...]],
 ) -> bool:
     """Whether the candidate's OI is unchanged over the voters for ``plateau`` cycles.
 
@@ -726,7 +781,12 @@ def _holds(
     """
     for step in range(1, plateau + 1):
         later = _cycle_oi(
-            ticker, following_text, cycles[index + step], root, include_quarantined, occ_index
+            ticker,
+            following_text,
+            cycles[index + step],
+            root,
+            include_quarantined,
+            following_index,
         )
         if later is None:
             return False
@@ -805,7 +865,8 @@ def _settled(
     session_text: str,
     roster: tuple[_Contract, ...],
     outcome: _Outcome,
-    occ_index: dict[str, int],
+    session_index: dict[str, tuple[int, ...]],
+    day_text: str,
 ) -> pa.Table:
     """The roster against the selected cycle, contract by contract.
 
@@ -829,11 +890,16 @@ def _settled(
     gone.
     """
     found = outcome.open_interest or {}
+    # Keyed through the same index and the same guard as the maps above. The roster is a
+    # list rather than a dict, so a collision here loses nothing, but it would hand two rows
+    # one contract's figure. That is the same silently wrong number, so it refuses too, and
+    # refusing in one path while answering in the other is what would make the rule arbitrary.
+    keys = _keyed_roster(session_index, roster, ticker, day_text)
     verdicts: list[str] = []
     reasons: list[str | None] = []
     values: list[int | None] = []
-    for row in roster:
-        value = found.get(occ_index.get(row.occ_symbol, row.occ_symbol))
+    for position, row in enumerate(roster):
+        value = found.get(keys[position])
         if not row.expires_after_session:
             verdicts.append(VERDICT_ABSENT)
             reasons.append(REASON_EXPIRED_OUT)
