@@ -200,7 +200,6 @@ from lake.loader import (
     _occ_root,
     load_chain,
 )
-from lake.manifest import RowCountRegression
 from lake.occ_mapping import (
     CHECK_OCC_MAPPING,
     MappingError,
@@ -1223,18 +1222,15 @@ def _examine(
         # boundary, so it ends the run the way the walk's own first read of the master does.
         # ``main`` turns each into its own line naming the fix.
         raise
-    except (
-        MappingError,
-        SecurityMasterError,
-        RowCountRegression,
-        ValueError,
-        OSError,
-    ) as exc:
-        # Five classes rather than two, and ``RowCountRegression`` is the one a catch on the
-        # master's own errors would miss: it is a bare ``Exception``. This write can never
-        # cause it, since registering and remapping only grow the row list, and a restore from
-        # backup makes it reachable anyway. A refusal here costs this boundary its mapping and
-        # not the run, because the ledger entry below is a separate record.
+    except (MappingError, SecurityMasterError, ValueError, OSError) as exc:
+        # Four classes rather than two. ``MappingError`` is this module's own, and it carries
+        # the manifest failure too: ``record_partition`` raises a bare ``RowCountRegression``
+        # that a catch on the master's errors would miss, and rather than list that class
+        # here, where nothing could ever reach it, the write wraps it in
+        # ``ManifestNotRecorded``. That is not tidying. The two say opposite things to an
+        # operator, because the rows are on disk and only the lake's record of them is stale.
+        # A refusal here costs this boundary its mapping and not the run, since the ledger
+        # entry below is a separate record.
         hold(_finding(ticker, day, CHECK_OCC_MAPPING, exc, session.instrument_id))
 
     if new.same_as(prior):
