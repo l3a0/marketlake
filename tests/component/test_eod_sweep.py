@@ -2289,8 +2289,9 @@ def test_a_ledger_that_is_not_utf8_is_contained_and_the_run_still_files(
     ASCII and every prefix of a written line is valid UTF-8.
 
     Not every hand edit lands here. A byte-order mark is valid UTF-8, so it decodes and never
-    reaches this refusal, and on a one-entry ledger it reads as a torn tail and lifts the
-    quarantine. That is marketlake #506, and it behaves identically on the code before this.
+    reaches this refusal. It has one of its own, ``manifest.LedgerHasByteOrderMark``, and until
+    marketlake #506 added that one, a mark on a one-entry ledger read as a torn tail and lifted
+    the quarantine. The case below this one drives that shape end to end.
 
     The count is the second witness and it comes through a different door.
     ``sweep._counted`` catches bare ``Exception``, so that door was never the one that failed.
@@ -2319,6 +2320,54 @@ def test_a_ledger_that_is_not_utf8_is_contained_and_the_run_still_files(
     assert any("human's job under the lock" in problem for problem in outcome.nightly.problems), (
         "the operator gets the error's name without what to do about it"
     )
+    assert outcome.nightly.pinged is False
+    assert pinger.urls == []
+
+
+def test_a_ledger_with_a_byte_order_mark_is_contained_and_the_run_still_files(
+    fixture_lake: FixtureLake,
+):
+    """Marketlake #506, end to end, and the fourth shape the three tests above hold three of.
+
+    A byte-order mark is valid UTF-8, so it decodes and never reaches ``LedgerNotUtf8``. On a
+    ledger of two lines or more a leading one still reached ``TornLedger``, because entries sit
+    behind the stop. On a one-entry ledger it reached neither: line 1 was unparseable with
+    nothing behind it, so the read discarded it as a torn tail and the partition it withheld read
+    clean. Driven through this same sweep on
+    the code before the fix, the run filed its record with no problems, reported a quarantine
+    count of zero and **pinged**, on a lake that was withholding a partition the whole time.
+
+    That is the one thing this case holds that its three siblings cannot: the others fail loudly
+    without their fix, and this one fails silently. The ping is the assertion that says so. A
+    damaged ledger must never reach the end of this run looking healthy.
+
+    One entry is what the ledger holds from the battery's first verdict on, which is why the
+    fixture is one line rather than several. A second line makes the read stop with something
+    behind it, and ``TornLedger`` already refuses that.
+    """
+    from lake.manifest import BYTE_ORDER_MARK, append_line, quarantine_path
+
+    root = _lake(fixture_lake)
+    ledger = quarantine_path(root)
+    append_line(ledger, {"partition": "a", "verdict": "quarantined", "check": "e"})
+    ledger.write_bytes(BYTE_ORDER_MARK.encode("utf-8") + ledger.read_bytes())
+
+    outcome, pinger, _ = _run(root)
+
+    assert outcome.filed_at is not None, "the run died instead of filing its record"
+    assert any(
+        "dividends did not run: LedgerHasByteOrderMark" in problem
+        for problem in outcome.nightly.problems
+    ), outcome.nightly.problems
+    assert any(
+        "quarantine count unreadable: LedgerHasByteOrderMark" in line
+        for line in outcome.nightly.report
+    ), outcome.nightly.report
+    assert any("human's job under the lock" in problem for problem in outcome.nightly.problems), (
+        "the operator gets the error's name without what to do about it"
+    )
+
+    # What the defect did instead of any of the above: nothing at all, and a ping saying so.
     assert outcome.nightly.pinged is False
     assert pinger.urls == []
 
