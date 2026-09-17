@@ -1998,6 +1998,52 @@ def test_the_containment_is_the_error_class_and_not_the_one_shape(fixture_lake: 
     ), outcome.nightly.problems
 
 
+def test_a_ledger_that_is_not_utf8_is_contained_and_the_run_still_files(
+    fixture_lake: FixtureLake,
+):
+    """Marketlake #495, end to end, and the third shape the two tests above hold two of.
+
+    ``manifest.read_quarantine`` decoded strictly, so one byte of bit rot raised
+    ``UnicodeDecodeError``. That is a ``ValueError``, so it escaped ``_LEDGER_REFUSALS``
+    entirely even after marketlake #469 widened that tuple to ``ManifestError``. Executed
+    against `9e767ab` this lake died inside the **bar** walk rather than the dividend walk the
+    two tests above exercise, at ``loader._clear_partition``, and took the whole 18:30 run with
+    it: no record, no report, no ping, and on a Friday no Sunday wake.
+
+    **The damage is one flipped byte in a line that is otherwise whole**, which is the shape
+    bit rot and a hand edit saved in another encoding both produce. It is deliberately not a
+    torn write: no writer here can make one of these, because ``append_line`` emits pure ASCII
+    and every prefix of a written line is valid UTF-8.
+
+    The count is the second witness and it comes through a different door.
+    ``sweep._counted`` catches bare ``Exception``, so the count reported the damage even before
+    this fix, into the report file rather than into ``problems``. What it reports now is the
+    class rather than a ``UnicodeDecodeError`` nothing had a name for.
+    """
+    from lake.manifest import append_line, quarantine_path
+
+    root = _lake(fixture_lake)
+    ledger = quarantine_path(root)
+    append_line(ledger, {"partition": "a", "verdict": "clean", "check": "e"})
+    ledger.write_bytes(ledger.read_bytes().replace(b'"clean"', b'"cl\xffean"'))
+    append_line(ledger, {"partition": "b", "verdict": "clean", "check": "e"})
+
+    outcome, pinger, _ = _run(root)
+
+    assert outcome.filed_at is not None, "the run died instead of filing its record"
+    assert any(
+        "dividends did not run: LedgerNotUtf8" in problem for problem in outcome.nightly.problems
+    ), outcome.nightly.problems
+    assert any(
+        "quarantine count unreadable: LedgerNotUtf8" in line for line in outcome.nightly.report
+    ), outcome.nightly.report
+    assert any("human's job under the lock" in problem for problem in outcome.nightly.problems), (
+        "the operator gets the error's name without what to do about it"
+    )
+    assert outcome.nightly.pinged is False
+    assert pinger.urls == []
+
+
 def test_a_quarantine_the_battery_wrote_is_reported_and_still_pings(fixture_lake: FixtureLake):
     """A quarantine is the run working. It withholds nothing and it reaches the record."""
     from lake.battery import BatteryReport

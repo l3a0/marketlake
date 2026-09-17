@@ -17,6 +17,8 @@ import pyarrow.parquet as pq
 import pytest
 
 from lake.manifest import (
+    LedgerNotUtf8,
+    ManifestError,
     RowCountRegression,
     TornLedger,
     append_line,
@@ -421,6 +423,134 @@ def test_a_fusion_reads_until_the_next_write_lands_behind_it(lake_root):
     append_line(quarantine_path(lake_root), _verdict("tonight"))
     with pytest.raises(TornLedger):
         read_quarantine(lake_root)
+
+
+# -- a ledger whose bytes are not UTF-8 refuses rather than escaping ----------
+
+
+def _flip(lake_root, needle: bytes, replacement: bytes) -> None:
+    """Change one byte of an already written ledger, the way bit rot or a hand edit does."""
+    path = quarantine_path(lake_root)
+    raw = path.read_bytes()
+    assert raw.count(needle) == 1, "the fixture no longer says what it meant to"
+    path.write_bytes(raw.replace(needle, replacement))
+
+
+def test_a_ledger_that_is_not_utf8_refuses_as_a_manifest_error(lake_root):
+    """The defect marketlake #495 is.
+
+    ``read_text`` decodes strictly, so ``UnicodeDecodeError`` came out of here. It is a
+    ``ValueError`` and so neither a ``ManifestError`` nor an ``OSError``, which are the two
+    families every containment around this ledger names. Escaping them cost the whole 18:30
+    run: no record filed, no report, no ping, and on a Friday no Sunday wake.
+
+    The class is what matters more than the name. Every consumer already says in writing that
+    a damaged quarantine ledger raises ``ManifestError``, so refusing as one needs no tuple
+    anywhere to be widened.
+    """
+    append_quarantine(lake_root, _verdict("kept"))
+    _flip(lake_root, b'"quarantined"', b'"quarantin\xffd"')
+
+    with pytest.raises(LedgerNotUtf8) as refusal:
+        read_quarantine(lake_root)
+
+    assert isinstance(refusal.value, ManifestError)
+    assert str(quarantine_path(lake_root)) in str(refusal.value)
+
+
+def test_the_refusal_names_the_byte_and_the_line_a_repair_has_to_find(lake_root):
+    """The number's whole job is to send the person repairing the file to the right place.
+
+    ``UnicodeDecodeError`` carries a byte offset alone, which is the wrong unit for an editor,
+    so the line is counted from the newlines in front of it. Three whole verdicts land first,
+    so a line number taken from the entries rather than the bytes would read 1 here.
+    """
+    for name in ("first", "second", "third"):
+        append_quarantine(lake_root, _verdict(name))
+    _flip(lake_root, b'"third"', b'"thi\xffd"')
+
+    with pytest.raises(LedgerNotUtf8) as refusal:
+        read_quarantine(lake_root)
+
+    message = str(refusal.value)
+    assert "on line 3" in message, message
+    assert "0xff" in message, message
+    assert "human's job under the lock" in message, message
+
+
+def test_a_damaged_byte_in_the_last_line_refuses_rather_than_reading_as_a_torn_tail(lake_root):
+    """A torn tail is discarded on purpose, and this is not one.
+
+    ``parse_jsonl`` drops a trailing line it cannot parse because a torn write did not finish.
+    No torn write can produce these bytes: every prefix of a line ``append_line`` emits is
+    valid UTF-8. So a last line that does not decode is damage rather than an unfinished
+    write, and reading it as a tail would drop a whole verdict silently.
+    """
+    append_quarantine(lake_root, _verdict("kept"))
+    append_quarantine(lake_root, _verdict("last"))
+    _flip(lake_root, b'"last"', b'"la\xfft"')
+
+    with pytest.raises(LedgerNotUtf8):
+        read_quarantine(lake_root)
+
+
+def test_every_quarantine_reader_funnels_through_the_decode_refusal_too(lake_root):
+    """The same funnel ``TornLedger`` has, for the same reason.
+
+    ``latest_quarantine`` and ``latest_quarantine_by_check`` are what ``loader``, ``sweep``,
+    ``dashboard`` and ``signoff`` actually call. A refusal only ``read_quarantine`` made would
+    leave all four meeting the bare ``UnicodeDecodeError``.
+    """
+    append_quarantine(lake_root, _verdict("kept"))
+    _flip(lake_root, b'"quarantined"', b'"quarantin\xffd"')
+
+    for reader in (read_quarantine, latest_quarantine, latest_quarantine_by_check):
+        with pytest.raises(LedgerNotUtf8):
+            reader(lake_root)
+
+
+def test_the_refusal_is_not_a_replacement_because_replacing_inverts_the_guard(lake_root):
+    """Why this refuses instead of decoding with ``errors="replace"``, which is one line.
+
+    A replacement character inside a JSON string leaves the line **valid JSON** with one field
+    silently rewritten. When that field is ``partition``, the entry files under a key no reader
+    asks about, so the partition the verdict withholds disappears from the ledger and reads
+    clean. The assertions below are what a replacement would produce, stated as the thing that
+    must not happen.
+    """
+    held = "chains/ticker=SPY/date=2026-09-14.parquet"
+    append_quarantine(lake_root, _verdict(held))
+    _flip(lake_root, b"2026-09-14", b"2026-09-\xff4")
+
+    with pytest.raises(LedgerNotUtf8):
+        latest_quarantine(lake_root)
+
+    # The two facts a replacement would establish instead, both of them wrong.
+    replaced = quarantine_path(lake_root).read_bytes().decode("utf-8", "replace")
+    entries = json.loads(replaced.splitlines()[0])
+    assert entries["partition"] != held, "the premise of this test no longer holds"
+    assert json.loads(replaced.splitlines()[0])["verdict"] == "quarantined"
+
+
+def test_no_writer_in_the_tree_can_put_a_byte_outside_ascii_in_a_ledger(lake_root):
+    """What the refusal's own message tells the operator, held as a test.
+
+    The message says these bytes were changed by something other than a writer, and the
+    reachability argument on marketlake #495 rests on the same fact. ``json.dumps`` runs with
+    ``ensure_ascii`` at its default, and flipping that default is a one-word edit in
+    ``append_line`` that nothing else would notice.
+
+    The second half is what rules out a torn write: ``os.write`` can stop between bytes but
+    never inside one, so if every prefix of a written line decodes then no crash mid-append can
+    produce this shape.
+    """
+    reason = "vendor said \u201cdelayed\u201d \u00e9 \U0001f600"
+    append_line(quarantine_path(lake_root), {"partition": "p", "check": "e", "reason": reason})
+    raw = quarantine_path(lake_root).read_bytes()
+
+    assert max(raw) < 128, f"a writer emitted a byte outside ASCII: {raw!r}"
+    for cut in range(len(raw) + 1):
+        raw[:cut].decode("utf-8")
 
 
 def test_a_lake_with_no_ledger_and_an_empty_one_both_read_as_no_entries(lake_root):
