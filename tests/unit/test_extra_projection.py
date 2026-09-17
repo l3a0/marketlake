@@ -540,8 +540,9 @@ def test_a_version_absent_from_the_ledger_leaves_its_rows_exactly_as_written():
     """Nothing is guessed for a version whose shape was never recorded.
 
     A bump made without running ``python -m lake.schema_versions`` leaves the lake
-    holding rows at a version recorded nowhere, which is marketlake #130. Until that
-    lands the condition is live, so the projection has to answer it. Treating the version
+    holding rows at a version recorded nowhere. Marketlake #130 reports that while it is
+    still the running version and does not prevent it, so the projection still has to
+    answer it. Treating the version
     as carrying no columns would fill every column from the overflow, and refusing to read
     at all would make the unrecorded rows unreadable through the one path meant to
     investigate them.

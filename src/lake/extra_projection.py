@@ -157,8 +157,11 @@ class ExtraProjection(NamedTuple):
     ``unrecorded_versions`` names every version in the table that the ledger holds no
     shape for. Those rows come back exactly as written, because the projection cannot know
     which columns that version carried, and guessing would be worse than leaving the value
-    where it sits. That gap is what marketlake #130 exists to prevent, and until it lands a
-    caller reads this field to know the read was partial.
+    where it sits. Marketlake #130 is what makes that condition loud rather than what
+    removes it: the daemon and the vendor sweep both ask
+    ``schema_versions.check_running_version`` and report a running version the ledger has no
+    shape for, and the repair is still a ledger run. A caller reads this field to know the
+    read was partial.
 
     ``unfit`` names every value a column refused.
 

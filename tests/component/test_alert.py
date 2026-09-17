@@ -28,6 +28,7 @@ from tests.support.config import (
     SCHWAB_APP_SECRET,
     write_config,
 )
+from tests.support.schema_version import record_running_version
 
 ET = ZoneInfo("America/New_York")
 NOW = datetime(2026, 9, 2, 10, 0, tzinfo=ET)
@@ -178,6 +179,9 @@ def test_the_daemon_pages_through_the_publisher_when_a_surface_goes_quiet(tmp_pa
 
     lake_root = tmp_path / "lake"
     lake_root.mkdir()
+    # The running version recorded, so the startup check marketlake #130 added stays quiet and
+    # the first page this run raises is the watchdog's, which is what the case is about.
+    record_running_version(lake_root)
     config = write_config(tmp_path, lake_root)
     tickers = tmp_path / "tickers.yaml"
     tickers.write_text("XYZ: {options: false}\n")

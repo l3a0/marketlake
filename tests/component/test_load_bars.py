@@ -566,9 +566,10 @@ def test_an_unreadable_stamp_refuses_the_series(fixture_lake: FixtureLake):
 def test_a_version_the_ledger_has_no_bars_shape_for_reads_partial(fixture_lake: FixtureLake):
     """#368. The projection's refusal means on a bar exactly what it means on a chain.
 
-    This is also what the live lake will do the first time the sweep lands a partition, because
-    the ledger there records one version and covers chains and quotes alone. The cause is
-    marketlake #130 and the fix is a ledger run rather than a change to this reader.
+    This is also what the live lake did the first time the sweep landed a partition, because
+    the ledger there recorded one version and covered chains and quotes alone. The fix is a
+    ledger run rather than a change to this reader, and marketlake #130 is what now says so
+    out loud from the daemon's startup and the vendor sweep.
     """
     chains_only = {
         surface: dict(columns)

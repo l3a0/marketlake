@@ -97,7 +97,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Protocol
 
-from lake.alert import Message, NtfyTransport, Publisher, Transport
+from lake.alert import REFUSED, Message, NtfyTransport, Publisher, Transport
 from lake.calendar import Calendar, ExchangeCalendar
 from lake.capture import (
     CycleResult,
@@ -124,6 +124,7 @@ from lake.report import write_close_guard
 from lake.runner import Pinger, UrllibPinger
 from lake.schema_drift import SchemaDriftObserver
 from lake.schema_drift import page as page_schema_drift
+from lake.schema_versions import check_running_version
 from lake.schwab import DEFAULT_TOKEN_PATH
 from lake.security_master import SecurityMaster, SecurityMasterError, master_path
 from lake.session import (
@@ -861,6 +862,64 @@ def _alarm(
     )
 
 
+def _report_schema_version(
+    config_path: str | Path | None,
+    publisher: Publisher,
+    now: datetime,
+) -> None:
+    """Page once at startup when the running schema version is not recorded in the lake.
+
+    Marketlake #130. ``record_schema_version`` is hand-invoked beside a deliberate
+    ``journal.SCHEMA_VERSION`` bump and nothing forces the run, so a version can reach the
+    lake with its shape recorded nowhere and every read of its rows then refuses. Startup is
+    the moment the daemon first runs the new code, since a resident process carries the tree
+    it was started with until it restarts.
+
+    It reports and never refuses to start. A daemon that will not start captures nothing, and
+    under ``KeepAlive`` the successor reaches the same check, so a missing row in a reference
+    table would cost the session rather than the row. Capture is worth more than a current
+    ledger.
+
+    Once per process, because the check runs once and the condition cannot change inside one.
+    The price is named rather than hidden: that is the same in-process rule the watchdog and
+    the assertion holder keep, so a daemon crash-looping under ``KeepAlive`` sends this again
+    on each relaunch. A durable marker would be new state under the lake root that nothing
+    prunes, and a crash loop is already an outage the ``capture`` dead-man pages for, so the
+    repeats add noise to an alarm that is already sounding rather than raising a false one.
+
+    The recurring reminder is the vendor sweep's report line, not a second page from here. A
+    page a night until someone runs a command is its own outage.
+
+    A config that will not load returns quietly. Through ``run_loop_from_config`` that shape
+    is never reached, because ``_alarm`` reads the same file and refuses first.
+    """
+    try:
+        lake_root = load_config(config_path).lake_root
+    except ConfigError:
+        return
+    check = check_running_version(lake_root)
+    if check.ok:
+        return
+    # Published before anything is printed, which is ``_page_sunday_daemon_finding``'s
+    # bargain. A publisher that answered ``REFUSED`` found one of its own secrets in the body
+    # and redacted its record for that reason, so stderr must not print the fuller detail and
+    # undo the redaction.
+    delivery = publisher.publish(
+        Message(event=check.event, title=check.title, body=check.page_body), now=now
+    )
+    if delivery.reason == REFUSED:
+        print(f"schema_version: {check.event} page refused: it carried a secret", file=sys.stderr)
+        return
+    # The uncapped detail, and the one place the absolute path is named. The page body is
+    # capped for the design's byte budget and the nightly report line keeps machine paths out
+    # of a file the dashboard may read, so this log is the only reader that gets the whole of
+    # it.
+    print(f"schema_version: {check.detail}", file=sys.stderr)
+    if not delivery.sent:
+        kept = "written down" if delivery.recorded else "lost"
+        print(f"schema_version: page not sent: {delivery.reason}, {kept}", file=sys.stderr)
+
+
 def run_loop_from_config(
     *,
     config_path: str | Path | None = None,
@@ -960,6 +1019,11 @@ def run_loop_from_config(
     watchdog, publisher, deadman, schema_drift = _alarm(
         config_path, tickers_path, session_clock, transport, pinger
     )
+    # Marketlake #130, and it sits here for two reasons. The publisher above is the one
+    # surface a 01:32 restart reaches, since the daemon's stdout goes to a launchd log nobody
+    # reads at that hour. And it runs before any hook is wired, so the report leaves before
+    # startup gap-marking takes the lake-root lock.
+    _report_schema_version(config_path, publisher, clock.now())
     holder = AssertionHolder(runner=assertion_runner)
     caller_on_tick = hooks.on_tick
     pid_stamp = _assertion_pid_stamp(config_path)

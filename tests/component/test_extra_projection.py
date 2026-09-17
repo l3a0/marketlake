@@ -194,7 +194,7 @@ def test_the_ledger_the_projection_reads_is_the_file_the_tool_wrote(lake_root, m
     projection with no shape for those rows, so it fills nothing and says which version it
     could not place.
     The rows are untouched and the value is still in the overflow, which is the condition
-    marketlake #130 exists to prevent.
+    marketlake #130 reports on from the daemon's startup and the vendor sweep.
     """
     written = journal.read_segment(_write_segment(lake_root, "20260911T153000", 4242))
 

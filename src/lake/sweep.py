@@ -134,6 +134,7 @@ from lake.report import (
     write_nightly,
 )
 from lake.runner import PING_FAILURES, Pinger, UrllibPinger, escalate_ping_failure
+from lake.schema_versions import check_running_version
 from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor, VendorAuthError
 from lake.security_master import MasterUnreadable
 from lake.splits import SplitReport, detect_splits
@@ -665,6 +666,26 @@ def sweep(
     problems: list[str] = []
     report: list[str] = []
     pieces: list[tuple[str, PieceOutcome]] = []
+
+    # **Marketlake #130: is the running schema version recorded in the lake at all.** Nothing
+    # forces ``python -m lake.schema_versions`` to be run beside a deliberate bump, and a
+    # version whose shape is recorded nowhere makes every read of its rows refuse. The daemon
+    # asks the same question at startup and pages once. This is the recurring half, because a
+    # resident daemon carries the tree it was started with, so a deploy with no restart lands
+    # the new version in the lake from *this* process: ``backfill_bars`` below stamps
+    # ``journal.SCHEMA_VERSION`` on every bar it writes.
+    #
+    # Report-tier rather than a problem, which is ``_counted``'s line. The work the
+    # ``eod-sweep`` check watches did happen, so a summary must not withhold the ping. The
+    # line then repeats every weekday until the tool is run, the cadence ``count_quarantined``
+    # already sets.
+    #
+    # Outside the session branch, because a holiday skips the walks and this is not a walk.
+    # The condition does not depend on the session and the report file is written on every
+    # run, holiday no-op included.
+    version_check = check_running_version(root)
+    if not version_check.ok:
+        report.append(version_check.summary)
 
     if session:
         closed = calendar.session_close(day) <= now

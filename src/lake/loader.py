@@ -639,8 +639,10 @@ class PartialRead(LoadError):
 
     Three conditions reach here, and each leaves the table readable but incomplete.
 
-    1. A version the schema-version ledger holds no shape for, which is marketlake #130's
-       condition and which an absent ledger produces for every version at once.
+    1. A version the schema-version ledger holds no shape for, which an absent ledger
+       produces for every version at once. Marketlake #130 is what reports that condition
+       while it is still the running version, from the daemon's startup and the vendor
+       sweep, and the repair is a ledger run rather than a change here.
     2. A value a promoted column refused.
     3. A column a vendor retype routed into the overflow.
 
