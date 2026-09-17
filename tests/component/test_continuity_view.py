@@ -51,9 +51,15 @@ from lake.continuity import (
     ThreadAmbiguous,
     continuity_view,
 )
-from lake.loader import PartitionQuarantined
+from lake.loader import ADJUST_SPLIT, PartitionQuarantined, load_bars
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
-from lake.security_master import ID_TYPE_OCC, KIND_OPTION, SecurityMaster, master_path
+from lake.security_master import (
+    ID_TYPE_OCC,
+    KIND_OPTION,
+    Mapping,
+    SecurityMaster,
+    master_path,
+)
 from tests.support.lake import FixtureLake
 
 TICKER = "SPY"
@@ -127,6 +133,30 @@ CONTINUITY_CHAINS_SCHEMA = pa.schema(
 )
 
 CHAIN_UNDERLYING = 999.99
+
+
+def _cash_leg(units: float, cash: float) -> str:
+    """A deliverable no single float describes: shares plus a cash component.
+
+    This is `docs/design.md`'s own example of the adjustment the view must surface rather than
+    normalize, and `splits.require_scalar` is what refuses it.
+    """
+    return json.dumps(
+        [
+            {
+                "assetType": "STOCK",
+                "currencyType": None,
+                "deliverableUnits": units,
+                "symbol": TICKER,
+            },
+            {
+                "assetType": "CURRENCY",
+                "currencyType": "USD",
+                "deliverableUnits": cash,
+                "symbol": "USD",
+            },
+        ]
+    )
 
 
 def _deliverable(units: float | None) -> str | None:
@@ -741,3 +771,352 @@ def test_a_row_whose_own_terms_cannot_be_read_marks_that_row(fixture_lake):
     assert rows[S2]["reason"] == REASON_TERMS_UNREADABLE
     assert rows[S2]["underlying_close"] == CLOSES[S2]
     assert rows[S1]["verdict"] == VERDICT_SETTLED
+
+
+# 23 --------------------------------------------------------------------------------------
+
+
+def test_the_range_arguments_bound_the_walk(fixture_lake):
+    """`start` and `end` are the walk's only bound, so the answer has to move with them."""
+    root = _lake(fixture_lake, _unadjusted_chains(), master=_master(remapped=False))
+
+    def sessions(*args):
+        return [
+            row["session"]
+            for row in continuity_view(TICKER, OLD, *args, lake_root=root).to_pylist()
+        ]
+
+    assert sessions(S2, S3) == [S2, S3]
+    assert sessions(S1, S2) == [S1, S2]
+    assert sessions(S2, S2) == [S2]
+    assert sessions(None, S2) == [S1, S2]
+    assert sessions(S2, None) == [S2, S3]
+
+
+def test_a_bounded_range_the_contract_is_not_in_names_that_range(fixture_lake):
+    """The refusal says where it looked, so a caller can tell a bad range from a bad symbol."""
+    chains = _unadjusted_chains()
+    chains[S2] = [_contract(S2, "SPY   261218C00310000", strike=310.0)]
+    chains[S3] = [_contract(S3, "SPY   261218C00310000", strike=310.0)]
+    root = _lake(fixture_lake, chains, master=_master(remapped=False))
+
+    with pytest.raises(ContractNeverObserved) as caught:
+        continuity_view(TICKER, OLD, S2, S3, lake_root=root)
+
+    assert f"{S2}..{S3}" in str(caught.value)
+
+
+def test_a_range_holding_only_unreadable_sessions_still_raises(fixture_lake):
+    """An unreadable session is not an observation, so it cannot stand in for one."""
+    chains = {day: [_contract(day, OLD, strike=STRIKE_BEFORE, tag=None)] for day in (S1, S2)}
+    root = _lake(
+        fixture_lake, chains, bars={S1: [_bar(S1, CLOSES[S1])]}, master=_master(remapped=False)
+    )
+
+    with pytest.raises(ContractNeverObserved) as caught:
+        continuity_view(TICKER, OLD, lake_root=root)
+
+    assert "2 session(s)" in str(caught.value)
+
+
+# 24 --------------------------------------------------------------------------------------
+
+
+def test_include_quarantined_reaches_the_bars_read(fixture_lake):
+    """The flag reaches every read, so a verdict on either surface refuses this view."""
+    root = _lake(
+        fixture_lake,
+        _unadjusted_chains(),
+        master=_master(remapped=False),
+        quarantine=[
+            {
+                "partition": f"bars/ticker={TICKER}/freq={DAILY}/date={S2}.parquet",
+                "quarantined": True,
+                "reason": "battery",
+            }
+        ],
+    )
+
+    with pytest.raises(PartitionQuarantined):
+        continuity_view(TICKER, OLD, lake_root=root)
+
+    rows = _by_session(continuity_view(TICKER, OLD, lake_root=root, include_quarantined=True))
+    assert [rows[day]["underlying_close"] for day in (S1, S2, S3)] == [330.0, 333.0, 222.0]
+
+
+# 25 --------------------------------------------------------------------------------------
+
+
+def test_a_decided_boundary_beats_an_undecided_one(fixture_lake):
+    """`deliverable_not_scalar` stays true however the other boundaries read."""
+    fourth = "2026-09-17"
+    third_symbol = "SPY2  261218C00100000"
+    chains = {
+        S1: [_contract(S1, OLD, strike=STRIKE_BEFORE)],
+        S2: [_contract(S2, OLD, strike=STRIKE_BEFORE)],
+        # A boundary at S3 whose deliverable moved and which the ledger does not describe.
+        S3: [_contract(S3, NEW, strike=STRIKE_AFTER, units=UNITS_AFTER)],
+        # A second boundary at S4 the parse cannot read at all.
+        fourth: [_contract(fourth, third_symbol, strike=100.0, units=None)],
+    }
+    master = _master()
+    master.remap(2, ID_TYPE_OCC, third_symbol, effective=date.fromisoformat(fourth))
+    bars = {day: [_bar(day, CLOSES[day])] for day in CLOSES}
+    bars[fourth] = [_bar(fourth, 222.0)]
+    root = _lake(fixture_lake, chains, bars=bars, master=master)
+
+    rows = _by_session(continuity_view(TICKER, OLD, lake_root=root))
+
+    assert rows[S1]["reason"] == REASON_DELIVERABLE_NOT_SCALAR
+    assert rows[S1]["verdict"] == VERDICT_ABSENT
+    assert rows[S3]["reason"] == REASON_BOUNDARY_UNREADABLE
+    assert rows[S3]["verdict"] == VERDICT_INDETERMINATE
+
+
+# 26 --------------------------------------------------------------------------------------
+
+
+def test_a_non_scalar_deliverable_is_surfaced_even_when_the_ledger_holds_a_ratio(fixture_lake):
+    """The ledger lands one ratio per instrument, and it describes the equity, not the contract."""
+    chains = _adjusted_chains()
+    chains[S3] = [_contract(S3, NEW, strike=STRIKE_AFTER, units=UNITS_AFTER, mark=13.5)]
+    chains[S3][0]["option_deliverables_list"] = _cash_leg(UNITS_AFTER, 25.0)
+    root = _lake(fixture_lake, chains, master=_master(), split=True)
+
+    rows = _by_session(continuity_view(TICKER, OLD, lake_root=root))
+
+    for day in (S1, S2):
+        assert rows[day]["verdict"] == VERDICT_ABSENT
+        assert rows[day]["reason"] == REASON_DELIVERABLE_NOT_SCALAR
+        assert rows[day]["adjusted_strike"] is None
+
+
+def test_a_moved_multiplier_is_surfaced_the_same_way(fixture_lake):
+    """A ratio scales what a contract delivers; a moved multiplier scales what it is."""
+    chains = _adjusted_chains(units_after=UNITS_BEFORE)
+    chains[S3] = [_contract(S3, NEW, strike=STRIKE_AFTER, multiplier=150.0, mark=13.5)]
+    root = _lake(fixture_lake, chains, master=_master(), split=True)
+
+    rows = _by_session(continuity_view(TICKER, OLD, lake_root=root))
+
+    assert rows[S1]["reason"] == REASON_DELIVERABLE_NOT_SCALAR
+
+
+# 27 --------------------------------------------------------------------------------------
+
+
+def test_a_boundary_the_ledger_describes_survives_a_missing_bar_on_it(fixture_lake):
+    """The ledger's answer does not depend on a bar existing, so neither does the mark."""
+    bars = {day: [_bar(day, CLOSES[day])] for day in (S1, S2)}
+    root = _lake(fixture_lake, _adjusted_chains(), bars=bars, master=_master(), split=True)
+
+    rows = _by_session(continuity_view(TICKER, OLD, lake_root=root))
+
+    for day in (S1, S2):
+        assert rows[day]["verdict"] == VERDICT_SETTLED
+        assert rows[day]["adjusted_strike"] == STRIKE_AFTER
+    assert rows[S3]["reason"] == REASON_CLOSE_UNREADABLE
+
+
+def test_a_boundary_the_ledger_describes_survives_an_unreadable_deliverable(fixture_lake):
+    """A landed entry is the detector's own verdict that the boundary is scalar."""
+    chains = _adjusted_chains()
+    chains[S2] = [_contract(S2, OLD, strike=STRIKE_BEFORE, units=None, mark=13.0)]
+    root = _lake(fixture_lake, chains, master=_master(), split=True)
+
+    rows = _by_session(continuity_view(TICKER, OLD, lake_root=root))
+
+    assert rows[S1]["verdict"] == VERDICT_SETTLED
+    assert rows[S1]["adjusted_strike"] == STRIKE_AFTER
+    # An unreadable deliverable is not an unreadable term: the strike, mark and multiplier on
+    # that row are all fine, so it settles like any other.
+    assert rows[S2]["verdict"] == VERDICT_SETTLED
+
+
+# 28 --------------------------------------------------------------------------------------
+
+
+def test_a_boundary_past_the_range_end_is_still_classified(fixture_lake):
+    """Narrowing the range must not turn a marked answer into an unmarked settled one."""
+    root = _lake(fixture_lake, _adjusted_chains(), master=_master(), split=False)
+
+    rows = _by_session(continuity_view(TICKER, OLD, S1, S2, lake_root=root))
+
+    assert sorted(rows) == [S1, S2]
+    for day in (S1, S2):
+        assert rows[day]["verdict"] == VERDICT_INDETERMINATE
+        assert rows[day]["reason"] == REASON_BOUNDARY_UNREADABLE
+
+
+def test_a_ledger_described_boundary_past_the_range_end_leaves_the_rows_settled(fixture_lake):
+    """The scale already carries it, so the narrowed answer is in the reference era."""
+    root = _lake(fixture_lake, _adjusted_chains(), master=_master(), split=True)
+
+    rows = _by_session(continuity_view(TICKER, OLD, S1, S2, lake_root=root))
+
+    for day in (S1, S2):
+        assert rows[day]["verdict"] == VERDICT_SETTLED
+        assert rows[day]["adjusted_strike"] == STRIKE_AFTER
+
+
+# 29 --------------------------------------------------------------------------------------
+
+
+def test_the_adjusted_close_is_the_loaders_own_number(fixture_lake):
+    """Not the as-traded close divided by the ratio, which is a different double.
+
+    752.82 is chosen: at the fixture's ratio of 1.5 the loader answers 501.88 and the round
+    trip answers 501.87999999999994. Drawn from 400,000 random penny closes, the two disagree
+    often enough that a value picked without checking lands in the agreeing majority.
+    """
+    closes = {S1: 752.82, S2: 693.57, S3: 462.38}
+    root = _lake(
+        fixture_lake,
+        _adjusted_chains(),
+        bars={day: [_bar(day, close)] for day, close in closes.items()},
+        master=_master(),
+        split=True,
+    )
+
+    rows = _by_session(continuity_view(TICKER, OLD, lake_root=root))
+    bars = load_bars(TICKER, DAILY, S1, S3, adjust=ADJUST_SPLIT, lake_root=root)
+    expected = dict(
+        zip(
+            [stamp[:10] for stamp in bars.column("bar_ts").to_pylist()],
+            bars.column("close").to_pylist(),
+            strict=True,
+        )
+    )
+
+    for day in (S1, S2, S3):
+        assert rows[day]["adjusted_underlying_close"] == expected[day]
+
+
+# 30 --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("field", ["strike_price", "mark", "multiplier"])
+def test_a_zero_term_reads_as_unreadable(fixture_lake, field):
+    """A zero strike carries no moneyness, a zero multiplier describes no contract."""
+    chains = _unadjusted_chains()
+    chains[S2][0][field] = 0.0
+    root = _lake(fixture_lake, chains, master=_master(remapped=False))
+
+    rows = _by_session(continuity_view(TICKER, OLD, lake_root=root))
+
+    assert rows[S2]["reason"] == REASON_TERMS_UNREADABLE
+
+
+def test_a_zero_close_reads_as_unreadable(fixture_lake):
+    """A close of zero is not a price, and the ratio built from it is not a scale."""
+    bars = {day: [_bar(day, CLOSES[day])] for day in CLOSES}
+    bars[S2] = [_bar(S2, 0.0)]
+    root = _lake(fixture_lake, _unadjusted_chains(), bars=bars, master=_master(remapped=False))
+
+    rows = _by_session(continuity_view(TICKER, OLD, lake_root=root))
+
+    assert rows[S2]["reason"] == REASON_CLOSE_UNREADABLE
+    assert rows[S2]["split_ratio"] is None
+    assert rows[S2]["adjusted_underlying_close"] is None
+
+
+# 31 --------------------------------------------------------------------------------------
+
+
+def test_every_settled_row_carries_the_stored_multiplier(fixture_lake):
+    """One of thirteen columns, and the schema's shape says nothing about its values."""
+    root = _lake(fixture_lake, _unadjusted_chains(), master=_master(remapped=False))
+
+    table = continuity_view(TICKER, OLD, lake_root=root)
+
+    assert [row["multiplier"] for row in table.to_pylist()] == [MULTIPLIER] * 3
+
+
+# 32 --------------------------------------------------------------------------------------
+
+
+def test_the_session_listing_is_in_date_order_on_its_own(fixture_lake):
+    """Two sorts protect the answer's order, and each has to hold without the other."""
+    from lake.continuity import _chains_sessions
+
+    chains = _unadjusted_chains()
+    root = _lake(
+        fixture_lake, {day: chains[day] for day in (S3, S1, S2)}, master=_master(remapped=False)
+    )
+
+    listed = _chains_sessions(root, TICKER, None, None)
+    assert listed == [date.fromisoformat(day) for day in (S1, S2, S3)]
+    assert listed == sorted(listed)
+
+
+def test_a_file_that_does_not_name_a_session_is_passed_over(fixture_lake):
+    """`date.fromisoformat` accepts `20260824` and a week date; `parse_date_dir` does not."""
+    from lake.continuity import _chains_sessions
+
+    root = _lake(fixture_lake, _unadjusted_chains(), master=_master(remapped=False))
+    directory = root / "chains" / f"ticker={TICKER}"
+    (directory / "date=20260824.parquet").write_bytes(b"")
+    (directory / "date=2026-W35-1.parquet").write_bytes(b"")
+    (directory / "notes.txt").write_bytes(b"")
+
+    assert _chains_sessions(root, TICKER, None, None) == [
+        date.fromisoformat(day) for day in (S1, S2, S3)
+    ]
+
+
+# 33 --------------------------------------------------------------------------------------
+
+
+def test_the_thread_reads_only_this_instruments_occ_mappings(fixture_lake):
+    """A ticker mapping is not a spelling, and another instrument's mapping is not this one's.
+
+    Both decoys open *before* the contract's own thread does, so either one leaking into the
+    lookup would become the `earliest` spelling and S1 would resolve to a symbol the chain does
+    not hold, dropping that session from the answer.
+    """
+    master = _master(opens_on=S2)
+    decoy = datetime(2026, 9, 8, tzinfo=UTC)
+    master.register(
+        kind=KIND_OPTION,
+        capture_start=decoy,
+        valid_from=date(2026, 9, 1),
+        occ_symbol="SPY   261218C00999000",
+    )
+    planted = [
+        *master.mappings,
+        Mapping(
+            instrument_id=2,
+            id_type="ticker",
+            id_value="SPYX",
+            valid_from=date(2026, 9, 1),
+            valid_to=None,
+            kind=KIND_OPTION,
+            capture_start=decoy,
+        ),
+    ]
+    root = _lake(fixture_lake, _adjusted_chains(), master=SecurityMaster(planted), split=True)
+
+    rows = _by_session(continuity_view(TICKER, OLD, lake_root=root))
+
+    assert [rows[day]["occ_symbol"] for day in (S1, S2, S3)] == [OLD, OLD, NEW]
+
+
+def test_a_split_under_another_instrument_does_not_describe_this_boundary(fixture_lake):
+    """The ledger is keyed by instrument, so an entry for a different one says nothing here."""
+    root = _lake(fixture_lake, _adjusted_chains(), master=_master(), split=False)
+    actions.append(
+        root,
+        instrument_id=EQUITY + 40,
+        observed_on=BOUNDARY,
+        ex_date=BOUNDARY,
+        recorded_at=SPLIT_LEARNED_AT,
+        type=actions.TYPE_SPLIT,
+        pay_date=None,
+        declared_date=None,
+        split_ratio=RATIO,
+        provenance=actions.PROVENANCE_OBSERVED,
+    )
+
+    rows = _by_session(continuity_view(TICKER, OLD, lake_root=root))
+
+    assert rows[S1]["reason"] == REASON_DELIVERABLE_NOT_SCALAR

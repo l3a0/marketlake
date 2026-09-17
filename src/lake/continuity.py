@@ -21,27 +21,27 @@ neither carries a ``__main__``, so neither does this.
 partition layout: it is the one read whose order a caller will assume. The slice's other two
 views order by the roster instead, because each answers one session.
 
-What the design asks of this view is two things and only two. "A whole-ratio split maps
-exactly. Strikes scale by the ratio, and the contract count absorbs the rest. The view
-normalizes it. An uneven split or special dividend changes the deliverable itself. A
-non-standard contract delivering 150 shares plus cash has no multiplier that makes it
-comparable. There the view surfaces the event instead of faking one."
+What ``docs/design.md`` asks of this view is two things and only two. A whole-ratio split maps
+exactly, because strikes scale by the ratio and the contract count absorbs the rest, and the
+view normalizes it. An uneven split or a special dividend changes the deliverable itself, and
+a contract delivering shares plus cash has no multiplier that makes it comparable, so there
+the view surfaces the event instead of faking one.
 
-**The contract's own price is not one of them.** The word *premium* appears nowhere in
-``docs/design.md`` and nowhere under ``src/lake``, so this repo writes down no rule for
-carrying an option's price across an adjustment, and a view that invented one would be
-minting a convention rather than deriving a view. ``mark`` therefore rides as-traded.
-Considered and rejected, and the schema is what says so: a column with an ``adjusted_``
-partner has a rule behind it and a column without one does not. ``load_bars`` marks its
-answer with an ``adjust`` column because one of its tables is entirely one view or entirely
-the other, and this table is not, carrying both forms of the strike on one row.
+**The contract's own price is not one of them.** Nothing in ``docs/design.md`` and nothing
+else under ``src/lake`` states a rule for carrying an option's price across an adjustment, so
+a view that scaled it would be minting a convention rather than deriving a view. ``mark``
+therefore rides as-traded. Considered and rejected, and the schema is what says so: a column
+with an ``adjusted_`` partner has a rule behind it and a column without one does not.
+``load_bars`` marks its answer with an ``adjust`` column because one of its tables is entirely
+one view or entirely the other, and this table is not, carrying both forms of the strike on
+one row.
 
 What the join then makes comparable is moneyness. The underlying's split-adjusted close
 against the contract's adjusted strike is continuous across a whole-ratio adjustment, and
 that pairing is what a chains-to-bars join means once an adjustment sits in the middle of the
 series.
 
-Four reads make the answer and each is through the door that owns its question.
+Five reads make the answer and each is through the door that owns its question.
 
 1. *The contract's session.* ``load_chain(ticker, session)``, filtered to the contract's
    spelling for that session. Not ``load_contract``, which answers a contract's whole session
@@ -57,8 +57,10 @@ Four reads make the answer and each is through the door that owns its question.
    its own boundary, which is exactly the half this view exists to reach.
 3. *The underlying, as traded.* ``load_bars(ticker, '1d', ..., adjust='none')``.
 4. *The underlying, in the reference era.* The same read at ``adjust='split'``.
+5. *Whether the ledger describes a boundary.* ``actions.latest`` or ``actions.as_of``, asked
+   for the presence of a split entry and for nothing else.
 
-**The scale comes out of those two bar reads and never out of the ledger.** ``load_bars``
+**The scale comes out of the two bar reads and never out of the ledger.** ``load_bars``
 refuses the alternative in advance, about a caller wanting a point-in-time view: the door
 takes ``as_of`` "rather than making a caller who wants the second one read the ledger and
 apply factors itself. That caller would be a second adjustment path, in the one place where
@@ -66,15 +68,22 @@ it produces different numbers rather than an error." A view looping over ``actio
 and multiplying ex-dates together is that caller. The reading that avoids it is arithmetic:
 the ``split`` view's price factor is ``1 / ratio`` and nothing else, so a session's as-traded
 close over its split-adjusted close *is* the cumulative ratio of every ledger split whose
-ex-date falls after it. Both numbers come from one door under one ``as_of``, and this module
-imports no ledger reader at all.
+ex-date falls after it. Both numbers come from one door under one ``as_of``.
 
-The session's strike divided by that ratio is the strike in the reference era, and a
-position's contract count multiplied by it is that position in the reference era.
-``loader._in_view`` divides a price by the same ratio and multiplies a volume by it, which is
-the same pair of directions. The reference era is the ledger's current last one, which is
-what the ``split`` view normalizes to, so both sides of the join land in one scale without
-this view choosing an anchor of its own.
+**The ledger read above is a membership question and applies no factor.** It asks whether a
+split entry exists at one ex-date under one instrument, which is a fact about the ledger
+rather than a number multiplied into anything. That is what separates it from the caller
+``load_bars`` refuses. An earlier draft answered it by comparing the cumulative ratios either
+side of a boundary, and the review that caught this showed what that cost: a boundary session
+whose daily bar is absent has no ratio, so a series the ledger fully describes lost its
+adjusted strike on every row. Nothing about the ledger's own answer depends on a bar existing.
+
+The session's strike divided by the ratio is the strike in the reference era, and a position's
+contract count multiplied by it is that position in the reference era. ``loader._in_view``
+divides a price by the same ratio and multiplies a volume by it, which is the same pair of
+directions. The reference era is the ledger's current last one, which is what the ``split``
+view normalizes to, so both sides of the join land in one scale without this view choosing an
+anchor of its own.
 
 **A mapping row is not evidence of an adjustment, and that is the whole difficulty.**
 ``splits._examine`` writes the mapping before the ledger decides anything and says so in the
@@ -88,17 +97,37 @@ things and only the last carries a number.
 3. A ratio the vendor-against-itself gate refused, held under ``CHECK_SPLIT_CONSISTENCY``.
 4. A landed split, the only one of the four with a ledger entry.
 
-Cases 1 and 2 are identical from the ledger's side, because neither has an entry, and they
-want opposite treatments. What separates them is in the raw rows this view already reads.
-``splits.Deliverable.same_as`` is the detector's own test for it, and the rows are read
-through ``splits.deliverable_of_row``, which ``lake.settle`` already reuses for the reason
-that function gives: "Two parsers for one vendor column would be two answers to what a sealed
-row means."
+Three questions separate them, asked in that order, and every one of the three is answered by
+a function that already owns it.
+
+1. Did the deliverable move? ``splits.Deliverable.same_as``, the detector's own test, over
+   rows parsed by ``splits.deliverable_of_row``, which ``lake.settle`` already reuses for the
+   reason that function gives: "Two parsers for one vendor column would be two answers to what
+   a sealed row means." An unmoved deliverable is case 1 and the series crosses it. That
+   covers the whole-ratio split where the contract count absorbed the adjustment, since there
+   the deliverable does not move either and the ledger's ratio is the divisor for both.
+2. Does one float describe what it did? ``splits.require_scalar``, the same refusal the
+   detector runs before it will build an entry. It raises for cash beside shares, for two
+   deliverable entries, for a changed underlying and for a moved contract multiplier. A
+   boundary it refuses is case 2, whatever the ledger holds for the underlying. That last
+   clause is the correction a review made: the ledger lands one ratio per *instrument*, so an
+   already-adjusted contract on an underlying that landed a split was being scaled by a factor
+   that describes the equity and not the contract.
+3. Does the ledger hold that ratio? The membership read above. No entry is case 2 or case 3,
+   which are the same answer here: nothing this view may scale by.
 
 ``splits.check_split_consistency`` would hand this view a ratio computed from the contract's
 own two deliverables, and taking it would apply a factor the gate refused, on exactly the
 boundaries the gate refused it for. The design's rule for actions is that a factor lands only
-after validation agrees, so that is considered and rejected too.
+after validation agrees, so that is considered and rejected. So is the weaker version, which
+compares the ledger's landed ratio against the one the contract's own deliverable implies and
+marks a disagreement. A review demonstrated the case it would catch, a ledger entry at 2.0
+against a contract whose deliverable moved by 1.5, giving one contract two reference-era
+strikes with no mark. It stays rejected on two grounds. The count is zero, since ``lake.splits``
+derives a landed ratio from the deliverable and gates it, so the two agree by construction for
+every entry that path produces. And the class of "does the adjusted ladder make sense" is
+marketlake #138's, which owns the strike-against-spot guard, rather than a second answer to it
+here.
 
 **Which sessions the answer holds a row for.** The sessions are the sealed chains partitions
 in range, read off the filesystem for the reason ``loader._bars_sessions`` gives for the same
@@ -131,14 +160,14 @@ verdict is not." Demoting a verdict to one row would hand back a series that rea
 complete. ``include_quarantined=True`` is the other answer and marketlake #374 owns the third
 one that neither of them is.
 
-**The marks cover the answer's own span.** A range ending before a boundary answers a series
-continuous within itself, which is true, and it cannot claim its numbers sit in the reference
-era, because an adjustment the ledger holds out can sit between the last row and now. That
-limit is ``load_bars``'s already: its ``split`` view is in the era the ledger currently
-describes, and a held boundary is one the ledger does not describe. Reading past the range to
-classify such a boundary is considered and rejected, because telling a rename from an
-adjustment needs the contract's rows on both sides of it and those sit in sessions the caller
-excluded.
+**Every boundary the master holds is classified, including one past the last row.** The
+boundaries come from the contract's own mapping rows rather than from the sessions that
+happened to be observed, so narrowing the range cannot hide one. That matters because a
+boundary between the last row and the reference era is exactly the case where the rows are not
+in that era, and an earlier draft, which walked consecutive observed sessions, answered the
+same lake two ways depending on where the caller put ``end``. A boundary with no chains row on
+one side is classified by the ledger alone, which is the only question that can be asked
+without reading sessions the caller excluded.
 
 **The walk is bounded by the caller's range and by nothing else**, at one close-of-record read
 per session, 0.052 seconds each measured over SPY's eight sealed sessions. Bounding it by the
@@ -162,10 +191,12 @@ from pathlib import Path
 
 import pyarrow as pa
 
+from lake import actions
 from lake.bars import session_of
 from lake.loader import (
     ADJUST_NONE,
     ADJUST_SPLIT,
+    INSTRUMENT_ID_COLUMN,
     NoOptionClose,
     load_bars,
     load_chain,
@@ -175,10 +206,11 @@ from lake.occ_mapping import instruments_holding
 from lake.paths import CHAINS, PARQUET_SUFFIX, LakePaths, parse_date_dir
 from lake.security_master import ID_TYPE_OCC, SecurityMaster, master_path
 from lake.splits import (
-    SPLIT_CONSISTENCY_TOLERANCE,
     Deliverable,
     DeliverableUnreadable,
+    NonScalarDeliverable,
     deliverable_of_row,
+    require_scalar,
 )
 from lake.vendor import DAILY_FREQ
 
@@ -207,9 +239,9 @@ _CHAINS_COLUMNS = (
 CLOSE_COLUMN = "close"
 BAR_TS_COLUMN = "bar_ts"
 
-# What a row's ``verdict`` says. These are D19's tokens, reused rather than respelled, which is
-# what ``lake.settle`` does with the two of them it needs. This view needs three of the four.
-# ``settled`` carries the adjusted numbers. ``absent`` says there are none and names why.
+# What a row's ``verdict`` says. All three are ``lake.oi``'s tokens, reused rather than
+# respelled, which is what ``lake.settle`` does with the two of them it needs. ``settled``
+# carries the adjusted numbers. ``absent`` says there are none and names why.
 # ``indeterminate`` says the view could not decide which, the sense ``lake.oi`` gives it for a
 # comparable set too small "to distinguish a stale feed from quiet contracts".
 VERDICT_SETTLED = "settled"
@@ -217,25 +249,45 @@ VERDICT_ABSENT = "absent"
 VERDICT_INDETERMINATE = "indeterminate"
 
 # Why a row carries no adjusted numbers. Each is a fact about one session rather than about the
-# read, which is the line ``lake.settle`` draws between a marked row and a refusal. Two of the
-# five take D19's own spelling rather than a synonym for it, and none takes an exception's name.
+# read, which is the line ``lake.settle`` draws between a marked row and a refusal.
+#
+# Three of the five are taken from the slice's two shipped views rather than respelled.
+# ``no_close_of_record`` is ``lake.oi``'s. ``terms_unreadable`` is ``lake.settle``'s.
+# ``close_unreadable`` is the name ``lake.settle`` gives this same condition, where it raises
+# ``CloseUnreadable`` because it answers one session and a session with no close settles
+# nothing. Here the same condition is one row of a series, so it marks instead. That is the
+# opposite of the mistake this view made first, which was to take ``BarsAbsent``, the loader's
+# name for a *different* condition: a whole range holding no daily partition, which refuses.
 #
 # ``deliverable_not_scalar`` and ``boundary_unreadable`` are the two halves of the caveat and
 # they are deliberately not one token. The first is the view deciding: no single float describes
 # the adjustment, so no adjusted strike exists. The second is the view failing to decide, because
-# the deliverable parse refused a side of the boundary and a rename cannot be told from an
-# adjustment. Saying which of the two it was would be the guess the caveat exists to refuse.
+# the deliverable parse refused a side of the boundary and the ledger holds nothing either.
+# Saying which of the two it was would be the guess the caveat exists to refuse.
 REASON_DELIVERABLE_NOT_SCALAR = "deliverable_not_scalar"
 REASON_BOUNDARY_UNREADABLE = "boundary_unreadable"
 REASON_NO_CLOSE_OF_RECORD = "no_close_of_record"
 REASON_CLOSE_UNREADABLE = "close_unreadable"
 REASON_TERMS_UNREADABLE = "terms_unreadable"
 
+# What reading a boundary's two deliverables answers. ``None`` beside these three is a boundary
+# that could not be read at all, because a side has no chains row or the parse refused one.
+#
+# They are three rather than two because ``_NON_SCALAR`` and ``_SCALAR`` take opposite answers
+# from the same ledger entry. A ledger split is one ratio per *instrument*, so it describes the
+# underlying, and for an adjustment no float describes it says nothing about the contract. An
+# earlier draft folded the two together and a review showed the cost: a contract whose
+# deliverable moved to shares plus cash, on an underlying that landed a split, was scaled by the
+# equity's factor and marked nothing.
+_UNMOVED = "unmoved"
+_SCALAR = "scalar"
+_NON_SCALAR = "non_scalar"
+
 # The answer's shape. ``split_ratio``, ``adjusted_strike`` and ``adjusted_underlying_close`` are
 # null on every row that is not ``settled``, and ``reason`` is null on every row that is, which
-# is D19's own null rule. ``underlying_close`` is carried on every row it can be read on,
-# settled or not, because it is a property of the session rather than of the contract, exactly
-# as ``settle`` carries ``settlement_close``.
+# is ``lake.oi``'s own null rule. ``underlying_close`` is carried on every row it can be read
+# on, settled or not, because it is a property of the session rather than of the contract,
+# exactly as ``settle`` carries ``settlement_close``.
 #
 # ``split_ratio`` carries both directions the design names. The strike divided by it is the
 # strike in the reference era, and a position's contract count multiplied by it is that position
@@ -294,6 +346,11 @@ class ContractNeverObserved(ContinuityError):
     and it cannot: a contract that never listed, a range that misses its life, and a ticker
     that holds the contract under another partition all produce zero rows. ``load_contract``
     already refuses on that ground rather than returning empty, and this follows it.
+
+    The refusal fires whether or not the range held sessions the view could not read, because
+    an unreadable session is not an observation either. It says how many there were, so a
+    caller can tell a contract the lake never listed from one whose sessions all lack a
+    close-of-record cycle.
     """
 
 
@@ -341,11 +398,14 @@ def continuity_view(
     so the pre-adjustment symbol and the adjusted one answer the same series.
 
     ``start`` and ``end`` are session dates and both default to open, so a call naming neither
-    walks every sealed chains session the lake holds for that ticker.
+    walks every sealed chains session the lake holds for that ticker. They bound the chains
+    walk, and the bars read is bounded by what that walk observed rather than by them.
 
     ``as_of`` is a market date that resolves the actions ledger point-in-time, carrying
-    ``load_bars``'s meaning and its default. It reaches both bar reads, because a join whose
-    halves sat at two points in time would produce different numbers rather than an error.
+    ``load_bars``'s meaning and its default. It reaches the split-adjusted bar read and the
+    ledger's own membership read, so the scale and the classification answer at one moment. It
+    is passed to the as-traded read too, where it is inert, so the two bar calls are visibly
+    one read in two views.
 
     ``lake_root`` and ``include_quarantined`` carry the meanings the loader's doors give them.
     The flag reaches every read, so a verdict on either surface refuses this view by default.
@@ -354,8 +414,9 @@ def continuity_view(
     ``PartitionAbsent`` and ``PartitionQuarantined`` for either surface, ``BarsAbsent`` for a
     span holding no daily partition at all, ``PartialRead`` for a projection that could not
     complete, ``InstrumentUnknown`` and ``AdjustmentIncomplete`` for a split view the bars
-    cannot support. A torn security master raises ``MasterUnreadable``, the error of the module
-    that owns the file. This view adds the three under ``ContinuityError``.
+    cannot support. A torn security master raises ``MasterUnreadable`` and a damaged actions
+    ledger raises ``actions.LedgerLineError``, each the error of the module that owns the file.
+    This view adds the three under ``ContinuityError``.
     """
     root = resolve_lake_root(lake_root)
     first, last = _session(start), _session(end)
@@ -369,12 +430,13 @@ def continuity_view(
         except NoOptionClose:
             unreadable.add(day)
             continue
-        rows = _rows_for(chain, thread.spelling_on(day))
+        spelling = thread.spelling_on(day)
+        rows = _rows_for(chain, spelling)
         if len(rows) > 1:
             raise ContractDuplicated(
-                f"{ticker} {day.isoformat()} holds {len(rows)} rows for "
-                f"{thread.spelling_on(day)!r} in one close-of-record cycle. One cycle is one "
-                "observation per contract, so the session's terms cannot be vouched for."
+                f"{ticker} {day.isoformat()} holds {len(rows)} rows for {spelling!r} in one "
+                "close-of-record cycle. One cycle is one observation per contract, so the "
+                "session's terms cannot be vouched for."
             )
         if rows:
             observed[day] = rows[0]
@@ -389,9 +451,9 @@ def continuity_view(
 
     span_start, span_end = min(observed), max(observed)
     holes = {day for day in unreadable if span_start < day < span_end}
-    scales = _scales(root, ticker, span_start, span_end, as_of, include_quarantined)
-    marks = _boundary_marks(thread, observed, scales)
-    return _answer(ticker, thread, observed, holes, scales, marks)
+    reading = _read_bars(root, ticker, span_start, span_end, _session(as_of), include_quarantined)
+    marks = _boundary_marks(root, thread, observed, reading, _session(as_of))
+    return _answer(ticker, thread, observed, holes, reading.closes, marks)
 
 
 def _session(day: date | str | None) -> date | None:
@@ -413,29 +475,46 @@ class _Thread:
     ``instrument`` is ``None`` for every contract no re-symboling has touched, which is almost
     all of them: ``occ_mapping`` writes an instrument only for a contract a boundary moved, and
     its docstring calls an ordinary contract resolving to nothing "the right answer". ``given``
-    is then the spelling on every session.
+    is then the spelling on every session and ``master`` is never consulted.
 
-    ``earliest`` is the first spelling the master's ranges open on, and it is what a session
-    *before* the thread opens takes. A mapping's ``valid_from`` is the first session the split
-    walk read the contract, which ``occ_mapping`` chose deliberately as "both true and the
-    tightest honest claim", and that walk skips sessions. So the lake holds sealed sessions no
-    mapping range covers, and falling back to the caller's own spelling there would read an
-    early session under an adjusted symbol whenever the caller happened to hold one.
+    ``opens`` is the first date any of this instrument's OCC mappings is valid from, and
+    ``earliest`` is the spelling that one opens with. A session before ``opens`` takes it. A
+    mapping's ``valid_from`` is the first session the split walk read the contract, which
+    ``occ_mapping`` chose deliberately as "both true and the tightest honest claim", and that
+    walk skips sessions. So the lake holds sealed sessions no mapping range covers, and falling
+    back to the caller's own spelling there would read an early session under an adjusted
+    symbol whenever the caller happened to hold one.
+
+    ``boundaries`` is every later ``valid_from``, which is every session the contract's
+    spelling changed on. They come from the master rather than from the sessions a read
+    happened to observe, so a boundary outside the range asked for is still classified.
     """
 
     given: str
     instrument: int | None
+    master: SecurityMaster | None
+    opens: date | None
     earliest: str
-    ranges: tuple[tuple[date, str], ...]
+    boundaries: tuple[date, ...]
 
-    def spelling_on(self, day: date) -> str:
-        """The spelling this contract carried on ``day``."""
-        if self.instrument is None:
+    def spelling_on(self, day: date) -> str | None:
+        """The spelling this contract carried on ``day``, or ``None`` when it carried none.
+
+        The answer is ``SecurityMaster.symbol_at``'s, which resolves through
+        ``Mapping.valid_on`` and honours the half-open end of a range. An earlier draft scanned
+        ``valid_from`` in reverse and never looked at ``valid_to``, which is a second answer to
+        a question the master already owns, and it disagreed with the owner on a mapping closed
+        with no successor.
+
+        The one case ``symbol_at`` cannot answer is a session before this instrument's first
+        mapping opens, which is the gap the split walk's skipping leaves. That is the
+        ``earliest`` fallback and it is the whole of it.
+        """
+        if self.instrument is None or self.master is None:
             return self.given
-        for valid_from, symbol in reversed(self.ranges):
-            if day >= valid_from:
-                return symbol
-        return self.earliest
+        if self.opens is not None and day < self.opens:
+            return self.earliest
+        return self.master.symbol_at(self.instrument, day, ID_TYPE_OCC)
 
 
 def _thread(root: Path, occ_symbol: str) -> _Thread:
@@ -454,12 +533,12 @@ def _thread(root: Path, occ_symbol: str) -> _Thread:
     """
     path = master_path(root)
     if not path.is_file():
-        return _Thread(given=occ_symbol, instrument=None, earliest=occ_symbol, ranges=())
+        return _Thread(occ_symbol, None, None, None, occ_symbol, ())
 
     master = SecurityMaster.read(path)
     holding = instruments_holding(master, occ_symbol)
     if not holding:
-        return _Thread(given=occ_symbol, instrument=None, earliest=occ_symbol, ranges=())
+        return _Thread(occ_symbol, None, None, None, occ_symbol, ())
     if len(holding) > 1:
         raise ThreadAmbiguous(
             f"{occ_symbol!r} names instruments {sorted(holding)} in the security master, which "
@@ -468,14 +547,19 @@ def _thread(root: Path, occ_symbol: str) -> _Thread:
         )
 
     instrument = holding.pop()
-    ranges = tuple(
-        sorted(
-            (mapping.valid_from, mapping.id_value)
-            for mapping in master.mappings
-            if mapping.instrument_id == instrument and mapping.id_type == ID_TYPE_OCC
-        )
+    opens = sorted(
+        (mapping.valid_from, mapping.id_value)
+        for mapping in master.mappings
+        if mapping.instrument_id == instrument and mapping.id_type == ID_TYPE_OCC
     )
-    return _Thread(given=occ_symbol, instrument=instrument, earliest=ranges[0][1], ranges=ranges)
+    return _Thread(
+        given=occ_symbol,
+        instrument=instrument,
+        master=master,
+        opens=opens[0][0],
+        earliest=opens[0][1],
+        boundaries=tuple(valid_from for valid_from, _ in opens[1:]),
+    )
 
 
 def _chains_sessions(root: Path, ticker: str, start: date | None, end: date | None) -> list[date]:
@@ -512,50 +596,66 @@ def _chains_sessions(root: Path, ticker: str, start: date | None, end: date | No
     return sorted(found)
 
 
-def _rows_for(chain: pa.Table, spelling: str) -> list[dict[str, object]]:
+def _rows_for(chain: pa.Table, spelling: str | None) -> list[dict[str, object]]:
     """The close-of-record chain's rows for one contract, as plain dicts.
 
     Only the columns this view reads are selected, and a column the partition does not carry is
     left out rather than raising: ``_deliverable`` and ``_terms`` each decide for themselves
     what a missing value means, and both answer with a marked row rather than an exception.
+
+    A ``spelling`` of ``None`` is a session the master says the contract carried no symbol on,
+    and it matches nothing, which steps the session over.
     """
-    present = [name for name in _CHAINS_COLUMNS if name in chain.column_names]
-    if OCC_SYMBOL not in present:
+    if spelling is None:
         return []
+    present = [name for name in _CHAINS_COLUMNS if name in chain.column_names]
     return [row for row in chain.select(present).to_pylist() if row.get(OCC_SYMBOL) == spelling]
 
 
-def _scales(
+@dataclass(frozen=True)
+class _Reading:
+    """What the two bar reads answered, per session, plus the instruments they named.
+
+    ``closes`` maps a session to its as-traded close, its split-adjusted close, and the ratio
+    between them. The three travel together because they are read together, and a session
+    missing any of them is missing all three: with no usable close there is no underlying to
+    pair a strike with and no ratio to express it in. That is one condition rather than two.
+
+    ``instruments`` are the ids the bars carry, which is the key the actions ledger is written
+    under. They come off the read rather than out of the master, because a bars row carries the
+    id the ledger was keyed by and the master's option instrument is a different one:
+    ``occ_mapping`` hangs an OCC mapping on the contract, and a mapping hung on the equity
+    would tie a contract symbol to the underlying.
+    """
+
+    closes: dict[date, tuple[float, float, float]]
+    instruments: frozenset[int]
+
+
+def _read_bars(
     root: Path,
     ticker: str,
     span_start: date,
     span_end: date,
-    as_of: date | str | None,
+    as_of: date | None,
     include_quarantined: bool,
-) -> dict[date, tuple[float, float]]:
-    """Each session's as-traded close and its cumulative split ratio, from the two bar views.
+) -> _Reading:
+    """The underlying over the contract's span, as traded and in the reference era.
 
     The ``split`` view divides a bar by the cumulative ratio of every ledger split whose ex-date
     falls strictly after that session, and folds no dividend in, so the as-traded close over the
-    split-adjusted close is that ratio exactly. Reading it this way rather than looping over the
-    ledger is what keeps one adjustment path, which ``load_bars``'s own docstring asks for by
-    name.
+    split-adjusted close is that ratio exactly. Reading the scale this way rather than looping
+    over the ledger is what keeps one adjustment path, which ``load_bars``'s own docstring asks
+    for by name.
 
-    Both reads are one range under one ``as_of``. It is inert on the as-traded half, which
-    returns before touching the ledger, and it is passed there anyway so the two calls are
-    visibly one read in two views rather than two reads that might disagree.
+    ``adjusted_underlying_close`` is the split read's own number carried through rather than the
+    as-traded close divided by the ratio. The two are the same quantity and not the same double:
+    over 200,000 close-and-ratio pairs the round trip disagreed with the loader's answer on
+    5.5% of them, by up to 5.7e-14. A column naming the adjusted close should be the adjusted
+    close the loader returned.
 
-    The two travel together because they are read together, and a session missing either is
-    missing both: with no usable close there is no underlying to pair a strike with and no ratio
-    to express it in. That is one condition rather than two, and the caller marks that row rather
-    than refusing, because it is one session's problem.
-
-    ``load_bars`` orders its answer by the instant each ``bar_ts`` names, so iterating in order
-    and overwriting leaves each session's *last* candle, which is that session's close. The gate
-    checks that the session came back rather than that exactly one candle did, so a partition
-    holding two is not a defect. ``bars._bar_close`` answers the same question by sorting the
-    stamp text and marketlake #386 owns that; this compares instants through the ordering
-    ``load_bars`` already applied.
+    ``as_of`` is inert on the as-traded half, which returns before touching the ledger, and it
+    is passed there anyway so the two calls are visibly one read in two views.
     """
     reads = [
         load_bars(
@@ -571,15 +671,15 @@ def _scales(
         for adjust in (ADJUST_NONE, ADJUST_SPLIT)
     ]
     plain, scaled = _closes(reads[0]), _closes(reads[1])
-    found: dict[date, tuple[float, float]] = {}
+    closes: dict[date, tuple[float, float, float]] = {}
     for day, close in plain.items():
         split = scaled.get(day)
-        if split is None:
-            continue
-        ratio = close / split
-        if isfinite(ratio) and ratio > 0:
-            found[day] = (close, ratio)
-    return found
+        if split is not None:
+            closes[day] = (close, split, close / split)
+    instruments = {
+        value for value in reads[0].column(INSTRUMENT_ID_COLUMN).to_pylist() if value is not None
+    }
+    return _Reading(closes=closes, instruments=frozenset(instruments))
 
 
 def _closes(bars: pa.Table) -> dict[date, float]:
@@ -593,20 +693,25 @@ def _closes(bars: pa.Table) -> dict[date, float]:
     Marketlake #385 is the naive-stamp weakness and its live exposure is ``expiration_date``,
     a column this view does not read.
 
+    ``load_bars`` orders its answer by the instant each ``bar_ts`` names, so iterating in order
+    and overwriting leaves each session's *last* candle, which is that session's close. The gate
+    checks that the session came back rather than that exactly one candle did, so a partition
+    holding two is not a defect. ``bars._bar_close`` answers the same question by sorting the
+    stamp text and marketlake #386 owns that; this compares instants through the ordering
+    ``load_bars`` already applied.
+
     A close that is not a positive finite number leaves the session out. The schema permits what
     the evening sweep's gate refuses, and a caller can point ``lake_root`` at any lake, so the
     shape is possible even though production cannot land it.
     """
-    if BAR_TS_COLUMN not in bars.column_names or CLOSE_COLUMN not in bars.column_names:
-        return {}
     found: dict[date, float] = {}
     for stamp, close in zip(
         bars.column(BAR_TS_COLUMN).to_pylist(), bars.column(CLOSE_COLUMN).to_pylist(), strict=True
     ):
         number = _number(close)
-        if not isinstance(stamp, str) or number is None or number <= 0:
+        if number is None or number <= 0:
             continue
-        found[session_of(stamp)] = number
+        found[session_of(str(stamp))] = number
     return found
 
 
@@ -619,51 +724,76 @@ class _Mark:
 
 
 def _boundary_marks(
+    root: Path,
     thread: _Thread,
     observed: dict[date, dict[str, object]],
-    scales: dict[date, tuple[float, float]],
+    reading: _Reading,
+    as_of: date | None,
 ) -> dict[date, _Mark]:
-    """The boundaries this answer crosses that the view cannot normalize, keyed by their session.
+    """The boundaries this contract crosses that the view cannot normalize, keyed by their date.
 
-    A boundary is a pair of consecutive observed sessions whose spellings differ, and it is
-    named by the later of the two, which is the first session under the new spelling. Every row
-    *before* that session is the one a mark applies to. The boundary session itself sits on the
-    new side and is unaffected.
+    A boundary is a date the master says the contract's spelling changed on, and every row
+    *before* it is what a mark applies to. The boundary date itself sits on the new side and is
+    unaffected.
 
-    Four outcomes write a mapping and only one lands a ledger entry, so a spelling change on its
-    own says nothing about whether the terms moved. The deliverable does, through the detector's
-    own ``Deliverable.same_as``, and the ledger says whether what moved has a factor behind it.
+    Four outcomes write a mapping row and only one lands a ledger entry, so a spelling change
+    on its own says nothing about whether the terms moved. The module docstring states the three
+    questions that separate them and this is where they are asked.
 
-    The ledger is asked through the scale rather than directly. A split whose ex-date is the
-    boundary session is counted for the session before it and not for the boundary session
-    itself, so the two sessions' cumulative ratios differ exactly when the ledger describes the
-    boundary. The tolerance is ``splits.SPLIT_CONSISTENCY_TOLERANCE``, this repo's own figure for
-    how far two readings of one split ratio may sit apart: the two quotients carry a few units in
-    the last place, which is around 1e-15 relative, and the smallest adjustment the detector can
-    land moves the ratio by a quarter.
-
-    A boundary whose scale cannot be read on either side is undecidable for the same reason a
-    boundary whose deliverable cannot be parsed is, and takes the same answer.
+    A boundary with no readable chains row on one side, or one whose deliverable the parse
+    refuses, is decided by the ledger alone. An entry is the split detector's own verdict that
+    the boundary is scalar, since ``lake.splits`` runs ``require_scalar`` before it will build
+    one, so it is evidence this view may lean on. No entry leaves a rename and a held adjustment
+    indistinguishable, which is what ``boundary_unreadable`` says.
     """
+    if not thread.boundaries:
+        return {}
+    entries = actions.latest(root) if as_of is None else actions.as_of(root, as_of)
     days = sorted(observed)
     marks: dict[date, _Mark] = {}
-    for previous, day in zip(days, days[1:], strict=False):
-        if thread.spelling_on(previous) == thread.spelling_on(day):
-            continue
-        before = _deliverable(observed[previous], previous)
-        after = _deliverable(observed[day], day)
-        if before is None or after is None:
-            marks[day] = _Mark(VERDICT_INDETERMINATE, REASON_BOUNDARY_UNREADABLE)
-            continue
-        if after.same_as(before):
-            continue
-        earlier, later = scales.get(previous), scales.get(day)
-        if earlier is None or later is None:
-            marks[day] = _Mark(VERDICT_INDETERMINATE, REASON_BOUNDARY_UNREADABLE)
-            continue
-        if abs(earlier[1] - later[1]) / later[1] <= SPLIT_CONSISTENCY_TOLERANCE:
-            marks[day] = _Mark(VERDICT_ABSENT, REASON_DELIVERABLE_NOT_SCALAR)
+    for boundary in thread.boundaries:
+        described = any(
+            (instrument, boundary.isoformat(), actions.TYPE_SPLIT) in entries
+            for instrument in reading.instruments
+        )
+        before = max((day for day in days if day < boundary), default=None)
+        after = min((day for day in days if day >= boundary), default=None)
+        moved = _moved(observed, before, after)
+        if moved is None:
+            if not described:
+                marks[boundary] = _Mark(VERDICT_INDETERMINATE, REASON_BOUNDARY_UNREADABLE)
+        elif moved == _NON_SCALAR or (moved == _SCALAR and not described):
+            marks[boundary] = _Mark(VERDICT_ABSENT, REASON_DELIVERABLE_NOT_SCALAR)
     return marks
+
+
+def _moved(
+    observed: dict[date, dict[str, object]], before: date | None, after: date | None
+) -> str | None:
+    """What the deliverable did across a boundary, or ``None`` when it cannot be read.
+
+    ``_UNMOVED`` is a rename, or a whole-ratio split the contract count absorbed, and either
+    way the series crosses the boundary. ``_SCALAR`` is an adjustment one float can carry,
+    which the ledger then has to have landed. ``_NON_SCALAR`` is one no float carries, and it
+    is the caveat's own case: the view has decided, and the decision is that no adjusted strike
+    exists, whatever the ledger holds for the underlying.
+
+    ``splits.require_scalar`` draws that last line, and it is the same refusal the detector runs
+    before it will build a ledger entry, so the line drawn here is the line drawn there.
+    """
+    if before is None or after is None:
+        return None
+    prior = _deliverable(observed[before], before)
+    new = _deliverable(observed[after], after)
+    if prior is None or new is None:
+        return None
+    if new.same_as(prior):
+        return _UNMOVED
+    try:
+        require_scalar(prior, new)
+    except NonScalarDeliverable:
+        return _NON_SCALAR
+    return _SCALAR
 
 
 def _deliverable(row: dict[str, object], day: date) -> Deliverable | None:
@@ -686,9 +816,9 @@ def _standing(day: date, marks: dict[date, _Mark]) -> _Mark | None:
     A definite answer beats an undecided one. ``deliverable_not_scalar`` says no adjusted strike
     exists, which stays true however the other boundaries read, while ``boundary_unreadable``
     only says this view could not tell. So one non-scalar boundary anywhere after the session
-    settles it.
+    settles it, and the walk is in boundary order so an undecided answer is the earliest one.
     """
-    standing = [mark for boundary, mark in marks.items() if boundary > day]
+    standing = [marks[boundary] for boundary in sorted(marks) if boundary > day]
     for mark in standing:
         if mark.reason == REASON_DELIVERABLE_NOT_SCALAR:
             return mark
@@ -699,7 +829,11 @@ def _number(value: object) -> float | None:
     """``value`` as a finite float, or ``None`` when it is not one.
 
     A bool is refused before the numeric test, because ``True`` is an ``int`` in Python and
-    would otherwise arrive as a price of 1.0.
+    would otherwise arrive as a price of 1.0. No test holds that clause and none can on this
+    path: the columns it reads are ``float64``, and pyarrow has already coerced a bool to 1.0
+    by the time a row reaches here. ``settle._number`` carries the same clause and the same
+    disclosure, and it is kept for the same reason, which is that a caller handing this a row
+    it built itself is one refactor away.
     """
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
@@ -729,7 +863,7 @@ def _answer(
     thread: _Thread,
     observed: dict[date, dict[str, object]],
     holes: set[date],
-    scales: dict[date, tuple[float, float]],
+    closes: dict[date, tuple[float, float, float]],
     marks: dict[date, _Mark],
 ) -> pa.Table:
     """The table, one row per observed session plus one per hole inside the span.
@@ -742,7 +876,7 @@ def _answer(
     """
     rows: list[dict[str, object]] = []
     for day in sorted(set(observed) | holes):
-        close = scales.get(day)
+        close = closes.get(day)
         base: dict[str, object] = {
             "ticker": ticker,
             "session": day.isoformat(),
@@ -776,7 +910,6 @@ def _answer(
             base["reason"] = REASON_CLOSE_UNREADABLE
             rows.append(base)
             continue
-        as_traded, ratio = close
 
         standing = _standing(day, marks)
         if standing is not None:
@@ -785,9 +918,10 @@ def _answer(
             rows.append(base)
             continue
 
+        _, adjusted_close, ratio = close
         base["split_ratio"] = ratio
         base["adjusted_strike"] = strike / ratio
-        base["adjusted_underlying_close"] = as_traded / ratio
+        base["adjusted_underlying_close"] = adjusted_close
         base["verdict"] = VERDICT_SETTLED
         base["reason"] = None
         rows.append(base)
