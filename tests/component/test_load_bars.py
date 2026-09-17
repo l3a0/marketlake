@@ -310,6 +310,8 @@ def test_split_divides_price_and_multiplies_volume_before_the_ex_date(fixture_la
     assert _closes(table) == [300.0, 300.0, 310.0]
     assert table.column("volume").to_pylist() == [200, 100, 100]
     assert table.column("open").to_pylist() == [299.5, 299.0, 309.0]
+    assert table.column("high").to_pylist() == [300.5, 301.0, 311.0]
+    assert table.column("low").to_pylist() == [299.0, 298.0, 308.0]
 
 
 def test_split_leaves_the_ex_dates_own_bar_alone(fixture_lake: FixtureLake):
@@ -596,3 +598,388 @@ def test_a_promoted_value_is_read_back_out_of_the_overflow(fixture_lake: Fixture
     root = _lake(fixture_lake, {(DAILY, BEFORE): rows}, ledger=_ledger_table(without_volume))
     table = load_bars(TICKER, DAILY, lake_root=root)
     assert table.column("volume").to_pylist() == [4321]
+
+
+# -- what the adversarial review found -------------------------------------------------
+
+
+def test_a_split_sharing_the_dividends_ex_date_prices_them_in_one_share_term(
+    fixture_lake: FixtureLake,
+):
+    """The amount is per post-split share and the close is as-traded, so they need one term.
+
+    The split and the dividend share an ex-date, so the last daily close before it, 600, is in
+    pre-split shares while the 3.00 is paid on post-split ones. Dividing one by the other mixes
+    the two and understates the factor by the whole split ratio, which puts a spurious half a
+    percent of return across a day the continuity view exists to make flat.
+    """
+    root = _lake(
+        fixture_lake,
+        {(DAILY, BEFORE): [_bar(BEFORE, 600.0)], (DAILY, EX): [_bar(EX, 297.0)]},
+    )
+    _split(root, ex_date=EX, ratio=2.0)
+    _dividend(root, ex_date=EX, amount=3.0)
+    table = load_bars(TICKER, DAILY, lake_root=root, adjust=ADJUST_TOTAL)
+    assert _closes(table) == [pytest.approx(297.0), pytest.approx(297.0)]
+
+
+def test_a_split_inside_a_hole_before_the_ex_date_is_carried_into_the_close(
+    fixture_lake: FixtureLake,
+):
+    """The same mixing, reached through the surface's ordinary state rather than a shared date.
+
+    A missed bar is a re-fetch, so days absent from the middle are ordinary here. The last daily
+    close the lake holds before the ex-date is nine sessions earlier and in pre-split shares, and
+    nothing about the arithmetic notices unless the close is carried forward through the split.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            (DAILY, "2026-09-01"): [_bar("2026-09-01", 600.0)],
+            (DAILY, "2026-09-10"): [_bar("2026-09-10", 300.0)],
+        },
+    )
+    _split(root, ex_date="2026-09-05", ratio=2.0)
+    _dividend(root, ex_date="2026-09-10", amount=3.0)
+    table = load_bars(TICKER, DAILY, lake_root=root, adjust=ADJUST_TOTAL)
+    assert _closes(table) == [pytest.approx(297.0), pytest.approx(300.0)]
+
+
+def test_an_unrelated_entry_does_not_refuse_the_read(fixture_lake: FixtureLake):
+    """The ledger is one file for every instrument, so a read checks what it uses and no more.
+
+    ``actions.build_entry`` accepts a ``cash_amount`` of zero, and a suspended payer still
+    reporting a ``div_ex_date`` lands one through the real extraction. Checking the whole ledger
+    would let that entry, for an instrument with no bars here, refuse every adjusted read of
+    every ticker in the lake.
+    """
+    root = _three_daily_sessions(fixture_lake)
+    _split(root)
+    actions.append(
+        root,
+        instrument_id=INSTRUMENT + 900,
+        observed_on=date.fromisoformat(BEFORE),
+        recorded_at=RECORDED_AT,
+        ex_date=BEFORE,
+        type=actions.TYPE_DIVIDEND,
+        cash_amount=0.0,
+        provenance=actions.PROVENANCE_OBSERVED,
+    )
+    assert _closes(load_bars(TICKER, DAILY, lake_root=root, adjust=ADJUST_SPLIT)) == [
+        300.0,
+        300.0,
+        310.0,
+    ]
+
+
+def test_a_dividend_that_paid_nothing_adjusts_nothing_and_raises_nothing(
+    fixture_lake: FixtureLake,
+):
+    """A zero amount is a factor of exactly one, not a value no factor can be built from.
+
+    ``actions.build_entry`` accepts a zero ``cash_amount`` and refuses a negative one, and a
+    suspended payer still reporting a ``div_ex_date`` lands a zero through the real extraction.
+    Refusing it would take the total-return view away over an event that does not move a price.
+    """
+    root = _three_daily_sessions(fixture_lake)
+    _split(root)
+    _dividend(root, ex_date=AFTER, amount=0.0)
+    assert _closes(load_bars(TICKER, DAILY, lake_root=root, adjust=ADJUST_TOTAL)) == [
+        300.0,
+        300.0,
+        310.0,
+    ]
+
+
+def test_a_negative_amount_refuses(fixture_lake: FixtureLake):
+    """What a hand-edited ledger can hold and the writer cannot: below zero builds no factor."""
+    root = _three_daily_sessions(fixture_lake)
+    ledger = root / "actions" / "corporate_actions.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text(
+        json.dumps(
+            {
+                "instrument_id": INSTRUMENT,
+                "ex_date": AFTER,
+                "type": actions.TYPE_DIVIDEND,
+                "cash_amount": -3.0,
+                "split_ratio": None,
+                "observed_on": AFTER,
+                "recorded_at": RECORDED_AT.isoformat(),
+                "provenance": actions.PROVENANCE_OBSERVED,
+                "schema_version": actions.ACTIONS_SCHEMA_VERSION,
+            }
+        )
+        + chr(10)
+    )
+    with pytest.raises(AdjustmentIncomplete):
+        load_bars(TICKER, DAILY, lake_root=root, adjust=ADJUST_TOTAL)
+
+
+def test_a_file_name_that_is_not_a_session_is_passed_over(fixture_lake: FixtureLake):
+    """``date.fromisoformat`` accepts more spellings than a partition name ever holds.
+
+    On 3.12 it reads ``20260824`` and ``2026-W35-1`` as dates, which ``paths.parse_date_dir``
+    refuses by shape for exactly this reason. A stray file enumerated as a session makes the read
+    refuse the whole ticker, naming a date no file on disk holds.
+    """
+    root = _lake(fixture_lake, {(DAILY, BEFORE): [_bar(BEFORE, 600.0)]})
+    directory = root / "bars" / f"ticker={TICKER}" / f"freq={DAILY}"
+    (directory / "date=2026-W35-1.parquet").write_bytes(b"")
+    (directory / "date=20260824.parquet").write_bytes(b"")
+    (directory / "notes.txt").write_bytes(b"")
+    assert _closes(load_bars(TICKER, DAILY, lake_root=root)) == [600.0]
+
+
+def test_a_prior_close_the_master_could_not_place_still_prices_the_dividend(
+    fixture_lake: FixtureLake,
+):
+    """A null id on the reference bar says the master could not answer, not that it answered
+    someone else.
+
+    ``lake.bars`` lands such a row on purpose, filing a finding and keeping the bar, so refusing
+    on it would take every total-return read of the ticker away over a provenance gap on one
+    reference day. A different id is evidence and still refuses, which the test below holds.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            (DAILY, EX): [_bar(EX, 300.0, instrument_id=None)],
+            (MINUTE, AFTER): [_bar(AFTER, 310.0, freq=MINUTE, minute="14:31")],
+        },
+    )
+    _dividend(root, ex_date="2026-09-17", amount=3.0)
+    table = load_bars(TICKER, MINUTE, lake_root=root, adjust=ADJUST_TOTAL)
+    assert _closes(table) == [pytest.approx(310.0 * (1 - 3.0 / 300.0))]
+
+
+def test_a_prior_partition_without_a_close_column_refuses_as_a_load_error(
+    fixture_lake: FixtureLake,
+):
+    """Every way this door declines is a ``LoadError``, including the one Arrow would raise."""
+    narrow = pa.schema([f for f in journal.BARS_SCHEMA if f.name != "close"])
+    fixture_lake.with_bars(TICKER, DAILY, EX, _table([_bar(EX, 300.0)], schema=narrow))
+    fixture_lake.with_bars(
+        TICKER, MINUTE, AFTER, _table([_bar(AFTER, 310.0, freq=MINUTE, minute="14:31")])
+    )
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    root = fixture_lake.build()
+    _dividend(root, ex_date="2026-09-17", amount=3.0)
+    with pytest.raises(AdjustmentIncomplete):
+        load_bars(TICKER, MINUTE, lake_root=root, adjust=ADJUST_TOTAL)
+
+
+def test_volume_rounds_away_from_zero_rather_than_to_even(fixture_lake: FixtureLake):
+    """The mode is chosen. Arrow's default is half to even, and "rounds" reads as away from zero.
+
+    A one-for-two reverse split halves each volume, so every odd one lands on a half. Half to
+    even sends 1 and 5 down and 3 and 7 up, which is not what the docstring's word means.
+    """
+    rows = [
+        _bar(BEFORE, 600.0, freq=MINUTE, volume=volume, minute=f"14:3{index}")
+        for index, volume in enumerate((1, 3, 5, 7))
+    ]
+    root = _lake(fixture_lake, {(MINUTE, BEFORE): rows})
+    _split(root, ex_date=EX, ratio=0.5)
+    table = load_bars(TICKER, MINUTE, lake_root=root, adjust=ADJUST_SPLIT)
+    assert table.column("volume").to_pylist() == [1, 2, 3, 4]
+
+
+# -- what the mutation lens found the fixtures could not hold --------------------------
+
+
+def test_a_bars_session_is_eastern_rather_than_the_stamps_first_ten_characters(
+    fixture_lake: FixtureLake,
+):
+    """A bar stamped after 20:00 Eastern carries the next UTC date and the same session.
+
+    ``journal.py`` pins that a bar's session is decided by ``bar_ts``, and ``bars.session_of``
+    implements it by converting to Eastern. Reading the stamp's first ten characters agrees on
+    every regular-hours bar and disagrees here, which would leave this bar unadjusted while every
+    other bar of its own session is halved.
+    """
+    rows = [
+        _bar(BEFORE, 600.0, freq=MINUTE, minute="14:31"),
+        {
+            **_bar(BEFORE, 700.0, freq=MINUTE),
+            "bar_ts": f"{EX}T00:30:00+00:00",
+        },
+    ]
+    root = _lake(fixture_lake, {(MINUTE, BEFORE): rows})
+    _split(root, ex_date=EX, ratio=2.0)
+    table = load_bars(TICKER, MINUTE, lake_root=root, adjust=ADJUST_SPLIT)
+    assert _closes(table) == [300.0, 350.0]
+
+
+def test_the_prior_close_is_the_last_bar_by_stamp_not_the_first_row(fixture_lake: FixtureLake):
+    """``lake.bars`` takes the same reading for its own gate: the last by stamp is the close.
+
+    The daily window is wider than the session, so a response can carry more than one candle and
+    a partition can land more than one row. Row order is a property of the file, per #242, so the
+    stamp is what decides. This partition is written with the later candle first.
+    """
+    later = {**_bar(EX, 600.0), "bar_ts": f"{EX}T21:00:00+00:00"}
+    earlier = {**_bar(EX, 300.0), "bar_ts": f"{EX}T20:00:00+00:00"}
+    root = _lake(
+        fixture_lake,
+        {(DAILY, BEFORE): [_bar(BEFORE, 1000.0)], (DAILY, EX): [later, earlier]},
+    )
+    _dividend(root, ex_date=AFTER, amount=6.0)
+    table = load_bars(TICKER, DAILY, BEFORE, BEFORE, lake_root=root, adjust=ADJUST_TOTAL)
+    assert _closes(table) == [pytest.approx(990.0)]
+
+
+@pytest.mark.parametrize("close", [None, 0.0, -1.0, float("inf")])
+def test_a_prior_close_that_is_no_price_refuses(fixture_lake: FixtureLake, close):
+    """Null divides nothing, zero divides by zero, and below zero builds a factor above one."""
+    root = _lake(
+        fixture_lake,
+        {
+            (DAILY, EX): [{**_bar(EX, 300.0), "close": close}],
+            (MINUTE, AFTER): [_bar(AFTER, 310.0, freq=MINUTE, minute="14:31")],
+        },
+    )
+    _dividend(root, ex_date="2026-09-17", amount=3.0)
+    with pytest.raises(AdjustmentIncomplete):
+        load_bars(TICKER, MINUTE, lake_root=root, adjust=ADJUST_TOTAL)
+
+
+def test_an_empty_prior_partition_refuses(fixture_lake: FixtureLake):
+    """This refuses where ``lake.bars``' gate returns nothing, which its docstring names.
+
+    A gate holding a bar costs a night. A dividend silently dropped from a factor costs every
+    return computed through it.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            (DAILY, EX): [],
+            (MINUTE, AFTER): [_bar(AFTER, 310.0, freq=MINUTE, minute="14:31")],
+        },
+    )
+    _dividend(root, ex_date="2026-09-17", amount=3.0)
+    with pytest.raises(AdjustmentIncomplete):
+        load_bars(TICKER, MINUTE, lake_root=root, adjust=ADJUST_TOTAL)
+
+
+def _raw_ledger(root: Path, **fields) -> None:
+    """One ledger line written by hand, which is the only way to produce what the writer refuses.
+
+    ``actions.append`` validates every field on the way in, so the guards that exist for a
+    hand-edited `corporate_actions.jsonl` are unreachable through it. This is that file.
+    """
+    entry = {
+        "instrument_id": INSTRUMENT,
+        "ex_date": EX,
+        "type": actions.TYPE_SPLIT,
+        "cash_amount": None,
+        "split_ratio": 2.0,
+        "observed_on": EX,
+        "recorded_at": RECORDED_AT.isoformat(),
+        "provenance": actions.PROVENANCE_OBSERVED,
+        "schema_version": actions.ACTIONS_SCHEMA_VERSION,
+    }
+    entry.update(fields)
+    path = root / "actions" / "corporate_actions.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(entry) + chr(10))
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"ex_date": "2026-13-01"},
+        {"split_ratio": "2.0"},
+        {"split_ratio": True},
+        {"split_ratio": 0},
+        {"split_ratio": -2.0},
+        {"split_ratio": None},
+    ],
+    ids=["ex_date", "string", "bool", "zero", "negative", "null"],
+)
+def test_a_ledger_entry_this_cannot_read_refuses_rather_than_being_stepped_over(
+    fixture_lake: FixtureLake, fields
+):
+    """The ledger's own resolution raises at the offending entry, and so does this.
+
+    Stepping over a split silently returns as-traded prices under an adjusted name, which is the
+    corruption the ``adjust`` column exists to make visible. ``True`` is named because
+    ``float(True)`` is ``1.0`` and would pass as a ratio that adjusts nothing.
+    """
+    root = _three_daily_sessions(fixture_lake)
+    _raw_ledger(root, **fields)
+    with pytest.raises(AdjustmentIncomplete):
+        load_bars(TICKER, DAILY, lake_root=root, adjust=ADJUST_SPLIT)
+
+
+def test_a_cached_prior_close_is_not_reused_across_ex_dates(fixture_lake: FixtureLake):
+    """Two dividends on one instrument each take their own denominator.
+
+    The first is ex on the second session and prices against 600, the second is ex on the third
+    and prices against 300. A cache keyed on the instrument alone would give the second the
+    first's close, and the two factors are 0.98 and 0.99 rather than one number twice.
+    """
+    root = _three_daily_sessions(fixture_lake)
+    _dividend(root, ex_date=EX, amount=6.0)
+    _dividend(root, ex_date=AFTER, amount=6.0)
+    table = load_bars(TICKER, DAILY, lake_root=root, adjust=ADJUST_TOTAL)
+    assert _closes(table) == [
+        pytest.approx(600.0 * 0.99 * 0.98),
+        pytest.approx(300.0 * 0.98),
+        310.0,
+    ]
+
+
+def test_a_cached_prior_close_is_not_reused_across_instruments(fixture_lake: FixtureLake):
+    """The second instrument re-reads rather than inheriting the first one's answer.
+
+    The daily bar before the ex-date belongs to instrument A, so A's factor is computable and
+    B's is not. A cache keyed on the ex-date alone would hand B the close that was validated for
+    A, turning a refusal into a silent answer. A is first in the series, so the cache is warm by
+    the time B is reached.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            (DAILY, BEFORE): [_bar(BEFORE, 600.0)],
+            (DAILY, EX): [_bar(EX, 300.0, instrument_id=INSTRUMENT + 1)],
+            (DAILY, AFTER): [_bar(AFTER, 310.0)],
+        },
+    )
+    _dividend(root, ex_date="2026-09-17", amount=3.0)
+    actions.append(
+        root,
+        instrument_id=INSTRUMENT + 1,
+        observed_on=date.fromisoformat("2026-09-17"),
+        recorded_at=RECORDED_AT,
+        ex_date="2026-09-17",
+        type=actions.TYPE_DIVIDEND,
+        cash_amount=3.0,
+        provenance=actions.PROVENANCE_OBSERVED,
+    )
+    with pytest.raises(AdjustmentIncomplete):
+        load_bars(TICKER, DAILY, lake_root=root, adjust=ADJUST_TOTAL)
+
+
+def test_a_partition_being_written_is_not_a_session(fixture_lake: FixtureLake):
+    """``paths.temp_write_path`` names a partition mid-write, and a listing can catch one.
+
+    Reading that name as a session makes the door rebuild the canonical path and refuse a read
+    that should have succeeded, naming a date whose file is still being written.
+    """
+    root = _lake(fixture_lake, {(DAILY, BEFORE): [_bar(BEFORE, 600.0)]})
+    directory = root / "bars" / f"ticker={TICKER}" / f"freq={DAILY}"
+    (directory / f"date={EX}.parquet.tmp-1234").write_bytes(b"")
+    assert _closes(load_bars(TICKER, DAILY, lake_root=root)) == [600.0]
+
+
+def test_a_table_without_an_instrument_column_refuses_as_a_load_error(fixture_lake: FixtureLake):
+    """The column is the key every adjusted view joins on, so its absence is this door's error."""
+    narrow = pa.schema([f for f in journal.BARS_SCHEMA if f.name != "instrument_id"])
+    fixture_lake.with_bars(TICKER, DAILY, BEFORE, _table([_bar(BEFORE, 600.0)], schema=narrow))
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    root = fixture_lake.build()
+    _split(root)
+    assert _closes(load_bars(TICKER, DAILY, lake_root=root)) == [600.0]
+    with pytest.raises(LoadError):
+        load_bars(TICKER, DAILY, lake_root=root, adjust=ADJUST_SPLIT)
