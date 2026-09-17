@@ -168,3 +168,47 @@ def test_secret_reveal_and_equality():
 def test_guardconstants_from_empty_or_none_returns_defaults():
     assert GuardConstants.from_mapping(None) == GuardConstants()
     assert GuardConstants.from_mapping({}) == GuardConstants()
+
+
+def test_the_bar_request_budget_is_pinned_and_overridable():
+    """The design's pinned default, and a recalibration that costs a config edit.
+
+    The number nobody yet has the evidence to choose lives here rather than as a module constant
+    for exactly this reason: the first saturating run anyone observes should move it without a
+    release. Marketlake #478.
+    """
+    assert GuardConstants().bars_request_budget == 100
+    assert GuardConstants.from_mapping({"bars_request_budget": 40}).bars_request_budget == 40
+
+
+@pytest.mark.parametrize("budget", [0, -1, -100])
+def test_a_budget_below_one_is_refused_at_config_load(budget: int):
+    """A run allowed no request fetches no bar and never says it did not.
+
+    It would not be *silent*, since the nightly ``bars deferred:`` line would count every
+    ticker-day every evening. It would be unrefused: the run reports success, the ping goes out,
+    and the only thing saying the lake stopped fetching bars is one count beside two others that
+    are non-zero on a healthy evening.
+
+    Every command that loads config wraps the load in ``input_errors_exit``, so a ``ConfigError``
+    here reaches the operator as one named line and exit 2 from whichever command they ran, at
+    load rather than half way through a walk. That is why no guard is owed inside ``bars``.
+    """
+    with pytest.raises(ConfigError) as caught:
+        GuardConstants.from_mapping({"bars_request_budget": budget})
+    # The field and the offending value both appear, because a message naming neither sends the
+    # operator looking through a file for which line it meant.
+    assert "bars_request_budget" in str(caught.value)
+    assert repr(budget) in str(caught.value)
+
+
+def test_a_valid_budget_leaves_every_other_guard_on_its_pinned_default():
+    """The new check merges rather than replacing, which is what ``from_mapping`` promises.
+
+    A range check written as a rebuild rather than a guard would silently drop every other key the
+    operator set in the same section.
+    """
+    guards = GuardConstants.from_mapping({"bars_request_budget": 7, "watchdog_page_minutes": 9})
+    assert guards.bars_request_budget == 7
+    assert guards.watchdog_page_minutes == 9
+    assert guards.chain_chunk_max_split_depth == GuardConstants().chain_chunk_max_split_depth

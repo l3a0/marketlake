@@ -148,6 +148,7 @@ from lake.capture_spans import (
     spans_path,
 )
 from lake.clock import Clock, SystemClock
+from lake.config import GuardConstants
 from lake.extra_projection import ExtraProjectionError
 from lake.journal import UNFIT_ERRORS, bars_data_batch, bars_rows
 from lake.loader import (
@@ -412,6 +413,10 @@ class TickerDay:
     ticker: str
     freq: str
     session: date
+
+    def __str__(self) -> str:
+        """The one spelling of this ticker-day as a line, for the reason ``GateSkip`` gives."""
+        return f"{self.ticker} {self.freq} {self.session.isoformat()}"
 
 
 @dataclass(frozen=True)
@@ -1295,6 +1300,7 @@ class _WalkResult:
     held: tuple[HeldFinding, ...]
     unsettled: tuple[GateSkip, ...]
     abandoned: tuple[GateSkip, ...]
+    deferred: tuple[TickerDay, ...] = ()
 
 
 def _walk(
@@ -1306,6 +1312,7 @@ def _walk(
     master: SecurityMaster,
     days: Sequence[TickerDay],
     recorded_at: datetime,
+    budget: int | None = None,
 ) -> _WalkResult:
     """Skip, fetch, gate and land every ticker-day in ``days``, in the order given.
 
@@ -1324,6 +1331,33 @@ def _walk(
     marketlake #434. :func:`_gate_close` says whether one exists and the clock says whether that
     can still change, and the two answers are recorded apart because they mean opposite things
     to a reader. See the skip below for both.
+
+    **``budget`` bounds the requests one walk may spend, and ``None`` means unbounded.** It is
+    marketlake #478, and the backfill is what sets it. Nothing paces this loop, so a walk over a
+    rebuilt manifest asks for everything the spans cover back to back and crosses the vendor's
+    ceiling inside its first minute. A bound at or under that ceiling makes the crossing
+    arithmetically impossible however fast the run fires, which is why a cap subsumes a pacer here
+    rather than sitting beside one.
+
+    **The budget refuses requests. It does not truncate the walk.** A loop that stopped iterating
+    at exhaustion would stop counting the manifested skips and the gate skips behind the stop
+    point, so ``skipped``, ``unsettled`` and ``abandoned`` would all go partial. ``lake.sweep``
+    renders its ``bars abandoned:`` census off ``abandoned``, and marketlake #434 built that line
+    to surface the permanent gaps an operator has to find, so a truncating budget would move that
+    count for a reason that is not a change in the lake. The loop therefore runs to the end of
+    ``days`` and only the fetch is refused. It costs nothing extra: a skip spends no request, and
+    the daily gate read is a local Parquet read this walk already pays, so a budgeted run is
+    strictly cheaper than an unbudgeted one and never dearer.
+
+    That places the check exactly. It sits immediately before ``attempted`` is incremented and
+    after the daily gate block, because a check at the top of the loop would skip the gate read
+    that decides ``unsettled`` against ``abandoned``. A gate read that raises still files its
+    finding under an exhausted budget, because that is the lake's own files contradicting their
+    writers rather than a vendor cost.
+
+    ``fetch_session_bars`` reaches the vendor through here too and leaves this unbounded on
+    purpose. Its scope is one session against the enabled roster, which is four ticker-days at
+    this roster, and the runs that have crossed the ceiling through it number zero.
     """
     paths = LakePaths(root)
     session_clock = SessionClock(clock, calendar)
@@ -1349,6 +1383,7 @@ def _walk(
     held: list[HeldFinding] = []
     unsettled: list[GateSkip] = []
     abandoned: list[GateSkip] = []
+    deferred: list[TickerDay] = []
 
     def hold(finding: Withheld) -> None:
         # The sequence is the caller's, because ``report`` has only module functions and a
@@ -1469,6 +1504,13 @@ def _walk(
                 (abandoned if following_key in manifested else unsettled).append(entry)
                 continue
             settled = gate_close.close
+        if budget is not None and attempted >= budget:
+            # The budget is spent. This ticker-day is not fetched and the loop goes on, so every
+            # later skip is still counted and the remainder is a count rather than an inference.
+            # ``deferred`` is what the next run picks up, at no cost beyond the plan it already
+            # builds: a ticker-day not reached is simply one the manifest still does not hold.
+            deferred.append(day)
+            continue
         attempted += 1
         try:
             _land(
@@ -1523,6 +1565,7 @@ def _walk(
         held=tuple(held),
         unsettled=tuple(unsettled),
         abandoned=tuple(abandoned),
+        deferred=tuple(deferred),
     )
 
 
@@ -1862,8 +1905,35 @@ def _span_sessions(
 class BackfillPlan:
     """Every ticker-day a backfill run would fetch, and what it could not name.
 
-    ``days`` is sorted by session, then ticker, then frequency, so a run reads chronologically
-    and two runs over one lake produce the same order. It is built as a set first, for the
+    ``days`` is sorted by session **descending**, then ticker and frequency ascending, so the
+    newest session in range is walked first and two runs over one lake produce the same order.
+
+    **The direction is the budget's, and marketlake #478 is why it is not chronological.** A run is
+    bounded at ``guards.bars_request_budget`` requests and the walk takes this list in order, so
+    whatever sits at the front is what a bounded run spends itself on. Ascending puts the oldest
+    session there, and the oldest ``1m`` ticker-days are exactly the ones past Schwab's roughly
+    30-day lookback: they can never land, a held ticker-day is never manifested, and so they are
+    asked for again on every later run. A budget taken over that order reaches today's bars on no
+    run at all, while an unbudgeted walk lands them on the first. Simulated over a 259-session
+    rebuilt manifest at a budget of 100, chronological lands 100 of the 560 landable ticker-days
+    and reaches today's on no run, and newest-first lands 184 and reaches today's on run one.
+
+    Descending also puts the deadline first, which is the asymmetry this module already records:
+    Schwab serves a roughly 30-day one-minute lookback and daily bars indefinitely, so a recent
+    session is the one that stops being fetchable.
+
+    The tie-break inside a session is ``(ticker, freq)`` and stays that way, so nothing here rests
+    on frequency order: ``QQQ`` at ``1m`` is served before ``SPY`` at ``1d``. Reordering the two to
+    serve the convergent daily half first at the budget boundary was considered and rejected. It
+    buys at most one session's worth of requests, and marketlake #485 removes the reason to want
+    it.
+
+    ``sessions`` keeps its own ascending sort, so ``floor`` and ``ceiling`` still read the true
+    ends of the range. Reversing the sorted ``days`` list wholesale would flip ticker and frequency
+    with it and lose both properties above, which is why the key inverts one field rather than the
+    list being reversed.
+
+    It is built as a set first, for the
     reason :func:`_ticker_freqs` gives about a roster naming one frequency twice: one partition
     fetched twice spends two vendor requests and appends two manifest entries for one path. A
     span walk reaches that hazard two further ways. An instrument retired mid-session and brought
@@ -1944,7 +2014,17 @@ def plan_backfill(
             for freq in entry.bars:
                 planned.add(TickerDay(ticker=ticker, freq=freq, session=day))
     return BackfillPlan(
-        days=tuple(sorted(planned, key=lambda day: (day.session, day.ticker, day.freq))),
+        # Session descending, ticker and frequency ascending. ``date`` has no unary minus, so the
+        # inversion is a second sort pass over the session alone rather than a negated key, and
+        # Python's sort is stable so the first pass's tie-break survives it. The class docstring
+        # carries why the direction matters and why the list is not simply reversed.
+        days=tuple(
+            sorted(
+                sorted(planned, key=lambda day: (day.ticker, day.freq)),
+                key=lambda day: day.session,
+                reverse=True,
+            )
+        ),
         sessions=tuple(sorted(sessions)),
         unwalked=tuple(unwalked),
     )
@@ -1992,6 +2072,12 @@ class BackfillReport:
     lake is the newest session in range and nothing else: its own bar is judged against the next
     session's settled close, and that session has not been captured. The next run lands it.
 
+    ``deferred`` names a ticker-day the run's request budget stopped it from fetching, which is
+    marketlake #478. It is the one entry here that says nothing is wrong: the run did exactly what
+    it was told, and the next run picks the ticker-day up because the manifest still does not hold
+    it. It is rendered in full for the by-hand reader and counted to one line by the nightly, and
+    it changes no exit code, which stays keyed on findings nothing could write down.
+
     ``abandoned`` names one whose close of record is settled and holds no usable figure, so
     nothing
     this walk can wait for will change it. Marketlake #434 measured six of those on the live
@@ -2010,6 +2096,7 @@ class BackfillReport:
     unwalked: tuple[str, ...]
     unsettled: tuple[GateSkip, ...] = ()
     abandoned: tuple[GateSkip, ...] = ()
+    deferred: tuple[TickerDay, ...] = ()
 
     @property
     def unfiled(self) -> tuple[HeldFinding, ...]:
@@ -2035,6 +2122,11 @@ class BackfillReport:
         lines.extend(_render_held(self.held))
         lines.append(f"  skipped: {self.skipped}")
         lines.extend(_render_gate_skips(self.unsettled, self.abandoned))
+        # Rendered in full, for the reason ``_render_gate_skips`` gives about its own two lists:
+        # this is the command's own stdout, read by somebody who ran it and is waiting for the
+        # answer. The nightly digest counts instead, because its line repeats every evening.
+        lines.append(f"  deferred: {len(self.deferred)}")
+        lines.extend(f"    - {entry}" for entry in self.deferred)
         lines.append(f"  unwalked: {len(self.unwalked)}")
         for line in self.unwalked:
             lines.append(f"    - {line}")
@@ -2049,6 +2141,7 @@ def backfill_bars(
     calendar: Calendar,
     roster: Roster,
     spans: CaptureSpans,
+    guards: GuardConstants | None = None,
 ) -> BackfillReport:
     """Fetch, gate and land every ticker-day the capture spans cover and the clock allows.
 
@@ -2092,6 +2185,11 @@ def backfill_bars(
     recorded_at = clock.now()
     plan = plan_backfill(spans=spans, master=master, roster=roster, clock=clock, calendar=calendar)
     _require_supported_plan(plan)
+    # ``None`` resolves to the design's pinned defaults here rather than at the caller, which is
+    # the shape ``battery.judge`` already uses: ``lake.sweep`` passes whatever it holds straight
+    # through and the callee decides. ``GuardConstants.from_mapping`` is what refuses a budget
+    # below 1, at config load, so nothing is re-checked here.
+    guards = GuardConstants() if guards is None else guards
     walk = _walk(
         root=root,
         vendor=vendor,
@@ -2100,6 +2198,7 @@ def backfill_bars(
         master=master,
         days=plan.days,
         recorded_at=recorded_at,
+        budget=guards.bars_request_budget,
     )
     return BackfillReport(
         floor=plan.floor,
@@ -2112,6 +2211,7 @@ def backfill_bars(
         unwalked=plan.unwalked,
         unsettled=walk.unsettled,
         abandoned=walk.abandoned,
+        deferred=walk.deferred,
     )
 
 
@@ -2187,6 +2287,7 @@ def backfill_bars_from_config(
         calendar=ExchangeCalendar(),
         roster=load_tickers(tickers_path),
         spans=read_capture_spans(Path(config.lake_root)),
+        guards=config.guards,
     )
 
 

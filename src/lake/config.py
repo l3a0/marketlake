@@ -185,6 +185,38 @@ class GuardConstants:
     # split trigger. The open tail is never split and never merged.
     chain_window_max_contracts: int = 2500
     chain_window_min_contracts: int = 800
+    # The bar backfill's per-run request budget. `backfill_bars` walks every session the capture
+    # spans cover, so a lake whose manifest was rebuilt or restored skips nothing and asks for all
+    # of it back to back. Nothing paces that walk, so without a bound one run crosses the vendor
+    # ceiling inside its first minute and the ticker-days it loses are never manifested and so are
+    # asked for again on the next run. Marketlake #478.
+    #
+    # The band it sits in is what picks it rather than the digit, and five measurements bound it.
+    #
+    # 1. The ceiling is 120 a minute per client_id, which the design records as observed and
+    #    enforced via 429 rather than contractual. A budget sitting exactly on a non-contractual
+    #    ceiling is the wrong place to sit.
+    # 2. One run fires at most its budget and the 18:30 job fires once a day, so the budget is also
+    #    the most that can reach the vendor in any rolling minute. A budget at or under the ceiling
+    #    cannot cross it however fast the run fires, which is why a cap subsumes a pacer here.
+    # 3. At 18:30 nothing else draws. CAPTURE_PHASES ends at the 16:15 option close and
+    #    `backfill_bars` is the sweep's only vendor caller, so the nightly run has the whole 120.
+    # 4. The reservation is owed to the by-hand run instead. `--backfill` takes no date and can be
+    #    fired during the session, and the capture loop's draw then is one chain request per ticker
+    #    per chain-plan window plus one batched quotes request. At two tickers against the built-in
+    #    five-window plan that is 11 a minute, before the midpoint splitter adds any.
+    # 5. The steady state is not throttled. Measured read-only against the live lake on an 18:30
+    #    clock, a rebuilt manifest today spends 22 requests and an ordinary evening spends 2 to 4.
+    #
+    # So the band is 22 to 109, and 100 sits inside it leaving 20 for anything else on the same
+    # credentials in that minute. The constant is not meaningful past one significant figure,
+    # because the ceiling it derives from is itself observed rather than published, so a
+    # spuriously precise 109 would claim a precision the input does not have.
+    #
+    # The guarantee is per run. Two by-hand runs inside one minute put 200 into it, which the
+    # design already answers in its own terms: anything else on the same credentials draws from
+    # the daemon's 120.
+    bars_request_budget: int = 100
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object] | None) -> GuardConstants:
@@ -203,7 +235,26 @@ class GuardConstants:
         unknown = set(mapping) - known
         if unknown:
             raise ConfigError(f"unknown guard constant(s): {sorted(unknown)}")
-        return replace(cls(), **dict(mapping))
+        merged = replace(cls(), **dict(mapping))
+        # **One field is range-checked here, and the rest are not.** A zero or negative
+        # ``bars_request_budget`` stops the nightly bar fetch for ever, and it does it without
+        # being refused anywhere: the run reports success, the ping goes out, and the only thing
+        # saying the lake stopped fetching bars is one count on a report line beside two others
+        # that are non-zero on a healthy evening. Every command that loads config wraps the load in
+        # ``input_errors_exit``, so raising here reaches the operator as one named line and exit 2
+        # from whichever command they ran, at load rather than half way through a walk.
+        #
+        # This is the instance and not the class. ``from_mapping`` type-checks no value at all,
+        # because ``replace`` does not, and eleven constants carry that gap. Marketlake #487 is the
+        # per-field range mechanism for all of them. Reaching for it here would be fixing past the
+        # class, so the one field this change adds is checked at its own site instead.
+        if merged.bars_request_budget < 1:
+            raise ConfigError(
+                "bars_request_budget must be at least 1, got "
+                f"{merged.bars_request_budget!r}: a run that may spend no request never fetches a "
+                "bar and never says so"
+            )
+        return merged
 
 
 @dataclass(frozen=True)

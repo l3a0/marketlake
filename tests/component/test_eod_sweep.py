@@ -35,6 +35,7 @@ from lake.bars import CHECK_BAR_CLOSE
 from lake.calendar import NotASession
 from lake.capture_spans import SPANS_SCHEMA_VERSION, CaptureSpan, CaptureSpans
 from lake.cassette import Cassette
+from lake.config import GuardConstants
 from lake.control_plane import EOD_SWEEP_SLUG, SUNDAY_WAKE, pmset_schedule_args
 from lake.manifest import append_quarantine
 from lake.paths import CHAINS, QUOTES, LakePaths
@@ -289,8 +290,14 @@ def _run(
     transport: FakeTransport | None = None,
     roster: Roster | None = None,
     holidays: tuple[date, ...] = (),
+    guards: GuardConstants | None = None,
 ):
-    """One sweep run with every seam injected, returning the outcome and the fakes."""
+    """One sweep run with every seam injected, returning the outcome and the fakes.
+
+    ``guards`` stays ``None`` by default, which is what the production wiring passes when a
+    config names no ``guards:`` section. The bar walk resolves it to the design's pinned defaults
+    itself, so leaving it here proves that resolution happens rather than hiding it.
+    """
     pinger = pinger if pinger is not None else FakePinger()
     transport = transport if transport is not None else FakeTransport()
     publisher = (
@@ -309,6 +316,7 @@ def _run(
         publisher=publisher,
         schedule_reader=reader if reader is not None else (lambda: _schedule_text()),
         schedule_setter=setter if setter is not None else _RecordingSetter(),
+        guards=guards,
     )
     return outcome, pinger, transport
 
@@ -711,16 +719,19 @@ def test_a_sealed_reference_that_offers_no_close_is_reported_by_reason(
     session and the reason all gone. The assertion below reads the line after redaction for that
     reason, not before.
 
-    The second half is which reasons are present. The walk takes ``plan.days`` in session order,
-    so a named first entry is always the oldest session in range, and on the live lake that slot
-    belongs to the 2026-09-08 outage for ever. A quarantine appearing tonight would move a count
-    from six to seven and be named nowhere. A census of the classes cannot hide one.
+    The second half is which reasons are present. Naming a first entry is wrong whichever way the
+    walk runs, and marketlake #478 inverted it: the walk now takes ``plan.days`` newest session
+    first, so that slot is whichever ticker-day the newest session produced and changes every
+    evening. Before #478 it was the mirror image, fixed for ever on the live lake's 2026-09-08
+    outage. Either way a quarantine appearing tonight would move a count from six to seven and be
+    named nowhere. A census of the classes cannot hide one.
 
-    **The fixture puts the quarantine on the earlier session on purpose.** A ``Counter`` keeps
-    insertion order, which here is the walk's session order, so without the sort the census would
-    read "1 PartitionQuarantined, 1 NoSpotClose" and two nights over one lake could render the
-    same facts in two orders. An earlier fixture had the two sessions the other way round, where
-    insertion order and sorted order agree, and dropping the sort survived mutation because of it.
+    **The fixture puts the quarantine on one session and not the other on purpose.** A ``Counter``
+    keeps insertion order, which here is the walk's session order, so without the sort the census
+    could render the same facts in two orders on two nights. An earlier fixture had the two
+    sessions arranged so insertion order and sorted order agree, and dropping the sort survived
+    mutation because of it. The walk's order inverted under marketlake #478, which is exactly the
+    kind of change that would have re-hidden the mutation had the sort not been there.
     """
     # **One reason carries a count above one, on purpose.** The live lake's line is meant to read
     # "6 NoSpotClose", and the count is the only thing separating an outage from one new
@@ -2006,3 +2017,70 @@ def test_the_split_walk_is_handed_the_run_s_own_calendar(fixture_lake: FixtureLa
 
     assert seen == [calendar], "the split walk did not get the calendar the run was given"
     assert seen[0] is calendar
+
+
+def test_the_nightly_reports_a_run_the_request_budget_bounded(fixture_lake: FixtureLake):
+    """Marketlake #478's line, and the silence it exists to break.
+
+    A bounded run lands fewer partitions than the lake was owed and is otherwise
+    indistinguishable from a complete one: it refuses nothing, holds nothing, files no withheld
+    record and pings normally. Without a line here the operator reading the next morning's digest
+    would see a healthy evening.
+
+    **It is counted rather than listed, for the reason the two lines beside it give.** The list
+    repeats every evening a backfill is still catching up, so rendered whole it would walk this
+    report into ``digest_body``'s byte cap and truncate the battery's own census off the end.
+
+    **The line survives redaction, which is the half a substring check would miss.**
+    ``report.redacted`` keeps two colon-separated fields and is applied on the way into the
+    nightly file and again into the digest, so a line carrying a second ``": "`` would arrive with
+    everything after it gone. This asserts the redacted form equals the line.
+
+    **What was spent is read off the report rather than off the constant.** ``attempted`` is the
+    ticker-days that reached the vendor, so a line disagreeing with the walk is impossible. Naming
+    ``guards.bars_request_budget`` would be a second source for one number, and this job may hold
+    ``None`` while the walk resolved its own default.
+    """
+    # Four sessions in range rather than the default fixture's one, because a run that plans a
+    # single ticker-day can never defer and so can never produce this line at all.
+    later = EVENING + timedelta(days=3)
+    walked = _walked(later.date())
+    quotes = {("SPY", day): [_quote_row(day)] for day in (*walked, walked[-1] + timedelta(days=1))}
+    root = _lake(fixture_lake, quotes=quotes)
+    outcome, pinger, _ = _run(
+        root,
+        now=later,
+        vendor_source=_CountingVendorSource(_cassette(session=later.date())),
+        guards=GuardConstants(bars_request_budget=1),
+    )
+
+    (line,) = [entry for entry in outcome.nightly.report if entry.startswith("bars deferred")]
+    assert line == "bars deferred: 3 ticker-day(s), 1 request(s) spent"
+    assert report.redacted(line) == line, "the budget was cut off before any reader saw it"
+    assert line in outcome.digest.body
+    # A bound the run was told to respect is not a failure, so the ping still goes out and the
+    # bars piece does not refuse.
+    assert pinger.urls == [PING_URL]
+    assert outcome.nightly.pinged is True
+    assert dict(outcome.nightly.pieces)["bars"].refusal is None
+
+
+def test_an_unbounded_evening_writes_no_deferred_line(fixture_lake: FixtureLake):
+    """The line appears only when the bound actually bit.
+
+    The pinned budget is 100 against a nightly plan of a handful of ticker-days, so on every
+    healthy evening this condition is false. A line that appeared regardless would be one the
+    reader learns to skip, which is the argument ``dashboard._ping_owed`` already makes in those
+    words, and it would spend digest bytes the battery's census needs.
+
+    The condition is on the deferred list rather than on the budget being reached, so a run whose
+    last ticker-day was also its last allowed request reports nothing. That case is the one a
+    ``>=`` on the budget would get wrong.
+    """
+    root = _lake(fixture_lake)
+    outcome, _, _ = _run(root)
+    assert [line for line in outcome.nightly.report if line.startswith("bars deferred")] == []
+    # The same run, bounded at exactly what it spends, still writes nothing.
+    spent = dict(outcome.nightly.pieces)["bars"].landed
+    bounded, _, _ = _run(root, guards=GuardConstants(bars_request_budget=max(spent, 1)))
+    assert [line for line in bounded.nightly.report if line.startswith("bars deferred")] == []
