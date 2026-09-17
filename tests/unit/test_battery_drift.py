@@ -681,7 +681,7 @@ def test_a_refused_page_does_not_undo_its_own_redaction(tmp_path: Path, capsys):
 
 
 def test_a_version_the_ledger_records_no_shape_for_refuses_the_missing_half(tmp_path: Path):
-    """The shape #493 shipped a page for: the ledger reads, and holds no entry for the
+    """The shape PR #493 shipped a page for: the ledger reads, and holds no entry for the
     running version. Without a recorded shape there is nothing to ask ``has_column``, so a
     rotation cannot be told from a vendor drop."""
     _ledger(tmp_path)

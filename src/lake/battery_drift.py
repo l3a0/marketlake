@@ -651,7 +651,7 @@ def read_ledger(lake_root) -> SchemaVersionLedger | None:
 
         This is the absent or unparseable ledger alone. A ledger that reads but records no shape
         for the running version is the other refusal, which :func:`judge_day` takes on
-        ``ledger.get(version)``, and that one is the shape marketlake #493 shipped a page for:
+        ``ledger.get(version)``, and that one is the shape marketlake PR #493 shipped a page for:
         the running version was 2 while the ledger held version 1 alone, until 2026-09-17.
     """
     try:
