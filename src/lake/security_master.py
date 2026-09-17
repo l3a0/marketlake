@@ -385,6 +385,34 @@ class SecurityMaster:
             raise AmbiguousSymbol(symbol, on, sorted(matches))
         return next(iter(matches))
 
+    def instruments_named(self, symbol: str, id_type: str | None = None) -> set[int]:
+        """Every instrument this spelling has ever named, across every validity range.
+
+        :meth:`resolve` answers a question about a date. This one answers a question
+        about a spelling, which is what a caller wants when the date is already carried
+        by something else. The dashboard's scope clamp is that caller: the capture spans
+        it goes on to read already bound the window in time, so asking the master to
+        bound it a second time only loses the tickers whose mapping had not opened yet.
+
+        **This never raises ``AmbiguousSymbol``, and the difference is deliberate.**
+        ``resolve`` raises it for several instruments valid *on one date*, which is a
+        master that contradicts itself, and the repo reads the class that way
+        everywhere. A spelling naming several instruments across *disjoint* ranges is
+        an ordinary recycled ticker instead. Returning the set hands that distinction
+        to the caller, which is the only place that knows whether widening or refusing
+        is the safe answer.
+
+        ``id_type`` filters as it does on ``resolve``, and a caller asking about a ticker
+        should pass ``ID_TYPE_TICKER``. A re-symboled option contract puts
+        ``ID_TYPE_OCC`` rows in this same table, so an unfiltered spelling match can
+        cross the two.
+        """
+        return {
+            m.instrument_id
+            for m in self._mappings
+            if m.id_value == symbol and (id_type is None or m.id_type == id_type)
+        }
+
     def symbol_at(self, instrument_id: int, on: date, id_type: str = ID_TYPE_TICKER) -> str | None:
         """Resolve an ``instrument_id`` back to its symbol of ``id_type`` valid on ``on``.
 

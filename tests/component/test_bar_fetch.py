@@ -44,6 +44,7 @@ from lake.bars import (
     CHECK_BAR_RESPONSE,
     CHECK_BAR_SPAN,
     CLOSE_CROSS_TOLERANCE,
+    CLOSE_VALUE_ABSENT,
     MINUTE_EXTENDED_HOURS,
     UnsupportedBarFreq,
     bar_window,
@@ -569,14 +570,25 @@ def test_a_held_bar_files_again_on_the_next_run(fixture_lake: FixtureLake):
 # -- 6 and 7. the no-source rule --------------------------------------------------------
 
 
-def test_a_session_whose_quotes_have_no_spot_close_is_held_and_the_run_goes_on(
+def test_a_session_whose_quotes_have_no_spot_close_never_reaches_the_vendor(
     fixture_lake: FixtureLake,
 ):
-    """#280 test 6.
+    """#280 test 6, re-pointed by marketlake #434.
 
-    A session with gap rows and no data row has no comparison at all. The rule is written over
-    ``LoadError`` rather than over this refusal, because three causes reach it and each would
-    otherwise need its own branch.
+    A session with gap rows and no data row has no comparison at all. The rule is still written
+    over ``LoadError`` rather than over this refusal, because three causes reach it and each
+    would otherwise need its own branch.
+
+    **What moved is where the rule runs.** This used to fetch, gate and hold, spending a vendor
+    request on a comparison that could not happen and filing a finding again on every run. The
+    reference lives in this lake, so the walk reads it before the request and the ticker-day
+    never reaches the vendor at all. ``calls`` is what says so, and asserting on ``held`` alone
+    would pass just as well with the request still going out, which is the whole defect.
+
+    It lands in ``abandoned`` because the manifest holds the following session's quotes: the
+    lake sealed them and they carry no data row, so nothing this walk can wait for changes that.
+    ``test_the_newest_session_is_unsettled_rather_than_abandoned`` holds the other side, where
+    the lake has sealed nothing yet.
 
     The run continues to the next ticker, which is the containment: one unreadable session is
     not the other tickers' bars to lose.
@@ -593,10 +605,14 @@ def test_a_session_whose_quotes_have_no_spot_close_is_held_and_the_run_goes_on(
 
     result = _run(root, vendor, roster=_roster({"SPY": ["1d"], "QQQ": ["1d"]}))
 
-    (held,) = result.held
-    assert held.finding.symbol == "SPY"
-    assert held.finding.check == CHECK_BAR_CLOSE
-    assert "NoSpotClose" in (held.finding.exception or "")
+    assert result.abandoned == (f"SPY 1d {SESSION.isoformat()}: NoSpotClose",)
+    assert result.unsettled == ()
+    assert result.held == ()
+    assert _findings(root) == [], "a skipped ticker-day filed a withheld finding"
+    assert [call["symbol"] for call in vendor.calls] == ["QQQ"], (
+        "the skipped ticker-day still spent a vendor request"
+    )
+    assert result.attempted == 1, "a ticker-day that reached no vendor was counted attempted"
     (landed,) = result.landed
     assert landed.ticker == "QQQ", "one unreadable session cost the rest of the run"
     assert not _partition(root, "SPY", DAILY_FREQ).exists()
@@ -624,9 +640,10 @@ def test_a_session_with_no_sealed_quotes_partition_is_contained_the_same_way(
 
     result = _run(root, vendor, roster=_roster({"SPY": ["1d"], "QQQ": ["1d"]}))
 
-    (held,) = result.held
-    assert held.finding.symbol == "SPY"
-    assert "PartitionAbsent" in (held.finding.exception or "")
+    assert result.unsettled == (f"SPY 1d {SESSION.isoformat()}: PartitionAbsent",)
+    assert result.abandoned == (), "a session the lake never sealed was called abandoned"
+    assert result.held == ()
+    assert [call["symbol"] for call in vendor.calls] == ["QQQ"]
     assert [landed.ticker for landed in result.landed] == ["QQQ"]
 
 
@@ -1753,7 +1770,7 @@ def test_a_daily_response_carrying_no_candle_for_the_session_lands_no_row(
 
 
 def test_a_close_of_record_that_disagrees_is_contained_to_its_ticker(fixture_lake: FixtureLake):
-    """A disagreement holds the bar rather than ending the run.
+    """A disagreement holds the bar rather than ending the run, and is still filed.
 
     The close of record is one cycle and still more than one row when the partition holds two
     spellings of that instant. Those rows have to agree, and a disagreement raises rather than
@@ -1761,6 +1778,18 @@ def test_a_close_of_record_that_disagrees_is_contained_to_its_ticker(fixture_lak
     is judged against. What it must not do is escape: a bare ``ValueError`` falls through the
     walk's catch, which names only what this job contains, and ends the run on a traceback with
     no report at all while every later ticker loses its bars.
+
+    **This is the one marketlake #434 must not turn into a counted skip, and the assertions say
+    both halves.** A disagreement is not an absent close. It says one sealed ticker-day carries
+    two ``close_price`` values, which is this lake's own corruption, and nothing else looks for
+    it: no battery check covers it and ``lake.bars`` is the only module reading the column for
+    consistency. Folded into ``abandoned`` it would have left ``Nightly.disagreements`` reading
+    zero on the night it appeared, since that count sums the pieces' held findings, and the
+    sweep's one abandoned line names only its first entry, which sorts oldest first and so is
+    one of the six permanent ones for ever.
+
+    The request is still saved, which is all #434 asked for. A gate whose reference is ambiguous
+    cannot pass either, so the finding is filed without a fetch.
     """
     root = _lake(
         fixture_lake,
@@ -1774,15 +1803,22 @@ def test_a_close_of_record_that_disagrees_is_contained_to_its_ticker(fixture_lak
         master=_master(("SPY", "QQQ")),
     )
 
-    result = _run(
-        root,
-        _RecordingVendor(_cassette(tickers=("SPY", "QQQ"))),
-        roster=_roster({"SPY": ["1d"], "QQQ": ["1d"]}),
-    )
+    vendor = _RecordingVendor(_cassette(tickers=("SPY", "QQQ")))
+    result = _run(root, vendor, roster=_roster({"SPY": ["1d"], "QQQ": ["1d"]}))
 
     (held,) = result.held
     assert held.finding.symbol == "SPY"
+    assert held.finding.check == CHECK_BAR_CLOSE
     assert "CloseOfRecordDisagrees" in (held.finding.exception or "")
+    assert held.filed_at is not None, "the lake's own corruption was not written down"
+    assert [f["check"] for f in _findings(root)] == [CHECK_BAR_CLOSE]
+    assert result.unsettled == () and result.abandoned == (), (
+        "a disagreement was counted as a missing close of record"
+    )
+    assert [call["symbol"] for call in vendor.calls] == ["QQQ"], (
+        "a disagreement the walk can read before the fetch still spent the request"
+    )
+    assert result.attempted == 1, "a ticker-day that reached no vendor was counted attempted"
     assert [landed.ticker for landed in result.landed] == ["QQQ"]
 
 
@@ -1818,11 +1854,15 @@ def test_a_null_or_nan_close_is_an_absence_rather_than_a_disagreement(fixture_la
             ]
         },
     )
-    nan_result = _run(nan_root, _RecordingVendor(_cassette()))
+    nan_vendor = _RecordingVendor(_cassette())
+    nan_result = _run(nan_root, nan_vendor)
     assert nan_result.landed == ()
-    (held,) = nan_result.held
-    assert held.finding.check == CHECK_BAR_CLOSE
-    assert held.finding.against is None, "a NaN reached the comparison as a figure"
+    assert nan_result.held == ()
+    # Two NaNs leave the set empty rather than holding two answers, so the read returns ``None``
+    # and raises nothing. That is the outcome with no exception class to name, which is what
+    # ``CLOSE_VALUE_ABSENT`` is the token for.
+    assert nan_result.abandoned == (f"SPY 1d {SESSION.isoformat()}: {CLOSE_VALUE_ABSENT}",)
+    assert nan_vendor.calls == [], "a NaN reached the comparison as a figure"
 
 
 def test_a_retyped_vendor_close_holds_the_bar_rather_than_ending_the_run(
@@ -2480,11 +2520,14 @@ def test_an_ambiguous_symbol_is_contained_and_files_the_instruments_it_found(
 
 
 def test_a_quotes_partition_with_no_close_price_column_is_an_absence(fixture_lake: FixtureLake):
-    """A session sealed before the column existed holds the bar rather than ending the run.
+    """A session sealed before the column existed skips the bar rather than ending the run.
 
     Reading the column anyway raises ``KeyError``, which the walk's catch does not name, so one
     old partition would cost every ticker after it.
-    """
+
+    This is the second of the two outcomes that carry no exception class, so it files under the
+    same ``CLOSE_VALUE_ABSENT`` token the NaN case does. Marketlake #434 found both: a rule
+    written over the named refusals would have missed them, and each held the bar every night."""
     schema = pa.schema(
         [
             (name, QUOTES_SCHEMA.field(name).type)
@@ -2501,12 +2544,13 @@ def test_a_quotes_partition_with_no_close_price_column_is_an_absence(fixture_lak
     root = fixture_lake.build()
     _master().write(master_path(root))
 
-    result = _run(root, _RecordingVendor(_cassette()))
+    vendor = _RecordingVendor(_cassette())
+    result = _run(root, vendor)
 
     assert result.landed == ()
-    (held,) = result.held
-    assert held.finding.check == CHECK_BAR_CLOSE
-    assert held.finding.against is None
+    assert result.held == ()
+    assert result.abandoned == (f"SPY 1d {SESSION.isoformat()}: {CLOSE_VALUE_ABSENT}",)
+    assert vendor.calls == [], "a column the walk can miss before the fetch still spent one"
 
 
 def test_a_minute_response_starting_late_is_refused(fixture_lake: FixtureLake):
@@ -2693,13 +2737,30 @@ def test_a_naive_stamp_ends_the_run_rather_than_being_held_to_its_ticker_day():
     with pytest.raises(bars.StampNotAnInstant):
         bars.check_bar_span(broken, [], window)
 
-    from lake.journal import UNFIT_ERRORS
-    from lake.loader import LoadError
+    # **The clause is read out of the source, never restated here.** A hand-written copy of the
+    # tuple asserts a fact about the copy: adding ``StampNotAnInstant`` to the real ``except``
+    # left this green, because ``issubclass`` was being asked about a literal in this file.
+    # Marketlake #434 then narrowed one clause and added a second, and the copy went stale
+    # without anything failing. Parsing the walk is what makes this hold.
+    import ast
+    import inspect
 
-    walk_catches = (LoadError, VendorError, bars.CloseOfRecordDisagrees, *UNFIT_ERRORS)
-    assert not issubclass(bars.StampNotAnInstant, walk_catches), (
-        "the refusal joined the per-ticker-day catch, which contradicts its own docstring"
+    walk = next(
+        node
+        for node in ast.parse(inspect.getsource(bars)).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_walk"
     )
+    caught = {
+        ast.unparse(name)
+        for handler in ast.walk(walk)
+        if isinstance(handler, ast.ExceptHandler) and handler.type is not None
+        for name in (handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type])
+    }
+    assert caught, "the walk's except clauses were not found, so this asserts nothing"
+    assert "StampNotAnInstant" not in caught, (
+        "the refusal joined a per-ticker-day catch, which contradicts its own docstring"
+    )
+    assert "BarsError" not in caught, "the base would take StampNotAnInstant in with it"
 
 
 def test_the_command_turns_a_naive_stamp_into_one_named_line(capsys, monkeypatch):
@@ -2900,14 +2961,22 @@ def test_a_session_the_calendar_cannot_follow_holds_the_bar(fixture_lake: Fixtur
     A real calendar always has one, so this is the branch nothing reaches in production and
     everything reaches on a fake. It still has to hold rather than land ungated, because
     gate-before-land is the whole shape.
+
+    **Marketlake #434's gate precondition deliberately passes this one through.** It needs a
+    following session to read a reference against, so it cannot answer here, and the answer is a
+    guard rather than a fourth outcome: this records the calendar being wrong rather than the
+    lake having no data, which is a held finding's job. The request is still spent, on a path
+    ``_calendar_next_session`` says a real calendar never produces, and the assertions below say
+    so rather than leaving the choice looking accidental.
     """
     root = _lake(fixture_lake)
     only_monday = weekday_sessions(MONDAY)
     only_monday._sessions = {SESSION: only_monday._sessions[SESSION]}
+    vendor = _RecordingVendor(_cassette())
 
     result = fetch_session_bars(
         lake_root=root,
-        vendor=_RecordingVendor(_cassette()),
+        vendor=vendor,
         clock=ManualClock(FIRST_NIGHT),
         calendar=only_monday,
         roster=_roster({"SPY": ["1d"]}),
@@ -2918,6 +2987,9 @@ def test_a_session_the_calendar_cannot_follow_holds_the_bar(fixture_lake: Fixtur
     (held,) = result.held
     assert held.finding.check == CHECK_BAR_CLOSE
     assert "NoFollowingSession" in (held.finding.exception or "")
+    assert result.unsettled == () and result.abandoned == ()
+    assert [call["symbol"] for call in vendor.calls] == ["SPY"]
+    assert result.attempted == 1
 
 
 def test_a_failed_write_leaves_no_temp_file_beside_the_partition(
@@ -2961,29 +3033,41 @@ def test_the_window_builder_refuses_a_frequency_the_seam_cannot_fetch():
 
 
 def test_the_report_renders_a_run_that_both_landed_and_held(fixture_lake: FixtureLake):
-    """The sign-off block is what an operator reads, so both halves have to appear in it.
+    """The sign-off block is what an operator reads, so every half has to appear in it.
 
     Every other render assertion sits on a run where landed equals attempted and where one
-    finding carries numbers. This one lands one partition, holds another finding whose detail
-    comes from its exception rather than from a pair, and reads both back.
+    finding carries numbers. This one lands one partition, holds a finding whose detail comes
+    from its exception rather than from a pair, skips a third ticker-day at the gate, and reads
+    all of it back.
+
+    The held half is driven by a refused request rather than by an absent close of record.
+    Marketlake #434 made the second of those a skip, so it no longer produces a finding at all,
+    and this test would otherwise have asserted the render of a block the run cannot fill.
     """
     root = _lake(
         fixture_lake,
-        quotes={("QQQ", FOLLOWING): [_quote_row(FOLLOWING, ticker="QQQ")]},
-        master=_master(("SPY", "QQQ")),
+        quotes={
+            ("QQQ", FOLLOWING): [_quote_row(FOLLOWING, ticker="QQQ")],
+            ("XLF", FOLLOWING): [_quote_row(FOLLOWING, ticker="XLF")],
+        },
+        master=_master(("SPY", "QQQ", "XLF")),
     )
 
     result = _run(
         root,
-        _RecordingVendor(_cassette(tickers=("SPY", "QQQ"))),
-        roster=_roster({"SPY": ["1d"], "QQQ": ["1d"]}),
+        _RecordingVendor(
+            _cassette(tickers=("QQQ", "XLF")), fail_with={"XLF": VendorError("refused")}
+        ),
+        roster=_roster({"SPY": ["1d"], "QQQ": ["1d"], "XLF": ["1d"]}),
     )
 
     rendered = result.render()
     assert "landed:  1" in rendered and "held:    1" in rendered
-    assert result.attempted == 2, "the landed count would read the same as attempted"
-    assert "PartitionAbsent" in rendered, "a finding with no pair rendered no detail"
-    assert "SPY" in rendered and "QQQ 1d" in rendered
+    assert result.attempted == 2, "a ticker-day skipped at the gate was counted attempted"
+    assert "VendorError" in rendered, "a finding with no pair rendered no detail"
+    assert "unsettled: 1" in rendered and "abandoned: 0" in rendered
+    assert f"    - SPY 1d {SESSION.isoformat()}: PartitionAbsent" in rendered
+    assert "QQQ 1d" in rendered
     assert "filed at" in rendered
 
 

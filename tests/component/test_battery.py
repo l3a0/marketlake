@@ -977,10 +977,12 @@ def test_a_renamed_tickers_old_partitions_are_still_judged(lake: Path):
 
 
 def test_a_day_before_the_masters_valid_from_still_resolves_its_clamp(lake: Path):
-    """The other direction, which is marketlake #405's failure on the dashboard.
+    """The other direction, which was marketlake #405's failure on the dashboard.
 
     Resolving as of the judged day loses the clamp on any day before ``valid_from``. The
     partition then has no span, and the out-of-scope rule that should protect it never runs.
+    The dashboard reached the same answer by its own route, so this is now the shared rule
+    rather than the one check that keeps it.
     """
     early = date(2026, 8, 20)
     _write(lake, "chains", "SPY", early, _clean_rows("chains", staleness=900.0))

@@ -16,8 +16,9 @@ What one run does, in the design's own order.
    is the calendar's answer and not the manifest's. Marketlake #431.
 2. The bar walk, ``bars.backfill_bars``. The close cross-check is inside it, and the
    walk covers every session the capture spans still hold unlanded rather than only
-   the one the clock is in, because a daily bar cannot pass that check on the night
-   it is fetched. Marketlake #422.
+   the one the clock is in, because a daily bar has no close of record to pass that
+   check against on the night of its own session. Marketlake #422, with marketlake
+   #434 turning that night's fetch into a skip.
 3. The validation battery, ``battery.judge``, which judges the sealed chains and quotes
    partitions and writes a quarantine verdict for what fails. The design places it between the
    bar fetch and the Friday branch, which is where this list puts it.
@@ -86,6 +87,7 @@ module runs offline in a test, with no network and no shelling out.
 from __future__ import annotations
 
 import subprocess
+from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -657,12 +659,19 @@ def sweep(
         if closed:
             # **The walk is the backfill, not a single session, and marketlake #422 is why.**
             # A daily bar is judged against the calendar-next session's settled close, which at
-            # 18:30 on session S has not been captured, so every daily bar is held on the night
-            # it is fetched. ``fetch_session_bars`` says that settles itself because "the next
-            # run lands the bar", and it did not: the next run fetched the *next* session and
-            # met the same absence for it, and nothing scheduled ever came back. So the nightly
-            # job landed no daily bar at all, and the docstring's own promise is what this makes
-            # true.
+            # 18:30 on session S has not been captured. The single-session fetch said that
+            # settled itself because the next run would land the bar, and it did not: the next
+            # run fetched the *next* session and met the same absence for it, and nothing
+            # scheduled ever came back. So the nightly job landed no daily bar at all, and this
+            # walk is what makes that promise true.
+            #
+            # **What that night's ticker-day does about it changed under marketlake #434.** It
+            # used to be fetched, gated against a close nobody had captured, and held, which
+            # spent a vendor request and filed a withheld file on a gate that could not pass.
+            # The close of record is this lake's rather than the vendor's, so the walk reads it
+            # first and reports the ticker-day under ``unsettled`` instead. The recovery above
+            # is untouched, which is what makes the skip safe: a session skipped tonight is a
+            # session tomorrow's run still walks.
             #
             # ``backfill_bars`` is the walk that already existed, marketlake #319, and it
             # subsumes the single-session fetch rather than running beside it: ``_span_sessions``
@@ -718,6 +727,55 @@ def sweep(
                     report.append(
                         f"bars unwalked: {len(walked.unwalked)} ticker-day(s), "
                         f"first: {walked.unwalked[0]}"
+                    )
+                # A daily ticker-day whose gate has no close of record and never will. It is
+                # not a refusal, so it does not withhold the ping, and marketlake #434 is what
+                # stopped it being a held finding: filed nightly under ``reports/withheld/`` it
+                # was a permanent condition wearing an incident's clothes, and a genuinely new
+                # failure on night two hundred read as one more in the count.
+                #
+                # **Counted per reason, rather than naming the first entry.** The list repeats
+                # every night, so rendered in full it walks this report into ``digest_body``'s
+                # byte cap and truncates the battery's census off the end, and the full list
+                # stays on the by-hand ``--backfill`` run's own output. Naming the first entry
+                # was the obvious bound and it is the wrong one, twice over.
+                #
+                # ``report.redacted`` keeps two colon-separated fields, and an entry is itself
+                # composed as a ticker-day and then a reason, so a line reading "first: SPY 1d
+                # 2026-09-08: NoSpotClose" reaches both the digest and the nightly file as
+                # "first" with nothing after it. The ``unwalked`` line above has the same shape
+                # and loses its entry the same way. A line with one colon in it survives whole.
+                #
+                # And the walk takes ``plan.days`` in session order, so the first entry is
+                # always the oldest session in range. The live lake's six permanent ticker-days
+                # from the 2026-09-08 outage would hold that slot for ever, and a quarantine
+                # appearing tonight would move a count from six to seven and be named nowhere.
+                # Counting the classes is bounded by how many reasons exist, which is four, and
+                # a new class appearing in the line is the signal that something changed.
+                #
+                # A ``report`` line is the right carrier rather than a count on ``PieceOutcome``.
+                # That record holds "plain values rather than the walk's own report" shared by
+                # all three walks, and a bars-only number beside ``landed`` and ``held`` is what
+                # its import-direction rule refuses. The line reaches the nightly file, the
+                # digest and the dashboard's History panel, which renders what the file carries
+                # and computes none of it. Every one of those three reads it through
+                # ``report.redacted``, which is the other half of why it counts classes rather
+                # than naming an entry.
+                #
+                # **``unsettled`` is deliberately not reported here.** It is a ticker-day whose
+                # close of record the lake has not sealed yet, which on a healthy run is the
+                # newest session and nothing else, right every night by construction. A line
+                # that is loud every evening is one the reader learns to skip, which is the
+                # argument ``dashboard._ping_owed`` already makes in those words. It still
+                # reaches the by-hand run's own output, which is where a reader who wants it
+                # goes.
+                if walked.abandoned:
+                    reasons = Counter(entry.rpartition(": ")[2] for entry in walked.abandoned)
+                    census = ", ".join(
+                        f"{count} {reason}" for reason, count in sorted(reasons.items())
+                    )
+                    report.append(
+                        f"bars abandoned: {len(walked.abandoned)} ticker-day(s), {census}"
                     )
             except _BARS_REFUSALS as exc:
                 pieces.append((BARS_PIECE, _refused(exc)))
