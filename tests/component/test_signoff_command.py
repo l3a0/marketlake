@@ -417,6 +417,12 @@ def test_the_read_back_accepts_a_sign_off_a_later_entry_superseded(tmp_path: Pat
     assert report.still_withheld is True
     assert report.after["check"] == "quote_sanity"
     assert appended[0] in read_quarantine(tmp_path)
+    # A racing writer is the only way a second holder exists under today's resolution, so this
+    # is where the report's "still withheld under" line can be held at all. It names the other
+    # writer's check rather than the one this run signed off.
+    rendered = report.render()
+    assert "still withheld under: 'quote_sanity'" in rendered
+    assert "partition now:   withheld" in rendered
 
 
 # -- the dry run and the listing ---------------------------------------------
