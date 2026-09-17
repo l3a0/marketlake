@@ -746,6 +746,16 @@ def sweep(
                 # "first" with nothing after it. The ``unwalked`` line above has the same shape
                 # and loses its entry the same way. A line with one colon in it survives whole.
                 #
+                # The reason is read off ``GateSkip`` rather than parsed back out of its
+                # rendered line. That record exists for this: the two spellings agreed only
+                # because a class name carries no ``": "`` of its own, and nothing pinned that.
+                #
+                # ``sorted`` is what makes the line the same on two runs over one lake. A
+                # ``Counter`` keeps insertion order, which here is the walk's session order, so
+                # an outage and a quarantine would swap places in the census according to which
+                # session came first and a reader diffing two nights would see a change that is
+                # not one.
+                #
                 # And the walk takes ``plan.days`` in session order, so the first entry is
                 # always the oldest session in range. The live lake's six permanent ticker-days
                 # from the 2026-09-08 outage would hold that slot for ever, and a quarantine
@@ -770,7 +780,7 @@ def sweep(
                 # reaches the by-hand run's own output, which is where a reader who wants it
                 # goes.
                 if walked.abandoned:
-                    reasons = Counter(entry.rpartition(": ")[2] for entry in walked.abandoned)
+                    reasons = Counter(entry.reason for entry in walked.abandoned)
                     census = ", ".join(
                         f"{count} {reason}" for reason, count in sorted(reasons.items())
                     )

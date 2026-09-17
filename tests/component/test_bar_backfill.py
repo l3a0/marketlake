@@ -38,6 +38,7 @@ from lake.bars import (
     CHECK_BAR_CLOSE,
     CHECK_BAR_RESPONSE,
     MINUTE_EXTENDED_HOURS,
+    GateSkip,
     SpansAbsent,
     TickerDay,
     UnsupportedBarFreq,
@@ -46,9 +47,9 @@ from lake.bars import (
 )
 from lake.capture_spans import SPANS_SCHEMA, SPANS_SCHEMA_VERSION, CaptureSpans, spans_path
 from lake.cassette import Cassette
-from lake.extra_projection import ExtraProjectionError
-from lake.loader import LoadError
-from lake.manifest import read_manifest
+from lake.extra_projection import ExtraProjection, ExtraProjectionError
+from lake.loader import LoadError, NoSpotClose, PartialRead
+from lake.manifest import ManifestError, read_manifest
 from lake.paths import LakePaths
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
 from lake.schwab import VendorAuthError
@@ -605,9 +606,13 @@ def test_a_session_whose_quotes_hold_only_gap_rows_is_abandoned_without_a_reques
     # 09-08, 09-09 and 09-10 each read a following session holding only gap rows. 09-11 reads
     # 09-14, which settled, so it lands like every session after it.
     assert result.abandoned == tuple(
-        f"SPY 1d {day.isoformat()}: NoSpotClose"
+        GateSkip("SPY", DAILY_FREQ, day, "NoSpotClose")
         for day in (date(2026, 9, 8), date(2026, 9, 9), date(2026, 9, 10))
     )
+    # ``skipped`` is the manifested count and nothing else, which is what ``BarsReport`` rests its
+    # second-run argument on and what the digest prints. Counting a gate skip there too would read
+    # as "the lake already has these bars".
+    assert result.skipped == 0, "a gate skip was counted as a manifested one"
     assert result.held == ()
     assert {entry.session for entry in result.landed} == set(SESSIONS[3:])
     assert [call["symbol"] for call in vendor.calls] == ["SPY"] * len(SESSIONS[3:]), (
@@ -638,7 +643,7 @@ def test_the_newest_session_is_unsettled_rather_than_abandoned(fixture_lake: Fix
     root = _lake(fixture_lake, quotes=quotes)
     vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,)))
     result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
-    assert result.unsettled == ("SPY 1d 2026-09-16: PartitionAbsent",)
+    assert result.unsettled == (GateSkip("SPY", DAILY_FREQ, date(2026, 9, 16), "PartitionAbsent"),)
     assert result.abandoned == ()
     assert result.held == ()
     assert len(vendor.calls) == len(SESSIONS) - 1
@@ -728,8 +733,17 @@ def test_a_lake_that_contradicts_its_own_writers_is_held_rather_than_abandoned(
     assert result.attempted == 0
 
 
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        ExtraProjectionError("row 0 holds an extra value that is not JSON"),
+        ManifestError("the quarantine ledger holds a line that is not JSON"),
+        pa.lib.ArrowInvalid("Parquet magic bytes not found in footer"),
+    ],
+    ids=["projection", "manifest", "arrow"],
+)
 def test_a_partition_the_projection_cannot_present_costs_one_ticker_day(
-    fixture_lake: FixtureLake, monkeypatch
+    fixture_lake: FixtureLake, monkeypatch, refusal
 ):
     """Moving the read in front of the fetch is what made this reachable, so it is named.
 
@@ -746,6 +760,13 @@ def test_a_partition_the_projection_cannot_present_costs_one_ticker_day(
 
     Marketlake #365 put this family on the filing side and named ``lake.bars`` as its precedent,
     so the blast radius is one ticker-day and the record is a held finding.
+
+    **All three are driven, because covering one covered none of the others.** The loader reaches
+    the manifest through ``latest_quarantine_by_check`` and ``withholding`` for the quarantine
+    guard, so a malformed ledger raises ``ManifestError`` on this same read, and a partition whose
+    footer is not Parquet raises out of ``pq.read_table`` as an ``ArrowInvalid`` the loader does
+    not wrap. Each was dropped from the clause on its own and the suite stayed green while a
+    sibling case held the other two.
     """
     from lake import bars as bars_module
 
@@ -753,17 +774,71 @@ def test_a_partition_the_projection_cannot_present_costs_one_ticker_day(
     root = _lake(fixture_lake, quotes=quotes)
 
     def refuse(ticker, day, *args, **kwargs):
-        raise ExtraProjectionError("row 0 holds an extra value that is not JSON")
+        raise refusal
 
     monkeypatch.setattr(bars_module, "load_quotes", refuse)
     vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ, MINUTE_FREQ)))
     result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ, MINUTE_FREQ]}))
 
     assert len(result.held) == len(SESSIONS), "a broken partition ended the walk"
-    assert all("ExtraProjectionError" in (f.finding.exception or "") for f in result.held)
+    named = type(refusal).__name__
+    assert all(named in (f.finding.exception or "") for f in result.held)
     assert len(result.landed) == len(SESSIONS), "the minute half went down with the daily half"
     assert {call["symbol"] for call in vendor.calls} == {"SPY"}
     assert result.unsettled == () and result.abandoned == ()
+
+
+# ``PartialRead`` carries the projection that could not be presented whole, so building one needs
+# an ``ExtraProjection``. An empty one is enough here: what this drives is which bucket the refusal
+# lands in, never what it says.
+_EMPTY_PROJECTION = ExtraProjection(
+    table=None, filled=0, unrecorded_versions=(), unfit=(), retyped=()
+)
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        PartialRead("SPY", "2026-09-09", "quotes", _EMPTY_PROJECTION),
+        NoSpotClose("SPY", "2026-09-09", 1),
+    ],
+    ids=["partial-read", "no-spot-close"],
+)
+def test_every_refusal_that_means_unreadable_takes_the_skip(
+    fixture_lake: FixtureLake, monkeypatch, refusal
+):
+    """The four ``_gate_close`` contains are one class, so each of them has to be driven.
+
+    They are the four ``actions._observation`` contains out of the same ``load_quotes`` call, and
+    what they share is that the session cannot be read. Everything else out of that read says the
+    lake contradicts its own writers and is filed instead.
+
+    ``PartialRead`` is the member that nothing reached. Dropping it from the four left the suite
+    green, because it is a ``LoadError`` and so fell through to the outer catch and became a held
+    finding filed every night, which is the permanent condition wearing an incident's clothes that
+    marketlake #434 exists to remove. The other three each had a test.
+    """
+    from lake import bars as bars_module
+
+    quotes = {("SPY", day): [_quote_row(day)] for day in SESSIONS}
+    root = _lake(fixture_lake, quotes=quotes)
+
+    def refuse(ticker, day, *args, **kwargs):
+        raise refusal
+
+    monkeypatch.setattr(bars_module, "load_quotes", refuse)
+    vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,)))
+    result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
+
+    skips = (*result.abandoned, *result.unsettled)
+    assert result.held == (), "a refusal that means unreadable was filed as a finding"
+    assert len(skips) == len(SESSIONS)
+    assert {entry.reason for entry in skips} == {type(refusal).__name__}
+    # The newest session is the one whose following quotes the lake has not sealed, so it is
+    # unsettled while the rest are abandoned. Which bucket is the manifest's answer, not the
+    # refusal's, so the split is asserted here rather than left to read as noise.
+    assert len(result.unsettled) == 1 and len(result.abandoned) == len(SESSIONS) - 1
+    assert vendor.calls == []
 
 
 def test_a_quarantined_reference_is_abandoned_under_its_own_name(fixture_lake: FixtureLake):
@@ -787,7 +862,7 @@ def test_a_quarantined_reference_is_abandoned_under_its_own_name(fixture_lake: F
     vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,)))
     result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
 
-    assert "SPY 1d 2026-09-08: PartitionQuarantined" in result.abandoned
+    assert GateSkip("SPY", DAILY_FREQ, date(2026, 9, 8), "PartitionQuarantined") in result.abandoned
     assert result.held == ()
     assert date(2026, 9, 8) not in {entry.session for entry in result.landed}
 
@@ -1278,12 +1353,19 @@ def test_the_two_gate_skip_blocks_are_rendered_in_the_backfill_block(fixture_lak
     result = _run(
         root, RecordingVendor(_cassette(freqs=(DAILY_FREQ,))), roster=_roster({"SPY": [DAILY_FREQ]})
     )
-    rendered = result.render()
-    assert "unsettled: 1" in rendered
-    assert "    - SPY 1d 2026-09-16: PartitionAbsent" in rendered
-    assert "abandoned: 3" in rendered
-    assert "    - SPY 1d 2026-09-08: NoSpotClose" in rendered
-    assert "    - SPY 1d 2026-09-10: NoSpotClose" in rendered
+    # **The two blocks are asserted whole, in order.** Substring checks leave the structure
+    # unpinned: swapping the blocks, so a reader meets the permanent list before the transient
+    # one, changed nothing any of them could see.
+    rendered = result.render().splitlines()
+    first = rendered.index("  unsettled: 1")
+    assert rendered[first : first + 6] == [
+        "  unsettled: 1",
+        "    - SPY 1d 2026-09-16: PartitionAbsent",
+        "  abandoned: 3",
+        "    - SPY 1d 2026-09-08: NoSpotClose",
+        "    - SPY 1d 2026-09-09: NoSpotClose",
+        "    - SPY 1d 2026-09-10: NoSpotClose",
+    ]
 
 
 def test_the_two_reports_render_a_held_finding_the_same_way():
