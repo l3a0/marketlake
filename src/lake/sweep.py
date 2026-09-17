@@ -13,13 +13,24 @@ What one run does, in the design's own order.
 1. The corporate-actions poll, so today's split flags before bars land. Two walks over sealed
    rows: ``actions.extract_dividends`` reads quotes and ``splits.detect_splits`` reads chains.
 2. The bar fetch, ``bars.fetch_session_bars``. The close cross-check is inside it.
-3. The Friday branch, which sets the Sunday one-shot wake and reads it back.
-4. The ping.
-5. The dated report file under ``reports/``.
-6. The digest, at priority 2.
+3. The validation battery, ``battery.judge``, which judges the sealed chains and quotes
+   partitions and writes a quarantine verdict for what fails.
+4. The Friday branch, which sets the Sunday one-shot wake and reads it back.
+5. The ping.
+6. The dated report file under ``reports/``.
+7. The digest, at priority 2.
 
-The battery the design names between steps 2 and 3 is marketlake #138's and does not exist.
-Nothing here builds it, and the quarantine count it would feed reads zero until it does.
+The battery the design names between steps 2 and 3 is ``lake.battery``, and step 2.5 below is
+where it runs. Marketlake #406 built its spine and the real-time entitlement check. The other
+seal-then-flag checks are its siblings under #138 and plug into the same writer, so nothing here
+changes when they land.
+
+**Its failure does not withhold the ping, and that is a decision rather than the default.** The
+``eod-sweep`` row says a missed ping means the day's official bars or actions are missing, and a
+battery that could not run leaves the day *unjudged* instead. That is ``_counted``'s line from
+the other side: the work the check watches did happen. So the battery's own trouble rides
+``report`` and its findings ride the file, while a quarantine is the run working rather than
+failing and withholds nothing either.
 
 **Why the privileged half lives here and not in the control plane.** That module's docstring
 opens by refusing it: "It executes nothing privileged. No ``sudo``, no ``pmset`` write, no
@@ -74,8 +85,10 @@ from pathlib import Path
 from lake.actions import ExtractionReport, MasterAbsent, extract_dividends
 from lake.alert import Message, NtfyTransport, Publisher, undelivered
 from lake.bars import BarsReport, UnsupportedBarFreq, fetch_session_bars
+from lake.battery import BatteryReport, judge
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
 from lake.clock import Clock, SystemClock
+from lake.config import GuardConstants
 from lake.control_plane import (
     EOD_SWEEP_SLUG,
     PMSET_BINARY,
@@ -200,9 +213,15 @@ def count_gaps(lake_root: Path | str, day: date) -> int | None:
 def count_quarantined(lake_root: Path | str) -> int:
     """How many partitions the quarantine ledger currently withholds.
 
-    It reads zero until marketlake #138's battery writes the first verdict, and the live lake
-    holds no ``quarantine.jsonl`` at all. A missing ledger reads as no entries, which is what
-    keeps this inert rather than raising.
+    ``lake.battery`` is what writes the verdicts this counts, and it runs earlier in this same
+    job, so the number is this evening's rather than last evening's. A lake with no
+    ``quarantine.jsonl`` reads as no entries, which is what keeps this from raising on a fresh
+    lake.
+
+    This is the whole ledger's open count rather than tonight's new findings. From the first
+    verdict until a human signs it off, every night's file carries a standing non-zero number.
+    That is quarantine being loud on purpose. What separates a new finding from an old one is
+    ``battery_appended`` beside it, which counts the lines this run wrote.
     """
     root = Path(lake_root)
     return sum(1 for entry in latest_quarantine(root).values() if is_quarantined(entry))
@@ -292,11 +311,16 @@ class SweepOutcome:
     nothing broke looks exactly like a dead subscription, and this message is the design's
     answer to that. A night where it silently did not go is the night the answer stops
     working.
+
+    ``battery`` is what :func:`lake.battery.judge` returned, or ``None`` on a holiday and on a
+    run whose battery refused. Its counts reach the report file through ``report`` too, and
+    this is where the command's sign-off block reads them from.
     """
 
     nightly: Nightly
     digest: Message
     delivered: bool
+    battery: BatteryReport | None = None
     filed_at: Path | None = None
     filing_error: str | None = None
 
@@ -481,6 +505,7 @@ def sweep(
     publisher: Publisher | None,
     schedule_reader: ScheduleReader,
     schedule_setter: ScheduleSetter,
+    guards: GuardConstants | None = None,
 ) -> SweepOutcome:
     """Run one evening sweep. Every seam is required, and the module docstring says why.
 
@@ -545,6 +570,26 @@ def sweep(
                 )
             )
 
+    # Step 2.5, the design's own placement: after the bar fetch and before the Friday branch.
+    # Contained in its own tuple for the reason ``_LEDGER_REFUSALS`` exists, and with a broad
+    # catch under it. The partitions most likely to make this raise are the ones a battery would
+    # quarantine, and it opens every one of them on purpose, so an uncontained raise here would
+    # cost the Friday wake, the ping and the report file on exactly the night that mattered.
+    battery: BatteryReport | None = None
+    if session:
+        try:
+            battery = judge(
+                root,
+                now=now,
+                day=day,
+                guards=guards,
+                publisher=publisher,
+            )
+        except Exception as exc:  # noqa: BLE001 - the battery must not cost the record
+            report.append(f"battery did not run: {type(exc).__name__}: {exc}")
+        else:
+            report.extend(battery.report)
+
     if day.weekday() == _PY_FRIDAY:
         wake_problems, wake_report = _friday_wake(
             now=now,
@@ -577,6 +622,12 @@ def sweep(
             # This job runs once per process, so it pages at most once per run by
             # construction and needs no ``SlugEscalation`` to hold that.
             escalate_ping_failure(exc, slug=EOD_SWEEP_SLUG, publisher=publisher, now=now)
+
+    if battery is not None and battery.appended:
+        report.append(
+            f"battery wrote {len(battery.appended)} quarantine "
+            f"line{'s' if len(battery.appended) != 1 else ''}"
+        )
 
     nightly = Nightly(
         day=day,
@@ -616,6 +667,7 @@ def sweep(
         delivered=delivered,
         filed_at=filed_at,
         filing_error=filing_error,
+        battery=battery,
     )
 
 
@@ -662,6 +714,7 @@ def sweep_from_config(
         ),
         schedule_reader=read_pmset_schedule if schedule_reader is None else schedule_reader,
         schedule_setter=set_sunday_wake if schedule_setter is None else schedule_setter,
+        guards=config.guards,
     )
 
 

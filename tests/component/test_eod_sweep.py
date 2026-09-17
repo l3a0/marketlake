@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -1214,3 +1215,119 @@ def test_a_digest_that_never_left_is_not_a_clean_run(fixture_lake: FixtureLake):
     assert outcome.ok is False
     # Recorded like any other lost page, and counted by no run, which is why ok carries it.
     assert list((root / "reports" / "alerts").glob("date=*/*.json"))
+
+
+# -- the validation battery, step 2.5 ---------------------------------------------------
+
+
+def test_the_battery_runs_on_a_session_and_its_counts_reach_the_outcome(
+    fixture_lake: FixtureLake,
+):
+    """The design places it between the bar fetch and the Friday branch, and this is it.
+
+    The fixture lake has no capture spans, so every partition is out of scope and the run
+    judges nothing. That is the right answer rather than a gap in the test: what it asserts is
+    that the battery ran at all, which is what nothing in this module could assert before.
+    """
+    root = _lake(fixture_lake)
+
+    outcome, _, _ = _run(root)
+
+    assert outcome.battery is not None
+    assert outcome.battery.appended == ()
+
+
+def test_a_holiday_runs_no_battery_at_all(fixture_lake: FixtureLake):
+    """The design has compaction and the sweep no-op on an empty journal, and this follows it."""
+    root = _lake(fixture_lake)
+
+    outcome, _, _ = _run(root, holidays=(EVENING.date(),))
+
+    assert outcome.battery is None
+
+
+def test_a_battery_that_raises_costs_the_run_nothing_and_says_so(
+    fixture_lake: FixtureLake, monkeypatch
+):
+    """The containment #352 describes from the other side.
+
+    An uncontained raise at step 2.5 would leave ``sweep.sweep`` entirely and cost the Friday
+    wake, the ping and the report file, on exactly the night the battery had something to say.
+    """
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("the ledger is on fire")
+
+    monkeypatch.setattr(sweep, "judge", explode)
+    root = _lake(fixture_lake)
+
+    outcome, pinger, _ = _run(root)
+
+    assert outcome.battery is None
+    assert pinger.urls == [PING_URL]
+    assert outcome.filed_at is not None
+    assert any("battery did not run: RuntimeError" in line for line in outcome.nightly.report)
+
+
+def test_a_battery_that_raises_does_not_withhold_the_ping(fixture_lake: FixtureLake, monkeypatch):
+    """Named as a decision rather than left as a default.
+
+    The ``eod-sweep`` row says a missed ping means the day's official bars or actions are
+    missing. A battery that could not run leaves the day *unjudged* instead, which is
+    ``_counted``'s line: the work the check watches did happen.
+    """
+
+    def explode(*args, **kwargs):
+        raise OSError("no")
+
+    monkeypatch.setattr(sweep, "judge", explode)
+    root = _lake(fixture_lake)
+
+    outcome, _, _ = _run(root)
+
+    assert outcome.nightly.pinged is True
+    assert not any("battery" in problem for problem in outcome.nightly.problems)
+
+
+def test_a_quarantine_the_battery_wrote_is_reported_and_still_pings(fixture_lake: FixtureLake):
+    """A quarantine is the run working. It withholds nothing and it reaches the record."""
+    from lake.battery import BatteryReport
+
+    root = _lake(fixture_lake)
+    written = BatteryReport(judged=1, quarantined=1, appended=("chains/x.parquet",))
+
+    with _battery_returning(written):
+        outcome, pinger, _ = _run(root)
+
+    assert outcome.nightly.pinged is True
+    assert pinger.urls == [PING_URL]
+    assert any("battery wrote 1 quarantine line" in line for line in outcome.nightly.report)
+
+
+def test_the_quarantine_count_on_the_file_is_this_evenings_not_last_evenings(
+    fixture_lake: FixtureLake,
+):
+    """``count_quarantined`` is read after the battery ran, so the number includes tonight."""
+    fixture_lake.with_quarantine(
+        {"partition": "chains/ticker=SPY/date=2026-08-24.parquet", "verdict": "quarantined"}
+    )
+    root = _lake(fixture_lake)
+
+    outcome, _, _ = _run(root)
+
+    assert outcome.nightly.quarantined == 1
+    assert _filed(root)[0]["quarantined"] == 1
+
+
+@contextmanager
+def _battery_returning(report):
+    """Replace the battery with one that returns ``report``, for the wiring's own assertions."""
+    import lake.battery
+
+    original = sweep.judge
+    sweep.judge = lambda *args, **kwargs: report
+    try:
+        yield
+    finally:
+        sweep.judge = original
+        assert lake.battery.judge is not None
