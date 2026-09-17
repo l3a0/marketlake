@@ -1389,3 +1389,44 @@ def _battery_returning(report):
     finally:
         sweep.judge = original
         assert lake.battery.judge is not None
+
+
+def test_the_command_hands_the_batterys_threshold_to_the_battery(
+    fixture_lake: FixtureLake, capsys, monkeypatch, tmp_path
+):
+    """A recalibrated guard constant has to survive the whole wiring, not just ``judge``.
+
+    ``judge`` reading the guards it is handed is held elsewhere. What this holds is the link
+    between them: ``sweep_from_config`` passing the config's guards rather than letting
+    ``judge`` fall back to the pinned defaults. Without it an operator's tuned
+    ``staleness_page_seconds`` is silently ignored and the run looks exactly the same.
+    """
+    from tests.support.config import write_config
+
+    root = _lake(fixture_lake)
+    config = write_config(tmp_path, lake_root=root, guards={"staleness_page_seconds": 7})
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("SPY:\n  options: true\n  bars:\n  - 1d\n")
+
+    seen: list[int] = []
+    real = sweep.judge
+
+    def recording(*args, **kwargs):
+        seen.append(kwargs["guards"].staleness_page_seconds)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(sweep, "judge", recording)
+    monkeypatch.setattr(sweep, "UrllibPinger", FakePinger)
+    monkeypatch.setattr(sweep, "NtfyTransport", lambda topic: FakeTransport())
+    monkeypatch.setattr(sweep, "ExchangeCalendar", lambda: weekday_sessions(MONDAY, NEXT_MONDAY))
+
+    sweep.main(
+        ["--config", str(config), "--tickers", str(tickers)],
+        clock=ManualClock(EVENING),
+        vendor_source=_CountingVendorSource(),
+        schedule_setter=_RecordingSetter(),
+        schedule_reader=lambda: _schedule_text(),
+    )
+    capsys.readouterr()
+
+    assert seen == [7], "the battery was handed the pinned default, not the config's"

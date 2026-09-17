@@ -1412,3 +1412,120 @@ def test_a_sealed_partition_on_a_non_session_day_keeps_the_flag_half(lake: Path)
 
     assert report.quarantined == 1
     assert "do not carry is_delayed=False" in report.findings[0].reason
+
+
+# -- the statistic is the median, and the boundaries are half-open ------------
+
+
+def test_one_outlier_row_does_not_move_the_verdict(lake: Path):
+    """The median is required rather than decorative, and a mean is not a median.
+
+    Every other fixture here uses one staleness for every row, where the mean and the median
+    coincide, so none of them can tell the two apart. The live lake's tail is why this matters:
+    the per-row maximum on QQQ 2026-09-14 is 1,789,392,600 seconds against a session median of
+    -1.9, and a mean over that partition would read about 447 million seconds and quarantine a
+    feed that is fine.
+    """
+    rows = _clean_rows("chains", staleness=-1.7, count=5)
+    rows.append(_row(5, staleness=1_789_392_600.0, flag=False, surface="chains"))
+    _write(lake, "chains", "SPY", DAY, rows)
+    _seed_spans(lake)
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert report.cleared == 1
+    assert report.quarantined == 0
+    assert report.findings[0].computed == pytest.approx(-1.7)
+
+
+def test_a_span_opening_at_the_days_end_does_not_cover_that_day(lake: Path):
+    """The interval is half-open, so a span that opens as the day ends covers none of it."""
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
+    _seed_spans(lake, start=datetime(2026, 9, 17, 4, 0, tzinfo=UTC))
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert report.out_of_scope == 1
+    assert report.quarantined == 0
+
+
+def test_a_span_closing_at_the_days_start_does_not_cover_that_day(lake: Path):
+    """The other end of the same interval, which a retirement produces."""
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
+    _seed_spans(
+        lake,
+        start=SPAN_START,
+        end=datetime(2026, 9, 16, 4, 0, tzinfo=UTC),
+    )
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert report.out_of_scope == 1
+    assert report.quarantined == 0
+
+
+def test_transition_compares_the_check_directly(lake: Path):
+    """Asserted on the function rather than through ``judge``, because one check exists today.
+
+    Through ``judge`` the clause is unreachable, so deleting it changes nothing a run can see.
+    What it guards is the day a second check finds a different fault on a partition the first
+    already quarantined: without it that finding is never recorded and never pages.
+    """
+    from lake.battery import _entitlement_finding, _transition
+
+    quarantined_by_a = {
+        "partition": "chains/ticker=SPY/date=2026-09-16.parquet",
+        "verdict": QUARANTINED_VERDICT,
+        "check": "row_count_band",
+        "provenance": PROVENANCE_BATTERY,
+    }
+    fails_under_b = _entitlement_finding(
+        _partition(lake), QUARANTINED_VERDICT, "the feed is delayed"
+    )
+
+    assert _transition(quarantined_by_a, fails_under_b) is True
+    assert _transition(quarantined_by_a, replace(fails_under_b, check="row_count_band")) is False
+
+
+def test_the_manifest_entry_and_the_ledger_line_agree_on_the_clock(lake: Path):
+    """Both writes happen in one invocation, so a reader comparing them compares one clock."""
+    entry = build_entry(
+        partition="chains/ticker=SPY/date=2026-09-16.parquet",
+        verdict=QUARANTINED_VERDICT,
+        check=CHECK_ENTITLEMENT,
+        observed_at=NOW,
+    )
+    append_verdict(lake, entry, observed_at=NOW)
+
+    manifested = [
+        json.loads(line)
+        for line in (lake / "manifest.jsonl").read_text().splitlines()
+        if line.strip() and json.loads(line)["partition"] == "quarantine.jsonl"
+    ]
+    assert len(manifested) == 1
+    assert manifested[0]["fetched_at"] == entry["observed_at"]
+    assert manifested[0]["source"] == "battery"
+    assert manifested[0]["rows"] == 1
+
+
+def test_a_refused_page_keeps_its_body_off_stderr(lake: Path, capsys):
+    """The publisher redacted its own record because the body carried a secret.
+
+    Printing the body to stderr afterwards would undo that, and launchd writes stderr to a file
+    on disk. The body is a count, a staleness figure and partition paths, so this is defence in
+    depth rather than a live leak, which is why nothing had exercised it.
+    """
+    from lake.battery import _entitlement_finding
+
+    secret = "chains/ticker=SPY/date=2026-09-16.parquet"
+    publisher, transport = _publisher(lake, secrets=(secret,))
+    finding = _entitlement_finding(
+        _partition(lake), QUARANTINED_VERDICT, "delayed", computed=900.0, against=60.0
+    )
+
+    page_delayed_feed(publisher, [finding], now=NOW)
+
+    printed = capsys.readouterr().err
+    assert transport.messages == []
+    assert secret not in printed
+    assert "refused" in printed
