@@ -11,9 +11,11 @@ keeps the other view it names, option continuity across an adjustment, which can
 until something writes an OCC mapping into the security master.
 
 This is a function over loader reads rather than a DuckDB view. The read layer returns a
-``pyarrow.Table``, and D19 shipped the slice's other view the same way, as
-``lake.oi.oi_view``. The only DuckDB in this package opens partition files directly, which is
-the second read path the design refuses.
+``pyarrow.Table``, and D19 shipped the slice's other view the same way, as ``lake.oi.oi_view``.
+The rule is about this slice rather than about DuckDB: a view of sealed partitions that opened
+them itself would skip the quarantine exclusion the loader owns, and the design's rule for
+sealed data is fail closed. The dashboard's own DuckDB reads are specified deliberately, with
+their own sandbox, and are not what that rule is aimed at.
 
 **The answer is one row per contract expiring on the session**, taken from that session's
 close of record and ordered by ``occ_symbol``. A row is ``settled`` and carries a number, or
@@ -38,9 +40,9 @@ Three other sources look like they would do and none of them is it. ``spot_close
 pre-auction book rather than the auction print, and the design says so outright. The
 option-close snapshot is a different market's close. And the chain's own ``underlying_price``,
 which is the closest of the three, is a vendor snapshot with no gate behind it. That last one
-is worth keeping as a cross-check rather than dismissing: at the option close, which sits
-after the 16:00 auction, it equals the close the lake settled on all four ticker-sessions the
-two can be compared over, 760.88 and 757.39 on SPY and 709.18 and 704.54 on QQQ. A number
+is worth keeping as a cross-check rather than dismissing: at the option close, which sits after
+the 16:00 auction, it equals the close the lake settled on all four ticker-sessions the two can
+be compared over, 760.88 and 757.39 on SPY and 709.18 and 704.54 on QQQ. A number
 that agrees four times out of four is a good check and still not the source, because the
 ``bars/`` close has passed gate-before-land and this one has passed nothing.
 
@@ -85,10 +87,18 @@ would take the rest of the roster away with it.
 
 So an unreadable ``expiration_date`` refuses: a row whose expiration cannot be read cannot be
 placed inside or outside the roster, which is the same reason ``_load_surface`` refuses a
-partition holding a null ``row_kind``. A null daily close refuses too, because it settles no
-contract on the session. Production cannot produce that second one, since the daily gate holds
-a candle whose close is missing, but the schema permits what the gate refuses and a caller can
-point ``lake_root`` at any lake.
+partition holding a null ``row_kind``. Unreadable includes a stamp carrying no UTC offset, which
+parses cleanly and then resolves against whatever timezone the process runs in, so the roster
+would differ by machine with nothing raised. A daily close the view cannot read refuses too,
+because it settles no contract on the session: a partition with no row, a null close, or a close
+that is not a whole number of cents. Production cannot produce the middle one, since the daily
+gate holds a candle whose close is missing, but the schema permits what the gate refuses and a
+caller can point ``lake_root`` at any lake.
+
+A term the view cannot read marks its own row instead, because it is one contract's problem: a
+missing side, strike or multiplier, a deliverables list the parse refuses, a settlement code that
+is absent rather than naming a convention, and a strike no whole number of cents can carry. A NaN
+or an infinity is one of these rather than an arithmetic error, for the reason ``_number`` gives.
 
 One consequence is worth stating rather than discovering. The daily gate compares a candle
 against the *following* session's captured close, so a session's settlement is available one
@@ -97,7 +107,8 @@ session later at the earliest. D19's OI view carries the same lag for its own re
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
+from math import isfinite
 from pathlib import Path
 
 import pyarrow as pa
@@ -108,8 +119,11 @@ from lake.splits import Deliverable, DeliverableUnreadable, deliverable_of_row
 from lake.vendor import DAILY_FREQ
 
 # The chains columns this view reads. Named here rather than at each use, so a reader can see
-# that it reads nine of the chains schema's several dozen. The four in the middle are the
-# contract's terms and the last two are the deliverable's two witnesses.
+# that it reads nine of the chains schema's several dozen.
+#
+# The two witnesses ``_standard`` compares are ``non_standard``, the vendor's classification, and
+# ``option_deliverables_list``, its typed description. ``deliverable_note`` is read because
+# ``splits._reading`` takes it as part of the same tuple, and nothing here consults it.
 OCC_SYMBOL = "occ_symbol"
 EXPIRATION_DATE = "expiration_date"
 PUT_CALL = "put_call"
@@ -133,12 +147,15 @@ PUT = "PUT"
 #
 # **This reading is an assumption and the lake cannot confirm it.** ``journal.py`` maps
 # ``settlementType`` onto the column and documents no value, and nothing else in this package
-# or in ``docs/design.md`` says what any of the vendor's enum codes stand for. Every one of the
-# 73,132 rows in the lake's six close-of-record chains carries ``P``, across all four
-# ``expiration_type`` kinds, and none carries any other value. So the guard below is inert on
-# every row the lake holds, and if the reading is wrong the failure runs as a false negative,
-# an AM-settled contract this test does not catch, rather than a standard contract it
-# wrongly withholds.
+# or in ``docs/design.md`` says what any of the vendor's enum codes stand for.
+#
+# The lake holds seven close-of-record chains and 73,134 rows across them. 73,132 carry ``P``,
+# across all four ``expiration_type`` kinds, and none carries a different code. The other two are
+# in SPY's 2026-09-02 partition and carry no code at all, which ``_verdict`` answers as a term it
+# cannot read rather than as AM settlement. So no row the lake holds reaches the comparison
+# below with a value, and if the reading is wrong the failure runs as a false negative, an
+# AM-settled contract this test does not catch, rather than a standard contract it wrongly
+# withholds.
 SETTLEMENT_TYPE_PM = "P"
 
 # The two verdicts. They are D19's tokens, reused rather than respelled as synonyms, and each
@@ -163,6 +180,11 @@ _CENT_EPSILON = 1e-6
 
 # What the OCC's exercise-by-exception takes, in whole cents.
 EXERCISE_THRESHOLD_CENTS = 1
+
+# What an ``int64`` column can carry. ``intrinsic_cents`` is one, and Python's integers are
+# unbounded, so a value past this reaches Arrow rather than the reader.
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
 
 SETTLEMENT_VIEW_SCHEMA = pa.schema(
     [
@@ -310,19 +332,47 @@ def _roster(
     roster = []
     for row in rows:
         stamp = row.get(EXPIRATION_DATE)
-        try:
-            expires_on = session_of(str(stamp))
-        except (TypeError, ValueError) as exc:
+        expires_on = _expires_on(stamp)
+        if expires_on is None:
             raise ExpirationUnreadable(
                 f"{ticker} {session_text} holds a contract, {row.get(OCC_SYMBOL)!r}, whose "
                 f"{EXPIRATION_DATE} is {stamp!r}, which names no session. Whether it belongs "
                 "in this session's expiry roster cannot be decided, so the roster cannot be "
                 "vouched for."
-            ) from exc
+            )
         if expires_on == session:
             roster.append(row)
     roster.sort(key=lambda row: str(row.get(OCC_SYMBOL)))
     return roster
+
+
+def _expires_on(stamp: object) -> date | None:
+    """The session a contract's expiration stamp names, or ``None`` when it names none.
+
+    The reading is ``bars.session_of``'s, which is the rule for how a stamp names a session and
+    is what ``load_bars`` uses on a bar. This adds the precondition that function documents and
+    does not enforce: "the stamp is a UTC instant".
+
+    An offset is what makes the reading a fact rather than a property of the machine. A naive
+    stamp parses, and ``astimezone`` then reads it in whatever timezone the process is running
+    in, so the same chain would put a contract in the expiry roster on one machine and leave it
+    out on another, with nothing raised either way. That is exactly the silently short roster
+    ``ExpirationUnreadable`` exists to prevent, so a stamp with no offset is one this cannot
+    read. The weakness is ``session_of``'s own and is marketlake #385; this check comes out when
+    that lands.
+
+    Every one of the 19,775,426 data rows in the lake's sealed chains carries an offset, so
+    nothing on disk reaches the refusal today.
+    """
+    if not isinstance(stamp, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+        return None
+    return session_of(stamp)
 
 
 def _settlement_close(
@@ -330,11 +380,17 @@ def _settlement_close(
 ) -> tuple[float, int]:
     """The session's official equity close, in dollars and in whole cents.
 
-    The daily gate checks that the session came back rather than that exactly one candle did,
-    so a partition holding two candles for the session is not refused. ``bars._bar_close``
-    already decided what such a partition's close is, taking the last by stamp and stating that
-    the same reading answers either frequency, so this takes that one rather than minting a
-    second.
+    The daily gate checks that the session came back rather than that exactly one candle did, so
+    a partition holding two candles for the session is not refused. The close is then the last
+    candle by the instant its stamp names, which is what ``load_bars`` has already ordered the
+    answer by, so the last row is it.
+
+    ``bars._bar_close`` answers the same question for the gate and answers it differently.
+    It sorts the raw stamp text, and the same instant has more than one spelling, so a response
+    mixing ``-04:00`` and ``+00:00`` sends the two readings apart. The loader's module docstring
+    carries the measurement that says this is not hypothetical, 408 distinct ``snap_ts`` texts
+    naming 406 distinct instants in one live partition. Comparing instants is the reading that
+    survives that, so this takes it, and the gate's text sort is marketlake #386.
 
     Three shapes refuse rather than settling anything, and all three are session-wide because
     the close is one number for the whole roster: an empty partition, a null close, and a close
@@ -358,8 +414,9 @@ def _settlement_close(
         close = _number(bars.column(CLOSE_COLUMN)[-1].as_py())
     if close is None:
         raise CloseUnreadable(
-            f"{ticker} {session_text} holds a daily bar carrying no close, so no contract "
-            "expiring on that session has an official close to settle against."
+            f"{ticker} {session_text} has no daily close to settle against, because its bars "
+            "partition holds no row or the row it holds carries no close. No contract expiring "
+            "on that session can be settled."
         )
     cents = _cents(close)
     if cents is None:
@@ -409,7 +466,15 @@ def _verdict(
     standard either. Then what the contract delivers. Then whether the arithmetic can
     represent the strike.
     """
-    if row.get(SETTLEMENT_TYPE) != SETTLEMENT_TYPE_PM:
+    settlement_type = row.get(SETTLEMENT_TYPE)
+    if settlement_type is None:
+        # A missing code is not a statement that the contract settles at the open. The two are
+        # folded together by an inequality, and one of them is a positive claim about the
+        # contract while the other is the absence of any claim. The lake holds the second shape
+        # already: SPY's 2026-09-02 close of record carries two rows whose ``settlement_type``,
+        # ``multiplier``, ``non_standard`` and deliverables list are all null.
+        return VERDICT_ABSENT, REASON_TERMS_UNREADABLE, None, None
+    if settlement_type != SETTLEMENT_TYPE_PM:
         return VERDICT_ABSENT, REASON_AM_SETTLED, None, None
 
     side = row.get(PUT_CALL)
@@ -486,7 +551,9 @@ def _delivers_shares(deliverable: Deliverable, ticker: str) -> bool:
         deliverable.entries == 1
         and not deliverable.cash
         and deliverable.symbol == ticker
-        and deliverable.multiplier is not None
+        # ``multiplier`` is a number by the time this runs, because ``_verdict`` has already
+        # returned ``terms_unreadable`` for a row whose multiplier ``_number`` refused. A guard
+        # here would be a branch nothing can reach, which reads as a case that can happen.
         and deliverable.units == deliverable.multiplier
     )
 
@@ -495,22 +562,47 @@ def _cents(value: float) -> int | None:
     """``value`` dollars as whole cents, or ``None`` when it is not a whole number of them.
 
     A penny-denominated amount scales to within a few units in the last place of an integer,
-    while a half-cent strike lands half a cent away, so the tolerance separates the two by
-    orders of magnitude rather than by a hair.
+    while a half-cent strike lands half a cent away, so the tolerance separates the two by orders
+    of magnitude rather than by a hair. The inexact case is real rather than theoretical, and
+    common: ``0.07 * 100`` is ``7.000000000000001`` and ``1.15 * 100`` is ``114.99999999999999``,
+    while ``757.38 * 100`` happens to be exactly ``75738.0``. Which pennies scale exactly is not
+    something a reader can predict, which is why the comparison never assumes it.
     """
     scaled = value * 100
     nearest = round(scaled)
     if abs(scaled - nearest) > _CENT_EPSILON:
         return None
+    if not _INT64_MIN <= nearest <= _INT64_MAX:
+        # ``intrinsic_cents`` is an ``int64`` column, and Python's own integers are not bounded,
+        # so a strike of ``1e17`` scales to a whole number of cents that ``pa.table`` then refuses
+        # while building the answer. That refusal arrives as an ``OverflowError`` from Arrow with
+        # the whole roster already computed, so the bound is checked here where the value can
+        # still become one contract's marker.
+        return None
     return int(nearest)
 
 
 def _number(value: object) -> float | None:
-    """``value`` as a float, or ``None`` when it is not a number.
+    """``value`` as a finite float, or ``None`` when it is not one.
 
-    A bool is excluded by name, because ``float(True)`` is ``1.0`` and would read as a strike
-    of one dollar.
+    A bool is excluded by name, because ``float(True)`` is ``1.0`` and would read as a strike of
+    one dollar. No test holds that clause and none can: both call sites read a ``pa.float64()``
+    column, and Arrow casts a bool to ``1.0`` as the partition is written, so a bool never
+    survives to be read back. It stays because ``bars._bar_close`` carries the same exclusion
+    where it *is* reachable, over vendor rows that are still plain dicts, and because a helper
+    that answers "is this a number" should not answer yes for ``True`` whoever calls it.
+
+    A NaN or an infinity is excluded for the reason the rest of this package already gives.
+    ``actions.build_entry`` refuses a non-finite amount because "a NaN amount also turns every
+    adjusted price it touches into a NaN", and ``splits._deliverable`` refuses a non-finite unit
+    count. Both are ``pa.float64()`` columns, like ``strike_price`` and ``close``, so the schema
+    permits the value and every reader has to decide what it means. Here it means the term cannot
+    be read: ``int(float("nan"))`` raises ``ValueError`` and ``int(float("inf"))`` raises
+    ``OverflowError``, so admitting one would end the read on a traceback and take the whole
+    roster with it, which is the opposite of what this view says it does with a bad contract.
     """
     if value is None or isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    if not isfinite(value):
         return None
     return float(value)

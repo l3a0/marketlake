@@ -21,6 +21,7 @@ from lake.splits import (
     Session,
     check_split_consistency,
     deliverable_of,
+    deliverable_of_row,
     require_scalar,
 )
 
@@ -248,6 +249,34 @@ def test_contracts_disagreeing_about_the_deliverable_raise():
 
     with pytest.raises(DeliverableUnreadable, match="disagree"):
         deliverable_of(session, frozenset({"SPY1"}))
+
+
+def test_the_row_door_reads_what_the_session_door_reads():
+    """``deliverable_of_row`` is the same parse given one row instead of a session's rows.
+
+    ``lake.settle`` needs a per-contract answer and the gate needs a per-root one. Two parsers
+    for one vendor column would be two answers to what a sealed row means, so the row door is a
+    door on the same reading rather than a second implementation. This is what says the two stay
+    in step: a change to ``_reading`` or ``_deliverable`` that moved one moves both.
+    """
+    root, row = _row("SPY1", 150.0, note="150 SPY")
+    session = _session((root, row))
+
+    assert deliverable_of_row(row, DAY) == deliverable_of(session, frozenset({"SPY1"}))
+
+
+def test_the_row_door_refuses_what_the_session_door_refuses_and_names_the_day():
+    """A row the parse cannot read raises, and the message carries the day it was handed.
+
+    The refusal is the whole difference in policy between the two callers: the gate lets it end
+    the boundary, and ``lake.settle`` catches it and marks that one contract. So the exception
+    has to reach the caller rather than being answered here.
+    """
+    _, row = _row("SPY1")
+    row["option_deliverables_list"] = "{not json"
+
+    with pytest.raises(DeliverableUnreadable, match=str(DAY)):
+        deliverable_of_row(row, DAY)
 
 
 def test_a_root_with_no_rows_raises():

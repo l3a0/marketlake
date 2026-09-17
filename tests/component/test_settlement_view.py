@@ -1,8 +1,9 @@
 """``settlement_view`` against a fixture lake on disk.
 
 Slice 4 fetches nothing, so a fixture lake is its whole test surface. Every test here crosses
-files: a sealed chains partition, a sealed daily bars partition, and the schema-version ledger.
-No vendor, no network, no wall clock, and the real lake is never touched.
+files: a sealed chains partition, the schema-version ledger, and a sealed daily bars partition
+except where its absence is the thing under test. No vendor, no network, no wall clock, and the
+real lake is never touched.
 
 **This file carries its own chains schema, and that is deliberate.** The view reads
 ``expiration_date``, ``strike_price``, ``put_call`` and ``settlement_type``, and
@@ -37,7 +38,7 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
-from lake import journal
+from lake import journal, oi
 from lake.loader import BarsAbsent, NoOptionClose, PartitionQuarantined
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
 from lake.settle import (
@@ -69,6 +70,11 @@ RECORDED_AT = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
 # SPY's 2026-09-15 daily close would be, taken from the live lake's own chain underlying, and the
 # 757.38 call is the contract a float comparison abandons and the OCC exercises.
 CLOSE = 757.39
+
+# What the chain's own `underlying_price` carries in this fixture. On the live lake it equals the
+# settled close; here it is a different number on purpose, so a view reading the close off the
+# chain rather than off `bars/` returns the wrong figure and a test sees it.
+CHAIN_UNDERLYING = 999.99
 ONE_CENT_ITM_CALL_STRIKE = 757.38
 ATM_STRIKE = 757.39
 ONE_CENT_OTM_CALL_STRIKE = 757.40
@@ -90,6 +96,14 @@ SETTLE_CHAINS_SCHEMA = pa.schema(
         ("put_call", pa.string()),
         ("strike_price", pa.float64()),
         ("expiration_date", pa.string()),
+        # The two vendor columns a wrong implementation would reach for instead of computing.
+        # Without them in the fixture, a view reading the close off ``underlying_price`` or
+        # returning the vendor's signed ``intrinsic_value`` passes every test in this file: the
+        # first raises a ``KeyError`` that reads as an unrelated failure and the second yields
+        # zero, which is what an out-of-the-money contract asserts anyway. They carry values that
+        # disagree with the right answer so that taking them is visible.
+        ("underlying_price", pa.float64()),
+        ("intrinsic_value", pa.float64()),
         ("settlement_type", pa.string()),
         ("multiplier", pa.float64()),
         ("non_standard", pa.bool_()),
@@ -124,6 +138,15 @@ def _deliverables(units: float | None, symbol: str = TICKER, *, cash: bool = Fal
     return json.dumps(entries)
 
 
+def _signed_intrinsic(strike: float, put_call: str) -> float:
+    """The vendor's `intrinsic_value`: the signed difference, with no floor.
+
+    Measured on the live lake, it matches this on 310 of SPY's 310 contracts expiring on
+    2026-09-15 and is negative on 155 of them.
+    """
+    return (CHAIN_UNDERLYING - strike) if put_call == "CALL" else (strike - CHAIN_UNDERLYING)
+
+
 def _contract(
     strike: float,
     *,
@@ -138,6 +161,8 @@ def _contract(
     cash: bool = False,
     note: str | None = None,
     close_tag: str = "option_close",
+    underlying_price: float | None = None,
+    intrinsic_value: float | None = None,
 ) -> dict:
     """One chains row at the close of record, carrying what this view reads.
 
@@ -158,6 +183,13 @@ def _contract(
         "expiration_date": stamp,
         "settlement_type": settlement_type,
         "multiplier": multiplier,
+        # The chain's own underlying at the option close, which on the live lake equals the
+        # settled close. Here it deliberately does not, so a view reading it is caught.
+        "underlying_price": CHAIN_UNDERLYING if underlying_price is None else underlying_price,
+        # The vendor's signed intrinsic, with no floor, which is what it really carries.
+        "intrinsic_value": (
+            _signed_intrinsic(strike, put_call) if intrinsic_value is None else intrinsic_value
+        ),
         "non_standard": non_standard,
         "mini": False,
         "option_deliverables_list": _deliverables(units, deliverable_symbol, cash=cash),
@@ -256,12 +288,32 @@ def test_1_the_roster_is_the_session_expiries_and_nothing_else(fixture_lake):
             _contract(760.0, put_call="PUT"),
             _contract(700.0, expires="2026-09-18"),
             _contract(800.0, put_call="PUT", expires="2026-12-18"),
+            # Already expired. A view comparing with <= rather than == sweeps this one in and
+            # settles a contract that stopped existing four sessions ago.
+            _contract(770.0, expires="2026-09-11"),
         ],
     )
     answer = _view(root)
-    assert answer.schema == SETTLEMENT_VIEW_SCHEMA
     assert [row["strike_price"] for row in _rows(answer)] == [750.0, 760.0]
     assert {row["session"] for row in _rows(answer)} == {SESSION}
+    # The shape is asserted against the literal contract rather than against the module's own
+    # constant, which would compare it to itself and hold nothing.
+    assert answer.schema.names == [
+        "ticker",
+        "session",
+        "occ_symbol",
+        "put_call",
+        "strike_price",
+        "multiplier",
+        "settlement_close",
+        "intrinsic_cents",
+        "exercised",
+        "verdict",
+        "reason",
+    ]
+    assert answer.schema.field("intrinsic_cents").type == pa.int64()
+    assert answer.schema.field("exercised").type == pa.bool_()
+    assert answer.schema.field("settlement_close").type == pa.float64()
 
 
 def test_2_the_close_is_the_daily_partitions_and_not_the_chains(fixture_lake):
@@ -274,6 +326,9 @@ def test_2_the_close_is_the_daily_partitions_and_not_the_chains(fixture_lake):
     row = _only(_view(root))
     assert row["settlement_close"] == 700.0
     assert row["intrinsic_cents"] == 5000
+    # The chain carries its own underlying, and on the live lake it equals the settled close. A
+    # view preferring it when it is present reads 999.99 here and settles at 34,999 cents.
+    assert row["settlement_close"] != CHAIN_UNDERLYING
 
 
 def test_17_the_expiry_is_read_from_the_stamps_eastern_date(fixture_lake):
@@ -297,6 +352,7 @@ def test_18_a_session_with_no_expiry_returns_an_empty_table(fixture_lake):
     answer = _view(root)
     assert answer.num_rows == 0
     assert answer.schema == SETTLEMENT_VIEW_SCHEMA
+    assert answer.schema.names[0] == "ticker" and answer.schema.names[-1] == "reason"
 
 
 def test_the_answer_is_ordered_by_occ_symbol(fixture_lake):
@@ -354,6 +410,11 @@ def test_5_an_out_of_the_money_contract_settles_at_zero(fixture_lake):
     assert [row["intrinsic_cents"] for row in rows] == [0, 0]
     assert [row["exercised"] for row in rows] == [False, False]
     assert {row["verdict"] for row in rows} == {VERDICT_SETTLED}
+    # The fixture writes the vendor's own column at its real shape, the signed difference
+    # against the chain's underlying with no floor. It is negative here, as it is on 155 of
+    # SPY's 310 contracts expiring on 2026-09-15, so a view returning that column instead of
+    # computing its own settles this put at a large negative number.
+    assert _signed_intrinsic(550.0, "PUT") < 0
 
 
 def test_6_a_puts_intrinsic_is_the_strike_less_the_close(fixture_lake):
@@ -366,6 +427,8 @@ def test_6_a_puts_intrinsic_is_the_strike_less_the_close(fixture_lake):
     row = _only(_view(root))
     assert row["intrinsic_cents"] == 261
     assert row["exercised"] is True
+    # The side is carried through rather than hardcoded, so a put comes back labelled a put.
+    assert row["put_call"] == "PUT"
 
 
 def test_the_multiplier_is_carried_so_a_caller_can_value_the_contract(fixture_lake):
@@ -400,6 +463,19 @@ def test_7_an_am_settled_contract_is_absent_and_the_rest_still_settles(fixture_l
     assert rows[1]["settlement_close"] == CLOSE
 
 
+def _withheld(row: dict, reason: str) -> None:
+    """A withheld row says what it is, why, and carries no number.
+
+    All three matter separately. The `verdict` is what a caller filters on, so a row carrying a
+    reason while still reading `settled` is picked up as an answer. And `intrinsic_cents` of 0
+    reads as at-the-money rather than as unanswered, so a withheld row carries null.
+    """
+    assert row["verdict"] == VERDICT_ABSENT
+    assert row["reason"] == reason
+    assert row["intrinsic_cents"] is None
+    assert row["exercised"] is None
+
+
 def test_8_a_contract_both_witnesses_call_non_standard_is_absent(fixture_lake):
     """Test 8. A contract delivering 150 shares, flagged non-standard, carries ``non_standard``.
 
@@ -412,7 +488,8 @@ def test_8_a_contract_both_witnesses_call_non_standard_is_absent(fixture_lake):
         [_contract(750.0), _contract(755.0, non_standard=True, units=150.0)],
     )
     rows = _rows(_view(root))
-    assert [row["reason"] for row in rows] == [None, REASON_NON_STANDARD]
+    assert rows[0]["verdict"] == VERDICT_SETTLED
+    _withheld(rows[1], REASON_NON_STANDARD)
 
 
 def test_9_a_flag_and_a_deliverable_that_disagree_are_absent(fixture_lake):
@@ -429,11 +506,8 @@ def test_9_a_flag_and_a_deliverable_that_disagree_are_absent(fixture_lake):
             _contract(755.0, non_standard=True, units=STANDARD_UNITS),
         ],
     )
-    rows = _rows(_view(root))
-    assert [row["reason"] for row in rows] == [
-        REASON_DELIVERABLE_DISAGREES,
-        REASON_DELIVERABLE_DISAGREES,
-    ]
+    for row in _rows(_view(root)):
+        _withheld(row, REASON_DELIVERABLE_DISAGREES)
 
 
 def test_9b_a_cash_leg_and_a_foreign_deliverable_are_not_shares_at_strike(fixture_lake):
@@ -450,10 +524,8 @@ def test_9b_a_cash_leg_and_a_foreign_deliverable_are_not_shares_at_strike(fixtur
             _contract(755.0, deliverable_symbol="IVV", note="100 IVV"),
         ],
     )
-    assert [row["reason"] for row in _rows(_view(root))] == [
-        REASON_DELIVERABLE_DISAGREES,
-        REASON_DELIVERABLE_DISAGREES,
-    ]
+    for row in _rows(_view(root)):
+        _withheld(row, REASON_DELIVERABLE_DISAGREES)
 
 
 def test_10_a_strike_that_is_not_a_whole_cent_is_absent(fixture_lake):
@@ -464,7 +536,8 @@ def test_10_a_strike_that_is_not_a_whole_cent_is_absent(fixture_lake):
     """
     root = _lake(fixture_lake, [_contract(750.0), _contract(750.005)])
     rows = _rows(_view(root))
-    assert [row["reason"] for row in rows] == [None, REASON_STRIKE_NOT_IN_CENTS]
+    assert rows[0]["verdict"] == VERDICT_SETTLED
+    _withheld(rows[1], REASON_STRIKE_NOT_IN_CENTS)
 
 
 def test_a_row_missing_a_term_is_absent_rather_than_dropped(fixture_lake):
@@ -482,9 +555,8 @@ def test_a_row_missing_a_term_is_absent_rather_than_dropped(fixture_lake):
             _contract(760.0, put_call="PUT", non_standard=None),
         ],
     )
-    rows = _rows(_view(root))
-    assert [row["reason"] for row in rows] == [REASON_TERMS_UNREADABLE] * 3
-    assert [row["verdict"] for row in rows] == [VERDICT_ABSENT] * 3
+    for row in _rows(_view(root)):
+        _withheld(row, REASON_TERMS_UNREADABLE)
 
 
 # -- what refuses the whole read -------------------------------------------------------
@@ -607,3 +679,197 @@ def test_16_two_candles_for_the_session_take_the_last_by_stamp(fixture_lake):
     row = _only(_view(root))
     assert row["settlement_close"] == CLOSE
     assert row["intrinsic_cents"] == 10739
+
+
+# -- what the mutation pass on #384 found nothing holding ------------------------------
+
+
+def test_a_basket_and_a_cash_only_deliverable_are_each_caught_alone(fixture_lake):
+    """Each clause of the deliverable test is tripped by a payload only it catches.
+
+    The cash fixture in test 9b also carries two entries, so the two clauses cover for each
+    other and either can be deleted with the suite green. A basket of two stocks with no cash
+    leg trips only the entry count, and a single stock entry carrying a currency type trips only
+    the cash clause.
+    """
+    stock = {
+        "assetType": "STOCK",
+        "currencyType": None,
+        "deliverableUnits": 100.0,
+        "symbol": TICKER,
+    }
+    bond = {
+        "assetType": "BOND",
+        "currencyType": None,
+        "deliverableUnits": 1.0,
+        "symbol": "T-BILL",
+    }
+    # Written in place, because `_contract` builds only the shapes a plain contract takes.
+    contracts = [_contract(750.0), _contract(755.0), _contract(760.0)]
+    contracts[1]["option_deliverables_list"] = json.dumps([stock, bond])
+    contracts[2]["option_deliverables_list"] = json.dumps([{**stock, "currencyType": "USD"}])
+    root = _lake(fixture_lake, contracts)
+    rows = _rows(_view(root))
+    assert rows[0]["verdict"] == VERDICT_SETTLED
+    _withheld(rows[1], REASON_DELIVERABLE_DISAGREES)
+    _withheld(rows[2], REASON_DELIVERABLE_DISAGREES)
+
+
+def test_an_inexact_penny_still_settles(fixture_lake):
+    """A dollar amount whose scaling is not exact settles rather than reading as a half cent.
+
+    Every value in the rest of this file scales exactly: `757.38 * 100` is `75738.0`. Plenty do
+    not, and which ones is unpredictable: `1.15 * 100` is `114.99999999999999`. That is the
+    whole job of `_CENT_EPSILON`, and without a case in the inexact family the constant can be
+    set to zero, or `round` replaced by truncation, with nothing failing.
+    """
+    root = _lake(fixture_lake, [_contract(1.15)], [_bar(1.16)])
+    row = _only(_view(root))
+    assert row["verdict"] == VERDICT_SETTLED
+    assert row["intrinsic_cents"] == 1
+    assert row["exercised"] is True
+
+
+def test_a_stamp_whose_utc_and_eastern_dates_differ_reads_as_eastern(fixture_lake):
+    """A contract stamped at 00:30 UTC on the next day expires on this session.
+
+    Every other stamp in this file is 20:00 UTC, whose UTC and Eastern dates agree, so nothing
+    else here tells the two readings apart. `journal.py` pins that a stamp names the session its
+    Eastern date falls on, and this is the case where obeying that rule and ignoring it give
+    different rosters.
+    """
+    root = _lake(
+        fixture_lake,
+        [_contract(750.0, expiration_date=f"{NEXT_SESSION}T00:30:00.000+00:00")],
+    )
+    row = _only(_view(root))
+    assert row["verdict"] == VERDICT_SETTLED
+
+
+def test_a_naive_expiration_stamp_refuses_rather_than_reading_the_machines_clock(fixture_lake):
+    """A stamp with no UTC offset is one this view cannot read.
+
+    It parses cleanly, and `astimezone` then resolves it against whatever timezone the process
+    runs in, so the same chain would put this contract in the roster on one machine and leave it
+    out on another with nothing raised. That is the silently short roster the refusal exists for.
+    The weakness is `bars.session_of`'s own, marketlake #385.
+    """
+    root = _lake(fixture_lake, [_contract(750.0, expiration_date=f"{SESSION}T20:00:00.000")])
+    with pytest.raises(ExpirationUnreadable):
+        _view(root)
+
+
+def test_a_plain_date_expiration_refuses_too(fixture_lake):
+    """The plain-date spelling is refused rather than misread, for the same reason.
+
+    `2026-09-15` parses as midnight with no offset, so before the guard above it read as the
+    session on an Eastern machine and as the session before it on a UTC one.
+    """
+    root = _lake(fixture_lake, [_contract(750.0, expiration_date=SESSION)])
+    with pytest.raises(ExpirationUnreadable):
+        _view(root)
+
+
+def test_a_null_settlement_type_is_unreadable_rather_than_am_settled(fixture_lake):
+    """A missing settlement code is the absence of a claim, not a claim about the open.
+
+    An inequality against the PM code folds the two together, and one of them asserts the
+    contract settles at the opening print. The lake holds the second shape: SPY's 2026-09-02
+    close of record carries two rows with a null `settlement_type`.
+    """
+    root = _lake(fixture_lake, [_contract(750.0), _contract(755.0, settlement_type=None)])
+    rows = _rows(_view(root))
+    assert rows[0]["verdict"] == VERDICT_SETTLED
+    _withheld(rows[1], REASON_TERMS_UNREADABLE)
+
+
+def test_an_am_settled_contract_that_is_also_non_standard_reads_am_settled(fixture_lake):
+    """The order of the checks is widest question first, and this is what pins it.
+
+    Every other AM fixture here is standard in all other respects, so the AM check can be moved
+    to the end with nothing failing. A contract that trips two conditions is what says which one
+    answers.
+    """
+    root = _lake(
+        fixture_lake,
+        [_contract(750.0, settlement_type="A", non_standard=True, units=150.0)],
+    )
+    _withheld(_only(_view(root)), REASON_AM_SETTLED)
+
+
+def test_an_unknown_side_is_a_term_this_view_cannot_read(fixture_lake):
+    """A `put_call` that is neither CALL nor PUT has no intrinsic direction.
+
+    Without this the side check can be deleted, and the contract then falls through the call
+    branch's `else` and is settled as a put: a wrong number rather than a marker.
+    """
+    root = _lake(fixture_lake, [_contract(750.0, put_call="STRADDLE")])
+    _withheld(_only(_view(root)), REASON_TERMS_UNREADABLE)
+
+
+def test_a_null_strike_is_a_term_this_view_cannot_read(fixture_lake):
+    """A contract with no strike cannot be settled and does not take the roster with it."""
+    contracts = [_contract(750.0), _contract(755.0)]
+    contracts[1]["strike_price"] = None
+    root = _lake(fixture_lake, contracts)
+    rows = _rows(_view(root))
+    assert rows[0]["verdict"] == VERDICT_SETTLED
+    _withheld(rows[1], REASON_TERMS_UNREADABLE)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), 1e17])
+def test_a_non_finite_or_oversized_strike_marks_one_row(fixture_lake, bad):
+    """A NaN, an infinity or a strike no `int64` can carry marks its contract and no more.
+
+    Each of these ends the read on a traceback if it reaches the arithmetic: `int(nan)` raises
+    `ValueError`, `int(inf)` raises `OverflowError`, and `1e17` scaled to cents overflows the
+    `int64` column while Arrow builds the answer. Every one would take the whole roster with it,
+    which is the opposite of what this view says it does with a bad contract. `strike_price` is
+    a `pa.float64()`, so all four are values the schema permits.
+    """
+    contracts = [_contract(750.0), _contract(755.0)]
+    contracts[1]["strike_price"] = bad
+    root = _lake(fixture_lake, contracts)
+    rows = _rows(_view(root))
+    assert len(rows) == 2
+    assert rows[0]["verdict"] == VERDICT_SETTLED
+    assert rows[1]["verdict"] == VERDICT_ABSENT
+    assert rows[1]["reason"] in (REASON_TERMS_UNREADABLE, REASON_STRIKE_NOT_IN_CENTS)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_a_non_finite_close_refuses_the_read(fixture_lake, bad):
+    """A close that is not a number settles nothing on the session.
+
+    It says so by name rather than ending the read on a traceback out of the arithmetic.
+    """
+    root = _lake(fixture_lake, [_contract(750.0)], [_bar(bad)])
+    with pytest.raises(CloseUnreadable):
+        _view(root)
+
+
+def test_an_empty_daily_partition_refuses_the_read(fixture_lake):
+    """A bars partition holding no row has no close, and does not settle everything at zero.
+
+    `load_bars` has no empty-partition refusal of its own, unlike `load_chain`, so this branch is
+    reachable and without a test the close can be initialised to `0.0` with nothing failing.
+    """
+    root = _lake(fixture_lake, [_contract(750.0)], [])
+    with pytest.raises(CloseUnreadable):
+        _view(root)
+
+
+def test_the_verdict_and_reason_tokens_are_the_spellings_d19_pinned(fixture_lake):
+    """The answer's tokens are literal strings, not whatever the constants happen to say.
+
+    Every other test imports the constants, so respelling one moves the test with it. #382 asks
+    for D19's vocabulary reused rather than a synonym coined, which is a claim about the strings.
+    """
+    assert VERDICT_SETTLED == "settled"
+    assert VERDICT_ABSENT == "absent"
+    assert REASON_AM_SETTLED == "am_settled"
+    assert REASON_NON_STANDARD == "non_standard"
+    assert REASON_DELIVERABLE_DISAGREES == "deliverable_disagrees"
+    assert REASON_STRIKE_NOT_IN_CENTS == "strike_not_in_cents"
+    assert REASON_TERMS_UNREADABLE == "terms_unreadable"
+    assert (VERDICT_SETTLED, VERDICT_ABSENT) == (oi.VERDICT_SETTLED, oi.VERDICT_ABSENT)
