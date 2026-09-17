@@ -212,6 +212,50 @@ class LedgerLineError(ActionsError):
         self.position = position
 
 
+class LedgerNotUtf8(ActionsError):
+    """Raised for a ledger whose bytes this reader cannot decode as UTF-8.
+
+    ``read_text`` decodes strictly, so one byte that is not valid UTF-8 raises
+    ``UnicodeDecodeError``. That is a ``ValueError`` rather than an ``ActionsError`` or an
+    ``OSError``, so it lands in none of the tuples a damaged ledger is meant to be caught by,
+    and the whole 18:30 run ends on it. ``manifest.LedgerNotUtf8`` is the same defect on the
+    quarantine ledger and marketlake #495 closed it there. This is the corporate-actions
+    ledger's half, and marketlake #499 carries both.
+
+    **It is a new class rather than a reuse of either neighbour.** ``LedgerLineError`` takes a
+    ``position`` and renders "entry N ...", and a file that will not decode has a byte offset
+    rather than an entry position. ``manifest.LedgerNotUtf8`` is a ``ManifestError``, and
+    ``main`` below already prints a line for that class about a damaged *quarantine* ledger, so
+    raising it here would file this file under the wrong family and send an operator to the
+    wrong repair.
+
+    **It is an ``ActionsError`` so that it needs no tuple anywhere widened.**
+    ``sweep._LEDGER_REFUSALS`` and ``sweep._BARS_REFUSALS`` both name ``ActionsError`` as the
+    class rather than one of its members, which marketlake #497 made true, so the nightly run
+    contained this sibling on the day it was written. ``main`` is the surface that needed
+    something, because a general ``ActionsError`` reaches an operator as a stack there.
+
+    **Refusing beats decoding with a replacement, for the reason its quarantine sibling gives.**
+    A replacement character inside a JSON string leaves the line valid JSON with one field
+    silently rewritten, and this ledger's fields are the key every adjusted price is computed
+    through: a byte flipped inside ``ex_date`` files the action under a key no reader resolves,
+    so the split it records adjusts nothing and the view hands back an as-traded price under an
+    adjusted name.
+    """
+
+    def __init__(self, path: Path, offset: int, line: int, byte: int, reason: str) -> None:
+        super().__init__(
+            f"{path}: byte {offset} on line {line} is {byte:#04x}, which is not valid UTF-8 "
+            f"({reason}). Nothing in this lake writes a byte outside ASCII, so these bytes were "
+            "changed by something other than a writer. Every entry in this file is unreadable "
+            "until that byte is repaired, so this ledger cannot say what any instrument's "
+            "adjustments are. Repairing a ledger is a human's job under the lock."
+        )
+        self.path = path
+        self.offset = offset
+        self.line = line
+
+
 class UnresolvedSymbol(ActionsError):
     """Raised when the master has no instrument for a symbol on the observation date.
 
@@ -311,6 +355,41 @@ def _require_utc(when: datetime, label: str) -> datetime:
 # -- reading -----------------------------------------------------------------
 
 
+def _decode(path: Path, raw: bytes) -> str:
+    """The ledger's bytes as text, or :class:`LedgerNotUtf8` naming the byte that refused.
+
+    ``read_text`` is not used, for two reasons that both reach this file.
+
+    It decodes strictly, so its ``UnicodeDecodeError`` escapes every containment named around
+    this ledger. ``tickers.py`` and ``config.py`` already write that rule down for their own
+    files, and ``manifest._decode`` writes it for the quarantine ledger. This is the third.
+
+    It also decodes in the **locale's** encoding rather than UTF-8. Python 3.12 turns UTF-8
+    mode on by itself under a C locale, so a bare ``LC_ALL=C`` is harmless, and it takes UTF-8
+    mode being off as well before the decode narrows to ASCII. A ledger a writer produced
+    survives even that, because ``json.dumps`` leaves ``ensure_ascii`` at its default, and no
+    installed launchd job sets a locale or turns UTF-8 mode off. So pinning the encoding removes
+    a dependence on an interpreter flag nobody tracks rather than a failure anything has met.
+
+    ``manifest.decode_utf8`` is not reused, although the rule is identical, because it raises
+    ``manifest.LedgerNotUtf8``. That is a ``ManifestError``, and :func:`main` already prints a
+    line for that class about a damaged quarantine ledger. This file wants its own family, so it
+    gets its own decoder and the two stay one rule written twice rather than one class raised
+    about two files.
+
+    **The message sends the person repairing the file to the byte and to the line.** The
+    exception carries the byte offset alone, which is the wrong unit for an editor, so the line
+    is counted from the newlines in front of it, the same care ``manifest.decode_utf8`` takes
+    for the same reader.
+    """
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise LedgerNotUtf8(
+            path, exc.start, raw.count(b"\n", 0, exc.start) + 1, raw[exc.start], exc.reason
+        ) from exc
+
+
 def read(lake_root: Path | str) -> list[dict]:
     """Every entry in file order, with the torn trailing line discarded.
 
@@ -328,7 +407,7 @@ def read(lake_root: Path | str) -> list[dict]:
     path = actions_path(lake_root)
     if not path.exists():
         return []
-    return parse_jsonl(path.read_text())
+    return parse_jsonl(_decode(path, path.read_bytes()))
 
 
 def entry_line_count(lake_root: Path | str) -> int:
@@ -337,11 +416,30 @@ def entry_line_count(lake_root: Path | str) -> int:
     This is the manifest entry's row count. It counts what was written rather than what
     reads back, so it never falls after a line the read cannot parse, and comparing it
     against ``len(read(...))`` is how a damaged ledger announces itself.
+
+    **This read pins the encoding and still never refuses, and both halves matter.** It sits on
+    the write path, inside :func:`append`, after ``append_line`` has already landed the line and
+    before ``record_partition`` records the entry that describes it. A raise between those two
+    leaves the ledger a line longer than its manifest entry and no later run repairs it, which
+    is marketlake #523. So this decodes with a replacement rather than through :func:`_decode`,
+    which is the opposite of what :func:`read` does one function above and is right for the
+    opposite reason: a count resolves nothing, so a replaced character cannot mislead anything.
+    ``manifest.LedgerNotUtf8``'s docstring blesses that precedent for ``_backup_scrub``, and a
+    count is the second place it fits.
+
+    **A replacement never changes the count, and counting over the raw bytes would.**
+    ``bytes.splitlines`` splits on fewer separators than ``str.splitlines``, so a hand edit
+    holding ``U+2028`` or ``U+0085`` inside a field counts one line over the bytes where it
+    counts two over the text. A count that falls is exactly what ``manifest.guard_row_count``
+    raises on. Decoding with a replacement keeps ``str.splitlines`` and substitutes only inside
+    a line, so the count is the one this function has always returned on every file that used to
+    decode, and it answers on the files that did not.
     """
     path = actions_path(lake_root)
     if not path.exists():
         return 0
-    return sum(1 for line in path.read_text().splitlines() if line.strip())
+    text = path.read_bytes().decode("utf-8", "replace")
+    return sum(1 for line in text.splitlines() if line.strip())
 
 
 def entry_key(entry: dict, *, path: Path, position: int) -> ActionKey:
@@ -1450,6 +1548,22 @@ def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> in
     except MasterUnreadable as exc:
         print(f"actions: {exc}. Restore it from the backup.", file=sys.stderr)
         return 2
+    except LedgerNotUtf8 as exc:
+        # **A line rather than a stack, for the reason the ``ManifestError`` arm below gives.**
+        # It is the same kind of mistake with a different file behind it, so it gets the same
+        # treatment. Caught apart from that arm because the two name different files and the
+        # repair is the same sentence about a different one.
+        #
+        # This catches the new class alone rather than ``ActionsError`` as a whole.
+        # ``docs/design.md`` says the lake-state errors keep their stack on purpose, because a
+        # corrupt lake wants the frames that name where the corruption was found, and widening
+        # to the base class here would quietly reverse that.
+        print(
+            f"actions: {exc} Repair it by hand under the lake-root lock, or restore it from "
+            "the backup.",
+            file=sys.stderr,
+        )
+        return 2
     except ManifestError as exc:
         # Both walks read sealed partitions through ``lake.loader``, which resolves the
         # quarantine ledger on every one it opens, so a damaged ledger stops this command the
@@ -1496,6 +1610,7 @@ __all__ = [
     "HeldFinding",
     "Landed",
     "LedgerLineError",
+    "LedgerNotUtf8",
     "MasterAbsent",
     "Skip",
     "UnresolvedSymbol",

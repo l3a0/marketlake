@@ -1478,3 +1478,35 @@ def test_an_absent_master_raises_rather_than_holding_one_finding_per_ticker_day(
         extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
 
     assert _findings(root, DAY_ONE) == []
+
+
+def test_the_command_against_an_undecodable_actions_ledger_is_a_line_and_not_a_stack(
+    fixture_lake: FixtureLake, tmp_path: Path, capsys
+):
+    """Marketlake #499's operator surface, which is the half the nightly run did not need.
+
+    ``sweep._LEDGER_REFUSALS`` names ``ActionsError`` as the class, so the 18:30 walk contained
+    the new refusal on the day it was written. This command did not: ``actions.main`` catches
+    ``MasterAbsent``, ``MasterUnreadable`` and ``ManifestError``, and nothing else from this
+    module's family, so the refusal arrived as a stack.
+
+    The handler names the new class alone rather than ``ActionsError``. ``docs/design.md`` says
+    the lake-state errors keep their stack on purpose, because a corrupt lake wants the frames
+    that name where the corruption was found, and widening to the base class here would reverse
+    that quietly.
+    """
+    root = _lake(fixture_lake, {("SPY", DAY_ONE): [_row(DAY_ONE)]})
+    ledger = actions.actions_path(root)
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_bytes(b'{"instrument_id": 1, "ex_date": "2026-06-18", "type": "divid\xffnd"}\n')
+    config = write_config(tmp_path, root)
+
+    code = actions.main(["--config", str(config)], clock=ManualClock(FIRST_NIGHT))
+
+    assert code == 2
+    printed = capsys.readouterr().err
+    assert "Traceback" not in printed
+    assert printed.startswith("actions: ")
+    assert str(ledger) in printed, "the line does not say which file to open"
+    assert "not valid UTF-8" in printed
+    assert "Repair it by hand under the lake-root lock" in printed

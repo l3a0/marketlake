@@ -488,3 +488,178 @@ def test_an_append_after_a_torn_line_keeps_the_writer_working(lake_root):
     # The count the manifest carries is above what the damaged file reads back, which is
     # the signal that the ledger needs a human.
     assert len(actions.read(lake_root)) < latest_entries(lake_root)[ACTIONS_PARTITION]["rows"]
+
+
+def _damage(path: Path, needle: bytes, replacement: bytes) -> None:
+    """Change one byte of an already written ledger, the way bit rot or a hand edit does."""
+    raw = path.read_bytes()
+    assert raw.count(needle) == 1, "the fixture no longer says what it meant to"
+    path.write_bytes(raw.replace(needle, replacement))
+
+
+def test_a_ledger_that_is_not_utf8_refuses_as_an_actions_error(lake_root):
+    """Site 2 of marketlake #499, and ``manifest.LedgerNotUtf8``'s sibling on this file.
+
+    ``read_text`` decoded strictly, so ``UnicodeDecodeError`` came out of here. It is a
+    ``ValueError`` and therefore not an ``ActionsError``, so it reached neither
+    ``sweep._LEDGER_REFUSALS`` nor ``sweep._BARS_REFUSALS`` and ended the whole 18:30 run.
+
+    The class is what matters more than the name. Both tuples name ``ActionsError`` rather than
+    one of its members, which marketlake #497 made true, so this sibling was contained on the
+    day it was written and no tuple anywhere had to be widened. That is asserted here rather
+    than assumed, because the containment is what the refusal is for.
+    """
+    _dividend(lake_root, cash_amount=1.60, recorded_at=RECORDED)
+    _damage(actions_path(lake_root), b'"dividend"', b'"dividen\xff"')
+
+    with pytest.raises(actions.LedgerNotUtf8) as refusal:
+        actions.read(lake_root)
+
+    assert isinstance(refusal.value, actions.ActionsError)
+    assert not isinstance(refusal.value, ValueError), "a ValueError is what escaped every tuple"
+    assert str(actions_path(lake_root)) in str(refusal.value)
+
+    from lake.sweep import _BARS_REFUSALS, _LEDGER_REFUSALS
+
+    assert isinstance(refusal.value, _LEDGER_REFUSALS)
+    assert isinstance(refusal.value, _BARS_REFUSALS)
+
+
+def test_the_actions_refusal_names_the_byte_and_the_line_a_repair_has_to_find(lake_root):
+    """The number's whole job is to send the person repairing the file to the right place.
+
+    ``UnicodeDecodeError`` carries a byte offset alone, which is the wrong unit for an editor,
+    so the line is counted from the newlines in front of it. Two whole entries land first, so a
+    line number taken from the entries rather than the bytes would read 1 here.
+    """
+    _dividend(lake_root, cash_amount=1.60, recorded_at=RECORDED)
+    _dividend(lake_root, cash_amount=1.65, recorded_at=CORRECTED, ex_date="2026-06-19")
+    _damage(actions_path(lake_root), b'"2026-06-19"', b'"2026-06-\xff9"')
+
+    with pytest.raises(actions.LedgerNotUtf8) as refusal:
+        actions.read(lake_root)
+
+    message = str(refusal.value)
+    assert "on line 2" in message, message
+    assert "0xff" in message, message
+    # Derived from the fixture rather than typed, so a mutant hard-coding the number fails.
+    offset = actions_path(lake_root).read_bytes().index(b"\xff")
+    assert f"byte {offset} " in message, message
+    assert "invalid start byte" in message, message
+    assert "writes a byte outside ASCII" in message, message
+    assert "human's job under the lock" in message, message
+    # The consequence names this ledger's loss. ``manifest``'s sentence is about the partitions
+    # a quarantine ledger withholds, and this file withholds nothing.
+    assert "adjustments" in message, message
+    assert "withholds" not in message, message
+
+
+def test_the_actions_refusal_is_not_a_replacement_because_replacing_mangles_the_key(lake_root):
+    """Why this refuses instead of decoding with ``errors="replace"``, which is one line.
+
+    A replacement character inside a JSON string leaves the line **valid JSON** with one field
+    silently rewritten, and every field this ledger resolves on is part of the key. A byte
+    flipped inside ``ex_date`` files the action under a key no reader asks for, so the event it
+    records adjusts nothing and ``load_bars`` hands back an as-traded price under an adjusted
+    name. The assertions below are what a replacement would produce, stated as what must not
+    happen.
+    """
+    _dividend(lake_root, cash_amount=1.60, recorded_at=RECORDED)
+    _damage(actions_path(lake_root), b'"2026-06-18"', b'"2026-06-\xff8"')
+
+    with pytest.raises(actions.LedgerNotUtf8):
+        actions.latest(lake_root)
+
+    replaced = actions_path(lake_root).read_bytes().decode("utf-8", "replace")
+    entry = json.loads(replaced.splitlines()[0])
+    assert entry["ex_date"] != "2026-06-18", "the premise of this test no longer holds"
+    assert entry["type"] == TYPE_DIVIDEND
+
+
+def test_a_hand_repaired_actions_ledger_may_hold_non_ascii_and_still_reads(lake_root):
+    """The accepting side of the boundary, which is where narrowing it would do the damage.
+
+    No writer here emits a byte outside ASCII, so decoding as ASCII would pass every test the
+    tree has and still refuse a ledger a human had just repaired. Repairing this file is a hand
+    edit under the lock, and a person writes the characters their language has.
+    """
+    entry = {"instrument_id": 1, "ex_date": "2026-06-18", "type": TYPE_DIVIDEND, "note": "café"}
+    actions_path(lake_root).parent.mkdir(parents=True, exist_ok=True)
+    actions_path(lake_root).write_bytes(
+        (json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+    )
+
+    assert max(actions_path(lake_root).read_bytes()) > 127, "the fixture stopped being the case"
+    assert actions.read(lake_root)[0]["note"] == "café"
+
+
+def test_the_count_answers_on_a_ledger_the_read_refuses_and_never_falls(lake_root):
+    """Site 3 of marketlake #499, and the half that must **not** refuse.
+
+    This count sits inside ``append``, after ``append_line`` has landed the line and before
+    ``record_partition`` records the entry describing it. A raise between those two leaves the
+    ledger a line longer than its manifest entry, which is marketlake #523, so the count keeps
+    its direct read and answers where the reader above refuses.
+
+    The number is what the count always returned. A replacement substitutes inside a line and
+    never changes how many lines there are, which is the property counting over the raw bytes
+    would lose.
+    """
+    _dividend(lake_root, cash_amount=1.60, recorded_at=RECORDED)
+    _dividend(lake_root, cash_amount=1.65, recorded_at=CORRECTED, ex_date="2026-06-19")
+    assert actions.entry_line_count(lake_root) == 2
+
+    _damage(actions_path(lake_root), b'"2026-06-19"', b'"2026-06-\xff9"')
+
+    with pytest.raises(actions.LedgerNotUtf8):
+        actions.read(lake_root)
+    assert actions.entry_line_count(lake_root) == 2, "the count stopped answering"
+
+
+def test_counting_over_the_raw_bytes_would_let_the_count_fall(lake_root):
+    """Why the count decodes rather than counting newlines over ``read_bytes``.
+
+    ``bytes.splitlines`` splits on fewer separators than ``str.splitlines``, so a hand edit
+    holding ``U+2028`` inside a field counts one line over the bytes where it counts two over
+    the text. A count that falls is exactly what ``manifest.guard_row_count`` raises on, and
+    the raise would land after ``append_line`` had already written the line.
+
+    The byte count is computed here rather than described, so the gap this avoids is a
+    measurement rather than a claim.
+    """
+    raw = (
+        json.dumps({"instrument_id": 1, "ex_date": "2026-06-18", "type": TYPE_DIVIDEND}) + "\n"
+    ).encode("utf-8") + (
+        json.dumps({"instrument_id": 2, "note": "a b"}, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    actions_path(lake_root).parent.mkdir(parents=True, exist_ok=True)
+    actions_path(lake_root).write_bytes(raw)
+
+    over_bytes = sum(1 for line in raw.splitlines() if line.strip())
+    assert over_bytes == 2, "the fixture stopped separating the two counts"
+    assert actions.entry_line_count(lake_root) == 3
+
+
+def test_both_actions_reads_pin_utf8_rather_than_the_locales_encoding(lake_root, monkeypatch):
+    """``read_text`` with no argument decodes in the locale's encoding, and neither read does.
+
+    Python 3.12 turns UTF-8 mode on by itself under a C locale, so a hostile locale cannot be
+    set from inside this process, and tests here never shell out. What holds the pinning instead
+    is the method neither read may call: patched to raise, a revert to ``read_text`` fails here
+    rather than passing on a machine whose locale happens to be UTF-8.
+
+    Both reads are driven, because they were fixed for opposite reasons and a test covering one
+    would leave the other free to go back.
+    """
+    entry = {"instrument_id": 1, "ex_date": EX_DATE, "type": TYPE_DIVIDEND, "note": "café"}
+    actions_path(lake_root).parent.mkdir(parents=True, exist_ok=True)
+    actions_path(lake_root).write_bytes(
+        (json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+    )
+
+    def refuse(*args, **kwargs):  # pragma: no cover - neither call may reach it
+        raise AssertionError("the ledger was read in the locale's encoding")
+
+    monkeypatch.setattr(Path, "read_text", refuse)
+    assert actions.read(lake_root)[0]["note"] == "café"
+    assert actions.entry_line_count(lake_root) == 1

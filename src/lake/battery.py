@@ -520,11 +520,29 @@ def entry_line_count(lake_root: Path | str) -> int:
     line the read cannot parse ends the read, so a parsed count can fall below the manifested
     one, and the manifest's row-count guard would then raise on every later append after that
     append had already written its line. A line count only ever grows.
+
+    **This read pins the encoding and still never refuses, and ``docs/design.md`` asked for
+    both.** The design doc places this function outside ``manifest.read_quarantine``'s refusals
+    "because it counts lines for the manifest row count and resolves nothing, and a count on the
+    write path must not refuse". That sentence was written about a torn ledger, where a direct
+    read still answers. A file that will not decode breaks its premise, because ``read_text``
+    gives the count no text to count, so :func:`write_verdict` raised after ``append_line`` had
+    landed its line. Executed against `6496640`, ``append_verdict`` on such a ledger left the
+    file two lines long with its manifest entry still reading one row, and three runs left it
+    four lines long against the same frozen entry. Marketlake #499 answers that sentence rather
+    than deleting it: the count keeps its direct read and resolves nothing, and it answers where
+    it used to raise.
+
+    A replacement is right here for the reason it is wrong in ``manifest.read_quarantine``. That
+    reader resolves a verdict, so a silently rewritten field inverts the guard. This resolves
+    nothing, and a replacement substitutes only inside a line, so it cannot change how many
+    lines there are. ``actions.entry_line_count`` carries why counting over the raw bytes would.
     """
     path = quarantine_path(Path(lake_root))
     if not path.exists():
         return 0
-    return sum(1 for line in path.read_text().splitlines() if line.strip())
+    text = path.read_bytes().decode("utf-8", "replace")
+    return sum(1 for line in text.splitlines() if line.strip())
 
 
 def append_verdict(

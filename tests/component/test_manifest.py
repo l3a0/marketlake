@@ -11,11 +11,13 @@ import json
 import os
 import threading
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from lake import manifest
 from lake.manifest import (
     LedgerNotUtf8,
     ManifestError,
@@ -640,6 +642,12 @@ def test_the_manifest_ledger_keeps_its_truncating_read(lake_root):
     ``scrub`` resolves the manifest through ``latest_entries``, so raising here would take
     the Sunday scrub down on the very file it exists to report. The quarantine ledger's
     readers are a guard and refuse. The manifest's read short, and #447 owns that half.
+
+    **This is the torn tail and it is the whole of what this holds.** The argument above
+    protects a read that still answers, which a torn one does: the entries in front of the tear
+    are real. Marketlake #499 narrowed it rather than widening it, because a manifest ledger
+    whose bytes will not decode answers nothing, so refusing that shape took nothing from the
+    scrub. The sibling below holds that half.
     """
     append_manifest(
         lake_root, partition="a", source="capture", sha256="s1", rows=1, fetched_at=None
@@ -695,3 +703,136 @@ def test_an_append_in_flight_never_refuses_a_ledger_nothing_is_wrong_with(lake_r
     assert not refusals, f"{len(refusals)} reads refused a ledger nothing is wrong with"
     assert reads, "no read completed, so this test proves nothing"
     assert len(read_quarantine(lake_root)) == appends
+
+
+def test_a_manifest_ledger_that_does_not_decode_refuses_as_a_manifest_error(lake_root):
+    """Site 1 of marketlake #499, and the half of #447's boundary that moved.
+
+    ``read_text`` decoded strictly, so ``UnicodeDecodeError`` came out of here. It is a
+    ``ValueError`` and so neither a ``ManifestError`` nor an ``OSError``, which are the two
+    families every containment around this ledger names, and this is the lake's most read file.
+
+    Refusing took nothing away, which is what separates this from the torn tail two tests above.
+    Measured against `6496640`, every reader below already raised on this file. The assertion is
+    on the class rather than on whether it raises.
+    """
+    append_manifest(
+        lake_root, partition="a", source="capture", sha256="s1", rows=1, fetched_at=None
+    )
+    path = manifest_path(lake_root)
+    raw = path.read_bytes()
+    assert raw.count(b"capture") == 1, "the fixture no longer says what it meant to"
+    path.write_bytes(raw.replace(b"capture", b"captur\xff"))
+
+    for reader in (read_manifest, latest_entries, scrub):
+        with pytest.raises(LedgerNotUtf8) as refusal:
+            reader(lake_root)
+        assert isinstance(refusal.value, ManifestError)
+
+    # The two guards on the write path reach the same read, through ``guard_row_count``, and a
+    # damaged manifest reaching them as a bare ``ValueError`` is what marketlake #523 measures.
+    with pytest.raises(LedgerNotUtf8):
+        would_shrink(lake_root, "a", 1)
+    with pytest.raises(LedgerNotUtf8):
+        guard_row_count(lake_root, "a", 1)
+
+
+def test_the_manifest_refusal_says_what_this_ledger_loses_rather_than_the_quarantine_ledger(
+    lake_root,
+):
+    """The consequence sentence is per ledger, and reusing one on the other misleads.
+
+    ``manifest.jsonl`` withholds nothing. A message telling its repairer that the file "cannot
+    say which partitions it withholds" names the quarantine ledger's loss on the manifest's file,
+    which sends them to the wrong question about the right file.
+
+    The byte and the line are asserted here too, because they come from the shared decode and a
+    caller that passed the wrong bytes would still produce a plausible sentence.
+    """
+    append_manifest(
+        lake_root, partition="a", source="capture", sha256="s1", rows=1, fetched_at=None
+    )
+    append_manifest(
+        lake_root, partition="b", source="capture", sha256="s2", rows=2, fetched_at=None
+    )
+    path = manifest_path(lake_root)
+    path.write_bytes(path.read_bytes().replace(b'"s2"', b'"s\xff"'))
+
+    with pytest.raises(LedgerNotUtf8) as refusal:
+        read_manifest(lake_root)
+
+    message = str(refusal.value)
+    assert "which partitions the lake holds" in message, message
+    assert "withholds" not in message, message
+    assert "on line 2" in message, message
+    # Derived from the fixture rather than typed, so a mutant hard-coding the number fails.
+    offset = path.read_bytes().index(b"\xff")
+    assert f"byte {offset} " in message, message
+    assert "0xff" in message, message
+    assert "human's job under the lock" in message, message
+
+
+def test_the_backup_canary_still_answers_on_a_manifest_every_other_reader_refuses(lake_root):
+    """The alarm sits outside the refusal, which the ranking directive asks for by name.
+
+    ``backup_scrub`` is the Sunday check on the removable disk, and it reads the manifest's bytes
+    itself and decodes them with a replacement rather than through ``_read_jsonl``. A refusal
+    reaching it would cost the run its canary over the damage the canary exists to report.
+
+    This is what makes routing ``_backup_scrub`` through the refusal a decision rather than a
+    tidy-up somebody does on the way past.
+    """
+    append_manifest(
+        lake_root, partition="a", source="capture", sha256="s1", rows=1, fetched_at=None
+    )
+    target = lake_root.parent / "backup"
+    target.mkdir()
+    manifest_path(target).write_bytes(manifest_path(lake_root).read_bytes())
+
+    path = manifest_path(lake_root)
+    path.write_bytes(path.read_bytes().replace(b"capture", b"captur\xff"))
+
+    with pytest.raises(LedgerNotUtf8):
+        read_manifest(lake_root)
+    result = manifest.backup_scrub(lake_root, target)
+    assert result.unreadable is None, result
+
+
+def test_a_hand_repaired_manifest_may_hold_non_ascii_and_still_reads(lake_root):
+    """The accepting side of the boundary, which is where narrowing it would do the damage.
+
+    No writer here emits a byte outside ASCII, so decoding as ASCII would pass every test the
+    tree has and still refuse a manifest a human had just repaired. The quarantine ledger's
+    sibling test found exactly that by mutation, and the manifest inherits the reason: repairing
+    this file is a hand edit under the lock, and a person writes the characters their language
+    has.
+    """
+    entry = {"partition": "quotes/ticker=CAFÉ/date=2026-09-16.parquet", "rows": 1}
+    raw = json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n"
+    manifest_path(lake_root).write_bytes(raw.encode("utf-8"))
+
+    assert max(manifest_path(lake_root).read_bytes()) > 127, "the fixture stopped being the case"
+    assert list(latest_entries(lake_root)) == [entry["partition"]]
+
+
+def test_the_manifest_read_pins_utf8_rather_than_the_locales_encoding(lake_root, monkeypatch):
+    """``read_text`` with no argument decodes in the locale's encoding, and this does not.
+
+    Python 3.12 turns UTF-8 mode on by itself under a C locale, so a hostile locale cannot be
+    set from inside this process, and tests here never shell out. What holds the pinning instead
+    is the method the read must not call: patched to raise, a revert to ``read_text`` fails here
+    rather than passing on a machine whose locale happens to be UTF-8.
+
+    Executed out of process against `6496640`, ``read_manifest`` under ``LC_ALL=C`` with
+    ``-X utf8=0`` raised ``UnicodeDecodeError`` on this file before the change.
+    """
+    entry = {"partition": "quotes/ticker=CAFÉ/date=2026-09-16.parquet", "rows": 1}
+    manifest_path(lake_root).write_bytes(
+        (json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+    )
+
+    def refuse(*args, **kwargs):  # pragma: no cover - the call under test must not reach it
+        raise AssertionError("the manifest read text in the locale's encoding")
+
+    monkeypatch.setattr(Path, "read_text", refuse)
+    assert read_manifest(lake_root)[0]["partition"] == entry["partition"]
