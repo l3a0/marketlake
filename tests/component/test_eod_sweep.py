@@ -2345,12 +2345,15 @@ def test_a_ledger_with_a_byte_order_mark_is_contained_and_the_run_still_files(
     fixture is one line rather than several. A second line makes the read stop with something
     behind it, and ``TornLedger`` already refuses that.
     """
-    from lake.manifest import BYTE_ORDER_MARK, append_line, quarantine_path
+    from lake.manifest import append_line, quarantine_path
 
     root = _lake(fixture_lake)
     ledger = quarantine_path(root)
     append_line(ledger, {"partition": "a", "verdict": "quarantined", "check": "e"})
-    ledger.write_bytes(BYTE_ORDER_MARK.encode("utf-8") + ledger.read_bytes())
+    # The literal bytes an editor writes, not ``manifest.BYTE_ORDER_MARK``. A fixture taken from
+    # the reader's own constant moves with it, so this case would keep passing while a real mark
+    # read clean again.
+    ledger.write_bytes(b"\xef\xbb\xbf" + ledger.read_bytes())
 
     outcome, pinger, _ = _run(root)
 

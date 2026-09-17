@@ -706,6 +706,15 @@ def test_an_append_in_flight_never_refuses_a_ledger_nothing_is_wrong_with(lake_r
 # -- a ledger carrying a byte-order mark refuses rather than reading wrong ----
 
 
+# The bytes an editor actually writes, spelled out rather than taken from the reader's own
+# constant. A fixture built from ``manifest.BYTE_ORDER_MARK`` moves whenever that constant moves,
+# so the suite would hold "the reader refuses whatever it is looking for" rather than "the reader
+# refuses a byte-order mark". The review lens found exactly that: repointing the constant at a
+# zero-width space passed all 4,296 tests while a real mark on a one-entry ledger read clean
+# again, which is marketlake #506 restored with the suite green.
+MARK_BYTES = b"\xef\xbb\xbf"
+
+
 def _mark_before(lake_root, needle: bytes) -> int:
     """Put a byte-order mark in front of ``needle`` and return its byte offset.
 
@@ -716,8 +725,19 @@ def _mark_before(lake_root, needle: bytes) -> int:
     raw = path.read_bytes()
     assert raw.count(needle) == 1, "the fixture no longer says what it meant to"
     offset = raw.index(needle)
-    path.write_bytes(raw[:offset] + BYTE_ORDER_MARK.encode("utf-8") + raw[offset:])
+    path.write_bytes(raw[:offset] + MARK_BYTES + raw[offset:])
     return offset
+
+
+def test_the_constant_the_reader_searches_for_is_the_byte_order_mark(lake_root):
+    """What every other case here would stop meaning if this moved.
+
+    The reader searches for a character and an editor writes bytes, so one assertion has to join
+    the two. Without it the constant can be repointed at any other invisible character and the
+    whole battery follows it, refusing something no editor writes while a real mark reads clean.
+    """
+    assert BYTE_ORDER_MARK.encode("utf-8") == MARK_BYTES
+    assert BYTE_ORDER_MARK == "\ufeff"
 
 
 def test_a_byte_order_mark_on_a_one_entry_ledger_refuses_instead_of_lifting_it(lake_root):
@@ -822,7 +842,7 @@ def test_the_refusal_names_the_character_because_no_number_can_locate_it(lake_ro
     offset = _mark_before(lake_root, b'{"check": "entitlement", "partition": "second"')
     assert offset > 0, "the fixture stopped testing a mark that is not leading"
     raw = quarantine_path(lake_root).read_bytes()
-    assert raw[offset : offset + 3] == BYTE_ORDER_MARK.encode("utf-8"), "the offset is not a byte"
+    assert raw[offset : offset + 3] == MARK_BYTES, "the offset is not a byte"
     assert offset != raw.decode("utf-8").index(BYTE_ORDER_MARK), (
         "the fixture stopped telling a byte offset apart from a character index"
     )
@@ -861,6 +881,32 @@ def test_the_refusal_tells_a_leading_mark_apart_because_the_repair_differs(lake_
     assert "leads the file" in message, message
     assert "re-saving as UTF-8 without a byte-order mark" in message, message
     assert "sits inside the file" not in message, message
+
+
+def test_a_second_mark_changes_the_repair_and_the_message_says_so(lake_root):
+    """The advice for one mark is false for two, and the message must not give it anyway.
+
+    Re-saving without a byte-order mark clears a leading one and clears nothing else. On a file
+    that holds a second, that advice sends the operator away believing the ledger is repaired.
+    The guard still holds, because the next read refuses again, but they acted on a sentence that
+    was not true and the character that proves it is invisible.
+
+    This also fixes which mark the number points at. Reporting the last one instead of the first
+    passes every other case here, since each of them holds exactly one.
+    """
+    append_quarantine(lake_root, _verdict("first"))
+    append_quarantine(lake_root, _verdict("second"))
+    path = quarantine_path(lake_root)
+    lines = path.read_bytes().splitlines(keepends=True)
+    path.write_bytes(MARK_BYTES + lines[0] + MARK_BYTES + lines[1])
+
+    with pytest.raises(LedgerHasByteOrderMark) as refusal:
+        read_quarantine(lake_root)
+
+    message = str(refusal.value)
+    assert "byte 0 on line 1" in message, message
+    assert "first of 2 in this file" in message, message
+    assert "re-saving as UTF-8 without a byte-order mark removes it" not in message, message
 
 
 def test_a_torn_first_append_still_reads_as_an_empty_ledger(lake_root):

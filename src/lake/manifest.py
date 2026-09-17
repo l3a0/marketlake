@@ -229,6 +229,12 @@ class LedgerHasByteOrderMark(ManifestError):
     **The message names the character rather than only locating it.** Both sibling refusals send
     the repairer to a number, and that unit fails here: the character is invisible, so an
     operator sent to line 1 opens the file and sees nothing wrong.
+
+    **It also says how many the file holds, because the repair for one is not the repair for
+    two.** Re-saving without a byte-order mark clears a leading one and clears nothing else, so
+    advising it on a file that holds a second would send the operator away believing the ledger
+    is repaired. The guard still holds, since the next read refuses again, but the advice would
+    have been false and the person acting on it has no way to see the character that proves it.
     """
 
 
@@ -444,11 +450,21 @@ def _decode(path: Path, raw: bytes) -> str:
     if index != -1:
         offset = len(text[:index].encode("utf-8"))
         line = text.count("\n", 0, index) + 1
-        where = (
-            "It leads the file, so re-saving as UTF-8 without a byte-order mark removes it"
-            if index == 0
-            else "It sits inside the file, so the character has to be deleted where it is"
-        )
+        # The first mark rather than any mark, so the number sends the repairer to the top of the
+        # file and they work down. The count is what keeps the advice from being false: re-saving
+        # clears a leading mark and clears nothing else, so a file holding a second one would
+        # read as repaired and refuse again on the next read.
+        total = text.count(BYTE_ORDER_MARK)
+        if total > 1:
+            where = (
+                f"It is the first of {total} in this file, so each one has to be found and "
+                "deleted rather than re-saving once"
+            )
+        elif index == 0:
+            where = "It leads the file, so re-saving as UTF-8 without a byte-order mark removes it"
+        else:
+            where = "It sits inside the file, so the character has to be deleted where it is"
+
         raise LedgerHasByteOrderMark(
             f"{path}: byte {offset} on line {line} begins a byte-order mark, the three bytes "
             f"ef bb bf. It is valid UTF-8 and zero width, so it decodes cleanly and an editor "
