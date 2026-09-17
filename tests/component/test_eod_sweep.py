@@ -41,6 +41,7 @@ from lake.manifest import append_quarantine
 from lake.paths import CHAINS, QUOTES, LakePaths
 from lake.schema_versions import (
     LEDGER_PARTITION,
+    LedgerUnreadable,
     RecordedVersion,
     SchemaVersionLedger,
     running_fingerprints,
@@ -2322,3 +2323,38 @@ def test_the_line_carries_no_machine_path(fixture_lake: FixtureLake):
     (line,) = _version_lines(outcome)
     assert LEDGER_PARTITION in line
     assert str(root) not in line
+
+
+def test_an_unreadable_ledger_reaches_the_report_on_a_holiday_and_nowhere_else_yet(
+    fixture_lake: FixtureLake,
+):
+    """The third verdict, and the bound marketlake #494 puts on it.
+
+    A holiday opens no reference file, so the check is the only reader of the ledger and its
+    line lands. A session evening does not get that far: ``_LEDGER_REFUSALS`` does not name
+    ``SchemaVersionsError``, so ``extract_dividends`` lets ``LedgerUnreadable`` out and it
+    escapes ``sweep`` with the report file, the digest and the ping. The line is computed and
+    lost with them.
+
+    That escape predates the check and is #494's to close. This case is here so the bound is
+    written down where the next reader meets it, and so the day #494 lands turns the second
+    half of this test red rather than leaving it to be noticed.
+
+    The daemon's startup check reports the same verdict meanwhile, which is
+    ``test_daemon_wiring.test_an_unreadable_ledger_pages_under_its_own_event``.
+    """
+    root = _lake(fixture_lake)
+    (root / "reference" / "schema_versions.parquet").write_bytes(b"not parquet at all")
+
+    outcome, pinger, _ = _run(root, holidays=(SESSION,))
+
+    (line,) = _version_lines(outcome)
+    assert "LedgerUnreadable" in line
+    assert pinger.urls == [PING_URL]
+
+    # And the session evening, which does not survive to file anything. The holiday run above
+    # already filed one, so what this counts is that the second run added none.
+    before = len(_filed(root))
+    with pytest.raises(LedgerUnreadable):
+        _run(root)
+    assert len(_filed(root)) == before, "the run that raised must not have filed a report"

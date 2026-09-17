@@ -587,9 +587,11 @@ def _capped(names: Sequence[str]) -> str:
 
     The count survives the cut for ``schema_drift``'s reason: it is what separates one moved
     column from a wholesale retype, and stderr names every column either way.
+
+    ``names`` is never empty. :func:`_page_moved` is the only caller and it asks only for a
+    list ``journal.fingerprint_diff`` reported as non-empty. A guard for the empty case would
+    be a line that cannot fire, which is a line the next reader has to reason about.
     """
-    if not names:
-        return "none"
     shown = list(names[:PAGE_COLUMN_CAP])
     left = len(names) - len(shown)
     if left:

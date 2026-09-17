@@ -95,7 +95,7 @@ from lake.vendor import VendorResponse
 from tests.support.backup import FakeBackup
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
-from tests.support.config import PING_KEY, write_config
+from tests.support.config import NTFY_TOPIC, PING_KEY, write_config
 from tests.support.pinger import FakePinger
 from tests.support.schema_version import record_running_version
 
@@ -2126,3 +2126,69 @@ def test_the_startup_page_carries_no_machine_path(tmp_path):
     assert schema_versions.LEDGER_PARTITION in page.body
     assert str(rig.lake_root) not in page.body
     assert str(rig.lake_root) not in page.title
+
+
+def test_an_unreadable_ledger_pages_under_its_own_event(tmp_path):
+    """The third verdict, and the only site that reports it on a session day.
+
+    ``sweep`` computes the same verdict and loses it with the rest of the run, because
+    ``_LEDGER_REFUSALS`` does not name ``SchemaVersionsError``. That is marketlake #494. Until
+    it lands, this binding is the whole of what says a corrupt ledger exists, and the file it
+    names is the one the next backup copies over the last good copy.
+    """
+    rig = _rig(tmp_path)
+    ledger_path(rig.lake_root).write_bytes(b"not parquet at all")
+    clock = ManualClock(start=et(2026, 9, 2, 8, 29, 30))
+
+    _run(rig, clock, ticks=4, cycle_runner=_no_cycle)
+
+    (page,) = _version_pages(rig)
+    assert page.event == schema_versions.UNREADABLE_EVENT
+    assert rig.pinger.urls == [CAPTURE_URL] * 4
+
+
+def test_the_uncapped_detail_reaches_the_log_the_operator_is_sent_to(tmp_path, capsys):
+    """stderr is the only surface carrying the absolute path and the uncapped rendering.
+
+    The page body is cut at ``PAGE_COLUMN_CAP`` for the design's byte budget and the nightly
+    report line keeps capture-machine paths out of a file the dashboard may read. So a line
+    deleted here leaves the operator with the capped page and no way to reach the rest.
+    """
+    rig = _rig(tmp_path)
+    ledger_path(rig.lake_root).unlink()
+    clock = ManualClock(start=et(2026, 9, 2, 8, 29, 30))
+
+    _run(rig, clock, ticks=2, cycle_runner=_no_cycle)
+
+    printed = capsys.readouterr().err
+    assert str(ledger_path(rig.lake_root)) in printed
+    assert str(journal.SCHEMA_VERSION) in printed
+
+
+def test_a_page_the_publisher_refuses_does_not_get_its_body_printed_instead(tmp_path, capsys):
+    """The bargain ``_page_sunday_daemon_finding`` already makes, held here too.
+
+    A publisher answers ``REFUSED`` when it finds one of its own secrets in a page, and it
+    redacts its record for that reason. Printing the fuller detail afterwards would undo the
+    redaction in the launchd log, which is a file on the same machine. So the refusal ends the
+    reporting rather than falling through to stderr.
+
+    The topic is the secret here, and it is set to a string the body already carries, which is
+    how a real body could ever come to contain one.
+    """
+    rig = _rig(tmp_path)
+    ledger_path(rig.lake_root).unlink()
+    config = rig.config.read_text().replace(
+        f"ntfy_topic: {NTFY_TOPIC}\n", "ntfy_topic: schema_version\n"
+    )
+    rig.config.write_text(config)
+    clock = ManualClock(start=et(2026, 9, 2, 8, 29, 30))
+
+    _run(rig, clock, ticks=2, cycle_runner=_no_cycle)
+
+    printed = capsys.readouterr().err
+    assert "page refused: it carried a secret" in printed
+    # The detail names the absolute ledger path and, on a conflict, every column that moved.
+    # Neither may follow a refusal.
+    assert str(rig.lake_root) not in printed
+    assert rig.transport.sent == []
