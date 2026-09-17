@@ -234,8 +234,10 @@ ICON_LINK = re.compile(
 def test_the_status_page_ships_in_the_package_and_is_self_contained():
     page = dashboard.load_status_page()
     assert b"<title>" in page
-    assert b"/api/now" in page
-    assert b"/api/today" in page
+    # Every route the service serves, named in the page that fetches them. A route the
+    # page does not name is a panel that never loads.
+    for route in ROUTES:
+        assert route.encode() in page
     # The page declares exactly one resource: its own tab icon, on its own origin.
     rest, found = ICON_LINK.subn(b"", page)
     assert found == 1, "the page declares the tab icon exactly once"

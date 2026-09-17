@@ -131,7 +131,8 @@ def test_the_server_binds_the_loopback_address(served):
 
 
 @pytest.mark.parametrize(
-    "path", ["/", "/favicon.ico", "/api/now", "/api/today?date=2026-08-24", "/nope"]
+    "path",
+    ["/", "/favicon.ico", "/api/now", "/api/today?date=2026-08-24", "/api/history", "/nope"],
 )
 def test_a_foreign_host_is_refused_first(served, path: str):
     server, _root = served
@@ -368,6 +369,8 @@ def test_the_page_carries_the_whole_content_security_policy(served):
         ("/api/now", "localhost", 200),
         ("/api/today?date=2026-08-24", "localhost", 200),
         ("/api/today?ticker=NOPE", "localhost", 400),
+        ("/api/history", "localhost", 200),
+        ("/api/history?date=2026-08-24", "localhost", 400),
         ("/api/now", "dashboard.evil.example", 403),
         ("/nope", "localhost", 404),
     ],

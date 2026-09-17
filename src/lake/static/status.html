@@ -122,6 +122,11 @@
   }
   body.degraded .stale-note { display: block; }
   body.degraded .panel { opacity: .55; filter: grayscale(85%); }
+  /* The degraded wash says "this is not live", and it follows the load that failed. Now
+     and Today share one load, so they wash together. History has its own, so a live
+     History section is not greyed out because the minute above it went stale, and a
+     failed one says so in its own words rather than borrowing that banner. */
+  body.degraded #history-panel { opacity: 1; filter: none; }
   body.degraded #asof { opacity: .5; }
 </style>
 </head>
@@ -172,8 +177,7 @@
 
 <section>
   <h2>History <span id="window" class="muted"></span></h2>
-  <p id="history-stale" class="stale-note"></p>
-  <div class="panel">
+  <div class="panel" id="history-panel">
     <h3 class="muted">Completeness</h3>
     <div id="heat"></div>
     <h3 class="muted">Open quarantines <span id="quarantine-count"></span></h3>
@@ -316,7 +320,6 @@
   function setStaleNotes(text) {
     byId("now-stale").textContent = text;
     byId("today-stale").textContent = text;
-    byId("history-stale").textContent = text;
   }
 
   function staleText(failedAt) {
@@ -853,30 +856,49 @@
 
   // -- the refresh cycle ----------------------------------------------------
 
-  // Both payloads are fetched before either panel is painted. A partial failure would
+  // Now and Today are fetched together and painted together. A partial failure would
   // otherwise leave a fresh Now table beside a Today strip from the previous poll, with
   // the page mixing two instants and saying so nowhere.
+  //
+  // History is deliberately not on that chain. It answers a different question over a
+  // different span, a month of sessions rather than this minute, so it cannot mix two
+  // instants with either of them. Joining it was tried and is wrong: its window reaches
+  // thirty days back, so one drifted partition a month old would take the whole page
+  // down while the two panels reading today were both healthy. It fails into its own
+  // section instead, and the page above it keeps working.
   function refresh() {
     if (inFlight) { return; }
     inFlight = true;
     var pending = null;
-    var pendingToday = null;
+    var history = getJSON("/api/history").then(renderHistory, historyFailed);
     getJSON("/api/now").then(function (now) {
       pending = now;
       return getJSON("/api/today?date=" + encodeURIComponent(now.session_date));
     }).then(function (today) {
-      pendingToday = today;
-      return getJSON("/api/history");
-    }).then(function (history) {
       renderNow(pending);
-      renderToday(pendingToday);
-      renderHistory(history);
+      renderToday(today);
       markFresh(pending);
     }).catch(function (err) {
       markStale(err.message);
     }).then(function () {
+      return history;
+    }).then(function () {
       inFlight = false;
     });
+  }
+
+  // The History section saying its own load failed. It never touches the page-wide
+  // banner, because the panels above it are still live and that banner says they are not.
+  function historyFailed(err) {
+    byId("window").textContent = "";
+    clear(byId("heat"));
+    byId("quarantine-count").textContent = "";
+    clear(byId("quarantines"));
+    byId("reports-note").textContent = "";
+    clear(byId("reports"));
+    byId("heat").appendChild(el("p",
+      "The history query is failing: " + err.message +
+      ". Nothing in this section is live. The panels above it are.", "alarm"));
   }
 
   byId("refresh").addEventListener("click", refresh);

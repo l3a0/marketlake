@@ -77,6 +77,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -132,7 +133,7 @@ DEFAULT_PORT = 8765
 # rebinding attempt or a misdirected request and gets a 403.
 ALLOWED_HOSTS = frozenset({"localhost", BIND_HOST})
 
-# The surfaces the two panels read: the minute-cadence capture surfaces.
+# The surfaces every panel reads: the minute-cadence capture surfaces.
 PANEL_SURFACES = (CHAINS, QUOTES)
 
 # The capture cadence. One slot per minute, matching the design's minutely loop.
@@ -1488,6 +1489,14 @@ HISTORY_WINDOW_DAYS = 30
 # reads a bounded tail rather than the directory.
 HISTORY_REPORTS = 10
 
+# The largest nightly file the panel will open. ``HISTORY_REPORTS`` bounds how many files
+# are read and this bounds how much, which is not the same promise. The read is plain
+# filesystem I/O, so the connection's ``QUERY_MEMORY_LIMIT`` does not reach it, and the
+# service runs under ``KeepAlive``, so a single oversized file's cost would sit in the
+# process for as long as it lives. A nightly file is counts and one line per failing
+# surface-ticker, so a real one is kilobytes and this refuses nothing the sweep writes.
+HISTORY_REPORT_MAX_BYTES = 4 * 1024 * 1024
+
 # The window aggregate: the same per-slot grouping ``_SLOT_SELECT`` makes, keyed by the
 # file each row came from so one query covers every ticker-day on a surface. The
 # filename is mapped back to its ticker and day in Python, against the very paths this
@@ -1561,11 +1570,27 @@ def _window_aggregates(
     partition and re-checks the partition after the segments are read, "so a seal that
     landed in between does not render a fully captured day as entirely missing."
 
-    The bulk read is all-or-nothing, which is the price of one query. A partition listed
-    and then gone, from a restore or a repair, raises out of ``read_parquet`` and would
-    take every ticker-day on the surface with it. So that failure falls back to reading
-    each of them the per-day way, and the loss is counted in ``unreadable_partitions``
-    rather than dropping the window.
+    The bulk read is all-or-nothing, which is the price of one query, so any failure of
+    it falls back to reading each ticker-day the per-day way. That fallback adds no count
+    of its own. ``_slot_aggregates`` counts a partition it cannot read, on the one cell
+    that holds it, so adding a second count here would blame every healthy ticker-day on
+    the surface for one bad file and count the bad one twice.
+
+    **The catch is broad here, and this is the one place in this module where it is.**
+    ``_PARTITION_READ_ERRORS`` stays narrow, because it guards a read of one file and its
+    own comment says why: the pair is enumerated "so a real SQL defect still surfaces."
+    This read is a different shape. It unions every partition in the window by name, so
+    what it can raise depends on the data rather than on the statement: two partitions
+    disagreeing on a column's type raise a ``BinderException``, and so does a column that
+    no partition in the union happens to carry. Neither is reachable per-day, because
+    ``_slot_aggregates`` always registers the journal view and its pinned schema beside
+    the one file.
+
+    So the fallback is not a swallow. It is a retreat to the reader that does not union,
+    which is the reader that was there before this panel, and a real defect surfaces from
+    it exactly as it did. The traceback is logged either way. The cost of narrowing this
+    back is the whole page: ``_serve`` turns an escape into a 500, so one drifted
+    partition thirty days back would blank the Now and Today panels beside this one.
     """
     result: dict[tuple[str, date], tuple[list[SlotAggregate], SegmentHealth]] = {}
     bulk: dict[str, tuple[str, date]] = {}
@@ -1586,11 +1611,11 @@ def _window_aggregates(
     }
     try:
         rows = con.execute(_WINDOW_SELECT, params).fetchall()
-    except _PARTITION_READ_ERRORS:
+    except Exception:  # noqa: BLE001 - the window must not cost the page, per the docstring
+        log.exception("window read failed for %s, so the window falls back per day", surface)
         for key in bulk.values():
             ticker, day = key
-            placed, health = _slot_aggregates(con, paths, surface, ticker, day)
-            result[key] = (placed, health + SegmentHealth(unreadable_partitions=1))
+            result[key] = _slot_aggregates(con, paths, surface, ticker, day)
         return result
     grouped: dict[tuple[str, date], list[tuple]] = {key: [] for key in bulk.values()}
     for row in rows:
@@ -1700,7 +1725,8 @@ def _nightly_reports(root: Path, limit: int) -> tuple[list[dict[str, object]], i
     happened.
 
     ``nightly_path`` names a file ``{day}-{stamp}-{pid}.json``, so the day sorts first
-    and the newest files are the tail of a name sort. Only ``limit`` of them are opened.
+    and the newest files are the tail of a name sort. Only ``limit`` of them are opened,
+    and none over ``HISTORY_REPORT_MAX_BYTES`` is opened at all.
     The glob is on the ``reports/`` root, so the four producers' own subdirectories are
     not matched, which is the naming rule ``report.py`` chose a reader for.
 
@@ -1710,15 +1736,29 @@ def _nightly_reports(root: Path, limit: int) -> tuple[list[dict[str, object]], i
     ``Nightly``'s own rule.
     """
     directory = root / REPORTS_DIR
+    if not directory.is_dir():
+        # A true zero, which is today's answer: no nightly run has filed anything yet.
+        return [], 0, None
     try:
-        files = sorted(directory.glob("*.json"))[-limit:]
+        names = sorted(name for name in os.listdir(directory) if name.endswith(".json"))
     except OSError as exc:
+        # ``Path.glob`` is not used for this listing, and that is the whole reason. It
+        # swallows the ``OSError`` a directory it cannot read raises and yields nothing,
+        # so an unreadable ``reports/`` would render as "no report has been filed yet".
+        # That is a false zero on the one panel a reader opens to find out what is wrong.
         log.warning("reports directory unlistable: %s", type(exc).__name__)
         return [], 0, type(exc).__name__
+    files = [directory / name for name in names[-limit:]]
     reports: list[dict[str, object]] = []
     unreadable = 0
     for path in reversed(files):
         try:
+            if path.stat().st_size > HISTORY_REPORT_MAX_BYTES:
+                # Counted rather than read. A file this size is not a nightly report, and
+                # reading it to find that out is the cost the bound exists to refuse.
+                log.warning("nightly report over the size bound, so the panel counts it")
+                unreadable += 1
+                continue
             entry = json.loads(path.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001 - one bad file must not cost the others
             log.exception("nightly report unreadable, so the panel counts it instead")
