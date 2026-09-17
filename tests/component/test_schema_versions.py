@@ -668,8 +668,14 @@ def test_a_ledger_holding_only_an_earlier_version_reads_as_unrecorded(lake_root)
     assert str(journal.SCHEMA_VERSION - 1) in check.page_body
 
 
-@pytest.mark.parametrize("shape", [_narrowed, _widened], ids=["narrower", "wider"])
-def test_the_running_version_recorded_under_another_shape_reads_as_conflicting(lake_root, shape):
+@pytest.mark.parametrize(
+    "shape, moved",
+    [(_narrowed, "added bid"), (_widened, "dropped gamma_impact")],
+    ids=["narrower", "wider"],
+)
+def test_the_running_version_recorded_under_another_shape_reads_as_conflicting(
+    lake_root, shape, moved
+):
     """Both directions of the shape this check exists to catch, and the reader cannot.
 
     ``project_extra`` asks the ledger ``has_column`` and never compares the recorded shape
@@ -685,8 +691,10 @@ def test_the_running_version_recorded_under_another_shape_reads_as_conflicting(l
     assert check.event == CONFLICT_EVENT
     assert check.recorded == (journal.SCHEMA_VERSION,)
     # The column that moved is named, which is the whole reason the fingerprint is a column
-    # list rather than a digest.
-    assert "bid" in check.page_body or "gamma_impact" in check.page_body
+    # list rather than a digest, and it is named under the right verb. The two arguments are
+    # one swap apart, and swapped they render the right column the wrong way round, which
+    # sends an operator to put back a column they should be taking out.
+    assert moved in check.page_body
 
 
 def test_the_check_agrees_with_the_run_it_sends_an_operator_to(lake_root):
