@@ -18,11 +18,14 @@ import pytest
 
 from lake.manifest import (
     RowCountRegression,
+    TornLedger,
+    append_line,
     append_manifest,
     append_quarantine,
     guard_row_count,
     latest_entries,
     latest_quarantine,
+    latest_quarantine_by_check,
     manifest_path,
     quarantine_path,
     read_manifest,
@@ -342,3 +345,152 @@ def test_quarantine_appends_and_last_verdict_wins(lake_root):
     assert len(read_quarantine(lake_root)) == 2
     assert quarantine_path(lake_root).read_text().splitlines()[0]
     assert latest_quarantine(lake_root)[CHAINS_REL]["verdict"] == "clean"
+
+
+# -- a torn quarantine ledger refuses rather than reading short ---------------
+
+
+def _verdict(partition: str) -> dict:
+    return {"partition": partition, "verdict": "quarantined", "check": "entitlement"}
+
+
+def _torn_after(lake_root, *behind: str) -> None:
+    """One good verdict, then a write that crashed mid-line, then ``behind`` appended onto it.
+
+    The fragment carries no terminating newline, so the first name in ``behind`` fuses onto
+    it and becomes part of the same line. Every name after that one is a whole line the read
+    never reaches. Built by writing the fragment directly, because no writer in the tree can
+    be made to crash on demand.
+    """
+    append_quarantine(lake_root, _verdict("kept"))
+    with quarantine_path(lake_root).open("a") as handle:
+        handle.write('{"partition": "torn", "verd')
+    for partition in behind:
+        append_line(quarantine_path(lake_root), _verdict(partition))
+
+
+def test_a_read_stopping_with_verdicts_behind_it_refuses_and_names_them(lake_root):
+    """The defect marketlake #469 is. Read short, the ledger withholds nothing at all.
+
+    Two appends land behind the fragment: the first fuses onto it and the second is hidden
+    outright. Returning the entries in front of the damage would hand every consumer a
+    ledger missing its own contents, and ``load_chain`` would then admit exactly the
+    partitions those verdicts exist to exclude.
+    """
+    _torn_after(lake_root, "fused", "hidden")
+
+    with pytest.raises(TornLedger) as refusal:
+        read_quarantine(lake_root)
+
+    assert str(quarantine_path(lake_root)) in str(refusal.value)
+    assert "1 entry is written after it" in str(refusal.value)
+
+
+def test_every_quarantine_reader_funnels_through_the_one_refusal(lake_root):
+    """Neither resolver keeps a path around the guard.
+
+    ``latest_quarantine`` and ``latest_quarantine_by_check`` are what ``loader``, ``sweep``,
+    ``dashboard`` and ``signoff`` actually call. A refusal only ``read_quarantine`` made
+    would leave all four reading short.
+    """
+    _torn_after(lake_root, "fused", "hidden")
+
+    for reader in (read_quarantine, latest_quarantine, latest_quarantine_by_check):
+        with pytest.raises(TornLedger):
+            reader(lake_root)
+
+
+def test_a_torn_tail_still_reads_because_it_hides_nothing(lake_root):
+    _torn_after(lake_root)
+
+    assert [e["partition"] for e in read_quarantine(lake_root)] == ["kept"]
+
+
+def test_a_fusion_reads_until_the_next_write_lands_behind_it(lake_root):
+    """``append_line``'s accepted cost, and the exact moment it stops being only that.
+
+    The fused line costs the one entry appended onto it and hides nothing else, so refusing
+    at this point would refuse the case the module already decided to pay for. Nothing
+    repairs an append-only file, though, so the very next verdict lands behind a line no
+    read gets past. That is where this starts refusing, and it never stops until a human
+    repairs the file. Two verdicts lost, then it holds.
+    """
+    _torn_after(lake_root, "fused")
+    assert [e["partition"] for e in read_quarantine(lake_root)] == ["kept"]
+
+    append_line(quarantine_path(lake_root), _verdict("tonight"))
+    with pytest.raises(TornLedger):
+        read_quarantine(lake_root)
+
+
+def test_a_lake_with_no_ledger_and_an_empty_one_both_read_as_no_entries(lake_root):
+    """Tonight's first run. The battery has never written, so nothing may refuse."""
+    assert read_quarantine(lake_root) == []
+    assert latest_quarantine(lake_root) == {}
+
+    quarantine_path(lake_root).write_text("")
+    assert read_quarantine(lake_root) == []
+    assert latest_quarantine(lake_root) == {}
+
+
+def test_the_manifest_ledger_keeps_its_truncating_read(lake_root):
+    """The boundary against marketlake #447, pinned so it cannot widen unnoticed.
+
+    ``scrub`` resolves the manifest through ``latest_entries``, so raising here would take
+    the Sunday scrub down on the very file it exists to report. The quarantine ledger's
+    readers are a guard and refuse. The manifest's read short, and #447 owns that half.
+    """
+    append_manifest(
+        lake_root, partition="a", source="capture", sha256="s1", rows=1, fetched_at=None
+    )
+    raw = manifest_path(lake_root).read_text()
+    manifest_path(lake_root).write_text(raw.rstrip("\n")[:-20])
+    append_line(manifest_path(lake_root), {"partition": "b", "sha256": "s2", "rows": 2})
+    append_line(manifest_path(lake_root), {"partition": "c", "sha256": "s3", "rows": 3})
+
+    assert read_manifest(lake_root) == []
+    assert latest_entries(lake_root) == {}
+    assert scrub(lake_root).ok
+
+
+def test_an_append_in_flight_never_refuses_a_ledger_nothing_is_wrong_with(lake_root):
+    """What makes failing closed safe, given that ``loader._guard`` takes no lock.
+
+    ``append_line`` writes one line in one ``O_APPEND`` write, so a reader landing mid-write
+    can only ever see a partial *last* line, which is the tail this does not count. A line
+    in the body needs a later append to have already landed behind a fragment, which is
+    damage that is permanent rather than transient. Without this property a fail-closed
+    guard on an unsynchronised read would refuse healthy lakes at random.
+    """
+    path = quarantine_path(lake_root)
+    path.write_text("")
+    appends = 1500
+    done = threading.Event()
+    refusals: list[Exception] = []
+    reads = []
+
+    def writer() -> None:
+        try:
+            for i in range(appends):
+                append_line(path, dict(_verdict(f"p{i}"), reason="x" * 300))
+        finally:
+            done.set()
+
+    def reader() -> None:
+        while not done.is_set():
+            try:
+                reads.append(len(read_quarantine(lake_root)))
+            except TornLedger as exc:
+                refusals.append(exc)
+
+    threads = [threading.Thread(target=writer)] + [
+        threading.Thread(target=reader) for _ in range(3)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not refusals, f"{len(refusals)} reads refused a ledger nothing is wrong with"
+    assert reads, "no read completed, so this test proves nothing"
+    assert len(read_quarantine(lake_root)) == appends

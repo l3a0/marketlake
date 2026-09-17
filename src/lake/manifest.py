@@ -119,7 +119,18 @@ class RowCountRegression(Exception):
 
 
 class ManifestError(Exception):
-    """Raised for a ledger line that parses and names no partition."""
+    """Raised for a ledger line a reader cannot interpret."""
+
+
+class TornLedger(ManifestError):
+    """Raised for a ledger read that stopped with entries still behind it.
+
+    ``parse_jsonl`` ends the read at the first line it cannot parse. When that line is the
+    last one, nothing is hidden and the read is complete, which is the torn tail
+    ``append_line`` accepts. When it is anywhere else, every entry after it is invisible to
+    every reader while the file still holds them, and a guard resolved from those entries
+    answers from a ledger that is missing its own contents.
+    """
 
 
 def manifest_path(lake_root: Path) -> Path:
@@ -151,8 +162,13 @@ def sha256_file(path: Path) -> str:
 def parse_jsonl(text: str) -> list[dict]:
     """Parse ledger text into entries, discarding a torn trailing line.
 
-    A blank line is skipped. The first line that does not parse ends the read. By the
-    append rule only the last line can be torn, so this discards exactly the torn tail.
+    A blank line is skipped. The first line that does not parse ends the read.
+
+    **That line is the last one only until a later append lands behind it.** A torn write
+    leaves no terminating newline, so the next append concatenates onto the fragment and the
+    fused line sits in the body with every entry after it unread. ``append_line`` states the
+    fusing rule and marketlake #447 carries the class. :func:`read_quarantine` refuses that
+    case for the quarantine ledger, where the entries behind it are a guard's own verdicts.
     """
     entries: list[dict] = []
     for line in text.splitlines():
@@ -211,9 +227,70 @@ def latest_entries(lake_root: Path) -> dict[str, dict]:
     return _latest_by_partition(read_manifest(lake_root), manifest_path(lake_root))
 
 
+def _refuse_hidden_entries(path: Path, text: str, entries: Sequence[dict]) -> None:
+    """Raise :class:`TornLedger` when whole lines sit after the point the read stopped at.
+
+    ``parse_jsonl`` ends the read at the first line it cannot parse, so the count it returns
+    says where it stopped: at line ``len(entries) + 1``. Every non-blank line after that one
+    is a complete entry some writer landed and no reader can see. That count is what decides,
+    and it is zero in the two cases that are not damage: a file the read consumed whole, and
+    a file whose last line is the torn tail ``parse_jsonl`` discards on purpose.
+
+    **The line the read stopped at is not counted, and that is deliberate.** A torn write
+    leaves no terminating newline, so the next append concatenates onto the fragment and the
+    two become one line. That line costs exactly the one entry appended onto it, which is the
+    price ``append_line`` states and accepts and which ``lake.signoff`` guards for a hand
+    write. What neither of them accepts, and what this refuses, is every further entry behind
+    that line.
+
+    **The fused line is permanent, so the refusal takes hold on the write after it.** Nothing
+    repairs an append-only file, so every later append lands behind a line no read gets past.
+    Executed on a temp lake, a verdict torn on night one costs night two's verdict to the
+    fusion and night three's to the body, and every read from night four on refuses with the
+    file frozen at two lines. Two verdicts, then it holds, against a ledger that grows a
+    hidden line and fires a page every night without this.
+
+    A fragment whose partial write did end in a newline is its own line rather than a fusion.
+    It costs no entry of its own, and the entries after it are counted here like any others.
+    """
+    lines = sum(1 for line in text.splitlines() if line.strip())
+    hidden = lines - 1 - len(entries)
+    if hidden <= 0:
+        return
+    raise TornLedger(
+        f"{path}: the read stopped at line {len(entries) + 1} and {hidden} "
+        f"entr{'y is' if hidden == 1 else 'ies are'} written after it that no reader can "
+        "see. Every verdict behind that line is invisible, so this ledger cannot say which "
+        "partitions it withholds. Repairing a ledger is a human's job under the lock."
+    )
+
+
 def read_quarantine(lake_root: Path) -> list[dict]:
-    """Every quarantine entry in file order, with the torn trailing line discarded."""
-    return _read_jsonl(quarantine_path(lake_root))
+    """Every quarantine entry in file order, with the torn trailing line discarded.
+
+    A read that stops in the body raises :class:`TornLedger` rather than returning the
+    entries in front of the damage. This is the one reader every quarantine consumer funnels
+    through, so the refusal reaches all of them from one place.
+
+    **Why the refusal is here and not in ``parse_jsonl``.** The rule is the same for both
+    ledgers and the consequences are not. :func:`scrub` resolves the manifest through
+    :func:`latest_entries`, so a manifest raising here would take the Sunday scrub down on
+    exactly the file it exists to report. Marketlake #447 carries the manifest ledger and the
+    scrub's own reporting of damage. This ledger's readers are a guard, and a guard that
+    cannot read its own ledger has to refuse rather than admit, which is
+    :func:`is_quarantined`'s stated rule at file scope.
+
+    ``_read_jsonl`` is not reused because this needs the text the count is taken from, and
+    that function returns entries alone. A missing ledger still reads as no entries, which is
+    what keeps every consumer inert on a lake no verdict has been written to yet.
+    """
+    path = quarantine_path(lake_root)
+    if not path.exists():
+        return []
+    text = path.read_text()
+    entries = parse_jsonl(text)
+    _refuse_hidden_entries(path, text, entries)
+    return entries
 
 
 def latest_quarantine_by_check(lake_root: Path) -> dict[str, dict[str, dict]]:

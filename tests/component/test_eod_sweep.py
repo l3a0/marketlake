@@ -1887,6 +1887,52 @@ def test_a_battery_that_raises_does_not_withhold_the_ping(fixture_lake: FixtureL
     assert not any("battery" in problem for problem in outcome.nightly.problems)
 
 
+def test_a_torn_ledger_is_contained_and_reaches_the_record_rather_than_killing_the_run(
+    fixture_lake: FixtureLake,
+):
+    """Marketlake #469, end to end rather than through a monkeypatched explosion.
+
+    Both walks read through ``lake.loader``, which resolves the quarantine ledger on every
+    partition it opens, so a damaged one refuses inside ``extract_dividends``. Executed
+    against `8fb1fda` that escaped ``_LEDGER_REFUSALS`` entirely and took the whole 18:30 run
+    with it, including the report file and the Friday wake, which is why ``ManifestError``
+    joined that tuple as the class rather than by member.
+
+    **The ping is withheld here, and that is the designed meaning rather than a casualty.**
+    The ``eod-sweep`` row says a missed ping means the day's official bars or actions are
+    missing, and a ledger the loader cannot resolve is exactly a night the dividend walk did
+    not run. That is the opposite of the battery's own trouble, which rides ``report`` and
+    withholds nothing, because the work the check watches did still happen.
+
+    This lake also carries the case the count is the only witness for: no partition is in
+    scope, so ``judge`` never reaches its per-partition ledger read and finishes normally.
+    ``count_quarantined`` reports the damage in the same run regardless.
+    """
+    from lake.manifest import append_line, quarantine_path
+
+    root = _lake(fixture_lake)
+    ledger = quarantine_path(root)
+    with ledger.open("a") as handle:
+        handle.write('{"partition": "chains/ticker=SPY/date=2026-09-16.parq')
+    append_line(ledger, {"partition": "fused", "verdict": "clean", "check": "e"})
+    append_line(ledger, {"partition": "hidden", "verdict": "clean", "check": "e"})
+
+    outcome, pinger, _ = _run(root)
+
+    assert outcome.filed_at is not None, "the run died instead of filing its record"
+    assert any(
+        "dividends did not run: TornLedger" in problem for problem in outcome.nightly.problems
+    ), outcome.nightly.problems
+    assert any(
+        "quarantine count unreadable: TornLedger" in line for line in outcome.nightly.report
+    ), outcome.nightly.report
+    assert any("human's job under the lock" in problem for problem in outcome.nightly.problems), (
+        "the operator gets the error's name without what to do about it"
+    )
+    assert outcome.nightly.pinged is False
+    assert pinger.urls == []
+
+
 def test_a_quarantine_the_battery_wrote_is_reported_and_still_pings(fixture_lake: FixtureLake):
     """A quarantine is the run working. It withholds nothing and it reaches the record."""
     from lake.battery import BatteryReport

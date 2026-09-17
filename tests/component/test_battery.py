@@ -70,10 +70,13 @@ from lake.capture_spans import CaptureSpan
 from lake.config import GuardConstants
 from lake.manifest import (
     CLEAN_VERDICT,
+    TornLedger,
+    append_line,
     append_quarantine,
     is_quarantined,
     latest_quarantine,
     latest_quarantine_by_check,
+    quarantine_path,
     read_quarantine,
     scrub,
     withholding,
@@ -1245,6 +1248,46 @@ def test_one_page_for_the_run_names_every_partition_it_quarantined(lake: Path):
     assert "session-median staleness 900.0s" in message.body
     assert "chains/ticker=QQQ/date=2026-09-16.parquet" in message.body
     assert "chains/ticker=SPY/date=2026-09-16.parquet" in message.body
+
+
+def _tear_the_ledger(root: Path, *, behind: int) -> str:
+    """A verdict whose write crashed mid-line, with ``behind`` appends landing onto it.
+
+    The first fuses onto the fragment and is lost outright. Every one after it is a whole
+    line no read gets past. Written by hand because no writer in the tree can be made to
+    crash on demand.
+    """
+    path = quarantine_path(root)
+    with path.open("a") as handle:
+        handle.write('{"partition": "chains/ticker=SPY/date=2026-09-16.parq')
+    for index in range(behind):
+        append_line(path, {"partition": f"b{index}", "verdict": "clean", "check": "e"})
+    return path.read_text()
+
+
+def test_a_torn_ledger_stops_the_walk_before_it_writes_or_pages(lake: Path):
+    """Marketlake #469. The re-page this ends, and the lines it stops appending.
+
+    Read short, the ledger carries no entry for the partition, so ``_transition`` reads every
+    night's verdict as a fresh one. On `8fb1fda` eleven runs appended eleven lines and fired
+    eleven pages, the ledger growing to twelve lines no reader could see. The read is the
+    first thing inside the per-partition hold, ahead of ``write_verdict``, so refusing there
+    is what keeps a line from landing behind the poison.
+    """
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
+    _seed_spans(lake)
+    publisher, transport = _publisher(lake)
+    judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants(), publisher=publisher)
+    assert len(transport.messages) == 1, "the first night's page is the legitimate one"
+
+    before = _tear_the_ledger(lake, behind=2)
+
+    for _ in range(2):
+        with pytest.raises(TornLedger):
+            judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants(), publisher=publisher)
+
+    assert quarantine_path(lake).read_text() == before, "a run wrote behind the torn line"
+    assert len(transport.messages) == 1, "the run paged again about a verdict it re-found"
 
 
 def test_the_page_fires_once_on_the_transition_and_not_again(lake: Path):
