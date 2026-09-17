@@ -1902,8 +1902,9 @@ def test_the_report_prints_every_count_including_the_zeroes():
         "appended": "ledger lines written",
     }
     # The fields that are not counts, for the reasons ``tests/component/test_eod_sweep.py``
-    # gives where it draws the same line.
-    not_counts = {"report", "findings", "paged"}
+    # gives where it draws the same line. ``drift_paged`` is there on ``paged``'s own
+    # reasoning, which that file states and which holds of the schema-drift page unchanged.
+    not_counts = {"report", "findings", "paged", "drift_paged"}
 
     named = {field.name for field in fields(BatteryReport)}
     assert labelled.keys() <= named, f"stale label: {labelled.keys() - named}"

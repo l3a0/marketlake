@@ -81,7 +81,18 @@ CENSUS_RENAMED = {"cleared": "clean", "appended": "wrote"}
 # ``reports/alerts/`` and counted as ``pages_lost``, which the report file and the dashboard both
 # carry. That in-process asymmetry is what separates it from the three counts marketlake #477
 # added, which reached the hand run alone.
-CENSUS_NOT_COUNTS = {"report", "findings", "paged"}
+# ``drift_paged`` joins ``paged`` on that same reasoning rather than a new one, because all
+# three parts of it hold of the schema-drift page too. It is a tuple of page titles rather
+# than a number. ``battery_drift.page`` prints on every delivery path, the refused and the
+# unsent included, into the same in-process log. And a drift page that did not land is filed
+# under ``reports/alerts/`` and counted by ``alert.undelivered`` as ``pages_lost``, which was
+# measured rather than assumed: a page built with no transport writes
+# ``...-battery_schema_drift-....json`` there and ``undelivered`` returns 1 for it.
+#
+# Whether the battery's pages belong in the census at all is a fair question, and it is
+# ``paged``'s question as much as this field's. Answering it for one of the two would leave
+# the pair inconsistent, so it is not marketlake #427's to answer.
+CENSUS_NOT_COUNTS = {"report", "findings", "paged", "drift_paged"}
 
 # The week the fixture calendar serves. 2026-09-14 is a Monday, so the sessions run Monday
 # through Friday and the second Monday gives the Friday branch a next week to wake before.
