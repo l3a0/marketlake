@@ -19,6 +19,8 @@ import pytest
 
 from lake import manifest
 from lake.manifest import (
+    BYTE_ORDER_MARK,
+    LedgerHasByteOrderMark,
     LedgerNotUtf8,
     ManifestError,
     RowCountRegression,
@@ -617,11 +619,15 @@ def test_append_line_emits_pure_ascii_and_every_prefix_of_it_decodes(lake_root):
     never inside one, so if every prefix of a written line decodes then no crash mid-append can
     produce this shape.
     """
-    reason = "vendor said \u201cdelayed\u201d \u00e9 \U0001f600"
+    # The byte-order mark is in the fixture because marketlake #506's refusal rests on this same
+    # default. Refusing that character anywhere in the file is safe only while no writer can emit
+    # it, and a field literally holding it is the case that would prove otherwise.
+    reason = f"vendor said \u201cdelayed\u201d \u00e9 \U0001f600{BYTE_ORDER_MARK}"
     append_line(quarantine_path(lake_root), {"partition": "p", "check": "e", "reason": reason})
     raw = quarantine_path(lake_root).read_bytes()
 
     assert max(raw) < 128, f"a writer emitted a byte outside ASCII: {raw!r}"
+    assert BYTE_ORDER_MARK.encode("utf-8") not in raw, f"a writer emitted the mark raw: {raw!r}"
     for cut in range(len(raw) + 1):
         raw[:cut].decode("utf-8")
 
@@ -836,3 +842,310 @@ def test_the_manifest_read_pins_utf8_rather_than_the_locales_encoding(lake_root,
 
     monkeypatch.setattr(Path, "read_text", refuse)
     assert read_manifest(lake_root)[0]["partition"] == entry["partition"]
+
+
+# -- a ledger carrying a byte-order mark refuses rather than reading wrong ----
+
+
+# The bytes an editor actually writes, spelled out rather than taken from the reader's own
+# constant. A fixture built from ``manifest.BYTE_ORDER_MARK`` moves whenever that constant moves,
+# so the suite would hold "the reader refuses whatever it is looking for" rather than "the reader
+# refuses a byte-order mark". The review lens found exactly that: repointing the constant at a
+# zero-width space passed all 4,296 tests while a real mark on a one-entry ledger read clean
+# again, which is marketlake #506 restored with the suite green.
+MARK_BYTES = b"\xef\xbb\xbf"
+
+
+def _mark_before(lake_root, needle: bytes) -> int:
+    """Put a byte-order mark in front of ``needle`` and return its byte offset.
+
+    The offset is returned rather than typed, so a message assertion cannot pass a mutant that
+    hard-codes the number. That is the lesson ``LedgerNotUtf8``'s own message test wrote down.
+    """
+    path = quarantine_path(lake_root)
+    raw = path.read_bytes()
+    assert raw.count(needle) == 1, "the fixture no longer says what it meant to"
+    offset = raw.index(needle)
+    path.write_bytes(raw[:offset] + MARK_BYTES + raw[offset:])
+    return offset
+
+
+def test_the_constant_the_reader_searches_for_is_the_byte_order_mark(lake_root):
+    """What every other case here would stop meaning if this moved.
+
+    The reader searches for a character and an editor writes bytes, so one assertion has to join
+    the two. Without it the constant can be repointed at any other invisible character and the
+    whole battery follows it, refusing something no editor writes while a real mark reads clean.
+    """
+    assert BYTE_ORDER_MARK.encode("utf-8") == MARK_BYTES
+    assert BYTE_ORDER_MARK == "\ufeff"
+
+
+def test_a_byte_order_mark_on_a_one_entry_ledger_refuses_instead_of_lifting_it(lake_root):
+    """The defect marketlake #506 is, at the size the ledger is on the battery's first night.
+
+    A byte-order mark is valid UTF-8, so it decodes and never reaches ``LedgerNotUtf8``. At this
+    size it reaches nothing else either: it makes line 1 unparseable, ``parse_jsonl`` stops there,
+    and with nothing written behind it ``_refuse_hidden_entries`` counts nothing hidden, so the
+    line is discarded as the torn tail that function accepts on purpose. A second line would sit
+    behind the stop and ``TornLedger`` would refuse, which is why this is the size that matters.
+    The partition then reads clean while its verdict is still on disk, which is
+    ``is_quarantined``'s rule inverted.
+
+    The assertion that matters is the one before the refusal. Without it this test would pass on
+    a fixture whose verdict never withheld anything.
+    """
+    held = "chains/ticker=SPY/date=2026-09-16.parquet"
+    append_quarantine(lake_root, _verdict(held))
+    assert held in latest_quarantine(lake_root), "the fixture withheld nothing to begin with"
+
+    _mark_before(lake_root, b"{")
+
+    with pytest.raises(LedgerHasByteOrderMark) as refusal:
+        latest_quarantine(lake_root)
+
+    assert isinstance(refusal.value, ManifestError)
+    assert str(quarantine_path(lake_root)) in str(refusal.value)
+
+
+def test_a_byte_order_mark_before_the_last_line_refuses_at_any_ledger_length(lake_root):
+    """One entry is when the damage is reachable, not what makes it possible.
+
+    What decides is the stopped line's position. Every entry behind the stop makes the hidden
+    count positive and ``TornLedger`` refuses, and a mark in front of the **last** line leaves
+    nothing behind it whatever the file's length. Executed on the code before this, a
+    three-entry ledger marked at line 3 returned the first two verdicts and dropped the third.
+
+    A fix that only looked at the front of the file would pass every other case here and fail
+    this one.
+    """
+    for name in ("first", "second", "third"):
+        append_quarantine(lake_root, _verdict(name))
+    assert sorted(latest_quarantine(lake_root)) == ["first", "second", "third"]
+
+    _mark_before(lake_root, b'{"check": "entitlement", "partition": "third"')
+
+    with pytest.raises(LedgerHasByteOrderMark):
+        latest_quarantine(lake_root)
+
+
+def test_a_byte_order_mark_inside_a_value_refuses_rather_than_mangling_the_key(lake_root):
+    """The second shape, and the one that rules out stripping the mark.
+
+    Here the line **parses**. The character lands inside the partition name, so the verdict files
+    under a key no reader asks about: the partition it withholds disappears from the ledger and
+    reads clean while ``sweep.count_quarantined`` still reports one quarantine standing. That is
+    ``LedgerNotUtf8``'s argument about the replacement character, reached by a character that
+    decodes.
+
+    ``utf-8-sig`` removes a leading mark only, so it would leave this case exactly as it was. The
+    assertions below are what stripping would produce, stated as the thing that must not happen.
+    """
+    held = "chains/ticker=SPY/date=2026-09-16.parquet"
+    append_quarantine(lake_root, _verdict(held))
+    _mark_before(lake_root, b"2026-09-16")
+
+    with pytest.raises(LedgerHasByteOrderMark):
+        latest_quarantine(lake_root)
+
+    # The two facts stripping would establish instead, both of them wrong.
+    stripped = quarantine_path(lake_root).read_bytes().decode("utf-8-sig")
+    entry = json.loads(stripped.splitlines()[0])
+    assert entry["partition"] != held, "the premise of this test no longer holds"
+    assert entry["verdict"] == "quarantined"
+
+
+def test_the_refusal_names_the_character_because_no_number_can_locate_it(lake_root):
+    """A number is the wrong unit for something an editor does not draw.
+
+    Both sibling refusals send the repairer to a byte and a line, and that is right for a byte
+    they can see. This character is zero width, so an operator sent to line 1 opens the file,
+    sees the entry and sees nothing wrong. The message therefore names what the character is and
+    says outright that it is invisible.
+
+    The mark here is deliberately not at the front. A leading one sits at byte 0, and an
+    assertion against 0 would pass a mutant that hard-codes it.
+
+    **Line 1 is hand written and carries non-ASCII, so the offset is a byte count rather than a
+    character count.** The two are the same number for every ledger a writer produced, because
+    ``append_line`` escapes non-ASCII, so only a hand repair puts those bytes on disk. That is a
+    supported ledger, which the accepting-side test above decided. Without such a line this would
+    pass a reader reporting the character index, and that reader would send an operator into the
+    middle of a multi-byte character in the reason they themselves wrote. The review lens found
+    it by mutation: dropping the ``encode`` passed all 186 tests in the three files this change
+    touches.
+    """
+    hand = {**_verdict("first"), "reason": "retard\u00e9 \u201chalt\u201d"}
+    quarantine_path(lake_root).write_bytes(
+        (json.dumps(hand, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+    )
+    append_quarantine(lake_root, _verdict("second"))
+    offset = _mark_before(lake_root, b'{"check": "entitlement", "partition": "second"')
+    assert offset > 0, "the fixture stopped testing a mark that is not leading"
+    raw = quarantine_path(lake_root).read_bytes()
+    assert raw[offset : offset + 3] == MARK_BYTES, "the offset is not a byte"
+    assert offset != raw.decode("utf-8").index(BYTE_ORDER_MARK), (
+        "the fixture stopped telling a byte offset apart from a character index"
+    )
+
+    with pytest.raises(LedgerHasByteOrderMark) as refusal:
+        read_quarantine(lake_root)
+
+    message = str(refusal.value)
+    assert f"byte {offset} " in message, message
+    assert "on line 2" in message, message
+    assert "ef bb bf" in message, message
+    assert "zero width" in message, message
+    assert "editor shows nothing there" in message, message
+    assert "sits inside the file" in message, message
+    assert "human's job under the lock" in message, message
+
+    # The sentence the test below this one proves. Holding the fact and not the sentence lets
+    # the sentence be deleted while the fact stays true.
+    assert "Nothing in this lake writes this character" in message, message
+
+
+def test_the_refusal_tells_a_leading_mark_apart_because_the_repair_differs(lake_root):
+    """One re-save fixes a leading mark. A mark inside a value has to be deleted where it is.
+
+    Sending the operator to the wrong one of those costs them the repair, so the message says
+    which it met rather than describing both and letting them guess.
+    """
+    append_quarantine(lake_root, _verdict("kept"))
+    assert _mark_before(lake_root, b"{") == 0
+
+    with pytest.raises(LedgerHasByteOrderMark) as refusal:
+        read_quarantine(lake_root)
+
+    message = str(refusal.value)
+    assert "byte 0 on line 1" in message, message
+    assert "leads the file" in message, message
+    assert "re-saving as UTF-8 without a byte-order mark" in message, message
+    assert "sits inside the file" not in message, message
+
+
+def test_a_second_mark_changes_the_repair_and_the_message_says_so(lake_root):
+    """The advice for one mark is false for two, and the message must not give it anyway.
+
+    Re-saving without a byte-order mark clears a leading one and clears nothing else. On a file
+    that holds a second, that advice sends the operator away believing the ledger is repaired.
+    The guard still holds, because the next read refuses again, but they acted on a sentence that
+    was not true and the character that proves it is invisible.
+
+    This also fixes which mark the number points at. Reporting the last one instead of the first
+    passes every other case here, since each of them holds exactly one.
+    """
+    append_quarantine(lake_root, _verdict("first"))
+    append_quarantine(lake_root, _verdict("second"))
+    path = quarantine_path(lake_root)
+    lines = path.read_bytes().splitlines(keepends=True)
+    path.write_bytes(MARK_BYTES + lines[0] + MARK_BYTES + lines[1])
+
+    with pytest.raises(LedgerHasByteOrderMark) as refusal:
+        read_quarantine(lake_root)
+
+    message = str(refusal.value)
+    assert "byte 0 on line 1" in message, message
+    assert "first of 2 in this file" in message, message
+    assert "re-saving as UTF-8 without a byte-order mark removes it" not in message, message
+
+
+def test_a_torn_first_append_still_reads_as_an_empty_ledger(lake_root):
+    """The accepting side, and the shape this change deliberately did **not** refuse.
+
+    Refusing every unparseable first line would cover the mark as a class, and it would be
+    wrong. ``append_line`` emits the entry with one ``os.write`` to an ``O_APPEND`` descriptor
+    and never reads the file first, so a crash during the very first append leaves an unparseable
+    line 1 with nothing behind it. That is a genuine torn tail, and
+    ``_refuse_hidden_entries``'s docstring argues at length for discarding it.
+
+    So the refusal keys on the character rather than on the position, because nothing at the
+    reader can tell a marked line from a torn fragment.
+    """
+    with quarantine_path(lake_root).open("ab") as handle:
+        handle.write(b'{"check": "entitlement", "partit')
+
+    assert read_quarantine(lake_root) == []
+
+
+def test_every_quarantine_reader_funnels_through_the_byte_order_mark_refusal(lake_root):
+    """The same funnel the other two refusals have, for the same reason.
+
+    ``latest_quarantine`` and ``latest_quarantine_by_check`` are what ``loader``, ``sweep``,
+    ``dashboard`` and ``signoff`` actually call. A refusal only ``read_quarantine`` made would
+    leave all four reading a lifted quarantine.
+    """
+    append_quarantine(lake_root, _verdict("kept"))
+    _mark_before(lake_root, b"{")
+
+    for reader in (read_quarantine, latest_quarantine, latest_quarantine_by_check):
+        with pytest.raises(LedgerHasByteOrderMark):
+            reader(lake_root)
+
+
+def test_a_mark_before_a_line_in_the_body_refuses_as_the_mark_not_as_a_tear(lake_root):
+    """The precedence between this refusal and ``TornLedger``, which nothing else holds.
+
+    A mark anywhere but in front of the last line leaves whole lines behind the point the read
+    stops at, so ``_refuse_hidden_entries`` would refuse it as a tear. Both refuse, so the guard
+    never inverts either way, and what the choice decides is what the operator is told. A tear
+    sends them looking for a half-written line, and a three-line ledger with a mark in it holds
+    three intact lines. They would find nothing wrong and have no reason to trust the message.
+
+    So the mark wins, because it is a statement about the whole file and a tear is a statement
+    about one line in it. Moving the check out of ``_decode`` to sit beside
+    ``_refuse_hidden_entries`` is a plausible refactor, since both refuse the whole file and one
+    already lives there. The review lens made that move and all 186 tests in the three files this
+    change touches still passed.
+    """
+    for name in ("first", "second", "third"):
+        append_quarantine(lake_root, _verdict(name))
+    _mark_before(lake_root, b'{"check": "entitlement", "partition": "second"')
+
+    with pytest.raises(LedgerHasByteOrderMark) as refusal:
+        read_quarantine(lake_root)
+
+    # The fixture is a tear as far as the line count is concerned, which is what makes the
+    # choice real rather than vacuous. Without this the test would pass on a ledger where
+    # nothing was hidden and no second refusal was ever in the running.
+    assert "on line 2" in str(refusal.value), refusal.value
+    assert len(quarantine_path(lake_root).read_text().splitlines()) == 3
+
+
+def test_a_byte_that_does_not_decode_beside_a_mark_refuses_as_not_utf8(lake_root):
+    """The order between the two refusals, which is decided by what each one needs.
+
+    A file cannot be searched for a character before it decodes, so bytes that do not decode
+    refuse first. Both classes are a ``ManifestError`` and both say a human repairs the file
+    under the lock, so the operator is sent somewhere useful either way. What this holds is that
+    the order is the one the code can actually implement rather than an accident nobody chose.
+    """
+    append_quarantine(lake_root, _verdict("kept"))
+    _mark_before(lake_root, b"{")
+    _flip(lake_root, b'"quarantined"', b'"quarantin\xffd"')
+
+    with pytest.raises(LedgerNotUtf8):
+        read_quarantine(lake_root)
+
+
+def test_a_manifest_ledger_carrying_a_mark_still_reads_short_rather_than_refusing(lake_root):
+    """The scope line this change draws, held rather than only written in a docstring.
+
+    ``_decode`` is the quarantine ledger's decoder and not this module's. ``scrub`` resolves the
+    manifest through ``latest_entries``, so a refusal reaching that read would take the Sunday
+    scrub down on the very file it exists to report, which is the asymmetry
+    ``read_quarantine``'s docstring already states for ``TornLedger``.
+
+    The manifest's own answer to this character is marketlake #519, and it is deliberately not
+    here. This test is what makes moving that line a decision somebody takes rather than
+    something a later change does by accident.
+    """
+    entry = {"partition": "chains/ticker=SPY/date=2026-09-16.parquet", "rows": 3, "sha256": "x"}
+    append_line(manifest_path(lake_root), entry)
+    assert list(latest_entries(lake_root)) == [entry["partition"]]
+
+    path = manifest_path(lake_root)
+    path.write_bytes(BYTE_ORDER_MARK.encode("utf-8") + path.read_bytes())
+
+    assert read_manifest(lake_root) == []
+    assert latest_entries(lake_root) == {}

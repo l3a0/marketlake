@@ -31,11 +31,14 @@ deletion. This module gives it the same append helper and its own reader.
 The read is where it parts from rule 1, and marketlake #469 is why. Its entries are a guard,
 so a read that stopped with whole lines behind it would resolve to a ledger missing its own
 verdicts and admit the partitions they withhold. :func:`read_quarantine` refuses that with
-:class:`TornLedger` instead. The manifest's reader keeps the truncating read **for a torn
-tail**, because :func:`scrub` resolves through it and a Sunday scrub that raised would fail on
-the very file it exists to report. Bytes that will not decode are not that shape, and both
-ledgers refuse them as :class:`LedgerNotUtf8`, because a read that cannot decode the file
-answers nothing for the scrub to report either way. Marketlake #499 is that half.
+:class:`TornLedger` instead, and refuses two further shapes of damage to the whole file:
+:class:`LedgerNotUtf8` for bytes that do not decode and :class:`LedgerHasByteOrderMark` for a
+byte-order mark, which does decode and still cannot be read past. The manifest's reader keeps
+the truncating read **for a torn tail**, because :func:`scrub` resolves through it and a Sunday
+scrub that raised would fail on the very file it exists to report. Bytes that will not decode
+are not that shape, and both ledgers refuse them as :class:`LedgerNotUtf8`, because a read that
+cannot decode the file answers nothing for the scrub to report either way. Marketlake #499 is
+that half. What the manifest does about a byte-order mark is still open and is marketlake #519.
 
 The corporate-actions ledger at ``actions/corporate_actions.jsonl`` follows them too, and
 it keys on the action rather than on a path, the way the quarantine ledger keys on the
@@ -111,6 +114,11 @@ VERDICT_FIELD = "verdict"
 CLEAN_VERDICT = "clean"
 
 
+# The character a byte-order mark decodes to. It is written as an escape rather than typed,
+# because typing it would put an invisible character in this file and in every grep for it.
+BYTE_ORDER_MARK = "\ufeff"
+
+
 class RowCountRegression(Exception):
     """Raised when an append would shrink a manifested partition's row count.
 
@@ -180,6 +188,61 @@ class LedgerNotUtf8(ManifestError):
     so a damaged one still ends the 18:30 run. ``control_plane.sunday_maintenance`` calls
     ``scrub`` with no ``try`` around it. Marketlake #517 carries the tuple, and until it lands
     the sentence above is true of one of the two ledgers this class now covers.
+    """
+
+
+class LedgerHasByteOrderMark(ManifestError):
+    """Raised for a ledger holding a byte-order mark, which decodes cleanly and reads wrong.
+
+    A byte-order mark is ``b"\\xef\\xbb\\xbf"``, and it is **valid UTF-8**, so it decodes without
+    complaint and never reaches :class:`LedgerNotUtf8`. It decodes to one zero-width character,
+    ``U+FEFF``, and that character silently lifts a quarantine two different ways. Marketlake
+    #506 is that defect.
+
+    **In front of the ledger's last line it discards a verdict.** The character sits ahead of the
+    ``{`` and makes the line unparseable, ``parse_jsonl`` ends the read there, and
+    :func:`_refuse_hidden_entries` scores nothing hidden behind it, so the line is dropped as the
+    torn tail it was built to accept. Executed against `6496640`, a one-entry ledger went from
+    withholding its partition to withholding nothing, and a three-entry ledger with the mark in
+    front of line 3 lost that verdict alone. A one-entry ledger's line 1 is always its last line,
+    and one entry is what the ledger holds from the battery's first verdict on.
+
+    **Inside a value the line parses and the key is mangled.** The verdict files under a
+    partition name no reader asks about, so the partition it withholds disappears from the ledger
+    and reads clean while ``sweep.count_quarantined`` still reports one quarantine standing. That
+    is :class:`LedgerNotUtf8`'s own argument about the replacement character, reached here by a
+    character that decodes.
+
+    **Refusing rather than stripping, because stripping reaches one of the two.**
+    ``utf-8-sig`` removes a **leading** mark only, so it fixes neither a mark in front of a later
+    last line nor one inside a value. It is also fail open on every question the character's
+    presence raises about the rest of the file: ``append_line`` cannot write one, so a ledger
+    carrying it was rewritten by something that is not a writer.
+
+    **Refusing it anywhere cannot fail closed on a real ledger.** ``append_line`` calls
+    ``json.dumps`` with ``ensure_ascii`` at its default, so this character is emitted as its
+    six-character ASCII escape even when a field literally holds it, and every prefix of such a
+    line is escaped the same way. The design doc states that property for the whole ledger and
+    marketlake #495 rests on it too.
+
+    **This narrows what a hand repair may contain, and the narrowing is one character wide.**
+    ``test_a_hand_repaired_ledger_may_hold_non_ascii_and_still_reads`` decided that a person
+    writing a reason by hand writes the characters their language has, which is why this decodes
+    UTF-8 rather than ASCII. ``U+FEFF`` is a zero-width no-break space no language needs inside a
+    reason, and its presence is a save-time or copy-paste artifact rather than a typed character.
+    :func:`_decode` sees the file rather than the field, so it cannot accept the character in a
+    ``reason`` while refusing it in a ``partition``, which is the field where it inverts the
+    guard. Every other non-ASCII character still reads.
+
+    **The message names the character rather than only locating it.** Both sibling refusals send
+    the repairer to a number, and that unit fails here: the character is invisible, so an
+    operator sent to line 1 opens the file and sees nothing wrong.
+
+    **It also says how many the file holds, because the repair for one is not the repair for
+    two.** Re-saving without a byte-order mark clears a leading one and clears nothing else, so
+    advising it on a file that holds a second would send the operator away believing the ledger
+    is repaired. The guard still holds, since the next read refuses again, but the advice would
+    have been false and the person acting on it has no way to see the character that proves it.
     """
 
 
@@ -445,26 +508,76 @@ def _refuse_hidden_entries(path: Path, text: str, entries: Sequence[dict]) -> No
 
 
 def _decode(path: Path, raw: bytes) -> str:
-    """The quarantine ledger's bytes as text, or the refusal its damage earns.
+    """The quarantine ledger's bytes as text, or a refusal naming what in them cannot be read.
 
-    :func:`_decode_utf8` is the whole of it today, and the two are kept apart anyway, because
-    this is where a rule belonging to this ledger alone goes. Marketlake #506 is adding one, a
-    refusal for a byte-order mark, which decodes cleanly and still cannot be read past.
-    Marketlake #519 is that same question for the manifest and it is open, so the seam is what
-    lets the first land without deciding the second: :func:`_read_jsonl` reads through
-    :func:`_decode_utf8` and meets only the shared refusal.
+    Two shapes refuse. Bytes that do not decode raise :class:`LedgerNotUtf8`, through
+    :func:`_decode_utf8`, which both ledgers share. Text that decodes and holds a byte-order
+    mark raises :class:`LedgerHasByteOrderMark`, and that one is this ledger's alone: marketlake
+    #519 is the same question for the manifest and it is open, so :func:`_read_jsonl` reads
+    through :func:`_decode_utf8` and meets only the first of the two.
+
+    **The byte-order mark is looked for in the decoded text rather than in the bytes.** A UTF-16
+    mark is not valid UTF-8, so ``FF FE`` and ``FE FF`` both refuse above as
+    :class:`LedgerNotUtf8` and never reach this. The only mark that survives the decode is the
+    UTF-8 one, and reading the text catches the character wherever in the file it arrived rather
+    than only at the front. The offset is recovered from the text index because the message keeps
+    the units its sibling above uses.
+
+    The two refusals here are ordered by what they need. A file cannot be searched before it
+    decodes, so a ledger carrying both an undecodable byte and a mark refuses as
+    :class:`LedgerNotUtf8`.
+
+    **The mark also takes precedence over :class:`TornLedger`, and that is a choice rather than
+    an accident of where this sits.** A mark anywhere but in front of the ledger's last line
+    leaves whole lines behind the point the read stops at, so the torn check would refuse it too.
+    Both refuse, so the guard never inverts either way, and what the choice decides is what the
+    operator is told. A tear sends them looking for a half-written line, and a marked ledger
+    holds none: every line in it is intact. The mark wins because it is a statement about the
+    whole file, where a tear is a statement about one line in it.
     """
-    return _decode_utf8(path, raw, consequence=_QUARANTINE_CONSEQUENCE)
+    text = _decode_utf8(path, raw, consequence=_QUARANTINE_CONSEQUENCE)
+    index = text.find(BYTE_ORDER_MARK)
+    # ``!= -1`` rather than a truthiness test. A leading mark is the one an editor writes, so it
+    # is the case that has to be caught, and its index is zero, which a truthiness test drops.
+    if index != -1:
+        offset = len(text[:index].encode("utf-8"))
+        line = text.count("\n", 0, index) + 1
+        # The first mark rather than any mark, so the number sends the repairer to the top of the
+        # file and they work down. The count is what keeps the advice from being false: re-saving
+        # clears a leading mark and clears nothing else, so a file holding a second one would
+        # read as repaired and refuse again on the next read.
+        total = text.count(BYTE_ORDER_MARK)
+        if total > 1:
+            where = (
+                f"It is the first of {total} in this file, so each one has to be found and "
+                "deleted rather than re-saving once"
+            )
+        elif index == 0:
+            where = "It leads the file, so re-saving as UTF-8 without a byte-order mark removes it"
+        else:
+            where = "It sits inside the file, so the character has to be deleted where it is"
+
+        raise LedgerHasByteOrderMark(
+            f"{path}: byte {offset} on line {line} begins a byte-order mark, the three bytes "
+            f"ef bb bf. It is valid UTF-8 and zero width, so it decodes cleanly and an editor "
+            f"shows nothing there. {where}. Nothing in this lake writes this character, so these "
+            "bytes were changed by something other than a writer. Read past it, a verdict is "
+            "either discarded or filed under a name no reader asks about, so this ledger cannot "
+            "say which partitions it withholds. Repairing a ledger is a human's job under the "
+            "lock."
+        )
+    return text
 
 
 def read_quarantine(lake_root: Path) -> list[dict]:
     """Every quarantine entry in file order, with the torn trailing line discarded.
 
-    Two shapes refuse rather than reading short, and both are a :class:`ManifestError`. A read
-    that stops in the body raises :class:`TornLedger` rather than returning the entries in
-    front of the damage. Bytes that do not decode raise :class:`LedgerNotUtf8`. This is the one
-    reader every quarantine consumer funnels through, so both refusals reach all of them from
-    one place.
+    Three shapes refuse rather than reading short, and all three are a :class:`ManifestError`. A
+    read that stops in the body raises :class:`TornLedger` rather than returning the entries in
+    front of the damage. Bytes that do not decode raise :class:`LedgerNotUtf8`. Text that decodes
+    and holds a byte-order mark raises :class:`LedgerHasByteOrderMark`, and marketlake #506 is
+    why a character that decodes cleanly still cannot be read past. This is the one reader every
+    quarantine consumer funnels through, so all three refusals reach all of them from one place.
 
     **Why the torn-tail refusal is here and not in ``parse_jsonl``.** The rule is the same for
     both ledgers and the consequences are not. :func:`scrub` resolves the manifest through

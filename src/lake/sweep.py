@@ -209,11 +209,12 @@ ScheduleSetter = Callable[[date], None]
 # they belong is marketlake #446.
 # ``ManifestError`` as the class rather than one of its members, the lesson ``_BARS_REFUSALS``
 # below already writes down. Both walks read through ``lake.loader``, which resolves the
-# quarantine ledger on every partition it opens and publishes a damaged one as this error. Five
-# shapes reach here, two from the lower layer of that read and three from the upper.
-# ``manifest.read_quarantine`` refuses the whole file, as ``manifest.TornLedger`` for a read that
-# stopped with verdicts written behind it and as ``manifest.LedgerNotUtf8`` for bytes that do not
-# decode.
+# quarantine ledger on every partition it opens and publishes a damaged one as this error. Six
+# shapes reach here, three from each layer of that read. ``manifest.read_quarantine`` refuses the
+# whole file, as ``manifest.TornLedger`` for a read that stopped with verdicts written behind it,
+# as ``manifest.LedgerNotUtf8`` for bytes that do not decode, and as
+# ``manifest.LedgerHasByteOrderMark`` for a byte-order mark, which is valid UTF-8 and so reaches
+# neither of the other two.
 # ``manifest.latest_quarantine_by_check`` refuses one entry above it, three ways: a line that
 # parses and names no partition, one whose ``partition`` cannot be a dict key, and one whose
 # ``check`` cannot be. Executed against
@@ -222,15 +223,17 @@ ScheduleSetter = Callable[[date], None]
 # was one bad line in a ledger these walks do not even write. Marketlake #469 made the torn read
 # likely enough to matter, since a crash mid-append needs no hand-malformed line, and marketlake
 # #495 added the bytes that do not decode, which until then escaped this tuple as a
-# ``ValueError``.
+# ``ValueError``. Marketlake #506 added the byte-order mark, which escaped both: it decodes, so
+# it is not #495, and on a one-entry ledger it read as a torn tail and lifted the quarantine
+# rather than refusing at all.
 #
-# **The fifth shape was the one this tuple could not reach, and marketlake #514 closed it at the
-# raise rather than by widening here.** An entry whose ``partition`` cannot be a dict key raised
-# a bare ``TypeError`` out of ``manifest.latest_quarantine_by_check``, which is neither a
+# **The one shape this tuple could not reach was closed at the raise rather than by widening
+# here, and marketlake #514 is that change.** An entry whose ``partition`` cannot be a dict key
+# raised a bare ``TypeError`` out of ``manifest.latest_quarantine_by_check``, which is neither a
 # ``ManifestError`` nor an ``OSError``, so it escaped this tuple the way the non-decodable bytes
 # did before marketlake #495. Executed against `ba348f3`, a ledger holding ``{"partition": []}``
-# took this whole run down. It is now a ``ManifestError`` and lands here with its four siblings.
-# So the five above are what reaches this tuple rather than every way the ledger can be damaged.
+# took this whole run down. It is now a ``ManifestError`` and lands here with its five siblings.
+# So the six above are what reaches this tuple rather than every way the ledger can be damaged.
 #
 # **This answers ``manifest._latest_by_partition``'s own sentence rather than ignoring it.**
 # That docstring says raising is safe because the two callers that must survive it already
@@ -407,10 +410,11 @@ def count_quarantined(lake_root: Path | str) -> int:
 
     A damaged ledger raises rather than reading low, because any count this reader could
     still take from one would say nothing. From a torn read it is the entries in front of the
-    damage and reads low, and from bytes that do not decode there is nothing to count. Five
-    shapes raise as a ``manifest.ManifestError``, the five the comment above
-    ``_LEDGER_REFUSALS`` enumerates, so this names the class rather than one of its members.
-    The fifth is an entry whose ``partition`` cannot be a dict key, which raised a bare
+    damage and reads low, from bytes that do not decode there is nothing to count, and from a
+    byte-order mark it is either low by the verdict the mark discarded or right about a partition
+    no reader asks about. Six shapes raise as a ``manifest.ManifestError``, the six the comment
+    above ``_LEDGER_REFUSALS`` enumerates, so this names the class rather than one of its members.
+    One of them is an entry whose ``partition`` cannot be a dict key, which raised a bare
     ``TypeError`` until marketlake #514.
     :func:`_counted` catches every one of them, because it catches bare ``Exception``, and
     reports the line.
