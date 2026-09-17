@@ -752,7 +752,12 @@ def test_a_naive_expiration_stamp_refuses_rather_than_reading_the_machines_clock
     It parses cleanly, and `astimezone` then resolves it against whatever timezone the process
     runs in, so the same chain would put this contract in the roster on one machine and leave it
     out on another with nothing raised. That is the silently short roster the refusal exists for.
-    The weakness is `bars.session_of`'s own, marketlake #385.
+
+    **The refusal moved into `bars.session_of` and this assertion did not change**, which is the
+    point of keeping it. Marketlake #385 put the test where the reading lives, so `_expires_on`
+    no longer carries its own copy. What a caller of this view sees is still
+    `ExpirationUnreadable` rather than the `BarsError` raised underneath it, because this view
+    owes its callers its own vocabulary for a roster it cannot vouch for.
     """
     root = _lake(fixture_lake, [_contract(750.0, expiration_date=f"{SESSION}T20:00:00.000")])
     with pytest.raises(ExpirationUnreadable):
@@ -768,6 +773,27 @@ def test_a_plain_date_expiration_refuses_too(fixture_lake):
     root = _lake(fixture_lake, [_contract(750.0, expiration_date=SESSION)])
     with pytest.raises(ExpirationUnreadable):
         _view(root)
+
+
+def test_an_expiration_that_is_not_a_string_reads_as_unreadable_rather_than_raising():
+    """The type guard is what keeps the refusal in this view's own vocabulary.
+
+    `_expires_on` hands the stamp to `bars.session_of`, which parses it, and
+    `datetime.fromisoformat` raises `TypeError` on a non-string. That is not in the
+    `except (ValueError, StampNotAnInstant)` below it, so without the guard a `date` read back
+    from a schema change would escape as a `TypeError` rather than as the
+    `ExpirationUnreadable` this view documents. Replacing the guard with an `is None` test left
+    the whole suite green, so nothing said which of the two a caller gets.
+    """
+    from datetime import date as _date
+
+    from lake.settle import _expires_on
+
+    assert _expires_on(_date(2026, 9, 18)) is None
+    assert _expires_on(None) is None
+    assert _expires_on(20260918) is None
+    assert _expires_on("not a stamp") is None
+    assert _expires_on(f"{SESSION}T20:00:00.000+00:00") == _date.fromisoformat(SESSION)
 
 
 def test_a_null_settlement_type_is_unreadable_rather_than_am_settled(fixture_lake):

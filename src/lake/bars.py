@@ -256,6 +256,57 @@ class UnsupportedBarFreq(BarsError):
         self.freq = freq
 
 
+class StampNotAnInstant(BarsError):
+    """A stamp carrying no UTC offset, which names no instant this module can read.
+
+    ``datetime.fromisoformat`` accepts a naive stamp, and ``astimezone`` then resolves it against
+    whatever timezone the process happens to be running in. So the same stamp names one session
+    on a machine set to Eastern and another on a machine set to UTC, with nothing raised either
+    way. Measured: ``2026-09-16T01:00:00`` reads as 2026-09-16 under ``TZ=America/New_York`` and
+    as 2026-09-15 under ``TZ=UTC``.
+
+    Every other stamp reader in this package tests for that before trusting a stamp.
+    ``onboard``, ``vendor``, ``actions``, ``capture_spans`` and ``security_master`` each spell the
+    same condition, and ``lake.bars`` was the one that did not. ``settle`` spelled it too until
+    this class took the rule over, and it reaches the same refusal now by calling
+    :func:`session_of` rather than by keeping its own copy. The refusal names the offset form to
+    pass, which is the rule ``docs/design.md`` states for onboarding's own naive-instant refusal.
+
+    **It stays out of the walk's catch in :func:`fetch_session_bars`.** That tuple names
+    ``CloseOfRecordDisagrees`` rather than the ``BarsError`` base precisely so a later subclass
+    decides for itself, and this one decides to stay out. Inside this module every stamp is
+    minted by ``journal.bars_rows`` through ``journal.epoch_ms_to_utc``, which pins ``tz=UTC``,
+    so a stamp reaching this refusal means that guarantee has broken for the run rather than for
+    the ticker-day being walked. Holding it per ticker-day would file the same finding for every
+    ticker and still write the run as though it had worked. ``UnsupportedBarFreq`` refuses up
+    front for that same reason.
+
+    **It is named at both doors an operator meets, which is the other half of the
+    ``UnsupportedBarFreq`` comparison.** Staying out of the per-ticker-day catch is not a reason
+    to reach a person as a stack trace. ``main`` prints one named line and exits 2, and
+    ``sweep._BARS_REFUSALS`` holds it so the 18:30 job reports a refused bars piece rather than
+    ending mid-run. That second one is what keeps an escape from costing the report file, the
+    digest and the Friday ``pmset`` wake, which are all written after the pieces block.
+    ``docs/design.md`` states the rule: one named line and exit 2 rather than a stack.
+
+    **Two readers outside this module call :func:`session_of`, and only one can reach this.**
+    ``lake.settle`` can, on ``expiration_date``, which ``journal`` keeps as the vendor's ISO
+    string verbatim rather than minting it. It catches this and reads the stamp as unreadable,
+    which leaves ``ExpirationUnreadable`` as the refusal that view already documents.
+    ``loader._in_view`` cannot, and the reason is ordering rather than anything it does:
+    ``load_bars`` runs ``_sorted_by_instant`` over the same table first, which refuses an
+    unreadable stamp in ``LoadError`` vocabulary before ``_in_view`` sees it.
+    """
+
+    def __init__(self, bar_ts: str) -> None:
+        super().__init__(
+            f"{bar_ts!r} carries no UTC offset, so the session it names would be decided by "
+            "this machine's timezone rather than by the stamp. Pass an offset, like "
+            "2026-09-15T20:00:00+00:00 or 2026-09-15T16:00:00-04:00."
+        )
+        self.bar_ts = bar_ts
+
+
 class SpansAbsent(BarsError):
     """The lake holds no capture-spans file, so the backfill has no range to walk.
 
@@ -392,8 +443,12 @@ def session_of(bar_ts: str) -> date:
     That direction fails closed. A stamp this reading places on the wrong date leaves the
     selection below with no candle for the session, the span check refuses, and nothing lands.
     The ticker-day is held with a finding instead of landing a bar under the wrong day.
+
+    **A stamp carrying no offset is refused rather than read.** ``StampNotAnInstant`` says why.
+    A naive stamp resolves against the process's own timezone, so this would answer by the
+    machine rather than by the stamp. Marketlake #385.
     """
-    return datetime.fromisoformat(bar_ts).astimezone(MARKET_TZ).date()
+    return _as_instant(bar_ts).astimezone(MARKET_TZ).date()
 
 
 def select_session_rows(rows: Sequence[dict], window: BarWindow) -> list[dict]:
@@ -413,6 +468,24 @@ def select_session_rows(rows: Sequence[dict], window: BarWindow) -> list[dict]:
     return [row for row in rows if session_of(str(row["bar_ts"])) == window.session]
 
 
+def _as_instant(bar_ts: str) -> datetime:
+    """One bars stamp as a UTC instant, refusing one that carries no offset.
+
+    This is the module's single rule for turning a ``bar_ts`` string into an instant, and the
+    three readers that need one share it: :func:`session_of` names the session a stamp belongs
+    to, :func:`_instant` places a row against the requested window, and :func:`_bar_close` picks
+    the session's last candle. Writing the rule once is the point. Two of those readers were
+    written apart and drifted, which is what marketlake #385 and #386 are.
+
+    ``StampNotAnInstant`` carries the argument for refusing a naive stamp rather than resolving
+    it against the process's timezone.
+    """
+    parsed = datetime.fromisoformat(bar_ts)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise StampNotAnInstant(bar_ts)
+    return parsed.astimezone(UTC)
+
+
 def _instant(row: dict) -> datetime:
     """One row's stamp as a UTC instant.
 
@@ -421,7 +494,7 @@ def _instant(row: dict) -> datetime:
     not disagree about which stamps are readable, and they cannot, because only a stamp the
     builder already accepted ever reaches a row.
     """
-    return datetime.fromisoformat(str(row["bar_ts"])).astimezone(UTC)
+    return _as_instant(str(row["bar_ts"]))
 
 
 def check_bar_span(
@@ -1016,6 +1089,10 @@ def _walk(
             #
             # ``CloseOfRecordDisagrees`` is named rather than its ``BarsError`` base, so a
             # later subclass has to decide for itself whether it belongs in here.
+            # ``StampNotAnInstant`` decided to stay out, and its own docstring carries why: a
+            # stamp it refuses means the row builder's one-offset guarantee has broken for the
+            # run rather than for this ticker-day, so containing it here would file the same
+            # finding for every ticker and still write the run as though it had worked.
             #
             # The blast radius is one ticker-day. A session the lake cannot read and a vendor
             # that refused this request are both conditions the next run can meet differently,
@@ -1211,10 +1288,36 @@ def _bar_close(rows: Sequence[dict]) -> float | None:
     ``selected`` holds the rows for the session being gated, which on ``1d`` is the one candle
     whose stamp maps to it. The last by stamp is the session's close on either frequency, so
     the same reading answers a 1-min partition should a check ever want it.
+
+    **The last by stamp is the last instant, not the last string.** This sorted the raw text
+    until marketlake #386, and the two orders come apart whenever two stamps spell one instant
+    differently. That input is not reachable through the row builder, which mints every
+    ``bar_ts`` from an epoch through ``journal.epoch_ms_to_utc`` at one offset, so the text sort
+    answered correctly for as long as that held. It held two modules away and nothing here said
+    so, which is the whole of what was wrong with it. ``load_bars`` orders its own answer by
+    instant, and ``lake.settle`` takes the last row of it, so the two readings of one session's
+    close now agree by construction rather than by coincidence.
+
+    **The tie is stated rather than inherited, and it is ``load_bars``'s.** Two candles can name
+    one instant while spelling it differently, and the two readings used to split on that:
+    ``max`` returns the first maximal row, where ``load_bars`` sorts stably and ``lake.settle``
+    takes the last. Measured on that pair, the gate read 700.0 and the view read 757.39. Sorting
+    and taking the last row is ``load_bars``'s own rule, so this takes it rather than minting a
+    second one, and the agreement above covers a tie rather than stopping short of it.
+
+    No such pair exists to measure against, because the lake holds no bars at all yet. That is
+    the reason to state the rule now rather than after one arrives.
+
+    **Parsing here cannot raise in the sweep, and the order is why.** ``_as_instant`` raises on a
+    stamp ``str`` would have swallowed. Every row reaching this has already been parsed twice,
+    by ``select_session_rows`` and then by ``check_bar_span``, so a stamp that would raise has
+    ended the ticker-day before this runs. A change that reorders those two checks puts the raise
+    back on this path, where the ``except`` below does not cover it: that clause is about a close
+    the vendor retyped, not about a stamp.
     """
     if not rows:
         return None
-    latest = max(rows, key=lambda row: str(row["bar_ts"]))
+    latest = sorted(rows, key=_instant)[-1]
     value = latest.get("close")
     if value is None or isinstance(value, bool):
         return None
@@ -1747,6 +1850,13 @@ def main(
     except UnsupportedBarFreq as exc:
         print(f"bars: {exc}. Fix the bars list in tickers.yaml.", file=sys.stderr)
         return 2
+    except StampNotAnInstant as exc:
+        # The refusal reaches a person as one line rather than a stack, which is the treatment
+        # ``UnsupportedBarFreq`` above already gets and the rule ``docs/design.md`` states. No
+        # instruction is invented past the exception's own message, because that message already
+        # names the offset form to pass and a wrong instruction is worse than none.
+        print(f"bars: {exc}", file=sys.stderr)
+        return 2
     except NotASession as exc:
         print(f"bars: {exc}, so there are no bars to fetch.", file=sys.stderr)
         return 2
@@ -1777,6 +1887,7 @@ __all__ = [
     "LandedPartition",
     "SpanCoverage",
     "SpansAbsent",
+    "StampNotAnInstant",
     "TickerDay",
     "UnsupportedBarFreq",
     "backfill_bars",

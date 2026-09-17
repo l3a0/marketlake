@@ -111,13 +111,13 @@ session later at the earliest. D19's OI view carries the same lag for its own re
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date
 from math import isfinite
 from pathlib import Path
 
 import pyarrow as pa
 
-from lake.bars import session_of
+from lake.bars import StampNotAnInstant, session_of
 from lake.loader import ADJUST_NONE, load_bars, load_chain, resolve_lake_root
 from lake.splits import Deliverable, DeliverableUnreadable, deliverable_of_row
 from lake.vendor import DAILY_FREQ
@@ -354,29 +354,35 @@ def _expires_on(stamp: object) -> date | None:
     """The session a contract's expiration stamp names, or ``None`` when it names none.
 
     The reading is ``bars.session_of``'s, which is the rule for how a stamp names a session and
-    is what ``load_bars`` uses on a bar. This adds the precondition that function documents and
-    does not enforce: "the stamp is a UTC instant".
+    is what ``load_bars`` uses on a bar. It now enforces the precondition its docstring used to
+    only document, that the stamp is a UTC instant, and raises ``StampNotAnInstant`` on one
+    carrying no offset. Marketlake #385 moved that refusal there, and the duplicate test this
+    function used to carry came out with it, which is what the previous version of this
+    docstring said would happen.
 
     An offset is what makes the reading a fact rather than a property of the machine. A naive
     stamp parses, and ``astimezone`` then reads it in whatever timezone the process is running
     in, so the same chain would put a contract in the expiry roster on one machine and leave it
     out on another, with nothing raised either way. That is exactly the silently short roster
-    ``ExpirationUnreadable`` exists to prevent, so a stamp with no offset is one this cannot
-    read. The weakness is ``session_of``'s own and is marketlake #385; this check comes out when
-    that lands.
+    ``ExpirationUnreadable`` exists to prevent.
 
-    Every one of the 19,775,426 data rows in the lake's sealed chains carries an offset, so
-    nothing on disk reaches the refusal today.
+    **The refusal moved and the answer did not.** A stamp with no offset still reads as no
+    session here, because this catches what ``session_of`` now raises rather than passing it up.
+    A caller of this view sees ``ExpirationUnreadable``, which is what it documents, rather than
+    a ``BarsError`` from a module it did not call.
+
+    ``expiration_date`` is the one column a vendor spelling survives into: ``journal`` keeps it
+    as the vendor's ISO string verbatim rather than minting it from an epoch, which is why this
+    reader is the one that can reach the refusal and the two inside ``lake.bars`` cannot. Every
+    one of the 29,715,426 data rows in the lake's sealed chains carries an offset, so nothing on
+    disk reaches it today.
     """
     if not isinstance(stamp, str):
         return None
     try:
-        parsed = datetime.fromisoformat(stamp)
-    except ValueError:
+        return session_of(stamp)
+    except (ValueError, StampNotAnInstant):
         return None
-    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
-        return None
-    return session_of(stamp)
 
 
 def _settlement_close(
@@ -389,12 +395,11 @@ def _settlement_close(
     candle by the instant its stamp names, which is what ``load_bars`` has already ordered the
     answer by, so the last row is it.
 
-    ``bars._bar_close`` answers the same question for the gate and answers it differently.
-    It sorts the raw stamp text, and the same instant has more than one spelling, so a response
-    mixing ``-04:00`` and ``+00:00`` sends the two readings apart. The loader's module docstring
-    carries the measurement that says this is not hypothetical, 408 distinct ``snap_ts`` texts
-    naming 406 distinct instants in one live partition. Comparing instants is the reading that
-    survives that, so this takes it, and the gate's text sort is marketlake #386.
+    ``bars._bar_close`` answers the same question for the gate, and the two now agree by
+    construction. It sorted the raw stamp text until marketlake #386, which is an order that
+    comes apart from the instant order whenever two stamps spell one instant differently. Both
+    sides compare parsed instants now, so a reader taking this view's close and a gate holding a
+    bar are reading the same candle rather than two candles that happened to match.
 
     Three shapes refuse rather than settling anything, and all three are session-wide because
     the close is one number for the whole roster: an empty partition, a null close, and a close
