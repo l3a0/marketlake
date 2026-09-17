@@ -115,7 +115,8 @@ def test_read_rejects_an_unsupported_schema_version(lake_root: Path):
 
 
 def test_write_goes_through_a_temp_file_and_one_rename(lake_root: Path, monkeypatch):
-    """Onboarding writes the master while the daemon and dashboard read it.
+    """Onboarding and the split detector's mapping write both rewrite the master, while
+    the daemon and the dashboard read it.
 
     A write straight onto the target truncates it first, so a reader can catch it half
     done. The write instead lands in a temp file beside the target and renames over it in

@@ -215,6 +215,15 @@ def write_close_guard(
     are the two readings this lake refuses to confuse everywhere else, so the file says
     which it was and the price is one small JSON per session day.
 
+    **The rosters are what the six lists are read against.** Five fields name what went
+    wrong and the sixth names what was repaired, and none of them says how many tickers the
+    run had to judge. So an empty file meant "every close landed" and "nobody was examined"
+    alike, which is this writer's own ambiguity one level further in. ``spot_owed`` and
+    ``option_owed`` carry the tickers rather than a count, because a reader holding the
+    file wants to know which of the tickers that owed a close is the one sitting in
+    ``unobserved``. They go down whole, like every field but ``problems``: a ticker is not a
+    path and carries nothing to redact.
+
     **Raises rather than swallowing.** The caller is the daemon's close+5 dispatch, and
     that dispatch already wraps every session-relative job so a failure costs the job and
     never the loop. Catching here would hide the failure from the one place that reports
@@ -233,6 +242,9 @@ def write_close_guard(
         "shortfalls": list(outcome.shortfalls),
         "refused": list(outcome.refused),
         "problems": [_redacted(problem) for problem in outcome.problems],
+        "spot_owed": list(outcome.spot_owed),
+        "option_owed": list(outcome.option_owed),
+        "sources_missing": list(outcome.sources_missing),
     }
     # `parents=True` from a missing lake root would create the lake itself. The Sunday
     # job decides whether to ping on `root.is_dir()` and re-reads that on every retry, so

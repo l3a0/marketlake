@@ -556,7 +556,10 @@ reach:
 Test 13 joined that list when [#279](https://github.com/l3a0/marketlake/issues/279) shipped
 the detector it replays against. The fixture builder can express a split now that
 `tests/support/lake.py` carries `option_root`, the four deliverable columns, `mini` and
-`is_chain_truncated`.
+`is_chain_truncated`. [#353](https://github.com/l3a0/marketlake/issues/353) added `ssid`
+beside them, which is what lets a fixture say *which* contract was re-symboled into which
+rather than only that a root changed, so the replay can assert the master's mapping rows and
+not just the ledger's entry.
 
 One is blocked on work that does not exist yet, because its subject is slice 3's: 12, the
 nightly sweep chain, which waits on [#281](https://github.com/l3a0/marketlake/issues/281).

@@ -36,15 +36,19 @@ from lake.paths import DATE_PARTITIONED
 
 # A fixture schema for chains rows. Provenance columns plus a few vendor columns.
 #
-# Seven of the vendor columns are here for the split detector, which reads a corporate
+# Eight of the vendor columns are here for the split detector, which reads a corporate
 # action out of what a contract delivers rather than out of its price. ``option_root`` is
 # the signal, Schwab's own ``optionRoot``, and the OCC re-symboling that announces a split
-# is a change in it. The four that follow are where the deliverable is written down, and
-# they are what the ratio and its gate are computed from. ``mini`` is there because a mini
-# contract is a tenth-size contract under its own root, so the first one to list looks
-# exactly like an adjustment and is not one. ``is_chain_truncated`` rides beside ``suspect``
-# because a thin snapshot carries a thin root set, so both are what say a session cannot
-# bound a boundary.
+# is a change in it. ``ssid`` is Schwab's own contract identifier, and it is what pairs a
+# re-symboled contract's old symbol to its new one, since the symbol moves and the contract
+# behind it does not. Without it a fixture can express a root that changed and cannot express
+# which contract was re-symboled into which. ``option_deliverables_list``,
+# ``deliverable_note`` and ``multiplier`` are where the deliverable is written down, and
+# with ``non_standard`` they are what the ratio and its gate are computed from. ``mini`` is there
+# because a mini contract is a tenth-size contract under its own root, so the first one to
+# list looks exactly like an adjustment and is not one. ``is_chain_truncated`` rides beside
+# ``suspect`` because a thin snapshot carries a thin root set, so both are what say a session
+# cannot bound a boundary.
 #
 # Widening is additive and costs the existing callers nothing. ``_table`` fills each
 # column with ``row.get(name)``, so a row written against the narrower schema still builds
@@ -56,6 +60,7 @@ FIXTURE_CHAINS_SCHEMA = pa.schema(
         ("vendor_quote_ts", pa.string()),
         ("ticker", pa.string()),
         ("occ_symbol", pa.string()),
+        ("ssid", pa.int64()),
         ("bid", pa.float64()),
         ("ask", pa.float64()),
         ("last", pa.float64()),
