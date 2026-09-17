@@ -209,13 +209,26 @@ ScheduleSetter = Callable[[date], None]
 # they belong is marketlake #446.
 # ``ManifestError`` as the class rather than one of its members, the lesson ``_BARS_REFUSALS``
 # below already writes down. Both walks read through ``lake.loader``, which resolves the
-# quarantine ledger on every partition it opens and publishes a damaged one as this error. Two
-# shapes reach here: a line that parses and names no partition, and ``manifest.TornLedger`` from
-# a read that stopped with verdicts written behind it. Executed against `8fb1fda`, the first
-# already took this whole run down, and with it the battery, the report file, the digest, the
-# ping and the Friday wake, on a lake whose only fault was one bad line in a ledger these walks
-# do not even write. Marketlake #469 made the second shape likely enough to matter, since a
-# crash mid-append needs no hand-malformed line.
+# quarantine ledger on every partition it opens and publishes a damaged one as this error. Four
+# shapes reach here, two from each layer of that read. ``manifest.read_quarantine`` refuses the
+# whole file, as ``manifest.TornLedger`` for a read that stopped with verdicts written behind it
+# and as ``manifest.LedgerNotUtf8`` for bytes that do not decode.
+# ``manifest.latest_quarantine_by_check`` refuses one entry above it, for a line that parses and
+# names no partition and for one whose ``check`` cannot be a dict key. Executed against
+# `8fb1fda`, the line naming no partition already took this whole run down, and with it the
+# battery, the report file, the digest, the ping and the Friday wake, on a lake whose only fault
+# was one bad line in a ledger these walks do not even write. Marketlake #469 made the torn read
+# likely enough to matter, since a crash mid-append needs no hand-malformed line, and marketlake
+# #495 added the bytes that do not decode, which until then escaped this tuple as a
+# ``ValueError``.
+#
+# **A fifth shape reaches none of this, and marketlake #514 is that defect.** An entry whose
+# ``partition`` cannot be a dict key raises a bare ``TypeError`` out of
+# ``manifest.latest_quarantine_by_check``, which is neither a ``ManifestError`` nor an
+# ``OSError``, so it escapes this tuple the way the non-decodable bytes did before marketlake
+# #495. Executed against `ba348f3`, a ledger holding ``{"partition": []}`` took this whole run
+# down. So the four above are what reaches this tuple rather than every way the ledger can be
+# damaged, and containing the fifth belongs at the raise rather than in a wider tuple here.
 #
 # **This answers ``manifest._latest_by_partition``'s own sentence rather than ignoring it.**
 # That docstring says raising is safe because the two callers that must survive it already
@@ -380,10 +393,14 @@ def count_quarantined(lake_root: Path | str) -> int:
     ``quarantine.jsonl`` reads as no entries, which is what keeps this from raising on a fresh
     lake.
 
-    A ledger whose read stops with verdicts written behind it does raise, as
-    ``manifest.TornLedger``, because a count taken from the entries in front of the damage
-    would read low and say nothing. :func:`_counted` contains it and reports the line, which
-    is the same containment every other count here already has.
+    A damaged ledger raises rather than reading low, because any count this reader could
+    still take from one would say nothing. From a torn read it is the entries in front of the
+    damage and reads low, and from bytes that do not decode there is nothing to count. Four
+    shapes raise as a ``manifest.ManifestError``, the four the comment above
+    ``_LEDGER_REFUSALS`` enumerates, so this names the class rather than one of its members.
+    A fifth raises a bare ``TypeError`` instead, and marketlake #514 is that defect.
+    :func:`_counted` catches every one of them, because it catches bare ``Exception``, and
+    reports the line.
 
     This is the whole ledger's open count rather than tonight's new findings. From the first
     verdict until a human signs it off, every night's file carries a standing non-zero number.
