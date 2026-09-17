@@ -23,8 +23,8 @@ like, and the three readings that fail on real data are each driven here:
 ``tests/component/test_oi_view.py`` gives the reasons and this takes the second of them.
 Adding these two to the shared schema would break nothing, unlike ``volume``, which
 ``test_load_chain.test_a_promoted_value_is_lifted_out_of_the_overflow`` asserts is absent from
-``_chains(rows)``. What the local schema buys is keeping the sixteen files that
-import the shared one out of this change. ``test_settlement_view.py`` and
+``_chains(rows)``. What the local schema buys is keeping the fourteen other files
+that import the shared one out of this change. ``test_settlement_view.py`` and
 ``test_continuity_view.py`` do the same.
 
 **Every session here carries a ladder and a spot**, because the scale guard staying silent on
@@ -1363,6 +1363,127 @@ def test_a_pair_spanning_two_instruments_is_not_a_pair(fixture_lake: FixtureLake
 
     assert _scale_unread(report_out) == [REASON_INSTRUMENT_CHANGED]
     assert report_out.held == ()
+
+
+def test_a_finding_about_an_unreadable_row_does_not_hide_a_real_split(
+    fixture_lake: FixtureLake,
+):
+    """The suppression asks what the walk filed, not whether it filed.
+
+    A gained root whose ``non_standard`` flag is null files ``split_payload``, which says a row
+    could not be read rather than that a corporate action was described. Reading any finding as
+    an answer would hide a genuine 2:1 behind an unrelated unreadable row, every night, for as
+    long as that row survives.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): _ladder_rows(DAY_ONE, LADDER, 700.0),
+            ("SPY", DAY_TWO): _ladder_rows(
+                DAY_TWO,
+                tuple(strike / 2 for strike in LADDER),
+                349.5,
+                option_root=ADJUSTED_ROOT,
+                non_standard=None,
+            ),
+        },
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    filed = sorted(held.finding.check for held in report_out.held)
+    assert filed == [CHECK_SPLIT_PAYLOAD, CHECK_STRIKE_SCALE]
+    assert report_out.scale_covered == 0
+
+
+def test_a_gate_refusing_this_split_does_suppress_the_scale_finding(
+    fixture_lake: FixtureLake,
+):
+    """The other side of the same rule: a refusal *about* this adjustment is an answer.
+
+    The consistency gate holds a ratio the vendor's two spellings disagree about. That names the
+    same event, so filing a scale finding beside it would put two lines in front of an operator
+    for one split and neither would ever clear.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): _ladder_rows(DAY_ONE, LADDER, 700.0),
+            ("SPY", DAY_TWO): [
+                _row(
+                    DAY_TWO,
+                    occ_symbol=_occ(strike / 2, ADJUSTED_ROOT),
+                    ssid=_ssid(_occ(strike)),
+                    underlying=349.5,
+                    option_root=ADJUSTED_ROOT,
+                    deliverables=_deliverables(200.0),
+                    note="150 SPY",
+                    non_standard=True,
+                )
+                for strike in LADDER
+            ],
+        },
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert [held.finding.check for held in report_out.held] == [CHECK_SPLIT_CONSISTENCY]
+    assert report_out.scale_covered == 1
+
+
+def test_a_finding_on_another_ticker_does_not_suppress_this_one(fixture_lake: FixtureLake):
+    """The comparison is against what this session filed, not against the run so far.
+
+    ``by_ticker`` walks QQQ before SPY, so a boundary QQQ could not date leaves a finding on the
+    list before SPY's pair is judged. Counting from the start of the run rather than from this
+    session would read that as SPY's split being described already.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("QQQ", DAY_ONE): [_row(DAY_ONE, ticker="QQQ", occ_symbol=QQQ_OCC)],
+            ("QQQ", DAY_TWO): [_gap_day_row(DAY_TWO, ticker="QQQ")],
+            ("QQQ", DAY_THREE): [
+                _row(DAY_THREE, ticker="QQQ", occ_symbol=QQQ_OCC),
+                _row(
+                    DAY_THREE,
+                    ticker="QQQ",
+                    occ_symbol="QQQ1  260918C00433330",
+                    ssid=_ssid(QQQ_OCC),
+                    option_root="QQQ1",
+                    deliverables=ADJUSTED,
+                    note=ADJUSTED_NOTE,
+                    non_standard=True,
+                ),
+            ],
+            ("SPY", DAY_ONE): _ladder_rows(DAY_ONE, LADDER, 700.0),
+            ("SPY", DAY_TWO): _ladder_rows(DAY_TWO, tuple(strike / 2 for strike in LADDER), 349.5),
+        },
+        master=SecurityMaster([_mapping(1, "SPY"), _mapping(2, "QQQ")]),
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    filed = sorted(held.finding.check for held in report_out.held)
+    assert CHECK_SPLIT_BOUNDARY in filed, "the QQQ boundary should still be held"
+    assert CHECK_STRIKE_SCALE in filed, "SPY's split was hidden behind QQQ's finding"
+
+
+def test_the_render_names_each_reason_a_pair_was_not_compared(fixture_lake: FixtureLake):
+    """A count with no breakdown says how many and never which, which is half a sign-off."""
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): _ladder_rows(DAY_ONE, LADDER, 700.0),
+            ("SPY", DAY_TWO): [_gap_day_row(DAY_TWO)],
+            ("SPY", DAY_THREE): _ladder_rows(DAY_THREE, LADDER, 700.0),
+        },
+    )
+
+    rendered = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT)).render()
+
+    assert "  scale not compared: 1" in rendered
+    assert f"    - {REASON_SCALE_WINDOW}: 1" in rendered
 
 
 def test_the_render_says_what_the_scale_guard_did(fixture_lake: FixtureLake):

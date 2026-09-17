@@ -15,6 +15,7 @@ from datetime import date
 import pytest
 
 from lake.splits import (
+    _STRIKE_PLACES,
     REASON_INSTRUMENT_CHANGED,
     REASON_NO_LADDER,
     REASON_NO_UNDERLYING,
@@ -622,3 +623,140 @@ def test_the_instrument_is_asked_before_the_window():
         check_strike_scale(_scale_session(), _scale_session(instrument_id=2), skipped_since=3)
         == REASON_INSTRUMENT_CHANGED
     )
+
+
+def test_a_degenerate_previous_session_is_refused_rather_than_dividing_by_it():
+    """The refusals have to read *both* sides, and the previous side is the one that crashes.
+
+    ``confirmed`` divides by ``len(previous.strikes)`` and ``spot_ratio`` divides by
+    ``previous.spot``, so a check reading only the incoming session leaves a ``ZeroDivisionError``
+    and a ``TypeError`` live in a walk that would then abandon every ticker it had not reached.
+    """
+    ordinary = _scale_session()
+    assert (
+        check_strike_scale(_scale_session(strikes=frozenset()), ordinary, skipped_since=0)
+        == REASON_NO_LADDER
+    )
+    assert (
+        check_strike_scale(_scale_session(spot=None), ordinary, skipped_since=0)
+        == REASON_NO_UNDERLYING
+    )
+
+
+def test_the_window_is_asked_before_the_ladder_and_the_spot():
+    """A pair failing two conditions reports the one that decides it, not whichever ran first.
+
+    The window refusal is about the comparison being unmeasurable across a gap, which is true
+    whatever the two sessions carry, so it outranks a reading that could not be taken.
+    """
+    ordinary = _scale_session()
+    assert (
+        check_strike_scale(ordinary, _scale_session(spot=None), skipped_since=1)
+        == REASON_SCALE_WINDOW
+    )
+    assert (
+        check_strike_scale(ordinary, _scale_session(strikes=frozenset()), skipped_since=1)
+        == REASON_SCALE_WINDOW
+    )
+
+
+def test_an_odd_ratio_confirms_at_the_precision_the_vendor_can_write():
+    """The rounding is the vendor's own three decimals, and a fourth breaks every odd ratio.
+
+    The OCC symbol carries a strike in thousandths, so a 3-for-1 rescaling of 205 is listed as
+    68.333 and nothing else. Asking for 68.3333 matches no rung, and measured on the live
+    ladders that leaves 3:1 confirming at 0.333, well under the floor and read as an ordinary
+    day. Every other scale test divides round hundreds by 2, where the fourth decimal is zero.
+    """
+    ladder = frozenset({205.0, 610.0, 700.0, 1000.0, 204.78})
+    listed = frozenset(round(strike / 3, 3) for strike in ladder)
+    assert 68.333 in listed, "the fixture must rescale at the vendor's own precision"
+
+    verdict = check_strike_scale(
+        _scale_session(strikes=ladder, spot=900.0),
+        _scale_session(strikes=listed, spot=300.0),
+        skipped_since=0,
+    )
+
+    assert _STRIKE_PLACES == 3
+    assert verdict.ratio == 3.0
+    assert verdict.confirmed == 1.0
+    assert verdict.holds
+
+
+def test_the_floor_is_a_floor_and_it_sits_where_the_constant_says():
+    """Exactly half the ladder following is enough, and one rung fewer is not.
+
+    Written with a twenty-rung ladder so the two cases land on 0.50 and 0.45 rather than near
+    them. A floor nothing lands on leaves its value unpinned, and a pair of cases a tenth apart
+    leaves every value between them unpinned too.
+    """
+    ladder = frozenset(float(600 + 10 * step) for step in range(20))
+    rungs = sorted(ladder)
+
+    def confirmed_over(count: int):
+        return check_strike_scale(
+            _scale_session(strikes=ladder, spot=700.0),
+            _scale_session(strikes=frozenset(s / 2 for s in rungs[:count]), spot=350.0),
+            skipped_since=0,
+        )
+
+    exactly, under = confirmed_over(10), confirmed_over(9)
+
+    assert exactly.confirmed == 0.5
+    assert exactly.holds, "a confirmation exactly at the floor is inside it"
+    assert under.confirmed == 0.45
+    assert not under.holds, "the floor sits at 0.50 and not below it"
+
+
+def test_the_tolerance_admits_and_refuses_at_written_out_numbers():
+    """Literal values, because a probe derived from the constant cannot fail when it moves.
+
+    A ratio of 2.09 is 4.5% off a 2:1 and rides. 2.10 is 5% off and does not. Nothing here
+    mentions ``WHOLE_RATIO_TOLERANCE``, which is the point.
+    """
+
+    def ratio(spot_ratio: float):
+        return check_strike_scale(
+            _scale_session(spot=spot_ratio), _scale_session(spot=1.0), skipped_since=0
+        ).ratio
+
+    assert ratio(2.09) == 2.0
+    assert ratio(2.10) is None
+    assert ratio(2.11) is None
+    assert ratio(4.75) == 5.0, "a move exactly at the tolerance is inside it"
+
+
+def test_a_subnormal_underlying_declines_the_pair_rather_than_ending_the_run():
+    """``round`` of an overflowed reciprocal raises, and the raise would cost every later ticker.
+
+    ``check_split_consistency`` refuses the same hazard by name for the ledger's own ratio, so
+    the module already treats a denormal as in scope rather than impossible.
+    """
+    for spot in (1e-310, 5e-324):
+        verdict = check_strike_scale(
+            _scale_session(spot=spot), _scale_session(spot=1.0), skipped_since=0
+        )
+        assert verdict.ratio is None
+
+
+def test_a_hostile_strike_or_underlying_is_not_a_reading():
+    """Bools are ints in Python, and a zero underlying beside a real one is not a second price.
+
+    Without the positivity filter a zero would make the session name two values, and the guard
+    would go silent on a genuine split rather than filing it.
+    """
+    from lake.splits import _ladder, _spot
+
+    rows = [
+        {"strike_price": 650.0, "underlying_price": 700.0},
+        {"strike_price": True, "underlying_price": True},
+        {"strike_price": 0.0, "underlying_price": 0.0},
+        {"strike_price": -5.0, "underlying_price": -5.0},
+        {"strike_price": float("inf"), "underlying_price": float("inf")},
+        {"strike_price": float("nan"), "underlying_price": float("nan")},
+        {"strike_price": None, "underlying_price": None},
+    ]
+
+    assert sorted(_ladder(rows)) == [650.0]
+    assert _spot(rows) == 700.0

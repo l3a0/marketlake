@@ -1249,7 +1249,12 @@ def _build_parser():
     subcommands = parser.add_subparsers(dest="command")
     for name, help_text in (
         (DIVIDENDS_COMMAND, "Read dividends out of the lake's sealed quote rows. The default."),
-        (SPLITS_COMMAND, "Read splits out of the OCC re-symboling in the lake's sealed chains."),
+        (
+            SPLITS_COMMAND,
+            "Read splits out of the lake's sealed chains: the OCC re-symboling, and the "
+            "strike ladder against the session's spot for the whole-ratio split that "
+            "re-symbols nothing.",
+        ),
     ):
         subcommand = subcommands.add_parser(name, help=help_text, description=help_text)
         subcommand.add_argument(

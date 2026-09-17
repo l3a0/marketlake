@@ -262,7 +262,7 @@ CHAINS_COLUMNS = (
     UNDERLYING_PRICE,
 )
 
-# The four gates this module files a refusal under. They name what refused rather than what
+# The three gates this module files a refusal under. They name what refused rather than what
 # was refused, the way ``lake.actions``'s do, because the finding already carries the event.
 # ``CHECK_INSTRUMENT_RESOLUTION`` is reused from there rather than respelled, since a master
 # that cannot place a symbol says the same thing whichever walk met it.
@@ -273,6 +273,14 @@ CHECK_SPLIT_BOUNDARY = "split_boundary"
 # ``sweep._subjects`` renders it into the nightly report file as ``<symbol> <day> <check>`` and
 # ``write_withheld`` writes it into the finding's JSON, and those two are where it is read.
 CHECK_STRIKE_SCALE = "strike_scale"
+# The three that describe a corporate action on the session rather than a failure to read one.
+# Only these suppress the scale guard, because only these tell an operator that the walk already
+# has something to say about an adjustment here. ``CHECK_SPLIT_PAYLOAD`` and
+# ``CHECK_OCC_MAPPING`` say a read came apart, which is not an answer to whether a whole-ratio
+# split happened, and suppressing on one hides the split behind an unrelated unreadable row.
+BOUNDARY_CHECKS = frozenset(
+    {CHECK_SPLIT_CONSISTENCY, CHECK_SPLIT_DELIVERABLE, CHECK_SPLIT_BOUNDARY}
+)
 # The payload the read's own rules refused: a deliverable the columns do not agree about, or
 # one they carry no usable number for. Each one would otherwise end the run as a traceback,
 # which is neither fail-closed nor a record.
@@ -315,13 +323,18 @@ WHOLE_RATIO_TOLERANCE = 0.05
 # across ratios of 2, 3, 4 and 10 in both directions, the highest is SPY's 0.287785 and QQQ's is
 # 0.135755. This sits 0.212215 above that and 0.50 below what a real adjustment gives.
 SCALE_CONFIRMATION_FLOOR = 0.50
-# Where a rescaled strike is rounded before it is looked for in the next session's ladder. The
-# OCC symbol encodes a strike to three decimal places, so this is one past the vendor's own
-# precision. It exists because dividing a stored double by a ratio can land one unit in the last
-# place away from the double the vendor would have written, and the ladders are compared by
-# exact equality. That equality is what the lake measures: QQQ carries 204.78 and 209.78 beside
-# its round rungs, and the sets matched exactly across all four adjacent pairs.
-_STRIKE_PLACES = 4
+# Where a strike is rounded, both on the ladder and on the rescaled value looked for in it.
+#
+# **It is the vendor's own precision, and one decimal more silently breaks the odd ratios.** The
+# OCC symbol carries the strike in an eight-digit thousandths field, so a 3-for-1 rescaling of a
+# 205 strike can only be listed as 68.333. Rounding the rescaled value to four places asks for
+# 68.3333 instead, which no rung matches, and the confirmation collapses. Measured against the
+# live ladders, with each rung divided by the ratio and written at three decimals, four places
+# confirms 3:1 at 0.333, 6:1 at 0.333, 7:1 at 0.143 and 9:1 at 0.110, every one of them under
+# the floor and read as an ordinary day. At three places all nine ratios confirm at 1.000.
+# Rounding this far merges no rung either: SPY's 483 and QQQ's 523 stay distinct, and the vendor
+# uses at most two decimals.
+_STRIKE_PLACES = 3
 
 # What ``deliverable_note`` looks like when it names a plain share count of one security.
 # The live lake's is ``100 SPY`` on every row of both tickers. A note this does not match is
@@ -798,7 +811,8 @@ def _ladder(rows) -> list[float]:
     Built off the rows that survived the ``mini`` filter, so the ladder is read from the same
     contracts the root set is. A mini contract lists at the same strike a standard one does, so
     dropping it removes a rung only where no standard contract carries it, and ``mini`` is
-    ``False`` on all 19,799,808 data rows the lake holds.
+    ``False`` on every data row the lake holds. The count of those rows is marketlake #367's to
+    sweep, so it is not restated here.
     """
     return [
         round(value, _STRIKE_PLACES)
@@ -1104,7 +1118,14 @@ def _whole_ratio(spot_ratio: float) -> float | None:
     if spot_ratio >= WHOLE_RATIO_GATE:
         candidate = float(round(spot_ratio))
     elif spot_ratio <= 1.0 / WHOLE_RATIO_GATE:
-        candidate = 1.0 / round(1.0 / spot_ratio)
+        # A subnormal ratio overflows its own reciprocal to infinity, and ``round`` of that
+        # raises rather than answering. ``check_split_consistency`` refuses the same hazard by
+        # name for the ledger's ratio, and a raise here would end the walk for every ticker it
+        # had not reached rather than declining one pair.
+        reciprocal = 1.0 / spot_ratio
+        if not isfinite(reciprocal):
+            return None
+        candidate = 1.0 / round(reciprocal)
     else:
         return None
     if abs(spot_ratio - candidate) / candidate > WHOLE_RATIO_TOLERANCE:
@@ -1386,10 +1407,21 @@ def detect_splits(*, lake_root: Path | str, clock: Clock) -> SplitReport:
                 else:
                     scale_pairs += 1
                     if scale.holds:
+                        # What ``_examine`` filed, rather than whether it filed at all. A
+                        # payload finding about some other root's unreadable row is not an
+                        # answer to this question, and treating it as one hides a real split
+                        # behind it for as long as the unreadable row survives.
+                        examined = {
+                            entry.finding.check for entry in held[filed_before:]
+                        } & BOUNDARY_CHECKS
+                        # ``outcome.unchanged`` is deliberately not a fifth term. It is true
+                        # only where ``same_but_for_recorded_at`` matched an entry, which
+                        # refuses a ``None``, so it already implies the ledger read below on
+                        # the same key. The review that found this proved the term could not
+                        # change an answer, and a condition nothing can reach reads as a rule.
                         recorded = (
                             outcome.landed is not None
-                            or outcome.unchanged
-                            or len(held) > filed_before
+                            or bool(examined)
                             # ``normalize_date`` renders the key's date, so the ledger's key
                             # carries it as text and a ``date`` here would never match.
                             or (session.instrument_id, day.isoformat(), TYPE_SPLIT) in current
