@@ -94,7 +94,7 @@ from datetime import date, datetime
 from functools import partial
 from pathlib import Path
 
-from lake.actions import ExtractionReport, MasterAbsent, extract_dividends
+from lake.actions import ActionsError, ExtractionReport, extract_dividends
 from lake.alert import Message, NtfyTransport, Publisher, undelivered
 from lake.bars import (
     BackfillReport,
@@ -136,7 +136,7 @@ from lake.report import (
 from lake.runner import PING_FAILURES, Pinger, UrllibPinger, escalate_ping_failure
 from lake.schema_versions import check_running_version
 from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor, VendorAuthError
-from lake.security_master import MasterUnreadable
+from lake.security_master import SecurityMasterError
 from lake.splits import SplitReport, detect_splits
 from lake.tickers import Roster, load_tickers
 from lake.vendor import Vendor
@@ -230,7 +230,49 @@ ScheduleSetter = Callable[[date], None]
 # it through ``manifest.latest_entries`` and ``_BARS_REFUSALS`` carries no ``ManifestError``,
 # so the claim above is redeemed for the quarantine ledger and not for the manifest.
 # Marketlake #447 owns the manifest ledger, and that sibling belongs to it rather than here.
-_LEDGER_REFUSALS = (MasterAbsent, MasterUnreadable, ManifestError, OSError)
+#
+# **``ActionsError`` and ``SecurityMasterError`` as the classes, and marketlake #497 is why.**
+# This tuple used to name ``MasterAbsent`` and ``MasterUnreadable``, one member of each family,
+# beside two entries that already named their class. Two siblings reach here and both are raised
+# by a read that runs before any ticker is walked, so both took the whole 18:30 job down.
+# ``UnsupportedSchemaVersion`` comes out of ``SecurityMaster.read`` through ``from_table``, which
+# ``actions.read_master`` does not fold because it keeps its ``FileNotFoundError`` arm narrow on
+# purpose. ``LedgerLineError`` comes out of ``entry_key``, reached through ``actions.latest``,
+# which both walks call once for the run to compare every ticker-day against one snapshot.
+# Executed against `9e767ab`, one ledger line naming no ``type`` raised out of ``sweep()`` and
+# the run wrote no report file and sent no ping.
+#
+# **This does not widen a blast radius, which is the objection marketlake #446 owns.** The
+# members that are per-ticker are already contained per-ticker, in both walks:
+# ``extract_dividends`` catches ``(UnresolvedSymbol, AmbiguousSymbol)`` and ``detect_splits``
+# catches them at both of its ``resolve_instrument`` call sites. ``occ_mapping.write_mappings``'s
+# caller draws a related line one level down, re-raising ``MasterAbsent`` and ``MasterUnreadable``
+# and containing ``SecurityMasterError`` per boundary. So what reaches this tuple is by
+# construction the kind whose blast radius is the whole walk however it is caught. That site
+# sorts by member rather than by class, which is marketlake #509 rather than this change.
+#
+# **The price is named rather than hidden.** Naming ``ActionsError`` means a future
+# ``UnresolvedSymbol`` escaping that per-ticker catch would be caught here and cost every ticker
+# after it its dividends, where today it would end the run. The cost is the blast radius and not
+# the reporting: a refusal writes the report file and withholds the ping, where an escape writes
+# no file and sends nothing, so this path says strictly more than the one it replaces. What is
+# lost is the exit code and the eleven tickers. That is the standing cost of naming a class
+# instead of listing members, and this tuple already pays it for ``ManifestError`` while the one
+# below pays it for ``CaptureSpansError``.
+#
+# The members are replaced rather than joined. ``except`` treats every entry identically, so a
+# subclass beside its base buys nothing, and a redundant name reads as though it did.
+#
+# **Two families still escape this tuple and neither is one of these.** A ledger byte that is not
+# UTF-8 raises ``UnicodeDecodeError``, a ``ValueError``, which is marketlake #495 and #499, and
+# ``SchemaVersionsError`` is marketlake #494. Both are named so this entry is not read as
+# covering every way a ledger can fail.
+#
+# The level below sorts these same two families by member rather than by class, at
+# ``splits.py``'s mapping write, so a sibling lands in the per-boundary arm the re-raise exists
+# to keep it out of. That is marketlake #509 and it is not fixed here, because it decides
+# whether a condition ends a walk rather than what this job records.
+_LEDGER_REFUSALS = (ActionsError, SecurityMasterError, ManifestError, OSError)
 # ``CaptureSpansError`` as the class rather than one of its members, which is the lesson
 # ``bars.main`` already wrote down for itself: naming ``SpansUnreadable`` alone left its sibling
 # ``UnsupportedSpansSchemaVersion`` reaching the operator as a stack, and a spans file from a
@@ -238,9 +280,29 @@ _LEDGER_REFUSALS = (MasterAbsent, MasterUnreadable, ManifestError, OSError)
 # that file for the first time under marketlake #422, so it inherits the lesson rather than
 # rediscovering it. Escaping here would cost the battery, the report file, the digest, the ping
 # and, on a Friday, the Sunday wake.
+#
+# **``SecurityMasterError`` here is the same hole as the tuple above, and marketlake #497 is
+# still why.** ``lake.bars`` has its own ``_read_master`` folding ``FileNotFoundError`` alone, so
+# ``UnsupportedSchemaVersion`` escaped this tuple too. Measured: widening the tuple above alone
+# left a master stamped with a version this code does not read still taking the whole run down,
+# from the bar walk rather than the ledger walks. Fixing one tuple would have been this file
+# repeating its own lesson one tuple over.
+#
+# **``ActionsError`` here changes nothing today, and it is named for uniformity rather than for
+# a failure.** The only member of that family this walk can raise is ``MasterAbsent``, which the
+# tuple already carried. ``lake.bars`` never resolves the actions ledger, so ``LedgerLineError``
+# cannot arise, and ``UnresolvedSymbol`` is contained per ticker-day beside ``AmbiguousSymbol``
+# at the resolve. Measured under #497: replacing this entry with ``MasterAbsent`` leaves the
+# suite green, and that is an equivalence rather than a gap. It is written here because the
+# alternative is one tuple naming a class and its sibling naming a member, which reads as an
+# oversight, and because a walk that later reads an adjusted view would meet the ledger through
+# ``loader._in_view``.
+#
+# ``SpansAbsent`` stays beside ``CaptureSpansError`` because it is a ``BarsError`` and the class
+# beside it does not cover it.
 _BARS_REFUSALS = (
-    MasterAbsent,
-    MasterUnreadable,
+    ActionsError,
+    SecurityMasterError,
     SpansAbsent,
     CaptureSpansError,
     StampNotAnInstant,
