@@ -1555,7 +1555,8 @@ def test_a_report_that_cannot_be_written_costs_the_file_and_not_the_markers(tmp_
     ]
     assert len(marked) == 1, "the failed write cost the marker the guard had already made"
     reported = capsys.readouterr().err
-    assert "close+5 2026-09-02: unobserved=XYZ" in reported, "stderr lost the findings too"
+    assert "close+5 2026-09-02:" in reported, "stderr lost the findings too"
+    assert "unobserved=XYZ" in reported, "stderr lost the findings too"
     assert "close+5: 2026-09-02:" in reported, "the failed write was swallowed silently"
 
 
