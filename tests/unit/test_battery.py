@@ -244,3 +244,31 @@ def test_a_clean_verdict_for_a_check_that_never_spoke_is_not_a_line():
 
     assert _wrote(outcome) == []
     assert outcome.released is False, "a partition nothing withheld was not released"
+
+
+# -- what the run reports about a partition it did not release ---------------
+
+
+def test_holders_name_a_check_this_same_call_quarantined():
+    """The projection has to carry the check, not only the verdict.
+
+    A quarantine written earlier in one walk is a holder of the clean finding behind it. Read
+    back without its `check`, that holder has no name and the report line calls it "None".
+    """
+    outcome = decide_partition(
+        None, [_finding(ROWS, QUARANTINED_VERDICT), _finding(CHECK_ENTITLEMENT, CLEAN_VERDICT)]
+    )
+
+    assert outcome.decisions[-1].holders == (ROWS,)
+
+
+def test_holders_name_every_standing_check_rather_than_the_first():
+    """Two foreign quarantines stand and the passing check owes both names."""
+    state = {
+        "a_check": _entry("a_check", QUARANTINED_VERDICT),
+        "b_check": _entry("b_check", QUARANTINED_VERDICT),
+    }
+
+    outcome = decide_partition(state, [_finding(CHECK_ENTITLEMENT, CLEAN_VERDICT)])
+
+    assert outcome.decisions[0].holders == ("a_check", "b_check")

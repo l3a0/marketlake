@@ -1037,6 +1037,7 @@ def test_the_loader_refuses_a_partition_this_run_quarantined(lake: Path):
         load_chain("SPY", DAY, lake_root=lake)
     assert caught.value.entry["check"] == CHECK_ENTITLEMENT
     assert caught.value.entry["verdict"] == QUARANTINED_VERDICT
+    assert "quarantined by 1 check:" in str(caught.value), "the plural is conditional"
 
 
 def test_the_refusal_names_every_check_withholding_the_partition(lake: Path):
@@ -1067,6 +1068,7 @@ def test_the_refusal_names_every_check_withholding_the_partition(lake: Path):
 
     held = [entry["check"] for entry in caught.value.entries]
     assert held == ["row_count_band", CHECK_ENTITLEMENT]
+    assert "quarantined by 2 checks" in str(caught.value)
     assert "row_count_band" in str(caught.value)
     assert CHECK_ENTITLEMENT in str(caught.value)
     assert caught.value.entry is caught.value.entries[0]
@@ -1103,6 +1105,72 @@ def test_a_partition_another_check_withholds_is_refused_after_this_one_clears(la
     assert report.deferred == 0, "a sibling check's deferral is not a human sign-off"
     with pytest.raises(PartitionQuarantined):
         load_chain("SPY", DAY, lake_root=lake)
+
+
+def test_every_census_line_carries_its_own_number(lake: Path):
+    """A report whose counters are all zero but one cannot catch a mislabelled line.
+
+    Each count gets a distinct value, so swapping two labels, dropping one, or hardcoding a
+    number fails here. ``human precedence`` and ``still withheld`` are the pair marketlake
+    #426 split apart, and a swap is exactly what undoes that split.
+    """
+    printed = render(
+        BatteryReport(
+            judged=1,
+            quarantined=2,
+            cleared=3,
+            insufficient_history=4,
+            out_of_scope=5,
+            deferred=6,
+            withheld=7,
+            released=8,
+            unreadable=9,
+            scope_unknown=10,
+            appended=("a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"),
+            report=("battery: a line the run owed an operator",),
+        )
+    )
+
+    assert "judged:               1" in printed
+    assert "quarantined:          2" in printed
+    assert "clean:                3" in printed
+    assert "insufficient history: 4" in printed
+    assert "out of scope:         5" in printed
+    assert "human precedence:     6" in printed
+    assert "still withheld:       7" in printed
+    assert "released:             8" in printed
+    assert "unreadable:           9" in printed
+    assert "scope unknown:        10" in printed
+    assert "ledger lines written: 11" in printed
+    assert "battery: a line the run owed an operator" in printed
+
+
+def test_the_report_line_names_every_check_still_withholding(lake: Path):
+    """Two foreign quarantines stand and the passing check owes both names, not the first.
+
+    The refusal and the panel each have a test for this claim. The report line makes the same
+    claim to the operator who reads the nightly file.
+    """
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains"))
+    _seed_spans(lake)
+    partition = "chains/ticker=SPY/date=2026-09-16.parquet"
+    for check in ("row_count_band", "strike_grid_completeness"):
+        append_verdict(
+            lake,
+            build_entry(
+                partition=partition,
+                verdict=QUARANTINED_VERDICT,
+                check=check,
+                observed_at=NOW,
+            ),
+            observed_at=NOW,
+        )
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    (line,) = [ln for ln in report.report if "stays quarantined under" in ln]
+    assert "'row_count_band'" in line
+    assert "'strike_grid_completeness'" in line
 
 
 def test_a_holder_naming_no_check_reads_as_prose_rather_than_as_none(lake: Path):

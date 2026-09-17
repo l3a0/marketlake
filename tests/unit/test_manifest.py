@@ -343,3 +343,28 @@ def test_a_check_that_cannot_be_a_key_names_this_ledger_and_its_position(tmp_pat
 
     assert str(quarantine_path(tmp_path)) in str(raised.value)
     assert "entry 2" in str(raised.value), str(raised.value)
+
+
+def test_the_deciding_entry_is_the_earlier_of_two_still_withholding(tmp_path):
+    """With one holder left, ``held[0]`` and ``held[-1]`` are the same entry and prove nothing."""
+    _ledger(
+        tmp_path,
+        _verdict(CHAINS, "quarantined", "row_count_band"),
+        _verdict(CHAINS, "quarantined", "realtime_entitlement"),
+    )
+
+    assert latest_quarantine(tmp_path)[CHAINS]["check"] == "row_count_band"
+
+
+def test_a_partition_every_check_cleared_reports_the_last_line_written(tmp_path):
+    """Nothing withholds, so the deciding entry is the newest rather than the oldest."""
+    _ledger(
+        tmp_path,
+        _verdict(CHAINS, "clean", "row_count_band"),
+        _verdict(CHAINS, "clean", "realtime_entitlement"),
+    )
+
+    deciding = latest_quarantine(tmp_path)[CHAINS]
+
+    assert deciding["check"] == "realtime_entitlement"
+    assert is_quarantined(deciding) is False

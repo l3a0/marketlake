@@ -2666,6 +2666,9 @@ def test_each_withholding_check_carries_its_own_verdict(fixture_lake: FixtureLak
         {"check": "realtime_entitlement", "verdict": "delayed_feed"},
         {"check": "row_count_band", "verdict": "row_count_low"},
     ]
+    # The row's own verdict is the deciding entry's, which is the first still withholding.
+    # With two holders under two spellings, taking the last one instead is visible here.
+    assert payload["quarantines"][0]["verdict"] == "delayed_feed"
 
 
 def test_an_entry_naming_no_check_is_carried_rather_than_stringified(
