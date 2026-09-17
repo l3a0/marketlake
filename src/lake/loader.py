@@ -44,20 +44,21 @@ rows carry is a property of the session and not of the contract. ``load_contract
 same way over one session, which is why a caller holding the pre-adjustment symbol now gets the
 sessions after the boundary instead of ``ContractAbsent``.
 
-Three rules come out of the master's rows, and each is written where it happens. The symbol is
-resolved per session and the ticker once, because an option instrument carries an ``occ_symbol``
-mapping and nothing else, so it names no underlying, and an adjusted root is not a ticker either.
-A session before the thread opens takes the thread's earliest symbol, because a mapping's
-``valid_from`` is the first session the split walk *read* the contract and that walk skips
-sessions. And the entry is ``occ_mapping.instruments_holding`` rather than
-``SecurityMaster.resolve``, because a caller holds one spelling and no date, while ``resolve``
-answers only for a date that spelling was current on.
+Three rules come out of the master's rows, and each is written where it happens. The entry is
+``occ_mapping.instruments_holding`` rather than ``SecurityMaster.resolve``, because a caller holds
+one spelling and no date, while ``resolve`` answers only for a date that spelling was current on.
+The ticker is settled once from the thread's earliest symbol, because an option instrument carries
+an ``occ_symbol`` mapping and nothing else, so it names no underlying, and an adjusted root is not
+a ticker either. And the selection is every spelling the contract has worn rather than the one the
+master places on each session, because those ranges are drawn by a walk that skips sessions and
+dates a boundary to the session it happened to read. A range used to *exclude* a row the vendor
+actually wrote is how a read returns less than the lake holds while reading as whole.
 
 Where the master says nothing the two doors read exactly as they did, which is every contract a
 re-symboling has not touched and every lake with no master in it. An absent master threads nothing
-and raises nothing, the way an absent actions ledger adjusts nothing. A torn one raises
-``MasterUnreadable``, the error of the module that owns the file. The read holds no cache, so the
-master joins the schema-version and quarantine ledgers in being read per call.
+and raises nothing. A damaged one refuses every call at these two doors, wider than a threaded
+call, because nothing can ask whether the master holds a symbol without reading it. The read holds
+no cache, so the master joins the schema-version and quarantine ledgers in being read per call.
 
 Four defaults are settled by marketlake #135, which is authoritative for this deliverable.
 
@@ -278,15 +279,7 @@ from lake.config import load_config
 from lake.extra_projection import EXTRA_COLUMN, ExtraProjection, project_extra
 from lake.manifest import is_quarantined, latest_quarantine
 from lake.occ_mapping import instruments_holding
-from lake.paths import (
-    BARS,
-    CHAINS,
-    DATE_PREFIX,
-    PARQUET_SUFFIX,
-    QUOTES,
-    LakePaths,
-    parse_date_dir,
-)
+from lake.paths import BARS, CHAINS, PARQUET_SUFFIX, QUOTES, LakePaths, parse_date_dir
 from lake.schema_versions import SchemaVersionLedger, ledger_path
 from lake.security_master import ID_TYPE_OCC, SecurityMaster, master_path
 from lake.security_master import Mapping as MappingRow
@@ -523,10 +516,9 @@ class ContractAbsent(LoadError):
     otherwise. Naming both lets a caller relying on the derivation see which ticker was
     tried and why.
 
-    ``occ_symbol`` is the spelling the read looked for rather than the one the caller
-    named, and the two differ when the master threaded the contract onto another. A
-    caller who asked for the pre-adjustment symbol and gets a refusal naming the adjusted
-    one can see that the thread was followed and the contract still was not there.
+    ``occ_symbol`` is the spelling the caller named, on both doors that raise this. A threaded
+    read looks for every spelling the contract has worn, so there is no single one it looked
+    for, and naming the caller's is what lets them recognise the call they made.
 
     ``day`` carries a range rather than a session when ``load_contract_life`` raises this,
     since a contract appearing in no session of a range is the same condition at a wider
@@ -1297,25 +1289,33 @@ def load_contract(
     takes one for its two genuinely different callers would offer a call that cannot work.
 
     **The symbol is threaded through the security master**, marketlake #135. An OCC
-    re-symboling gives one contract a new spelling, and ``lake.occ_mapping`` records that as
-    a mapping row, so the spelling a session's rows carry is a property of the session rather
-    than of the contract. This resolves the caller's symbol to its instrument, reads the
-    symbol that instrument wore on ``day``, and selects on that. A caller holding the
-    pre-adjustment symbol therefore gets the session after the boundary rather than
-    ``ContractAbsent``, and one holding the adjusted symbol gets the sessions before it.
+    re-symboling gives one contract a new spelling, and ``lake.occ_mapping`` records that as a
+    mapping row, so the spelling a session's rows carry is a property of the session rather than
+    of the contract. This resolves the caller's symbol to its instrument and selects on every
+    spelling that instrument has worn, the caller's among them, per ``_spellings``. So a caller
+    holding the pre-adjustment symbol gets the sessions after the boundary rather than
+    ``ContractAbsent``, one holding the adjusted symbol gets the sessions before it, and neither
+    loses a row the door returned before the master was consulted at all.
 
     Where the master says nothing the read is unchanged, which is every contract a
     re-symboling has not touched. ``instruments_holding`` answers an empty set for an unmapped
-    symbol and the selection falls through to the one the caller gave. An absent master is the
-    same answer reached a different way: it threads nothing and raises nothing, the way an
-    absent actions ledger adjusts nothing in ``load_bars``, which is what keeps the door inert
-    on a lake nothing has mapped. A master present but torn is not that case and raises
-    ``MasterUnreadable``, and a symbol naming two instruments raises ``ContractAmbiguous``.
+    symbol and the selection is the one the caller gave. An absent master is the same answer
+    reached a different way, so it threads nothing and raises nothing, which is what keeps the
+    door inert on a lake nothing has mapped.
+
+    **A master present but damaged refuses every call here**, including one for a contract it
+    never held and one that named its own ``ticker``. That is wider than it looks and it is
+    deliberate. There is no asking whether the master holds a symbol without reading it, and
+    the alternative to refusing is threading nothing, which would hand back a half a life that
+    reads as a whole one. So a torn master raises ``MasterUnreadable`` and a symbol naming two
+    instruments raises ``ContractAmbiguous``. ``load_bars`` is not the same case and is not the
+    precedent: it reaches the actions ledger only for a view that needs one, so ``adjust='none'``
+    reads through a damaged ledger and an adjusted view does not.
 
     ``ticker`` names the partition to look in. Left as ``None``, it is derived from the first
     six characters of the *earliest* symbol on the thread, falling back to ``occ_symbol`` when
     there is no thread: ``'SPY   260918C00650000'[:6].strip()`` is ``'SPY'``, which matches
-    every row of the live lake. The earliest rather than the day's, because an adjusted root
+    every row of the live lake. The earliest rather than the caller's, because an adjusted root
     is not a ticker. ``'SPY1  261218C00250000'`` derives ``'SPY1'``, which names no directory,
     and those are exactly the symbols a thread exists to read. It is still a guess rather than
     a guarantee. An index root like ``SPXW``, or an underlying a rename moved to another
@@ -1359,13 +1359,6 @@ def load_contract(
     day_text = day.isoformat() if isinstance(day, date) else str(day)
     thread = _thread(root, occ_symbol)
     ticker_used, absent_detail = _thread_ticker(thread, occ_symbol, ticker)
-    # A ``day`` this cannot read as a session is left to the path build to refuse, which is
-    # what it did before there was a thread to consult. Parsing it here to raise earlier
-    # would change which error a caller gets for an argument the thread never touches.
-    # ``parse_date_dir`` reads the directory name rather than the bare date, and ``paths``
-    # owns that prefix, so the name is built rather than the shape spelled a second time.
-    session = parse_date_dir(f"{DATE_PREFIX}{day_text}")
-    symbol = occ_symbol if session is None else _symbol_on(thread, session, occ_symbol)
     _, path = _open_partition(
         ticker_used,
         day_text,
@@ -1375,13 +1368,13 @@ def load_contract(
         absent_detail=absent_detail,
     )
 
-    selection = _Selection(OCC_SYMBOL_COLUMN, (symbol,))
+    selection = _Selection(OCC_SYMBOL_COLUMN, _spellings(thread, occ_symbol))
     table = _fetch_selection(
         path, root, selection, ticker_used, day_text, CHAINS, check_row_kind=True
     )
     if table.num_rows == 0:
-        raise ContractAbsent(symbol, ticker_used, day_text)
-    return _sorted_by_instant(table, SNAP_TS_COLUMN, symbol, ticker_used, day_text)
+        raise ContractAbsent(occ_symbol, ticker_used, day_text)
+    return _sorted_by_instant(table, SNAP_TS_COLUMN, occ_symbol, ticker_used, day_text)
 
 
 def load_contract_life(
@@ -1395,17 +1388,18 @@ def load_contract_life(
 ) -> pa.Table:
     """One contract's whole life, across every symbol the master records it under.
 
-    ``load_contract`` answers one session. This answers a range of them, and it is the sixth
+    ``load_contract`` answers one session. This answers a range of them, and it is the fifth
     door here and the second that spans partitions. ``start`` and ``end`` are session dates and
     both default to open, the way ``load_bars`` takes them, so a call naming neither reads every
     sealed chains session the lake holds for the ticker.
 
-    **The symbol is resolved per session and the ticker once**, which is the asymmetry the
-    master's rows force. An option instrument carries an ``occ_symbol`` mapping and nothing
-    else, so it names no underlying, and the partition to open cannot come from the day's own
-    symbol either, since an adjusted root is not a ticker. So the ticker is settled once from
-    the earliest symbol on the thread, and each session is read under the symbol that session's
-    contract wore. Both come from one lookup.
+    **One selection spans the range and the ticker is settled once**, both from one reading of
+    the master. The selection is every spelling the contract has worn, per ``_spellings``, which
+    is what keeps a session the master's ranges place wrongly from dropping out of a life in
+    silence. The ticker cannot come from a session's own symbol, because an adjusted root is not
+    a ticker, and it cannot come from the master either, because an option instrument carries an
+    ``occ_symbol`` mapping and nothing else and so names no underlying. So it is settled once
+    from the earliest symbol on the thread.
 
     **An absent session inside the range is stepped over and a quarantined one refuses the
     read.** A contract lists, trades and expires, so sessions it does not appear in are the
@@ -1458,6 +1452,7 @@ def load_contract_life(
             f"as its directory is.{absent_detail}"
         )
 
+    selection = _Selection(OCC_SYMBOL_COLUMN, _spellings(thread, occ_symbol))
     found: list[pa.Table] = []
     for session in sessions:
         day_text = session.isoformat()
@@ -1472,13 +1467,7 @@ def load_contract_life(
             absent_detail=absent_detail,
         )
         table = _fetch_selection(
-            path,
-            root,
-            _Selection(OCC_SYMBOL_COLUMN, (_symbol_on(thread, session, occ_symbol),)),
-            ticker_used,
-            day_text,
-            CHAINS,
-            check_row_kind=True,
+            path, root, selection, ticker_used, day_text, CHAINS, check_row_kind=True
         )
         if table.num_rows:
             found.append(table)
@@ -1498,10 +1487,17 @@ def _thread(root: Path, occ_symbol: str) -> tuple[MappingRow, ...]:
     session after the boundary and the new one on every session before it. The whole-table
     question is the one ``occ_mapping`` already argued for on the write side and exports.
 
-    An absent master threads nothing, the way ``_ledger`` treats an absent schema-version
-    file. A torn one is a different condition and ``SecurityMaster.read`` raises
-    ``MasterUnreadable`` for it, which reaches the caller as the error of the module that owns
-    the file, the same rule ``load_bars`` follows for a damaged actions ledger.
+    An absent master threads nothing, the way ``_ledger`` treats an absent schema-version file.
+    A damaged one is a different condition and refuses, which reaches the caller as the error of
+    the module that owns the file: ``MasterUnreadable`` from ``SecurityMaster.read``, or
+    ``UnsupportedSchemaVersion`` for a version this code cannot read. That refuses every call
+    here rather than only a threaded one, because nothing can ask whether the master holds a
+    symbol without reading it, and the caller's door says why that is the answer chosen.
+
+    Not every damaged shape refuses. A master whose parquet is readable but carries other
+    columns raises ``KeyError`` out of ``SecurityMaster.from_table``, and a directory at the
+    path reads as an empty master. Both predate this read, since every caller of
+    ``SecurityMaster.read`` meets them, and both are marketlake #396.
 
     Nothing here caches. The file is read per call, beside the schema-version ledger and the
     quarantine ledger, so a mapping a nightly ``lake.splits`` run writes is read by the next
@@ -1529,27 +1525,33 @@ def _thread(root: Path, occ_symbol: str) -> tuple[MappingRow, ...]:
     )
 
 
-def _symbol_on(thread: Sequence[MappingRow], session: date, given: str) -> str:
-    """The OCC symbol the contract wore on ``session``.
+def _spellings(thread: Sequence[MappingRow], given: str) -> tuple[str, ...]:
+    """Every OCC spelling this contract's rows can carry, the caller's among them.
 
-    A session before the thread opens takes the thread's earliest symbol rather than the one
-    the caller named. A mapping's ``valid_from`` is the first session the split walk *read* the
-    contract under that symbol, and the walk skips a session for seven reasons, so the lake can
-    hold sealed sessions the range does not cover. A session before the chain opens is one the
-    contract wore the earliest symbol on, which is why that mapping opened under it. Falling
-    back to the caller's symbol there would read an early session under an adjusted spelling
-    for a caller who happened to name one.
+    **The master's ranges widen the selection rather than replace it**, and that direction is
+    the whole of it. A row carrying a symbol is direct evidence of what the vendor wrote. A
+    validity range is an inference, drawn by a walk that skips sessions for seven reasons and
+    dates a boundary to the session it happened to read. Using the inference to *exclude* a row
+    the evidence produced is how a read returns less than the lake holds while reading as whole.
 
-    A session past every range takes the latest. No writer produces a thread whose last mapping
-    is closed, since ``register`` opens one and ``remap`` closes the open one as it opens the
-    next, so this only answers a master something edited by hand.
+    Three states make that concrete and all three are reachable. ``lake.occ_mapping`` records
+    the first in its own docstring, a boundary dated two ways, leaving ``resolve`` answering
+    the old symbol "on a day the sealed chains already carried the new one". The second is the
+    under-claim ``valid_from`` makes by construction, since it is the first session the walk
+    *read* the contract rather than the first the lake holds it. The third is the boundary
+    session itself, which can carry both spellings, because the master's ranges are date-grained
+    and a partition holds a whole day of minutes.
+
+    A union reads all three correctly and takes nothing away from what the shipped door
+    returned, which a per-session substitution did on the first two. The price is named rather
+    than hidden: a spelling the market re-issued to a different contract would match that
+    contract's rows too. No lake holds that today, ``occ_mapping``'s forward guard refuses the
+    write that would make one, and adjusted roots are issued in sequence rather than reused.
+
+    The caller's own spelling leads, and ``dict.fromkeys`` keeps the order while dropping the
+    duplicate it usually is.
     """
-    if not thread:
-        return given
-    for mapping in thread:
-        if mapping.valid_on(session):
-            return mapping.id_value
-    return thread[0].id_value if session < thread[0].valid_from else thread[-1].id_value
+    return tuple(dict.fromkeys([given, *(mapping.id_value for mapping in thread)]))
 
 
 def _thread_ticker(

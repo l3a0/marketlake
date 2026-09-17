@@ -310,10 +310,16 @@ def test_9_a_symbol_naming_two_instruments_refuses_rather_than_picking_one(
         load_contract_life(OLD, lake_root=root)
 
 
-def test_10_a_torn_master_raises_the_masters_own_error_rather_than_a_load_error(
+def test_10_a_torn_master_refuses_every_call_at_these_doors_with_the_masters_own_error(
     fixture_lake: FixtureLake,
 ):
-    """#135 test 10. A file contradicting its writer raises the error of the module owning it."""
+    """#135 test 10. A file contradicting its writer raises the error of the module owning it.
+
+    The blast radius is asserted rather than left to be discovered. Nothing can ask whether the
+    master holds a symbol without reading it, so a contract it never held and a call that named
+    its own ticker refuse too. ``load_bars`` is not the precedent and does not behave this way:
+    it reaches the actions ledger only for a view that needs one.
+    """
     root = _lake(fixture_lake, master=_master())
     path = master_path(root)
     path.write_bytes(path.read_bytes()[:40])
@@ -324,18 +330,21 @@ def test_10_a_torn_master_raises_the_masters_own_error_rather_than_a_load_error(
     with pytest.raises(MasterUnreadable):
         load_contract_life(OLD, lake_root=root)
 
+    # A contract with no mapping of any kind, and a caller who supplied the ticker, so the
+    # master has nothing to contribute to the read. It refuses anyway.
+    with pytest.raises(MasterUnreadable):
+        load_contract(PLAIN, SEALED[0], lake_root=root, ticker="SPY")
+
 
 # -- the edges of the thread --------------------------------------------------
 
 
-def test_11_a_session_before_the_thread_opens_reads_under_the_earliest_symbol(
-    fixture_lake: FixtureLake,
-):
+def test_11_a_session_the_masters_ranges_do_not_cover_is_still_read(fixture_lake: FixtureLake):
     """#135 test 11. ``valid_from`` is the first session the walk read, not the lake's first.
 
     The walk skips a session for seven reasons, so the lake holds sealed sessions no mapping
-    range covers. Reading one under the caller's own spelling would put an early session under
-    an adjusted symbol whenever the caller happened to name one.
+    range covers. The selection is every spelling the contract has worn, so a range that places
+    a session wrongly cannot take that session away.
     """
     days = _life_rows()
     days[BEFORE] = [_data(BEFORE, "10:31", OLD)]
@@ -361,3 +370,75 @@ def test_12_a_contract_remapped_twice_threads_through_all_three_symbols(
 
     assert _symbols(table) == [OLD, OLD, OLD, ADJUSTED, AGAIN]
     assert _days(table) == [*SEALED, again_day]
+
+
+# -- where the master and the lake disagree -----------------------------------
+
+
+def test_13_a_master_dating_the_boundary_late_still_returns_every_session(
+    fixture_lake: FixtureLake,
+):
+    """#135 test 13. The ranges widen the selection; they never narrow it.
+
+    ``lake.occ_mapping``'s own docstring records this state: a boundary dated two ways leaves
+    ``resolve`` answering the old symbol "on a day the sealed chains already carried the new
+    one". A read that substituted the master's answer per session would refuse a session whose
+    rows are on disk, and the life read's step-over rule would then turn that refusal into a
+    hole that reads as a session the contract did not trade in.
+    """
+    # The chains turned over on 09-14 and the master dates the boundary 09-15, one late.
+    days = {
+        SEALED[0]: [_data(SEALED[0], "10:31", OLD)],
+        SEALED[1]: [_data(SEALED[1], "10:31", OLD)],
+        SEALED[2]: [_data(SEALED[2], "10:31", ADJUSTED)],
+        SEALED[3]: [_data(SEALED[3], "10:31", ADJUSTED)],
+    }
+    root = _lake(fixture_lake, master=_master(), days=days)
+
+    assert _days(load_contract_life(OLD, lake_root=root)) == SEALED
+    assert _symbols(load_contract(ADJUSTED, SEALED[2], lake_root=root)) == [ADJUSTED]
+
+
+def test_14_a_boundary_session_carrying_both_spellings_returns_both(fixture_lake: FixtureLake):
+    """#135 test 14. The master's ranges are date-grained and a partition holds a day of minutes.
+
+    So the session a mapping closes on can carry the old spelling early and the new one late,
+    and one symbol per session would drop half of it without saying so.
+    """
+    days = _life_rows()
+    days[SEALED[3]] = [
+        _data(SEALED[3], "09:31", OLD),
+        _data(SEALED[3], "15:31", ADJUSTED),
+    ]
+    root = _lake(fixture_lake, master=_master(), days=days)
+
+    boundary = load_contract(OLD, SEALED[3], lake_root=root)
+    assert _symbols(boundary) == [OLD, ADJUSTED]
+
+    life = load_contract_life(OLD, lake_root=root)
+    assert _symbols(life) == [OLD, OLD, OLD, OLD, ADJUSTED]
+
+
+def test_15_the_selection_keeps_every_row_the_door_returned_before_the_master_existed(
+    fixture_lake: FixtureLake,
+):
+    """#135 test 15. Threading is additive, which is what makes it safe on a shipped door.
+
+    Whatever spelling a caller names, a row carrying that spelling comes back. The master can
+    only add spellings to look for, so no reading of it can take a row away.
+    """
+    days = _life_rows()
+    root = _lake(fixture_lake, master=_master(), days=days)
+    bare = _lake(FixtureLake(root.parent / "bare"), days=days)
+
+    for symbol in (OLD, ADJUSTED, PLAIN):
+        for day in SEALED:
+            try:
+                without = _symbols(load_contract(symbol, day, lake_root=bare, ticker="SPY"))
+            except ContractAbsent:
+                without = []
+            try:
+                with_master = _symbols(load_contract(symbol, day, lake_root=root, ticker="SPY"))
+            except ContractAbsent:
+                with_master = []
+            assert set(without) <= set(with_master), (symbol, day, without, with_master)
