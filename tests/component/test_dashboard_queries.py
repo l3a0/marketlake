@@ -3113,6 +3113,24 @@ def test_a_damaged_quarantine_ledger_is_reported_and_never_raised(fixture_lake: 
     assert len(payload["cells"]) == 9
 
 
+def test_a_partition_that_cannot_be_a_key_reports_its_class_rather_than_TypeError(
+    fixture_lake: FixtureLake,
+):
+    """Marketlake #514 at the panel. The containment held here already; the name did not.
+
+    ``_open_quarantines`` catches bare ``Exception`` and reports whatever class it met, so
+    this shape never cost the page. What it reported was ``TypeError``, which tells an
+    operator nothing about which file broke. It now joins its four siblings under the one
+    class every other reader of this ledger states in writing.
+    """
+    build_lake(fixture_lake)
+    fixture_lake.with_quarantine({"partition": [], "verdict": "quarantined", "check": "e"})
+    payload = service_over(fixture_lake.build()).run_query("history", {})
+    assert payload["quarantine_unreadable"] == "ManifestError"
+    assert payload["quarantines"] == []
+    assert len(payload["cells"]) == 9
+
+
 def test_an_absent_quarantine_ledger_reads_as_no_entries(service: DashboardService, root: Path):
     assert not (root / "quarantine.jsonl").exists()
     payload = service.run_query("history", {})

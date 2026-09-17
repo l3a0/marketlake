@@ -1093,6 +1093,27 @@ def test_a_manifest_line_naming_no_partition_is_recorded_rather_than_raised(tmp_
     assert "entry 1" in report.problems[0], "the report located no line"
 
 
+def test_a_manifest_partition_that_cannot_be_a_key_is_recorded_rather_than_raised(tmp_path):
+    """Marketlake #514 on the daemon's side of the same crash the test above closes.
+
+    A line naming no partition was already recorded. A line naming a partition that cannot be
+    a dict key raised a bare ``TypeError`` out of ``latest_entries`` instead, and this catch
+    survived it only because it catches bare ``Exception``. What it recorded was
+    ``marking pass: TypeError: unhashable type: 'list'``, which names neither the ledger nor
+    the line, on a file that sits on disk and meets every ``KeepAlive`` restart again.
+    """
+    (tmp_path / "manifest.jsonl").write_text('{"partition": [], "rows": 406}\n')
+    marker = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=_roster_of("XYZ"))
+
+    report = marker.on_start()
+
+    assert len(report.problems) == 1, report.problems
+    assert report.problems[0].startswith("marking pass: ManifestError"), report.problems
+    assert "entry 1" in report.problems[0], "the report located no line"
+    assert "cannot be a key" in report.problems[0], report.problems
+    assert "manifest.jsonl" in report.problems[0], "the report named no ledger"
+
+
 def test_a_drifted_segment_is_recorded_rather_than_raised(tmp_path):
     """The second way in. A readable segment that lost its columns took the daemon down too.
 

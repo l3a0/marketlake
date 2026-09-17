@@ -249,12 +249,13 @@ def open_quarantines(lake_root: Path | str) -> list[OpenQuarantine]:
     the count and not the path cannot act on it.
 
     ``key=str`` sorts rather than the values themselves. ``manifest.latest_quarantine`` raises
-    on an entry naming no partition and passes through one whose partition is not a string, so a
-    hand-repaired ledger can hold an integer key. Sorting those against strings raised
-    ``TypeError`` out of the listing, which is a bare traceback on the path three of this
-    module's own refusals send an operator down when they say repairing a ledger is a human's
-    job. The damaged key is printed rather than hidden, because seeing it is how the human finds
-    what to repair.
+    on an entry naming no partition, and since marketlake #514 on one whose partition cannot be
+    a dict key. It passes through every other non-string, so a hand-repaired ledger can still
+    hold an integer key: ``7``, ``1.5``, ``null`` and ``true`` all reach here. Sorting those
+    against strings raised ``TypeError`` out of the listing, which is a bare traceback on the
+    path three of this module's own refusals send an operator down when they say repairing a
+    ledger is a human's job. The damaged key is printed rather than hidden, because seeing it
+    is how the human finds what to repair.
     """
     ledger = latest_quarantine(Path(lake_root))
     return [
