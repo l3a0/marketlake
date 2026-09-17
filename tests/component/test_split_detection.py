@@ -1046,6 +1046,77 @@ def test_the_splits_subcommand_runs_the_detection(fixture_lake: FixtureLake, tmp
     assert entry["type"] == TYPE_SPLIT
 
 
+def test_the_subcommand_builds_a_calendar_that_answers(
+    fixture_lake: FixtureLake, tmp_path: Path, capsys
+):
+    """The entry point's default is only exercised where a session sits between two sealed days.
+
+    ``detect_splits_from_config`` is the one caller that constructs the calendar, and every
+    other subcommand test runs over consecutive sessions, where nothing ever dereferences it.
+    A default that resolved to ``None`` would pass all of them and raise ``AttributeError`` on
+    the first gap the live lake met, which is SPY's own 2026-09-02 to 2026-09-08.
+
+    The real ``ExchangeCalendar`` answers here, so this also says the two fixture days really
+    are one session apart on the exchange's own calendar rather than only on the fake's.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_THREE): [_row(DAY_THREE)],
+        },
+    )
+    config = _config(tmp_path, root)
+
+    code = actions.main(["splits", "--config", str(config)], clock=ManualClock(FIRST_NIGHT))
+
+    assert code == 0
+    assert f"- {REASON_NOT_SEALED}: 1" in capsys.readouterr().out
+
+
+def test_the_calendar_cannot_ride_in_on_a_default(fixture_lake: FixtureLake):
+    """A caller that omits it gets a ``TypeError``, never a live exchange calendar.
+
+    ``tests/unit/test_seam_defaults.py`` states the rule this follows and deliberately does not
+    carry a row for it: a seam is a dependency whose production value reaches past this process,
+    and "a system clock and an exchange calendar never reach past this process, so neither is a
+    seam." So the requirement is held here, beside the walk, rather than in a table about
+    something else. What it buys is the same thing that table buys: a later edit re-adding
+    ``= ExchangeCalendar()`` goes red instead of passing every test while the walk quietly reads
+    the real calendar.
+    """
+    root = _two_sessions(fixture_lake)
+
+    with pytest.raises(TypeError):
+        detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+
+def test_two_uncaptured_sessions_are_reported_as_two_in_date_order(fixture_lake: FixtureLake):
+    """A window wider than one session, which is what an operator has to go and look at.
+
+    The count and both ends reach the operator only through the run's own render, because
+    ``report.redacted`` drops the message from the filed record. A count that says one while two
+    sessions are dark sends them to the wrong window.
+    """
+    day_four = date(2026, 9, 17)
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", day_four): [
+                _row(day_four, occ_symbol=CARRIED_OCC),
+                _adjusted_row(day_four),
+            ],
+        },
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
+
+    assert [skip.day for skip in report_out.skipped] == [DAY_TWO, DAY_THREE]
+    (line,) = [line for line in report_out.render().splitlines() if "BoundaryUnbounded" in line]
+    assert f"between {DAY_ONE.isoformat()} and {day_four.isoformat()}, 2 of them" in line
+
+
 def test_config_is_accepted_before_the_subcommand_too(fixture_lake: FixtureLake, tmp_path: Path):
     """The subparser declares ``--config`` with ``SUPPRESS``, so the top-level value survives.
 

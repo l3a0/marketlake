@@ -16,10 +16,21 @@ import pytest
 
 from lake.splits import (
     _STRIKE_PLACES,
+    REASON_DELIVERABLE_UNCHANGED,
     REASON_INSTRUMENT_CHANGED,
     REASON_NO_LADDER,
+    REASON_NO_OPTION_CLOSE,
     REASON_NO_UNDERLYING,
+    REASON_NOT_SEALED,
+    REASON_OUT_OF_SCOPE,
+    REASON_PARTIAL_READ,
+    REASON_PARTITION_ABSENT,
+    REASON_QUARANTINED,
+    REASON_ROOT_RETURNED,
     REASON_SCALE_WINDOW,
+    REASON_STANDARD_SERIES,
+    REASON_THIN,
+    REASON_UNRESOLVED,
     SCALE_CONFIRMATION_FLOOR,
     WHOLE_RATIO_GATE,
     WHOLE_RATIO_TOLERANCE,
@@ -599,6 +610,40 @@ def test_a_ladder_that_only_half_followed_does_not_confirm():
 
     assert verdict.confirmed == pytest.approx(3 / len(LADDER))
     assert not verdict.holds
+
+
+def test_every_reason_this_module_names_reads_differently():
+    """``actions.by_reason`` groups on the string, so two reasons sharing text become one line.
+
+    Every other test in this file compares against the constant, which makes a collision
+    invisible to all of them: a run holding one thin session and one unsealed session would
+    render a single counted line and an operator could not tell a truncated chain from a day
+    the machine was off. The reasons are the vocabulary the render is written in, so their
+    distinctness is the property to hold rather than each one's wording.
+    """
+    skips = {
+        "REASON_NO_OPTION_CLOSE": REASON_NO_OPTION_CLOSE,
+        "REASON_NOT_SEALED": REASON_NOT_SEALED,
+        "REASON_OUT_OF_SCOPE": REASON_OUT_OF_SCOPE,
+        "REASON_PARTIAL_READ": REASON_PARTIAL_READ,
+        "REASON_PARTITION_ABSENT": REASON_PARTITION_ABSENT,
+        "REASON_QUARANTINED": REASON_QUARANTINED,
+        "REASON_THIN": REASON_THIN,
+        "REASON_UNRESOLVED": REASON_UNRESOLVED,
+    }
+    unread = {
+        "REASON_INSTRUMENT_CHANGED": REASON_INSTRUMENT_CHANGED,
+        "REASON_NO_LADDER": REASON_NO_LADDER,
+        "REASON_NO_UNDERLYING": REASON_NO_UNDERLYING,
+        "REASON_SCALE_WINDOW": REASON_SCALE_WINDOW,
+    }
+    marks = {
+        "REASON_DELIVERABLE_UNCHANGED": REASON_DELIVERABLE_UNCHANGED,
+        "REASON_ROOT_RETURNED": REASON_ROOT_RETURNED,
+        "REASON_STANDARD_SERIES": REASON_STANDARD_SERIES,
+    }
+    for group in (skips, unread, marks):
+        assert len(set(group.values())) == len(group), f"two reasons share one text: {group}"
 
 
 def test_the_sessions_between_two_sealed_days_come_off_the_calendar():
