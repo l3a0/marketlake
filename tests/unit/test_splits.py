@@ -16,10 +16,21 @@ import pytest
 
 from lake.splits import (
     _STRIKE_PLACES,
+    REASON_DELIVERABLE_UNCHANGED,
     REASON_INSTRUMENT_CHANGED,
     REASON_NO_LADDER,
+    REASON_NO_OPTION_CLOSE,
     REASON_NO_UNDERLYING,
+    REASON_NOT_SEALED,
+    REASON_OUT_OF_SCOPE,
+    REASON_PARTIAL_READ,
+    REASON_PARTITION_ABSENT,
+    REASON_QUARANTINED,
+    REASON_ROOT_RETURNED,
     REASON_SCALE_WINDOW,
+    REASON_STANDARD_SERIES,
+    REASON_THIN,
+    REASON_UNRESOLVED,
     SCALE_CONFIRMATION_FLOOR,
     WHOLE_RATIO_GATE,
     WHOLE_RATIO_TOLERANCE,
@@ -27,12 +38,14 @@ from lake.splits import (
     DeliverableUnreadable,
     NonScalarDeliverable,
     Session,
+    _uncaptured_sessions,
     check_split_consistency,
     check_strike_scale,
     deliverable_of,
     deliverable_of_row,
     require_scalar,
 )
+from tests.support.calendar import weekday_sessions
 
 DAY = date(2026, 9, 15)
 
@@ -517,7 +530,7 @@ def test_no_two_whole_ratios_can_ever_claim_one_spot_move():
     for step in range(15, 2001):
         move = step / 100
         verdict = check_strike_scale(
-            _scale_session(spot=move * 100.0), _scale_session(spot=100.0), skipped_since=0
+            _scale_session(spot=move * 100.0), _scale_session(spot=100.0), unread_since=0
         )
         assert not isinstance(verdict, str)
         if verdict.ratio is None:
@@ -532,7 +545,7 @@ def test_an_ordinary_move_names_no_ratio_at_all():
     """The live lake's four adjacent pairs run 0.999745 to 1.006586, nowhere near a ratio."""
     for move in (0.999745, 1.000255, 1.004429, 1.004608, 1.006586):
         verdict = check_strike_scale(
-            _scale_session(spot=move * 700.0), _scale_session(spot=700.0), skipped_since=0
+            _scale_session(spot=move * 700.0), _scale_session(spot=700.0), unread_since=0
         )
         assert verdict.ratio is None
         assert verdict.confirmed == 0.0
@@ -543,7 +556,7 @@ def test_a_move_just_inside_the_gate_still_names_nothing():
     below = check_strike_scale(
         _scale_session(spot=(WHOLE_RATIO_GATE - 0.01) * 700.0),
         _scale_session(spot=700.0),
-        skipped_since=0,
+        unread_since=0,
     )
     assert below.ratio is None
 
@@ -551,7 +564,7 @@ def test_a_move_just_inside_the_gate_still_names_nothing():
 def test_a_move_too_far_from_its_candidate_names_nothing():
     """1.8 rounds to 2 and sits 10% away from it, which is twice the tolerance."""
     verdict = check_strike_scale(
-        _scale_session(spot=1.8 * 700.0), _scale_session(spot=700.0), skipped_since=0
+        _scale_session(spot=1.8 * 700.0), _scale_session(spot=700.0), unread_since=0
     )
     assert verdict.ratio is None
     assert verdict.spot_ratio == pytest.approx(1.8)
@@ -566,7 +579,7 @@ def test_the_confirmation_runs_at_the_candidate_and_not_at_the_raw_move():
     previous = _scale_session()
     session = _scale_session(strikes={strike / 2 for strike in LADDER}, spot=700.0 / 2.000637)
 
-    verdict = check_strike_scale(previous, session, skipped_since=0)
+    verdict = check_strike_scale(previous, session, unread_since=0)
 
     assert verdict.ratio == 2.0
     assert verdict.spot_ratio == pytest.approx(2.000637)
@@ -581,7 +594,7 @@ def test_a_stationary_ladder_confirms_far_below_the_floor():
     a whole ratio anyway, against 1.000000 for a real adjustment. This ladder's own coincidence
     is whatever it is, and the claim is that it stays under the floor.
     """
-    verdict = check_strike_scale(_scale_session(), _scale_session(spot=350.0), skipped_since=0)
+    verdict = check_strike_scale(_scale_session(), _scale_session(spot=350.0), unread_since=0)
 
     assert verdict.ratio == 2.0
     assert verdict.confirmed < SCALE_CONFIRMATION_FLOOR
@@ -593,26 +606,80 @@ def test_a_ladder_that_only_half_followed_does_not_confirm():
     followed = sorted(LADDER)[:3]
     session = _scale_session(strikes={strike / 2 for strike in followed}, spot=350.0)
 
-    verdict = check_strike_scale(_scale_session(), session, skipped_since=0)
+    verdict = check_strike_scale(_scale_session(), session, unread_since=0)
 
     assert verdict.confirmed == pytest.approx(3 / len(LADDER))
     assert not verdict.holds
+
+
+def test_every_reason_this_module_names_reads_differently():
+    """``actions.by_reason`` groups on the string, so two reasons sharing text become one line.
+
+    Every other test in this file compares against the constant, which makes a collision
+    invisible to all of them: a run holding one thin session and one unsealed session would
+    render a single counted line and an operator could not tell a truncated chain from a day
+    the machine was off. The reasons are the vocabulary the render is written in, so their
+    distinctness is the property to hold rather than each one's wording.
+    """
+    skips = {
+        "REASON_NO_OPTION_CLOSE": REASON_NO_OPTION_CLOSE,
+        "REASON_NOT_SEALED": REASON_NOT_SEALED,
+        "REASON_OUT_OF_SCOPE": REASON_OUT_OF_SCOPE,
+        "REASON_PARTIAL_READ": REASON_PARTIAL_READ,
+        "REASON_PARTITION_ABSENT": REASON_PARTITION_ABSENT,
+        "REASON_QUARANTINED": REASON_QUARANTINED,
+        "REASON_THIN": REASON_THIN,
+        "REASON_UNRESOLVED": REASON_UNRESOLVED,
+    }
+    unread = {
+        "REASON_INSTRUMENT_CHANGED": REASON_INSTRUMENT_CHANGED,
+        "REASON_NO_LADDER": REASON_NO_LADDER,
+        "REASON_NO_UNDERLYING": REASON_NO_UNDERLYING,
+        "REASON_SCALE_WINDOW": REASON_SCALE_WINDOW,
+    }
+    marks = {
+        "REASON_DELIVERABLE_UNCHANGED": REASON_DELIVERABLE_UNCHANGED,
+        "REASON_ROOT_RETURNED": REASON_ROOT_RETURNED,
+        "REASON_STANDARD_SERIES": REASON_STANDARD_SERIES,
+    }
+    for group in (skips, unread, marks):
+        assert len(set(group.values())) == len(group), f"two reasons share one text: {group}"
+
+
+def test_the_sessions_between_two_sealed_days_come_off_the_calendar():
+    """The helper that closes marketlake #431, asked directly.
+
+    Both ends are exclusive, because both are days the manifest holds and the question is what
+    sits between them. A weekend and a holiday contribute nothing, which is why the calendar
+    answers this and weekday arithmetic does not.
+    """
+    calendar = weekday_sessions(date(2026, 9, 14), date(2026, 9, 21), holidays=[date(2026, 9, 16)])
+
+    assert _uncaptured_sessions(calendar, date(2026, 9, 14), date(2026, 9, 15)) == []
+    assert _uncaptured_sessions(calendar, date(2026, 9, 14), date(2026, 9, 17)) == [
+        date(2026, 9, 15)
+    ]
+    assert _uncaptured_sessions(calendar, date(2026, 9, 18), date(2026, 9, 21)) == []
+    assert _uncaptured_sessions(calendar, date(2026, 9, 14), date(2026, 9, 18)) == [
+        date(2026, 9, 15),
+        date(2026, 9, 17),
+    ]
 
 
 def test_the_four_refusals_come_back_as_reasons_rather_than_verdicts():
     """Each one is a pair nobody judged, which the report keeps apart from a pair it passed."""
     ordinary = _scale_session()
     assert (
-        check_strike_scale(ordinary, _scale_session(instrument_id=2), skipped_since=0)
+        check_strike_scale(ordinary, _scale_session(instrument_id=2), unread_since=0)
         == REASON_INSTRUMENT_CHANGED
     )
-    assert check_strike_scale(ordinary, ordinary, skipped_since=1) == REASON_SCALE_WINDOW
+    assert check_strike_scale(ordinary, ordinary, unread_since=1) == REASON_SCALE_WINDOW
     assert (
-        check_strike_scale(ordinary, _scale_session(strikes=frozenset()), skipped_since=0)
+        check_strike_scale(ordinary, _scale_session(strikes=frozenset()), unread_since=0)
         == REASON_NO_LADDER
     )
     assert (
-        check_strike_scale(ordinary, _scale_session(spot=None), skipped_since=0)
+        check_strike_scale(ordinary, _scale_session(spot=None), unread_since=0)
         == REASON_NO_UNDERLYING
     )
 
@@ -620,7 +687,7 @@ def test_the_four_refusals_come_back_as_reasons_rather_than_verdicts():
 def test_the_instrument_is_asked_before_the_window():
     """Two securities are not a pair at all, whatever sits between their sessions."""
     assert (
-        check_strike_scale(_scale_session(), _scale_session(instrument_id=2), skipped_since=3)
+        check_strike_scale(_scale_session(), _scale_session(instrument_id=2), unread_since=3)
         == REASON_INSTRUMENT_CHANGED
     )
 
@@ -634,11 +701,11 @@ def test_a_degenerate_previous_session_is_refused_rather_than_dividing_by_it():
     """
     ordinary = _scale_session()
     assert (
-        check_strike_scale(_scale_session(strikes=frozenset()), ordinary, skipped_since=0)
+        check_strike_scale(_scale_session(strikes=frozenset()), ordinary, unread_since=0)
         == REASON_NO_LADDER
     )
     assert (
-        check_strike_scale(_scale_session(spot=None), ordinary, skipped_since=0)
+        check_strike_scale(_scale_session(spot=None), ordinary, unread_since=0)
         == REASON_NO_UNDERLYING
     )
 
@@ -651,11 +718,11 @@ def test_the_window_is_asked_before_the_ladder_and_the_spot():
     """
     ordinary = _scale_session()
     assert (
-        check_strike_scale(ordinary, _scale_session(spot=None), skipped_since=1)
+        check_strike_scale(ordinary, _scale_session(spot=None), unread_since=1)
         == REASON_SCALE_WINDOW
     )
     assert (
-        check_strike_scale(ordinary, _scale_session(strikes=frozenset()), skipped_since=1)
+        check_strike_scale(ordinary, _scale_session(strikes=frozenset()), unread_since=1)
         == REASON_SCALE_WINDOW
     )
 
@@ -675,7 +742,7 @@ def test_an_odd_ratio_confirms_at_the_precision_the_vendor_can_write():
     verdict = check_strike_scale(
         _scale_session(strikes=ladder, spot=900.0),
         _scale_session(strikes=listed, spot=300.0),
-        skipped_since=0,
+        unread_since=0,
     )
 
     assert _STRIKE_PLACES == 3
@@ -698,7 +765,7 @@ def test_the_floor_is_a_floor_and_it_sits_where_the_constant_says():
         return check_strike_scale(
             _scale_session(strikes=ladder, spot=700.0),
             _scale_session(strikes=frozenset(s / 2 for s in rungs[:count]), spot=350.0),
-            skipped_since=0,
+            unread_since=0,
         )
 
     exactly, under = confirmed_over(10), confirmed_over(9)
@@ -718,7 +785,7 @@ def test_the_tolerance_admits_and_refuses_at_written_out_numbers():
 
     def ratio(spot_ratio: float):
         return check_strike_scale(
-            _scale_session(spot=spot_ratio), _scale_session(spot=1.0), skipped_since=0
+            _scale_session(spot=spot_ratio), _scale_session(spot=1.0), unread_since=0
         ).ratio
 
     assert ratio(2.09) == 2.0
@@ -735,7 +802,7 @@ def test_a_subnormal_underlying_declines_the_pair_rather_than_ending_the_run():
     """
     for spot in (1e-310, 5e-324):
         verdict = check_strike_scale(
-            _scale_session(spot=spot), _scale_session(spot=1.0), skipped_since=0
+            _scale_session(spot=spot), _scale_session(spot=1.0), unread_since=0
         )
         assert verdict.ratio is None
 

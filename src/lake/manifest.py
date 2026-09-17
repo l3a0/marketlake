@@ -238,8 +238,9 @@ def latest_quarantine_by_check(lake_root: Path) -> dict[str, dict[str, dict]]:
     Each partition's inner mapping is ordered by where that check's *current* entry sits in the
     file, which is why an existing check is removed before it is re-inserted. A plain
     reassignment keeps the position a key was first seen at, and the two disagree as soon as a
-    check has written twice. The order is what :func:`withholding` hands back, so the
-    longest-standing unresolved verdict comes first.
+    check has written twice. The order is what :func:`withholding` hands back, and that
+    function's own docstring is where what the order does and does not mean is stated: it is
+    where each check's current entry sits, which is not the same as longest-standing first.
 
     An entry whose ``check`` cannot be a dict key raises ``ManifestError`` naming this ledger
     and the entry's position, for the reason ``_latest_by_partition`` gives about a missing
@@ -324,10 +325,12 @@ def is_quarantined(entry: dict | None) -> bool:
     partition is :func:`withholding` folded over every check's current entry, and
     :func:`latest_quarantine` hands back the one that decides.
 
-    The rule sits beside the ledger rather than inside its first reader. Marketlake #139
-    is authoritative for the entry shape and has not been built, so reader and writer have
-    to meet at one definition or the exclusion silently inverts. A sign-off tool writing
-    its own spelling of "cleared" would leave a partition it just cleared refused forever.
+    The rule sits beside the ledger rather than inside its first reader, because reader and
+    writer have to meet at one definition or the exclusion silently inverts. A sign-off tool
+    writing its own spelling of "cleared" would leave a partition it just cleared refused
+    forever. Marketlake #139 built that tool as ``lake.signoff``, and it writes
+    :data:`CLEAN_VERDICT` from ``lake.battery`` rather than a spelling of its own, so the
+    hypothesis this paragraph was written against is now settled rather than open.
     """
     return entry is not None and entry.get(VERDICT_FIELD) != CLEAN_VERDICT
 

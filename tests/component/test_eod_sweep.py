@@ -1854,3 +1854,39 @@ def test_the_command_hands_the_batterys_threshold_to_the_battery(
     capsys.readouterr()
 
     assert seen == [7], "the battery was handed the pinned default, not the config's"
+
+
+def test_the_split_walk_is_handed_the_run_s_own_calendar(fixture_lake: FixtureLake, monkeypatch):
+    """Not one the sweep builds for itself, which would read as working and be untestable.
+
+    ``detect_splits`` decides whether two sealed sessions are adjacent, and that is the
+    calendar's answer under marketlake #431. A sweep that constructed its own would agree with
+    the injected fake on every ordinary week and disagree on exactly the days a test declares,
+    so the identity is the assertion rather than any verdict downstream of it.
+    """
+    root = _lake(fixture_lake)
+    calendar = weekday_sessions(MONDAY, NEXT_MONDAY)
+    seen: list[object] = []
+    real = sweep.detect_splits
+
+    def recording(**kwargs):
+        seen.append(kwargs["calendar"])
+        return real(**kwargs)
+
+    monkeypatch.setattr(sweep, "detect_splits", recording)
+
+    sweep.sweep(
+        lake_root=root,
+        clock=ManualClock(EVENING),
+        calendar=calendar,
+        roster=_roster(),
+        vendor_source=_CountingVendorSource(),
+        pinger=FakePinger(),
+        ping_url=PING_URL,
+        publisher=None,
+        schedule_reader=lambda: _schedule_text(),
+        schedule_setter=_RecordingSetter(),
+    )
+
+    assert seen == [calendar], "the split walk did not get the calendar the run was given"
+    assert seen[0] is calendar
