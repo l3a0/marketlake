@@ -64,8 +64,11 @@ rather than the entries a read returns, so a damaged ledger cannot stop the writ
 The pair sits at two levels rather than one. :func:`append_verdict` takes the lock and is what
 ``lake.signoff`` and any other caller holding none wants. :func:`write_verdict` is the same two
 writes for a caller already inside the hold, which is :func:`judge`, because it has to read the
-ledger and append under one hold and ``lake_lock`` blocks forever on re-entry.
-``lake.occ_mapping`` splits its own writer the same way and for the same reason.
+ledger and append under one hold and ``lake_lock`` blocks forever on re-entry. No other module
+carries two levels, because none has needed them: ``lake.occ_mapping`` reaches the same end by
+calling ``manifest.record_partition``, which already takes no lock, rather than the locking
+``actions.append``. The ledger's pair had no such primitive to reach for, since the rule that
+its line and its manifest entry go together is what :func:`append_verdict` exists to enforce.
 
 **Human precedence, which #139 states and this builds.** Before appending, the battery reads
 that check's own current entry for the partition. If a human wrote it, a verdict from the
@@ -193,7 +196,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Iterable, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -540,6 +543,11 @@ def append_verdict(
     names the wrong producer, and every other writer in the lake stamps its own.
     """
     root = Path(lake_root)
+    # Before the lock, not inside it. ``lake_lock`` opens ``manifest.jsonl`` with ``O_CREAT``,
+    # which creates the file and never its directory, so acquiring against a lake root that
+    # does not exist raises before any body could make it. Executed: without this line
+    # ``append_verdict`` on an absent root raises ``FileNotFoundError`` where it used to write.
+    quarantine_path(root).parent.mkdir(parents=True, exist_ok=True)
 
     # Local to keep this module free of the lock unless it writes, the same reason
     # ``actions``, ``onboard``, ``retire`` and ``schema_versions`` import it at the call site.
@@ -1836,7 +1844,8 @@ def judge(
     partition is the failure this deliverable's audit found would quarantine the lake's oldest
     data on the first run.
 
-    **The ledger is read inside the hold that appends, one hold per partition.** The
+    **The ledger is read inside the hold that appends, one hold per partition.** A dry run
+    appends nothing, so it takes no hold and the comment at that line says why. The
     alternative is one read before the walk, and that snapshot is as old as the walk. Marketlake
     #470 is that defect, and the comment at the hold carries what it cost. The hold is per
     partition rather than around the whole walk because the walk is seconds, the sweep's other
@@ -1932,9 +1941,16 @@ def judge(
         #
         # The hold covers ledger work alone. Reading and judging the partition is seconds and
         # stays above this line, which is the rule ``bars`` states for its vendor round trip.
-        # A dry run takes the hold too, so the counts an operator reads before deciding are
-        # produced the way the real run produces them.
-        with lake_lock(root):
+        #
+        # **A dry run takes no hold.** The lock is what makes the read and the append one
+        # step, and a dry run has no append for it to be atomic with, so it would be holding
+        # an exclusive lock over a read nothing acts on. That is not free either way it is
+        # decided: ``lake_lock`` opens the manifest with ``O_CREAT``, so a preview would
+        # create a ``manifest.jsonl`` in a lake that had none, and ``compact.sweep`` holds the
+        # lock across a whole rewrite, so a preview would block behind it where it used to
+        # answer. The price is that a dry run's counts are read without synchronisation, which
+        # is what a forecast is.
+        with nullcontext() if dry_run else lake_lock(root):
             # **One call for the partition, not one per finding.** ``decide_partition`` carries
             # the ledger state forward as lines land, and two checks clearing in one walk both
             # change what withholds the partition. Called once per finding that state never

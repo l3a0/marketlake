@@ -76,21 +76,28 @@ after it is dropped by every reader. Measured on a temp lake, eight lines writte
 with all six sign-offs among them invisible while each writer returned success. Marketlake #447
 carries that class. This carries the guard for its own write.
 
-The check is membership rather than currency, on purpose. A racing writer superseding the
-sign-off is a different outcome from the sign-off never being readable, and the report says
-which happened by printing the partition's current entry beside it. So this tool's own window,
-between picking the check off the deciding entry and appending under it, is left open. What
-lands in it is a supersede the report names, and
-``test_the_read_back_accepts_a_sign_off_a_later_entry_superseded`` holds that.
+The check is membership rather than currency, on purpose. A writer superseding the sign-off
+between the append and the read-back is a different outcome from the sign-off never being
+readable, and the report says which happened by printing the partition's current entry beside
+it. ``test_the_read_back_accepts_a_sign_off_a_later_entry_superseded`` holds that one.
 
-``battery.judge``'s window was the same shape and a different outcome, so marketlake #470
-closed it. A sign-off landing in that one was buried rather than reported: the battery appended
-its own verdict after the human's, and the next run read ``provenance: battery`` on the entry
-``human_precedence`` compares. Closing it did not mean holding the lock wider.
-``lake.lock.lake_lock`` is not re-entrant, so a caller holding it deadlocks against
-``append_verdict`` taking it, and what the battery does instead is read the ledger inside its
-own hold and append through ``battery.write_verdict``, which is the same two writes without the
-lock. Nothing here needs that, because nothing here decides from the read it would protect.
+**This tool's earlier window is open and is not the same defect.**
+:func:`_superseded_entry` reads the deciding entry outside the hold :func:`append_verdict`
+later takes, and it decides three things from that read: whether to refuse, which direction is
+legal, and the check token the entry is written under. What can land in the window is a writer
+changing the partition's readability. Executed on a temp lake: a battery ``clean`` under the
+same check landing there leaves this tool appending a sign-off that changes nothing and
+reporting ``partition was: withheld`` for a partition that already read, where the same ledger
+state read without the race refuses with "no entry withholds it". That is a line nobody needed
+and one wrong word in a report, against ``battery.judge``'s window, which lost a human decision
+outright. Marketlake #470 closed that one and left this one, and the difference in what they
+cost is the reason rather than any claim that this read is safe.
+
+Closing the battery's did not mean reaching a wider hold *through* ``append_verdict``.
+``lake.lock.lake_lock`` is not re-entrant, so a caller holding it deadlocks against that
+function taking it. The battery instead takes the hold itself, reads the ledger inside it, and
+appends through ``battery.write_verdict``, which is the same two writes without the lock. The
+same two levels are what this tool would need to close its own window.
 
 **Nothing here rolls anything back.** ``append_verdict`` appends the line and then refreshes the
 manifest entry, and a failure between them leaves the ledger a line ahead of its manifest entry,

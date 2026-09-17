@@ -626,6 +626,53 @@ def test_a_second_run_overlapping_the_first_appends_one_line_and_not_two(lake: P
     assert len(read_quarantine(lake)) == 1
 
 
+def test_append_verdict_still_writes_to_a_lake_root_that_does_not_exist_yet(tmp_path: Path):
+    """The directory has to be made before the lock, because the lock cannot make it.
+
+    ``lake_lock`` opens ``manifest.jsonl`` with ``O_CREAT``, which creates the file and never
+    the directory holding it. Moving the ``mkdir`` inside the hold, where the writes are, turns
+    the acquire into a ``FileNotFoundError`` on a root nothing has created. Caught by the
+    correctness review on marketlake #479 rather than by any existing test, because every
+    other caller reaches this function with the root already on disk.
+    """
+    root = tmp_path / "absent"
+
+    append_verdict(
+        root,
+        build_entry(
+            partition=JUDGED,
+            verdict=QUARANTINED_VERDICT,
+            check=CHECK_ENTITLEMENT,
+            observed_at=NOW,
+        ),
+        observed_at=NOW,
+    )
+
+    assert [entry["check"] for entry in read_quarantine(root)] == [CHECK_ENTITLEMENT]
+    assert (root / "manifest.jsonl").exists()
+
+
+def test_a_dry_run_creates_no_manifest_in_a_lake_that_has_none(tmp_path: Path):
+    """A preview writes nothing at all, and taking the lock would break that.
+
+    ``lake_lock`` creates ``manifest.jsonl`` on acquire, so a dry run holding it writes a file
+    into a lake root that had none. ``test_a_dry_run_writes_no_line_and_sends_no_page`` cannot
+    see this, because the ``lake`` fixture creates the manifest itself, which is why this one
+    builds its root by hand.
+    """
+    root = tmp_path / "lake"
+    root.mkdir()
+    _write(root, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
+    _seed_spans(root)
+    assert not (root / "manifest.jsonl").exists()
+
+    report = judge(root, calendar=CALENDAR, now=NOW, guards=GuardConstants(), dry_run=True)
+
+    assert report.quarantined == 1, "the walk has to reach the check for this to prove anything"
+    assert not (root / "manifest.jsonl").exists()
+    assert not (root / "quarantine.jsonl").exists()
+
+
 def test_append_verdict_takes_the_lock_and_write_verdict_leaves_it_to_its_caller(lake: Path):
     """The two levels the split created, asserted against the real lock rather than by reading.
 
