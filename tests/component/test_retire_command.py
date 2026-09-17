@@ -7,6 +7,7 @@ entry or removes it. The span end is what the guard and the walk read later.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -182,3 +183,194 @@ def test_onboard_retire_reonboard_opens_a_second_span(tmp_path: Path):
     assert spans.in_scope(1, first) is True
     assert spans.in_scope(1, away) is False
     assert spans.in_scope(1, rejoin) is True
+
+
+# -- the spans read and the lock -----------------------------------------------------------
+
+
+QQQ_ONBOARD = datetime(2026, 8, 27, 15, 30, tzinfo=UTC)  # 11:30 ET
+CLOSED_AT = datetime(2026, 8, 27, 19, 0, tzinfo=UTC)  # 15:00 ET
+
+
+def _racing(lake: Path, write, *, on: str = "acquire"):
+    """A ``lake_lock`` that runs ``write`` as the hold is taken, or as it is released.
+
+    The pattern is ``test_occ_mapping``'s ``racing_lock``. ``on="acquire"`` puts the other
+    writer inside the hold, which is where a blocked one cannot be. ``on="release"`` puts it
+    the instant the hold ends, which is where a writer blocked on the lock actually lands.
+    The pair separates a read under *a* lock from a read under *the* lock the write uses.
+    """
+    from lake.lock import lake_lock as real_lock
+
+    done: list[bool] = []
+
+    @contextmanager
+    def racing_lock(lake_root):
+        with real_lock(lake_root) as held:
+            if on == "acquire" and not done:
+                done.append(True)
+                write()
+            yield held
+        if on == "release" and not done:
+            done.append(True)
+            write()
+
+    return racing_lock
+
+
+def test_a_span_closed_during_the_run_is_not_reopened(tmp_path: Path, monkeypatch):
+    """The spans file is rewritten whole, so a stale snapshot discards another close.
+
+    This is the state ``retire``'s own module docstring rules out: the roster entry off and the
+    span still open. Ordering keeps a crash away from it and only the lock keeps a second
+    writer away.
+    """
+    lake, tickers = tmp_path / "lake", tmp_path / "tickers.yaml"
+    lake.mkdir()
+    spy = _setup(lake, tickers)
+    master = SecurityMaster.read(master_path(lake))
+    qqq = master.register(
+        kind="equity", capture_start=QQQ_ONBOARD, valid_from=QQQ_ONBOARD.date(), ticker="QQQ"
+    )
+    master.write(master_path(lake))
+    spans = CaptureSpans.read(spans_path(lake))
+    spans.open_span(qqq, QQQ_ONBOARD, False)
+    spans.write(spans_path(lake))
+    upsert_ticker("QQQ", options=False, path=tickers)
+
+    def close_qqq():
+        late = CaptureSpans.read(spans_path(lake))
+        late.close_span(qqq, CLOSED_AT)
+        late.write(spans_path(lake))
+
+    monkeypatch.setattr("lake.lock.lake_lock", _racing(lake, close_qqq))
+
+    retire("SPY", clock=ManualClock(RETIRE), lake_root=lake, tickers_path=tickers)
+
+    after = CaptureSpans.read(spans_path(lake))
+    assert after.spans_of(qqq)[0].end == CLOSED_AT, (
+        "a concurrent retire's close was discarded, leaving QQQ off the roster with an open span"
+    )
+    assert after.spans_of(spy)[0].end == RETIRE, "this run's own close still landed"
+
+
+def test_a_span_opened_during_the_run_survives_and_stays_in_capture_scope(
+    tmp_path: Path, monkeypatch
+):
+    """The costliest case, because this command never writes the master.
+
+    An instrument onboarded in the window keeps its master row and loses its span, so
+    ``capture._live_roster`` resolves it and finds nothing in scope. The ticker is enabled,
+    registered, and captured by nothing, and neither the watchdog nor gap marking can see it,
+    because both read that state as a retirement.
+    """
+    from lake.capture import _live_roster
+
+    lake, tickers = tmp_path / "lake", tmp_path / "tickers.yaml"
+    lake.mkdir()
+    _setup(lake, tickers)
+
+    landed: list[int] = []
+
+    def onboard_qqq():
+        late = SecurityMaster.read(master_path(lake))
+        iid = late.register(
+            kind="equity", capture_start=QQQ_ONBOARD, valid_from=QQQ_ONBOARD.date(), ticker="QQQ"
+        )
+        late.write(master_path(lake))
+        late_spans = CaptureSpans.read(spans_path(lake))
+        late_spans.open_span(iid, QQQ_ONBOARD, False)
+        late_spans.write(spans_path(lake))
+        upsert_ticker("QQQ", options=False, path=tickers)
+        landed.append(iid)
+
+    monkeypatch.setattr("lake.lock.lake_lock", _racing(lake, onboard_qqq))
+
+    retire("SPY", clock=ManualClock(RETIRE), lake_root=lake, tickers_path=tickers)
+
+    qqq = landed[0]
+    assert CaptureSpans.read(spans_path(lake)).has_open_span(qqq), (
+        "the ticker onboarded during the retire lost its span"
+    )
+    in_scope = [entry.ticker for entry in _live_roster(load_tickers(tickers), lake, RETIRE).enabled]
+    assert "QQQ" in in_scope, (
+        "QQQ is enabled and registered and capture would record nothing for it, which is minutes "
+        "gone with nothing to announce it"
+    )
+
+
+def test_a_retire_that_only_locks_its_write_still_discards_the_close(tmp_path: Path, monkeypatch):
+    """Reading under *a* lock is not reading under *the* lock the write happens in.
+
+    A writer blocked on a read-only hold lands the instant it is released, which is before a
+    separate write hold is taken.
+    """
+    lake, tickers = tmp_path / "lake", tmp_path / "tickers.yaml"
+    lake.mkdir()
+    _setup(lake, tickers)
+
+    landed: list[int] = []
+
+    def onboard_qqq():
+        late = SecurityMaster.read(master_path(lake))
+        iid = late.register(
+            kind="equity", capture_start=QQQ_ONBOARD, valid_from=QQQ_ONBOARD.date(), ticker="QQQ"
+        )
+        late.write(master_path(lake))
+        late_spans = CaptureSpans.read(spans_path(lake))
+        late_spans.open_span(iid, QQQ_ONBOARD, False)
+        late_spans.write(spans_path(lake))
+        landed.append(iid)
+
+    monkeypatch.setattr("lake.lock.lake_lock", _racing(lake, onboard_qqq, on="release"))
+
+    retire("SPY", clock=ManualClock(RETIRE), lake_root=lake, tickers_path=tickers)
+
+    assert CaptureSpans.read(spans_path(lake)).has_open_span(landed[0]), (
+        "a writer that landed as the hold released had its span discarded"
+    )
+
+
+def test_an_already_retired_ticker_is_decided_inside_the_lock(tmp_path: Path, monkeypatch):
+    """Whether anything is written is itself decided from the read, so it is decided in the hold.
+
+    A close landing in the window makes this run's own work already done. Deciding that outside
+    the lock writes a second close, moving the recorded end later than the instant the ticker
+    actually stopped.
+    """
+    lake, tickers = tmp_path / "lake", tmp_path / "tickers.yaml"
+    lake.mkdir()
+    spy = _setup(lake, tickers)
+
+    def close_spy():
+        late = CaptureSpans.read(spans_path(lake))
+        late.close_span(spy, CLOSED_AT)
+        late.write(spans_path(lake))
+
+    monkeypatch.setattr("lake.lock.lake_lock", _racing(lake, close_spy))
+
+    report = retire("SPY", clock=ManualClock(RETIRE), lake_root=lake, tickers_path=tickers)
+
+    assert report.already_retired is True
+    assert report.span_end is None
+    assert CaptureSpans.read(spans_path(lake)).spans_of(spy)[0].end == CLOSED_AT, (
+        "the earlier close was overwritten with this run's later instant"
+    )
+
+
+def test_the_report_names_the_instant_the_span_was_closed_at(tmp_path: Path):
+    """``span_end`` on a retire that actually closed something, which nothing asserted.
+
+    Every other assertion on this field is the already-retired case, where it is ``None``,
+    so a report hard-coding ``None`` would satisfy all of them while telling the operator
+    no span was closed on the run that closed one.
+    """
+    lake, tickers = tmp_path / "lake", tmp_path / "tickers.yaml"
+    lake.mkdir()
+    iid = _setup(lake, tickers)
+
+    report = retire("SPY", clock=ManualClock(RETIRE), lake_root=lake, tickers_path=tickers)
+
+    assert report.already_retired is False
+    assert report.span_end == RETIRE, "the report did not name the instant it closed the span at"
+    assert CaptureSpans.read(spans_path(lake)).spans_of(iid)[0].end == RETIRE

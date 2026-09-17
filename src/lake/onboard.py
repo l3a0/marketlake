@@ -88,8 +88,10 @@ Five stamps keep reading the clock, because each records when this command ran.
 Threading the epoch into any of the five would write today's chain into a backdated
 partition and corrupt captured data that can never be captured again.
 
-Three refusals guard the option, all of them ahead of the vendor call and ahead of every
-write, so a typo spends neither a request nor a rewritten roster.
+Three refusals guard the option. All three are asked ahead of the vendor call and ahead of
+every write, so a typo spends neither a request nor a rewritten roster, and the third is
+then asked a second time under the lock, where it can refuse later. The paragraph below
+the list carries that second asking.
 
 1. An instant after the clock's own now is refused. A capture span starting in the
    future reports out of scope, so the ticker would not be captured until that instant
@@ -110,6 +112,15 @@ go there, because asking what the master already holds means reading the master,
 means the lake root from config. It raises ``OnboardError`` from ``onboard`` instead, and
 ``main`` turns that into the same named line and the same exit 2, so all three read alike.
 Every other ``OnboardError`` the flow raises arrives the same way.
+
+The third refusal is asked *twice*, and only the first asking is free. It runs before the
+vendor call, which is what keeps the guarantee above that a typo spends no request. It
+then runs again against the master read inside the lock, because a ticker another
+onboarding registered during the fetch resolves there, and reusing that instrument would
+drop this caller's epoch without a word. So that second asking can raise after the request
+is spent and after the roster entry is written. That is the price of deciding from what
+the lake holds at the moment of the write rather than from a snapshot taken before a
+network round trip, and it is paid deliberately. Marketlake #481.
 
 Deferred, not faked. Each is a later slice, and this command is structured so each
 becomes an added step here without reshaping the flow.
@@ -328,8 +339,10 @@ def _parse_capture_start(text: str) -> datetime:
        ticker is not captured until that instant arrives and nothing says so.
 
     ``register`` and ``open_span`` both refuse a naive instant themselves, so nothing
-    reaches the master unchecked. They refuse it after the live fetch and after the
-    roster upsert. Refusing here is what saves the vendor call and the rewritten roster.
+    reaches the master unchecked, and both now run inside the lake-root lock, which is
+    after the live fetch and after the roster upsert. So ``onboard`` refuses a naive epoch
+    of its own accord before either, and refusing here as well is what turns it into one
+    named line and exit 2 rather than a ``ValueError``.
 
     Every refusal raises ``ArgumentTypeError``, so the operator gets one named line and
     exit 2 rather than a stack. The clock is the real one, because this runs before any
@@ -356,6 +369,90 @@ def _parse_capture_start(text: str) -> datetime:
             "instant arrives and nothing says so."
         )
     return instant
+
+
+def _read_master(master_path: Path) -> SecurityMaster:
+    """The master on disk, or an empty one when the lake has no master yet.
+
+    Named rather than inlined because it is read twice on purpose: once before the vendor
+    call, for the refusals that must answer without spending a request, and once inside
+    the lock, for every value the write is derived from. Marketlake #481.
+    """
+    return SecurityMaster.read(master_path) if master_path.exists() else SecurityMaster()
+
+
+def _read_spans(spans_file: Path) -> capture_spans.CaptureSpans:
+    """The capture spans on disk, or an empty set when the lake has no spans file yet."""
+    return (
+        capture_spans.CaptureSpans.read(spans_file)
+        if spans_file.exists()
+        else capture_spans.CaptureSpans()
+    )
+
+
+def _refuse_an_unseeded_lake(master: SecurityMaster, spans_file: Path) -> None:
+    """Refuse a lake whose master has instruments and whose spans file does not exist.
+
+    The master already has instruments, registered under the old capture_start-only
+    scheme, and the seed run that gives them their spans has not happened. Opening a
+    fresh, empty spans file here would silently discard every one of their capture
+    histories: an already-registered ticker would look never-captured to every span
+    reader. Refuse instead of guessing, and name the fix. A brand-new lake, with no
+    instruments yet, never trips this, so a fresh onboarding needs no seed run first.
+
+    Asked twice, like the epoch refusal beside it: once before the vendor call and once
+    against the master the lock actually writes.
+    """
+    if not spans_file.exists() and master.instrument_ids():
+        raise OnboardError(
+            "capture spans are missing but the security master already has instruments; "
+            "run `python -m lake.seed_spans` before onboarding"
+        )
+
+
+def _refuse_a_second_ticker_mapping(master: SecurityMaster, ticker: str) -> None:
+    """Refuse registering a ticker the master already maps on some other date.
+
+    ``resolve`` answers as of one date, so a mapping opened under a later market date is
+    invisible to it and the caller would register a second instrument for one ticker over
+    overlapping open ranges. ``resolve`` then raises ``AmbiguousSymbol`` on every date they
+    share, which is the state the master calls corrupt, and nothing repairs it by re-running.
+    Marketlake #481.
+    """
+    held = [m for m in master.mappings if m.id_type == ID_TYPE_TICKER and m.id_value == ticker]
+    if not held:
+        return
+    ranges = ", ".join(
+        f"instrument_id {m.instrument_id} from {m.valid_from.isoformat()}"
+        for m in sorted(held, key=lambda m: (m.instrument_id, m.valid_from))
+    )
+    raise OnboardError(
+        f"{ticker} resolves to no instrument on this run's date and the master already maps "
+        f"it ({ranges}), which another onboarding landed while this one fetched. Registering "
+        f"on top of that would give one ticker two instruments over overlapping ranges. "
+        f"Re-run to take the idempotent path"
+    )
+
+
+def _refuse_a_span_that_overlaps_a_close(
+    spans: capture_spans.CaptureSpans, instrument_id: int, start: datetime, ticker: str
+) -> None:
+    """Refuse opening a span that would begin inside one already closed.
+
+    ``CaptureSpans.open_span`` refuses a second *open* span and nothing else, so a start
+    earlier than an existing close is accepted and the two overlap. ``in_scope`` is a union
+    over the spans, so the overlap reads the recorded retirement away, and
+    ``close_guard`` selects by span rather than by roster and would mark the ticker owed
+    for ever. Marketlake #481.
+    """
+    latest = max((s.end for s in spans.spans_of(instrument_id) if s.end is not None), default=None)
+    if latest is None or start > latest:
+        return
+    raise OnboardError(
+        f"{ticker} was retired at {latest.isoformat()} while this onboarding ran, which is "
+        f"after the {start.isoformat()} this run would open its new span at. Opening it "
+        f"would overlap the span that retirement closed. Re-run to rejoin the ticker"
+    )
 
 
 def _refuse_a_second_epoch(master: SecurityMaster, ticker: str) -> None:
@@ -449,64 +546,38 @@ def onboard(
     valid_from = _market_date(epoch)
 
     master_path = security_master.master_path(lake_root)
-    master = SecurityMaster.read(master_path) if master_path.exists() else SecurityMaster()
     spans_file = capture_spans.spans_path(lake_root)
-    if not spans_file.exists() and master.instrument_ids():
-        # The master already has instruments, registered under the old capture_start-only
-        # scheme, and the seed run that gives them their spans has not happened. Opening
-        # a fresh, empty spans file here would silently discard every one of their
-        # capture histories: an already-registered ticker would look never-captured to
-        # every span reader. Refuse instead of guessing, and name the fix. A brand-new
-        # lake, with no instruments yet, never trips this, so a fresh onboarding needs no
-        # seed run first.
-        raise OnboardError(
-            "capture spans are missing but the security master already has instruments; "
-            "run `python -m lake.seed_spans` before onboarding"
-        )
-    spans = (
-        capture_spans.CaptureSpans.read(spans_file)
-        if spans_file.exists()
-        else capture_spans.CaptureSpans()
-    )
 
-    # An explicit epoch is what makes the resolution below depend on the caller's value,
-    # so it is what owes the duplicate-symbol guard. An omitted epoch resolves at the
-    # clock's own date and leaves the idempotent re-onboard exactly as it was.
+    # A preflight read, for the refusals alone. Both of them have to answer before the
+    # vendor call, so a typo spends neither a request nor a rewritten roster, which is
+    # what the module docstring pins. Nothing is decided from this snapshot: every value
+    # the write needs is re-derived from a fresh read inside the lock below, because a
+    # reference table is rewritten whole and a stale snapshot discards whatever landed in
+    # the window rather than superseding it. Marketlake #481.
+    if capture_start is not None and (
+        capture_start.tzinfo is None or capture_start.utcoffset() is None
+    ):
+        # ``register`` and ``open_span`` both refuse this themselves, and both now run
+        # inside the lock, so leaving it to them spends a request and rewrites the roster
+        # first. ``ValueError`` is what they raise and what a library caller already
+        # handles, so the type is kept and only the moment moves.
+        raise ValueError("capture_start must be timezone-aware")
+
+    preflight = _read_master(master_path)
+    _refuse_an_unseeded_lake(preflight, spans_file)
+    # The spans are read here too, and what they say is deliberately thrown away. No
+    # decision is taken from this call. It is the read itself that has to happen before
+    # the vendor call, because a spans file that will not parse raises ``SpansUnreadable``,
+    # and an operator is owed that refusal for the price of no request and no roster
+    # entry. Moving it inside the lock alone put it after both, and the half-onboarded
+    # ticker left in the roster is then captured anyway, since ``capture._live_roster``
+    # widens when the spans file cannot be read.
+    _read_spans(spans_file)
     if capture_start is not None:
-        _refuse_a_second_epoch(master, ticker)
-
-    # Idempotent-friendly: reuse the existing instrument if the ticker is already known.
-    existing_id = master.resolve(ticker, valid_from, id_type=ID_TYPE_TICKER)
-    already_registered = existing_id is not None
-
-    if already_registered:
-        instrument_id = existing_id
-    else:
-        # Register with the ticker mapping only. The FIGI is left unset here and
-        # backfills later from the captured CUSIP. The two facts that cannot be redone,
-        # the instrument_id and the capture_start epoch, are what onboarding pins now.
-        instrument_id = master.register(
-            kind=KIND_EQUITY,
-            capture_start=epoch,
-            valid_from=valid_from,
-            ticker=ticker,
-        )
-
-    # Open a capture span. A new instrument opens its first. A ticker brought back after
-    # retirement, its spans all closed, opens a fresh one at the clock's now, because
-    # retiring leaves the ticker mapping open and the refusal above turns away a rejoin
-    # carrying an explicit epoch. A ticker already capturing keeps its open span, so
-    # re-onboarding is idempotent for scope too.
-    if spans.has_open_span(instrument_id):
-        opened_span = False
-    else:
-        spans.open_span(instrument_id, epoch, options)
-        opened_span = True
-    # The report's capture_start is the current span's start: the epoch for a new or
-    # rejoined ticker, and the existing open span's start for one already capturing. It
-    # takes its own name, because the parameter above is what the caller asked for and
-    # this is what the lake now holds.
-    span_start = next(s.start for s in spans.spans_of(instrument_id) if s.end is None)
+        # An explicit epoch is what makes the resolution below depend on the caller's
+        # value, so it is what owes the duplicate-symbol guard. An omitted epoch resolves
+        # at the clock's own date and leaves the idempotent re-onboard exactly as it was.
+        _refuse_a_second_epoch(preflight, ticker)
 
     # The first snapshot proves the real-time entitlement before the ticker is trusted.
     # It is stamped like a capture cycle so it can be journaled as the first cycle:
@@ -590,6 +661,86 @@ def onboard(
     from lake.lock import lake_lock
 
     with lake_lock(lake_root):
+        # Read both reference tables inside the hold that rewrites them, and re-derive
+        # every decision from what they say now rather than from the preflight snapshot.
+        # The window above holds a whole vendor round trip, and the write is a whole-file
+        # rewrite, so anything another writer landed in it would be discarded rather than
+        # superseded. ``SecurityMaster.register`` takes its id from
+        # ``next_instrument_id()`` on the snapshot it is handed, so a stale one does not
+        # merely drop a registration: it hands that instrument's id to this ticker, and
+        # the master's promise that ids never change is what breaks.
+        #
+        # Holding across the fetch instead is rejected. ``lake_lock`` is a blocking
+        # exclusive ``flock`` on the manifest, and a vendor round trip inside it would put
+        # a network call in front of capture's per-minute append, which is the same reason
+        # ``lake.bars`` fetches outside its own hold.
+        master = _read_master(master_path)
+        spans = _read_spans(spans_file)
+        _refuse_an_unseeded_lake(master, spans_file)
+        if capture_start is not None:
+            # Asked again, and not only for symmetry. A ticker another onboarding
+            # registered in the window resolves here, so the branch below would reuse that
+            # instrument and drop this caller's epoch without a word, which is the second
+            # of the two failures this refusal exists for. The price is that it can now
+            # raise after the request is spent and after the roster entry is written, and
+            # the module docstring above says so rather than leaving it to be met here.
+            _refuse_a_second_epoch(master, ticker)
+
+        # Idempotent-friendly: reuse the existing instrument if the ticker is already
+        # known.
+        existing_id = master.resolve(ticker, valid_from, id_type=ID_TYPE_TICKER)
+        if existing_id is None:
+            # Resolution is as of one date and the guard is over every date. An onboarding
+            # that landed in the window under a *later* market date leaves a mapping this
+            # resolution cannot see, and registering on top of it gives one ticker two
+            # instruments over overlapping open ranges. ``register`` guards the duplicate
+            # id and never the duplicate symbol, so ``resolve`` would raise
+            # ``AmbiguousSymbol`` on every date they share, which the master calls corrupt
+            # and which no re-run repairs.
+            _refuse_a_second_ticker_mapping(master, ticker)
+        already_registered = existing_id is not None
+        if already_registered:
+            instrument_id = existing_id
+        else:
+            # Register with the ticker mapping only. The FIGI is left unset here and
+            # backfills later from the captured CUSIP. The two facts that cannot be
+            # redone, the instrument_id and the capture_start epoch, are what onboarding
+            # pins now.
+            instrument_id = master.register(
+                kind=KIND_EQUITY,
+                capture_start=epoch,
+                valid_from=valid_from,
+                ticker=ticker,
+            )
+
+        # Open a capture span. A new instrument opens its first. A ticker brought back
+        # after retirement, its spans all closed, opens a fresh one at the clock's now,
+        # because retiring leaves the ticker mapping open and the refusal above turns away
+        # a rejoin carrying an explicit epoch. A ticker already capturing keeps its open
+        # span, so re-onboarding is idempotent for scope too.
+        if spans.has_open_span(instrument_id):
+            opened_span = False
+        else:
+            # A brand-new instrument opens at the epoch, which is the caller's value or
+            # the clock's now. A rejoin reads the clock again here instead, because the
+            # first reading was taken before the vendor round trip and a retire landing in
+            # that window closes the span at an instant later than it. Opening at the
+            # stale reading then starts a second span inside the one just closed.
+            # ``open_span`` guards only against an *open* span, so it accepts that overlap
+            # and ``in_scope`` is a union, which reads the recorded retirement away.
+            start_at = clock.now() if already_registered else epoch
+            _refuse_a_span_that_overlaps_a_close(spans, instrument_id, start_at, ticker)
+            spans.open_span(instrument_id, start_at, options)
+            opened_span = True
+        # The report's capture_start is the current span's start: the epoch for a new or
+        # rejoined ticker, and the existing open span's start for one already capturing.
+        # It takes its own name, because the parameter above is what the caller asked for
+        # and this is what the lake now holds. The branch above leaves an open span either
+        # way, so this needs no guard of its own.
+        span_start = next(s.start for s in spans.spans_of(instrument_id) if s.end is None)
+
+        # Persist the master and record it. The manifest entry keeps the reverse
+        # integrity scrub from flagging the master as an orphan.
         master.write(master_path)
         record_partition(
             lake_root,

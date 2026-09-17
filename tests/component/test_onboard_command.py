@@ -23,6 +23,7 @@ runs in its own process with no alarm behind it, so the sign-off report is its c
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -41,6 +42,7 @@ from lake.paths import LakePaths
 from lake.security_master import (
     ID_TYPE_FIGI,
     ID_TYPE_TICKER,
+    KIND_EQUITY,
     SecurityMaster,
     SecurityMasterError,
     master_path,
@@ -1693,3 +1695,508 @@ def test_onboarding_on_a_drifting_field_reaches_no_pager(lake_root, tmp_path, mo
 
     assert report.routed_columns == ("open_interest",), "the drifting case did not arise"
     assert called == [], "onboarding paged"
+
+
+# -- the reference reads and the lock ------------------------------------------------------
+
+
+_RACER_START = datetime(2026, 8, 20, 13, 30, tzinfo=UTC)
+
+
+def _racing(write, *, on: str = "acquire"):
+    """A ``lake_lock`` that runs ``write`` as the hold is taken, or as it is released.
+
+    The pattern is ``test_occ_mapping``'s ``racing_lock``. The ``on="release"`` half is what
+    separates a read under *a* lock from a read under *the* lock the write happens in: a
+    writer blocked on a read-only hold lands the instant that hold ends, which is before a
+    separate write hold is taken. ``onboard`` imports the lock inside the function, so
+    patching the module attribute is what the call resolves against.
+    """
+    from lake.lock import lake_lock as real_lock
+
+    done: list[bool] = []
+
+    @contextmanager
+    def racing_lock(lake_root):
+        with real_lock(lake_root) as held:
+            if on == "acquire" and not done:
+                done.append(True)
+                write()
+            yield held
+        if on == "release" and not done:
+            done.append(True)
+            write()
+
+    return racing_lock
+
+
+def _onboard_iwm(lake_root: Path, landed: list[int]):
+    """What a concurrent ``lake.onboard`` writes: a master row and an open span."""
+
+    def write():
+        master = (
+            SecurityMaster.read(master_path(lake_root))
+            if master_path(lake_root).exists()
+            else SecurityMaster()
+        )
+        iid = master.register(
+            kind=KIND_EQUITY,
+            capture_start=_RACER_START,
+            valid_from=_RACER_START.date(),
+            ticker="IWM",
+        )
+        master.write(master_path(lake_root))
+        spans = (
+            CaptureSpans.read(spans_path(lake_root))
+            if spans_path(lake_root).exists()
+            else CaptureSpans()
+        )
+        spans.open_span(iid, _RACER_START, False)
+        spans.write(spans_path(lake_root))
+        landed.append(iid)
+
+    return write
+
+
+def test_an_onboarding_during_the_fetch_is_not_discarded_and_its_id_is_not_reissued(
+    lake_root, tmp_path, monkeypatch
+):
+    """The window holds a whole vendor round trip, and the write is a whole-file rewrite.
+
+    A stale master does not merely drop the other registration. ``SecurityMaster.register``
+    takes its id from ``next_instrument_id()`` on the snapshot it is handed, so this ticker is
+    issued the id that instrument already holds, and the master's promise that ids never
+    change is what breaks.
+    """
+    landed: list[int] = []
+    monkeypatch.setattr("lake.lock.lake_lock", _racing(_onboard_iwm(lake_root, landed)))
+
+    report = onboard(
+        "SPY",
+        clock=ManualClock(start=_MID_SESSION),
+        vendor=_chain_vendor(is_delayed=False),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=True,
+    )
+
+    iwm = landed[0]
+    master = SecurityMaster.read(master_path(lake_root))
+    assert master.resolve("IWM", _MID_SESSION.date(), id_type=ID_TYPE_TICKER) == iwm, (
+        "the ticker onboarded during the fetch was discarded by a stale snapshot"
+    )
+    assert report.instrument_id != iwm, "two tickers were issued one instrument_id"
+    assert CaptureSpans.read(spans_path(lake_root)).has_open_span(iwm), (
+        "the ticker onboarded during the fetch lost its capture span"
+    )
+
+
+def test_an_onboarding_that_only_locks_its_write_still_discards_the_other(
+    lake_root, tmp_path, monkeypatch
+):
+    """Reading under *a* lock is not reading under *the* lock the write happens in."""
+    landed: list[int] = []
+    monkeypatch.setattr(
+        "lake.lock.lake_lock", _racing(_onboard_iwm(lake_root, landed), on="release")
+    )
+
+    onboard(
+        "SPY",
+        clock=ManualClock(start=_MID_SESSION),
+        vendor=_chain_vendor(is_delayed=False),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=True,
+    )
+
+    iwm = landed[0]
+    assert (
+        SecurityMaster.read(master_path(lake_root)).resolve(
+            "IWM", _MID_SESSION.date(), id_type=ID_TYPE_TICKER
+        )
+        == iwm
+    ), "a writer that landed as the hold released was discarded"
+
+
+def test_a_span_closed_during_the_fetch_is_not_reopened(lake_root, tmp_path, monkeypatch):
+    """A retire landing in the window has its close discarded by a stale spans snapshot.
+
+    The instrument is a different one from the ticker being onboarded, so nothing here is the
+    rejoin path. A reopened span is a retired ticker captured again with nothing saying so.
+    """
+    master = SecurityMaster()
+    iwm = master.register(
+        kind=KIND_EQUITY, capture_start=_RACER_START, valid_from=_RACER_START.date(), ticker="IWM"
+    )
+    master.write(master_path(lake_root))
+    spans = CaptureSpans()
+    spans.open_span(iwm, _RACER_START, False)
+    spans.write(spans_path(lake_root))
+    closed_at = _MID_SESSION
+
+    def retire_iwm():
+        late = CaptureSpans.read(spans_path(lake_root))
+        late.close_span(iwm, closed_at)
+        late.write(spans_path(lake_root))
+
+    monkeypatch.setattr("lake.lock.lake_lock", _racing(retire_iwm))
+
+    onboard(
+        "SPY",
+        clock=ManualClock(start=_MID_SESSION),
+        vendor=_chain_vendor(is_delayed=False),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=True,
+    )
+
+    assert CaptureSpans.read(spans_path(lake_root)).spans_of(iwm)[0].end == closed_at, (
+        "a concurrent retire's close was discarded by a stale spans snapshot"
+    )
+
+
+def test_an_explicit_epoch_is_refused_against_a_registration_that_landed_in_the_window(
+    lake_root, tmp_path, monkeypatch
+):
+    """The refusal is asked again under the lock, and this is the case that needs it.
+
+    A ticker another onboarding registered during the fetch resolves inside the hold, so the
+    idempotent branch would reuse that instrument and drop this caller's epoch without a word.
+    That is the second of the two failures the refusal exists for, so it refuses instead. It
+    reaches the operator as one named line and exit 2 the same way the preflight asking does.
+    """
+
+    def onboard_spy_first():
+        master = (
+            SecurityMaster.read(master_path(lake_root))
+            if master_path(lake_root).exists()
+            else SecurityMaster()
+        )
+        iid = master.register(
+            kind=KIND_EQUITY,
+            capture_start=_RACER_START,
+            valid_from=_RACER_START.date(),
+            ticker="SPY",
+        )
+        master.write(master_path(lake_root))
+        spans = CaptureSpans()
+        spans.open_span(iid, _RACER_START, True)
+        spans.write(spans_path(lake_root))
+
+    monkeypatch.setattr("lake.lock.lake_lock", _racing(onboard_spy_first))
+
+    with pytest.raises(OnboardError, match="already"):
+        onboard(
+            "SPY",
+            clock=ManualClock(start=_MID_SESSION),
+            vendor=_chain_vendor(is_delayed=False),
+            lake_root=lake_root,
+            tickers_path=tmp_path / "tickers.yaml",
+            options=True,
+            capture_start=_MID_SESSION,
+        )
+
+    span = CaptureSpans.read(spans_path(lake_root)).spans_of(1)[0]
+    assert span.start == _RACER_START, "the other onboarding's epoch was silently replaced"
+
+
+# -- what the preflight still owes, and what the re-derivation must not invent ------------
+
+
+class _CountingVendor:
+    """A vendor that counts what reached it, so a refusal can be shown to cost no request."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.calls = 0
+
+    def get_quotes(self, symbols):
+        self.calls += 1
+        return self.inner.get_quotes(symbols)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+def test_an_unreadable_spans_file_refuses_before_the_request_is_spent(lake_root, tmp_path):
+    """Moving a read into the lock must not move the refusal it raises past the fetch.
+
+    ``CaptureSpans.read`` raises ``SpansUnreadable`` on a file that will not parse, and an
+    operator is owed that for the price of no request and no roster entry. Inside the lock
+    alone it arrives after both, and the half-onboarded ticker left in the roster is then
+    captured anyway, because ``capture._live_roster`` widens when the spans cannot be read.
+    So the spans keep a preflight read whose answer is thrown away.
+    """
+    master = SecurityMaster()
+    master.register(
+        kind=KIND_EQUITY, capture_start=_MID_SESSION, valid_from=_MID_SESSION.date(), ticker="SPY"
+    )
+    master.write(master_path(lake_root))
+    spans_path(lake_root).write_bytes(b"not a parquet file at all")
+    tickers_path = tmp_path / "tickers.yaml"
+    vendor = _CountingVendor(_quote_vendor("QQQ", realtime=True))
+
+    with pytest.raises(CaptureSpansError):
+        onboard(
+            "QQQ",
+            clock=ManualClock(start=_MID_SESSION),
+            vendor=vendor,
+            lake_root=lake_root,
+            tickers_path=tickers_path,
+            options=False,
+        )
+
+    assert vendor.calls == 0, "the refusal cost a vendor request"
+    assert not tickers_path.exists(), "the refusal left an enabled roster entry behind"
+
+
+def test_a_naive_epoch_refuses_before_the_request_is_spent(lake_root, tmp_path):
+    """``register`` and ``open_span`` both refuse it, and both now run inside the lock.
+
+    The command line's own hook catches this first, so only a library caller reaches here.
+    Leaving it to those two would spend a request and write the roster before refusing.
+    """
+    SecurityMaster().write(master_path(lake_root))
+    CaptureSpans().write(spans_path(lake_root))
+    tickers_path = tmp_path / "tickers.yaml"
+    vendor = _CountingVendor(_quote_vendor("SPY", realtime=True))
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        onboard(
+            "SPY",
+            clock=ManualClock(start=_MID_SESSION),
+            vendor=vendor,
+            lake_root=lake_root,
+            tickers_path=tickers_path,
+            options=False,
+            capture_start=datetime(2026, 8, 20, 0, 0),
+        )
+
+    assert vendor.calls == 0
+    assert not tickers_path.exists()
+
+
+def test_a_rejoin_refuses_rather_than_opening_a_span_inside_one_just_closed(
+    lake_root, tmp_path, monkeypatch
+):
+    """The decision is re-derived from the fresh read and the instant must be too.
+
+    A retire landing in the window closes the span at an instant later than the ``epoch``
+    this run read before the fetch. The fresh read then shows no open span, so the rejoin
+    branch is taken, and opening at that stale instant starts a second span *inside* the
+    one just closed. ``open_span`` guards only against an open span, so it accepts the
+    overlap, and ``in_scope`` is a union, which reads the recorded retirement away.
+    """
+    master = SecurityMaster()
+    spy = master.register(
+        kind=KIND_EQUITY, capture_start=_RACER_START, valid_from=_RACER_START.date(), ticker="SPY"
+    )
+    master.write(master_path(lake_root))
+    spans = CaptureSpans()
+    spans.open_span(spy, _RACER_START, False)
+    spans.write(spans_path(lake_root))
+    closed_at = _MID_SESSION + timedelta(minutes=10)
+
+    def retire_spy():
+        late = CaptureSpans.read(spans_path(lake_root))
+        late.close_span(spy, closed_at)
+        late.write(spans_path(lake_root))
+
+    monkeypatch.setattr("lake.lock.lake_lock", _racing(retire_spy))
+
+    with pytest.raises(OnboardError, match="was retired at"):
+        onboard(
+            "SPY",
+            clock=ManualClock(start=_MID_SESSION),
+            vendor=_quote_vendor("SPY", realtime=True),
+            lake_root=lake_root,
+            tickers_path=tmp_path / "tickers.yaml",
+            options=False,
+        )
+
+    after = CaptureSpans.read(spans_path(lake_root)).spans_of(spy)
+    assert len(after) == 1, "a second span was opened inside the one the retire closed"
+    assert after[0].end == closed_at, "the recorded retirement was read away by an overlap"
+
+
+def test_a_registration_under_a_later_date_is_refused_rather_than_made_ambiguous(
+    lake_root, tmp_path, monkeypatch
+):
+    """``resolve`` answers as of one date and the master has to be right on every date.
+
+    An onboarding landing in the window under a later market date leaves a mapping this
+    run's resolution cannot see. ``register`` guards the duplicate id and never the
+    duplicate symbol, so registering on top gives one ticker two instruments over
+    overlapping open ranges, and ``resolve`` then raises ``AmbiguousSymbol`` on every date
+    they share. No re-run repairs that, which is why it refuses instead.
+    """
+    SecurityMaster().write(master_path(lake_root))
+    CaptureSpans().write(spans_path(lake_root))
+    later = _MID_SESSION + timedelta(days=1)
+
+    def onboard_spy_later():
+        late = SecurityMaster.read(master_path(lake_root))
+        late.register(kind=KIND_EQUITY, capture_start=later, valid_from=later.date(), ticker="SPY")
+        late.write(master_path(lake_root))
+
+    monkeypatch.setattr("lake.lock.lake_lock", _racing(onboard_spy_later))
+
+    with pytest.raises(OnboardError, match="already maps it"):
+        onboard(
+            "SPY",
+            clock=ManualClock(start=_MID_SESSION),
+            vendor=_quote_vendor("SPY", realtime=True),
+            lake_root=lake_root,
+            tickers_path=tmp_path / "tickers.yaml",
+            options=False,
+        )
+
+    master = SecurityMaster.read(master_path(lake_root))
+    assert len([m for m in master.mappings if m.id_value == "SPY"]) == 1
+    assert master.resolve("SPY", later.date(), id_type=ID_TYPE_TICKER) is not None, (
+        "the master was left ambiguous, which no re-run repairs"
+    )
+
+
+def test_a_second_onboarding_of_the_same_ticker_in_the_window_takes_the_idempotent_path(
+    lake_root, tmp_path, monkeypatch
+):
+    """The decision has to come from the fresh master, not only the bytes written.
+
+    Deriving `existing_id` from the preflight snapshot leaves every write fresh and gets
+    the idempotence lookup wrong, which no assertion about file contents can see. The
+    earlier races here onboard a *different* ticker, so `existing_id` is `None` either way
+    and only `register`'s id assignment is exercised. This one races the same ticker with
+    no explicit epoch, which is the case that reaches the lookup itself.
+    """
+    landed: list[int] = []
+
+    def onboard_spy_first():
+        master = (
+            SecurityMaster.read(master_path(lake_root))
+            if master_path(lake_root).exists()
+            else SecurityMaster()
+        )
+        iid = master.register(
+            kind=KIND_EQUITY,
+            capture_start=_MID_SESSION,
+            valid_from=_MID_SESSION.date(),
+            ticker="SPY",
+        )
+        master.write(master_path(lake_root))
+        spans = CaptureSpans()
+        spans.open_span(iid, _MID_SESSION, False)
+        spans.write(spans_path(lake_root))
+        landed.append(iid)
+
+    monkeypatch.setattr("lake.lock.lake_lock", _racing(onboard_spy_first))
+
+    report = onboard(
+        "SPY",
+        clock=ManualClock(start=_MID_SESSION),
+        vendor=_quote_vendor("SPY", realtime=True),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=False,
+    )
+
+    assert report.already_registered is True, "the ticker registered in the window was not reused"
+    assert report.instrument_id == landed[0]
+    master = SecurityMaster.read(master_path(lake_root))
+    open_ticker_rows = [
+        m
+        for m in master.mappings
+        if m.id_type == ID_TYPE_TICKER and m.id_value == "SPY" and m.valid_to is None
+    ]
+    assert len(open_ticker_rows) == 1, (
+        "one ticker gained two open mappings, which makes resolve raise AmbiguousSymbol forever"
+    )
+
+
+def test_the_unseeded_refusal_is_asked_again_against_the_master_the_lock_writes(
+    lake_root, tmp_path, monkeypatch
+):
+    """A registration landing in the window is what makes a clean lake an unseeded one.
+
+    The preflight asking sees a lake with no instruments and no spans file, which is the
+    brand-new lake this guard deliberately lets through. A writer that registers into the
+    master and writes no spans file, the shape `occ_mapping` lands in, turns it into the
+    lake the guard exists to refuse. Without the second asking the run opens a fresh spans
+    file holding only its own ticker, and `seed_spans` will then never give the other one a
+    span, because the file exists.
+    """
+
+    def register_only():
+        master = (
+            SecurityMaster.read(master_path(lake_root))
+            if master_path(lake_root).exists()
+            else SecurityMaster()
+        )
+        master.register(
+            kind=KIND_EQUITY,
+            capture_start=_RACER_START,
+            valid_from=_RACER_START.date(),
+            ticker="IWM",
+        )
+        master.write(master_path(lake_root))
+
+    monkeypatch.setattr("lake.lock.lake_lock", _racing(register_only))
+
+    with pytest.raises(OnboardError, match="capture spans are missing"):
+        onboard(
+            "SPY",
+            clock=ManualClock(start=_MID_SESSION),
+            vendor=_quote_vendor("SPY", realtime=True),
+            lake_root=lake_root,
+            tickers_path=tmp_path / "tickers.yaml",
+            options=False,
+        )
+
+    assert not spans_path(lake_root).exists(), (
+        "a spans file was opened that leaves the other instrument never-captured"
+    )
+
+
+def test_an_idempotent_re_onboard_of_a_live_ticker_records_no_second_spans_entry(
+    lake_root, tmp_path
+):
+    """The written claim beside the write, which nothing asserted.
+
+    "Write the spans file only when a span was opened, so an idempotent re-onboard of a
+    live ticker adds no manifest entry." The bytes would be identical either way, so only
+    the entry count says whether the guard is there.
+    """
+    tickers_path = tmp_path / "tickers.yaml"
+    kwargs = dict(lake_root=lake_root, tickers_path=tickers_path, options=False)
+    # Distinct pids, because the segment name carries the writer session and both runs
+    # share a clock. The same minute from the same pid collides on ``O_CREAT|O_EXCL``.
+    onboard(
+        "SPY",
+        clock=ManualClock(start=_MID_SESSION),
+        vendor=_quote_vendor("SPY", realtime=True),
+        pid=1,
+        **kwargs,
+    )
+    before = _spans_entry_count(lake_root)
+
+    onboard(
+        "SPY",
+        clock=ManualClock(start=_MID_SESSION),
+        vendor=_quote_vendor("SPY", realtime=True),
+        pid=2,
+        **kwargs,
+    )
+
+    assert _spans_entry_count(lake_root) == before, (
+        "a re-onboard that opened no span still recorded a manifest entry for the spans file"
+    )
+
+
+def _spans_entry_count(lake_root: Path) -> int:
+    """Every manifest line keyed to the spans file, not just the latest one."""
+    import json
+
+    lines = (lake_root / "manifest.jsonl").read_text().splitlines()
+    return sum(
+        1 for line in lines if line.strip() and json.loads(line).get("partition") == SPANS_PARTITION
+    )
