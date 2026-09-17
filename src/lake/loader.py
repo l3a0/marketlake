@@ -1,4 +1,4 @@
-"""The read layer's door onto sealed chains and quotes partitions.
+"""The read layer's doors onto the lake's sealed partitions.
 
 The lake has been write-only. Capture seals a ticker-day into one immutable Parquet
 partition at close+15, the manifest checksums it, and until now nothing in ``src/lake``
@@ -20,6 +20,21 @@ spelling check, the quarantine guard, the overflow projection, and the final fil
 data rows. It orders its answer by the instant each row's ``snap_ts`` names rather than
 by the partition's own layout, for the same reason the fetch predicate never trusts that
 layout either: nothing here rides on how the writer happened to order the file.
+
+``load_bars`` is the fourth door and the first one that is not a read of chains or quotes,
+marketlake #368. It answers a ticker's bar series at one frequency over a range of sessions,
+in one of three views: as-traded, split-adjusted, or total-return. No adjusted price is ever
+stored, so each view is computed at read time out of the sealed bars and the corporate-actions
+ledger, and a newly discovered action fixes all of history without any stored number changing
+meaning.
+
+It shares this module's guards and almost none of its resolutions. What carries over is the
+quarantine guard, the exact-spelling check, ``_read`` and the overflow projection with its
+``PartialRead`` refusal. What does not is the whole resolve pass below, because that reads
+``snap_ts``, ``row_kind`` and ``close_tag`` and a bars row carries none of the three: it has no
+minute slot, no close of record in the sense the two capture surfaces have, and no absence
+markers at all. A missed chain sample is gone forever and a missed bar is a re-fetch, so the
+writer marks nothing and this reader filters nothing.
 
 Four defaults are settled by marketlake #135, which is authoritative for this deliverable.
 
@@ -171,8 +186,9 @@ version, which is what separates this from the ``row_kind`` refusal below. The c
 explain an empty answer are taken over every row, and Arrow's filter drops a row with no
 ``row_kind`` from both sides of them, so that one has to stay whole-partition and does.
 
-The loader never returns a table it cannot vouch for. Three shapes would otherwise come
-back quietly wrong rather than loudly refused, and each raises instead.
+The loader never returns a table it cannot vouch for. Five shapes would otherwise come
+back quietly wrong rather than loudly refused, and each raises instead. The first three are
+the capture surfaces' and the last two are the adjusted views'.
 
 1. A row whose ``row_kind`` is null is neither a vendor observation nor an absence marker,
    and Arrow's filter drops it from both sides. It would vanish from the result and from
@@ -182,6 +198,19 @@ back quietly wrong rather than loudly refused, and each raises instead.
 3. A ``snap_ts`` that cannot be read as an instant is refused only when nothing matched
    the minute asked for. A read that found its minute has no ambiguity to resolve, so one
    unreadable value elsewhere in the day does not take the answer away.
+4. A bar with no ``instrument_id`` under an adjusted view would join against nothing and
+   hand back the as-traded price under an adjusted name. ``InstrumentUnknown``.
+5. A dividend whose prior close the lake cannot supply would be dropped from the factor,
+   understating every return computed through it. ``AdjustmentIncomplete``.
+
+``load_bars`` is also the one door that spans partitions, because an adjusted view only means
+something over a series that crosses an ex-date. Three rules follow from that and each is
+written where it happens. The stitch promotes rather than raising, since two partitions at two
+schema versions can come back with different column sets. An absent day inside a range is
+returned around and a quarantined one refuses the read, because a hole in a re-fetchable surface
+is ordinary and a verdict is not. And the answer is ordered by the instant each ``bar_ts`` names,
+through the same helper that orders one contract's session, because a series is the one read
+whose order a caller will assume.
 
 Nothing here reads a clock or the network. One line reads a config file, and it is inside
 ``resolve_lake_root``, which turns ``lake_root=None`` into the configured lake. Every
@@ -206,7 +235,8 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from math import isfinite
 from pathlib import Path
 from typing import NamedTuple
 
@@ -220,9 +250,10 @@ from lake.calendar import MARKET_TZ
 from lake.config import load_config
 from lake.extra_projection import EXTRA_COLUMN, ExtraProjection, project_extra
 from lake.manifest import is_quarantined, latest_quarantine
-from lake.paths import CHAINS, QUOTES, LakePaths
+from lake.paths import BARS, CHAINS, PARQUET_SUFFIX, QUOTES, LakePaths, parse_date_dir
 from lake.schema_versions import SchemaVersionLedger, ledger_path
 from lake.session import OPTION_CLOSE, SPOT_CLOSE
+from lake.vendor import DAILY_FREQ
 
 # The columns a read resolves against: ``snap_ts`` is the minute slot the cycle was
 # scheduled for, ``close_tag`` is the tag capture stamps on a close-of-record cycle,
@@ -246,8 +277,45 @@ CLOSE_COLUMNS = (SNAP_TS_COLUMN, ROW_KIND_COLUMN, CLOSE_TAG_COLUMN)
 # An ET wall-clock minute, ``HH:MM`` on a 24-hour clock and nothing else.
 _SNAP_SHAPE = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
 
+# The bars columns this module names. ``bar_ts`` is the candle's own instant and the only
+# non-null column on the surface, so it is both the slot a bars row sits in and the one
+# thing every row has. ``instrument_id`` is the key the actions ledger is written under,
+# carried on the row rather than resolved per read. The four prices and the volume are what an
+# adjusted view rewrites. ``freq`` takes no constant, because it is a path level this module
+# builds from a caller's argument and never a column this module reads.
+BAR_TS_COLUMN = "bar_ts"
+INSTRUMENT_ID_COLUMN = "instrument_id"
+CLOSE_COLUMN = "close"
+PRICE_COLUMNS = ("open", "high", "low", CLOSE_COLUMN)
+VOLUME_COLUMN = "volume"
+
+# The column every answer from ``load_bars`` carries, naming the view that produced it.
+# A table of adjusted numbers is shaped exactly like a table of as-traded ones, and
+# ``docs/design.md`` calls mixing the two the classic corruption, so the answer says which
+# it is. It is a column rather than Arrow schema metadata because ``pa.concat_tables`` over
+# two tables whose metadata disagrees does not raise and keeps the first table's, so a
+# stitch of an as-traded read and an adjusted one would have carried one word over rows half
+# of which were adjusted. A column concat keeps per row.
+ADJUST_COLUMN = "adjust"
+
+# The three views. ``none`` is as-traded, which is what the lake stores and the only thing it
+# ever stores. ``split`` divides out the cumulative split ratio, which is price continuity.
+# ``total`` folds the dividends in on top of that, which is total return.
+ADJUST_NONE = "none"
+ADJUST_SPLIT = "split"
+ADJUST_TOTAL = "total"
+ADJUSTMENTS = (ADJUST_NONE, ADJUST_SPLIT, ADJUST_TOTAL)
+
 __all__ = [
+    "ADJUSTMENTS",
+    "ADJUST_NONE",
+    "ADJUST_SPLIT",
+    "ADJUST_TOTAL",
+    "AdjustUnknown",
+    "AdjustmentIncomplete",
+    "BarsAbsent",
     "ContractAbsent",
+    "InstrumentUnknown",
     "LoadError",
     "NoCloseOfRecord",
     "NoOptionClose",
@@ -258,6 +326,7 @@ __all__ = [
     "SnapAbsent",
     "SnapMalformed",
     "list_chain_cycles",
+    "load_bars",
     "load_chain",
     "load_contract",
     "load_quotes",
@@ -422,6 +491,57 @@ class ContractAbsent(LoadError):
         self.day = day
 
 
+class BarsAbsent(LoadError):
+    """Raised when a bars range holds no sealed partition at all.
+
+    An absent day inside a range is not this. Bars carry no gap rows, because a missed chain
+    sample is gone forever and a missed bar is a re-fetch inside Schwab's window, so a surface
+    with days missing from the middle is the ordinary state of one and a range returns the days
+    it holds. A range holding nothing is different: an empty series and an unfetched one read
+    the same to a caller and mean opposite things, which is the rule every door here follows.
+
+    A frequency directory spelled other than it is on disk lands here too, for the reason
+    ``PartitionAbsent`` gives for a ticker. The bars path adds a ``freq=`` level, so there is
+    one more component whose case a case-insensitive filesystem would match through.
+    """
+
+
+class AdjustUnknown(LoadError, ValueError):
+    """Raised for an ``adjust`` outside ``ADJUSTMENTS``.
+
+    A ``ValueError`` as well, because a caller naming a view that does not exist passed a bad
+    argument rather than reaching a lake that could not answer, which is the same split
+    ``SnapMalformed`` makes for a malformed minute.
+    """
+
+
+class InstrumentUnknown(LoadError):
+    """Raised when an adjusted read meets a row whose ``instrument_id`` is null.
+
+    ``BARS_SCHEMA`` declares ``bar_ts`` non-null and nothing else, and ``lake.bars`` lands a
+    row with a null id when the security master cannot place its ticker, filing a finding and
+    keeping the bar. The actions ledger is keyed on ``(instrument_id, ex_date, type)``, so a
+    null id is the join key gone: an adjusted read of that row would find no actions and hand
+    back the as-traded price under an adjusted name.
+
+    ``adjust='none'`` reads the row, because as-traded is what it says it is.
+    """
+
+
+class AdjustmentIncomplete(LoadError):
+    """Raised when a dividend factor cannot be computed from what the lake holds.
+
+    The factor for a cash dividend is ``1 - A / C``, where ``C`` is the close of the last
+    daily session before the ex-date. Dropping a dividend whose ``C`` is missing understates
+    every return computed through it while the table still looks whole, which is the failure
+    ``PartialRead`` refuses one layer down. So the read refuses instead.
+
+    Three ways in. The lake holds no ``1d`` partition before the ex-date at all. The one it
+    holds carries no usable close. Or that partition's own ``instrument_id`` is not the
+    dividend's, which means the close belongs to a different instrument than the event.
+    """
+
+
 class PartialRead(LoadError):
     """Raised when the overflow projection could not present every value as its column.
 
@@ -562,6 +682,512 @@ def load_quotes(
     )
 
 
+def load_bars(
+    ticker: str,
+    freq: str,
+    start: date | str | None = None,
+    end: date | str | None = None,
+    *,
+    adjust: str = ADJUST_NONE,
+    as_of: date | str | None = None,
+    lake_root: Path | str | None = None,
+    include_quarantined: bool = False,
+) -> pa.Table:
+    """One ticker's bar series at one frequency, as a table, in one of three views.
+
+    ``freq`` is ``'1m'`` or ``'1d'``, the two ``vendor.BAR_FREQS`` spells, and it is a level of
+    the partition path rather than a column filter, so one read is one frequency. It is not
+    checked against that tuple, because a frequency the lake never fetched has no directory and
+    ``BarsAbsent`` says so by name. A second guard here would refuse a frequency the day someone
+    adds one to the fetch, while ``vendor.require_bar_freq`` already refuses one at the seam that
+    would have to fetch it.
+
+    ``start`` and ``end`` are session dates and both default to open, so a call naming neither
+    reads every session the lake holds for that ticker and frequency. This is the one door here
+    that spans partitions, because the adjusted views only mean something over a series that
+    crosses an ex-date.
+
+    ``adjust`` names the view. ``'none'`` is as-traded, which is what the lake stores and the
+    only thing it ever stores. ``'split'`` divides the cumulative split ratio out, which is
+    price continuity. ``'total'`` folds the dividends in on top of that, which is total return.
+    Every answer carries an ``adjust`` column naming the view that produced it, because a table
+    of adjusted numbers is shaped exactly like a table of as-traded ones.
+
+    ``as_of`` is a market date that resolves the actions ledger point-in-time, and the default
+    is the ledger's current answer. Both readings are the ledger's own, and the door takes both
+    rather than making a caller who wants the second one read the ledger and apply factors
+    itself. That caller would be a second adjustment path, in the one place where it produces
+    different numbers rather than an error.
+
+    ``lake_root`` and ``include_quarantined`` carry the meanings the three shipped doors give
+    them. Two of this deliverable's four defaults carry over and two do not apply. The return is
+    a ``pyarrow.Table``, and the read is of sealed partitions only, which for bars is automatic
+    because ``journal.JOURNALED_SURFACES`` is chains and quotes alone and a bars partition has
+    no unsealed form. An ET wall-clock minute and the data-rows-only filter are both
+    chains-and-quotes rules: a bars row's slot is ``bar_ts`` and bars carry no ``row_kind``.
+
+    **An absent day inside the range is returned around and a quarantined one refuses it.**
+    Bars carry no gap rows, because a missed chain sample is gone forever and a missed bar is a
+    re-fetch, so days missing from the middle are the ordinary state of the surface. A flagged
+    day is a verdict rather than an ordinary hole, and stepping over one would hand back a
+    series that reads as complete, so it raises ``PartitionQuarantined`` for the whole read.
+    A range holding no partition at all raises ``BarsAbsent``.
+
+    Every way a read resolves to no table raises a ``LoadError``: ``BarsAbsent`` for a range
+    holding no partition, ``PartitionAbsent`` and ``PartitionQuarantined`` per day,
+    ``PartialRead`` for a projection that could not complete, ``InstrumentUnknown`` for a bar an
+    adjusted view cannot key, and ``AdjustmentIncomplete`` for a dividend factor the lake cannot
+    supply. An ``adjust`` outside ``ADJUSTMENTS`` raises ``AdjustUnknown``, which is a
+    ``ValueError`` too, because naming a view that does not exist is a bad argument rather than a
+    lake that could not answer.
+
+    Two conditions raise something other than a ``LoadError``, for the reason ``load_chain``
+    gives for its own three: each says a file contradicts its writer, so it raises the error of
+    the module that owns that file. A machine with no ``config.yaml`` raises ``ConfigError``. And
+    a damaged ``corporate_actions.jsonl`` raises ``actions.LedgerLineError``, which is the ledger
+    resolving a line rather than this door reading a partition. An absent ledger is not one of
+    them: it adjusts nothing and raises nothing, which is what keeps every view inert on a lake
+    the extraction has not written to.
+
+    **The stitch promotes rather than raising.** The overflow projection adds a promoted column
+    only when a row it is handed carries a value for it, so two partitions at two schema
+    versions can come back with different column sets, and ``pa.concat_tables`` raises on that.
+    This is the first door here that stitches, so it names ``promote_options='permissive'``,
+    which unions by name. Unreachable at the one recorded version the live lake holds and
+    reachable the first time a bars column is promoted.
+    """
+    if adjust not in ADJUSTMENTS:
+        raise AdjustUnknown(f"adjust {adjust!r} is not one of {list(ADJUSTMENTS)}")
+    root = resolve_lake_root(lake_root)
+    sessions = _bars_sessions(root, ticker, freq, _session(start), _session(end))
+    if not sessions:
+        raise BarsAbsent(
+            f"{ticker} {freq} holds no sealed partition in "
+            f"{_range_text(start, end)} under {LakePaths(root).root / BARS}. "
+            "A frequency and a ticker are each spelled as their directory is."
+        )
+    table = pa.concat_tables(
+        [_read_bars(root, ticker, freq, day, include_quarantined) for day in sessions],
+        promote_options="permissive",
+    )
+    ordered = _sorted_by_instant(table, BAR_TS_COLUMN, freq, ticker, _range_text(start, end))
+    return _in_view(
+        ordered,
+        adjust=adjust,
+        root=root,
+        ticker=ticker,
+        as_of=_session(as_of),
+        include_quarantined=include_quarantined,
+    )
+
+
+def _session(day: date | str | None) -> date | None:
+    """A session argument as a ``date``, leaving ``None`` open."""
+    if day is None:
+        return None
+    return day if isinstance(day, date) else date.fromisoformat(str(day))
+
+
+def _range_text(start: date | str | None, end: date | str | None) -> str:
+    """How a refusal names the range it found nothing in."""
+    return f"{'open' if start is None else start}..{'open' if end is None else end}"
+
+
+def _bars_sessions(
+    root: Path, ticker: str, freq: str, start: date | None, end: date | None
+) -> list[date]:
+    """The sessions this ticker and frequency hold a sealed partition for, in date order.
+
+    The listing comes from the filesystem rather than from the manifest, and both halves of
+    that are deliberate. Nothing else enumerates a bars surface: ``actions.surface_ticker_days``
+    reads manifest keys through ``paths.parse_partition_rel``, which returns ``None`` for every
+    bars key by design, and that walk passes over a key it cannot read rather than raising, so
+    asking it for bars answers an empty list on a lake full of them. And the filesystem is the
+    question ``_clear_partition`` already asks, through ``is_file`` and ``_spelled_exactly``, so
+    enumerating from the manifest and opening from disk would answer two questions in one read.
+
+    The frequency directory is checked for its exact spelling before it is listed. macOS matches
+    a path case-insensitively, so ``freq=1D`` would otherwise list the ``freq=1d`` partitions and
+    every quarantine lookup below would key on a path no verdict was ever written under.
+
+    A name under the directory that does not read as ``date=YYYY-MM-DD.parquet`` is passed over
+    rather than raising. A partition being written lands under ``paths.temp_write_path``'s marker
+    and is renamed into place, so a listing taken mid-write sees a name this cannot read, and
+    that file is not a session yet.
+    """
+    directory = LakePaths(root).bars_partition_path(ticker, freq, date(1970, 1, 1)).parent
+    if not (directory.is_dir() and _spelled_exactly(root, directory)):
+        return []
+    found: list[date] = []
+    for entry in directory.iterdir():
+        day = _partition_day(entry.name)
+        if day is None:
+            continue
+        if (start is None or day >= start) and (end is None or day <= end):
+            found.append(day)
+    return sorted(found)
+
+
+def _partition_day(name: str) -> date | None:
+    """The session a ``date=YYYY-MM-DD.parquet`` file name holds, or ``None`` for anything else.
+
+    The date is read by ``paths.parse_date_dir``, which owns that spelling, rather than by a bare
+    ``date.fromisoformat`` here. That function's own docstring says why one is not the other: on
+    3.12 ``fromisoformat`` accepts ``20260824`` and ``2026-W35-1`` as well, so a stray file named
+    either would be enumerated as a session, and the read would then refuse the whole ticker
+    naming a date no file on disk holds.
+    """
+    if not name.endswith(PARQUET_SUFFIX):
+        return None
+    return parse_date_dir(name[: -len(PARQUET_SUFFIX)])
+
+
+def _read_bars(
+    root: Path, ticker: str, freq: str, day: date, include_quarantined: bool
+) -> pa.Table:
+    """One sealed bars partition, cleared and projected, as every row it holds.
+
+    What ``_load_surface`` lends bars is its tail rather than its head. The path comes from
+    ``bars_partition_path``, because ``LakePaths.partition_path`` raises on this surface and its
+    docstring says why. The resolve pass goes entirely, because ``MINUTE_COLUMNS`` and
+    ``CLOSE_COLUMNS`` are built from ``snap_ts``, ``row_kind`` and ``close_tag`` and a bars row
+    carries none of the three. What carries over untouched is the quarantine guard, the
+    exact-spelling check, ``_read`` and the overflow projection, whose ``PartialRead`` refusal
+    means here exactly what it means on a chain.
+
+    There is no fetch predicate, because a day is the selection. ``_predicate`` names the rows an
+    answer is made of out of a partition holding a session's worth of other minutes, and a bars
+    partition holds one session at one frequency, which is the whole answer for that day.
+    """
+    day_text = day.isoformat()
+    path = LakePaths(root).bars_partition_path(ticker, freq, day)
+    _clear_partition(
+        root,
+        path,
+        ticker,
+        day_text,
+        BARS,
+        include_quarantined=include_quarantined,
+        absent_detail=f" The frequency {freq!r} is a level of that path.",
+    )
+    fetched = _read(path)
+    projection = project_extra(fetched, surface=BARS, ledger=_ledger(root))
+    if not projection.complete:
+        raise PartialRead(ticker, day_text, BARS, projection)
+    return projection.table
+
+
+def _in_view(
+    table: pa.Table,
+    *,
+    adjust: str,
+    root: Path,
+    ticker: str,
+    as_of: date | None,
+    include_quarantined: bool,
+) -> pa.Table:
+    """``table`` in the view ``adjust`` names, marked with which view that is.
+
+    The marker goes on every answer including the as-traded one, because what it protects
+    against is two answers being mixed, and one of the two is always as-traded.
+
+    ``lake.actions`` and ``lake.bars`` are imported here rather than at the top of the module,
+    and the reason is an import direction rather than a preference: both of them import this
+    module, so naming either above would be a cycle. ``actions.append`` keeps its own direction
+    one-way the same way. ``adjust='none'`` needs neither module, so the import sits on the one
+    path that needs it.
+
+    A bar's session comes from ``bars.session_of`` rather than from the ``date=`` level of the
+    partition it was read out of. The path level is free and the two agree on every partition
+    the writer wrote, because ``select_session_rows`` filters every landed row through that same
+    function. ``journal.py`` pins that a bar's session is decided by ``bar_ts``, and reading the
+    path instead would mint a second definition of a bar's session to get the answer the first
+    one already gives.
+    """
+    marked = table.append_column(
+        ADJUST_COLUMN, pa.array([adjust] * table.num_rows, type=pa.string())
+    )
+    if adjust == ADJUST_NONE:
+        return marked
+
+    # Local for the cycle named above. ``lake.actions`` imports ``load_quotes`` from here and
+    # ``lake.bars`` imports ``LoadError`` and ``load_quotes``, so either at module level fails
+    # at interpreter start rather than at call time.
+    from lake import actions
+    from lake.bars import session_of
+
+    if INSTRUMENT_ID_COLUMN not in table.column_names:
+        raise LoadError(
+            f"{ticker} bars carry no {INSTRUMENT_ID_COLUMN} column, which is the key the "
+            f"actions ledger is written under, so no {adjust} view can be computed."
+        )
+
+    instruments = table.column(INSTRUMENT_ID_COLUMN).to_pylist()
+    stamps = table.column(BAR_TS_COLUMN).to_pylist()
+    entries = actions.latest(root) if as_of is None else actions.as_of(root, as_of)
+    events = _by_instrument(
+        entries,
+        {instrument for instrument in instruments if instrument is not None},
+        adjust,
+    )
+
+    closes: dict[tuple[int, date], tuple[float, date]] = {}
+    price_factors: list[float] = []
+    volume_factors: list[float] = []
+    for instrument, stamp in zip(instruments, stamps, strict=True):
+        if instrument is None:
+            raise InstrumentUnknown(
+                f"{ticker} holds a bar at {stamp} with no {INSTRUMENT_ID_COLUMN}, which is the "
+                f"key the actions ledger is written under. A {adjust} view of it would find no "
+                "actions and hand back the as-traded price under an adjusted name. Read it with "
+                f"adjust={ADJUST_NONE!r}."
+            )
+        session = session_of(str(stamp))
+        splits, dividends = events.get(instrument, ((), ()))
+
+        # Strictly after, never on or after. An ex-date is the first session that trades at the
+        # new price, so the ex-date's own bar is already adjusted and applying the factor there
+        # would halve it twice.
+        ratio = 1.0
+        for ex_date, value in splits:
+            if ex_date > session:
+                ratio *= value
+
+        folded = 1.0
+        if adjust == ADJUST_TOTAL:
+            for ex_date, amount in dividends:
+                if ex_date > session:
+                    close, priced_on = _prior_close(
+                        root, ticker, instrument, ex_date, include_quarantined, closes
+                    )
+                    # The amount is the cash per share the vendor reported at the ex-date, so it
+                    # is denominated in the shares that exist then. The close is as-traded on an
+                    # earlier session, in the shares that existed on that one. A split between
+                    # the two makes them different units, and the factor would then be wrong by
+                    # the whole split ratio rather than by any drift. So the close is carried
+                    # forward through every split that fell between them. The factor is a ratio
+                    # of the two, so which era's shares they are both in does not matter, only
+                    # that it is the same one.
+                    for split_ex, split_ratio in splits:
+                        if priced_on < split_ex <= ex_date:
+                            close /= split_ratio
+                    if amount >= close:
+                        raise AdjustmentIncomplete(
+                            f"{ticker} instrument {instrument} pays {amount} on {ex_date} "
+                            f"against a prior close of {close}, which is no dividend factor a "
+                            "price can be multiplied by."
+                        )
+                    folded *= 1.0 - amount / close
+
+        # A split divides the price and multiplies the volume, because the ratio is the
+        # deliverable's share count after the adjustment over the count before it. A dividend
+        # moves the price and leaves the share count alone.
+        price_factors.append(folded / ratio)
+        volume_factors.append(ratio)
+
+    return _rescaled(marked, price_factors, volume_factors)
+
+
+def _by_instrument(
+    entries: dict[tuple[int, str, str], dict],
+    instruments: set[int],
+    adjust: str,
+) -> dict[int, tuple[tuple[tuple[date, float], ...], tuple[tuple[date, float], ...]]]:
+    """The ledger's current answers for this read, grouped by instrument into splits and dividends.
+
+    ``instruments`` are the ones the rows being adjusted actually name, and ``adjust`` says which
+    kinds of action the view folds in. Both narrow what is read before any of it is checked, and
+    that narrowing is the point rather than a saving. The ledger is one file for every instrument
+    in the lake, so checking all of it would let an entry this read never touches refuse it: a
+    dividend for a ticker whose bars are not in the range, or a dividend of any kind at all under
+    the ``split`` view, which folds no dividend in. ``actions.build_entry`` accepts a
+    ``cash_amount`` of ``0.0``, and a suspended payer still reporting a ``div_ex_date`` lands one
+    through the extraction, so that is a real entry rather than a hand-edited one.
+
+    The grouping is on the instrument rather than on the ticker, which is the rule
+    ``actions.by_ticker`` states: the instrument enters the comparison rather than the grouping,
+    which is what gives a symbol handed between two instruments a first observation under each.
+    ``lake.bars`` follows it too, resolving the id per ticker-day rather than once per ticker, so
+    a range spanning a handover carries two of them and each half is adjusted by its own
+    instrument's actions.
+
+    An entry inside that narrowing which this cannot read raises rather than being stepped over,
+    which is the rule the ledger's own resolution follows: it raises at the offending entry rather
+    than stepping past a line it cannot interpret.
+    """
+    # Local for the same cycle ``_in_view`` names: ``lake.actions`` imports this module.
+    from lake import actions
+
+    grouped: dict[int, tuple[list[tuple[date, float]], list[tuple[date, float]]]] = {}
+    for (instrument, ex_text, action_type), entry in entries.items():
+        if instrument not in instruments:
+            continue
+        if action_type == actions.TYPE_SPLIT:
+            field, index = "split_ratio", 0
+        elif action_type == actions.TYPE_DIVIDEND and adjust == ADJUST_TOTAL:
+            field, index = "cash_amount", 1
+        else:
+            continue
+        try:
+            ex_date = date.fromisoformat(ex_text)
+        except ValueError as exc:
+            raise AdjustmentIncomplete(
+                f"the actions ledger holds a {action_type} for instrument {instrument} whose "
+                f"ex_date {ex_text!r} does not name a date."
+            ) from exc
+        value = entry.get(field)
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise AdjustmentIncomplete(
+                f"the actions ledger's {action_type} for instrument {instrument} on {ex_text} "
+                f"carries a {field} of {value!r}, which is not a number."
+            )
+        value = float(value)
+        # A split ratio is divided by, so zero and below build no factor at all. A cash amount is
+        # subtracted, so zero is a factor of exactly one: an entry recording that nothing was
+        # paid adjusts nothing, and refusing it would take the view away over an event that does
+        # not move a price. ``actions.build_entry`` accepts a zero amount and refuses a negative
+        # one, so zero arrives through the extraction and below zero does not arrive at all.
+        floor = 0.0 if action_type == actions.TYPE_DIVIDEND else None
+        if not isfinite(value) or (value < 0 if floor is not None else value <= 0):
+            raise AdjustmentIncomplete(
+                f"the actions ledger's {action_type} for instrument {instrument} on {ex_text} "
+                f"carries a {field} of {value!r}, which no factor can be built from."
+            )
+        grouped.setdefault(instrument, ([], []))[index].append((ex_date, value))
+    return {
+        instrument: (tuple(splits), tuple(dividends))
+        for instrument, (splits, dividends) in grouped.items()
+    }
+
+
+def _prior_close(
+    root: Path,
+    ticker: str,
+    instrument: int,
+    ex_date: date,
+    include_quarantined: bool,
+    closes: dict[tuple[int, date], tuple[float, date]],
+) -> tuple[float, date]:
+    """The as-traded close the dividend factor divides into, with the session it was traded on.
+
+    The session comes back because the close is as-traded and the caller has to know which era's
+    shares it is in. A split between that session and the ex-date puts it in different units from
+    the amount, and the caller carries it forward.
+
+    The factor for a cash dividend of ``A`` with ex-date ``E`` is ``1 - A / C``, where ``C`` is
+    the close of the last daily session before ``E``, carried into ``E``'s share terms by the
+    caller. That close is a property of the instrument
+    and the date rather than of the frequency asked for, so it comes from the ``1d`` partition
+    whatever frequency the caller asked for: a minute series has no close of record in itself,
+    and its last minute bar is not the official close.
+
+    Which row of that partition is the close is the reading ``lake.bars`` already takes for its
+    own gate, the last row by stamp, which answers a partition at either frequency. This one
+    refuses where that one returns nothing, because a gate holding a bar costs a night and a
+    dividend silently dropped from a factor costs every return computed through it.
+
+    The session is the last one the lake holds a ``1d`` partition for before the ex-date, rather
+    than the calendar's previous session. A calendar step here would be the fourth private
+    spelling of one, which marketlake #334 names as where that stops being a smell, and it would
+    refuse a factor over a day the sweep has not fetched rather than over a day it cannot price.
+    The price of the lake's own reading is named: a hole in the ``1d`` surface immediately before
+    an ex-date moves the denominator to an older close, which moves the factor by a fraction of
+    the drift over those sessions rather than making it wrong by the dividend.
+    """
+    key = (instrument, ex_date)
+    if key in closes:
+        return closes[key]
+
+    detail = (
+        f"{ticker} instrument {instrument} pays on {ex_date} and the {ADJUST_TOTAL} view needs "
+        f"the {DAILY_FREQ} close before it"
+    )
+    sessions = _bars_sessions(root, ticker, DAILY_FREQ, None, ex_date - timedelta(days=1))
+    if not sessions:
+        raise AdjustmentIncomplete(
+            f"{detail}, and the lake holds no {DAILY_FREQ} session before it."
+        )
+    day = sessions[-1]
+    table = _read_bars(root, ticker, DAILY_FREQ, day, include_quarantined)
+    if table.num_rows == 0:
+        raise AdjustmentIncomplete(f"{detail}, and its {DAILY_FREQ} partition for {day} is empty.")
+    ordered = _sorted_by_instant(table, BAR_TS_COLUMN, DAILY_FREQ, ticker, day.isoformat())
+    last = ordered.num_rows - 1
+
+    # A partition that does not carry the two columns this reads is refused as an incomplete
+    # adjustment rather than indexed. Every other way this door declines is a ``LoadError``, and
+    # indexing a column Arrow does not have raises a ``KeyError`` that a caller catching the one
+    # would not catch. Unreachable while bars have shipped at a single schema version, and
+    # reachable the moment a partition sealed below a promotion is read back.
+    for required in (INSTRUMENT_ID_COLUMN, CLOSE_COLUMN):
+        if required not in ordered.column_names:
+            raise AdjustmentIncomplete(
+                f"{detail}, and its {DAILY_FREQ} partition for {day} carries no {required} column."
+            )
+
+    # A null owner is not evidence of a different instrument. ``lake.bars`` lands a bar with no
+    # ``instrument_id`` on purpose when the master cannot place its ticker, filing a finding and
+    # keeping the row, so a null here says the master could not answer rather than that it
+    # answered someone else. The bar is still this ticker's own close on that session, which is
+    # what the factor needs, and refusing on it would take every total-return read of the ticker
+    # away over a provenance gap on one reference day. A different owner is evidence, and refuses.
+    owner = ordered.column(INSTRUMENT_ID_COLUMN)[last].as_py()
+    if owner is not None and owner != instrument:
+        raise AdjustmentIncomplete(
+            f"{detail}, and the {DAILY_FREQ} bar for {day} belongs to instrument {owner!r}."
+        )
+    value = ordered.column(CLOSE_COLUMN)[last].as_py()
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise AdjustmentIncomplete(
+            f"{detail}, and the {DAILY_FREQ} bar for {day} carries a close of {value!r}."
+        )
+    value = float(value)
+    if not isfinite(value) or value <= 0:
+        raise AdjustmentIncomplete(
+            f"{detail}, and the {DAILY_FREQ} bar for {day} carries a close of {value!r}."
+        )
+    closes[key] = (value, day)
+    return closes[key]
+
+
+def _rescaled(table: pa.Table, price_factors: list[float], volume_factors: list[float]) -> pa.Table:
+    """``table`` with its prices and volume moved into the view, row by row.
+
+    A null stays null, because Arrow's arithmetic propagates one and a bar the vendor sent
+    without a high has no adjusted high either.
+
+    The volume comes back as the integer it went in as, so a ratio that is not a whole number
+    rounds. Carrying it as a float instead would make the column's type depend on which view was
+    asked for, and the join this feeds would then meet two types for one column. Rounding is
+    stated rather than hidden: a whole-ratio split, which is every split that maps exactly, moves
+    a volume to another whole number and rounds nothing.
+
+    The mode is named rather than inherited, because Arrow's default is half to even and the word
+    "rounds" reads as half away from zero, which Arrow spells ``half_towards_infinity``. A volume
+    is never negative, so the two readings of that name agree here. What neither mode fixes is
+    the floor: a reverse split scales a volume down, and a minute that traded one contract under a
+    one-for-ten reverse split
+    is 0.1 and reads as untraded whichever way it rounds. That is the int64 column's own limit
+    rather than the view's, and it is the price of keeping the column one type across the three
+    views.
+    """
+    prices = pa.array(price_factors, type=pa.float64())
+    volumes = pa.array(volume_factors, type=pa.float64())
+    for name in PRICE_COLUMNS:
+        if name not in table.column_names:
+            continue
+        index = table.column_names.index(name)
+        scaled = pc.multiply(pc.cast(table.column(name), pa.float64()), prices)
+        table = table.set_column(index, table.field(index), scaled.cast(table.field(index).type))
+    if VOLUME_COLUMN in table.column_names:
+        index = table.column_names.index(VOLUME_COLUMN)
+        field = table.field(index)
+        scaled = pc.multiply(pc.cast(table.column(VOLUME_COLUMN), pa.float64()), volumes)
+        rounded = pc.round(scaled, round_mode="half_towards_infinity")
+        table = table.set_column(index, field, rounded.cast(field.type))
+    return table
+
+
 def load_contract(
     occ_symbol: str,
     day: date | str,
@@ -637,7 +1263,7 @@ def load_contract(
     )
     if table.num_rows == 0:
         raise ContractAbsent(occ_symbol, ticker_used, day_text)
-    return _sorted_by_snap(table, occ_symbol, ticker_used, day_text)
+    return _sorted_by_instant(table, SNAP_TS_COLUMN, occ_symbol, ticker_used, day_text)
 
 
 def resolve_lake_root(lake_root: Path | str | None) -> Path:
@@ -795,6 +1421,40 @@ def _open_partition(
     """
     root = resolve_lake_root(lake_root)
     path = LakePaths(root).partition_path(surface, ticker, day_text)
+    _clear_partition(
+        root,
+        path,
+        ticker,
+        day_text,
+        surface,
+        include_quarantined=include_quarantined,
+        absent_detail=absent_detail,
+    )
+    return root, path
+
+
+def _clear_partition(
+    root: Path,
+    path: Path,
+    ticker: str,
+    day_text: str,
+    surface: str,
+    *,
+    include_quarantined: bool,
+    absent_detail: str = "",
+) -> None:
+    """Both guards, run against a path somebody else built.
+
+    ``_open_partition`` builds the path through ``LakePaths.partition_path``, which is for the
+    surfaces keyed by ticker and date alone and raises on the other two. ``load_bars`` builds
+    its own through ``bars_partition_path``, because a bars partition carries a ``freq=`` level
+    that method has no slot for. Both then need the same two guards, and this is them, so
+    neither surface gets its own reading of what an absent or quarantined partition means.
+
+    The quarantine key is the partition's lake-relative path as the caller spelled it, which a
+    bars path produces like any other and nothing here parses. That is why the exclusion covers
+    a surface ``paths.parse_partition_rel`` refuses to read apart.
+    """
     if not (path.is_file() and _spelled_exactly(root, path)):
         raise PartitionAbsent(
             f"{ticker} {day_text} has no sealed {surface} partition at {path}. "
@@ -807,7 +1467,6 @@ def _open_partition(
         entry = latest_quarantine(root).get(partition)
         if is_quarantined(entry):
             raise PartitionQuarantined(partition, entry)
-    return root, path
 
 
 def _fetch_selection(
@@ -1021,8 +1680,15 @@ def _occ_root(occ_symbol: str) -> str:
     return occ_symbol[:_OCC_ROOT_WIDTH].strip()
 
 
-def _sorted_by_snap(table: pa.Table, occ_symbol: str, ticker: str, day_text: str) -> pa.Table:
-    """``table`` ordered by the instant each row's ``snap_ts`` names, not the stored text.
+def _sorted_by_instant(
+    table: pa.Table, column: str, subject: str, ticker: str, day_text: str
+) -> pa.Table:
+    """``table`` ordered by the instant each row's stamp names, not the stored text.
+
+    ``column`` is the stamp a surface sits in, ``snap_ts`` on chains and quotes and ``bar_ts``
+    on bars, and ``subject`` is what the refusal names the rows by, an OCC symbol for one
+    contract's session and a frequency for a bars series. The rule below is one rule, so the
+    two series read through it rather than beside each other.
 
     The same instant has more than one ISO spelling, so a lexicographic sort of the text
     disagrees with time order whenever spellings mix: SPY's sealed 2026-09-11 partition
@@ -1032,21 +1698,22 @@ def _sorted_by_snap(table: pa.Table, occ_symbol: str, ticker: str, day_text: str
     from the partition's own layout either, per #242's audit of what row-group pruning
     actually guarantees. So this parses every value and sorts on that instead.
 
-    A ``snap_ts`` that cannot be read as an instant raises rather than sorting anyway.
+    A stamp that cannot be read as an instant raises rather than sorting anyway.
     ``load_chain`` and ``load_quotes`` can set an unreadable value aside, because it sits
-    beside the one minute or cycle that answers their read and never in it. Every row
-    here is already part of the answer, resolved by ``occ_symbol`` rather than by
-    instant, so an unreadable ``snap_ts`` has no ambiguity to be excused from: it is a
-    row this read owes an order to and cannot give one.
+    beside the one minute or cycle that answers their read and never in it. Every row a
+    series read hands here is already part of the answer, selected by ``occ_symbol`` or by
+    the day its partition is keyed under rather than by instant, so an unreadable stamp has
+    no ambiguity to be excused from: it is a row this read owes an order to and cannot give
+    one.
     """
-    texts = table.column(SNAP_TS_COLUMN).to_pylist()
+    texts = table.column(column).to_pylist()
     instants = [_instant(text) for text in texts]
     pairs = zip(texts, instants, strict=True)
     unreadable = sorted({repr(text) for text, instant in pairs if instant is None})
     if unreadable:
         raise LoadError(
-            f"{ticker} {day_text} holds {len(unreadable)} {occ_symbol!r} rows whose "
-            f"{SNAP_TS_COLUMN} cannot be read as an instant: {unreadable}."
+            f"{ticker} {day_text} holds {len(unreadable)} {subject!r} rows whose "
+            f"{column} cannot be read as an instant: {unreadable}."
         )
     order = sorted(range(len(texts)), key=lambda index: instants[index])
     return table.take(pa.array(order, type=pa.int64()))

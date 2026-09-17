@@ -450,9 +450,10 @@ class SecurityMaster:
     def write(self, path: Path | str) -> Path:
         """Write the master to a parquet file at ``path``, through a temp file and a rename.
 
-        Onboarding writes the master while the daemon and the dashboard read it. A write
-        straight onto the target truncates it first, so a reader can catch the file empty
-        or half done. The write instead goes to a temp file beside the target, flushes,
+        Two jobs write the master while the daemon and the dashboard read it: onboarding,
+        and the OCC mapping write in ``lake.occ_mapping`` that the split detector calls. A
+        write straight onto the target truncates it first, so a reader can catch the file
+        empty or half done. The write instead goes to a temp file beside the target, flushes,
         then renames over the target in one step. A reader sees the whole old master or
         the whole new one, never a torn one. The roster's write takes this shape for the
         same reason, added for the same bug. A crash mid-write leaves the prior master
