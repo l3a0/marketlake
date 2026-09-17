@@ -56,6 +56,17 @@ neither leaves a manifest entry the way a seal does. A night that learns nothing
 nothing either, and what says the run happened is the sweep's own ping rather than a marker
 file.
 
+The fourth producer is the vendor sweep itself, and it writes the dated report file at the
+tree's root rather than in a subdirectory of its own. That file is the run's whole record: the
+counts the digest sends to the phone, the per-piece detail the digest's byte budget keeps off
+it, and the report-tier findings the design says send no message at all. It writes on every
+run including a holiday no-op, for the close+5 guard's reason, since an absent file cannot be
+told from a run that never happened.
+
+It sits at the root because nothing else does. Four named subdirectories sit under it, so a
+reader globbing ``reports/*.json`` picks up the nightly files and nothing else, and the four
+counting globs each name their own directory.
+
 A held finding recurs every night, because nothing settles it, and nothing under
 ``reports/`` is ever pruned. So one unresolved disagreement is thirty files in one
 directory after a month, and that repetition is the record rather than a defect to design
@@ -491,6 +502,191 @@ def write_withheld(
     return path
 
 
+# The vendor sweep's three walks, named in the order the run makes them. The order is the
+# design's, which polls corporate actions first so today's split flags before bars land.
+DIVIDENDS_PIECE = "dividends"
+SPLITS_PIECE = "splits"
+BARS_PIECE = "bars"
+PIECES = (DIVIDENDS_PIECE, SPLITS_PIECE, BARS_PIECE)
+
+
+@dataclass(frozen=True)
+class PieceOutcome:
+    """What one of the sweep's three walks did, reduced to plain values.
+
+    Plain values rather than the walk's own report, and the import direction is why.
+    ``lake.actions``, ``lake.bars`` and ``lake.splits`` each import this module for
+    ``Withheld`` and ``write_withheld``, so a record here naming ``BarsReport`` or
+    ``ExtractionReport`` would close the loop. ``SchemaDrift`` above reasons the same way
+    about ``GuardOutcome``, which lives in ``close_guard`` because the daemon wires the two
+    together. ``lake.sweep`` plays that part here.
+
+    ``refusal`` is the named condition that ended the walk, or ``None`` when it finished. It
+    is what withholds the sweep's ping, because a walk that did not finish means the day's
+    actions or bars really are missing, which is what a missed ``eod-sweep`` ping says.
+
+    ``subjects`` names each held finding, as ``<symbol> <observed_on> <check>``. The digest
+    carries counts alone and this is where the detail lands, which is what keeps the digest
+    under its byte budget on the night that has many rather than only on the nights that have
+    none.
+    """
+
+    landed: int = 0
+    held: int = 0
+    unfiled: int = 0
+    unchanged: int = 0
+    skipped: int = 0
+    subjects: tuple[str, ...] = ()
+    refusal: str | None = None
+
+    @property
+    def finished(self) -> bool:
+        """Whether the walk ran to its end."""
+        return self.refusal is None
+
+    @property
+    def refusal_class(self) -> str | None:
+        """The refusal with the exception's own message dropped, or ``None``.
+
+        A refusal is composed as the exception's class and then whatever that exception
+        chose to say, and an ``OSError`` says the filename it failed on, which is an
+        absolute path on the capture machine. This file sits in the directories the
+        dashboard may read and the digest goes to a phone, so the message stops here and
+        the fuller string stays on the job's own stdout for a reader who has the log.
+
+        :func:`_redacted` cannot do it, because it keeps two fields and a refusal has
+        exactly two, so its rule would pass this through whole. Its own docstring names
+        that limit: a shape it was not written for loses detail rather than leaking it.
+        A refusal carrying no message, like the close guard's, has one field and survives.
+        """
+        if self.refusal is None:
+            return None
+        kind, _, _ = self.refusal.partition(": ")
+        return kind
+
+    def as_entry(self) -> dict:
+        """This outcome as the mapping the nightly file carries."""
+        entry: dict = {
+            "landed": self.landed,
+            "held": self.held,
+            "unfiled": self.unfiled,
+            "unchanged": self.unchanged,
+            "skipped": self.skipped,
+            "subjects": [_redacted(subject) for subject in self.subjects],
+        }
+        if self.refusal is not None:
+            entry["refusal"] = self.refusal_class
+        return entry
+
+
+@dataclass(frozen=True)
+class Nightly:
+    """One vendor-sweep run, as the dated report file records it.
+
+    ``day`` is the run's own Eastern date rather than the instant it wrote, which is
+    :func:`close_guard_dir`'s rule. The two agree on an ordinary evening and stop agreeing on
+    a catch-up run, and the day a reader asking "what happened on the 16th" wants is the
+    former. On a session day it is the session. A holiday has no session for it to name,
+    which is what ``session`` says.
+
+    ``pieces`` holds a :class:`PieceOutcome` per walk that ran. A walk absent from it did not
+    run, which on a holiday is all three: the design has compaction and the sweep no-op on an
+    empty journal, and the one-line digest is what settles it, since a run whose walks found
+    something would have nowhere to say so.
+
+    ``gaps`` is ``None`` when the day has no sealed partition to count, which is a different
+    answer from zero and has to stay one. Compaction seals at close+15, so an absent partition
+    at 18:30 says the seal did not happen rather than that the day was clean.
+
+    ``problems`` are what withheld the ping. ``report`` are the report-tier findings, which
+    ride this file and send no message of their own. ``SundayOutcome`` carries the same split
+    in the same two names, and keeping them one list is what would let a held finding silence
+    the check.
+    """
+
+    day: date
+    session: bool
+    pinged: bool
+    gaps: int | None = None
+    quarantined: int = 0
+    pages_lost: int = 0
+    pieces: tuple[tuple[str, PieceOutcome], ...] = ()
+    problems: tuple[str, ...] = ()
+    report: tuple[str, ...] = ()
+
+    @property
+    def disagreements(self) -> int:
+        """Every finding the run's gates held, across the walks that ran.
+
+        Derived rather than stored, and counted off the walks rather than by globbing
+        tonight's ``withheld/`` directory. :func:`withheld_dir` keys its path on the day the
+        rows belong to, so a dividend disagreement about a June ex-date re-files tonight under
+        that session's date. A glob of tonight's would read zero while the condition is live.
+        """
+        return sum(outcome.held for _, outcome in self.pieces)
+
+    @property
+    def unfiled(self) -> int:
+        """Every held finding whose record could not be written down."""
+        return sum(outcome.unfiled for _, outcome in self.pieces)
+
+
+def nightly_path(lake_root: Path | str, day: date, *, stamp: str, pid: int) -> Path:
+    """Where one vendor-sweep run's report file lands.
+
+    At the ``reports/`` root, named by the day it is about and then by the stamp and the pid,
+    which is rule 3 above. A name keyed on the day alone would collide with a second run the
+    same night, and the second run is a second verdict rather than a correction: this
+    directory has no resolution step, so every file in it is one run's answer, the way the
+    repeats under ``withheld/`` are.
+    """
+    return Path(lake_root) / REPORTS_DIR / f"{day.isoformat()}-{stamp}-{pid}.json"
+
+
+def write_nightly(
+    lake_root: Path | str,
+    nightly: Nightly,
+    *,
+    now: datetime,
+    pid: int | None = None,
+) -> Path:
+    """File one vendor-sweep run's report, and hand back the path it landed at.
+
+    **Raises rather than swallowing**, the way :func:`write_close_guard` does. The caller is
+    the sweep, the run is finished by the time this is called, and the sweep turns the failure
+    into an exit code and a line in the digest. Catching here would hide the failure from the
+    one thing left that can report it, since the digest is the other copy of these counts.
+    """
+    pid = os.getpid() if pid is None else pid
+    eastern = now.astimezone(MARKET_TZ)
+    entry = {
+        "at": eastern.isoformat(),
+        "day": nightly.day.isoformat(),
+        "session": nightly.session,
+        "pinged": nightly.pinged,
+        "gaps": nightly.gaps,
+        "quarantined": nightly.quarantined,
+        "disagreements": nightly.disagreements,
+        "pages_lost": nightly.pages_lost,
+        "pieces": {name: outcome.as_entry() for name, outcome in nightly.pieces},
+        "problems": [_redacted(problem) for problem in nightly.problems],
+        "report": [_redacted(line) for line in nightly.report],
+    }
+    # `parents=True` from a missing lake root would create the lake itself, which
+    # `write_close_guard` and `alert._record` both refuse for the reason given there. A
+    # report is written inside a lake that exists, or not at all.
+    root = Path(lake_root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"lake root missing: {root}")
+    directory = root / REPORTS_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    path = nightly_path(root, nightly.day, stamp=eastern.strftime("%H%M%S%f"), pid=pid)
+    with open(path, "x", encoding="utf-8") as handle:
+        json.dump(entry, handle, sort_keys=True)
+        handle.write("\n")
+    return path
+
+
 def _redacted(problem: str) -> str:
     """One of the guard's problems, with any exception message dropped.
 
@@ -516,15 +712,23 @@ def _redacted(problem: str) -> str:
 
 
 __all__ = [
+    "BARS_PIECE",
     "CLOSE_GUARD_DIR",
+    "DIVIDENDS_PIECE",
+    "PIECES",
     "SCHEMA_DRIFT_DIR",
+    "SPLITS_PIECE",
     "WITHHELD_DIR",
+    "Nightly",
+    "PieceOutcome",
     "SchemaDrift",
     "Withheld",
     "close_guard_dir",
+    "nightly_path",
     "schema_drift_dir",
     "withheld_dir",
     "write_close_guard",
+    "write_nightly",
     "write_schema_drift",
     "write_withheld",
 ]

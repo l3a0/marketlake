@@ -10,7 +10,7 @@
 #     ./install.sh                     # from the directory it was rendered into
 #     ~/marketlake-install/install.sh  # or by path, from anywhere
 #
-# Read it first. Of the 18 commands below, 14 run under sudo. The rest need no root,
+# Read it first. Of the 20 commands below, 16 run under sudo. The rest need no root,
 # and step 4 must not have any.
 #
 # It stops at the first failure, so a visudo that rejects the drop-in never
@@ -31,7 +31,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# 1. Install the five LaunchDaemons, root-owned as launchd requires.
+# 1. Install the six LaunchDaemons, root-owned as launchd requires.
 echo '+ sudo install -o root -g wheel -m 644 "$HERE/com.marketlake.daemon.plist" /Library/LaunchDaemons/'
 sudo install -o root -g wheel -m 644 "$HERE/com.marketlake.daemon.plist" /Library/LaunchDaemons/
 echo '+ sudo install -o root -g wheel -m 644 "$HERE/com.marketlake.dashboard.plist" /Library/LaunchDaemons/'
@@ -42,6 +42,8 @@ echo '+ sudo install -o root -g wheel -m 644 "$HERE/com.marketlake.calendar-prob
 sudo install -o root -g wheel -m 644 "$HERE/com.marketlake.calendar-probe.plist" /Library/LaunchDaemons/
 echo '+ sudo install -o root -g wheel -m 644 "$HERE/com.marketlake.sunday.plist" /Library/LaunchDaemons/'
 sudo install -o root -g wheel -m 644 "$HERE/com.marketlake.sunday.plist" /Library/LaunchDaemons/
+echo '+ sudo install -o root -g wheel -m 644 "$HERE/com.marketlake.eod-sweep.plist" /Library/LaunchDaemons/'
+sudo install -o root -g wheel -m 644 "$HERE/com.marketlake.eod-sweep.plist" /Library/LaunchDaemons/
 # 2. Install the sudoers drop-in after visudo validates it.
 echo '+ sudo visudo -cf "$HERE/marketlake.sudoers"'
 sudo visudo -cf "$HERE/marketlake.sudoers"
@@ -74,6 +76,8 @@ echo '+ sudo launchctl bootstrap system /Library/LaunchDaemons/com.marketlake.ca
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.marketlake.calendar-probe.plist
 echo '+ sudo launchctl bootstrap system /Library/LaunchDaemons/com.marketlake.sunday.plist'
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.marketlake.sunday.plist
+echo '+ sudo launchctl bootstrap system /Library/LaunchDaemons/com.marketlake.eod-sweep.plist'
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.marketlake.eod-sweep.plist
 echo '+ launchctl print system/com.marketlake.daemon'
 launchctl print system/com.marketlake.daemon
 # The token. None of the above captures anything until a Schwab token exists at
@@ -87,10 +91,10 @@ launchctl print system/com.marketlake.daemon
 # after the bootstrap above and never before. A check armed ahead of the jobs
 # makes the page that follows about the install order rather than about the
 # daemon.
-# Open healthchecks.io and press Ping Now on each of these checks: capture,
-# pre-open, sunday, compaction and calendar-probe. The list shows a check by name
-# rather than by slug, and a retired slice-1 row can still be sitting beside it,
-# so read the slug before pressing.
+# Open healthchecks.io and press Ping Now on each of these checks:
+# capture, pre-open, sunday, compaction, calendar-probe and eod-sweep.
+# The list shows a check by name rather than by slug, and a retired slice-1 row
+# can still be sitting beside it, so read the slug before pressing.
 # healthchecks keeps a check that has never been pinged in a new state, which
 # never goes down and never sends. What arms a row is its first ping rather than
 # its first run, so a job that fails every run stays silent instead of paging.

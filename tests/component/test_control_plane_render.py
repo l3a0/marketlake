@@ -57,6 +57,7 @@ EXPECTED_FILES = {
     "com.marketlake.self-check.plist",
     "com.marketlake.calendar-probe.plist",
     "com.marketlake.sunday.plist",
+    "com.marketlake.eod-sweep.plist",
     cp.SUDOERS_FILE,
     cp.INSTALL_SCRIPT_FILE,
     cp.UNINSTALL_SCRIPT_FILE,
@@ -256,21 +257,24 @@ def test_the_install_text_excludes_the_directory_and_reads_it_back(tmp_path, cap
     assert "tmutil isexcluded /Users/someone/.config/marketlake" in printed
 
 
-def test_the_install_text_says_who_sets_the_sunday_one_shot_until_slice_3(tmp_path, capsys):
+def test_the_install_text_hands_over_the_one_shot_once_and_names_who_takes_it(tmp_path, capsys):
     out = tmp_path / "out"
     cp.main(["render", "--out", str(out), *RENDER_ARGS])
     printed = capsys.readouterr().out
-    # Nothing in this deliverable sets the one-shot, and the Sunday read-back cannot
-    # catch a week that missed it. So the install text has to hand the operator the
-    # by-hand step rather than leave the gap to be discovered on a Monday.
+    # The step used to be a standing Friday task, because nothing set the one-shot. The
+    # sweep does now, so the step is owed once and the text has to say which job takes
+    # it over. An operator left thinking it is still weekly keeps doing it by hand, and
+    # one left thinking it is fully automatic misses the Sunday before the first Friday.
     # The interpreter and the working directory come from the render, like every other
     # line. A bare `python` is not on a stock Mac, and this is the one step whose whole
     # job is to be pasted and run.
     assert (
         "cd /Users/someone/marketlake && /opt/py/bin/python -m lake.control_plane pmset" in printed
     )
-    assert "each Friday" in printed
-    assert "# prints under sudo." in printed
+    prose = " ".join(line.removeprefix("#").strip() for line in printed.splitlines())
+    assert f"the 18:30 {cp.EOD_SWEEP_LABEL} job sets it every Friday and reads it back" in prose
+    assert "a step of the first install rather than a standing task" in prose
+    assert "# Run this line and run the second command it prints under sudo." in printed
 
 
 def test_the_install_text_numbers_its_steps_in_order(tmp_path, capsys):
@@ -395,7 +399,7 @@ def test_sudoers_refuses_the_reserved_word_all_as_the_owner():
 def test_the_install_text_carries_every_command_line_in_order(tmp_path, capsys):
     # Every runnable line, in order. The comments around them stay free to move. This
     # script is pasted by hand on a machine with no other guard, so the root ownership,
-    # the 440 the sudoers drop-in needs, the visudo gate ahead of it, and all five
+    # the 440 the sudoers drop-in needs, the visudo gate ahead of it, and all six
     # bootstrap labels are checked exactly rather than sampled.
     out = tmp_path / "out"
     cp.main(["render", "--out", str(out), *RENDER_ARGS])
@@ -408,6 +412,7 @@ def test_the_install_text_carries_every_command_line_in_order(tmp_path, capsys):
         "com.marketlake.self-check",
         "com.marketlake.calendar-probe",
         "com.marketlake.sunday",
+        "com.marketlake.eod-sweep",
     ]
     sudoers = resolved / cp.SUDOERS_FILE
     assert commands == [
@@ -450,7 +455,7 @@ def test_the_install_text_names_the_reload_and_leaves_it_commented(tmp_path, cap
     printed = capsys.readouterr().out
     assert "Re-installing." in printed
     bootouts = [line for line in printed.splitlines() if "launchctl bootout" in line]
-    assert len(bootouts) == 5
+    assert len(bootouts) == 6
     assert all(line.startswith("# ") for line in bootouts)
 
 
@@ -1253,7 +1258,7 @@ def test_the_rendered_reauth_script_runs_and_forwards_its_arguments(tmp_path):
 PING_NOW = "Ping Now"
 
 # Every check the install tells the operator to arm, read from the renderer's own
-# constants rather than spelled here. Four of the five ping only when their own job
+# constants rather than spelled here. Five of the six ping only when their own job
 # succeeds, so a failing install leaves each row in the never-pinged state where it
 # cannot page. ``calendar-probe`` arms itself by the next weekday 09:35 and is in the
 # list anyway, because a roster with one member left out is how the gap comes back.
@@ -1263,6 +1268,7 @@ ARMED_SLUGS = (
     "SUNDAY_SLUG",
     "COMPACTION_SLUG",
     "CALENDAR_PROBE_SLUG",
+    "EOD_SWEEP_SLUG",
 )
 
 # The one place the block uses the word capture as English rather than as the slug. The
@@ -1352,8 +1358,10 @@ def test_the_step_reads_every_slug_rather_than_spelling_it(tmp_path, capsys):
     test is what separates them, and it is the rename that would otherwise ship an
     install pointing the operator at a row that no longer exists.
 
-    Every one of the five is renamed, one at a time, because a block that reads one slug
-    and spells the other four is the half-fix this section exists to stop. The original
+    Every one of the six is renamed, one at a time, because a block that reads one slug
+    and spells the other five is the half-fix this section exists to stop. That is also
+    why the renderer reads ``live_check_slugs()`` on each call rather than a tuple bound
+    at import: a frozen roster would leave this check unable to fail. The original
     has to be gone from the block afterwards, so a renderer that read the constant and
     spelled the word beside it fails too. ``capture`` is the one exception, and it is
     named rather than waived: the block also says *capture window*, which is the session
@@ -1432,7 +1440,7 @@ def test_the_arming_step_comes_after_the_jobs_are_bootstrapped(tmp_path, capsys)
         bootstraps = [
             i for i, line in enumerate(lines) if line.startswith("sudo launchctl bootstrap")
         ]
-        assert len(bootstraps) == 5, bootstraps
+        assert len(bootstraps) == 6, bootstraps
         read_back = [
             i
             for i, line in enumerate(lines)
@@ -1447,27 +1455,35 @@ def test_the_arming_step_asks_for_a_press_on_every_check_and_on_no_other(tmp_pat
 
     Healthchecks shows one row per check, and a row nobody presses stays in the state
     where it cannot page. The install used to name one, ``capture``, and said nothing
-    about the other four. The daemon builds one dead-man and feeds ``capture`` with it,
+    about the other five. The daemon builds one dead-man and feeds ``capture`` with it,
     so nothing was arming them.
 
     Read off the instruction rather than off the block, and compared as a set rather than
     as a search. Presence alone would pass an install that named ``capture`` to press and
     said the rest arm themselves, and a one-way search would pass one that sent the
     operator hunting for a sixth row no job pings. The quantifier is asserted for the same
-    reason: an instruction to press one of five is not an instruction to press five.
+    reason: an instruction to press one of six is not an instruction to press six.
 
     The slugs are also all the step may carry, because a ping URL is a secret and the
     renderer's output is tracked.
 
-    ``lake.control_plane`` defines all five, so the two read through ``lake.deadman`` and
-    ``lake.compact`` assert that the job re-exports the same constant the renderer names
-    rather than a second spelling of it.
+    ``lake.control_plane`` defines all six, so the three read through ``lake.deadman``,
+    ``lake.compact`` and ``lake.sweep`` assert that the job re-exports the same constant
+    the renderer names rather than a second spelling of it.
     """
     from lake.compact import COMPACTION_SLUG
     from lake.control_plane import CALENDAR_PROBE_SLUG, PRE_OPEN_SLUG, SUNDAY_SLUG
     from lake.deadman import CAPTURE_SLUG
+    from lake.sweep import EOD_SWEEP_SLUG
 
-    slugs = [CAPTURE_SLUG, PRE_OPEN_SLUG, SUNDAY_SLUG, COMPACTION_SLUG, CALENDAR_PROBE_SLUG]
+    slugs = [
+        CAPTURE_SLUG,
+        PRE_OPEN_SLUG,
+        SUNDAY_SLUG,
+        COMPACTION_SLUG,
+        CALENDAR_PROBE_SLUG,
+        EOD_SWEEP_SLUG,
+    ]
     assert len(set(slugs)) == len(slugs), slugs
     for text in _rendered_install(tmp_path, capsys):
         instruction = _press_instruction(_arming_block(text))
@@ -1641,8 +1657,8 @@ def test_the_install_script_runs_every_step_in_order(tmp_path):
     proc, log = _run_script(tmp_path, visudo_fails=False)
     assert proc.returncode == 0, proc.stderr
     installs = [line for line in log if line.startswith("sudo install")]
-    assert len(installs) == 6, log  # five plists plus the sudoers drop-in
-    assert sum(1 for line in log if "launchctl bootstrap" in line) == 5, log
+    assert len(installs) == 7, log  # six plists plus the sudoers drop-in
+    assert sum(1 for line in log if "launchctl bootstrap" in line) == 6, log
     assert log[-1].startswith("launchctl print system/com.marketlake.daemon"), log[-1]
 
 
@@ -1806,8 +1822,8 @@ def test_reinstalling_runs_the_whole_uninstall_before_the_whole_install(tmp_path
     deletes = [i for i, line in enumerate(log) if line.startswith("rm -f /Library/LaunchDaemons")]
     installs = [i for i, line in enumerate(log) if line.startswith("install ")]
     boots_in = [i for i, line in enumerate(log) if line.startswith("launchctl bootstrap")]
-    assert len(boots_out) == 5 and len(deletes) == 5, log
-    assert len(installs) == 6 and len(boots_in) == 5, log
+    assert len(boots_out) == 6 and len(deletes) == 6, log
+    assert len(installs) == 7 and len(boots_in) == 6, log
     assert max(deletes) < min(installs), log
     assert max(boots_out) < min(boots_in), log
     # The sudoers drop-in is removed and written again. The re-tune case that the
@@ -1996,16 +2012,16 @@ def _run_restart(
 def test_the_restart_offers_exactly_the_jobs_that_can_go_stale(tmp_path):
     """Derived from ``keep_alive``, because that is what makes a job able to go stale.
 
-    A resident job holds the Python it imported at start. The three calendar jobs exec
+    A resident job holds the Python it imported at start. The four calendar jobs exec
     fresh on every fire, so restarting one would be meaningless. Listing the two by hand
-    would let a sixth resident job be added without this script learning about it.
+    would let a third resident job be added without this script learning about it.
     """
     out = tmp_path / "out"
     assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
     script = (out / cp.RESTART_SCRIPT_FILE).read_text()
     resident = [job.label for job in cp.all_jobs(_host()) if job.keep_alive]
     transient = [job.label for job in cp.all_jobs(_host()) if not job.keep_alive]
-    assert len(resident) == 2 and len(transient) == 3, (resident, transient)
+    assert len(resident) == 2 and len(transient) == 4, (resident, transient)
     for label in resident:
         assert f"LABELS=({label})" in script, label
     for label in transient:
@@ -2195,7 +2211,7 @@ def test_the_uninstall_deletes_exactly_what_the_install_writes(tmp_path):
     out = tmp_path / "out"
     assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
     installed = _install_targets(out)
-    assert len(installed) == 6, installed  # five plists plus the sudoers drop-in
+    assert len(installed) == 7, installed  # six plists plus the sudoers drop-in
     assert _rm_targets(out) == installed
 
 
@@ -2347,7 +2363,7 @@ def test_the_uninstall_runs_the_install_backwards(tmp_path):
     wake = [i for i, line in enumerate(log) if line == "pmset repeat cancel"]
     dropin = [i for i, line in enumerate(log) if line == "rm -f /etc/sudoers.d/marketlake"]
     plists = [i for i, line in enumerate(log) if line.startswith("rm -f /Library/LaunchDaemons")]
-    assert len(boots) == 5 and len(wake) == 1 and len(dropin) == 1 and len(plists) == 5, log
+    assert len(boots) == 6 and len(wake) == 1 and len(dropin) == 1 and len(plists) == 6, log
     assert max(boots) < wake[0] < dropin[0] < min(plists), log
 
 
@@ -2356,7 +2372,7 @@ def test_the_uninstall_converges_from_a_partial_install(tmp_path):
     proc, log = _run_uninstall(tmp_path, loaded=False)
     assert proc.returncode == 0, proc.stderr
     assert not [line for line in log if line.startswith("launchctl bootout")], log
-    assert len([line for line in log if line.startswith("rm -f /Library/LaunchDaemons")]) == 5
+    assert len([line for line in log if line.startswith("rm -f /Library/LaunchDaemons")]) == 6
     assert any(line == "pmset repeat cancel" for line in log), log
     assert any(line == "rm -f /etc/sudoers.d/marketlake" for line in log), log
 

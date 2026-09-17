@@ -90,9 +90,12 @@ SURFACES = (CHAINS, QUOTES, BARS, ACTIONS)
 DATE_PARTITIONED = frozenset({CHAINS, QUOTES})
 
 # The journal top-level directory, the reference directory, the reports directory,
-# and the two lake-root ledgers. ``reports/`` holds one dated file per night, written by
-# the vendor sweep. Four more trees sit under it, each in a subdirectory of its own so a
-# reader counting one never picks up another.
+# and the two lake-root ledgers. ``reports/`` holds one dated file per vendor-sweep run,
+# written by ``lake.sweep`` and named by the day it is about, then by the stamp and the
+# writing process's id. Two runs on one night are two verdicts rather than a correction,
+# because nothing here resolves one file against another. Four more trees sit under it,
+# each in a subdirectory of its own so a reader counting one never picks up another, and
+# a flat file at the root is reached by ``reports/*.json`` and by none of their globs.
 #
 # 1. One file per page that never reached the phone, under `reports/alerts/date=D/`.
 # 2. One file per close+5 guard run, under `reports/close_guard/date=D/`.

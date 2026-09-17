@@ -441,3 +441,145 @@ def test_a_problem_with_no_separator_at_all_survives_verbatim(lake_root):
     report.write_close_guard(lake_root, GuardOutcome(DAY, problems=("boom",)), now=AT, pid=11)
 
     assert _entries(lake_root)[0]["problems"] == ["boom"]
+
+
+# -- the nightly report file ------------------------------------------------------------
+
+NIGHT = report.Nightly(
+    day=DAY,
+    session=True,
+    pinged=True,
+    gaps=3,
+    quarantined=0,
+    pages_lost=1,
+    pieces=(
+        (report.DIVIDENDS_PIECE, report.PieceOutcome(landed=1, unchanged=4)),
+        (
+            report.BARS_PIECE,
+            report.PieceOutcome(
+                held=2,
+                unfiled=1,
+                subjects=("SPY 2026-09-02 bar_close", "QQQ 2026-09-02 bar_close"),
+            ),
+        ),
+    ),
+    problems=("ping failed: OSError",),
+    report=("weekday wake repeat alarm missing",),
+)
+
+
+def _nightly_entries(root: Path) -> list[dict]:
+    return [json.loads(p.read_text()) for p in sorted((root / "reports").glob("*.json"))]
+
+
+def test_the_nightly_file_lands_at_the_tree_root_and_no_glob_of_a_producer_finds_it(lake_root):
+    """The four named subdirectories are what the counting globs read, and this is not one.
+
+    ``undelivered`` counts ``reports/alerts/``, and a nightly file placed inside any
+    producer's directory would inflate that producer's count. A flat file at the root is
+    reached by ``reports/*.json`` and by nothing else.
+    """
+    path = report.write_nightly(lake_root, NIGHT, now=AT, pid=11)
+
+    assert path.parent == lake_root / "reports"
+    assert path.name == f"{DAY.isoformat()}-162000000000-11.json"
+    assert undelivered(lake_root, DAY) == 0
+    assert list(report.close_guard_dir(lake_root, DAY).glob("*.json")) == []
+
+
+def test_the_nightly_file_carries_every_count_and_the_detail_the_digest_drops(lake_root):
+    """The fields are named here so the History panel's query is not inventing them."""
+    report.write_nightly(lake_root, NIGHT, now=AT, pid=11)
+
+    (entry,) = _nightly_entries(lake_root)
+    assert entry["day"] == DAY.isoformat()
+    assert entry["session"] is True
+    assert entry["pinged"] is True
+    assert entry["gaps"] == 3
+    assert entry["quarantined"] == 0
+    assert entry["pages_lost"] == 1
+    assert entry["problems"] == ["ping failed: OSError"]
+    assert entry["report"] == ["weekday wake repeat alarm missing"]
+    assert entry["pieces"]["bars"]["subjects"] == [
+        "SPY 2026-09-02 bar_close",
+        "QQQ 2026-09-02 bar_close",
+    ]
+    assert entry["pieces"]["dividends"]["landed"] == 1
+
+
+def test_the_disagreement_count_is_derived_so_it_cannot_disagree_with_the_pieces(lake_root):
+    """Storing it beside the pieces is how the two drift. It is summed off them instead."""
+    assert NIGHT.disagreements == 2
+    assert NIGHT.unfiled == 1
+
+    report.write_nightly(lake_root, NIGHT, now=AT, pid=11)
+    (entry,) = _nightly_entries(lake_root)
+    assert entry["disagreements"] == sum(p["held"] for p in entry["pieces"].values())
+
+
+def test_an_unsealed_day_files_a_null_gap_count_rather_than_zero(lake_root):
+    """Zero is a clean day. ``None`` is a day compaction never sealed, and the two differ."""
+    report.write_nightly(lake_root, report.Nightly(DAY, True, True), now=AT, pid=11)
+
+    (entry,) = _nightly_entries(lake_root)
+    assert entry["gaps"] is None
+
+
+def test_a_holiday_files_no_pieces_and_says_it_was_not_a_session(lake_root):
+    """An absent file means the run never happened, so a no-op writes one too."""
+    report.write_nightly(lake_root, report.Nightly(DAY, False, True), now=AT, pid=11)
+
+    (entry,) = _nightly_entries(lake_root)
+    assert entry["session"] is False
+    assert entry["pieces"] == {}
+
+
+def test_two_runs_on_one_night_both_survive(lake_root):
+    """A name keyed on the day alone would raise on the second, because the writer opens `x`.
+
+    Two runs are two verdicts. This directory has no resolution step, the way the repeats
+    under ``withheld/`` have none.
+    """
+    report.write_nightly(lake_root, NIGHT, now=AT, pid=11)
+    report.write_nightly(lake_root, NIGHT, now=AT, pid=12)
+
+    assert len(_nightly_entries(lake_root)) == 2
+
+
+def test_an_exception_message_stops_at_the_boundary(lake_root):
+    """Two redactions, because the two fields carry a message in different shapes.
+
+    ``problems`` is a place and then an exception, so ``_redacted``'s keep-two-fields rule
+    cuts it. A refusal is the exception alone, which is exactly two fields, so that rule
+    would pass it through whole and ``refusal_class`` keeps the class instead. An
+    ``OSError`` says the filename it failed on, which is an absolute path on the capture
+    machine, and this file sits in the directories the dashboard may read.
+    """
+    leaky = report.Nightly(
+        DAY,
+        True,
+        False,
+        pieces=(
+            (
+                report.BARS_PIECE,
+                report.PieceOutcome(refusal="OSError: [Errno 13] /Users/someone/secret"),
+            ),
+        ),
+        problems=("bars did not run: OSError: [Errno 13] /Users/someone/secret",),
+    )
+    report.write_nightly(lake_root, leaky, now=AT, pid=11)
+
+    (entry,) = _nightly_entries(lake_root)
+    assert "/Users/someone" not in json.dumps(entry)
+    assert entry["pieces"]["bars"]["refusal"] == "OSError"
+    assert entry["problems"] == ["bars did not run: OSError"]
+
+
+def test_a_missing_lake_root_refuses_rather_than_conjuring_one(tmp_path):
+    """``write_close_guard`` and ``alert._record`` refuse on the same test for the same reason.
+
+    ``parents=True`` from a missing root would create the lake, and the Sunday job decides
+    whether to ping on ``root.is_dir()``.
+    """
+    with pytest.raises(FileNotFoundError, match="lake root missing"):
+        report.write_nightly(tmp_path / "gone", NIGHT, now=AT, pid=11)

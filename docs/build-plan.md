@@ -545,21 +545,21 @@ for the ones that need no real process to die partway. Test 4 is the first test 
 tier to kill a running process, and the child it kills is
 `tests/support/compaction_child.py`. The five split into two kinds.
 
-Four are buildable now, and each covers a failure the unit and component suites cannot
+All five are buildable now, and each covers a failure the unit and component suites cannot
 reach:
 
 1. 6, overnight death,
 2. 7, fully dark session,
-3. 13, synthetic split replay,
-4. 14, restore from backup.
+3. 12, the nightly sweep chain,
+4. 13, synthetic split replay,
+5. 14, restore from backup.
 
 Test 13 joined that list when [#279](https://github.com/l3a0/marketlake/issues/279) shipped
 the detector it replays against. The fixture builder can express a split now that
 `tests/support/lake.py` carries `option_root`, the four deliverable columns, `mini` and
-`is_chain_truncated`.
-
-One is blocked on work that does not exist yet, because its subject is slice 3's: 12, the
-nightly sweep chain, which waits on [#281](https://github.com/l3a0/marketlake/issues/281).
+`is_chain_truncated`. Test 12 joined it when
+[#281](https://github.com/l3a0/marketlake/issues/281) shipped the 18:30 job it replays, and
+nothing is blocked on unbuilt work any more.
 
 ## The 7 live checks
 
@@ -589,7 +589,7 @@ Each healthchecks.io check is created by hand, in the session that first makes i
    rather than reporting it on a log line nobody reads.
 3. **D13**, `capture`, and the daemon's own pages. The per-cycle dead-man. Delete the `slice1-capture` row in the same session, because `capture` supersedes it. Ship every daemon page path through one publisher: auth death, sustained 429s, the watchdog, and the sampler collapse. The parser's schema-drift page carries the retype half, and the half a vanished field leaves no trace of is tracked in [#265](https://github.com/l3a0/marketlake/issues/265) above. The auth-gap reminder that #92 also carried is considered and rejected, in the design's auth-death bullet. Rehearse the topic rotation once, end to end. The 09:35 calendar probe ships here too, with its page and its `calendar-probe` check.
 4. **D14**, `pre-open` and `sunday`, and the Sunday reminder. D14 renders the launchd jobs and the wake schedules those two checks watch. The Sunday job sends the re-auth reminder on its 20:00, 21:00, and 22:00 canary runs only, while the throwaway call or the coverage assertion still fails, reading the token's mint time from `token.json` itself.
-5. **D16**, `eod-sweep`, and the nightly summary. This is where the report channel is created, and the sweep's own ping lands before the digest it sends. Its ping owes the refused-ping page the other five producers send, because it is the one steady-state check whose producer did not exist when [#213](https://github.com/l3a0/marketlake/issues/213) shipped. Scope in [#281](https://github.com/l3a0/marketlake/issues/281), which holds the digest's priority, the holiday no-op rule, and the inputs already on disk.
+5. **D16**, `eod-sweep`, and the nightly summary. `lake.sweep` ships the producer, so this row is owed on the next weekday its 18:30 job runs through. Create the check and confirm ntfy and email both read on for it. Until the row exists the ping goes to a slug healthchecks does not know, and the job pages once to say so, which is the refused-ping page working rather than a fault. That page is the one [#213](https://github.com/l3a0/marketlake/issues/213) could not wire, because no code pinged this slug when it shipped. The report channel is created here too: the sweep's own ping lands before the digest it sends. Scope in [#281](https://github.com/l3a0/marketlake/issues/281).
 6. **D20**, the battery's pages, delayed feed and nightly schema drift.
 
 ## Discipline rules
