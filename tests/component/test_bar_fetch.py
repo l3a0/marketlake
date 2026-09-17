@@ -2221,6 +2221,103 @@ def test_the_bar_close_is_the_last_row_by_stamp():
     assert bars._bar_close([]) is None
 
 
+def test_the_bar_close_reads_the_last_instant_rather_than_the_last_string():
+    """Marketlake #386. One instant has more than one spelling, and text order is not time order.
+
+    Sorting the raw stamps puts ``2026-09-14T18:00:00+00:00`` after
+    ``2026-09-14T16:00:00-04:00`` because ``'1'`` sorts after ``'0'``, while the second names
+    20:00Z and is the later instant by two hours. The gate would then compare a close the
+    session did not end on.
+
+    **The row builder cannot currently produce this pair, and that is the point.**
+    ``journal.bars_rows`` mints every ``bar_ts`` from an epoch through ``epoch_ms_to_utc``, which
+    pins ``tz=UTC``, so one spelling is all that reaches a row and the text sort answered
+    correctly by inheriting a guarantee made two modules away. This calls the helper directly
+    because that is where the stated contract, "the last by stamp", is either kept or not. A
+    test routed through the builder could only ever assert the guarantee, never the rule.
+    """
+    rows = [
+        {"bar_ts": "2026-09-14T16:00:00-04:00", "close": 757.39},
+        {"bar_ts": "2026-09-14T18:00:00+00:00", "close": 700.00},
+    ]
+    assert bars._bar_close(rows) == 757.39
+    assert bars._bar_close(list(reversed(rows))) == 757.39
+    assert max(rows, key=lambda row: str(row["bar_ts"]))["close"] == 700.00, (
+        "the text sort stopped disagreeing, so this test no longer separates the two readings"
+    )
+
+
+def test_the_bar_close_breaks_a_tie_on_the_first_row_it_was_handed():
+    """The tie rule is stated in the docstring, so it is asserted rather than left to ``max``.
+
+    Two candles at one instant resolve to the earlier row here, because ``max`` returns the
+    first maximal one, and to the later row through ``load_bars``, whose sort is stable. Nothing
+    in the lake carries two candles at one instant. This holds the rule so a reader can tell the
+    decision from an accident, and so a change of key that quietly reversed it would fail.
+    """
+    rows = [
+        {"bar_ts": "2026-09-14T20:00:00+00:00", "close": 651.0},
+        {"bar_ts": "2026-09-14T16:00:00-04:00", "close": 652.0},
+    ]
+    assert bars._bar_close(rows) == 651.0
+    assert bars._bar_close(list(reversed(rows))) == 652.0
+
+
+def test_a_stamp_carrying_no_offset_is_refused_by_every_reader_in_the_module():
+    """Marketlake #385. A naive stamp names a session by the machine, so it names none.
+
+    ``datetime.fromisoformat`` accepts it and ``astimezone`` then resolves it against the
+    process's own timezone, so the same stamp answered 2026-09-16 on a machine set to Eastern
+    and 2026-09-15 on one set to UTC, with nothing raised either way.
+
+    All three readers are driven, because one strict reader beside two lenient ones is the
+    second rule the fix exists to remove. The refusal names the offset form to pass, which is
+    what ``docs/design.md`` asks of onboarding's own naive-instant refusal.
+    """
+    naive = "2026-09-16T01:00:00"
+    with pytest.raises(bars.StampNotAnInstant, match="carries no UTC offset"):
+        bars.session_of(naive)
+    with pytest.raises(bars.StampNotAnInstant):
+        bars._instant({"bar_ts": naive})
+    with pytest.raises(bars.StampNotAnInstant):
+        bars._bar_close([{"bar_ts": naive, "close": 651.0}])
+    assert "2026-09-15T20:00:00+00:00" in str(bars.StampNotAnInstant(naive))
+
+    # The offset-carrying stamp still reads, so the refusal narrowed nothing it should not.
+    assert bars.session_of("2026-09-15T20:00:00.000+00:00") == date(2026, 9, 15)
+
+
+def test_a_candle_stamped_exactly_at_the_window_end_is_outside_and_refuses():
+    """Marketlake #389. The window is half-open and nothing held its end.
+
+    Widening ``<`` to ``<=`` in ``check_bar_span`` left the whole suite green, so the boundary
+    was correct and unheld. A candle stamped exactly at ``window.end`` is the vendor returning a
+    minute past what was asked for, which is the shape the check exists to refuse: the check's
+    own docstring says a 1-min session's last candle is stamped 15:59, because a candle carries
+    its minute's open.
+
+    Both frequencies are driven. The daily window is a bracket wider than the session, so its
+    end is a different instant from the minute window's, and a check that refused only one of
+    them would pass a test naming only the other.
+    """
+    from lake.session import SessionClock
+
+    bounds = SessionClock(ManualClock(FIRST_NIGHT), weekday_sessions(MONDAY)).bounds(SESSION)
+    for freq in (MINUTE_FREQ, DAILY_FREQ):
+        window = bar_window(freq, bounds)
+        built = [{"bar_ts": window.end.isoformat(), "close": 651.0}]
+        selected = bars.select_session_rows(built, window)
+        assert bars.check_bar_span(built, selected, window).covers is False, (
+            f"a {freq} candle stamped exactly at the window end was counted as inside it"
+        )
+
+    # A candle one minute before the minute window's end is inside, so the assertion above is
+    # about the boundary rather than about the row being refused for some other reason.
+    minute = bar_window(MINUTE_FREQ, bounds)
+    inside = {"bar_ts": (minute.end - timedelta(minutes=1)).isoformat(), "close": 651.0}
+    assert bars._instant(inside) < minute.end
+
+
 def test_a_minute_partition_consults_no_settled_close(fixture_lake: FixtureLake, monkeypatch):
     """The close cross-check speaks to ``1d`` alone, and this is what says so.
 

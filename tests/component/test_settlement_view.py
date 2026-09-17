@@ -752,7 +752,12 @@ def test_a_naive_expiration_stamp_refuses_rather_than_reading_the_machines_clock
     It parses cleanly, and `astimezone` then resolves it against whatever timezone the process
     runs in, so the same chain would put this contract in the roster on one machine and leave it
     out on another with nothing raised. That is the silently short roster the refusal exists for.
-    The weakness is `bars.session_of`'s own, marketlake #385.
+
+    **The refusal moved into `bars.session_of` and this assertion did not change**, which is the
+    point of keeping it. Marketlake #385 put the test where the reading lives, so `_expires_on`
+    no longer carries its own copy. What a caller of this view sees is still
+    `ExpirationUnreadable` rather than the `BarsError` raised underneath it, because this view
+    owes its callers its own vocabulary for a roster it cannot vouch for.
     """
     root = _lake(fixture_lake, [_contract(750.0, expiration_date=f"{SESSION}T20:00:00.000")])
     with pytest.raises(ExpirationUnreadable):

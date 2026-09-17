@@ -256,6 +256,45 @@ class UnsupportedBarFreq(BarsError):
         self.freq = freq
 
 
+class StampNotAnInstant(BarsError):
+    """A stamp carrying no UTC offset, which names no instant this module can read.
+
+    ``datetime.fromisoformat`` accepts a naive stamp, and ``astimezone`` then resolves it against
+    whatever timezone the process happens to be running in. So the same stamp names one session
+    on a machine set to Eastern and another on a machine set to UTC, with nothing raised either
+    way. Measured: ``2026-09-16T01:00:00`` reads as 2026-09-16 under ``TZ=America/New_York`` and
+    as 2026-09-15 under ``TZ=UTC``.
+
+    Every other stamp reader in this package tests for that before trusting a stamp.
+    ``onboard``, ``vendor``, ``actions``, ``capture_spans``, ``security_master`` and ``settle``
+    each spell the same condition, and ``lake.bars`` was the one that did not. The refusal names
+    the offset form to pass, which is the rule ``docs/design.md`` states for onboarding's own
+    naive-instant refusal.
+
+    **It stays out of the walk's catch in :func:`fetch_session_bars`.** That tuple names
+    ``CloseOfRecordDisagrees`` rather than the ``BarsError`` base precisely so a later subclass
+    decides for itself, and this one decides to stay out. Inside this module every stamp is
+    minted by ``journal.bars_rows`` through ``journal.epoch_ms_to_utc``, which pins ``tz=UTC``,
+    so a stamp reaching this refusal means that guarantee has broken for the run rather than for
+    the ticker-day being walked. Holding it per ticker-day would file the same finding for every
+    ticker and still write the run as though it had worked. ``UnsupportedBarFreq`` refuses up
+    front for that same reason.
+
+    ``lake.settle`` is the caller that can reach it, on ``expiration_date``, which ``journal``
+    keeps as the vendor's ISO string verbatim rather than minting it. It catches this and reads
+    the stamp as unreadable, which leaves ``ExpirationUnreadable`` as the refusal that view
+    already documents.
+    """
+
+    def __init__(self, bar_ts: str) -> None:
+        super().__init__(
+            f"{bar_ts!r} carries no UTC offset, so the session it names would be decided by "
+            "this machine's timezone rather than by the stamp. Pass an offset, like "
+            "2026-09-15T20:00:00+00:00 or 2026-09-15T16:00:00-04:00."
+        )
+        self.bar_ts = bar_ts
+
+
 class SpansAbsent(BarsError):
     """The lake holds no capture-spans file, so the backfill has no range to walk.
 
@@ -392,8 +431,12 @@ def session_of(bar_ts: str) -> date:
     That direction fails closed. A stamp this reading places on the wrong date leaves the
     selection below with no candle for the session, the span check refuses, and nothing lands.
     The ticker-day is held with a finding instead of landing a bar under the wrong day.
+
+    **A stamp carrying no offset is refused rather than read.** ``StampNotAnInstant`` says why.
+    A naive stamp resolves against the process's own timezone, so this would answer by the
+    machine rather than by the stamp. Marketlake #385.
     """
-    return datetime.fromisoformat(bar_ts).astimezone(MARKET_TZ).date()
+    return _as_instant(bar_ts).astimezone(MARKET_TZ).date()
 
 
 def select_session_rows(rows: Sequence[dict], window: BarWindow) -> list[dict]:
@@ -413,6 +456,24 @@ def select_session_rows(rows: Sequence[dict], window: BarWindow) -> list[dict]:
     return [row for row in rows if session_of(str(row["bar_ts"])) == window.session]
 
 
+def _as_instant(bar_ts: str) -> datetime:
+    """One bars stamp as a UTC instant, refusing one that carries no offset.
+
+    This is the module's single rule for turning a ``bar_ts`` string into an instant, and the
+    three readers that need one share it: :func:`session_of` names the session a stamp belongs
+    to, :func:`_instant` places a row against the requested window, and :func:`_bar_close` picks
+    the session's last candle. Writing the rule once is the point. Two of those readers were
+    written apart and drifted, which is what marketlake #385 and #386 are.
+
+    ``StampNotAnInstant`` carries the argument for refusing a naive stamp rather than resolving
+    it against the process's timezone.
+    """
+    parsed = datetime.fromisoformat(bar_ts)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise StampNotAnInstant(bar_ts)
+    return parsed.astimezone(UTC)
+
+
 def _instant(row: dict) -> datetime:
     """One row's stamp as a UTC instant.
 
@@ -421,7 +482,7 @@ def _instant(row: dict) -> datetime:
     not disagree about which stamps are readable, and they cannot, because only a stamp the
     builder already accepted ever reaches a row.
     """
-    return datetime.fromisoformat(str(row["bar_ts"])).astimezone(UTC)
+    return _as_instant(str(row["bar_ts"]))
 
 
 def check_bar_span(
@@ -1016,6 +1077,10 @@ def _walk(
             #
             # ``CloseOfRecordDisagrees`` is named rather than its ``BarsError`` base, so a
             # later subclass has to decide for itself whether it belongs in here.
+            # ``StampNotAnInstant`` decided to stay out, and its own docstring carries why: a
+            # stamp it refuses means the row builder's one-offset guarantee has broken for the
+            # run rather than for this ticker-day, so containing it here would file the same
+            # finding for every ticker and still write the run as though it had worked.
             #
             # The blast radius is one ticker-day. A session the lake cannot read and a vendor
             # that refused this request are both conditions the next run can meet differently,
@@ -1211,10 +1276,31 @@ def _bar_close(rows: Sequence[dict]) -> float | None:
     ``selected`` holds the rows for the session being gated, which on ``1d`` is the one candle
     whose stamp maps to it. The last by stamp is the session's close on either frequency, so
     the same reading answers a 1-min partition should a check ever want it.
+
+    **The last by stamp is the last instant, not the last string.** This sorted the raw text
+    until marketlake #386, and the two orders come apart whenever two stamps spell one instant
+    differently. That input is not reachable through the row builder, which mints every
+    ``bar_ts`` from an epoch through ``journal.epoch_ms_to_utc`` at one offset, so the text sort
+    answered correctly for as long as that held. It held two modules away and nothing here said
+    so, which is the whole of what was wrong with it. ``load_bars`` orders its own answer by
+    instant, and ``lake.settle`` takes the last row of it, so the two readings of one session's
+    close now agree by construction rather than by coincidence.
+
+    **The tie is stated rather than inherited.** ``max`` returns the first maximal row, so two
+    candles at one instant resolve to the earlier row here and to the later one through a stable
+    sort in ``load_bars``. Nothing in the lake has ever carried two candles at one instant, and
+    naming the rule is what lets a reader tell a decision from an accident.
+
+    **Parsing here cannot raise in the sweep, and the order is why.** ``_as_instant`` raises on a
+    stamp ``str`` would have swallowed. Every row reaching this has already been parsed twice,
+    by ``select_session_rows`` and then by ``check_bar_span``, so a stamp that would raise has
+    ended the ticker-day before this runs. A change that reorders those two checks puts the raise
+    back on this path, where the ``except`` below does not cover it: that clause is about a close
+    the vendor retyped, not about a stamp.
     """
     if not rows:
         return None
-    latest = max(rows, key=lambda row: str(row["bar_ts"]))
+    latest = max(rows, key=_instant)
     value = latest.get("close")
     if value is None or isinstance(value, bool):
         return None
@@ -1777,6 +1863,7 @@ __all__ = [
     "LandedPartition",
     "SpanCoverage",
     "SpansAbsent",
+    "StampNotAnInstant",
     "TickerDay",
     "UnsupportedBarFreq",
     "backfill_bars",
