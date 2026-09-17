@@ -44,12 +44,13 @@ from lake.runner import (
     refused_status,
     run_once,
 )
+from lake.sweep import EOD_SWEEP_SLUG
 from tests.support.config import NTFY_TOPIC, PING_KEY, write_config
 from tests.support.transport import FakeTransport
 
 NOW = datetime(2026, 9, 14, 16, 30, tzinfo=MARKET_TZ)
 
-# The five checks a live job feeds. The retired slice-1 slug is deliberately absent, and
+# The six checks a live job feeds. The retired slice-1 slug is deliberately absent, and
 # the test at the bottom of this file is what keeps it absent.
 LIVE_SLUGS = (
     COMPACTION_SLUG,
@@ -57,6 +58,7 @@ LIVE_SLUGS = (
     PRE_OPEN_SLUG,
     SUNDAY_SLUG,
     CAPTURE_SLUG,
+    EOD_SWEEP_SLUG,
 )
 
 
@@ -290,7 +292,7 @@ def test_no_refused_ping_page_carries_the_url_or_its_key(slug: str, tmp_path: Pa
 
 
 def test_the_retired_slice_one_check_escalates_nothing():
-    """``slice1-capture`` is the sixth ping site and the one that must stay silent.
+    """``slice1-capture`` is the seventh ping site and the one that must stay silent.
 
     Its healthchecks row was deleted on purpose when the slice-2 checks superseded it,
     so a refusal there is the expected answer rather than a finding. Escalating would

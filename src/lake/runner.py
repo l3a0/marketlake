@@ -97,7 +97,7 @@ _MINUTES_PER_DAY = 24 * 60
 # that. So a raising ping used to cost the verdict as well as the ping. The ping is lost
 # either way and healthchecks pages for it after the grace. Losing the report too is
 # what these catches prevent. It lives here beside the protocol rather than in one
-# caller, because all four call sites need the same answer.
+# caller, because every call site needs the same answer.
 #
 # Only the exception's type is ever reported. The URL carries the ping key, and the
 # design's rule is that it never reaches a log.

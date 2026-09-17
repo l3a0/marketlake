@@ -68,7 +68,7 @@ from lake.paths import (
 #
 # 1. The manifest cannot cover itself.
 # 2. Journal segments are manifest-less by rule, so the whole tree is out.
-# 3. ``reports/`` holds the nightly report, one dated file per night, and four trees
+# 3. ``reports/`` holds the nightly report, one dated file per sweep run, and four trees
 #    beside it: one file per page that never reached the phone, one file per close+5
 #    guard run, one file per ticker-day compaction's merge had something to say about,
 #    and one file per finding a vendor-sweep gate refused to land. The daemon writes the

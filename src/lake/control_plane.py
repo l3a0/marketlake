@@ -30,7 +30,9 @@ Terms, glossed at first use.
   ping does not arrive, so silence is the alarm. A ping fires only on the job's
   success condition, never on mere liveness.
 - The *vendor sweep* is the 18:30 weekday job that pulls the day's settled vendor data.
-  Slice 3 builds it. Its Friday run is what sets the Sunday one-shot wake.
+  ``lake.sweep`` is it. Its Friday run is what sets the Sunday one-shot wake. This module
+  renders that job and reasons about its alarms, and the privileged half of the Friday
+  branch lives over there, because the rule above holds here without exception.
 - The *canary* is the Sunday throwaway authenticated call that proves the brokerage
   token still works. It retries every 30 minutes until it passes or its deadline.
 - The *scrub* is the weekly integrity pass over the lake. It checks every recorded file
@@ -183,7 +185,7 @@ _PY_WEEKDAYS = frozenset({0, 1, 2, 3, 4})
 _PY_SATURDAY = 5
 _PY_SUNDAY = 6
 
-# The launchd labels. A label is the job's unique identity to launchd. All five sit in
+# The launchd labels. A label is the job's unique identity to launchd. All six sit in
 # the system domain because they are LaunchDaemons.
 LAUNCHD_DOMAIN = "system"
 DAEMON_LABEL = "com.marketlake.daemon"
@@ -191,13 +193,14 @@ DASHBOARD_LABEL = "com.marketlake.dashboard"
 SELF_CHECK_LABEL = "com.marketlake.self-check"
 CALENDAR_PROBE_LABEL = "com.marketlake.calendar-probe"
 SUNDAY_LABEL = "com.marketlake.sunday"
+EOD_SWEEP_LABEL = "com.marketlake.eod-sweep"
 
 # The healthchecks slugs the two calendar jobs ping. Log the slug, never the URL.
 CALENDAR_PROBE_SLUG = "calendar-probe"
 PRE_OPEN_SLUG = "pre-open"
 SUNDAY_SLUG = "sunday"
 
-# The slug of the dead-man check the daemon feeds. It sits here with its four siblings
+# The slug of the dead-man check the daemon feeds. It sits here with its five siblings
 # rather than in ``lake.deadman`` because the install renderer names it too, and
 # ``lake.deadman`` imports this module. Reaching the other way would load a second copy
 # of this module under ``python -m lake.control_plane``. ``lake.deadman`` re-exports it,
@@ -214,6 +217,75 @@ CAPTURE_SLUG = "capture"
 # re-exports it, so every consumer still reads it from there.
 COMPACTION_SLUG = "compaction"
 
+# The slug of the check the 18:30 vendor sweep pings. It sits here for the reason its two
+# neighbours give. The install renderer names every slug, and reaching into ``lake.sweep``
+# from here would make every process that imports this module load the bar fetch, the
+# corporate-actions walks and pyarrow behind them. ``lake.sweep`` imports it back and
+# re-exports it, so every consumer still reads it from there.
+EOD_SWEEP_SLUG = "eod-sweep"
+
+
+def live_check_slugs() -> tuple[str, ...]:
+    """Every live dead-man check, in the order the first install presses them.
+
+    ``capture`` leads because inside the capture window its deadline is five minutes away,
+    while every other deadline here is hours or days out.
+
+    It is one roster because two renderings enumerate it and they had already fallen out
+    of step. The install's arming block named five and the uninstall's warning named four,
+    so ``compaction`` went unmentioned there from the day its slug landed, which is
+    marketlake #308. A list written out in two places is what let one of them fall behind,
+    and the next check added would have left both behind again. Both read this instead.
+
+    It is a function rather than a constant, and that is not decoration. A tuple bound at
+    import freezes the six spellings, and the rendering's own guard renames a slug under
+    the renderer and asserts the rendering moved. Reading the constants on each call is
+    what keeps that guard able to fail, and a rendering is built once per install.
+
+    The retired slice-1 ``slice1-capture`` row is deliberately absent. Its row was deleted
+    when the slice-2 checks superseded it, so naming it would send the operator to press a
+    button on a check that no longer exists.
+    """
+    return (
+        CAPTURE_SLUG,
+        PRE_OPEN_SLUG,
+        SUNDAY_SLUG,
+        COMPACTION_SLUG,
+        CALENDAR_PROBE_SLUG,
+        EOD_SWEEP_SLUG,
+    )
+
+
+# The English words for the small counts the rendered scripts spell out in prose. A count
+# written as a word beside a list read from a roster is exactly how the uninstall came to
+# say four while five went silent, so the word is derived from the list rather than typed.
+_NUMBER_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")
+
+
+def _spelled(count: int) -> str:
+    """``count`` as an English word, or as a numeral when there is no word for it.
+
+    It falls back rather than refusing, and that is the whole of the reasoning. The only
+    callers are two sentences inside ``uninstall_script``, which ``render_all`` calls, so
+    raising here would take the entire install and uninstall rendering down over the
+    spelling of one word. The design's own budget is not nine: it puts the per-job check
+    pattern "well inside the free tier's 20-check allowance". A tenth check is a thing
+    this project expects to have one day, and reading "Pause all 10 from healthchecks" is
+    a smaller cost than a renderer that will not run.
+    """
+    if 0 <= count < len(_NUMBER_WORDS):
+        return _NUMBER_WORDS[count]
+    return str(count)
+
+
+def _listed(items: Sequence[str]) -> str:
+    """``items`` as an English list, as in ``a, b and c``."""
+    items = list(items)
+    if len(items) < 2:
+        return "".join(items)
+    return f"{', '.join(items[:-1])} and {items[-1]}"
+
+
 # The system PATH a LaunchDaemon gets. launchd gives a job a minimal environment, so
 # the plist restores the OS tool directories the jobs shell out to: pmset, launchctl,
 # tmutil, caffeinate, and rsync. These are OS locations, not machine-specific paths.
@@ -225,7 +297,7 @@ _SYSTEM_PATH = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
 # a real directory the /etc entry is the one that catches it.
 _PROTECTED_ROOTS = (Path("/Library"), Path("/System"), Path("/etc"), Path("/private/etc"))
 
-# The one rendered setup file beside the five plists. The Time Machine exclusion is a
+# The one rendered setup file beside the six plists. The Time Machine exclusion is a
 # printed install step rather than a rendered script, so there is one copy of it.
 SUDOERS_FILE = "marketlake.sudoers"
 
@@ -233,8 +305,8 @@ SUDOERS_FILE = "marketlake.sudoers"
 # runs it, per the build plan's D14.
 INSTALL_SCRIPT_FILE = "install.sh"
 
-# The reverse of install.sh. It takes off the five jobs, the weekday wake, the sudoers
-# drop-in and the five plists, in that order. It leaves the lake, the config directory
+# The reverse of install.sh. It takes off the six jobs, the weekday wake, the sudoers
+# drop-in and the six plists, in that order. It leaves the lake, the config directory
 # and that directory's Time Machine exclusion, so an uninstall is neither a data loss
 # nor a re-auth, and it does not expose the token to the next backup.
 UNINSTALL_SCRIPT_FILE = "uninstall.sh"
@@ -388,8 +460,8 @@ def sunday_job(host: LaunchdHost) -> LaunchdJob:
     derives it from. The daemon reads that file, this job asserts coverage over it,
     and the Time Machine exclusion protects the directory holding it. No render
     argument can point any of the three somewhere else, so they cannot split. The
-    18:30 vendor sweep is not rendered here. That job is slice 3's, and it does not
-    exist yet.
+    18:30 vendor sweep is :func:`eod_sweep_job` below, and it takes no ``--token`` of its
+    own for the reason that function gives.
 
     ``RunAtLoad`` is deliberately off, as it is for the calendar probe. It would
     otherwise run at every bootstrap and every boot, on any day. That means a
@@ -410,6 +482,36 @@ def sunday_job(host: LaunchdHost) -> LaunchdJob:
     )
 
 
+def eod_sweep_job(host: LaunchdHost) -> LaunchdJob:
+    """The 18:30 weekday vendor sweep, whose health check is the ``eod-sweep`` slug.
+
+    It runs ``python -m lake.sweep``: the corporate-actions walks, the bar fetch, the
+    nightly report file, the ping, and the digest. On a Friday it also sets the Sunday
+    one-shot wake and reads it back, which is why install step 6 no longer asks the
+    operator to do that by hand.
+
+    **It carries no arguments**, which is the shape ``daemon_job`` and
+    ``calendar_probe_job`` take rather than ``sunday_job``'s. That job passes ``--token``
+    because it asserts coverage over the same file the daemon reads and the Time Machine
+    exclusion protects, and one derivation for the three is what keeps them from
+    splitting. Nothing here needs a second spelling of that path: ``environment`` sets
+    ``HOME``, ``schwab.DEFAULT_TOKEN_PATH`` is bound from it at import, and
+    ``bars.fetch_session_bars_from_config`` already defaults to that constant.
+
+    ``RunAtLoad`` is off, for ``calendar_probe_job``'s reason rather than a new one. A
+    load at any other hour would make vendor calls about a session the run is not in, and
+    ``bars.fetch_session_bars`` raises ``NotASession`` off one. launchd still fires a
+    missed 18:30 occurrence on the next wake, which is a catch-up this job has to refuse
+    rather than welcome, and ``lake.sweep`` refuses it by requiring the session's equity
+    close to have passed before it fetches.
+    """
+    return host.job(
+        EOD_SWEEP_LABEL,
+        "lake.sweep",
+        calendar=[VENDOR_SWEEP.launchd_interval(wd) for wd in LAUNCHD_WEEKDAYS],
+    )
+
+
 def all_jobs(host: LaunchdHost) -> tuple[LaunchdJob, ...]:
     """Every launchd job the control plane installs, resident processes first."""
     return (
@@ -418,6 +520,7 @@ def all_jobs(host: LaunchdHost) -> tuple[LaunchdJob, ...]:
         self_check_job(host),
         calendar_probe_job(host),
         sunday_job(host),
+        eod_sweep_job(host),
     )
 
 
@@ -792,9 +895,31 @@ def pmset_schedule_command(sunday: date) -> str:
     epoch-based across a DST weekend is live check 5. The canary's retry window
     absorbs an hour of skew either way, so nothing here compensates.
     """
+    return "pmset " + " ".join(
+        shlex.quote(argument) for argument in pmset_schedule_args(sunday)
+    ).replace("'", '"')
+
+
+# The binary the sudoers drop-in grants, named by its full path there, so the argument
+# list below is spelled the way the rule reads it.
+PMSET_BINARY = "/usr/bin/pmset"
+
+
+def pmset_schedule_args(sunday: date) -> tuple[str, ...]:
+    """The Sunday one-shot as an argument list, for a caller that runs it rather than prints it.
+
+    ``lake.sweep`` runs this every Friday under ``sudo -n``. It cannot run
+    :func:`pmset_schedule_command`'s string, because that line carries no ``sudo``, names
+    ``pmset`` rather than the ``/usr/bin/pmset`` the drop-in grants, and quotes the date and
+    time as one shell word rather than handing them over as one argument.
+
+    ``sudo`` joins a command's arguments into one string before matching, so the string these
+    three become is exactly what ``_SCHEDULE_ARGS_REGEX`` anchors. That is why the printed
+    line is built from this rather than beside it: one spelling cannot drift from itself.
+    """
     if sunday.weekday() != _PY_SUNDAY:
         raise ValueError(f"{sunday.isoformat()} is not a Sunday")
-    return f'pmset schedule wakeorpoweron "{_pmset_date(sunday)} {SUNDAY_WAKE.hms}"'
+    return ("schedule", "wakeorpoweron", f"{_pmset_date(sunday)} {SUNDAY_WAKE.hms}")
 
 
 def _next_monday(today: date) -> date:
@@ -834,10 +959,12 @@ def sunday_wake_command(now: datetime, calendar: Calendar) -> str:
     fired, and scheduling a moment in the past sets nothing, so the answer advances to
     the following Sunday.
 
-    The ``pmset`` subcommand is the only caller. It prints this line for the operator to
-    run by hand every Friday. Nothing in this deliverable sets the one-shot, and the
-    slice-3 sweep that will set it does not exist yet. Install step 6 names the gap, and
-    the design's DST-weekend live check needs the same line.
+    Two callers read it. The ``pmset`` subcommand prints this line for the operator, for
+    install step 6's one-off and for the design's DST-weekend live check. ``lake.sweep``
+    reads it on a Friday and runs the same wake, and it builds its own argument list
+    rather than running this string: the line carries no ``sudo``, the sudoers drop-in
+    names the binary by its full path, and the date and time here are one shell-quoted
+    word rather than one argument.
     """
     sunday = next_sunday_wake(now, calendar)
     if SUNDAY_WAKE.on(sunday) <= now:
@@ -2404,7 +2531,7 @@ def _first_install_lines(
     ``plist_path`` and ``sudoers_path`` arrive already shell-quoted.
     """
     lines: list[str | tuple[str, str]] = [
-        "# 1. Install the five LaunchDaemons, root-owned as launchd requires."
+        "# 1. Install the six LaunchDaemons, root-owned as launchd requires."
     ]
     for job in all_jobs(host):
         lines.append(
@@ -2462,7 +2589,8 @@ def install_script(host: LaunchdHost) -> str:
 
     Paths resolve from the script's own directory rather than from a baked absolute
     path, so moving the rendered directory does not break it. Step 6 is deliberately
-    absent. It is the standing Friday task, not part of the first install.
+    absent. It is run once from the install text, and the 18:30 sweep sets the one-shot
+    every Friday from then on, so it is not a step this script should re-run.
     """
     body: list[str] = []
     for item in _first_install_lines(
@@ -2513,8 +2641,9 @@ def install_script(host: LaunchdHost) -> str:
         "# reaches the install that would place it. Every command is echoed before it runs.",
         "# The last command reads back whether the daemon came up.",
         "#",
-        "# Step 6, the standing Friday one-shot, is not here. It is not part of the first",
-        "# install. Run it from the install text.",
+        "# Step 6, the Sunday one-shot, is not here. Run it once from the install text.",
+        f"# From then on the 18:30 {EOD_SWEEP_LABEL} job sets it every",
+        "# Friday and reads it back.",
         "#",
         "# To reinstall after a re-render, run the uninstall first and this second:",
         "#",
@@ -2534,8 +2663,8 @@ def install_script(host: LaunchdHost) -> str:
 def uninstall_script(host: LaunchdHost) -> str:
     """Take the control plane off a machine, in the reverse of the install's order.
 
-    The install writes five plists (step 1), the sudoers drop-in (step 2), the weekday
-    firmware wake (step 3), the Time Machine exclusion (step 4), and bootstraps five
+    The install writes six plists (step 1), the sudoers drop-in (step 2), the weekday
+    firmware wake (step 3), the Time Machine exclusion (step 4), and bootstraps six
     labels (step 5). This runs 5, 3, 2, 1. Step 4 is deliberately skipped, and the
     bootout leading is what keeps launchd from ever holding a definition whose file is
     gone. Booting out a label that is not loaded is skipped rather than treated as a
@@ -2573,8 +2702,8 @@ def uninstall_script(host: LaunchdHost) -> str:
         "#",
         f"#     ./{UNINSTALL_SCRIPT_FILE}",
         "#",
-        "# It boots out the five launchd jobs, cancels the weekday firmware wake, removes",
-        "# the sudoers drop-in, and deletes the five plists. That is install steps 5, 3, 2",
+        "# It boots out the six launchd jobs, cancels the weekday firmware wake, removes",
+        "# the sudoers drop-in, and deletes the six plists. That is install steps 5, 3, 2",
         "# and 1, undone in that order.",
         "#",
         "# Three things it leaves:",
@@ -2605,12 +2734,17 @@ def uninstall_script(host: LaunchdHost) -> str:
         "# There is no third script. A reinstall is these two, in that order, and nothing",
         "# else, so it cannot drift from what an install and an uninstall mean.",
         "#",
-        "# Four dead-man checks go silent when these jobs stop: capture, pre-open,",
-        "# calendar-probe and sunday. Each pages once its own deadline passes, which for",
-        "# capture is inside the weekday capture window and for sunday is Sunday 23:30.",
-        "# Pause all four from healthchecks first if the machine is meant to stay",
-        "# uninstalled. A check that has been pinged once does not go back to `new` on its",
-        "# own, so simply stopping the jobs is not enough to keep them quiet.",
+        f"# {_spelled(len(live_check_slugs())).capitalize()} dead-man checks go silent when"
+        " these jobs stop:",
+        f"# {_listed(live_check_slugs())}.",
+        "# Each pages once its own deadline passes, which for capture is inside the weekday",
+        f"# capture window and for {SUNDAY_SLUG} is Sunday 23:30. One of them has no label of",
+        f"# its own in the list below: the daemon spawns {COMPACTION_SLUG} at close+15, so",
+        "# booting the daemon out stops that job exactly as surely as it stops capture.",
+        f"# Pause all {_spelled(len(live_check_slugs()))} from healthchecks first if the"
+        " machine is meant to",
+        "# stay uninstalled. A check that has been pinged once does not go back to `new` on",
+        "# its own, so simply stopping the jobs is not enough to keep them quiet.",
         "set -euo pipefail",
         "",
     ]
@@ -2620,7 +2754,7 @@ def uninstall_script(host: LaunchdHost) -> str:
         lines.append(command)
 
     labels = [job.label for job in all_jobs(host)]
-    lines.append("# 1. Boot the five jobs out. This undoes install step 5, and it leads so that")
+    lines.append("# 1. Boot the six jobs out. This undoes install step 5, and it leads so that")
     lines.append("# no plist below is deleted while launchd still holds its definition.")
     for label in labels:
         domain = f"{LAUNCHD_DOMAIN}/{label}"
@@ -2644,7 +2778,7 @@ def uninstall_script(host: LaunchdHost) -> str:
     lines.append("# pmset writes and nothing this script runs, so nothing above depended on it.")
     emit("sudo rm -f /etc/sudoers.d/marketlake")
 
-    lines.append("# 4. Delete the five plists. This undoes install step 1, the first thing the")
+    lines.append("# 4. Delete the six plists. This undoes install step 1, the first thing the")
     lines.append("# install placed and so the last thing to come off.")
     for label in labels:
         emit(f"sudo rm -f /Library/LaunchDaemons/{label}.plist")
@@ -2667,14 +2801,14 @@ def uninstall_script(host: LaunchdHost) -> str:
 def restart_script(host: LaunchdHost) -> str:
     """Restart a resident job so it picks up new code. The renderer never runs it.
 
-    Only two of the five jobs can go stale, and the reason is the shape of the job rather
+    Only two of the six jobs can go stale, and the reason is the shape of the job rather
     than anything about the code. The daemon and the dashboard are resident: launchd
     starts each once and ``KeepAlive`` relaunches it if it exits, so each holds the Python
     it imported at start. The venv is an editable install whose path entry is the absolute
     ``src`` directory, so editing that tree changes what a *new* process imports and
     nothing about one already running. The self-check, the calendar probe and the Sunday
     job exec fresh on every fire, so they always run current code and never need this. The
-    pair is derived from ``keep_alive``, so a sixth resident job is covered by adding the
+    pair is derived from ``keep_alive``, so a third resident job is covered by adding the
     job and nothing else.
 
     ``launchctl kickstart -k`` runs the service immediately whatever its launch conditions
@@ -2897,7 +3031,7 @@ def _arm_checks_step_lines() -> list[str]:
     Every live check is named, because what arms a row is its first ping rather than its
     first run. healthchecks keeps a check that has never been pinged in a ``new`` state,
     which never goes down and never sends, so a job that fails every run leaves its row
-    silent instead of paging. What separates the five is what arms each of them when
+    silent instead of paging. What separates the six is what arms each of them when
     nobody presses.
 
     1. ``capture`` takes the daemon's tagged idle heartbeat through the weekday envelope
@@ -2915,6 +3049,11 @@ def _arm_checks_step_lines() -> list[str]:
        09:35 on any install whose config and token file load. It is pressed with the rest
        because it reads ``Never`` until then, and because leaving one member of a roster
        out is how the gap comes back.
+    6. ``eod-sweep`` has no install-time path either, for ``sunday``'s reason. Its plist
+       carries ``RunAtLoad`` as false, so nothing runs it before the next weekday 18:30,
+       and it pings on its success condition alone. An install made on a machine whose
+       token is dead reaches the bar fetch, fails it, and withholds the ping every
+       evening, which leaves the row reading ``Never`` for as long as that lasts.
 
     Running the jobs instead does not arm the install that needs arming. ``self-check``
     exits 1 when it did not ping, and the script runs under ``set -e``, so the one
@@ -2933,17 +3072,19 @@ def _arm_checks_step_lines() -> list[str]:
     secret, and a rendered directory has to stay safe to paste into a bug report. The
     slug is what the operator has to read, because healthchecks lists a check under its
     name and the retired slice-1 row's name also carries the word capture.
+
+    The list itself comes from :func:`live_check_slugs` rather than being written out
+    here, so a check added later reaches this block and the uninstall's warning together.
     """
     return [
         "# Arming the checks. This is the last step of the first install, and it happens",
         "# after the bootstrap above and never before. A check armed ahead of the jobs",
         "# makes the page that follows about the install order rather than about the",
         "# daemon.",
-        f"# Open healthchecks.io and press Ping Now on each of these checks: {CAPTURE_SLUG},",
-        f"# {PRE_OPEN_SLUG}, {SUNDAY_SLUG}, {COMPACTION_SLUG} and {CALENDAR_PROBE_SLUG}. The"
-        " list shows a check by name",
-        "# rather than by slug, and a retired slice-1 row can still be sitting beside it,",
-        "# so read the slug before pressing.",
+        "# Open healthchecks.io and press Ping Now on each of these checks:",
+        f"# {_listed(live_check_slugs())}.",
+        "# The list shows a check by name rather than by slug, and a retired slice-1 row",
+        "# can still be sitting beside it, so read the slug before pressing.",
         "# healthchecks keeps a check that has never been pinged in a new state, which",
         "# never goes down and never sends. What arms a row is its first ping rather than",
         "# its first run, so a job that fails every run stays silent instead of paging.",
@@ -3069,12 +3210,15 @@ def install_commands(out_dir: Path, host: LaunchdHost) -> str:
     lines += _token_step_lines()
     lines += _arm_checks_step_lines()
     lines += [
-        "# 6. Set the Sunday one-shot. The slice-3 vendor sweep will do this every Friday.",
-        "# Until that sweep lands, run this line each Friday and run the second command it",
-        "# prints under sudo. Nothing else sets the one-shot, and the Sunday read-back",
-        "# cannot catch a missed one: by Sunday evening a wake that never got set and one",
-        "# that already fired look the same. A machine left asleep still pages, because",
-        "# the Sunday check never runs and its dead-man ping never arrives.",
+        "# 6. Set the Sunday one-shot, once, to cover this coming Sunday. From then on",
+        f"# the 18:30 {EOD_SWEEP_LABEL} job sets it every Friday",
+        "# and reads it back, so this is a step of the first install rather than a standing",
+        "# task. It is still owed once, because the first Friday sweep may be days away and",
+        "# the Sunday before it is not.",
+        "# Run this line and run the second command it prints under sudo. The Sunday",
+        "# read-back cannot catch a missed one: by Sunday evening a wake that never got set",
+        "# and one that already fired look the same. A machine left asleep still pages,",
+        "# because the Sunday check never runs and its dead-man ping never arrives.",
         f"cd {shlex.quote(host.project_dir)} && "
         f"{shlex.quote(host.python)} -m lake.control_plane pmset",
     ]
@@ -3082,8 +3226,8 @@ def install_commands(out_dir: Path, host: LaunchdHost) -> str:
     # install. The bootout lines stay commented out: booting out a label that was never
     # loaded fails, so a fresh install must not run them.
     lines += [
-        "# Re-installing. Steps 1 to 5 are the first install and run once. Step 6 is the",
-        "# standing Friday task until slice 3 lands.",
+        "# Re-installing. Steps 1 to 6 are the first install and run once. Step 6 is not a",
+        "# standing task: the Friday sweep re-sets the one-shot from then on.",
         "# Step by step is not the recommended path. Run the two scripts beside this file",
         f"#     ./{UNINSTALL_SCRIPT_FILE} && ./{INSTALL_SCRIPT_FILE}",
         "# which re-runs every step and so cannot skip one that changed. The && is",
@@ -3356,6 +3500,8 @@ __all__ = [
     "CANARY_DEADLINE",
     "CAPTURE_SLUG",
     "COMPACTION_SLUG",
+    "EOD_SWEEP_LABEL",
+    "EOD_SWEEP_SLUG",
     "CANARY_RETRY",
     "CANARY_SYMBOL",
     "DAEMON_LABEL",
@@ -3427,11 +3573,14 @@ __all__ = [
     "restart_script",
     "uninstall_script",
     "launchctl_probe",
+    "live_check_slugs",
     "main",
     "next_sunday_wake",
     "parse_exclusions",
     "parse_launchctl_print",
+    "PMSET_BINARY",
     "parse_pmset_schedule",
+    "pmset_schedule_args",
     "pmset_repeat_command",
     "pmset_schedule_command",
     "read_exclusions",
