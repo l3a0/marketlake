@@ -48,6 +48,7 @@ from lake.schema_versions import (
     SchemaVersionsError,
     UnsupportedLedgerSchemaVersion,
     _conflict_detail,
+    _page_moved,
     check_running_version,
     ledger_path,
     main,
@@ -953,6 +954,57 @@ def test_the_page_body_stays_inside_the_design_body_budget(lake_root, shape):
     assert len(check.detail.encode("utf-8")) > PAGE_BODY_BYTE_CAP
 
 
+# -- what the page says moved ------------------------------------------------
+#
+# ``_page_moved`` is ``_conflict_detail``'s twin under the body budget, and the three cases
+# below mirror the three that already hold the older one. A page reached only through the
+# verdict is reached through one assertion that some column name appears in it, which a walk
+# over the wrong side of the comparison still satisfies.
+
+
+def test_the_page_names_a_surface_only_the_ledger_holds():
+    """The walk is over the union, so a surface the running code dropped still gets named.
+
+    Walking the derived side alone renders an empty string, and the page then says a version
+    disagrees and names nothing at all.
+    """
+    derived = running_fingerprints()
+    recorded = {**derived, "ghost_surface": {"who": "string"}}
+
+    moved = _page_moved(derived, recorded)
+
+    assert "ghost_surface" in moved
+    assert "who" in moved
+
+
+def test_the_page_says_which_way_a_column_moved():
+    """The verb is the whole instruction. A column the running code has and the ledger does
+    not is *added*, and calling it dropped sends an operator the opposite way.
+
+    Swapping the two arguments is a one-word edit that renders the right column under the
+    wrong verb, which is the shape a test asserting only that the name appears cannot see.
+    """
+    derived = running_fingerprints()
+    recorded = {surface: dict(columns) for surface, columns in derived.items()}
+    recorded[journal.CHAINS_SURFACE].pop("bid")
+
+    assert "added bid" in _page_moved(derived, recorded)
+    assert "dropped bid" in _page_moved(recorded, derived)
+
+
+def test_the_page_stays_silent_about_a_surface_that_did_not_move():
+    """One surface disagreeing names one surface. The other two are not mentioned."""
+    derived = running_fingerprints()
+    recorded = {surface: dict(columns) for surface, columns in derived.items()}
+    recorded[journal.BARS_SURFACE].pop("volume")
+
+    moved = _page_moved(derived, recorded)
+
+    assert journal.BARS_SURFACE in moved
+    assert journal.CHAINS_SURFACE not in moved
+    assert journal.QUOTES_SURFACE not in moved
+
+
 def test_the_page_names_the_cap_worth_of_columns_and_counts_the_rest(lake_root):
     """One surface's clause names exactly ``PAGE_COLUMN_CAP`` columns, then says how many are
     left.
@@ -1006,6 +1058,19 @@ def test_the_report_line_survives_redaction_whole(lake_root, build):
 
     assert not check.ok
     assert redacted(check.summary) == check.summary
+
+
+def test_the_three_event_names_are_three_names():
+    """Pinned as literals, because comparing the constants to themselves holds nothing.
+
+    A set built from the three constants and compared against a set of the same three
+    constants collapses on both sides the moment two of them are spelled alike, and passes.
+    That is what this file's first draft asserted.
+    """
+    assert len({UNRECORDED_EVENT, CONFLICT_EVENT, UNREADABLE_EVENT}) == 3
+    assert UNRECORDED_EVENT == "schema_version_unrecorded"
+    assert CONFLICT_EVENT == "schema_version_conflict"
+    assert UNREADABLE_EVENT == "schema_version_ledger_unreadable"
 
 
 def test_each_reportable_verdict_carries_an_event_of_its_own(lake_root):

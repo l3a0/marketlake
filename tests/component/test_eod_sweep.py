@@ -2300,6 +2300,38 @@ def test_the_line_reaches_the_report_file_and_the_digest(fixture_lake: FixtureLa
     assert str(journal.SCHEMA_VERSION) in transport.messages[0].body
 
 
+def _conflicting_ledger() -> pa.Table:
+    """The running version recorded under a shape the running code does not have.
+
+    A column the ledger holds and the code dropped, which is the direction no read-time
+    refusal can see: it falls outside the projection's reachable set, so the read comes back
+    whole while the dropped column's nulls read as vendor nulls.
+    """
+    shapes = {surface: dict(columns) for surface, columns in running_fingerprints().items()}
+    shapes[journal.CHAINS_SURFACE]["gamma_impact"] = "double"
+    entry = RecordedVersion(
+        version=journal.SCHEMA_VERSION, recorded_at=RECORDED_AT, fingerprints=shapes
+    )
+    return SchemaVersionLedger([entry]).to_table()
+
+
+def test_a_conflicting_ledger_files_its_own_line(fixture_lake: FixtureLake):
+    """The second verdict, and it is not the one the other cases here drive.
+
+    Every case above builds a stale ledger, so a caller that filed a line for `unrecorded`
+    alone would leave the two verdicts that compound unreported and pass all of them. This is
+    the worse of the two, because nothing at read time refuses it.
+    """
+    root = _lake(fixture_lake, ledger=_conflicting_ledger())
+
+    outcome, pinger, _ = _run(root)
+
+    (line,) = _version_lines(outcome)
+    assert "different shape" in line
+    assert outcome.nightly.problems == ()
+    assert pinger.urls == [PING_URL]
+
+
 def test_a_run_against_a_recorded_version_files_no_line(fixture_lake: FixtureLake):
     """The steady state, and the case that decides whether this line is noise.
 

@@ -87,7 +87,7 @@ from lake.deadman import CAPTURE_SLUG
 from lake.paths import LakePaths
 from lake.runner import PING_REFUSED_EVENT
 from lake.schema_drift import SCHEMA_DRIFT_EVENT, SCHEMA_DRIFT_TITLE
-from lake.schema_versions import ledger_path
+from lake.schema_versions import check_running_version, ledger_path
 from lake.security_master import SecurityMaster, master_path
 from lake.session import SPOT_CLOSE, TICK
 from lake.tickers import TickersError
@@ -2043,6 +2043,11 @@ def test_a_daemon_started_on_a_version_the_ledger_does_not_know_pages_and_keeps_
     assert page.event == schema_versions.UNRECORDED_EVENT
     assert page.priority == PAGE_PRIORITY
     assert str(journal.SCHEMA_VERSION) in page.body
+    # The title is the first thing read on a locked phone, and ``alert._record`` keeps it on
+    # every failure but a refusal. A constant title would satisfy a test that only asked for
+    # the machine path to be absent from it.
+    assert page.title == check_running_version(rig.lake_root).title
+    assert str(journal.SCHEMA_VERSION) in page.title
     # The loop ticked every minute it was given, which is what "report, never refuse"
     # means. These ticks sit an hour before the open, so the dead-man's idle heartbeat is
     # what shows the loop is alive rather than a cycle.
@@ -2163,6 +2168,35 @@ def test_the_uncapped_detail_reaches_the_log_the_operator_is_sent_to(tmp_path, c
     printed = capsys.readouterr().err
     assert str(ledger_path(rig.lake_root)) in printed
     assert str(journal.SCHEMA_VERSION) in printed
+
+
+class _BrokenTransport:
+    """A ``Transport`` whose POST never lands, standing for ntfy being unreachable."""
+
+    def __init__(self) -> None:
+        self.sent: list[Message] = []
+
+    def send(self, message: Message) -> None:
+        raise urllib.error.URLError("no route to host")
+
+
+def test_a_startup_page_that_never_left_the_laptop_says_so_in_the_log(tmp_path, capsys):
+    """The design's rule that a page which did not reach the phone must never be invisible.
+
+    ``Publisher`` writes it down under ``reports/alerts/`` either way, and that record is what
+    the Now panel counts. The line on stderr is what a person reading the launchd log after a
+    deploy sees, and without it a lost page leaves that log silent about a condition every
+    read of the lake is already refusing over.
+    """
+    rig = replace(_rig(tmp_path), transport=_BrokenTransport())
+    ledger_path(rig.lake_root).unlink()
+    clock = ManualClock(start=et(2026, 9, 2, 8, 29, 30))
+
+    _run(rig, clock, ticks=2, cycle_runner=_no_cycle)
+
+    printed = capsys.readouterr().err
+    assert "schema_version: page not sent" in printed
+    assert "written down" in printed, "a page nobody recorded is a page lost twice"
 
 
 def test_a_page_the_publisher_refuses_does_not_get_its_body_printed_instead(tmp_path, capsys):
