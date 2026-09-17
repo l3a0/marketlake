@@ -34,6 +34,8 @@ from lake.schema_versions import (
     LEDGER_PARTITION,
     LEDGER_SCHEMA,
     LEDGER_SCHEMA_VERSION,
+    PAGE_BODY_BYTE_CAP,
+    PAGE_COLUMN_CAP,
     RECORDED,
     UNREADABLE,
     UNREADABLE_EVENT,
@@ -752,6 +754,48 @@ def _a_directory(path: Path) -> None:
     path.mkdir(parents=True)
 
 
+def _a_null_surface(path: Path) -> None:
+    """A ledger the pinned schema accepts and no run could have written.
+
+    Every field of ``LEDGER_SCHEMA`` is nullable, so this file parses. It is the shape that
+    proves the guard has to cover the decision rather than the read: a null reaches ``sorted``
+    inside ``_page_moved`` as a ``TypeError``, long after ``read`` has returned.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.table(
+            {
+                "journal_schema_version": pa.array([journal.SCHEMA_VERSION], pa.int32()),
+                "surface": pa.array([None], pa.string()),
+                "column_name": ["bid"],
+                "column_type": ["double"],
+                "recorded_at": pa.array([NOW], pa.timestamp("us", tz="UTC")),
+                "schema_version": pa.array([LEDGER_SCHEMA_VERSION], pa.int32()),
+            },
+            schema=LEDGER_SCHEMA,
+        ),
+        path,
+    )
+
+
+def _the_right_names_at_the_wrong_types(path: Path) -> None:
+    """A foreign parquet whose column names match, which no ``KeyError`` can catch."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.table(
+            {
+                "journal_schema_version": pa.array([journal.SCHEMA_VERSION], pa.int32()),
+                "surface": pa.array([7], pa.int64()),
+                "column_name": pa.array([9], pa.int64()),
+                "column_type": ["double"],
+                "recorded_at": pa.array([NOW], pa.timestamp("us", tz="UTC")),
+                "schema_version": pa.array([LEDGER_SCHEMA_VERSION], pa.int32()),
+            }
+        ),
+        path,
+    )
+
+
 @pytest.mark.parametrize(
     "build, state",
     [
@@ -760,8 +804,18 @@ def _a_directory(path: Path) -> None:
         (_other_columns, UNREADABLE),
         (_a_ledger_format_from_the_future, UNREADABLE),
         (_a_directory, UNRECORDED),
+        (_a_null_surface, UNREADABLE),
+        (_the_right_names_at_the_wrong_types, UNREADABLE),
     ],
-    ids=["not parquet", "truncated", "other columns", "future format", "a directory"],
+    ids=[
+        "not parquet",
+        "truncated",
+        "other columns",
+        "future format",
+        "a directory",
+        "a null surface",
+        "the right names at the wrong types",
+    ],
 )
 def test_no_ledger_this_code_cannot_read_takes_the_daemon_down(lake_root, build, state):
     """Every way the read fails becomes a verdict, because the caller is a daemon at startup.
@@ -770,6 +824,12 @@ def test_no_ledger_this_code_cannot_read_takes_the_daemon_down(lake_root, build,
     classes. An absent file raises ``OSError``, a torn one ``LedgerUnreadable``, a format this
     code does not read ``UnsupportedLedgerSchemaVersion``, and some other parquet file at that
     path a bare ``KeyError``. A guard naming the first three lets the fourth take the session.
+
+    The list is not even one long past the read. Every field of ``LEDGER_SCHEMA`` is nullable,
+    so a ledger with a null ``surface`` parses and then reaches ``sorted`` inside
+    ``_page_moved`` as a ``TypeError``. A foreign parquet whose names match and whose types do
+    not reaches ``str.join`` the same way, and no ``KeyError`` sees it. So the guard covers the
+    whole decision rather than the read.
 
     A directory is the odd row. ``pq.read_table`` reads one as a dataset and an empty one
     yields an empty ledger, so the running version is simply absent from it.
@@ -837,29 +897,81 @@ def test_a_lake_root_that_does_not_exist_reads_as_unrecorded(tmp_path):
 # -- what the page and the report line are allowed to carry -------------------
 
 
-def test_the_page_body_stays_under_the_design_body_budget(lake_root):
+def _three_clause_conflict() -> dict[str, dict[str, str]]:
+    """A recorded shape that drops, adds and retypes columns on every pinned surface.
+
+    This is what ``_page_moved`` can actually emit at its widest: three clauses per surface
+    across three surfaces, so nine capped lists in one body. The all-retyped shape below
+    produces one clause per surface and is the narrow case, not the wide one.
+    """
+    shape = {}
+    for surface, columns in running_fingerprints().items():
+        kept = dict(list(columns.items())[:PAGE_COLUMN_CAP])
+        for index in range(PAGE_COLUMN_CAP):
+            kept[f"gone_{surface}_{index:02d}"] = "double"
+        for name in list(kept)[:PAGE_COLUMN_CAP]:
+            kept[name] = "RETYPED"
+        shape[surface] = kept
+    return shape
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        lambda: {
+            surface: {name: "RETYPED" for name in columns}
+            for surface, columns in running_fingerprints().items()
+        },
+        _three_clause_conflict,
+    ],
+    ids=["every column retyped", "dropped, added and retyped on every surface"],
+)
+def test_the_page_body_stays_inside_the_design_body_budget(lake_root, shape):
     """A conflict wide enough to blow the budget still sends a page.
 
     The design pins a page body at plain text under 1,000 bytes. ``_conflict_detail`` renders
-    every column that moved on every surface and is unbounded: 2,777 bytes when every column
-    of every surface is added and 5,677 when every one is retyped. The second is past ntfy's
-    own 4,096-byte limit, which ``NtfyTransport`` answers with a 400 and does not retry, so
-    uncapped the page saying the most would be the page that never arrives.
+    every column that moved on every surface and is unbounded: 2,777 bytes when every column of
+    every surface is added and 5,677 when every one is retyped. The second is past ntfy's own
+    4,096-byte limit, which ``NtfyTransport`` answers with a 400 and does not retry, so uncapped
+    the page saying the most would be the page that never arrives.
+
+    ``PAGE_COLUMN_CAP`` alone does not bound it, which is why both shapes are driven.
+    ``_page_moved`` emits up to three clauses per surface, so nine capped lists can land in one
+    body: measured at 1,547 bytes with every list inside the column cap. The all-retyped shape
+    yields one clause per surface and passes on a body the column cap never had to bound, so a
+    test driving it alone would hold nothing.
     """
-    retyped = {
-        surface: {name: "RETYPED" for name in columns}
-        for surface, columns in running_fingerprints().items()
-    }
-    _record_shape(lake_root, retyped)
+    _record_shape(lake_root, shape())
 
     check = check_running_version(lake_root)
 
     assert check.state == CONFLICTING
-    assert len(check.page_body.encode("utf-8")) < 1000
-    # The count survives the cut, because it is what separates one moved column from a
-    # wholesale retype. The uncapped rendering is still on the verdict for stderr.
-    assert "more" in check.page_body
-    assert len(check.detail.encode("utf-8")) > 1000
+    assert len(check.page_body.encode("utf-8")) <= PAGE_BODY_BYTE_CAP
+    # The version leads the body and survives any cut, because the head is never what gives way.
+    assert str(journal.SCHEMA_VERSION) in check.page_body
+    # The uncapped rendering is still on the verdict, for the log the operator is sent to.
+    assert len(check.detail.encode("utf-8")) > PAGE_BODY_BYTE_CAP
+
+
+def test_the_page_names_the_cap_worth_of_columns_and_counts_the_rest(lake_root):
+    """One surface's clause names exactly ``PAGE_COLUMN_CAP`` columns, then says how many are
+    left.
+
+    The count is what separates one moved column from a wholesale retype, and the number of
+    names is what makes the page worth reading at all. A body bounded only by its byte cap
+    would satisfy the budget while naming whatever happened to fit.
+    """
+    extra = PAGE_COLUMN_CAP + 5
+    shapes = {surface: dict(columns) for surface, columns in running_fingerprints().items()}
+    for index in range(extra):
+        shapes[journal.CHAINS_SURFACE][f"gone_{index:02d}"] = "double"
+    _record_shape(lake_root, shapes)
+
+    body = check_running_version(lake_root).page_body
+
+    assert f"gone_{PAGE_COLUMN_CAP - 1:02d}" in body
+    assert f"gone_{PAGE_COLUMN_CAP:02d}" not in body
+    assert f"and {extra - PAGE_COLUMN_CAP} more" in body
 
 
 def test_neither_the_page_nor_the_report_line_names_an_absolute_path(lake_root):
