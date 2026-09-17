@@ -32,13 +32,13 @@ points at the test the issue names.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pyarrow as pa
 import pytest
 
-from lake import journal, oi
+from lake import actions, journal, oi
 from lake.loader import BarsAbsent, NoOptionClose, PartitionQuarantined
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
 from lake.settle import (
@@ -873,3 +873,49 @@ def test_the_verdict_and_reason_tokens_are_the_spellings_d19_pinned(fixture_lake
     assert REASON_STRIKE_NOT_IN_CENTS == "strike_not_in_cents"
     assert REASON_TERMS_UNREADABLE == "terms_unreadable"
     assert (VERDICT_SETTLED, VERDICT_ABSENT) == (oi.VERDICT_SETTLED, oi.VERDICT_ABSENT)
+
+
+def test_a_quarter_cent_strike_is_refused_like_a_half_cent_one(fixture_lake):
+    """A strike a quarter of a cent off is not a whole number of cents either.
+
+    The half-cent strike in test 10 sits 0.5 away from the integer, which any tolerance short of
+    a half cent refuses, so it says nothing about where the tolerance actually is. This one sits
+    0.25 away. Together they bound `_CENT_EPSILON` from both sides: it has to be small enough to
+    refuse a quarter cent and large enough to admit the scaling error of an ordinary penny,
+    which the test above supplies at 1.4e-14.
+    """
+    root = _lake(fixture_lake, [_contract(750.0), _contract(750.0025)])
+    rows = _rows(_view(root))
+    assert rows[0]["verdict"] == VERDICT_SETTLED
+    _withheld(rows[1], REASON_STRIKE_NOT_IN_CENTS)
+
+
+def test_the_close_is_as_traded_even_when_a_split_would_move_it(fixture_lake):
+    """Settlement reads the bars as-traded, with a split in the ledger that would rescale them.
+
+    The design's one scale rule puts a same-date comparison in as-traded space against as-traded
+    strikes, and settlement is a same-date comparison. Without a split in the fixture the bars
+    read can ask for any view and come back with the same numbers, so the rule is stated and held
+    by nothing.
+
+    The ledger is appended after the lake is built, because `FixtureLake.build` rewrites the
+    manifest whole from its own list and an append that ran first would leave the ledger on disk
+    with no manifest entry.
+    """
+    root = _lake(fixture_lake, [_contract(650.0)])
+    actions.append(
+        root,
+        instrument_id=INSTRUMENT,
+        observed_on=date.fromisoformat(NEXT_SESSION),
+        recorded_at=RECORDED_AT,
+        ex_date=NEXT_SESSION,
+        type=actions.TYPE_SPLIT,
+        split_ratio=2.0,
+        provenance=actions.PROVENANCE_OBSERVED,
+    )
+
+    row = _only(_view(root))
+    # The ex-date is after the session, so the split view would halve this bar. It settles at the
+    # as-traded close instead, and the contract is 107.39 in the money rather than 28.695.
+    assert row["settlement_close"] == CLOSE
+    assert row["intrinsic_cents"] == 10739
