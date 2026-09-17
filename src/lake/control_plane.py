@@ -2812,9 +2812,11 @@ def restart_script(host: LaunchdHost) -> str:
     nothing about one already running. Every other job runs on a calendar and execs fresh
     on every fire, so it always runs current code and never needs this.
 
-    This docstring names no calendar job, and ``restart.sh`` names and counts neither
-    side by hand. Both come from ``keep_alive``, so a third resident job is covered by
-    adding the job and nothing else, and so is a fifth calendar one.
+    This docstring names no calendar job, and nothing in ``restart.sh`` names or counts
+    either side by hand. The residents come from ``keep_alive`` and so does the count of
+    the rest, so a third resident job is covered by adding the job and nothing else, and
+    so is a fifth calendar one. The one sentence that still said "both residents" is now
+    "every resident", because a sentence with no count in it cannot fall behind one.
 
     What makes the indirection worth it is how the last job arrived. Before the 18:30
     sweep there were five jobs, two resident and three exec fresh, and three sentences
@@ -2848,7 +2850,7 @@ def restart_script(host: LaunchdHost) -> str:
     leaves the service down rather than merely unrestarted. ``kickstart`` cannot reach that
     state, because launchd holds the definition throughout.
 
-    **Defaulting to both residents is considered and rejected** too. Restarting the
+    **Defaulting to every resident is considered and rejected** too. Restarting the
     dashboard costs its open connections. Restarting the daemon costs the in-flight cycle
     and its ``caffeinate`` assertion until it is back. A bare invocation must not be the
     command that takes capture down, so the daemon has to be named.
@@ -2897,7 +2899,7 @@ def restart_script(host: LaunchdHost) -> str:
         "#",
         f"#     ./{UNINSTALL_SCRIPT_FILE} && ./{INSTALL_SCRIPT_FILE}",
         "#",
-        "# That reinstall does restart both residents on the way through, so it is not that",
+        "# That reinstall does restart every resident on the way through, so it is not that",
         "# this case had no tool. It is that the only tool was one that takes the whole",
         "# control plane off and puts it back to achieve a process restart.",
         "#",

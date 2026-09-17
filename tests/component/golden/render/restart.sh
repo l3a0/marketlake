@@ -26,7 +26,7 @@
 #
 #     ./uninstall.sh && ./install.sh
 #
-# That reinstall does restart both residents on the way through, so it is not that
+# That reinstall does restart every resident on the way through, so it is not that
 # this case had no tool. It is that the only tool was one that takes the whole
 # control plane off and puts it back to achieve a process restart.
 #
