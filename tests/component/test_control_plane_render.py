@@ -2047,6 +2047,30 @@ def test_both_staleness_sentences_count_the_calendar_jobs_from_the_roster(tmp_pa
     assert f"The other {word} jobs exec fresh every fire" in install_text, install_text
 
 
+def test_both_staleness_sentences_follow_a_seventh_job_onto_the_machine(
+    tmp_path, capsys, monkeypatch
+):
+    """A number that is right today is what the last job addition left behind.
+
+    Matching the sentence against the roster's current length cannot tell a derived
+    count from a typed one, because a typed "four" is right until the seventh job lands.
+    So the roster grows a calendar job here and the sentences have to follow it. This is
+    the assertion a literal survives nothing of.
+    """
+    roster = cp.all_jobs(_host())
+    grown = roster + (
+        _host().job("com.marketlake.seventh", "lake.nothing", calendar={"Hour": 3, "Minute": 0}),
+    )
+    monkeypatch.setattr(cp, "all_jobs", lambda host: grown)
+    transient = [job for job in grown if not job.keep_alive]
+    word = cp._spelled(len(transient))
+    assert word == "five", (word, transient)
+    restart = cp.restart_script(_host())
+    install_text = cp.install_commands(tmp_path / "out", _host())
+    assert f"The other {word} jobs exec fresh on every" in restart, restart
+    assert f"The other {word} jobs exec fresh every fire" in install_text, install_text
+
+
 def test_the_restart_docstring_names_no_calendar_job(tmp_path):
     """Prose cannot read the roster, so it is allowed to name neither side of it.
 
