@@ -2653,9 +2653,7 @@ def test_a_check_that_cleared_drops_out_of_the_row_while_the_other_holds(
         ("quarantined", "realtime_entitlement"),
         ("clean", "realtime_entitlement"),
     ):
-        fixture_lake.with_quarantine(
-            {"partition": partition, "verdict": verdict, "check": check}
-        )
+        fixture_lake.with_quarantine({"partition": partition, "verdict": verdict, "check": check})
 
     payload = service_over(fixture_lake.build()).run_query("history", {})
 
