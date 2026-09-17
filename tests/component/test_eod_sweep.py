@@ -32,7 +32,8 @@ from lake.bars import CHECK_BAR_CLOSE
 from lake.calendar import NotASession
 from lake.cassette import Cassette
 from lake.control_plane import EOD_SWEEP_SLUG, SUNDAY_WAKE, pmset_schedule_args
-from lake.paths import CHAINS, QUOTES
+from lake.manifest import append_quarantine
+from lake.paths import CHAINS, QUOTES, LakePaths
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
 from lake.schwab import VendorAuthError
 from lake.security_master import KIND_EQUITY, SecurityMaster, master_path
@@ -872,6 +873,39 @@ def test_the_file_carries_the_counts_and_the_detail_the_digest_dropped(
         "unfiled",
     ]
     assert filed["disagreements"] == outcome.nightly.disagreements
+
+
+def test_a_quarantined_quotes_partition_does_not_take_the_whole_sweep(
+    fixture_lake: FixtureLake,
+):
+    """Marketlake #352, at the scale that made it worth fixing before #406 ships.
+
+    The corporate-actions poll is step 1 of this job. Before the dividend walk contained the
+    loader's refusals, ``PartitionQuarantined`` left ``extract_dividends`` and
+    ``_LEDGER_REFUSALS`` did not cover it, so the night after the validation battery wrote its
+    first verdict the poll raised before the bar fetch, before the ping and before the report
+    file. Executed against this fixture on the code before the fix, the run died with
+    ``reports/`` empty.
+
+    ``_LEDGER_REFUSALS`` is deliberately left alone. A refusal caught here ends the walk, and
+    the walk is ordered by ticker, so containing it at this level would cost every ticker
+    after the quarantined one its dividends, which is the same defect one level up.
+    """
+    root = _lake(fixture_lake)
+    partition = (
+        LakePaths(root).partition_path(QUOTES, "SPY", FOLLOWING).relative_to(root).as_posix()
+    )
+    append_quarantine(root, {"partition": partition, "verdict": "suspect", "check": "delayed_feed"})
+
+    outcome, pinger, _ = _run(root)
+
+    dividends = dict(outcome.nightly.pieces)["dividends"]
+    assert dividends.finished, "the quarantined partition was reported as a refused walk"
+    assert dividends.skipped == 1, "the skip reached the nightly file as a count"
+    assert outcome.nightly.quarantined == 1
+    assert pinger.urls, "the ping was lost with the raise"
+    assert outcome.filed_at is not None, "the report file was lost with the raise"
+    assert "dividends: landed 0, held 0, unchanged 0, skipped 1" in outcome.digest.body
 
 
 def test_a_report_file_that_could_not_be_written_does_not_withhold_the_ping(

@@ -25,6 +25,7 @@ drive is a fixture rather than something captured.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -39,10 +40,15 @@ from lake.actions import (
     DIVIDEND_CONSISTENCY_TOLERANCE,
     PROVENANCE_OBSERVED,
     PROVENANCE_VENDOR_REPORTED,
+    REASON_NO_SPOT_CLOSE,
+    REASON_PARTIAL_READ,
+    REASON_PARTITION_ABSENT,
+    REASON_QUARANTINED,
     TYPE_DIVIDEND,
     check_dividend_consistency,
     extract_dividends,
 )
+from lake.paths import QUOTES, LakePaths
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
 from lake.security_master import ID_TYPE_TICKER, KIND_EQUITY, SecurityMaster, master_path
 from tests.support.clock import ManualClock
@@ -53,6 +59,8 @@ from tests.support.lake import FixtureLake
 # second night is a day later, which is what test 3 needs to mean two runs.
 DAY_ONE = date(2026, 9, 14)
 DAY_TWO = date(2026, 9, 15)
+# A third session, for the walk that has to step over the middle one.
+DAY_THREE = date(2026, 9, 16)
 FIRST_NIGHT = datetime(2026, 9, 15, 0, 0, tzinfo=UTC)  # 20:00 ET on 2026-09-14
 # 20:01 ET on 2026-09-15, a minute later in the day rather than the same minute. A withheld
 # file is named by its ET time of day and filed under the ticker-day its rows belong to, so
@@ -187,17 +195,32 @@ def _lake(
     *,
     master: SecurityMaster | None = None,
     chains: tuple[str, date] | None = None,
+    quarantined: tuple[str, date] | None = None,
+    ledger: bool = True,
 ) -> Path:
     """A lake holding one quotes partition per session, plus the ledger and the master.
 
     ``chains`` seals a chains partition beside them, for the test that asks which surface the
-    walk enumerates.
+    walk enumerates. ``quarantined`` writes the verdict ledger's entry for one quotes
+    ticker-day, which is what the validation battery will append. ``ledger=False`` leaves out
+    the schema-version ledger, which is what makes the overflow projection refuse every read.
     """
     for (ticker, day), rows in sessions.items():
         fixture_lake.with_quotes(ticker, day, _table(rows))
     if chains is not None:
         fixture_lake.with_partition("chains", chains[0], chains[1], _table([_row(chains[1])]))
-    fixture_lake.with_reference("schema_versions", _ledger_table())
+    if ledger:
+        fixture_lake.with_reference("schema_versions", _ledger_table())
+    if quarantined is not None:
+        partition = (
+            LakePaths(fixture_lake.root)
+            .partition_path(QUOTES, quarantined[0], quarantined[1])
+            .relative_to(fixture_lake.root)
+            .as_posix()
+        )
+        fixture_lake.with_quarantine(
+            {"partition": partition, "verdict": "suspect", "check": "delayed_feed"}
+        )
     root = fixture_lake.build()
     (master if master is not None else _master()).write(master_path(root))
     return root
@@ -207,10 +230,22 @@ def _entries(root: Path) -> list[dict]:
     return actions.read(root)
 
 
+def _clear_quarantine(root: Path, ticker: str, day: date) -> None:
+    """Append the sign-off row that clears one partition's verdict.
+
+    Resolution reads the last entry on a partition in file order, so a clearing row supersedes
+    the withholding one rather than replacing it.
+    """
+    partition = LakePaths(root).partition_path(QUOTES, ticker, day).relative_to(root).as_posix()
+    line = json.dumps(
+        {"partition": partition, "verdict": "clean", "check": "delayed_feed"}, sort_keys=True
+    )
+    path = root / "quarantine.jsonl"
+    path.write_text(path.read_text() + line + "\n")
+
+
 def _findings(root: Path, day: date) -> list[dict]:
     """Every withheld finding filed for one ticker-day, read back off the files."""
-    import json
-
     directory = report.withheld_dir(root, day)
     if not directory.is_dir():
         return []
@@ -340,6 +375,9 @@ def test_a_ticker_day_with_no_equity_close_emits_nothing(fixture_lake: FixtureLa
         "a gap day is no observation, so the day after it is still the first one"
     )
     assert result.ticker_days == 2 and result.held == ()
+    assert [(skip.ticker, skip.day, skip.reason) for skip in result.skipped] == [
+        ("SPY", DAY_ONE, REASON_NO_SPOT_CLOSE)
+    ], "the gap day was skipped in silence"
 
 
 def test_a_data_row_with_null_dividend_fields_emits_nothing(fixture_lake: FixtureLake):
@@ -716,9 +754,10 @@ def test_the_ticker_days_come_from_the_manifest_and_name_the_quotes_surface(
 ):
     """A chains partition is not a session this walk reads, and is not counted as one.
 
-    The manifest is the lake's own record of what it holds, which is what keeps every
-    enumerated partition one that exists, so ``NoSpotClose`` is the only absence the walk can
-    meet.
+    The manifest is the lake's own record of what it holds, which is what keeps the walk from
+    asking for a session the lake never captured. It bounds what a refusal can be and does not
+    remove refusals, which marketlake #352 corrected: the manifest records what was sealed
+    rather than what is still on disk, and four of the loader's refusals reach this walk.
     """
     root = _lake(
         fixture_lake,
@@ -995,6 +1034,177 @@ def test_a_ticker_handed_to_a_second_instrument_lands_that_instrument_its_own_en
     assert len(result.appended) == 2
     # Neither instrument watched the value change, so neither entry claims it did.
     assert {entry["provenance"] for entry in _entries(root)} == {PROVENANCE_VENDOR_REPORTED}
+
+
+# -- the three refusals beyond the gap day --------------------------------------------
+
+
+def test_a_quarantined_partition_costs_that_ticker_day_and_not_the_run(
+    fixture_lake: FixtureLake,
+):
+    """Marketlake #352.
+
+    Before this was contained, ``load_quotes`` raised ``PartitionQuarantined`` out of
+    ``_observation`` and the run ended where it met it. QQQ sorts before SPY in ``by_ticker``,
+    so SPY's dividend never landed and nothing was written down, which reads exactly like a
+    night with no dividends in it.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("QQQ", DAY_ONE): [_row(DAY_ONE, ticker="QQQ")],
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+        },
+        master=_master(tickers=("SPY", "QQQ")),
+        quarantined=("QQQ", DAY_ONE),
+    )
+
+    result = extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    (entry,) = _entries(root)
+    assert entry["instrument_id"] == 1, "SPY was lost to QQQ's quarantined partition"
+    assert [(skip.ticker, skip.day, skip.reason) for skip in result.skipped] == [
+        ("QQQ", DAY_ONE, REASON_QUARANTINED)
+    ]
+    assert result.held == (), "a withheld verdict is not a finding this walk files"
+
+
+def test_a_manifested_partition_whose_file_is_gone_costs_that_ticker_day(
+    fixture_lake: FixtureLake,
+):
+    """The manifest records what the lake sealed, not what is still on disk.
+
+    ``splits.read_session`` gives exactly that as its reason for catching ``PartitionAbsent``,
+    and this walk's docstring used to argue the opposite.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("QQQ", DAY_ONE): [_row(DAY_ONE, ticker="QQQ")],
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+        },
+        master=_master(tickers=("SPY", "QQQ")),
+    )
+    LakePaths(root).partition_path(QUOTES, "QQQ", DAY_ONE).unlink()
+
+    result = extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    (entry,) = _entries(root)
+    assert entry["instrument_id"] == 1, "SPY was lost to QQQ's missing file"
+    assert [skip.reason for skip in result.skipped] == [REASON_PARTITION_ABSENT]
+
+
+def test_a_partition_the_projection_cannot_present_whole_costs_that_ticker_day(
+    fixture_lake: FixtureLake,
+):
+    """An absent schema-version ledger makes the overflow projection refuse every read.
+
+    Reading on would compare against contents nobody saw in full, so ``PartialRead`` refuses
+    the bypass. Every ticker-day is refused here, which is what makes the count the only thing
+    separating this run from one that read nothing at all.
+    """
+    root = _lake(fixture_lake, {("SPY", DAY_ONE): [_row(DAY_ONE)]}, ledger=False)
+
+    result = extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert _entries(root) == []
+    assert [skip.reason for skip in result.skipped] == [REASON_PARTIAL_READ]
+    assert result.ticker_days == 1, "the ticker-day was enumerated and then refused"
+
+
+def test_a_quarantined_partition_reaches_the_operator_as_a_counted_line(
+    fixture_lake: FixtureLake, tmp_path: Path, capsys
+):
+    """A caught refusal nothing counts is one silence traded for another.
+
+    ``actions.main`` has no catch for a ``LoadError``, so before this the command died on a
+    traceback before ``render`` ran, which cost the operator the block for every ticker that
+    did land. The reason is on the line because the count alone cannot tell a gap day from a
+    partition the battery withheld.
+    """
+    root = _lake(
+        fixture_lake,
+        {("SPY", DAY_ONE): [_row(DAY_ONE)]},
+        quarantined=("SPY", DAY_ONE),
+    )
+    config = write_config(tmp_path, root)
+
+    code = actions.main(["--config", str(config)], clock=ManualClock(FIRST_NIGHT))
+
+    assert code == 0
+    printed = capsys.readouterr()
+    assert "Traceback" not in printed.err
+    assert "skipped:   1" in printed.out
+    assert f"- {REASON_QUARANTINED}: 1" in printed.out
+
+
+def test_a_verdict_that_clears_lands_the_entry_the_skip_delayed(fixture_lake: FixtureLake):
+    """The skip is repairable, which is what settles it against holding a finding.
+
+    ``ex_date`` is read off the row rather than derived from a boundary, so what a skip moves
+    is ``observed_on``, which is no part of the ledger's key. The run after the verdict clears
+    appends the corrected entry once, and it supersedes rather than landing beside the first.
+    """
+    root = _lake(
+        fixture_lake,
+        {("SPY", DAY_ONE): [_row(DAY_ONE)], ("SPY", DAY_TWO): [_row(DAY_TWO)]},
+        quarantined=("SPY", DAY_ONE),
+    )
+
+    extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    (delayed,) = _entries(root)
+    assert delayed["observed_on"] == DAY_TWO.isoformat()
+
+    # The sign-off tool clears the verdict, the way marketlake #139 will.
+    _clear_quarantine(root, "SPY", DAY_ONE)
+
+    second = extract_dividends(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+
+    assert second.skipped == ()
+    corrected = _entries(root)
+    assert len(corrected) == 2, "the corrected entry did not land"
+    assert corrected[-1]["observed_on"] == DAY_ONE.isoformat()
+    assert corrected[-1]["ex_date"] == corrected[0]["ex_date"], (
+        "a second key would leave both entries resolving separately"
+    )
+
+    # A third run learns nothing new, so the correction lands once rather than every night.
+    third = extract_dividends(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+    assert len(_entries(root)) == 2 and third.unchanged == 1
+
+
+def test_a_skipped_session_can_lose_a_transition_rather_than_delay_it(
+    fixture_lake: FixtureLake,
+):
+    """The cost the count exists to make visible.
+
+    A value that moves and moves back across the skipped session leaves ``previous`` matching
+    the session after it, so the middle value is never recorded at all. This is the shape a
+    gap day has always had, and it is why a run that skipped something must not read like a
+    quiet night.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_TWO): [
+                _row(
+                    DAY_TWO,
+                    ex_date=NEXT_EX_DATE,
+                    pay_amount=NEXT_PAY_AMOUNT,
+                    amount=NEXT_ANNUALIZED,
+                )
+            ],
+            ("SPY", DAY_THREE): [_row(DAY_THREE)],
+        },
+        quarantined=("SPY", DAY_TWO),
+    )
+
+    result = extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    landed = [entry["ex_date"] for entry in _entries(root)]
+    assert landed == ["2026-06-18"], "only the value either side of the skip landed"
+    assert [skip.reason for skip in result.skipped] == [REASON_QUARANTINED]
 
 
 # -- 8 and 9. the entry point -------------------------------------------------------------

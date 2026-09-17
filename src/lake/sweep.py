@@ -235,13 +235,20 @@ def _subjects(held: Sequence) -> tuple[str, ...]:
 
 
 def _ledger_outcome(report: ExtractionReport | SplitReport) -> PieceOutcome:
-    """One corporate-actions walk's result, reduced to the plain values the file carries."""
+    """One corporate-actions walk's result, reduced to the plain values the file carries.
+
+    ``skipped`` is read as a field on both reports. It used to be read through a ``getattr``
+    default, because only ``SplitReport`` carried it and ``ExtractionReport`` did not, which
+    meant the dividends piece reported zero skips on every night by construction. Marketlake
+    #352 gave the dividend walk the same record, so the default has nothing left to cover and
+    a defensive one that cannot fire is a line the next reader has to reason about.
+    """
     return PieceOutcome(
         landed=len(report.appended),
         held=len(report.held),
         unfiled=len(report.unfiled),
         unchanged=report.unchanged,
-        skipped=len(getattr(report, "skipped", ())),
+        skipped=len(report.skipped),
         subjects=_subjects(report.held),
     )
 
