@@ -2862,15 +2862,23 @@ def test_the_quarantine_names_the_snapshot_furthest_from_the_median(lake: Path):
 
 
 def test_a_pass_reports_the_judged_sessions_own_median(lake: Path):
-    """The clean branch's ``computed`` is the comparison that passed, not the extreme of it."""
+    """The clean branch's ``computed`` is the comparison that passed, not the extreme of it.
+
+    The three snapshots differ on purpose. Written at one size the median, the maximum and the
+    minimum are the same number, and the assertion passes under any of them, which is how the
+    first version of this test let a mutation to the maximum through.
+    """
     _history(lake)
-    _write(lake, "chains", "SPY", DAY, _snapshots(DAY, count=3, rows_each=75))
+    rows = _snapshots(DAY, count=1, rows_each=80)
+    rows += _snapshots(DAY, count=1, rows_each=75, first=1)
+    rows += _snapshots(DAY, count=1, rows_each=100, first=2)
+    _write(lake, "chains", "SPY", DAY, rows)
     _seed_spans(lake)
 
     finding = _answer(judge(lake, calendar=CALENDAR, now=NOW), CHECK_ROW_COUNT_BAND, JUDGED)
 
     assert finding.verdict == CLEAN_VERDICT
-    assert finding.computed == 75.0
+    assert finding.computed == 80.0, "the median of 75, 80 and 100, not the 100 or the 75"
     assert finding.against == 100.0
 
 
