@@ -931,6 +931,7 @@ def test_the_file_carries_the_counts_and_the_detail_the_digest_dropped(
     [
         ("security_master.parquet", ("dividends", "splits", "bars")),
         ("capture_spans.parquet", ("bars",)),
+        ("schema_versions.parquet", ("dividends", "bars")),
     ],
 )
 def test_an_unreadable_reference_file_refuses_its_walks_and_keeps_the_evening(
