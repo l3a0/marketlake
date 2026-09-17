@@ -16,12 +16,14 @@ Two properties of the fixtures are worth naming before the tests.
    asked for. The cassette key carries the window, so a drifted fetch would miss every
    recording, and asserting the recorded call says which window rather than only that one
    was found.
-2. **The daily stamps are the fixture's own convention, not a recorded one.** No live
-   ``freq=1d`` recording exists yet, so these stamp a daily candle at Eastern midnight of
-   its session. That is a fixture choice, and the code reads the session off the stamp
-   rather than off the window precisely so the choice can be corrected by a recording
-   without moving the rule. Test 24 is written around selection-by-stamp, which is what
-   survives whichever instant Schwab turns out to use.
+2. **The daily stamps are one of the two instants a recording showed.** Marketlake #362
+   recorded ``freq=1d`` live and found the stamp falls on the session's Eastern date, at or
+   shortly after midnight, rather than at midnight exactly. The two candles it caught were
+   23 hours apart, one at 00:00 Eastern and one at 01:00. These fixtures use the midnight
+   spelling, which is the first of the two, and
+   ``test_the_recorded_daily_stamps_each_name_their_own_eastern_session`` holds the other
+   against the recording itself. What the code reads off a stamp is the session, which is
+   what survives the hour of wander between them.
 """
 
 from __future__ import annotations
@@ -46,8 +48,8 @@ from lake.bars import (
     bar_window,
     fetch_session_bars,
 )
-from lake.calendar import NotASession
-from lake.cassette import Cassette
+from lake.calendar import MARKET_TZ, NotASession
+from lake.cassette import Cassette, load_cassette
 from lake.manifest import manifest_path, read_manifest
 from lake.paths import LakePaths, temp_write_path
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
@@ -55,6 +57,7 @@ from lake.schwab import VendorAuthError
 from lake.security_master import KIND_EQUITY, SecurityMaster, master_path
 from lake.tickers import Roster
 from lake.vendor import DAILY_FREQ, MINUTE_FREQ, VendorError, bars_params
+from tests.conftest import CASSETTES
 from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import write_config
@@ -194,9 +197,12 @@ def _minute_candles(
 def _daily_candle(session: date = SESSION, *, close: float = SETTLED_CLOSE) -> dict:
     """One daily candle, stamped at Eastern midnight of its session.
 
-    The stamp is the fixture's convention, since no live daily recording exists yet. What the
-    code reads off it is the session, so a recording that shows a different instant moves this
-    line and nothing in ``lake.bars``.
+    Marketlake #362's recording caught two daily stamps, at 00:00 and at 01:00 Eastern of
+    their sessions, so midnight is one of the two observed spellings rather than a fixed
+    convention. What the code reads off the stamp is the session, and that reading gives the
+    right answer at either hour, which is why an exact instant here is a fixture choice and
+    not a rule. The recording itself is replayed by
+    ``test_the_recorded_daily_stamps_each_name_their_own_eastern_session``.
     """
     when = datetime.fromisoformat(f"{session.isoformat()}T00:00:00-04:00")
     return bars_candle(when, open_=645.0, high=651.0, low=644.0, close=close, volume=70_000_000)
@@ -1499,10 +1505,11 @@ def test_a_daily_response_lands_the_candle_whose_stamp_maps_to_the_session(
     neighbours is expected, and taking ``candles[0]`` would land the wrong session's bar under
     this session's date with nothing to say so.
 
-    The stamps here are the fixture's convention, since no live daily recording exists yet.
-    What the code reads off them is the session, which is the rule ``journal.py`` pins on the
-    bars schema: a bar's session is decided by ``bar_ts``, never by when the sweep fetched it.
-    A recording showing a different instant moves this fixture and nothing in ``lake.bars``.
+    The stamps here are one of the two instants #362's recording caught. What the code reads
+    off them is the session, which is the rule ``journal.py`` pins on the bars schema: a bar's
+    session is decided by ``bar_ts``, never by when the sweep fetched it. That reading is what
+    holds across the hour the stamp wanders, so selection-by-stamp is the property and the
+    exact instant is not.
     """
     root = _lake(fixture_lake)
     # The neighbour comes first in the list, so an implementation taking ``candles[0]`` lands
@@ -1526,10 +1533,10 @@ def test_a_stamp_names_its_eastern_session_rather_than_its_utc_date(fixture_lake
     """The session a stamp names is its Eastern date, and the two differ in the evening.
 
     A bar stamped at 22:00 Eastern on the session is 02:00 UTC the next day, so a reading that
-    took the UTC date would file it under the wrong session. The convention question the live
-    recording settles is which instant Schwab stamps a daily candle at, and this is the rule
-    that reads it either way: the zone comes from ``lake.calendar``, so nothing here names a
-    session time of its own.
+    took the UTC date would file it under the wrong session. #362's recording settled that
+    Schwab stamps a daily candle on the session's own Eastern date, at or shortly after
+    midnight, and this is the rule that reads it whichever hour it lands on: the zone comes
+    from ``lake.calendar``, so nothing here names a session time of its own.
 
     The sweep is driven with the same stamp, so the rule is pinned where it is used rather
     than only on the helper.
@@ -1566,6 +1573,68 @@ def test_a_candle_with_no_stamp_at_all_lands_no_row_either(fixture_lake: Fixture
     assert landed.rows == 1
     table = pa.parquet.read_table(_partition(root, "SPY", DAILY_FREQ))
     assert table.column("bar_ts").null_count == 0
+
+
+# -- the recorded convention ------------------------------------------------------------
+
+
+def test_the_recorded_daily_stamps_each_name_their_own_eastern_session():
+    """Marketlake #362: the daily convention, held against a recording rather than a guess.
+
+    Every other daily fixture in this module stamps an exact Eastern midnight, which was a
+    fixture choice made before any ``freq=1d`` response had been seen. This one replays the
+    recording that settled it, so the convention the suite rests on is an observed fact.
+
+    ``tests/cassettes/spy_daily.json`` is sanitized rather than raw, which is the rule
+    ``lake.record`` states twice: a recording from a real account is not committed, and a
+    committed cassette is synthetic or sanitized. The two ``datetime`` stamps are the observed
+    fact and are kept exactly. The prices around them are synthesized, the headers are trimmed
+    to the one the other three cassettes keep, and ``token_mint_time`` is theirs.
+
+    Two properties are asserted, and the second is why the first is worth a test.
+
+    1. Each stamp's Eastern date names its own session, so ``session_of`` is right on real
+       stamps and not only on the fixture's.
+    2. The two stamps are 23 hours apart, not 24, and only one of them is midnight. A daily
+       stamp's time of day is not fixed, so a comparison tightened from dates to instants
+       would break on the 01:00 candle. Marketlake #380 owns that gap.
+
+    **This test cannot catch a reading that took the UTC date, and no daily recording could.**
+    A stamp at 00:00 or 01:00 Eastern is 04:00 or 05:00 the same day in UTC, so both readings
+    give the same answer on every candle here. Mutating ``session_of`` to read the UTC date
+    leaves this test passing. What catches that is
+    ``test_a_stamp_names_its_eastern_session_rather_than_its_utc_date``, which drives a 22:00
+    Eastern stamp because the two dates only diverge in the evening. The two tests hold
+    different halves and neither replaces the other.
+    """
+    vendor = CassetteVendor(load_cassette(CASSETTES / "spy_daily.json"))
+    start = datetime.fromisoformat("2026-09-15T04:00:00+00:00")
+    end = datetime.fromisoformat("2026-09-17T04:00:00+00:00")
+
+    response = vendor.get_daily_bars("SPY", start=start, end=end)
+    rows = journal.bars_rows(
+        response.body,
+        ticker="SPY",
+        freq=DAILY_FREQ,
+        instrument_id=None,
+        fetch_ts=RECORDED_AT,
+        fetch_end_ts=None,
+        window_start=start,
+        window_end=end,
+        extended_hours=None,
+    )
+
+    sessions = [bars.session_of(str(row["bar_ts"])) for row in rows]
+    assert sessions == [date(2026, 9, 15), date(2026, 9, 16)], (
+        "a recorded daily stamp did not name its own Eastern session"
+    )
+
+    stamps = [datetime.fromisoformat(str(row["bar_ts"])) for row in rows]
+    assert stamps[1] - stamps[0] == timedelta(hours=23), "the recorded stamps were 24 apart"
+    eastern = [stamp.astimezone(MARKET_TZ) for stamp in stamps]
+    assert [(when.hour, when.minute) for when in eastern] == [(1, 0), (0, 0)], (
+        "the recorded stamps were not the observed 01:00 and 00:00 Eastern"
+    )
 
 
 def test_the_close_is_read_off_the_next_session_rather_than_the_session_itself(
