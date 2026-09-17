@@ -2,7 +2,8 @@
 
 One check exists, so no run can produce two findings about one partition and ``judge`` cannot
 be driven into the cases marketlake #426 is about. ``decide_partition`` is where they are
-decided, and this is where they are held. The disk-backed half lives in the component tier.
+decided, and these tests are what cover them. The disk-backed half lives in the component
+tier.
 
 The ledger resolves last entry wins within each check, so these build the state the way
 ``manifest.latest_quarantine_by_check`` hands it over: one entry per check, already resolved.

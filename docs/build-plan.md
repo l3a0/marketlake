@@ -497,7 +497,7 @@ Slice 5 adds the validation battery, the rest of the dashboard, and the quaranti
 
 - **D20** validation battery plus the History and Lake panels. Scope in [#138](https://github.com/l3a0/marketlake/issues/138), which split into six sub-issues rather than shipping as one.
   - **D20a** the battery's spine, the quarantine writer, and the real-time entitlement check. [#406](https://github.com/l3a0/marketlake/issues/406).
-  - **D20b** trading-calendar coverage, quote sanity, and the snapshot row-count band. [#407](https://github.com/l3a0/marketlake/issues/407). Gated on [#426](https://github.com/l3a0/marketlake/issues/426), which is what makes the quarantine ledger hold a verdict per check. Landing a second check on the spine before it means one check's pass releases a partition another check withholds, and nothing downstream says so.
+  - **D20b** trading-calendar coverage, quote sanity, and the snapshot row-count band. [#407](https://github.com/l3a0/marketlake/issues/407).
   - **D20c** the strike-vs-spot scale guard. [#408](https://github.com/l3a0/marketlake/issues/408).
   - **D20d** quote-quality drift against a trailing band. [#409](https://github.com/l3a0/marketlake/issues/409).
   - **D20e** the dashboard's History panel. [#410](https://github.com/l3a0/marketlake/issues/410).

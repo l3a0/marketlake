@@ -1702,12 +1702,19 @@ def _open_quarantines(root: Path) -> tuple[list[dict[str, object]], str | None]:
     prints no sign-off command, because the tool that would run it does not exist and its
     spelling is not settled.
 
-    **Every withholding check is named.** Each check keeps its own current verdict, so a
-    partition can be withheld by more than one at a time and signing one off leaves the rest
-    standing. A row saying only "quarantined" cannot tell an operator that. It is also how a
-    stranded token shows: a check that quarantined and then stopped judging, because it was
-    renamed or it now answers ``insufficient_history`` forever, holds its partition until a
-    human signs that token off, and the token is the only thing that says so.
+    **Every withholding check is named, each with its own verdict.** Each check keeps its own
+    current verdict, so a partition can be withheld by more than one at a time and signing one
+    off leaves the rest standing. A row saying only "quarantined" cannot tell an operator that.
+    The verdicts are carried per check rather than once for the row, because two checks
+    withhold under two different spellings and one of them printed beside both check names
+    says the wrong thing about the other.
+
+    It is also how a stranded token shows: a check that quarantined and then stopped judging,
+    because it was renamed or it now answers ``insufficient_history`` forever, holds its
+    partition until a human signs that token off, and the token is the only thing that says so.
+
+    The row's own ``verdict`` stays, and it is the deciding entry's, which is what
+    ``manifest.latest_quarantine`` would return.
     """
     try:
         ledger = latest_quarantine_by_check(root)
@@ -1727,7 +1734,10 @@ def _open_quarantines(root: Path) -> tuple[list[dict[str, object]], str | None]:
                 # ``battery.build_entry`` assembles carries one, so a missing check means a
                 # hand-written or damaged line, and the page shows it the way it shows a
                 # missing verdict rather than printing the word "None".
-                "checks": [entry.get("check") for entry in held],
+                "checks": [
+                    {"check": entry.get("check"), "verdict": entry.get(VERDICT_FIELD)}
+                    for entry in held
+                ],
             }
         )
     return open_entries, None

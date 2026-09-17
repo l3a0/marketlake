@@ -395,13 +395,22 @@ class PartitionQuarantined(LoadError):
     **Every withholding check is named, not just one.** Several checks judge one partition and
     each keeps its own current verdict, so signing one off can leave the partition withheld by
     another. A refusal naming one entry would send an operator to a sign-off that changes
-    nothing they can see. ``entries`` is all of them, longest-standing first, and ``entry`` is
-    the first of those, which is the attribute callers in ``actions``, ``oi`` and ``splits``
-    already read.
+    nothing they can see.
+
+    ``entries`` holds them in the order ``manifest.withholding`` gives, which is where each
+    check's current entry sits in the file. ``entry`` stays as the first of those. No module
+    reads it: ``actions``, ``oi`` and ``splits`` all catch this exception without touching its
+    attributes, and the readers are assertions in ``test_load_chain`` and ``test_battery``. It
+    is kept because a single-entry refusal is the ordinary case and a caller reaching for one
+    entry should not have to index a tuple.
     """
 
     def __init__(self, partition: str, entries: Sequence[dict]) -> None:
         held = tuple(entries)
+        if not held:
+            raise ValueError(
+                f"{partition}: a quarantine refusal needs the entries that withhold it"
+            )
         named = ", ".join(repr(e) for e in held)
         super().__init__(
             f"{partition} is quarantined by {len(held)} "
@@ -410,7 +419,7 @@ class PartitionQuarantined(LoadError):
         )
         self.partition = partition
         self.entries = held
-        self.entry = held[0] if held else None
+        self.entry = held[0]
 
 
 class SnapMalformed(LoadError, ValueError):

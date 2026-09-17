@@ -509,7 +509,11 @@ def test_quarantine_covers_only_the_partition_it_names(fixture_lake: FixtureLake
 
 
 def test_a_superseding_clean_verdict_un_quarantines(fixture_lake: FixtureLake):
-    """Last entry per partition wins, so un-quarantine is an entry rather than a deletion."""
+    """Last entry per check wins, so un-quarantine is an entry rather than a deletion.
+
+    Neither entry names a check, so both resolve in the same bucket and the later one wins.
+    tests/unit/test_manifest.py covers the keyed path.
+    """
     root = _lake(
         fixture_lake,
         quarantine=[

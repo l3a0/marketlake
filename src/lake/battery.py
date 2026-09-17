@@ -29,9 +29,9 @@ the verdict about it is not.
 partition forever, and marketlake #139 states a precedence rule before its own tool is built.
 Between them they decide four of the five.
 
-1. ``partition``, which the reader keys on.
+1. ``partition``, the first half of the key the reader resolves on.
 2. ``verdict``, which the reader resolves.
-3. ``check``, which #139's rule compares.
+3. ``check``, the second half of that key, which #139's rule also compares.
 4. ``provenance``, which #139's rule reads to tell a human's row from the battery's.
 5. ``observed_at``, the run's own stamp, which is the one this module chose.
 
@@ -294,13 +294,13 @@ class BatteryReport:
 
     ``deferred`` counts the human sign-offs this run re-observed and left standing, which is
     #139's rule producing a number rather than only a log line. It counts those alone.
-    A check that passed into another check's standing quarantine is ``withheld``, which was
-    folded into ``deferred`` until marketlake #426 and printed under a heading that named a
-    human, so a sibling check's deferral inflated a number about sign-offs.
+    ``withheld`` counts the passes recorded while another check still withholds the
+    partition. Until marketlake #426 those counted as ``deferred`` and printed under a heading
+    naming a human, so another check's hold inflated the sign-off count.
 
-    ``released`` counts the partitions that rejoined the readable set this run, which is the
-    one thing about a battery run that is otherwise invisible: a partition that reads again
-    looks exactly like a partition nothing ever withheld.
+    ``released`` counts the partitions that rejoined the readable set this run. A release is
+    otherwise invisible: a partition that reads again looks exactly like a partition nothing
+    ever withheld.
     """
 
     judged: int = 0
@@ -458,7 +458,7 @@ def _transition(current: dict | None, finding: Finding) -> bool:
 
     **The rule is per check rather than per partition, and that is marketlake #426.** The
     ledger resolves last entry wins within each check, so a ``clean`` line under one check can
-    no longer bury another check's quarantine. #406 held that with a writer-side guard against
+    no longer bury another check's quarantine. #406 enforced that with a writer-side guard against
     the ledger's last entry, which covered two entries and not three: a third entry buried the
     second, and the second to clear released the partition with the first still failing.
 
@@ -483,12 +483,16 @@ class Decision:
     ``wrote`` and ``deferred_to_human`` are exclusive. ``holders`` is filled for a finding that
     did not withhold, and names every check still holding the partition after this finding is
     applied, so a line that cleared its own check can still say the partition does not read.
+
+    A holder carries its check as the entry spells it, including ``None`` for an entry that
+    names none. Rendering is the caller's, because ``str()`` here would put the word "None"
+    into the nightly report where ``dashboard._open_quarantines`` shows a dash.
     """
 
     finding: Finding
     wrote: bool = False
     deferred_to_human: bool = False
-    holders: tuple[str, ...] = ()
+    holders: tuple[str | None, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -532,7 +536,8 @@ def decide_partition(
             continue
         wrote = _transition(current, finding)
         if wrote:
-            # The projection carries the two fields resolution reads, and no stamp. A stamp
+            # The projection carries ``partition`` plus the two fields resolution reads,
+            # ``verdict`` and ``check``, and no stamp. A stamp
             # here would be a second clock beside the one ``judge`` writes with, and nothing
             # downstream of this function reads one: ``holders`` hands back check names.
             state[finding.check] = {
@@ -541,9 +546,7 @@ def decide_partition(
                 "check": finding.check,
             }
         holders = (
-            ()
-            if finding.withholds
-            else tuple(str(entry.get("check")) for entry in withholding(state))
+            () if finding.withholds else tuple(entry.get("check") for entry in withholding(state))
         )
         decisions.append(Decision(finding, wrote=wrote, holders=holders))
 
@@ -1049,9 +1052,8 @@ def judge(
     disk either way.
 
     **A release is reported and never paged.** A page reaches a phone and asks for action, and
-    a partition rejoining the readable set asks for none. What a release does owe is to be
-    visible at all, because it looks from the outside exactly like a partition that was never
-    withheld. :attr:`BatteryReport.released` is the count and the report carries the line.
+    a partition rejoining the readable set asks for none. :attr:`BatteryReport.released` is the
+    count and the report carries the line.
     """
     root = Path(lake_root)
     guards = GuardConstants() if guards is None else guards
@@ -1119,7 +1121,10 @@ def judge(
                 continue
             if decision.holders:
                 withheld += 1
-                named = ", ".join(repr(check) for check in decision.holders)
+                named = ", ".join(
+                    repr(check) if check is not None else "an unnamed check"
+                    for check in decision.holders
+                )
                 report.append(
                     f"battery: {decision.finding.partition} passes {decision.finding.check} "
                     f"and stays quarantined under {named}"
@@ -1147,7 +1152,11 @@ def judge(
             written.append(decision.finding)
         if outcome.released:
             released += 1
-            report.append(f"battery: {finding.partition} now reads, no check withholds it")
+            report.append(
+                f"battery: {finding.partition} would now read, no check would withhold it"
+                if dry_run
+                else f"battery: {finding.partition} now reads, no check withholds it"
+            )
 
     # The findings this run actually wrote a line for, rather than every quarantining finding
     # whose partition appears in ``appended``. Once a partition carries two checks those differ:

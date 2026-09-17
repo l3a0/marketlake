@@ -50,6 +50,7 @@ from lake.capture_spans import CaptureSpan
 from lake.config import GuardConstants
 from lake.manifest import (
     CLEAN_VERDICT,
+    append_quarantine,
     is_quarantined,
     latest_quarantine,
     read_quarantine,
@@ -1104,6 +1105,40 @@ def test_a_partition_another_check_withholds_is_refused_after_this_one_clears(la
         load_chain("SPY", DAY, lake_root=lake)
 
 
+def test_a_holder_naming_no_check_reads_as_prose_rather_than_as_none(lake: Path):
+    """``str(None)`` in a report line is the word "None" dressed as a check name.
+
+    Only a hand-written or damaged entry gets here, because ``build_entry`` refuses one
+    without a check. The panel already shows such an entry as a dash, so the report owes the
+    same rather than quoting a token nothing is called.
+    """
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains"))
+    _seed_spans(lake)
+    append_quarantine(
+        lake,
+        {"partition": "chains/ticker=SPY/date=2026-09-16.parquet", "verdict": "stale"},
+    )
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert report.withheld == 1
+    assert any("stays quarantined under an unnamed check" in line for line in report.report)
+    assert not any("'None'" in line for line in report.report)
+
+
+def test_a_refusal_that_names_no_entry_is_refused_at_the_door(lake: Path):
+    """A quarantine refusal carrying nothing is damage, not a refusal.
+
+    ``manifest._latest_by_partition`` states the posture this follows: a reader that quietly
+    stepped over damage in this ledger would make every check downstream weaker than it
+    reads. The loader never builds one, and this is what keeps that true.
+    """
+    from lake.loader import PartitionQuarantined
+
+    with pytest.raises(ValueError, match="needs the entries that withhold it"):
+        PartitionQuarantined("chains/ticker=SPY/date=2026-09-16.parquet", ())
+
+
 def test_a_release_is_counted_and_reported_when_the_last_check_clears(lake: Path):
     """A partition rejoining the readable set looks exactly like one nothing ever withheld."""
     from lake.loader import PartitionQuarantined, load_chain
@@ -1139,6 +1174,12 @@ def test_a_dry_run_reports_the_release_the_real_run_would_produce(lake: Path):
 
     assert dry.released == real.released == 1
     assert dry.appended == ()
+    # The count is a forecast and says so. Every other line in the walk is conditional under
+    # a dry run, and a release stated in the present tense tells an operator the partition
+    # reads while the ledger still refuses it.
+    assert any("would now read, no check would withhold it" in line for line in dry.report)
+    assert not any("now reads, no check withholds it" in line for line in dry.report)
+    assert any("now reads, no check withholds it" in line for line in real.report)
 
 
 def test_include_quarantined_reads_past_a_verdict_this_writer_wrote(fixture_lake):

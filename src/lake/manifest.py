@@ -18,15 +18,19 @@ The ledger lives at ``manifest.jsonl`` at the lake root. Its rules are few and e
    And every data file in the lake must have an entry. The second direction catches a
    crash between writing a file and appending its entry.
 
-The quarantine ledger at ``quarantine.jsonl`` follows the same three rules. It records
+The quarantine ledger at ``quarantine.jsonl`` follows rules 1 and 3, and resolves on
+``(partition, check)`` rather than on the path alone, because several checks judge one
+partition and each keeps its own current verdict. :func:`latest_quarantine_by_check` is that
+resolution and marketlake #426 is why it is not the path alone. It records
 data-quality verdicts per partition. Un-quarantine is a superseding entry, never a
 deletion. This module gives it the same append and read helpers.
 
 The corporate-actions ledger at ``actions/corporate_actions.jsonl`` follows them too, and
-it keys on the action rather than on a path, so ``lake.actions`` resolves its own last
-entry and reuses ``append_line`` and ``parse_jsonl`` for the line rules alone. Those two
-are public for that reason: three ledgers now implement one rule, and a second copy of it
-would be a second answer to what a torn tail is.
+it keys on the action rather than on a path, the way the quarantine ledger keys on the
+partition and the check, so ``lake.actions`` resolves its own last entry and reuses
+``append_line`` and ``parse_jsonl`` for the line rules alone. Those two are public for that
+reason: three ledgers now implement one rule, and a second copy of it would be a second
+answer to what a torn tail is.
 
 The same ledger judges the backup copy. ``backup_scrub`` walks the rsync target and
 checks it against this manifest rather than against the copy of the manifest riding on
@@ -262,7 +266,13 @@ def latest_quarantine_by_check(lake_root: Path) -> dict[str, dict[str, dict]]:
 
 
 def withholding(by_check: dict[str, dict] | None) -> tuple[dict, ...]:
-    """The entries currently withholding one partition, longest-standing first.
+    """The entries currently withholding one partition, in the ledger's own order.
+
+    The order is where each check's *current* entry sits in the file, so the check that last
+    re-stated its verdict comes last. That is deliberately not "longest-standing first": a
+    check withholding since line 1 that re-wrote at line 3 sorts after one that first withheld
+    at line 2. Readability does not depend on the order, and every consumer that shows it
+    shows all of them.
 
     ``by_check`` is what :func:`latest_quarantine_by_check` returns for one partition, or
     ``None`` when the ledger holds no entry for it. An empty result means the partition reads.
@@ -280,8 +290,8 @@ def withholding(by_check: dict[str, dict] | None) -> tuple[dict, ...]:
 def latest_quarantine(lake_root: Path) -> dict[str, dict]:
     """The entry that decides each partition's readability.
 
-    That is the longest-standing entry still withholding the partition, or the last entry
-    written when none withholds. It is deliberately not the ledger's chronologically last line
+    That is the first entry :func:`withholding` returns, or the last entry written when none
+    withholds. It is deliberately not the ledger's chronologically last line
     for the partition: once several checks judge one partition, the last line can be a ``clean``
     from a check that never saw the fault another check is still holding.
 
