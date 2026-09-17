@@ -2030,7 +2030,7 @@ def test_coverage_walks_the_whole_span_even_when_one_session_is_named(lake: Path
 
 
 def test_a_missing_session_writes_no_ledger_line_and_never_pages(lake: Path):
-    """``loader._guard_partition`` raises ``PartitionAbsent`` before it reads the ledger, so a
+    """``loader._clear_partition`` raises ``PartitionAbsent`` before it reads the ledger, so a
     verdict for a partition that never landed changes no read. It could also never be cleared,
     because there is no backfill and the partition can never land."""
     _seed_spans(lake)
