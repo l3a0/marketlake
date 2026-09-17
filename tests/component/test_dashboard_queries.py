@@ -2205,12 +2205,179 @@ def test_a_ticker_the_master_no_longer_maps_today_still_clamps(root: Path):
     assert chains["counts"]["captured"] + chains["counts"]["suspect"] == 3
 
 
-def test_a_recycled_ticker_unions_both_instruments_spans_in_start_order(root: Path):
+def _recycled_master(root: Path, *, first_start: datetime, second_start: datetime) -> None:
+    """One spelling on two instruments over disjoint ranges, the recycled-ticker case."""
+    SecurityMaster(
+        [
+            Mapping(
+                instrument_id=1,
+                id_type=ID_TYPE_TICKER,
+                id_value="SPY",
+                valid_from=date(2026, 1, 2),
+                valid_to=MONDAY,
+                kind=KIND_EQUITY,
+                capture_start=first_start.astimezone(UTC),
+            ),
+            Mapping(
+                instrument_id=2,
+                id_type=ID_TYPE_TICKER,
+                id_value="SPY",
+                valid_from=MONDAY,
+                valid_to=None,
+                kind=KIND_EQUITY,
+                capture_start=second_start.astimezone(UTC),
+            ),
+        ]
+    ).write(master_path(root))
+
+
+def test_an_instrument_with_no_span_row_costs_the_whole_ticker_its_clamp(root: Path):
+    # The second route into a partial union, and it needs no drift at all. A crash
+    # between ``register`` and ``open_span`` leaves an instrument the master names with
+    # no span row. Instrument 1 owns Monday and has none, instrument 2 has an open span
+    # from 09:36. Keeping only the survivor would lend its scope to days it never owned
+    # and turn the fixture's 09:32 gap marker into an out-of-scope minute.
+    _recycled_master(root, first_start=et(MONDAY, 9, 30), second_start=et(MONDAY, 9, 36))
+    CaptureSpans([CaptureSpan(2, et(MONDAY, 9, 36).astimezone(UTC), None, False)]).write(
+        spans_path(root)
+    )
+    chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
+        "strips"
+    ][0]
+    assert chains["capture_start"] is None
+    assert chains["counts"]["out_of_scope"] == 0
+    assert chains["slots"][2]["status"] == "gap"
+    assert chains["slots"][2]["error_class"] == ["http_429"]
+
+
+def test_a_span_opening_after_the_close_does_not_excuse_an_earlier_dark_one(root: Path):
+    # The Now panel's stale verdict reads against the last minute a cycle was owed, and
+    # the epoch beside it has to be read against that same minute. This ticker captured
+    # until 09:33 and went dark. A second span opens at 17:00, after the option close.
+    # Reading the union's latest start would put the epoch past the owed minute, which
+    # is the "onboarded after today's close" excuse, and a ticker dark all session would
+    # read clean.
+    _recycled_master(root, first_start=et(MONDAY, 9, 30), second_start=et(MONDAY, 17, 0))
+    CaptureSpans(
+        [
+            CaptureSpan(
+                1, et(MONDAY, 9, 30).astimezone(UTC), et(MONDAY, 16, 15).astimezone(UTC), False
+            ),
+            CaptureSpan(2, et(MONDAY, 17, 0).astimezone(UTC), None, False),
+        ]
+    ).write(spans_path(root))
+    row = next(
+        row
+        for row in service_over(root, now=et(MONDAY, 18, 0)).run_query("now", {})["surfaces"]
+        if (row["ticker"], row["surface"]) == ("SPY", "chains")
+    )
+    assert row["last_data_snap_ts"] == et(MONDAY, 9, 33).isoformat()
+    assert row["capture_start"] == et(MONDAY, 9, 30).isoformat()
+    assert row["stale"] is True
+
+
+def test_one_unusable_span_costs_the_whole_ticker_its_clamp(root: Path):
+    # A partial clamp is the one way this reading can come back narrower than the truth,
+    # so a ticker with any unusable span gets no clamp rather than the spans that
+    # survived. Instrument 1 captured Monday 09:30 to 09:34, which covers the fixture's
+    # 09:32 gap marker, and its span is closed. Instrument 2 is still open, so its
+    # ``span_end`` is null and a drifted ``span_end`` column leaves it usable while
+    # dropping instrument 1's. Keeping only the survivor would put 09:32 out of scope and
+    # erase a real gap marker.
+    SecurityMaster(
+        [
+            Mapping(
+                instrument_id=1,
+                id_type=ID_TYPE_TICKER,
+                id_value="SPY",
+                valid_from=date(2026, 1, 2),
+                valid_to=MONDAY,
+                kind=KIND_EQUITY,
+                capture_start=et(MONDAY, 9, 30).astimezone(UTC),
+            ),
+            Mapping(
+                instrument_id=2,
+                id_type=ID_TYPE_TICKER,
+                id_value="SPY",
+                valid_from=MONDAY,
+                valid_to=None,
+                kind=KIND_EQUITY,
+                capture_start=et(MONDAY, 9, 36).astimezone(UTC),
+            ),
+        ]
+    ).write(master_path(root))
+    table = CaptureSpans(
+        [
+            CaptureSpan(
+                1, et(MONDAY, 9, 30).astimezone(UTC), et(MONDAY, 9, 34).astimezone(UTC), False
+            ),
+            CaptureSpan(2, et(MONDAY, 9, 36).astimezone(UTC), None, False),
+        ]
+    ).to_table()
+    path = spans_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(_retype(table, {"span_end": pa.timestamp("us")}), path)
+
+    chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
+        "strips"
+    ][0]
+    assert chains["capture_start"] is None
+    assert chains["counts"]["out_of_scope"] == 0
+    assert chains["slots"][2]["status"] == "gap"
+    assert chains["slots"][2]["error_class"] == ["http_429"]
+
+
+def test_the_same_two_instruments_undrifted_do_clamp(root: Path):
+    # The control for the pair above. Nothing is unusable here, so the union forms and
+    # 09:32 sits inside instrument 1's span. Without this, the no-clamp verdict above
+    # could be satisfied by a master the panel simply cannot read.
+    SecurityMaster(
+        [
+            Mapping(
+                instrument_id=1,
+                id_type=ID_TYPE_TICKER,
+                id_value="SPY",
+                valid_from=date(2026, 1, 2),
+                valid_to=MONDAY,
+                kind=KIND_EQUITY,
+                capture_start=et(MONDAY, 9, 30).astimezone(UTC),
+            ),
+            Mapping(
+                instrument_id=2,
+                id_type=ID_TYPE_TICKER,
+                id_value="SPY",
+                valid_from=MONDAY,
+                valid_to=None,
+                kind=KIND_EQUITY,
+                capture_start=et(MONDAY, 9, 36).astimezone(UTC),
+            ),
+        ]
+    ).write(master_path(root))
+    CaptureSpans(
+        [
+            CaptureSpan(
+                1, et(MONDAY, 9, 30).astimezone(UTC), et(MONDAY, 9, 34).astimezone(UTC), False
+            ),
+            CaptureSpan(2, et(MONDAY, 9, 36).astimezone(UTC), None, False),
+        ]
+    ).write(spans_path(root))
+    chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
+        "strips"
+    ][0]
+    assert chains["capture_start"] == et(MONDAY, 9, 36).isoformat()
+    assert chains["slots"][2]["status"] == "gap"
+    # 09:34 and 09:35 are the away period between the two spans, which the union leaves
+    # out of scope while covering everything either span holds.
+    assert [slot["status"] for slot in chains["slots"][4:6]] == ["out_of_scope"] * 2
+    assert chains["counts"]["out_of_scope"] == 2
+
+
+def test_a_recycled_ticker_unions_both_instruments_spans(root: Path):
     # One spelling, two instruments over disjoint ranges. Partitions are keyed by
     # ticker, so the one ``ticker=SPY`` directory holds both instruments' rows and the
     # honest scope for it covers both spans. The spans file lists the newer instrument
-    # first, so an unsorted union would report the older span's start as the reported
-    # ``capture_start`` and would leave Monday's first six minutes in scope.
+    # first, to show that nothing here depends on the order two reference files happen
+    # to be written in.
     master = SecurityMaster(
         [
             Mapping(
@@ -2241,9 +2408,6 @@ def test_a_recycled_ticker_unions_both_instruments_spans_in_start_order(root: Pa
         ]
     ).write(spans_path(root))
     service = service_over(root)
-    # The sort's only observable is the reported epoch, because ``_in_scope`` asks every
-    # span. Unsorted, the file's order puts the older instrument's span last and this
-    # reads Thursday 09:30.
     monday = service.run_query("today", {"date": "2026-08-24", "ticker": "SPY"})["strips"][0]
     assert monday["capture_start"] == et(MONDAY, 9, 36).isoformat()
     assert monday["slots"][5]["status"] == "out_of_scope"
@@ -2254,6 +2418,10 @@ def test_a_recycled_ticker_unions_both_instruments_spans_in_start_order(root: Pa
     thursday = service.run_query("today", {"date": "2026-08-20", "ticker": "SPY"})["strips"][0]
     assert thursday["counts"]["missing"] == 390
     assert thursday["counts"]["out_of_scope"] == 16
+    # The epoch beside a strip is the one that had opened by the day it renders. Reading
+    # the union's latest start here would print "capture began Monday 09:36" above 390
+    # Thursday minutes the same strip calls missing, which the page's own tooltip denies.
+    assert thursday["capture_start"] == et(THURSDAY, 9, 30).isoformat()
     # Friday sits between the two spans, which is the away period neither covers.
     friday = service.run_query("today", {"date": "2026-08-21", "ticker": "SPY"})["strips"][0]
     assert friday["counts"]["out_of_scope"] == len(friday["slots"])
