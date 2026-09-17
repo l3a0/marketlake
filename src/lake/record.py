@@ -244,11 +244,17 @@ def build_parser() -> argparse.ArgumentParser:
     intended path meets it.
 
     A vendor flag rides after the four as a named field, ``extended_hours=false``, rather than
-    as a bare fifth one. That is what keeps the refusal above working. No ISO instant carries an
-    ``=``, so a bound that split on its own fractional-second comma can never be read as a flag,
-    and the two halves it left behind still reach the four-field refusal with the sentence
-    naming the case. A bare fifth field would read such a half as a flag whenever its tail
-    happened to spell one, and the field count would no longer detect the marker at all.
+    as a bare fifth one. No ISO instant carries an ``=``, so a bound that split on its own
+    fractional-second comma can never be read as a flag, and the two halves it left behind
+    still reach the four-field refusal with the sentence naming the case. That separation is a
+    property of the grammar rather than of the data.
+
+    A bare fifth field read as the flag whatever it said would lose it. The ISO case would
+    arrive as a bad flag value naming the end bound, and the fractional-second sentence would
+    never be reached. A bare fifth field popped only when it spells ``true`` or ``false`` would
+    in fact keep it, because an ISO fractional part is digits and never spells either word. But
+    that rests the guard on a coincidence about the data, and a bare value says nothing at the
+    terminal about what it means. So a bare fifth field is refused, and a test holds it.
 
     The named field is read in trailing position only, so the four positional fields stay
     positional. The ``metavar`` shows that position, because a flag written in the middle falls

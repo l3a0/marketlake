@@ -655,6 +655,20 @@ def test_a_split_bound_is_still_named_even_when_a_real_flag_rides_behind_it():
         )
 
 
+def test_a_bare_fifth_field_is_refused_even_when_it_spells_a_flag_value():
+    """The named form is a grammar, not a convenience.
+
+    A parser that also popped a bare ``true`` or ``false`` keeps the fractional-second refusal
+    working, because an ISO fractional part is digits and never spells either word. Mutation
+    found that: the suite passed unchanged with the bare form accepted alongside the named one.
+    It is refused anyway, because that variant rests the guard on a coincidence about the data
+    rather than on the shape of the value, and because a bare ``false`` at the terminal says
+    nothing about which flag it sets.
+    """
+    with pytest.raises(ValueError, match="four comma-separated fields"):
+        _parse_bar_requests([f"{UNFLAGGED},false"])
+
+
 def test_two_bars_values_with_one_key_are_refused():
     # Cassette.find returns the first exact match, so a second interaction keyed alike is a live
     # request spent on something nothing can ever read back. That is the loss the --out refusal
