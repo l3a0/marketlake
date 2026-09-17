@@ -17,6 +17,20 @@ like, and the three readings that fail on real data are each driven here:
    2026-09-02 and 21 on the later partitions, because the vendor narrowed an eight-digit
    expiry to six.
 3. The root survives both.
+
+**This file carries its own chains schema, and that is deliberate.** The scale guard reads
+``strike_price`` and ``underlying_price``, and ``FIXTURE_CHAINS_SCHEMA`` carries neither.
+``tests/component/test_oi_view.py`` gives the reasons and this takes the second of them.
+Adding these two to the shared schema would break nothing, unlike ``volume``, which
+``test_load_chain.test_a_promoted_value_is_lifted_out_of_the_overflow`` asserts is absent from
+``_chains(rows)``. What the local schema buys is keeping the sixteen files that
+import the shared one out of this change. ``test_settlement_view.py`` and
+``test_continuity_view.py`` do the same.
+
+**Every session here carries a ladder and a spot**, because the scale guard staying silent on
+an ordinary day is the claim most of this file's detections exercise. A default row that left
+the two columns null would make the guard report every pair uncomparable and assert that
+silence nowhere.
 """
 
 from __future__ import annotations
@@ -54,20 +68,66 @@ from lake.splits import (
     CHECK_SPLIT_CONSISTENCY,
     CHECK_SPLIT_DELIVERABLE,
     CHECK_SPLIT_PAYLOAD,
+    CHECK_STRIKE_SCALE,
     REASON_DELIVERABLE_UNCHANGED,
+    REASON_INSTRUMENT_CHANGED,
+    REASON_NO_LADDER,
     REASON_NO_OPTION_CLOSE,
+    REASON_NO_UNDERLYING,
     REASON_OUT_OF_SCOPE,
     REASON_PARTIAL_READ,
     REASON_PARTITION_ABSENT,
     REASON_QUARANTINED,
     REASON_ROOT_RETURNED,
+    REASON_SCALE_WINDOW,
     REASON_STANDARD_SERIES,
     REASON_THIN,
     detect_splits,
 )
 from tests.support.clock import ManualClock
 from tests.support.config import write_config
-from tests.support.lake import FixtureLake, sample_chains_table
+from tests.support.lake import FixtureLake
+
+# The shared fixture schema plus the scale guard's two columns, in the shared one's own order.
+# Everything else matches it, so the loader's rules apply unchanged.
+SPLIT_CHAINS_SCHEMA = pa.schema(
+    [
+        ("snap_ts", pa.string()),
+        ("fetch_ts", pa.string()),
+        ("vendor_quote_ts", pa.string()),
+        ("ticker", pa.string()),
+        ("occ_symbol", pa.string()),
+        ("ssid", pa.int64()),
+        ("bid", pa.float64()),
+        ("ask", pa.float64()),
+        ("last", pa.float64()),
+        ("open_interest", pa.int64()),
+        ("option_root", pa.string()),
+        ("multiplier", pa.float64()),
+        ("non_standard", pa.bool_()),
+        ("mini", pa.bool_()),
+        ("deliverable_note", pa.string()),
+        ("option_deliverables_list", pa.string()),
+        ("is_chain_truncated", pa.bool_()),
+        ("row_kind", pa.string()),
+        ("error_class", pa.string()),
+        ("suspect", pa.bool_()),
+        ("close_tag", pa.string()),
+        ("session_phase", pa.string()),
+        ("schema_version", pa.int64()),
+        ("extra", pa.string()),
+        ("strike_price", pa.float64()),
+        ("underlying_price", pa.float64()),
+    ]
+)
+
+
+def _chains(rows: list[dict] | None = None, schema: pa.Schema | None = None) -> pa.Table:
+    """A chains table in this file's schema, filling a column no row names with nulls."""
+    schema = SPLIT_CHAINS_SCHEMA if schema is None else schema
+    rows = [] if rows is None else rows
+    return pa.table({name: [row.get(name) for row in rows] for name in schema.names}, schema=schema)
+
 
 # Three consecutive sessions. The lake's own 2026-09-14 and 2026-09-15 are the pair that
 # carry data, and a third sits after them so a boundary has a session on each side of it.
@@ -149,6 +209,18 @@ def _ssid(occ_symbol: str) -> int:
 _DERIVE = object()
 
 
+def _strike(occ_symbol: str | None) -> float | None:
+    """The strike the OCC symbol itself spells, so a fixture row cannot contradict its symbol.
+
+    The last eight digits are the strike in thousandths, which is the vendor's own encoding and
+    what ``ADJUSTED_OCC``'s ``00433330`` means. Deriving it rather than defaulting to one number
+    is what gives a session a ladder with more than one rung, and the scale guard reads the
+    ladder. A row carrying no symbol at all names no strike either, which is the shape a row
+    with nothing on it has.
+    """
+    return None if occ_symbol is None else int(occ_symbol[-8:]) / 1000
+
+
 def _row(
     day: date,
     *,
@@ -165,6 +237,8 @@ def _row(
     suspect: bool = False,
     truncated: bool = False,
     ticker: str = "SPY",
+    strike: float | None | object = _DERIVE,
+    underlying: float | None = 655.0,
 ) -> dict:
     """One chains row at the session's option close, carrying the deliverable columns.
 
@@ -174,6 +248,8 @@ def _row(
     """
     if ssid is _DERIVE:
         ssid = _ssid(occ_symbol)
+    if strike is _DERIVE:
+        strike = _strike(occ_symbol)
     return {
         "snap_ts": f"{day.isoformat()}T20:15:00+00:00",
         "fetch_ts": f"{day.isoformat()}T20:15:00.400+00:00",
@@ -199,6 +275,8 @@ def _row(
         "session_phase": None,
         "schema_version": 1,
         "extra": None,
+        "strike_price": strike,
+        "underlying_price": underlying,
     }
 
 
@@ -219,6 +297,8 @@ def _gap_day_row(day: date, ticker: str = "SPY") -> dict:
         non_standard=None,
         mini=None,
         ticker=ticker,
+        strike=None,
+        underlying=None,
     )
 
 
@@ -296,11 +376,9 @@ def _lake(
     walk enumerates.
     """
     for (ticker, day), rows in sessions.items():
-        fixture_lake.with_chains(ticker, day, sample_chains_table(rows))
+        fixture_lake.with_chains(ticker, day, _chains(rows))
     if quotes is not None:
-        fixture_lake.with_partition(
-            "quotes", quotes[0], quotes[1], sample_chains_table([_row(quotes[1])])
-        )
+        fixture_lake.with_partition("quotes", quotes[0], quotes[1], _chains([_row(quotes[1])]))
     fixture_lake.with_reference("schema_versions", _ledger_table())
     for entry in quarantine or []:
         fixture_lake.with_quarantine(entry)
@@ -346,6 +424,52 @@ def _reasons(report_out) -> list[str]:
 def _not_splits(report_out) -> list[str]:
     """Why each root change the run met had no corporate action behind it."""
     return sorted(mark.reason for mark in report_out.not_adjustments)
+
+
+# -- the scale guard's fixtures ---------------------------------------------------------
+
+# A ladder wide enough that a coincidence and a real rescaling are different numbers. Measured
+# on the live lake, a stationary SPY ladder confirms at most 0.287785 when spot moves by a whole
+# ratio anyway, and a real adjustment confirms at 1.000000. A one-rung ladder cannot tell those
+# apart, because one rung either maps or does not.
+LADDER = (600.0, 650.0, 700.0, 750.0, 800.0, 810.0, 820.0)
+
+
+def _occ(strike: float, ticker: str = "SPY") -> str:
+    """One contract's symbol at a strike, spelled the way the vendor spells it."""
+    return f"{ticker:<6}260918C{int(round(strike * 1000)):08d}"
+
+
+def _ladder_rows(day: date, strikes, spot: float, ticker: str = "SPY", **kwargs) -> list[dict]:
+    """One session listing a contract at each strike, all naming one underlying price."""
+    return [
+        _row(day, occ_symbol=_occ(strike, ticker), underlying=spot, ticker=ticker, **kwargs)
+        for strike in strikes
+    ]
+
+
+def _scale_lake(
+    fixture_lake: FixtureLake,
+    *,
+    before=LADDER,
+    after=LADDER,
+    spot_before: float = 700.0,
+    spot_after: float = 700.0,
+    **kwargs,
+) -> Path:
+    """Two adjacent sessions of one ticker, each with its own ladder and its own spot."""
+    return _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): _ladder_rows(DAY_ONE, before, spot_before),
+            ("SPY", DAY_TWO): _ladder_rows(DAY_TWO, after, spot_after),
+        },
+        **kwargs,
+    )
+
+
+def _scale_unread(report_out) -> list[str]:
+    return sorted(unread.reason for unread in report_out.scale_unread)
 
 
 # -- the boundary and the ratio ---------------------------------------------------------
@@ -573,7 +697,7 @@ def test_a_partial_read_is_skipped_rather_than_read_incomplete(fixture_lake: Fix
     way to get the table. So a comparison made across it would be a comparison against
     contents nobody saw in full.
     """
-    fixture_lake.with_chains("SPY", DAY_ONE, sample_chains_table([_row(DAY_ONE)]))
+    fixture_lake.with_chains("SPY", DAY_ONE, _chains([_row(DAY_ONE)]))
     root = fixture_lake.build()
     _master().write(master_path(root))
 
@@ -974,6 +1098,284 @@ def test_the_render_says_splits_and_names_the_ratio(fixture_lake: FixtureLake):
     assert "cash" not in rendered
 
 
+# -- the strike-vs-spot scale guard -----------------------------------------------------
+
+
+def test_an_ordinary_pair_names_no_ratio_and_files_nothing(fixture_lake: FixtureLake):
+    """The claim the live lake bears out, and the one the guard must not break.
+
+    The four adjacent pairs the lake holds move spot between 0.999745 and 1.006586 and never
+    move the ladder at all. Nothing there is within reach of a whole ratio, so no candidate is
+    even formed and the confirmation is never computed.
+    """
+    root = _scale_lake(fixture_lake, spot_before=700.0, spot_after=696.5)
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert report_out.scale_pairs == 1
+    assert report_out.held == ()
+    assert _findings(root, DAY_TWO) == []
+
+
+def test_a_whole_ratio_split_the_root_signal_cannot_see_is_filed(fixture_lake: FixtureLake):
+    """The gap this guard exists for.
+
+    A whole-ratio split leaves the deliverable exactly where it was, so ``Deliverable.same_as``
+    is true on all six fields and the root signal records nothing. Every strike halves and so
+    does spot, and that pair is the only evidence the lake holds.
+    """
+    root = _scale_lake(
+        fixture_lake,
+        before=LADDER,
+        after=tuple(strike / 2 for strike in LADDER),
+        spot_before=700.0,
+        spot_after=349.5,
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert _entries(root) == [], "the root signal cannot land a whole-ratio split"
+    (held,) = report_out.held
+    assert held.finding.check == CHECK_STRIKE_SCALE
+    assert held.finding.computed == 2.0
+    assert held.finding.against == pytest.approx(700.0 / 349.5)
+    (filed,) = _findings(root, DAY_TWO)
+    assert filed["check"] == CHECK_STRIKE_SCALE
+    assert filed["computed"] == 2.0
+    assert filed["day"] == DAY_TWO.isoformat()
+
+
+def test_a_reverse_split_is_the_same_test_run_the_other_way(fixture_lake: FixtureLake):
+    """``round`` picks the candidate off the reciprocal, so the ratio comes back below one."""
+    root = _scale_lake(
+        fixture_lake,
+        before=LADDER,
+        after=tuple(strike * 2 for strike in LADDER),
+        spot_before=700.0,
+        spot_after=1398.0,
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    (held,) = report_out.held
+    assert held.finding.check == CHECK_STRIKE_SCALE
+    assert held.finding.computed == 0.5
+
+
+def test_a_crash_moves_spot_and_leaves_the_ladder_where_it_was(fixture_lake: FixtureLake):
+    """Spot halving alone is not a split, and the ladder is what says so.
+
+    Measured on the live lake, a stationary ladder confirms at most 0.287785 when spot moves by
+    a whole ratio anyway. That is what the floor sits above, and it is the crash this must not
+    read as a corporate action. The price check for a move like this is #280's, in
+    ``bars.CHECK_BAR_CLOSE``.
+    """
+    root = _scale_lake(fixture_lake, spot_before=700.0, spot_after=349.5)
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert report_out.scale_pairs == 1
+    assert report_out.held == (), "a crash was recorded as a split"
+
+
+def test_a_split_the_ledger_already_holds_is_counted_and_not_filed(fixture_lake: FixtureLake):
+    """A held finding never clears, so a resolved split must stop being filed.
+
+    marketlake #286's manual entry is the only resolution ``write_withheld`` names, and such an
+    entry never reaches ``_examine`` at all, because no root appeared. So the ledger is read
+    directly, through the snapshot the run already takes.
+    """
+    root = _scale_lake(
+        fixture_lake,
+        before=LADDER,
+        after=tuple(strike / 2 for strike in LADDER),
+        spot_before=700.0,
+        spot_after=349.5,
+    )
+    actions.append(
+        root,
+        instrument_id=1,
+        observed_on=DAY_TWO,
+        ex_date=DAY_TWO,
+        recorded_at=RECORDED_AT,
+        type=TYPE_SPLIT,
+        pay_date=None,
+        declared_date=None,
+        split_ratio=2.0,
+        provenance=PROVENANCE_OBSERVED,
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert report_out.scale_covered == 1
+    assert report_out.held == (), "a split the ledger already describes was filed again"
+
+
+def test_a_landed_uneven_split_does_not_file_a_scale_finding_beside_it(
+    fixture_lake: FixtureLake,
+):
+    """Both signals can fire on one adjustment, and the ledger entry is the whole answer.
+
+    Without the suppression the same line files every night forever for an event the ledger
+    already holds, because nothing in ``reports/`` is ever pruned.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): _ladder_rows(DAY_ONE, LADDER, 700.0),
+            ("SPY", DAY_TWO): [
+                *_ladder_rows(DAY_TWO, LADDER, 349.5),
+                *[
+                    _row(
+                        DAY_TWO,
+                        occ_symbol=_occ(strike / 2, ADJUSTED_ROOT),
+                        # The contract's own id, carried across the symbol change. That is
+                        # what a re-symboling is, and ``lake.occ_mapping`` refuses a boundary
+                        # where no contract pairs.
+                        ssid=_ssid(_occ(strike)),
+                        underlying=349.5,
+                        option_root=ADJUSTED_ROOT,
+                        deliverables=ADJUSTED,
+                        note=ADJUSTED_NOTE,
+                        non_standard=True,
+                    )
+                    for strike in LADDER
+                ],
+            ],
+        },
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert len(report_out.appended) == 1, "the root signal did not land its own entry"
+    assert report_out.scale_covered == 1
+    assert [held.finding.check for held in report_out.held] == []
+
+
+def test_a_skipped_session_between_the_pair_is_not_judged(fixture_lake: FixtureLake):
+    """Ladder attrition across a wider window is unmeasured, and a wrong finding never clears.
+
+    ``CHECK_SPLIT_BOUNDARY`` refuses a wide window for its own reason, which is the ledger key.
+    This one refuses it because the comparison itself has no measurement behind it.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): _ladder_rows(DAY_ONE, LADDER, 700.0),
+            ("SPY", DAY_TWO): [_gap_day_row(DAY_TWO)],
+            ("SPY", DAY_THREE): _ladder_rows(
+                DAY_THREE, tuple(strike / 2 for strike in LADDER), 349.5
+            ),
+        },
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert report_out.scale_pairs == 0
+    assert _scale_unread(report_out) == [REASON_SCALE_WINDOW]
+    assert report_out.held == ()
+
+
+def test_a_session_naming_no_single_spot_is_not_judged(fixture_lake: FixtureLake):
+    """Two rows disagreeing about the underlying leave no ratio to round.
+
+    Taking the first would let the file's own order decide what the guard compares, which is the
+    refusal ``deliverable_of`` already makes about its own reading.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): _ladder_rows(DAY_ONE, LADDER, 700.0),
+            ("SPY", DAY_TWO): [
+                _row(DAY_TWO, occ_symbol=_occ(650.0), underlying=349.5),
+                _row(DAY_TWO, occ_symbol=_occ(700.0), underlying=350.5),
+            ],
+        },
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert _scale_unread(report_out) == [REASON_NO_UNDERLYING]
+    assert report_out.scale_pairs == 0
+
+
+def test_a_null_underlying_beside_a_named_one_is_not_a_disagreement(fixture_lake: FixtureLake):
+    """A row saying nothing does not contradict a row that names the price.
+
+    ``_column`` already treats a column a partition never carried as a session with nothing to
+    say, and one null row inside a snapshot is the same thing one row at a time.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): _ladder_rows(DAY_ONE, LADDER, 700.0),
+            ("SPY", DAY_TWO): [
+                *_ladder_rows(DAY_TWO, tuple(s / 2 for s in LADDER), 349.5),
+                _row(DAY_TWO, occ_symbol=_occ(300.0), underlying=None),
+            ],
+        },
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert report_out.scale_unread == ()
+    assert [held.finding.check for held in report_out.held] == [CHECK_STRIKE_SCALE]
+
+
+def test_a_session_listing_no_strike_is_not_judged(fixture_lake: FixtureLake):
+    """A ladder with nothing in it is a denominator of zero rather than a confirmation."""
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): _ladder_rows(DAY_ONE, LADDER, 700.0),
+            ("SPY", DAY_TWO): [_row(DAY_TWO, strike=None, underlying=349.5)],
+        },
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert _scale_unread(report_out) == [REASON_NO_LADDER]
+    assert report_out.held == ()
+
+
+def test_a_pair_spanning_two_instruments_is_not_a_pair(fixture_lake: FixtureLake):
+    """Two securities' ladders are not comparable, which ``_examine`` already decides.
+
+    The master hands the ticker from one instrument to another between the two sessions, so the
+    sessions describe different things and their strikes say nothing about each other.
+    """
+    master = SecurityMaster(
+        [
+            _mapping(1, "SPY", valid_to=DAY_TWO),
+            _mapping(2, "SPY", valid_from=DAY_TWO),
+        ]
+    )
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): _ladder_rows(DAY_ONE, LADDER, 700.0),
+            ("SPY", DAY_TWO): _ladder_rows(DAY_TWO, tuple(strike / 2 for strike in LADDER), 349.5),
+        },
+        master=master,
+    )
+
+    report_out = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+
+    assert _scale_unread(report_out) == [REASON_INSTRUMENT_CHANGED]
+    assert report_out.held == ()
+
+
+def test_the_render_says_what_the_scale_guard_did(fixture_lake: FixtureLake):
+    """A run that compared pairs must not read like a run that compared none."""
+    root = _scale_lake(fixture_lake, spot_before=700.0, spot_after=696.5)
+
+    rendered = detect_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT)).render()
+
+    assert "  scale compared: 1" in rendered
+    assert "  scale already recorded: 0" in rendered
+    assert "  scale not compared: 0" in rendered
+
+
 def test_the_subcommand_inherits_the_three_code_contract(
     fixture_lake: FixtureLake, tmp_path: Path, capsys
 ):
@@ -984,7 +1386,7 @@ def test_the_subcommand_inherits_the_three_code_contract(
     fix behind it. #294 and #300 were this class of defect on the onboarding command, so a
     refusal let out here as a stack trace repeats a fixed bug.
     """
-    fixture_lake.with_chains("SPY", DAY_ONE, sample_chains_table([_row(DAY_ONE)]))
+    fixture_lake.with_chains("SPY", DAY_ONE, _chains([_row(DAY_ONE)]))
     fixture_lake.with_reference("schema_versions", _ledger_table())
     root = fixture_lake.build()
     config = _config(tmp_path, root)
@@ -1265,12 +1667,8 @@ def test_a_partition_missing_a_column_reads_it_as_null_rather_than_raising(
     ``actions._observation`` reads its own columns the same way and for the same reason. A
     ``KeyError`` here would end the whole run rather than skipping one session.
     """
-    narrow = pa.schema(
-        [f for f in sample_chains_table().schema if f.name not in {"option_root", "mini"}]
-    )
-    rows = [_row(DAY_ONE)]
-    table = pa.table({n: [r.get(n) for r in rows] for n in narrow.names}, schema=narrow)
-    fixture_lake.with_chains("SPY", DAY_ONE, table)
+    narrow = pa.schema([f for f in SPLIT_CHAINS_SCHEMA if f.name not in {"option_root", "mini"}])
+    fixture_lake.with_chains("SPY", DAY_ONE, _chains([_row(DAY_ONE)], schema=narrow))
     fixture_lake.with_reference("schema_versions", _ledger_table())
     root = fixture_lake.build()
     _master().write(master_path(root))

@@ -126,8 +126,8 @@ against a contract whose deliverable moved by 1.5, giving one contract two refer
 strikes with no mark. It stays rejected on two grounds. The count is zero, since ``lake.splits``
 derives a landed ratio from the deliverable and gates it, so the two agree by construction for
 every entry that path produces. And the class of "does the adjusted ladder make sense" is
-marketlake #138's, which owns the strike-against-spot guard, rather than a second answer to it
-here.
+``splits.check_strike_scale``'s, which reads the strike ladder against the session's spot,
+rather than a second answer to it here.
 
 **Which sessions the answer holds a row for.** The sessions are the sealed chains partitions
 in range, read off the filesystem for the reason ``loader._bars_sessions`` gives for the same
