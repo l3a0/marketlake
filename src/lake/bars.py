@@ -106,7 +106,13 @@ from lake.actions import (
     resolve_instrument,
 )
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
-from lake.capture_spans import CaptureSpan, CaptureSpans, SpansUnreadable, spans_path
+from lake.capture_spans import (
+    CaptureSpan,
+    CaptureSpans,
+    CaptureSpansError,
+    SpansUnreadable,
+    spans_path,
+)
 from lake.clock import Clock, SystemClock
 from lake.journal import UNFIT_ERRORS, bars_data_batch, bars_rows
 from lake.loader import LoadError, load_quotes
@@ -542,6 +548,35 @@ class LandedPartition:
     rows: int
 
 
+def _render_held(held: Sequence[HeldFinding]) -> list[str]:
+    """The held-findings block of a sign-off report, for the one reader who has to act on it.
+
+    One spelling rather than two, for the reason :func:`_unfiled` gives beside it: the two reports
+    say the same thing about a held finding, and a second copy is how the two drift into saying
+    different things. This one is sixteen lines where that one is two, so the argument is stronger
+    here.
+
+    A finding with neither a computed pair nor an exception renders its subject line alone, which
+    is the shape a caller filing only ``check`` produces, and it does not raise.
+    """
+    lines = [f"  held:    {len(held)}"]
+    for entry in held:
+        finding = entry.finding
+        detail = (
+            f"{finding.symbol} {finding.event} {finding.observed_on.isoformat()} {finding.check}"
+        )
+        if finding.computed is not None or finding.against is not None:
+            detail += f": {finding.computed} against {finding.against}"
+        elif finding.exception:
+            detail += f": {finding.exception}"
+        lines.append(f"    - {detail}")
+        if entry.filed_at is None:
+            lines.append(f"      NOT filed: {entry.filing_error}")
+        else:
+            lines.append(f"      filed at {entry.filed_at}")
+    return lines
+
+
 def _unfiled(held: Sequence[HeldFinding]) -> tuple[HeldFinding, ...]:
     """Every held finding whose record could not be written down.
 
@@ -586,22 +621,7 @@ class BarsReport:
             lines.append(
                 f"    - {entry.ticker} {entry.freq} {entry.rows} row(s) at {entry.partition}"
             )
-        lines.append(f"  held:    {len(self.held)}")
-        for held in self.held:
-            finding = held.finding
-            detail = (
-                f"{finding.symbol} {finding.event} "
-                f"{finding.observed_on.isoformat()} {finding.check}"
-            )
-            if finding.computed is not None or finding.against is not None:
-                detail += f": {finding.computed} against {finding.against}"
-            elif finding.exception:
-                detail += f": {finding.exception}"
-            lines.append(f"    - {detail}")
-            if held.filed_at is None:
-                lines.append(f"      NOT filed: {held.filing_error}")
-            else:
-                lines.append(f"      filed at {held.filed_at}")
+        lines.extend(_render_held(self.held))
         lines.append(f"  skipped: {self.skipped}")
         return "\n".join(lines)
 
@@ -1216,13 +1236,21 @@ def _read_spans(lake_root: Path) -> CaptureSpans:
 
     An absent file and a torn one are told apart, because the fixes differ: one wants
     ``python -m lake.seed_spans`` and the other wants a restore. ``CaptureSpans.read`` already
-    separates them, raising ``OSError`` for the first and ``SpansUnreadable`` for the second,
-    and this only gives the first a name of its own.
+    separates them, raising ``FileNotFoundError`` for the first and ``SpansUnreadable`` for the
+    second, and this only gives the first a name of its own.
+
+    It catches that one class rather than the whole ``OSError`` family, which is narrower than the
+    four other readers of this file. They answer a scope question and widen on anything they
+    cannot read, so an unreadable file costing them their answer is the same as an absent one. This
+    is a command, and the difference reaches a person: a permission or I/O failure on a file that
+    is there would be reported as "no capture spans" and would send them to the seeder, which
+    reads the same file and fails the same way. ``_read_master`` draws the line in the same place
+    one reference file over.
     """
     path = spans_path(lake_root)
     try:
         return CaptureSpans.read(path)
-    except OSError as exc:
+    except FileNotFoundError as exc:
         raise SpansAbsent(path) from exc
 
 
@@ -1249,15 +1277,30 @@ def _span_sessions(
        short under a manifested entry that the skip never re-fetches, and nothing would mark it
        short. A bar is the vendor's record of the session rather than the lake's record of its
        own coverage, and no column on a bars row claims capture was running.
-    3. **The equity close has passed.** That is the ceiling, and it makes a partial session
+    3. **The equity close has arrived.** That is the ceiling, and it makes a partial session
        unreachable rather than asking an operator not to run mid-session. ``equity_close`` is
-       where the ``1m`` window ends, so a session past it is complete, and an early close moves
-       the bound without anything here naming a wall-clock time. A run before the close leaves
+       where the ``1m`` window ends, so a session at or past it is complete, and an early close
+       moves the bound without anything here naming a wall-clock time. The comparison is inclusive
+       for that reason: a run at exactly the close is asking for a window that has just finished,
+       not one still open. A run before the close leaves
        that session to the next run.
 
     The same predicate answers both ends, so a closed span's final session is decided by the
     rule that decided an open span's first one.
+
+    **A span covering no instant at all covers no session either.** ``close_span`` permits an end
+    equal to the start, refusing only an end before it, so a retire landing in the same microsecond
+    as the onboard leaves a half-open ``[t, t)`` that holds nothing. ``CaptureSpans.in_scope``
+    answers ``False`` for that instant and for either side of it, and the intersection test above
+    would answer ``True`` for the whole session, which is the lake's own scope reading and this
+    walk disagreeing. The walk is the one that would then spend a request and land a permanent,
+    manifested partition for a session capture never covered, which is exactly what taking the
+    range from the spans rather than from a typed date is supposed to make impossible. It is
+    refused here rather than later because the manifested skip never re-fetches what has landed,
+    so a guard added afterwards would leave the partition on disk.
     """
+    if span.end is not None and span.end <= span.start:
+        return
     market_today = now.astimezone(MARKET_TZ).date()
     first = span.start.astimezone(MARKET_TZ).date()
     last = market_today
@@ -1431,22 +1474,7 @@ class BackfillReport:
                 f"    - {entry.ticker} {entry.freq} {entry.session.isoformat()} "
                 f"{entry.rows} row(s) at {entry.partition}"
             )
-        lines.append(f"  held:    {len(self.held)}")
-        for held in self.held:
-            finding = held.finding
-            detail = (
-                f"{finding.symbol} {finding.event} "
-                f"{finding.observed_on.isoformat()} {finding.check}"
-            )
-            if finding.computed is not None or finding.against is not None:
-                detail += f": {finding.computed} against {finding.against}"
-            elif finding.exception:
-                detail += f": {finding.exception}"
-            lines.append(f"    - {detail}")
-            if held.filed_at is None:
-                lines.append(f"      NOT filed: {held.filing_error}")
-            else:
-                lines.append(f"      filed at {held.filed_at}")
+        lines.extend(_render_held(self.held))
         lines.append(f"  skipped: {self.skipped}")
         lines.append(f"  unwalked: {len(self.unwalked)}")
         for line in self.unwalked:
@@ -1653,12 +1681,22 @@ def main(
     reaches past this process, and what "a second night" means has to be something a test
     decides.
 
-    Four conditions reach the operator as one line rather than a stack, and each has a fix
-    behind it. An absent master wants the onboarding command and a torn one wants a restore,
-    because an operator told to seed a corrupt file is being told the wrong thing. A roster
-    frequency nothing can fetch wants an edit to ``tickers.yaml``. A dead refresh token wants
-    the reauth command, and it is named rather than contained because every remaining
-    ticker-day would fail it identically.
+    Seven conditions reach the operator as one line rather than a stack, and all but the last
+    carry a fix.
+
+    1. An absent master wants the onboarding command, and a torn one wants a restore, because an
+       operator told to seed a corrupt file is being told the wrong thing.
+    2. An absent capture-spans file wants ``python -m lake.seed_spans``, which is what a master
+       from before that file existed needs, and a torn one wants a restore.
+    3. A roster frequency nothing can fetch wants an edit to ``tickers.yaml``.
+    4. A day that is not a session has no bars to fetch.
+    5. A dead refresh token wants the reauth command, and it is named rather than contained
+       because every remaining ticker-day would fail it identically.
+    6. Every other capture-spans failure is named and nothing is prescribed, because the
+       exception's own message is what says what is wrong.
+
+    The count was already one short of the handlers below before ``--backfill`` added two, so it
+    is a list rather than a sentence now: a list that disagrees with the code disagrees visibly.
 
     **A finding the run could not write down is what the third exit code is for.** The walk
     contains that failure so one unwritable file does not cost the other tickers their bars,
@@ -1695,6 +1733,15 @@ def main(
         return 2
     except SpansUnreadable as exc:
         print(f"bars: {exc}. Restore it from the backup.", file=sys.stderr)
+        return 2
+    except CaptureSpansError as exc:
+        # The class rather than its members, which is what the four other readers of this file
+        # already catch. Naming ``SpansUnreadable`` alone left its sibling
+        # ``UnsupportedSpansSchemaVersion`` reaching the operator as a stack, and a spans file from
+        # a newer version of this code is the one shape of it a person actually meets. No fix is
+        # invented for the rest, because the exception's own message is what says what is wrong
+        # and a wrong instruction is worse than none.
+        print(f"bars: {exc}.", file=sys.stderr)
         return 2
     except UnsupportedBarFreq as exc:
         print(f"bars: {exc}. Fix the bars list in tickers.yaml.", file=sys.stderr)

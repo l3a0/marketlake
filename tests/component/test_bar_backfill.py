@@ -29,6 +29,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from lake import bars, journal, report
@@ -40,7 +41,7 @@ from lake.bars import (
     backfill_bars,
     plan_backfill,
 )
-from lake.capture_spans import CaptureSpans, spans_path
+from lake.capture_spans import SPANS_SCHEMA, SPANS_SCHEMA_VERSION, CaptureSpans, spans_path
 from lake.cassette import Cassette
 from lake.manifest import read_manifest
 from lake.paths import LakePaths
@@ -705,31 +706,71 @@ def test_reusing_the_per_session_check_would_let_a_retired_frequency_through():
 # -- 12. a run that stops part-way -----------------------------------------------------
 
 
+def _landed_partitions(root: Path, freq: str = MINUTE_FREQ) -> list[tuple[str, date]]:
+    """Every bars partition on disk, read back off the files rather than off a report."""
+    return [
+        (ticker, day)
+        for ticker in ("SPY", "QQQ")
+        for day in SESSIONS
+        if _partition(root, ticker, freq, day).exists()
+    ]
+
+
 def test_a_run_that_dies_on_auth_resumes_from_what_it_landed(fixture_lake: FixtureLake):
     """#319 test 12.
 
     ``VendorAuthError`` stops the run rather than being contained, which #280 decided: every
     remaining ticker-day fails it identically. What makes that survivable over a range is the
     manifested skip, so the run after a new token costs nothing for the ticker-days already
-    landed. The second vendor's calls are what prove it rather than the report's own count.
+    landed.
+
+    **The death has to land part-way, and that is the whole difficulty of writing this.** The plan
+    is sorted, so a failure keyed on a ticker falls on the very first call and leaves nothing
+    behind. A test written that way asserts that the next run skipped zero and asked for all of
+    them, which is true of a run that never started and says nothing about resuming. ``fail_after``
+    is what puts the death in the middle instead, and the assertion below refuses a run that landed
+    nothing so the tautology cannot come back.
+    """
+    root = _lake(fixture_lake, spans=_open_span(1, 2), master=_master(("SPY", "QQQ")))
+    roster = _roster({"SPY": [MINUTE_FREQ], "QQQ": [MINUTE_FREQ]})
+    total = 2 * len(SESSIONS)
+    dying = RecordingVendor(
+        _cassette(tickers=("SPY", "QQQ"), freqs=(MINUTE_FREQ,)),
+        fail_after=5,
+        failure=VendorAuthError("the refresh token is dead"),
+    )
+    with pytest.raises(VendorAuthError):
+        _run(root, dying, roster=roster, spans=_open_span(1, 2))
+
+    # Five calls went out and the sixth raised, so the run stopped there rather than carrying on.
+    assert len(dying.calls) == 6
+    landed = _landed_partitions(root)
+    assert 0 < len(landed) < total
+
+    resumed = RecordingVendor(_cassette(tickers=("SPY", "QQQ"), freqs=(MINUTE_FREQ,)))
+    result = _run(root, resumed, roster=roster, spans=_open_span(1, 2))
+    assert result.skipped == len(landed)
+    assert len(resumed.calls) == total - len(landed)
+    assert len(_landed_partitions(root)) == total
+
+
+def test_the_death_stops_the_run_rather_than_being_held_per_ticker_day(fixture_lake: FixtureLake):
+    """A dead token is not contained, so no ticker-day after it is even asked for.
+
+    This is the half the resume test cannot show, and it is what ``RecordingVendor`` keeping its
+    calls exists for: the assertion is about the requests that did *not* go out.
     """
     root = _lake(fixture_lake, spans=_open_span(1, 2), master=_master(("SPY", "QQQ")))
     roster = _roster({"SPY": [MINUTE_FREQ], "QQQ": [MINUTE_FREQ]})
     dying = RecordingVendor(
         _cassette(tickers=("SPY", "QQQ"), freqs=(MINUTE_FREQ,)),
-        fail_with={"QQQ": VendorAuthError("the refresh token is dead")},
+        fail_after=3,
+        failure=VendorAuthError("the refresh token is dead"),
     )
     with pytest.raises(VendorAuthError):
         _run(root, dying, roster=roster, spans=_open_span(1, 2))
-
-    # The plan is sorted by session then ticker, so QQQ on the floor session is the first call and
-    # SPY on it is the second. The death lands on the first, before anything was written.
-    landed_before = [day for day in SESSIONS if _partition(root, "SPY", MINUTE_FREQ, day).exists()]
-
-    resumed = RecordingVendor(_cassette(tickers=("SPY", "QQQ"), freqs=(MINUTE_FREQ,)))
-    result = _run(root, resumed, roster=roster, spans=_open_span(1, 2))
-    assert result.skipped == len(landed_before)
-    assert len(resumed.calls) == 2 * len(SESSIONS) - len(landed_before)
+    assert len(dying.calls) == 4
+    assert len(dying.calls) < 2 * len(SESSIONS)
 
 
 # -- 13. an instrument the master cannot name ------------------------------------------
@@ -945,6 +986,216 @@ def test_an_unwalked_ticker_day_is_named_in_the_sign_off_block():
     ).render()
     assert f"unwalked: {len(SESSIONS)}" in rendered
     assert "QQQ on 2026-09-08" in rendered
+
+
+def test_the_command_runs_the_backfill_and_exits_zero(fixture_lake: FixtureLake, tmp_path: Path):
+    """``--backfill`` end to end, which is the only thing that exercises the command's contract.
+
+    The two refusal tests above stop inside ``_read_spans`` and never reach ``backfill_bars``, so
+    without this nothing runs ``BackfillReport.unfiled``, nothing prints a backfill's sign-off
+    block, and exit 0 for this flag has nothing behind it. "A run nobody can start is a library
+    with no entry point" is the issue's own argument for the flag existing, and this is what says
+    it can be started.
+    """
+    root = _lake(fixture_lake)
+    config = write_config(tmp_path, root)
+    vendor = RecordingVendor(_cassette(freqs=(MINUTE_FREQ,)))
+    code = bars.main(
+        ["--backfill", "--config", str(config), "--tickers", str(_tickers_file(tmp_path))],
+        clock=ManualClock(TONIGHT),
+        vendor_factory=lambda *a, **k: vendor,
+    )
+    assert code == 0
+    assert len(vendor.calls) == len(SESSIONS)
+    for day in SESSIONS:
+        assert _partition(root, "SPY", MINUTE_FREQ, day).exists()
+
+
+def test_the_command_prints_the_backfill_block_rather_than_the_session_one(
+    fixture_lake: FixtureLake, tmp_path: Path, capsys
+):
+    """The two commands print different blocks, and the flag is what picks which.
+
+    Without this a dispatch that ran the per-session fetch under ``--backfill`` would pass every
+    other test here, because those call ``backfill_bars`` directly and never go through ``main``.
+    """
+    root = _lake(fixture_lake)
+    config = write_config(tmp_path, root)
+    bars.main(
+        ["--backfill", "--config", str(config), "--tickers", str(_tickers_file(tmp_path))],
+        clock=ManualClock(TONIGHT),
+        vendor_factory=lambda *a, **k: RecordingVendor(_cassette(freqs=(MINUTE_FREQ,))),
+    )
+    out = capsys.readouterr().out
+    assert "Bar backfill over 2026-09-08..2026-09-16, 7 session(s)" in out
+    assert "Bar fetch for" not in out
+
+
+def test_the_default_command_still_fetches_one_session(
+    fixture_lake: FixtureLake, tmp_path: Path, capsys
+):
+    """No flag means the evening run, unchanged. The flag adds a path rather than moving one."""
+    root = _lake(fixture_lake)
+    config = write_config(tmp_path, root)
+    bars.main(
+        ["--config", str(config), "--tickers", str(_tickers_file(tmp_path))],
+        clock=ManualClock(TONIGHT),
+        vendor_factory=lambda *a, **k: RecordingVendor(_cassette(freqs=(MINUTE_FREQ,))),
+    )
+    out = capsys.readouterr().out
+    assert "Bar fetch for 2026-09-16" in out
+    assert "Bar backfill" not in out
+
+
+def test_a_held_finding_is_rendered_in_the_backfill_block(fixture_lake: FixtureLake):
+    """The held block is one spelling shared with the per-session report, and this is its reader.
+
+    Tests 7 and 8 produce held findings and read them off the report's fields. Nothing rendered
+    them, so a drift in the block would have failed nothing.
+    """
+    quotes = {("SPY", day): [_gap_row(day)] for day in (*SESSIONS, date(2026, 9, 17))}
+    root = _lake(fixture_lake, quotes=quotes)
+    result = _run(
+        root, RecordingVendor(_cassette(freqs=(DAILY_FREQ,))), roster=_roster({"SPY": [DAILY_FREQ]})
+    )
+    rendered = result.render()
+    assert f"held:    {len(SESSIONS)}" in rendered
+    assert f"SPY 1d 2026-09-08 {CHECK_BAR_CLOSE}" in rendered
+    assert "NoSpotClose" in rendered
+    assert "filed at" in rendered
+
+
+def test_the_two_reports_render_a_held_finding_the_same_way():
+    """One spelling, asserted rather than assumed, because two copies is how the two drift."""
+    finding = report.Withheld(
+        symbol="SPY",
+        observed_on=date(2026, 9, 8),
+        event=DAILY_FREQ,
+        check=CHECK_BAR_CLOSE,
+        computed=None,
+        against=None,
+        exception="NoSpotClose: nothing settled",
+    )
+    held = (bars.HeldFinding(finding=finding, filed_at="reports/withheld/x.json"),)
+    session_lines = bars.BarsReport(
+        session=date(2026, 9, 8), attempted=1, landed=(), held=held, skipped=0
+    ).render()
+    backfill_lines = bars.BackfillReport(
+        floor=date(2026, 9, 8),
+        ceiling=date(2026, 9, 8),
+        sessions=1,
+        attempted=1,
+        landed=(),
+        held=held,
+        skipped=0,
+        unwalked=(),
+    ).render()
+    shared = [line for line in session_lines.splitlines() if line.startswith(("  held", "    "))]
+    assert shared
+    assert shared == [
+        line for line in backfill_lines.splitlines() if line.startswith(("  held", "    "))
+    ]
+
+
+# -- a span covering no instant ---------------------------------------------------------
+
+
+def test_a_span_covering_no_instant_covers_no_session(fixture_lake: FixtureLake):
+    """A zero-length span is empty by the lake's own scope answer, so the walk must agree.
+
+    ``close_span`` refuses an end before the start and permits one equal to it, so a retire landing
+    in the same microsecond as the onboard leaves ``[t, t)``. ``CaptureSpans.in_scope`` answers
+    ``False`` for that instant and either side of it. Without the guard the intersection test
+    answers ``True`` for the whole session, and the walk spends a request and lands a permanent
+    partition for a session capture never covered, which is what taking the range from the spans
+    rather than from a typed date is supposed to make impossible.
+    """
+    instant = datetime(2026, 9, 10, 17, 0, tzinfo=UTC)
+    empty = _spans((1, instant, instant))
+    assert not empty.in_scope(1, instant)
+    assert empty.spans_covering(instant) == ()
+
+    root = _lake(fixture_lake, spans=empty)
+    vendor = RecordingVendor(_cassette(freqs=(MINUTE_FREQ,)))
+    result = _run(root, vendor, spans=empty)
+    assert result.sessions == 0
+    assert vendor.calls == []
+    assert result.landed == ()
+
+
+def test_a_span_of_one_microsecond_does_cover_its_session():
+    """The guard refuses the empty span and not the short one, which is the floor rule itself.
+
+    A span holding a single instant of a session puts that whole session in range, because a bar
+    is not clipped to the span. Guarding on ``end <= start`` rather than on a duration is what
+    keeps these two apart.
+    """
+    instant = datetime(2026, 9, 10, 17, 0, tzinfo=UTC)
+    tiny = _spans((1, instant, instant + timedelta(microseconds=1)))
+    assert tiny.in_scope(1, instant)
+    assert _plan(spans=tiny).sessions == (date(2026, 9, 10),)
+
+
+def test_a_spans_file_from_a_newer_schema_reaches_the_operator_as_one_line(
+    fixture_lake: FixtureLake, tmp_path: Path, capsys
+):
+    """``UnsupportedSpansSchemaVersion`` is a sibling of ``SpansUnreadable``, not a stack.
+
+    ``main`` catches the ``CaptureSpansError`` class rather than naming one member, which is what
+    the four other readers of this file already do. No fix is prescribed, because the exception's
+    own message says what is wrong and a wrong instruction is worse than none.
+    """
+    root = _lake(fixture_lake)
+    table = pa.table(
+        {
+            "instrument_id": [1],
+            "span_start": [SPAN_START],
+            "span_end": [None],
+            "options": [True],
+            "schema_version": [SPANS_SCHEMA_VERSION + 1],
+        },
+        schema=SPANS_SCHEMA,
+    )
+    pq.write_table(table, spans_path(root))
+    config = write_config(tmp_path, root)
+    code = bars.main(
+        ["--backfill", "--config", str(config), "--tickers", str(_tickers_file(tmp_path))],
+        clock=ManualClock(TONIGHT),
+        vendor_factory=lambda *a, **k: RecordingVendor(_cassette()),
+    )
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "capture-spans schema version 2, this code reads 1" in err
+    assert "Traceback" not in err
+
+
+def test_an_unreadable_spans_file_that_is_present_is_not_reported_as_absent(
+    fixture_lake: FixtureLake,
+):
+    """``_read_spans`` names only ``FileNotFoundError``, which is where ``_read_master`` draws it.
+
+    Catching the whole ``OSError`` family would tell an operator whose file is there but
+    unreadable that there is no file, and send them to the seeder, which reads the same file and
+    fails the same way.
+    """
+    root = _lake(fixture_lake)
+    spans_path(root).chmod(0o000)
+    try:
+        with pytest.raises(PermissionError):
+            bars._read_spans(root)
+    finally:
+        spans_path(root).chmod(0o644)
+
+
+def test_the_ceiling_takes_the_session_at_exactly_its_close():
+    """The rule reads "at or past the close", and the boundary instant is where that is decided.
+
+    At ``now == equity_close`` the ``1m`` window the fetch asks for has just finished, so the
+    session is complete and belongs in the range. One microsecond earlier it does not.
+    """
+    close = datetime.fromisoformat("2026-09-16T16:00:00-04:00")
+    assert _plan(now=close).ceiling == date(2026, 9, 16)
+    assert _plan(now=close - timedelta(microseconds=1)).ceiling == date(2026, 9, 15)
 
 
 def test_the_walk_asks_for_one_window_per_ticker_day(fixture_lake: FixtureLake):

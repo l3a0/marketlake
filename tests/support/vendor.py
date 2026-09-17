@@ -430,21 +430,43 @@ class RecordingVendor:
     ``CassetteError`` rather than replaying a neighbour's recording. Keeping the calls turns that
     precondition into an assertion a test can read: which window, in which order.
 
-    ``fail_with`` raises for a named ticker instead of replaying, which is how an auth death and a
-    vendor refusal are driven. The call is recorded first, so a test can tell a ticker that failed
-    apart from one that was never reached.
+    ``fail_with`` raises for a named ticker instead of replaying, which is how a vendor refusal is
+    driven. ``fail_after`` raises once that many calls have been recorded, whichever ticker they
+    were for, which is how a run is made to die *part-way* rather than on its first request.
 
-    ``tests/component/test_bar_fetch.py`` carries a private twin of this, which predates it and is
-    left alone while marketlake #383 is open against that file.
+    The two are not interchangeable, and a test about resuming needs the second. A walk over a
+    range asks for its ticker-days in a sorted order, so a failure keyed on a ticker can land on
+    the very first call and leave nothing behind. A test written that way then asserts that zero
+    partitions were skipped by the next run, which is true and says nothing.
+
+    Either way the call is recorded before the raise, so a test can tell a ticker that failed apart
+    from one that was never reached.
+
+    ``tests/component/test_bar_fetch.py`` carries a private twin of this, which predates it.
+    Repointing its thirty-five call sites is marketlake #396 rather than the backfill's, because
+    it changes no behaviour in either file and would grow a diff that has none of its own there.
     """
 
-    def __init__(self, cassette: Cassette, *, fail_with: Mapping[str, BaseException] | None = None):
+    def __init__(
+        self,
+        cassette: Cassette,
+        *,
+        fail_with: Mapping[str, BaseException] | None = None,
+        fail_after: int | None = None,
+        failure: BaseException | None = None,
+    ):
         self._replay = CassetteVendor(cassette)
         self._fail_with = dict(fail_with or {})
+        self._fail_after = fail_after
+        self._failure = failure
         self.calls: list[dict] = []
 
     def _record(self, symbol: str, freq: str, start: datetime, end: datetime) -> None:
         self.calls.append(bars_params(symbol, freq, start=start, end=end))
+        if self._fail_after is not None and len(self.calls) > self._fail_after:
+            if self._failure is None:
+                raise ValueError("fail_after needs a failure to raise")
+            raise self._failure
         if symbol in self._fail_with:
             raise self._fail_with[symbol]
 
