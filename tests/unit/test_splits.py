@@ -15,11 +15,20 @@ from datetime import date
 import pytest
 
 from lake.splits import (
+    _STRIKE_PLACES,
+    REASON_INSTRUMENT_CHANGED,
+    REASON_NO_LADDER,
+    REASON_NO_UNDERLYING,
+    REASON_SCALE_WINDOW,
+    SCALE_CONFIRMATION_FLOOR,
+    WHOLE_RATIO_GATE,
+    WHOLE_RATIO_TOLERANCE,
     Deliverable,
     DeliverableUnreadable,
     NonScalarDeliverable,
     Session,
     check_split_consistency,
+    check_strike_scale,
     deliverable_of,
     deliverable_of_row,
     require_scalar,
@@ -476,3 +485,278 @@ def test_a_ratio_the_counts_cannot_represent_raises_rather_than_riding_a_finding
     """
     with pytest.raises(DeliverableUnreadable, match="no ratio a reader can represent"):
         check_split_consistency(_deliverable(units=5e-324), _deliverable(150.0, note_units=150.0))
+
+
+# -- the scale guard's arithmetic -------------------------------------------------------
+
+# A ladder wide enough that a rescaling and a coincidence are different numbers.
+LADDER = frozenset({600.0, 650.0, 700.0, 750.0, 800.0, 810.0, 820.0})
+
+
+def _scale_session(
+    strikes=LADDER, spot: float | None = 700.0, day: date = DAY, instrument_id: int = 1
+) -> Session:
+    return Session(
+        day=day,
+        instrument_id=instrument_id,
+        roots=frozenset({"SPY"}),
+        rows=(),
+        strikes=frozenset(strikes),
+        spot=spot,
+    )
+
+
+def test_no_two_whole_ratios_can_ever_claim_one_spot_move():
+    """The property a band of tolerances does not have, which is why the candidate is rounded.
+
+    Bands of plus or minus 10% around 2, 3 and 4 are disjoint, then 5's runs to 5.500 while 6's
+    starts at 5.400, and from there every move falls inside some band. Rounding leaves one
+    candidate by construction, so this walks a fine grid and asserts the answer is always the
+    single nearest whole ratio or nothing at all.
+    """
+    for step in range(15, 2001):
+        move = step / 100
+        verdict = check_strike_scale(
+            _scale_session(spot=move * 100.0), _scale_session(spot=100.0), skipped_since=0
+        )
+        assert not isinstance(verdict, str)
+        if verdict.ratio is None:
+            continue
+        expected = float(round(move)) if move >= WHOLE_RATIO_GATE else 1.0 / round(1.0 / move)
+        assert verdict.ratio == expected, f"{move} named {verdict.ratio}"
+        assert abs(move - verdict.ratio) / verdict.ratio <= WHOLE_RATIO_TOLERANCE
+        assert move >= WHOLE_RATIO_GATE or move <= 1 / WHOLE_RATIO_GATE
+
+
+def test_an_ordinary_move_names_no_ratio_at_all():
+    """The live lake's four adjacent pairs run 0.999745 to 1.006586, nowhere near a ratio."""
+    for move in (0.999745, 1.000255, 1.004429, 1.004608, 1.006586):
+        verdict = check_strike_scale(
+            _scale_session(spot=move * 700.0), _scale_session(spot=700.0), skipped_since=0
+        )
+        assert verdict.ratio is None
+        assert verdict.confirmed == 0.0
+
+
+def test_a_move_just_inside_the_gate_still_names_nothing():
+    """The gate is the midpoint below the smallest whole ratio, so 1.49 is not a candidate."""
+    below = check_strike_scale(
+        _scale_session(spot=(WHOLE_RATIO_GATE - 0.01) * 700.0),
+        _scale_session(spot=700.0),
+        skipped_since=0,
+    )
+    assert below.ratio is None
+
+
+def test_a_move_too_far_from_its_candidate_names_nothing():
+    """1.8 rounds to 2 and sits 10% away from it, which is twice the tolerance."""
+    verdict = check_strike_scale(
+        _scale_session(spot=1.8 * 700.0), _scale_session(spot=700.0), skipped_since=0
+    )
+    assert verdict.ratio is None
+    assert verdict.spot_ratio == pytest.approx(1.8)
+
+
+def test_the_confirmation_runs_at_the_candidate_and_not_at_the_raw_move():
+    """An ex-date carries overnight drift, so the raw move lands between rungs.
+
+    Dividing each rung by 2.000637 gives 299.9, 324.9 and so on, none of which is listed. The
+    candidate is 2, and dividing by it lands on the rungs the OCC created.
+    """
+    previous = _scale_session()
+    session = _scale_session(strikes={strike / 2 for strike in LADDER}, spot=700.0 / 2.000637)
+
+    verdict = check_strike_scale(previous, session, skipped_since=0)
+
+    assert verdict.ratio == 2.0
+    assert verdict.spot_ratio == pytest.approx(2.000637)
+    assert verdict.confirmed == 1.0
+    assert verdict.holds
+
+
+def test_a_stationary_ladder_confirms_far_below_the_floor():
+    """The crash the guard must not read as a split.
+
+    Measured on the live lake, a stationary ladder confirms at most 0.287785 when spot moves by
+    a whole ratio anyway, against 1.000000 for a real adjustment. This ladder's own coincidence
+    is whatever it is, and the claim is that it stays under the floor.
+    """
+    verdict = check_strike_scale(_scale_session(), _scale_session(spot=350.0), skipped_since=0)
+
+    assert verdict.ratio == 2.0
+    assert verdict.confirmed < SCALE_CONFIRMATION_FLOOR
+    assert not verdict.holds
+
+
+def test_a_ladder_that_only_half_followed_does_not_confirm():
+    """The floor is a floor, so a partial rescaling is not a whole-ratio adjustment."""
+    followed = sorted(LADDER)[:3]
+    session = _scale_session(strikes={strike / 2 for strike in followed}, spot=350.0)
+
+    verdict = check_strike_scale(_scale_session(), session, skipped_since=0)
+
+    assert verdict.confirmed == pytest.approx(3 / len(LADDER))
+    assert not verdict.holds
+
+
+def test_the_four_refusals_come_back_as_reasons_rather_than_verdicts():
+    """Each one is a pair nobody judged, which the report keeps apart from a pair it passed."""
+    ordinary = _scale_session()
+    assert (
+        check_strike_scale(ordinary, _scale_session(instrument_id=2), skipped_since=0)
+        == REASON_INSTRUMENT_CHANGED
+    )
+    assert check_strike_scale(ordinary, ordinary, skipped_since=1) == REASON_SCALE_WINDOW
+    assert (
+        check_strike_scale(ordinary, _scale_session(strikes=frozenset()), skipped_since=0)
+        == REASON_NO_LADDER
+    )
+    assert (
+        check_strike_scale(ordinary, _scale_session(spot=None), skipped_since=0)
+        == REASON_NO_UNDERLYING
+    )
+
+
+def test_the_instrument_is_asked_before_the_window():
+    """Two securities are not a pair at all, whatever sits between their sessions."""
+    assert (
+        check_strike_scale(_scale_session(), _scale_session(instrument_id=2), skipped_since=3)
+        == REASON_INSTRUMENT_CHANGED
+    )
+
+
+def test_a_degenerate_previous_session_is_refused_rather_than_dividing_by_it():
+    """The refusals have to read *both* sides, and the previous side is the one that crashes.
+
+    ``confirmed`` divides by ``len(previous.strikes)`` and ``spot_ratio`` divides by
+    ``previous.spot``, so a check reading only the incoming session leaves a ``ZeroDivisionError``
+    and a ``TypeError`` live in a walk that would then abandon every ticker it had not reached.
+    """
+    ordinary = _scale_session()
+    assert (
+        check_strike_scale(_scale_session(strikes=frozenset()), ordinary, skipped_since=0)
+        == REASON_NO_LADDER
+    )
+    assert (
+        check_strike_scale(_scale_session(spot=None), ordinary, skipped_since=0)
+        == REASON_NO_UNDERLYING
+    )
+
+
+def test_the_window_is_asked_before_the_ladder_and_the_spot():
+    """A pair failing two conditions reports the one that decides it, not whichever ran first.
+
+    The window refusal is about the comparison being unmeasurable across a gap, which is true
+    whatever the two sessions carry, so it outranks a reading that could not be taken.
+    """
+    ordinary = _scale_session()
+    assert (
+        check_strike_scale(ordinary, _scale_session(spot=None), skipped_since=1)
+        == REASON_SCALE_WINDOW
+    )
+    assert (
+        check_strike_scale(ordinary, _scale_session(strikes=frozenset()), skipped_since=1)
+        == REASON_SCALE_WINDOW
+    )
+
+
+def test_an_odd_ratio_confirms_at_the_precision_the_vendor_can_write():
+    """The rounding is the vendor's own three decimals, and a fourth breaks every odd ratio.
+
+    The OCC symbol carries a strike in thousandths, so a 3-for-1 rescaling of 205 is listed as
+    68.333 and nothing else. Asking for 68.3333 matches no rung, and measured on the live
+    ladders that leaves 3:1 confirming at 0.333, well under the floor and read as an ordinary
+    day. Every other scale test divides round hundreds by 2, where the fourth decimal is zero.
+    """
+    ladder = frozenset({205.0, 610.0, 700.0, 1000.0, 204.78})
+    listed = frozenset(round(strike / 3, 3) for strike in ladder)
+    assert 68.333 in listed, "the fixture must rescale at the vendor's own precision"
+
+    verdict = check_strike_scale(
+        _scale_session(strikes=ladder, spot=900.0),
+        _scale_session(strikes=listed, spot=300.0),
+        skipped_since=0,
+    )
+
+    assert _STRIKE_PLACES == 3
+    assert verdict.ratio == 3.0
+    assert verdict.confirmed == 1.0
+    assert verdict.holds
+
+
+def test_the_floor_is_a_floor_and_it_sits_where_the_constant_says():
+    """Exactly half the ladder following is enough, and one rung fewer is not.
+
+    Written with a twenty-rung ladder so the two cases land on 0.50 and 0.45 rather than near
+    them. A floor nothing lands on leaves its value unpinned, and a pair of cases a tenth apart
+    leaves every value between them unpinned too.
+    """
+    ladder = frozenset(float(600 + 10 * step) for step in range(20))
+    rungs = sorted(ladder)
+
+    def confirmed_over(count: int):
+        return check_strike_scale(
+            _scale_session(strikes=ladder, spot=700.0),
+            _scale_session(strikes=frozenset(s / 2 for s in rungs[:count]), spot=350.0),
+            skipped_since=0,
+        )
+
+    exactly, under = confirmed_over(10), confirmed_over(9)
+
+    assert exactly.confirmed == 0.5
+    assert exactly.holds, "a confirmation exactly at the floor is inside it"
+    assert under.confirmed == 0.45
+    assert not under.holds, "the floor sits at 0.50 and not below it"
+
+
+def test_the_tolerance_admits_and_refuses_at_written_out_numbers():
+    """Literal values, because a probe derived from the constant cannot fail when it moves.
+
+    A ratio of 2.09 is 4.5% off a 2:1 and rides. 2.10 is 5% off and does not. Nothing here
+    mentions ``WHOLE_RATIO_TOLERANCE``, which is the point.
+    """
+
+    def ratio(spot_ratio: float):
+        return check_strike_scale(
+            _scale_session(spot=spot_ratio), _scale_session(spot=1.0), skipped_since=0
+        ).ratio
+
+    assert ratio(2.09) == 2.0
+    assert ratio(2.10) is None
+    assert ratio(2.11) is None
+    assert ratio(4.75) == 5.0, "a move exactly at the tolerance is inside it"
+
+
+def test_a_subnormal_underlying_declines_the_pair_rather_than_ending_the_run():
+    """``round`` of an overflowed reciprocal raises, and the raise would cost every later ticker.
+
+    ``check_split_consistency`` refuses the same hazard by name for the ledger's own ratio, so
+    the module already treats a denormal as in scope rather than impossible.
+    """
+    for spot in (1e-310, 5e-324):
+        verdict = check_strike_scale(
+            _scale_session(spot=spot), _scale_session(spot=1.0), skipped_since=0
+        )
+        assert verdict.ratio is None
+
+
+def test_a_hostile_strike_or_underlying_is_not_a_reading():
+    """Bools are ints in Python, and a zero underlying beside a real one is not a second price.
+
+    Without the positivity filter a zero would make the session name two values, and the guard
+    would go silent on a genuine split rather than filing it.
+    """
+    from lake.splits import _ladder, _spot
+
+    rows = [
+        {"strike_price": 650.0, "underlying_price": 700.0},
+        {"strike_price": True, "underlying_price": True},
+        {"strike_price": 0.0, "underlying_price": 0.0},
+        {"strike_price": -5.0, "underlying_price": -5.0},
+        {"strike_price": float("inf"), "underlying_price": float("inf")},
+        {"strike_price": float("nan"), "underlying_price": float("nan")},
+        {"strike_price": None, "underlying_price": None},
+    ]
+
+    assert sorted(_ladder(rows)) == [650.0]
+    assert _spot(rows) == 700.0

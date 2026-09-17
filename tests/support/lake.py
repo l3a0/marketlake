@@ -36,8 +36,12 @@ from lake.paths import DATE_PARTITIONED
 
 # A fixture schema for chains rows. Provenance columns plus a few vendor columns.
 #
-# Eight of the vendor columns are here for the split detector, which reads a corporate
-# action out of what a contract delivers rather than out of its price. ``option_root`` is
+# Eight of the vendor columns are here for the split detector's re-symboling signal, which
+# reads a corporate action out of what a contract delivers. Its other signal, the strike
+# ladder against the session's spot, reads ``strike_price`` and ``underlying_price``, and
+# this schema carries neither. A file needing those brings its own, as
+# ``tests/component/test_split_detection.py`` does and for the reason
+# ``tests/component/test_oi_view.py`` gives. ``option_root`` is
 # the signal, Schwab's own ``optionRoot``, and the OCC re-symboling that announces a split
 # is a change in it. ``ssid`` is Schwab's own contract identifier, and it is what pairs a
 # re-symboled contract's old symbol to its new one, since the symbol moves and the contract

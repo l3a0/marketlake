@@ -419,9 +419,9 @@ _BARS_FETCH_FIELDS = [
 #    re-fetch rather than a hole to mark. ``gap.surfaces_for`` says the same from the other
 #    end: it returns quotes, and chains beside them when the ticker carries options, and
 #    never bars.
-# 2. ``suspect`` flags a response for the validation battery to judge after it lands. The
-#    battery judges bars before they land instead, per the design's split detector "run
-#    before bars land", so there is no later judge for the flag to reach.
+# 2. ``suspect`` flags a response for the validation battery to judge after it lands. Bars are
+#    judged before they land instead, under the design's gate-before-land rule for the
+#    vendor-sweep surfaces, so there is no later judge for the flag to reach.
 # 3. ``close_tag`` names the cycle a row was captured in. A daily bar is the close and a
 #    minute bar belongs to its own minute, so neither has a cycle to tag.
 # 4. ``session_phase`` tags a row observed after the equity close. A bar's session is decided
