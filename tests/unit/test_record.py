@@ -669,6 +669,24 @@ def test_a_bare_fifth_field_is_refused_even_when_it_spells_a_flag_value():
         _parse_bar_requests([f"{UNFLAGGED},false"])
 
 
+def test_a_named_field_is_read_in_trailing_position_only():
+    """The four positional fields stay positional.
+
+    A flag written in the middle falls to the four-field refusal and collects the
+    fractional-second sentence, which blames the wrong thing. That cost is accepted on #437,
+    because making the hint precise means detecting the comma marker in the raw value instead of
+    counting fields, which is a change to the guard this work exists to preserve. The metavar
+    shows the position, so the form the operator is shown is the form that works.
+
+    Mutation found this unheld: popping named fields from anywhere in the value passed the suite
+    unchanged, and that is a wider grammar than the metavar promises.
+    """
+    with pytest.raises(ValueError, match="four comma-separated fields"):
+        _parse_bar_requests(
+            ["SPY,1m,extended_hours=false,2026-09-14T09:30:00-04:00,2026-09-14T16:00:00-04:00"]
+        )
+
+
 def test_two_bars_values_with_one_key_are_refused():
     # Cassette.find returns the first exact match, so a second interaction keyed alike is a live
     # request spent on something nothing can ever read back. That is the loss the --out refusal
