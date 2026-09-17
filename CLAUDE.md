@@ -112,6 +112,18 @@ Review by fanning out independent lenses, then verifying each finding adversaria
 
 Verify by executing, not by reading. Mutate the code and confirm a test fails. A test that still passes under mutation does not cover what it claims to cover. Say plainly what the review found and what it refuted, including when it found nothing.
 
+**Watch the checks and fix what they find (owner directive, 2026-09-17).** A pull request is not handed over until its checks have run and settled. Pushing is not the end of the work, because the branch that passes locally is not the branch CI builds. CI builds the merge of the branch and its base, and the base moves.
+
+So watch the run rather than assume it. `gh pr checks <n> --watch` blocks until every check settles, and `gh pr view <n> --json statusCheckRollup` says what each one concluded. When a check fails, read its log, fix the cause, and push again, in the same session and without waiting to be asked. A red check the owner finds first is work handed over unfinished.
+
+Three measurements from this repository make the rule sharper than "look for a green tick".
+
+1. **Nothing requires a check to pass.** The `Default` ruleset on `main` carries no `required_status_checks` rule, so a red job blocks no merge. Forty-three pull requests merged from 2026-09-16 onward and none of them had to pass anything. Until #412 closes, the check is advice, which is exactly why reading it is the session's job rather than the gate's.
+2. **A conflicting pull request gets no run at all.** A `pull_request` workflow builds the merge ref, and a branch that conflicts has none, so no run is created. PR #414 showed three green CodeQL entries and no `test` run whatsoever. An absent check reads as a short rollup rather than as a failure, so count what ran instead of scanning for red.
+3. **Green goes stale.** A run is computed against one merge ref, and a later merge to the base replaces it. PR #433's checks read green after the branch had already conflicted underneath them. Re-read the rollup whenever the base has moved.
+
+Fix the cause rather than the symptom. A lint rule that fails on one file usually fails on its siblings, so sweep for the class. Re-running a job changes nothing the second time unless the failure was the runner rather than the code. Where a failure comes from another branch's merge rather than from this change, say so on the pull request instead of absorbing an unrelated fix into it.
+
 **A filed issue carries its milestone and its labels (owner directive, 2026-09-13).** Filing is not finished when the issue exists. An issue with no milestone appears in no slice view and no view scoped by kind, so only a sweep for nulls finds it, and nothing brings it back on its own. Three arrived that way in a single day, each from a session told to file what it found and nothing further: #143, then #145 and #146. The sessions did exactly what was asked, which is why the rule belongs here rather than in a reminder.
 
 So a filed issue is finished when it says three things.
