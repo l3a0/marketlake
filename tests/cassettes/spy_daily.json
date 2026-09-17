@@ -1,0 +1,41 @@
+{
+  "cassette_version": 1,
+  "interactions": [
+    {
+      "body": {
+        "candles": [
+          {
+            "close": 648.5,
+            "datetime": 1789448400000,
+            "high": 651.0,
+            "low": 644.0,
+            "open": 645.0,
+            "volume": 70000000
+          },
+          {
+            "close": 650.0,
+            "datetime": 1789531200000,
+            "high": 652.0,
+            "low": 646.0,
+            "open": 648.5,
+            "volume": 80000000
+          }
+        ],
+        "empty": false,
+        "symbol": "SPY"
+      },
+      "endpoint": "bars",
+      "headers": {
+        "content-type": "application/json"
+      },
+      "params": {
+        "end": "2026-09-17T04:00:00+00:00",
+        "freq": "1d",
+        "start": "2026-09-15T04:00:00+00:00",
+        "symbol": "SPY"
+      },
+      "status": 200
+    }
+  ],
+  "token_mint_time": "2026-08-23T20:05:00-04:00"
+}
