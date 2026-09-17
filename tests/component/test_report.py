@@ -108,6 +108,37 @@ def test_a_real_run_files_what_it_found(lake_root):
     (entry,) = _entries(lake_root)
     assert entry["unobserved"] == ["XYZ"]
     assert entry["reportable"] is True
+    # The roster the list above is read against. XYZ captured no options, so it owed the
+    # equity close alone, and a reader sees one ticker owed and the same one unobserved.
+    assert entry["spot_owed"] == ["XYZ"]
+    assert entry["option_owed"] == []
+    assert entry["sources_missing"] == []
+
+
+def test_a_run_that_examined_nobody_files_as_reportable(lake_root):
+    """The file this issue exists for. Empty lists, and now a reason for them.
+
+    Neither reference file answers, so the guard checks nobody and every list it files is
+    empty, which is byte for byte what a day with both closes landed used to write. The
+    rosters and the named sources are what a reader has to tell them apart, and
+    ``reportable`` is what puts this day in front of a reader at all.
+    """
+    blind = close_guard.CloseGuard(
+        lake_root=lake_root,
+        spans=lambda: None,
+        session_clock=SessionClock(clock=ManualClock(start=AT), calendar=weekday_sessions(WEEK)),
+        master=lambda: None,
+        pid=9,
+    )
+
+    report.write_close_guard(lake_root, blind.run(DAY), now=AT, pid=11)
+
+    (entry,) = _entries(lake_root)
+    assert entry["unobserved"] == [], "the fixture stopped standing for a silent run"
+    assert entry["spot_owed"] == []
+    assert entry["option_owed"] == []
+    assert entry["sources_missing"] == ["spans", "master"]
+    assert entry["reportable"] is True
 
 
 def test_the_file_lands_under_the_guards_own_dated_directory(lake_root):
@@ -145,7 +176,7 @@ def test_a_clean_run_writes_a_file_too(lake_root):
     makes "no file" ambiguous between a run that found nothing and a run that never
     happened, which is the hole-versus-row distinction this lake refuses everywhere else.
     """
-    clean = GuardOutcome(DAY, filled=("SPY",))
+    clean = GuardOutcome(DAY, filled=("SPY",), spot_owed=("SPY",), option_owed=("SPY",))
     assert not clean.reportable
 
     report.write_close_guard(lake_root, clean, now=AT, pid=11)
@@ -397,7 +428,9 @@ def test_any_one_finding_files_the_day_as_reportable(lake_root, field):
     day whose only finding is a refusal could file as ``reportable: false`` and drop out
     of the nightly report with its ``refused`` list sitting unread in the file.
     """
-    outcome = GuardOutcome(DAY, **{field: ("XYZ",)})
+    # A roster, so this clause is the only thing that can file the day. Without one the
+    # empty-roster rule files it anyway and every clause here could be deleted green.
+    outcome = GuardOutcome(DAY, spot_owed=("XYZ",), option_owed=("XYZ",), **{field: ("XYZ",)})
     assert outcome.reportable, f"{field} alone did not count as worth reporting"
 
     report.write_close_guard(lake_root, outcome, now=AT, pid=11)
@@ -408,8 +441,15 @@ def test_any_one_finding_files_the_day_as_reportable(lake_root, field):
 
 
 def test_a_run_that_only_filled_is_not_reportable(lake_root):
-    """The other side of the same field. A repaired close is not a finding."""
-    report.write_close_guard(lake_root, GuardOutcome(DAY, filled=("XYZ",)), now=AT, pid=11)
+    """The other side of the same field. A repaired close is not a finding.
+
+    The rosters are what make this run distinguishable from one that examined nobody, and
+    an outcome without them is the second of those. So the ticker it repaired owed both
+    closes, which is the only way this day is a repair rather than a dead guard.
+    """
+    outcome = GuardOutcome(DAY, filled=("XYZ",), spot_owed=("XYZ",), option_owed=("XYZ",))
+
+    report.write_close_guard(lake_root, outcome, now=AT, pid=11)
 
     assert _entries(lake_root)[0]["reportable"] is False
 

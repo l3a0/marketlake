@@ -390,7 +390,12 @@ def test_the_other_three_findings_reach_stderr_too(field, label, capsys):
     being printed. A refusal is the one that costs most: it is how a fill that captured
     nothing is recorded at all.
     """
-    outcome = close_guard.GuardOutcome(DAY, **{field: ("XYZ: reason",)})
+    # A roster, so the clause under test is the only thing that can make this reportable.
+    # Without one, an empty roster reports the day on its own and every clause below could
+    # be deleted with this case still green.
+    outcome = close_guard.GuardOutcome(
+        DAY, spot_owed=("XYZ",), option_owed=("XYZ",), **{field: ("XYZ: reason",)}
+    )
     assert outcome.reportable, f"{field} alone did not count as worth reporting"
 
     daemon._report_guard(outcome)
@@ -410,6 +415,40 @@ def test_a_field_with_nothing_in_it_is_left_out(capsys):
     assert "unobserved=XYZ" in reported
     assert "refused=" not in reported, "an empty field was printed anyway"
     assert "problems=" not in reported
+
+
+def test_the_line_says_how_many_were_owed(capsys):
+    """The denominator rides every reported line, not only the line it rescues.
+
+    A reader seeing ``unobserved=XYZ`` wants to know whether that was one ticker out of
+    two or the only one there was. The file carries the tickers, because one log line
+    cannot carry a roster, and this carries the two lengths.
+    """
+    outcome = close_guard.GuardOutcome(
+        DAY, unobserved=("XYZ",), spot_owed=("XYZ", "ABC"), option_owed=("XYZ",)
+    )
+
+    daemon._report_guard(outcome)
+
+    assert "owed=2/1" in capsys.readouterr().err
+
+
+def test_a_run_that_owed_nobody_says_something_after_the_colon(capsys):
+    """The empty-roster run fills none of the five named lists, so the line needs its own.
+
+    Without the ``owed=`` part this prints ``close+5 2026-09-02:`` and stops, which is
+    what the suite captured from the daemon's production entry while this was being
+    built. A reportable run that says nothing is worse than the silence it replaced.
+    """
+    outcome = close_guard.GuardOutcome(DAY, sources_missing=("spans",))
+    assert outcome.reportable
+
+    daemon._report_guard(outcome)
+
+    reported = capsys.readouterr().err.strip()
+    assert reported != f"close+5 {DAY.isoformat()}:", "the line stopped at the colon"
+    assert "owed=0/0" in reported
+    assert "sources-missing=spans" in reported, "the file that did not answer went unnamed"
 
 
 def test_a_config_that_will_not_load_still_reaches_stderr(tmp_path, capsys):
@@ -438,7 +477,15 @@ def test_a_run_that_only_had_problems_still_says_so_on_stderr(capsys):
     asserted, because either one alone leaves the other free to drop the field: the
     outcome has to count as reportable, and the report has to carry the field.
     """
-    outcome = close_guard.GuardOutcome(DAY, problems=("prologue: KeyError: 'partition'",))
+    # The roster keeps ``problems`` the only clause on trial here. A prologue failure
+    # before the sources are read owes nobody, and that day reports for two reasons at
+    # once, which is a case that cannot tell which of them is doing the work.
+    outcome = close_guard.GuardOutcome(
+        DAY,
+        problems=("prologue: KeyError: 'partition'",),
+        spot_owed=("XYZ",),
+        option_owed=("XYZ",),
+    )
 
     assert outcome.reportable, "a run that failed outright judged itself not worth reporting"
     daemon._report_guard(outcome)
@@ -756,6 +803,154 @@ def test_the_daemon_gives_the_guard_live_spans_and_the_master(tmp_path):
     assert marked("LATE") == [], "its span opens after this session's close"
 
 
+# -- the roster the six lists are read against -----------------------------------------
+
+
+def _blind(root: Path, *, spans=None, master=None) -> close_guard.CloseGuard:
+    """A guard whose sources are chosen one at a time, including not at all."""
+    return close_guard.CloseGuard(
+        lake_root=root,
+        spans=spans if spans is not None else (lambda: None),
+        session_clock=_clock(et(2026, 9, 2, 16, 18)),
+        master=master if master is not None else (lambda: None),
+        pid=9,
+    )
+
+
+def test_a_run_that_examined_nobody_says_so_rather_than_reporting_clean(tmp_path):
+    """The whole of this issue in one case. A dead guard used to write a clean day.
+
+    Neither source answers, so ``_covering`` returns nothing for both closes and no list
+    can ever fill. Before the rosters, that outcome was identical to a day where every
+    close landed for every ticker, and the file the daemon wrote beside it said the same.
+    """
+    outcome = _blind(tmp_path).run(DAY)
+
+    assert outcome.spot_owed == ()
+    assert outcome.option_owed == ()
+    assert outcome.sources_missing == ("spans", "master")
+    assert outcome.reportable, "a run that looked at nobody judged itself not worth reporting"
+
+
+def test_the_source_that_answered_is_not_named_as_missing(tmp_path):
+    """Both are named separately, because the two files are seeded by different commands.
+
+    A reader told only that "a source is missing" has to go and look at both. Naming the
+    one that did not answer is what makes the next step obvious.
+    """
+    spans_reader, _ = _scope(("XYZ", False))
+
+    outcome = _blind(tmp_path, spans=spans_reader).run(DAY)
+
+    assert outcome.sources_missing == ("master",)
+
+
+def test_a_clean_day_says_who_it_checked(tmp_path):
+    """The other half of the pair. Nothing to report, and now a record of the work.
+
+    XYZ captured its equity close, so every list is empty, which is exactly the document
+    the case above used to write. The rosters are the only thing separating them.
+    """
+    _row(tmp_path, "quotes", "XYZ", et(2026, 9, 2, 16, 0), tag=SPOT_CLOSE, kind="data")
+
+    outcome = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 18)), [("XYZ", False)]).run(DAY)
+
+    assert outcome.spot_owed == ("XYZ",)
+    assert not outcome.reportable, "a day with a ticker in scope and nothing wrong reported"
+
+
+def test_the_option_roster_leaves_out_a_ticker_that_captured_no_options(tmp_path):
+    """The two rosters are taken per close, and the option one is not every covering span.
+
+    ``_covering`` answers 16:15 with every span that covers it, paired with whether that
+    span captured options, and the run then skips the equity-only ones. A roster built
+    from the length of that list would say two tickers owed an option close when one did.
+    """
+    outcome = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 18)), [("OPT", True), ("EQ", False)]).run(
+        DAY
+    )
+
+    assert outcome.spot_owed == ("OPT", "EQ")
+    assert outcome.option_owed == ("OPT",)
+
+
+def test_a_ticker_retired_between_the_closes_owes_only_the_earlier_one(tmp_path):
+    """Why the rosters are two fields and not one number for the run.
+
+    The span ends at 16:02, so it covers the equity close and not the option close. One
+    roster for the run would have to pick one of those two answers and be wrong about the
+    other.
+    """
+    outcome = _guard(
+        tmp_path,
+        _clock(et(2026, 9, 2, 16, 18)),
+        [("XYZ", True, _OPEN, et(2026, 9, 2, 16, 2))],
+    ).run(DAY)
+
+    assert outcome.spot_owed == ("XYZ",)
+    assert outcome.option_owed == ()
+
+
+def test_a_span_the_master_cannot_name_is_recorded_rather_than_dropped(tmp_path):
+    """A third way to an empty roster, and the one nothing else would say.
+
+    Every row this guard writes names a ticker, so a span whose instrument the master
+    cannot name on the day is a close that will not be checked and will not be marked.
+    Both sources answered here, so ``sources_missing`` is empty and the rosters alone
+    would read as a lake nobody has onboarded.
+    """
+    master = SecurityMaster()
+    spans = CaptureSpans()
+    instrument = master.register(
+        kind="equity", capture_start=_OPEN, valid_from=date(2026, 9, 3), ticker="LATE"
+    )
+    spans.open_span(instrument, _OPEN, False)
+
+    outcome = _blind(tmp_path, spans=lambda: spans, master=lambda: master).run(DAY)
+
+    assert outcome.spot_owed == ()
+    assert outcome.sources_missing == ()
+    assert outcome.problems == (
+        f"spans: 1 covering {SPOT_CLOSE} name no ticker",
+        f"spans: 1 covering {OPTION_CLOSE} name no ticker",
+    )
+
+
+def test_a_source_reader_that_raises_is_a_problem_rather_than_an_exit(tmp_path):
+    """The docstring promises that nothing here raises. This is what tests the promise.
+
+    The production readers swallow every error and answer ``None``, so nothing reaches
+    this today. It matters because the guard runs from a hook ``run_loop`` does not wrap:
+    an exception out of this method exits the process, and under ``KeepAlive`` the
+    successor reaches the same minute and exits again. Keeping the calendar and the two
+    readers inside the prologue's ``try`` is what holds the promise for the next reader
+    who wires a stricter one.
+    """
+
+    def unreadable():
+        raise OSError("spans file is unreadable")
+
+    outcome = _blind(tmp_path, spans=unreadable).run(DAY)
+
+    assert outcome.problems == ("prologue: OSError: spans file is unreadable",)
+    assert outcome.reportable
+
+
+def test_a_prologue_failure_still_says_which_source_was_missing(tmp_path):
+    """The run has two returns and the early one carries the sources too.
+
+    ``latest_entries`` is read after the two sources and it is the call that raises in
+    practice. A run that reported the unreadable ledger and stayed silent about the
+    missing spans file would name the rarer of the two failures and hide the likelier.
+    """
+    manifest_path(tmp_path).write_text('{"source": "compaction", "rows": 406}\n')
+
+    outcome = _blind(tmp_path).run(DAY)
+
+    assert outcome.problems[0].startswith("prologue: ManifestError"), outcome.problems
+    assert outcome.sources_missing == ("spans", "master")
+
+
 # -- a day compaction has already sealed -----------------------------------------------
 
 
@@ -807,6 +1002,24 @@ def test_a_sealed_day_is_left_alone_rather_than_marked_unobserved(tmp_path):
 
     assert outcome.unobserved == (), "the guard called a sealed day's close unobserved"
     assert not _rows(tmp_path, "quotes", "XYZ", DAY), "a marker landed beside a sealed day"
+
+
+def test_a_sealed_ticker_day_stays_in_the_roster_it_owed(tmp_path):
+    """The roster answers what the spans owed, not what this run opened a file for.
+
+    The seal happens after the roster is built, and the skip that follows is the guard
+    being finished with the day rather than failing to check it. Dropping the ticker from
+    the roster would make a post-seal restart look like a run that examined nobody, which
+    is the one thing the roster exists to distinguish.
+    """
+    _row(tmp_path, "quotes", "XYZ", et(2026, 9, 2, 16, 0), tag=SPOT_CLOSE, kind="data")
+    _seal(tmp_path, "XYZ", DAY)
+
+    outcome = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 18)), [("XYZ", False)]).run(DAY)
+
+    assert outcome.spot_owed == ("XYZ",)
+    assert outcome.unobserved == (), "the sealed day was claimed unobserved"
+    assert not outcome.reportable
 
 
 # -- a failure that must not take the daemon down ---------------------------------------
