@@ -583,7 +583,11 @@ def write_verdict(
     """
     root = Path(lake_root)
     target = quarantine_path(root)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    # No ``mkdir`` here. ``target.parent`` is the lake root itself, and every caller has
+    # already been through the lock, which opens the manifest beside it and cannot create the
+    # directory either. :func:`append_verdict` makes it before acquiring and :func:`judge`
+    # walks a lake that exists, so a ``mkdir`` on this path is unreachable rather than
+    # defensive. The mutation review found it inert.
     append_line(target, entry)
     record_partition(
         root,

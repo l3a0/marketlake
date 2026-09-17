@@ -272,3 +272,27 @@ def test_holders_name_every_standing_check_rather_than_the_first():
     outcome = decide_partition(state, [_finding(CHECK_ENTITLEMENT, CLEAN_VERDICT)])
 
     assert outcome.decisions[0].holders == ("a_check", "b_check")
+
+
+def test_the_second_finding_for_one_check_is_decided_against_the_first_not_the_snapshot():
+    """The carry-forward has to reach the per-finding decision, not only ``holders``.
+
+    ``decide_partition``'s docstring states it: "The state is carried forward as lines land,
+    rather than read once." Deciding each finding against the snapshot instead leaves the
+    second identical finding a transition too, so the run appends the same line twice, which
+    is the append-on-transition rule inverted.
+
+    ``judge`` cannot reach this today, because ``_judge_partition`` returns at most one
+    finding per check. This is the pure function's own contract, driven here with the two
+    findings a caller is free to pass, which is what this tier exists for. Found as a
+    surviving mutant by the review on marketlake #479.
+    """
+    twice = [
+        _finding(CHECK_ENTITLEMENT, QUARANTINED_VERDICT),
+        _finding(CHECK_ENTITLEMENT, QUARANTINED_VERDICT),
+    ]
+
+    outcome = decide_partition(None, twice)
+
+    assert _wrote(outcome) == [CHECK_ENTITLEMENT]
+    assert [d.wrote for d in outcome.decisions] == [True, False]

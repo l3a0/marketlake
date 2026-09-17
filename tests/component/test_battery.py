@@ -467,29 +467,42 @@ def _human(root: Path, verdict: str) -> dict:
 
 
 @contextmanager
-def _signing_off(verdict: str):
-    """A ``lake_lock`` that lands a human entry the moment the hold is taken.
+def _signing_off(verdict: str, *, on: str = "acquire"):
+    """A ``lake_lock`` that lands a human entry as the hold is taken, or as it is released.
 
-    The pattern is ``test_occ_mapping``'s ``racing_lock``. It puts the write exactly in the
-    window a read taken before the walk cannot see, so a read left outside the hold uses the
-    stale snapshot and the assertions below fail. ``judge`` imports the lock inside the
-    function, so patching the module attribute is what the call resolves against.
+    The pattern is ``test_occ_mapping``'s ``racing_lock``. ``on="acquire"`` puts the write in
+    the window a read taken before the walk cannot see, so a read left outside the hold uses
+    the stale snapshot. ``on="release"`` puts it in the window between one hold and the next,
+    which is the shape a writer blocked on the lock actually lands in: it waits, and the
+    kernel hands it the lock the instant the holder lets go.
 
-    The entry goes in through ``write_verdict`` rather than through ``signoff``, because this
-    code already holds the lock and that tool takes it.
+    The pair is what separates a read under *a* lock from a read under *the* lock the append
+    happens in. Splitting the two into one hold for the read and another for the append passes
+    every ``on="acquire"`` assertion, because the human entry still lands before the read.
+    Found by the mutation lens on marketlake #479.
+
+    ``judge`` imports the lock inside the function, so patching the module attribute is what
+    the call resolves against. The entry goes in through ``write_verdict`` rather than through
+    ``signoff``, because this code already holds the lock and that tool takes it.
     """
     from lake.lock import lake_lock as real_lock
 
     landed: list[dict] = []
+    holds: list[int] = []
 
     @contextmanager
     def racing_lock(lake_root):
+        holds.append(1)
         with real_lock(lake_root) as held:
-            if not landed:
+            if on == "acquire" and not landed:
                 landed.append(_human(Path(lake_root), verdict))
-            yield held
+            try:
+                yield held
+            finally:
+                if on == "release" and not landed:
+                    landed.append(_human(Path(lake_root), verdict))
 
-    yield racing_lock, landed
+    yield racing_lock, landed, holds
 
 
 def test_the_ledger_is_read_inside_the_lock_the_verdict_is_appended_under(lake: Path, monkeypatch):
@@ -503,7 +516,7 @@ def test_the_ledger_is_read_inside_the_lock_the_verdict_is_appended_under(lake: 
     """
     _quarantined_then_fixed(lake)
 
-    with _signing_off(CLEAN_VERDICT) as (racing_lock, landed):
+    with _signing_off(CLEAN_VERDICT) as (racing_lock, landed, _holds):
         monkeypatch.setattr("lake.lock.lake_lock", racing_lock)
         report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
@@ -513,6 +526,38 @@ def test_the_ledger_is_read_inside_the_lock_the_verdict_is_appended_under(lake: 
     assert read_quarantine(lake)[-1]["provenance"] == PROVENANCE_HUMAN
     assert latest_quarantine(lake)[JUDGED]["provenance"] == PROVENANCE_HUMAN
     assert any("human precedence stands" in line for line in report.report)
+
+
+def test_the_append_happens_in_the_same_hold_as_the_read_and_not_a_second_one(
+    lake: Path, monkeypatch
+):
+    """Reading under *a* lock is not reading under *the* lock the append happens in.
+
+    Splitting the two, one hold to read and the public locking writer for the append, is the
+    plausible refactor: it keeps the per-partition read, keeps it locked, and removes the
+    re-entrancy hazard, so it looks safer. It reinstates marketlake #470 at a narrower window.
+    A sign-off blocked on the lock lands the instant the reader lets go, which is before the
+    append rather than after it, and the battery's own line buries it exactly as before.
+
+    Every assertion that lands its write on acquisition passes under that refactor, because
+    the human entry still precedes the read. This one lands on release, and counts the holds,
+    which is the other way to say the same thing.
+    """
+    _quarantined_then_fixed(lake)
+
+    with _signing_off(CLEAN_VERDICT, on="release") as (racing_lock, landed, holds):
+        monkeypatch.setattr("lake.lock.lake_lock", racing_lock)
+        judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert landed, "the seam never fired, so this test proves nothing"
+    assert latest_quarantine(lake)[JUDGED]["provenance"] == PROVENANCE_HUMAN, (
+        "the battery's own line landed after the sign-off, so the next run that fails this "
+        "check will re-quarantine what a person cleared"
+    )
+    assert read_quarantine(lake)[-1]["provenance"] == PROVENANCE_HUMAN
+    # One hold for the partition, covering its read and its appends together. Two holds is
+    # the refactor above, whatever order they are written in.
+    assert holds == [1], f"judge took {len(holds)} holds for one partition, not one"
 
 
 def test_a_sign_off_landing_mid_walk_leaves_what_one_landing_before_it_leaves(
@@ -532,7 +577,7 @@ def test_a_sign_off_landing_mid_walk_leaves_what_one_landing_before_it_leaves(
         _quarantined_then_fixed(root)
         counts: list[tuple] = []
         if mid_walk:
-            with _signing_off(CLEAN_VERDICT) as (racing_lock, landed):
+            with _signing_off(CLEAN_VERDICT) as (racing_lock, landed, _holds):
                 monkeypatch.setattr("lake.lock.lake_lock", racing_lock)
                 night_two = judge(root, calendar=CALENDAR, now=NOW, guards=GuardConstants())
                 assert landed, "the seam never fired, so this half proves nothing"
@@ -581,7 +626,7 @@ def test_a_revoke_landing_mid_walk_is_not_superseded_by_the_runs_own_verdict(
     )
     _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
 
-    with _signing_off(QUARANTINED_VERDICT) as (racing_lock, landed):
+    with _signing_off(QUARANTINED_VERDICT) as (racing_lock, landed, _holds):
         monkeypatch.setattr("lake.lock.lake_lock", racing_lock)
         report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
 
