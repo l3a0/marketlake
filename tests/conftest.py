@@ -263,13 +263,14 @@ def _no_network() -> Iterator[None]:
 
 # -- the subprocess guard --------------------------------------------------------------
 
-# Five production call sites shell out to a named external tool through
+# Six production call sites shell out to a named external tool through
 # ``subprocess.run``: ``RsyncBackup.sync`` runs ``rsync``, ``launchctl_probe`` runs
 # ``launchctl``, ``read_pmset_schedule`` and ``pmset_assertions_probe`` run ``pmset``,
-# and ``read_exclusions`` runs ``tmutil``. Each is a seam, so a test injects a fake in
-# place of the function that calls it. A test that forgets runs the real tool instead,
-# which the network guard above cannot catch: none of the five touch a socket in this
-# process. This fixture closes that gap the same way, on those program names only.
+# ``read_exclusions`` runs ``tmutil``, and ``sweep.set_sunday_wake`` runs ``pmset`` under
+# ``sudo``. Each is a seam, so a test injects a fake in place of the function that calls
+# it. A test that forgets runs the real tool instead, which the network guard above
+# cannot catch: none of the six touch a socket in this process. This fixture closes that
+# gap the same way, on those program names only.
 #
 # The refusal has to name the program rather than block every subprocess. Four tests in
 # ``tests/component/test_control_plane_render.py`` run the rendered install, reinstall,
@@ -277,8 +278,21 @@ def _no_network() -> Iterator[None]:
 # at stand-ins for the tools the script calls. Those calls name a script path or
 # ``bash``, never one of the guarded names directly, so refusing only those names
 # leaves them untouched.
+#
+# The sixth site is what made the wrapper case real. ``set_sunday_wake`` runs
+# ``sudo -n /usr/bin/pmset schedule ...``, so the program at ``argv[0]`` is ``sudo`` and
+# the guarded name sits three elements further along. Reading the head alone let exactly
+# the call with the largest blast radius through, because it is the only guarded call
+# that writes rather than reads: a forgotten seam would have re-scheduled the
+# developer's own machine. So the wrapper is stepped over below.
 
 _GUARDED_PROGRAMS = frozenset({"rsync", "launchctl", "pmset", "tmutil"})
+
+# Programs that run another program named later in the same argument list. ``sudo`` is
+# the one this repo uses. ``env`` and ``arch`` are listed beside it because all three
+# take the same shape, and a guard that knew only the spelling in front of it today
+# would have to be widened again by whoever adds the next one.
+_WRAPPER_PROGRAMS = frozenset({"sudo", "env", "arch"})
 
 
 class SubprocessAccessInTest(BaseException):
@@ -294,21 +308,48 @@ class SubprocessAccessInTest(BaseException):
 
 
 def _program_of(args: object) -> str | None:
-    """The program a subprocess call names, or ``None`` when there is not one.
+    """The program a subprocess call really runs, or ``None`` when there is not one.
 
     ``subprocess.run`` and ``Popen`` both take the command as a sequence whose first
-    element is the program, which is how all four guarded call sites and all four
-    render tests call them. A ``bytes`` element is decoded first, since ``subprocess``
-    accepts one and a raw ``str()`` of it would never match a guarded name. Two forms
-    still are not handled: a single string with ``shell=True``, and a prefix wrapper
-    (``env``, ``arch``, ``sudo``) naming the guarded program as a later element. No
-    call site in this repo uses either form today.
+    element is the program, which is how every guarded call site and every render test
+    calls them. A ``bytes`` element is decoded first, since ``subprocess`` accepts one
+    and a raw ``str()`` of it would never match a guarded name.
+
+    **A prefix wrapper is stepped over rather than answered.** ``sudo -n /usr/bin/pmset
+    schedule ...`` runs ``pmset``, and reading ``argv[0]`` answers ``sudo``, which is in
+    no guarded set and so let the call through. That was not hypothetical. It is the
+    shape ``sweep.set_sunday_wake`` takes, and it is the only guarded call in the repo
+    that writes rather than reads, so the gap sat under the one seam whose blast radius
+    is the developer's own power schedule.
+
+    The walk skips a wrapper and the options that follow it, then answers the first
+    element that is neither. A wrapper with nothing after it answers itself, because
+    ``sudo -l`` lists rules and runs nothing. It cannot tell an option's value from the
+    program when a wrapper takes one, as in ``env -C /tmp pmset``, and answers ``/tmp``
+    there. That over-reports rather than under-reports, which is the safe direction for
+    a guard, and nothing in this repo passes one.
+
+    One form is still not handled: a single string with ``shell=True``. No call site
+    uses it, and a guard for it would have to parse a shell command line.
     """
-    if isinstance(args, (list, tuple)) and args:
-        head = args[0]
-        if isinstance(head, bytes):
-            head = os.fsdecode(head)
-        return Path(str(head)).name
+    if not isinstance(args, (list, tuple)) or not args:
+        return None
+
+    def name_of(element: object) -> str:
+        if isinstance(element, bytes):
+            element = os.fsdecode(element)
+        return Path(str(element)).name
+
+    index = 0
+    while index < len(args):
+        program = name_of(args[index])
+        if program not in _WRAPPER_PROGRAMS:
+            return program
+        index += 1
+        while index < len(args) and str(args[index]).startswith("-"):
+            index += 1
+        if index >= len(args):
+            return program
     return None
 
 
