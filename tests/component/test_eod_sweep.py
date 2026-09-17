@@ -673,11 +673,19 @@ def test_the_friday_run_sets_the_sunday_one_shot_and_reads_it_back(fixture_lake:
     )
 
     assert setter.sundays == [SUNDAY]
-    # The battery's coverage census prints on every session run, including one that found
-    # nothing wrong, because it is the only thing in the report file that says the check ran.
-    # The fixture lake seals one quotes partition, and by this Friday evening the span has
-    # owed ten partitions across five sessions. The line is asserted whole rather than
-    # described, because a comment describing it cannot be wrong in a way anything catches.
+    # **One report-tier line, and the bars walk deliberately does not add a second.** This
+    # fixture lake seals one quotes partition, so the sessions before Friday are each gated
+    # against a session the lake never sealed. The manifest is what the walk asks, and it says
+    # nothing was sealed for them, so they are unsettled rather than abandoned and nothing here
+    # claims the lake has given up. A compaction that has not run is not a bar that is lost.
+    # ``test_a_sealed_reference_that_offers_no_close_is_reported_by_reason`` drives the line
+    # this run does not produce.
+    #
+    # The line that does print is the battery's coverage census, which prints on every session
+    # run including one that found nothing wrong, because it is the only thing in the report
+    # file that says the check ran. By this Friday evening the span has owed ten partitions
+    # across five sessions. It is asserted whole rather than described, because a comment
+    # describing it cannot be wrong in a way anything catches.
     (census,) = outcome.nightly.report
     assert census == (
         "battery: calendar coverage, 9 of 10 owed sessions have no partition, "
@@ -685,6 +693,46 @@ def test_the_friday_run_sets_the_sunday_one_shot_and_reads_it_back(fixture_lake:
     )
     assert outcome.nightly.problems == ()
     assert pinger.urls == [PING_URL]
+
+
+def test_a_sealed_reference_that_offers_no_close_is_reported_by_reason(
+    fixture_lake: FixtureLake,
+):
+    """The nightly line marketlake #434 exists to produce, and the two ways it can lose its point.
+
+    A daily ticker-day whose close of record is sealed and offers nothing is the thing an
+    operator has to be able to find. The digest carries counts and never a list, so this is the
+    one channel it has.
+
+    **It is counted per reason rather than by naming an entry, and both halves are asserted.**
+    ``report.redacted`` keeps two colon-separated fields and is applied to every report line on
+    its way into the nightly file and again into the digest. An entry is itself a ticker-day and
+    then a reason, so a line naming one arrives as a dangling "first" with the ticker, the
+    session and the reason all gone. The assertion below reads the line after redaction for that
+    reason, not before.
+
+    The second half is which reasons are present. The walk takes ``plan.days`` in session order,
+    so a named first entry is always the oldest session in range, and on the live lake that slot
+    belongs to the 2026-09-08 outage for ever. A quarantine appearing tonight would move a count
+    from six to seven and be named nowhere. A census of the classes cannot hide one.
+    """
+    quotes = {
+        ("SPY", FOLLOWING): [_quote_row(FOLLOWING, row_kind=journal.ROW_KIND_GAP)],
+        ("SPY", date(2026, 9, 16)): [_quote_row(date(2026, 9, 16))],
+    }
+    fixture_lake.with_quarantine(
+        {"partition": "quotes/ticker=SPY/date=2026-09-16.parquet", "verdict": "held"}
+    )
+    root = _lake(fixture_lake, quotes=quotes)
+    outcome, _, _ = _run(root, now=EVENING + timedelta(days=1))
+
+    (line,) = [entry for entry in outcome.nightly.report if entry.startswith("bars abandoned")]
+    assert line == "bars abandoned: 2 ticker-day(s), 1 NoSpotClose, 1 PartitionQuarantined"
+    assert report.redacted(line) == line, "the reasons were cut off before any reader saw them"
+    assert "bars abandoned: 2 ticker-day(s), 1 NoSpotClose, 1 PartitionQuarantined" in (
+        outcome.digest.body
+    )
+    assert outcome.nightly.problems == (), "an abandoned ticker-day withheld the ping"
 
 
 def test_a_weekday_that_is_not_friday_sets_nothing(fixture_lake: FixtureLake):
@@ -1471,25 +1519,32 @@ def test_a_daily_bar_held_tonight_is_reached_again_tomorrow(fixture_lake: Fixtur
     scheduled ever asked about S again. The nightly job therefore landed no daily bar, ever.
 
     **This is the test the old shape could not pass.** Two runs a day apart over one lake. The
-    first is the night of ``SESSION`` with no quotes sealed for the session after it, so the bar
-    is held and no partition exists. The second is the following night, by which point that
-    session's quotes are sealed, and it has to reach back and land the bar the first run held.
+    first is the night of ``SESSION`` with no quotes sealed for the session after it, so no bar
+    lands and no partition exists. The second is the following night, by which point that
+    session's quotes are sealed, and it has to reach back and land the bar the first run left.
 
     The second run is the whole point: under a single-session fetch it would ask only about
     ``FOLLOWING`` and ``SESSION``'s partition would stay missing forever.
+
+    **Marketlake #434 changed what night one does about it, not what night two recovers.** That
+    night used to fetch the bar, gate it against a close nobody had captured, and hold a finding.
+    The reference is this lake's rather than the vendor's, so the walk reads it first and the
+    ticker-day is left unsettled with the request unspent. The recovery below is unchanged, which
+    is what makes the skip safe: a session that is skipped tonight is a session the next run still
+    walks.
     """
     root = _lake(fixture_lake, quotes={})
     partition = LakePaths(root).bars_partition_path("SPY", DAILY_FREQ, SESSION)
 
     # Night one, the night of SESSION. The close cross-check reads the calendar-next session's
-    # settled close, and that session has not been captured yet, so the bar is held.
+    # settled close, and that session has not been captured yet, so nothing is fetched for it.
     first, _, _ = _run(
         root,
         now=EVENING,
         vendor_source=_CountingVendorSource(_cassette(session=SESSION)),
     )
     held = dict(first.nightly.pieces)["bars"]
-    assert (held.landed, held.held) == (0, 1), "the bar landed on the night it was fetched"
+    assert (held.landed, held.held) == (0, 0), "the bar landed on the night it was fetched"
     assert not partition.exists()
 
     # FOLLOWING's quotes seal, which is what its own compaction does the next afternoon.
