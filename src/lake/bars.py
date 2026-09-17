@@ -2021,6 +2021,7 @@ __all__ = [
     "CHECK_BAR_SPAN",
     "CLOSE_CROSS_TOLERANCE",
     "DAILY_WINDOW_MARGIN",
+    "MINUTE_EXTENDED_HOURS",
     "BackfillPlan",
     "BackfillReport",
     "BarWindow",
