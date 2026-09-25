@@ -160,6 +160,7 @@ from lake.config import GuardConstants, input_errors_exit, load_config
 from lake.manifest import record_partition
 from lake.security_master import ID_TYPE_TICKER, KIND_EQUITY, SecurityMaster
 from lake.tickers import upsert_ticker
+from lake.timing import RequestRecord
 from lake.vendor import Vendor
 
 # The manifest ``source`` for the security master's reference entry.
@@ -588,6 +589,7 @@ def onboard(
     partial_chain = False
     windows: tuple[tuple[date, date | None], ...] = ()
     absent_markers: tuple[journal.AbsentMarker, ...] = ()
+    requests: tuple[RequestRecord, ...] = ()
     if options:
         # The chain goes through the capture loop's own windowed fetch. One bare request
         # for a whole chain exceeds Schwab's gateway body limit, which is a 502, so the
@@ -634,6 +636,7 @@ def onboard(
         partial_chain = fetched.error_class is not None
         windows = fetched.windows
         absent_markers = fetched.absent_markers
+        requests = fetched.requests
         snapshot_surface = journal.CHAINS_SURFACE
     else:
         fetch_ts = clock.now()
@@ -777,6 +780,18 @@ def onboard(
         windows=windows,
         absent_markers=absent_markers,
     )
+    # The first snapshot's requests go to the timing file under the minute the snapshot
+    # landed at, the same as a loop cycle's. Onboarding runs in its own process, and the
+    # file takes one ``O_APPEND`` write per line, so this never interleaves with the
+    # daemon's lines. It never raises either.
+    first_slot = cycle_start.replace(second=0, microsecond=0)
+    capture.record_requests(
+        lake_root,
+        snap_ts=first_slot,
+        day=first_slot.date(),
+        records=requests,
+        where=f"onboarding {ticker}",
+    )
 
     return OnboardReport(
         ticker=ticker,
@@ -827,14 +842,16 @@ def onboard_from_config(
     from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor
 
     config = load_config(config_path)
+    resolved_clock = clock if clock is not None else SystemClock()
     vendor = SchwabVendor.from_token(
         token_path if token_path is not None else DEFAULT_TOKEN_PATH,
         api_key=config.schwab_api_key.reveal(),
         app_secret=config.schwab_app_secret.reveal(),
+        clock=resolved_clock,
     )
     return onboard(
         ticker,
-        clock=clock if clock is not None else SystemClock(),
+        clock=resolved_clock,
         vendor=vendor,
         lake_root=config.lake_root,
         tickers_path=tickers_path,

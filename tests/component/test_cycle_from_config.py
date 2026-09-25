@@ -228,7 +228,7 @@ def _wire(monkeypatch, rig: _Rig, build) -> None:
 
     class _Stub:
         @staticmethod
-        def from_token(token_path, *, api_key, app_secret):
+        def from_token(token_path, *, api_key, app_secret, clock=None):
             return build(Path(token_path))
 
     monkeypatch.setattr(capture, "SchwabVendor", _Stub)

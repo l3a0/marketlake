@@ -168,6 +168,30 @@ def test_onboarding_an_existing_ticker_before_the_seed_run_has_happened_refuses(
         )
 
 
+def test_onboarding_writes_one_timing_line_per_window_it_fetched(lake_root, tmp_path):
+    # Onboarding's first snapshot is a real cycle through ``fetch_chain``, so its requests
+    # reach the timing file under the minute the snapshot landed at, like a loop cycle's.
+    import json
+
+    onboard(
+        "SPY",
+        clock=ManualClock(start=_MID_SESSION),
+        vendor=_chain_vendor(is_delayed=False),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=True,
+    )
+
+    path = LakePaths(lake_root).timing_path(_MID_SESSION_DAY)
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    windows = DEFAULT_CHAIN_PLAN.windows_for(_MID_SESSION_DAY)
+    assert [(line["window_start"], line["window_end"]) for line in lines] == [
+        (start.isoformat(), end.isoformat() if end is not None else None) for start, end in windows
+    ]
+    assert {(line["surface"], line["ticker"]) for line in lines} == {("chains", "SPY")}
+    assert {line["snap_ts"] for line in lines} == {_MID_SESSION.isoformat()}
+
+
 def test_onboard_registers_verifies_and_writes(lake_root, tmp_path):
     clock = ManualClock(start=_MID_SESSION)
     tickers_path = tmp_path / "tickers.yaml"
@@ -1279,7 +1303,7 @@ def test_the_wrapper_loads_the_plan_and_passes_the_config_s_guards(
 
     class _Stub:
         @staticmethod
-        def from_token(token_path, *, api_key, app_secret):
+        def from_token(token_path, *, api_key, app_secret, clock=None):
             return vendor
 
     real_fetch_chain = lake.onboard.capture.fetch_chain
@@ -1327,7 +1351,7 @@ def _stub_the_vendor(monkeypatch, vendor) -> None:
 
     class _Stub:
         @staticmethod
-        def from_token(token_path, *, api_key, app_secret):
+        def from_token(token_path, *, api_key, app_secret, clock=None):
             return vendor
 
     monkeypatch.setattr(lake.schwab, "SchwabVendor", _Stub)

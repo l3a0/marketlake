@@ -693,7 +693,7 @@ def _stub_schwab(vendor: _PlanVendor):
 
     class _Stub:
         @staticmethod
-        def from_token(path, *, api_key, app_secret):
+        def from_token(path, *, api_key, app_secret, clock=None):
             return vendor
 
     return _Stub
