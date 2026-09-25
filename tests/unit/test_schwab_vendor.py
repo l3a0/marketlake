@@ -427,8 +427,9 @@ def test_a_successful_reply_whose_body_is_not_an_object_is_refused(fetch, status
     Schwab already answers 200 with empty expiration maps on purpose, and the close+5 fill
     treats that as a close nobody captured. A malformed payload must not look the same.
     """
-    with pytest.raises(VendorBodyError):
+    with pytest.raises(VendorBodyError) as refused:
         fetch(_vendor_answering(FakeResponse(status, content=content)))
+    assert f"http {status} " in str(refused.value)
 
 
 @pytest.mark.parametrize("status", [199, 300, 302])
@@ -453,7 +454,9 @@ def test_the_refusal_says_why_and_never_quotes_the_body():
         _vendor_answering(reply).get_chain("SPY")
     message = str(not_json.value)
     assert "http 200" in message
-    assert "not JSON" in message
+    # The parse error's own line says where the body stopped being JSON. It is ``json``'s
+    # text rather than the body's, so it is the one detail the message can carry.
+    assert "not JSON (Expecting value: line 1 column 1 (char 0))" in message
     assert "'text/html'" in message
     assert f"{len(_HTML)} characters" in message
     assert "slow down" not in message

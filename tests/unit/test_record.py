@@ -88,6 +88,18 @@ def test_a_failed_reply_that_is_not_json_is_refused_and_quoted_rather_than_recor
     assert "429-005 burst limit" in message
 
 
+def test_a_failed_reply_with_an_empty_body_is_refused_too():
+    """An empty body is not a JSON object either. Its ``body_text`` is the empty string, which
+    is falsy, so a refusal that tested for text rather than for ``None`` would let this 429
+    through as a recording of ``{}``."""
+    client = FakeSchwabClient(chains={"SPY": FakeResponse(429, content=b"")})
+
+    with pytest.raises(ValueError, match="http 429"):
+        record_cassette(
+            FAKE_KEY, FAKE_SECRET, chain_symbols=["SPY"], vendor_factory=_factory(client)
+        )
+
+
 def test_a_failed_reply_with_an_object_body_is_still_recorded():
     """The other side of the refusal: a JSON error body fits a cassette and is recorded."""
     client = FakeSchwabClient(chains={"SPY": FakeResponse(429, content=b'{"error": "slow"}')})
