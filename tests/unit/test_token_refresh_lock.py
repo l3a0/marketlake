@@ -137,3 +137,10 @@ def test_close_closes_the_session_once_and_a_failed_close_does_not_raise(capsys)
     client.session.close = refuse
     vendor.close()
     assert "client close failed: OSError: socket already gone" in capsys.readouterr().err
+
+    def refuse_otherwise() -> None:
+        raise RuntimeError("transport in a bad state")
+
+    client.session.close = refuse_otherwise
+    vendor.close()
+    assert "RuntimeError: transport in a bad state" in capsys.readouterr().err

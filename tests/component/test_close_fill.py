@@ -1635,6 +1635,14 @@ def test_the_fill_closes_the_client_it_built(tmp_path, monkeypatch):
     vendor = _both_windows()
     closes: list[int] = []
     vendor.close = lambda: closes.append(1)
+    closed_at_request: list[int] = []
+    get_chain = vendor.get_chain
+
+    def recording_get_chain(*args, **kwargs):
+        closed_at_request.append(len(closes))
+        return get_chain(*args, **kwargs)
+
+    vendor.get_chain = recording_get_chain
 
     class _Stub:
         @staticmethod
@@ -1654,3 +1662,5 @@ def test_the_fill_closes_the_client_it_built(tmp_path, monkeypatch):
     )
 
     assert closes == [1]
+    # Both windows went out before the close, not after it.
+    assert closed_at_request == [0, 0]

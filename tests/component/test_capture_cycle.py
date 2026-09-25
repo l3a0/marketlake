@@ -401,6 +401,32 @@ def test_round_trip_is_captured_on_success_and_on_a_slow_failure(cassette_vendor
     assert _round_trip(spy_gap) == pytest.approx(0.6)
 
 
+def test_a_raised_quote_request_keeps_its_round_trip_at_a_cap_of_one(cassette_vendor, lake_root):
+    # The sequential cycle stamps the quote's end after the raise, so the gap rows carry how
+    # long the failed request took, the same as a raised chain window does above.
+    clock = ManualClock(start=_CLOCK_START)
+
+    class _SlowQuoteFailure(_AdvancingVendor):
+        def get_quotes(self, symbols):
+            self._clock.advance(self._quote_seconds)
+            raise VendorError("quote batch timed out")
+
+    vendor = _SlowQuoteFailure(cassette_vendor, clock, chain_seconds=0.4, quote_seconds=0.7)
+    result = capture.run_cycle(
+        clock,
+        vendor,
+        _both_options(),
+        lake_root,
+        pid=4244,
+        plan=_ONE_WINDOW,
+        guards=GuardConstants(capture_max_concurrency=1),
+    )
+
+    gap = _rows(result.segment(QUOTES, "SPY"))[0]
+    assert gap["error_class"] == "vendor_error"
+    assert _round_trip(gap) == pytest.approx(0.7)
+
+
 # -- 6. the CUSIP is captured wherever Schwab puts it ------------------------
 
 

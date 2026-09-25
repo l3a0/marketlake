@@ -25,6 +25,8 @@ import time
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from lake import capture, journal
 from lake.chain_plan import ChainPlan
 from lake.clock import SystemClock
@@ -143,7 +145,7 @@ class _ThreadedVendor:
                 self.chain_calls.append((symbol, from_date, to_date))
             time.sleep(self._delay.get((symbol, from_date), self._default_delay))
             reply = self._answer.get((symbol, from_date))
-            if isinstance(reply, Exception):
+            if isinstance(reply, BaseException):
                 raise reply
             if reply is not None:
                 return reply
@@ -428,18 +430,64 @@ def test_a_window_task_that_raises_costs_only_its_own_window(lake_root):
     # The pool hands the raise back, and the window is recorded as failing under the
     # exception's class while the other two land. At a cap of 1 the same raise leaves the
     # cycle, as it always did, which the pull request for #532 names.
-    vendor = _ThreadedVendor(answer={("SPY", _d(10)): _UnreadableBody()})
+    # It is the first window that fails, so the marker also shows each result was paired
+    # with its own window: the first and last windows sit at opposite ends of the plan.
+    vendor = _ThreadedVendor(answer={("SPY", _d(0)): _UnreadableBody()})
     fetched = _fetch_spy(vendor, lake_root)
 
     assert fetched.body is not None
     assert fetched.error_class == "body_unreadable_error"
-    assert [(m.window_start, m.error_class) for m in fetched.absent_markers] == [
-        (_d(10).isoformat(), "body_unreadable_error")
+    assert [(m.window_start, m.window_end, m.error_class) for m in fetched.absent_markers] == [
+        (_d(0).isoformat(), _d(9).isoformat(), "body_unreadable_error")
     ]
     assert list(fetched.body["callExpDateMap"]) == [
-        f"{_d(0).isoformat()}:7",
+        f"{_d(10).isoformat()}:7",
         f"{_d(31).isoformat()}:7",
     ]
+
+
+def test_an_interrupt_in_a_pool_task_is_raised_not_recorded(lake_root):
+    # Only an ``Exception`` becomes a failed window. A ``SystemExit`` or an interrupt leaves
+    # the fetch, the way it would have left a sequential one.
+    vendor = _ThreadedVendor(answer={("SPY", _d(10)): SystemExit(3)})
+
+    with pytest.raises(SystemExit):
+        _fetch_spy(vendor, lake_root)
+
+
+@pytest.mark.parametrize("cap", [1, 20])
+def test_a_raised_quote_request_is_classed_by_its_own_exception(lake_root, cap):
+    vendor = _ThreadedVendor(quotes=RuntimeError("the batch never came back"))
+    result = _run(vendor, lake_root, guards=GuardConstants(capture_max_concurrency=cap))
+
+    for ticker in ("SPY", "QQQ"):
+        assert [r["error_class"] for r in _rows(result, QUOTES, ticker)] == ["runtime_error"]
+
+
+def test_a_chain_the_row_builder_refuses_keeps_its_own_finish_stamp(lake_root, monkeypatch):
+    # The builder raising turns the chain into a whole-chain gap, and that gap still carries
+    # the round trip the fetch really took, the latest of its own windows' finishes.
+    clock = _TaskClock(_CLOCK_START)
+    ms = timedelta(milliseconds=1)
+    finishes = {"quotes": 10 * ms}
+    for ticker in ("SPY", "QQQ"):
+        for offset, at in ((0, 100), (10, 600), (31, 200)):
+            finishes[(ticker, _d(offset))] = at * ms
+    vendor = _StampingVendor(clock, finishes)
+    real = journal.chains_data_batch
+
+    def refuse_spy(body, *, ticker, **kwargs):
+        if ticker == "SPY":
+            raise ValueError("the builder refused this chain")
+        return real(body, ticker=ticker, **kwargs)
+
+    monkeypatch.setattr(journal, "chains_data_batch", refuse_spy)
+    result = _run(vendor, lake_root, clock=clock, guards=GuardConstants(capture_stagger_ms=0))
+
+    gap = _rows(result, CHAINS, "SPY")[0]
+    assert (gap["row_kind"], gap["error_class"]) == (journal.ROW_KIND_GAP, "value_error")
+    assert gap["fetch_ts"] == _CLOCK_START.isoformat()
+    assert gap["fetch_end_ts"] == (_CLOCK_START + 600 * ms).isoformat()
 
 
 def test_a_quote_request_that_raises_gaps_every_quoted_ticker(lake_root):

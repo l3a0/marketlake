@@ -528,11 +528,26 @@ def test_a_drifted_spans_file_widens_rather_than_crashing_the_cycle(tmp_path, mo
 
 
 class _ClosingVendor(_Vendor):
-    """A vendor that counts its closes, the way ``SchwabVendor.close`` frees its client."""
+    """A vendor that counts its closes, the way ``SchwabVendor.close`` frees its client.
+
+    It also records how many closes had happened by each request, since a real client that
+    was closed first refuses every request, and the cycle would then journal only gaps.
+    """
 
     def __init__(self) -> None:
         super().__init__()
         self.closed = 0
+        self.closed_at_request: list[int] = []
+
+    def get_chain(self, symbol, *, from_date=None, to_date=None, strike_count=None):
+        self.closed_at_request.append(self.closed)
+        return super().get_chain(
+            symbol, from_date=from_date, to_date=to_date, strike_count=strike_count
+        )
+
+    def get_quotes(self, symbols):
+        self.closed_at_request.append(self.closed)
+        return super().get_quotes(symbols)
 
     def close(self) -> None:
         self.closed += 1
@@ -559,3 +574,20 @@ def test_the_production_entry_closes_the_client_it_built(tmp_path, monkeypatch):
     _cycle(rig, clock)
 
     assert [vendor.closed for vendor in built] == [1, 1]
+    # Every request went out before the close, not after it.
+    assert all(v.closed_at_request and set(v.closed_at_request) == {0} for v in built)
+
+
+def test_the_client_is_closed_when_the_cycle_raises(tmp_path, monkeypatch):
+    rig = _rig(tmp_path, SPY_ONLY)
+    vendor = _ClosingVendor()
+    _wire(monkeypatch, rig, lambda path: vendor)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("the cycle broke")
+
+    monkeypatch.setattr(capture, "run_cycle", broken)
+    with pytest.raises(RuntimeError, match="the cycle broke"):
+        _cycle(rig, ManualClock(start=FIRST_MINUTE))
+
+    assert vendor.closed == 1
