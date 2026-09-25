@@ -262,6 +262,16 @@ def test_a_file_not_found_is_quiet_even_when_the_list_names_oserror(tmp_path, ca
     assert _lines(capsys) == []
 
 
+def test_a_file_not_found_answers_none_even_when_the_list_leaves_out_oserror(tmp_path, capsys):
+    """An absent reference file is a fresh lake to every reader, whatever the reader lists."""
+    result = reference_read.read_or_none(
+        tmp_path / "absent.parquet", SecurityMaster.read, (ValueError,), now=lambda: AT
+    )
+
+    assert result is None
+    assert _lines(capsys) == []
+
+
 def test_a_clock_that_raises_costs_the_line_its_instant_and_nothing_else(tmp_path, capsys):
     def denied(path: Path) -> object:
         raise PermissionError(1, "Operation not permitted", str(path))
