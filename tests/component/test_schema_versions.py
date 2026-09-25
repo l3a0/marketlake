@@ -884,12 +884,16 @@ def test_a_ledger_this_process_may_not_open_is_inaccessible_rather_than_unrecord
     finally:
         os.chmod(target, 0o644)
 
-    assert check.state == INACCESSIBLE
+    assert check.state == INACCESSIBLE == "inaccessible"
+    assert check.recorded == ()
     assert "PermissionError" in check.summary
     assert str(target) in check.detail
+    assert "Permission denied" in check.detail, "the detail lost the exception's own message"
     # And the shape really is recorded, so "not recorded" would have been false as well as
-    # useless.
-    assert check_running_version(lake_root).ok
+    # useless. A recorded verdict pages nobody either.
+    healthy = check_running_version(lake_root)
+    assert healthy.ok
+    assert not healthy.pages
 
 
 def test_a_ledger_this_process_may_not_open_pages_nobody(lake_root):

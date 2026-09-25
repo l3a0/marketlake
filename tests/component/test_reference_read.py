@@ -21,11 +21,17 @@ from pathlib import Path
 import pytest
 
 from lake import daemon, reference_read
+from lake.alert import Publisher
 from lake.capture import _live_roster
-from lake.capture_spans import CaptureSpans, spans_path
-from lake.security_master import SecurityMaster, master_path
+from lake.capture_spans import CaptureSpans, SpansUnreadable, spans_path
+from lake.schema_drift import SchemaDriftObserver
+from lake.security_master import MasterUnreadable, SecurityMaster, master_path
+from lake.session import SessionClock
 from lake.tickers import Roster, TickerConfig
+from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
+from tests.support.config import NTFY_TOPIC, PING_KEY, write_config
+from tests.support.transport import FakeTransport
 
 START = datetime(2026, 9, 8, 17, 7, tzinfo=UTC)
 AT = datetime(2026, 9, 21, 13, 30, tzinfo=UTC)
@@ -122,7 +128,7 @@ def test_an_unreadable_spans_file_widens_the_roster_and_says_so(lake, capsys):
 
     assert _captured(roster) == ["SPY", "QQQ"]
     (line,) = _lines(capsys)
-    assert line.startswith(f"reference: {spans_path(lake)} could not be read at ")
+    assert line.startswith(f"reference: {spans_path(lake)} could not be read at {AT.isoformat()}")
 
 
 def test_a_master_that_reads_again_says_so_once_with_its_instant(lake, capsys):
@@ -295,3 +301,141 @@ def test_a_message_with_newlines_prints_as_one_line(tmp_path, capsys):
     err = capsys.readouterr().err
     assert err.count("\n") == 1
     assert err.endswith("OSError: Couldn't deserialize thrift Deserializing page header failed.\n")
+
+
+# -- every class each reader already caught still widens rather than raising ------------------
+#
+# The readers' catch lists predate marketlake #536, and the change moved them into a new call.
+# A list that lost a member would let that class out of ``_live_roster`` into the cycle
+# ``run_loop`` calls unguarded, which ends the daemon. So every member is driven, for both files,
+# through both the capture reader and the daemon's reader. ``UnicodeDecodeError`` is the
+# ``ValueError`` a real bit flip produced, about one flip in 300 under the mutation review.
+
+
+def _decode_error(path: Path) -> object:
+    raise UnicodeDecodeError("utf-8", b"\x97", 0, 1, "invalid start byte")
+
+
+@pytest.mark.parametrize(
+    ("file", "raised"),
+    [
+        ("master", MasterUnreadable(Path("m"))),
+        ("master", "decode"),
+        ("master", ValueError("a bad value")),
+        ("spans", SpansUnreadable(Path("s"))),
+        ("spans", "decode"),
+        ("spans", ValueError("a bad value")),
+    ],
+)
+def test_every_class_a_reader_catches_widens_and_says_so(lake, monkeypatch, capsys, file, raised):
+    def fail(cls, path):
+        if raised == "decode":
+            _decode_error(path)
+        raise raised
+
+    target = SecurityMaster if file == "master" else CaptureSpans
+    monkeypatch.setattr(target, "read", classmethod(fail))
+    reader = daemon._master_reader if file == "master" else daemon._spans_reader
+
+    assert _captured(_live_roster(ROSTER, lake, AT)) == ["SPY", "QQQ"]
+    assert reader(lake, ManualClock(AT))() is None
+    (line,) = _lines(capsys)
+    assert "could not be read" in line
+
+
+def test_a_torn_spans_file_widens_the_roster_and_leaves_the_daemon_reader_answering_none(
+    lake, capsys
+):
+    spans_path(lake).write_bytes(b"not parquet at all")
+
+    assert _captured(_live_roster(ROSTER, lake, AT)) == ["SPY", "QQQ"]
+    assert daemon._spans_reader(lake, ManualClock(AT))() is None
+    (line,) = _lines(capsys)
+    assert line.startswith(f"reference: {spans_path(lake)} could not be read at ")
+
+
+def test_both_files_unreadable_print_one_line_because_the_spans_are_not_read(lake, capsys):
+    """The roster widens on the master alone, so the spans are never opened that cycle."""
+    with _Locked(master_path(lake)), _Locked(spans_path(lake)):
+        assert _captured(_live_roster(ROSTER, lake, AT)) == ["SPY", "QQQ"]
+
+    (line,) = _lines(capsys)
+    assert str(master_path(lake)) in line
+
+
+def test_a_file_denied_then_deleted_then_restored_still_says_it_reads_again(lake, capsys):
+    """The module docstring promises this sequence. The absent step must not clear the record."""
+    good = master_path(lake).read_bytes()
+    with _Locked(master_path(lake)):
+        _live_roster(ROSTER, lake, AT)
+    master_path(lake).unlink()
+    _live_roster(ROSTER, lake, AT)
+    master_path(lake).write_bytes(good)
+    _live_roster(ROSTER, lake, LATER)
+
+    lines = _lines(capsys)
+    assert [line.split(" at ")[0] for line in lines] == [
+        f"reference: {master_path(lake)} could not be read",
+        f"reference: {master_path(lake)} reads again",
+    ]
+
+
+def test_the_failure_line_carries_the_exception_message_as_well_as_its_class(tmp_path, capsys):
+    def denied(path: Path) -> object:
+        raise PermissionError(1, "Operation not permitted", str(path))
+
+    reference_read.read_or_none(tmp_path / "x", denied, (OSError,), now=lambda: AT)
+
+    (line,) = _lines(capsys)
+    assert "PermissionError: [Errno 1] Operation not permitted" in line
+
+
+# -- the daemon hands its own clock to both consumers' readers --------------------------------
+
+
+def _daemon_config(tmp_path: Path, lake: Path) -> tuple[str, str]:
+    config = write_config(tmp_path, lake)
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("SPY: {options: false}\n")
+    return str(config), str(tickers)
+
+
+def test_the_gap_marker_readers_stamp_the_daemon_clock(tmp_path, lake, capsys):
+    config, tickers = _daemon_config(tmp_path, lake)
+    clock = ManualClock(AT)
+    marker = daemon._gap_marker(
+        config, tickers, SessionClock(clock=clock, calendar=weekday_sessions()), clock
+    )
+    assert marker is not None
+
+    with _Locked(master_path(lake)), _Locked(spans_path(lake)):
+        assert marker._master() is None
+        assert marker._spans() is None
+
+    lines = _lines(capsys)
+    assert len(lines) == 2
+    assert all(f"could not be read at {AT.isoformat()}" in line for line in lines)
+
+
+def test_the_close_guard_readers_stamp_the_daemon_clock(tmp_path, lake, capsys):
+    config, tickers = _daemon_config(tmp_path, lake)
+    clock = ManualClock(AT)
+    guard = daemon._close_guard(
+        config,
+        tickers,
+        SessionClock(clock=clock, calendar=weekday_sessions()),
+        clock,
+        observer=SchemaDriftObserver(),
+        publisher=Publisher(
+            lake_root=lake, transport=FakeTransport(), secrets=(PING_KEY, NTFY_TOPIC)
+        ),
+    )
+    assert guard is not None
+
+    with _Locked(master_path(lake)), _Locked(spans_path(lake)):
+        assert guard._master() is None
+        assert guard._spans() is None
+
+    lines = _lines(capsys)
+    assert len(lines) == 2
+    assert all(f"could not be read at {AT.isoformat()}" in line for line in lines)
