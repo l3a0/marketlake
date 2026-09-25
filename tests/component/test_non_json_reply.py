@@ -15,12 +15,14 @@ in the code under test.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+import json
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from lake import capture, journal
 from lake.cassette import load_cassette
 from lake.chain_plan import ChainPlan
+from lake.paths import LakePaths
 from lake.schwab import SchwabVendor
 from lake.tickers import Roster
 from lake.watchdog import Watchdog
@@ -73,6 +75,20 @@ def test_a_chain_answered_429_with_html_is_recorded_as_a_429(lake_root):
     assert classes[("chains", "SPY")] == {"http_429"}
     assert classes[("quotes", "SPY")] == {None}
     assert classes[("quotes", "QQQ")] == {None}
+
+
+def test_the_timing_file_keeps_an_html_rejection_as_its_own_text(lake_root):
+    """The request's timing line copies a rejected reply's body for the sub-code search. For a
+    page that is not JSON, that copy is the page, not the empty mapping standing in for it."""
+    page = b"<html><body>Rate limit 429-005</body></html>"
+    _cycle(lake_root, chain=FakeResponse(429, content=page), quotes=_QUOTES_OK)
+
+    timing = LakePaths(lake_root).timing_path(date(2026, 8, 24))
+    lines = [json.loads(line) for line in timing.read_text(encoding="utf-8").splitlines()]
+    (chain,) = [line for line in lines if line["surface"] == "chains"]
+    assert (chain["status"], chain["error_class"]) == (429, "http_429")
+    assert chain["request_subcode"] == "429-005"
+    assert json.loads(chain["request_error_detail"])["body"] == page.decode()
 
 
 def test_a_chain_answered_401_with_null_no_longer_takes_the_cycle_down(lake_root):
