@@ -507,9 +507,13 @@ def test_the_fake_parses_and_decodes_the_way_httpx_does():
         assert real.text == fake.text
         try:
             expected = real.json()
-        except ValueError:
-            with pytest.raises(ValueError):
+        except ValueError as real_error:
+            # The exact class, not only ``ValueError``. A Latin-1 page raises
+            # ``UnicodeDecodeError`` and the rest ``JSONDecodeError``, and a fake that turned one
+            # into the other would hide a catch narrowed to ``JSONDecodeError``.
+            with pytest.raises(ValueError) as fake_error:
                 fake.json()
+            assert type(fake_error.value) is type(real_error)
         else:
             assert fake.json() == expected
 
