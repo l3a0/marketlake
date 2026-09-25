@@ -456,12 +456,16 @@ def test_the_journaled_snapshot_carries_the_clock_not_the_epoch(lake_root, tmp_p
     # shape rather than against a datetime, which would compare unequal whatever was
     # written and prove nothing.
     ran_at = _MID_SESSION.isoformat()
+    # The windows are fired concurrently, 50 ms apart on the manual clock, and each stamps its
+    # own finish on its pool thread. So the fetch ends within the submissions, which is still
+    # the clock's day, not the epoch's.
+    latest = (_MID_SESSION + timedelta(milliseconds=50) * (len(_WINDOWS) - 1)).isoformat()
     rows = journal.read_segment(lake_root / report.snapshot_segment).to_pylist()
     assert rows
     for row in rows:
         assert row["snap_ts"] == ran_at
         assert row["fetch_ts"] == ran_at
-        assert row["fetch_end_ts"] == ran_at
+        assert ran_at <= row["fetch_end_ts"] <= latest
 
 
 def test_the_equity_only_snapshot_carries_the_clock_too(lake_root, tmp_path):
@@ -1052,6 +1056,8 @@ def test_the_journaled_round_trip_spans_every_window(lake_root, tmp_path):
     seconds = 3
     vendor = _SlowVendor(_chain_vendor(is_delayed=False), clock, seconds=seconds)
 
+    # The vendor advances the manual clock inside each call, which is only well defined
+    # when one call runs at a time, so this runs at a cap of 1 and the span is the sum.
     report = onboard(
         "SPY",
         clock=clock,
@@ -1059,6 +1065,7 @@ def test_the_journaled_round_trip_spans_every_window(lake_root, tmp_path):
         lake_root=lake_root,
         tickers_path=tmp_path / "tickers.yaml",
         options=True,
+        guards=GuardConstants(capture_max_concurrency=1),
     )
 
     rows = journal.read_segment(lake_root / report.snapshot_segment).to_pylist()
