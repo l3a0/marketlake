@@ -351,7 +351,7 @@ def test_the_calendar_probe_entry_pages_through_a_real_publisher(tmp_path, monke
 
     class _Vendor:
         @staticmethod
-        def from_token(path, *, api_key, app_secret):
+        def from_token(path, *, api_key, app_secret, clock=None):
             return _Vendor()
 
         def get_quotes(self, symbols):

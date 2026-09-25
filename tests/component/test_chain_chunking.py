@@ -30,6 +30,7 @@ They cover the chunker's contract:
 from __future__ import annotations
 
 import json
+from collections import Counter
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -169,6 +170,20 @@ class _WindowVendor:
         return datetime(2026, 8, 23, tzinfo=UTC)
 
 
+def _assert_calls(vendor: _WindowVendor, cap: int, expected: list) -> None:
+    """Assert the ranges a chain fetch requested, in order where order is defined.
+
+    At a cap of 1 the windows are fetched one at a time on the calling thread, so the
+    sequence is the contract, as it was before marketlake #532. Above it the windows are
+    fired concurrently and arrive at the vendor in whatever order the threads reach it, so
+    what is asserted is that each range was requested exactly as often as expected.
+    """
+    if cap == 1:
+        assert vendor.chain_calls == expected
+    else:
+        assert Counter(vendor.chain_calls) == Counter(expected)
+
+
 def _calls_for(vendor: _WindowVendor, from_iso: str, to_iso: str | None) -> int:
     """How many times a given date range was fetched, to prove split fan-out or its absence."""
     return sum(1 for (_sym, f, t) in vendor.chain_calls if (f, t) == (from_iso, to_iso))
@@ -202,7 +217,8 @@ def _chain_rows(result, ticker: str = "SPY") -> list[dict]:
 # -- 1. the plan's windows reassemble to one segment -------------------------------------
 
 
-def test_windows_reassemble_to_one_segment_with_the_first_success_header(lake_root):
+@pytest.mark.parametrize("cap", [1, 20])
+def test_windows_reassemble_to_one_segment_with_the_first_success_header(lake_root, cap):
     # Two windows: a near-term closed window and the open tail. Each returns one expiration.
     # Both reassemble into one snapshot. The header comes from the first successful window,
     # so its underlying price wins over the tail's deliberately different one.
@@ -213,7 +229,7 @@ def test_windows_reassemble_to_one_segment_with_the_first_success_header(lake_ro
             (_d(10), None): _chain_response(["2026-09-18"], underlying_price=999.0),
         },
     )
-    result = _run(vendor, lake_root, plan)
+    result = _run(vendor, lake_root, plan, guards=GuardConstants(capture_max_concurrency=cap))
 
     # Exactly one chains segment for SPY, and it is a data segment.
     chain_segs = [s for s in result.segments if s.surface == CHAINS]
@@ -245,16 +261,21 @@ def test_windows_reassemble_to_one_segment_with_the_first_success_header(lake_ro
 
     # The request trace is exactly the plan's two windows, fetched by date range, with no
     # strike_count discovery call anywhere.
-    assert vendor.chain_calls == [
-        ("SPY", _d(0), _d(9)),
-        ("SPY", _d(10), None),
-    ]
+    _assert_calls(
+        vendor,
+        cap,
+        [
+            ("SPY", _d(0), _d(9)),
+            ("SPY", _d(10), None),
+        ],
+    )
 
 
 # -- 2. a too-big window is split at its date midpoint -----------------------------------
 
 
-def test_a_too_big_window_splits_at_its_date_midpoint(lake_root):
+@pytest.mark.parametrize("cap", [1, 20])
+def test_a_too_big_window_splits_at_its_date_midpoint(lake_root, cap):
     # One closed window ten days wide. The whole-range fetch 502s, so it is halved at its
     # date midpoint and each half succeeds. All four contracts land, with no gaps. The open
     # tail is empty.
@@ -267,20 +288,25 @@ def test_a_too_big_window_splits_at_its_date_midpoint(lake_root):
             (_d(11), None): _chain_response([]),
         },
     )
-    result = _run(vendor, lake_root, plan)
+    result = _run(vendor, lake_root, plan, guards=GuardConstants(capture_max_concurrency=cap))
 
     rows = _chain_rows(result)
     assert len(rows) == 4
     assert all(r["row_kind"] == journal.ROW_KIND_DATA for r in rows)
     assert result.segment(CHAINS, "SPY").error_class is None
     # The split is visible in the request trace: the full window, then its two date halves
-    # (midpoint at offset 5), then the open tail.
-    assert vendor.chain_calls == [
-        ("SPY", _d(0), _d(10)),
-        ("SPY", _d(0), _d(5)),
-        ("SPY", _d(6), _d(10)),
-        ("SPY", _d(11), None),
-    ]
+    # (midpoint at offset 5), then the open tail. That sequence holds at a cap of 1. Above
+    # it the tail's request runs beside the split, so only the set of ranges is asserted.
+    _assert_calls(
+        vendor,
+        cap,
+        [
+            ("SPY", _d(0), _d(10)),
+            ("SPY", _d(0), _d(5)),
+            ("SPY", _d(6), _d(10)),
+            ("SPY", _d(11), None),
+        ],
+    )
 
 
 def test_an_is_chain_truncated_200_also_splits(lake_root):
@@ -472,7 +498,8 @@ def test_a_bounded_split_depth_gives_up_on_the_deeper_ranges(lake_root):
 # -- 5. a whole-chain gap when every window fails ----------------------------------------
 
 
-def test_every_window_failing_yields_a_whole_chain_gap(lake_root):
+@pytest.mark.parametrize("cap", [1, 20])
+def test_every_window_failing_yields_a_whole_chain_gap(lake_root, cap):
     # Two windows, a one-day near window and the open tail, both TooBigBody 502s. Neither can
     # be split, so nothing survives and the whole chain is one gap, tagged with the
     # size-failure class rather than becoming an empty snapshot.
@@ -483,7 +510,7 @@ def test_every_window_failing_yields_a_whole_chain_gap(lake_root):
             (_d(1), None): _TOO_BIG,
         },
     )
-    result = _run(vendor, lake_root, plan)
+    result = _run(vendor, lake_root, plan, guards=GuardConstants(capture_max_concurrency=cap))
 
     outcome = result.segment(CHAINS, "SPY")
     assert outcome.row_kind == journal.ROW_KIND_GAP
@@ -493,13 +520,18 @@ def test_every_window_failing_yields_a_whole_chain_gap(lake_root):
     assert gap["row_kind"] == journal.ROW_KIND_GAP
     assert gap["bid"] is None
     # Both windows were tried by date range, with no discovery call.
-    assert vendor.chain_calls == [
-        ("SPY", _d(0), _d(0)),
-        ("SPY", _d(1), None),
-    ]
+    _assert_calls(
+        vendor,
+        cap,
+        [
+            ("SPY", _d(0), _d(0)),
+            ("SPY", _d(1), None),
+        ],
+    )
 
 
-def test_whole_chain_gap_carries_the_first_failed_windows_class(lake_root):
+@pytest.mark.parametrize("cap", [1, 20])
+def test_whole_chain_gap_carries_the_first_failed_windows_class(lake_root, cap):
     # Every window returns 401. None is a size failure, so none is split and nothing is
     # captured. The whole chain gaps with the representative class, http_401, not a blanket
     # chunk-failure, so the failure model still sees auth death on the chain surface.
@@ -511,17 +543,21 @@ def test_whole_chain_gap_carries_the_first_failed_windows_class(lake_root):
             (_d(11), None): unauthorized,
         },
     )
-    result = _run(vendor, lake_root, plan)
+    result = _run(vendor, lake_root, plan, guards=GuardConstants(capture_max_concurrency=cap))
 
     outcome = result.segment(CHAINS, "SPY")
     assert outcome.row_kind == journal.ROW_KIND_GAP
     assert outcome.error_class == "http_401"
     assert outcome.rows == 1
     # Each window was tried exactly once, with no split fan-out.
-    assert vendor.chain_calls == [
-        ("SPY", _d(0), _d(10)),
-        ("SPY", _d(11), None),
-    ]
+    _assert_calls(
+        vendor,
+        cap,
+        [
+            ("SPY", _d(0), _d(10)),
+            ("SPY", _d(11), None),
+        ],
+    )
 
 
 def test_the_representative_class_is_the_first_failed_window_and_not_the_last(lake_root):

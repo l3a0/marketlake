@@ -168,6 +168,67 @@ def test_onboarding_an_existing_ticker_before_the_seed_run_has_happened_refuses(
         )
 
 
+def test_onboarding_writes_one_timing_line_per_window_it_fetched(lake_root, tmp_path):
+    # Onboarding's first snapshot is a real cycle through ``fetch_chain``, so its requests
+    # reach the timing file under the minute the snapshot landed at, like a loop cycle's.
+    # The clock starts 45 seconds into the minute, so the slot has to be floored to it.
+    import json
+
+    onboard(
+        "SPY",
+        clock=ManualClock(start=_MID_SESSION + timedelta(seconds=45)),
+        vendor=_chain_vendor(is_delayed=False),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=True,
+    )
+
+    path = LakePaths(lake_root).timing_path(_MID_SESSION_DAY)
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    windows = DEFAULT_CHAIN_PLAN.windows_for(_MID_SESSION_DAY)
+    assert [(line["window_start"], line["window_end"]) for line in lines] == [
+        (start.isoformat(), end.isoformat() if end is not None else None) for start, end in windows
+    ]
+    assert {(line["surface"], line["ticker"]) for line in lines} == {("chains", "SPY")}
+    assert {line["snap_ts"] for line in lines} == {_MID_SESSION.isoformat()}
+
+
+def test_equity_only_onboarding_writes_its_quote_line(lake_root, tmp_path):
+    # The one quote this branch fetches produces a quotes row, so it gets a line too.
+    import json
+
+    onboard(
+        "QQQ",
+        clock=ManualClock(start=_MID_SESSION),
+        vendor=_quote_vendor("QQQ", realtime=True),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=False,
+    )
+
+    path = LakePaths(lake_root).timing_path(_MID_SESSION_DAY)
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [(line["surface"], line["ticker"], line["symbols"]) for line in lines] == [
+        ("quotes", None, ["QQQ"])
+    ]
+    assert (lines[0]["status"], lines[0]["error_class"]) == (200, None)
+
+
+def test_a_refused_onboarding_writes_no_timing_line(lake_root, tmp_path):
+    # A refused onboarding writes nothing to the lake, the timing file included.
+    with pytest.raises(EntitlementError):
+        onboard(
+            "SPY",
+            clock=ManualClock(start=_MID_SESSION),
+            vendor=_chain_vendor(is_delayed=True),
+            lake_root=lake_root,
+            tickers_path=tmp_path / "tickers.yaml",
+            options=True,
+        )
+
+    assert not LakePaths(lake_root).timing_path(_MID_SESSION_DAY).exists()
+
+
 def test_onboard_registers_verifies_and_writes(lake_root, tmp_path):
     clock = ManualClock(start=_MID_SESSION)
     tickers_path = tmp_path / "tickers.yaml"
@@ -456,12 +517,16 @@ def test_the_journaled_snapshot_carries_the_clock_not_the_epoch(lake_root, tmp_p
     # shape rather than against a datetime, which would compare unequal whatever was
     # written and prove nothing.
     ran_at = _MID_SESSION.isoformat()
+    # The windows are fired concurrently, 50 ms apart on the manual clock, and each stamps its
+    # own finish on its pool thread. So the fetch ends within the submissions, which is still
+    # the clock's day, not the epoch's.
+    latest = (_MID_SESSION + timedelta(milliseconds=50) * (len(_WINDOWS) - 1)).isoformat()
     rows = journal.read_segment(lake_root / report.snapshot_segment).to_pylist()
     assert rows
     for row in rows:
         assert row["snap_ts"] == ran_at
         assert row["fetch_ts"] == ran_at
-        assert row["fetch_end_ts"] == ran_at
+        assert ran_at <= row["fetch_end_ts"] <= latest
 
 
 def test_the_equity_only_snapshot_carries_the_clock_too(lake_root, tmp_path):
@@ -1052,6 +1117,8 @@ def test_the_journaled_round_trip_spans_every_window(lake_root, tmp_path):
     seconds = 3
     vendor = _SlowVendor(_chain_vendor(is_delayed=False), clock, seconds=seconds)
 
+    # The vendor advances the manual clock inside each call, which is only well defined
+    # when one call runs at a time, so this runs at a cap of 1 and the span is the sum.
     report = onboard(
         "SPY",
         clock=clock,
@@ -1059,6 +1126,7 @@ def test_the_journaled_round_trip_spans_every_window(lake_root, tmp_path):
         lake_root=lake_root,
         tickers_path=tmp_path / "tickers.yaml",
         options=True,
+        guards=GuardConstants(capture_max_concurrency=1),
     )
 
     rows = journal.read_segment(lake_root / report.snapshot_segment).to_pylist()
@@ -1276,10 +1344,12 @@ def test_the_wrapper_loads_the_plan_and_passes_the_config_s_guards(
         windowed_chain_cassette("SPY", _MID_SESSION_DAY, _chain_body(is_delayed=False), plan=tuned)
     )
     seen: list[GuardConstants] = []
+    clocks: list = []
 
     class _Stub:
         @staticmethod
-        def from_token(token_path, *, api_key, app_secret):
+        def from_token(token_path, *, api_key, app_secret, clock=None):
+            clocks.append(clock)
             return vendor
 
     real_fetch_chain = lake.onboard.capture.fetch_chain
@@ -1293,9 +1363,10 @@ def test_the_wrapper_loads_the_plan_and_passes_the_config_s_guards(
     monkeypatch.setattr(lake.onboard.capture, "fetch_chain", _record)
 
     config = write_config(tmp_path, lake_root, guards={"chain_chunk_max_split_depth": 0})
+    clock = ManualClock(start=_MID_SESSION)
     report = lake.onboard.onboard_from_config(
         "SPY",
-        clock=ManualClock(start=_MID_SESSION),
+        clock=clock,
         config_path=str(config),
         tickers_path=tmp_path / "tickers.yaml",
         token_path=tmp_path / "token.json",
@@ -1308,6 +1379,10 @@ def test_the_wrapper_loads_the_plan_and_passes_the_config_s_guards(
 
     # The config's own recalibrated guard reached it too, rather than the pinned default.
     assert [g.chain_chunk_max_split_depth for g in seen] == [0]
+
+    # The vendor was built with the run's own clock, which is what turns request timing on.
+    assert len(clocks) == 1
+    assert clocks[0] is clock
 
 
 def _stub_the_vendor(monkeypatch, vendor) -> None:
@@ -1327,7 +1402,7 @@ def _stub_the_vendor(monkeypatch, vendor) -> None:
 
     class _Stub:
         @staticmethod
-        def from_token(token_path, *, api_key, app_secret):
+        def from_token(token_path, *, api_key, app_secret, clock=None):
             return vendor
 
     monkeypatch.setattr(lake.schwab, "SchwabVendor", _Stub)
