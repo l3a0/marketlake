@@ -125,6 +125,13 @@ QUARANTINE_FILE = "quarantine.jsonl"
 # shell alive forever.
 JOURNAL_METADATA_FILE = "metadata.json"
 
+# The request timing files, one per day, written by ``lake.timing``. The directory sits at
+# the journal root beside the metadata stamp and outside every ``date=`` directory, for the
+# same reason: compaction prunes a sealed day's directories, and these files outlive the
+# seal. A day's file is ``timing/date=YYYY-MM-DD.jsonl``.
+TIMING_DIR = "timing"
+JSONL_SUFFIX = ".jsonl"
+
 # The key prefix on a partition-date directory or filename, as in ``date=2026-01-05``.
 DATE_PREFIX = "date="
 
@@ -246,6 +253,10 @@ class LakePaths:
     def journal_metadata_path(self) -> Path:
         """The journal metadata stamp: the token mint time, the roster, and the last ping."""
         return self.journal_dir / JOURNAL_METADATA_FILE
+
+    def timing_path(self, day: date | str) -> Path:
+        """One day's request timing file, appended one line per vendor request."""
+        return self.journal_dir / TIMING_DIR / f"{DATE_PREFIX}{_day_str(day)}{JSONL_SUFFIX}"
 
     def segment_dir(self, surface: str, ticker: str, day: date | str) -> Path:
         """The directory holding one surface, ticker, and day's journal segments.
@@ -510,6 +521,7 @@ __all__ = [
     "DATE_PREFIX",
     "JOURNAL_DIR",
     "JOURNAL_METADATA_FILE",
+    "JSONL_SUFFIX",
     "MANIFEST_FILE",
     "PARQUET_SUFFIX",
     "QUARANTINE_FILE",
@@ -525,6 +537,7 @@ __all__ = [
     "TEMP_MARKER",
     "TICKERS_FILE",
     "TICKER_PREFIX",
+    "TIMING_DIR",
     "TOKEN_FILE",
     "LakePaths",
     "PartitionRef",

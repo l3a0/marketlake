@@ -63,7 +63,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from lake.calendar import Calendar
-from lake.paths import JOURNAL_DIR, PARQUET_SUFFIX, parse_date_dir
+from lake.paths import JOURNAL_DIR, JSONL_SUFFIX, PARQUET_SUFFIX, TIMING_DIR, parse_date_dir
 
 # How many trailing calendar days the growth rate is measured over. It matches the
 # History panel's window so the page's two spans read alike to a human, and the two
@@ -129,14 +129,18 @@ class Usage:
     ``day_bytes`` maps a day to the bytes attributable to it. A path names its day
     through any component that parses as ``date=YYYY-MM-DD``, which covers the filename
     for ``chains``, ``quotes`` and ``bars``, and the directory for ``journal/date=<D>/``
-    and ``reports/close_guard/date=<D>/``.
+    and ``reports/close_guard/date=<D>/``. The request timing file,
+    ``journal/timing/date=<D>.jsonl``, is read by its own filename, because it is the one
+    dated file under ``journal/`` that is not a segment.
 
     ``undated`` is everything else, which is real disk the growth rate cannot see and so
     is pure undercount. It is carried rather than dropped: it is about 300 KB a day
     against a 566 MB a day rate today, five hundredths of one percent, and nothing says
     it stays that way.
 
-    ``unsealed`` names the days some of whose bytes are still journal segments. A day's
+    ``unsealed`` names the days some of whose bytes are still journal segments. The timing
+    file never counts toward it, since it outlives the seal on purpose, and counting it
+    would show every day since timing began as unsealed forever. A day's
     bytes are not stable: mid-session it is Arrow IPC under ``journal/date=<D>/`` and
     after close+15 it is one compressed Parquet partition, and compaction appends the
     manifest entry before it unlinks the segments, so for a moment a day is both. Both
@@ -235,6 +239,19 @@ def _day_of(parts: Sequence[str]) -> date | None:
     return None
 
 
+def _is_timing_file(parts: Sequence[str]) -> bool:
+    """Whether a lake-relative path is a request timing file, ``journal/timing/<file>``."""
+    return len(parts) == 3 and parts[0] == JOURNAL_DIR and parts[1] == TIMING_DIR
+
+
+def _timing_day(parts: Sequence[str]) -> date | None:
+    """The day a timing file's name carries, as in ``date=2026-09-24.jsonl``."""
+    name = parts[-1]
+    if not name.endswith(JSONL_SUFFIX):
+        return None
+    return parse_date_dir(name[: -len(JSONL_SUFFIX)])
+
+
 def walk(lake_root: Path | str) -> Usage:
     """Walk the lake once and report its allocated bytes, by entry and by day.
 
@@ -304,13 +321,14 @@ def walk(lake_root: Path | str) -> Usage:
             entry = parts[0]
             entry_bytes[entry] = entry_bytes.get(entry, 0) + size
             entry_files[entry] = entry_files.get(entry, 0) + 1
-            day = _day_of(parts)
+            timing = _is_timing_file(parts)
+            day = _timing_day(parts) if timing else _day_of(parts)
             if day is None:
                 undated += size
             else:
                 dated += size
                 day_bytes[day] = day_bytes.get(day, 0) + size
-                if entry == JOURNAL_DIR:
+                if entry == JOURNAL_DIR and not timing:
                     unsealed.add(day)
 
     entries = tuple(

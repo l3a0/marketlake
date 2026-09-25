@@ -158,3 +158,39 @@ def test_from_token_locks_the_session_token_refresh(tmp_path, monkeypatch):
     session.ensure_active_token(stale)
     assert session.checked == [session.token]
     assert session.checked[0] is not stale
+
+
+def test_from_token_turns_timing_on_only_when_given_a_clock(tmp_path, monkeypatch):
+    """A clock hooks the client's session, and no clock leaves it as the library built it.
+
+    The capture cycle, the close+5 fill and onboarding pass their clock. Every other caller
+    passes none, so its client is untouched.
+    """
+    from tests.support.clock import ManualClock
+
+    token = tmp_path / "token.json"
+    _write_token(token, MINT_BEFORE)
+    built: list[FakeSchwabClient] = []
+
+    class _Factory(_RecordingFactory):
+        def __call__(self, *args, **kwargs):
+            client = super().__call__(*args, **kwargs)
+            # The one member of an ``httpx.Client`` that ``attach_timing`` writes.
+            client.session.event_hooks = {"request": [], "response": []}
+            built.append(client)
+            return client
+
+    _install_seam(monkeypatch, _Factory())
+
+    SchwabVendor.from_token(token, api_key="k", app_secret="s")
+    SchwabVendor.from_token(
+        token,
+        api_key="k",
+        app_secret="s",
+        clock=ManualClock(start=datetime(2026, 8, 24, tzinfo=UTC)),
+    )
+
+    untimed, timed = built
+    assert untimed.session.event_hooks == {"request": [], "response": []}
+    assert len(timed.session.event_hooks["request"]) == 1
+    assert len(timed.session.event_hooks["response"]) == 1

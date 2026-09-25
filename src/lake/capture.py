@@ -56,6 +56,7 @@ minutes.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -78,6 +79,7 @@ from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor
 from lake.security_master import ID_TYPE_TICKER, SecurityMaster, SecurityMasterError, master_path
 from lake.session import OPTION_CLOSE
 from lake.tickers import Roster, load_tickers
+from lake.timing import RequestRecord, append_requests, failures
 from lake.vendor import Vendor, VendorError, VendorResponse
 
 # The manifest ``source`` for a capture-written segment entry.
@@ -254,6 +256,149 @@ def _error_class(exc: BaseException) -> str:
 def _ok(status: int) -> bool:
     """Whether an HTTP status is a success. A non-2xx is a fetch failure."""
     return 200 <= status < 300
+
+
+# A 429's sub-code, such as ``429-005`` for a burst or ``429-001`` for a sustained rate. The
+# design calls the sub-codes community-documented rather than published, and no 429 has
+# ever reached the lake, so where Schwab puts one is unmeasured. The pattern is therefore
+# looked for anywhere in the reply rather than at one assumed field.
+_SUBCODE = re.compile(r"429-\d{3}")
+
+# How much of a rejected reply's body ``request_error_detail`` keeps, in UTF-8 bytes.
+ERROR_DETAIL_MAX_BYTES = 4096
+
+# The one response header the error copy never keeps. A cookie can carry a session.
+_DROPPED_HEADER = "set-cookie"
+
+
+def _rejection(response: VendorResponse) -> tuple[str | None, str | None, str | None]:
+    """What a non-2xx reply says about itself: its sub-code, a bounded copy, and any failure.
+
+    Nothing here decides anything. ``error_class`` stays ``http_<status>`` whatever this
+    finds, because the watchdog pages on that exact string, and the design says the
+    handler never *depends* on a sub-code. The three answers only ride the request's
+    timing line.
+
+    1. ``subcode`` is the first ``429-`` and three digits found in the body or a header
+       value, looked for on a 429 alone, so a 400 echoing a parameter cannot yield one.
+    2. ``detail`` is JSON holding the reply's headers, less ``Set-Cookie``, and its body
+       re-serialized and cut to ``ERROR_DETAIL_MAX_BYTES``. It keeps the first real
+       rejection's shape, so the pattern above can be narrowed against a real sample.
+    3. ``failure`` names what went wrong building the other two, which are then ``None``.
+
+    A 2xx reply answers three ``None``. This reads the ``VendorResponse`` the vendor
+    already returned, the same way ``_is_too_big`` reads a 502's fault body, because the
+    vendor seam promises never to inspect a body itself.
+    """
+    try:
+        if _ok(response.status):
+            return None, None, None
+        headers = {
+            str(name): str(value)
+            for name, value in response.headers.items()
+            if str(name).lower() != _DROPPED_HEADER
+        }
+        body_text = json.dumps(response.body, sort_keys=True, default=str)
+        kept = body_text.encode("utf-8")[:ERROR_DETAIL_MAX_BYTES].decode("utf-8", "ignore")
+        detail = json.dumps({"body": kept, "headers": headers}, sort_keys=True)
+        subcode = None
+        if response.status == 429:
+            for text in (body_text, *headers.values()):
+                found = _SUBCODE.search(text)
+                if found is not None:
+                    subcode = found.group(0)
+                    break
+        return subcode, detail, None
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must never cost a window
+        return None, None, f"{type(exc).__name__}: {exc}"
+
+
+def request_record(
+    surface: str,
+    *,
+    ticker: str | None,
+    symbols: Sequence[str] = (),
+    window: tuple[date, date | None] | None = None,
+    start: datetime,
+    end: datetime,
+    response: VendorResponse | None,
+    error_class: str | None,
+) -> RequestRecord:
+    """One request's record from what the caller saw around it.
+
+    ``response`` is ``None`` when the call raised. The timing is read with ``getattr``
+    because a vendor fake may return a reply built before timing existed.
+    """
+    subcode = detail = failure = None
+    timing = None
+    status = None
+    if response is not None:
+        status = response.status
+        timing = getattr(response, "timing", None)
+        subcode, detail, failure = _rejection(response)
+    return RequestRecord(
+        surface=surface,
+        ticker=ticker,
+        symbols=tuple(symbols),
+        window_start=window[0] if window is not None else None,
+        window_end=window[1] if window is not None else None,
+        start=start,
+        end=end,
+        status=status,
+        error_class=error_class,
+        timing=timing,
+        subcode=subcode,
+        error_detail=detail,
+        failure=failure,
+    )
+
+
+def record_requests(
+    lake_root: Path | str,
+    *,
+    snap_ts: datetime,
+    day: date,
+    records: Sequence[RequestRecord],
+    where: str,
+) -> None:
+    """Append a batch of request lines to the timing file, and never raise.
+
+    Every caller runs this after its segments are durable and its manifest entries are
+    appended, so nothing here can sit in front of a captured minute. A write that fails
+    costs its lines. A record that came out incomplete costs
+    its fields. Neither is silent: each prints one stderr line per call, once rather than
+    once per request, the way ``_write`` reports a failed drift scan. The print is guarded
+    too, because a full disk that refuses the file may refuse stderr as well, and a raise
+    from here would leave the loop and exit the daemon.
+    """
+    if not records:
+        return
+    # One append per record, so a record that cannot be written costs its own line and
+    # never the lines after it. The first failure is the one reported.
+    refused: BaseException | None = None
+    for record in records:
+        try:
+            append_requests(lake_root, snap_ts=snap_ts, day=day, records=(record,))
+        except Exception as exc:  # noqa: BLE001 - timing must never cost a minute
+            refused = refused or exc
+    if refused is not None:
+        _say(
+            f"capture: request timing not written for {where}: {type(refused).__name__}: {refused}"
+        )
+    try:
+        found = failures(records)
+    except Exception as exc:  # noqa: BLE001 - timing must never cost a minute
+        found = [f"{type(exc).__name__}: {exc}"]
+    if found:
+        _say(f"capture: request timing incomplete for {where}: {'; '.join(found)}")
+
+
+def _say(line: str) -> None:
+    """Print one diagnostic to stderr, and swallow a stderr that refuses it."""
+    try:
+        print(line, file=sys.stderr)
+    except Exception:  # noqa: BLE001 - nowhere left to report it
+        pass
 
 
 def _epoch_ms_to_datetime(value: object) -> datetime | None:
@@ -474,7 +619,8 @@ class ChainFetch:
     places inside the failed range. ``error_class`` is the first failed window's class,
     the representative signal, and ``None`` when every window succeeded. ``fetch_ts`` and
     ``fetch_end_ts`` span the whole windowed fetch, so even a timeout's duration is in
-    them.
+    them. ``requests`` is one record per request the fetch made, splits included, in the
+    order they were made. They are what the timing file's lines are built from.
     """
 
     body: Mapping[str, object] | None
@@ -483,6 +629,7 @@ class ChainFetch:
     fetch_ts: datetime
     fetch_end_ts: datetime
     error_class: str | None
+    requests: tuple[RequestRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -580,7 +727,8 @@ def fetch_chain(
     serially there, so one oversize window cannot turn into a burst of up to 31 requests.
 
     ``fetch_ts`` is stamped before the first window is fetched and ``fetch_end_ts`` once
-    the last has finished, so the round trip spans the whole windowed fetch.
+    the last has finished, so the round trip spans the whole windowed fetch. Each request
+    inside it is stamped too, and lands in ``requests`` for the timing file.
 
     ``lake_root`` is read only on the failure path, and only to name the absence markers.
     The daemon holds no expiration state, so the missing expirations come from the
@@ -589,7 +737,7 @@ def fetch_chain(
     windows = tuple(plan.windows_for(day))
     if guards.capture_max_concurrency == 1:
         fetch_ts = clock.now()
-        outcomes = [_run_window(vendor, guards, ticker, f, t) for f, t in windows]
+        outcomes = [_run_window(clock, vendor, guards, ticker, f, t) for f, t in windows]
         fetch_end_ts = clock.now()
     else:
         fetched = _fetch_concurrently(clock, vendor, guards, (ticker,), windows, ())
@@ -605,15 +753,18 @@ class _WindowOutcome:
     so two windows fetched on two threads never write to the same dict. ``failed`` holds
     the ranges this window gave up, one entry for the window or one per split half.
     ``header`` is the first successful response body inside this window, or ``None``.
+    ``requests`` is one record per request the window made, in call order, splits included.
     """
 
     call_map: dict[str, dict[str, list]]
     put_map: dict[str, dict[str, list]]
     failed: tuple[tuple[date, date | None, str], ...]
     header: Mapping[str, object] | None
+    requests: tuple[RequestRecord, ...] = ()
 
 
 def _run_window(
+    clock: Clock,
     vendor: Vendor,
     guards: GuardConstants,
     ticker: str,
@@ -623,18 +774,36 @@ def _run_window(
     """Fetch one plan window, splitting it if it comes back too big, into its own maps.
 
     This is the unit of work a pool thread runs. It makes the vendor calls and parses the
-    responses, and it does nothing else: it reads no clock, writes nothing to the lake and
-    touches no state another window can see.
+    responses, and it does nothing else: it writes nothing to the lake and touches no state
+    another window can see. It reads the clock only to stamp each request's start and end
+    for the timing file (marketlake #531), and ``now`` changes nothing, so that is safe from
+    a pool thread.
     """
     call_map: dict[str, dict[str, list]] = {}
     put_map: dict[str, dict[str, list]] = {}
     failed: list[tuple[date, date | None, str]] = []
     header_holder: list[Mapping[str, object]] = []
+    requests: list[RequestRecord] = []
     _fetch_window(
-        vendor, guards, ticker, from_date, to_date, 0, call_map, put_map, failed, header_holder
+        clock,
+        vendor,
+        guards,
+        ticker,
+        from_date,
+        to_date,
+        0,
+        call_map,
+        put_map,
+        failed,
+        header_holder,
+        requests,
     )
     return _WindowOutcome(
-        call_map, put_map, tuple(failed), header_holder[0] if header_holder else None
+        call_map,
+        put_map,
+        tuple(failed),
+        header_holder[0] if header_holder else None,
+        tuple(requests),
     )
 
 
@@ -651,13 +820,16 @@ def _assemble_chain(
     ``outcomes`` parallels ``windows``. Merging in plan order is what makes a concurrent
     fetch reassemble the same snapshot a sequential one would. The first success in plan
     order supplies the header, ``failed[0]`` is the first failed range in plan order, and
-    the contracts are inserted in the order the windows were planned.
+    the contracts are inserted in the order the windows were planned. The request records
+    follow the same plan order, and within one window the order its calls were made.
     """
     call_map: dict[str, dict[str, list]] = {}
     put_map: dict[str, dict[str, list]] = {}
     failed: list[tuple[date, date | None, str]] = []
+    requests: list[RequestRecord] = []
     header_source: Mapping[str, object] | None = None
     for outcome in outcomes:
+        requests.extend(outcome.requests)
         for source, target in ((outcome.call_map, call_map), (outcome.put_map, put_map)):
             for exp_key, bucket in source.items():
                 merged = target.setdefault(exp_key, {})
@@ -681,6 +853,7 @@ def _assemble_chain(
             fetch_ts,
             fetch_end_ts,
             failed[0][2] if failed else CHAIN_CHUNK_FAILED,
+            tuple(requests),
         )
 
     # Reassemble one snapshot. The chain-level header fields are taken from the first
@@ -724,6 +897,7 @@ def _assemble_chain(
         fetch_ts,
         fetch_end_ts,
         failed[0][2] if failed else None,
+        tuple(requests),
     )
 
 
@@ -734,12 +908,17 @@ _QUOTES_UNIT = object()
 
 @dataclass(frozen=True)
 class _QuoteFetch:
-    """The one batched quote request's result: a response or the exception it raised."""
+    """The one batched quote request's result: a response or the exception it raised.
+
+    ``request_start`` is when the call itself began. In the pool that is the worker's own
+    start, which can follow ``fetch_ts``, the submission. ``None`` means the two coincide.
+    """
 
     response: VendorResponse | None
     error: Exception | None
     fetch_ts: datetime
     fetch_end_ts: datetime
+    request_start: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -827,7 +1006,7 @@ def _fetch_concurrently(
         for from_date, to_date in windows:
             for ticker in tickers:
                 chain_futures[ticker].append(
-                    submit(ticker, _run_window, vendor, guards, ticker, from_date, to_date)
+                    submit(ticker, _run_window, clock, vendor, guards, ticker, from_date, to_date)
                 )
         wait(submitted)
 
@@ -842,17 +1021,29 @@ def _fetch_concurrently(
     quotes = None
     if quote_future is not None:
         result = _task_result(quote_future)
-        quotes = _QuoteFetch(result.value, result.error, started[_QUOTES_UNIT], result.finished_at)
+        quotes = _QuoteFetch(
+            result.value,
+            result.error,
+            started[_QUOTES_UNIT],
+            result.finished_at,
+            result.started_at,
+        )
     return _Fetched(chains, quotes)
 
 
 @dataclass(frozen=True)
 class _TaskResult:
-    """What one pool task returned or raised, and when it finished by the injected clock."""
+    """What one pool task returned or raised, and when it started and finished.
+
+    Both instants are the injected clock's, read on the pool thread. ``started_at`` is when
+    the task began to run rather than when it was submitted, which is the quote request's
+    ``request_start_ts`` for the timing file.
+    """
 
     value: object
     error: Exception | None
     finished_at: datetime
+    started_at: datetime | None = None
 
 
 def _timed(clock: Clock, fn: Callable[..., object], *args: object) -> _TaskResult:
@@ -862,11 +1053,12 @@ def _timed(clock: Clock, fn: Callable[..., object], *args: object) -> _TaskResul
     interrupt or a ``SystemExit``, is left to propagate, the way it would have left a
     sequential fetch.
     """
+    started_at = clock.now()
     try:
         value, error = fn(*args), None
     except Exception as exc:
         value, error = None, exc
-    return _TaskResult(value, error, clock.now())
+    return _TaskResult(value, error, clock.now(), started_at)
 
 
 def _task_result(future: Future) -> _TaskResult:
@@ -886,6 +1078,7 @@ def _window_outcome(result: _TaskResult, window: tuple[date, date | None]) -> _W
 
 
 def _fetch_window(
+    clock: Clock,
     vendor: Vendor,
     guards: GuardConstants,
     ticker: str,
@@ -896,6 +1089,7 @@ def _fetch_window(
     put_map: dict[str, dict[str, list]],
     failed: list[tuple[date, date | None, str]],
     header_holder: list[Mapping[str, object]],
+    requests: list[RequestRecord],
 ) -> None:
     """Fetch one date window, splitting only a genuine size failure at its midpoint.
 
@@ -949,13 +1143,47 @@ def _fetch_window(
 
     The depth bound still caps a too-big window's split, and it is deliberately the only cap
     there. One number an operator can read and lower is worth more than a rule beside it.
+
+    Every request lands one record in ``requests``, stamped from ``clock`` just before the
+    call and just after it returned or raised, with the class this function gave it. A
+    too-big request that is split records no class, because nothing failed yet, and its
+    halves record their own.
     """
+    window = (from_date, to_date)
+    start = clock.now()
     try:
         response = vendor.get_chain(ticker, from_date=from_date, to_date=to_date)
     except Exception as exc:
         # A raised fetch is a transport failure. Record it with its own class, no split.
-        failed.append((from_date, to_date, _error_class(exc)))
+        end = clock.now()
+        error_class = _error_class(exc)
+        failed.append((from_date, to_date, error_class))
+        requests.append(
+            request_record(
+                CHAINS,
+                ticker=ticker,
+                window=window,
+                start=start,
+                end=end,
+                response=None,
+                error_class=error_class,
+            )
+        )
         return
+    end = clock.now()
+
+    def note(error_class: str | None) -> None:
+        requests.append(
+            request_record(
+                CHAINS,
+                ticker=ticker,
+                window=window,
+                start=start,
+                end=end,
+                response=response,
+                error_class=error_class,
+            )
+        )
 
     too_big = _is_too_big(response.body)
     if _ok(response.status) and not too_big:
@@ -963,7 +1191,6 @@ def _fetch_window(
             _collect_contracts(response.body, call_map, put_map)
             if not header_holder:
                 header_holder.append(response.body)
-            return
         except Exception:
             # A body that would not merge is recorded once and never split, the same way a
             # non-2xx status below is. The other windows still land, so the loss is this
@@ -973,11 +1200,17 @@ def _fetch_window(
             # for a problem the chunk plan cannot fix. The docstring above carries why the
             # split this used to fall through to was given up.
             failed.append((from_date, to_date, CHAIN_SCHEMA_DRIFT))
+            note(CHAIN_SCHEMA_DRIFT)
             return
+        # Recorded outside the ``try``, so a record that failed to build could never be
+        # read as a body that failed to merge.
+        note(None)
+        return
     elif not too_big:
         # A non-2xx status that is not the TooBigBody fault is not a size problem. Record
         # it once with its http class and do not split.
         failed.append((from_date, to_date, f"http_{response.status}"))
+        note(f"http_{response.status}")
         return
 
     splittable = (
@@ -990,12 +1223,26 @@ def _fetch_window(
         # Size is the only failure that reaches here, since drift is recorded where it is
         # seen and a non-2xx status returns above, so the class is the size class.
         failed.append((from_date, to_date, CHAIN_CHUNK_FAILED))
+        note(CHAIN_CHUNK_FAILED)
         return
+    note(None)
     mid = from_date + timedelta(days=(to_date - from_date).days // 2)
     _fetch_window(
-        vendor, guards, ticker, from_date, mid, depth + 1, call_map, put_map, failed, header_holder
+        clock,
+        vendor,
+        guards,
+        ticker,
+        from_date,
+        mid,
+        depth + 1,
+        call_map,
+        put_map,
+        failed,
+        header_holder,
+        requests,
     )
     _fetch_window(
+        clock,
         vendor,
         guards,
         ticker,
@@ -1006,6 +1253,7 @@ def _fetch_window(
         put_map,
         failed,
         header_holder,
+        requests,
     )
 
 
@@ -1015,6 +1263,9 @@ class _CaptureCycle:
 
     ``close_tag`` and ``session_phase`` are the loop's two provenance tags. They are
     cycle-wide: every batch this cycle builds, data and gap alike, carries both.
+
+    ``requests`` collects one record per vendor request the cycle made, chains and quotes,
+    for the timing file the cycle appends to last of all.
     """
 
     clock: Clock
@@ -1029,6 +1280,7 @@ class _CaptureCycle:
     snap_ts: datetime = field(init=False)
     day: date = field(init=False)
     start_ts: str = field(init=False)
+    requests: list[RequestRecord] = field(init=False, default_factory=list)
 
     def __post_init__(self) -> None:
         # One instant anchors the whole cycle. The snap slot is that instant floored to
@@ -1099,8 +1351,10 @@ class _CaptureCycle:
 
         ``_plan_chain`` carries the three outcomes. This is its second half, split out so
         the concurrent cycle, which fetches every chain at once, plans each one the same
-        way the sequential cycle does.
+        way the sequential cycle does. It is also where either path's requests join the
+        cycle's records for the timing file.
         """
+        self.requests.extend(fetched.requests)
         if fetched.body is None:
             return self._gap_plan(
                 CHAINS, ticker, fetched.error_class, fetched.fetch_ts, fetched.fetch_end_ts
@@ -1157,8 +1411,10 @@ class _CaptureCycle:
         """
         symbols = self.roster.symbols
         fetch_ts, fetch_end_ts = fetched.fetch_ts, fetched.fetch_end_ts
+        start = fetched.request_start if fetched.request_start is not None else fetch_ts
         if fetched.error is not None:
             error_class = _error_class(fetched.error)
+            self._note_quotes(symbols, start, fetch_end_ts, None, error_class)
             return [
                 (sym, self._gap_plan(QUOTES, sym, error_class, fetch_ts, fetch_end_ts))
                 for sym in symbols
@@ -1166,14 +1422,37 @@ class _CaptureCycle:
         response = fetched.response
         if not _ok(response.status):
             error_class = f"http_{response.status}"
+            self._note_quotes(symbols, start, fetch_end_ts, response, error_class)
             return [
                 (sym, self._gap_plan(QUOTES, sym, error_class, fetch_ts, fetch_end_ts))
                 for sym in symbols
             ]
+        self._note_quotes(symbols, start, fetch_end_ts, response, None)
         return [
             (sym, self._plan_one_quote(response.body, sym, fetch_ts, fetch_end_ts))
             for sym in symbols
         ]
+
+    def _note_quotes(
+        self,
+        symbols: Sequence[str],
+        start: datetime,
+        end: datetime,
+        response: VendorResponse | None,
+        error_class: str | None,
+    ) -> None:
+        """Record the one batched quote request. Its stamps are the batch's own."""
+        self.requests.append(
+            request_record(
+                QUOTES,
+                ticker=None,
+                symbols=symbols,
+                start=start,
+                end=end,
+                response=response,
+                error_class=error_class,
+            )
+        )
 
     def _plan_one_quote(
         self,
@@ -1312,6 +1591,15 @@ class _CaptureCycle:
 
         # Last, stamp what the rows cannot carry: the token's mint time and the roster.
         self._stamp()
+        # Then the timing file, after everything the minute depends on is durable, so a
+        # write that is slow or fails can never sit in front of a captured segment.
+        record_requests(
+            self.lake_root,
+            snap_ts=self.snap_ts,
+            day=self.day,
+            records=self.requests,
+            where=f"the {self.snap_ts.isoformat()} cycle",
+        )
         return CycleResult(
             snap_ts=self.snap_ts,
             segments=tuple(outcomes),
@@ -1429,6 +1717,7 @@ def run_cycle_from_config(
         token_path if token_path is not None else DEFAULT_TOKEN_PATH,
         api_key=config.schwab_api_key.reveal(),
         app_secret=config.schwab_app_secret.reveal(),
+        clock=resolved_clock,
     )
     try:
         return run_cycle(
@@ -1709,7 +1998,10 @@ def fill_option_close(
         # would leave a zero-row segment and a ``rows=0`` manifest entry standing for a
         # close nobody captured, and would report the close as filled. The check runs
         # before the write, so no segment is created to clean up. The class still rides
-        # the result, so the guard can say which failure it was.
+        # the result, so the guard can say which failure it was. The requests still reach
+        # the timing file, because a fill that captured nothing is the one most worth
+        # taking apart.
+        _record_fill_requests(lake_root, slot, fetched, ticker)
         return FillResult(error_class=fetched.error_class)
     outcome = journal_snapshot(
         lake_root,
@@ -1726,11 +2018,29 @@ def fill_option_close(
         windows=fetched.windows,
         absent_markers=fetched.absent_markers,
     )
+    _record_fill_requests(lake_root, slot, fetched, ticker)
     return FillResult(
         tuple(_landed_expirations(outcome.path)),
         fetched.absent_markers,
         fetched.error_class,
         outcome.routed_columns,
+    )
+
+
+def _record_fill_requests(
+    lake_root: Path, slot: datetime, fetched: ChainFetch, ticker: str
+) -> None:
+    """Append a close+5 fill's request lines under the slot the fill lands its rows at.
+
+    The day is the one ``journal_snapshot`` files the fill's segment under, the slot's own
+    date, so the lines and the segment agree on which day the close belongs to.
+    """
+    record_requests(
+        lake_root,
+        snap_ts=slot,
+        day=slot.date(),
+        records=fetched.requests,
+        where=f"the close+5 fill of {ticker}",
     )
 
 
@@ -1759,14 +2069,16 @@ def fill_option_close_from_config(
     normally never runs, and it buys a token read as fresh as the minute the fill fires.
     """
     config = load_config(config_path)
+    resolved_clock = clock if clock is not None else SystemClock()
     vendor = SchwabVendor.from_token(
         token_path if token_path is not None else DEFAULT_TOKEN_PATH,
         api_key=config.schwab_api_key.reveal(),
         app_secret=config.schwab_app_secret.reveal(),
+        clock=resolved_clock,
     )
     try:
         return fill_option_close(
-            clock if clock is not None else SystemClock(),
+            resolved_clock,
             vendor,
             ticker,
             slot=slot,
@@ -1790,6 +2102,8 @@ __all__ = [
     "fill_option_close",
     "fill_option_close_from_config",
     "journal_snapshot",
+    "record_requests",
+    "request_record",
     "run_cycle",
     "run_cycle_from_config",
 ]

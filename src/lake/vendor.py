@@ -13,6 +13,14 @@ Nothing here parses, validates, or reshapes it. Raw stays vendor-verbatim, alway
 The fetch time is stamped by the caller from the injected clock, never by the
 vendor, so it is not part of a response.
 
+One kind of time is the vendor's to record, because only the transport can see it: when a
+request went out, when its connection opened, when the response headers arrived and when
+the body finished. ``RequestTiming`` carries those four instants, read through the
+caller's own clock, and a response carries them when the vendor could record them. The
+caller still stamps everything it can see, including when it called the vendor and when
+the call returned. Marketlake #531 is where this came from: a slow cycle's time could not
+be split into Schwab's wait and the network's without it.
+
 One rule has an exception, and it is about an argument rather than a payload. Every
 optional parameter here is omitted from the request when left ``None``, which is the
 pass-through this file promises. A price-history window cannot work that way, because
@@ -47,6 +55,34 @@ class VendorError(Exception):
 
 
 @dataclass(frozen=True)
+class RequestTiming:
+    """What the transport saw of one request, read through the caller's clock.
+
+    Four instants, each ``None`` when it was not observed.
+
+    - ``sent`` is when the request left the client, after any token refresh the client
+      made first.
+    - ``connected`` is when a new connection finished its TCP and TLS setup. It is
+      ``None`` when the request reused an open connection.
+    - ``headers`` is when the response headers arrived. From ``sent`` to here is roughly
+      the vendor's own time.
+    - ``body`` is when the response body finished arriving. From ``headers`` to here is
+      roughly the network's.
+
+    ``bytes`` is the body's size on the wire. ``failure`` names what went wrong when the
+    recording itself failed. A failure never fails the request, so a reader meets it here
+    rather than as a lost response.
+    """
+
+    sent: datetime | None = None
+    connected: datetime | None = None
+    headers: datetime | None = None
+    body: datetime | None = None
+    bytes: int | None = None
+    failure: str | None = None
+
+
+@dataclass(frozen=True)
 class VendorResponse:
     """One vendor reply, verbatim.
 
@@ -54,11 +90,16 @@ class VendorResponse:
     the HTTP status code. ``headers`` are the response headers. Timestamps that
     belong to the capture cycle, like the fetch time, are the caller's to stamp from
     the injected clock. They are not here.
+
+    ``timing`` is the exception. It holds the transport's own view of the request, the
+    instants only the transport can see, and it is ``None`` when the vendor recorded none.
+    The module docstring says why those are the vendor's to record and nothing else is.
     """
 
     status: int
     body: Mapping[str, object]
     headers: Mapping[str, str] = field(default_factory=dict)
+    timing: RequestTiming | None = None
 
 
 def require_utc_bound(when: datetime | None, label: str) -> datetime:
