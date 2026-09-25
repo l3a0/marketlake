@@ -3,9 +3,16 @@
 This is the production implementation of the ``Vendor`` seam from ``lake.vendor``.
 It talks to Schwab through ``schwab-py``, the maintained client library the design
 names as this project's auth and endpoint layer. Everything it returns is the
-vendor's payload verbatim. Nothing here parses, validates, or reshapes the body.
-Raw stays vendor-verbatim, always. The downstream capture primitive decides what a
-status code or a thin chain means. This layer only fetches and hands back.
+vendor's payload verbatim. Nothing here reads a field of the body, validates it, or
+reshapes it. Raw stays vendor-verbatim, always. The downstream capture primitive decides
+what a status code or a thin chain means. This layer only fetches and hands back.
+
+One check does run on the body, and it is about its type rather than its content. A
+``VendorResponse`` body is a JSON object, and ``_response_from`` below is where a reply
+that is not one is handled. A failed reply keeps its status and carries its text beside
+an empty body. A successful one is refused with ``VendorBodyError``. That branch on the
+status decides nothing about what the status means to the lake. It only refuses to hand
+back a success whose body cannot be one.
 
 Two design rules shape this file.
 
@@ -21,9 +28,10 @@ Two design rules shape this file.
    metadata. Converting a stored epoch to a datetime is not a clock read.
 
 ``schwab-py`` returns an ``httpx.Response`` from each endpoint call. This module only
-needs three things off that response: its status code, its parsed JSON body, and its
-headers. The ``HttpResponse`` protocol below pins exactly that surface, so a fake in
-a test is a few lines.
+needs four things off that response: its status code, its parsed JSON body, its text,
+and its headers. The text is read only when the body is not a JSON object. The
+``HttpResponse`` protocol below pins exactly that surface, so a fake in a test is a few
+lines.
 """
 
 from __future__ import annotations
@@ -59,8 +67,8 @@ QUOTE_FIELD_GROUPS = ("quote", "fundamental", "regular", "extended", "reference"
 class HttpResponse(Protocol):
     """The slice of an ``httpx.Response`` this vendor reads.
 
-    ``schwab-py`` hands back an ``httpx.Response``. Only these three members matter
-    here. A test fake implements the same three.
+    ``schwab-py`` hands back an ``httpx.Response``. Only these four members matter
+    here. A test fake implements the same four.
     """
 
     @property
@@ -73,8 +81,15 @@ class HttpResponse(Protocol):
         """The response headers."""
         ...
 
-    def json(self) -> Mapping[str, object]:
-        """The parsed JSON body, exactly as the vendor sent it."""
+    @property
+    def text(self) -> str:
+        """The body decoded as text. ``httpx`` decodes with ``errors="replace"``, so it
+        never raises, whatever bytes arrived."""
+        ...
+
+    def json(self) -> object:
+        """The body parsed as JSON. It raises ``ValueError`` on a body that is not JSON,
+        and returns whatever the JSON holds, which need not be an object."""
         ...
 
 
@@ -161,18 +176,66 @@ class SchwabClient(Protocol):
         ...
 
 
+class VendorBodyError(VendorError):
+    """A successful reply whose body is not a JSON object.
+
+    A 2xx body is the payload, so one that will not parse, or that parses to a list,
+    ``null`` or a bare string, is the vendor's payload changing shape. Handing it back as
+    an empty mapping would read downstream as an empty success, which is a shape Schwab
+    already sends on purpose, so it is refused instead. Capture records it per window or
+    per batch as ``vendor_body_error``.
+
+    It subclasses ``VendorError`` because that is what the bars walk contains per
+    ticker-day. A bare ``ValueError`` would end the walk for every ticker after this one.
+
+    The message names the status, the content type, the body's length and why it is not
+    an object. It never carries the body itself, because the bars walk writes the message
+    into a finding that lands in the lake, and nothing reads the text of a 2xx body.
+    """
+
+
 def _response_from(reply: HttpResponse) -> VendorResponse:
     """Shape one ``schwab-py`` reply into a verbatim ``VendorResponse``.
 
-    The body is taken exactly as ``json()`` parsed it. Headers are copied into a
-    plain dict so the result does not alias the client's own mutable state. Nothing
-    is inspected or reshaped.
+    A body that parses to a JSON object is handed back exactly as ``json()`` parsed it,
+    whatever the status. Headers are copied into a plain dict so the result does not
+    alias the client's own mutable state.
+
+    A body that is not a JSON object splits on the status, because the status is what
+    the reply is for.
+
+    1. **A failed reply keeps its status.** A 429 or a 401 answered by a gateway's HTML
+       page, or by an empty body, is still a 429 or a 401, and the watchdog pages on
+       exactly that. So ``body`` is an empty mapping and ``body_text`` carries the reply's
+       text verbatim. Reading the status after the parse would lose it, which is what
+       this function did until marketlake #539.
+    2. **A successful reply is refused** with ``VendorBodyError``. Its body is the payload,
+       and an empty mapping standing in for it would read as an empty success.
+
+    Only ``ValueError`` is caught from the parse. ``json`` raises ``JSONDecodeError`` for
+    a body that is not JSON, and both it and ``UnicodeDecodeError`` subclass
+    ``ValueError``. Anything else is not a statement about the body and passes through.
     """
-    return VendorResponse(
-        status=reply.status_code,
-        body=reply.json(),
-        headers=dict(reply.headers),
-    )
+    status = reply.status_code
+    headers = dict(reply.headers)
+    try:
+        parsed = reply.json()
+    except ValueError as exc:
+        parse_error: ValueError | None = exc
+        reason = f"it is not JSON ({exc})"
+    else:
+        if isinstance(parsed, Mapping):
+            return VendorResponse(status=status, body=parsed, headers=headers)
+        parse_error = None
+        reason = f"it parses to {type(parsed).__name__}"
+    text = reply.text
+    if 200 <= status < 300:
+        content_type = reply.headers.get("content-type")
+        raise VendorBodyError(
+            f"http {status} body is not a JSON object: {reason}, "
+            f"content-type {content_type!r}, {len(text)} characters"
+        ) from parse_error
+    return VendorResponse(status=status, body={}, headers=headers, body_text=text)
 
 
 # The base classes every authlib credential failure inherits from. Matching on the

@@ -12,6 +12,7 @@ right endpoint with the right symbols.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -21,16 +22,33 @@ from datetime import date, datetime
 class FakeResponse:
     """A stand-in for the ``httpx.Response`` ``schwab-py`` returns.
 
-    It carries exactly the three members ``SchwabVendor`` reads: a status code, a
-    parsed JSON body, and headers.
+    It carries the four members ``SchwabVendor`` reads: a status code, headers, the
+    parsed JSON body, and the body as text.
+
+    It has two forms. The ``body`` form hands a parsed object straight back from
+    ``json()``, which is all a test of a well-formed reply needs. The ``content`` form
+    holds the raw bytes of the reply instead, and parses and decodes them the way ``httpx``
+    does: ``json()`` is ``json.loads`` over the bytes, so a body that is not JSON raises
+    ``ValueError``, and ``text`` decodes them as UTF-8 with ``errors="replace"``, so it
+    never raises. That is the form for a reply whose body is an HTML page, empty, or JSON
+    that is not an object.
     """
 
     status_code: int
-    body: Mapping[str, object]
+    body: object = field(default_factory=dict)
     headers: Mapping[str, str] = field(default_factory=dict)
+    content: bytes | None = None
 
-    def json(self) -> Mapping[str, object]:
+    def json(self) -> object:
+        if self.content is not None:
+            return json.loads(self.content)
         return self.body
+
+    @property
+    def text(self) -> str:
+        if self.content is not None:
+            return self.content.decode("utf-8", errors="replace")
+        return json.dumps(self.body)
 
 
 @dataclass

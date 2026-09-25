@@ -71,6 +71,34 @@ def test_records_a_chain_interaction_keyed_for_replay():
     assert interaction.headers == {"content-type": "application/json"}
 
 
+def test_a_failed_reply_that_is_not_json_is_refused_and_quoted_rather_than_recorded_empty():
+    """marketlake #539. The vendor hands back an HTML 429 with an empty body and the page in
+    ``body_text``. A cassette body has nowhere for the text, so recording ``{}`` would drop the
+    first sample of Schwab's error body anyone has seen. The refusal quotes it instead."""
+    page = b"<html><body>429-005 burst limit</body></html>"
+    client = FakeSchwabClient(chains={"SPY": FakeResponse(429, content=page)})
+
+    with pytest.raises(ValueError) as refused:
+        record_cassette(
+            FAKE_KEY, FAKE_SECRET, chain_symbols=["SPY"], vendor_factory=_factory(client)
+        )
+
+    message = str(refused.value)
+    assert "http 429" in message
+    assert "429-005 burst limit" in message
+
+
+def test_a_failed_reply_with_an_object_body_is_still_recorded():
+    """The other side of the refusal: a JSON error body fits a cassette and is recorded."""
+    client = FakeSchwabClient(chains={"SPY": FakeResponse(429, content=b'{"error": "slow"}')})
+    cassette = record_cassette(
+        FAKE_KEY, FAKE_SECRET, chain_symbols=["SPY"], vendor_factory=_factory(client)
+    )
+    interaction = cassette.find("chains", {"symbol": "SPY"})
+    assert interaction.status == 429
+    assert interaction.body == {"error": "slow"}
+
+
 def test_records_a_quote_batch_keyed_on_the_symbol_list():
     cassette = record_cassette(
         FAKE_KEY, FAKE_SECRET, quote_batches=[["SPY", "QQQ"]], vendor_factory=_factory(_client())

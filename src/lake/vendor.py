@@ -50,15 +50,27 @@ class VendorError(Exception):
 class VendorResponse:
     """One vendor reply, verbatim.
 
-    ``body`` is the parsed JSON payload exactly as the vendor sent it. ``status`` is
-    the HTTP status code. ``headers`` are the response headers. Timestamps that
-    belong to the capture cycle, like the fetch time, are the caller's to stamp from
-    the injected clock. They are not here.
+    ``status`` is the HTTP status code. ``headers`` are the response headers. ``body`` is
+    the parsed JSON object exactly as the vendor sent it, with one exception. A failed
+    reply, one whose status is not 2xx, can carry a body that is not a JSON object at
+    all: an HTML error page from a gateway, an empty body, or JSON that parses to a list,
+    ``null`` or a bare string. Its status is still the signal, so the reply is still
+    returned. ``body`` is then an empty mapping and ``body_text`` carries the reply's
+    text verbatim, so nothing the vendor said is dropped.
+
+    ``body_text`` is set exactly when ``body`` is that empty-mapping stand-in, which is
+    what lets a reader tell a vendor that sent ``{}`` from one that sent something that
+    is not an object. A 2xx reply never takes this path. Its body is the payload, and one
+    that is not an object is refused where the reply is shaped, in ``lake.schwab``.
+
+    Timestamps that belong to the capture cycle, like the fetch time, are the caller's to
+    stamp from the injected clock. They are not here.
     """
 
     status: int
     body: Mapping[str, object]
     headers: Mapping[str, str] = field(default_factory=dict)
+    body_text: str | None = None
 
 
 def require_utc_bound(when: datetime | None, label: str) -> datetime:
