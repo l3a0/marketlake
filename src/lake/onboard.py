@@ -161,7 +161,7 @@ from lake.manifest import record_partition
 from lake.security_master import ID_TYPE_TICKER, KIND_EQUITY, SecurityMaster
 from lake.tickers import upsert_ticker
 from lake.timing import RequestRecord
-from lake.vendor import Vendor
+from lake.vendor import Vendor, VendorResponse
 
 # The manifest ``source`` for the security master's reference entry.
 REFERENCE_SOURCE = "reference"
@@ -265,6 +265,54 @@ class OnboardReport:
         lines.append("  deferred to later slices:")
         lines.extend(f"    - {item}" for item in self.deferred)
         return "\n".join(lines)
+
+
+def _record_first_requests(
+    lake_root: Path | str,
+    cycle_start: datetime,
+    ticker: str,
+    records: Sequence[RequestRecord],
+) -> None:
+    """Send the first snapshot's requests to the timing file, once the snapshot landed.
+
+    The lines go under the minute the snapshot lands at, the same as a loop cycle's, and
+    only after it landed. A refused onboarding writes nothing to the lake, and the
+    refusal tests assert that no ``journal/`` exists afterwards, so a refused snapshot's
+    requests go unrecorded. The price is that the one onboarding most worth taking apart,
+    a chain rejected on every window, leaves only its refusal message.
+    ``capture.record_requests`` never raises, and a line is one ``O_APPEND`` write, so
+    this never interleaves with the daemon's own lines.
+    """
+    first_slot = cycle_start.replace(second=0, microsecond=0)
+    capture.record_requests(
+        lake_root,
+        snap_ts=first_slot,
+        day=first_slot.date(),
+        records=records,
+        where=f"onboarding {ticker}",
+    )
+
+
+def _quote_record(
+    ticker: str,
+    start: datetime,
+    end: datetime,
+    response: VendorResponse,
+) -> RequestRecord:
+    """The equity-only branch's one quote request, recorded the way the loop records a batch.
+
+    It is recorded only when onboarding goes on to land the snapshot, so its status is a
+    success and it carries no class.
+    """
+    return capture.request_record(
+        journal.QUOTES_SURFACE,
+        ticker=None,
+        symbols=(ticker,),
+        start=start,
+        end=end,
+        response=response,
+        error_class=None,
+    )
 
 
 def _ok(status: int) -> bool:
@@ -608,6 +656,7 @@ def onboard(
             plan=plan if plan is not None else DEFAULT_CHAIN_PLAN,
             guards=guards if guards is not None else GuardConstants(),
         )
+        requests = fetched.requests
         # The fetch stamps its own pair around every window, so the journaled round trip
         # covers the whole fetch rather than one call that no longer happens.
         fetch_ts = fetched.fetch_ts
@@ -636,12 +685,12 @@ def onboard(
         partial_chain = fetched.error_class is not None
         windows = fetched.windows
         absent_markers = fetched.absent_markers
-        requests = fetched.requests
         snapshot_surface = journal.CHAINS_SURFACE
     else:
         fetch_ts = clock.now()
         response = vendor.get_quotes([ticker])
         fetch_end_ts = clock.now()
+        requests = (_quote_record(ticker, fetch_ts, fetch_end_ts, response),)
         if not _ok(response.status):
             raise OnboardError(f"first quote for {ticker} failed: HTTP {response.status}")
         _assert_quote_realtime(ticker, response.body)
@@ -780,18 +829,7 @@ def onboard(
         windows=windows,
         absent_markers=absent_markers,
     )
-    # The first snapshot's requests go to the timing file under the minute the snapshot
-    # landed at, the same as a loop cycle's. Onboarding runs in its own process, and the
-    # file takes one ``O_APPEND`` write per line, so this never interleaves with the
-    # daemon's lines. It never raises either.
-    first_slot = cycle_start.replace(second=0, microsecond=0)
-    capture.record_requests(
-        lake_root,
-        snap_ts=first_slot,
-        day=first_slot.date(),
-        records=requests,
-        where=f"onboarding {ticker}",
-    )
+    _record_first_requests(lake_root, cycle_start, ticker, requests)
 
     return OnboardReport(
         ticker=ticker,

@@ -312,7 +312,7 @@ def _rejection(response: VendorResponse) -> tuple[str | None, str | None, str | 
         return None, None, f"{type(exc).__name__}: {exc}"
 
 
-def _request_record(
+def request_record(
     surface: str,
     *,
     ticker: str | None,
@@ -364,18 +364,26 @@ def record_requests(
 
     Every caller runs this after its segments are durable and its manifest entries are
     appended, so nothing here can sit in front of a captured minute. A write that fails
-    costs its lines. A record that came out incomplete costs its fields. Neither is
-    silent: each prints one stderr line per call, once rather than once per request, the
-    way ``_write`` reports a failed drift scan. The print is guarded too, because a full
-    disk that refuses the file may refuse stderr as well, and a raise from here would
-    leave the loop and exit the daemon.
+    costs its lines. A record that came out incomplete costs
+    its fields. Neither is silent: each prints one stderr line per call, once rather than
+    once per request, the way ``_write`` reports a failed drift scan. The print is guarded
+    too, because a full disk that refuses the file may refuse stderr as well, and a raise
+    from here would leave the loop and exit the daemon.
     """
     if not records:
         return
-    try:
-        append_requests(lake_root, snap_ts=snap_ts, day=day, records=records)
-    except Exception as exc:  # noqa: BLE001 - timing must never cost a minute
-        _say(f"capture: request timing not written for {where}: {type(exc).__name__}: {exc}")
+    # One append per record, so a record that cannot be written costs its own line and
+    # never the lines after it. The first failure is the one reported.
+    refused: BaseException | None = None
+    for record in records:
+        try:
+            append_requests(lake_root, snap_ts=snap_ts, day=day, records=(record,))
+        except Exception as exc:  # noqa: BLE001 - timing must never cost a minute
+            refused = refused or exc
+    if refused is not None:
+        _say(
+            f"capture: request timing not written for {where}: {type(refused).__name__}: {refused}"
+        )
     try:
         found = failures(records)
     except Exception as exc:  # noqa: BLE001 - timing must never cost a minute
@@ -889,7 +897,7 @@ def _fetch_window(
         error_class = _error_class(exc)
         failed.append((from_date, to_date, error_class))
         requests.append(
-            _request_record(
+            request_record(
                 CHAINS,
                 ticker=ticker,
                 window=window,
@@ -904,7 +912,7 @@ def _fetch_window(
 
     def note(error_class: str | None) -> None:
         requests.append(
-            _request_record(
+            request_record(
                 CHAINS,
                 ticker=ticker,
                 window=window,
@@ -1150,7 +1158,7 @@ class _CaptureCycle:
     ) -> None:
         """Record the one batched quote request. Its stamps are the batch's own."""
         self.requests.append(
-            _request_record(
+            request_record(
                 QUOTES,
                 ticker=None,
                 symbols=symbols,
@@ -1774,6 +1782,7 @@ __all__ = [
     "fill_option_close_from_config",
     "journal_snapshot",
     "record_requests",
+    "request_record",
     "run_cycle",
     "run_cycle_from_config",
 ]

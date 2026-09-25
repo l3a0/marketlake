@@ -217,6 +217,7 @@ def test_every_request_writes_one_line_that_joins_to_its_rows(lake_root):
         assert line["snap_ts"] == _SNAP.isoformat()
         assert (line["status"], line["error_class"]) == (200, None)
         assert (line["request_subcode"], line["request_error_detail"]) == (None, None)
+        assert line["request_failure"] is None
 
     # The keys join every chain row to its request's line.
     rows = journal.read_segment(result.segment(CHAINS, "SPY").path).to_pylist()
@@ -435,8 +436,35 @@ def test_an_incomplete_record_says_so_once_per_cycle(lake_root, capsys):
     err = capsys.readouterr().err
     assert err.count("capture: request timing incomplete for") == 1
     assert "RuntimeError: hook broke" in err
-    # The lines still land, carrying what was recorded.
-    assert [line["request_sent_ts"] for line in _chain_lines(lake_root)] == [_iso(0.1)] * 2
+    # The lines still land, carrying what was recorded and naming what was not, so a null
+    # stamp that failed reads differently from one nobody observed.
+    lines = _chain_lines(lake_root)
+    assert [line["request_sent_ts"] for line in lines] == [_iso(0.1)] * 2
+    assert [line["request_failure"] for line in lines] == ["RuntimeError: hook broke"] * 2
+    quotes = [line for line in _lines(lake_root) if line["surface"] == QUOTES]
+    assert [line["request_failure"] for line in quotes] == [None]
+
+
+def test_a_record_that_cannot_be_written_costs_only_its_own_line(lake_root, capsys):
+    # A vendor fake whose timing is not a ``RequestTiming`` makes that one line fail to
+    # build. The lines before and after it still land.
+    clock = ManualClock(start=_CLOCK_START)
+    vendor = _TimedVendor(
+        clock,
+        windows={
+            NEAR: (1.0, VendorResponse(200, _chain_body(["2026-08-28"]), timing=object())),
+            TAIL: (1.0, VendorResponse(200, _chain_body(["2026-09-18"]))),
+        },
+        quotes=(0.5, VendorResponse(200, _QUOTE_BODY)),
+    )
+
+    _run(vendor, clock, lake_root)
+
+    assert [(line["surface"], line["window_start"]) for line in _lines(lake_root)] == [
+        (CHAINS, TAIL[0]),
+        (QUOTES, None),
+    ]
+    assert capsys.readouterr().err.count("capture: request timing not written for") == 1
 
 
 @pytest.mark.parametrize(

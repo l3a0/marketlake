@@ -26,9 +26,11 @@ both, including one that raised. The transport stamps the middle four, through
 headers is roughly Schwab's time, from headers to body roughly the network's, and from body
 to end the JSON parse. ``request_bytes`` is the body's size on the wire, which is what
 separates a bandwidth limit from a slow answer. A rejection adds ``request_subcode``, a
-429's sub-code, and ``request_error_detail``, a bounded copy of the reply. Every line
-carries ``v``, the line format's version, because nothing like ``schema_version`` covers a
-JSON file, and ``kind``, which is ``request`` here.
+429's sub-code, and ``request_error_detail``, a bounded copy of the reply.
+``request_failure`` names what went wrong while the line was being recorded, and is null
+when nothing did, so a reader can tell a stamp nobody observed from one that failed. Every
+line carries ``v``, the line format's version, because nothing like ``schema_version``
+covers a JSON file, and ``kind``, which is ``request`` here.
 
 The file is ``journal/timing/date=YYYY-MM-DD.jsonl`` under the lake root. The journal
 tree is the right home for four reasons that were already true of it.
@@ -40,8 +42,8 @@ tree is the right home for four reasons that were already true of it.
 4. The dashboard reads only the lake, so the Today strip can name the phase that ran
    long (marketlake #538).
 
-Two rules keep the file from ever costing a minute. A cycle appends its lines only after
-its segments are durable and its manifest entries are appended. And each line is one
+Two rules keep the file from ever costing a minute. Every writer appends its lines only
+after its segments are durable and its manifest entries are appended. And each line is one
 ``O_APPEND`` write through ``manifest.append_line``, the same primitive the ledgers use,
 so onboarding, which fetches from its own process, can append to the same file without
 interleaving. A reader discards a torn trailing line, as the ledger readers do.
@@ -117,6 +119,7 @@ class RequestRecord:
             "request_bytes": timing.bytes,
             "request_subcode": self.subcode,
             "request_error_detail": self.error_detail,
+            "request_failure": "; ".join(reasons(self)) or None,
         }
 
 
@@ -151,12 +154,18 @@ def append_requests(
     return path
 
 
+def reasons(record: RequestRecord) -> list[str]:
+    """Why one record came out incomplete: its own failure, then its timing's, if any."""
+    found = [record.failure, record.timing.failure if record.timing else None]
+    return [reason for reason in found if reason is not None]
+
+
 def failures(records: Sequence[RequestRecord]) -> list[str]:
     """Every distinct reason a record came out incomplete, in the order they first appear."""
     found: list[str] = []
     for record in records:
-        for reason in (record.failure, record.timing.failure if record.timing else None):
-            if reason is not None and reason not in found:
+        for reason in reasons(record):
+            if reason not in found:
                 found.append(reason)
     return found
 
@@ -167,5 +176,6 @@ __all__ = [
     "RequestRecord",
     "append_requests",
     "failures",
+    "reasons",
     "timing_path",
 ]

@@ -237,3 +237,34 @@ def test_two_requests_at_once_each_keep_their_own_record(server):
     assert short >= delays["short"]
     assert long >= delays["long"]
     assert short < long
+
+
+def test_a_read_timeout_keeps_the_callers_stamps_and_no_transport_stamps(server, lake_root):
+    # The shape #534 needs timed. The client gives up waiting for the headers, httpx raises,
+    # no response exists, and the line keeps the caller's start and end with every transport
+    # stamp null.
+    import httpx
+
+    from lake.capture import fetch_chain
+    from lake.chain_plan import ChainPlan
+    from lake.config import GuardConstants
+
+    client = _client(server)
+    client.session.timeout = httpx.Timeout(5.0, read=0.05)
+    clock = SystemClock()
+    attach_timing(client, clock)
+
+    fetched = fetch_chain(
+        clock,
+        SchwabVendor(client),
+        "SPY",
+        day=datetime(2026, 8, 24, tzinfo=UTC).date(),
+        lake_root=lake_root,
+        plan=ChainPlan(((0, None),)),
+        guards=GuardConstants(),
+    )
+
+    (record,) = fetched.requests
+    assert (record.status, record.error_class) == (None, "read_timeout")
+    assert _seconds(record.end, record.start) >= 0.05
+    assert record.timing is None

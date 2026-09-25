@@ -192,6 +192,42 @@ def test_onboarding_writes_one_timing_line_per_window_it_fetched(lake_root, tmp_
     assert {line["snap_ts"] for line in lines} == {_MID_SESSION.isoformat()}
 
 
+def test_equity_only_onboarding_writes_its_quote_line(lake_root, tmp_path):
+    # The one quote this branch fetches produces a quotes row, so it gets a line too.
+    import json
+
+    onboard(
+        "QQQ",
+        clock=ManualClock(start=_MID_SESSION),
+        vendor=_quote_vendor("QQQ", realtime=True),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=False,
+    )
+
+    path = LakePaths(lake_root).timing_path(_MID_SESSION_DAY)
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [(line["surface"], line["ticker"], line["symbols"]) for line in lines] == [
+        ("quotes", None, ["QQQ"])
+    ]
+    assert (lines[0]["status"], lines[0]["error_class"]) == (200, None)
+
+
+def test_a_refused_onboarding_writes_no_timing_line(lake_root, tmp_path):
+    # A refused onboarding writes nothing to the lake, the timing file included.
+    with pytest.raises(EntitlementError):
+        onboard(
+            "SPY",
+            clock=ManualClock(start=_MID_SESSION),
+            vendor=_chain_vendor(is_delayed=True),
+            lake_root=lake_root,
+            tickers_path=tmp_path / "tickers.yaml",
+            options=True,
+        )
+
+    assert not LakePaths(lake_root).timing_path(_MID_SESSION_DAY).exists()
+
+
 def test_onboard_registers_verifies_and_writes(lake_root, tmp_path):
     clock = ManualClock(start=_MID_SESSION)
     tickers_path = tmp_path / "tickers.yaml"
