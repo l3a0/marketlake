@@ -32,21 +32,35 @@ needs four things off that response: its status code, its parsed JSON body, its 
 and its headers. The text is read only when the body is not a JSON object. The
 ``HttpResponse`` protocol below pins exactly that surface, so a fake in a test is a few
 lines.
+
+One thing more is read when it is there: the request's timing, the four instants
+``lake.vendor.RequestTiming`` names. ``attach_timing`` records them by adding httpx event
+hooks to the client's ``session``, which is the ``httpx.Client`` ``schwab-py`` builds on
+through authlib's ``OAuth2Client``. ``schwab-py`` passes no httpx options through
+``client_from_token_file``, but the session's ``event_hooks`` can be set after the
+client exists. The hooks read the caller's injected clock, never a clock of their own, so
+the second rule above still holds. Each request carries its own record in its
+``extensions``, never in state shared between requests, so a record stays with its
+request however many run at once. Every hook catches its own failures, because a hook
+that raises propagates out of ``session.get`` and would cost the response it was timing.
+A fake client with no ``session`` records nothing, and its responses carry no timing.
 """
 
 from __future__ import annotations
 
 import sys
 import threading
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from lake.clock import Clock
 from lake.paths import TOKEN_FILE, config_dir
 from lake.token_epoch import epoch_second_to_utc
-from lake.vendor import VendorError, VendorResponse, require_utc_bound
+from lake.vendor import RequestTiming, VendorError, VendorResponse, require_utc_bound
 
 # The standard location of the Schwab token, per the design's Configuration section.
 # It sits outside the repo and outside the backup-synced lake tree. This is a home-
@@ -219,6 +233,8 @@ def _response_from(reply: HttpResponse) -> VendorResponse:
     Only ``ValueError`` is caught from the parse. ``json`` raises ``JSONDecodeError`` for
     a body that is not JSON, and both it and ``UnicodeDecodeError`` subclass
     ``ValueError``. Anything else is not a statement about the body and passes through.
+
+    The timing record rides along when ``attach_timing`` left one on the request.
     """
     status = reply.status_code
     headers = dict(reply.headers)
@@ -229,7 +245,9 @@ def _response_from(reply: HttpResponse) -> VendorResponse:
         reason = f"it is not JSON ({exc})"
     else:
         if isinstance(parsed, Mapping):
-            return VendorResponse(status=status, body=parsed, headers=headers)
+            return VendorResponse(
+                status=status, body=parsed, headers=headers, timing=read_timing(reply)
+            )
         parse_error = None
         reason = f"it parses to {type(parsed).__name__}"
     text = reply.text
@@ -239,7 +257,127 @@ def _response_from(reply: HttpResponse) -> VendorResponse:
             f"http {status} body is not a JSON object: {reason}, "
             f"content-type {content_type!r}, {len(text)} characters"
         ) from parse_error
-    return VendorResponse(status=status, body={}, headers=headers, body_text=text)
+    return VendorResponse(
+        status=status, body={}, headers=headers, body_text=text, timing=read_timing(reply)
+    )
+
+
+# -- request timing ------------------------------------------------------------
+
+# The key a request's timing record sits under in its httpx ``extensions``.
+_TIMING_EXTENSION = "lake_timing"
+
+# The httpcore trace events that end a new connection's setup. TLS finishes after TCP, so
+# the last of the two to fire is when the connection was ready.
+_CONNECTED_EVENTS = frozenset({"connection.connect_tcp.complete", "connection.start_tls.complete"})
+
+# The suffix of the httpcore trace event that ends the body, for HTTP/1.1 and HTTP/2 alike.
+_BODY_EVENT_SUFFIX = ".receive_response_body.complete"
+
+
+@dataclass
+class _TimingRecord:
+    """One request's timing while it is in flight. Written only by that request's hooks."""
+
+    sent: datetime | None = None
+    connected: datetime | None = None
+    headers: datetime | None = None
+    body: datetime | None = None
+    failure: str | None = None
+
+    def fail(self, exc: BaseException) -> None:
+        """Keep the first failure, so the record names what broke rather than what followed."""
+        if self.failure is None:
+            self.failure = f"{type(exc).__name__}: {exc}"
+
+
+def attach_timing(client: object, clock: Clock) -> bool:
+    """Record every request's timing on a ``schwab-py`` client, and say whether it could.
+
+    Two hooks go on the client's ``session``, beside any it already has. The request hook
+    stamps ``sent`` and gives the request its own record, plus an httpcore ``trace``
+    callback that stamps ``connected`` and ``body`` as those events fire. The response
+    hook stamps ``headers``. httpx fires it once the headers are in and before the body is
+    read, so the gap between the two is the body's time on the wire.
+
+    It returns ``False`` rather than raising when the client has no ``session`` to hook,
+    which is every fake. The chain-size probe builds its own client, and this takes any
+    client, so it can time its requests the same way (marketlake #354).
+    """
+    session = getattr(client, "session", None)
+    if session is None:
+        return False
+
+    def tracer(record: _TimingRecord) -> Callable[[str, object], None]:
+        def trace(event: str, info: object) -> None:
+            try:
+                if event in _CONNECTED_EVENTS:
+                    record.connected = clock.now()
+                elif event.endswith(_BODY_EVENT_SUFFIX):
+                    record.body = clock.now()
+            except Exception as exc:  # noqa: BLE001 - timing must never cost a response
+                record.fail(exc)
+
+        return trace
+
+    def on_request(request: object) -> None:
+        # The record and its trace go on first and the stamp last, each on its own, so a
+        # clock that fails costs ``sent`` alone and the trace still stamps the rest.
+        record = _TimingRecord()
+        try:
+            request.extensions[_TIMING_EXTENSION] = record
+            request.extensions["trace"] = tracer(record)
+        except Exception as exc:  # noqa: BLE001 - timing must never cost a response
+            record.fail(exc)
+        try:
+            record.sent = clock.now()
+        except Exception as exc:  # noqa: BLE001 - timing must never cost a response
+            record.fail(exc)
+
+    def on_response(response: object) -> None:
+        try:
+            record = response.request.extensions.get(_TIMING_EXTENSION)
+            if isinstance(record, _TimingRecord):
+                try:
+                    record.headers = clock.now()
+                except Exception as exc:  # noqa: BLE001 - timing must never cost a response
+                    record.fail(exc)
+        except Exception:  # noqa: BLE001 - no record to note it on, and none is owed
+            pass
+
+    try:
+        hooks = session.event_hooks
+        session.event_hooks = {
+            "request": [*hooks.get("request", ()), on_request],
+            "response": [*hooks.get("response", ()), on_response],
+        }
+    except Exception:  # noqa: BLE001 - a client that will not take hooks is left untimed
+        return False
+    return True
+
+
+def read_timing(reply: object) -> RequestTiming | None:
+    """The timing ``attach_timing`` recorded for one reply, or ``None`` when there is none.
+
+    Total. A fake reply has no ``request`` and a real one without hooks has no record, and
+    both read as ``None``. ``bytes`` is httpx's ``num_bytes_downloaded``, the body's size on
+    the wire before any decompression.
+    """
+    try:
+        record = reply.request.extensions.get(_TIMING_EXTENSION)
+    except Exception:  # noqa: BLE001 - an untimed reply is not a failure
+        return None
+    if not isinstance(record, _TimingRecord):
+        return None
+    size = getattr(reply, "num_bytes_downloaded", None)
+    return RequestTiming(
+        sent=record.sent,
+        connected=record.connected,
+        headers=record.headers,
+        body=record.body,
+        bytes=size if isinstance(size, int) and not isinstance(size, bool) else None,
+        failure=record.failure,
+    )
 
 
 # The base classes every authlib credential failure inherits from. Matching on the
@@ -467,6 +605,7 @@ class SchwabVendor:
         *,
         api_key: str,
         app_secret: str,
+        clock: Clock | None = None,
     ) -> SchwabVendor:
         """Build the real vendor from a token file.
 
@@ -478,6 +617,10 @@ class SchwabVendor:
 
         ``api_key`` and ``app_secret`` are secrets. They are passed in by the caller,
         never read from or written to the repo.
+
+        ``clock`` turns on request timing through ``attach_timing``, read off that clock.
+        The three callers that fetch a chain pass theirs: the capture cycle, the close+5
+        fill and onboarding. Every other caller leaves it ``None`` and records nothing.
         """
         from schwab.auth import client_from_token_file  # lazy: real dep, live only
 
@@ -487,6 +630,8 @@ class SchwabVendor:
         # The capture cycle shares this client across a pool of threads, so an expired token
         # must be refreshed once rather than once per request in flight.
         serialize_token_refresh(client.session)
+        if clock is not None:
+            attach_timing(client, clock)
         return cls(client)
 
     def close(self) -> None:

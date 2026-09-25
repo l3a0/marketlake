@@ -213,7 +213,7 @@ def _rig(tmp_path: Path, roster: str, *, plan: ChainPlan = ONE_WINDOW) -> _Rig:
     )
 
 
-def _wire(monkeypatch, rig: _Rig, build) -> None:
+def _wire(monkeypatch, rig: _Rig, build) -> list:
     """Point the entry's two module-level names at the rig, with no real client in path.
 
     1. ``load_chain_plan`` is pointed at a test-owned path. The plan file is machine-local,
@@ -223,16 +223,20 @@ def _wire(monkeypatch, rig: _Rig, build) -> None:
        ``schwab-py`` client, and a test has no token to build one from.
 
     ``build`` receives the token path the entry passed, so a case can answer by what the
-    file holds at that moment.
+    file holds at that moment. The returned list collects the ``clock`` each build was
+    handed, which is what turns request timing on.
     """
     monkeypatch.setattr(capture, "load_chain_plan", lambda: load_chain_plan(rig.plan))
+    clocks: list = []
 
     class _Stub:
         @staticmethod
-        def from_token(token_path, *, api_key, app_secret):
+        def from_token(token_path, *, api_key, app_secret, clock=None):
+            clocks.append(clock)
             return build(Path(token_path))
 
     monkeypatch.setattr(capture, "SchwabVendor", _Stub)
+    return clocks
 
 
 def _cycle(rig: _Rig, clock: ManualClock) -> capture.CycleResult:
@@ -249,6 +253,21 @@ def _cycle(rig: _Rig, clock: ManualClock) -> capture.CycleResult:
 def _kinds(result: capture.CycleResult) -> set[tuple[str, str, str, str | None]]:
     """Every segment as ``(surface, ticker, row_kind, error_class)``."""
     return {(seg.surface, seg.ticker, seg.row_kind, seg.error_class) for seg in result.segments}
+
+
+def test_the_production_entry_turns_request_timing_on_with_its_own_clock(tmp_path, monkeypatch):
+    # ``from_token`` hooks the client only when handed a clock. The daemon's cycles reach
+    # capture only through this entry, so a clock dropped here would switch production
+    # timing off with every other test still green.
+    rig = _rig(tmp_path, SPY_ONLY)
+    vendor = _Vendor()
+    clocks = _wire(monkeypatch, rig, lambda path: vendor)
+    clock = ManualClock(start=FIRST_MINUTE)
+
+    _cycle(rig, clock)
+
+    assert len(clocks) == 1
+    assert clocks[0] is clock
 
 
 # -- 1. the roster reaches the chain workers -----------------------------------------

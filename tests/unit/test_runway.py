@@ -141,6 +141,28 @@ def test_a_journal_day_is_flagged_unsealed_and_a_sealed_one_is_not(tmp_path: Pat
     assert usage.unsealed == frozenset({date(2026, 9, 16)})
 
 
+def test_a_timing_file_is_dated_by_its_name_and_never_flags_its_day_unsealed(tmp_path: Path):
+    # ``journal/timing/date=D.jsonl`` outlives the day's seal on purpose. Read by the rule
+    # for everything else, its name parses as no day and its bytes fall out of the growth
+    # rate, and read as a journal day it would flag every day since timing began as
+    # unsealed forever. So it counts toward its day's bytes and never toward ``unsealed``.
+    _write(tmp_path, "journal/timing/date=2026-09-15.jsonl", 5000)
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-15.parquet", 10)
+    usage = walk(tmp_path)
+    assert date(2026, 9, 15) in usage.day_bytes
+    assert usage.day_bytes[date(2026, 9, 15)] > usage.day_bytes.get(date(2026, 9, 14), 0)
+    assert usage.undated == 0
+    assert usage.unsealed == frozenset()
+
+
+def test_a_timing_file_beside_a_live_segment_leaves_that_day_unsealed(tmp_path: Path):
+    # The timing file must not hide a day that really is still journal segments.
+    _write(tmp_path, "journal/timing/date=2026-09-16.jsonl", 10)
+    _write(tmp_path, "journal/date=2026-09-16/surface=chains/ticker=SPY/seg-a.arrows", 10)
+    usage = walk(tmp_path)
+    assert usage.unsealed == frozenset({date(2026, 9, 16)})
+
+
 # -- what the walk refuses ---------------------------------------------------
 
 

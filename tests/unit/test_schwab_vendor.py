@@ -325,6 +325,24 @@ def test_the_matched_names_are_the_ones_authlib_actually_raises():
     assert issubclass(OAuthError, AuthlibBaseError)
 
 
+def test_a_reply_with_no_timing_record_carries_no_timing():
+    # A fake reply has no ``request``, and neither does any client ``attach_timing`` never
+    # hooked, so the vendor returns the reply with ``timing`` left ``None``.
+    response = SchwabVendor(_client()).get_chain("SPY")
+    assert response.timing is None
+
+
+def test_attach_timing_leaves_a_session_with_no_hooks_untouched():
+    # The fake's session is no ``httpx.Client`` and has no ``event_hooks`` to extend, so the
+    # client is left untimed rather than given hooks it would never fire.
+    from lake.schwab import attach_timing
+    from tests.support.clock import ManualClock
+
+    client = _client()
+    assert attach_timing(client, ManualClock(start=datetime(2026, 8, 24, tzinfo=UTC))) is False
+    assert not hasattr(client.session, "event_hooks")
+
+
 # -- a body that is not a JSON object ----------------------------------------------------
 #
 # Every body below is a literal, so none of these tests can move with a constant in the code

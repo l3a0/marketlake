@@ -221,6 +221,40 @@ def _fill(lake_root: Path, vendor, *, ticker: str = "SPY", pid: int = 7):
     )
 
 
+def _timing_lines(root: Path, day: date) -> list[dict]:
+    import json
+
+    path = LakePaths(root).timing_path(day)
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_a_fill_writes_its_requests_under_the_close_it_lands_at(lake_root):
+    # The fill's rows carry the close as ``snap_ts`` and land under the close's own date,
+    # so its timing lines do the same, one per window it fetched.
+    _fill(lake_root, _both_windows())
+
+    lines = _timing_lines(lake_root, CLOSE.date())
+    assert [(line["window_start"], line["window_end"]) for line in lines] == [NEAR, TAIL]
+    assert {line["snap_ts"] for line in lines} == {CLOSE.isoformat()}
+    assert {line["status"] for line in lines} == {200}
+
+
+def test_a_fill_that_captured_nothing_still_writes_its_requests(lake_root):
+    # A fill with no body lands no segment, which is exactly the fill worth taking apart.
+    vendor = _WindowVendor(
+        windows={NEAR: VendorResponse(status=503, body={}), TAIL: TimeoutError("read")}
+    )
+
+    result = _fill(lake_root, vendor)
+
+    assert not result.landed
+    lines = _timing_lines(lake_root, CLOSE.date())
+    assert [(line["status"], line["error_class"]) for line in lines] == [
+        (503, "http_503"),
+        (None, "timeout_error"),
+    ]
+
+
 def _rows(root: Path, ticker: str = "SPY", surface: str = CHAINS) -> list[dict]:
     directory = LakePaths(root).segment_dir(surface, ticker, DAY)
     if not directory.is_dir():
@@ -657,7 +691,7 @@ def test_the_daemon_hands_the_guard_a_fill_that_lands_the_close(tmp_path, monkey
 
     class _Stub:
         @staticmethod
-        def from_token(token_path, *, api_key, app_secret):
+        def from_token(token_path, *, api_key, app_secret, clock=None):
             return vendor
 
     monkeypatch.setattr(capture, "SchwabVendor", _Stub)
@@ -872,19 +906,22 @@ def test_the_fill_honours_a_recalibrated_guard_constant(tmp_path, monkeypatch):
     lake_root.mkdir()
     config = write_config(tmp_path, lake_root, guards={"chain_chunk_max_split_depth": 0})
     vendor = _WindowVendor(windows={NEAR: TOO_BIG, TAIL: _chain([TAIL_EXP])})
+    clocks: list = []
 
     class _Stub:
         @staticmethod
-        def from_token(token_path, *, api_key, app_secret):
+        def from_token(token_path, *, api_key, app_secret, clock=None):
+            clocks.append(clock)
             return vendor
 
     monkeypatch.setattr(capture, "SchwabVendor", _Stub)
     monkeypatch.setattr(capture, "load_chain_plan", lambda: TWO_WINDOWS)
+    clock = ManualClock(start=FILL_MINUTE)
 
     capture.fill_option_close_from_config(
         "SPY",
         slot=CLOSE,
-        clock=ManualClock(start=FILL_MINUTE),
+        clock=clock,
         config_path=str(config),
         token_path=str(tmp_path / "token.json"),
         pid=7,
@@ -894,6 +931,9 @@ def test_the_fill_honours_a_recalibrated_guard_constant(tmp_path, monkeypatch):
     # halve it and ask for ranges this vendor has never heard of.
     # The two windows are fired concurrently (#532), so they reach the vendor in either order.
     assert Counter(vendor.calls) == Counter([("SPY", *NEAR), ("SPY", *TAIL)])
+    # The vendor was built with the fill's own clock, which is what turns request timing on.
+    assert len(clocks) == 1
+    assert clocks[0] is clock
 
 
 def test_the_fill_builds_its_vendor_from_the_token_and_config_it_was_given(tmp_path, monkeypatch):
@@ -911,7 +951,7 @@ def test_the_fill_builds_its_vendor_from_the_token_and_config_it_was_given(tmp_p
 
     class _Stub:
         @staticmethod
-        def from_token(token_path, *, api_key, app_secret):
+        def from_token(token_path, *, api_key, app_secret, clock=None):
             seen.append((str(token_path), api_key, app_secret))
             return _both_windows()
 
@@ -940,7 +980,7 @@ def test_the_daemon_threads_its_token_path_down_to_the_fill(tmp_path, monkeypatc
 
     class _Stub:
         @staticmethod
-        def from_token(token_path, *, api_key, app_secret):
+        def from_token(token_path, *, api_key, app_secret, clock=None):
             seen.append(str(token_path))
             return _both_windows()
 
@@ -1343,7 +1383,7 @@ def _drift_fill(tmp_path, lake_root, monkeypatch, *, observer, transport, clock)
 
     class _Stub:
         @staticmethod
-        def from_token(token_path, *, api_key, app_secret):
+        def from_token(token_path, *, api_key, app_secret, clock=None):
             return vendors.pop(0)
 
     monkeypatch.setattr(capture, "SchwabVendor", _Stub)
@@ -1582,7 +1622,7 @@ def test_the_daemon_shares_one_drift_observer_between_its_cycles_and_its_fill(
 
     class _Stub:
         @staticmethod
-        def from_token(token_path, *, api_key, app_secret):
+        def from_token(token_path, *, api_key, app_secret, clock=None):
             return vendor
 
     monkeypatch.setattr(capture, "SchwabVendor", _Stub)
@@ -1646,7 +1686,7 @@ def test_the_fill_closes_the_client_it_built(tmp_path, monkeypatch):
 
     class _Stub:
         @staticmethod
-        def from_token(token_path, *, api_key, app_secret):
+        def from_token(token_path, *, api_key, app_secret, clock=None):
             return vendor
 
     monkeypatch.setattr(capture, "SchwabVendor", _Stub)
