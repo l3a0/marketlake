@@ -71,12 +71,14 @@ def test_records_a_chain_interaction_keyed_for_replay():
     assert interaction.headers == {"content-type": "application/json"}
 
 
-def test_a_failed_reply_that_is_not_json_is_refused_and_quoted_rather_than_recorded_empty():
-    """marketlake #539. The vendor hands back an HTML 429 with an empty body and the page in
-    ``body_text``. A cassette body has nowhere for the text, so recording ``{}`` would drop the
-    first sample of Schwab's error body anyone has seen. The refusal quotes it instead."""
+@pytest.mark.parametrize("status", [401, 403, 429, 503])
+def test_a_failed_reply_that_is_not_json_is_refused_and_quoted_rather_than_recorded_empty(status):
+    """marketlake #539. The vendor hands back a failed reply whose body is an HTML page with an
+    empty ``body`` and the page in ``body_text``. A cassette body has nowhere for the text, so
+    recording ``{}`` would drop the first sample of Schwab's error body anyone has seen. The
+    refusal quotes it instead, and names the request it came from."""
     page = b"<html><body>429-005 burst limit</body></html>"
-    client = FakeSchwabClient(chains={"SPY": FakeResponse(429, content=page)})
+    client = FakeSchwabClient(chains={"SPY": FakeResponse(status, content=page)})
 
     with pytest.raises(ValueError) as refused:
         record_cassette(
@@ -84,8 +86,28 @@ def test_a_failed_reply_that_is_not_json_is_refused_and_quoted_rather_than_recor
         )
 
     message = str(refused.value)
-    assert "http 429" in message
-    assert "429-005 burst limit" in message
+    assert f"http {status}" in message
+    assert "chains" in message
+    assert "'SPY'" in message
+    assert repr("<html><body>429-005 burst limit</body></html>") in message
+
+
+def test_the_refusal_quotes_only_the_start_of_a_long_page():
+    """The quote is the first 200 characters, enough to recognise the page, and the rest stays
+    out of the traceback. The page is built from literals so the bound is checked from outside."""
+    head = "<html>" + "a" * 194
+    tail = "<!-- the tail -->" + "b" * 800
+    client = FakeSchwabClient(chains={"SPY": FakeResponse(503, content=(head + tail).encode())})
+
+    with pytest.raises(ValueError) as refused:
+        record_cassette(
+            FAKE_KEY, FAKE_SECRET, chain_symbols=["SPY"], vendor_factory=_factory(client)
+        )
+
+    message = str(refused.value)
+    assert len(head) == 200
+    assert message.endswith(repr(head))
+    assert "the tail" not in message
 
 
 def test_a_failed_reply_with_an_empty_body_is_refused_too():

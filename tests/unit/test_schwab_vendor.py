@@ -335,14 +335,20 @@ def test_the_matched_names_are_the_ones_authlib_actually_raises():
 _HTML = b"<html><head><title>429 Too Many Requests</title></head><body>slow down</body></html>"
 
 # Bodies that are not a JSON object, each with the text ``httpx`` would decode it to. The last
-# is not valid UTF-8, which ``json.loads`` refuses and the decoder replaces rather than raising.
+# two are not valid UTF-8, and they fail the parse in different ways. ``json.loads`` reads a
+# leading ``\xff\xfe`` as a UTF-16 byte-order mark and raises ``JSONDecodeError``. A Latin-1
+# page with no mark raises ``UnicodeDecodeError`` instead, which is why the catch is
+# ``ValueError`` rather than ``JSONDecodeError``. The whitespace body checks that the text is
+# kept verbatim rather than tidied.
 _NOT_AN_OBJECT = [
     pytest.param(_HTML, _HTML.decode(), id="html"),
     pytest.param(b"", "", id="empty"),
+    pytest.param(b"  busy\n", "  busy\n", id="whitespace"),
     pytest.param(b"[]", "[]", id="json-list"),
     pytest.param(b"null", "null", id="json-null"),
     pytest.param(b'"slow down"', '"slow down"', id="json-string"),
-    pytest.param(b"\xff\xfe<html>", "��<html>", id="invalid-utf8"),
+    pytest.param(b"\xff\xfe<html>", "��<html>", id="bom-then-html"),
+    pytest.param(b"<p>caf\xe9</p>", "<p>caf�</p>", id="latin-1"),
 ]
 
 
@@ -485,7 +491,17 @@ def test_the_fake_parses_and_decodes_the_way_httpx_does():
     """Every test above trusts ``FakeResponse``'s ``content`` form. This checks it against
     the real ``httpx.Response`` over the same literal bytes."""
     httpx = pytest.importorskip("httpx")
-    for content in (_HTML, b"", b"[]", b"null", b'"slow down"', b"\xff\xfe<html>", b"{}"):
+    for content in (
+        _HTML,
+        b"",
+        b"  busy\n",
+        b"[]",
+        b"null",
+        b'"slow down"',
+        b"\xff\xfe<html>",
+        b"<p>caf\xe9</p>",
+        b"{}",
+    ):
         real = httpx.Response(429, content=content)
         fake = FakeResponse(429, content=content)
         assert real.text == fake.text
