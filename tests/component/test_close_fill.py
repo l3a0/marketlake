@@ -38,6 +38,7 @@ Ten claims are covered.
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -327,7 +328,8 @@ def test_the_fill_fetches_by_the_chunk_plan_rather_than_one_whole_chain_request(
     vendor = _both_windows()
     _fill(lake_root, vendor)
 
-    assert vendor.calls == [("SPY", *NEAR), ("SPY", *TAIL)]
+    # The two windows are fired concurrently (#532), so they reach the vendor in either order.
+    assert Counter(vendor.calls) == Counter([("SPY", *NEAR), ("SPY", *TAIL)])
     # Each row carries the plan window that fetched it, the fetch provenance the nightly
     # re-tune groups by. A one-request fill would leave both null.
     rows = _rows(lake_root)
@@ -730,7 +732,8 @@ def test_the_daemon_hands_the_guard_a_fill_that_lands_the_close(tmp_path, monkey
     # The fetch really happened at close+5, five minutes after the slot the rows carry.
     assert {r["fetch_ts"][:16] for r in rows} == {"2026-09-02T16:20"}
     # The daemon's producer went through the chunk plan, not one whole-chain request.
-    assert vendor.calls == [("SPY", *NEAR), ("SPY", *TAIL)]
+    # The two windows are fired concurrently (#532), so they reach the vendor in either order.
+    assert Counter(vendor.calls) == Counter([("SPY", *NEAR), ("SPY", *TAIL)])
 
 
 # -- what the lenses found: a fill that captured nothing, and one that gave up a window --
@@ -926,7 +929,8 @@ def test_the_fill_honours_a_recalibrated_guard_constant(tmp_path, monkeypatch):
 
     # Depth 0 gives the near window up where it stands. The built-in default of 4 would
     # halve it and ask for ranges this vendor has never heard of.
-    assert vendor.calls == [("SPY", *NEAR), ("SPY", *TAIL)]
+    # The two windows are fired concurrently (#532), so they reach the vendor in either order.
+    assert Counter(vendor.calls) == Counter([("SPY", *NEAR), ("SPY", *TAIL)])
     # The vendor was built with the fill's own clock, which is what turns request timing on.
     assert len(clocks) == 1
     assert clocks[0] is clock
@@ -1655,4 +1659,48 @@ def test_the_daemon_shares_one_drift_observer_between_its_cycles_and_its_fill(
     assert "chains: open_interest on 1 ticker(s)" in drift[0].body
     # The fill really ran, so the silence is a shared observer rather than a fill that
     # never happened.
-    assert vendor.calls == [("SPY", *NEAR), ("SPY", *TAIL)]
+    # The two windows are fired concurrently (#532), so they reach the vendor in either order.
+    assert Counter(vendor.calls) == Counter([("SPY", *NEAR), ("SPY", *TAIL)])
+
+
+def test_the_fill_closes_the_client_it_built(tmp_path, monkeypatch):
+    """A fill builds a client for one call, so it closes it when the call ends.
+
+    Since marketlake #532 the fill's windows are fired concurrently, one connection each, and
+    authlib's client frees its sockets only when the cyclic collector runs.
+    """
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
+    vendor = _both_windows()
+    closes: list[int] = []
+    vendor.close = lambda: closes.append(1)
+    closed_at_request: list[int] = []
+    get_chain = vendor.get_chain
+
+    def recording_get_chain(*args, **kwargs):
+        closed_at_request.append(len(closes))
+        return get_chain(*args, **kwargs)
+
+    vendor.get_chain = recording_get_chain
+
+    class _Stub:
+        @staticmethod
+        def from_token(token_path, *, api_key, app_secret, clock=None):
+            return vendor
+
+    monkeypatch.setattr(capture, "SchwabVendor", _Stub)
+    monkeypatch.setattr(capture, "load_chain_plan", lambda: TWO_WINDOWS)
+
+    capture.fill_option_close_from_config(
+        "SPY",
+        slot=CLOSE,
+        clock=ManualClock(start=FILL_MINUTE),
+        config_path=str(config),
+        token_path=str(tmp_path / "token.json"),
+        pid=7,
+    )
+
+    assert closes == [1]
+    # Both windows went out before the close, not after it.
+    assert closed_at_request == [0, 0]

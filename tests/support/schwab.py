@@ -40,6 +40,28 @@ class _FakeTokenMetadata:
     creation_timestamp: float | None
 
 
+class _FakeSession:
+    """The client's ``session``, the authlib ``OAuth2Client`` a real client carries.
+
+    ``SchwabVendor.from_token`` wraps the session's ``ensure_active_token`` in a lock, and
+    ``SchwabVendor.close`` closes it, so the fake carries both. ``token`` is what the lock
+    re-reads, ``checked`` records every token ``ensure_active_token`` was asked about, and
+    ``closed`` counts the closes.
+    """
+
+    def __init__(self) -> None:
+        self.token: dict[str, object] = {"access_token": "live"}
+        self.checked: list[object] = []
+        self.closed = 0
+
+    def ensure_active_token(self, token: object = None) -> bool:
+        self.checked.append(token)
+        return True
+
+    def close(self) -> None:
+        self.closed += 1
+
+
 class FakeSchwabClient:
     """A ``schwab-py`` client stand-in with canned replies.
 
@@ -79,6 +101,7 @@ class FakeSchwabClient:
         self._quotes = dict(quotes or {})
         self._bars = dict(bars or {})
         self.token_metadata = _FakeTokenMetadata(creation_timestamp)
+        self.session = _FakeSession()
         self.chain_calls: list[str] = []
         self.chain_underlying_quote: list[bool] = []
         self.chain_from_date: list[date | None] = []

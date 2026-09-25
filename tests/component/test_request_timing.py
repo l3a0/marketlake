@@ -6,6 +6,12 @@ network's (marketlake #531). These run whole cycles with a programmable vendor a
 clock. The vendor advances the clock by a different amount inside each call, so every
 stamp a line carries is an exact instant a test can name, and no real time is read.
 
+Advancing the clock from inside a vendor call is only allowed on the one-at-a-time path.
+Marketlake #532 fires a cycle's requests through a pool whose threads must never advance
+the clock, so these cycles run at a concurrency cap of 1, the path that restores fetching
+one request at a time. One test at the end runs the pool itself, with a vendor that leaves
+the clock alone, and checks what the lines must say whatever order the responses land in.
+
 What they cover:
 
 1. One line per request, carrying the caller's own start and end stamps, the transport's
@@ -141,7 +147,7 @@ def _run(vendor: _TimedVendor, clock: ManualClock, lake_root: Path, plan=TWO_WIN
         lake_root,
         pid=4242,
         plan=plan,
-        guards=guards,
+        guards=guards if guards is not None else GuardConstants(capture_max_concurrency=1),
     )
 
 
@@ -532,7 +538,12 @@ def test_each_failed_window_records_the_class_capture_gave_it(lake_root):
         quotes=(0.5, VendorResponse(200, _QUOTE_BODY)),
     )
 
-    _run(vendor, clock, lake_root, guards=GuardConstants(chain_chunk_max_split_depth=0))
+    _run(
+        vendor,
+        clock,
+        lake_root,
+        guards=GuardConstants(chain_chunk_max_split_depth=0, capture_max_concurrency=1),
+    )
 
     assert [(line["status"], line["error_class"]) for line in _chain_lines(lake_root)] == [
         (200, capture.CHAIN_SCHEMA_DRIFT),
@@ -652,3 +663,60 @@ def test_the_body_is_searched_before_the_headers(lake_root):
     _run(vendor, clock, lake_root)
 
     assert _chain_lines(lake_root)[1]["request_subcode"] == "429-005"
+
+
+class _StillVendor:
+    """A vendor that answers from a map and never touches the clock, safe for pool threads."""
+
+    def __init__(self, windows: dict, quotes: VendorResponse) -> None:
+        self._windows = windows
+        self._quotes = quotes
+
+    def get_chain(self, symbol, *, from_date=None, to_date=None, strike_count=None):
+        key = (from_date.isoformat(), to_date.isoformat() if to_date is not None else None)
+        answer = self._windows[key]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    def get_quotes(self, symbols):
+        return self._quotes
+
+    def token_mint_time(self):
+        return datetime(2026, 8, 23, tzinfo=UTC)
+
+
+def test_the_pool_writes_one_line_per_request_in_plan_order(lake_root):
+    # Through #532's pool the requests run concurrently and land in any order. The chain's
+    # lines still follow the plan, each line keeps its own window's outcome, and the quote
+    # batch gets its line, all written once by the cycle after the minute is durable.
+    clock = ManualClock(start=_CLOCK_START)
+    vendor = _StillVendor(
+        windows={
+            NEAR: VendorResponse(200, _chain_body(["2026-08-28"]), timing=_timing(1, 2, 3, size=7)),
+            TAIL: VendorResponse(429, {"detail": "429-005"}),
+        },
+        quotes=VendorResponse(200, _QUOTE_BODY),
+    )
+
+    capture.run_cycle(
+        clock,
+        vendor,
+        Roster.from_mapping({"SPY": {"options": True, "chain_cadence": "1m"}}),
+        lake_root,
+        pid=4242,
+        plan=TWO_WINDOWS,
+        guards=GuardConstants(capture_max_concurrency=4, capture_stagger_ms=0),
+    )
+
+    lines = _lines(lake_root)
+    chains = [line for line in lines if line["surface"] == CHAINS]
+    assert [(line["window_start"], line["status"], line["request_subcode"]) for line in chains] == [
+        (NEAR[0], 200, None),
+        (TAIL[0], 429, "429-005"),
+    ]
+    assert chains[0]["request_headers_ts"] == _iso(2)
+    assert chains[0]["request_bytes"] == 7
+    (batch,) = [line for line in lines if line["surface"] == QUOTES]
+    assert (batch["status"], batch["symbols"]) == (200, ["SPY"])
+    assert {line["snap_ts"] for line in lines} == {_SNAP.isoformat()}

@@ -36,6 +36,7 @@ Two boundaries are worth naming, because the design's claim is wider than this f
 from __future__ import annotations
 
 import json
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -299,9 +300,9 @@ def test_a_ticker_onboarded_mid_session_is_chained_on_the_next_cycle(tmp_path, m
     with pytest.raises(KeyError):
         before.segment(CHAINS, "QQQ")
 
-    # The next cycle chained both. The two are compared order-free on purpose. Tickers are
-    # fetched sequentially in roster order today, and the design fires them as parallel
-    # per-ticker workers later, so their relative order is not this claim's to assert.
+    # The next cycle chained both. The two are compared order-free on purpose. Since
+    # marketlake #532 the tickers' windows are fired concurrently, so the order they reach
+    # the vendor is not this claim's to assert.
     assert sorted(second) == ["QQQ", "SPY"]
 
     # The next cycle fetched the new ticker's chain and journaled its contracts as data.
@@ -427,7 +428,10 @@ def test_a_recalibrated_split_depth_takes_effect_on_the_next_cycle(tmp_path, mon
     # splits it at its date midpoint and refetches both halves. Those two half-ranges are
     # a set no cycle reading the first bound could produce. The open tail is refused the
     # same way under both bounds, because it can never be split.
-    assert vendor.windows == [WHOLE, TAIL, WHOLE, FIRST_HALF, SECOND_HALF, TAIL]
+    # Each cycle fires its windows concurrently (#532), so within a cycle the ranges reach the
+    # vendor in any order. A split's two halves still run in turn inside their window's task.
+    assert Counter(vendor.windows[:2]) == Counter([WHOLE, TAIL])
+    assert Counter(vendor.windows[2:]) == Counter([WHOLE, FIRST_HALF, SECOND_HALF, TAIL])
 
 
 # -- 5. capture never records outside a capture span ----------------------------------
@@ -537,3 +541,72 @@ def test_a_drifted_spans_file_widens_rather_than_crashing_the_cycle(tmp_path, mo
     result = _cycle(rig, clock)
 
     assert {seg.ticker for seg in result.segments} == {"SPY"}
+
+
+# -- the per-cycle client is closed ------------------------------------------------------
+
+
+class _ClosingVendor(_Vendor):
+    """A vendor that counts its closes, the way ``SchwabVendor.close`` frees its client.
+
+    It also records how many closes had happened by each request, since a real client that
+    was closed first refuses every request, and the cycle would then journal only gaps.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed = 0
+        self.closed_at_request: list[int] = []
+
+    def get_chain(self, symbol, *, from_date=None, to_date=None, strike_count=None):
+        self.closed_at_request.append(self.closed)
+        return super().get_chain(
+            symbol, from_date=from_date, to_date=to_date, strike_count=strike_count
+        )
+
+    def get_quotes(self, symbols):
+        self.closed_at_request.append(self.closed)
+        return super().get_quotes(symbols)
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+def test_the_production_entry_closes_the_client_it_built(tmp_path, monkeypatch):
+    """Each cycle builds a new client, so each cycle closes the one it built.
+
+    Marketlake #532 lets a cycle open one connection per request in flight, and authlib's client
+    is a reference cycle that frees its sockets only when the cyclic collector runs. So the
+    connections are closed when the cycle ends rather than left for the collector.
+    """
+    rig = _rig(tmp_path, SPY_ONLY)
+    built: list[_ClosingVendor] = []
+
+    def build(path: Path) -> _ClosingVendor:
+        built.append(_ClosingVendor())
+        return built[-1]
+
+    _wire(monkeypatch, rig, build)
+    clock = ManualClock(start=FIRST_MINUTE)
+    _cycle(rig, clock)
+    clock.advance(60)
+    _cycle(rig, clock)
+
+    assert [vendor.closed for vendor in built] == [1, 1]
+    # Every request went out before the close, not after it.
+    assert all(v.closed_at_request and set(v.closed_at_request) == {0} for v in built)
+
+
+def test_the_client_is_closed_when_the_cycle_raises(tmp_path, monkeypatch):
+    rig = _rig(tmp_path, SPY_ONLY)
+    vendor = _ClosingVendor()
+    _wire(monkeypatch, rig, lambda path: vendor)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("the cycle broke")
+
+    monkeypatch.setattr(capture, "run_cycle", broken)
+    with pytest.raises(RuntimeError, match="the cycle broke"):
+        _cycle(rig, ManualClock(start=FIRST_MINUTE))
+
+    assert vendor.closed == 1

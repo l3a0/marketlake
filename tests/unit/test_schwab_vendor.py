@@ -332,10 +332,12 @@ def test_a_reply_with_no_timing_record_carries_no_timing():
     assert response.timing is None
 
 
-def test_attach_timing_leaves_a_client_with_no_session_untouched():
+def test_attach_timing_leaves_a_session_with_no_hooks_untouched():
+    # The fake's session is no ``httpx.Client`` and has no ``event_hooks`` to extend, so the
+    # client is left untimed rather than given hooks it would never fire.
     from lake.schwab import attach_timing
     from tests.support.clock import ManualClock
 
     client = _client()
     assert attach_timing(client, ManualClock(start=datetime(2026, 8, 24, tzinfo=UTC))) is False
-    assert not hasattr(client, "session")
+    assert not hasattr(client.session, "event_hooks")

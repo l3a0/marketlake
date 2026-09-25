@@ -67,6 +67,7 @@ from __future__ import annotations
 import json
 import sys
 import urllib.error
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
@@ -734,7 +735,8 @@ def test_a_rewritten_chain_plan_takes_effect_on_the_next_cycle(tmp_path, monkeyp
     assert first_cycle == [(DAY, None)]
     # The 10:01 cycle fetched the pair the rewrite left behind, which is a set of ranges
     # no plan read before the rewrite could have produced.
-    assert vendor.windows[1:] == [(DAY, DAY), (NEXT_DAY, None)]
+    # Fired concurrently (#532), so the two ranges reach the vendor in either order.
+    assert Counter(vendor.windows[1:]) == Counter([(DAY, DAY), (NEXT_DAY, None)])
 
 
 # -- 7. the skipped-slot hook charges what the roster names --------------------------

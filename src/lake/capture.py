@@ -60,7 +60,8 @@ import json
 import os
 import re
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -699,8 +700,8 @@ def fetch_chain(
     1. **Read the plan.** ``plan.windows_for(day)`` turns the day-offset windows into
        concrete ``(from_date, to_date)`` ranges against the session date. The last
        range's ``to_date`` is ``None``, the open tail.
-    2. **Fetch each window, sequentially.** ``_fetch_window`` fetches the range and merges
-       its contracts. Only a genuine size signal, a ``TooBigBody`` 502 or a body flagged
+    2. **Fetch each window.** ``_fetch_window`` fetches the range and merges its contracts.
+       Only a genuine size signal, a ``TooBigBody`` 502 or a body flagged
        ``isChainTruncated``, is split at the window's date midpoint and refetched, bounded
        by ``chain_chunk_max_split_depth``. Any other failure, a non-2xx status, a raised
        exception, or a body that will not merge, is recorded once with its own error class
@@ -710,47 +711,133 @@ def fetch_chain(
        as ``http_401`` and the failure model still sees auth death on the chain surface.
     4. **Reassemble.** Every collected contract is merged into one body, a single snapshot
        the caller journals under one ``snap_ts``. The chain-level header fields (rates,
-       underlying price, entitlement flag) come from the first window that returned
-       successfully. Every window response carries the same top-level fields, so the first
-       success is an unambiguous source.
+       underlying price, entitlement flag) come from the first window, in plan order, that
+       returned successfully. Every window response carries the same top-level fields, so
+       the first success is an unambiguous source.
     5. **Name the absence.** A window whose range failed becomes an absent marker the
        caller rides inside that same snapshot, carrying that window's own error class.
 
-    The windows are fetched sequentially. Firing them in parallel with per-window jitter,
-    to cut wall-time to the slowest window, is a refinement the design pins for after the
-    D9 loop. It is deliberately not built here.
+    How the windows are fetched follows ``guards.capture_max_concurrency``, marketlake
+    #532. At a cap of 1 they are fetched one at a time on the calling thread, exactly as
+    before #532. Above it they are fired concurrently through ``_fetch_concurrently``, a
+    few tens of milliseconds apart, so the chain costs about its slowest window rather than
+    the sum. Either way the merge runs in plan order, so the header, the first failed
+    window's class, and the order of the contracts do not depend on which response arrived
+    first. A too-big window's midpoint split stays inside its own window's task and runs
+    serially there, so one oversize window cannot turn into a burst of up to 31 requests.
 
-    ``fetch_ts`` is stamped before the first window fetch and ``fetch_end_ts`` after the
-    last, so the round trip spans the whole windowed fetch. Each request inside it is
-    stamped too, and lands in ``requests`` for the timing file.
+    ``fetch_ts`` is stamped before the first window is fetched and ``fetch_end_ts`` once
+    the last has finished, so the round trip spans the whole windowed fetch. Each request
+    inside it is stamped too, and lands in ``requests`` for the timing file.
 
     ``lake_root`` is read only on the failure path, and only to name the absence markers.
     The daemon holds no expiration state, so the missing expirations come from the
     journal's latest prior durable batch, read once per ticker per fetch.
     """
-    windows = plan.windows_for(day)
-    fetch_ts = clock.now()
+    windows = tuple(plan.windows_for(day))
+    if guards.capture_max_concurrency == 1:
+        fetch_ts = clock.now()
+        outcomes = [_run_window(clock, vendor, guards, ticker, f, t) for f, t in windows]
+        fetch_end_ts = clock.now()
+    else:
+        fetched = _fetch_concurrently(clock, vendor, guards, (ticker,), windows, ())
+        outcomes, fetch_ts, fetch_end_ts = fetched.chains[ticker]
+    return _assemble_chain(ticker, windows, outcomes, fetch_ts, fetch_end_ts, lake_root)
+
+
+@dataclass(frozen=True)
+class _WindowOutcome:
+    """What one plan window's fetch brought back, before it is merged into the chain.
+
+    Each window collects into maps of its own rather than into the chain's shared ones,
+    so two windows fetched on two threads never write to the same dict. ``failed`` holds
+    the ranges this window gave up, one entry for the window or one per split half.
+    ``header`` is the first successful response body inside this window, or ``None``.
+    ``requests`` is one record per request the window made, in call order, splits included.
+    """
+
+    call_map: dict[str, dict[str, list]]
+    put_map: dict[str, dict[str, list]]
+    failed: tuple[tuple[date, date | None, str], ...]
+    header: Mapping[str, object] | None
+    requests: tuple[RequestRecord, ...] = ()
+
+
+def _run_window(
+    clock: Clock,
+    vendor: Vendor,
+    guards: GuardConstants,
+    ticker: str,
+    from_date: date,
+    to_date: date | None,
+) -> _WindowOutcome:
+    """Fetch one plan window, splitting it if it comes back too big, into its own maps.
+
+    This is the unit of work a pool thread runs. It makes the vendor calls and parses the
+    responses, and it does nothing else: it writes nothing to the lake and touches no state
+    another window can see. It reads the clock only to stamp each request's start and end
+    for the timing file (marketlake #531), and ``now`` changes nothing, so that is safe from
+    a pool thread.
+    """
     call_map: dict[str, dict[str, list]] = {}
     put_map: dict[str, dict[str, list]] = {}
     failed: list[tuple[date, date | None, str]] = []
     header_holder: list[Mapping[str, object]] = []
     requests: list[RequestRecord] = []
-    for from_date, to_date in windows:
-        _fetch_window(
-            clock,
-            vendor,
-            guards,
-            ticker,
-            from_date,
-            to_date,
-            0,
-            call_map,
-            put_map,
-            failed,
-            header_holder,
-            requests,
-        )
-    fetch_end_ts = clock.now()
+    _fetch_window(
+        clock,
+        vendor,
+        guards,
+        ticker,
+        from_date,
+        to_date,
+        0,
+        call_map,
+        put_map,
+        failed,
+        header_holder,
+        requests,
+    )
+    return _WindowOutcome(
+        call_map,
+        put_map,
+        tuple(failed),
+        header_holder[0] if header_holder else None,
+        tuple(requests),
+    )
+
+
+def _assemble_chain(
+    ticker: str,
+    windows: tuple[tuple[date, date | None], ...],
+    outcomes: Sequence[_WindowOutcome],
+    fetch_ts: datetime,
+    fetch_end_ts: datetime,
+    lake_root: Path | str,
+) -> ChainFetch:
+    """Merge a chain's window outcomes, in plan order, into one ``ChainFetch``.
+
+    ``outcomes`` parallels ``windows``. Merging in plan order is what makes a concurrent
+    fetch reassemble the same snapshot a sequential one would. The first success in plan
+    order supplies the header, ``failed[0]`` is the first failed range in plan order, and
+    the contracts are inserted in the order the windows were planned. The request records
+    follow the same plan order, and within one window the order its calls were made.
+    """
+    call_map: dict[str, dict[str, list]] = {}
+    put_map: dict[str, dict[str, list]] = {}
+    failed: list[tuple[date, date | None, str]] = []
+    requests: list[RequestRecord] = []
+    header_source: Mapping[str, object] | None = None
+    for outcome in outcomes:
+        requests.extend(outcome.requests)
+        for source, target in ((outcome.call_map, call_map), (outcome.put_map, put_map)):
+            for exp_key, bucket in source.items():
+                merged = target.setdefault(exp_key, {})
+                for strike, contracts in bucket.items():
+                    merged.setdefault(strike, []).extend(contracts)
+        failed.extend(outcome.failed)
+        if header_source is None and outcome.header is not None:
+            header_source = outcome.header
 
     # No window returned successfully, so nothing was captured. The caller turns that into
     # a whole-chain gap, tagged with the first failed window's class so auth death, a
@@ -758,10 +845,10 @@ def fetch_chain(
     # window, and every window path either seeds the header or records a failure, so a
     # failure exists here; the fallback only guards the impossible empty case. No absence
     # markers ride a whole-chain gap: the one gap row already stands for the whole chain.
-    if not header_holder:
+    if header_source is None:
         return ChainFetch(
             None,
-            tuple(windows),
+            windows,
             (),
             fetch_ts,
             fetch_end_ts,
@@ -775,7 +862,6 @@ def fetch_chain(
     # unambiguous source. The contracts come from every window. The contract count and
     # truncation flag are not read from the header. chains_data_batch recomputes them
     # from the reassembled rows, so they describe the captured chain.
-    header_source = header_holder[0]
     merged_body: dict[str, object] = {
         key: value for key, value in header_source.items() if key not in _CHAIN_EXP_MAPS
     }
@@ -806,13 +892,189 @@ def fetch_chain(
                 absent_markers.append(journal.AbsentMarker(start, end, error_class, None))
     return ChainFetch(
         merged_body,
-        tuple(windows),
+        windows,
         tuple(absent_markers),
         fetch_ts,
         fetch_end_ts,
         failed[0][2] if failed else None,
         tuple(requests),
     )
+
+
+# The key the quote request's completion is tracked under, beside the chain tickers. A
+# sentinel rather than a string, so no roster ticker can collide with it.
+_QUOTES_UNIT = object()
+
+
+@dataclass(frozen=True)
+class _QuoteFetch:
+    """The one batched quote request's result: a response or the exception it raised.
+
+    ``request_start`` is when the call itself began. In the pool that is the worker's own
+    start, which can follow ``fetch_ts``, the submission. ``None`` means the two coincide.
+    """
+
+    response: VendorResponse | None
+    error: Exception | None
+    fetch_ts: datetime
+    fetch_end_ts: datetime
+    request_start: datetime | None = None
+
+
+@dataclass(frozen=True)
+class _Fetched:
+    """What one concurrent fetch brought back, per chain ticker and for the quotes.
+
+    ``chains`` maps each ticker to its window outcomes, in plan order, with the instant
+    its first window was submitted and the instant its last one was seen to finish.
+    ``quotes`` is ``None`` when no quote request was made.
+    """
+
+    chains: dict[str, tuple[list[_WindowOutcome], datetime, datetime]]
+    quotes: _QuoteFetch | None
+
+
+def _fetch_concurrently(
+    clock: Clock,
+    vendor: Vendor,
+    guards: GuardConstants,
+    tickers: Sequence[str],
+    windows: tuple[tuple[date, date | None], ...],
+    symbols: Sequence[str],
+) -> _Fetched:
+    """Fire every chain window and the quote request through one bounded pool.
+
+    Marketlake #532. A cycle's requests used to run one after another, so its wall time was
+    their sum, and on 2026-09-24 three cycles ran past their minute and lost four. Here they
+    run concurrently, at most ``guards.capture_max_concurrency`` at once. Three rules shape
+    how.
+
+    1. **One flat pool, bounded by the cap.** Every (ticker, window) pair is one task, and
+       the quote request is one more. A pool per ticker with its windows nested inside
+       would put ``tickers × windows`` requests in flight at once, a number that grows with
+       the roster and with every plan rewrite. One pool holds the volley at the cap
+       whatever the roster.
+    2. **Submission order.** The quote request goes first, because it is one request for
+       the whole roster and sampling it nearest the minute top is what the design asks of a
+       poll. The chain windows follow in plan order, interleaved across tickers: every
+       ticker's first window, then every ticker's second. Below the cap some tasks wait in
+       the pool's queue, and submitting one ticker's windows ahead of the next ticker's
+       would put the second ticker's whole chain behind the first's. Interleaving also
+       starts every ticker's near-term windows, the densest, first.
+    3. **Only this thread advances the clock.** Submissions are ``guards.capture_stagger_ms``
+       apart, slept on the injected clock here, so a volley leaves over about a second rather
+       than in one instant, clear of Schwab's burst rejection (429-005). This thread stamps
+       each unit's ``fetch_ts`` just before its first submission. Pool threads make vendor
+       calls and parse the responses, and read the clock once more to stamp when their own
+       task finished. A unit's ``fetch_end_ts`` is the latest of its tasks' finish stamps, so
+       it is when the unit's last response landed, whatever else was still being submitted.
+       Reading the clock from a pool thread is safe, since ``now`` changes nothing, and no
+       pool thread ever sleeps on it or advances it.
+
+    Below the cap some tasks wait in the pool's queue, so a unit's ``fetch_ts`` is when its
+    first request was submitted, which can precede when it was sent. At the default cap of 20
+    today's 19 tasks never queue.
+
+    A task never raises into the cycle. A window task that raised is recorded as that
+    window failing, under its exception's class, the way ``_fetch_window`` records a raised
+    vendor call. A quote request that raised is returned as its exception, which the caller
+    turns into a gap for every quoted ticker.
+    """
+    tasks = len(tickers) * len(windows) + (1 if symbols else 0)
+    if tasks == 0:
+        return _Fetched({}, None)
+    stagger = guards.capture_stagger_ms / 1000
+    started: dict[object, datetime] = {}
+    chain_futures: dict[str, list[Future]] = {ticker: [] for ticker in tickers}
+    quote_future: Future | None = None
+    submitted: list[Future] = []
+    with ThreadPoolExecutor(
+        max_workers=min(guards.capture_max_concurrency, tasks),
+        thread_name_prefix="capture-fetch",
+    ) as pool:
+
+        def submit(unit: object, fn: Callable[..., object], *args: object) -> Future:
+            if submitted and stagger:
+                clock.sleep(stagger)
+            started.setdefault(unit, clock.now())
+            future = pool.submit(_timed, clock, fn, *args)
+            submitted.append(future)
+            return future
+
+        if symbols:
+            quote_future = submit(_QUOTES_UNIT, vendor.get_quotes, tuple(symbols))
+        for from_date, to_date in windows:
+            for ticker in tickers:
+                chain_futures[ticker].append(
+                    submit(ticker, _run_window, clock, vendor, guards, ticker, from_date, to_date)
+                )
+        wait(submitted)
+
+    chains = {}
+    for ticker in tickers:
+        results = [_task_result(future) for future in chain_futures[ticker]]
+        chains[ticker] = (
+            [_window_outcome(r, w) for r, w in zip(results, windows, strict=True)],
+            started[ticker],
+            max(r.finished_at for r in results),
+        )
+    quotes = None
+    if quote_future is not None:
+        result = _task_result(quote_future)
+        quotes = _QuoteFetch(
+            result.value,
+            result.error,
+            started[_QUOTES_UNIT],
+            result.finished_at,
+            result.started_at,
+        )
+    return _Fetched(chains, quotes)
+
+
+@dataclass(frozen=True)
+class _TaskResult:
+    """What one pool task returned or raised, and when it started and finished.
+
+    Both instants are the injected clock's, read on the pool thread. ``started_at`` is when
+    the task began to run rather than when it was submitted, which is the quote request's
+    ``request_start_ts`` for the timing file.
+    """
+
+    value: object
+    error: Exception | None
+    finished_at: datetime
+    started_at: datetime | None = None
+
+
+def _timed(clock: Clock, fn: Callable[..., object], *args: object) -> _TaskResult:
+    """Run one task on a pool thread and stamp when it finished, raise or return.
+
+    An ``Exception`` is caught and returned, so its finish is stamped too. Anything else, an
+    interrupt or a ``SystemExit``, is left to propagate, the way it would have left a
+    sequential fetch.
+    """
+    started_at = clock.now()
+    try:
+        value, error = fn(*args), None
+    except Exception as exc:
+        value, error = None, exc
+    return _TaskResult(value, error, clock.now(), started_at)
+
+
+def _task_result(future: Future) -> _TaskResult:
+    """A finished task's result, re-raising what ``_timed`` let propagate."""
+    error = future.exception()
+    if error is not None:
+        raise error
+    return future.result()
+
+
+def _window_outcome(result: _TaskResult, window: tuple[date, date | None]) -> _WindowOutcome:
+    """A window task's outcome, or that window failing under its exception's class."""
+    if result.error is None:
+        return result.value
+    from_date, to_date = window
+    return _WindowOutcome({}, {}, ((from_date, to_date, _error_class(result.error)),), None)
 
 
 def _fetch_window(
@@ -1082,6 +1344,16 @@ class _CaptureCycle:
             plan=self.plan,
             guards=self.guards,
         )
+        return self._plan_fetched_chain(ticker, fetched)
+
+    def _plan_fetched_chain(self, ticker: str, fetched: ChainFetch) -> _Plan:
+        """Resolve one already-fetched chain into its segment's plan, never raising.
+
+        ``_plan_chain`` carries the three outcomes. This is its second half, split out so
+        the concurrent cycle, which fetches every chain at once, plans each one the same
+        way the sequential cycle does. It is also where either path's requests join the
+        cycle's records for the timing file.
+        """
         self.requests.extend(fetched.requests)
         if fetched.body is None:
             return self._gap_plan(
@@ -1127,22 +1399,35 @@ class _CaptureCycle:
         try:
             response = self.vendor.get_quotes(symbols)
         except Exception as exc:
-            fetch_end_ts = self.clock.now()
-            error_class = _error_class(exc)
-            self._note_quotes(symbols, fetch_ts, fetch_end_ts, None, error_class)
+            return self._plan_quote_fetch(_QuoteFetch(None, exc, fetch_ts, self.clock.now()))
+        return self._plan_quote_fetch(_QuoteFetch(response, None, fetch_ts, self.clock.now()))
+
+    def _plan_quote_fetch(self, fetched: _QuoteFetch) -> list[tuple[str, _Plan]]:
+        """Plan a segment per roster ticker from the batched quote request's result.
+
+        A request that raised, or one that answered with a non-2xx status, gaps every
+        ticker under the same class. The round-trip stamps are the batch's own, since one
+        request served every ticker.
+        """
+        symbols = self.roster.symbols
+        fetch_ts, fetch_end_ts = fetched.fetch_ts, fetched.fetch_end_ts
+        start = fetched.request_start if fetched.request_start is not None else fetch_ts
+        if fetched.error is not None:
+            error_class = _error_class(fetched.error)
+            self._note_quotes(symbols, start, fetch_end_ts, None, error_class)
             return [
                 (sym, self._gap_plan(QUOTES, sym, error_class, fetch_ts, fetch_end_ts))
                 for sym in symbols
             ]
-        fetch_end_ts = self.clock.now()
+        response = fetched.response
         if not _ok(response.status):
             error_class = f"http_{response.status}"
-            self._note_quotes(symbols, fetch_ts, fetch_end_ts, response, error_class)
+            self._note_quotes(symbols, start, fetch_end_ts, response, error_class)
             return [
                 (sym, self._gap_plan(QUOTES, sym, error_class, fetch_ts, fetch_end_ts))
                 for sym in symbols
             ]
-        self._note_quotes(symbols, fetch_ts, fetch_end_ts, response, None)
+        self._note_quotes(symbols, start, fetch_end_ts, response, None)
         return [
             (sym, self._plan_one_quote(response.body, sym, fetch_ts, fetch_end_ts))
             for sym in symbols
@@ -1253,15 +1538,31 @@ class _CaptureCycle:
 
     def run(self) -> CycleResult:
         plans: list[tuple[str, str, _Plan]] = []
-        # Chains: one per options ticker, each planned on its own for skip-not-block. The
-        # tickers are fetched sequentially, in roster order. The design's per-ticker
-        # workers, fired in parallel at the minute top with a few tens of milliseconds of
-        # stagger, are a later refinement past the D9 loop. Not built here.
-        for entry in self.roster:
-            if entry.options:
-                plans.append((CHAINS, entry.ticker, self._plan_chain(entry.ticker)))
-        # Quotes: one shared batched request, then a segment per roster ticker.
-        for ticker, plan in self._plan_quotes():
+        # Chains: one per options ticker, each planned on its own for skip-not-block.
+        # Quotes: one shared batched request, then a segment per roster ticker. How they
+        # are fetched follows the concurrency cap (marketlake #532). At a cap of 1 the
+        # chains are fetched one at a time in roster order and the quotes after them,
+        # exactly the cycle that ran before #532. Above it every request goes through one
+        # bounded pool at once, and ``_fetch_concurrently`` carries the rules. Either way
+        # the segments are planned and written here in the same order, chains in roster
+        # order and then quotes, and only this thread writes.
+        option_tickers = [entry.ticker for entry in self.roster if entry.options]
+        if self.guards.capture_max_concurrency == 1:
+            for ticker in option_tickers:
+                plans.append((CHAINS, ticker, self._plan_chain(ticker)))
+            quote_plans = self._plan_quotes()
+        else:
+            windows = tuple(self.plan.windows_for(self.day))
+            fetched = _fetch_concurrently(
+                self.clock, self.vendor, self.guards, option_tickers, windows, self.roster.symbols
+            )
+            for ticker in option_tickers:
+                chain = _assemble_chain(ticker, windows, *fetched.chains[ticker], self.lake_root)
+                plans.append((CHAINS, ticker, self._plan_fetched_chain(ticker, chain)))
+            quote_plans = (
+                self._plan_quote_fetch(fetched.quotes) if fetched.quotes is not None else []
+            )
+        for ticker, plan in quote_plans:
             plans.append((QUOTES, ticker, plan))
 
         # Write every segment durably before touching the manifest. A write failure
@@ -1358,12 +1659,14 @@ def run_cycle(
     The steps, in order:
 
     1. Assign ``snap_ts`` from the clock, floored to the minute.
-    2. For each options ticker, fetch the chain by its date-window plan and write a chains
-       segment. A chain where every window failed writes a chains gap row. A window that
-       fails past every split becomes an absence marker inside the snapshot. One ticker's
-       failure never blocks another.
-    3. Fetch the batched quotes for every roster ticker, split per ticker, and write a
-       quotes segment each. A failed batch gaps every ticker's quotes.
+    2. Fetch every options ticker's chain by its date-window plan, and the batched quotes
+       for every roster ticker. Above a ``guards.capture_max_concurrency`` of 1 these
+       requests run concurrently through one bounded pool, marketlake #532. At a cap of 1
+       they run one at a time, chains in roster order and then the quotes.
+    3. Write a chains segment per options ticker. A chain where every window failed writes
+       a chains gap row. A window that fails past every split becomes an absence marker
+       inside the snapshot. One ticker's failure never blocks another. Then write a quotes
+       segment per roster ticker. A failed batch gaps every ticker's quotes.
     4. Append one manifest entry per segment, keyed by the segment path, under the
        lake-root lock.
     5. Stamp the token's mint time and the roster into the journal metadata, so the
@@ -1416,17 +1719,32 @@ def run_cycle_from_config(
         app_secret=config.schwab_app_secret.reveal(),
         clock=resolved_clock,
     )
-    return run_cycle(
-        resolved_clock,
-        vendor,
-        live_roster,
-        config.lake_root,
-        pid=pid,
-        guards=config.guards,
-        plan=load_chain_plan(),
-        close_tag=close_tag,
-        session_phase=session_phase,
-    )
+    try:
+        return run_cycle(
+            resolved_clock,
+            vendor,
+            live_roster,
+            config.lake_root,
+            pid=pid,
+            guards=config.guards,
+            plan=load_chain_plan(),
+            close_tag=close_tag,
+            session_phase=session_phase,
+        )
+    finally:
+        _close_vendor(vendor)
+
+
+def _close_vendor(vendor: object) -> None:
+    """Close a vendor built for one call, where the vendor has a ``close``.
+
+    ``SchwabVendor.close`` frees the client's connections and never raises. A vendor a test
+    swapped in through ``SchwabVendor.from_token`` may have no ``close`` at all, since the
+    ``Vendor`` seam does not ask for one.
+    """
+    close = getattr(vendor, "close", None)
+    if close is not None:
+        close()
 
 
 def _live_roster(roster: Roster, lake_root: Path | str, now: datetime) -> Roster:
@@ -1758,17 +2076,20 @@ def fill_option_close_from_config(
         app_secret=config.schwab_app_secret.reveal(),
         clock=resolved_clock,
     )
-    return fill_option_close(
-        resolved_clock,
-        vendor,
-        ticker,
-        slot=slot,
-        lake_root=config.lake_root,
-        guards=config.guards,
-        plan=load_chain_plan(),
-        pid=pid,
-        session_phase=session_phase,
-    )
+    try:
+        return fill_option_close(
+            resolved_clock,
+            vendor,
+            ticker,
+            slot=slot,
+            lake_root=config.lake_root,
+            guards=config.guards,
+            plan=load_chain_plan(),
+            pid=pid,
+            session_phase=session_phase,
+        )
+    finally:
+        _close_vendor(vendor)
 
 
 __all__ = [

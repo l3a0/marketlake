@@ -40,6 +40,8 @@ A fake client with no ``session`` records nothing, and its responses carry no ti
 
 from __future__ import annotations
 
+import sys
+import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -95,9 +97,11 @@ class SchwabClient(Protocol):
     """What ``SchwabVendor`` needs from a ``schwab-py`` client.
 
     The real ``schwab.client.Client`` satisfies this. So does a test fake. Four
-    endpoint methods and one nested token attribute is the whole contract. Price history
-    is two of the four, because ``schwab-py`` has no frequency-parameterized call: it
-    ships one method per frequency, and this lake captures two.
+    endpoint methods and one nested token attribute is the whole contract the vendor calls
+    through. Price history is two of the four, because ``schwab-py`` has no
+    frequency-parameterized call: it ships one method per frequency, and this lake captures
+    two. ``from_token`` and ``close`` also reach the client's ``session``, the authlib
+    ``OAuth2Client`` underneath it, to lock its token refresh and to close its connections.
 
     ``token_metadata`` is ``schwab-py``'s handle on the loaded token. Its
     ``creation_timestamp`` is the epoch second the refresh token was minted. That is
@@ -346,6 +350,46 @@ def _auth_failures_named() -> Iterator[None]:
         raise
 
 
+def serialize_token_refresh(session: object) -> None:
+    """Make an authlib session refresh an expired token once, however many threads ask.
+
+    Marketlake #532 fires a capture cycle's requests from a pool of threads through one
+    ``schwab-py`` client, and that client's ``session`` is authlib's sync ``OAuth2Client``.
+    Its ``request`` calls ``self.ensure_active_token(self.token)`` before every request with
+    no lock around it, unlike authlib's async client, which holds one. So when the access
+    token has lapsed, every request in flight refreshes it. A probe on 2026-09-24 sent 19
+    concurrent requests through one client holding an expired token: the token endpoint was
+    hit 19 times, and the ``update_token`` callback, which in ``schwab-py`` rewrites
+    ``token.json``, ran 19 times over the same file. The access token lives 30 minutes with a
+    300-second leeway and the client is rebuilt every cycle, so about one cycle in 25 would
+    do that.
+
+    The fix replaces the session's ``ensure_active_token`` with one that takes a lock and
+    then checks the session's live ``token``, not the token it was called with. That second
+    half is the one that matters. authlib tests expiry on its argument, so a thread that
+    waited on the lock still holds the expired token object it was called with, and a lock
+    that forwarded the argument refreshed eight times out of eight in the same probe.
+
+    It reaches into the session by attribute, so a library upgrade that moves it raises
+    ``AttributeError`` from ``from_token`` rather than running capture with the refresh
+    unguarded. Two tests cover what can be covered offline.
+    ``tests/unit/test_token_refresh_lock.py`` drives a real authlib ``OAuth2Client`` through
+    ``httpx.MockTransport``, so an authlib upgrade that renames ``ensure_active_token`` fails
+    there. ``tests/unit/test_schwab_from_token.py`` checks that ``from_token`` installs the
+    lock. Neither can see a ``schwab-py`` upgrade that renames the client's ``session``, since
+    no test builds a real ``schwab-py`` client. That upgrade raises from every ``from_token``
+    caller, the capture daemon included, which exits and is relaunched into the same error.
+    """
+    ensure_active_token = session.ensure_active_token
+    lock = threading.Lock()
+
+    def ensure_active_token_once(token: object = None) -> object:
+        with lock:
+            return ensure_active_token(session.token)
+
+    session.ensure_active_token = ensure_active_token_once
+
+
 class SchwabVendor:
     """A ``Vendor`` backed by a ``schwab-py`` client.
 
@@ -512,6 +556,28 @@ class SchwabVendor:
         # enforce_enums=False lets get_quotes pass the field groups as plain strings
         # rather than schwab-py Fields enum members, keeping this layer enum-agnostic.
         client = client_from_token_file(str(token_path), api_key, app_secret, enforce_enums=False)
+        # The capture cycle shares this client across a pool of threads, so an expired token
+        # must be refreshed once rather than once per request in flight.
+        serialize_token_refresh(client.session)
         if clock is not None:
             attach_timing(client, clock)
         return cls(client)
+
+    def close(self) -> None:
+        """Close the client's connections, and never raise.
+
+        ``run_cycle_from_config`` builds a new client every cycle, and marketlake #532 lets a
+        cycle open one connection per request in flight rather than one in all. authlib's
+        ``OAuth2Client`` passes itself to its own base class as its session, a reference
+        cycle, so dropping the client frees nothing until the cyclic collector runs, and the
+        sockets stay open until then. Closing it at the end of the cycle frees them at once.
+        A close that fails costs nothing the cycle captured, so it prints one line to the
+        launchd log and returns.
+        """
+        session = getattr(self._client, "session", None)
+        if session is None:
+            return
+        try:
+            session.close()
+        except Exception as exc:  # noqa: BLE001 - a close must never cost a captured cycle
+            print(f"schwab: client close failed: {type(exc).__name__}: {exc}", file=sys.stderr)
