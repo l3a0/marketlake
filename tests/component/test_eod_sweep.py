@@ -2821,6 +2821,35 @@ def test_an_unreadable_ledger_reaches_the_report_on_a_holiday_and_nowhere_else_y
     assert len(_filed(root)) == before, "the run that raised must not have filed a report"
 
 
+def test_a_ledger_this_process_may_not_open_reaches_the_report_on_a_session_evening_too(
+    fixture_lake: FixtureLake,
+):
+    """The fourth verdict, marketlake #536, and unlike the third it survives a session evening.
+
+    The daemon no longer pages a refused ledger, and one reason that is safe is this line.
+    ``PermissionError`` is an ``OSError``, which ``_LEDGER_REFUSALS`` names, so the walks that
+    open the ledger refuse and the run still files its report and its digest. The refusals are
+    problems, so the ``eod-sweep`` ping is withheld, and a refusal that lasts the evening pages
+    through that check's silence.
+    """
+    root = _lake(fixture_lake)
+    target = root / "reference" / "schema_versions.parquet"
+
+    os.chmod(target, 0o000)
+    try:
+        outcome, pinger, transport = _run(root)
+    finally:
+        os.chmod(target, 0o644)
+
+    (line,) = _version_lines(outcome)
+    assert line == f"schema_version: {LEDGER_PARTITION} could not be opened, PermissionError"
+    assert f"report: {line}" in transport.messages[0].body
+    (filed,) = _filed(root)
+    assert line in filed["report"]
+    assert outcome.nightly.problems, "the walks that open the ledger refused nothing"
+    assert pinger.urls == []
+
+
 def test_a_damaged_manifest_ledger_is_named_and_still_ends_the_run(fixture_lake: FixtureLake):
     """Marketlake #499's manifest half, end to end, and the half it deliberately does not fix.
 

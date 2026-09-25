@@ -747,11 +747,11 @@ def check_running_version(lake_root: Path | str) -> RunningVersionCheck:
     It never raises, and the caller is why. A daemon that will not start captures nothing, and
     under launchd's ``KeepAlive`` the successor reaches the same check and refuses again, so a
     missing row in a reference table would cost a whole session. Anything the decision raises
-    becomes ``UNREADABLE`` instead. The guard is broad rather than a list of classes, because
-    the list is not two long: a torn file raises ``LedgerUnreadable``, a ledger format this
-    code does not read ``UnsupportedLedgerSchemaVersion``, and some other parquet file at that
-    path a bare ``KeyError``. That is ``sweep._counted``'s rule, that a summary must never cost
-    the record.
+    becomes ``UNREADABLE`` instead, except the two failures of the open named below. The guard
+    is broad rather than a list of classes, because the list is not two long: a torn file raises
+    ``LedgerUnreadable``, a ledger format this code does not read
+    ``UnsupportedLedgerSchemaVersion``, and some other parquet file at that path a bare
+    ``KeyError``. That is ``sweep._counted``'s rule, that a summary must never cost the record.
 
     The guard covers the whole decision and not the read alone, because the file decides more
     than whether it parses. Every field of :data:`LEDGER_SCHEMA` is nullable, so a ledger with a
@@ -764,12 +764,11 @@ def check_running_version(lake_root: Path | str) -> RunningVersionCheck:
     Absent is the one condition that is not unreadable, and it is caught by class rather than
     by looking first. ``FileNotFoundError`` alone means no ledger. A ``PermissionError`` or an
     I/O error on a file that is there means the shape is recorded and this process cannot see
-    it, which is a different sentence and a different repair. A ``PermissionError`` is split
-    off once more, into ``INACCESSIBLE``, which reports and does not page, per
-    :func:`_inaccessible_check`. Reporting that as "not recorded"
-    would send an operator to ``python -m lake.schema_versions``, which opens the same file and
-    dies the same way. The sweep's reference readers were widened for exactly that reason under
-    marketlake #435.
+    it, which is a different sentence and a different repair. Reporting either as "not
+    recorded" would send an operator to ``python -m lake.schema_versions``, which opens the same
+    file and dies the same way. The sweep's reference readers were widened for exactly that
+    reason under marketlake #435. A ``PermissionError`` on the open is split off once more,
+    into ``INACCESSIBLE``, which reports and does not page, per :func:`_inaccessible_check`.
 
     It takes no lock and writes nothing. :meth:`SchemaVersionLedger.write` goes through a temp
     file and a rename, so a lockless read sees the whole old file or the whole new one, and the
@@ -787,7 +786,7 @@ def check_running_version(lake_root: Path | str) -> RunningVersionCheck:
     target = ledger_path(lake_root)
     version = journal.SCHEMA_VERSION
     try:
-        return _decide(target, version)
+        ledger = SchemaVersionLedger.read(target)
     except FileNotFoundError:
         # No ledger, which is not a corrupt one. ``loader._ledger`` tells the two apart for the
         # same reason. Reading straight through rather than asking first is what keeps a
@@ -799,14 +798,20 @@ def check_running_version(lake_root: Path | str) -> RunningVersionCheck:
         # under marketlake #536).
         return _unrecorded_check(version, target, ())
     except PermissionError as exc:
+        # The open alone, not the decision below. A refusal is the one failure that means the
+        # file is intact and this process was kept out of it, so only the read may land here.
         return _inaccessible_check(version, target, exc)
+    except Exception as exc:  # noqa: BLE001 - a startup check must never cost the session
+        return _unreadable_check(version, target, exc)
+    try:
+        return _decide(ledger, target, version)
     except Exception as exc:  # noqa: BLE001 - a startup check must never cost the session
         return _unreadable_check(version, target, exc)
 
 
-def _decide(target: Path, version: int) -> RunningVersionCheck:
-    """The verdict itself. Every raise it can make is the caller's to turn into one."""
-    ledger = SchemaVersionLedger.read(target)
+def _decide(ledger: SchemaVersionLedger, target: Path, version: int) -> RunningVersionCheck:
+    """The verdict on a ledger that opened. Every raise it can make is the caller's to turn
+    into ``UNREADABLE``, a ``PermissionError`` included, since the open is behind it."""
     recorded = ledger.versions()
     entry = ledger.get(version)
     if entry is None:

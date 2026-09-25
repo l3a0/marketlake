@@ -59,8 +59,9 @@ def read_or_none[T](
 
     ``unreadable`` is the caller's own list, because what counts as a file that did not come
     back differs by reader. ``FileNotFoundError`` is caught ahead of it and never reported,
-    even when the list names ``OSError``. Anything outside the list propagates, as it did
-    before this helper existed.
+    even when the list names ``OSError``, and it answers ``None`` whatever the list says,
+    since an absent reference file is a fresh lake to every reader here. Anything else
+    outside the list propagates, as it did before this helper existed.
 
     An absent file leaves the record alone. A file that was unreadable and is then deleted
     has not been read, so no recovery line prints for it, and one prints when it next reads.
@@ -73,11 +74,12 @@ def read_or_none[T](
     except unreadable as exc:
         if path not in _unreadable:
             _unreadable.add(path)
-            _say(f"reference: {path} could not be read at {_at(now)}: {type(exc).__name__}: {exc}")
+            error = exc
+            _say(lambda: f"reference: {path} could not be read at {_at(now)}: {_one_line(error)}")
         return None
     if path in _unreadable:
         _unreadable.discard(path)
-        _say(f"reference: {path} reads again at {_at(now)}")
+        _say(lambda: f"reference: {path} reads again at {_at(now)}")
     return value
 
 
@@ -98,10 +100,23 @@ def _at(now: Callable[[], datetime]) -> str:
         return "an unknown time"
 
 
-def _say(line: str) -> None:
-    """Print one line to stderr, and drop it rather than raise when it cannot be written."""
+def _one_line(exc: BaseException) -> str:
+    """The exception's class and message, with its whitespace collapsed to single spaces.
+
+    pyarrow's decode errors carry embedded newlines, so a raw message can split one event
+    across several log lines, and a message a file supplies can forge a line of its own.
+    """
+    return " ".join(f"{type(exc).__name__}: {exc}".split())
+
+
+def _say(line: Callable[[], str]) -> None:
+    """Build one line and print it to stderr, and drop it rather than raise on either step.
+
+    The line is built in here rather than by the caller, because building it calls the
+    exception's ``__str__``, and a failure there must not cost the reader its answer either.
+    """
     try:
-        print(line, file=sys.stderr)
+        print(line(), file=sys.stderr)
     except Exception:  # noqa: BLE001 - see "The line never raises" in the module docstring
         pass
 

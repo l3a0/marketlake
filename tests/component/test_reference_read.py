@@ -268,3 +268,30 @@ def test_a_clock_that_raises_costs_the_line_its_instant_and_nothing_else(tmp_pat
     assert result is None
     (line,) = _lines(capsys)
     assert "could not be read at an unknown time: PermissionError: " in line
+
+
+def test_an_exception_whose_message_raises_costs_the_line_and_nothing_else(tmp_path, capsys):
+    """Building the line calls ``__str__``, so it sits inside the same guard as the print."""
+
+    class Unprintable(OSError):
+        def __str__(self) -> str:
+            raise RuntimeError("no message")
+
+    def read(path: Path) -> object:
+        raise Unprintable()
+
+    assert reference_read.read_or_none(tmp_path / "x", read, (OSError,), now=lambda: AT) is None
+    assert _lines(capsys) == []
+
+
+def test_a_message_with_newlines_prints_as_one_line(tmp_path, capsys):
+    """pyarrow's decode errors carry newlines, and one event must stay one line in the log."""
+
+    def read(path: Path) -> object:
+        raise OSError("Couldn't deserialize thrift\nDeserializing page header failed.\n\n")
+
+    reference_read.read_or_none(tmp_path / "x", read, (OSError,), now=lambda: AT)
+
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert err.endswith("OSError: Couldn't deserialize thrift Deserializing page header failed.\n")

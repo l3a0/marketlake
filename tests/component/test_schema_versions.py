@@ -914,6 +914,24 @@ def test_a_ledger_this_process_may_not_open_pages_nobody(lake_root):
     assert redacted(check.summary) == check.summary
 
 
+def test_a_permission_error_after_the_open_still_pages(lake_root, monkeypatch):
+    """Only a refused open is ``INACCESSIBLE``, because only a refused open says the file is intact.
+
+    The decision after the open does no I/O today. A later edit that adds some must not turn a
+    failure there into a verdict that pages nobody.
+    """
+    _record(lake_root)
+
+    def refused():
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr("lake.schema_versions.running_fingerprints", refused)
+    check = check_running_version(lake_root)
+
+    assert check.state == UNREADABLE
+    assert check.pages
+
+
 def test_a_corrupt_ledger_pyarrow_reports_as_a_bare_oserror_still_pages(lake_root, monkeypatch):
     """The no-page arm is ``PermissionError`` alone, because corruption arrives as ``OSError``.
 
@@ -1126,7 +1144,7 @@ def test_the_three_event_names_are_three_names():
     assert UNREADABLE_EVENT == "schema_version_ledger_unreadable"
 
 
-def test_each_reportable_verdict_carries_an_event_of_its_own(lake_root):
+def test_each_paged_verdict_carries_an_event_of_its_own(lake_root):
     """``alert._record`` keeps no body, and drops the title too when a page was refused, so
     the event is the only field guaranteed to say which of the three went quiet.
     """

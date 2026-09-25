@@ -2171,7 +2171,9 @@ def test_a_ledger_the_daemon_may_not_open_pages_nobody_and_says_so_on_stderr(tmp
     finally:
         os.chmod(target, 0o644)
 
-    assert _version_pages(rig) == []
+    # Every page the run sent, not ``_version_pages``, which filters by the three paged events
+    # and so could never see a page sent for a verdict that has none.
+    assert rig.transport.sent == []
     assert f"schema_version: {target} could not be opened: PermissionError" in (
         capsys.readouterr().err
     )
