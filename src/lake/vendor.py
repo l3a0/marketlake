@@ -9,7 +9,10 @@ A cassette is a saved vendor response replayed offline. Its format lives in
 a later deliverable (D5). The cassette-backed fake lives under ``tests/support``.
 
 The interface is deliberately narrow. It returns the vendor's payload verbatim.
-Nothing here parses, validates, or reshapes it. Raw stays vendor-verbatim, always.
+Nothing here reads a field of it, validates it, or reshapes it. Raw stays
+vendor-verbatim, always. The one reply that is not handed back as parsed is a failed
+one whose body is not a JSON object, and even that keeps the vendor's words:
+``VendorResponse`` carries them in ``body_text`` beside an empty ``body``.
 The fetch time is stamped by the caller from the injected clock, never by the
 vendor, so it is not part of a response.
 
@@ -226,7 +229,8 @@ class Vendor(Protocol):
 
         A candle carries ``open``, ``high``, ``low``, ``close``, ``volume`` and a
         ``datetime`` that is Schwab's epoch-millisecond stamp. Nothing here reads it. The
-        body comes back exactly as the vendor sent it.
+        body comes back exactly as the vendor sent it, under the one exception
+        ``VendorResponse`` describes for a failed reply whose body is not a JSON object.
         """
         ...
 

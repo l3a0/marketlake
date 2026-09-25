@@ -291,10 +291,10 @@ def test_the_transform_is_the_shared_one_rather_than_a_third_copy():
 
 def test_the_vendor_response_the_daemon_wires_is_unwrapped_rather_than_raising():
     # `main` wires `fetch=vendor.get_quotes`, which returns a `VendorResponse` of
-    # `status`, `body` and `headers`. The reader was handed that whole response and asked
-    # it for symbols, which raised `AttributeError` before `report` could ping. The one
-    # check that asks someone else whether a closed day is really closed could not have
-    # survived reaching the vendor. Every other caller unwraps before reading.
+    # `status`, `body`, `headers` and `body_text`. The reader was handed that whole
+    # response and asked it for symbols, which raised `AttributeError` before `report` could
+    # ping. The one check that asks someone else whether a closed day is really closed could
+    # not have survived reaching the vendor. Every other caller unwraps before reading.
     result = run_probe(
         calendar=weekday_sessions(WEEK),
         clock=ManualClock(start=et(2026, 9, 5, 9, 35)),

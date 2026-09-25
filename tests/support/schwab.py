@@ -29,9 +29,9 @@ class FakeResponse:
     ``json()``, which is all a test of a well-formed reply needs. The ``content`` form
     holds the raw bytes of the reply instead, and parses and decodes them the way ``httpx``
     does: ``json()`` is ``json.loads`` over the bytes, so a body that is not JSON raises
-    ``ValueError``, and ``text`` decodes them as UTF-8 with ``errors="replace"``, so it
-    never raises. That is the form for a reply whose body is an HTML page, empty, or JSON
-    that is not an object.
+    ``ValueError``, and ``text`` decodes them as UTF-8 with ``errors="replace"``, which is
+    what ``httpx`` does for a reply that declares no charset. That is the form for a reply
+    whose body is an HTML page, empty, or JSON that is not an object.
     """
 
     status_code: int

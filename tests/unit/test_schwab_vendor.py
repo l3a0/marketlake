@@ -347,13 +347,38 @@ _NOT_AN_OBJECT = [
 
 
 def _vendor_answering(reply: FakeResponse) -> SchwabVendor:
-    """A vendor whose chain and quote requests both get ``reply``."""
-    return SchwabVendor(FakeSchwabClient(chains={"SPY": reply}, quotes={("SPY",): reply}))
+    """A vendor whose every request, on all four endpoints, gets ``reply``."""
+    return SchwabVendor(
+        FakeSchwabClient(
+            chains={"SPY": reply},
+            quotes={("SPY",): reply},
+            bars={("SPY", "1m"): reply, ("SPY", "1d"): reply},
+        )
+    )
 
 
+_OPEN = datetime(2026, 9, 14, 13, 30, tzinfo=UTC)
+_CLOSE = datetime(2026, 9, 14, 20, 0, tzinfo=UTC)
+
+# The four vendor methods. Each shapes its own reply through ``_response_from``, and a method
+# that shaped its reply any other way would bring the old failure back on that endpoint alone,
+# so the rules below are asserted on every one of them rather than on the chain.
+_FETCHES = [
+    pytest.param(lambda vendor: vendor.get_chain("SPY"), id="chain"),
+    pytest.param(lambda vendor: vendor.get_quotes(["SPY"]), id="quotes"),
+    pytest.param(
+        lambda vendor: vendor.get_minute_bars("SPY", start=_OPEN, end=_CLOSE), id="minute-bars"
+    ),
+    pytest.param(
+        lambda vendor: vendor.get_daily_bars("SPY", start=_OPEN, end=_CLOSE), id="daily-bars"
+    ),
+]
+
+
+@pytest.mark.parametrize("fetch", _FETCHES)
 @pytest.mark.parametrize("status", [401, 403, 429, 502])
 @pytest.mark.parametrize(("content", "text"), _NOT_AN_OBJECT)
-def test_a_failed_reply_keeps_its_status_whatever_its_body_is(status, content, text):
+def test_a_failed_reply_keeps_its_status_whatever_its_body_is(fetch, status, content, text):
     """The status is the signal, so a body that is not an object must not cost it.
 
     The watchdog pages "rate limited" on ``http_429`` and "token dead" on ``http_401``. A
@@ -361,14 +386,11 @@ def test_a_failed_reply_keeps_its_status_whatever_its_body_is(status, content, t
     body parsing to a list raised in capture instead, which took the whole cycle down.
     """
     reply = FakeResponse(status, headers={"content-type": "text/html"}, content=content)
-    for response in (
-        _vendor_answering(reply).get_chain("SPY"),
-        _vendor_answering(reply).get_quotes(["SPY"]),
-    ):
-        assert response.status == status
-        assert response.body == {}
-        assert response.body_text == text
-        assert response.headers == {"content-type": "text/html"}
+    response = fetch(_vendor_answering(reply))
+    assert response.status == status
+    assert response.body == {}
+    assert response.body_text == text
+    assert response.headers == {"content-type": "text/html"}
 
 
 def test_a_failed_reply_with_an_object_body_is_handed_back_unchanged():
@@ -396,19 +418,17 @@ def test_a_successful_object_body_is_handed_back_with_no_text():
     assert response.body_text is None
 
 
+@pytest.mark.parametrize("fetch", _FETCHES)
 @pytest.mark.parametrize("status", [200, 203, 299])
 @pytest.mark.parametrize(("content", "text"), _NOT_AN_OBJECT)
-def test_a_successful_reply_whose_body_is_not_an_object_is_refused(status, content, text):
+def test_a_successful_reply_whose_body_is_not_an_object_is_refused(fetch, status, content, text):
     """A 2xx body is the payload, so an empty mapping would read as an empty success.
 
     Schwab already answers 200 with empty expiration maps on purpose, and the close+5 fill
     treats that as a close nobody captured. A malformed payload must not look the same.
     """
-    reply = FakeResponse(status, content=content)
     with pytest.raises(VendorBodyError):
-        _vendor_answering(reply).get_chain("SPY")
-    with pytest.raises(VendorBodyError):
-        _vendor_answering(reply).get_quotes(["SPY"])
+        fetch(_vendor_answering(FakeResponse(status, content=content)))
 
 
 @pytest.mark.parametrize("status", [199, 300, 302])

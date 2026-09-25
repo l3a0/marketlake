@@ -83,8 +83,12 @@ class HttpResponse(Protocol):
 
     @property
     def text(self) -> str:
-        """The body decoded as text. ``httpx`` decodes with ``errors="replace"``, so it
-        never raises, whatever bytes arrived."""
+        """The body decoded as text, in the charset the reply declares or UTF-8 when it
+        declares none. ``httpx`` decodes with ``errors="replace"``, so bytes that are not
+        valid in that charset become replacement characters rather than a raise. One
+        declared charset still raises: ``utf-16`` with no byte-order mark raises
+        ``UnicodeError``. ``schwab-py`` logs every reply's text before this module sees it,
+        so in production that raise happens inside the client call, not here."""
         ...
 
     def json(self) -> object:
