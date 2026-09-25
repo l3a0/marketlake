@@ -5,8 +5,14 @@ the only honest test drives the real stack: ``schwab.client.Client`` over authli
 ``OAuth2Client`` over httpx and httpcore. A server on ``127.0.0.1`` plays Schwab. The
 suite's socket guard in ``tests/conftest.py`` refuses every other machine and allows this
 one. The clock is the real ``SystemClock``, because the hooks stamp events as the
-transport reports them, so each assertion is a lower bound set by a delay the server
-applies. A lower bound cannot be broken by a slow machine, only by a wrong stamp.
+transport reports them, so each assertion is a bound set by a delay the server applies.
+
+Most of those bounds are strict. The header wait is one: ``sent`` is stamped before the
+request leaves, and the server sleeps only after it arrives, so no lag on either side can
+shorten the measured wait below the sleep. The body gap is not strict. ``headers`` is
+stamped a moment after the server sends them, so that moment comes off the measured gap,
+and CI measured 0.299924 seconds against a 0.3 second sleep. That bound carries
+``CLIENT_LAG`` of slack, far below the sleep, so a swapped or missing stamp still fails it.
 
 What they cover:
 
@@ -42,6 +48,9 @@ from lake.schwab import SchwabVendor, attach_timing, read_timing  # noqa: E402
 HEADER_DELAY = 0.2
 BODY_DELAY = 0.3
 REFRESH_DELAY = 0.6
+
+# How much the client's headers stamp may lag the server's send, taken off the body gap.
+CLIENT_LAG = 0.05
 
 _CHAIN = {"symbol": "SPY", "status": "SUCCESS", "callExpDateMap": {}, "putExpDateMap": {}}
 
@@ -143,7 +152,7 @@ def test_the_four_instants_arrive_in_order_with_the_servers_gaps(server):
     assert timing.sent <= timing.connected <= timing.headers <= timing.body
     # The server held the headers, then held the second half of the body.
     assert _seconds(timing.headers, timing.sent) >= HEADER_DELAY
-    assert _seconds(timing.body, timing.headers) >= BODY_DELAY
+    assert _seconds(timing.body, timing.headers) >= BODY_DELAY - CLIENT_LAG
     # The body is uncompressed here, so its size on the wire is its length.
     assert timing.bytes == len(json.dumps({**_CHAIN, "pad": "p" * 20_000}))
     assert response.body["status"] == "SUCCESS"
