@@ -270,3 +270,59 @@ def test_a_boolean_budget_is_refused_rather_than_read_as_one(raw: str):
         GuardConstants.from_mapping(mapping)
     # The pinned default is a real int, not something that merely equals one.
     assert type(GuardConstants().bars_request_budget) is int
+
+
+# -- the capture cycle's concurrency constants, marketlake #532 ---------------------------
+
+
+def test_the_capture_concurrency_defaults_are_pinned_and_overridable():
+    """The owner's defaults, and a config edit that changes them on the next cycle.
+
+    The cap is advertised as the lever an operator lowers mid-session, so both the default and
+    an override are asserted, and the accepted boundary of each: a cap of 1, which is the
+    sequential cycle, and a stagger of 0.
+    """
+    assert GuardConstants().capture_max_concurrency == 20
+    assert GuardConstants().capture_stagger_ms == 50
+    assert type(GuardConstants().capture_max_concurrency) is int
+    assert type(GuardConstants().capture_stagger_ms) is int
+    lowered = GuardConstants.from_mapping({"capture_max_concurrency": 1, "capture_stagger_ms": 0})
+    assert (lowered.capture_max_concurrency, lowered.capture_stagger_ms) == (1, 0)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "capture_max_concurrency: 0",
+        "capture_max_concurrency: -1",
+        "capture_max_concurrency: yes",
+        "capture_max_concurrency: 2.5",
+        "capture_max_concurrency: '20'",
+        "capture_max_concurrency:",
+    ],
+)
+def test_a_cap_that_is_not_a_whole_number_of_at_least_one_is_refused(raw: str):
+    """Refused at load, as one named line, rather than inside the cycle.
+
+    Unchecked, a cap of 0 raises ``ValueError`` from the thread pool on every cycle, and ``yes``
+    parses to ``True`` and runs silently as a cap of 1. A key with no value parses to ``None``,
+    which a bare ``< 1`` would meet with a ``TypeError`` rather than the named refusal.
+    """
+    with pytest.raises(ConfigError, match="capture_max_concurrency"):
+        GuardConstants.from_mapping(yaml.safe_load(raw))
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "capture_stagger_ms: -1",
+        "capture_stagger_ms: yes",
+        "capture_stagger_ms: 0.5",
+        "capture_stagger_ms: '50'",
+        "capture_stagger_ms:",
+    ],
+)
+def test_a_stagger_that_is_not_a_whole_number_of_at_least_zero_is_refused(raw: str):
+    """A negative pause raises from the clock's sleep inside the cycle, so it is refused here."""
+    with pytest.raises(ConfigError, match="capture_stagger_ms"):
+        GuardConstants.from_mapping(yaml.safe_load(raw))

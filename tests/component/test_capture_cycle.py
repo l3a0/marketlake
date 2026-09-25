@@ -23,7 +23,7 @@ They cover the cycle's observable contract:
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -31,6 +31,7 @@ import pytest
 from lake import capture, journal
 from lake.cassette import Cassette, Interaction, load_cassette
 from lake.chain_plan import ChainPlan
+from lake.config import GuardConstants
 from lake.manifest import latest_entries, sha256_file
 from lake.metadata import JournalMetadata, read_metadata
 from lake.tickers import Roster
@@ -49,6 +50,9 @@ _ONE_WINDOW = ChainPlan(((0, None),))
 # A clock whose seconds are non-zero, so flooring to the minute is observable. 09:30:45
 # Eastern, expressed in UTC.
 _CLOCK_START = datetime(2026, 8, 24, 13, 30, 45, tzinfo=UTC)
+# The default pause between two submissions to the capture pool, written as a literal so a
+# change to the constant fails these tests rather than moving with them.
+_STAGGER = timedelta(milliseconds=50)
 _EXPECTED_SNAP = datetime(2026, 8, 24, 13, 30, 0, tzinfo=UTC)
 
 # The synthetic vendor quote times the cassettes carry, as ISO strings. The chain stamp
@@ -144,12 +148,16 @@ def test_happy_cycle_writes_chains_and_quotes_with_correct_stamps(cassette_vendo
     assert [r["bid"] for r in spy_chain] == [4.2, 3.8]
     # Each contract's totalVolume lands in the typed volume column, not the overflow.
     assert [r["volume"] for r in spy_chain] == [5555, 4444]
+    # The default cap fires the cycle's three requests through one pool, 50 ms apart on the
+    # injected clock: the quote request at the start, SPY's one window one stagger later,
+    # QQQ's one after that. A chain's fetch_ts is when its first window was submitted, and
+    # every request is stamped finished once the last submission is over, since the manual
+    # clock does not move while the fakes answer. So the round trip is still stamped, not
+    # null, and it spans the submissions still to come after this ticker's.
     for row in spy_chain:
         assert row["snap_ts"] == _EXPECTED_SNAP.isoformat()
-        assert row["fetch_ts"] == _CLOCK_START.isoformat()
-        # The manual clock does not advance across the fetch, so the request-end stamp
-        # equals the dispatch stamp here. It is still stamped, not null.
-        assert row["fetch_end_ts"] == _CLOCK_START.isoformat()
+        assert row["fetch_ts"] == (_CLOCK_START + _STAGGER).isoformat()
+        assert row["fetch_end_ts"] == (_CLOCK_START + 2 * _STAGGER).isoformat()
         assert row["vendor_quote_ts"] == _CHAIN_VQT
         assert row["close_tag"] is None
         assert row["suspect"] is False
@@ -167,7 +175,7 @@ def test_happy_cycle_writes_chains_and_quotes_with_correct_stamps(cassette_vendo
     assert spy_quote["realtime"] is True
     assert spy_quote["snap_ts"] == _EXPECTED_SNAP.isoformat()
     assert spy_quote["fetch_ts"] == _CLOCK_START.isoformat()
-    assert spy_quote["fetch_end_ts"] == _CLOCK_START.isoformat()
+    assert spy_quote["fetch_end_ts"] == (_CLOCK_START + 2 * _STAGGER).isoformat()
     assert spy_quote["vendor_quote_ts"] == _QUOTE_VQT
     # The full quote block lands in its typed columns. quoteTime is still consumed into
     # vendor_quote_ts, not a column.
@@ -355,10 +363,15 @@ def _round_trip(row: dict) -> float:
 
 
 def test_round_trip_is_captured_on_success_and_on_a_slow_failure(cassette_vendor, lake_root):
+    # The vendor advances the manual clock inside each call to model a request that takes
+    # time, which is only well defined when one call runs at a time. So this runs at a cap
+    # of 1, the sequential cycle, where each round trip is its own call's span. The
+    # concurrent cycle's round trip is covered in test_capture_concurrency.py.
+    sequential = GuardConstants(capture_max_concurrency=1)
     clock = ManualClock(start=_CLOCK_START)
     vendor = _AdvancingVendor(cassette_vendor, clock, chain_seconds=0.4, quote_seconds=0.25)
     result = capture.run_cycle(
-        clock, vendor, _both_options(), lake_root, pid=4242, plan=_ONE_WINDOW
+        clock, vendor, _both_options(), lake_root, pid=4242, plan=_ONE_WINDOW, guards=sequential
     )
 
     # A chain is fetched by its plan of date windows, one window here, so one 0.4s request.
@@ -379,7 +392,7 @@ def test_round_trip_is_captured_on_success_and_on_a_slow_failure(cassette_vendor
         cassette_vendor, clock2, chain_seconds=0.6, quote_seconds=0.25, raise_chain=True
     )
     result2 = capture.run_cycle(
-        clock2, failing, _both_options(), lake_root, pid=4243, plan=_ONE_WINDOW
+        clock2, failing, _both_options(), lake_root, pid=4243, plan=_ONE_WINDOW, guards=sequential
     )
     spy_gap = _rows(result2.segment(CHAINS, "SPY"))[0]
     assert spy_gap["row_kind"] == journal.ROW_KIND_GAP

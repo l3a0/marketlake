@@ -217,6 +217,23 @@ class GuardConstants:
     # design already answers in its own terms: anything else on the same credentials draws from
     # the daemon's 120.
     bars_request_budget: int = 100
+    # The capture cycle's two concurrency constants, marketlake #532. A cycle makes one request
+    # per chain-plan window per options ticker plus one batched quotes request, 19 at two tickers
+    # against the nine-window plan the machine ran on 2026-09-24. Fetched one at a time, a cycle
+    # costs the sum of them, and on that afternoon three cycles overran and lost four minutes.
+    #
+    # The cap is how many requests are in flight at once. It is not the 120-a-minute ceiling,
+    # which limits requests per rolling minute and which firing them together does not change.
+    # At 20 today's 19 tasks go out in one round, so a cycle overruns only once the mean window
+    # passes about 60s, against about 30s at a cap of 10. What it risks is the burst rejection
+    # (429-005), whose threshold is unpublished and unmeasured. A cap of 1 runs the sequential
+    # cycle exactly as it ran before #532, with no pool and no stagger, so lowering it here is a
+    # rollback that takes effect on the next cycle.
+    capture_max_concurrency: int = 20
+    # The pause, in milliseconds, between two submissions to the pool, so a volley leaves over
+    # about a second rather than in one instant. The design's figure is "a few tens of
+    # milliseconds". It is slept on the injected clock by the thread that submits.
+    capture_stagger_ms: int = 50
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object] | None) -> GuardConstants:
@@ -236,18 +253,19 @@ class GuardConstants:
         if unknown:
             raise ConfigError(f"unknown guard constant(s): {sorted(unknown)}")
         merged = replace(cls(), **dict(mapping))
-        # **One field is range-checked here, and the rest are not.** A zero or negative
-        # ``bars_request_budget`` stops the nightly bar fetch for ever, and it does it without
-        # being refused anywhere: the run reports success, the ping goes out, and the only thing
-        # saying the lake stopped fetching bars is one count on a report line beside two others
-        # that are non-zero on a healthy evening. Every command that loads config wraps the load in
-        # ``input_errors_exit``, so raising here reaches the operator as one named line and exit 2
-        # from whichever command they ran, at load rather than half way through a walk.
+        # **Three fields are range-checked here, and the rest are not.** This one came first. A
+        # zero or negative ``bars_request_budget`` stops the nightly bar fetch for ever, and it
+        # does it without being refused anywhere: the run reports success, the ping goes out, and
+        # the only thing saying the lake stopped fetching bars is one count on a report line
+        # beside two others that are non-zero on a healthy evening. Every command that loads
+        # config wraps the load in ``input_errors_exit``, so raising here reaches the operator as
+        # one named line and exit 2 from whichever command they ran, at load rather than half way
+        # through a walk.
         #
-        # This is the instance and not the class. ``from_mapping`` type-checks no value at all,
+        # This is the instance and not the class. ``from_mapping`` type-checks no other value,
         # because ``replace`` does not, and eleven constants carry that gap. Marketlake #487 is the
         # per-field range mechanism for all of them. Reaching for it here would be fixing past the
-        # class, so the one field this change adds is checked at its own site instead.
+        # class, so the one field that change added is checked at its own site instead.
         #
         # **The type is checked before the range, and that order is the whole point.** A bare
         # ``< 1`` dereferences whatever YAML produced, and ``<`` against an ``int`` raises
@@ -267,6 +285,25 @@ class GuardConstants:
             raise ConfigError(
                 f"bars_request_budget must be a whole number of at least 1, got {budget!r}: "
                 "a run that may spend no request never fetches a bar and never says so"
+            )
+        # The two capture constants from #532 are checked here for the same reason and in the
+        # same order, since the cap is advertised as the lever an operator lowers mid-session.
+        # Unchecked, a cap of 0 raises ``ValueError`` from ``ThreadPoolExecutor`` inside the
+        # cycle, and ``yes`` parses to ``True`` and runs silently as a cap of 1. A negative
+        # stagger raises from the clock's sleep. Checked or not, a refused value stops capture,
+        # because ``run_cycle_from_config`` loads config every cycle and the daemon exits on the
+        # raise. The check makes that one named line rather than a traceback.
+        cap = merged.capture_max_concurrency
+        if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
+            raise ConfigError(
+                f"capture_max_concurrency must be a whole number of at least 1, got {cap!r}: "
+                "it is how many vendor requests a capture cycle has in flight at once"
+            )
+        stagger = merged.capture_stagger_ms
+        if not isinstance(stagger, int) or isinstance(stagger, bool) or stagger < 0:
+            raise ConfigError(
+                f"capture_stagger_ms must be a whole number of at least 0, got {stagger!r}: "
+                "it is the pause in milliseconds between two capture requests"
             )
         return merged
 
