@@ -30,6 +30,7 @@ import pytest
 
 from lake import capture, journal
 from lake.chain_plan import ChainPlan
+from lake.config import GuardConstants
 from lake.manifest import latest_entries
 from lake.paths import LakePaths
 from lake.tickers import Roster
@@ -132,7 +133,7 @@ class _TimedVendor:
         return datetime(2026, 8, 23, tzinfo=UTC)
 
 
-def _run(vendor: _TimedVendor, clock: ManualClock, lake_root: Path, plan=TWO_WINDOWS):
+def _run(vendor: _TimedVendor, clock: ManualClock, lake_root: Path, plan=TWO_WINDOWS, guards=None):
     return capture.run_cycle(
         clock,
         vendor,
@@ -140,6 +141,7 @@ def _run(vendor: _TimedVendor, clock: ManualClock, lake_root: Path, plan=TWO_WIN
         lake_root,
         pid=4242,
         plan=plan,
+        guards=guards,
     )
 
 
@@ -152,9 +154,17 @@ def _chain_lines(lake_root: Path) -> list[dict]:
     return [line for line in _lines(lake_root) if line["surface"] == CHAINS]
 
 
-def _timing(sent: float, headers: float, body: float, *, size: int) -> RequestTiming:
+def _timing(
+    sent: float, headers: float, body: float, *, size: int, connected: float | None = None
+) -> RequestTiming:
     """Transport stamps as literals, never derived from anything the code computes."""
-    return RequestTiming(sent=_at(sent), headers=_at(headers), body=_at(body), bytes=size)
+    return RequestTiming(
+        sent=_at(sent),
+        connected=None if connected is None else _at(connected),
+        headers=_at(headers),
+        body=_at(body),
+        bytes=size,
+    )
 
 
 def _iso(seconds: float) -> str:
@@ -169,7 +179,7 @@ def test_every_request_writes_one_line_that_joins_to_its_rows(lake_root):
     near = VendorResponse(
         200,
         _chain_body(["2026-08-28"]),
-        timing=_timing(0.25, 2.5, 2.75, size=81_000),
+        timing=_timing(0.25, 2.5, 2.75, size=81_000, connected=0.5),
     )
     tail = VendorResponse(
         200,
@@ -185,6 +195,10 @@ def test_every_request_writes_one_line_that_joins_to_its_rows(lake_root):
 
     result = _run(vendor, clock, lake_root)
 
+    # The file sits where runway, compaction and the scrub were each checked to expect it.
+    assert LakePaths(lake_root).timing_path(SESSION) == (
+        lake_root / "journal" / "timing" / "date=2026-08-24.jsonl"
+    )
     lines = _lines(lake_root)
     assert [(line["surface"], line["window_start"], line["window_end"]) for line in lines] == [
         (CHAINS, NEAR[0], NEAR[1]),
@@ -201,7 +215,8 @@ def test_every_request_writes_one_line_that_joins_to_its_rows(lake_root):
     assert first["request_sent_ts"] == _iso(0.25)
     assert first["request_headers_ts"] == _iso(2.5)
     assert first["request_body_ts"] == _iso(2.75)
-    assert first["request_connected_ts"] is None
+    assert first["request_connected_ts"] == _iso(0.5)
+    assert second["request_connected_ts"] is None
     assert (first["request_bytes"], second["request_bytes"], batch["request_bytes"]) == (
         81_000,
         52_000,
@@ -434,8 +449,11 @@ def test_an_incomplete_record_says_so_once_per_cycle(lake_root, capsys):
     _run(vendor, clock, lake_root)
 
     err = capsys.readouterr().err
-    assert err.count("capture: request timing incomplete for") == 1
-    assert "RuntimeError: hook broke" in err
+    # One line for the whole cycle, naming the reason once however many records share it.
+    assert err.splitlines() == [
+        f"capture: request timing incomplete for the {_SNAP.isoformat()} cycle: "
+        "RuntimeError: hook broke"
+    ]
     # The lines still land, carrying what was recorded and naming what was not, so a null
     # stamp that failed reads differently from one nobody observed.
     lines = _chain_lines(lake_root)
@@ -497,3 +515,140 @@ def test_a_failed_quote_batch_still_writes_its_line(
         subcode,
     )
     assert (batch["request_start_ts"], batch["request_end_ts"]) == (_iso(2), _iso(6))
+
+
+def test_each_failed_window_records_the_class_capture_gave_it(lake_root):
+    # A body the merge cannot read is given up as drift, and a too-big window past the
+    # depth bound as the size class. Each line carries the class its own branch recorded.
+    clock = ManualClock(start=_CLOCK_START)
+    drifted = _chain_body(["2026-08-28"])
+    drifted["callExpDateMap"]["2026-08-28:7"]["655.0"] = "XY"
+    vendor = _TimedVendor(
+        clock,
+        windows={
+            NEAR: (1.0, VendorResponse(200, drifted)),
+            TAIL: (1.0, VendorResponse(502, {"errorcode": "protocol.http.TooBigBody"})),
+        },
+        quotes=(0.5, VendorResponse(200, _QUOTE_BODY)),
+    )
+
+    _run(vendor, clock, lake_root, guards=GuardConstants(chain_chunk_max_split_depth=0))
+
+    assert [(line["status"], line["error_class"]) for line in _chain_lines(lake_root)] == [
+        (200, capture.CHAIN_SCHEMA_DRIFT),
+        (502, capture.CHAIN_CHUNK_FAILED),
+    ]
+
+
+def test_the_lines_are_written_only_after_the_minute_is_durable(lake_root, monkeypatch):
+    # At the moment the append runs, every segment is manifested and the cycle's metadata
+    # stamp is on disk, so a slow or failed append can never sit in front of either.
+    seen: list[tuple[bool, bool]] = []
+    real = capture.append_requests
+
+    def spy(root, **kwargs):
+        manifested = latest_entries(root)
+        segments = [p.relative_to(root).as_posix() for p in (root / "journal").rglob("*.arrows")]
+        seen.append(
+            (
+                bool(segments) and all(seg in manifested for seg in segments),
+                (root / "journal" / "metadata.json").exists(),
+            )
+        )
+        return real(root, **kwargs)
+
+    monkeypatch.setattr(capture, "append_requests", spy)
+    clock = ManualClock(start=_CLOCK_START)
+    vendor = _TimedVendor(
+        clock,
+        windows={
+            NEAR: (1.0, VendorResponse(200, _chain_body(["2026-08-28"]))),
+            TAIL: (1.0, VendorResponse(200, _chain_body(["2026-09-18"]))),
+        },
+        quotes=(0.5, VendorResponse(200, _QUOTE_BODY)),
+    )
+
+    _run(vendor, clock, lake_root)
+
+    assert seen and all(entry == (True, True) for entry in seen)
+
+
+def test_a_reply_the_rejection_parser_cannot_read_costs_only_its_copy(lake_root, capsys):
+    # A fake reply with no headers mapping makes the parser fail. The cycle lands, the line
+    # names the failure, and stderr says so once.
+    clock = ManualClock(start=_CLOCK_START)
+    vendor = _TimedVendor(
+        clock,
+        windows={
+            NEAR: (1.0, VendorResponse(200, _chain_body(["2026-08-28"]))),
+            TAIL: (1.0, VendorResponse(503, {}, headers=None)),
+        },
+        quotes=(0.5, VendorResponse(200, _QUOTE_BODY)),
+    )
+
+    result = _run(vendor, clock, lake_root)
+
+    assert not result.errors
+    tail = _chain_lines(lake_root)[1]
+    assert (tail["error_class"], tail["request_error_detail"]) == ("http_503", None)
+    assert tail["request_failure"].startswith("AttributeError")
+    assert capsys.readouterr().err.count("capture: request timing incomplete for") == 1
+
+
+class _Refusing:
+    """A stderr that refuses every write, the way a full disk refuses a launchd log."""
+
+    def write(self, text: str) -> int:
+        raise OSError(28, "No space left on device")
+
+    def flush(self) -> None:
+        raise OSError(28, "No space left on device")
+
+
+def test_nothing_in_the_timing_path_can_raise_out_of_a_cycle(lake_root, monkeypatch):
+    # The append raises something that is not an ``OSError``, the failure count raises,
+    # and stderr refuses the report. The cycle still returns with every segment landed.
+    import sys
+
+    def broken_append(*args, **kwargs):
+        raise RuntimeError("append broke")
+
+    def broken_failures(records):
+        raise RuntimeError("count broke")
+
+    monkeypatch.setattr(capture, "append_requests", broken_append)
+    monkeypatch.setattr(capture, "failures", broken_failures)
+    clock = ManualClock(start=_CLOCK_START)
+    vendor = _TimedVendor(
+        clock,
+        windows={
+            NEAR: (1.0, VendorResponse(200, _chain_body(["2026-08-28"]))),
+            TAIL: (1.0, VendorResponse(200, _chain_body(["2026-09-18"]))),
+        },
+        quotes=(0.5, VendorResponse(200, _QUOTE_BODY)),
+    )
+    monkeypatch.setattr(sys, "stderr", _Refusing())
+
+    result = _run(vendor, clock, lake_root)
+
+    assert {(s.surface, s.ticker) for s in result.segments} == {(CHAINS, "SPY"), (QUOTES, "SPY")}
+    assert not result.errors
+
+
+def test_the_body_is_searched_before_the_headers(lake_root):
+    clock = ManualClock(start=_CLOCK_START)
+    vendor = _TimedVendor(
+        clock,
+        windows={
+            NEAR: (1.0, VendorResponse(200, _chain_body(["2026-08-28"]))),
+            TAIL: (
+                1.0,
+                VendorResponse(429, {"detail": "429-005"}, headers={"x-code": "429-001"}),
+            ),
+        },
+        quotes=(0.5, VendorResponse(200, _QUOTE_BODY)),
+    )
+
+    _run(vendor, clock, lake_root)
+
+    assert _chain_lines(lake_root)[1]["request_subcode"] == "429-005"

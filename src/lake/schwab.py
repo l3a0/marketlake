@@ -246,11 +246,16 @@ def attach_timing(client: object, clock: Clock) -> bool:
         return trace
 
     def on_request(request: object) -> None:
+        # The record and its trace go on first and the stamp last, each on its own, so a
+        # clock that fails costs ``sent`` alone and the trace still stamps the rest.
         record = _TimingRecord()
         try:
             request.extensions[_TIMING_EXTENSION] = record
-            record.sent = clock.now()
             request.extensions["trace"] = tracer(record)
+        except Exception as exc:  # noqa: BLE001 - timing must never cost a response
+            record.fail(exc)
+        try:
+            record.sent = clock.now()
         except Exception as exc:  # noqa: BLE001 - timing must never cost a response
             record.fail(exc)
 

@@ -171,11 +171,12 @@ def test_onboarding_an_existing_ticker_before_the_seed_run_has_happened_refuses(
 def test_onboarding_writes_one_timing_line_per_window_it_fetched(lake_root, tmp_path):
     # Onboarding's first snapshot is a real cycle through ``fetch_chain``, so its requests
     # reach the timing file under the minute the snapshot landed at, like a loop cycle's.
+    # The clock starts 45 seconds into the minute, so the slot has to be floored to it.
     import json
 
     onboard(
         "SPY",
-        clock=ManualClock(start=_MID_SESSION),
+        clock=ManualClock(start=_MID_SESSION + timedelta(seconds=45)),
         vendor=_chain_vendor(is_delayed=False),
         lake_root=lake_root,
         tickers_path=tmp_path / "tickers.yaml",
@@ -1336,10 +1337,12 @@ def test_the_wrapper_loads_the_plan_and_passes_the_config_s_guards(
         windowed_chain_cassette("SPY", _MID_SESSION_DAY, _chain_body(is_delayed=False), plan=tuned)
     )
     seen: list[GuardConstants] = []
+    clocks: list = []
 
     class _Stub:
         @staticmethod
         def from_token(token_path, *, api_key, app_secret, clock=None):
+            clocks.append(clock)
             return vendor
 
     real_fetch_chain = lake.onboard.capture.fetch_chain
@@ -1353,9 +1356,10 @@ def test_the_wrapper_loads_the_plan_and_passes_the_config_s_guards(
     monkeypatch.setattr(lake.onboard.capture, "fetch_chain", _record)
 
     config = write_config(tmp_path, lake_root, guards={"chain_chunk_max_split_depth": 0})
+    clock = ManualClock(start=_MID_SESSION)
     report = lake.onboard.onboard_from_config(
         "SPY",
-        clock=ManualClock(start=_MID_SESSION),
+        clock=clock,
         config_path=str(config),
         tickers_path=tmp_path / "tickers.yaml",
         token_path=tmp_path / "token.json",
@@ -1368,6 +1372,10 @@ def test_the_wrapper_loads_the_plan_and_passes_the_config_s_guards(
 
     # The config's own recalibrated guard reached it too, rather than the pinned default.
     assert [g.chain_chunk_max_split_depth for g in seen] == [0]
+
+    # The vendor was built with the run's own clock, which is what turns request timing on.
+    assert len(clocks) == 1
+    assert clocks[0] is clock
 
 
 def _stub_the_vendor(monkeypatch, vendor) -> None:

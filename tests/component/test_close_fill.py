@@ -903,19 +903,22 @@ def test_the_fill_honours_a_recalibrated_guard_constant(tmp_path, monkeypatch):
     lake_root.mkdir()
     config = write_config(tmp_path, lake_root, guards={"chain_chunk_max_split_depth": 0})
     vendor = _WindowVendor(windows={NEAR: TOO_BIG, TAIL: _chain([TAIL_EXP])})
+    clocks: list = []
 
     class _Stub:
         @staticmethod
         def from_token(token_path, *, api_key, app_secret, clock=None):
+            clocks.append(clock)
             return vendor
 
     monkeypatch.setattr(capture, "SchwabVendor", _Stub)
     monkeypatch.setattr(capture, "load_chain_plan", lambda: TWO_WINDOWS)
+    clock = ManualClock(start=FILL_MINUTE)
 
     capture.fill_option_close_from_config(
         "SPY",
         slot=CLOSE,
-        clock=ManualClock(start=FILL_MINUTE),
+        clock=clock,
         config_path=str(config),
         token_path=str(tmp_path / "token.json"),
         pid=7,
@@ -924,6 +927,9 @@ def test_the_fill_honours_a_recalibrated_guard_constant(tmp_path, monkeypatch):
     # Depth 0 gives the near window up where it stands. The built-in default of 4 would
     # halve it and ask for ranges this vendor has never heard of.
     assert vendor.calls == [("SPY", *NEAR), ("SPY", *TAIL)]
+    # The vendor was built with the fill's own clock, which is what turns request timing on.
+    assert len(clocks) == 1
+    assert clocks[0] is clock
 
 
 def test_the_fill_builds_its_vendor_from_the_token_and_config_it_was_given(tmp_path, monkeypatch):
