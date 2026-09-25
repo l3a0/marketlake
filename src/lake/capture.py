@@ -73,6 +73,7 @@ from lake.config import GuardConstants, load_config
 from lake.lock import lake_lock
 from lake.manifest import record_partition
 from lake.metadata import stamp_cycle
+from lake.reference_read import read_or_none
 from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor
 from lake.security_master import ID_TYPE_TICKER, SecurityMaster, SecurityMasterError, master_path
 from lake.session import OPTION_CLOSE
@@ -1185,15 +1186,28 @@ def _live_roster(roster: Roster, lake_root: Path | str, now: datetime) -> Roster
     never stop capture, the same rule every other reader of these two files follows. A
     ticker the master cannot resolve is kept for the same reason: losing the clamp only
     ever widens what gets captured.
+
+    Absent and unreadable widen alike, and only the absent one is quiet. A reference file
+    that is there and cannot be read prints one line through ``reference_read``, stamped
+    with ``now``, when it first fails and when it next reads (marketlake #536). This runs
+    every cycle, so a line per call would be about 400 a session for one standing denial.
     """
     enabled = roster.enabled
-    try:
-        master = SecurityMaster.read(master_path(lake_root))
-    except (OSError, SecurityMasterError, ValueError):
+    master = read_or_none(
+        master_path(lake_root),
+        SecurityMaster.read,
+        (OSError, SecurityMasterError, ValueError),
+        now=lambda: now,
+    )
+    if master is None:
         return Roster(enabled)
-    try:
-        spans = CaptureSpans.read(spans_path(lake_root))
-    except (OSError, CaptureSpansError, ValueError):
+    spans = read_or_none(
+        spans_path(lake_root),
+        CaptureSpans.read,
+        (OSError, CaptureSpansError, ValueError),
+        now=lambda: now,
+    )
+    if spans is None:
         return Roster(enabled)
     on = now.astimezone(MARKET_TZ).date()
     kept = []

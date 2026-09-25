@@ -715,11 +715,12 @@ def test_the_spans_are_read_when_the_guard_runs_not_at_daemon_start(tmp_path):
     spans.open_span(xyz, et(2026, 8, 31, 9, 30), False)
     spans.write(spans_path(lake_root))
 
+    wall = ManualClock(start=et(2026, 9, 2, 18, 0))
     guard = close_guard.CloseGuard(
         lake_root=lake_root,
-        spans=daemon._spans_reader(lake_root),
+        spans=daemon._spans_reader(lake_root, wall),
         session_clock=_clock(et(2026, 9, 2, 18, 0)),
-        master=daemon._master_reader(lake_root),
+        master=daemon._master_reader(lake_root, wall),
     )
 
     # LATE is onboarded at 17:00, after the guard was built, with a span past the closes.

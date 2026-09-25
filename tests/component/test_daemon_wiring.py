@@ -65,6 +65,7 @@ Fourteen bindings are covered here.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.error
 from collections.abc import Callable, Mapping, Sequence
@@ -2149,6 +2150,31 @@ def test_an_unreadable_ledger_pages_under_its_own_event(tmp_path):
 
     (page,) = _version_pages(rig)
     assert page.event == schema_versions.UNREADABLE_EVENT
+    assert rig.pinger.urls == [CAPTURE_URL] * 4
+
+
+def test_a_ledger_the_daemon_may_not_open_pages_nobody_and_says_so_on_stderr(tmp_path, capsys):
+    """Marketlake #536, through the production entry.
+
+    On 2026-09-19 this check was the daemon's first read of the lake after a reboot, a few
+    seconds before the owner's login session existed. It came back ``EPERM``, it paged, and
+    every later read of the same file worked. A refused open prints its detail and pages
+    nobody, and capture goes on.
+    """
+    rig = _rig(tmp_path)
+    target = ledger_path(rig.lake_root)
+    clock = ManualClock(start=et(2026, 9, 2, 8, 29, 30))
+
+    os.chmod(target, 0o000)
+    try:
+        _run(rig, clock, ticks=4, cycle_runner=_no_cycle)
+    finally:
+        os.chmod(target, 0o644)
+
+    assert _version_pages(rig) == []
+    assert f"schema_version: {target} could not be opened: PermissionError" in (
+        capsys.readouterr().err
+    )
     assert rig.pinger.urls == [CAPTURE_URL] * 4
 
 
