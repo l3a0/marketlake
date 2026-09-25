@@ -295,7 +295,8 @@ def test_a_too_big_window_splits_at_its_date_midpoint(lake_root, cap):
     assert all(r["row_kind"] == journal.ROW_KIND_DATA for r in rows)
     assert result.segment(CHAINS, "SPY").error_class is None
     # The split is visible in the request trace: the full window, then its two date halves
-    # (midpoint at offset 5), then the open tail.
+    # (midpoint at offset 5), then the open tail. That sequence holds at a cap of 1. Above
+    # it the tail's request runs beside the split, so only the set of ranges is asserted.
     _assert_calls(
         vendor,
         cap,

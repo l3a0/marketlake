@@ -456,15 +456,16 @@ def test_the_journaled_snapshot_carries_the_clock_not_the_epoch(lake_root, tmp_p
     # shape rather than against a datetime, which would compare unequal whatever was
     # written and prove nothing.
     ran_at = _MID_SESSION.isoformat()
-    # The windows are fired concurrently, 50 ms apart on the manual clock, so the fetch ends
-    # once the last window has been submitted. That is still the clock's day, not the epoch's.
-    ended_at = (_MID_SESSION + timedelta(milliseconds=50) * (len(_WINDOWS) - 1)).isoformat()
+    # The windows are fired concurrently, 50 ms apart on the manual clock, and each stamps its
+    # own finish on its pool thread. So the fetch ends within the submissions, which is still
+    # the clock's day, not the epoch's.
+    latest = (_MID_SESSION + timedelta(milliseconds=50) * (len(_WINDOWS) - 1)).isoformat()
     rows = journal.read_segment(lake_root / report.snapshot_segment).to_pylist()
     assert rows
     for row in rows:
         assert row["snap_ts"] == ran_at
         assert row["fetch_ts"] == ran_at
-        assert row["fetch_end_ts"] == ended_at
+        assert ran_at <= row["fetch_end_ts"] <= latest
 
 
 def test_the_equity_only_snapshot_carries_the_clock_too(lake_root, tmp_path):

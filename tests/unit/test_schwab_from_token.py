@@ -57,13 +57,15 @@ class _RecordingFactory:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, str, bool]] = []
+        self.clients: list[FakeSchwabClient] = []
 
     def __call__(
         self, token_path: str, api_key: str, app_secret: str, *, enforce_enums: bool = True
     ) -> FakeSchwabClient:
         contents = json.loads(Path(token_path).read_text())
         self.calls.append((token_path, api_key, app_secret, enforce_enums))
-        return FakeSchwabClient(creation_timestamp=contents["creation_timestamp"])
+        self.clients.append(FakeSchwabClient(creation_timestamp=contents["creation_timestamp"]))
+        return self.clients[-1]
 
 
 def _install_seam(monkeypatch: pytest.MonkeyPatch, factory: _RecordingFactory) -> None:
@@ -133,3 +135,26 @@ def test_from_token_reads_the_file_on_every_call_not_once(tmp_path, monkeypatch)
     assert len(factory.calls) == 2
     # Fact two: the second client is built from the rewritten contents.
     assert second.token_mint_time() == datetime.fromtimestamp(MINT_AFTER, tz=UTC)
+
+
+def test_from_token_locks_the_session_token_refresh(tmp_path, monkeypatch):
+    """The capture cycle shares the client across threads, so the refresh must be locked.
+
+    ``tests/unit/test_token_refresh_lock.py`` covers the lock against a real authlib client.
+    This covers that ``from_token`` installs it, which nothing else in the suite would
+    notice being dropped. The installed check ignores the token it is called with and asks
+    about the session's live one, which is what makes a thread that waited on the lock see a
+    refresh another thread already made.
+    """
+    token = tmp_path / "token.json"
+    _write_token(token, MINT_BEFORE)
+    factory = _RecordingFactory()
+    _install_seam(monkeypatch, factory)
+
+    SchwabVendor.from_token(token, api_key="api-key", app_secret="app-secret")
+
+    session = factory.clients[-1].session
+    stale = {"access_token": "stale"}
+    session.ensure_active_token(stale)
+    assert session.checked == [session.token]
+    assert session.checked[0] is not stale

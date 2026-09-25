@@ -280,7 +280,7 @@ def test_the_capture_concurrency_defaults_are_pinned_and_overridable():
 
     The cap is advertised as the lever an operator lowers mid-session, so both the default and
     an override are asserted, and the accepted boundary of each: a cap of 1, which is the
-    sequential cycle, and a stagger of 0.
+    sequential fetch, a stagger of 0, and a stagger of 1000, the widest accepted.
     """
     assert GuardConstants().capture_max_concurrency == 20
     assert GuardConstants().capture_stagger_ms == 50
@@ -288,6 +288,8 @@ def test_the_capture_concurrency_defaults_are_pinned_and_overridable():
     assert type(GuardConstants().capture_stagger_ms) is int
     lowered = GuardConstants.from_mapping({"capture_max_concurrency": 1, "capture_stagger_ms": 0})
     assert (lowered.capture_max_concurrency, lowered.capture_stagger_ms) == (1, 0)
+    widest = GuardConstants.from_mapping({"capture_stagger_ms": 1000})
+    assert widest.capture_stagger_ms == 1000
 
 
 @pytest.mark.parametrize(
@@ -316,13 +318,20 @@ def test_a_cap_that_is_not_a_whole_number_of_at_least_one_is_refused(raw: str):
     "raw",
     [
         "capture_stagger_ms: -1",
+        "capture_stagger_ms: 1001",
+        "capture_stagger_ms: 4000",
         "capture_stagger_ms: yes",
         "capture_stagger_ms: 0.5",
         "capture_stagger_ms: '50'",
         "capture_stagger_ms:",
     ],
 )
-def test_a_stagger_that_is_not_a_whole_number_of_at_least_zero_is_refused(raw: str):
-    """A negative pause raises from the clock's sleep inside the cycle, so it is refused here."""
+def test_a_stagger_outside_zero_to_a_second_is_refused(raw: str):
+    """A negative pause raises from the clock's sleep inside the cycle, so it is refused here.
+
+    So is one past a second. The whole pause comes out of the minute once per request, 18
+    times at 19 tasks, and at about 3.3 seconds the submission alone outruns the minute. That
+    skips every other slot and pages nothing, because the cycles between still land data.
+    """
     with pytest.raises(ConfigError, match="capture_stagger_ms"):
         GuardConstants.from_mapping(yaml.safe_load(raw))

@@ -236,11 +236,15 @@ def serialize_token_refresh(session: object) -> None:
     waited on the lock still holds the expired token object it was called with, and a lock
     that forwarded the argument refreshed eight times out of eight in the same probe.
 
-    It reaches into the session by attribute, so an authlib upgrade that renames
-    ``ensure_active_token`` raises ``AttributeError`` here, from ``from_token``, rather than
-    running capture with the refresh unguarded. ``tests/unit/test_token_refresh_lock.py``
-    drives a real ``OAuth2Client`` through ``httpx.MockTransport``, so that upgrade fails in
-    continuous integration before it reaches the daemon.
+    It reaches into the session by attribute, so a library upgrade that moves it raises
+    ``AttributeError`` from ``from_token`` rather than running capture with the refresh
+    unguarded. Two tests cover what can be covered offline.
+    ``tests/unit/test_token_refresh_lock.py`` drives a real authlib ``OAuth2Client`` through
+    ``httpx.MockTransport``, so an authlib upgrade that renames ``ensure_active_token`` fails
+    there. ``tests/unit/test_schwab_from_token.py`` checks that ``from_token`` installs the
+    lock. Neither can see a ``schwab-py`` upgrade that renames the client's ``session``, since
+    no test builds a real ``schwab-py`` client. That upgrade raises from every ``from_token``
+    caller, the capture daemon included, which exits and is relaunched into the same error.
     """
     ensure_active_token = session.ensure_active_token
     lock = threading.Lock()

@@ -240,8 +240,9 @@ def test_the_quote_goes_first_then_windows_round_robin_across_tickers(lake_root)
     # unit's fetch_ts says where in the submission order its first request went:
     #   quote +0, SPY window 1 +50, QQQ window 1 +100, SPY window 2 +150, ... QQQ window 3 +300.
     # Submitting one ticker's windows before the next ticker's would put QQQ's first window
-    # at +200. Submitting the quote last would put it at +300. Every unit is stamped finished
-    # once the last submission is over.
+    # at +200. Submitting the quote last would put it at +300. Each unit's finish is its own
+    # tasks' latest, read on the pool threads while submission is still moving the clock, so
+    # it falls between the unit's first submission and the last one.
     result = _run(_ThreadedVendor(), lake_root)
 
     quote = _rows(result, QUOTES, "SPY")[0]
@@ -252,7 +253,7 @@ def test_the_quote_goes_first_then_windows_round_robin_across_tickers(lake_root)
     assert qqq["fetch_ts"] == (_CLOCK_START + 2 * _STAGGER).isoformat()
     last_submission = (_CLOCK_START + 6 * _STAGGER).isoformat()
     for row in (quote, spy, qqq):
-        assert row["fetch_end_ts"] == last_submission
+        assert row["fetch_ts"] <= row["fetch_end_ts"] <= last_submission
 
 
 def test_a_stagger_of_zero_submits_without_moving_the_clock(lake_root):
@@ -262,6 +263,81 @@ def test_a_stagger_of_zero_submits_without_moving_the_clock(lake_root):
         row = _rows(result, surface, ticker)[0]
         assert row["fetch_ts"] == _CLOCK_START.isoformat()
         assert row["fetch_end_ts"] == _CLOCK_START.isoformat()
+
+
+class _TaskClock:
+    """A manual clock that answers each pool thread with the finish its own call recorded.
+
+    The vendor below calls ``finish_at`` at the end of every request, on the pool thread that
+    made it, and ``now`` on that thread then answers that instant. Everywhere else it is the
+    manual clock. So each task's finish stamp is a known value, whatever order the threads ran
+    in, and a test can say exactly which instant each unit's ``fetch_end_ts`` must be.
+    """
+
+    def __init__(self, start: datetime) -> None:
+        self._inner = ManualClock(start=start)
+        self._local = threading.local()
+
+    def now(self) -> datetime:
+        return getattr(self._local, "at", None) or self._inner.now()
+
+    def monotonic(self) -> float:
+        return self._inner.monotonic()
+
+    def sleep(self, seconds: float) -> None:
+        self._inner.sleep(seconds)
+
+    def finish_at(self, when: datetime) -> None:
+        self._local.at = when
+
+
+class _StampingVendor(_ThreadedVendor):
+    """A vendor whose every request records its own finish on the task clock."""
+
+    def __init__(self, clock: _TaskClock, finishes: dict[object, timedelta]) -> None:
+        super().__init__()
+        self._clock = clock
+        self._finishes = finishes
+
+    def get_chain(self, symbol, *, from_date=None, to_date=None, strike_count=None):
+        reply = super().get_chain(symbol, from_date=from_date, to_date=to_date)
+        self._clock.finish_at(_CLOCK_START + self._finishes[(symbol, from_date)])
+        return reply
+
+    def get_quotes(self, symbols):
+        reply = super().get_quotes(symbols)
+        self._clock.finish_at(_CLOCK_START + self._finishes["quotes"])
+        return reply
+
+
+def test_each_unit_is_stamped_finished_when_its_own_last_request_landed(lake_root):
+    # The quote request finished 58 ms in, long before submission ended, and its round trip is
+    # that alone. Each chain finished when its slowest window did. SPY's slowest is its first
+    # window, not its last, so a stamp taken from the last task, or from the earliest, or from
+    # the end of submission, reads a different instant.
+    clock = _TaskClock(_CLOCK_START)
+    ms = timedelta(milliseconds=1)
+    vendor = _StampingVendor(
+        clock,
+        {
+            "quotes": 58 * ms,
+            ("SPY", _d(0)): 900 * ms,
+            ("SPY", _d(10)): 300 * ms,
+            ("SPY", _d(31)): 400 * ms,
+            ("QQQ", _d(0)): 200 * ms,
+            ("QQQ", _d(10)): 250 * ms,
+            ("QQQ", _d(31)): 700 * ms,
+        },
+    )
+    result = _run(vendor, lake_root, clock=clock, guards=GuardConstants(capture_stagger_ms=0))
+
+    def ended(surface: str, ticker: str) -> str:
+        return _rows(result, surface, ticker)[0]["fetch_end_ts"]
+
+    assert ended(QUOTES, "SPY") == (_CLOCK_START + 58 * ms).isoformat()
+    assert ended(QUOTES, "QQQ") == (_CLOCK_START + 58 * ms).isoformat()
+    assert ended(CHAINS, "SPY") == (_CLOCK_START + 900 * ms).isoformat()
+    assert ended(CHAINS, "QQQ") == (_CLOCK_START + 700 * ms).isoformat()
 
 
 # -- 4. plan-order merge -----------------------------------------------------------------
@@ -329,17 +405,36 @@ def test_the_representative_class_is_the_first_failed_window_in_plan_order(lake_
 # -- 5. failures -------------------------------------------------------------------------
 
 
+class BodyUnreadableError(Exception):
+    """A failure no fetcher guard names, raised from past the vendor call."""
+
+
+class _UnreadableBody:
+    """A 200 reply whose body raises when read, which ``_is_too_big`` does first.
+
+    The fetcher guards the vendor call and the merge, and this raise comes from neither, so
+    it is the case where only the pool's own catch stands between one window and the cycle.
+    """
+
+    status = 200
+    headers: dict[str, str] = {}
+
+    @property
+    def body(self):
+        raise BodyUnreadableError("the body could not be read")
+
+
 def test_a_window_task_that_raises_costs_only_its_own_window(lake_root):
-    # A body that is not a mapping raises inside the window's task, past the vendor call the
-    # fetcher already guards. The pool hands the raise back, and the window is recorded as
-    # failing under the exception's class while the other two land.
-    vendor = _ThreadedVendor(answer={("SPY", _d(10)): VendorResponse(status=200, body=[])})
+    # The pool hands the raise back, and the window is recorded as failing under the
+    # exception's class while the other two land. At a cap of 1 the same raise leaves the
+    # cycle, as it always did, which the pull request for #532 names.
+    vendor = _ThreadedVendor(answer={("SPY", _d(10)): _UnreadableBody()})
     fetched = _fetch_spy(vendor, lake_root)
 
     assert fetched.body is not None
-    assert fetched.error_class == "attribute_error"
+    assert fetched.error_class == "body_unreadable_error"
     assert [(m.window_start, m.error_class) for m in fetched.absent_markers] == [
-        (_d(10).isoformat(), "attribute_error")
+        (_d(10).isoformat(), "body_unreadable_error")
     ]
     assert list(fetched.body["callExpDateMap"]) == [
         f"{_d(0).isoformat()}:7",

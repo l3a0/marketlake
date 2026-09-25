@@ -150,14 +150,14 @@ def test_happy_cycle_writes_chains_and_quotes_with_correct_stamps(cassette_vendo
     assert [r["volume"] for r in spy_chain] == [5555, 4444]
     # The default cap fires the cycle's three requests through one pool, 50 ms apart on the
     # injected clock: the quote request at the start, SPY's one window one stagger later,
-    # QQQ's one after that. A chain's fetch_ts is when its first window was submitted, and
-    # every request is stamped finished once the last submission is over, since the manual
-    # clock does not move while the fakes answer. So the round trip is still stamped, not
-    # null, and it spans the submissions still to come after this ticker's.
+    # QQQ's one after that. A chain's fetch_ts is when its first window was submitted. Its
+    # fetch_end_ts is when its own task finished, read on the pool thread, which lands
+    # somewhere in the submissions still under way, since only the stagger moves the manual
+    # clock. So the round trip is stamped, not null, and it falls inside that span.
     for row in spy_chain:
         assert row["snap_ts"] == _EXPECTED_SNAP.isoformat()
         assert row["fetch_ts"] == (_CLOCK_START + _STAGGER).isoformat()
-        assert row["fetch_end_ts"] == (_CLOCK_START + 2 * _STAGGER).isoformat()
+        assert row["fetch_ts"] <= row["fetch_end_ts"] <= (_CLOCK_START + 2 * _STAGGER).isoformat()
         assert row["vendor_quote_ts"] == _CHAIN_VQT
         assert row["close_tag"] is None
         assert row["suspect"] is False
@@ -175,7 +175,8 @@ def test_happy_cycle_writes_chains_and_quotes_with_correct_stamps(cassette_vendo
     assert spy_quote["realtime"] is True
     assert spy_quote["snap_ts"] == _EXPECTED_SNAP.isoformat()
     assert spy_quote["fetch_ts"] == _CLOCK_START.isoformat()
-    assert spy_quote["fetch_end_ts"] == (_CLOCK_START + 2 * _STAGGER).isoformat()
+    assert _CLOCK_START.isoformat() <= spy_quote["fetch_end_ts"]
+    assert spy_quote["fetch_end_ts"] <= (_CLOCK_START + 2 * _STAGGER).isoformat()
     assert spy_quote["vendor_quote_ts"] == _QUOTE_VQT
     # The full quote block lands in its typed columns. quoteTime is still consumed into
     # vendor_quote_ts, not a column.

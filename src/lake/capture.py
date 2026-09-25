@@ -59,9 +59,8 @@ from __future__ import annotations
 import os
 import re
 import sys
-from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -783,17 +782,19 @@ def _fetch_concurrently(
        the pool's queue, and submitting one ticker's windows ahead of the next ticker's
        would put the second ticker's whole chain behind the first's. Interleaving also
        starts every ticker's near-term windows, the densest, first.
-    3. **Only this thread touches the clock's progress.** Submissions are
-       ``guards.capture_stagger_ms`` apart, slept on the injected clock here, so a volley
-       leaves over about a second rather than in one instant, clear of Schwab's burst
-       rejection (429-005). This thread stamps each unit's ``fetch_ts`` just before its first
-       submission, and its ``fetch_end_ts`` when it sees the unit's last task finish. Pool
-       threads make vendor calls and parse the responses, and nothing else.
+    3. **Only this thread advances the clock.** Submissions are ``guards.capture_stagger_ms``
+       apart, slept on the injected clock here, so a volley leaves over about a second rather
+       than in one instant, clear of Schwab's burst rejection (429-005). This thread stamps
+       each unit's ``fetch_ts`` just before its first submission. Pool threads make vendor
+       calls and parse the responses, and read the clock once more to stamp when their own
+       task finished. A unit's ``fetch_end_ts`` is the latest of its tasks' finish stamps, so
+       it is when the unit's last response landed, whatever else was still being submitted.
+       Reading the clock from a pool thread is safe, since ``now`` changes nothing, and no
+       pool thread ever sleeps on it or advances it.
 
-    The completion stamps are taken once submission is over, so a unit that finished while
-    later units were still being submitted is stamped when submission ends, at most
-    ``(tasks - 1) × stagger`` late, about a second at 19 tasks. The stamps then do not
-    depend on thread timing, which a test driving a manual clock needs.
+    Below the cap some tasks wait in the pool's queue, so a unit's ``fetch_ts`` is when its
+    first request was submitted, which can precede when it was sent. At the default cap of 20
+    today's 19 tasks never queue.
 
     A task never raises into the cycle. A window task that raised is recorded as that
     window failing, under its exception's class, the way ``_fetch_window`` records a raised
@@ -804,21 +805,21 @@ def _fetch_concurrently(
     if tasks == 0:
         return _Fetched({}, None)
     stagger = guards.capture_stagger_ms / 1000
-    units: dict[Future, object] = {}
     started: dict[object, datetime] = {}
     chain_futures: dict[str, list[Future]] = {ticker: [] for ticker in tickers}
     quote_future: Future | None = None
+    submitted: list[Future] = []
     with ThreadPoolExecutor(
         max_workers=min(guards.capture_max_concurrency, tasks),
         thread_name_prefix="capture-fetch",
     ) as pool:
 
         def submit(unit: object, fn: Callable[..., object], *args: object) -> Future:
-            if units and stagger:
+            if submitted and stagger:
                 clock.sleep(stagger)
             started.setdefault(unit, clock.now())
-            future = pool.submit(fn, *args)
-            units[future] = unit
+            future = pool.submit(_timed, clock, fn, *args)
+            submitted.append(future)
             return future
 
         if symbols:
@@ -828,63 +829,60 @@ def _fetch_concurrently(
                 chain_futures[ticker].append(
                     submit(ticker, _run_window, vendor, guards, ticker, from_date, to_date)
                 )
-        finished = _await_units(clock, units)
+        wait(submitted)
 
-    chains = {
-        ticker: (
-            [_window_outcome(f, w) for f, w in zip(chain_futures[ticker], windows, strict=True)],
+    chains = {}
+    for ticker in tickers:
+        results = [_task_result(future) for future in chain_futures[ticker]]
+        chains[ticker] = (
+            [_window_outcome(r, w) for r, w in zip(results, windows, strict=True)],
             started[ticker],
-            finished[ticker],
+            max(r.finished_at for r in results),
         )
-        for ticker in tickers
-    }
     quotes = None
     if quote_future is not None:
-        error = _task_error(quote_future)
-        quotes = _QuoteFetch(
-            None if error is not None else quote_future.result(),
-            error,
-            started[_QUOTES_UNIT],
-            finished[_QUOTES_UNIT],
-        )
+        result = _task_result(quote_future)
+        quotes = _QuoteFetch(result.value, result.error, started[_QUOTES_UNIT], result.finished_at)
     return _Fetched(chains, quotes)
 
 
-def _await_units(clock: Clock, units: Mapping[Future, object]) -> dict[object, datetime]:
-    """Wait for every task, and stamp each unit the moment its last task is seen to finish."""
-    remaining = Counter(units.values())
-    finished: dict[object, datetime] = {}
-    pending = set(units)
-    while pending:
-        done, pending = wait(pending, return_when=FIRST_COMPLETED)
-        now = clock.now()
-        for future in done:
-            unit = units[future]
-            remaining[unit] -= 1
-            if remaining[unit] == 0:
-                finished[unit] = now
-    return finished
+@dataclass(frozen=True)
+class _TaskResult:
+    """What one pool task returned or raised, and when it finished by the injected clock."""
+
+    value: object
+    error: Exception | None
+    finished_at: datetime
 
 
-def _task_error(future: Future) -> Exception | None:
-    """The exception a finished task raised, or ``None``.
+def _timed(clock: Clock, fn: Callable[..., object], *args: object) -> _TaskResult:
+    """Run one task on a pool thread and stamp when it finished, raise or return.
 
-    An ``Exception`` is returned for the caller to record. Anything else, an interrupt or a
-    ``SystemExit``, is re-raised, the way it would have left a sequential fetch.
+    An ``Exception`` is caught and returned, so its finish is stamped too. Anything else, an
+    interrupt or a ``SystemExit``, is left to propagate, the way it would have left a
+    sequential fetch.
     """
+    try:
+        value, error = fn(*args), None
+    except Exception as exc:
+        value, error = None, exc
+    return _TaskResult(value, error, clock.now())
+
+
+def _task_result(future: Future) -> _TaskResult:
+    """A finished task's result, re-raising what ``_timed`` let propagate."""
     error = future.exception()
-    if error is None or isinstance(error, Exception):
-        return error
-    raise error
+    if error is not None:
+        raise error
+    return future.result()
 
 
-def _window_outcome(future: Future, window: tuple[date, date | None]) -> _WindowOutcome:
-    """A finished window task's outcome, or that window failing under its exception's class."""
-    error = _task_error(future)
-    if error is None:
-        return future.result()
+def _window_outcome(result: _TaskResult, window: tuple[date, date | None]) -> _WindowOutcome:
+    """A window task's outcome, or that window failing under its exception's class."""
+    if result.error is None:
+        return result.value
     from_date, to_date = window
-    return _WindowOutcome({}, {}, ((from_date, to_date, _error_class(error)),), None)
+    return _WindowOutcome({}, {}, ((from_date, to_date, _error_class(result.error)),), None)
 
 
 def _fetch_window(

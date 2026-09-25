@@ -36,6 +36,7 @@ Two boundaries are worth naming, because the design's claim is wider than this f
 from __future__ import annotations
 
 import json
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -408,7 +409,10 @@ def test_a_recalibrated_split_depth_takes_effect_on_the_next_cycle(tmp_path, mon
     # splits it at its date midpoint and refetches both halves. Those two half-ranges are
     # a set no cycle reading the first bound could produce. The open tail is refused the
     # same way under both bounds, because it can never be split.
-    assert vendor.windows == [WHOLE, TAIL, WHOLE, FIRST_HALF, SECOND_HALF, TAIL]
+    # Each cycle fires its windows concurrently (#532), so within a cycle the ranges reach the
+    # vendor in any order. A split's two halves still run in turn inside their window's task.
+    assert Counter(vendor.windows[:2]) == Counter([WHOLE, TAIL])
+    assert Counter(vendor.windows[2:]) == Counter([WHOLE, FIRST_HALF, SECOND_HALF, TAIL])
 
 
 # -- 5. capture never records outside a capture span ----------------------------------
