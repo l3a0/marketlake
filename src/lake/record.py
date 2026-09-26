@@ -93,6 +93,11 @@ BAR_FLAG_NAME = "extended_hours"
 BAR_FLAG_VALUES = {"true": True, "false": False}
 
 
+# How much of an unrecordable body the recorder's refusal quotes. Enough to recognise a
+# gateway's error page or a sub-code, and short enough to read as one line of a traceback.
+_REFUSED_BODY_CHARS = 200
+
+
 def _interaction(endpoint: str, params: dict, response: VendorResponse) -> Interaction:
     """Shape one verbatim ``VendorResponse`` into a recorded ``Interaction``.
 
@@ -103,7 +108,20 @@ def _interaction(endpoint: str, params: dict, response: VendorResponse) -> Inter
     timezone normalization a second spelling would get wrong. The body and headers are
     copied into plain dicts so the recording does not alias live state. Nothing in the
     body is inspected.
+
+    A failed reply whose body was not a JSON object is refused rather than recorded. The
+    vendor hands it back with an empty ``body`` and the text in ``body_text``, and a
+    cassette body is a JSON object with nowhere to put the text. Recording the empty body
+    would silently drop the vendor's own words, and a sample of Schwab's error bodies is
+    exactly what no cassette holds yet. So the refusal quotes the start of the text, which
+    puts it in front of whoever ran the recorder.
     """
+    if response.body_text is not None:
+        raise ValueError(
+            f"{endpoint} {params} answered http {response.status} with a body that is not a "
+            f"JSON object, which a cassette cannot hold. It began: "
+            f"{response.body_text[:_REFUSED_BODY_CHARS]!r}"
+        )
     return Interaction(
         endpoint=endpoint,
         params=params,

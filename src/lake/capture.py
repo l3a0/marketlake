@@ -282,13 +282,19 @@ def _rejection(response: VendorResponse) -> tuple[str | None, str | None, str | 
     1. ``subcode`` is the first ``429-`` and three digits found in the body or a header
        value, looked for on a 429 alone, so a 400 echoing a parameter cannot yield one.
     2. ``detail`` is JSON holding the reply's headers, less ``Set-Cookie``, and its body
-       re-serialized and cut to ``ERROR_DETAIL_MAX_BYTES``. It keeps the first real
-       rejection's shape, so the pattern above can be narrowed against a real sample.
+       cut to ``ERROR_DETAIL_MAX_BYTES``. It keeps the first real rejection's shape, so the
+       pattern above can be narrowed against a real sample.
     3. ``failure`` names what went wrong building the other two, which are then ``None``.
+
+    The body searched and copied is the vendor's own text when the reply carries one.
+    A rejection whose body is not a JSON object, a gateway's HTML page or an empty body,
+    arrives with an empty ``body`` and its text in ``body_text`` (marketlake #539), so
+    re-serializing ``body`` would search and keep ``{}``. A JSON object body has no text
+    kept beside it and is re-serialized instead.
 
     A 2xx reply answers three ``None``. This reads the ``VendorResponse`` the vendor
     already returned, the same way ``_is_too_big`` reads a 502's fault body, because the
-    vendor seam promises never to inspect a body itself.
+    vendor seam promises never to read a field of a body itself.
     """
     try:
         if _ok(response.status):
@@ -298,7 +304,10 @@ def _rejection(response: VendorResponse) -> tuple[str | None, str | None, str | 
             for name, value in response.headers.items()
             if str(name).lower() != _DROPPED_HEADER
         }
-        body_text = json.dumps(response.body, sort_keys=True, default=str)
+        if response.body_text is not None:
+            body_text = response.body_text
+        else:
+            body_text = json.dumps(response.body, sort_keys=True, default=str)
         kept = body_text.encode("utf-8")[:ERROR_DETAIL_MAX_BYTES].decode("utf-8", "ignore")
         detail = json.dumps({"body": kept, "headers": headers}, sort_keys=True)
         subcode = None

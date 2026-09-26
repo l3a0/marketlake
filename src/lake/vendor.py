@@ -9,7 +9,10 @@ A cassette is a saved vendor response replayed offline. Its format lives in
 a later deliverable (D5). The cassette-backed fake lives under ``tests/support``.
 
 The interface is deliberately narrow. It returns the vendor's payload verbatim.
-Nothing here parses, validates, or reshapes it. Raw stays vendor-verbatim, always.
+Nothing here reads a field of it, validates it, or reshapes it. Raw stays
+vendor-verbatim, always. The one reply that is not handed back as parsed is a failed
+one whose body is not a JSON object, and even that keeps the vendor's words:
+``VendorResponse`` carries them in ``body_text`` beside an empty ``body``.
 The fetch time is stamped by the caller from the injected clock, never by the
 vendor, so it is not part of a response.
 
@@ -86,10 +89,21 @@ class RequestTiming:
 class VendorResponse:
     """One vendor reply, verbatim.
 
-    ``body`` is the parsed JSON payload exactly as the vendor sent it. ``status`` is
-    the HTTP status code. ``headers`` are the response headers. Timestamps that
-    belong to the capture cycle, like the fetch time, are the caller's to stamp from
-    the injected clock. They are not here.
+    ``status`` is the HTTP status code. ``headers`` are the response headers. ``body`` is
+    the parsed JSON object exactly as the vendor sent it, with one exception. A failed
+    reply, one whose status is not 2xx, can carry a body that is not a JSON object at
+    all: an HTML error page from a gateway, an empty body, or JSON that parses to a list,
+    ``null`` or a bare string. Its status is still the signal, so the reply is still
+    returned. ``body`` is then an empty mapping and ``body_text`` carries the reply's
+    text verbatim, so nothing the vendor said is dropped.
+
+    ``body_text`` is set exactly when ``body`` is that empty-mapping stand-in, which is
+    what lets a reader tell a vendor that sent ``{}`` from one that sent something that
+    is not an object. A 2xx reply never takes this path. Its body is the payload, and one
+    that is not an object is refused where the reply is shaped, in ``lake.schwab``.
+
+    Timestamps that belong to the capture cycle, like the fetch time, are the caller's to
+    stamp from the injected clock. They are not here.
 
     ``timing`` is the exception. It holds the transport's own view of the request, the
     instants only the transport can see, and it is ``None`` when the vendor recorded none.
@@ -99,6 +113,7 @@ class VendorResponse:
     status: int
     body: Mapping[str, object]
     headers: Mapping[str, str] = field(default_factory=dict)
+    body_text: str | None = None
     timing: RequestTiming | None = None
 
 
@@ -255,7 +270,8 @@ class Vendor(Protocol):
 
         A candle carries ``open``, ``high``, ``low``, ``close``, ``volume`` and a
         ``datetime`` that is Schwab's epoch-millisecond stamp. Nothing here reads it. The
-        body comes back exactly as the vendor sent it.
+        body comes back exactly as the vendor sent it, under the one exception
+        ``VendorResponse`` describes for a failed reply whose body is not a JSON object.
         """
         ...
 

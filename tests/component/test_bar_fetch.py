@@ -56,7 +56,7 @@ from lake.cassette import Cassette, load_cassette
 from lake.manifest import manifest_path, read_manifest
 from lake.paths import LakePaths, temp_write_path
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
-from lake.schwab import VendorAuthError
+from lake.schwab import SchwabVendor, VendorAuthError
 from lake.security_master import KIND_EQUITY, SecurityMaster, master_path
 from lake.tickers import Roster
 from lake.vendor import DAILY_FREQ, MINUTE_FREQ, VendorError, bars_params
@@ -65,6 +65,7 @@ from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import write_config
 from tests.support.lake import FixtureLake
+from tests.support.schwab import FakeResponse, FakeSchwabClient
 from tests.support.vendor import CassetteVendor, bars_candle, bars_interactions
 
 # The session the sweep fetches, and the one after it whose sealed quotes carry the settled
@@ -803,6 +804,78 @@ def test_an_ordinary_vendor_failure_is_contained_to_its_ticker(fixture_lake: Fix
     assert [call["symbol"] for call in vendor.calls] == ["SPY", "QQQ"]
     assert [landed.ticker for landed in result.landed] == ["QQQ"]
     assert len(result.held) == 1 and result.held[0].finding.symbol == "SPY"
+
+
+class _SpyThroughSchwab(_RecordingVendor):
+    """SPY's daily request goes through the real ``SchwabVendor`` over one canned reply, and
+    every other ticker replays the cassette.
+
+    That puts the reply shaping in ``schwab._response_from`` under test from the bars walk,
+    which is where a body that is not a JSON object used to escape the per-ticker containment
+    as a bare ``JSONDecodeError`` and end the run.
+    """
+
+    def __init__(self, cassette: Cassette, reply: FakeResponse) -> None:
+        super().__init__(cassette)
+        self._spy = SchwabVendor(FakeSchwabClient(bars={("SPY", DAILY_FREQ): reply}))
+
+    def get_daily_bars(self, symbol, *, start, end, extended_hours=None, previous_close=None):
+        if symbol != "SPY":
+            return super().get_daily_bars(
+                symbol, start=start, end=end, extended_hours=extended_hours
+            )
+        self._record(symbol, DAILY_FREQ, start, end, extended_hours)
+        return self._spy.get_daily_bars(symbol, start=start, end=end)
+
+
+_GATEWAY_PAGE = b"<html><body><h1>Service Unavailable</h1></body></html>"
+
+
+def _two_ticker_lake(fixture_lake: FixtureLake) -> Path:
+    return _lake(
+        fixture_lake,
+        quotes={
+            ("SPY", FOLLOWING): [_quote_row(FOLLOWING)],
+            ("QQQ", FOLLOWING): [_quote_row(FOLLOWING, ticker="QQQ")],
+        },
+        master=_master(("SPY", "QQQ")),
+    )
+
+
+def test_a_successful_reply_that_is_not_json_is_contained_to_its_ticker(
+    fixture_lake: FixtureLake,
+):
+    """marketlake #539. A 200 answered with an HTML page is refused as ``VendorBodyError``,
+    which is a ``VendorError``, so the walk files it and goes on to QQQ. The finding's text
+    comes from the exception's message, and the page itself stays out of the lake."""
+    root = _two_ticker_lake(fixture_lake)
+    reply = FakeResponse(200, headers={"content-type": "text/html"}, content=_GATEWAY_PAGE)
+    vendor = _SpyThroughSchwab(_cassette(tickers=("SPY", "QQQ")), reply)
+
+    result = _run(root, vendor, roster=_roster({"SPY": ["1d"], "QQQ": ["1d"]}))
+
+    assert [landed.ticker for landed in result.landed] == ["QQQ"]
+    (held,) = result.held
+    assert held.finding.symbol == "SPY"
+    assert held.finding.check == CHECK_BAR_RESPONSE
+    assert (held.finding.exception or "").startswith("VendorBodyError: http 200")
+    assert "Service Unavailable" not in json.dumps(_findings(root))
+
+
+def test_a_failed_reply_that_is_not_json_is_refused_by_its_status(fixture_lake: FixtureLake):
+    """marketlake #539. A 503 answered with an HTML page keeps its status through the seam,
+    so the walk refuses it by name and goes on to QQQ rather than ending the run."""
+    root = _two_ticker_lake(fixture_lake)
+    reply = FakeResponse(503, headers={"content-type": "text/html"}, content=_GATEWAY_PAGE)
+    vendor = _SpyThroughSchwab(_cassette(tickers=("SPY", "QQQ")), reply)
+
+    result = _run(root, vendor, roster=_roster({"SPY": ["1d"], "QQQ": ["1d"]}))
+
+    assert [landed.ticker for landed in result.landed] == ["QQQ"]
+    (held,) = result.held
+    assert held.finding.symbol == "SPY"
+    assert held.finding.check == CHECK_BAR_RESPONSE
+    assert "http_503" in (held.finding.exception or "")
 
 
 # -- 12. a frequency the seam cannot fetch ----------------------------------------------

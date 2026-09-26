@@ -203,11 +203,11 @@ def _batch_of(
     it cannot, and the probe reports that problem the same way it reports a vendor it
     could not reach.
 
-    The vendor answers with a ``VendorResponse`` of ``status``, ``body`` and ``headers``,
-    and the reader wants the quotes inside it. Every other caller unwraps before reading.
-    ``record.py``, ``capture.py`` and ``onboard.py`` read ``response.body``, and the
-    Sunday canary reads ``reply.status``. The probe read neither, so the reader was handed
-    the whole reply and asked it for symbols. That raised, which costs the answer and the
+    The vendor answers with a ``VendorResponse`` of ``status``, ``body``, ``headers`` and
+    ``body_text``, and the reader wants the quotes inside it. Every other caller unwraps
+    before reading. ``record.py``, ``capture.py`` and ``onboard.py`` read ``response.body``,
+    and the Sunday canary reads ``reply.status``. The probe read neither, so the reader was
+    handed the whole reply and asked it for symbols. That raised, which costs the answer and the
     healthchecks ping together.
 
     Six shapes stop here rather than reaching the reader. Each gets its own line, because
