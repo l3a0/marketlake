@@ -12,7 +12,7 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 
 from lake.capture import _error_class
-from lake.schwab import QUOTE_FIELD_GROUPS, SchwabVendor, VendorAuthError
+from lake.schwab import QUOTE_FIELD_GROUPS, SchwabVendor, VendorAuthError, VendorBodyError
 from lake.vendor import Vendor, VendorError, VendorResponse
 from tests.support.schwab import FakeResponse, FakeSchwabClient
 
@@ -341,3 +341,206 @@ def test_attach_timing_leaves_a_session_with_no_hooks_untouched():
     client = _client()
     assert attach_timing(client, ManualClock(start=datetime(2026, 8, 24, tzinfo=UTC))) is False
     assert not hasattr(client.session, "event_hooks")
+
+
+# -- a body that is not a JSON object ----------------------------------------------------
+#
+# Every body below is a literal, so none of these tests can move with a constant in the code
+# under test. The statuses are literals for the same reason: the watchdog pages on the exact
+# strings ``http_401``, ``http_403`` and ``http_429``, and a status recomputed from the code's
+# own success range would agree with the code whatever that range became.
+
+_HTML = b"<html><head><title>429 Too Many Requests</title></head><body>slow down</body></html>"
+
+# Bodies that are not a JSON object, each with the text ``httpx`` would decode it to. The last
+# two are not valid UTF-8, and they fail the parse in different ways. ``json.loads`` reads a
+# leading ``\xff\xfe`` as a UTF-16 byte-order mark and raises ``JSONDecodeError``. A Latin-1
+# page with no mark raises ``UnicodeDecodeError`` instead, which is why the catch is
+# ``ValueError`` rather than ``JSONDecodeError``. The whitespace body checks that the text is
+# kept verbatim rather than tidied.
+_NOT_AN_OBJECT = [
+    pytest.param(_HTML, _HTML.decode(), id="html"),
+    pytest.param(b"", "", id="empty"),
+    pytest.param(b"  busy\n", "  busy\n", id="whitespace"),
+    pytest.param(b"[]", "[]", id="json-list"),
+    pytest.param(b"null", "null", id="json-null"),
+    pytest.param(b'"slow down"', '"slow down"', id="json-string"),
+    pytest.param(b"\xff\xfe<html>", "��<html>", id="bom-then-html"),
+    pytest.param(b"<p>caf\xe9</p>", "<p>caf�</p>", id="latin-1"),
+]
+
+
+def _vendor_answering(reply: FakeResponse) -> SchwabVendor:
+    """A vendor whose every request, on all four endpoints, gets ``reply``."""
+    return SchwabVendor(
+        FakeSchwabClient(
+            chains={"SPY": reply},
+            quotes={("SPY",): reply},
+            bars={("SPY", "1m"): reply, ("SPY", "1d"): reply},
+        )
+    )
+
+
+_OPEN = datetime(2026, 9, 14, 13, 30, tzinfo=UTC)
+_CLOSE = datetime(2026, 9, 14, 20, 0, tzinfo=UTC)
+
+# The four vendor methods. Each shapes its own reply through ``_response_from``, and a method
+# that shaped its reply any other way would bring the old failure back on that endpoint alone,
+# so the rules below are asserted on every one of them rather than on the chain.
+_FETCHES = [
+    pytest.param(lambda vendor: vendor.get_chain("SPY"), id="chain"),
+    pytest.param(lambda vendor: vendor.get_quotes(["SPY"]), id="quotes"),
+    pytest.param(
+        lambda vendor: vendor.get_minute_bars("SPY", start=_OPEN, end=_CLOSE), id="minute-bars"
+    ),
+    pytest.param(
+        lambda vendor: vendor.get_daily_bars("SPY", start=_OPEN, end=_CLOSE), id="daily-bars"
+    ),
+]
+
+
+@pytest.mark.parametrize("fetch", _FETCHES)
+@pytest.mark.parametrize("status", [401, 403, 429, 502])
+@pytest.mark.parametrize(("content", "text"), _NOT_AN_OBJECT)
+def test_a_failed_reply_keeps_its_status_whatever_its_body_is(fetch, status, content, text):
+    """The status is the signal, so a body that is not an object must not cost it.
+
+    The watchdog pages "rate limited" on ``http_429`` and "token dead" on ``http_401``. A
+    gateway's HTML page used to raise out of the parse before the status was read, and a
+    body parsing to a list raised in capture instead, which took the whole cycle down.
+    """
+    reply = FakeResponse(status, headers={"content-type": "text/html"}, content=content)
+    response = fetch(_vendor_answering(reply))
+    assert response.status == status
+    assert response.body == {}
+    assert response.body_text == text
+    assert response.headers == {"content-type": "text/html"}
+
+
+def test_a_failed_reply_with_an_object_body_is_handed_back_unchanged():
+    """The other side of the fallback: an error body that is an object is the payload."""
+    reply = FakeResponse(429, content=b'{"errors": [{"id": "429-005"}]}')
+    response = _vendor_answering(reply).get_chain("SPY")
+    assert response.status == 429
+    assert response.body == {"errors": [{"id": "429-005"}]}
+    assert response.body_text is None
+
+
+def test_a_failed_reply_whose_object_body_is_empty_is_told_apart_from_the_fallback():
+    """``body_text`` is what separates a vendor that sent ``{}`` from one that sent HTML."""
+    sent_empty = _vendor_answering(FakeResponse(429, content=b"{}")).get_chain("SPY")
+    sent_html = _vendor_answering(FakeResponse(429, content=_HTML)).get_chain("SPY")
+    assert sent_empty.body == sent_html.body == {}
+    assert sent_empty.body_text is None
+    assert sent_html.body_text == _HTML.decode()
+
+
+def test_a_successful_object_body_is_handed_back_with_no_text():
+    response = _vendor_answering(FakeResponse(200, content=b'{"symbol": "SPY"}')).get_chain("SPY")
+    assert response.status == 200
+    assert response.body == {"symbol": "SPY"}
+    assert response.body_text is None
+
+
+@pytest.mark.parametrize("fetch", _FETCHES)
+@pytest.mark.parametrize("status", [200, 203, 299])
+@pytest.mark.parametrize(("content", "text"), _NOT_AN_OBJECT)
+def test_a_successful_reply_whose_body_is_not_an_object_is_refused(fetch, status, content, text):
+    """A 2xx body is the payload, so an empty mapping would read as an empty success.
+
+    Schwab already answers 200 with empty expiration maps on purpose, and the close+5 fill
+    treats that as a close nobody captured. A malformed payload must not look the same.
+    """
+    with pytest.raises(VendorBodyError) as refused:
+        fetch(_vendor_answering(FakeResponse(status, content=content)))
+    assert f"http {status} " in str(refused.value)
+
+
+@pytest.mark.parametrize("status", [199, 300, 302])
+def test_the_success_range_ends_where_http_says(status):
+    """Either side of the 2xx range, a body that is not an object is a failed reply."""
+    response = _vendor_answering(FakeResponse(status, content=_HTML)).get_chain("SPY")
+    assert response.status == status
+    assert response.body_text == _HTML.decode()
+
+
+def test_the_refusal_is_a_vendor_error_named_by_the_lake():
+    """The bars walk contains ``VendorError`` per ticker-day and nothing broader, and capture
+    records the class by name."""
+    assert issubclass(VendorBodyError, VendorError)
+    assert _error_class(VendorBodyError("x")) == "vendor_body_error"
+
+
+def test_the_refusal_says_why_and_never_quotes_the_body():
+    """The bars walk writes the message into a finding in the lake, so the body stays out."""
+    reply = FakeResponse(200, headers={"content-type": "text/html"}, content=_HTML)
+    with pytest.raises(VendorBodyError) as not_json:
+        _vendor_answering(reply).get_chain("SPY")
+    message = str(not_json.value)
+    assert "http 200" in message
+    # The parse error's own line says where the body stopped being JSON. It is ``json``'s
+    # text rather than the body's, so it is the one detail the message can carry.
+    assert "not JSON (Expecting value: line 1 column 1 (char 0))" in message
+    assert "'text/html'" in message
+    assert f"{len(_HTML)} characters" in message
+    assert "slow down" not in message
+    assert "<html>" not in message
+    assert isinstance(not_json.value.__cause__, ValueError)
+
+    with pytest.raises(VendorBodyError) as a_list:
+        _vendor_answering(FakeResponse(200, content=b'["SPY"]')).get_chain("SPY")
+    assert "parses to list" in str(a_list.value)
+    assert "SPY" not in str(a_list.value)
+    assert a_list.value.__cause__ is None
+
+
+def test_a_parse_failure_that_is_not_about_the_body_passes_through():
+    """Only ``ValueError`` means the body is not JSON. Anything else is not caught here."""
+
+    class _Broken(FakeResponse):
+        def json(self):
+            raise RuntimeError("the client broke")
+
+    with pytest.raises(RuntimeError, match="the client broke"):
+        _vendor_answering(_Broken(429)).get_chain("SPY")
+
+
+def test_the_fake_parses_and_decodes_the_way_httpx_does():
+    """Every test above trusts ``FakeResponse``'s ``content`` form. This checks it against
+    the real ``httpx.Response`` over the same literal bytes."""
+    httpx = pytest.importorskip("httpx")
+    for content in (
+        _HTML,
+        b"",
+        b"  busy\n",
+        b"[]",
+        b"null",
+        b'"slow down"',
+        b"\xff\xfe<html>",
+        b"<p>caf\xe9</p>",
+        b"{}",
+    ):
+        real = httpx.Response(429, content=content)
+        fake = FakeResponse(429, content=content)
+        assert real.text == fake.text
+        try:
+            expected = real.json()
+        except ValueError as real_error:
+            # The exact class, not only ``ValueError``. A Latin-1 page raises
+            # ``UnicodeDecodeError`` and the rest ``JSONDecodeError``, and a fake that turned one
+            # into the other would hide a catch narrowed to ``JSONDecodeError``.
+            with pytest.raises(ValueError) as fake_error:
+                fake.json()
+            assert type(fake_error.value) is type(real_error)
+        else:
+            assert fake.json() == expected
+
+
+def test_the_real_httpx_reply_satisfies_the_protocol_end_to_end():
+    """The vendor over a real ``httpx.Response`` keeps a 429's status on an HTML body."""
+    httpx = pytest.importorskip("httpx")
+    reply = httpx.Response(429, content=_HTML, headers={"content-type": "text/html"})
+    response = _vendor_answering(reply).get_chain("SPY")
+    assert response.status == 429
+    assert response.body == {}
+    assert response.body_text == _HTML.decode()

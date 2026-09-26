@@ -314,6 +314,58 @@ def test_a_429_sub_code_is_found_where_it_sits(lake_root, body, headers, expecte
     assert {name.lower() for name in detail["headers"]} == set(headers)
 
 
+@pytest.mark.parametrize(
+    ("page", "expected"),
+    [
+        ("<html><body>Rate limit 429-005, slow down</body></html>", "429-005"),
+        ("<html><body>Too Many Requests</body></html>", None),
+        ("", None),
+    ],
+)
+def test_a_429_whose_body_is_not_json_is_searched_and_kept_as_its_own_text(
+    lake_root, page, expected
+):
+    """marketlake #539. The vendor hands a rejection whose body is not a JSON object back with
+    an empty ``body`` and the page in ``body_text``. Re-serializing ``body`` would search and
+    keep ``"{}"``, so the page itself is what is searched and copied."""
+    clock = ManualClock(start=_CLOCK_START)
+    rejected = VendorResponse(429, {}, headers={"content-type": "text/html"}, body_text=page)
+    vendor = _TimedVendor(
+        clock,
+        windows={
+            NEAR: (1.0, VendorResponse(200, _chain_body(["2026-08-28"]))),
+            TAIL: (1.0, rejected),
+        },
+        quotes=(0.5, VendorResponse(200, _QUOTE_BODY)),
+    )
+
+    _run(vendor, clock, lake_root)
+
+    tail = _chain_lines(lake_root)[1]
+    assert (tail["status"], tail["error_class"]) == (429, "http_429")
+    assert tail["request_subcode"] == expected
+    assert json.loads(tail["request_error_detail"])["body"] == page
+
+
+def test_a_rejection_that_sent_an_empty_object_is_kept_as_that_object(lake_root):
+    """The other side: a vendor that sent ``{}`` has no text beside it, so the copy is the
+    object re-serialized, exactly as for any other JSON body."""
+    clock = ManualClock(start=_CLOCK_START)
+    vendor = _TimedVendor(
+        clock,
+        windows={
+            NEAR: (1.0, VendorResponse(200, _chain_body(["2026-08-28"]))),
+            TAIL: (1.0, VendorResponse(429, {})),
+        },
+        quotes=(0.5, VendorResponse(200, _QUOTE_BODY)),
+    )
+
+    _run(vendor, clock, lake_root)
+
+    tail = _chain_lines(lake_root)[1]
+    assert json.loads(tail["request_error_detail"])["body"] == "{}"
+
+
 def test_a_sub_code_is_read_only_off_a_429(lake_root):
     # A 400 that echoes the pattern back is not a rate limit, and a 200 has nothing to say.
     clock = ManualClock(start=_CLOCK_START)
