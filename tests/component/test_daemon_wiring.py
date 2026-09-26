@@ -65,6 +65,7 @@ Fourteen bindings are covered here.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.error
 from collections import Counter
@@ -2071,11 +2072,12 @@ def test_the_startup_page_goes_out_once_however_long_the_daemon_lives(tmp_path):
     assert len(_version_pages(rig)) == 1
 
 
-def test_a_daemon_started_on_a_recorded_version_says_nothing(tmp_path):
+def test_a_daemon_started_on_a_recorded_version_says_nothing(tmp_path, capsys):
     """The steady state, and the case that decides whether this page is noise.
 
     ``_rig`` records the running version because a production lake has it recorded, so every
-    other case in this file drives this branch too.
+    other case in this file drives this branch too. Nothing reaches stderr either, which is
+    the half a check that returned on ``pages`` alone would break: ``RECORDED`` has no page.
     """
     rig = _rig(tmp_path)
     clock = ManualClock(start=et(2026, 9, 2, 8, 29, 30))
@@ -2083,6 +2085,22 @@ def test_a_daemon_started_on_a_recorded_version_says_nothing(tmp_path):
     _run(rig, clock, ticks=4, cycle_runner=_no_cycle)
 
     assert _version_pages(rig) == []
+    assert "schema_version:" not in capsys.readouterr().err
+
+
+def test_a_reference_line_carries_the_instant_of_the_clock_the_daemon_was_given(tmp_path, capsys):
+    """Marketlake #536. The line's instant is what separates a five-second refusal from a
+    five-day one, so it has to be the daemon's own clock rather than one a builder made."""
+    rig = _rig(tmp_path)
+    master_path(rig.lake_root).write_bytes(b"not parquet at all")
+    start = et(2026, 9, 2, 8, 29, 30)
+
+    _run(rig, ManualClock(start=start), ticks=2, cycle_runner=_no_cycle)
+
+    assert (
+        f"reference: {master_path(rig.lake_root)} could not be read at {start.isoformat()}"
+        in capsys.readouterr().err
+    )
 
 
 def test_a_version_recorded_under_a_different_shape_pages_under_its_own_event(tmp_path):
@@ -2151,6 +2169,33 @@ def test_an_unreadable_ledger_pages_under_its_own_event(tmp_path):
 
     (page,) = _version_pages(rig)
     assert page.event == schema_versions.UNREADABLE_EVENT
+    assert rig.pinger.urls == [CAPTURE_URL] * 4
+
+
+def test_a_ledger_the_daemon_may_not_open_pages_nobody_and_says_so_on_stderr(tmp_path, capsys):
+    """Marketlake #536, through the production entry.
+
+    On 2026-09-19 this check was the daemon's first read of the lake after a reboot, a few
+    seconds before the owner's login session existed. It came back ``EPERM``, it paged, and
+    every later read of the same file worked. A refused open prints its detail and pages
+    nobody, and capture goes on.
+    """
+    rig = _rig(tmp_path)
+    target = ledger_path(rig.lake_root)
+    clock = ManualClock(start=et(2026, 9, 2, 8, 29, 30))
+
+    os.chmod(target, 0o000)
+    try:
+        _run(rig, clock, ticks=4, cycle_runner=_no_cycle)
+    finally:
+        os.chmod(target, 0o644)
+
+    # Every page the run sent, not ``_version_pages``, which filters by the three paged events
+    # and so could never see a page sent for a verdict that has none.
+    assert rig.transport.sent == []
+    assert f"schema_version: {target} could not be opened: PermissionError" in (
+        capsys.readouterr().err
+    )
     assert rig.pinger.urls == [CAPTURE_URL] * 4
 
 

@@ -806,8 +806,11 @@ def sweep(
     # The condition does not depend on the session and the report file is written on every
     # run, holiday no-op included.
     #
-    # **One of the three verdicts cannot survive a session evening, and that is marketlake
-    # #494 rather than this call's doing.** ``_LEDGER_REFUSALS`` below does not name
+    # **One of the four verdicts cannot survive a session evening, and that is marketlake
+    # #494 rather than this call's doing.** The fourth, a ledger this process was refused
+    # permission to open, does survive: ``PermissionError`` is an ``OSError``, which
+    # ``_LEDGER_REFUSALS`` names, so the walks refuse and this line still reaches the report
+    # (marketlake #536). ``_LEDGER_REFUSALS`` below does not name
     # ``SchemaVersionsError``, so a ledger this code cannot read raises out of
     # ``extract_dividends`` and out of this function, taking the report file, the digest and
     # the ping with it. The line is computed and lost with them. A holiday survives, because

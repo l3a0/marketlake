@@ -114,10 +114,12 @@ class GuardOutcome:
 
     ``sources_missing`` names which of the spans and the master did not answer, which is
     one reason a roster comes back empty. Which of absent and unreadable it was goes
-    unsaid, because the readers answer ``None`` for both. Two other routes reach an empty
-    roster. A lake whose tickers have all been retired answers from both files and owes
-    nobody a close, and a span the master cannot name that day is recorded in ``problems``
-    by ``_covering``.
+    unsaid here, because the readers answer ``None`` for both. The daemon's readers say it
+    on stderr instead: an unreadable file prints a line through ``reference_read`` when it
+    first fails and when it next reads, and an absent one prints nothing (marketlake #536).
+    Two other routes reach an empty roster. A lake whose tickers have all been retired
+    answers from both files and owes nobody a close, and a span the master cannot name that
+    day is recorded in ``problems`` by ``_covering``.
     """
 
     day: date

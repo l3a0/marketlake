@@ -646,7 +646,7 @@ def test_the_master_is_read_when_a_pass_runs_not_held_from_daemon_start(tmp_path
         lake_root=tmp_path,
         roster=lambda: Roster((EQUITY_ONLY, TickerConfig(ticker="NEW", options=False))),
         session_clock=SessionClock(clock=clock, calendar=weekday_sessions(WEEK)),
-        master=daemon._master_reader(tmp_path),
+        master=daemon._master_reader(tmp_path, clock),
         pid=4,
     )
 
@@ -682,7 +682,7 @@ def test_a_corrupt_master_leaves_the_daemon_reader_unclamped_rather_than_crashin
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"not parquet at all")
 
-    assert daemon._master_reader(tmp_path)() is None
+    assert daemon._master_reader(tmp_path, ManualClock(start=et(2026, 9, 2, 10, 10)))() is None
 
 
 # -- the production wiring -----------------------------------------------------------

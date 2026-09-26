@@ -120,6 +120,7 @@ from lake.deadman import CAPTURE_SLUG, DeadMan
 from lake.gap import GapMarker, MarkingReport, surfaces_for
 from lake.journal import CHAINS_SURFACE, ROW_KIND_DATA
 from lake.metadata import stamp_assertion_pid, stamp_cycle, stamp_ping
+from lake.reference_read import read_or_none
 from lake.report import write_close_guard
 from lake.runner import Pinger, UrllibPinger
 from lake.schema_drift import SchemaDriftObserver
@@ -300,7 +301,7 @@ def _report(report: MarkingReport, pass_name: str) -> None:
     print(" ".join(parts), file=sys.stderr)
 
 
-def _master_reader(lake_root: Path | str) -> Callable[[], SecurityMaster | None]:
+def _master_reader(lake_root: Path | str, clock: Clock) -> Callable[[], SecurityMaster | None]:
     """A reader that returns the security master as it stands, or ``None``.
 
     The master answers when a ticker came into scope, and onboarding writes it while the
@@ -319,19 +320,25 @@ def _master_reader(lake_root: Path | str) -> Callable[[], SecurityMaster | None]
 
     Read per pass rather than per ticker. The callers each read once and hand the result
     down, so one pass judges every ticker against one master.
+
+    Absent and unreadable get the same answer and not the same silence. A master that is
+    there and cannot be read prints one line through ``reference_read``, with ``clock``'s
+    instant, when it first fails and when it next reads (marketlake #536).
     """
     path = master_path(lake_root)
 
     def read() -> SecurityMaster | None:
-        try:
-            return SecurityMaster.read(path)
-        except (OSError, SecurityMasterError, ValueError):
-            return None
+        return read_or_none(
+            path,
+            SecurityMaster.read,
+            (OSError, SecurityMasterError, ValueError),
+            now=clock.now,
+        )
 
     return read
 
 
-def _spans_reader(lake_root: Path | str) -> Callable[[], CaptureSpans | None]:
+def _spans_reader(lake_root: Path | str, clock: Clock) -> Callable[[], CaptureSpans | None]:
     """A reader that returns the capture spans as they stand, or ``None``.
 
     The spans file says which instruments were in scope at a given minute, and onboarding
@@ -340,15 +347,18 @@ def _spans_reader(lake_root: Path | str) -> Callable[[], CaptureSpans | None]:
 
     ``None`` means the file is absent or unreadable. The guard treats that as no ticker in
     scope, so a missing file writes no false marker. The reader never raises, because it
-    runs from hooks ``run_loop`` does not guard.
+    runs from hooks ``run_loop`` does not guard. An unreadable file prints its line the way
+    :func:`_master_reader`'s does.
     """
     path = spans_path(lake_root)
 
     def read() -> CaptureSpans | None:
-        try:
-            return CaptureSpans.read(path)
-        except (OSError, CaptureSpansError, ValueError):
-            return None
+        return read_or_none(
+            path,
+            CaptureSpans.read,
+            (OSError, CaptureSpansError, ValueError),
+            now=clock.now,
+        )
 
     return read
 
@@ -357,6 +367,7 @@ def _gap_marker(
     config_path: str | Path | None,
     tickers_path: str | Path | None,
     session_clock: SessionClock,
+    clock: Clock,
 ) -> GapMarker | None:
     """The gap marker for this daemon, or ``None`` when it cannot be built.
 
@@ -386,8 +397,8 @@ def _gap_marker(
         lake_root=config.lake_root,
         roster=lambda: load_tickers(tickers_path),
         session_clock=session_clock,
-        master=_master_reader(config.lake_root),
-        spans=_spans_reader(config.lake_root),
+        master=_master_reader(config.lake_root, clock),
+        spans=_spans_reader(config.lake_root, clock),
     )
 
 
@@ -581,9 +592,9 @@ def _close_guard(
         return None
     return CloseGuard(
         lake_root=config.lake_root,
-        spans=_spans_reader(config.lake_root),
+        spans=_spans_reader(config.lake_root, clock),
         session_clock=session_clock,
-        master=_master_reader(config.lake_root),
+        master=_master_reader(config.lake_root, clock),
         fill=_close_fill(
             config_path,
             token_path,
@@ -890,6 +901,13 @@ def _report_schema_version(
     The recurring reminder is the vendor sweep's report line, not a second page from here. A
     page a night until someone runs a command is its own outage.
 
+    A ledger this process was refused permission to open prints its detail and pages nobody.
+    That is the one verdict the "cannot change inside one" above does not cover. On
+    2026-09-19 this check was the daemon's first read of the lake after a reboot, a few
+    seconds before the owner's login session existed, and it came back ``EPERM`` for a file
+    every later read opened (marketlake #536). ``schema_versions._inaccessible_check`` gives
+    why a refusal that lasts pages anyway, through the ``compaction`` check.
+
     A config that will not load returns quietly. Through ``run_loop_from_config`` that shape
     is never reached, because ``_alarm`` reads the same file and refuses first.
     """
@@ -899,6 +917,9 @@ def _report_schema_version(
         return
     check = check_running_version(lake_root)
     if check.ok:
+        return
+    if not check.pages:
+        print(f"schema_version: {check.detail}", file=sys.stderr)
         return
     # Published before anything is printed, which is ``_page_sunday_daemon_finding``'s
     # bargain. A publisher that answered ``REFUSED`` found one of its own secrets in the body
@@ -1051,7 +1072,7 @@ def run_loop_from_config(
 
         hooks = replace(hooks, on_tick=on_tick_stamped)
 
-    marker = _gap_marker(config_path, tickers_path, session_clock)
+    marker = _gap_marker(config_path, tickers_path, session_clock, clock)
     if marker is not None:
         caller_on_start = hooks.on_start
         caller_on_skipped = hooks.on_skipped

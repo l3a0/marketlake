@@ -513,14 +513,18 @@ def record_schema_version_from_config(
 
 # -- is the running version in the ledger --------------------------------------
 
-# The four answers :func:`check_running_version` gives. ``RECORDED`` is the healthy one and
-# the only one nothing reports.
+# The five answers :func:`check_running_version` gives. ``RECORDED`` is the healthy one and
+# the only one nothing reports. ``INACCESSIBLE`` is a ledger this process was refused
+# permission to open, which is reported and never paged, for the reason
+# :func:`_inaccessible_check` gives.
 RECORDED = "recorded"
 UNRECORDED = "unrecorded"
 CONFLICTING = "conflicting"
 UNREADABLE = "unreadable"
+INACCESSIBLE = "inaccessible"
 
-# One page event per reportable verdict, because the three name three different repairs.
+# One page event per paged verdict, because the three name three different repairs.
+# ``INACCESSIBLE`` has none, because it does not page.
 # ``alert._record`` keeps the event, the reason and the priority when a page fails to send,
 # keeps the title unless the page was refused, and never keeps the body. So the event is the
 # only field guaranteed to say which of the three went quiet.
@@ -564,12 +568,14 @@ PAGE_BODY_BYTE_CAP = 1000
 class RunningVersionCheck:
     """Where the running ``journal.SCHEMA_VERSION`` stands in one lake's ledger.
 
-    ``state`` is one of the four above. ``recorded`` is every version the ledger holds, empty
+    ``state`` is one of the five above. ``recorded`` is every version the ledger holds, empty
     when it holds none or could not be read.
 
-    The other four fields are ``None`` on a ``RECORDED`` verdict and set on every other, which
-    is what makes "say nothing when healthy" a property of this object rather than a rule each
-    caller has to remember.
+    ``summary`` and ``detail`` are ``None`` on a ``RECORDED`` verdict and set on every other,
+    which is what makes "say nothing when healthy" a property of this object rather than a
+    rule each caller has to remember. ``page_body``, ``event`` and ``title`` are set on every
+    verdict that pages, and :attr:`pages` says which those are. ``INACCESSIBLE`` is reported
+    and carries none of the three.
 
     ``summary`` is one line, safe for the nightly report. It carries no absolute path, because
     ``report.redacted`` exists to keep capture-machine paths out of a file the dashboard may
@@ -594,6 +600,11 @@ class RunningVersionCheck:
     def ok(self) -> bool:
         """Whether the running version is recorded under the shape the running code derives."""
         return self.state == RECORDED
+
+    @property
+    def pages(self) -> bool:
+        """Whether this verdict is one a caller pages for. False on ``RECORDED`` too."""
+        return self.event is not None
 
 
 def _capped(names: Sequence[str]) -> str:
@@ -695,6 +706,36 @@ def _unreadable_check(version: int, target: Path, exc: BaseException) -> Running
     )
 
 
+def _inaccessible_check(version: int, target: Path, exc: BaseException) -> RunningVersionCheck:
+    """The verdict for a ledger this process was refused permission to open. It never pages.
+
+    The unreadable verdict pages because a torn ledger gets worse by waiting: the design
+    has the next close+15 backup copy it over the last good one. A refused open does not.
+    The backup runs ``rsync -a`` as the same user, which cannot open the file either, so it
+    leaves the backup's copy alone and exits non-zero. The backup then raises before the
+    compaction ping, the ``compaction`` check goes silent, and that pages. So a refusal that
+    lasts to close+15 already pages, and one that clears first needs no page. Marketlake #536
+    is the second kind: a reboot starts the daemon a few seconds before the owner's login
+    session exists, and on 2026-09-19 its first read of this file came back ``EPERM`` and
+    paged, for a condition that had cleared before anyone could read the page.
+
+    ``PermissionError`` alone, not the wider ``OSError``, because pyarrow reports most
+    corruption as a bare ``OSError``. Of 400 random byte flips in a real ledger, 262 raised
+    ``OSError: Corrupt snappy compressed data``. That is the torn ledger the page exists for,
+    so it stays with :func:`_unreadable_check`.
+
+    The summary still reaches the sweep's nightly report, which appends it for any verdict
+    but ``RECORDED``, so a refusal that outlasts the evening is reported there.
+    """
+    return RunningVersionCheck(
+        version=version,
+        state=INACCESSIBLE,
+        recorded=(),
+        summary=f"schema_version: {LEDGER_PARTITION} could not be opened, {type(exc).__name__}",
+        detail=f"{target} could not be opened: {type(exc).__name__}: {exc}",
+    )
+
+
 def check_running_version(lake_root: Path | str) -> RunningVersionCheck:
     """Where the running ``journal.SCHEMA_VERSION`` stands in ``lake_root``'s ledger.
 
@@ -706,11 +747,11 @@ def check_running_version(lake_root: Path | str) -> RunningVersionCheck:
     It never raises, and the caller is why. A daemon that will not start captures nothing, and
     under launchd's ``KeepAlive`` the successor reaches the same check and refuses again, so a
     missing row in a reference table would cost a whole session. Anything the decision raises
-    becomes ``UNREADABLE`` instead. The guard is broad rather than a list of classes, because
-    the list is not two long: a torn file raises ``LedgerUnreadable``, a ledger format this
-    code does not read ``UnsupportedLedgerSchemaVersion``, and some other parquet file at that
-    path a bare ``KeyError``. That is ``sweep._counted``'s rule, that a summary must never cost
-    the record.
+    becomes ``UNREADABLE`` instead, except the two failures of the open named below. The guard
+    is broad rather than a list of classes, because the list is not two long: a torn file raises
+    ``LedgerUnreadable``, a ledger format this code does not read
+    ``UnsupportedLedgerSchemaVersion``, and some other parquet file at that path a bare
+    ``KeyError``. That is ``sweep._counted``'s rule, that a summary must never cost the record.
 
     The guard covers the whole decision and not the read alone, because the file decides more
     than whether it parses. Every field of :data:`LEDGER_SCHEMA` is nullable, so a ledger with a
@@ -723,10 +764,11 @@ def check_running_version(lake_root: Path | str) -> RunningVersionCheck:
     Absent is the one condition that is not unreadable, and it is caught by class rather than
     by looking first. ``FileNotFoundError`` alone means no ledger. A ``PermissionError`` or an
     I/O error on a file that is there means the shape is recorded and this process cannot see
-    it, which is a different sentence and a different repair. Reporting that as "not recorded"
-    would send an operator to ``python -m lake.schema_versions``, which opens the same file and
-    dies the same way. The sweep's reference readers were widened for exactly that reason under
-    marketlake #435.
+    it, which is a different sentence and a different repair. Reporting either as "not
+    recorded" would send an operator to ``python -m lake.schema_versions``, which opens the same
+    file and dies the same way. The sweep's reference readers were widened for exactly that
+    reason under marketlake #435. A ``PermissionError`` on the open is split off once more,
+    into ``INACCESSIBLE``, which reports and does not page, per :func:`_inaccessible_check`.
 
     It takes no lock and writes nothing. :meth:`SchemaVersionLedger.write` goes through a temp
     file and a rename, so a lockless read sees the whole old file or the whole new one, and the
@@ -744,20 +786,32 @@ def check_running_version(lake_root: Path | str) -> RunningVersionCheck:
     target = ledger_path(lake_root)
     version = journal.SCHEMA_VERSION
     try:
-        return _decide(target, version)
+        ledger = SchemaVersionLedger.read(target)
     except FileNotFoundError:
         # No ledger, which is not a corrupt one. ``loader._ledger`` tells the two apart for the
-        # same reason. Reading straight through rather than asking ``exists`` first is what
-        # keeps a present-but-unreadable file out of this arm: ``Path.exists`` answers False on
-        # a permission error, so looking first would call a locked ledger an absent one.
+        # same reason. Reading straight through rather than asking first is what keeps a
+        # present-but-unreadable file out of this arm, and the rule does not rest on which
+        # ``exists`` a later edit reaches for. ``os.path.exists`` answers False on any
+        # ``OSError``, so it would call a locked ledger an absent one. ``pathlib.Path.exists``
+        # raises ``PermissionError`` on a refused stat on Python 3.12 instead, and a file whose
+        # own mode refuses the read still stats, so both would answer True for it (measured
+        # under marketlake #536).
         return _unrecorded_check(version, target, ())
+    except PermissionError as exc:
+        # The open alone, not the decision below. A refusal is the one failure that means the
+        # file is intact and this process was kept out of it, so only the read may land here.
+        return _inaccessible_check(version, target, exc)
+    except Exception as exc:  # noqa: BLE001 - a startup check must never cost the session
+        return _unreadable_check(version, target, exc)
+    try:
+        return _decide(ledger, target, version)
     except Exception as exc:  # noqa: BLE001 - a startup check must never cost the session
         return _unreadable_check(version, target, exc)
 
 
-def _decide(target: Path, version: int) -> RunningVersionCheck:
-    """The verdict itself. Every raise it can make is the caller's to turn into one."""
-    ledger = SchemaVersionLedger.read(target)
+def _decide(ledger: SchemaVersionLedger, target: Path, version: int) -> RunningVersionCheck:
+    """The verdict on a ledger that opened. Every raise it can make is the caller's to turn
+    into ``UNREADABLE``, a ``PermissionError`` included, since the open is behind it."""
     recorded = ledger.versions()
     entry = ledger.get(version)
     if entry is None:
@@ -820,6 +874,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "CONFLICTING",
     "CONFLICT_EVENT",
+    "INACCESSIBLE",
     "LEDGER_FILENAME",
     "LEDGER_PARTITION",
     "LEDGER_SCHEMA",

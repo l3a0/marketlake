@@ -30,6 +30,7 @@ from lake.report import redacted
 from lake.schema_versions import (
     CONFLICT_EVENT,
     CONFLICTING,
+    INACCESSIBLE,
     LEDGER_FILENAME,
     LEDGER_PARTITION,
     LEDGER_SCHEMA,
@@ -862,16 +863,18 @@ def test_an_unreadable_ledger_says_which_file_and_what_refused_it(lake_root):
     assert str(ledger_path(lake_root)) in check.detail
 
 
-def test_a_ledger_this_process_may_not_open_is_unreadable_rather_than_unrecorded(lake_root):
+def test_a_ledger_this_process_may_not_open_is_inaccessible_rather_than_unrecorded(lake_root):
     """A locked ledger is not an absent one, and saying otherwise sends an operator nowhere.
 
     ``python -m lake.schema_versions`` is the repair a "not recorded" page names, and it opens
     this same file and dies the same way. The sweep's reference readers were widened for
     exactly that reason under marketlake #435, whose own test locks this very file.
 
-    ``Path.exists`` answers False on a permission error, so a check that looked before reading
-    would fall into the absent arm. This reads straight through and tells the two apart by
-    class.
+    ``os.path.exists`` answers False on any ``OSError``, so a check that looked with it before
+    reading would fall into the absent arm. ``pathlib.Path.exists`` raises instead on Python
+    3.12, and the ``chmod`` below leaves the file's own stat working, so either answers True
+    here (measured under marketlake #536). The check reads straight through and tells the two
+    apart by class, which does not rest on which ``exists`` a later edit reaches for.
     """
     _record(lake_root)
     target = ledger_path(lake_root)
@@ -881,12 +884,76 @@ def test_a_ledger_this_process_may_not_open_is_unreadable_rather_than_unrecorded
     finally:
         os.chmod(target, 0o644)
 
-    assert check.state == UNREADABLE
-    assert check.event == UNREADABLE_EVENT
+    assert check.state == INACCESSIBLE == "inaccessible"
+    assert check.recorded == ()
     assert "PermissionError" in check.summary
+    assert str(target) in check.detail
+    assert "Permission denied" in check.detail, "the detail lost the exception's own message"
     # And the shape really is recorded, so "not recorded" would have been false as well as
-    # useless.
-    assert check_running_version(lake_root).ok
+    # useless. A recorded verdict pages nobody either.
+    healthy = check_running_version(lake_root)
+    assert healthy.ok
+    assert not healthy.pages
+
+
+def test_a_ledger_this_process_may_not_open_pages_nobody(lake_root):
+    """Marketlake #536. A refused open is not a torn file, and the page's reason is the latter.
+
+    The unreadable page earns its tier because the next backup would copy a torn ledger over
+    the last good copy. The backup cannot open a refused file either, so it copies nothing and
+    fails, and the ``compaction`` check's silence pages for a refusal that lasts. On
+    2026-09-19 the refusal lasted seconds and the page went out anyway.
+    """
+    _record(lake_root)
+    target = ledger_path(lake_root)
+    os.chmod(target, 0o000)
+    try:
+        check = check_running_version(lake_root)
+    finally:
+        os.chmod(target, 0o644)
+
+    assert not check.ok
+    assert not check.pages
+    assert (check.page_body, check.event, check.title) == (None, None, None)
+    assert redacted(check.summary) == check.summary
+
+
+def test_a_permission_error_after_the_open_still_pages(lake_root, monkeypatch):
+    """Only a refused open is ``INACCESSIBLE``, because only a refused open says the file is intact.
+
+    The decision after the open does no I/O today. A later edit that adds some must not turn a
+    failure there into a verdict that pages nobody.
+    """
+    _record(lake_root)
+
+    def refused():
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr("lake.schema_versions.running_fingerprints", refused)
+    check = check_running_version(lake_root)
+
+    assert check.state == UNREADABLE
+    assert check.pages
+
+
+def test_a_corrupt_ledger_pyarrow_reports_as_a_bare_oserror_still_pages(lake_root, monkeypatch):
+    """The no-page arm is ``PermissionError`` alone, because corruption arrives as ``OSError``.
+
+    Of 400 random byte flips in a real ledger, measured under marketlake #536, 262 raised
+    ``OSError: Corrupt snappy compressed data`` from pyarrow rather than ``LedgerUnreadable``.
+    An arm catching ``OSError`` would have stopped the page for the torn ledger it exists for.
+    """
+    _record(lake_root)
+
+    def corrupt(cls, path):
+        raise OSError("Corrupt snappy compressed data.")
+
+    monkeypatch.setattr(SchemaVersionLedger, "read", classmethod(corrupt))
+    check = check_running_version(lake_root)
+
+    assert check.state == UNREADABLE
+    assert check.pages
+    assert check.event == UNREADABLE_EVENT
 
 
 def test_a_lake_root_that_does_not_exist_reads_as_unrecorded(tmp_path):
@@ -1081,7 +1148,7 @@ def test_the_three_event_names_are_three_names():
     assert UNREADABLE_EVENT == "schema_version_ledger_unreadable"
 
 
-def test_each_reportable_verdict_carries_an_event_of_its_own(lake_root):
+def test_each_paged_verdict_carries_an_event_of_its_own(lake_root):
     """``alert._record`` keeps no body, and drops the title too when a page was refused, so
     the event is the only field guaranteed to say which of the three went quiet.
     """
