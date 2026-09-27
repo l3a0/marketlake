@@ -85,14 +85,11 @@ SEGMENT_BYTES = 9736
 ROWS_PER_SEGMENT = 2
 # Read as a stream that fails, so the segment contributed nothing and the day sealed 8 of
 # its 10 rows. The shape 896 of 2,000 flips took when marketlake #556 measured it. Found by
-# flipping bit 0 at every 24th byte with no check in front of the seal, and it lands the
-# same way on macOS and on CI's Linux.
+# flipping bit 0 at every 24th byte with no check in front of the seal.
 DROPS_THE_SEGMENT = 4632
 # Decodes cleanly with one value changed, so the day sealed all 10 rows and one was wrong.
-# No structural check can see it. Only the digest does. It is located by content rather
-# than by offset, because a literal offset that turned a stamp's "2026" into "3026" on
-# macOS landed on a byte that changed nothing on CI's Linux. The flip is bit 0 of the first
-# character of the first stored stamp, so "2026" becomes "3026" wherever the buffer sits.
+# No structural check can see it. Only the digest does. The flip is bit 0 of the first
+# character of the first stored stamp, located by content, so "2026" becomes "3026".
 CHANGES_A_VALUE = b"2026-08-24T10:"
 
 
@@ -179,7 +176,18 @@ def _findings(lake_root: Path) -> list[dict]:
 
 
 def _segments_table(paths: list[Path]) -> pa.Table:
-    return pa.concat_tables([journal.read_segment(path) for path in paths])
+    """The segments' rows, copied out of the files they were read from.
+
+    ``journal.read_segment`` memory-maps the segment, so a table it returns can share pages
+    with the file. On Linux a test that then rewrites the file in place changes that table
+    too, and a before-and-after comparison sees the damage on both sides. A round trip
+    through an in-memory stream gives the table buffers of its own.
+    """
+    table = pa.concat_tables([journal.read_segment(path) for path in paths])
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    return pa.ipc.open_stream(sink.getvalue()).read_all()
 
 
 # -- 1. the healthy side -----------------------------------------------------
