@@ -625,3 +625,69 @@ def test_an_interrupted_fetch_with_no_bound_waits_for_its_requests(lake_root, ho
         assert ("SPY", _d(10), _d(30)) in vendor.chain_calls
     finally:
         releaser.join()
+
+
+# -- 8. edges the mutation review found --------------------------------------------------
+
+
+@pytest.mark.parametrize("cap", [1, 20])
+def test_a_cycle_that_starts_exactly_at_its_bound_sends_nothing(lake_root, cap):
+    # The bound is the instant requests must be done by, so one that would start at it is
+    # refused. The clock does not move either: no stagger is slept once the bound has passed.
+    vendor = _HoldingVendor()
+    clock = ManualClock(start=_utc(BOUND))
+    result = _run(vendor, lake_root, clock, guards=GuardConstants(capture_max_concurrency=cap))
+
+    assert vendor.chain_calls == []
+    assert vendor.quote_calls == 0
+    assert clock.now() == BOUND
+    assert {seg.error_class for seg in result.segments} == {ABANDONED}
+
+
+class _TwoHeldVendor(_HoldingVendor):
+    """A vendor holding SPY's one window and the quote batch, each on its own event."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release_chain = threading.Event()
+        self.release_quotes = threading.Event()
+
+    def get_chain(self, symbol, *, from_date=None, to_date=None, strike_count=None):
+        assert self.release_chain.wait(30)
+        return super().get_chain(symbol, from_date=from_date, to_date=to_date)
+
+    def get_quotes(self, symbols):
+        assert self.release_quotes.wait(30)
+        return super().get_quotes(symbols)
+
+
+def test_the_vendor_closes_once_after_the_last_of_several_abandoned_requests(
+    tmp_path, monkeypatch, holding
+):
+    # Both of the cycle's requests are held past the bound. Releasing one leaves the vendor
+    # open, and releasing the other closes it exactly once.
+    rig = _rig(tmp_path, SPY_ONLY)
+    vendor = holding(_TwoHeldVendor())
+    _wire(monkeypatch, rig, lambda path: vendor)
+    try:
+        capture.run_cycle_from_config(
+            clock=ManualClock(start=_utc(FIRST_MINUTE) + timedelta(seconds=1)),
+            config_path=rig.config,
+            tickers_path=rig.tickers,
+            token_path=rig.token,
+            pid=4242,
+            slot=FIRST_MINUTE,
+        )
+        assert vendor.closed == 0
+
+        vendor.release_quotes.set()
+        time.sleep(0.3)
+        assert vendor.closed == 0
+
+        vendor.release_chain.set()
+        _wait_for(lambda: vendor.closed >= 1)
+        time.sleep(0.1)
+        assert vendor.closed == 1
+    finally:
+        vendor.release_quotes.set()
+        vendor.release_chain.set()
