@@ -124,6 +124,7 @@ from lake import journal
 from lake.alert import REFUSED, Message, Publisher
 from lake.calendar import MARKET_TZ
 from lake.journal import EXTRA_COLUMN, ROW_KIND_COLUMN, ROW_KIND_DATA
+from lake.report import ACTION, HEALTHY, INFO, ReportLines
 from lake.schema_versions import (
     SchemaVersionLedger,
     SchemaVersionsError,
@@ -666,6 +667,7 @@ class DriftReport:
 
     findings: tuple[DriftFinding, ...] = ()
     report: tuple[str, ...] = ()
+    report_kinds: tuple[str, ...] = ()
 
     @property
     def paged_titles(self) -> tuple[str, ...]:
@@ -708,7 +710,7 @@ def judge_day(
             by_surface[partition.surface].append(partition)
 
     findings: list[DriftFinding] = []
-    report: list[str] = []
+    report = ReportLines()
     judged_surfaces: list[str] = []
 
     for surface in surfaces:
@@ -716,28 +718,29 @@ def judge_day(
         if not today_parts:
             continue
         today = read_surface_day(today_parts, surface, day)
-        report.extend(
-            f"battery: schema drift on {surface} skipped a partition: {line}"
-            for line in today.unreadable
-        )
+        for line in today.unreadable:
+            report.add(f"battery: schema drift on {surface} skipped a partition: {line}", ACTION)
         if not today.judged:
             continue
 
         if baseline is None or baseline_partitions is None:
-            report.append(
+            report.add(
                 f"battery: schema drift on {surface} {day.isoformat()}: "
-                "insufficient_history, no earlier sealed day to compare"
+                "insufficient_history, no earlier sealed day to compare",
+                INFO,
             )
             continue
         before = read_surface_day(baseline_partitions.get(surface, ()), surface, baseline)
-        report.extend(
-            f"battery: schema drift on {surface} skipped a baseline partition: {line}"
-            for line in before.unreadable
-        )
+        for line in before.unreadable:
+            report.add(
+                f"battery: schema drift on {surface} skipped a baseline partition: {line}",
+                ACTION,
+            )
         if not before.judged:
-            report.append(
+            report.add(
                 f"battery: schema drift on {surface} {day.isoformat()}: "
-                f"insufficient_history, {baseline.isoformat()} carried no data row"
+                f"insufficient_history, {baseline.isoformat()} carried no data row",
+                INFO,
             )
             continue
 
@@ -761,18 +764,20 @@ def judge_day(
         if not candidates:
             continue
         if ledger is None or len(today.versions) != 1:
-            report.append(
+            report.add(
                 f"battery: schema drift on {surface} {day.isoformat()}: "
                 f"insufficient_history, {_version_reason(ledger, today.versions)}, so a "
-                "rotation cannot be told from a vendor drop"
+                "rotation cannot be told from a vendor drop",
+                INFO,
             )
             continue
         version = next(iter(today.versions))
         if ledger.get(version) is None:
-            report.append(
+            report.add(
                 f"battery: schema drift on {surface} {day.isoformat()}: "
                 f"insufficient_history, the ledger records no shape for schema_version "
-                f"{version}, so a rotation cannot be told from a vendor drop"
+                f"{version}, so a rotation cannot be told from a vendor drop",
+                INFO,
             )
             continue
         dropped = rotation_dropped(ledger, surface, version)
@@ -789,7 +794,8 @@ def judge_day(
             )
         )
 
-    report.extend(finding.line for finding in findings)
+    for finding in findings:
+        report.add(finding.line, ACTION)
     # **The check says it ran, even on the night it finds nothing.** This is
     # ``coverage_line``'s rule on a second check: its correct answer against a healthy lake is
     # that nothing drifted, and silence cannot be told from a check that did not run. The line
@@ -800,11 +806,17 @@ def judge_day(
     # pins the rule that every count prints including the zeroes, so a count here would be a
     # change to that function and to ``sweep.SweepOutcome.render``, and marketlake #477 holds
     # both.
+    #
+    # Its kind is ``HEALTHY`` on the night nothing moved and ``ACTION`` on one that did, so a
+    # reader told to act by the findings above is not told the opposite by their summary.
     if judged_surfaces:
         moved = len(findings)
         verdict = f"{moved} drifted" if moved else "nothing drifted"
-        report.append(f"battery: schema drift judged {', '.join(judged_surfaces)}, {verdict}")
-    return DriftReport(findings=tuple(findings), report=tuple(report))
+        report.add(
+            f"battery: schema drift judged {', '.join(judged_surfaces)}, {verdict}",
+            ACTION if moved else HEALTHY,
+        )
+    return DriftReport(findings=tuple(findings), report=report.lines, report_kinds=report.kinds)
 
 
 def newly_absent(today: SurfaceDay, before: SurfaceDay) -> set[str]:
