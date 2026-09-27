@@ -440,7 +440,7 @@ def test_the_seal_publishes_its_partition_through_the_same_rename(lake_root, mon
     steps = _record_the_syscalls(monkeypatch)
 
     sealed = compact._seal(
-        lake_root, paths, CHAINS, "SPY", DAY, [segment], clock=clock, guard=False
+        lake_root, paths, CHAINS, "SPY", DAY, [segment], clock=clock, guard=False, entries={}
     )
 
     assert sealed.rows == 2

@@ -138,8 +138,10 @@ def write_token(token_path: Path | str, payload: object) -> None:
     part-way through leaves the prior token intact at the real path and a temp file
     beside it, rather than a truncated file where the credential used to be. The temp
     name comes from ``paths.temp_write_path``, which owns the one spelling of the marker
-    the backup exclusion matches, and carries the writing process's id, so two writers
-    never share one.
+    the backup exclusion matches, and carries the writing process's id, so two processes
+    never share one. Two threads in one process would. The daemon's writes come from token
+    refreshes, and ``lake.schwab.serialize_token_refresh`` makes those one at a time across
+    the process, which is what keeps that safe.
 
     The payload is serialised to a string before any file is opened. So a value JSON
     cannot encode fails before the write starts rather than half-way through it.

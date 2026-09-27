@@ -10,7 +10,7 @@ They cover the job's contract:
 1. A day of segments compacts to one Parquet per surface and ticker, rows equal to the
    sum, a manifest entry carrying the sha, the segments deleted. A second run no-ops.
 2. A torn tail compacts to its complete batches. Bytes after an end-of-stream marker
-   fail loudly and seal nothing for that ticker-day.
+   in a segment with no manifest entry fail loudly and seal nothing for that ticker-day.
 3. An orphaned segment from an older date is swept and sealed.
 4. A ticker-day whose close+5 has not passed is never touched.
 5. A manifested partition is sha-verified, its debris deleted, and never rewritten. A
@@ -49,6 +49,7 @@ from lake.calendar import MARKET_TZ
 from lake.chain_plan import DEFAULT_CHAIN_PLAN, ChainPlan, load_chain_plan
 from lake.compact import (
     COMPACTION_SLUG,
+    REFUSED_TYPES_DISAGREE,
     CompactionResult,
     CompactionVerifyError,
     PartitionMismatch,
@@ -1657,6 +1658,7 @@ def test_render_names_a_refusal_the_scan_could_not_explain(lake_root):
         partition="chains/ticker=SPY/date=2026-08-24.parquet",
         conflicts=(),
         segments=("journal/date=2026-08-24/surface=chains/ticker=SPY/seg-a-1.arrows",),
+        reason=REFUSED_TYPES_DISAGREE,
     )
     result = CompactionResult(
         sealed=(),

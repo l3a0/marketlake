@@ -93,7 +93,7 @@ DATE_PARTITIONED = frozenset({CHAINS, QUOTES})
 # and the two lake-root ledgers. ``reports/`` holds one dated file per vendor-sweep run,
 # written by ``lake.sweep`` and named by the day it is about, then by the stamp and the
 # writing process's id. Two runs on one night are two verdicts rather than a correction,
-# because nothing here resolves one file against another. Four more trees sit under it,
+# because nothing here resolves one file against another. Five more trees sit under it,
 # each in a subdirectory of its own so a reader counting one never picks up another, and
 # a flat file at the root is reached by ``reports/*.json`` and by none of their globs.
 #
@@ -110,9 +110,13 @@ DATE_PARTITIONED = frozenset({CHAINS, QUOTES})
 #    `reports/withheld/date=D/`, keyed on the ticker-day whose rows produced it. A held
 #    finding never reaches the ledger that would settle it, so it files again on every
 #    night it survives, and that repetition is what says the condition is still live.
+# 5. One file per ticker-day compaction refused because a segment no longer matched the
+#    sha256 its manifest entry recorded when it closed, under
+#    `reports/damaged_segments/date=D/`. It files on every run the damage survives, for
+#    the refused merge's reason, and it is not drift, so it stays out of item 3's tree.
 #
 # The tree sits inside the backup sync root, so a restore carries the reports with the
-# data, and outside the manifest, because none of the five is a measurement.
+# data, and outside the manifest, because none of the six is a measurement.
 JOURNAL_DIR = "journal"
 REFERENCE_DIR = "reference"
 REPORTS_DIR = "reports"
@@ -321,8 +325,9 @@ def temp_write_path(target: Path | str, pid: int) -> Path:
     """The temp file an atomic write to ``target`` writes into first.
 
     It sits beside the target, so the rename that finishes the write stays on one
-    filesystem. ``pid`` is the writing process's id. Two writers therefore never share
-    a temp file, and a leftover names the process that died holding it.
+    filesystem. ``pid`` is the writing process's id. Two processes therefore never share
+    a temp file, and a leftover names the process that died holding it. Two threads in one
+    process would share it, so a writer used from several threads serialises its writes.
     """
     target = Path(target)
     return target.with_name(f"{target.name}{TEMP_MARKER}{pid}")

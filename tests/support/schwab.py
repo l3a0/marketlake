@@ -58,17 +58,29 @@ class _FakeTokenMetadata:
     creation_timestamp: float | None
 
 
+class FakeToken(dict):
+    """The token a fake session holds. ``is_expired`` answers from ``expired``, never a clock."""
+
+    expired = False
+
+    def is_expired(self, leeway: int = 60) -> bool:
+        return self.expired
+
+
 class _FakeSession:
     """The client's ``session``, the authlib ``OAuth2Client`` a real client carries.
 
     ``SchwabVendor.from_token`` wraps the session's ``ensure_active_token`` in a lock, and
     ``SchwabVendor.close`` closes it, so the fake carries both. ``token`` is what the lock
     re-reads, ``checked`` records every token ``ensure_active_token`` was asked about, and
-    ``closed`` counts the closes.
+    ``closed`` counts the closes. ``leeway`` is the one other member the lock reads, to ask
+    whether ``token`` has expired.
     """
 
+    leeway = 300
+
     def __init__(self) -> None:
-        self.token: dict[str, object] = {"access_token": "live"}
+        self.token: dict[str, object] = FakeToken(access_token="live")
         self.checked: list[object] = []
         self.closed = 0
 
