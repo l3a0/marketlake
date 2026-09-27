@@ -34,12 +34,13 @@ from collections import Counter
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 
 from lake import capture, journal
 from lake.chain_plan import ChainPlan
 from lake.config import GuardConstants
-from lake.manifest import latest_entries
+from lake.manifest import LedgerNotUtf8, latest_entries, manifest_path
 from lake.tickers import Roster
 from lake.vendor import VendorError, VendorResponse
 from tests.support.clock import ManualClock
@@ -1297,3 +1298,225 @@ def test_a_merge_failure_of_any_kind_gives_up_the_window(lake_root, monkeypatch)
     assert outcome.row_kind == journal.ROW_KIND_GAP
     assert outcome.error_class == capture.CHAIN_SCHEMA_DRIFT
     assert result.segment(QUOTES, "SPY").row_kind == journal.ROW_KIND_DATA
+
+
+# -- a prior-batch read that raises (marketlake #548) ------------------------------------
+#
+# The read that names a failed window's expirations runs before any segment is written, and
+# ``run_loop`` calls the cycle with no guard. A raise from it used to cost every surface's
+# minute and end the daemon. What it raises is not a short list, so the tests drive classes
+# from each source: a manifest refusal, a manifest line that is not an object, and the two a
+# damaged segment raises past ``UNUSABLE_SEGMENT``.
+
+_FAILING_NEAR = ChainPlan(((0, 9), (10, None)))
+
+
+@pytest.fixture(autouse=True)
+def _forget_prior_reads():
+    """The record of failed prior reads is process-wide, so every test starts it empty."""
+    capture._prior_unreadable.clear()
+    yield
+    capture._prior_unreadable.clear()
+
+
+def _near_fails() -> _WindowVendor:
+    return _WindowVendor(
+        windows={
+            (_d(0), _d(9)): VendorResponse(status=401, body={"error": "unauthorized"}),
+            (_d(10), None): _chain_response(["2026-09-18"]),
+        },
+    )
+
+
+def _prior_cycle(lake_root: Path) -> None:
+    """A clean cycle, so the journal holds a prior batch naming the near window's series."""
+    vendor = _WindowVendor(
+        windows={
+            (_d(0), _d(9)): _chain_response(["2026-08-28", "2026-08-30"]),
+            (_d(10), None): _chain_response(["2026-09-18"]),
+        },
+    )
+    _run(vendor, lake_root, _FAILING_NEAR, pid=4242)
+
+
+def _raising(exc: BaseException):
+    def read(*args, **kwargs):
+        raise exc
+
+    return read
+
+
+def _assert_one_per_window_marker(rows: list[dict]) -> None:
+    gap_rows = [r for r in rows if r["row_kind"] == journal.ROW_KIND_GAP]
+    assert len(gap_rows) == 1
+    assert gap_rows[0]["expiration_date"] is None
+    assert (gap_rows[0]["window_start"], gap_rows[0]["window_end"]) == (_d(0), _d(9))
+    assert gap_rows[0]["error_class"] == "http_401"
+    data_rows = [r for r in rows if r["row_kind"] == journal.ROW_KIND_DATA]
+    assert {r["expiration_date"] for r in data_rows} == {"2026-09-18T20:00:00.000+00:00"}
+
+
+@pytest.mark.parametrize("cap", [1, 20])
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(pa.lib.ArrowNotImplementedError("bad type id"), id="arrow"),
+        pytest.param(SystemError("error return without exception set"), id="system"),
+        pytest.param(AttributeError("'list' object has no attribute 'get'"), id="attribute"),
+        pytest.param(PermissionError(1, "Operation not permitted"), id="permission"),
+    ],
+)
+def test_a_prior_read_that_raises_lands_the_minute_with_per_window_markers(
+    lake_root, monkeypatch, capsys, cap, exc
+):
+    # The prior batch names two series inside the failed window, so a working read would
+    # mark each one. The read raising instead costs that detail and nothing else: the chain
+    # lands as data with one marker for the whole failed range, still carrying its class,
+    # and the quotes land beside it.
+    _prior_cycle(lake_root)
+    monkeypatch.setattr(journal, "latest_expirations", _raising(exc))
+
+    result = _run(
+        _near_fails(),
+        lake_root,
+        _FAILING_NEAR,
+        guards=GuardConstants(capture_max_concurrency=cap),
+        pid=4243,
+    )
+
+    assert result.errors == ()
+    chains = result.segment(CHAINS, "SPY")
+    assert chains.row_kind == journal.ROW_KIND_DATA
+    assert chains.error_class == "http_401"
+    _assert_one_per_window_marker(_chain_rows(result))
+    assert result.segment(QUOTES, "SPY").row_kind == journal.ROW_KIND_DATA
+    err = capsys.readouterr().err
+    assert "capture: SPY: the prior chains batch could not be read at " in err
+    assert type(exc).__name__ in err
+
+
+@pytest.mark.parametrize("cap", [1, 20])
+def test_a_refused_manifest_still_stops_the_cycle_at_the_append_after_the_segments_land(
+    lake_root, cap
+):
+    # A manifest holding a byte that will not decode refuses at every read. The prior-batch
+    # read is contained, so the cycle writes its segments. Then its own manifest append
+    # reads the manifest again and raises, which ``manifest._latest_by_partition`` and
+    # ``lake.daemon`` decide is correct. This test records both halves, so a change to
+    # either one is seen rather than inherited.
+    _prior_cycle(lake_root)
+    ledger = manifest_path(lake_root)
+    raw = ledger.read_bytes()
+    ledger.write_bytes(raw[:10] + b"\xff" + raw[11:])
+    before = set(lake_root.rglob("*.arrows"))
+
+    with pytest.raises(LedgerNotUtf8):
+        _run(
+            _near_fails(),
+            lake_root,
+            _FAILING_NEAR,
+            guards=GuardConstants(capture_max_concurrency=cap),
+            pid=4243,
+        )
+
+    landed = set(lake_root.rglob("*.arrows")) - before
+    by_surface = {path.parent.parent.name: path for path in landed}
+    assert sorted(by_surface) == [f"surface={CHAINS}", f"surface={QUOTES}"]
+    _assert_one_per_window_marker(journal.read_segment(by_surface[f"surface={CHAINS}"]).to_pylist())
+
+
+def test_the_line_prints_once_per_failure_and_once_when_the_read_next_works(
+    lake_root, monkeypatch, capsys
+):
+    # This read runs on every cycle with a failed window, which during a vendor outage is
+    # every minute. A standing failure prints one line, not one a minute, and a read that
+    # works again says so once.
+    _prior_cycle(lake_root)
+    working = journal.latest_expirations
+    monkeypatch.setattr(journal, "latest_expirations", _raising(SystemError("damaged")))
+    _run(_near_fails(), lake_root, _FAILING_NEAR, pid=4243)
+    _run(_near_fails(), lake_root, _FAILING_NEAR, pid=4244)
+    err = capsys.readouterr().err
+    assert err.count("could not be read") == 1
+    assert "reads again" not in err
+
+    monkeypatch.setattr(journal, "latest_expirations", working)
+    _run(_near_fails(), lake_root, _FAILING_NEAR, pid=4245)
+    _run(_near_fails(), lake_root, _FAILING_NEAR, pid=4246)
+    err = capsys.readouterr().err
+    assert err.count("capture: SPY: the prior chains batch reads again at ") == 1
+    assert "could not be read" not in err
+
+
+def test_the_line_is_keyed_by_ticker(lake_root, monkeypatch, capsys):
+    # Two tickers can fail on two different segments, so one ticker's standing failure must
+    # not swallow the other's first line.
+    monkeypatch.setattr(journal, "latest_expirations", _raising(SystemError("damaged")))
+    for ticker in ("SPY", "QQQ"):
+        capture._assemble_chain(
+            ticker,
+            _FAILING_NEAR.windows_for(SESSION),
+            [
+                capture._WindowOutcome({}, {}, ((SESSION, SESSION, "http_401"),), None),
+                capture._WindowOutcome({}, {}, (), {"underlyingPrice": 1.0}),
+            ],
+            _CLOCK_START,
+            _CLOCK_START,
+            lake_root,
+        )
+    err = capsys.readouterr().err
+    assert "capture: SPY: the prior chains batch could not be read" in err
+    assert "capture: QQQ: the prior chains batch could not be read" in err
+
+
+class _Unprintable(Exception):
+    def __str__(self) -> str:
+        raise RuntimeError("no message")
+
+
+class _RefusingStream:
+    def write(self, text: str) -> int:
+        raise OSError(28, "No space left on device")
+
+    def flush(self) -> None:
+        raise OSError(28, "No space left on device")
+
+
+@pytest.mark.parametrize("where", ["message", "stderr"])
+def test_the_line_never_costs_the_minute(lake_root, monkeypatch, where):
+    # The line exists to report a fallback that keeps the minute, so it must not be what
+    # loses it. Building it calls the exception's ``__str__``, and printing it writes to a
+    # launchd log that can sit on a full volume.
+    _prior_cycle(lake_root)
+    if where == "message":
+        monkeypatch.setattr(journal, "latest_expirations", _raising(_Unprintable()))
+    else:
+        monkeypatch.setattr(journal, "latest_expirations", _raising(SystemError("damaged")))
+        monkeypatch.setattr("sys.stderr", _RefusingStream())
+
+    result = _run(_near_fails(), lake_root, _FAILING_NEAR, pid=4243)
+
+    _assert_one_per_window_marker(_chain_rows(result))
+
+
+def test_a_close_fill_whose_prior_read_raises_still_lands(lake_root, monkeypatch):
+    # The fill shares ``_assemble_chain`` with the loop. A raise there used to reach the
+    # guard's per-ticker handler and cost the fill even when most of its windows answered.
+    _prior_cycle(lake_root)
+    monkeypatch.setattr(journal, "latest_expirations", _raising(SystemError("damaged")))
+
+    result = capture.fill_option_close(
+        ManualClock(start=_CLOCK_START),
+        _near_fails(),
+        "SPY",
+        slot=_CLOCK_START.replace(second=0),
+        lake_root=lake_root,
+        plan=_FAILING_NEAR,
+        pid=4243,
+    )
+
+    assert result.landed
+    assert result.expirations == ("2026-09-18",)
+    assert len(result.absent) == 1
+    assert result.absent[0].expiration_date is None
+    assert result.absent_expirations == frozenset()

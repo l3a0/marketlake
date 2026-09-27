@@ -411,6 +411,84 @@ def _say(line: str) -> None:
         pass
 
 
+# The tickers whose prior-batch read last failed and has not succeeded since. Process-wide
+# for the reason ``lake.reference_read`` gives for its own record: ``run_cycle_from_config``
+# rebuilds everything each minute, so nothing inside a cycle outlives it. It sits outside
+# ``run_loop``, whose one datetime is the loop's only state, and it decides nothing about
+# capture, only whether a line prints, so a restart that forgets it costs one repeated line.
+# Keyed by ticker rather than by file, because the caller cannot tell whether the manifest or
+# a segment deep in the walk refused, and two tickers can fail on two different segments.
+_prior_unreadable: set[str] = set()
+
+
+def _prior_expirations(lake_root: Path | str, ticker: str, at: datetime) -> list[str] | None:
+    """The prior durable batch's expirations, or ``None`` when that read raised. Never raises.
+
+    Marketlake #548. This read runs only when a window has failed, which is when the vendor
+    is already failing, and it runs before any segment of the cycle is written. A raise from
+    it used to leave the cycle, write nothing for any surface, and end the daemon, since
+    ``run_loop`` calls the cycle with no guard. What it raises is not a short list: a manifest
+    that refuses, a manifest line that is not an object, and a damaged segment's
+    ``ArrowNotImplementedError`` or ``SystemError`` all reach here. So every ``Exception`` is
+    answered the way no prior batch is answered, with one marker per failed window, which
+    still carries that window's class and dates and names no series.
+
+    The fallback is caught here rather than inside ``journal.latest_expirations``, because
+    that reader's ``None`` means nothing in scope names an expiration. The close+5 guard reads
+    it the same way, and a refusal returned as ``None`` would tell it a day had no cycle.
+
+    A read that fails prints one line, the first time for its ticker, and one line when a read
+    for that ticker next succeeds. That is ``lake.reference_read``'s rule, kept here rather
+    than routed through ``read_or_none``, which keys by a path and names the file. Only a cycle
+    with a failed window makes this read, so the second line's instant is when the read was
+    next tried, not when the damage cleared. ``at`` is that instant, from the caller's
+    injected clock. Neither line can raise, because building one calls the exception's own
+    ``__str__``, and a raise there would cost the minute this function exists to keep.
+    """
+    try:
+        prior = journal.latest_expirations(lake_root, ticker)
+    except Exception as exc:  # noqa: BLE001 - a raise here would cost every surface's minute
+        if ticker not in _prior_unreadable:
+            _prior_unreadable.add(ticker)
+            error = exc
+            _say_built(
+                lambda: (
+                    f"capture: {ticker}: the prior chains batch could not be read at "
+                    f"{at.isoformat()}, so each failed window is marked once rather than per "
+                    f"expiration: {_one_line(error)}"
+                )
+            )
+        return None
+    if ticker in _prior_unreadable:
+        _prior_unreadable.discard(ticker)
+        _say_built(
+            lambda: f"capture: {ticker}: the prior chains batch reads again at {at.isoformat()}"
+        )
+    return prior
+
+
+def _one_line(exc: BaseException) -> str:
+    """The exception's class and message, whitespace collapsed, as ``reference_read`` prints it.
+
+    pyarrow's messages carry embedded newlines, and a manifest refusal's runs to several
+    sentences, so a raw message would split one event across several log lines.
+    """
+    return " ".join(f"{type(exc).__name__}: {exc}".split())
+
+
+def _say_built(line: Callable[[], str]) -> None:
+    """Build one diagnostic and print it, and drop it rather than raise on either step.
+
+    ``_say`` takes a finished string, so a message that interpolates an exception has
+    already called its ``__str__`` outside the guard. This builds the string inside it.
+    """
+    try:
+        text = line()
+    except Exception:  # noqa: BLE001 - the line never costs the cycle its minute
+        return
+    _say(text)
+
+
 def _epoch_ms_to_datetime(value: object) -> datetime | None:
     """A vendor epoch-millisecond timestamp as a UTC datetime, or ``None``.
 
@@ -626,7 +704,8 @@ class ChainFetch:
     window failed and nothing was captured. ``windows`` is the concrete plan the fetch
     ran, the ``(from_date, to_date | None)`` ranges. ``absent_markers`` names what a
     failed window should have carried, one marker per expiration the prior durable batch
-    places inside the failed range. ``error_class`` is the first failed window's class,
+    places inside the failed range, or one for the whole range when that batch has none
+    there, does not exist, or could not be read. ``error_class`` is the first failed window's class,
     the representative signal, and ``None`` when every window succeeded. ``fetch_ts`` and
     ``fetch_end_ts`` span the whole windowed fetch, so even a timeout's duration is in
     them. ``requests`` is one record per request the fetch made, splits included, in the
@@ -685,7 +764,8 @@ class FillResult:
 
         Named off the markers rather than recomputed, so the set the guard subtracts is
         exactly the set already on disk. A marker for a window with no prior batch to
-        read names no expiration, and contributes nothing here.
+        read, or whose prior batch could not be read, names no expiration and contributes
+        nothing here.
         """
         return frozenset(m.expiration_date for m in self.absent if m.expiration_date)
 
@@ -742,7 +822,9 @@ def fetch_chain(
 
     ``lake_root`` is read only on the failure path, and only to name the absence markers.
     The daemon holds no expiration state, so the missing expirations come from the
-    journal's latest prior durable batch, read once per ticker per fetch.
+    journal's latest prior durable batch, read once per ticker per fetch. That read never
+    raises into the fetch: one that fails is treated as no prior batch, and
+    ``_prior_expirations`` carries why and what it prints.
     """
     windows = tuple(plan.windows_for(day))
     if guards.capture_max_concurrency == 1:
@@ -882,11 +964,12 @@ def _assemble_chain(
     # expirations come from the journal's latest prior durable batch, read once per
     # ticker per fetch and only on the failure path. For each failed range, keep the
     # prior expirations inside it and dated on or after the session date, one marker
-    # each. With no prior batch, or none inside, emit one per-window marker instead. So
-    # every failed range yields at least one marker and its class is never lost.
+    # each. With no prior batch, none inside, or a prior read that raised, emit one
+    # per-window marker instead. So every failed range yields at least one marker and its
+    # class is never lost.
     absent_markers: list[journal.AbsentMarker] = []
     if failed:
-        prior = journal.latest_expirations(lake_root, ticker)
+        prior = _prior_expirations(lake_root, ticker, fetch_end_ts)
         for from_date, to_date, error_class in failed:
             start = from_date.isoformat()
             end = None if to_date is None else to_date.isoformat()
