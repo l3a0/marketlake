@@ -1599,7 +1599,7 @@ def _roster_401(minute: int) -> CycleResult:
 
 @pytest.mark.parametrize("recorded", [None, "http_401"])
 def test_a_chain_that_answered_empty_breaks_the_unanimity_of_a_dead_token(recorded):
-    """A 200 proves the request authenticated, so the minute is not one dead token.
+    """A 200 proves a request authenticated, so the minute is not one dead token.
 
     Two readings would fold it anyway. A segment naming no class was skipped when the
     classes were gathered, so the rest agreed. And the mixed shape records its failed

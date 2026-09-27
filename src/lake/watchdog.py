@@ -361,8 +361,8 @@ class Watchdog:
 
         ``recorded`` is the class each failed segment is failing with, ``contracts_absent``
         included, so a chain that answered 200 with no contract counts against unanimity.
-        That answer proves the request authenticated and was not rate-limited, so the
-        cycle is not one cause. A surface whose segment could not be written is left out,
+        That answer proves at least one of its requests authenticated and got through, so
+        the cycle is not one cause. A surface whose segment could not be written is left out,
         because a write failure says nothing about what the vendor did.
         """
         if not failed or failed != touched or len(touched) < 2:
@@ -424,8 +424,9 @@ class Watchdog:
 
         A cause with no surfaces left has nothing to explain, so dropping it re-arms it.
         Three things bring a surface here: it produced data, the roster dropped it, or it
-        answered with no contract. That answer proves the request authenticated and was
-        not rate-limited, so no cause can still be what is failing the surface. Kept in the
+        answered with no contract. That answer proves at least one of the surface's
+        requests authenticated and got through, so the token works and the vendor is
+        serving it, and what fails the surface now is an answer no cause explains. Kept in the
         cause instead, it held a token-dead cause live after the token recovered, and the
         next token death that session paged nothing (marketlake #326). Its counter keeps
         climbing, because it still produced nothing. A surface that merely started failing

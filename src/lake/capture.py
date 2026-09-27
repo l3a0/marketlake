@@ -139,6 +139,8 @@ CHAIN_CHUNK_FAILED = "chain_chunk_failed"
 # that stopped producing data. A chain that lost one window lands as data carrying that
 # window's absence marker, which resets the watchdog rather than tripping it, so the marker
 # rows are what a reader has. That was true before marketlake #305 and is unchanged by it.
+# It resets because it still holds contracts. A chain whose every successful window answered
+# with no contract holds none, so it trips the watchdog as ``contracts_absent`` (#326).
 CHAIN_SCHEMA_DRIFT = "chain_schema_drift"
 
 # The two chain maps every window response nests contracts under.
