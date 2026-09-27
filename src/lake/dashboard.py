@@ -1915,6 +1915,12 @@ def _nightly_payload(entry: Mapping[str, object]) -> dict[str, object]:
     string before it tests membership, since a list value would make ``in`` raise, and
     nothing here may raise.
 
+    ``pieces`` keeps each walk as a record of its ``refusal`` and its ``subjects``. The
+    subjects are the file's own names for the findings the sweep's gate held, one
+    ``<symbol> <observed_on> <check>`` per held finding, so the panel can say which ones
+    ``disagreements`` counts (marketlake #590). They go through ``_lines`` like ``problems``,
+    and a piece that is not a mapping is dropped whole.
+
     ``day`` and ``at`` both ride along, because the design pins the nightly report as
     "the one pre-written thing the dashboard shows, and it is dated, so a stale one never
     reads as now."
@@ -1937,7 +1943,10 @@ def _nightly_payload(entry: Mapping[str, object]) -> dict[str, object]:
         "pages_lost": entry.get("pages_lost"),
         "unfiled": unfiled,
         "pieces": {
-            name: outcome.get("refusal")
+            name: {
+                "refusal": outcome.get("refusal"),
+                "subjects": _lines(outcome.get("subjects")),
+            }
             for name, outcome in pieces.items()
             if isinstance(outcome, Mapping)
         },
