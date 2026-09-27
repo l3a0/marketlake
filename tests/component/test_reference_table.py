@@ -248,13 +248,53 @@ def test_a_string_schema_version_is_unreadable_rather_than_newer(reader, target)
         reader.read(target)
 
 
-def test_a_retyped_column_is_unreadable_and_names_it(reader, target):
-    column = reader.columns[reader.other]
-    _write(_table(reader.columns, **{reader.other: column.cast(pa.string())}), target)
+def _retyped(column: pa.Array) -> pa.Array:
+    """The same one value at another type: a string column becomes an integer, anything else
+    a string, and ``schema_version`` a wider integer holding the same version."""
+    if pa.types.is_string(column.type):
+        return pa.array([7], pa.int64())
+    if pa.types.is_int32(column.type):
+        return column.cast(pa.int64())
+    return column.cast(pa.string())
+
+
+# Every column of every reader, so a check that stopped short of any one of them fails here.
+EVERY_COLUMN = [(r, name) for r in READERS for name in r.columns]
+
+
+@pytest.mark.parametrize(
+    "reader, name", EVERY_COLUMN, ids=[f"{r.name}-{name}" for r, name in EVERY_COLUMN]
+)
+def test_every_retyped_column_is_unreadable_and_names_it(reader, name, tmp_path):
+    target = reader.path(tmp_path / "lake")
+    target.parent.mkdir(parents=True)
+    _write(_table(reader.columns, **{name: _retyped(reader.columns[name])}), target)
 
     with pytest.raises(reader.unreadable) as caught:
         reader.read(target)
-    assert f"its {reader.other} column is string" in caught.value.reason
+    assert f"its {name} column is " in caught.value.reason
+
+
+TIMESTAMP_DRIFTS = {
+    "naive": pa.timestamp("us"),
+    "milliseconds": pa.timestamp("ms", tz="UTC"),
+    "another zone": pa.timestamp("us", tz="America/New_York"),
+}
+
+
+@pytest.mark.parametrize("drift", TIMESTAMP_DRIFTS, ids=list(TIMESTAMP_DRIFTS))
+def test_a_timestamp_in_another_unit_or_zone_is_unreadable(reader, target, drift):
+    """Same type family, so a check comparing only the kind of type would let it through.
+
+    A naive ``span_start`` is the drift the daemon's per-ticker guard used to absorb from a
+    comparison. The read refuses it now, before any comparison runs.
+    """
+    name = next(n for n, c in reader.columns.items() if pa.types.is_timestamp(c.type))
+    retyped = reader.columns[name].cast(TIMESTAMP_DRIFTS[drift])
+    _write(_table(reader.columns, **{name: retyped}), target)
+
+    with pytest.raises(reader.unreadable, match=f"its {name} column is timestamp"):
+        reader.read(target)
 
 
 def test_a_missing_column_is_unreadable_and_names_it(reader, target):
@@ -367,6 +407,8 @@ def test_an_os_error_from_the_read_is_not_folded(reader, target, monkeypatch):
         pa.ArrowNotImplementedError("Unsupported encoding"),
         OverflowError("date value out of range"),
         KeyError("schema_version"),
+        AttributeError("'NoneType' object has no attribute 'astimezone'"),
+        type("NoListNamesThis", (Exception,), {})("an error no enumerated fold would name"),
     ],
     ids=lambda e: type(e).__name__,
 )
