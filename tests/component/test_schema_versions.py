@@ -789,7 +789,11 @@ def _a_null_surface(path: Path) -> None:
 
 
 def _the_right_names_at_the_wrong_types(path: Path) -> None:
-    """A foreign parquet whose column names match, which no ``KeyError`` can catch."""
+    """A foreign parquet whose column names match, which no ``KeyError`` can catch.
+
+    The read refuses it now, since two of its columns are not at their pinned types, so it
+    no longer reaches the ``str.join`` inside the decision that it used to.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(
         pa.table(
@@ -813,7 +817,7 @@ def _the_right_names_at_the_wrong_types(path: Path) -> None:
         (_truncated_parquet, UNREADABLE),
         (_other_columns, UNREADABLE),
         (_a_ledger_format_from_the_future, UNREADABLE),
-        (_a_directory, UNRECORDED),
+        (_a_directory, UNREADABLE),
         (_a_null_surface, UNREADABLE),
         (_the_right_names_at_the_wrong_types, UNREADABLE),
     ],
@@ -830,19 +834,21 @@ def _the_right_names_at_the_wrong_types(path: Path) -> None:
 def test_no_ledger_this_code_cannot_read_takes_the_daemon_down(lake_root, build, state):
     """Every way the read fails becomes a verdict, because the caller is a daemon at startup.
 
-    The list is not two long, which is why the guard is broad rather than a set of named
-    classes. An absent file raises ``OSError``, a torn one ``LedgerUnreadable``, a format this
-    code does not read ``UnsupportedLedgerSchemaVersion``, and some other parquet file at that
-    path a bare ``KeyError``. A guard naming the first three lets the fourth take the session.
+    The guard is broad rather than a set of named classes, because the list of what the read
+    raises has run long before. An absent file raises ``OSError``, a format this code does not
+    read ``UnsupportedLedgerSchemaVersion``, and every damaged file ``LedgerUnreadable``. That
+    last class now covers a directory, some other parquet file at that path, and one whose
+    names match and whose types do not, which used to arrive as an empty ledger, a bare
+    ``KeyError`` and a ``TypeError`` from ``str.join`` (marketlake #551).
 
     The list is not even one long past the read. Every field of ``LEDGER_SCHEMA`` is nullable,
-    so a ledger with a null ``surface`` parses and then reaches ``sorted`` inside
-    ``_page_moved`` as a ``TypeError``. A foreign parquet whose names match and whose types do
-    not reaches ``str.join`` the same way, and no ``KeyError`` sees it. So the guard covers the
-    whole decision rather than the read.
+    so a ledger with a null ``surface`` passes the read and then reaches ``sorted`` inside
+    ``_page_moved`` as a ``TypeError``. So the guard covers the whole decision rather than the
+    read.
 
-    A directory is the odd row. ``pq.read_table`` reads one as a dataset and an empty one
-    yields an empty ledger, so the running version is simply absent from it.
+    A directory is unreadable rather than unrecorded. It used to read as an empty ledger,
+    because ``pq.read_table`` reads one as a dataset, and the page then sent the operator to
+    ``python -m lake.schema_versions``, which dies at ``os.replace`` on the directory.
     """
     build(ledger_path(lake_root))
 
@@ -853,14 +859,21 @@ def test_no_ledger_this_code_cannot_read_takes_the_daemon_down(lake_root, build,
 
 
 def test_an_unreadable_ledger_says_which_file_and_what_refused_it(lake_root):
-    """The operator needs the class, since the three verdicts send them to three repairs."""
+    """The operator needs the class, since the three verdicts send them to three repairs.
+
+    A foreign parquet used to put ``KeyError`` in the summary. It is ``LedgerUnreadable`` now,
+    like every other damaged ledger, and the summary loses nothing an operator acts on: every
+    damaged shape has the same repair, restoring the file or re-recording it. What told the
+    shapes apart moves to the detail, as the reason the read gives.
+    """
     _other_columns(ledger_path(lake_root))
 
     check = check_running_version(lake_root)
 
     assert check.event == UNREADABLE_EVENT
-    assert "KeyError" in check.summary
+    assert "LedgerUnreadable" in check.summary
     assert str(ledger_path(lake_root)) in check.detail
+    assert "has no integer schema_version" in check.detail
 
 
 def test_a_ledger_this_process_may_not_open_is_inaccessible_rather_than_unrecorded(lake_root):

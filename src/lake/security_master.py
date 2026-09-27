@@ -54,6 +54,7 @@ import pyarrow.parquet as pq
 
 from lake.calendar import MARKET_TZ
 from lake.paths import temp_write_path
+from lake.reference_table import read_reference_table
 
 # The pinned schema version for this reference table. A file stamps it on every row.
 MASTER_SCHEMA_VERSION = 1
@@ -126,20 +127,28 @@ class UnsupportedSchemaVersion(SecurityMasterError):
 
 
 class MasterUnreadable(SecurityMasterError):
-    """Raised when the master file is present but truncated or otherwise not valid parquet.
+    """Raised when something is at the master's path and it is not a master this code can read.
 
-    A torn write, or a write interrupted partway, leaves fewer bytes than a whole master.
-    ``pyarrow`` refuses those with ``ArrowInvalid``, whose class tree is ``ArrowInvalid ->
-    ValueError``, not a ``SecurityMasterError``. A caller guarding the master's own errors
-    alone would let it escape, so ``read`` folds it into this class. Two other unreadable
+    That is every damaged file, not only a torn one. A torn write leaves fewer bytes than a
+    whole master, and ``pyarrow`` refuses it with ``ArrowInvalid``, whose class tree is
+    ``ArrowInvalid -> ValueError``, not a ``SecurityMasterError``. A directory reads as an
+    empty table, a readable parquet in some other schema used to raise a bare ``KeyError``
+    from the build, and a bit flip can raise ``ArrowNotImplementedError`` or
+    ``OverflowError``. A caller guarding the master's own errors alone would let each of
+    them escape or read as a master holding nothing, so ``read`` folds them all into this
+    class, through ``reference_table.read_reference_table`` (marketlake #396, #551).
+
+    ``reason`` says which shape it was, and the message carries it, because the daemon's
+    line prints the message and a directory is not "not readable parquet". Two unreadable
     cases raise ``OSError`` instead, and callers guard that beside this class: an absent
     master, and an on-disk read error such as a bad sector, which ``pyarrow`` reports as
     ``ArrowIOError``.
     """
 
-    def __init__(self, path: Path) -> None:
-        super().__init__(f"security master at {path} is not readable parquet")
+    def __init__(self, path: Path, reason: str = "is not readable parquet") -> None:
+        super().__init__(f"security master at {path} {reason}")
         self.path = path
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -510,15 +519,22 @@ class SecurityMaster:
     def read(cls, path: Path | str) -> SecurityMaster:
         """Read a master from a parquet file at ``path``.
 
-        A truncated or torn file raises ``pyarrow``'s ``ArrowInvalid``. It is folded into
-        ``MasterUnreadable`` so a caller guarding ``SecurityMasterError`` catches it rather
-        than a stray ``ValueError``. An absent file raises ``OSError``, and so does an
-        on-disk read error such as a bad sector. The fold stays narrow on purpose: an
-        absent master is not a corrupt one, and callers treat the two apart.
+        Every damaged file raises ``MasterUnreadable``, so a caller guarding
+        ``SecurityMasterError`` catches it rather than a stray ``ValueError`` or
+        ``KeyError``. That covers a torn file, a directory, a parquet in some other schema
+        and a column of the wrong type. A master from newer code raises
+        ``UnsupportedSchemaVersion``. An absent file raises ``OSError``, and so does a
+        refused open or an on-disk read error such as a bad sector. ``OSError`` stays out
+        of the fold on purpose: an absent master is not a corrupt one, and callers treat
+        the two apart. ``reference_table.read_reference_table`` carries the rule and its
+        order for all three reference tables.
         """
-        path = Path(path)
-        try:
-            table = pq.read_table(path)
-        except pa.ArrowInvalid as exc:
-            raise MasterUnreadable(path) from exc
-        return cls.from_table(table)
+        return read_reference_table(
+            Path(path),
+            schema=MASTER_SCHEMA,
+            version=MASTER_SCHEMA_VERSION,
+            build=cls.from_table,
+            unreadable=MasterUnreadable,
+            base=SecurityMasterError,
+            unsupported=UnsupportedSchemaVersion,
+        )

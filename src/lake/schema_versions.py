@@ -76,6 +76,7 @@ from lake.clock import Clock, SystemClock
 from lake.config import input_errors_exit, load_config
 from lake.manifest import record_partition
 from lake.paths import REFERENCE_DIR, temp_write_path
+from lake.reference_table import read_reference_table
 
 # The pinned schema version for this reference table itself. Every row stamps it. It is
 # this file's own shape, not the journal shape a row describes, and the two move
@@ -128,18 +129,26 @@ class UnsupportedLedgerSchemaVersion(SchemaVersionsError):
 
 
 class LedgerUnreadable(SchemaVersionsError):
-    """Raised when the ledger file is present but truncated or not valid parquet.
+    """Raised when something is at the ledger's path and it is not a ledger this code can read.
 
-    A torn write leaves fewer bytes than a whole file. ``pyarrow`` refuses those with
-    ``ArrowInvalid``, whose class tree is ``ArrowInvalid -> ValueError``, not a
-    ``SchemaVersionsError``. ``read`` folds it into this class so a caller guarding this
-    module's own errors catches it. An absent file raises ``OSError`` instead, and callers
-    guard that beside this class, because an absent ledger is not a corrupt one.
+    That is every damaged file, not only a torn one. A torn write leaves fewer bytes than a
+    whole file, and ``pyarrow`` refuses it with ``ArrowInvalid``, whose class tree is
+    ``ArrowInvalid -> ValueError``, not a ``SchemaVersionsError``. A directory reads as an
+    empty table, which used to answer "not recorded" and send the operator to a repair that
+    dies at ``os.replace`` (marketlake #551). A parquet in some other schema used to raise a
+    bare ``KeyError``. ``read`` folds them all into this class, through
+    ``reference_table.read_reference_table``, so a caller guarding this module's own errors
+    catches every one.
+
+    ``reason`` says which shape it was, and the message carries it, because the ledger
+    check's page puts the message in its detail. An absent file raises ``OSError`` instead,
+    and callers guard that beside this class, because an absent ledger is not a corrupt one.
     """
 
-    def __init__(self, path: Path) -> None:
-        super().__init__(f"schema-versions ledger at {path} is not readable parquet")
+    def __init__(self, path: Path, reason: str = "is not readable parquet") -> None:
+        super().__init__(f"schema-versions ledger at {path} {reason}")
         self.path = path
+        self.reason = reason
 
 
 class SchemaVersionConflict(SchemaVersionsError):
@@ -315,16 +324,22 @@ class SchemaVersionLedger:
     def read(cls, path: Path | str) -> SchemaVersionLedger:
         """Read a ledger from parquet at ``path``.
 
-        A truncated or torn file raises ``pyarrow``'s ``ArrowInvalid``, folded into
-        ``LedgerUnreadable`` so a caller guarding ``SchemaVersionsError`` catches it. An
-        absent file raises ``OSError`` instead, and callers guard that apart.
+        Every damaged file raises ``LedgerUnreadable``, so a caller guarding
+        ``SchemaVersionsError`` catches it. That covers a torn file, a directory, a parquet
+        in some other schema and a column of the wrong type. A file from newer code raises
+        ``UnsupportedLedgerSchemaVersion``. An absent file raises ``OSError`` instead, and
+        so does a refused open, and callers guard that apart.
+        ``reference_table.read_reference_table`` carries the rule.
         """
-        path = Path(path)
-        try:
-            table = pq.read_table(path)
-        except pa.ArrowInvalid as exc:
-            raise LedgerUnreadable(path) from exc
-        return cls.from_table(table)
+        return read_reference_table(
+            Path(path),
+            schema=LEDGER_SCHEMA,
+            version=LEDGER_SCHEMA_VERSION,
+            build=cls.from_table,
+            unreadable=LedgerUnreadable,
+            base=SchemaVersionsError,
+            unsupported=UnsupportedLedgerSchemaVersion,
+        )
 
 
 def ledger_path(lake_root: Path | str) -> Path:
@@ -748,18 +763,19 @@ def check_running_version(lake_root: Path | str) -> RunningVersionCheck:
     under launchd's ``KeepAlive`` the successor reaches the same check and refuses again, so a
     missing row in a reference table would cost a whole session. Anything the decision raises
     becomes ``UNREADABLE`` instead, except the two failures of the open named below. The guard
-    is broad rather than a list of classes, because the list is not two long: a torn file raises
-    ``LedgerUnreadable``, a ledger format this code does not read
-    ``UnsupportedLedgerSchemaVersion``, and some other parquet file at that path a bare
-    ``KeyError``. That is ``sweep._counted``'s rule, that a summary must never cost the record.
+    is broad rather than a list of classes, because every list so far has run short. The read
+    now folds every damaged file into ``LedgerUnreadable``, including a directory and some
+    other parquet file at that path, which used to read as an empty ledger and raise a bare
+    ``KeyError`` (marketlake #551). A ledger format this code does not read raises
+    ``UnsupportedLedgerSchemaVersion``. That is ``sweep._counted``'s rule, that a summary must
+    never cost the record.
 
     The guard covers the whole decision and not the read alone, because the file decides more
     than whether it parses. Every field of :data:`LEDGER_SCHEMA` is nullable, so a ledger with a
     null ``surface`` is a file the pinned schema accepts, and it reaches ``sorted`` in
     :func:`_page_moved` as ``TypeError: '<' not supported between instances of 'str' and
-    'NoneType'``. A foreign parquet whose column names match and whose types do not reaches
-    ``str.join`` the same way. Both are content rather than a programming error, and a guard
-    stopping at the read would hand each of them to a daemon at startup.
+    'NoneType'``. That is content rather than a programming error, and a guard stopping at the
+    read would hand it to a daemon at startup.
 
     Absent is the one condition that is not unreadable, and it is caught by class rather than
     by looking first. ``FileNotFoundError`` alone means no ledger. A ``PermissionError`` or an

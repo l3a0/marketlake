@@ -238,14 +238,15 @@ _CALENDAR_RANGE_ERRORS = (ValueError, OverflowError)
 
 # What a failed security-master read raises, named so each can be logged for what it is.
 # The master is a Parquet file. An absent one raises ``OSError``, caught just above as
-# ``FileNotFoundError``. A torn or corrupt one is folded by ``SecurityMaster.read`` into
-# ``MasterUnreadable``, a ``SecurityMasterError``, so this guard no longer depends on a
-# ``pyarrow`` type leaking out of the read. A file whose columns drifted raises
-# ``KeyError``, and the master's own refusals raise ``SecurityMasterError``. ``ValueError``
-# stays as a defensive classifier: ``ArrowInvalid`` is one, so a read that skipped the
-# fold would still be logged here rather than escape. This set is not the only guard.
-# ``_capture_spans`` catches everything, because a file with the pinned column names and
-# drifted value types raises from a comparison much later, not from the read.
+# ``FileNotFoundError``. Every damaged one, torn, a directory, another schema or a column
+# at the wrong type, is folded by ``SecurityMaster.read`` into ``MasterUnreadable``, a
+# ``SecurityMasterError``, so this guard no longer depends on a ``pyarrow`` type leaking
+# out of the read (marketlake #551). A file whose columns drifted used to raise
+# ``KeyError`` and now refuses as ``MasterUnreadable``. ``KeyError`` and ``ValueError``
+# stay as defensive classifiers: ``ArrowInvalid`` is a ``ValueError``, so a read that
+# skipped the fold would still be logged here rather than escape. This set is not the only
+# guard. ``_capture_spans`` catches everything, because the read checks types and not
+# values, and a null in a pinned column raises from a comparison much later.
 _MASTER_READ_ERRORS = (OSError, KeyError, ValueError, SecurityMasterError)
 
 # The spans-file counterpart to ``_MASTER_READ_ERRORS``, same reasoning.
@@ -850,9 +851,9 @@ def _capture_spans(paths: LakePaths, tickers: Iterable[str]) -> dict[str, tuple[
     except Exception:
         # The guard is broad here, and only here. The master and the spans file are
         # optional reference files read off disk, so their contents are data that may be
-        # malformed in ways no enumerated error set anticipates: a file with the pinned
-        # column names and drifted value types raises a ``TypeError`` or an
-        # ``AttributeError`` from a comparison several frames deep, not a read error.
+        # malformed in ways no enumerated error set anticipates. The reads refuse a column
+        # at the wrong type, but a value the pinned type allows, such as a null, can
+        # still raise a ``TypeError`` from a comparison several frames deep.
         # The promise above is absolute, and the cost of keeping it is one panel served
         # without a clamp rather than a panel not served at all. Do not narrow this back
         # to a list of error types. The traceback is logged, so a real defect is still
@@ -937,9 +938,10 @@ def _read_capture_spans(
 def _valid_span(span: CaptureSpan) -> bool:
     """Whether a span's ends are fit to clamp with: aware datetimes throughout.
 
-    A retyped file drifts the same way the master's ``capture_start`` column can, and a
-    span unfit to compare is dropped rather than raising, which costs that span its
-    clamp and nothing else.
+    The read refuses a retyped file outright (marketlake #551), so what reaches here is a
+    file at the pinned types carrying a null ``span_start``, which every pinned field
+    allows. A span unfit to compare is dropped rather than raising, which costs that span
+    its clamp and nothing else.
     """
     if not isinstance(span.start, datetime) or span.start.utcoffset() is None:
         return False

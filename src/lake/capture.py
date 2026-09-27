@@ -1973,10 +1973,12 @@ def _live_roster(roster: Roster, lake_root: Path | str, now: datetime) -> Roster
             instrument_id = master.resolve(entry.ticker, on, id_type=ID_TYPE_TICKER)
             in_scope = instrument_id is None or spans.in_scope(instrument_id, now)
         except Exception:  # noqa: BLE001 - a per-ticker scope check must never crash a cycle
-            # Deliberately broad. A master or a spans file that loaded but carries a
-            # drifted value (a naive or retyped timestamp) raises from a comparison
-            # inside resolution or the span check, not from the read that opened the
-            # file. This is the live capture path, so the price of missing an
+            # Deliberately broad. The read refuses a pinned column at the wrong type
+            # (marketlake #551), but it checks types and not values, and every pinned
+            # field is nullable. So a master or a spans file that loaded can still carry
+            # a null that raises from a comparison inside resolution or the span check,
+            # not from the read that opened the file. This is the live capture path, so
+            # the price of missing an
             # unenumerated error here is a crashed cycle, worse than the dashboard's
             # unclamped panel. Widen instead: keep the ticker, the same answer a
             # missing master or spans file already gives.

@@ -40,6 +40,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from lake.paths import REFERENCE_DIR, temp_write_path
+from lake.reference_table import read_reference_table
 
 if TYPE_CHECKING:
     from lake.security_master import SecurityMaster
@@ -96,18 +97,25 @@ class UnsupportedSpansSchemaVersion(CaptureSpansError):
 
 
 class SpansUnreadable(CaptureSpansError):
-    """Raised when the spans file is present but truncated or not valid parquet.
+    """Raised when something is at the spans path and it is not a spans file this code can read.
 
-    A torn write leaves fewer bytes than a whole file. ``pyarrow`` refuses those with
-    ``ArrowInvalid``, whose class tree is ``ArrowInvalid -> ValueError``, not a
-    ``CaptureSpansError``. ``read`` folds it into this class so a caller guarding the
-    module's own errors catches it. An absent file raises ``OSError`` instead, and
-    callers guard that beside this class.
+    That is every damaged file, not only a torn one. A torn write leaves fewer bytes than a
+    whole file, and ``pyarrow`` refuses it with ``ArrowInvalid``, whose class tree is
+    ``ArrowInvalid -> ValueError``, not a ``CaptureSpansError``. A directory reads as an
+    empty table, which used to answer "no instrument is in scope" and stop capture
+    silently (marketlake #551). A parquet in some other schema used to raise a bare
+    ``KeyError``. ``read`` folds them all into this class, through
+    ``reference_table.read_reference_table``, so a caller guarding the module's own errors
+    catches every one.
+
+    ``reason`` says which shape it was, and the message carries it. An absent file raises
+    ``OSError`` instead, and callers guard that beside this class.
     """
 
-    def __init__(self, path: Path) -> None:
-        super().__init__(f"capture spans at {path} are not readable parquet")
+    def __init__(self, path: Path, reason: str = "is not readable parquet") -> None:
+        super().__init__(f"capture spans at {path} {reason}")
         self.path = path
+        self.reason = reason
 
 
 def spans_path(lake_root: Path | str) -> Path:
@@ -299,17 +307,22 @@ class CaptureSpans:
     def read(cls, path: Path | str) -> CaptureSpans:
         """Read a spans set from parquet at ``path``.
 
-        A truncated or torn file raises ``pyarrow``'s ``ArrowInvalid``, folded into
-        ``SpansUnreadable`` so a caller guarding ``CaptureSpansError`` catches it. An
-        absent file raises ``OSError``, and callers guard that apart, since an absent
-        spans file is not a corrupt one.
+        Every damaged file raises ``SpansUnreadable``, so a caller guarding
+        ``CaptureSpansError`` catches it. That covers a torn file, a directory, a parquet
+        in some other schema and a column of the wrong type. A file from newer code raises
+        ``UnsupportedSpansSchemaVersion``. An absent file raises ``OSError``, and so does a
+        refused open, and callers guard that apart, since an absent spans file is not a
+        corrupt one. ``reference_table.read_reference_table`` carries the rule.
         """
-        path = Path(path)
-        try:
-            table = pq.read_table(path)
-        except pa.ArrowInvalid as exc:
-            raise SpansUnreadable(path) from exc
-        return cls.from_table(table)
+        return read_reference_table(
+            Path(path),
+            schema=SPANS_SCHEMA,
+            version=SPANS_SCHEMA_VERSION,
+            build=cls.from_table,
+            unreadable=SpansUnreadable,
+            base=CaptureSpansError,
+            unsupported=UnsupportedSpansSchemaVersion,
+        )
 
 
 def build_from_master(

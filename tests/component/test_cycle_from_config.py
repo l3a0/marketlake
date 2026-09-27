@@ -589,13 +589,16 @@ def test_with_no_master_or_spans_file_every_enabled_ticker_is_captured(tmp_path,
     assert result.out_of_span == ()
 
 
-def test_a_drifted_spans_file_widens_rather_than_crashing_the_cycle(tmp_path, monkeypatch):
-    """A comparison inside the span check must not be allowed to crash a live cycle.
+@pytest.mark.parametrize("drift", ["naive span_start", "null span_start"])
+def test_a_drifted_spans_file_widens_rather_than_crashing_the_cycle(tmp_path, monkeypatch, drift):
+    """A drifted spans file must not be allowed to crash a live cycle.
 
-    A retyped ``span_start`` column reads back as a naive or non-comparable value, which
-    raises out of ``CaptureSpan.contains`` rather than out of the file read that opened
-    it. The live capture path treats that the same as a missing spans file: it keeps the
-    ticker rather than let the cycle crash.
+    Two routes reach the same answer. A retyped ``span_start`` column is refused by the
+    read, which checks every pinned column's type (marketlake #551), and ``_live_roster``
+    widens on the refusal. A null ``span_start`` passes the read, because every pinned
+    field is nullable, and raises out of ``CaptureSpan.contains`` instead. The per-ticker
+    guard catches that one. Either way the live capture path keeps the ticker, the answer
+    a missing spans file gives.
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -612,15 +615,20 @@ def test_a_drifted_spans_file_widens_rather_than_crashing_the_cycle(tmp_path, mo
     spans = CaptureSpans()
     spans.open_span(iid, FIRST_MINUTE, True)
     table = spans.to_table()
-    drifted = pa.schema(
-        [
-            pa.field("span_start", pa.timestamp("us")) if f.name == "span_start" else f
-            for f in table.schema
-        ]
-    )
+    if drift == "naive span_start":
+        drifted = pa.schema(
+            [
+                pa.field("span_start", pa.timestamp("us")) if f.name == "span_start" else f
+                for f in table.schema
+            ]
+        )
+        table = table.cast(drifted)
+    else:
+        starts = table.schema.get_field_index("span_start")
+        table = table.set_column(starts, "span_start", pa.nulls(1, pa.timestamp("us", tz="UTC")))
     path = spans_path(rig.lake_root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(table.cast(drifted), path)
+    pq.write_table(table, path)
 
     vendor = _Vendor()
     _wire(monkeypatch, rig, lambda path: vendor)
