@@ -15,7 +15,7 @@ They cover the loop's observable contract:
 4. The five hooks fire as specified: ``on_start`` once before any cycle, ``on_tick`` on
    every minute the loop sees, ``close_tag_for`` once per capture slot with its answer
    passed through, ``on_cycle`` with every result in order, and ``on_skipped`` with the
-   capture slots an overrun missed.
+   capture slots a stall missed.
 5. ``session_phase`` is ``post_equity_close`` on the slots past the equity close and
    through the option close, and null elsewhere.
 6. A slow cycle skips no minute, because each cycle runs on a thread of its own. A stall
@@ -935,6 +935,42 @@ def test_a_cycle_is_handed_on_when_it_finishes_rather_than_at_the_next_tick(cale
         # The last cycle, handed on as the loop leaves.
         ("cycle", et(REGULAR, 10, 1).astimezone(UTC)),
     ]
+
+
+def test_an_on_cycle_that_runs_past_the_top_fires_that_minute_late_rather_than_skipping_it(
+    calendar,
+):
+    # The 10:00 result is handed on while the loop waits for 10:01, and its hook runs to
+    # 10:01:10. Before marketlake #565 the loop computed its next top after the hook,
+    # realigned to 10:02, and marked 10:01 skipped. Now the top was fixed before the hook
+    # ran, so the loop reads 10:01 as soon as the hook returns and fires it ten seconds
+    # late, with ten seconds less of its bound left.
+    clock = ManualClock(start=et(REGULAR, 9, 59, 30).astimezone(UTC))
+    session_clock = SessionClock(clock, calendar)
+    runner = _RecordingRunner(clock)
+    fired_at: list[datetime] = []
+    reports: list[list[datetime]] = []
+
+    def on_cycle(slot: datetime, result: CycleResult) -> None:
+        if slot == et(REGULAR, 10, 0):
+            clock.advance(70)
+
+    def on_tick(slot: datetime) -> None:
+        fired_at.append(clock.now())
+
+    hooks = daemon.DaemonHooks(
+        on_tick=on_tick,
+        on_cycle=on_cycle,
+        on_skipped=lambda slots: reports.append(list(slots)),
+    )
+    end = et(REGULAR, 10, 2).astimezone(UTC)
+    daemon.run_loop(
+        session_clock, runner, clock=clock, hooks=hooks, should_continue=lambda: clock.now() < end
+    )
+
+    assert runner.slots == [et(REGULAR, 10, 0), et(REGULAR, 10, 1), et(REGULAR, 10, 2)]
+    assert fired_at[1] == et(REGULAR, 10, 1, 10).astimezone(UTC)
+    assert reports == []
 
 
 def test_a_cycle_that_raises_ends_the_loop_after_the_cycles_behind_it_finish(calendar):

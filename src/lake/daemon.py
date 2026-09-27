@@ -61,9 +61,9 @@ A slow cycle never delays or shifts a later sample, because the loop never waits
 cycle before firing the next. A cycle ends when its own requests are done, or at the bound
 ``lake.capture`` puts on them (marketlake #597). What the loop can still miss is a minute
 its own thread was not awake for: the machine slept, the process was suspended, the wall
-clock jumped, or a hook on the loop thread ran past a minute. The loop then aligns to the
-next minute top from wherever the clock stands. The minutes it missed fire no cycle and
-are never caught up. They must still be recorded. The design counts completeness from
+clock jumped, or a tick's hooks ran past the next top. The loop then aligns to the next
+minute top from wherever the clock stands. The minutes it missed fire no cycle and are
+never caught up. They must still be recorded. The design counts completeness from
 rows, never from holes, and the loop is the only piece that can see the skip. So the loop
 keeps the slot of the previous tick. On each tick of a session date it walks the minutes
 strictly between that slot and the current one, keeps the ones inside the capture window,
@@ -79,6 +79,11 @@ through it, and the loop owns every minute after it. So the two writers never ov
 loop reports what it slept through while alive, and startup marking reports what happened
 while it was dead. One read rather than two, because a second read can fall past a minute
 top the first did not, and both writers would then claim that minute.
+
+An ``on_cycle`` that runs past the top while the loop waits is the one hook that skips
+nothing. The loop reads its slot as soon as the hook returns, so that minute's cycle fires
+late, with that much less of its bound left. A minute is skipped only when the hook also
+runs past the top after it.
 
 The loop's other state is the queue of cycles still in flight, in slot order. It exists
 only while cycles run, and a restart that loses it loses those minutes' cycles, which the
