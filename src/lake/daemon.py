@@ -1421,5 +1421,5 @@ __all__ = [
 ]
 
 
-if __name__ == "__main__":  # pragma: no cover - exercised via the console, not in CI
+if __name__ == "__main__":
     raise SystemExit(main())
