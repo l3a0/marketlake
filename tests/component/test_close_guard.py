@@ -1280,18 +1280,16 @@ def _segments(root: Path, ticker: str, surface: str = journal.QUOTES_SURFACE) ->
     return sorted(LakePaths(root).segment_dir(surface, ticker, DAY).glob("*.arrows"))
 
 
-def _unparseable_segment(root: Path, surface: str, ticker: str) -> Path:
-    """A segment that opens cleanly and whose close-tag column will not decode.
-
-    The two columns are the right type and the file is valid Arrow IPC, so the open
-    succeeds and ``to_pylist`` raises a ``UnicodeDecodeError``, which is a ``ValueError``
-    and lands as ``unparseable`` rather than as drift. Nothing went missing and nothing was
-    retyped, which is the line the dashboard already draws and the reason the fifth kind
-    exists.
+def _invalid_utf8_segment(root: Path, surface: str, ticker: str) -> Path:
+    """A valid Arrow IPC segment whose close-tag column holds bytes that are not UTF-8.
 
     The first row's tag is a legible ``spot_close``. It is written by hand because no
     writer produces bytes like these, and it is there so the file this plants is one that
     demonstrably holds the close while refusing to say so.
+
+    It used to open cleanly and raise ``UnicodeDecodeError`` on the column, which filed it
+    ``unparseable``. Full validation now refuses the batch at the read, because an Arrow
+    string column must hold UTF-8, so it files ``corrupt`` (marketlake #552).
     """
     import pyarrow as pa
 
@@ -1307,7 +1305,24 @@ def _unparseable_segment(root: Path, surface: str, ticker: str) -> Path:
     return path
 
 
-def test_a_segment_whose_values_will_not_decode_withholds_the_marker(tmp_path):
+def test_a_segment_whose_bytes_are_not_utf8_withholds_the_marker(tmp_path):
+    """A garbled string column is damage the read refuses, and the marker still waits.
+
+    The file holds the close in its first row. Validation turns what used to be a column
+    decode error into a refusal at the read, and the guard must answer that the same way
+    it answers every other kind.
+    """
+    path = _invalid_utf8_segment(tmp_path, journal.QUOTES_SURFACE, "GARBLE")
+
+    guard = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 20)), [("GARBLE", False), ("OK", False)])
+    outcome = guard.run(DAY)
+
+    assert outcome.problems == ("quotes/GARBLE: 1 unreadable (1 corrupt)",), outcome.problems
+    assert outcome.unobserved == ("OK",), "the guard denied a close the garbled file holds"
+    assert _segments(tmp_path, "GARBLE") == [path], "a marker landed beside a garbled file"
+
+
+def test_a_segment_whose_values_will_not_decode_withholds_the_marker(tmp_path, monkeypatch):
     """The fifth kind, which the rule covers by argument and this covers by example.
 
     ``unparseable`` is not drift: the columns are present and the right type, and one value
@@ -1315,9 +1330,23 @@ def test_a_segment_whose_values_will_not_decode_withholds_the_marker(tmp_path):
     the file opened and its rows went unread, and one of those rows is the close. Without a
     case here the refusal could be narrowed to exclude this kind alone with the suite
     green, and the comment's own sentence about covering it invites exactly that edit.
-    """
-    path = _unparseable_segment(tmp_path, journal.QUOTES_SURFACE, "GARBLE")
 
+    The reader is replaced rather than fed a file. ``close_tag_rows`` reads two string
+    columns and compares them, and once full validation refuses bytes that are not UTF-8,
+    no valid file makes that raise. The branch still has to answer the kind, because which
+    kinds the reader can produce is the reader's business and not the guard's.
+    """
+    path = _invalid_utf8_segment(tmp_path, journal.QUOTES_SURFACE, "GARBLE")
+    real = journal.close_tag_rows
+
+    def unparseable(root, surface, ticker, day, close_tag):
+        if ticker != "GARBLE":
+            return real(root, surface, ticker, day, close_tag)
+        return journal.CloseTagRows(
+            0, 0, (journal.UnusableSegment(path, journal.SEGMENT_UNPARSEABLE),)
+        )
+
+    monkeypatch.setattr(journal, "close_tag_rows", unparseable)
     guard = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 20)), [("GARBLE", False), ("OK", False)])
     outcome = guard.run(DAY)
 
