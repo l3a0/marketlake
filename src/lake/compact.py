@@ -337,7 +337,7 @@ class SegmentSchemaConflict(Exception):
 
 
 class DamagedSegments(Exception):
-    """Raised when a ticker-day's segment no longer matches the hash taken when it closed.
+    """Raised when a ticker-day's segment no longer matches its hash or reads as damaged.
 
     Every capture segment has a manifest entry whose sha256 the cycle hashed from the file
     right after closing it. ``_seal`` compares each segment that has one before reading any
@@ -434,9 +434,9 @@ class RefusedTickerDay:
     ``REFUSED_TYPES_DISAGREE`` is a merge the segments' column types refused, filed under
     ``reports/schema_drift/``, and ``conflicts`` names each column, rendered
     ``name: earlier -> later``. ``REFUSED_SEGMENT_DAMAGED`` is a segment whose bytes no
-    longer match the hash taken when it closed, filed under ``reports/damaged_segments/``,
-    and ``damaged`` names each such segment with both digests. Each leaves the other's
-    field empty.
+    longer match the hash taken when it closed, or whose read proved them damaged, filed
+    under ``reports/damaged_segments/``, and ``damaged`` names each such segment with both
+    digests or the read's failure. Each leaves the other's field empty.
 
     Both join one list because the re-tune needs to know every chains ticker-day the day
     is missing, whatever the reason, and a refused ticker's absent rows would otherwise
@@ -493,7 +493,7 @@ class CompactionResult:
     that already had a manifest entry and were sha-checked, with their debris deleted.
     ``skipped`` lists the date directories left alone. ``refused`` lists the ticker-days
     the sweep would not seal, either because their segments disagreed about a column type,
-    which the merge cannot reconcile, or because a segment no longer matched its hash.
+    which the merge cannot reconcile, or because a segment's bytes were damaged.
     ``retune`` is the window re-tune verdict, or ``None`` when no chains partition of an
     eligible day was available to profile. ``backed_up`` and ``pinged`` record the two
     post-seal steps. ``problem`` names a ping that failed, which leaves ``pinged`` false.
@@ -978,7 +978,7 @@ def _file_drift(
     """File one finding, remember it for the run's page, and never let either cost the run.
 
     The sweep catches two failures out of ``_seal``, the merge a column type conflict
-    refused and a segment that no longer matches its hash, and ``compact``'s only other
+    refused and a segment whose bytes were damaged, and ``compact``'s only other
     ``try/except`` wraps the health-check ping. So
     anything raised here would cost every ticker-day still to be sealed, the window
     re-tune, the backup, and the ping. Trading a null column on one ticker for a lake-wide
@@ -1370,7 +1370,8 @@ def _seal(
     caller already holds. It is required rather than defaulted, because a caller that
     forgot it would skip the check on every segment and nothing would say so. Every
     segment is then read before anything is written, so a shadow-append raises with the
-    ticker-day untouched. The
+    ticker-day untouched, and every segment the read proves damaged raises
+    ``DamagedSegments`` the same way, after the rest have been read. The
     Parquet lands and is read back once. That read yields both the row count, checked
     against the sum across the segments, and the digest the manifest entry carries. The
     entry is appended. Only then are the segments unlinked.
@@ -1445,7 +1446,10 @@ def _seal(
             # The read proved what the hash check above could not, for a segment with no
             # manifest entry: a batch that fails validation, or a stream that stops inside
             # a finished file. The refusal is the hash check's own, and every other
-            # segment is still read first, so the finding names all of them in one run.
+            # segment is still read first, so the finding names every segment the read
+            # refuses in one run. A digest mismatch refuses the ticker-day before any read,
+            # so a segment the read would refuse beside one is named on the first run after
+            # the mismatch is repaired.
             seg = path.relative_to(root).as_posix()
             recorded = entries.get(seg)
             unreadable.append(
@@ -1453,7 +1457,7 @@ def _seal(
                     segment=seg,
                     expected=None if recorded is None else str(recorded["sha256"]),
                     actual=sha256_file(path),
-                    error=str(exc),
+                    error=exc.detail,
                 )
             )
             continue
@@ -1963,7 +1967,7 @@ def compact(
         # does not match its manifest entry, and any OSError from the write or the unlink.
         # A merge the segments' types refused is one failure it catches instead, and that
         # finding joins ``drifted`` like any other, so this same page carries it. A
-        # segment that no longer matches its hash is the other, and its finding joins
+        # segment whose bytes were damaged is the other, and its finding joins
         # ``damage``, which pages from the same ``finally`` under its own title.
         # A ticker-day that already drifted and sealed has had its segments unlinked, so
         # the next run finds nothing to merge for it and never runs the check again. The

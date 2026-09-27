@@ -2345,6 +2345,8 @@ class SegmentDamaged(pa.ArrowInvalid):
 
     def __init__(self, path: Path, detail: str) -> None:
         self.path = path
+        # What failed, without the path, for a record that already names the segment.
+        self.detail = detail
         super().__init__(f"{path}: {detail}")
 
 
@@ -2361,6 +2363,11 @@ def _ends_in_eos(source: pa.MemoryMappedFile) -> bool:
     size = source.size()
     marker = len(_EOS_MARKER)
     return size >= marker and source.read_at(marker, size - marker) == _EOS_MARKER
+
+
+# What pyarrow raises about a stream's bytes. On a file with no end-of-stream marker, only
+# these read as a tear. ``ArrowNotImplementedError`` is an ``ArrowException``.
+_BYTE_FAILURES = (pa.ArrowException, OSError)
 
 
 def _complete_batches(
@@ -2385,19 +2392,28 @@ def _complete_batches(
     and then raise ``SystemError`` or crash the process when a column is read, and only the
     full validation catches it. The cheap one left 49 of 51 crashing flips in place.
 
-    Whatever the stream raises is caught, not a list of classes, because each list tried
-    so far has missed a member. On a file that ends in the marker it becomes
-    ``SegmentDamaged``. On one that does not, a failure at the open becomes ``ArrowInvalid``,
-    which compaction reads as a segment torn before its first batch, and a failure after it
-    is the torn tail. The memory map is opened by the caller, outside this, so a missing
-    file still raises ``FileNotFoundError`` and a refused one ``PermissionError``.
+    On a file that ends in the marker, whatever the stream raises is caught, not a list of
+    classes, because each list tried so far has missed a member, and it becomes
+    ``SegmentDamaged``. Misfiling a failure there is loud, since every reader refuses the
+    segment. On a file that does not end in it, only what pyarrow raises about the bytes is
+    caught: an ``ArrowException`` or an ``OSError``. A failure at the open becomes
+    ``ArrowInvalid``, which compaction reads as a segment torn before its first batch, and a
+    failure after it is the torn tail. Both of those drop rows without a word, so anything
+    else, a programming error for one, propagates rather than reading a durable batch as
+    torn. ``MemoryError`` propagates from either kind of file, because running out of memory
+    says nothing about the bytes. The memory map is opened by the caller, outside this, so a
+    missing file still raises ``FileNotFoundError`` and a refused one ``PermissionError``.
     """
     finished = _ends_in_eos(source)
     try:
         reader = pa.ipc.open_stream(source)
+    except MemoryError:
+        raise
     except Exception as exc:
         if finished:
             raise SegmentDamaged(path, f"the stream will not open: {exc!r}") from exc
+        if not isinstance(exc, _BYTE_FAILURES):
+            raise
         raise pa.ArrowInvalid(f"{path}: the stream will not open: {exc!r}") from exc
     batches: list[pa.RecordBatch] = []
     while True:
@@ -2405,14 +2421,20 @@ def _complete_batches(
             batch = reader.read_next_batch()
         except StopIteration:
             return reader.schema, batches, True
+        except MemoryError:
+            raise
         except Exception as exc:
             if finished:
                 raise SegmentDamaged(
                     path, f"the stream stopped inside a finished file: {exc!r}"
                 ) from exc
+            if not isinstance(exc, _BYTE_FAILURES):
+                raise
             return reader.schema, batches, False
         try:
             batch.validate(full=True)
+        except MemoryError:
+            raise
         except Exception as exc:
             raise SegmentDamaged(path, f"a batch failed validation: {exc!r}") from exc
         batches.append(batch)
@@ -2468,7 +2490,8 @@ UNUSABLE_SEGMENT = (OSError, ShadowAppendError, KeyError, TypeError, ValueError)
 # Why a segment could not be used. The first four names are ``dashboard.SegmentHealth``'s,
 # reused rather than renamed so the panel and the readers under it name one failure one way.
 SEGMENT_VANISHED = "vanished"  # listed and then gone, a seal landing mid-read
-SEGMENT_CORRUPT = "corrupt"  # the bytes will not open: a torn header, or no Arrow stream
+# the bytes will not open or are damaged: a torn header, no Arrow stream, or SegmentDamaged
+SEGMENT_CORRUPT = "corrupt"
 SEGMENT_SHADOW_APPEND = "shadow_append"  # bytes follow the end-of-stream marker
 SEGMENT_DRIFTED = "drifted"  # it opened, and the column asked of it is gone or retyped
 SEGMENT_UNPARSEABLE = "unparseable"  # the column is the right type and a value is not usable

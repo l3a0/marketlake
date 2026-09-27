@@ -97,6 +97,8 @@ CHANGES_A_VALUE = b"2026-08-24T10:"
 # and the last byte of its one batch body. Flipping it breaks the last column's buffers,
 # which only full validation sees, and leaves the end-of-stream marker after it intact.
 MARKER_BYTES = 9088
+# Raises ``OSError`` at the open, the commonest class a flip raises there.
+OSERROR_AT_OPEN = 1860
 MARKER_FLIP = 9079
 
 
@@ -503,6 +505,8 @@ def test_an_unmanifested_flip_the_read_proves_refuses_the_ticker_day(lake_root):
         sha256_file(damaged),
     )
     assert item.error is not None and "stopped inside a finished file" in item.error
+    # The record already names the segment, so the error does not repeat its machine path.
+    assert str(lake_root) not in item.error
     (finding,) = _findings(lake_root)
     assert finding["damaged"] == [
         {
@@ -520,6 +524,51 @@ def test_an_unmanifested_flip_the_read_proves_refuses_the_ticker_day(lake_root):
     assert "no longer match" not in page.body
     (line,) = [line for line in result.render().splitlines() if line.startswith("  refused")]
     assert line.endswith(f"segments=5 kept, damaged, failed to read: {damaged.name}")
+
+
+def test_every_damaged_segment_is_named_in_one_run(lake_root):
+    spy = _unmanifested(lake_root)
+    _flip(spy[1], DROPS_THE_SEGMENT)
+    _flip(spy[3], DROPS_THE_SEGMENT)
+
+    result, _ = _run(lake_root)
+
+    (refused,) = result.refused
+    assert [bad.segment for bad in refused.damaged] == [
+        _rel(lake_root, spy[1]),
+        _rel(lake_root, spy[3]),
+    ]
+
+
+def test_a_ticker_day_whose_every_segment_is_damaged_is_still_refused(lake_root):
+    """No segment survives the read, so nothing is left to merge. Sealing the empty merge
+    would unlink every segment, the only copy of the day's rows."""
+    spy = _unmanifested(lake_root)
+    for path in spy:
+        _flip(path, DROPS_THE_SEGMENT)
+    before = {path: path.read_bytes() for path in spy}
+
+    result, _ = _run(lake_root)
+
+    assert result.sealed == ()
+    (refused,) = result.refused
+    assert refused.reason == REFUSED_SEGMENT_DAMAGED
+    assert len(refused.damaged) == len(spy)
+    assert {path: path.read_bytes() for path in spy} == before
+
+
+def test_an_os_error_at_the_open_refuses_the_ticker_day(lake_root):
+    """The commonest class a flip raises at the open, which compaction used to read as a
+    segment torn before its first batch."""
+    spy = _unmanifested(lake_root)
+    _flip(spy[2], OSERROR_AT_OPEN)
+
+    result, _ = _run(lake_root)
+
+    assert result.sealed == ()
+    (refused,) = result.refused
+    assert [bad.segment for bad in refused.damaged] == [_rel(lake_root, spy[2])]
+    assert spy[2].exists()
 
 
 def test_a_damaged_marker_beside_intact_captures_refuses_the_ticker_day(lake_root):
@@ -836,8 +885,50 @@ def test_the_page_and_the_summary_count_each_kind_of_damage_apart():
         "and 1 segment(s) failed to read as damaged." in body
     )
     assert kinds == "sha256 no longer matches: seg-a.arrows; failed to read: seg-b.arrows"
-    assert "seg-a.arrows (sha256 no longer matches: recorded " in message
+    assert message.startswith(f"{found[0].partition}: 2 segment(s) damaged: ")
+    a, b = "a" * 64, "b" * 64
+    assert f"seg-a.arrows (sha256 no longer matches: recorded {a}, now {b})" in message
     assert "seg-b.arrows (failed to read: stopped; no sha256 recorded, now " in message
+
+
+def test_the_words_follow_each_segment_rather_than_the_first():
+    """A read refusal of a segment that did have a digest names that digest, two mismatches
+    are both named, and a page with no read refusal does not mention one."""
+    base = f"journal/date={DAY.isoformat()}/surface=chains/ticker=SPY"
+    refused = DamagedSegment(
+        segment=f"{base}/seg-r.arrows", expected="d" * 64, actual="c" * 64, error="x"
+    )
+    first = DamagedSegment(segment=f"{base}/seg-a.arrows", expected="a" * 64, actual="b" * 64)
+    second = DamagedSegment(segment=f"{base}/seg-c.arrows", expected="a" * 64, actual="b" * 64)
+
+    message = str(
+        DamagedSegments(
+            surface="chains",
+            ticker="SPY",
+            day=DAY,
+            partition="p",
+            segments=(refused.segment,),
+            damaged=(refused,),
+        )
+    )
+    kinds = compact_module._damage_kinds((first, second))
+    body = compact_module._damage_body(
+        [
+            SegmentDamage(
+                surface="chains",
+                ticker="SPY",
+                day=DAY,
+                partition="p",
+                segments=(first.segment,),
+                damaged=(first,),
+            )
+        ]
+    )
+
+    assert f"seg-r.arrows (failed to read: x; recorded {'d' * 64}, now {'c' * 64})" in message
+    assert kinds == "sha256 no longer matches: seg-a.arrows, seg-c.arrows"
+    assert "failed to read" not in body
+    assert "1 segment(s) no longer match the sha256 taken when they closed. " in body
 
 
 # -- 7. the human-invoked repair ---------------------------------------------

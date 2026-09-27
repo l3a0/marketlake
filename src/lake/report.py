@@ -53,9 +53,11 @@ into one message and sends the reader here for the per-ticker-day detail.
 Compaction files a second kind of finding, in a subdirectory of its own. Before it reads a
 ticker-day's segments it checks each one that has a manifest entry against the sha256 that
 entry recorded when the segment closed, and a segment that no longer matches refuses the
-whole ticker-day. That finding is damage rather than drift, and a reader counting drift
-must not pick it up, so it goes under ``reports/damaged_segments/`` and not
-``reports/schema_drift/``. It names the segment and both hashes, and it files on every run
+whole ticker-day. A segment the read proves damaged refuses it the same way, which is the
+only check a segment with no manifest entry gets. That finding is damage rather than
+drift, and a reader counting drift must not pick it up, so it goes under
+``reports/damaged_segments/`` and not ``reports/schema_drift/``. It names the segment and
+both hashes, or the read's failure where no hash was recorded, and it files on every run
 the damage survives, for the reason a refused merge does: nothing was sealed, so no
 manifest entry makes a later silence readable.
 
@@ -375,13 +377,13 @@ def write_schema_drift(
 
 @dataclass(frozen=True)
 class DamagedSegment:
-    """One segment whose bytes no longer match the sha256 recorded when it closed.
+    """One segment compaction refused: its digest moved, or its read proved it damaged.
 
     ``segment`` is the lake-relative path. ``expected`` is the digest the segment's manifest
     entry carries, which the capture cycle hashed from the file right after closing it.
-    ``actual`` is the digest of the bytes on disk when compaction came to seal them. The
-    two differ, which is the whole finding: a flip anywhere in the file changes the digest,
-    whether it breaks the stream, drops a batch, or rewrites one value.
+    ``actual`` is the digest of the bytes on disk when compaction came to seal them. For a
+    digest refusal the two differ, which is the whole finding: a flip anywhere in the file
+    changes the digest, whether it breaks the stream, drops a batch, or rewrites one value.
 
     Both digests are here because the pair is what an operator repairing the day compares.
     Only the expected one says what the segment was. The actual one says the copy on disk
@@ -404,13 +406,13 @@ class DamagedSegment:
 
 @dataclass(frozen=True)
 class SegmentDamage:
-    """One ticker-day compaction refused because a segment no longer matched its hash.
+    """One ticker-day compaction refused because a segment's bytes were damaged.
 
     ``partition`` is the Parquet the refusal did not write. ``segments`` names every segment
     of the ticker-day, all still on disk, because the refusal keeps the whole ticker-day
     rather than sealing the healthy segments: the next run would find the partition
-    manifested and delete the kept one as debris. ``damaged`` names the ones that failed the
-    check, each with both digests.
+    manifested and delete the kept one as debris. ``damaged`` names the ones that failed,
+    each with both digests or with the read's failure, as ``DamagedSegment`` says.
     """
 
     surface: str

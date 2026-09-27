@@ -513,7 +513,7 @@ class SegmentHealth:
     stamp is counted there and nowhere else, because it has no slot to be judged in.
     """
 
-    corrupt: int = 0  # unreadable bytes: a torn header, or not an Arrow stream at all
+    corrupt: int = 0  # unreadable bytes: a torn header, no Arrow stream, or damage
     vanished: int = 0  # the file was listed and then gone, the seal landing mid-read
     shadow_append: int = 0  # bytes follow the end-of-stream marker
     drifted: int = 0  # a required provenance column is missing or cannot be cast back
@@ -659,7 +659,8 @@ def _load_journal_rows(segments: Sequence[Path]) -> tuple[pa.Table, SegmentHealt
     call for different responses.
 
     1. The file vanished under a landing seal.
-    2. Its bytes are unreadable, from a torn header or a file that is no Arrow stream.
+    2. Its bytes are unreadable, from a torn header, a file that is no Arrow stream, or
+       damage the read proves (``journal.SegmentDamaged``).
     3. It carries a shadow-append, bytes written past the end-of-stream marker.
     4. Its schema drifted past what a cast can repair.
 

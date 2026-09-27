@@ -442,8 +442,10 @@ def _prior_expirations(lake_root: Path | str, ticker: str, at: datetime) -> list
     retracting the only sign of it before close+15. That is when compaction checks each
     segment against the hash taken when it closed and pages the one that no longer matches
     (marketlake #556). So a second failure is a second event, and a read that works says
-    nothing. A refused manifest ends the cycle at its own manifest append anyway, so it
-    prints one line per relaunch beside the traceback.
+    nothing. That measurement predates marketlake #552, which made the walk skip a damaged
+    segment without raising, so damage no longer reaches this fallback at all. It surfaces
+    at compaction, which refuses the ticker-day. A refused manifest ends the cycle at its own
+    manifest append anyway, so it prints one line per relaunch beside the traceback.
 
     ``at`` is the line's instant, from the caller's injected clock. The line cannot raise,
     because building it calls the exception's own ``__str__``, and a raise there would cost
