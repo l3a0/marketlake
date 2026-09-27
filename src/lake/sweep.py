@@ -97,6 +97,7 @@ from pathlib import Path
 from lake.actions import ActionsError, ExtractionReport, extract_dividends
 from lake.alert import Message, NtfyTransport, Publisher, undelivered
 from lake.bars import (
+    CLOSE_VALUE_ABSENT,
     BackfillReport,
     BarsReport,
     SpansAbsent,
@@ -122,14 +123,18 @@ from lake.control_plane import (
     pmset_schedule_args,
     read_pmset_schedule,
 )
+from lake.loader import NoSpotClose
 from lake.manifest import ManifestError, is_quarantined, latest_quarantine
 from lake.paths import CHAINS, QUOTES
 from lake.report import (
+    ACTION,
     BARS_PIECE,
     DIVIDENDS_PIECE,
+    INFO,
     SPLITS_PIECE,
     Nightly,
     PieceOutcome,
+    ReportLines,
     redacted,
     write_nightly,
 )
@@ -340,6 +345,15 @@ _BARS_REFUSALS = (
     OSError,
 )
 
+# The ``bars abandoned`` reasons that say the sealed partition holds no usable close. The
+# segments it was built from are gone, so nothing can change either one, and a line naming
+# only these is ``INFO``. ``bars.GateSkip`` carries the reason as the class-shaped token, which
+# ``bars`` calls "what separates a quarantine somebody can sign off from a gap nothing can
+# rebuild". The other three want a human. ``PartitionAbsent`` is a manifested partition gone
+# from disk, which wants a restore, ``PartitionQuarantined`` a sign-off, and ``PartialRead`` a
+# schema change (marketlake #530).
+_PERMANENT_ABANDON_REASONS = frozenset({NoSpotClose.__name__, CLOSE_VALUE_ABSENT})
+
 
 def set_sunday_wake(sunday: date) -> None:
     """The real setter: ``sudo -n /usr/bin/pmset schedule wakeorpoweron "<date> 19:55:00"``.
@@ -483,7 +497,7 @@ def _bars_outcome(report: BarsReport | BackfillReport) -> PieceOutcome:
     )
 
 
-def _counted(what: str, read: Callable[[], int | None], report: list[str]) -> int | None:
+def _counted(what: str, read: Callable[[], int | None], report: ReportLines) -> int | None:
     """One summary count, or ``None`` with a line saying why it could not be read.
 
     The three counts are a summary of the run rather than the run itself, so a failure
@@ -499,7 +513,7 @@ def _counted(what: str, read: Callable[[], int | None], report: list[str]) -> in
     try:
         return read()
     except Exception as exc:  # noqa: BLE001 - a summary must not cost the record
-        report.append(f"{what} unreadable: {type(exc).__name__}: {exc}")
+        report.add(f"{what} unreadable: {type(exc).__name__}: {exc}", ACTION)
         return None
 
 
@@ -696,7 +710,7 @@ def _friday_wake(
     calendar: Calendar,
     schedule_setter: ScheduleSetter,
     schedule_reader: ScheduleReader,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], ReportLines]:
     """Set the Sunday one-shot and read it back. Returns the problems and the report lines.
 
     The set runs on a Friday alone, holiday no-ops included, which the design's pmset table
@@ -713,7 +727,7 @@ def _friday_wake(
     wake this run just set rather than about one that fired days ago.
     """
     problems: list[str] = []
-    report: list[str] = []
+    report = ReportLines()
 
     try:
         sunday = next_sunday_wake(now, calendar)
@@ -750,7 +764,9 @@ def _friday_wake(
         )
     else:
         alarms = check_alarms(schedule, one_shot_date=expected_one_shot(now, calendar))
-    report.extend(alarms.problems)
+    # pmset alarm drift, every line of it: a wake that will not fire wants a human.
+    for line in alarms.problems:
+        report.add(line, ACTION)
     return problems, report
 
 
@@ -786,7 +802,7 @@ def sweep(
     session = calendar.is_session(day)
 
     problems: list[str] = []
-    report: list[str] = []
+    report = ReportLines()
     pieces: list[tuple[str, PieceOutcome]] = []
 
     # **Marketlake #130: is the running schema version recorded in the lake at all.** Nothing
@@ -818,7 +834,7 @@ def sweep(
     # verdict, so the condition is not invisible while #494 is open.
     version_check = check_running_version(root)
     if not version_check.ok:
-        report.append(version_check.summary)
+        report.add(version_check.summary, ACTION)
 
     if session:
         closed = calendar.session_close(day) <= now
@@ -922,9 +938,10 @@ def sweep(
                 # these. A line that silences the check above it is worse than no line, so this
                 # one is bounded and the full list stays in the by-hand ``--backfill`` run.
                 if walked.unwalked:
-                    report.append(
+                    report.add(
                         f"bars unwalked: {len(walked.unwalked)} ticker-day(s), "
-                        f"first: {walked.unwalked[0]}"
+                        f"first: {walked.unwalked[0]}",
+                        ACTION,
                     )
                 # A daily ticker-day whose gate has no close of record and never will. It is
                 # not a refusal, so it does not withhold the ping, and marketlake #434 is what
@@ -986,8 +1003,12 @@ def sweep(
                     census = ", ".join(
                         f"{count} {reason}" for reason, count in sorted(reasons.items())
                     )
-                    report.append(
-                        f"bars abandoned: {len(walked.abandoned)} ticker-day(s), {census}"
+                    # ``INFO`` only when every reason says the sealed partition holds no
+                    # usable close, which nothing can change. The other three want a human:
+                    # a restore, a sign-off, or a schema change (marketlake #530).
+                    report.add(
+                        f"bars abandoned: {len(walked.abandoned)} ticker-day(s), {census}",
+                        INFO if set(reasons) <= _PERMANENT_ABANDON_REASONS else ACTION,
                     )
                 # A ticker-day the run's request budget stopped it from fetching, which is
                 # marketlake #478. It is the only line here that reports no fault: the run spent
@@ -1016,9 +1037,10 @@ def sweep(
                 # from a single deferred ticker-day to five figures of them, against a 1000-byte
                 # cap the three bars lines together reach about a sixth of.
                 if walked.deferred:
-                    report.append(
+                    report.add(
                         f"bars deferred: {len(walked.deferred)} ticker-day(s), "
-                        f"{walked.attempted} request(s) spent"
+                        f"{walked.attempted} request(s) spent",
+                        INFO,
                     )
             except _BARS_REFUSALS as exc:
                 pieces.append((BARS_PIECE, _refused(exc)))
@@ -1061,9 +1083,9 @@ def sweep(
                 publisher=publisher,
             )
         except Exception as exc:  # noqa: BLE001 - the battery must not cost the record
-            report.append(f"battery did not run: {type(exc).__name__}: {exc}")
+            report.add(f"battery did not run: {type(exc).__name__}: {exc}", ACTION)
         else:
-            report.extend(battery.report)
+            report.pour(battery.report, battery.report_kinds)
 
     if day.weekday() == _PY_FRIDAY:
         wake_problems, wake_report = _friday_wake(
@@ -1073,7 +1095,7 @@ def sweep(
             schedule_reader=schedule_reader,
         )
         problems.extend(wake_problems)
-        report.extend(wake_report)
+        report.pour(wake_report.lines, wake_report.kinds)
 
     for name, outcome in pieces:
         if outcome.refusal is not None:
@@ -1099,9 +1121,14 @@ def sweep(
             escalate_ping_failure(exc, slug=EOD_SWEEP_SLUG, publisher=publisher, now=now)
 
     if battery is not None and battery.appended:
-        report.append(
+        # ``ACTION``, because this line is how a new quarantine reaches the nightly, and for
+        # the two checks that report and never page it is the only sign of one. The count
+        # includes releases until marketlake #439 splits it, and the kind cannot say which
+        # half a line is.
+        report.add(
             f"battery wrote {len(battery.appended)} quarantine "
-            f"line{'s' if len(battery.appended) != 1 else ''}"
+            f"line{'s' if len(battery.appended) != 1 else ''}",
+            ACTION,
         )
 
     nightly = Nightly(
@@ -1113,7 +1140,8 @@ def sweep(
         pages_lost=pages_lost,
         pieces=tuple(pieces),
         problems=tuple(problems),
-        report=tuple(report),
+        report=report.lines,
+        report_kinds=report.kinds,
     )
 
     filed_at: Path | None = None

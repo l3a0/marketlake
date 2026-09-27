@@ -221,6 +221,7 @@ from lake.manifest import (
     withholding,
 )
 from lake.paths import CHAINS, DATE_PREFIX, QUARANTINE_FILE, QUOTES, TICKER_PREFIX
+from lake.report import ACTION, HEALTHY, INFO, ReportLines
 from lake.security_master import ID_TYPE_TICKER, SecurityMaster, SecurityMasterError, master_path
 
 # The surfaces that seal first and are flagged later. Bars and corporate actions gate before
@@ -426,6 +427,10 @@ class BatteryReport:
     and to ``sweep.SweepOutcome.render``. The finding reaches both through ``report``
     instead.
 
+    ``report_kinds`` gives each ``report`` line its kind, set where the line is composed, and
+    ``report.Nightly`` says what the kinds are for. The sweep pours the pair into its own
+    through ``report.ReportLines.pour``.
+
     ``sessions_owed`` and ``sessions_missing`` are the coverage check's pair, and they are the
     one pair here not scoped by ``day``. :func:`coverage` says why. The denominator is carried
     because the check's correct answer against today's lake is that it found nothing, and a
@@ -448,6 +453,7 @@ class BatteryReport:
     paged: tuple[str, ...] = ()
     drift_paged: tuple[str, ...] = ()
     report: tuple[str, ...] = ()
+    report_kinds: tuple[str, ...] = ()
     findings: tuple[Finding, ...] = field(default=())
 
     @property
@@ -1922,7 +1928,11 @@ def judge(
         # reason says capture was not running, which is a fact this run does not have. The
         # command exits non-zero on this for the same reason it does on an unreadable
         # partition: the lake's health is unknown rather than good.
-        return BatteryReport(scope_unknown=len(partitions), report=(f"battery: {exc}",))
+        return BatteryReport(
+            scope_unknown=len(partitions),
+            report=(f"battery: {exc}",),
+            report_kinds=(ACTION,),
+        )
 
     # Local, the same reason :func:`append_verdict` gives for the same import.
     from lake.lock import lake_lock
@@ -1930,7 +1940,9 @@ def judge(
     findings: list[Finding] = []
     written: list[Finding] = []
     appended: list[str] = []
-    report: list[str] = list(found.unnamed)
+    report = ReportLines()
+    for line in found.unnamed:
+        report.add(line, ACTION)
     medians: dict[str, float] = {}
     deferred = 0
     withheld = 0
@@ -1962,7 +1974,7 @@ def judge(
             )
         except PartitionUnreadable as exc:
             unreadable += 1
-            report.append(f"battery: {exc}")
+            report.add(f"battery: {exc}", ACTION)
             continue
         findings.extend(judged)
 
@@ -1999,17 +2011,22 @@ def judge(
             for decision in outcome.decisions:
                 if decision.deferred_to_human:
                     deferred += 1
-                    report.append(
+                    report.add(
                         f"battery: {decision.finding.partition} re-observed, human precedence "
-                        f"stands ({decision.finding.reason})"
+                        f"stands ({decision.finding.reason})",
+                        INFO,
                     )
                     continue
                 if not decision.wrote:
                     continue
                 if dry_run:
-                    report.append(
+                    # The preview of the write ``sweep`` reports as ``battery wrote N
+                    # quarantine lines``, so it takes that line's kind. Only a dry run
+                    # reaches it, and the sweep never asks for one.
+                    report.add(
                         f"battery: would write {decision.finding.verdict} for "
-                        f"{decision.finding.partition} under {decision.finding.check}"
+                        f"{decision.finding.partition} under {decision.finding.check}",
+                        ACTION,
                     )
                     continue
                 write_verdict(
@@ -2041,16 +2058,20 @@ def judge(
                 repr(check) if check is not None else "an unnamed check"
                 for check in outcome.holders
             )
-            report.append(
+            report.add(
                 f"battery: {partition.relative} passes {', '.join(passed)} "
-                f"and stays quarantined under {named}"
+                f"and stays quarantined under {named}",
+                ACTION,
             )
         if outcome.released:
             released += 1
-            report.append(
+            # ``INFO``, which is the docstring's reading: a partition rejoining the
+            # readable set "asks for none" (marketlake #530).
+            report.add(
                 f"battery: {partition.relative} would now read, no check would withhold it"
                 if dry_run
-                else f"battery: {partition.relative} now reads, no check withholds it"
+                else f"battery: {partition.relative} now reads, no check withholds it",
+                INFO,
             )
 
     # **The page is one check's, and it is filtered to that check.** ``written`` is every
@@ -2077,9 +2098,9 @@ def judge(
     try:
         drift = _judge_drift(root, partitions, day=day, surfaces=SEALED_SURFACES)
     except Exception as exc:  # noqa: BLE001 - a second page must not cost the first
-        report.append(f"battery: schema drift did not run: {type(exc).__name__}: {exc}")
+        report.add(f"battery: schema drift did not run: {type(exc).__name__}: {exc}", ACTION)
     else:
-        report.extend(drift.report)
+        report.pour(drift.report, drift.report_kinds)
         if publisher and not dry_run:
             drift_paged = battery_drift.page(publisher, drift.findings, now=now)
 
@@ -2091,9 +2112,15 @@ def judge(
     # **The census goes last.** ``sweep.digest_body`` truncates the tail at 1000 bytes, and the
     # comment this line's reasoning comes from assumed "what falls off the end first is the
     # battery's own census". Put in front it would be the last thing to fall off instead, and
-    # the lines it would push out are the actionable ones: a release, a partition another check
-    # still withholds, a partition that would not read.
-    report.append(coverage_line(found))
+    # the lines it would push out are the ones a reader most needs: a partition another check
+    # still withholds and a partition that would not read, which ask for action, and a release,
+    # which asks for none, as ``judge``'s docstring says, but is otherwise invisible.
+    #
+    # A full census is ``HEALTHY``. A miss is ``INFO``, because a session the capture never
+    # sealed is a standing fact about the lake, and the capture dead-man is what pages the day
+    # a whole session goes missing. Promoting a miss when the count moves is deferred on
+    # marketlake #530 until the first night one does.
+    report.add(coverage_line(found), INFO if found.missing else HEALTHY)
 
     return BatteryReport(
         judged=sum(1 for f in findings if f.judged),
@@ -2111,7 +2138,8 @@ def judge(
         appended=tuple(appended),
         paged=paged,
         drift_paged=drift_paged,
-        report=tuple(report),
+        report=report.lines,
+        report_kinds=report.kinds,
         findings=tuple(findings),
     )
 
