@@ -557,9 +557,10 @@ def _segments(lake_root: Path, surface: str, ticker: str) -> list[Path]:
 
 
 def _durable(path: Path) -> bool:
-    """Whether a segment reads back its one batch, which the writer makes durable at close.
+    """Whether a segment reads back a complete batch, which the writer finishes at close.
 
-    The cycle writes one batch per segment, so any complete batch is the whole of it.
+    The cycle writes one batch per segment, so any complete batch is the whole of it. The
+    read sees the page cache, so this says the writer finished rather than that an fsync did.
     """
     try:
         return journal.read_segment(path).num_rows > 0
@@ -676,3 +677,92 @@ def test_the_timing_lines_keep_plan_order_whatever_order_the_units_finished(lake
         (CHAINS, "QQQ", _d(31).isoformat()),
         (QUOTES, None, None),
     ]
+
+
+def test_only_the_calling_thread_writes_segments(lake_root, monkeypatch):
+    # Pool threads fetch and parse. Every segment, including the ones that land while SPY's
+    # windows are still in flight, is opened on the thread that ran the cycle.
+    real = journal.SegmentWriter.open
+    writers: list[threading.Thread] = []
+
+    def record(*args, **kwargs):
+        writers.append(threading.current_thread())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(journal.SegmentWriter, "open", record)
+    vendor = _ThreadedVendor(delay={("SPY", _d(0)): 0.2})
+    result = _run(vendor, lake_root)
+
+    assert len(result.segments) == 4
+    assert writers == [threading.current_thread()] * 4
+
+
+class _YieldingClock(ManualClock):
+    """A manual clock whose sleep also yields a little real time.
+
+    The instant fakes then finish between two submissions, so a cycle that collected
+    mid-volley would find the quote unit done and write it there.
+    """
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(0.02)
+        super().sleep(seconds)
+
+
+def test_a_slow_write_cannot_stretch_the_stagger(lake_root, monkeypatch):
+    # Writing the quote segments takes a second on the cycle's own clock. Collection starts
+    # only after the last submission, so every chain's first request still goes out at its
+    # own stagger rather than a second late.
+    real = capture._CaptureCycle._write
+
+    def slow(self, surface, ticker, plan):
+        if surface == QUOTES:
+            self.clock.advance(1.0)
+        return real(self, surface, ticker, plan)
+
+    monkeypatch.setattr(capture._CaptureCycle, "_write", slow)
+    result = _run(_ThreadedVendor(), lake_root, clock=_YieldingClock(start=_CLOCK_START))
+
+    assert _rows(result, CHAINS, "SPY")[0]["fetch_ts"] == (_CLOCK_START + _STAGGER).isoformat()
+    assert _rows(result, CHAINS, "QQQ")[0]["fetch_ts"] == (_CLOCK_START + 2 * _STAGGER).isoformat()
+
+
+@pytest.mark.parametrize("cap", [1, 20])
+def test_a_write_that_raises_any_exception_costs_only_its_own_segment(lake_root, monkeypatch, cap):
+    # ``write_cycle`` can raise pyarrow's ``ArrowInvalid``, a ``ValueError`` rather than an
+    # ``OSError``. It is recorded like a refused disk, and the other units still land.
+    real = journal.SegmentWriter.open
+
+    def refuse(root, surface, ticker, *args, **kwargs):
+        if (surface, ticker) == (CHAINS, "QQQ"):
+            raise ValueError("the batch would not write")
+        return real(root, surface, ticker, *args, **kwargs)
+
+    monkeypatch.setattr(journal.SegmentWriter, "open", refuse)
+    result = _run(_ThreadedVendor(), lake_root, guards=GuardConstants(capture_max_concurrency=cap))
+
+    assert result.errors == (capture.SegmentError(CHAINS, "QQQ", "value_error"),)
+    assert len(result.segments) == 3
+
+
+class _LookingVendor(_ThreadedVendor):
+    """A vendor whose quote request records which segments are already on disk."""
+
+    def __init__(self, lake_root: Path) -> None:
+        super().__init__()
+        self._root = lake_root
+        self.seen: list[Path] | None = None
+
+    def get_quotes(self, symbols):
+        self.seen = sorted(self._root.rglob("*.arrows"))
+        return super().get_quotes(symbols)
+
+
+def test_at_a_cap_of_one_nothing_is_written_until_every_unit_is_planned(lake_root):
+    # The sequential cycle is unchanged: the quotes are fetched after the chains and before
+    # any segment is written.
+    vendor = _LookingVendor(lake_root)
+    result = _run(vendor, lake_root, guards=GuardConstants(capture_max_concurrency=1))
+
+    assert vendor.seen == []
+    assert len(result.segments) == 4

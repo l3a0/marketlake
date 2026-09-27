@@ -1302,8 +1302,8 @@ def test_a_merge_failure_of_any_kind_gives_up_the_window(lake_root, monkeypatch)
 
 # -- a prior-batch read that raises (marketlake #548) ------------------------------------
 #
-# The read that names a failed window's expirations runs before any segment is written, and
-# ``run_loop`` calls the cycle with no guard. A raise from it used to cost every surface's
+# The read that names a failed window's expirations runs before the cycle's manifest append,
+# and ``run_loop`` calls the cycle with no guard. A raise from it used to cost every surface's
 # minute and end the daemon. What it raises is not a short list, so the tests drive classes
 # from each source: a manifest refusal, a manifest line that is not an object, and the two a
 # damaged segment raises past ``UNUSABLE_SEGMENT``.

@@ -1033,7 +1033,7 @@ def _fetch_concurrently(
 
     Marketlake #532. A cycle's requests used to run one after another, so its wall time was
     their sum, and on 2026-09-24 three cycles ran past their minute and lost four. Here they
-    run concurrently, at most ``guards.capture_max_concurrency`` at once. Three rules shape
+    run concurrently, at most ``guards.capture_max_concurrency`` at once. Four rules shape
     how.
 
     1. **One flat pool, bounded by the cap.** Every (ticker, window) pair is one task, and
@@ -1161,7 +1161,9 @@ def _timed(clock: Clock, fn: Callable[..., object], *args: object) -> _TaskResul
 
     An ``Exception`` is caught and returned, so its finish is stamped too. Anything else, an
     interrupt or a ``SystemExit``, is left to propagate, the way it would have left a
-    sequential fetch.
+    sequential fetch. It surfaces when its unit's last task is done, so in the loop's own
+    cycle the units that landed before it stay on disk with no manifest entry, as any raise
+    that ends a cycle early leaves them.
     """
     started_at = clock.now()
     try:
@@ -1662,7 +1664,9 @@ class _CaptureCycle:
         # after planning is recorded and the cycle keeps going, never crashing. Each landed
         # segment is filed under its place in plan order, chains in roster order and then
         # quotes, so the manifest, the result, and the timing file keep that order whatever
-        # order the units finished in.
+        # order the units finished in. A diagnostic line printed while a unit lands, the
+        # prior-batch fallback or a failed drift scan, prints in landing order and names
+        # its own ticker.
         option_tickers = [entry.ticker for entry in self.roster if entry.options]
         landed: list[tuple[int, SegmentOutcome | SegmentError]] = []
 
@@ -1803,10 +1807,13 @@ def run_cycle(
        for every roster ticker. Above a ``guards.capture_max_concurrency`` of 1 these
        requests run concurrently through one bounded pool, marketlake #532. At a cap of 1
        they run one at a time, chains in roster order and then the quotes.
-    3. Write a chains segment per options ticker. A chain where every window failed writes
-       a chains gap row. A window that fails past every split becomes an absence marker
-       inside the snapshot. One ticker's failure never blocks another. Then write a quotes
-       segment per roster ticker. A failed batch gaps every ticker's quotes.
+    3. Write a chains segment per options ticker and a quotes segment per roster ticker. A
+       chain where every window failed writes a chains gap row. A window that fails past
+       every split becomes an absence marker inside the snapshot. One ticker's failure
+       never blocks another. A failed batch gaps every ticker's quotes. At a cap of 1 the
+       segments are written once every fetch is done. Above it each chain, and the quote
+       batch, is written as soon as its own requests are done, marketlake #563, so step 2
+       and this step overlap and the quotes usually land first.
     4. Append one manifest entry per segment, keyed by the segment path, under the
        lake-root lock.
     5. Stamp the token's mint time and the roster into the journal metadata, so the
