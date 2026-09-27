@@ -39,10 +39,11 @@ An onboarding snapshot writes that same shape of segment and never arrives here 
 runs in its own process with no alarm behind it, so its finding rides its sign-off report,
 at ``onboard.OnboardReport``.
 
-Evidence comes from data segments alone, and it is counted per ticker rather than per
-surface. A gap segment carries no vendor observation, so a ticker that gapped says nothing
-about the payload's shape and a column it was drifting stays drifting until that same
-ticker lands a clean data row.
+Evidence comes from data rows alone, and it is counted per ticker rather than per
+surface. A gap segment carries no vendor observation, and neither does a data segment
+holding no data row, such as a chain that answered with no contract. So a ticker that
+gapped says nothing about the payload's shape, and a column it was drifting stays drifting
+until that same ticker lands a clean data row.
 
 Counting the evidence per surface instead is the shape that fails, and it fails quietly.
 One ticker retyped against a roster that is otherwise healthy means the surface produces

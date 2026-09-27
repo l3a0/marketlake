@@ -23,7 +23,8 @@ comfortable one.
 One failure can take every surface down at once, such as a dead token or a rate
 limit. The watchdog calls that a cause, pages it once under its own title, and then
 suppresses the pages of every surface it named. That suppression ends one surface at a
-time, and the cause re-arms only when the last of them is back. So a rate limit that
+time, as each produces data again, answers with no contract, or leaves the roster, and
+the cause re-arms only when the last of them has. So a rate limit that
 runs all session stays one condition, and one surface returning and dying again never
 re-pages the cause.
 
@@ -415,7 +416,7 @@ class Watchdog:
         # and pages again.
         self._paged_overrun = False
         # This surface is back, so no cause covers it now. A cause that named others is
-        # still true of them and stays live until the last one returns.
+        # still true of them and stays live until the last one is released.
         self._release(key)
 
     def _release(self, key: Surface) -> None:
