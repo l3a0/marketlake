@@ -1,15 +1,17 @@
-"""Every entry launchd starts reaches ``main`` through its ``__main__`` guard.
+"""Every entry started unattended reaches ``main`` through its ``__main__`` guard.
 
-The installed plists start ``lake`` modules with ``python -m``, and a guard that is
-deleted, or that calls ``main`` with the wrong argv, fails nothing in the suite outside
-this file and ``tests/component/test_unattended_entries_fresh.py``, which starts the same
-jobs from a fresh interpreter. The daemon is the member that costs the most: under
-``KeepAlive`` a daemon whose guard is gone imports, exits 0 and is relaunched every ten
-seconds, and capture never starts.
+The installed plists start ``lake`` modules with ``python -m``, and so does the daemon when
+it spawns compaction. A guard that is deleted, or that calls ``main`` with the wrong argv,
+fails nothing in the suite outside this file and
+``tests/component/test_unattended_entries_fresh.py``, which starts the same entries from a
+fresh interpreter. The daemon is the member that costs the most: under ``KeepAlive`` a
+daemon whose guard is gone imports, exits 0 and is relaunched every ten seconds, and
+capture never starts.
 
 The roster is ``control_plane.all_jobs``, the list ``render_all`` writes one plist per job
-from, so a job added there is covered here with no edit. Each entry runs in process under
-``runpy`` with the job's own arguments, and stops at the config load, because the suite's
+from, so a job added there is covered here with no edit. The compaction child joins it
+with the argv ``daemon.compaction_command`` builds. Each entry runs in process under
+``runpy`` with the entry's own arguments, and stops at the config load, because the suite's
 config directory is an empty throwaway. That exit is the first stop between the entry and
 live work. The conftest's network and subprocess guards catch some of what lies past it,
 but not a server bound to a local port or a loop that never calls out. So the precondition
@@ -22,11 +24,12 @@ from __future__ import annotations
 import os
 import runpy
 import signal
+import subprocess
 import sys
 
 import pytest
 
-from lake import config
+from lake import config, daemon
 from lake import control_plane as cp
 from tests.support.config_guard import is_protected
 
@@ -39,6 +42,18 @@ HOST = cp.LaunchdHost(
 )
 
 JOBS = cp.all_jobs(HOST)
+
+# The one entry the product starts for itself rather than through launchd. The daemon
+# spawns it, and the installed daemon plist passes no ``--config``, so the live argv is the
+# one built from ``None``. Deriving it here rather than typing it is what makes the entry
+# case below cover the join: an argv the entry refuses fails there, not only in the argv
+# test.
+COMPACTION = "compaction"
+
+# Every unattended entry, as a label and the argv it starts with.
+ENTRIES = [(job.label, job.program_arguments) for job in JOBS] + [
+    (COMPACTION, tuple(daemon.compaction_command(None)))
+]
 
 # Every current entry exits at the config load in well under a second. The deadline is
 # for one that does not, such as the dashboard given ``--lake-root``, which skips the
@@ -66,10 +81,10 @@ class EntryCrashed(Exception):
     """A failure planted inside ``main``, standing in for any bug past the config load."""
 
 
-def run_entry(job, monkeypatch) -> None:
-    """Run one job's module as ``__main__`` with its own arguments, under a deadline."""
-    python, flag, module, *args = job.program_arguments
-    assert flag == "-m", f"{job.label} does not start a module: {job.program_arguments}"
+def run_entry(label, argv, monkeypatch) -> None:
+    """Run one entry's module as ``__main__`` with its own arguments, under a deadline."""
+    python, flag, module, *args = argv
+    assert flag == "-m", f"{label} does not start a module: {argv}"
 
     # The entry is stopped only by the missing config. A config found here would start
     # the daemon's loop, the dashboard's server, or a job's live seams.
@@ -78,7 +93,7 @@ def run_entry(job, monkeypatch) -> None:
     assert not is_protected(config.DEFAULT_CONFIG_PATH)
 
     def too_slow(signum, frame):
-        pytest.fail(f"{job.label} ran {DEADLINE_SECONDS}s without exiting at the config load")
+        pytest.fail(f"{label} ran {DEADLINE_SECONDS}s without exiting at the config load")
 
     monkeypatch.setattr(sys, "argv", [python, *args])
     previous = signal.signal(signal.SIGALRM, too_slow)
@@ -96,32 +111,78 @@ RUNPY_WARNING = "ignore:.*found in sys.modules after import:RuntimeWarning"
 
 
 @pytest.mark.filterwarnings(RUNPY_WARNING)
-@pytest.mark.parametrize("job", JOBS, ids=[job.label for job in JOBS])
-def test_the_entry_reaches_main_through_its_guard(job, monkeypatch, capsys):
+@pytest.mark.parametrize(("label", "argv"), ENTRIES, ids=[label for label, _ in ENTRIES])
+def test_the_entry_reaches_main_through_its_guard(label, argv, monkeypatch, capsys):
     with pytest.raises(SystemExit) as exited:
-        run_entry(job, monkeypatch)
+        run_entry(label, argv, monkeypatch)
 
     assert exited.value.code == 2
     # The whole line, path included. A guard that handed ``main`` a ``--config`` of its
     # own would exit 2 with the right label too, and under launchd it would refuse the
     # real config on every relaunch.
-    _, _, module, *args = job.program_arguments
+    _, _, module, *args = argv
     label = stderr_label(module, args)
     expected = f"{label}: config file not found: {config.DEFAULT_CONFIG_PATH}\n"
     assert capsys.readouterr().err == expected
 
 
 @pytest.mark.filterwarnings(RUNPY_WARNING)
-@pytest.mark.parametrize("job", JOBS, ids=[job.label for job in JOBS])
-def test_a_crash_in_main_escapes_the_guard(job, monkeypatch):
+@pytest.mark.parametrize(("label", "argv"), ENTRIES, ids=[label for label, _ in ENTRIES])
+def test_a_crash_in_main_escapes_the_guard(label, argv, monkeypatch):
     # The case above only ever sees ``SystemExit``, so a guard that swallowed every other
     # exception would pass it. Under launchd that turns a crash into a silent exit 0, and
     # the traceback the operator reads in the job's error log never gets written. Every
     # entry calls ``load_config`` first, and the ``runpy`` copy looks it up afresh, so a
     # failure planted there is a failure inside ``main``.
     def crash(*args, **kwargs):
-        raise EntryCrashed(job.label)
+        raise EntryCrashed(label)
 
     monkeypatch.setattr(config, "load_config", crash)
     with pytest.raises(EntryCrashed):
-        run_entry(job, monkeypatch)
+        run_entry(label, argv, monkeypatch)
+
+
+@pytest.mark.filterwarnings(RUNPY_WARNING)
+def test_the_compaction_entry_reads_the_config_the_daemon_forwards(tmp_path, monkeypatch, capsys):
+    # The other branch of ``compaction_command``: a daemon given ``--config`` forwards it.
+    # The bare argv carries nothing past the module, so a guard that dropped ``sys.argv``,
+    # or a ``main`` that read ``None`` as no arguments, passes every case above. Here that
+    # guard sends the child to the default config instead of the one it was handed, and
+    # a hand-run ``recompact`` would run the whole nightly job in place of the repair.
+    given = tmp_path / "given.yaml"
+    with pytest.raises(SystemExit) as exited:
+        run_entry(COMPACTION, daemon.compaction_command(given), monkeypatch)
+
+    assert exited.value.code == 2
+    assert capsys.readouterr().err == f"compact: config file not found: {given}\n"
+
+
+def test_the_daemon_spawns_compaction_with_the_bare_argv():
+    # The argv production runs, because the installed daemon plist passes no ``--config``.
+    # The daemon rig always hands the loop a config path, so no daemon test builds this
+    # form. ``sys.executable`` is asserted too: the child must run the daemon's own
+    # interpreter, and the in-process entry cases above never read the first item.
+    assert daemon.compaction_command(None) == [sys.executable, "-m", "lake.compact"]
+
+
+def test_the_compaction_child_inherits_the_daemons_environment(monkeypatch):
+    # The fresh-interpreter case starts the child with the daemon job's environment and
+    # working directory, because ``_spawn_compaction`` passes neither. An ``env`` built
+    # here would make that stand-in false, and one that left out ``HOME`` would send the
+    # child's config lookup somewhere else. The fake has no ``wait``, so a spawn that
+    # waited on the child, and stalled the daemon's loop for the whole job, fails too.
+    # Every keyword is refused, not only those two. ``stdout=subprocess.DEVNULL`` would
+    # drop the child's ``compaction:`` line from the daemon's log, which is the only
+    # record of its runs, so a new keyword is a change to review rather than to wave by.
+    calls = []
+
+    class FakePopen:
+        def __init__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    argv = daemon.compaction_command(None)
+    child = daemon._spawn_compaction(argv)
+
+    assert calls == [((argv,), {})]
+    assert isinstance(child, FakePopen)

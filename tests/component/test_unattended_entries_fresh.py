@@ -1,4 +1,4 @@
-"""Every entry launchd starts gets past its imports in a fresh interpreter.
+"""Every entry started unattended gets past its imports in a fresh interpreter.
 
 ``tests/unit/test_unattended_entries.py`` runs each entry in process, after the suite has
 already imported the ``lake`` modules it depends on. A real ``python -m lake.daemon``
@@ -12,9 +12,11 @@ on every relaunch.
 
 So each job here runs as a real child, the way launchd runs it: the job's own argv,
 environment and working directory. The working directory matters under ``-m``, because
-Python puts it first on ``sys.path``. The host is built per test with ``HOME`` under
-``tmp_path``, which makes the child's config directory and ``sunday``'s ``--token``
-throwaway without editing the job. The job's environment carries no
+Python puts it first on ``sys.path``. The compaction child the daemon spawns runs the same
+way, with the argv ``daemon.compaction_command`` builds and the daemon job's environment
+and working directory, which it inherits because the spawn passes neither. The host is
+built per test with ``HOME`` under ``tmp_path``, which makes the child's config directory
+and ``sunday``'s ``--token`` throwaway without editing the job. The job's environment carries no
 ``MARKETLAKE_CONFIG_DIR``, so the suite's redirect does not reach the child, and the
 precondition asserts that ``HOME`` is what the child resolves from instead.
 """
@@ -28,10 +30,11 @@ from pathlib import Path
 import pytest
 
 from lake import control_plane as cp
+from lake import daemon
 from lake.config import CONFIG_PATH_ENV
 from lake.paths import CONFIG_DIR_ENV, CONFIG_DIR_PARTS, CONFIG_FILE
 from tests.support.config_guard import is_protected
-from tests.unit.test_unattended_entries import JOBS, stderr_label
+from tests.unit.test_unattended_entries import COMPACTION, JOBS, stderr_label
 
 # The repository root, two levels up from this file. launchd starts every job there.
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -55,17 +58,29 @@ def fresh_job(label: str, home: Path) -> cp.LaunchdJob:
     return job
 
 
-@pytest.mark.parametrize("label", [job.label for job in JOBS])
+def fresh_entry(label: str, home: Path) -> tuple[list[str], dict[str, str], str]:
+    """The argv, environment and working directory the entry with this label starts with.
+
+    The compaction child is not a launchd job. The daemon spawns it with
+    ``subprocess.Popen`` and no ``env`` or ``cwd``, so it starts with the daemon job's.
+    """
+    if label == COMPACTION:
+        parent = fresh_job(cp.DAEMON_LABEL, home)
+        return daemon.compaction_command(None), parent.environment, parent.working_directory
+    job = fresh_job(label, home)
+    return list(job.program_arguments), job.environment, job.working_directory
+
+
+@pytest.mark.parametrize("label", [job.label for job in JOBS] + [COMPACTION])
 def test_the_entry_imports_cleanly_from_a_fresh_interpreter(label, tmp_path):
     home = tmp_path / "home"
     home.mkdir()
-    job = fresh_job(label, home)
-    python, flag, module, *args = job.program_arguments
-    assert flag == "-m", f"{label} does not start a module: {job.program_arguments}"
+    argv, env, cwd = fresh_entry(label, home)
+    python, flag, module, *args = argv
+    assert flag == "-m", f"{label} does not start a module: {argv}"
 
     # The child is stopped only by the missing config, and it has none of the suite's
     # guards. So its config must resolve under the throwaway home, and be absent there.
-    env = job.environment
     assert CONFIG_PATH_ENV not in env
     assert CONFIG_DIR_ENV not in env
     assert env["HOME"] == str(home)
@@ -74,9 +89,9 @@ def test_the_entry_imports_cleanly_from_a_fresh_interpreter(label, tmp_path):
     assert not is_protected(config_path)
 
     finished = subprocess.run(
-        job.program_arguments,
+        argv,
         env=env,
-        cwd=job.working_directory,
+        cwd=cwd,
         capture_output=True,
         text=True,
         timeout=TIMEOUT_SECONDS,

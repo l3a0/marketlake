@@ -56,11 +56,11 @@ from tests.support.config_defaults import modules_building_a_default
 # script. And the rendered ``reauth.sh`` unsets the variable before it calls the tool, so
 # anything it runs is outside this by design. One test's explicit-``env=`` children do
 # reach real code at a default path: ``tests/component/test_unattended_entries_fresh.py``
-# starts each launchd entry with its job's own environment, which carries no
-# config-directory variable, so ``DEFAULT_CONFIG_PATH`` is bound under ``HOME`` when the
-# child imports ``lake.config``. That test arranges its own redirect by pointing ``HOME``
-# at a throwaway directory. Any other child that reaches a default path has to do the
-# same.
+# starts each launchd entry with its job's own environment, and the compaction child the
+# daemon spawns with the daemon job's. Neither carries a config-directory variable, so
+# ``DEFAULT_CONFIG_PATH`` is bound under ``HOME`` when the child imports ``lake.config``.
+# That test arranges its own redirect by pointing ``HOME`` at a throwaway directory. Any
+# other child that reaches a default path has to do the same.
 #
 # The export sits above the rest of this file's imports because every default in the
 # package is built from ``config_dir`` when its module is imported. Exporting the
