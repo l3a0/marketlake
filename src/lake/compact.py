@@ -686,9 +686,10 @@ def _read_complete(path: Path) -> pa.Table | None:
     An ``OSError`` is not caught either. No tear raises one, because ``read_segment`` turns
     every failure of the stream's own bytes into ``ArrowInvalid`` or a torn tail. What
     still raises one is the memory map the reader opens first, which fails when the file
-    is denied, missing, or not a regular file. That is an access failure rather than
-    damage, and it used to read here as no rows, so the ticker-day sealed without the
-    segment and unlinked it (marketlake #591). It ends the run instead, the way the hash
+    is denied, missing, or not a regular file, or when the system cannot open it at all,
+    out of file descriptors for one. That is an access failure rather than damage, and it
+    used to read here as no rows, so the ticker-day sealed without the segment and
+    unlinked it (marketlake #591). It ends the run instead, the way the hash
     check's own read of a manifested segment already does.
     """
     try:

@@ -513,6 +513,29 @@ def test_an_empty_segment_reads_as_no_rows(lake_root):
     assert not whole.exists() and not empty.exists()
 
 
+def test_a_segment_with_no_marker_that_fails_to_open_as_an_os_error_reads_as_no_rows(lake_root):
+    # Compaction lets every OSError out of its read (marketlake #591), so it relies on the
+    # journal turning the one pyarrow raises about a file's bytes into ``ArrowInvalid``. A
+    # file with no end-of-stream marker cannot be told from a tear, so the rule for a tear
+    # applies: no rows, and the run goes on. A regression in that conversion would stop
+    # the run every night for as long as the file exists.
+    whole = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(3, snap_ts=_snap(DAY, 0)), start_ts="a"
+    )
+    batch = _chains(1, snap_ts=_snap(DAY, 1))
+    cut = bytearray(_stream_bytes([batch, batch])[:-8])
+    cut[0] ^= 0x01  # the continuation token, which pyarrow refuses as an OSError
+    odd = journal.segment_path(lake_root, "chains", "SPY", DAY, "b", PID)
+    odd.write_bytes(bytes(cut))
+    with pa.memory_map(str(odd), "rb") as source, pytest.raises(OSError):
+        pa.ipc.open_stream(source)
+
+    result, _, _, _ = _run(lake_root)
+
+    assert result.sealed[0].rows == 3
+    assert not whole.exists() and not odd.exists()
+
+
 def test_bytes_after_the_eos_fail_loudly_and_seal_nothing_for_the_ticker_day(lake_root):
     clean = _segment(
         lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a"
