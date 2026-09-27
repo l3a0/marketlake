@@ -321,11 +321,13 @@ def _out_of_span_body(page: Page) -> str:
     rest = len(page.tickers) - _OUT_OF_SPAN_NAMED
     if rest > 0:
         names = f"{names} and {rest} more"
+    # The minutes are the longest any of them has been out, since the set folds tickers
+    # that left at different times. The log's line names every one, past the cap.
     return (
-        f"{len(page.tickers)} enabled ticker(s) outside every capture span for "
-        f"{page.minutes} session minutes, so not captured: {names}. A retire, onboard or "
-        "rejoin that stopped midway leaves this, and so does a spans file that no longer "
-        "matches the lake"
+        f"{len(page.tickers)} enabled ticker(s) outside every capture span, the longest "
+        f"for {page.minutes} session minutes, so not captured: {names}. A retire, onboard "
+        "or rejoin that stopped midway leaves this, and so does a spans file that no "
+        "longer matches the lake. The daemon log's capture: lines name each change"
     )
 
 
@@ -347,6 +349,11 @@ class _OutOfSpanLine:
        sees the cycles in slot order, so a change is a change once.
     3. **It never raises.** ``run_loop`` wraps no hook, so a ``print`` that raises on a
        full log volume would end the daemon. A line that cannot be written is dropped.
+
+    When only some enabled tickers are left out, the watchdog pages them once they pass
+    its threshold, and that page names the same causes (marketlake #570). This line still
+    carries what the page cannot: every ticker past the page's cap of four, and when each
+    change happened.
 
     It prescribes no repair. The files cannot tell a retire that stopped midway, which
     owes nothing, from an onboard or a rejoin that stopped midway, or a spans file that
@@ -1426,10 +1433,10 @@ def run_loop_from_config(
         # Only the enabled entries are charged. A ticker disabled in place still names
         # an entry here, but its capture span is already closed, so charging it would
         # page for a surface nothing owes any more, the same reasoning gap-marking's
-        # roster read applies. An enabled entry the spans leave out is charged too, and
-        # the next cycle, which never touches it, drops the charge again (marketlake
-        # #570). Reading the spans here as well would cost two reference reads a stall
-        # to keep that one entry out of the overrun page's surface count.
+        # roster read applies. An enabled entry the spans leave out is handed over too,
+        # and the watchdog leaves out the tickers the last cycle named as out of span,
+        # counting the slots toward their own page instead (marketlake #570). That set
+        # comes from the cycle, so this hook reads no spans.
         watched = [
             Surface(surface, entry.ticker)
             for entry in load_tickers(tickers_path).enabled

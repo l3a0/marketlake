@@ -1308,17 +1308,24 @@ def test_a_partial_clamp_pages_the_tickers_the_spans_leave_out(tmp_path, monkeyp
     assert page.priority == PAGE_PRIORITY
     assert page.title == "Capture down: tickers outside every capture span"
     assert page.body == (
-        "1 enabled ticker(s) outside every capture span for 3 session minutes, so not "
-        "captured: XYZ. A retire, onboard or rejoin that stopped midway leaves this, and so "
-        "does a spans file that no longer matches the lake"
+        "1 enabled ticker(s) outside every capture span, the longest for 3 session minutes, "
+        "so not captured: XYZ. A retire, onboard or rejoin that stopped midway leaves this, "
+        "and so does a spans file that no longer matches the lake. The daemon log's capture: "
+        "lines name each change"
     )
 
 
-def test_the_out_of_span_page_names_four_tickers_and_counts_the_rest(tmp_path):
+@pytest.mark.parametrize(
+    ("left_out", "named"),
+    [
+        (("AAA", "BBB", "CCC", "DDD"), "AAA, BBB, CCC, DDD."),
+        (("AAA", "BBB", "CCC", "DDD", "EEE", "FFF"), "AAA, BBB, CCC, DDD and 2 more."),
+    ],
+)
+def test_the_out_of_span_page_names_four_tickers_and_counts_the_rest(tmp_path, left_out, named):
     # A spans file restored from an old backup can leave out most of the roster at once,
-    # and the body has a byte budget.
+    # and the body has a byte budget. Exactly four names every one and counts nothing.
     rig = _rig(tmp_path)
-    left_out = ("AAA", "BBB", "CCC", "DDD", "EEE", "FFF")
     landed = SegmentOutcome(
         surface=journal.QUOTES_SURFACE,
         ticker="XYZ",
@@ -1340,8 +1347,8 @@ def test_the_out_of_span_page_names_four_tickers_and_counts_the_rest(tmp_path):
 
     (page,) = rig.transport.sent
     assert page.body.startswith(
-        "6 enabled ticker(s) outside every capture span for 3 session minutes, so not "
-        "captured: AAA, BBB, CCC, DDD and 2 more. "
+        f"{len(left_out)} enabled ticker(s) outside every capture span, the longest for 3 "
+        f"session minutes, so not captured: {named} "
     )
 
 

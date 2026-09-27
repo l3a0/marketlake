@@ -1462,3 +1462,30 @@ def test_the_full_case_drops_only_the_tickers_it_names():
     watchdog.observe(_clamped(out=("QQQ",), at=_at(2)))
     assert watchdog.count("quotes", "QQQ") == 0
     assert watchdog.count("chains", "SPY") == 2
+
+
+def test_a_stall_inside_an_outage_that_paged_adds_no_page_for_a_clamped_ticker():
+    """SPY quotes has paged under its own title, and QQQ is out of span.
+
+    The skipped-slot hook charges both, since it reads no spans. Charged to QQQ's surface,
+    a three-slot stall found a fresh counter at the threshold and paged the loop as
+    overrun, where the same stall without QQQ adds nothing.
+    """
+    watched = [Surface("quotes", "SPY"), Surface("quotes", "QQQ")]
+    watchdog = Watchdog()
+    for m in range(3):
+        watchdog.observe(_clamped(_seg("quotes", "SPY", "gap"), out=("QQQ",), at=_at(m)))
+    assert watchdog.missed(watched, [_at(3), _at(4), _at(5)]) == []
+    assert watchdog.count("quotes", "QQQ") == 0
+
+
+def test_slept_through_slots_count_toward_the_out_of_span_page():
+    # QQQ was out for one cycle, the loop slept two slots, and one more cycle names it.
+    # That is four minutes out, so the page fires and says four.
+    watchdog = Watchdog()
+    watched = [Surface("quotes", "SPY"), Surface("quotes", "QQQ")]
+    assert watchdog.observe(_clamped(_seg("quotes", "SPY", "data"), out=("QQQ",), at=_at(0))) == []
+    watchdog.missed(watched, [_at(1), _at(2)])
+    (page,) = watchdog.observe(_clamped(_seg("quotes", "SPY", "data"), out=("QQQ",), at=_at(3)))
+    assert page.tickers == ("QQQ",)
+    assert page.minutes == 4

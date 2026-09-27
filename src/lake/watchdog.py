@@ -12,7 +12,8 @@ they are not data, so a minute that produced only a gap still increments. That i
 whole point: a surface that fails every minute is producing rows and producing nothing.
 
 Three consecutive minutes pages, once, on the transition. It stays silent after that
-until a durable cycle resets the counter, and re-arms when one does. A flapping surface
+until a durable cycle resets the counter or the surface leaves the cycle, and re-arms when
+either happens. A flapping surface
 can therefore page many times an hour, which is the honest signal rather than a
 comfortable one.
 
@@ -250,10 +251,19 @@ class Watchdog:
         every tick it wakes on, since nothing it charges ever reaches ``_paged``. A
         durable data cycle proves the loop is running and re-arms it, and so does the
         session date.
+
+        A ticker the last cycle named as out of span is left out of the charge, and its
+        out-of-span count advances by a slot instead. The hook charges every enabled
+        entry, since it reads no spans, and nothing fetches that ticker. Charged, its
+        fresh counter tripped this page for a stall inside an outage whose surfaces had
+        already paged, which the per-surface rule says adds nothing (marketlake #570).
+        Counted, its page reports the minutes it has really been out. The set is the last
+        cycle's, so a span that opened during the stall is judged on the next cycle.
         """
         if not slots:
             return []
-        watched = list(surfaces)
+        left_out = set(self._out_of_span)
+        watched = [key for key in surfaces if key.ticker not in left_out]
         # One overrun is reported in a single call, so the threshold is read once for the
         # batch rather than per slot.
         threshold = self._threshold()
@@ -261,6 +271,8 @@ class Watchdog:
             self._roll(slot)
             for key in sorted(watched, key=str):
                 self._counts[key] = self._counts.get(key, 0) + 1
+            for ticker in left_out:
+                self._out_of_span[ticker] = self._out_of_span.get(ticker, 0) + 1
         if self._paged_overrun:
             return []
         # Nothing was attempted in these minutes, so no class is named and no surface is
@@ -423,7 +435,8 @@ class Watchdog:
 
         One page covers every ticker tripping in the same cycle and names the whole
         standing set, so a clamp that widens later pages again for the new ticker. Its
-        minutes are the longest any named ticker has been out.
+        minutes are the longest any named ticker has been out, slots the loop slept
+        through included, since ``missed`` counts those.
 
         A cycle with no segment and no error captured nothing, so its live roster was
         empty and every enabled ticker is left out. The dead-man pages that case and no

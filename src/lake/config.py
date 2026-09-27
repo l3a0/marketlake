@@ -124,7 +124,8 @@ class GuardConstants:
     """
 
     # The watchdog pages when a per-ticker, per-surface counter reaches this many
-    # consecutive session minutes with no durable data cycle.
+    # consecutive session minutes with no durable data cycle, and when an enabled ticker
+    # has spent this many consecutive session minutes outside every capture span.
     watchdog_page_minutes: int = 3
     # A chain snapshot is tagged *suspect* when its contract count falls below this
     # fraction of the trailing-median count.
