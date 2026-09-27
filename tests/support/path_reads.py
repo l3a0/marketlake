@@ -76,12 +76,12 @@ def _caller(depth: int) -> str:
 
 
 def _innermost(value: object) -> object:
-    """``value`` with every ``functools.wraps`` layer peeled off."""
-    seen: set[int] = set()
-    while hasattr(value, "__wrapped__") and id(value) not in seen:
-        seen.add(id(value))
-        value = value.__wrapped__
-    return value
+    """The function a spy's wrapper calls, or ``value`` itself when it wraps nothing.
+
+    One layer is all there is. ``install`` replaces a wrapper rather than wrapping it, so
+    no binding ever carries two.
+    """
+    return getattr(value, "__wrapped__", value)
 
 
 def _lake_modules() -> list[ModuleType]:
