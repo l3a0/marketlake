@@ -78,18 +78,22 @@ PID = 7
 _RECORDED = load_cassette(CASSETTES / "spy_minimal.json")
 _CHAIN = _RECORDED.find("chains", {"symbol": "SPY"}).body
 
-# What one ``spy_minimal`` chains segment measures, and two single-bit flips inside it found
-# by flipping bit 0 at every 24th byte and running the seal with no check in front of it.
-# The size is asserted, so a cassette that changes shape fails loudly rather than moving
-# the flips somewhere they no longer do what the names say.
+# What one ``spy_minimal`` chains segment measures. The size is asserted, so a cassette that
+# changes shape fails loudly rather than moving a flip somewhere it no longer does what its
+# name says.
 SEGMENT_BYTES = 9736
 ROWS_PER_SEGMENT = 2
 # Read as a stream that fails, so the segment contributed nothing and the day sealed 8 of
-# its 10 rows. The shape 896 of 2,000 flips took when marketlake #556 measured it.
+# its 10 rows. The shape 896 of 2,000 flips took when marketlake #556 measured it. Found by
+# flipping bit 0 at every 24th byte with no check in front of the seal, and it lands the
+# same way on macOS and on CI's Linux.
 DROPS_THE_SEGMENT = 4632
 # Decodes cleanly with one value changed, so the day sealed all 10 rows and one was wrong.
-# No structural check can see it. Only the digest does.
-CHANGES_A_VALUE = 7992
+# No structural check can see it. Only the digest does. It is located by content rather
+# than by offset, because a literal offset that turned a stamp's "2026" into "3026" on
+# macOS landed on a byte that changed nothing on CI's Linux. The flip is bit 0 of the first
+# character of the first stored stamp, so "2026" becomes "3026" wherever the buffer sits.
+CHANGES_A_VALUE = b"2026-08-24T10:"
 
 
 # -- the seams ---------------------------------------------------------------
@@ -146,10 +150,15 @@ def _captured(lake_root: Path, ticker: str, *, count: int = 5) -> list[Path]:
     return paths
 
 
-def _flip(path: Path, offset: int) -> None:
-    """Flip bit 0 of one byte, the smallest damage a disk can do."""
+def _flip(path: Path, offset: int | bytes) -> None:
+    """Flip bit 0 of one byte, the smallest damage a disk can do.
+
+    ``offset`` is a byte position, or bytes whose first stored occurrence names the byte.
+    """
     assert path.stat().st_size == SEGMENT_BYTES
     data = bytearray(path.read_bytes())
+    if isinstance(offset, bytes):
+        offset = data.index(offset)
     data[offset] ^= 0x01
     path.write_bytes(bytes(data))
 
@@ -220,7 +229,9 @@ def test_manifested_intact_segments_seal_as_they_always_did(lake_root):
 # -- 2. a damaged manifested segment -----------------------------------------
 
 
-@pytest.mark.parametrize("offset", [DROPS_THE_SEGMENT, CHANGES_A_VALUE])
+@pytest.mark.parametrize(
+    "offset", [DROPS_THE_SEGMENT, CHANGES_A_VALUE], ids=["drops-the-segment", "changes-a-value"]
+)
 def test_a_flipped_byte_refuses_the_ticker_day_and_keeps_every_segment(lake_root, offset):
     spy = _captured(lake_root, "SPY")
     qqq = _captured(lake_root, "QQQ")
