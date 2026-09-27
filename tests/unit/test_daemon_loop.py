@@ -39,13 +39,14 @@ from lake import daemon
 from lake.alert import NtfyTransport
 from lake.calendar import MARKET_TZ
 from lake.capture import CycleResult
-from lake.config import ConfigError
+from lake.config import CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH, ConfigError
 from lake.runner import UrllibPinger
 from lake.session import CAPTURE_PHASES, SessionClock, SessionPhase
 from lake.tickers import TickersError
 from tests.support.calendar import FakeCalendar, SessionTimes
 from tests.support.clock import ManualClock
 from tests.support.config import NTFY_TOPIC, write_config
+from tests.support.config_guard import is_protected
 from tests.support.pinger import FakePinger
 from tests.support.transport import FakeTransport
 
@@ -963,3 +964,37 @@ def test_the_wired_daemon_still_runs_a_caller_tick_hook(tmp_path):
         should_continue=_stop_after(2),
     )
     assert len(ticks) == 2
+
+
+# -- the command-line entry under the installed plist ------------------------------
+
+
+def test_main_with_no_arguments_forwards_three_unset_paths(tmp_path, monkeypatch):
+    """The installed plist runs ``python -m lake.daemon`` with no arguments at all.
+
+    So ``None`` for all three paths is what production hands the loop, and the loop's
+    helpers each resolve ``None`` the same way. A ``main`` that filled in a default of its
+    own would hand them a path the environment variable no longer overrides, which under
+    ``control_plane render --config`` is a different file from the one ``main`` read.
+    ``MARKETLAKE_CONFIG`` points at this test's config, the shape that install writes.
+    """
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    monkeypatch.setenv(CONFIG_PATH_ENV, str(write_config(tmp_path, lake_root)))
+    # The config is found through the variable alone. A file at the default path would
+    # be found without it.
+    assert not DEFAULT_CONFIG_PATH.exists()
+    assert not is_protected(DEFAULT_CONFIG_PATH)
+    seen: dict[str, object] = {}
+
+    def fake_run_loop_from_config(**kwargs) -> None:
+        seen.update(kwargs)
+
+    monkeypatch.setattr(daemon, "run_loop_from_config", fake_run_loop_from_config)
+    assert daemon.main([]) == 0
+
+    assert seen["config_path"] is None
+    assert seen["tickers_path"] is None
+    assert seen["token_path"] is None
+    # The topic came from the file the variable names, so ``main`` read that config.
+    assert seen["transport"]._topic == NTFY_TOPIC

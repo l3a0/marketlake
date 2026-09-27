@@ -28,7 +28,9 @@ Ten claims are covered.
 8. The landed row is the shape an ordinary cycle writes, column for column, apart from
    the coordinates and tags the fill owns.
 9. The daemon's production wiring really passes the producer, and a guard the daemon
-   built lands the close.
+   built lands the close. It does so under both path shapes: paths passed by argument,
+   and the unset paths the installed plist runs on, where every config and roster read
+   has to receive ``None`` and every token read the default token path.
 10. The fill computes the schema-drift signature of the segment it writes, carries it
     back, and pages it as a partial observation naming the ticker it read. A fill for one
     ticker must not clear a column another ticker is drifting, a scan that raises must
@@ -48,17 +50,20 @@ from lake import capture, close_guard, daemon, journal, schema_drift
 from lake.alert import Publisher
 from lake.capture_spans import CaptureSpans, spans_path
 from lake.chain_plan import ChainPlan
-from lake.config import GuardConstants
+from lake.config import CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH, GuardConstants
 from lake.manifest import latest_entries
 from lake.paths import LakePaths
 from lake.schema_drift import SCHEMA_DRIFT_EVENT, SchemaDriftObserver
+from lake.schwab import DEFAULT_TOKEN_PATH
 from lake.security_master import SecurityMaster, master_path
 from lake.session import OPTION_CLOSE, SessionClock
-from lake.tickers import Roster
+from lake.tickers import DEFAULT_TICKERS_PATH, TICKERS_PATH_ENV, Roster
 from lake.vendor import VendorResponse
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import NTFY_TOPIC, PING_KEY, write_config
+from tests.support.config_guard import is_protected
+from tests.support.path_reads import FROM_TOKEN, PathReads
 from tests.support.pinger import FakePinger
 from tests.support.transport import FakeTransport
 
@@ -660,7 +665,8 @@ def test_the_guard_the_daemon_builds_carries_a_fill(tmp_path):
     assert guard._fill is not None, "the daemon built a guard that can never refetch"
 
 
-def test_the_daemon_hands_the_guard_a_fill_that_lands_the_close(tmp_path, monkeypatch):
+@pytest.mark.parametrize("unset", [False, True], ids=["given paths", "unset paths"])
+def test_the_daemon_hands_the_guard_a_fill_that_lands_the_close(unset, tmp_path, monkeypatch):
     """The whole production path, from the loop's dispatch down to the row on disk.
 
     Nothing here is replaced except the one thing a test cannot have: the ``schwab-py``
@@ -671,6 +677,13 @@ def test_the_daemon_hands_the_guard_a_fill_that_lands_the_close(tmp_path, monkey
     The clock starts at 16:14:30, so the sixth tick is 16:20, close+5, the moment the
     dispatch fires. The 16:15 cycle writes nothing, standing for the chain that failed at
     the close, so the guard finds the option close missing and fills it.
+
+    The unset shape is the one the installed plist runs, which passes the daemon no path
+    at all. ``MARKETLAKE_CONFIG`` and ``MARKETLAKE_TICKERS`` point the loaders at this
+    test's files, the shape ``control_plane render --config`` installs. The fill is the
+    only place the loop's config and token paths reach ``fill_option_close_from_config``,
+    and a guard that fills is needed to get there, which the daemon wiring file's rig
+    never builds. So a fill handed a mangled path is caught here and nowhere else.
     """
     lake_root = tmp_path / "lake"
     lake_root.mkdir()
@@ -687,14 +700,20 @@ def test_the_daemon_hands_the_guard_a_fill_that_lands_the_close(tmp_path, monkey
     spans.open_span(iid, et(2026, 9, 2, 9, 30), True)
     spans.write(spans_path(lake_root))
 
+    token = tmp_path / "token.json"
+    if unset:
+        monkeypatch.setenv(CONFIG_PATH_ENV, str(config))
+        monkeypatch.setenv(TICKERS_PATH_ENV, str(tickers))
+        # The loaders find this test's files through the variables alone. A file at a
+        # default path would be found without them.
+        for default in (DEFAULT_CONFIG_PATH, DEFAULT_TICKERS_PATH, DEFAULT_TOKEN_PATH):
+            assert not default.exists()
+            assert not is_protected(default)
+    given = (None, None, None) if unset else (str(config), str(tickers), str(token))
+
     vendor = _both_windows()
-
-    class _Stub:
-        @staticmethod
-        def from_token(token_path, *, api_key, app_secret, clock=None):
-            return vendor
-
-    monkeypatch.setattr(capture, "SchwabVendor", _Stub)
+    reads = PathReads.install(monkeypatch)
+    monkeypatch.setattr(capture, "SchwabVendor", reads.vendor_factory(vendor))
     monkeypatch.setattr(capture, "load_chain_plan", lambda: TWO_WINDOWS)
 
     clock = ManualClock(start=et(2026, 9, 2, 16, 14, 30))
@@ -705,9 +724,9 @@ def test_the_daemon_hands_the_guard_a_fill_that_lands_the_close(tmp_path, monkey
         return ticks[0] <= 6
 
     daemon.run_loop_from_config(
-        config_path=str(config),
-        tickers_path=str(tickers),
-        token_path=str(tmp_path / "token.json"),
+        config_path=given[0],
+        tickers_path=given[1],
+        token_path=given[2],
         clock=clock,
         calendar=weekday_sessions(WEEK),
         assertion_runner=lambda args: None,
@@ -734,6 +753,15 @@ def test_the_daemon_hands_the_guard_a_fill_that_lands_the_close(tmp_path, monkey
     # The daemon's producer went through the chunk plan, not one whole-chain request.
     # The two windows are fired concurrently (#532), so they reach the vendor in either order.
     assert Counter(vendor.calls) == Counter([("SPY", *NEAR), ("SPY", *TAIL)])
+
+    # Every read received the path the loop was given, the fill's own included.
+    reads.assert_no_reader_escaped()
+    assert {read.path for read in reads.of("load_config")} == {given[0]}
+    assert {read.path for read in reads.of("load_tickers")} == {given[1]}
+    token_reads = {str(read.path) for read in reads.of("read_token_mint", FROM_TOKEN)}
+    assert token_reads == {str(DEFAULT_TOKEN_PATH) if unset else str(token)}
+    assert "lake.capture.fill_option_close_from_config" in reads.callers("load_config")
+    assert "lake.capture.fill_option_close_from_config" in reads.callers(FROM_TOKEN)
 
 
 # -- what the lenses found: a fill that captured nothing, and one that gave up a window --
