@@ -74,8 +74,8 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
 - **[#88](https://github.com/l3a0/marketlake/issues/88).** Built. `manifest.backup_scrub` walks the rsync target and checks it against the lake's manifest rather than the copy of that manifest riding on the backup, and the Sunday job runs it beside `manifest.scrub`. The copy's own manifest is read for its length alone, which says how far the last sync got, so a partition sealed since then reads as pending rather than as loss. `--checksum` left `RsyncBackup.sync` in the same change, because the scrub now notices the bit rot the flag was standing in for and names the file instead of copying over it.
 - **The close+15 compaction dispatch.** Built. The daemon dispatches the close+15 job
   through D11's `session.SessionDispatch`, on the same tick hook the close+5 guard rides
-  outside a stall's waking tick, so the machine seals and backs up its own day instead of
-  waiting for a hand-run `python -m lake.compact`. That entry stays for the catch-up and
+  outside the waking tick of a stall across the equity close, so the machine seals and
+  backs up its own day instead of waiting for a hand-run `python -m lake.compact`. That entry stays for the catch-up and
   the run under an operator's eye, and the lake-root lock is what keeps the two from
   racing.
 
@@ -105,8 +105,8 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   1. **One tick past its moment.** Sealing is the one act here that cannot be taken back,
      so it follows every writer that can still add a row to the day. Startup marking runs
      from `on_start`, before the first tick. The close+5 guard runs from the tick hook,
-     already wrapped inside this one. On a tick that wakes from a stall it runs from
-     `on_skipped` instead, later in that same tick, and the seal still follows it because
+     already wrapped inside this one. On a tick that wakes from a stall across the equity
+     close it runs from `on_skipped` instead, later in that same tick, and the seal still follows it because
      the dispatch reads the previous tick's slot. The third decides it: `run_loop` calls
      `on_skipped` *after* `on_tick`, so a compaction dispatched from the tick the daemon
      woke on would seal the day a minute before the loop wrote the markers it owed for it,
@@ -162,7 +162,7 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
      cycle observer feeds, which is [#114](https://github.com/l3a0/marketlake/issues/114).
 - **D11** close tags and the close+5 guard. Close+5 is the five-minute window after the option close, the last moment an option-close fetch may land. It plugs into D9's close-tag hook, and it builds the session-relative dispatcher the design calls for. Everything session-relative runs from inside the daemon, because launchd's calendar intervals are fixed wall-clock and cannot express a close-relative time. `SessionDispatch` fires one job once per session day at a moment the calendar decides, including on a daemon that starts after that moment has passed. The close+15 compaction dispatch binds to the same seam, one tick later than its own moment, for the reason the entry above gives. Two rules are worth stating where both writers can see them:
   1. The guard's fill triggers on missing marks, not a missing cycle. A chain that failed at the option close leaves a tagged gap row holding nothing a reader can price against, and a close+5 refetch is exactly what rescues it.
-  2. On a post-close restart the guard runs before startup gap-marking, so the two close minutes it owns are already recorded when D10's marker walks the day. When gap marking runs first, after a restart or a stall that ends between the equity close and close+5, the guard finds 16:00 recorded and adds no row. On a tick that wakes from a stall past close+5, the wiring runs the guard from `on_skipped`, after that tick's overrun markers, so that case is the previous one again.
+  2. On a post-close restart the guard runs before startup gap-marking, so the two close minutes it owns are already recorded when D10's marker walks the day. When gap marking runs first, after a restart or a stall that ends between the equity close and close+5, the guard finds 16:00 recorded and adds no row. On a tick that wakes past close+5 from a stall across the equity close, the wiring runs the guard from `on_skipped`, after that tick's overrun markers, so that case is the previous one again.
 - **D11's fill.** The producer `daemon._close_guard` hands the guard. It fetches by the chain
   chunk plan through `capture.fetch_chain` and lands the result through
   `capture.journal_snapshot`, so the fill and a loop cycle share one code path rather than two.

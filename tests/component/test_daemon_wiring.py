@@ -22,9 +22,9 @@ Fourteen bindings are covered here.
 4. The cycle hook feeds the same dead-man's ``captured`` signal, which arms the check on
    the first durable cycle.
 5. The per-tick hook reaches the close+5 guard's dispatcher, so a daemon alive across
-   close+5 runs the guard on that minute. On a tick that wakes from a stall, the dispatch
-   waits for the skipped-slot hook and runs after its markers, so every ordering of the
-   guard and gap marking leaves one row at the equity close.
+   close+5 runs the guard on that minute. On a tick that wakes from a stall across the
+   equity close, the dispatch waits for the skipped-slot hook and runs after its markers, so
+   every ordering of the guard and gap marking leaves one row at the equity close.
 6. The cycle runner is the production entry that re-reads the chain plan, so a nightly
    plan rewrite takes effect the next minute.
 7. The skipped-slot hook charges the counters the current roster names. It re-reads the
@@ -801,23 +801,35 @@ def test_a_restart_leaves_one_row_at_the_equity_close(tmp_path, start, ticks, at
     assert _guard_found(rig.lake_root) == reports
 
 
-class _Stalls:
-    """A cycle runner whose 15:55 cycle lands and then sleeps for ``seconds``.
+# The cycle a stall starts after unless a test names another, the last before the close.
+BEFORE_THE_CLOSE = et(2026, 9, 2, 15, 55)
 
-    It stands for a lid closed after the 15:55 cycle. The loop wakes at the next minute
-    top past the stall, and the slots in between reach ``on_skipped`` on that tick.
+
+class _Stalls:
+    """A cycle runner whose cycle at ``at`` lands and then sleeps for ``seconds``.
+
+    It stands for a lid closed after that cycle, 15:55 unless a test says otherwise. The
+    loop wakes at the next minute top past the stall, and the slots in between reach
+    ``on_skipped`` on that tick.
     """
 
-    def __init__(self, root: Path, clock: ManualClock, seconds: float) -> None:
+    def __init__(
+        self,
+        root: Path,
+        clock: ManualClock,
+        seconds: float,
+        at: datetime = BEFORE_THE_CLOSE,
+    ) -> None:
         self._root = root
         self._clock = clock
         self._seconds = seconds
+        self._at = at
 
     def __call__(
         self, *, slot: datetime, close_tag: str | None, session_phase: str | None
     ) -> CycleResult:
         _record(self._root, journal.QUOTES_SURFACE, "XYZ", slot)
-        if slot == et(2026, 9, 2, 15, 55):
+        if slot == self._at:
             self._clock.advance(self._seconds)
         return CycleResult(slot, ())
 
@@ -845,6 +857,43 @@ def test_a_stall_across_the_close_leaves_one_row_there(tmp_path, seconds, ticks)
     (row,) = _at_close(rig.lake_root)
     assert row["error_class"] == gap.SLOT_OVERRUN
     assert _guard_found(rig.lake_root) == [["XYZ"]]
+
+
+@pytest.mark.parametrize(
+    ("start", "stalled_at", "seconds", "ran_before_the_markers"),
+    [
+        # The stall skipped 16:00, so the guard waits for that tick's markers.
+        pytest.param(
+            et(2026, 9, 2, 15, 54, 30), et(2026, 9, 2, 15, 55), 29 * 60 + 30, False, id="crossed"
+        ),
+        # The stall skipped 16:11 to 16:15 only. 16:00 already holds its row, so waiting
+        # would only put the page and the lake-root lock in front of the option-close fill.
+        pytest.param(
+            et(2026, 9, 2, 16, 9, 30), et(2026, 9, 2, 16, 10), 9 * 60 + 30, True, id="after-16:00"
+        ),
+    ],
+)
+def test_the_guard_waits_for_the_markers_only_when_the_stall_skipped_the_close(
+    tmp_path, start, stalled_at, seconds, ran_before_the_markers
+):
+    """The wait is as wide as its reason, a stall that skipped the equity close."""
+    rig = _rig(tmp_path)
+    _in_scope_all_day(rig)
+    at_skipped: list[list[list[str]]] = []
+    clock = ManualClock(start=start)
+    _run(
+        rig,
+        clock,
+        ticks=2,
+        cycle_runner=_Stalls(rig.lake_root, clock, seconds, at=stalled_at),
+        hooks=daemon.DaemonHooks(
+            on_skipped=lambda slots: at_skipped.append(_guard_found(rig.lake_root))
+        ),
+    )
+
+    assert at_skipped == ([[["XYZ"]]] if ran_before_the_markers else [[]])
+    assert _guard_found(rig.lake_root) == [["XYZ"]]
+    assert len(_at_close(rig.lake_root)) == 1
 
 
 def test_a_raise_in_the_waking_ticks_skipped_hook_does_not_cost_the_guard_its_run(tmp_path):
@@ -2031,11 +2080,11 @@ def test_a_guard_that_raises_costs_its_markers_and_not_the_session(tmp_path, cap
     """A crash loop here would trade two markers for every remaining capture minute.
 
     Both session-relative jobs ride the tick hook, the guard's from the skipped-slot hook on
-    a tick that wakes from a stall, and ``run_loop`` wraps no hook in a try. So a guard that
-    raises exits the process, and under ``KeepAlive`` the successor reaches the same minute,
-    runs the same guard against the same lake, and raises again. Capture is the
-    un-buy-backable thing and every other job is arranged not to block it, so that trade is
-    backwards.
+    a tick that wakes from a stall across the equity close, and ``run_loop`` wraps no hook
+    in a try. So a guard that raises exits the process, and under ``KeepAlive`` the
+    successor reaches the same minute, runs the same guard against the same lake, and raises
+    again. Capture is the un-buy-backable thing and every other job is arranged not to block
+    it, so that trade is backwards.
 
     ``CloseGuard.run`` handles the failures it can foresee at a finer grain, recording
     them in ``problems`` and carrying on, which is what ``test_close_guard.py`` covers.

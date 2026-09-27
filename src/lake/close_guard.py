@@ -43,8 +43,9 @@ still gets one row however the writers are ordered. There are three orders.
 2. When gap marking ran first, the guard finds the close minute recorded by an untagged
    ``daemon_dead`` or ``slot_overrun`` row and adds no row of its own. That is a restart
    or a stall that ends between the equity close and close+5.
-3. On a tick that wakes from a stall past close+5, the daemon's wiring runs the guard
-   after that tick's overrun markers, so this is order 2 again rather than a race.
+3. On a tick that wakes past close+5 from a stall across the equity close, the daemon's
+   wiring runs the guard after that tick's overrun markers, so this is order 2 again
+   rather than a race.
 
 Which tickers it checks is a rule of its own, because every row it writes names one. A
 ticker is checked for a close when a capture span covers that close's minute. The guard
