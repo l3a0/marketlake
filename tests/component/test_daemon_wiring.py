@@ -896,6 +896,35 @@ def test_the_guard_waits_for_the_markers_only_when_the_stall_skipped_the_close(
     assert len(_at_close(rig.lake_root)) == 1
 
 
+def test_a_stall_into_the_next_days_evening_leaves_one_row_at_that_days_close(tmp_path):
+    """The equity close a stall skipped can be the second day's, not the first's.
+
+    The lid closes after Wednesday's 16:10 cycle, past Wednesday's close, and opens on
+    Thursday at 16:25. The waking tick owes Thursday's guard and marks Thursday's 16:00 as
+    ``slot_overrun``, so the guard has to wait for that day's markers too.
+    """
+    rig = _rig(tmp_path)
+    _in_scope_all_day(rig)
+    clock = ManualClock(start=et(2026, 9, 2, 16, 9, 30))
+    stall = et(2026, 9, 3, 16, 24, 30) - et(2026, 9, 2, 16, 10)
+    _run(
+        rig,
+        clock,
+        ticks=2,
+        cycle_runner=_Stalls(
+            rig.lake_root, clock, stall.total_seconds(), at=et(2026, 9, 2, 16, 10)
+        ),
+    )
+
+    close = et(2026, 9, 3, 16, 0)
+    (row,) = [
+        row
+        for row in _rows(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", NEXT_DAY)
+        if datetime.fromisoformat(row["snap_ts"]) == close
+    ]
+    assert row["error_class"] == gap.SLOT_OVERRUN
+
+
 def test_a_raise_in_the_waking_ticks_skipped_hook_does_not_cost_the_guard_its_run(tmp_path):
     """The deferred run sits in a ``finally``, so a raise inside ``on_skipped`` still runs it.
 
