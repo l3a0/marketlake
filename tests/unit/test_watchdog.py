@@ -1489,3 +1489,24 @@ def test_slept_through_slots_count_toward_the_out_of_span_page():
     (page,) = watchdog.observe(_clamped(_seg("quotes", "SPY", "data"), out=("QQQ",), at=_at(3)))
     assert page.tickers == ("QQQ",)
     assert page.minutes == 4
+
+
+def test_the_page_reports_the_longest_out_whatever_its_place_in_the_roster():
+    # IWM comes first in roster order and joined last, so the minutes are QQQ's.
+    watchdog = Watchdog()
+    outs = [("QQQ",)] * 3 + [("IWM", "QQQ")] * 3
+    raised = []
+    for m, out in enumerate(outs):
+        raised += watchdog.observe(_clamped(_seg("quotes", "SPY", "data"), out=out, at=_at(m)))
+    assert [page.minutes for page in raised] == [3, 6]
+
+
+def test_a_ticker_below_the_threshold_when_another_pages_still_pages_itself():
+    # IWM joins one cycle after QQQ, so it is named on QQQ's page before it has tripped.
+    # Its own page still comes when it reaches the threshold.
+    watchdog = Watchdog()
+    outs = [("QQQ",)] * 2 + [("QQQ", "IWM")] * 3
+    raised = []
+    for m, out in enumerate(outs):
+        raised += watchdog.observe(_clamped(_seg("quotes", "SPY", "data"), out=out, at=_at(m)))
+    assert [page.tickers for page in raised] == [("QQQ", "IWM"), ("QQQ", "IWM")]
