@@ -275,8 +275,8 @@ class MasterAbsent(ActionsError):
     """Raised when the lake holds no security master for the extraction to resolve against.
 
     ``SecurityMaster.read`` reports an absent file as a bare ``FileNotFoundError``, and it
-    keeps the fold into ``MasterUnreadable`` narrow on purpose: an absent master is not a
-    corrupt one, and callers treat the two apart. This is that separation, named, so the
+    keeps ``OSError`` out of its fold into ``MasterUnreadable`` on purpose: an absent master
+    is not a corrupt one, and callers treat the two apart. This is that separation, named, so the
     command can say which of the two it met. An absent master wants the onboarding command.
     A torn one wants a restore, and running the onboarding command against it is being told
     the wrong thing.

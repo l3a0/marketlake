@@ -1527,10 +1527,12 @@ def _thread(root: Path, occ_symbol: str) -> tuple[MappingRow, ...]:
     here rather than only a threaded one, because nothing can ask whether the master holds a
     symbol without reading it, and the caller's door says why that is the answer chosen.
 
-    Not every damaged shape refuses. A master whose parquet is readable but carries other
-    columns raises ``KeyError`` out of ``SecurityMaster.from_table``, and a directory at the
-    path reads as an empty master. Both predate this read, since every caller of
-    ``SecurityMaster.read`` meets them, and both are marketlake #396.
+    Every damaged file refuses, including a readable parquet in another schema or with a
+    column at the wrong type, which ``SecurityMaster.read`` folds into ``MasterUnreadable``
+    (marketlake #396, #551). A directory at the path is the one exception, and it never
+    reaches the read. The ``is_file`` gate below answers absent for it first, because a
+    directory in a file's place is not that file, the read layer's rule for a partition and
+    for the ledger alike.
 
     Nothing here caches. The file is read per call, beside the schema-version ledger and the
     quarantine ledger, so a mapping a nightly ``lake.splits`` run writes is read by the next

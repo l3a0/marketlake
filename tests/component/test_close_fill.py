@@ -714,7 +714,7 @@ def test_the_daemon_hands_the_guard_a_fill_that_lands_the_close(tmp_path, monkey
         # The loop's own cycles write nothing, so the option close is missing when the
         # guard runs. That is the chain that failed at 16:15, which close+5 exists to
         # rescue.
-        cycle_runner=lambda *, close_tag, session_phase: capture.CycleResult(clock.now(), ()),
+        cycle_runner=lambda *, slot, close_tag, session_phase: capture.CycleResult(clock.now(), ()),
         transport=FakeTransport(),
         pinger=FakePinger(),
         compaction_runner=lambda args: None,
@@ -1636,7 +1636,7 @@ def test_the_daemon_shares_one_drift_observer_between_its_cycles_and_its_fill(
         ticks[0] += 1
         return ticks[0] <= 6
 
-    def drifting_cycle(*, close_tag, session_phase):
+    def drifting_cycle(*, slot, close_tag, session_phase):
         return capture.CycleResult(clock.now(), (_cycle_segment("SPY", "open_interest"),))
 
     daemon.run_loop_from_config(

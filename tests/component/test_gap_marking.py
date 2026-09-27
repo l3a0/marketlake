@@ -897,7 +897,7 @@ def _overrun_after_a_roster_change(tmp_path: Path, *, before: str, after: str) -
     alerts = FakeTransport()
     cycles = [0]
 
-    def cycle(*, close_tag, session_phase) -> CycleResult:
+    def cycle(*, slot, close_tag, session_phase) -> CycleResult:
         cycles[0] += 1
         if cycles[0] == 1:
             tickers.write_text(after)

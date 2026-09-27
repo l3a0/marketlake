@@ -180,7 +180,7 @@ def test_the_daemon_answers_the_close_tag_hook_from_the_calendar(tmp_path):
         assertion_runner=lambda args: None,
         # A real cycle runner always returns a CycleResult, and the loop now hands it
         # to observers, so a fake that returned None would be lying about the contract.
-        cycle_runner=lambda *, close_tag, session_phase: (
+        cycle_runner=lambda *, slot, close_tag, session_phase: (
             tags.append(close_tag) or CycleResult(et(2026, 9, 2, 16, 0), ())
         ),
         transport=FakeTransport(),
@@ -576,7 +576,9 @@ def test_the_guard_writes_the_close_minutes_before_gap_marking_claims_them(tmp_p
         clock=clock,
         calendar=weekday_sessions(WEEK),
         assertion_runner=lambda args: None,
-        cycle_runner=lambda *, close_tag, session_phase: CycleResult(et(2026, 9, 2, 16, 30), ()),
+        cycle_runner=lambda *, slot, close_tag, session_phase: CycleResult(
+            et(2026, 9, 2, 16, 30), ()
+        ),
         transport=FakeTransport(),
         pinger=FakePinger(),
         compaction_runner=lambda args: None,
@@ -778,7 +780,7 @@ def test_the_daemon_gives_the_guard_live_spans_and_the_master(tmp_path):
     clock = ManualClock(start=et(2026, 9, 2, 16, 14, 30))
     cycles = [0]
 
-    def cycle(*, close_tag, session_phase):
+    def cycle(*, slot, close_tag, session_phase):
         cycles[0] += 1
         if cycles[0] == 1:
             # Onboarding and retiring write the spans while the daemon runs. Writing them

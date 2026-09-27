@@ -17,9 +17,10 @@ a single quote needs no windowed fetch.
 
 Three terms recur, defined at first use.
 
-- A *snap_ts* is the minute slot the cycle fired for. The loop assigns it once at the
-  top of the cycle by flooring the current instant to the minute. It is neither the
-  fetch time nor the vendor quote time. Every row carries all three.
+- A *snap_ts* is the minute slot the cycle fired for, in UTC. The loop decides the slot
+  and hands it to the cycle, and a caller outside the loop gets the cycle's start
+  instant floored to the minute. It is neither the fetch time nor the vendor quote time.
+  Every row carries all three.
 - A *segment* is one Arrow IPC journal file, written by exactly one writer session and
   never re-opened. This cycle is one writer session. It opens one fresh segment per
   surface and ticker, writes one record batch, and closes it. Close writes the
@@ -63,7 +64,7 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from lake import journal
@@ -1392,6 +1393,9 @@ class _CaptureCycle:
 
     ``out_of_span`` is the enabled tickers the caller left out of ``roster`` because no
     capture span covers them. The cycle fetches nothing for them and only reports them.
+
+    ``slot`` is the minute the loop decided this cycle is for, or ``None`` for a caller
+    outside the loop.
     """
 
     clock: Clock
@@ -1404,18 +1408,28 @@ class _CaptureCycle:
     close_tag: str | None = None
     session_phase: str | None = None
     out_of_span: tuple[str, ...] = ()
+    slot: datetime | None = None
     snap_ts: datetime = field(init=False)
     day: date = field(init=False)
     start_ts: str = field(init=False)
     requests: list[RequestRecord] = field(init=False, default_factory=list)
 
     def __post_init__(self) -> None:
-        # One instant anchors the whole cycle. The snap slot is that instant floored to
-        # the minute. Zeroing seconds and microseconds is flooring, which the clock-seam
-        # scanner allows. The segment stamp and the partition date derive from the same
-        # instant, so every segment in the cycle files under one writer session.
+        # The snap slot is the loop's, when the loop handed one over. A second read of the
+        # clock here can land past a minute top the loop read short of, and the rows then
+        # file under a minute whose close tag and phase were decided for another
+        # (marketlake #572). The loop's slot is Eastern, and ``snap_ts`` is stored as text,
+        # so it is converted to UTC, the spelling every loop cycle's rows already carry.
+        #
+        # One instant still anchors the writer session. The segment stamp derives from the
+        # cycle's own start, so two cycles never share a segment name. A caller outside the
+        # loop gets that instant floored to the minute. Zeroing seconds and microseconds
+        # is flooring, which the clock-seam scanner allows.
         cycle_start = self.clock.now()
-        self.snap_ts = cycle_start.replace(second=0, microsecond=0)
+        if self.slot is not None:
+            self.snap_ts = self.slot.astimezone(UTC)
+        else:
+            self.snap_ts = cycle_start.replace(second=0, microsecond=0)
         self.day = self.snap_ts.date()
         self.start_ts = cycle_start.strftime(_SEGMENT_STAMP_FORMAT)
 
@@ -1803,6 +1817,7 @@ def run_cycle(
     close_tag: str | None = None,
     session_phase: str | None = None,
     out_of_span: tuple[str, ...] = (),
+    slot: datetime | None = None,
 ) -> CycleResult:
     """Run one capture cycle. The primitive the daemon calls once a minute.
 
@@ -1826,9 +1841,13 @@ def run_cycle(
     because those tickers still owe their minutes (marketlake #554). A caller whose roster
     is already exactly what it owes, as every test's is, leaves it empty.
 
+    ``slot`` is the minute the loop decided, and every row files under it, converted to
+    UTC. The loop passes it so the rows and the tags name one minute (marketlake #572). A
+    caller outside the loop leaves it unset and gets the cycle's start floored instead.
+
     The steps, in order:
 
-    1. Assign ``snap_ts`` from the clock, floored to the minute.
+    1. Assign ``snap_ts``: the loop's slot in UTC, or the clock floored to the minute.
     2. Fetch every options ticker's chain by its date-window plan, and the batched quotes
        for every roster ticker. Above a ``guards.capture_max_concurrency`` of 1 these
        requests run concurrently through one bounded pool, marketlake #532. At a cap of 1
@@ -1856,6 +1875,7 @@ def run_cycle(
         close_tag=close_tag,
         session_phase=session_phase,
         out_of_span=out_of_span,
+        slot=slot,
     )
     return cycle.run()
 
@@ -1869,6 +1889,7 @@ def run_cycle_from_config(
     pid: int | None = None,
     close_tag: str | None = None,
     session_phase: str | None = None,
+    slot: datetime | None = None,
 ) -> CycleResult:
     """Run one cycle wired from the real config, roster, and Schwab-backed vendor.
 
@@ -1880,8 +1901,9 @@ def run_cycle_from_config(
     plan rewrite takes effect the next minute and a re-auth is picked up the next cycle.
     The ``schwab-py`` client is built only here, lazily inside ``SchwabVendor.from_token``,
     so importing this module and running the offline suite need neither the library nor a
-    real token. A test drives ``run_cycle`` directly with fakes instead. ``close_tag`` and
-    ``session_phase`` pass straight through to ``run_cycle``.
+    real token. A test drives ``run_cycle`` directly with fakes instead. ``close_tag``,
+    ``session_phase`` and ``slot`` pass straight through to ``run_cycle``. The daemon's
+    runner always passes ``slot``. The slice-1 runner passes none and gets the floor.
 
     This is the one place that holds both the enabled roster and the live one, so it is
     where the enabled tickers the spans left out are named. They ride to the result as
@@ -1912,6 +1934,7 @@ def run_cycle_from_config(
             close_tag=close_tag,
             session_phase=session_phase,
             out_of_span=out_of_span,
+            slot=slot,
         )
     finally:
         _close_vendor(vendor)
@@ -1974,10 +1997,12 @@ def _live_roster(roster: Roster, lake_root: Path | str, now: datetime) -> Roster
             instrument_id = master.resolve(entry.ticker, on, id_type=ID_TYPE_TICKER)
             in_scope = instrument_id is None or spans.in_scope(instrument_id, now)
         except Exception:  # noqa: BLE001 - a per-ticker scope check must never crash a cycle
-            # Deliberately broad. A master or a spans file that loaded but carries a
-            # drifted value (a naive or retyped timestamp) raises from a comparison
-            # inside resolution or the span check, not from the read that opened the
-            # file. This is the live capture path, so the price of missing an
+            # Deliberately broad. The read refuses a pinned column at the wrong type
+            # (marketlake #551), but it checks types and not values, and every pinned
+            # field is nullable. So a master or a spans file that loaded can still carry
+            # a null that raises from a comparison inside resolution or the span check,
+            # not from the read that opened the file. This is the live capture path, so
+            # the price of missing an
             # unenumerated error here is a crashed cycle, worse than the dashboard's
             # unclamped panel. Widen instead: keep the ticker, the same answer a
             # missing master or spans file already gives.
@@ -2013,10 +2038,11 @@ def journal_snapshot(
     the same primitives end to end, so the result is indistinguishable in shape from a
     segment ``run_cycle`` writes:
 
-    1. Derive the coordinates from ``cycle_start`` the way a cycle does: ``snap_ts`` is
-       that instant floored to the minute, ``day`` is that slot's date, and ``start_ts``
-       is the writer-session stamp. The caller stamps ``cycle_start``, ``fetch_ts``, and
-       ``fetch_end_ts`` from the injected clock around its own fetch.
+    1. Derive the coordinates from ``cycle_start`` the way a cycle outside the loop does:
+       ``snap_ts`` is that instant floored to the minute unless ``slot`` names it, ``day``
+       is that slot's date, and ``start_ts`` is the writer-session stamp. The caller
+       stamps ``cycle_start``, ``fetch_ts``, and ``fetch_end_ts`` from the injected clock
+       around its own fetch.
     2. Build the surface's data batch with the D4 journal row builders.
     3. Read the schema-drift signature off that batch with ``journal.routed_columns`` and
        put it on the returned outcome's ``routed_columns``. The cycle's own writer does

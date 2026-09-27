@@ -2282,10 +2282,11 @@ def test_one_unusable_span_costs_the_whole_ticker_its_clamp(root: Path):
     # A partial clamp is the one way this reading can come back narrower than the truth,
     # so a ticker with any unusable span gets no clamp rather than the spans that
     # survived. Instrument 1 captured Monday 09:30 to 09:34, which covers the fixture's
-    # 09:32 gap marker, and its span is closed. Instrument 2 is still open, so its
-    # ``span_end`` is null and a drifted ``span_end`` column leaves it usable while
-    # dropping instrument 1's. Keeping only the survivor would put 09:32 out of scope and
-    # erase a real gap marker.
+    # 09:32 gap marker, and its span is closed. Instrument 1's ``span_start`` is null,
+    # which every pinned field allows, so its span is dropped while instrument 2's
+    # survives. A retyped ``span_end`` used to do the same, before the read refused a
+    # retyped file (marketlake #551). Keeping only the survivor would put 09:32 out of
+    # scope and erase a real gap marker.
     SecurityMaster(
         [
             Mapping(
@@ -2316,9 +2317,15 @@ def test_one_unusable_span_costs_the_whole_ticker_its_clamp(root: Path):
             CaptureSpan(2, et(MONDAY, 9, 36).astimezone(UTC), None, False),
         ]
     ).to_table()
+    starts = table.column("span_start").to_pylist()
+    table = table.set_column(
+        table.schema.get_field_index("span_start"),
+        "span_start",
+        pa.array([None, *starts[1:]], pa.timestamp("us", tz="UTC")),
+    )
     path = spans_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(_retype(table, {"span_end": pa.timestamp("us")}), path)
+    pq.write_table(table, path)
 
     chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
         "strips"
@@ -2476,9 +2483,10 @@ def test_a_non_ticker_mapping_of_the_same_spelling_stays_out_of_the_union(root: 
 def test_the_broad_guard_still_serves_a_panel_when_the_clamp_raises(root: Path, monkeypatch):
     # ``_capture_spans`` catches everything on purpose, and its comment says not to
     # narrow it back to a list of error types. Both file reads inside it have their own
-    # narrow guards, so nothing a reference file can hold reaches the broad one any
-    # more. This drives it directly, because a backstop no test reaches is a backstop
-    # nothing would notice the loss of.
+    # guards, and the reads refuse a column at the wrong type, but a null the pinned
+    # types allow can still raise from a comparison further in. This drives the guard
+    # directly, because a backstop no test reaches is a backstop nothing would notice the
+    # loss of.
     write_master(root, "SPY", et(MONDAY, 9, 36))
 
     def boom(span):
@@ -2496,7 +2504,10 @@ def test_the_broad_guard_still_serves_a_panel_when_the_clamp_raises(root: Path, 
 
 def test_the_unusable_span_warning_counts_spans_rather_than_tickers(root: Path, caplog):
     # The count is the whole content of that line, and it is what an operator reads to
-    # size the drift. One instrument with two unusable spans must say two.
+    # size the drift. One instrument with two unusable spans must say two. A retyped
+    # column no longer reaches this count, because the read refuses the whole file
+    # (marketlake #551). A null ``span_start`` still does, since every pinned field is
+    # nullable and the read checks types rather than values.
     master = SecurityMaster()
     instrument_id = master.register(
         kind=KIND_EQUITY,
@@ -2521,9 +2532,11 @@ def test_the_unusable_span_warning_counts_spans_rather_than_tickers(root: Path, 
             ),
         ]
     ).to_table()
+    starts = table.schema.get_field_index("span_start")
+    table = table.set_column(starts, "span_start", pa.nulls(2, pa.timestamp("us", tz="UTC")))
     path = spans_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(_retype(table, {"span_end": pa.string()}), path)
+    pq.write_table(table, path)
 
     with caplog.at_level(logging.WARNING, logger="lake.dashboard"):
         chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
@@ -2538,9 +2551,10 @@ def test_the_unusable_span_warning_counts_spans_rather_than_tickers(root: Path, 
 # -- a security master or a spans file whose types drifted -------------------
 
 # What each drift test below shares: a well-formed file rewritten with some columns'
-# types swapped. The names still line up, so the read itself succeeds and the wrong
-# types surface later, from a comparison several frames deep rather than from the read.
-# ``casts`` names the columns to swap and leaves the rest pinned. An empty ``casts``
+# types swapped. The names still line up. The read used to succeed and the wrong types
+# surfaced later, from a comparison several frames deep. The read now refuses any pinned
+# column at the wrong type (marketlake #551), so each of these costs the clamp at the
+# read. ``casts`` names the columns to swap and leaves the rest pinned. An empty ``casts``
 # writes a well-formed file, which is what makes the control test possible: it stops the
 # whole set from being satisfied by a panel that never clamps at all.
 
@@ -2598,9 +2612,8 @@ def write_retyped_spans(
 
 def test_a_drifted_master_costs_the_clamp_and_nothing_else(root: Path):
     # A reference table must never break a panel. This file is valid Parquet carrying
-    # the pinned column names, so the read itself succeeds and the drift lands later: a
-    # retyped ``schema_version`` is refused by the master's own reader. That costs this
-    # ticker its clamp and nothing more, so both panels still serve.
+    # the pinned column names at the wrong types, and the master's own reader refuses
+    # it. That costs this ticker its clamp and nothing more, so both panels still serve.
     casts = dict.fromkeys(MASTER_SCHEMA.names, pa.string())
     write_retyped_master(root, "SPY", et(MONDAY, 9, 36), casts)
     chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
@@ -2622,20 +2635,22 @@ def test_a_drifted_master_costs_the_clamp_and_nothing_else(root: Path):
     assert row["last_data_snap_ts"] == et(MONDAY, 9, 33).isoformat()
 
 
-def test_a_drifted_valid_from_no_longer_costs_the_clamp(root: Path):
-    # This used to sit in the parametrized case above, because ``resolve`` compared
-    # ``valid_from`` against the queried day and a string raised out of that comparison.
-    # Marketlake #405 took the date out of the clamp, so ``valid_from`` is a column the
-    # clamp never reads and its type cannot reach anything. The drift is real and the
-    # panel answers as if the file were clean, which is the better of the two outcomes:
-    # a column nothing consults cannot cost a ticker its scope.
+def test_a_drifted_valid_from_costs_the_clamp_at_the_read(root: Path, caplog):
+    # Marketlake #405 took the date out of the clamp, so the clamp never reads
+    # ``valid_from``, and this test used to show the panel answering as if the file were
+    # clean. Marketlake #551 moved the type check into the read, which refuses a pinned
+    # column at the wrong type whether or not this panel consults it. The master is one
+    # file with several readers, and the daemon's ``_live_roster`` resolves by date, which
+    # reads ``valid_from``, so a reader that accepted the drift would hand it a file it
+    # cannot use. The price is this panel's clamp, and the warning says why.
     write_retyped_master(root, "SPY", et(MONDAY, 9, 36), {"valid_from": pa.string()})
-    chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
-        "strips"
-    ][0]
-    assert chains["capture_start"] == et(MONDAY, 9, 36).isoformat()
-    assert chains["counts"]["out_of_scope"] == 3
-    assert chains["counts"]["gap"] == 0
+    with caplog.at_level(logging.WARNING, logger="lake.dashboard"):
+        chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
+            "strips"
+        ][0]
+    assert chains["capture_start"] is None
+    assert chains["counts"]["out_of_scope"] == 0
+    assert "security master unreadable" in caplog.text
 
 
 def test_the_same_helper_with_nothing_retyped_still_clamps(root: Path):
@@ -2660,14 +2675,10 @@ def test_the_same_helper_with_nothing_retyped_still_clamps(root: Path):
     ],
 )
 def test_a_drifted_spans_file_costs_the_clamp_and_nothing_else(root: Path, casts: dict):
-    # The spans-file mirror of the master drift test above. Two mechanisms carry it.
-    #
-    # 1. A retyped ``schema_version`` is refused by the spans reader itself, the same
-    #    way the master's is.
-    # 2. A retyped ``span_start`` is unfit to compare instants against, dropped by
-    #    ``_valid_span``.
-    #
-    # Either costs the ticker its clamp and nothing more.
+    # The spans-file mirror of the master drift test above. The spans reader refuses a
+    # pinned column at the wrong type, the same way the master's does, where a retyped
+    # ``span_start`` used to read and then be dropped by ``_valid_span``. Either way it
+    # costs the ticker its clamp and nothing more.
     write_retyped_spans(root, "SPY", et(MONDAY, 9, 36), casts)
     chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
         "strips"

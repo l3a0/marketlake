@@ -186,7 +186,7 @@ def test_the_daemon_pages_through_the_publisher_when_a_surface_goes_quiet(tmp_pa
     tickers = tmp_path / "tickers.yaml"
     tickers.write_text("XYZ: {options: false}\n")
 
-    def failing_cycle(*, close_tag, session_phase):
+    def failing_cycle(*, slot, close_tag, session_phase):
         return CycleResult(
             et(2026, 9, 2, 12, 0),
             (

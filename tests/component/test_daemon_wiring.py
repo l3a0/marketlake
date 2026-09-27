@@ -338,15 +338,16 @@ class _Overrunning:
         self._seconds = seconds
         self.slots: list[datetime] = []
 
-    def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult:
-        slot = self._clock.now().replace(second=0, microsecond=0)
+    def __call__(
+        self, *, slot: datetime, close_tag: str | None, session_phase: str | None
+    ) -> CycleResult:
         self.slots.append(slot)
         if len(self.slots) == 1:
             self._clock.advance(self._seconds)
         return CycleResult(snap_ts=slot, segments=())
 
 
-def _no_cycle(*, close_tag: str | None, session_phase: str | None) -> CycleResult:
+def _no_cycle(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:
     """A cycle runner for the minutes off the capture window, where none may run."""
     raise AssertionError("a cycle ran off the capture window")
 
@@ -538,7 +539,7 @@ def test_only_a_durable_cycle_arms_the_capture_dead_man(row_kind, pings, tmp_pat
     rig = _rig(tmp_path)
     result = CycleResult(et(2026, 9, 2, 11, 59), (_segment(row_kind, tmp_path),))
     clock = ManualClock(start=et(2026, 9, 2, 11, 58, 30))
-    _run(rig, clock, ticks=1, cycle_runner=lambda *, close_tag, session_phase: result)
+    _run(rig, clock, ticks=1, cycle_runner=lambda *, slot, close_tag, session_phase: result)
 
     assert rig.pinger.urls == [CAPTURE_URL] * pings
 
@@ -569,7 +570,7 @@ def test_one_live_surface_beside_a_dead_one_still_arms_the_dead_man(data_first, 
     segments = (landed, gapped) if data_first else (gapped, landed)
     result = CycleResult(et(2026, 9, 2, 11, 59), segments)
     clock = ManualClock(start=et(2026, 9, 2, 11, 58, 30))
-    _run(rig, clock, ticks=1, cycle_runner=lambda *, close_tag, session_phase: result)
+    _run(rig, clock, ticks=1, cycle_runner=lambda *, slot, close_tag, session_phase: result)
 
     assert rig.pinger.urls == [CAPTURE_URL]
 
@@ -598,7 +599,7 @@ def test_a_cycle_that_journalled_nothing_leaves_the_dead_man_silent(tmp_path):
     # ``nothing_to_capture`` is left at its default, which is the value a cycle over a
     # non-empty roster computes for itself in ``_CaptureCycle.run``. The errors are the
     # writes that failed, the way that cycle reports a segment it could not journal.
-    def runner(*, close_tag: str | None, session_phase: str | None) -> CycleResult:
+    def runner(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:
         return CycleResult(
             clock.now().replace(second=0, microsecond=0),
             (),
@@ -740,6 +741,55 @@ def test_a_rewritten_chain_plan_takes_effect_on_the_next_cycle(tmp_path, monkeyp
     assert Counter(vendor.windows[1:]) == Counter([(DAY, DAY), (NEXT_DAY, None)])
 
 
+def test_the_production_runner_files_the_cycle_under_the_loops_slot(tmp_path, monkeypatch):
+    """The real runner hands the loop's slot to the cycle, which files under it in UTC.
+
+    The 16:00 tick's hooks take 61 seconds here, so a cycle reading the clock for its own
+    minute would land in 16:01 and carry a close tag decided for 16:00 (marketlake #572).
+    This goes through ``run_a_cycle``, the closure the daemon really runs, because the
+    capture entry keeps the slot optional for the slice-1 runner. A closure that stopped
+    passing it would fall back to the clock with every direct ``run_cycle`` test still
+    passing.
+
+    The clock here reads Eastern time, so a cycle that kept the loop's Eastern slot as it
+    came would spell ``snap_ts`` with ``-04:00``. Every row a loop cycle writes is stored in
+    UTC, and
+    the text is what a row carries, so the text is asserted rather than the instant.
+    """
+    rig = _rig(tmp_path, roster=WITH_OPTIONS)
+    monkeypatch.setattr(capture, "SchwabVendor", _stub_schwab(_PlanVendor()))
+    clock = ManualClock(start=et(2026, 9, 2, 15, 59, 30))
+    close = et(2026, 9, 2, 16, 0)
+    cycles: list[tuple[datetime, CycleResult]] = []
+
+    def slow_close_tick(slot: datetime) -> None:
+        if slot == close:
+            clock.advance(61)
+
+    _run(
+        rig,
+        clock,
+        ticks=1,
+        hooks=daemon.DaemonHooks(
+            on_tick=slow_close_tick,
+            on_cycle=lambda slot, result: cycles.append((slot, result)),
+        ),
+    )
+
+    ((slot, result),) = cycles
+    assert slot == close
+    assert clock.now() > et(2026, 9, 2, 16, 1)
+    rows = [
+        row for segment in result.segments for row in journal.read_segment(segment.path).to_pylist()
+    ]
+    assert {segment.surface for segment in result.segments} == {
+        journal.CHAINS_SURFACE,
+        journal.QUOTES_SURFACE,
+    }
+    assert {row["snap_ts"] for row in rows} == {"2026-09-02T20:00:00+00:00"}
+    assert {row["close_tag"] for row in rows} == {"spot_close"}
+
+
 # -- 7. the skipped-slot hook charges what the roster names --------------------------
 
 
@@ -874,8 +924,9 @@ def test_a_broken_roster_off_the_capture_window_is_fatal_too(tmp_path):
     _seed_two(rig)
     clock = ManualClock(start=et(2026, 9, 2, 15, 58, 30))
 
-    def stall_across_the_close(*, close_tag: str | None, session_phase: str | None) -> CycleResult:
-        slot = clock.now().replace(second=0, microsecond=0)
+    def stall_across_the_close(
+        *, slot: datetime, close_tag: str | None, session_phase: str | None
+    ) -> CycleResult:
         rig.tickers.write_text(UNLOADABLE)
         clock.advance(ACROSS_THE_CLOSE)
         return CycleResult(snap_ts=slot, segments=())
@@ -938,7 +989,9 @@ class _FailingCycles:
         self._new_page_minutes = new_page_minutes
         self.calls = 0
 
-    def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult:
+    def __call__(
+        self, *, slot: datetime, close_tag: str | None, session_phase: str | None
+    ) -> CycleResult:
         self.calls += 1
         if self.calls == self._recalibrate_at:
             write_config(
@@ -946,7 +999,6 @@ class _FailingCycles:
                 self._rig.lake_root,
                 guards={"watchdog_page_minutes": self._new_page_minutes},
             )
-        slot = self._clock.now().replace(second=0, microsecond=0)
         return CycleResult(
             snap_ts=slot, segments=(_segment(journal.ROW_KIND_GAP, self._rig.lake_root),)
         )
@@ -996,8 +1048,9 @@ class _RateLimited:
         self._rig = rig
         self._clock = clock
 
-    def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult:
-        slot = self._clock.now().replace(second=0, microsecond=0)
+    def __call__(
+        self, *, slot: datetime, close_tag: str | None, session_phase: str | None
+    ) -> CycleResult:
         segment = SegmentOutcome(
             surface=journal.QUOTES_SURFACE,
             ticker="XYZ",
@@ -1036,8 +1089,9 @@ class _WholeDaemonFailure:
         self._rig = rig
         self._clock = clock
 
-    def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult:
-        slot = self._clock.now().replace(second=0, microsecond=0)
+    def __call__(
+        self, *, slot: datetime, close_tag: str | None, session_phase: str | None
+    ) -> CycleResult:
         segments = tuple(
             SegmentOutcome(
                 surface=surface,
@@ -1088,8 +1142,9 @@ class _DeadSampler:
         self._clock = clock
         self._tickers = tickers
 
-    def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult:
-        slot = self._clock.now().replace(second=0, microsecond=0)
+    def __call__(
+        self, *, slot: datetime, close_tag: str | None, session_phase: str | None
+    ) -> CycleResult:
         segments = tuple(
             SegmentOutcome(
                 surface=journal.QUOTES_SURFACE,
@@ -1138,8 +1193,9 @@ class _SplitSampler:
         self._clock = clock
         self._tickers = tickers
 
-    def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult:
-        slot = self._clock.now().replace(second=0, microsecond=0)
+    def __call__(
+        self, *, slot: datetime, close_tag: str | None, session_phase: str | None
+    ) -> CycleResult:
         segments = tuple(
             SegmentOutcome(
                 surface=journal.QUOTES_SURFACE,
@@ -1185,7 +1241,7 @@ def test_an_empty_roster_still_runs_the_loop_and_reports(tmp_path):
     clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
     calls = [0]
 
-    def cycle(*, close_tag, session_phase):
+    def cycle(*, slot, close_tag, session_phase):
         calls[0] += 1
         # The real cycle runner stamps this when the roster it read was empty; the fake
         # here reproduces that, since ``capture.py``'s own tests cover the stamping.
@@ -1504,7 +1560,7 @@ def test_a_stall_into_the_next_session_does_not_seal_in_front_of_a_live_minute(t
         rig,
         clock,
         ticks=3,
-        cycle_runner=lambda *, close_tag, session_phase: CycleResult(clock.now(), ()),
+        cycle_runner=lambda *, slot, close_tag, session_phase: CycleResult(clock.now(), ()),
         hooks=daemon.DaemonHooks(on_tick=close_the_lid),
     )
 
@@ -2104,10 +2160,11 @@ class _Drifting:
         self._drifting = set(drifting_on)
         self.cycles = 0
 
-    def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult:
+    def __call__(
+        self, *, slot: datetime, close_tag: str | None, session_phase: str | None
+    ) -> CycleResult:
         self.cycles += 1
         routed = ("open_interest",) if self.cycles in self._drifting else ()
-        slot = self._clock.now().replace(second=0, microsecond=0)
         segment = _segment(
             journal.ROW_KIND_DATA, self._rig.lake_root, journal.CHAINS_SURFACE, "XYZ", routed
         )
