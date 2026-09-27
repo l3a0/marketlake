@@ -1116,9 +1116,9 @@ def test_a_raise_in_the_waking_ticks_skipped_hook_does_not_cost_the_guard_its_ru
 class _PlanVendor:
     """A vendor that records the date window of every chain request.
 
-    Each chain fetch is refused with a 500. That is a non-size failure, which the
-    chunker records once and never splits, so the requests are exactly the plan's
-    windows and nothing else.
+    Each chain fetch is refused with a 400. That is a non-size failure that is not
+    transient, which the chunker records once and never splits or sends again (#558), so
+    the requests are exactly the plan's windows and nothing else.
     """
 
     def __init__(self) -> None:
@@ -1126,7 +1126,7 @@ class _PlanVendor:
 
     def get_chain(self, symbol, *, from_date=None, to_date=None, strike_count=None):
         self.windows.append((from_date, to_date))
-        return VendorResponse(status=500, body={})
+        return VendorResponse(status=400, body={})
 
     def get_quotes(self, symbols):
         return VendorResponse(status=200, body=QUOTE_BODY)

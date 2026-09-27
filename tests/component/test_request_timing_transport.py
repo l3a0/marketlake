@@ -242,7 +242,8 @@ def test_two_requests_at_once_each_keep_their_own_record(server):
 def test_a_read_timeout_keeps_the_callers_stamps_and_no_transport_stamps(server, lake_root):
     # The shape #534 needs timed. The client gives up waiting for the headers, httpx raises,
     # no response exists, and the line keeps the caller's start and end with every transport
-    # stamp null.
+    # stamp null. A read timeout is transient, so the window is sent once more (#558) and
+    # the retry times out the same way, with a line of its own.
     import httpx
 
     from lake.capture import fetch_chain
@@ -265,7 +266,10 @@ def test_a_read_timeout_keeps_the_callers_stamps_and_no_transport_stamps(server,
         deadline=None,
     )
 
-    (record,) = fetched.requests
-    assert (record.status, record.error_class) == (None, "read_timeout")
-    assert _seconds(record.end, record.start) >= 0.05
-    assert record.timing is None
+    first, retry = fetched.requests
+    for record in (first, retry):
+        assert (record.status, record.error_class) == (None, "read_timeout")
+        assert _seconds(record.end, record.start) >= 0.05
+        assert record.timing is None
+    assert retry.start >= first.end
+    assert fetched.error_class == "read_timeout"

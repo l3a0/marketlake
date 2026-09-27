@@ -357,12 +357,13 @@ def test_a_nested_fault_too_big_502_also_splits(lake_root):
 # -- 3. a non-size failure is classified, recorded once, and never split -----------------
 
 
-@pytest.mark.parametrize("status", [401, 429, 500])
-def test_a_non_size_failure_is_recorded_once_with_its_http_class(lake_root, status):
+@pytest.mark.parametrize(("status", "sent"), [(401, 1), (429, 1), (500, 2)])
+def test_a_non_size_failure_is_recorded_once_with_its_http_class(lake_root, status, sent):
     # A ten-day window that would split if it were a size failure. A non-2xx that is not
-    # TooBigBody is not a size problem, so it is fetched exactly once and recorded with its
-    # http class, never fanned out into split requests. The open tail succeeds, so the chain
-    # is a partial snapshot with one absent-marker carrying that class.
+    # TooBigBody is not a size problem, so it is recorded with its http class, never fanned
+    # out into split requests. A 401 or a 429 is fetched exactly once. A 500 is transient,
+    # so it is sent once more (#558), and the retry's 500 is what is recorded. The open tail
+    # succeeds, so the chain is a partial snapshot with one absent-marker carrying that class.
     plan = ChainPlan(((0, 10), (11, None)))
     vendor = _WindowVendor(
         windows={
@@ -372,8 +373,9 @@ def test_a_non_size_failure_is_recorded_once_with_its_http_class(lake_root, stat
     )
     result = _run(vendor, lake_root, plan)
 
-    # The failing window was fetched once, and neither date half was ever requested.
-    assert _calls_for(vendor, _d(0), _d(10)) == 1
+    # The failing window was fetched once, or twice for a 500, and neither date half was
+    # ever requested.
+    assert _calls_for(vendor, _d(0), _d(10)) == sent
     assert _calls_for(vendor, _d(0), _d(5)) == 0
     assert _calls_for(vendor, _d(6), _d(10)) == 0
 

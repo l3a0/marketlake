@@ -246,6 +246,8 @@ def test_a_fill_writes_its_requests_under_the_close_it_lands_at(lake_root):
 
 def test_a_fill_that_captured_nothing_still_writes_its_requests(lake_root):
     # A fill with no body lands no segment, which is exactly the fill worth taking apart.
+    # The fill has no bound, so its 503 is sent once more and both attempts get a line
+    # (#558). A builtin ``TimeoutError`` is not an httpx failure and is sent once.
     vendor = _WindowVendor(
         windows={NEAR: VendorResponse(status=503, body={}), TAIL: TimeoutError("read")}
     )
@@ -255,6 +257,7 @@ def test_a_fill_that_captured_nothing_still_writes_its_requests(lake_root):
     assert not result.landed
     lines = _timing_lines(lake_root, CLOSE.date())
     assert [(line["status"], line["error_class"]) for line in lines] == [
+        (503, "http_503"),
         (503, "http_503"),
         (None, "timeout_error"),
     ]

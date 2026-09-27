@@ -79,7 +79,7 @@ from lake.lock import lake_lock
 from lake.manifest import record_partition
 from lake.metadata import stamp_cycle
 from lake.reference_read import read_or_none
-from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor
+from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor, is_transient_failure
 from lake.security_master import ID_TYPE_TICKER, SecurityMaster, SecurityMasterError, master_path
 from lake.session import OPTION_CLOSE, OPTION_CLOSE_GUARD, TICK
 from lake.tickers import Roster, load_tickers
@@ -282,6 +282,21 @@ def _error_class(exc: BaseException) -> str:
 def _ok(status: int) -> bool:
     """Whether an HTTP status is a success. A non-2xx is a fetch failure."""
     return 200 <= status < 300
+
+
+def _transient(response: VendorResponse | None, error: Exception | None) -> bool:
+    """Whether one attempt failed the way that earns the one retry, marketlake #558.
+
+    The design names a timeout, a 5xx and a reset. A raised failure qualifies by
+    ``is_transient_failure``, and a reply by a status from 500 to 599 that is not the
+    ``TooBigBody`` 502, which is a size signal and splits instead. Nothing else is sent
+    again. A 429 is the burst the stagger exists to avoid (marketlake #533), a 401 or 403
+    is auth death, and a body that is the wrong shape or too big comes back the same way
+    the second time.
+    """
+    if error is not None:
+        return is_transient_failure(error)
+    return response is not None and 500 <= response.status < 600 and not _is_too_big(response.body)
 
 
 # A 429's sub-code, such as ``429-005`` for a burst or ``429-001`` for a sustained rate. The
@@ -976,8 +991,9 @@ def fetch_chain(
        Only a genuine size signal, a ``TooBigBody`` 502 or a body flagged
        ``isChainTruncated``, is split at the window's date midpoint and refetched, bounded
        by ``chain_chunk_max_split_depth``. Any other failure, a non-2xx status, a raised
-       exception, or a body that will not merge, is recorded once with its own error class
-       and never split.
+       exception, or a body that will not merge, is recorded with its own error class and
+       never split. A transient one, a timeout, a 5xx or a reset, is sent once more first
+       while the bound has not passed (marketlake #558), and ``_fetch_window`` carries how.
     3. **Nothing captured.** If no window succeeded, ``body`` is ``None`` and
        ``error_class`` carries the first failed window's class. So an all-401 chain reads
        as ``http_401`` and the failure model still sees auth death on the chain surface.
@@ -1228,8 +1244,14 @@ _QUOTES_UNIT = object()
 class _QuoteFetch:
     """The one batched quote request's result: a response or the exception it raised.
 
-    ``request_start`` is when the call itself began. In the pool that is the worker's own
-    start, which can follow ``fetch_ts``, the submission. ``None`` means the two coincide.
+    ``request_start`` is when the last attempt was sent. In the pool that can follow
+    ``fetch_ts``, the submission, and after a retry it always does. ``None`` means the two
+    coincide.
+
+    ``earlier`` is the record of an attempt that failed transiently before the one this
+    result is from (marketlake #558), so its timing line is written beside the last
+    attempt's. ``fetch_ts`` and ``fetch_end_ts`` span every attempt, the way a chain's pair
+    spans its whole windowed fetch.
     """
 
     response: VendorResponse | None
@@ -1237,6 +1259,7 @@ class _QuoteFetch:
     fetch_ts: datetime
     fetch_end_ts: datetime
     request_start: datetime | None = None
+    earlier: tuple[RequestRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1358,13 +1381,18 @@ def _fetch_concurrently(
         unit = unit_of[future]
         if unit is _QUOTES_UNIT:
             result = _task_result(future)
+            if result.error is not None:
+                sent = _QuoteSend(None, result.error, result.started_at)
+            else:
+                sent = result.value
             hand_over_quotes(
                 _QuoteFetch(
-                    result.value,
-                    result.error,
+                    sent.response,
+                    sent.error,
                     started[_QUOTES_UNIT],
                     result.finished_at,
-                    result.started_at,
+                    sent.start,
+                    sent.earlier,
                 )
             )
             return
@@ -1442,6 +1470,8 @@ def _fetch_concurrently(
         at = bound.at
         assert at is not None  # only a bound that has passed cuts a fetch
         if symbols and submitted[0] in pending:
+            # The last attempt sent is the one the bound cut. One before it, a first attempt
+            # that failed transiently, keeps the line it finished with.
             sent = calls.get(_QUOTES_UNIT, ())
             hand_over_quotes(
                 _QuoteFetch(
@@ -1451,7 +1481,8 @@ def _fetch_concurrently(
                     ),
                     started[_QUOTES_UNIT],
                     at,
-                    sent[0].start if sent else None,
+                    sent[-1].start if sent else None,
+                    tuple(call.at_the_bound(at) for call in sent[:-1]),
                 )
             )
         for ticker in tickers:
@@ -1487,15 +1518,62 @@ def _fetch_concurrently(
             pool.shutdown(wait=False, cancel_futures=True)
 
 
-def _send_quotes(vendor: Vendor, symbols: tuple[str, ...], deadline: _Deadline) -> VendorResponse:
-    """Send the batched quote request, unless the bound has already passed.
+@dataclass(frozen=True)
+class _QuoteSend:
+    """What ``_send_quotes`` brought back: the last attempt's reply or failure, and more.
 
-    Refused, it raises ``RequestAbandoned`` with ``sent`` false, which the caller turns into
-    a gap for every quoted ticker with no timing line.
+    ``start`` is when the last attempt was sent, or ``None`` when none was. ``earlier`` is
+    the record of a first attempt that failed transiently and was sent again.
     """
-    if deadline.send(_QUOTES_UNIT, QUOTES, ticker=None, symbols=symbols) is None:
-        raise RequestAbandoned("the cycle's bound passed before the quote request", sent=False)
-    return vendor.get_quotes(symbols)
+
+    response: VendorResponse | None
+    error: Exception | None
+    start: datetime | None
+    earlier: tuple[RequestRecord, ...] = ()
+
+
+def _send_quotes(vendor: Vendor, symbols: tuple[str, ...], deadline: _Deadline) -> _QuoteSend:
+    """Send the batched quote request, unless the bound has already passed, and never raise.
+
+    Refused, it answers ``RequestAbandoned`` with ``sent`` false, which the caller turns into
+    a gap for every quoted ticker with no timing line.
+
+    A transient failure, by ``_transient``, is sent once more here, inside the same task or
+    on the same thread, while the bound has not passed (marketlake #558). The first
+    attempt's record is filed in ``deadline``'s shared record before the retry registers, so
+    a retry the bound cuts still leaves the first attempt its own line. A retry the bound
+    refuses leaves the first attempt's reply or failure as the result. What the last
+    attempt returned decides the batch, and a retry is never itself retried.
+    """
+    call = deadline.send(_QUOTES_UNIT, QUOTES, ticker=None, symbols=symbols)
+    if call is None:
+        abandoned = RequestAbandoned(
+            "the cycle's bound passed before the quote request", sent=False
+        )
+        return _QuoteSend(None, abandoned, None)
+    earlier: tuple[RequestRecord, ...] = ()
+    while True:
+        response, error = None, None
+        try:
+            response = vendor.get_quotes(symbols)
+        except Exception as exc:
+            error = exc
+        if earlier or not _transient(response, error):
+            return _QuoteSend(response, error, call.start, earlier)
+        first = request_record(
+            QUOTES,
+            ticker=None,
+            symbols=symbols,
+            start=call.start,
+            end=deadline.clock.now(),
+            response=response,
+            error_class=_error_class(error) if response is None else f"http_{response.status}",
+        )
+        deadline.done(call, first)
+        retry = deadline.send(_QUOTES_UNIT, QUOTES, ticker=None, symbols=symbols)
+        if retry is None:
+            return _QuoteSend(response, error, call.start)
+        call, earlier = retry, (first,)
 
 
 @dataclass(frozen=True)
@@ -1503,8 +1581,9 @@ class _TaskResult:
     """What one pool task returned or raised, and when it started and finished.
 
     Both instants are the injected clock's, read on the pool thread. ``started_at`` is when
-    the task began to run rather than when it was submitted, which is the quote request's
-    ``request_start_ts`` for the timing file.
+    the task began to run rather than when it was submitted. ``_send_quotes`` reports its
+    own attempts' starts, so the quote request's ``request_start_ts`` comes from there, and
+    this one stands in only for a quote task that raised rather than returned.
     """
 
     value: object
@@ -1570,7 +1649,8 @@ def _fetch_window(
 
     1. A **raised exception** is a transport failure, not a size signal. The range is
        recorded in ``failed`` with the exception's own class and never split. Splitting a
-       network error would only multiply it.
+       network error would only multiply it. A transient one is sent once more first, per
+       the retry rule below.
     2. A **too-big** response, a ``TooBigBody`` 502 or a body flagged
        ``isChainTruncated`` (see ``_is_too_big``), is split at the window's date
        midpoint and each half refetched, when the window is splittable: a concrete
@@ -1578,8 +1658,10 @@ def _fetch_window(
        it cannot be split, the range is given up with the size class
        ``chain_chunk_failed``.
     3. Any **other non-2xx** status, an auth 401, a rate-limit 429, a transient 500, is
-       recorded once in ``failed`` with ``http_<status>`` and never split. Splitting a
-       429 in particular would fan out into more throttled requests.
+       recorded in ``failed`` with ``http_<status>`` and never split. Splitting a 429 in
+       particular would fan out into more throttled requests. A 5xx is sent once more
+       first, per the retry rule below, and every other status is recorded on its first
+       reply.
     4. A **successful** 2xx, untruncated response has its contracts merged into the
        reassembly maps and, on the first success, seeds the header source. A body the
        merge cannot read is recorded once under ``chain_schema_drift`` and never split, so
@@ -1632,51 +1714,79 @@ def _fetch_window(
     sent, and no line is written for a request that never went out. The range's absence
     marker is its record. Each finished request's record is filed in the shared record too,
     which is where a window the bound cut gets its lines from.
+
+    **One retry for a transient failure** (marketlake #558). The design promises one
+    immediate retry for a timeout, a 5xx or a reset, and ``_transient`` says which failures
+    those are. The retry is sent from here, inside the task that made the first attempt,
+    never as a new pool task, so the vendor stays open until it ends like any other request
+    in the task. It passes the same check before the call, so it goes out only while the
+    bound has not passed, and it registers under the same ``unit``. Nothing else decides
+    whether time is left: no full transport timeout has to fit, since one never does after
+    a timeout at an ordinary minute. Four outcomes follow.
+
+    1. **The retry succeeds.** The window lands as if the first attempt had not failed, and
+       only the first attempt's timing line shows it did.
+    2. **Both attempts fail.** The retry's class is recorded, and the first attempt's class
+       stays on its own line.
+    3. **The bound refuses the retry.** The first attempt's class is recorded, not
+       ``request_abandoned``, since the request that lost the window did go out.
+    4. **The retry is still running at the bound**, above a cap of 1. The task is cut and
+       the window fails under ``request_abandoned`` like any window the bound cut. The first
+       attempt keeps its own line from the shared record.
+
+    The retry's reply takes every branch a first reply takes: a too-big retry splits, one
+    that will not merge records ``chain_schema_drift``, and a 2xx lands. A retry is never
+    itself retried, and a split's halves each get their own. Retrying a window that
+    already failed fast can put two requests inside one stagger while the volley is still
+    going out. If that draws a 429, the window records ``http_429``, and marketlake #533
+    owns the stagger's answer to a burst. A pool thread never sleeps on the clock to spread
+    them, per ``_fetch_concurrently``'s rule 3.
     """
     window = (from_date, to_date)
     call = deadline.send(unit, CHAINS, ticker=ticker, window=window)
     if call is None:
         failed.append((from_date, to_date, REQUEST_ABANDONED))
         return
-    start = call.start
+    response: VendorResponse | None = None
 
-    def keep(record: RequestRecord) -> None:
+    def note(error_class: str | None) -> None:
+        # The record is the current attempt's, so a retry files its own beside the first's.
+        record = request_record(
+            CHAINS,
+            ticker=ticker,
+            window=window,
+            start=call.start,
+            end=end,
+            response=response,
+            error_class=error_class,
+        )
         requests.append(record)
         deadline.done(call, record)
 
-    try:
-        response = vendor.get_chain(ticker, from_date=from_date, to_date=to_date)
-    except Exception as exc:
-        # A raised fetch is a transport failure. Record it with its own class, no split.
+    for attempt in (1, 2):
+        response, error = None, None
+        try:
+            response = vendor.get_chain(ticker, from_date=from_date, to_date=to_date)
+        except Exception as exc:
+            error = exc
         end = clock.now()
-        error_class = _error_class(exc)
+        if response is not None and (_ok(response.status) or not _transient(response, None)):
+            break
+        # A raised fetch or a transient status, each recorded under its own class and never
+        # split, since splitting a network error would only multiply it. The first attempt
+        # of a transient one is sent once more while the bound has not passed. A retry the
+        # bound refuses leaves the first attempt's class standing, since that is what lost
+        # the window.
+        error_class = _error_class(error) if response is None else f"http_{response.status}"
+        note(error_class)
+        if attempt == 1 and _transient(response, error):
+            retry = deadline.send(unit, CHAINS, ticker=ticker, window=window)
+            if retry is not None:
+                call = retry
+                continue
         failed.append((from_date, to_date, error_class))
-        keep(
-            request_record(
-                CHAINS,
-                ticker=ticker,
-                window=window,
-                start=start,
-                end=end,
-                response=None,
-                error_class=error_class,
-            )
-        )
         return
-    end = clock.now()
-
-    def note(error_class: str | None) -> None:
-        keep(
-            request_record(
-                CHAINS,
-                ticker=ticker,
-                window=window,
-                start=start,
-                end=end,
-                response=response,
-                error_class=error_class,
-            )
-        )
+    assert response is not None  # an attempt with no reply returned above
 
     too_big = _is_too_big(response.body)
     if _ok(response.status) and not too_big:
@@ -1926,19 +2036,17 @@ class _CaptureCycle:
         symbols = self.roster.symbols
         if not symbols:
             return []
+        # The request goes through the same check before the call as the pool's does. When
+        # the chains ran the cycle to its bound it is never sent, and every quoted ticker
+        # gets a gap row under the abandon class (marketlake #597). The same check decides
+        # whether a transient failure is sent again (marketlake #558).
         fetch_ts = self.clock.now()
-        if self.deadline is not None and fetch_ts >= self.deadline:
-            # The chains ran the cycle to its bound, so the request is never sent and every
-            # quoted ticker gets a gap row under the abandon class (marketlake #597).
-            abandoned = RequestAbandoned(
-                "the cycle's bound passed before the quote request", sent=False
+        sent = _send_quotes(self.vendor, symbols, _Deadline(self.clock, self.deadline))
+        return self._plan_quote_fetch(
+            _QuoteFetch(
+                sent.response, sent.error, fetch_ts, self.clock.now(), sent.start, sent.earlier
             )
-            return self._plan_quote_fetch(_QuoteFetch(None, abandoned, fetch_ts, fetch_ts))
-        try:
-            response = self.vendor.get_quotes(symbols)
-        except Exception as exc:
-            return self._plan_quote_fetch(_QuoteFetch(None, exc, fetch_ts, self.clock.now()))
-        return self._plan_quote_fetch(_QuoteFetch(response, None, fetch_ts, self.clock.now()))
+        )
 
     def _plan_quote_fetch(self, fetched: _QuoteFetch) -> list[tuple[str, _Plan]]:
         """Plan a segment per roster ticker from the batched quote request's result.
@@ -1951,6 +2059,9 @@ class _CaptureCycle:
         symbols = self.roster.symbols
         fetch_ts, fetch_end_ts = fetched.fetch_ts, fetched.fetch_end_ts
         start = fetched.request_start if fetched.request_start is not None else fetch_ts
+        # A first attempt that failed transiently and was sent again has its own line, ahead
+        # of the last attempt's.
+        self.requests.extend(fetched.earlier)
         if fetched.error is not None:
             error_class = _error_class(fetched.error)
             if not (isinstance(fetched.error, RequestAbandoned) and not fetched.error.sent):

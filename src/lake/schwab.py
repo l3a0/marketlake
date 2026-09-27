@@ -408,6 +408,40 @@ def _is_auth_failure(exc: BaseException) -> bool:
     return any(base.__name__ in _AUTH_BASE_NAMES for base in type(exc).__mro__)
 
 
+# The base classes of the httpx failures the design calls transient, marketlake #558: the
+# four timeouts, a refused or reset connection, a failed read or write, and a server that
+# closed before its response was complete. A transfer cut mid-body raises the last one, so it
+# never reaches the body parse. They are matched by name for the same two reasons as
+# ``_AUTH_BASE_NAMES``.
+_TRANSIENT_BASE_NAMES = frozenset({"TimeoutException", "NetworkError", "RemoteProtocolError"})
+
+
+def is_transient_failure(exc: BaseException) -> bool:
+    """Whether a raised vendor failure earns the one retry the design promises.
+
+    It reads ``exc`` and then each ``__cause__`` behind it. A wrapper raised ``from`` an
+    httpx transport error keeps that error as its cause (marketlake #450 plans one at this
+    class), and reading only the outer class would stop the retry matching every timeout the
+    day such a wrapper landed, with no fake that raises httpx's classes directly noticing.
+
+    It does not follow ``__context__``, the exception that was being handled when this one
+    was raised. That link would match an httpx error that was dealt with before an unrelated
+    failure was raised, and retry the unrelated one.
+
+    Nothing else qualifies. A builtin ``TimeoutError`` is not an httpx class, and a token
+    refresh answered with a 5xx raises httpx's ``HTTPStatusError`` out of authlib, which is
+    not a transport error and stays unretried until marketlake #547 decides what it is.
+    """
+    seen: set[int] = set()
+    link: BaseException | None = exc
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        if any(base.__name__ in _TRANSIENT_BASE_NAMES for base in type(link).__mro__):
+            return True
+        link = link.__cause__
+    return False
+
+
 @contextmanager
 def _auth_failures_named() -> Iterator[None]:
     """Re-raise a credential failure as ``VendorAuthError``, and pass everything else.
