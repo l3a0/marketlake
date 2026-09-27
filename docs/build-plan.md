@@ -73,10 +73,11 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   4. `session.missed_slots`, D9's own day-by-day walk moved beside `skipped_slots` so both hooks share one enumerator and `lake.gap` needs no import of `lake.daemon`.
 - **[#88](https://github.com/l3a0/marketlake/issues/88).** Built. `manifest.backup_scrub` walks the rsync target and checks it against the lake's manifest rather than the copy of that manifest riding on the backup, and the Sunday job runs it beside `manifest.scrub`. The copy's own manifest is read for its length alone, which says how far the last sync got, so a partition sealed since then reads as pending rather than as loss. `--checksum` left `RsyncBackup.sync` in the same change, because the scrub now notices the bit rot the flag was standing in for and names the file instead of copying over it.
 - **The close+15 compaction dispatch.** Built. The daemon dispatches the close+15 job
-  through D11's `session.SessionDispatch`, on the same tick hook the close+5 guard rides,
-  so the machine seals and backs up its own day instead of waiting for a hand-run
-  `python -m lake.compact`. That entry stays for the catch-up and the run under an
-  operator's eye, and the lake-root lock is what keeps the two from racing.
+  through D11's `session.SessionDispatch`, on the same tick hook the close+5 guard rides
+  outside a stall's waking tick, so the machine seals and backs up its own day instead of
+  waiting for a hand-run `python -m lake.compact`. That entry stays for the catch-up and
+  the run under an operator's eye, and the lake-root lock is what keeps the two from
+  racing.
 
   **The job runs in its own process, not on the loop thread.** The design gives compaction
   and its backup roughly 25 minutes, and it gives the dead-man a 5-minute grace on an idle

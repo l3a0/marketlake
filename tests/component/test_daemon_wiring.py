@@ -2030,11 +2030,12 @@ def _boom(*args, **kwargs):
 def test_a_guard_that_raises_costs_its_markers_and_not_the_session(tmp_path, capsys):
     """A crash loop here would trade two markers for every remaining capture minute.
 
-    Both session-relative jobs ride the tick hook, and ``run_loop`` wraps no hook in a
-    try. So a guard that raises exits the process, and under ``KeepAlive`` the successor
-    reaches the same minute, runs the same guard against the same lake, and raises again.
-    Capture is the un-buy-backable thing and every other job is arranged not to block it,
-    so that trade is backwards.
+    Both session-relative jobs ride the tick hook, the guard's from the skipped-slot hook on
+    a tick that wakes from a stall, and ``run_loop`` wraps no hook in a try. So a guard that
+    raises exits the process, and under ``KeepAlive`` the successor reaches the same minute,
+    runs the same guard against the same lake, and raises again. Capture is the
+    un-buy-backable thing and every other job is arranged not to block it, so that trade is
+    backwards.
 
     ``CloseGuard.run`` handles the failures it can foresee at a finer grain, recording
     them in ``problems`` and carrying on, which is what ``test_close_guard.py`` covers.
