@@ -10,7 +10,7 @@ Two producers hand slots to one writer.
    cycle. It covers the minutes the previous incarnation never reached, back through
    whole sessions the machine slept through.
 2. Skipped-slot marking runs from ``on_skipped`` when a live loop sleeps through a
-   capture slot, after an overrun or a stall.
+   capture slot, because the loop thread itself woke late.
 
 They never overlap, because ``run_loop`` reads the minute it starts in once, hands it
 to startup marking, and keeps it as the previous slot its first tick counts from.
@@ -87,8 +87,10 @@ from lake.tickers import Roster, TickersError
 DAEMON_DEAD = "daemon_dead"
 
 # The reason stamped on a slot the live loop slept through. The daemon is alive on
-# these minutes, so ``daemon_dead`` would be false. A cycle that ran long, or a machine
-# that stalled without the process dying, lands here.
+# these minutes, so ``daemon_dead`` would be false. A machine that slept, or a loop thread
+# that stalled without the process dying, lands here. A slow cycle no longer does, since
+# each minute's cycle runs on a thread of its own (marketlake #565). The class keeps its
+# name because it is data in the lake.
 SLOT_OVERRUN = "slot_overrun"
 
 # How far back a startup pass will walk looking for where a ticker's record stops,

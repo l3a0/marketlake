@@ -205,8 +205,9 @@ STATUSES = (
 # starts at the top of that minute and has to fetch, journal and fsync before any row
 # exists, so the slot instant is not the moment a row was owed. A slot is judged only
 # once its own minute has ended and one further minute has passed on top. That second
-# minute covers two things. It covers a cycle that overruns its minute, which the loop
-# treats as an ordinary slow sample rather than a failure, and it covers the page's own
+# minute covers two things. It covers a cycle still running into the next minute, which
+# the loop does not wait for and which lands its rows when its own requests finish, and
+# it covers the page's own
 # 60-second refresh landing between the write and the read. Judging any sooner makes the
 # verdict flap. A slot called missing while its cycle is still running flips to captured
 # on the next refresh, and a cell that goes grey and then green reads worse than the

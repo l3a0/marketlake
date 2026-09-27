@@ -22,9 +22,12 @@ rebuilds everything each minute, so ``_live_roster`` has nothing that lives betw
 The daemon also builds its master and spans readers twice, once for the gap marker and once
 for the close guard, so state held in their closures would print once per consumer. One
 record here prints once per file for the whole process. It sits outside ``run_loop``, whose
-one datetime is the loop's only state, beside the in-process state the watchdog and the
-assertion holder already keep. It decides nothing about capture, only whether a line prints,
-so a restart that forgets it costs one repeated line.
+state is the previous tick's slot and the cycles still in flight, beside the in-process state
+the watchdog and the assertion holder already keep. It decides nothing about capture, only
+whether a line prints, so a restart that forgets it costs one repeated line. Each minute's
+cycle runs on a thread of its own (marketlake #565), so two cycles failing the same read
+together can both pass the check before either adds to the record, and the line then prints
+twice. It gets no lock for the same reason: all it decides is whether a line prints.
 
 **The line never raises.** All three readers promise not to, and ``_live_roster`` is why:
 ``run_loop`` calls the cycle with no guard, so an exception there ends the daemon, and under

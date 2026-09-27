@@ -61,7 +61,7 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   2. a per-tick hook, handed every minute the loop sees, session or not,
   3. a per-slot close-tag hook, asked what tag the minute carries,
   4. a cycle-outcome observer, handed each cycle's result,
-  5. a skipped-slot hook, handed the capture slots the loop missed after an overrun.
+  5. a skipped-slot hook, handed the capture slots the loop missed after a stall.
 
   The per-tick hook was added after this entry was written, for D14's power assertion and
   D13's idle heartbeat. Both need a minute the loop is awake for rather than a minute it

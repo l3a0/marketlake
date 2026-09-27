@@ -16,8 +16,8 @@ clock, the calendar, the network, and the backup still fake.
 
 Fifteen bindings are covered here.
 
-1. The skipped-slot hook reaches the gap marker, so a live overrun records the minutes
-   it slept through.
+1. The skipped-slot hook reaches the gap marker, so a live stall records the minutes it
+   slept through.
 2. The skipped-slot hook reaches the watchdog, so those same minutes charge its counters.
 3. The per-tick hook feeds the capture dead-man's idle heartbeat.
 4. The cycle hook feeds the same dead-man's ``captured`` signal, which arms the check on
@@ -75,6 +75,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import urllib.error
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -127,7 +128,7 @@ EQUITY_ONLY = "XYZ: {options: false}\n"
 WITH_OPTIONS = "SPY: {options: true, chain_cadence: 1m}\n"
 
 # Two equity-only tickers, and the same roster after one is retired. Neither carries
-# options, so each ticker owns exactly one counter. One overrun raises one page for
+# options, so each ticker owns exactly one counter. One stall raises one page for
 # every surface it charged, so the count on that page is how many counters the hook
 # found on the roster it read.
 TWO_TICKERS = "XYZ: {options: false}\nABC: {options: false}\n"
@@ -336,26 +337,29 @@ def _rows(root: Path, surface: str, ticker: str, day: date) -> list[dict]:
     ]
 
 
-class _Overrunning:
-    """A cycle runner whose first call outlives its minute.
+def _quiet(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:
+    """A cycle runner that journals nothing and never moves the clock."""
+    return CycleResult(snap_ts=slot, segments=())
 
-    The loop aligns to the next minute top from wherever the clock stands, so a cycle
-    that takes longer than a minute is how a live daemon sleeps through a capture slot.
-    Only the first call takes time, which keeps the skipped run a single stretch.
+
+def _stall_on_first_tick(clock: ManualClock, seconds: float) -> Callable[[datetime], None]:
+    """An ``on_tick`` hook that stalls the loop thread once, on the first tick it sees.
+
+    Each minute's cycle runs on a thread of its own, so a slow cycle no longer skips a
+    minute (marketlake #565). What still skips one is the loop thread waking late, and a
+    tick hook that runs past a minute is one way. The loop aligns to the next minute top
+    from wherever the clock stands, so the stall leaves the minutes it spans to the
+    skipped-slot hook. Only the first tick stalls, which keeps the skipped run a single
+    stretch. A fake cycle moving the clock instead would race the loop thread for it.
     """
+    stalled: list[datetime] = []
 
-    def __init__(self, clock: ManualClock, seconds: float) -> None:
-        self._clock = clock
-        self._seconds = seconds
-        self.slots: list[datetime] = []
+    def on_tick(slot: datetime) -> None:
+        if not stalled:
+            stalled.append(slot)
+            clock.advance(seconds)
 
-    def __call__(
-        self, *, slot: datetime, close_tag: str | None, session_phase: str | None
-    ) -> CycleResult:
-        self.slots.append(slot)
-        if len(self.slots) == 1:
-            self._clock.advance(self._seconds)
-        return CycleResult(snap_ts=slot, segments=())
+    return on_tick
 
 
 def _no_cycle(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:
@@ -406,45 +410,57 @@ def _segment(
 # -- 1. the skipped-slot hook reaches the gap marker ---------------------------------
 
 
-def test_a_live_overrun_reaches_the_gap_marker(tmp_path):
+def test_a_live_stall_reaches_the_gap_marker(tmp_path):
     """A minute the daemon slept through has to leave a marker row.
 
     Completeness is counted from rows and never from holes. Startup marking covers the
     minutes lost while the daemon was dead, and the loop is the only piece that can see
-    a slot a living daemon overran. So an unbound skipped-slot hook loses exactly the
-    minutes nothing else can report.
+    a slot a living daemon slept through. So an unbound skipped-slot hook loses exactly
+    the minutes nothing else can report.
     """
     rig = _rig(tmp_path)
     # A row at 09:58 stops startup marking at the daemon's own start minute, so every
     # marker past it came from the loop.
     _record(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", et(2026, 9, 2, 9, 58))
     clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
-    _run(rig, clock, ticks=2, cycle_runner=_Overrunning(clock, 150))
+    _run(
+        rig,
+        clock,
+        ticks=2,
+        cycle_runner=_quiet,
+        hooks=daemon.DaemonHooks(on_tick=_stall_on_first_tick(clock, 150)),
+    )
 
-    # The 10:00 cycle ran two and a half minutes, so the loop next woke at 10:03 and
+    # The 10:00 tick stalled two and a half minutes, so the loop next woke at 10:03 and
     # slept through the two slots between.
-    overran = sorted(
+    stalled = sorted(
         row["snap_ts"][:16]
         for row in _rows(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", DAY)
         if row["error_class"] == gap.SLOT_OVERRUN
     )
-    assert overran == ["2026-09-02T10:01", "2026-09-02T10:02"]
+    assert stalled == ["2026-09-02T10:01", "2026-09-02T10:02"]
 
 
 # -- 2. the skipped-slot hook reaches the watchdog -----------------------------------
 
 
-def test_the_minutes_a_live_overrun_slept_through_charge_the_watchdog(tmp_path):
+def test_the_minutes_a_live_stall_slept_through_charge_the_watchdog(tmp_path):
     """The minutes the daemon was worst off have to be the ones its counters see.
 
     The loop runs no cycle for a slot it slept through, so the cycle observer never
-    sees those minutes. An unbound skipped-slot hook leaves a daemon that overran for
+    sees those minutes. An unbound skipped-slot hook leaves a daemon that stalled for
     an hour looking healthy, because its counters only ever saw the cycles that ran.
     """
     rig = _rig(tmp_path)
     _record(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", et(2026, 9, 2, 9, 58))
     clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
-    _run(rig, clock, ticks=2, cycle_runner=_Overrunning(clock, 200))
+    _run(
+        rig,
+        clock,
+        ticks=2,
+        cycle_runner=_quiet,
+        hooks=daemon.DaemonHooks(on_tick=_stall_on_first_tick(clock, 200)),
+    )
 
     # Three slept-through slots is the design's page threshold. The cycles themselves
     # produced no segment, so nothing but the missed minutes charged a counter.
@@ -452,13 +468,67 @@ def test_the_minutes_a_live_overrun_slept_through_charge_the_watchdog(tmp_path):
     assert page.event == "capture_down"
     # The stall is what the page is about, and it says how many slots it slept through.
     # One surface was charged, so there is no fold count to carry.
-    assert page.title == "Capture down: loop overran"
+    assert page.title == "Capture down: loop stalled"
     # No class is named, and that is the point rather than an omission. Nothing was
     # attempted in a slept-through slot, so there is no failure to name.
     assert page.body == "3 session minutes without a durable cycle"
 
 
 # -- 3. the per-tick hook feeds the idle heartbeat -----------------------------------
+
+
+class _SleepsWithACycleInFlight(ManualClock):
+    """A manual clock whose first sleep from 10:00 on oversleeps by three minutes.
+
+    It stands for the machine sleeping mid-session with the 10:00 cycle still running.
+    The cycle is released half a second after the loop wakes, so it is still in flight
+    when the waking tick reads its slot.
+    """
+
+    def __init__(self, start: datetime, release: threading.Event) -> None:
+        super().__init__(start)
+        self._release = release
+        self._overslept = False
+
+    def sleep(self, seconds: float) -> None:
+        if not self._overslept and self.now() >= et(2026, 9, 2, 10, 0):
+            self._overslept = True
+            super().sleep(seconds + 180)
+            threading.Timer(0.5, self._release.set).start()
+            return
+        super().sleep(seconds)
+
+
+def test_a_cycle_in_flight_across_a_stall_reaches_the_watchdog_before_the_stall(tmp_path):
+    """The watchdog has to see the cycle that ran before a stall ahead of the stall itself.
+
+    The loop wakes three minutes late with the 10:00 cycle still running. That cycle
+    landed data, so in slot order it resets the counter, the stall raises it to three
+    and pages once, and the 10:04 cycle that fails takes it to four and pages its
+    surface. Handed on after the stall instead, the 10:00 cycle would reset the counter
+    the stall raised, and the failing minute after it would page nothing
+    (marketlake #565).
+    """
+    rig = _rig(tmp_path)
+    _record(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", et(2026, 9, 2, 9, 58))
+    release = threading.Event()
+    clock = _SleepsWithACycleInFlight(et(2026, 9, 2, 9, 59, 30), release)
+
+    def cycle(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        if slot == et(2026, 9, 2, 10, 0):
+            assert release.wait(10)
+            return CycleResult(
+                snap_ts=slot, segments=(_segment(journal.ROW_KIND_DATA, rig.lake_root),)
+            )
+        return CycleResult(snap_ts=slot, segments=(_segment(journal.ROW_KIND_GAP, rig.lake_root),))
+
+    _run(rig, clock, ticks=2, cycle_runner=cycle)
+
+    assert [page.title for page in rig.transport.sent] == [
+        "Capture down: loop stalled",
+        "Capture down: XYZ quotes",
+    ]
+    assert rig.transport.sent[0].body == "3 session minutes without a durable cycle"
 
 
 def test_an_idle_minute_feeds_the_capture_dead_man(tmp_path):
@@ -844,12 +914,14 @@ def test_the_production_runner_files_the_cycle_under_the_loops_slot(tmp_path, mo
 # -- 7. the skipped-slot hook charges what the roster names --------------------------
 
 
-def _rewrite_after_first_cycle(path: Path, roster: str) -> daemon.DaemonHooks:
-    """Hooks that replace the roster file once, after the first cycle.
+def _rewrite_after_first_cycle(
+    path: Path, roster: str, clock: ManualClock, stall: float
+) -> daemon.DaemonHooks:
+    """Hooks that stall the first tick, then replace the roster file after the first cycle.
 
-    This stands for a person editing ``tickers.yaml`` while the daemon runs. The first
-    cycle is the session up to that edit. The overrun after it is what hands the fresh
-    file to the skipped-slot hook.
+    The rewrite stands for a person editing ``tickers.yaml`` while the daemon runs. The
+    first cycle is the session up to that edit. The stall is what hands the fresh file to
+    the skipped-slot hook, on the tick the loop next wakes on.
     """
     cycles: list[datetime] = []
 
@@ -858,7 +930,7 @@ def _rewrite_after_first_cycle(path: Path, roster: str) -> daemon.DaemonHooks:
         if len(cycles) == 1:
             path.write_text(roster)
 
-    return daemon.DaemonHooks(on_cycle=on_cycle)
+    return daemon.DaemonHooks(on_tick=_stall_on_first_tick(clock, stall), on_cycle=on_cycle)
 
 
 def _seed_two(rig: _Rig) -> None:
@@ -872,9 +944,9 @@ def _seed_two(rig: _Rig) -> None:
 
 
 def _run_across_an_edit(rig: _Rig, roster: str) -> None:
-    """Run one cycle, rewrite the roster to ``roster``, then overrun three slots.
+    """Run one cycle, rewrite the roster to ``roster``, and stall across three slots.
 
-    The 10:00 cycle takes 200 seconds, so the loop next wakes at 10:04 and hands 10:01,
+    The 10:00 tick stalls 200 seconds, so the loop next wakes at 10:04 and hands 10:01,
     10:02, and 10:03 to the skipped-slot hook. Three slept-through slots is the design's
     page threshold. So the stretch raises one page, and that page counts the surfaces
     the hook charged. The cycles produce no segment of their own, so nothing but the
@@ -886,8 +958,8 @@ def _run_across_an_edit(rig: _Rig, roster: str) -> None:
         rig,
         clock,
         ticks=2,
-        cycle_runner=_Overrunning(clock, 200),
-        hooks=_rewrite_after_first_cycle(rig.tickers, roster),
+        cycle_runner=_quiet,
+        hooks=_rewrite_after_first_cycle(rig.tickers, roster, clock, 200),
     )
 
 
@@ -907,7 +979,7 @@ def test_a_ticker_retired_mid_session_stops_charging_the_watchdog(tmp_path):
     # One counter charged, ABC's, so the page carries no fold count. A hook closed over
     # the roster the daemon started with would have charged two and said so.
     (page,) = rig.transport.sent
-    assert page.title == "Capture down: loop overran"
+    assert page.title == "Capture down: loop stalled"
     assert page.body == "3 session minutes without a durable cycle"
 
 
@@ -927,7 +999,7 @@ def test_a_ticker_onboarded_mid_session_starts_charging_the_watchdog(tmp_path):
     # Three counters charged, so the hook read the file the edit left rather than the
     # two-ticker roster the daemon started with.
     (page,) = rig.transport.sent
-    assert page.title == "Capture down: loop overran"
+    assert page.title == "Capture down: loop stalled"
     assert page.body == "3 session minutes without a durable cycle, one page for 3 surfaces"
 
 
@@ -975,15 +1047,22 @@ def test_a_broken_roster_off_the_capture_window_is_fatal_too(tmp_path):
     _seed_two(rig)
     clock = ManualClock(start=et(2026, 9, 2, 15, 58, 30))
 
-    def stall_across_the_close(
-        *, slot: datetime, close_tag: str | None, session_phase: str | None
-    ) -> CycleResult:
-        rig.tickers.write_text(UNLOADABLE)
-        clock.advance(ACROSS_THE_CLOSE)
-        return CycleResult(snap_ts=slot, segments=())
+    stalled: list[datetime] = []
+
+    def stall_across_the_close(slot: datetime) -> None:
+        if not stalled:
+            stalled.append(slot)
+            rig.tickers.write_text(UNLOADABLE)
+            clock.advance(ACROSS_THE_CLOSE)
 
     with pytest.raises(TickersError):
-        _run(rig, clock, ticks=2, cycle_runner=stall_across_the_close)
+        _run(
+            rig,
+            clock,
+            ticks=2,
+            cycle_runner=_quiet,
+            hooks=daemon.DaemonHooks(on_tick=stall_across_the_close),
+        )
 
     # The waking tick is past the option close, so no cycle ran to raise first. The hook
     # is what took the daemon down.
@@ -997,18 +1076,24 @@ def test_the_hook_charges_every_surface_its_ticker_is_captured_on(tmp_path):
     The counters are per surface, so a dead chain worker pages while that ticker's
     quotes still flow. The hook expands each roster entry through ``surfaces_for``, the
     same rule capture plans a cycle with. Charging quotes alone would leave a chain
-    worker that died across an overrun invisible, on the one path where no cycle runs
-    to notice it.
+    worker that died across a stall invisible, on the one path where no cycle runs to
+    notice it.
     """
     rig = _rig(tmp_path, roster=WITH_OPTIONS)
     for surface in (journal.CHAINS_SURFACE, journal.QUOTES_SURFACE):
         _record(rig.lake_root, surface, "SPY", et(2026, 9, 2, 9, 58))
     clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
-    _run(rig, clock, ticks=2, cycle_runner=_Overrunning(clock, 200))
+    _run(
+        rig,
+        clock,
+        ticks=2,
+        cycle_runner=_quiet,
+        hooks=daemon.DaemonHooks(on_tick=_stall_on_first_tick(clock, 200)),
+    )
 
     # Two counters on one ticker, so charging quotes alone would have said one surface.
     (page,) = rig.transport.sent
-    assert page.title == "Capture down: loop overran"
+    assert page.title == "Capture down: loop stalled"
     assert page.body == "3 session minutes without a durable cycle, one page for 2 surfaces"
 
 
@@ -1658,8 +1743,14 @@ def test_a_stall_across_the_close_marks_its_minutes_before_the_day_is_sealed(tmp
     clock = ManualClock(start=et(2026, 9, 2, 16, 9, 30))
     rig.compaction.run_here(_compacts_here(rig, clock))
     _record(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", et(2026, 9, 2, 16, 9))
-    # The 16:10 cycle runs fifty minutes, so the loop next wakes past close+15.
-    _run(rig, clock, ticks=3, cycle_runner=_Overrunning(clock, 3000))
+    # The 16:10 tick stalls fifty minutes, so the loop next wakes past close+15.
+    _run(
+        rig,
+        clock,
+        ticks=3,
+        cycle_runner=_quiet,
+        hooks=daemon.DaemonHooks(on_tick=_stall_on_first_tick(clock, 3000)),
+    )
 
     partition = LakePaths(rig.lake_root).quotes_partition_path("XYZ", DAY)
     sealed = sorted(snap[:16] for snap in pq.read_table(partition).column("snap_ts").to_pylist())
@@ -2575,7 +2666,7 @@ def test_the_plists_unset_paths_reach_every_read_unchanged(tmp_path, monkeypatch
     production reads the roster at its default path. The variable stands in for that path
     here, because a test must not write there. The cycle runner is the production one,
     over a stub vendor. The run starts at 15:58:30 and lasts 35 ticks. The 16:00 tick
-    overruns into 16:02:30, so the skipped-slot hook reads the roster, and the run crosses
+    stalls into 16:02:30, so the skipped-slot hook reads the roster, and the run crosses
     close+5 at 16:20 and close+15's dispatch at 16:31.
     """
     rig = _rig(tmp_path, roster=WITH_OPTIONS)
@@ -2592,7 +2683,7 @@ def test_the_plists_unset_paths_reach_every_read_unchanged(tmp_path, monkeypatch
     cycles: list[datetime] = []
     skipped: list[datetime] = []
 
-    def overrun(slot: datetime) -> None:
+    def stall(slot: datetime) -> None:
         if slot == et(2026, 9, 2, 16, 0):
             clock.advance(150)
 
@@ -2608,7 +2699,7 @@ def test_the_plists_unset_paths_reach_every_read_unchanged(tmp_path, monkeypatch
         pinger=rig.pinger,
         compaction_runner=rig.compaction,
         hooks=daemon.DaemonHooks(
-            on_tick=overrun,
+            on_tick=stall,
             on_cycle=lambda slot, result: cycles.append(slot),
             on_skipped=skipped.extend,
         ),

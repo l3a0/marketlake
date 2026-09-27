@@ -41,10 +41,17 @@ Three writers share the file, and each replaces only its own keys.
 2. The dead-man stamps its landed ping.
 3. The tick hook that holds the power assertion stamps its child's pid.
 
-All three run in the daemon's single loop thread, so the read-modify-write below is
-never concurrent with itself. The write is atomic all the same: a temp file beside the
-target, a flush, then one rename. So a reader meets the old stamp or the new one, never
-half of either.
+The capture cycle runs on a thread of its own, one per minute, while the other two run
+on the daemon's loop thread (marketlake #565). So the read-modify-write below takes a
+process-wide lock, and two writers in one process take turns rather than each writing
+back a stamp that lacks the other's keys. The lock also keeps them off one temp file,
+whose name carries only the process id. The write is atomic all the same: a temp file
+beside the target, a flush, then one rename. So a reader meets the old stamp or the new
+one, never half of either.
+
+The price is named rather than hidden. Two cycles that finish within one write of each
+other can stamp out of slot order, so ``stamped_at`` can step back a minute until the next
+stamp.
 
 Nothing here is durable in the journal's sense. A capture cycle counts as captured only
 once its segment is fsynced, because a lost cycle is unrecoverable. A lost stamp is
@@ -68,6 +75,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -106,6 +114,11 @@ class JournalMetadata:
     tickers: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     dead_man_last_ping: datetime | None = None
     assertion_pid: int | None = None
+
+
+# Held across every read-modify-write of the stamp in this process, for the reason the
+# module docstring gives.
+_MERGE_LOCK = threading.Lock()
 
 
 def metadata_path(lake_root: Path | str) -> Path:
@@ -259,22 +272,23 @@ def _merge(lake_root: Path | str, updates: Mapping[str, object]) -> None:
     avoid.
     """
     target = metadata_path(lake_root)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    payload = {**_read_raw(target), **updates}
-    try:
-        text = _encode(payload)
-    except (RecursionError, TypeError, ValueError):
-        text = _encode(dict(updates))
-    tmp = target.with_name(f"{target.name}.tmp-{os.getpid()}")
-    try:
-        with open(tmp, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, target)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    with _MERGE_LOCK:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = {**_read_raw(target), **updates}
+        try:
+            text = _encode(payload)
+        except (RecursionError, TypeError, ValueError):
+            text = _encode(dict(updates))
+        tmp = target.with_name(f"{target.name}.tmp-{os.getpid()}")
+        try:
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, target)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
 
 
 __all__ = [

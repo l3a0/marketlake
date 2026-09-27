@@ -1093,13 +1093,15 @@ def test_a_restart_across_a_minute_top_writes_the_first_owed_minute_once(reads_s
 
 
 def _overrun_after_a_roster_change(tmp_path: Path, *, before: str, after: str) -> tuple[Path, int]:
-    """Run a loop whose first cycle rewrites ``tickers.yaml`` and then overruns.
+    """Run a loop whose first tick rewrites ``tickers.yaml`` and then stalls.
 
     Returns the lake root and how many surfaces the watchdog charged. Both skipped-slot
     consumers read the roster, so one run shows what each of them did.
 
-    The rewrite lands at 10:00 and that cycle returns at 10:03, so the next tick reports
-    10:01 through 10:03 as skipped. A skipped slot is the one hook where no cycle ran, so
+    The rewrite lands at 10:00 and that tick's hook runs to 10:03, so the next tick
+    reports 10:01 through 10:03 as skipped. The stall is on the loop thread rather than in
+    the cycle, which runs on a thread of its own and can no longer skip a minute
+    (marketlake #565). A skipped slot is the one hook where no cycle ran, so
     nothing but the roster each consumer reads decides which surfaces it acts on. Three
     skipped minutes is also the watchdog's page threshold, so a charged surface pages
     inside this run and an uncharged one stays silent.
@@ -1119,14 +1121,16 @@ def _overrun_after_a_roster_change(tmp_path: Path, *, before: str, after: str) -
 
     clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
     alerts = FakeTransport()
-    cycles = [0]
+    stalled = [False]
 
-    def cycle(*, slot, close_tag, session_phase) -> CycleResult:
-        cycles[0] += 1
-        if cycles[0] == 1:
+    def stall(slot) -> None:
+        if not stalled[0]:
+            stalled[0] = True
             tickers.write_text(after)
             clock.advance(seconds=60 * OVERRUN)
-        return CycleResult(clock.now(), ())
+
+    def cycle(*, slot, close_tag, session_phase) -> CycleResult:
+        return CycleResult(slot, ())
 
     ticks = [0]
 
@@ -1144,6 +1148,7 @@ def _overrun_after_a_roster_change(tmp_path: Path, *, before: str, after: str) -
         pinger=FakePinger(),
         compaction_runner=lambda args: None,
         cycle_runner=cycle,
+        hooks=daemon.DaemonHooks(on_tick=stall),
         should_continue=twice,
     )
     return lake_root, _charged(alerts.messages)
@@ -1162,7 +1167,7 @@ SKIPPED = [f"2026-09-02T10:{m:02d}" for m in range(1, OVERRUN + 1)]
 # size of the roster the hook read, and a hook reading the wrong one lands on a
 # different number in each case here.
 _FOLDED = re.compile(r"one page for (\d+) surfaces")
-_OVERRUN_TITLE = "Capture down: loop overran"
+_OVERRUN_TITLE = "Capture down: loop stalled"
 
 
 def _charged(messages: list) -> int:

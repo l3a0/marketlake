@@ -231,7 +231,7 @@ def test_a_slept_through_slot_increments_the_same_counters():
     raised = [watchdog.missed(surfaces, [_at(i)]) for i in range(3)]
     assert [len(pages) for pages in raised] == [0, 0, 1]
     page = raised[2][0]
-    assert page.title == "Capture down: loop overran"
+    assert page.title == "Capture down: loop stalled"
     assert page.minutes == 3
     assert page.surfaces == (Surface("chains", "SPY"),)
 
@@ -244,7 +244,7 @@ def test_a_stall_and_a_failing_cycle_count_toward_the_same_page():
     watchdog.missed([Surface("chains", "SPY")], [_at(0)])
     watchdog.observe(_cycle(_seg("chains", "SPY", "gap"), at=_at(1)))
     pages = watchdog.missed([Surface("chains", "SPY")], [_at(2)])
-    assert [p.title for p in pages] == ["Capture down: loop overran"]
+    assert [p.title for p in pages] == ["Capture down: loop stalled"]
     assert pages[0].minutes == 3
     assert watchdog.count("chains", "SPY") == 3
 
@@ -298,7 +298,7 @@ def test_a_slept_through_slot_is_not_a_dead_sampler():
     pages = watchdog.missed(
         [Surface("quotes", "SPY"), Surface("quotes", "QQQ")], [_at(i) for i in range(3)]
     )
-    assert [page.title for page in pages] == ["Capture down: loop overran"]
+    assert [page.title for page in pages] == ["Capture down: loop stalled"]
     assert not any(page.sampler_collapse for page in pages)
 
 
@@ -349,7 +349,7 @@ def test_one_overrun_raises_one_page_rather_than_one_per_surface():
     watchdog = Watchdog()
     pages = watchdog.missed(_roster(115), [_at(minute) for minute in range(3)])
     assert len(pages) == 1
-    assert pages[0].title == "Capture down: loop overran"
+    assert pages[0].title == "Capture down: loop stalled"
     assert not pages[0].sampler_collapse
 
 
@@ -385,7 +385,7 @@ def test_a_surface_still_dead_after_the_overrun_pages_on_its_own_account():
     """
     watchdog = Watchdog()
     overrun = watchdog.missed(_roster(2), [_at(minute) for minute in range(3)])
-    assert [page.title for page in overrun] == ["Capture down: loop overran"]
+    assert [page.title for page in overrun] == ["Capture down: loop stalled"]
     after = []
     for minute in range(3, 6):
         after += watchdog.observe(
@@ -483,7 +483,7 @@ def test_a_stall_that_trips_one_surface_while_the_others_sit_below_still_pages()
             )
         )
     pages = watchdog.missed(roster, [_at(2)])
-    assert [page.title for page in pages] == ["Capture down: loop overran"]
+    assert [page.title for page in pages] == ["Capture down: loop stalled"]
     assert pages[0].minutes == 3
     assert len(pages[0].surfaces) == 2
     assert watchdog.count("chains", "T000") == 1
@@ -538,9 +538,9 @@ def test_a_stall_pages_again_on_the_next_session_date():
     watchdog = Watchdog()
     roster = _roster(2)
     first = watchdog.missed(roster, [_at(minute) for minute in range(3)])
-    assert [page.title for page in first] == ["Capture down: loop overran"]
+    assert [page.title for page in first] == ["Capture down: loop stalled"]
     second = watchdog.missed(roster, [_at(minute, day=3) for minute in range(3)])
-    assert [page.title for page in second] == ["Capture down: loop overran"]
+    assert [page.title for page in second] == ["Capture down: loop stalled"]
 
 
 def test_a_stall_across_a_session_date_names_only_this_session_s_slots():
@@ -1130,7 +1130,7 @@ def test_a_slept_through_slot_pages_with_no_class():
     # name. Guessing one would point at a request that was never made.
     watchdog = Watchdog()
     pages = watchdog.missed([Surface("chains", "SPY")], [_at(minute) for minute in range(3)])
-    assert [page.title for page in pages] == ["Capture down: loop overran"]
+    assert [page.title for page in pages] == ["Capture down: loop stalled"]
     assert pages[0].cause is None
 
 

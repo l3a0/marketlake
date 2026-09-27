@@ -11,10 +11,17 @@ span as ``now``.
 ``wait`` is the one place this clock spends real time, because the futures it waits on
 run on real threads. It gives them a short real grace to finish. When none does, it moves
 virtual time forward to ``until`` and returns empty, the way a real wait times out.
+
+More than one thread moves this clock. The daemon runs each minute's cycle on a thread of
+its own, and that cycle sleeps its stagger and waits on its bound through the clock while
+the loop thread waits on the cycles (marketlake #565). ``advance`` and ``set`` are a read
+then a write, so two threads moving the clock at once could lose one move. A lock covers
+both, and covers ``wait``'s move forward to ``until``, so every move lands whole.
 """
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Collection
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from datetime import datetime, timedelta
@@ -30,11 +37,21 @@ WAIT_GRACE_SECONDS = 1.0
 class ManualClock:
     """A ``Clock`` whose time a test controls."""
 
-    def __init__(self, start: datetime, monotonic: float = 0.0) -> None:
+    def __init__(
+        self, start: datetime, monotonic: float = 0.0, *, grace: float = WAIT_GRACE_SECONDS
+    ) -> None:
+        """``grace`` is the real time ``wait`` gives a future before it moves forward.
+
+        A case whose held futures spend the whole grace on every wait passes a shorter one.
+        """
         if start.tzinfo is None:
             raise ValueError("ManualClock start must be timezone-aware")
         self._now = start
         self._monotonic = monotonic
+        self._grace = grace
+        # Re-entrant, because ``wait`` holds it while it moves forward through ``sleep``,
+        # which a subclass may override and which lands in ``advance``.
+        self._lock = threading.RLock()
 
     def now(self) -> datetime:
         return self._now
@@ -52,25 +69,28 @@ class ManualClock:
         there is no instant to give up at. Otherwise it moves forward through ``sleep``, so
         a subclass that overrides ``sleep`` still applies, and never backwards.
         """
-        timeout = None if until is None else WAIT_GRACE_SECONDS
+        timeout = None if until is None else self._grace
         done, _ = wait(futures, timeout=timeout, return_when=FIRST_COMPLETED)
         if done or until is None:
             return set(done)
-        remaining = (until - self.now()).total_seconds()
-        if remaining > 0:
-            self.sleep(remaining)
+        with self._lock:
+            remaining = (until - self.now()).total_seconds()
+            if remaining > 0:
+                self.sleep(remaining)
         return set()
 
     def advance(self, seconds: float) -> None:
         """Move both the wall clock and the monotonic timer forward."""
-        self._now = self._now + timedelta(seconds=seconds)
-        self._monotonic += seconds
+        with self._lock:
+            self._now = self._now + timedelta(seconds=seconds)
+            self._monotonic += seconds
 
     def set(self, when: datetime) -> None:
         """Jump the wall clock to a chosen instant. The monotonic timer is unmoved."""
         if when.tzinfo is None:
             raise ValueError("ManualClock time must be timezone-aware")
-        self._now = when
+        with self._lock:
+            self._now = when
 
 
 class CostlyClock(ManualClock):

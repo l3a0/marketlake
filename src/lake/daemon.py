@@ -9,16 +9,19 @@ own. Outside the capture window it idles and keeps ticking.
 
 Each minute the loop does three things, in order.
 
-1. **Align to the minute top.** It sleeps through the injected clock until the next
-   whole minute, and sleeps again if it wakes short of it. The wait is computed from the
-   clock's own ``now``, never from the wall clock, so a test with a manual clock steps the
-   loop deterministically and a sleep costs no real time.
+1. **Align to the minute top.** It waits through the injected clock until the next
+   whole minute, and waits again if it wakes short of it. While it waits, it hands each
+   cycle still in flight to the observer hook as that cycle finishes. The wait is computed
+   from the clock's own ``now``, never from the wall clock, so a test with a manual clock
+   steps the loop deterministically and a sleep costs no real time.
 2. **Consult the session clock.** ``SessionClock.phase`` says where the current minute
    sits in the session. The capture window is the open through the option close. Off it
    the loop idles.
-3. **Run one cycle** through the injected cycle runner, for the minute the loop read and
-   stamped with the two provenance tags the loop owns, then hand the result to the
-   observer hook.
+3. **Start one cycle** on a thread of its own, through the injected cycle runner, for the
+   minute the loop read and stamped with the two provenance tags the loop owns. The loop
+   does not wait for it. Each cycle builds its own vendor and pool and files under its
+   own minute, so a slow request in one minute costs no other minute anything
+   (marketlake #565).
 
 Five hooks let the loop-coupled deliverables plug in without touching the loop. Each
 has a no-op default, so the loop ships standalone.
@@ -33,12 +36,13 @@ has a no-op default, so the loop ships standalone.
 - ``close_tag_for(slot)`` is asked, once per capture slot, what ``close_tag`` the minute
   carries. The close-tag decision (D11) plugs in here: ``spot_close`` at the equity close
   and ``option_close`` at the option close. The default answers ``None``.
-- ``on_cycle(slot, result)`` is handed each cycle's ``CycleResult`` after it returns. The
-  watchdog (D13), which counts consecutive session minutes without a durable data cycle,
-  plugs in here. So does the schema-drift observer, which reads the columns the parser
-  refused off the same result and pages when a vendor retype starts.
-- ``on_skipped(slots)`` is handed the capture slots the loop missed, in order, when a
-  cycle overran its minute. The same gap-marking writer plugs in here, so a slot the
+- ``on_cycle(slot, result)`` is handed each cycle's ``CycleResult`` once the cycle
+  finishes, on the loop thread and in slot order. The watchdog (D13), which counts
+  consecutive session minutes without a durable data cycle, plugs in here. So does the
+  schema-drift observer, which reads the columns the parser refused off the same result
+  and pages when a vendor retype starts.
+- ``on_skipped(slots)`` is handed the capture slots the loop missed, in order, when the
+  loop thread itself woke late. The same gap-marking writer plugs in here, so a slot the
   loop slept through is recorded rather than left a hole.
 
 Two provenance tags ride every row of a cycle. The loop is the first piece that consults
@@ -53,34 +57,74 @@ The daemon holds no expiration state and no cached plan. The production cycle ru
 reloads the config, the roster, the token, and the chain plan on every call, so a nightly
 plan rewrite takes effect the next minute and a re-auth is picked up the next cycle.
 
-A slow cycle never shifts a later sample. When a cycle overruns its minute, the loop
-aligns to the next minute top from wherever the clock stands. The overrun minute fires no
-cycle and is never caught up. It must still be recorded. The design counts completeness
-from rows, never from holes, and the loop is the only piece that can see the skip. So the
-loop keeps exactly one datetime across ticks: the slot of the previous tick. On each tick
-of a session date it walks the minutes strictly between that slot and the current one,
-keeps the ones inside the capture window, the open through the option close, and hands
-them to ``on_skipped`` before doing anything else. Under normal cadence the two slots are
-adjacent and nothing is reported. The memory covers every tick, not only the ones that
-fired a cycle, and it spans days. Within one incarnation the loop reports every capture
-slot it slept through, an overrun or a stall, across as many session days as the stall
-covered. A lid closed Monday afternoon and opened Tuesday morning reports Monday's tail
-and Tuesday's head. Non-session days contribute nothing, and a night jump that touches
-no capture slot reports nothing. A restart seeds the memory from one read of the minute
-the daemon starts in, and hands that same minute to ``on_start``. Startup gap-marking
-owns every owed minute through it, and the loop owns every minute after it. So the two
-writers never overlap: the loop reports what it slept through while alive, and startup
-marking reports what happened while it was dead. One read rather than two, because a
-second read can fall past a minute top the first did not, and both writers would then
-claim that minute. That one datetime is the loop's only state. The loop keeps neither
-the expiration set nor the chain plan, because the cycle reads the plan fresh from its
-file and the expiration set off the journal on its failure path.
+A slow cycle never delays or shifts a later sample, because the loop never waits for one
+cycle before firing the next. A cycle ends when its own requests are done, or at the bound
+``lake.capture`` puts on them (marketlake #597). What the loop can still miss is a minute
+its own thread was not awake for: the machine slept, the process was suspended, the wall
+clock jumped, or a hook on the loop thread ran past a minute. The loop then aligns to the
+next minute top from wherever the clock stands. The minutes it missed fire no cycle and
+are never caught up. They must still be recorded. The design counts completeness from
+rows, never from holes, and the loop is the only piece that can see the skip. So the loop
+keeps the slot of the previous tick. On each tick of a session date it walks the minutes
+strictly between that slot and the current one, keeps the ones inside the capture window,
+the open through the option close, and hands them to ``on_skipped``. Under normal cadence
+the two slots are adjacent and nothing is reported. The memory covers every tick, not only
+the ones that fired a cycle, and it spans days. Within one incarnation the loop reports
+every capture slot it slept through, across as many session days as the stall covered. A
+lid closed Monday afternoon and opened Tuesday morning reports Monday's tail and Tuesday's
+head. Non-session days contribute nothing, and a night jump that touches no capture slot
+reports nothing. A restart seeds the memory from one read of the minute the daemon starts
+in, and hands that same minute to ``on_start``. Startup gap-marking owns every owed minute
+through it, and the loop owns every minute after it. So the two writers never overlap: the
+loop reports what it slept through while alive, and startup marking reports what happened
+while it was dead. One read rather than two, because a second read can fall past a minute
+top the first did not, and both writers would then claim that minute.
 
-A cycle that raises propagates out of the loop. The production entry reloads config and
-the token per cycle, so a raise there means a broken machine, not a vendor hiccup, and the
-loop has no channel of its own to report it. The process exits non-zero, launchd logs it
-and relaunches, and the successor's startup gap-marking records the minutes lost. A vendor
-failure never reaches here: the cycle resolves it into gap rows and returns normally.
+The loop's other state is the queue of cycles still in flight, in slot order. It exists
+only while cycles run, and a restart that loses it loses those minutes' cycles, which the
+successor's startup marking records like any other minute a dead daemon missed. The loop
+keeps neither the expiration set nor the chain plan, because the cycle reads the plan
+fresh from its file and the expiration set off the journal on its failure path.
+
+Results reach ``on_cycle`` in slot order, because three readers on the loop thread count
+minutes in order.
+
+1. The watchdog counts consecutive session minutes and rolls its counters on the session
+   date, so a later minute seen first would reset a counter the earlier one should raise.
+2. The out-of-span line remembers the previous set and prints when it changes, so a later
+   cycle seen first would print one change twice (marketlake #554).
+3. The watchdog charges a stall against the out-of-span set the last cycle named
+   (marketlake #570).
+
+So the loop hands on only from the front of the queue, and a later cycle that finished
+first waits for the earlier one. Two kinds of tick wait for every cycle in flight, and
+hand each on, before any hook runs.
+
+1. A tick with skipped slots to report. The cycle that ran before a stall must reach the
+   watchdog ahead of the stall's minutes. Handed on after them, a cycle that landed data
+   resets the counters the stall raised, and the next failing minute pages nothing.
+2. A tick at or past its day's close+5 deadline, the moment the close+5 guard is
+   dispatched at. The guard refills an option close only when no data row holds it, so a
+   guard that ran ahead of a 16:15 cycle still writing would fetch a second close.
+
+Both waits are short. Every cycle in flight at such a tick is already past its bound, so
+what remains is its writes. Inside a tick ``on_tick`` still runs before ``on_skipped``, and
+both run before the minute's cycle starts. The close+15 compaction's one-tick wait relies
+on that order.
+
+A cycle that raises propagates out of the loop once it reaches the front of the queue. The
+loop first waits for every other cycle in flight and hands none of them on, so their rows
+are whole on disk and the successor's startup marking reads them as recorded. The price is
+that the process exits up to one bound plus one transport timeout after the raise. Most of
+that delay would come anyway, since the interpreter joins a cycle's pool threads at exit.
+The production entry reloads config and the token per cycle, so a raise there means a
+broken machine, not a vendor hiccup, and the loop has no channel of its own to report it.
+The process exits non-zero, launchd logs it and relaunches, and the successor's startup
+gap-marking records the minutes lost. A vendor failure never reaches here: the cycle
+resolves it into gap rows and returns normally.
+
+Leaving the loop through ``should_continue`` waits for every cycle in flight and hands each
+on. The daemon never leaves that way, and every test of the loop does.
 
 The launchd plist that runs the daemon is deliberately not here. It is D14's.
 
@@ -95,14 +139,17 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
+from collections import deque
 from collections.abc import Callable, Sequence
+from concurrent.futures import Future
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Protocol
 
 from lake.alert import REFUSED, Message, NtfyTransport, Publisher, Transport
-from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar
+from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
 from lake.capture import (
     CycleResult,
     FillResult,
@@ -229,21 +276,121 @@ def next_minute_top(now: datetime) -> datetime:
     return now.replace(second=0, microsecond=0) + TICK
 
 
-def _sleep_until(clock: Clock, top: datetime) -> None:
-    """Sleep through ``clock`` until it reads ``top`` or later. Never return short of it.
+# The cycles still in flight, oldest first, each with the slot it was fired for.
+_InFlight = deque[tuple[datetime, "Future[CycleResult]"]]
 
-    ``SystemClock.sleep`` counts elapsed time on the monotonic timer, while ``now`` reads
-    the wall clock, so a sleep computed from the wall clock can end a few milliseconds
-    short of its top. It did twice on 2026-09-11. A loop that read its slot there took the
-    minute it had already served, and at a session boundary that loses the open minute or
-    moves a close tag onto the wrong minute (marketlake #572). So a clock still short of
-    the top sleeps the remainder. A sleep that overshoots returns as it is. The remainder
-    has no bound, so a wall clock stepped backward waits until it reaches the top again.
+
+def _start_cycle(
+    cycle_runner: CycleRunner,
+    *,
+    slot: datetime,
+    close_tag: str | None,
+    session_phase: str | None,
+) -> Future[CycleResult]:
+    """Start one cycle on a thread of its own and return the future it settles.
+
+    A thread per cycle rather than a place in a shared executor. An executor with a cap
+    would queue a minute's cycle behind cycles still finishing their writes, which is the
+    wait this module exists not to have. The bound on each request keeps the count small
+    without a cap: about two cycles overlap, and a third only while a tail runs long, such
+    as a manifest append waiting on another process's lake lock.
+
+    The thread is not a daemon thread, so an exit waits for the cycle's writes rather than
+    cutting them off. Anything the cycle raises is kept on the future and raised again on
+    the loop thread, where a raising cycle has always ended the process.
     """
-    now = clock.now()
-    while now < top:
-        clock.sleep((top - now).total_seconds())
+    future: Future[CycleResult] = Future()
+    future.set_running_or_notify_cancel()
+
+    def run() -> None:
+        try:
+            result = cycle_runner(slot=slot, close_tag=close_tag, session_phase=session_phase)
+        except BaseException as exc:  # noqa: BLE001 - raised again on the loop thread
+            future.set_exception(exc)
+        else:
+            future.set_result(result)
+
+    threading.Thread(target=run, name=f"cycle {slot.isoformat()}", daemon=False).start()
+    return future
+
+
+def _settle(clock: Clock, future: Future[CycleResult]) -> None:
+    """Wait for ``future`` to finish, however long that takes."""
+    while not future.done():
+        clock.wait([future], None)
+
+
+def _hand_on(
+    in_flight: _InFlight,
+    clock: Clock,
+    on_cycle: Callable[[datetime, CycleResult], None],
+    *,
+    drain: bool,
+) -> None:
+    """Hand ``on_cycle`` every finished cycle at the front of the queue, oldest first.
+
+    A cycle still running at the front stops the hand-on, because a later cycle cannot go
+    before it. With ``drain`` the loop waits for it instead, and so waits for every cycle
+    in flight. A cycle that raised, once it reaches the front, waits for every other cycle
+    in flight, hands none of them on, and raises.
+    """
+    while in_flight:
+        slot, future = in_flight[0]
+        if not future.done():
+            if not drain:
+                return
+            _settle(clock, future)
+        exc = future.exception()
+        if exc is not None:
+            for _slot, other in in_flight:
+                _settle(clock, other)
+            raise exc
+        in_flight.popleft()
+        on_cycle(slot, future.result())
+
+
+def _wait_for_top(
+    clock: Clock,
+    top: datetime,
+    in_flight: _InFlight,
+    on_cycle: Callable[[datetime, CycleResult], None],
+) -> None:
+    """Wait through ``clock`` until it reads ``top`` or later, handing on cycles as they finish.
+
+    It waits on the front of the queue alone. A later cycle cannot be handed on before the
+    front, and a wait on a set that holds a finished cycle returns at once, so waiting on
+    the whole queue would spin. With nothing in flight it sleeps.
+
+    It never returns short of ``top``. ``SystemClock`` times its sleep and its wait on the
+    monotonic timer, while ``now`` reads the wall clock, so a wait computed from the wall
+    clock can end a few milliseconds short of its top. A sleep did twice on 2026-09-11. A
+    loop that read its slot there took the minute it had already served, and at a session
+    boundary that loses the open minute or moves a close tag onto the wrong minute
+    (marketlake #572). So ``now`` is read again after every wait, and a clock still short of
+    the top waits the remainder. A wait that overshoots returns as it is. The remainder has
+    no bound, so a wall clock stepped backward waits until it reaches the top again.
+    """
+    while True:
+        _hand_on(in_flight, clock, on_cycle, drain=False)
         now = clock.now()
+        if now >= top:
+            return
+        if in_flight:
+            clock.wait([in_flight[0][1]], top)
+        else:
+            clock.sleep((top - now).total_seconds())
+
+
+def _at_or_past_close_guard(session_clock: SessionClock, slot: datetime) -> bool:
+    """Whether ``slot`` is at or past its day's close+5 deadline. Never on a non-session day.
+
+    That deadline is the moment ``SessionDispatch`` fires the close+5 guard at, so a tick
+    that answers yes is one whose ``on_tick`` may run the guard.
+    """
+    try:
+        return slot >= session_clock.bounds(slot.date()).option_close_deadline
+    except NotASession:
+        return False
 
 
 def _forever() -> bool:
@@ -267,30 +414,38 @@ def run_loop(
     startup marking and ``on_skipped`` would then both claim that minute. Then each
     iteration:
 
-    1. Sleep through ``clock.sleep`` until the next minute top, computed from
-       ``clock.now``, and sleep again while the clock still reads short of it. The top is
-       never earlier than the minute after the previous tick's slot, so a wall clock
-       stepped backward, during the sleep or during a tick, makes the loop wait rather
-       than serve a minute it already served.
-    2. Read the snap slot once and take its phase with ``phase_at``, then hand the slot
-       to ``on_tick``. One read, because two reads can fall on either side of a minute
-       top when a long sleep lands just before one, and the loop would then decide
-       capture on one minute and serve another. ``on_tick`` fires every minute, session
-       or not, because the power assertion the control plane holds is owed on holidays
-       too.
-    3. Hand any capture slots missed since the previous tick, across days if the loop
-       slept that long, to ``on_skipped``, then remember this tick's slot. This is the
-       loop's only state across ticks.
-    4. Off the capture window, idle: nothing else runs this tick.
-    5. On a capture slot, ask ``close_tag_for`` for the minute's tag, derive
-       ``session_phase`` from the phase, run one cycle for the slot with both, and hand
-       the result to ``on_cycle``. The cycle files under this slot rather than a minute
-       of its own, so a hook that runs past the next top cannot move its rows.
+    1. Wait through the clock until the next minute top, computed from ``clock.now``, and
+       wait again while the clock still reads short of it. While waiting, hand each cycle
+       in flight to ``on_cycle`` as it finishes, oldest first. The top is never earlier
+       than the minute after the previous tick's slot, so a wall clock stepped backward,
+       during the wait or during a tick, makes the loop wait rather than serve a minute it
+       already served.
+    2. Read the snap slot once and take its phase with ``phase_at``. One read, because two
+       reads can fall on either side of a minute top when a long wait lands just before
+       one, and the loop would then decide capture on one minute and serve another.
+    3. Hand on every finished cycle at the front of the queue.
+    4. When the tick has capture slots missed since the previous tick to report, across
+       days if the loop slept that long, or when the slot is at or past its day's close+5
+       deadline, wait for every cycle in flight and hand each on.
+    5. Hand the slot to ``on_tick``. It fires every minute, session or not, because the
+       power assertion the control plane holds is owed on holidays too.
+    6. Hand the missed slots to ``on_skipped``, still after ``on_tick``, then remember this
+       tick's slot.
+    7. Off the capture window, idle: nothing else runs this tick.
+    8. On a capture slot, ask ``close_tag_for`` for the minute's tag, derive
+       ``session_phase`` from the phase, and start one cycle for the slot with both on a
+       thread of its own. The loop does not wait for it. The cycle files under this slot
+       rather than a minute of its own, so a hook that runs past the next top cannot move
+       its rows.
 
     ``should_continue`` is checked at the top of each iteration. It defaults to forever.
-    A test binds it to a manual clock to bound a simulated session.
+    A test binds it to a manual clock to bound a simulated session. Leaving the loop
+    waits for every cycle in flight and hands each on. A cycle that raised ends the loop
+    when it reaches the front of the queue, after every other cycle in flight finishes,
+    and none of those is handed on.
     """
     hooks = hooks if hooks is not None else DaemonHooks()
+    in_flight: _InFlight = deque()
     # The slot of the previous tick, seeded before ``on_start`` runs so the handoff
     # between startup marking and the loop is exact rather than a matter of timing.
     # The seed is handed to ``on_start`` rather than read again there, and startup
@@ -304,11 +459,15 @@ def run_loop(
     last_slot = session_clock.snap_slot()
     hooks.on_start(last_slot)
     while should_continue():
-        _sleep_until(clock, max(next_minute_top(clock.now()), last_slot + TICK))
+        _wait_for_top(
+            clock, max(next_minute_top(clock.now()), last_slot + TICK), in_flight, hooks.on_cycle
+        )
         slot = session_clock.snap_slot()
         phase = session_clock.phase_at(slot)
-        hooks.on_tick(slot)
         skipped = missed_slots(session_clock, last_slot, slot)
+        drain = bool(in_flight) and (bool(skipped) or _at_or_past_close_guard(session_clock, slot))
+        _hand_on(in_flight, clock, hooks.on_cycle, drain=drain)
+        hooks.on_tick(slot)
         if skipped:
             hooks.on_skipped(skipped)
         last_slot = slot
@@ -316,8 +475,15 @@ def run_loop(
             continue
         close_tag = hooks.close_tag_for(slot)
         session_phase = phase.value if phase is SessionPhase.POST_EQUITY_CLOSE else None
-        result = cycle_runner(slot=slot, close_tag=close_tag, session_phase=session_phase)
-        hooks.on_cycle(slot, result)
+        in_flight.append(
+            (
+                slot,
+                _start_cycle(
+                    cycle_runner, slot=slot, close_tag=close_tag, session_phase=session_phase
+                ),
+            )
+        )
+    _hand_on(in_flight, clock, hooks.on_cycle, drain=True)
 
 
 # -- the production entry ------------------------------------------------------
@@ -1136,7 +1302,7 @@ def run_loop_from_config(
     ticker list current on every day the daemon is awake.
 
     Gap marking rides ``on_start`` and ``on_skipped`` the same way. Both hand their
-    missed slots to one ``GapMarker``, so a restart and a live overrun leave the same
+    missed slots to one ``GapMarker``, so a restart and a live stall leave the same
     kind of record. Marking needs the lake root, the roster, and the security master.
     Only the lake root is fixed here. The roster and the master are both read per pass,
     because onboarding writes both while the daemon runs and a copy from startup answers

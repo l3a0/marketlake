@@ -1284,15 +1284,19 @@ def _fetch_concurrently(
        the pool's queue, and submitting one ticker's windows ahead of the next ticker's
        would put the second ticker's whole chain behind the first's. Interleaving also
        starts every ticker's near-term windows, the densest, first.
-    3. **Only this thread advances the clock.** Submissions are ``guards.capture_stagger_ms``
-       apart, slept on the injected clock here, so a volley leaves over about a second rather
-       than in one instant, clear of Schwab's burst rejection (429-005). This thread stamps
+    3. **Within one fetch, only this thread moves the clock.** Submissions are
+       ``guards.capture_stagger_ms`` apart, slept on the injected clock here, so a volley
+       leaves over about a second rather than in one instant, clear of Schwab's burst
+       rejection (429-005). This thread stamps
        each unit's ``fetch_ts`` just before its first submission. Pool threads make vendor
        calls and parse the responses, and read the clock once more to stamp when their own
        task finished. A unit's ``fetch_end_ts`` is the latest of its tasks' finish stamps, so
        it is when the unit's last response landed, whatever else was still being submitted.
        Reading the clock from a pool thread is safe, since ``now`` changes nothing, and no
-       pool thread ever sleeps on it or advances it.
+       pool thread ever sleeps on it or advances it. Other threads do: each minute's cycle
+       runs on a thread of its own, and the daemon's loop thread waits on those cycles
+       through the same clock (marketlake #565). The real clock's sleep and wait change no
+       shared value, and the test clock takes a lock around every move.
     4. **A unit is handed over as soon as its own tasks are done** (marketlake #563). A unit
        is one ticker's chain, every window of it, or the one quote request. Once the whole
        volley is submitted, this thread waits for the first task to finish among those still

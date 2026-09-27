@@ -9,7 +9,8 @@ Five properties are covered here, because each one is what a reader's field rest
 
 1. The three writers share the file without clobbering each other. The cycle stamps the
    mint time and the roster, the dead-man stamps its ping, the assertion hook stamps its
-   pid, and each carries the others' keys forward.
+   pid, and each carries the others' keys forward, even when the cycle's thread and the
+   loop thread stamp at once.
 2. The roster is stored as the surfaces each ticker is captured on, so a ticker that
    journaled nothing still has rows to show as failing.
 3. The mint stamp is a timestamp. No token material reaches the file.
@@ -24,6 +25,7 @@ Five properties are covered here, because each one is what a reader's field rest
 from __future__ import annotations
 
 import json
+import threading
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
@@ -93,6 +95,45 @@ def test_the_two_writers_carry_each_others_keys_forward(lake_root):
     again = read_metadata(lake_root)
     assert again.dead_man_last_ping == PING
     assert again.stamped_at == later
+
+
+def test_a_cycle_stamp_and_a_pid_stamp_that_overlap_both_survive(lake_root, monkeypatch):
+    """Each minute's cycle stamps from a thread of its own, beside the loop thread's writers.
+
+    The cycle's read-modify-write is held open between its read and its write until the
+    pid stamp on another thread has reached the same point, or half a second passes. Two
+    writers that both read the stamp before either wrote it would each write back a stamp
+    lacking the other's key, and one of them would be lost. A lost pid fails the 08:30
+    self-check (marketlake #565). The lock makes the pid stamp wait its turn instead.
+    """
+    encode = metadata._encode
+    cycle_inside, pid_inside = threading.Event(), threading.Event()
+    cycle_thread: list[threading.Thread] = []
+
+    def held_encode(payload):
+        if threading.current_thread() in cycle_thread:
+            cycle_inside.set()
+            pid_inside.wait(0.5)
+        else:
+            pid_inside.set()
+        return encode(payload)
+
+    monkeypatch.setattr(metadata, "_encode", held_encode)
+    cycle = threading.Thread(
+        target=stamp_cycle,
+        args=(lake_root,),
+        kwargs={"at": SLOT, "token_minted_at": MINTED, "roster": _roster()},
+    )
+    cycle_thread.append(cycle)
+    cycle.start()
+    assert cycle_inside.wait(5)
+    stamp_assertion_pid(lake_root, pid=4242)
+    cycle.join(5)
+
+    stamp = read_metadata(lake_root)
+    assert stamp.assertion_pid == 4242
+    assert stamp.stamped_at == SLOT
+    assert stamp.token_minted_at == MINTED
 
 
 def test_the_assertion_pid_rides_beside_the_panel_s_own_keys(lake_root):

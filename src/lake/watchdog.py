@@ -83,9 +83,12 @@ _WHOLE_DAEMON_CAUSES = {
     "http_429": "Capture down: rate limited",
 }
 
-# What one overrun pages under. The gap rows the same stall produces are stamped
-# ``slot_overrun``, so operator and journal name the minute the same way.
-_OVERRUN_TITLE = "Capture down: loop overran"
+# What one stall of the loop thread pages under. A slow request no longer causes one,
+# since each minute's cycle runs on a thread of its own (marketlake #565), so the title
+# names the stall rather than an overrun. The gap rows the same stall produces keep the
+# class ``slot_overrun``. They are data in the lake, and renaming a class would split one
+# reason across two spellings.
+_OVERRUN_TITLE = "Capture down: loop stalled"
 
 # What enabled tickers the capture spans leave out page under, one page for all of them.
 _OUT_OF_SPAN_TITLE = "Capture down: tickers outside every capture span"

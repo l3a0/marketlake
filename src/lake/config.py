@@ -249,8 +249,9 @@ class GuardConstants:
     # whole of it comes out of the minute: 19 tasks spend 18 pauses before the last request
     # leaves. So it is bounded at 1000 ms, which already spends 18 seconds of the minute on
     # submission alone. The lever for a burst rejection is the cap above, not this pause. At
-    # a stagger of about 3.3 seconds the submission alone outruns the minute, every other
-    # slot is skipped, and nothing pages, because the cycles between still land data.
+    # a stagger of about 3 seconds the submission alone outruns the bound below, so the
+    # requests still waiting to leave at the bound are never sent and fail under
+    # ``request_abandoned``, every minute.
     capture_stagger_ms: int = 50
     # How long after its minute top a capture cycle waits on its requests, in seconds,
     # marketlake #597. A request not done by the minute's ``snap_ts`` plus this is abandoned:
@@ -268,9 +269,11 @@ class GuardConstants:
     # and at every value accepted here no mark taken past close+5 lands tagged ``option_close``.
     #
     # The range is whole seconds from 1 to 59. At 60 or more an ordinary cycle's bound falls
-    # in the next minute, which is the overrun the bound exists to end. At 0 every request is
-    # abandoned before it is sent. Monday 2026-09-28's timing file is the first to say how
-    # many requests 55 would cut that 59 would keep.
+    # in the next minute. The loop no longer waits for a cycle, so that costs the next minute
+    # nothing (marketlake #565), but it lets each minute's cycles run into the next, and a
+    # vendor that hangs then keeps more requests in flight than one minute makes. At 0 every
+    # request is abandoned before it is sent. Monday 2026-09-28's timing file is the first to
+    # say how many requests 55 would cut that 59 would keep.
     capture_request_bound_s: int = 55
 
     @classmethod
