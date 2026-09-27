@@ -20,7 +20,7 @@ Two design rules shape this file.
    already-built ``schwab-py`` client object. So a test injects a fake client with
    the same method shapes and never needs the network or a real token. The thin
    ``from_token`` factory builds the real client from a token file through
-   ``client_from_token``, the only place ``schwab-py`` is imported. It runs from the
+   ``client_from_token``, the only place this module imports ``schwab-py``. It runs from the
    capture daemon on every cycle, and in the by-hand live check. Continuous integration
    reaches it only through ``httpx.MockTransport`` and a temporary token file.
 2. No wall-clock read. ``token_mint_time`` derives its instant from the token the
@@ -61,7 +61,6 @@ from typing import Protocol, runtime_checkable
 
 from lake.clock import Clock
 from lake.paths import TOKEN_FILE, config_dir
-from lake.reauth import TokenWriter
 from lake.token_epoch import epoch_second_to_utc
 from lake.vendor import RequestTiming, VendorError, VendorResponse, require_utc_bound
 
@@ -534,7 +533,7 @@ def _adopt_stored_token(client: object, read_token: Callable[[], object]) -> Non
 def client_from_token(token_path: str | Path, *, api_key: str, app_secret: str) -> object:
     """Build a real ``schwab-py`` client from a token file, with its refreshes made safe.
 
-    This is the one place ``schwab-py`` is imported, and it is imported lazily. So
+    This is the one place this module imports ``schwab-py``, and it is imported lazily. So
     ``import lake.schwab`` and the whole unit suite run without the library installed.
 
     Two things differ from ``schwab-py``'s own ``client_from_token_file``.
@@ -558,6 +557,10 @@ def client_from_token(token_path: str | Path, *, api_key: str, app_secret: str) 
     rather than ``schwab-py`` ``Fields`` enum members, keeping this layer enum-agnostic.
     """
     from schwab.auth import client_from_access_functions  # lazy: real dep, live only
+
+    # Lazy too: ``lake.reauth`` imports ``lake.config`` and so ``yaml``, and the by-hand tools
+    # that import this module promise to import where ``lake.config`` is absent.
+    from lake.reauth import TokenWriter
 
     path = Path(token_path)
 

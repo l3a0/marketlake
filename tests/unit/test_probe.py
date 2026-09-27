@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime
 import importlib
 import json
+import subprocess
 import sys
 from dataclasses import dataclass
 
@@ -188,3 +189,16 @@ def test_import_does_not_require_schwab(monkeypatch):
     sys.modules.pop("lake.probe", None)
     module = importlib.import_module("lake.probe")
     assert module.measure_chain_size is not None
+
+
+def test_import_does_not_require_the_config_loader():
+    # ``main`` imports the config loader lazily, so the probe imports where ``lake.config`` is
+    # absent. The vendor layer it builds its client through must not import it either, which
+    # ``lake.reauth``'s atomic token writer would at the top of ``lake.schwab``. It runs in a
+    # fresh interpreter, because re-importing ``lake.schwab`` here would rebind the package
+    # attribute other tests patch through, and ``monkeypatch`` does not restore that.
+    code = (
+        "import sys; sys.modules['lake.config'] = None; "
+        "import lake.probe; assert 'yaml' not in sys.modules"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
