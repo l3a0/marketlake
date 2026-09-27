@@ -335,3 +335,38 @@ def test_a_stagger_outside_zero_to_a_second_is_refused(raw: str):
     """
     with pytest.raises(ConfigError, match="capture_stagger_ms"):
         GuardConstants.from_mapping(yaml.safe_load(raw))
+
+
+# -- the capture cycle's request bound, marketlake #597 ----------------------------------
+
+
+def test_the_request_bound_default_is_pinned_and_its_edges_are_accepted():
+    """55 by the owner's decision, and the two ends of the accepted range, 1 and 59."""
+    assert GuardConstants().capture_request_bound_s == 55
+    assert type(GuardConstants().capture_request_bound_s) is int
+    for edge in (1, 59):
+        guards = GuardConstants.from_mapping({"capture_request_bound_s": edge})
+        assert guards.capture_request_bound_s == edge
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "capture_request_bound_s: 0",
+        "capture_request_bound_s: -1",
+        "capture_request_bound_s: 60",
+        "capture_request_bound_s: 90",
+        "capture_request_bound_s: yes",
+        "capture_request_bound_s: 55.5",
+        "capture_request_bound_s: '55'",
+        "capture_request_bound_s:",
+    ],
+)
+def test_a_request_bound_outside_one_to_fifty_nine_seconds_is_refused(raw: str):
+    """At 60 or more an ordinary cycle's bound falls in the next minute, the overrun it ends.
+
+    At 0 every request is refused before it is sent. ``yes`` parses to ``True``, which a
+    bare range check reads as 1, so the type is checked first, as for the fields above.
+    """
+    with pytest.raises(ConfigError, match="capture_request_bound_s"):
+        GuardConstants.from_mapping(yaml.safe_load(raw))

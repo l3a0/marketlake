@@ -61,10 +61,12 @@ import json
 import os
 import re
 import sys
+import threading
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
+from functools import partial
 from pathlib import Path
 
 from lake import journal
@@ -79,7 +81,7 @@ from lake.metadata import stamp_cycle
 from lake.reference_read import read_or_none
 from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor
 from lake.security_master import ID_TYPE_TICKER, SecurityMaster, SecurityMasterError, master_path
-from lake.session import OPTION_CLOSE
+from lake.session import OPTION_CLOSE, OPTION_CLOSE_GUARD, TICK
 from lake.tickers import Roster, load_tickers
 from lake.timing import RequestRecord, append_requests, failures
 from lake.vendor import Vendor, VendorError, VendorResponse
@@ -140,6 +142,26 @@ CHAIN_CHUNK_FAILED = "chain_chunk_failed"
 # window's absence marker, which resets the watchdog rather than tripping it, so the marker
 # rows are what a reader has. That was true before marketlake #305 and is unchanged by it.
 CHAIN_SCHEMA_DRIFT = "chain_schema_drift"
+
+# The error class stamped on a request the cycle's bound cut, marketlake #597, and on every
+# window and quote batch it cost. It is written into the lake on gap rows and absence
+# markers, so its spelling is fixed rather than open to a later rename (owner decision,
+# 2026-09-27). It is also what ``_error_class`` makes of ``RequestAbandoned`` below.
+REQUEST_ABANDONED = "request_abandoned"
+
+
+class RequestAbandoned(Exception):
+    """A request the cycle's bound cut. Its gap class is ``request_abandoned``.
+
+    ``sent`` says whether the request had gone to the vendor. One that had not was refused
+    by the check before the call, so there is no request to write a timing line for, and
+    the gap rows or the absence marker are its whole record.
+    """
+
+    def __init__(self, message: str, *, sent: bool) -> None:
+        super().__init__(message)
+        self.sent = sent
+
 
 # The two chain maps every window response nests contracts under.
 _CHAIN_EXP_MAPS = ("callExpDateMap", "putExpDateMap")
@@ -777,6 +799,135 @@ class FillResult:
         return frozenset(m.expiration_date for m in self.absent if m.expiration_date)
 
 
+def cycle_deadline(snap_ts: datetime, close_tag: str | None, guards: GuardConstants) -> datetime:
+    """The instant a loop cycle's requests must be done by, marketlake #597.
+
+    An ordinary minute's bound is its ``snap_ts`` plus ``guards.capture_request_bound_s``, 55s
+    by default, which leaves the cycle the rest of its minute to write what landed.
+
+    The option close's bound is the close+5 deadline less the same margin: ``snap_ts`` plus
+    ``OPTION_CLOSE_GUARD``, less one ``TICK``, plus the field. At the default that is 16:19:55
+    on a regular day. Option marks freeze at the close and a fetch before close+5 still reads
+    them, which is the rule the close+5 fill rests on (marketlake #347). So the 16:15 cycle
+    may wait as long as a fill could, and no mark it keeps was taken past close+5 at any value
+    the config accepts.
+
+    The price lasts until each minute's cycle runs on its own thread (marketlake #565). A
+    16:15 request held that long holds the loop with it, and the dead-man can page before the
+    16:15 cycle feeds it. That takes a request outliving its 30s transport timeout by minutes,
+    and without the bound the same request holds the loop longer.
+    """
+    bound = timedelta(seconds=guards.capture_request_bound_s)
+    if close_tag == OPTION_CLOSE:
+        return snap_ts + OPTION_CLOSE_GUARD - TICK + bound
+    return snap_ts + bound
+
+
+@dataclass
+class _Call:
+    """One request sent under a ``_Deadline``: what it asked for, its start, and its record.
+
+    ``record`` is ``None`` while the request is in flight, and the finished request's own
+    timing record once it returned or raised.
+    """
+
+    surface: str
+    ticker: str | None
+    window: tuple[date, date | None] | None
+    symbols: tuple[str, ...]
+    start: datetime
+    record: RequestRecord | None = None
+
+    def at_the_bound(self, at: datetime) -> RequestRecord:
+        """This request's line as the bound left it.
+
+        A finished request keeps its own record. One still in flight gets its own start,
+        the bound as its end, and the abandon class. It carries no transport stamps, since
+        ``attach_timing`` keeps them on a record the vendor hands back only with the
+        response. Carrying them out mid-flight would say whether Schwab ever saw the
+        request, and it waits until an abandoned request is on record.
+        """
+        if self.record is not None:
+            return self.record
+        return request_record(
+            self.surface,
+            ticker=self.ticker,
+            symbols=self.symbols,
+            window=self.window,
+            start=self.start,
+            end=at,
+            response=None,
+            error_class=REQUEST_ABANDONED,
+        )
+
+
+class _Deadline:
+    """The instant a fetch's requests must be done by, and the record of every one sent.
+
+    Marketlake #597. Nothing used to bound how long a cycle waited on a request, so one
+    that ran past the minute held the whole cycle past it. This is the bound as the fetch
+    sees it. ``at`` is the instant, or ``None`` for a fetch nothing bounds, which is how the
+    close+5 fill and onboarding fetch.
+
+    It does two jobs, under one lock.
+
+    1. **The check before every vendor call.** ``send`` refuses a request once ``at`` has
+       passed or the coordinating thread has cut the fetch. So past the bound no further
+       call is made, at a concurrency cap of 1 as much as above it. A call already in
+       progress is not stopped. It runs to its transport timeout.
+    2. **The shared record.** ``send`` registers the request's start before the call, and
+       ``done`` files its record when the call returns. A pool task keeps its records in
+       its own list and returns them only when it finishes, so a task cut at the bound
+       returns nothing, and this record is where its lines come from. ``cut`` snapshots it.
+
+    The check and the registration share the lock, so a request either registers before
+    the snapshot or is never sent. Taken apart, a request could pass the check just before
+    the bound, register just after the snapshot, and go to the vendor with no line at all.
+    A record the cut thread files after the snapshot is not in it, so no request gets two
+    lines.
+    """
+
+    def __init__(self, clock: Clock, at: datetime | None) -> None:
+        self.clock = clock
+        self.at = at
+        self._lock = threading.Lock()
+        self._cut = False
+        self._calls: dict[object, list[_Call]] = {}
+
+    def passed(self) -> bool:
+        """Whether the clock has reached the bound. A fetch with no bound never passes it."""
+        return self.at is not None and self.clock.now() >= self.at
+
+    def send(
+        self,
+        unit: object,
+        surface: str,
+        *,
+        ticker: str | None,
+        window: tuple[date, date | None] | None = None,
+        symbols: Sequence[str] = (),
+    ) -> _Call | None:
+        """Register a request about to go out under ``unit``, or refuse it past the bound."""
+        with self._lock:
+            now = self.clock.now()
+            if self._cut or (self.at is not None and now >= self.at):
+                return None
+            call = _Call(surface, ticker, window, tuple(symbols), now)
+            self._calls.setdefault(unit, []).append(call)
+            return call
+
+    def done(self, call: _Call, record: RequestRecord) -> None:
+        """File a finished request's record."""
+        with self._lock:
+            call.record = record
+
+    def cut(self) -> dict[object, tuple[_Call, ...]]:
+        """Refuse every later request, and snapshot each unit's requests as they stand."""
+        with self._lock:
+            self._cut = True
+            return {unit: tuple(replace(c) for c in calls) for unit, calls in self._calls.items()}
+
+
 def fetch_chain(
     clock: Clock,
     vendor: Vendor,
@@ -786,6 +937,7 @@ def fetch_chain(
     lake_root: Path | str,
     plan: ChainPlan,
     guards: GuardConstants,
+    deadline: datetime | None,
 ) -> ChainFetch:
     """Fetch one chain by its date-window plan and reassemble it, never raising.
 
@@ -832,14 +984,28 @@ def fetch_chain(
     journal's latest prior durable batch, read once per ticker per fetch. That read never
     raises into the fetch: one that fails is treated as no prior batch, and
     ``_prior_expirations`` carries why and what it prints.
+
+    ``deadline`` is the instant the fetch's requests must be done by, marketlake #597, and
+    ``_Deadline`` carries the rules. A window not done by it fails under
+    ``request_abandoned``, and one not yet sent is never sent. The loop's cycle passes
+    ``cycle_deadline``. The close+5 fill and onboarding pass ``None`` and are not bounded.
+    The fill in particular must not inherit the option close's bound: it fetches from the
+    tick after the close+5 guard's deadline, past that bound, so every window would be
+    refused before it was sent. The keyword is required rather than defaulted, so a new
+    caller has to decide rather than forget.
     """
     windows = tuple(plan.windows_for(day))
     if guards.capture_max_concurrency == 1:
+        bound = _Deadline(clock, deadline)
         fetch_ts = clock.now()
-        outcomes = [_run_window(clock, vendor, guards, ticker, f, t) for f, t in windows]
+        outcomes = [
+            _run_window(clock, vendor, guards, ticker, f, t, deadline=bound) for f, t in windows
+        ]
         fetch_end_ts = clock.now()
     else:
-        fetched = _fetch_concurrently(clock, vendor, guards, (ticker,), windows, ())
+        fetched = _fetch_concurrently(
+            clock, vendor, guards, (ticker,), windows, (), deadline=deadline
+        )
         outcomes, fetch_ts, fetch_end_ts = fetched.chains[ticker]
     return _assemble_chain(ticker, windows, outcomes, fetch_ts, fetch_end_ts, lake_root)
 
@@ -869,6 +1035,8 @@ def _run_window(
     ticker: str,
     from_date: date,
     to_date: date | None,
+    *,
+    deadline: _Deadline,
 ) -> _WindowOutcome:
     """Fetch one plan window, splitting it if it comes back too big, into its own maps.
 
@@ -876,7 +1044,8 @@ def _run_window(
     responses, and it does nothing else: it writes nothing to the lake and touches no state
     another window can see. It reads the clock only to stamp each request's start and end
     for the timing file (marketlake #531), and ``now`` changes nothing, so that is safe from
-    a pool thread.
+    a pool thread. The one thing it shares is ``deadline``, which each request passes before
+    it is sent and files its record with, under the window's own key, ``_window_key``.
     """
     call_map: dict[str, dict[str, list]] = {}
     put_map: dict[str, dict[str, list]] = {}
@@ -896,6 +1065,8 @@ def _run_window(
         failed,
         header_holder,
         requests,
+        deadline=deadline,
+        unit=_window_key(ticker, (from_date, to_date)),
     )
     return _WindowOutcome(
         call_map,
@@ -903,6 +1074,30 @@ def _run_window(
         tuple(failed),
         header_holder[0] if header_holder else None,
         tuple(requests),
+    )
+
+
+def _window_key(ticker: str, window: tuple[date, date | None]) -> tuple[object, ...]:
+    """The key one plan window's requests are filed under in a ``_Deadline``, splits included."""
+    return (ticker, *window)
+
+
+def _abandoned_window(
+    window: tuple[date, date | None], calls: Sequence[_Call], at: datetime
+) -> _WindowOutcome:
+    """A plan window the bound cut: failed whole, with each of its requests as the bound left it.
+
+    The window fails whole even when it split and a half had landed, because that half's
+    contracts sit in maps local to the task that was cut. That is the price of cutting a
+    task rather than waiting on it.
+    """
+    from_date, to_date = window
+    return _WindowOutcome(
+        {},
+        {},
+        ((from_date, to_date, REQUEST_ABANDONED),),
+        None,
+        tuple(call.at_the_bound(at) for call in calls),
     )
 
 
@@ -1042,8 +1237,10 @@ def _fetch_concurrently(
     windows: tuple[tuple[date, date | None], ...],
     symbols: Sequence[str],
     *,
+    deadline: datetime | None,
     on_chain: Callable[[str, list[_WindowOutcome], datetime, datetime], None] | None = None,
     on_quotes: Callable[[_QuoteFetch], None] | None = None,
+    on_abandoned: Callable[[tuple[Future, ...]], None] | None = None,
 ) -> _Fetched:
     """Fire every chain window and the quote request through one bounded pool.
 
@@ -1082,6 +1279,17 @@ def _fetch_concurrently(
        writes on this thread, never on a pool thread. Collection starts only after the last
        submission, so a write can never stretch the stagger. The price is that a unit that
        finishes inside the volley is handed over at most one volley's staggers late.
+    5. **Nothing is waited on past ``deadline``** (marketlake #597). The wait is the clock's,
+       ``Clock.wait``, and it returns at the first completion or at the deadline, whichever
+       comes first. Once the deadline has passed, submission stops, the fetch is cut, and
+       every task still running is abandoned. Its window fails under ``request_abandoned``
+       and its unit is handed over at once, with whatever its other tasks brought, so a
+       chain with one hung window still lands as a partial chain carrying that window's
+       absence marker, and a hung quote batch still gaps every quoted ticker. Each request a
+       cut task made gets its line from the shared record ``_Deadline`` keeps. The pool is
+       shut without waiting, and its queued tasks are cancelled. The tasks still running
+       are handed to ``on_abandoned``, for a caller that must not close what they use
+       until they finish. A ``deadline`` of ``None`` waits for every task, as before.
 
     Below the cap some tasks wait in the pool's queue, so a unit's ``fetch_ts`` is when its
     first request was submitted, which can precede when it was sent. At the default cap of 20
@@ -1096,65 +1304,154 @@ def _fetch_concurrently(
     if tasks == 0:
         return _Fetched({}, None)
     stagger = guards.capture_stagger_ms / 1000
+    bound = _Deadline(clock, deadline)
     started: dict[object, datetime] = {}
     chain_futures: dict[str, list[Future]] = {ticker: [] for ticker in tickers}
     submitted: list[Future] = []
     unit_of: dict[Future, object] = {}
     chains: dict[str, tuple[list[_WindowOutcome], datetime, datetime]] = {}
     quotes: _QuoteFetch | None = None
-    with ThreadPoolExecutor(
+    left = {ticker: len(windows) for ticker in tickers}
+
+    def hand_over_quotes(fetched: _QuoteFetch) -> None:
+        nonlocal quotes
+        quotes = fetched
+        if on_quotes is not None:
+            on_quotes(quotes)
+
+    def hand_over_chain(
+        ticker: str, outcomes: list[_WindowOutcome], fetch_end_ts: datetime
+    ) -> None:
+        chains[ticker] = (outcomes, started[ticker], fetch_end_ts)
+        if on_chain is not None:
+            on_chain(ticker, *chains[ticker])
+
+    def collect(future: Future) -> None:
+        unit = unit_of[future]
+        if unit is _QUOTES_UNIT:
+            result = _task_result(future)
+            hand_over_quotes(
+                _QuoteFetch(
+                    result.value,
+                    result.error,
+                    started[_QUOTES_UNIT],
+                    result.finished_at,
+                    result.started_at,
+                )
+            )
+            return
+        left[unit] -= 1
+        if left[unit]:
+            return
+        results = [_task_result(f) for f in chain_futures[unit]]
+        hand_over_chain(
+            unit,
+            [_window_outcome(r, w) for r, w in zip(results, windows, strict=True)],
+            max(r.finished_at for r in results),
+        )
+
+    pool = ThreadPoolExecutor(
         max_workers=min(guards.capture_max_concurrency, tasks),
         thread_name_prefix="capture-fetch",
-    ) as pool:
+    )
+    try:
 
         def submit(unit: object, fn: Callable[..., object], *args: object) -> Future:
-            if submitted and stagger:
+            if submitted and stagger and not bound.passed():
                 clock.sleep(stagger)
             started.setdefault(unit, clock.now())
-            future = pool.submit(_timed, clock, fn, *args)
+            if bound.passed():
+                # Submission stops at the bound. The task runs here instead, where its check
+                # before the vendor call refuses it at once, so it sends nothing and its
+                # window or batch fails under the abandon class like any other.
+                future: Future = Future()
+                future.set_result(_timed(clock, fn, *args))
+            else:
+                future = pool.submit(_timed, clock, fn, *args)
             submitted.append(future)
             unit_of[future] = unit
             return future
 
         if symbols:
-            submit(_QUOTES_UNIT, vendor.get_quotes, tuple(symbols))
+            submit(_QUOTES_UNIT, _send_quotes, vendor, tuple(symbols), bound)
         for from_date, to_date in windows:
             for ticker in tickers:
                 chain_futures[ticker].append(
-                    submit(ticker, _run_window, clock, vendor, guards, ticker, from_date, to_date)
-                )
-
-        left = {ticker: len(windows) for ticker in tickers}
-        pending = set(submitted)
-        while pending:
-            done, pending = wait(pending, return_when=FIRST_COMPLETED)
-            for future in done:
-                unit = unit_of[future]
-                if unit is _QUOTES_UNIT:
-                    result = _task_result(future)
-                    quotes = _QuoteFetch(
-                        result.value,
-                        result.error,
-                        started[_QUOTES_UNIT],
-                        result.finished_at,
-                        result.started_at,
+                    submit(
+                        ticker,
+                        partial(
+                            _run_window,
+                            clock,
+                            vendor,
+                            guards,
+                            ticker,
+                            from_date,
+                            to_date,
+                            deadline=bound,
+                        ),
                     )
-                    if on_quotes is not None:
-                        on_quotes(quotes)
-                    continue
-                left[unit] -= 1
-                if left[unit]:
-                    continue
-                results = [_task_result(f) for f in chain_futures[unit]]
-                chains[unit] = (
-                    [_window_outcome(r, w) for r, w in zip(results, windows, strict=True)],
-                    started[unit],
-                    max(r.finished_at for r in results),
                 )
-                if on_chain is not None:
-                    on_chain(unit, *chains[unit])
 
-    return _Fetched({ticker: chains[ticker] for ticker in tickers}, quotes)
+        pending = set(submitted)
+        while pending and not bound.passed():
+            for future in clock.wait(pending, bound.at):
+                pending.discard(future)
+                collect(future)
+        if not pending:
+            return _Fetched({ticker: chains[ticker] for ticker in tickers}, quotes)
+
+        # The bound has passed with tasks still pending. Cut first, so nothing further is
+        # sent, then take stock. A task that finished between the last wait and the cut is
+        # collected as it stands. Every other one is abandoned.
+        calls = bound.cut()
+        for future in [f for f in submitted if f in pending and f.done()]:
+            pending.discard(future)
+            collect(future)
+        if on_abandoned is not None:
+            on_abandoned(tuple(f for f in submitted if f in pending))
+        at = bound.at
+        assert at is not None  # only a bound that has passed cuts a fetch
+        if symbols and submitted[0] in pending:
+            sent = calls.get(_QUOTES_UNIT, ())
+            hand_over_quotes(
+                _QuoteFetch(
+                    None,
+                    RequestAbandoned(
+                        "the quote request was not done by the cycle's bound", sent=bool(sent)
+                    ),
+                    started[_QUOTES_UNIT],
+                    at,
+                    sent[0].start if sent else None,
+                )
+            )
+        for ticker in tickers:
+            if ticker in chains:
+                continue
+            outcomes = []
+            for future, window in zip(chain_futures[ticker], windows, strict=True):
+                if future in pending:
+                    key = _window_key(ticker, window)
+                    outcomes.append(_abandoned_window(window, calls.get(key, ()), at))
+                else:
+                    outcomes.append(_window_outcome(_task_result(future), window))
+            # The unit ended at the bound, which is when its last task was given up on.
+            hand_over_chain(ticker, outcomes, at)
+        return _Fetched({ticker: chains[ticker] for ticker in tickers}, quotes)
+    finally:
+        # Never wait on the pool. Leaving a ``with`` block waited 8.95s more in a probe
+        # (marketlake #534), and a task the bound abandoned is still running.
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _send_quotes(vendor: Vendor, symbols: tuple[str, ...], deadline: _Deadline) -> VendorResponse:
+    """Send the batched quote request, unless the bound has already passed.
+
+    Refused, it raises ``RequestAbandoned`` with ``sent`` false, which the caller turns into
+    a gap for every quoted ticker with no timing line.
+    """
+    if deadline.send(_QUOTES_UNIT, QUOTES, ticker=None, symbols=symbols) is None:
+        raise RequestAbandoned("the cycle's bound passed before the quote request", sent=False)
+    return vendor.get_quotes(symbols)
 
 
 @dataclass(frozen=True)
@@ -1218,6 +1515,9 @@ def _fetch_window(
     failed: list[tuple[date, date | None, str]],
     header_holder: list[Mapping[str, object]],
     requests: list[RequestRecord],
+    *,
+    deadline: _Deadline,
+    unit: object,
 ) -> None:
     """Fetch one date window, splitting only a genuine size failure at its midpoint.
 
@@ -1256,9 +1556,12 @@ def _fetch_window(
     other three, and 1 for the open tail. The minute goes first and one ticker is enough,
     since a healthy SPY chain fetch already takes about nine seconds for its five windows and
     113 requests do not fit in sixty. The 120 req/min ceiling goes next, at two option
-    tickers. A cycle that overruns fires no cycle in the next minute and charges every watched
-    surface, quotes included. So the split traded a narrower loss inside one window for whole
-    minutes on both surfaces, on the one failure no narrower chunk plan fixes anyway.
+    tickers. When this was decided, a cycle that overran fired no cycle in the next minute and
+    charged every watched surface, quotes included. Since marketlake #597 the cycle's bound
+    abandons a request still running at its 55s instead, so the overrun is gone. The tree
+    still does not finish inside the bound, so its window is lost either way. So the split
+    traded a narrower loss inside one window for whole minutes on both surfaces, and under the
+    bound it would trade it for nothing, on the one failure no narrower chunk plan fixes anyway.
 
     The register entry this replaces rejected two proposals, stopping the split once both
     halves have failed and bounding drift lower than size, on the grounds that either buys a
@@ -1276,9 +1579,25 @@ def _fetch_window(
     call and just after it returned or raised, with the class this function gave it. A
     too-big request that is split records no class, because nothing failed yet, and its
     halves record their own.
+
+    Before every call, a split's later halves included, the request passes ``deadline``'s
+    check and registers under ``unit`` in its shared record (marketlake #597). Past the
+    bound the check refuses it: the range fails under ``request_abandoned``, nothing is
+    sent, and no line is written for a request that never went out. The range's absence
+    marker is its record. Each finished request's record is filed in the shared record too,
+    which is where a window the bound cut gets its lines from.
     """
     window = (from_date, to_date)
-    start = clock.now()
+    call = deadline.send(unit, CHAINS, ticker=ticker, window=window)
+    if call is None:
+        failed.append((from_date, to_date, REQUEST_ABANDONED))
+        return
+    start = call.start
+
+    def keep(record: RequestRecord) -> None:
+        requests.append(record)
+        deadline.done(call, record)
+
     try:
         response = vendor.get_chain(ticker, from_date=from_date, to_date=to_date)
     except Exception as exc:
@@ -1286,7 +1605,7 @@ def _fetch_window(
         end = clock.now()
         error_class = _error_class(exc)
         failed.append((from_date, to_date, error_class))
-        requests.append(
+        keep(
             request_record(
                 CHAINS,
                 ticker=ticker,
@@ -1301,7 +1620,7 @@ def _fetch_window(
     end = clock.now()
 
     def note(error_class: str | None) -> None:
-        requests.append(
+        keep(
             request_record(
                 CHAINS,
                 ticker=ticker,
@@ -1368,6 +1687,8 @@ def _fetch_window(
         failed,
         header_holder,
         requests,
+        deadline=deadline,
+        unit=unit,
     )
     _fetch_window(
         clock,
@@ -1382,6 +1703,8 @@ def _fetch_window(
         failed,
         header_holder,
         requests,
+        deadline=deadline,
+        unit=unit,
     )
 
 
@@ -1400,6 +1723,12 @@ class _CaptureCycle:
 
     ``slot`` is the minute the loop decided this cycle is for, or ``None`` for a caller
     outside the loop.
+
+    ``deadline`` is when the cycle's requests must be done by, ``cycle_deadline`` of the
+    loop's slot and close tag. A caller outside the loop has no minute to protect, and its
+    ``snap_ts`` is its own start floored, so a bound taken from it could already have passed
+    when the cycle began. It gets ``None`` and waits on its requests as it always did.
+    ``on_abandoned`` is handed the requests still running when the bound cut the fetch.
     """
 
     clock: Clock
@@ -1413,9 +1742,11 @@ class _CaptureCycle:
     session_phase: str | None = None
     out_of_span: tuple[str, ...] = ()
     slot: datetime | None = None
+    on_abandoned: Callable[[tuple[Future, ...]], None] | None = None
     snap_ts: datetime = field(init=False)
     day: date = field(init=False)
     start_ts: str = field(init=False)
+    deadline: datetime | None = field(init=False)
     requests: list[RequestRecord] = field(init=False, default_factory=list)
 
     def __post_init__(self) -> None:
@@ -1436,6 +1767,11 @@ class _CaptureCycle:
             self.snap_ts = cycle_start.replace(second=0, microsecond=0)
         self.day = self.snap_ts.date()
         self.start_ts = cycle_start.strftime(_SEGMENT_STAMP_FORMAT)
+        self.deadline = (
+            cycle_deadline(self.snap_ts, self.close_tag, self.guards)
+            if self.slot is not None
+            else None
+        )
 
     # -- planning: the fallible, fail-open half ------------------------------
 
@@ -1488,6 +1824,7 @@ class _CaptureCycle:
             lake_root=self.lake_root,
             plan=self.plan,
             guards=self.guards,
+            deadline=self.deadline,
         )
         return self._plan_fetched_chain(ticker, fetched)
 
@@ -1544,6 +1881,13 @@ class _CaptureCycle:
         if not symbols:
             return []
         fetch_ts = self.clock.now()
+        if self.deadline is not None and fetch_ts >= self.deadline:
+            # The chains ran the cycle to its bound, so the request is never sent and every
+            # quoted ticker gets a gap row under the abandon class (marketlake #597).
+            abandoned = RequestAbandoned(
+                "the cycle's bound passed before the quote request", sent=False
+            )
+            return self._plan_quote_fetch(_QuoteFetch(None, abandoned, fetch_ts, fetch_ts))
         try:
             response = self.vendor.get_quotes(symbols)
         except Exception as exc:
@@ -1555,14 +1899,16 @@ class _CaptureCycle:
 
         A request that raised, or one that answered with a non-2xx status, gaps every
         ticker under the same class. The round-trip stamps are the batch's own, since one
-        request served every ticker.
+        request served every ticker. A request the bound cut before it was sent writes the
+        gap rows and no timing line, because no request went out.
         """
         symbols = self.roster.symbols
         fetch_ts, fetch_end_ts = fetched.fetch_ts, fetched.fetch_end_ts
         start = fetched.request_start if fetched.request_start is not None else fetch_ts
         if fetched.error is not None:
             error_class = _error_class(fetched.error)
-            self._note_quotes(symbols, start, fetch_end_ts, None, error_class)
+            if not (isinstance(fetched.error, RequestAbandoned) and not fetched.error.sent):
+                self._note_quotes(symbols, start, fetch_end_ts, None, error_class)
             return [
                 (sym, self._gap_plan(QUOTES, sym, error_class, fetch_ts, fetch_end_ts))
                 for sym in symbols
@@ -1743,8 +2089,10 @@ class _CaptureCycle:
                 option_tickers,
                 windows,
                 self.roster.symbols,
+                deadline=self.deadline,
                 on_chain=land_chain,
                 on_quotes=land_quotes,
+                on_abandoned=self.on_abandoned,
             )
             # The request records were collected as each unit was planned. A stable sort
             # puts them back in plan order and keeps each unit's own calls in call order.
@@ -1822,6 +2170,7 @@ def run_cycle(
     session_phase: str | None = None,
     out_of_span: tuple[str, ...] = (),
     slot: datetime | None = None,
+    on_abandoned: Callable[[tuple[Future, ...]], None] | None = None,
 ) -> CycleResult:
     """Run one capture cycle. The primitive the daemon calls once a minute.
 
@@ -1849,13 +2198,22 @@ def run_cycle(
     UTC. The loop passes it so the rows and the tags name one minute (marketlake #572). A
     caller outside the loop leaves it unset and gets the cycle's start floored instead.
 
+    A slot also bounds the cycle (marketlake #597). A request not done by
+    ``cycle_deadline`` is abandoned under ``request_abandoned``, and the cycle lands what
+    it has and returns rather than waiting on it. A caller outside the loop is not bounded.
+    ``on_abandoned`` is handed the requests still running when the cycle returned, before
+    anything that could raise, so the caller can release what they use once they finish.
+    ``run_cycle_from_config`` uses it to close the vendor then rather than at the bound.
+
     The steps, in order:
 
     1. Assign ``snap_ts``: the loop's slot in UTC, or the clock floored to the minute.
     2. Fetch every options ticker's chain by its date-window plan, and the batched quotes
        for every roster ticker. Above a ``guards.capture_max_concurrency`` of 1 these
        requests run concurrently through one bounded pool, marketlake #532. At a cap of 1
-       they run one at a time, chains in roster order and then the quotes.
+       they run one at a time, chains in roster order and then the quotes. Either way no
+       request is sent past the cycle's bound, and above a cap of 1 none is waited on
+       past it.
     3. Write a chains segment per options ticker and a quotes segment per roster ticker. A
        chain where every window failed writes a chains gap row. A window that fails past
        every split becomes an absence marker inside the snapshot. One ticker's failure
@@ -1880,6 +2238,7 @@ def run_cycle(
         session_phase=session_phase,
         out_of_span=out_of_span,
         slot=slot,
+        on_abandoned=on_abandoned,
     )
     return cycle.run()
 
@@ -1913,6 +2272,16 @@ def run_cycle_from_config(
     where the enabled tickers the spans left out are named. They ride to the result as
     ``out_of_span``, and that is what stops a roster the spans emptied from reading as one
     whose every ticker retired (marketlake #554).
+
+    The vendor is closed once the cycle's last request is done, not when the cycle returns
+    (marketlake #597). The cycle returns at its bound with abandoned requests still running,
+    and one of them may be refreshing the token, since the refresh runs inside a request.
+    Closing the client under it discards the response, which for a refresh is the new token,
+    and if Schwab rotates the refresh token on each refresh, which nothing here has
+    measured, the file would keep one Schwab has superseded. Closing sooner would stop
+    nothing sooner either: a probe with httpx 0.28.1 closed a client one second into a
+    request, and the request still ran to its 30s read timeout. So the close waits, and an
+    abandoned request's sockets close at most that long after the bound.
     """
     config = load_config(config_path)
     roster = load_tickers(tickers_path)
@@ -1926,6 +2295,7 @@ def run_cycle_from_config(
         app_secret=config.schwab_app_secret.reveal(),
         clock=resolved_clock,
     )
+    abandoned: list[Future] = []
     try:
         return run_cycle(
             resolved_clock,
@@ -1939,9 +2309,33 @@ def run_cycle_from_config(
             session_phase=session_phase,
             out_of_span=out_of_span,
             slot=slot,
+            on_abandoned=abandoned.extend,
         )
     finally:
+        _close_vendor_when_done(vendor, abandoned)
+
+
+def _close_vendor_when_done(vendor: object, futures: Sequence[Future]) -> None:
+    """Close the vendor now, or once the last of ``futures`` finishes if any is still running.
+
+    The close runs from a done-callback, on the thread that finished the last task, or on
+    the thread that cancelled it. A future already done runs its callback at once.
+    """
+    if not futures:
         _close_vendor(vendor)
+        return
+    lock = threading.Lock()
+    left = [len(futures)]
+
+    def finished(_future: Future) -> None:
+        with lock:
+            left[0] -= 1
+            last = left[0] == 0
+        if last:
+            _close_vendor(vendor)
+
+    for future in futures:
+        future.add_done_callback(finished)
 
 
 def _close_vendor(vendor: object) -> None:
@@ -2216,6 +2610,9 @@ def fill_option_close(
         lake_root=lake_root,
         plan=plan if plan is not None else load_chain_plan(),
         guards=guards if guards is not None else GuardConstants(),
+        # Not the option close's bound. The guard fills from the tick after close+5, past
+        # that bound, so every window would be refused before it was sent (marketlake #597).
+        deadline=None,
     )
     if fetched.body is None or not _has_contracts(fetched.body):
         # Nothing to land. ``body is None`` is every window having failed. An empty body
@@ -2320,11 +2717,14 @@ def fill_option_close_from_config(
 
 
 __all__ = [
+    "REQUEST_ABANDONED",
     "ChainFetch",
     "FillResult",
     "CycleResult",
     "SegmentError",
+    "RequestAbandoned",
     "SegmentOutcome",
+    "cycle_deadline",
     "fetch_chain",
     "fill_option_close",
     "fill_option_close_from_config",
