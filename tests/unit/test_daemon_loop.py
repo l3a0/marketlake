@@ -22,7 +22,10 @@ They cover the loop's observable contract:
    caught up. The skipped slot is reported, never a silent hole.
 7. Skip detection reports exactly the missed capture slots: one for a one-slot overrun,
    both in order for a two-slot overrun, only the in-window slots when the overrun
-   crosses the option close, and nothing under normal cadence or on the first tick.
+   crosses the option close, and nothing under normal cadence or on a first tick that
+   follows the start minute. A startup hook that outlives its minute leaves the minutes
+   up to the first tick to skip detection, starting at the minute after the one the
+   daemon started in.
 8. A stall spans days within one incarnation. It reports the first day's tail and the
    last day's head, in order, with weekends and holidays contributing nothing. A wake
    on a Saturday still reports Friday's tail. A night jump reports nothing.
@@ -593,7 +596,7 @@ def test_normal_cadence_never_calls_on_skipped(calendar):
     assert reports == []
 
 
-def test_the_first_tick_never_calls_on_skipped(calendar):
+def test_a_quick_starts_first_tick_never_calls_on_skipped(calendar):
     # Started mid-session, mid-minute. The loop seeds its previous slot with 10:00, the
     # minute it started in, and hands that minute to startup gap-marking. The first tick
     # is 10:01, adjacent to the seed, so nothing is missed. Every minute through 10:00

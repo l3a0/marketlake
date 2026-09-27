@@ -217,14 +217,15 @@ class GapMarker:
         uncaptured and unmarked, a one-minute hole on every restart, which is the hole
         this exists to close.
         """
-        first_live_slot = slot + TICK
+        # The minute after the one the daemon started in. Markers stop short of it.
+        past_start = slot + TICK
 
         def plan(
             surface: str, ticker: str, recorded: dict[str, dict]
         ) -> tuple[list[datetime], MarkingReport]:
             self._unreadable = []
             missing, truncated, sealed = self._startup_missing(
-                surface, ticker, first_live_slot, recorded
+                surface, ticker, past_start, recorded
             )
             notes = MarkingReport(
                 sealed=tuple(sealed),
@@ -421,10 +422,13 @@ class GapMarker:
         self,
         surface: str,
         ticker: str,
-        first_live_slot: datetime,
+        past_start: datetime,
         recorded: dict[str, dict],
     ) -> tuple[list[datetime], bool, list[str]]:
         """The owed-but-unrecorded minutes for one ticker-surface, walking back from today.
+
+        ``past_start`` is the minute after the one the daemon started in. Every owed minute
+        before it is examined, and none from it on, because those are the loop's.
 
         For each session day, the owed minutes are the capture window intersected with the
         ticker's capture spans, and the missing ones are the owed minutes no row records. A
@@ -462,7 +466,7 @@ class GapMarker:
         )
         missing: list[datetime] = []
         sealed: list[str] = []
-        day = first_live_slot.date()
+        day = past_start.date()
         sessions = 0
         calendar_days = 0
         while sessions < MAX_LOOKBACK_SESSIONS and calendar_days < _CALENDAR_DAY_GUARD:
@@ -498,11 +502,11 @@ class GapMarker:
             owed = [
                 slot
                 for slot in session_slots(bounds)
-                if slot < first_live_slot and self._in_scope(surface, spanlist, slot)
+                if slot < past_start and self._in_scope(surface, spanlist, slot)
             ]
             day_missing = [slot for slot in owed if slot not in present.slots]
             missing.extend(day_missing)
-            if not day_missing and day < first_live_slot.date():
+            if not day_missing and day < past_start.date():
                 # A prior day with nothing missing: fully captured, or out of scope.
                 # Everything below it is accounted, so stop. The restart date itself never
                 # stops the walk, because a pre-open or mid-session restart owes little or

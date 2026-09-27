@@ -244,10 +244,10 @@ def test_the_walk_stops_at_the_first_fully_captured_prior_day(tmp_path):
     assert marked_days <= {date(2026, 9, 2)}
 
 
-# -- rule 7: today's markers stop at the first live slot -----------------------------
+# -- rule 7: today's markers stop at the minute the daemon started in ----------------
 
 
-def test_todays_markers_stop_at_the_first_slot_the_loop_will_capture(tmp_path):
+def test_todays_markers_stop_at_the_minute_the_daemon_started_in(tmp_path):
     # Tuesday fully captured is the floor. Today is dark up to the start minute.
     _capture(tmp_path, "XYZ", date(2026, 9, 1))
     report = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((EQUITY_ONLY,))).on_start(
@@ -895,8 +895,8 @@ def test_no_minute_falls_between_the_startup_pass_and_the_first_cycle(
     Startup marking bounds itself at the minute the daemon started in, which the loop
     hands it. A pass that outlives that minute pushes the loop's first tick past the
     bound, and the minutes in between belong to neither producer unless the loop is
-    seeded. That is the one-minute hole
-    gap marking exists to close, reopened by gap marking itself.
+    seeded. That is the one-minute hole gap marking exists to close, reopened by gap
+    marking itself.
     """
     from datetime import timedelta
 
