@@ -1611,9 +1611,9 @@ class AbsentMarker(NamedTuple):
     on the open tail. ``error_class`` is that window's own failure class. ``expiration_date``
     names one missing expiration when the chunker could read it off the journal's latest
     prior durable batch. It is ``None`` on the per-window marker, the fallback when no prior
-    batch exists or none of its expirations fall inside the failed range. Either way every
-    vendor column stays null, so the marker is the design's single exception to the
-    all-columns-null gap row only in ``expiration_date``.
+    batch exists, none of its expirations fall inside the failed range, or reading it raised
+    (marketlake #548). Either way every vendor column stays null, so the marker is the
+    design's single exception to the all-columns-null gap row only in ``expiration_date``.
     """
 
     window_start: str
@@ -1694,13 +1694,13 @@ def chains_data_batch(
     ``AbsentMarker`` per gap row here. The chunker names the missing expirations by reading
     the ticker's latest prior durable chains batch off the journal, keeping those inside the
     failed range and dated on or after the session date, one marker each. With no prior
-    batch, or none of its expirations inside the range, it hands one per-window marker
-    instead, its ``expiration_date`` null. Every marker becomes one gap row in this same
-    batch: ``row_kind`` gap, ``error_class`` the window's own class, ``window_start`` and
-    ``window_end`` the failed range, ``expiration_date`` as the marker says, and every other
-    vendor column null. So one segment carries the captured contracts and the absence
-    markers together, and no failed window loses its class. The default empty sequence is
-    the ordinary whole-chain case.
+    batch, none of its expirations inside the range, or a read of it that raised, it hands
+    one per-window marker instead, its ``expiration_date`` null. Every marker becomes one
+    gap row in this same batch: ``row_kind`` gap, ``error_class`` the window's own class,
+    ``window_start`` and ``window_end`` the failed range, ``expiration_date`` as the marker
+    says, and every other vendor column null. So one segment carries the captured contracts
+    and the absence markers together, and no failed window loses its class. The default
+    empty sequence is the ordinary whole-chain case.
     """
     header = {column: body.get(vendor) for vendor, column in _CHAINS_HEADER_MAP.items()}
     bounds = _window_bounds(windows)

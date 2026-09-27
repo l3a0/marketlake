@@ -1469,6 +1469,35 @@ def test_the_line_is_keyed_by_ticker(lake_root, monkeypatch, capsys):
     assert "capture: QQQ: the prior chains batch could not be read" in err
 
 
+def test_the_line_carries_the_fetch_end_and_one_line_of_message(lake_root, monkeypatch, capsys):
+    # The instant is when this fetch finished, from the injected clock, so a reader of the log
+    # can place it against the cycle's other lines. pyarrow's messages carry newlines, which
+    # would split one event across several log lines, and a message from a damaged file
+    # could forge a line of its own.
+    fetch_ts = datetime(2026, 8, 24, 13, 30, 1, tzinfo=UTC)
+    fetch_end_ts = datetime(2026, 8, 24, 13, 30, 7, tzinfo=UTC)
+    monkeypatch.setattr(
+        journal, "latest_expirations", _raising(SystemError("first\ncapture: forged\n  third"))
+    )
+    capture._assemble_chain(
+        "SPY",
+        _FAILING_NEAR.windows_for(SESSION),
+        [
+            capture._WindowOutcome({}, {}, ((SESSION, SESSION, "http_401"),), None),
+            capture._WindowOutcome({}, {}, (), {"underlyingPrice": 1.0}),
+        ],
+        fetch_ts,
+        fetch_end_ts,
+        lake_root,
+    )
+    lines = capsys.readouterr().err.splitlines()
+    assert lines == [
+        "capture: SPY: the prior chains batch could not be read at "
+        f"{fetch_end_ts.isoformat()}, so each failed window is marked once rather than per "
+        "expiration: SystemError: first capture: forged third"
+    ]
+
+
 class _Unprintable(Exception):
     def __str__(self) -> str:
         raise RuntimeError("no message")
