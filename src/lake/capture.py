@@ -411,16 +411,6 @@ def _say(line: str) -> None:
         pass
 
 
-# The tickers whose prior-batch read last failed and has not succeeded since. Process-wide
-# for the reason ``lake.reference_read`` gives for its own record: ``run_cycle_from_config``
-# rebuilds everything each minute, so nothing inside a cycle outlives it. It sits outside
-# ``run_loop``, whose one datetime is the loop's only state, and it decides nothing about
-# capture, only whether a line prints, so a restart that forgets it costs one repeated line.
-# Keyed by ticker rather than by file, because the caller cannot tell whether the manifest or
-# a segment deep in the walk refused, and two tickers can fail on two different segments.
-_prior_unreadable: set[str] = set()
-
-
 def _prior_expirations(lake_root: Path | str, ticker: str, at: datetime) -> list[str] | None:
     """The prior durable batch's expirations, or ``None`` when that read raised. Never raises.
 
@@ -437,34 +427,33 @@ def _prior_expirations(lake_root: Path | str, ticker: str, at: datetime) -> list
     that reader's ``None`` means nothing in scope names an expiration. The close+5 guard reads
     it the same way, and a refusal returned as ``None`` would tell it a day had no cycle.
 
-    A read that fails prints one line, the first time for its ticker, and one line when a read
-    for that ticker next succeeds. That is ``lake.reference_read``'s rule, kept here rather
-    than routed through ``read_or_none``, which keys by a path and names the file. Only a cycle
-    with a failed window makes this read, so the second line's instant is when the read was
-    next tried, not when the damage cleared. ``at`` is that instant, from the caller's
-    injected clock. Neither line can raise, because building one calls the exception's own
-    ``__str__``, and a raise there would cost the minute this function exists to keep.
+    **Every fallback prints its own line, and nothing is remembered between cycles.**
+    ``lake.reference_read`` prints once per standing failure and once on recovery, because
+    its reads repeat every minute against the same file. This one does not repeat that way.
+    The cycle that takes the fallback still writes a chains data segment, since it only runs
+    when some window answered, and the walk reads newest first, so the next failed window's
+    read finds that segment and succeeds while the damaged one sits untouched behind it.
+    Measured: a recovery line printed the very next minute with the damage still in place,
+    retracting the only sign of it until marketlake #556 lands. So a second failure is a
+    second event, and a read that works says nothing. A refused manifest ends the cycle at
+    its own manifest append anyway, so it prints one line per relaunch beside the traceback.
+
+    ``at`` is the line's instant, from the caller's injected clock. The line cannot raise,
+    because building it calls the exception's own ``__str__``, and a raise there would cost
+    the minute this function exists to keep.
     """
     try:
-        prior = journal.latest_expirations(lake_root, ticker)
+        return journal.latest_expirations(lake_root, ticker)
     except Exception as exc:  # noqa: BLE001 - a raise here would cost every surface's minute
-        if ticker not in _prior_unreadable:
-            _prior_unreadable.add(ticker)
-            error = exc
-            _say_built(
-                lambda: (
-                    f"capture: {ticker}: the prior chains batch could not be read at "
-                    f"{at.isoformat()}, so each failed window is marked once rather than per "
-                    f"expiration: {_one_line(error)}"
-                )
-            )
-        return None
-    if ticker in _prior_unreadable:
-        _prior_unreadable.discard(ticker)
+        error = exc
         _say_built(
-            lambda: f"capture: {ticker}: the prior chains batch reads again at {at.isoformat()}"
+            lambda: (
+                f"capture: {ticker}: the prior chains batch could not be read at "
+                f"{at.isoformat()}, so each failed window is marked once rather than per "
+                f"expiration: {_one_line(error)}"
+            )
         )
-    return prior
+        return None
 
 
 def _one_line(exc: BaseException) -> str:

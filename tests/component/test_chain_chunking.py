@@ -1311,14 +1311,6 @@ def test_a_merge_failure_of_any_kind_gives_up_the_window(lake_root, monkeypatch)
 _FAILING_NEAR = ChainPlan(((0, 9), (10, None)))
 
 
-@pytest.fixture(autouse=True)
-def _forget_prior_reads():
-    """The record of failed prior reads is process-wide, so every test starts it empty."""
-    capture._prior_unreadable.clear()
-    yield
-    capture._prior_unreadable.clear()
-
-
 def _near_fails() -> _WindowVendor:
     return _WindowVendor(
         windows={
@@ -1425,48 +1417,48 @@ def test_a_refused_manifest_still_stops_the_cycle_at_the_append_after_the_segmen
     _assert_one_per_window_marker(journal.read_segment(by_surface[f"surface={CHAINS}"]).to_pylist())
 
 
-def test_the_line_prints_once_per_failure_and_once_when_the_read_next_works(
+def test_every_fallback_prints_its_own_line_and_a_working_read_prints_nothing(
     lake_root, monkeypatch, capsys
 ):
-    # This read runs on every cycle with a failed window, which during a vendor outage is
-    # every minute. A standing failure prints one line, not one a minute, and a read that
-    # works again says so once.
+    # Nothing is remembered between cycles, so a second failure is reported as a second
+    # event rather than folded into the first, and a read that works says nothing.
     _prior_cycle(lake_root)
     working = journal.latest_expirations
     monkeypatch.setattr(journal, "latest_expirations", _raising(SystemError("damaged")))
     _run(_near_fails(), lake_root, _FAILING_NEAR, pid=4243)
     _run(_near_fails(), lake_root, _FAILING_NEAR, pid=4244)
-    err = capsys.readouterr().err
-    assert err.count("could not be read") == 1
-    assert "reads again" not in err
+    assert capsys.readouterr().err.count("capture: SPY: the prior chains batch could not") == 2
 
     monkeypatch.setattr(journal, "latest_expirations", working)
     _run(_near_fails(), lake_root, _FAILING_NEAR, pid=4245)
-    _run(_near_fails(), lake_root, _FAILING_NEAR, pid=4246)
-    err = capsys.readouterr().err
-    assert err.count("capture: SPY: the prior chains batch reads again at ") == 1
-    assert "could not be read" not in err
+    assert "prior chains batch" not in capsys.readouterr().err
 
 
-def test_the_line_is_keyed_by_ticker(lake_root, monkeypatch, capsys):
-    # Two tickers can fail on two different segments, so one ticker's standing failure must
-    # not swallow the other's first line.
-    monkeypatch.setattr(journal, "latest_expirations", _raising(SystemError("damaged")))
-    for ticker in ("SPY", "QQQ"):
-        capture._assemble_chain(
-            ticker,
-            _FAILING_NEAR.windows_for(SESSION),
-            [
-                capture._WindowOutcome({}, {}, ((SESSION, SESSION, "http_401"),), None),
-                capture._WindowOutcome({}, {}, (), {"underlyingPrice": 1.0}),
-            ],
-            _CLOCK_START,
-            _CLOCK_START,
-            lake_root,
-        )
+def test_a_damaged_segment_the_next_cycle_shadows_is_not_reported_as_repaired(
+    lake_root, monkeypatch, capsys
+):
+    # The fallback cycle still writes a chains data segment, and the walk reads newest first,
+    # so the next failed window's read finds that one and succeeds while the damaged segment
+    # sits untouched behind it. A line saying the read works again would retract the only
+    # sign of the damage one minute later. The damaged segment raises from the open itself.
+    _prior_cycle(lake_root)
+    (damaged,) = lake_root.glob(f"journal/*/surface={CHAINS}/ticker=SPY/*.arrows")
+    real_map = pa.memory_map
+
+    def memory_map(path, *args, **kwargs):
+        if Path(path) == damaged:
+            raise SystemError("error return without exception set")
+        return real_map(path, *args, **kwargs)
+
+    monkeypatch.setattr(journal.pa, "memory_map", memory_map)
+    first = _run(_near_fails(), lake_root, _FAILING_NEAR, pid=4243)
+    _assert_one_per_window_marker(_chain_rows(first))
+    second = _run(_near_fails(), lake_root, _FAILING_NEAR, pid=4244)
+    _assert_one_per_window_marker(_chain_rows(second))
+
     err = capsys.readouterr().err
-    assert "capture: SPY: the prior chains batch could not be read" in err
-    assert "capture: QQQ: the prior chains batch could not be read" in err
+    assert err.count("capture: SPY: the prior chains batch could not be read at ") == 1
+    assert "prior chains batch" in err and "again" not in err
 
 
 def test_the_line_carries_the_fetch_end_and_one_line_of_message(lake_root, monkeypatch, capsys):
