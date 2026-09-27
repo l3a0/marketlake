@@ -655,6 +655,8 @@ def onboard(
             lake_root=lake_root,
             plan=plan if plan is not None else DEFAULT_CHAIN_PLAN,
             guards=guards if guards is not None else GuardConstants(),
+            # Onboarding is not a loop minute, so nothing bounds it (marketlake #597).
+            deadline=None,
         )
         requests = fetched.requests
         # The fetch stamps its own pair around every window, so the journaled round trip

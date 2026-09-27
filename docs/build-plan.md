@@ -208,8 +208,11 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
      bound and so never walks a full tree, 31 for each of the other three, and 1 for the open
      tail. The minute goes first and one ticker is enough, since a healthy SPY chain fetch
      already takes about nine seconds for its five windows. The 120 req/min ceiling goes next,
-     at two option tickers. A cycle that overruns fires no cycle in the next minute and charges
-     every watched surface, quotes included. The entry this replaces rejected two proposals,
+     at two option tickers. When this was decided, a cycle that overran fired no cycle in the
+     next minute and charged every watched surface, quotes included. Since
+     [#597](https://github.com/l3a0/marketlake/issues/597) the cycle stops sending at its bound
+     and abandons what is still running there, and a tree of 113 requests still does not finish
+     inside it, so the window is lost either way. The entry this replaces rejected two proposals,
      stopping the split once both halves have failed and bounding drift lower than size,
      because either bought a smaller number in a case the vendor has never produced. What
      answers that is the ceiling rather than the size: past it the number stops being smaller

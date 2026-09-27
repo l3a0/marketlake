@@ -295,6 +295,9 @@ class _TaskClock:
     def sleep(self, seconds: float) -> None:
         self._inner.sleep(seconds)
 
+    def wait(self, futures, until):
+        return self._inner.wait(futures, until)
+
     def finish_at(self, when: datetime) -> None:
         self._local.at = when
 
@@ -360,6 +363,7 @@ def _fetch_spy(vendor, lake_root: Path) -> capture.ChainFetch:
         lake_root=lake_root,
         plan=_THREE_WINDOWS,
         guards=GuardConstants(),
+        deadline=None,
     )
 
 

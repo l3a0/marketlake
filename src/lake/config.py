@@ -114,6 +114,11 @@ class Secret:
 # The largest ``capture_stagger_ms`` the config accepts. The field's comment carries why.
 _MAX_CAPTURE_STAGGER_MS = 1000
 
+# The range ``capture_request_bound_s`` accepts, in whole seconds. The field's comment
+# carries why.
+_MIN_CAPTURE_REQUEST_BOUND_S = 1
+_MAX_CAPTURE_REQUEST_BOUND_S = 59
+
 
 @dataclass(frozen=True)
 class GuardConstants:
@@ -229,8 +234,10 @@ class GuardConstants:
     #
     # The cap is how many requests are in flight at once. It is not the 120-a-minute ceiling,
     # which limits requests per rolling minute and which firing them together does not change.
-    # At 20 today's 19 tasks go out in one round, so a cycle overruns only once the mean window
-    # passes about 60s, against about 30s at a cap of 10. What it risks is the burst rejection
+    # At 20 today's 19 tasks go out in one round, so without a bound a cycle would overrun only
+    # once its slowest window passed about 60s, against a mean of about 30s at a cap of 10. The
+    # bound below ends the cycle before that, so a slow window now costs its own window rather
+    # than the next minute (marketlake #597). What the cap risks is the burst rejection
     # (429-005), whose threshold is unpublished and unmeasured. A cap of 1 fetches exactly as
     # the cycle fetched before #532, with no pool and no stagger, so lowering it here rolls the
     # fetch back on the next cycle. The token-refresh lock and the per-cycle client close from
@@ -245,6 +252,26 @@ class GuardConstants:
     # a stagger of about 3.3 seconds the submission alone outruns the minute, every other
     # slot is skipped, and nothing pages, because the cycles between still land data.
     capture_stagger_ms: int = 50
+    # How long after its minute top a capture cycle waits on its requests, in seconds,
+    # marketlake #597. A request not done by the minute's ``snap_ts`` plus this is abandoned:
+    # its window or its quote batch is recorded under ``request_abandoned``, the chain lands
+    # with whatever its other windows brought, and the cycle ends. Without it one slow
+    # request held the whole cycle past its minute, and the loop lost the next minute on every
+    # surface. On 2026-09-25 at 16:04 ET, QQQ's chain took 54.2s, and the loop lost 16:05 on all
+    # four surfaces.
+    #
+    # 55 leaves the cycle 5s of its minute to write what landed. A cycle measured at
+    # ``4739564`` on a temporary lake, with a synthetic 12,000-contract chain per ticker and a
+    # vendor that answered at once, took 1.2s to 1.45s end to end, so the next top is still
+    # reached. The option-close cycle's bound sits at the close+5 deadline less the same margin
+    # the ordinary bound leaves in its minute, 16:19:55 at the default. So one field moves both,
+    # and at every value accepted here no mark taken past close+5 lands tagged ``option_close``.
+    #
+    # The range is whole seconds from 1 to 59. At 60 or more an ordinary cycle's bound falls
+    # in the next minute, which is the overrun the bound exists to end. At 0 every request is
+    # abandoned before it is sent. Monday 2026-09-28's timing file is the first to say how
+    # many requests 55 would cut that 59 would keep.
+    capture_request_bound_s: int = 55
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object] | None) -> GuardConstants:
@@ -264,7 +291,7 @@ class GuardConstants:
         if unknown:
             raise ConfigError(f"unknown guard constant(s): {sorted(unknown)}")
         merged = replace(cls(), **dict(mapping))
-        # **Three fields are range-checked here, and the rest are not.** This one came first. A
+        # **Four fields are range-checked here, and the rest are not.** This one came first. A
         # zero or negative ``bars_request_budget`` stops the nightly bar fetch for ever, and it
         # does it without being refused anywhere: the run reports success, the ping goes out, and
         # the only thing saying the lake stopped fetching bars is one count on a report line
@@ -274,7 +301,7 @@ class GuardConstants:
         # through a walk.
         #
         # This is the instance and not the class. ``from_mapping`` type-checks no value but these
-        # three, because ``replace`` does not, and the other fourteen constants carry that gap.
+        # four, because ``replace`` does not, and the other fourteen constants carry that gap.
         # Marketlake #487 is the per-field range mechanism for all of them. Reaching for it here
         # would be fixing past the class, so each field a change added is checked at its own
         # site instead.
@@ -322,6 +349,18 @@ class GuardConstants:
                 f"got {stagger!r}: it is the pause in milliseconds between two capture requests, "
                 "and it comes out of the minute once per request; lower "
                 "capture_max_concurrency instead to answer a burst rejection"
+            )
+        bound = merged.capture_request_bound_s
+        if (
+            not isinstance(bound, int)
+            or isinstance(bound, bool)
+            or not _MIN_CAPTURE_REQUEST_BOUND_S <= bound <= _MAX_CAPTURE_REQUEST_BOUND_S
+        ):
+            raise ConfigError(
+                "capture_request_bound_s must be a whole number from "
+                f"{_MIN_CAPTURE_REQUEST_BOUND_S} to {_MAX_CAPTURE_REQUEST_BOUND_S}, got "
+                f"{bound!r}: it is how many seconds after its minute top a capture cycle "
+                "waits on its requests, and at 60 or more a slow request costs the next minute"
             )
         return merged
 

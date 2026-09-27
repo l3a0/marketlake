@@ -3344,6 +3344,7 @@ def test_the_kinds_the_writer_set_ride_the_payload_beside_their_lines(root: Path
         (["a line"], [None]),
         (["a line"], "info"),
         (["a line", 7], ["info", "info"]),
+        (["a line", 7, "another"], ["action", "info"]),
         ("a line", ["info"]),
     ],
     ids=[
@@ -3356,6 +3357,7 @@ def test_the_kinds_the_writer_set_ride_the_payload_beside_their_lines(root: Path
         "a-null-value",
         "kinds-a-string",
         "report-holding-a-non-string",
+        "report-holding-a-non-string-kinds-fit-the-strings",
         "report-not-a-list",
     ],
 )

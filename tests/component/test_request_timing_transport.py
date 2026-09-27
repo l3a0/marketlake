@@ -262,6 +262,7 @@ def test_a_read_timeout_keeps_the_callers_stamps_and_no_transport_stamps(server,
         lake_root=lake_root,
         plan=ChainPlan(((0, None),)),
         guards=GuardConstants(),
+        deadline=None,
     )
 
     (record,) = fetched.requests

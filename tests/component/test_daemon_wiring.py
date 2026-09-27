@@ -4,7 +4,8 @@
 observer that plugs into a seam is covered on its own elsewhere. What these cover is the
 wiring ``run_loop_from_config`` builds between the two, which is the wiring the launchd
 job runs. A binding can be deleted with every isolated test still green, so each case
-here drives the production entry and watches the far end of one binding.
+here drives the production entry and watches the far end of one binding, apart from the
+case under item 15, which watches the reads instead.
 
 Each runs that entry with a manual clock, a fake calendar, and a throwaway config,
 roster, and lake on disk. The three seams that reach past the process are faked: the
@@ -13,7 +14,7 @@ test is a page a person receives, and a sync from one copies a throwaway lake on
 machine running the suite. So the tier is component: the daemon over real files, with the
 clock, the calendar, the network, and the backup still fake.
 
-Fourteen bindings are covered here.
+Fifteen bindings are covered here.
 
 1. The skipped-slot hook reaches the gap marker, so a live overrun records the minutes
    it slept through.
@@ -62,6 +63,13 @@ Fourteen bindings are covered here.
     ledger has no shape for pages instead of capturing in silence. The binding decides two
     things nothing else can: that the check reports rather than refusing to start, and that
     it speaks once for the process rather than once a tick.
+15. The loop hands every helper the config, roster and token paths it was given,
+    unchanged, including ``None``. The installed plist passes no path at all, so ``None``
+    is what production runs on. Items 1 to 14 watch each far end under real paths, and a
+    helper that mangled ``None`` would pass all of them, since most helpers answer a file
+    that will not load by standing down in silence. So this case records the path each
+    config, roster and token read receives, and every one has to be ``None`` or the
+    default token path.
 """
 
 from __future__ import annotations
@@ -86,20 +94,23 @@ from lake.capture import CycleResult, SegmentError, SegmentOutcome
 from lake.capture_spans import CaptureSpans, spans_path
 from lake.chain_plan import ChainPlan, load_chain_plan
 from lake.compact import COMPACTION_SLUG, compact, write_chain_plan
-from lake.config import GuardConstants
+from lake.config import CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH, GuardConstants
 from lake.deadman import CAPTURE_SLUG
 from lake.paths import LakePaths
 from lake.runner import PING_REFUSED_EVENT
 from lake.schema_drift import SCHEMA_DRIFT_EVENT, SCHEMA_DRIFT_TITLE
 from lake.schema_versions import check_running_version, ledger_path
+from lake.schwab import DEFAULT_TOKEN_PATH
 from lake.security_master import SecurityMaster, master_path
 from lake.session import SPOT_CLOSE, TICK
-from lake.tickers import TickersError
+from lake.tickers import DEFAULT_TICKERS_PATH, TICKERS_PATH_ENV, TickersError
 from lake.vendor import VendorResponse
 from tests.support.backup import FakeBackup
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import NTFY_TOPIC, PING_KEY, write_config
+from tests.support.config_guard import is_protected
+from tests.support.path_reads import FROM_TOKEN, PathReads
 from tests.support.pinger import FakePinger
 from tests.support.schema_version import record_running_version
 
@@ -2844,3 +2855,103 @@ def test_a_page_the_publisher_refuses_does_not_get_its_body_printed_instead(tmp_
     # Neither may follow a refusal.
     assert str(rig.lake_root) not in printed
     assert rig.transport.sent == []
+
+
+# -- 15. every read under the installed plist's paths receives them unchanged -----------
+
+
+def test_the_plists_unset_paths_reach_every_read_unchanged(tmp_path, monkeypatch):
+    """The installed plist passes no path, so every read has to receive ``None``.
+
+    ``python -m lake.daemon`` runs under launchd with no arguments, so ``daemon.main`` hands
+    the loop ``None`` for the config, the roster and the token. The loop forwards each to
+    every helper that reads its file. Most of those helpers answer a file that will not
+    load by returning ``None`` and carrying on, so a helper that turned ``None`` into the
+    string ``"None"`` would switch off gap marking, the close+5 guard or the idle stamp,
+    and nothing would page. The cases above watch each binding's far end under real paths.
+    This one watches the reads, which is where a mangled path shows.
+
+    ``MARKETLAKE_CONFIG`` points the config loader at the rig's config, the shape
+    ``control_plane render --config`` installs. No install sets ``MARKETLAKE_TICKERS``, so
+    production reads the roster at its default path. The variable stands in for that path
+    here, because a test must not write there. The cycle runner is the production one,
+    over a stub vendor. The run starts at 15:58:30 and lasts 35 ticks. The 16:00 tick
+    overruns into 16:02:30, so the skipped-slot hook reads the roster, and the run crosses
+    close+5 at 16:20 and close+15's dispatch at 16:31.
+    """
+    rig = _rig(tmp_path, roster=WITH_OPTIONS)
+    monkeypatch.setenv(CONFIG_PATH_ENV, str(rig.config))
+    monkeypatch.setenv(TICKERS_PATH_ENV, str(rig.tickers))
+    # The loaders find the rig through the variables alone. A file at a default path
+    # would be found without them.
+    for default in (DEFAULT_CONFIG_PATH, DEFAULT_TICKERS_PATH, DEFAULT_TOKEN_PATH):
+        assert not default.exists()
+        assert not is_protected(default)
+    reads = PathReads.install(monkeypatch)
+    monkeypatch.setattr(capture, "SchwabVendor", reads.vendor_factory(_PlanVendor()))
+
+    cycles: list[datetime] = []
+    skipped: list[datetime] = []
+
+    def overrun(slot: datetime) -> None:
+        if slot == et(2026, 9, 2, 16, 0):
+            clock.advance(150)
+
+    clock = ManualClock(start=et(2026, 9, 2, 15, 58, 30))
+    daemon.run_loop_from_config(
+        config_path=None,
+        tickers_path=None,
+        token_path=None,
+        clock=clock,
+        calendar=weekday_sessions(WEEK),
+        assertion_runner=lambda args: None,
+        transport=rig.transport,
+        pinger=rig.pinger,
+        compaction_runner=rig.compaction,
+        hooks=daemon.DaemonHooks(
+            on_tick=overrun,
+            on_cycle=lambda slot, result: cycles.append(slot),
+            on_skipped=skipped.extend,
+        ),
+        should_continue=_stop_after(35),
+    )
+    reads.assert_no_reader_escaped()
+
+    assert cycles
+    assert skipped == [et(2026, 9, 2, 16, 1), et(2026, 9, 2, 16, 2)]
+    loads = reads.of("load_config", "load_tickers")
+    assert [read for read in loads if read.path is not None] == []
+    tokens = reads.of("read_token_mint", FROM_TOKEN)
+    assert [read for read in tokens if read.path != DEFAULT_TOKEN_PATH] == []
+    assert rig.compaction.calls == [daemon.compaction_command(None)]
+    # Every read site the loop forwards a path to runs at least once in this run, so a
+    # mangled path at any of them reaches the lists above. Each reader is checked on its
+    # own, because a helper that reads two files could stop reading one and still appear
+    # among the callers of the other. The close+5 fill is the exception, since this rig
+    # owes no close, and ``test_close_fill.py`` drives it under the same shape.
+    sites = {
+        "load_config": {
+            "_alarm",
+            "_alarm.<locals>.<lambda>",
+            "_assertion_pid_stamp",
+            "_close_guard",
+            "_gap_marker",
+            "_guard_reporter",
+            "_idle_stamp",
+            "_report_schema_version",
+        },
+        "load_tickers": {
+            "_alarm",
+            "_close_guard",
+            "_gap_marker",
+            "_gap_marker.<locals>.<lambda>",
+            "_idle_stamp.<locals>.stamp",
+            "run_loop_from_config.<locals>.on_skipped",
+        },
+        "read_token_mint": {"_idle_stamp.<locals>.stamp"},
+    }
+    for reader, helpers in sites.items():
+        missing = {f"lake.daemon.{helper}" for helper in helpers} - reads.callers(reader)
+        assert not missing, f"{reader} never read by {sorted(missing)}"
+    for reader in ("load_config", "load_tickers", FROM_TOKEN):
+        assert "lake.capture.run_cycle_from_config" in reads.callers(reader), reader
