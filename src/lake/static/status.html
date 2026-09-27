@@ -913,7 +913,7 @@
     if (entry.nothing_withheld === true) {
       var withheld = el("li", "Nothing withheld the ping.", "nothing-withheld");
       withheld.title = "The run's problems list is empty and its ping went out. " +
-        "The counts above and the lines below can still carry findings.";
+        "The counts and held findings above and the lines below can still carry findings.";
       var held = el("ul", null, "lines");
       held.appendChild(withheld);
       item.appendChild(held);
@@ -935,7 +935,8 @@
       var subjects = piece && Array.isArray(piece.subjects) ? piece.subjects : [];
       subjects.forEach(function (subject) {
         var node = el("li", walk + " held " + subject, "held");
-        node.title = "The sweep's gate held this finding out of its ledger. " +
+        node.title = "The sweep's gate kept this finding out of the lake's data. " +
+          "Its detail is under reports/withheld/, by the date it names. " +
           "The file gives it no kind.";
         list.appendChild(node);
       });
