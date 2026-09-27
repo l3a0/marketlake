@@ -46,7 +46,7 @@ from datetime import date
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from lake.schwab import DEFAULT_TOKEN_PATH
+from lake.schwab import DEFAULT_TOKEN_PATH, client_from_token
 
 # The window brackets, in expirations from the front of the chain. Each names how many
 # expirations past the first the bracket reaches, so the body-size growth is visible.
@@ -298,14 +298,14 @@ def _client_from_token(
 ) -> ChainClient:
     """Build the real client from a token file.
 
-    This is the one place ``schwab-py`` is imported, and it is imported lazily. So
-    ``import lake.probe`` and the whole unit suite run without the library. The client
-    is built with ``enforce_enums=False`` so plain strings pass through, matching the
-    recorder. This factory runs only in the by-hand live check.
+    It is ``lake.schwab.client_from_token``, the builder every capture client uses, so a
+    refresh the probe makes rewrites ``token.json`` atomically like the daemon's do. The
+    probe can run while the daemon does, and ``schwab-py``'s own writer would leave the
+    file empty for a moment under the daemon's next read. That builder imports
+    ``schwab-py`` lazily, so ``import lake.probe`` and the whole unit suite run without the
+    library. This factory runs only in the by-hand live check.
     """
-    from schwab.auth import client_from_token_file  # lazy: real dep, live only
-
-    return client_from_token_file(str(token_path), api_key, app_secret, enforce_enums=False)
+    return client_from_token(token_path, api_key=api_key, app_secret=app_secret)
 
 
 def build_parser() -> argparse.ArgumentParser:

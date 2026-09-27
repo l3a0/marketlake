@@ -12,13 +12,16 @@ Nothing in the suite drove this factory before. Every test that reaches capture 
 and no test has a token. So a cache added inside the factory would satisfy the whole
 suite and still break re-auth recovery. These tests close that hole.
 
-The client build is faked at its seam, ``schwab.auth.client_from_token_file``, not at the
-factory. So the real ``from_token`` runs: it reads the path, forwards the secrets, and
-wraps whatever the seam returns. The fake seam reads the token file it is handed and
-returns a client whose mint time is the file's ``creation_timestamp``. So "built from the
-file" is observable through the public API, because ``token_mint_time`` reads that value
-back. A rewrite of the file changes that value, which is exactly the re-auth event the
-design promises to notice.
+The client build is faked at its seam, ``schwab.auth.client_from_access_functions``, not
+at the factory. So the real ``from_token`` runs: it hands the seam a reader of the path and
+the atomic writer, forwards the secrets, and wraps whatever the seam returns. The fake seam
+calls the reader it is handed and returns a client whose mint time is the file's
+``creation_timestamp``. So "built from the file" is observable through the public API,
+because ``token_mint_time`` reads that value back. A rewrite of the file changes that value,
+which is exactly the re-auth event the design promises to notice.
+
+``tests/component/test_token_file_refresh.py`` builds real ``schwab-py`` clients instead,
+and drives their refreshes through ``httpx.MockTransport``.
 
 The seam is installed as a fake ``schwab`` package in ``sys.modules`` rather than by
 patching the real module's attribute. ``from_token`` imports ``schwab-py`` lazily so the
@@ -30,12 +33,14 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 
+from lake.reauth import TokenWriter
 from lake.schwab import SchwabVendor
 from tests.support.schwab import FakeSchwabClient
 
@@ -47,23 +52,32 @@ MINT_AFTER = MINT_BEFORE + 7 * 86400  # one refresh-token lifetime later
 
 
 class _RecordingFactory:
-    """A stand-in for ``schwab.auth.client_from_token_file``.
+    """A stand-in for ``schwab.auth.client_from_access_functions``.
 
-    It reads the token file it is handed and builds a fake client whose mint time is the
+    It calls the token reader it is handed and builds a fake client whose mint time is the
     file's ``creation_timestamp``. So the client it returns is built from the file in the
-    one way the vendor later observes. Every call is recorded, so a test can assert the
-    factory ran once per ``from_token`` rather than serving a cache.
+    one way the vendor later observes. Every call is recorded, the writer with it, so a test
+    can assert the factory ran once per ``from_token`` rather than serving a cache, and that
+    refreshes are written through the atomic writer.
     """
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str, str, bool]] = []
+        self.calls: list[tuple[str, str, bool]] = []
+        self.writers: list[object] = []
         self.clients: list[FakeSchwabClient] = []
 
     def __call__(
-        self, token_path: str, api_key: str, app_secret: str, *, enforce_enums: bool = True
+        self,
+        api_key: str,
+        app_secret: str,
+        token_read_func: Callable[[], object],
+        token_write_func: object,
+        *,
+        enforce_enums: bool = True,
     ) -> FakeSchwabClient:
-        contents = json.loads(Path(token_path).read_text())
-        self.calls.append((token_path, api_key, app_secret, enforce_enums))
+        contents = token_read_func()
+        self.calls.append((api_key, app_secret, enforce_enums))
+        self.writers.append(token_write_func)
         self.clients.append(FakeSchwabClient(creation_timestamp=contents["creation_timestamp"]))
         return self.clients[-1]
 
@@ -71,12 +85,12 @@ class _RecordingFactory:
 def _install_seam(monkeypatch: pytest.MonkeyPatch, factory: _RecordingFactory) -> None:
     """Put a fake ``schwab.auth`` in ``sys.modules`` so the lazy import finds the factory.
 
-    Both entries are set, because ``from schwab.auth import client_from_token_file``
+    Both entries are set, because ``from schwab.auth import client_from_access_functions``
     resolves the parent package and then the submodule. ``monkeypatch`` restores the real
     ``sys.modules`` after the test, so a fake never leaks into another one.
     """
     auth = ModuleType("schwab.auth")
-    auth.client_from_token_file = factory  # type: ignore[attr-defined]
+    auth.client_from_access_functions = factory  # type: ignore[attr-defined]
     package = ModuleType("schwab")
     package.auth = auth  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "schwab", package)
@@ -91,10 +105,11 @@ def _write_token(path: Path, creation_timestamp: float) -> None:
 def test_from_token_builds_the_client_from_the_token_file(tmp_path, monkeypatch):
     """The factory reads the path it is given and forwards the caller's secrets.
 
-    This covers the seam's contract: the token path reaches the client build, the two
-    secrets pass through verbatim, and the enum flag is the ``False`` this layer pins so
-    the field groups stay plain strings. The resulting vendor's mint time is the one the
-    file names.
+    This covers the seam's contract: the client is built from the token path's contents,
+    the two secrets pass through verbatim, and the enum flag is the ``False`` this layer
+    pins so the field groups stay plain strings. The resulting vendor's mint time is the one
+    the file names. A refresh is written by the re-auth ritual's atomic writer, aimed at the
+    same path, never by ``schwab-py``'s writer, which truncates the file in place.
     """
     token = tmp_path / "token.json"
     _write_token(token, MINT_BEFORE)
@@ -103,7 +118,10 @@ def test_from_token_builds_the_client_from_the_token_file(tmp_path, monkeypatch)
 
     vendor = SchwabVendor.from_token(token, api_key="api-key", app_secret="app-secret")
 
-    assert factory.calls == [(str(token), "api-key", "app-secret", False)]
+    assert factory.calls == [("api-key", "app-secret", False)]
+    (writer,) = factory.writers
+    assert isinstance(writer, TokenWriter)
+    assert writer.token_path == token
     assert vendor.token_mint_time() == datetime.fromtimestamp(MINT_BEFORE, tz=UTC)
 
 
@@ -158,6 +176,33 @@ def test_from_token_locks_the_session_token_refresh(tmp_path, monkeypatch):
     session.ensure_active_token(stale)
     assert session.checked == [session.token]
     assert session.checked[0] is not stale
+
+
+def test_from_token_adopts_the_files_token_once_its_own_has_expired(tmp_path, monkeypatch):
+    """An expired session takes the token file's token before it asks for a refresh.
+
+    The file here is rewritten after the client was built, standing for another client's
+    refresh. Its token is what the check is asked about, and its mint time is what the
+    vendor then reports.
+    """
+    token = tmp_path / "token.json"
+    _write_token(token, MINT_BEFORE)
+    factory = _RecordingFactory()
+    _install_seam(monkeypatch, factory)
+
+    vendor = SchwabVendor.from_token(token, api_key="api-key", app_secret="app-secret")
+    session = factory.clients[-1].session
+    token.write_text(
+        json.dumps({"creation_timestamp": MINT_AFTER, "token": {"access_token": "on-disk"}})
+    )
+
+    session.ensure_active_token()
+    assert session.checked == [{"access_token": "live"}]
+
+    session.token.expired = True
+    session.ensure_active_token()
+    assert session.checked[-1] == {"access_token": "on-disk"}
+    assert vendor.token_mint_time() == datetime.fromtimestamp(MINT_AFTER, tz=UTC)
 
 
 def test_from_token_turns_timing_on_only_when_given_a_clock(tmp_path, monkeypatch):

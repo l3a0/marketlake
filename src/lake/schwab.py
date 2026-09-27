@@ -19,9 +19,10 @@ Two design rules shape this file.
 1. Dependency injection over the client. ``SchwabVendor`` is constructed with an
    already-built ``schwab-py`` client object. So a test injects a fake client with
    the same method shapes and never needs the network or a real token. The thin
-   ``from_token`` factory builds the real client from a token file. That factory is
-   the only place ``schwab-py`` is imported. It runs from the capture daemon on every
-   cycle, and in the by-hand live check. It never runs in continuous integration.
+   ``from_token`` factory builds the real client from a token file through
+   ``client_from_token``, the only place ``schwab-py`` is imported. It runs from the
+   capture daemon on every cycle, and in the by-hand live check. Continuous integration
+   reaches it only through ``httpx.MockTransport`` and a temporary token file.
 2. No wall-clock read. ``token_mint_time`` derives its instant from the token the
    injected client already holds, never from ``datetime.now`` and never from a
    separate file read. The mint time is a stored epoch second on the client's token
@@ -37,7 +38,7 @@ One thing more is read when it is there: the request's timing, the four instants
 ``lake.vendor.RequestTiming`` names. ``attach_timing`` records them by adding httpx event
 hooks to the client's ``session``, which is the ``httpx.Client`` ``schwab-py`` builds on
 through authlib's ``OAuth2Client``. ``schwab-py`` passes no httpx options through
-``client_from_token_file``, but the session's ``event_hooks`` can be set after the
+``client_from_access_functions``, but the session's ``event_hooks`` can be set after the
 client exists. The hooks read the caller's injected clock, never a clock of their own, so
 the second rule above still holds. Each request carries its own record in its
 ``extensions``, never in state shared between requests, so a record stays with its
@@ -48,6 +49,7 @@ A fake client with no ``session`` records nothing, and its responses carry no ti
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -59,6 +61,7 @@ from typing import Protocol, runtime_checkable
 
 from lake.clock import Clock
 from lake.paths import TOKEN_FILE, config_dir
+from lake.reauth import TokenWriter
 from lake.token_epoch import epoch_second_to_utc
 from lake.vendor import RequestTiming, VendorError, VendorResponse, require_utc_bound
 
@@ -421,7 +424,16 @@ def _auth_failures_named() -> Iterator[None]:
         raise
 
 
-def serialize_token_refresh(session: object) -> None:
+# One lock for the whole process, not one per client. The capture loop builds a new client
+# every cycle, and once cycles overlap (marketlake #534) two clients can find the token
+# expired at the same moment. A lock per client would let both refresh and both rewrite
+# ``token.json``. This one lets one refresh, and the other re-reads the file the first wrote.
+_TOKEN_REFRESH_LOCK = threading.Lock()
+
+
+def serialize_token_refresh(
+    session: object, adopt_stored: Callable[[], None] | None = None
+) -> None:
     """Make an authlib session refresh an expired token once, however many threads ask.
 
     Marketlake #532 fires a capture cycle's requests from a pool of threads through one
@@ -430,10 +442,9 @@ def serialize_token_refresh(session: object) -> None:
     no lock around it, unlike authlib's async client, which holds one. So when the access
     token has lapsed, every request in flight refreshes it. A probe on 2026-09-24 sent 19
     concurrent requests through one client holding an expired token: the token endpoint was
-    hit 19 times, and the ``update_token`` callback, which in ``schwab-py`` rewrites
-    ``token.json``, ran 19 times over the same file. The access token lives 30 minutes with a
-    300-second leeway and the client is rebuilt every cycle, so about one cycle in 25 would
-    do that.
+    hit 19 times, and the ``update_token`` callback, which rewrites ``token.json``, ran 19
+    times over the same file. The access token lives 30 minutes with a 300-second leeway and
+    the client is rebuilt every cycle, so about one cycle in 25 would do that.
 
     The fix replaces the session's ``ensure_active_token`` with one that takes a lock and
     then checks the session's live ``token``, not the token it was called with. That second
@@ -441,24 +452,123 @@ def serialize_token_refresh(session: object) -> None:
     waited on the lock still holds the expired token object it was called with, and a lock
     that forwarded the argument refreshed eight times out of eight in the same probe.
 
+    The lock is ``_TOKEN_REFRESH_LOCK``, shared by every session in the process, because two
+    clients refreshing at once is the same race one level up (marketlake #564). Sharing the
+    lock is not enough on its own. A second client that waited still holds the expired token
+    it was built with, since the first client's refresh changed the first client's session
+    and the file, never the second's session. Checking only its own session, it would refresh
+    again. ``adopt_stored`` closes that gap. When the session's token has expired, it is
+    called under the lock to replace the session's token with the one stored in the token
+    file. The file's token is then the one checked, so a refresh another client already
+    made is adopted rather than repeated, and a refresh that does happen uses the newest
+    refresh token on disk. That keeps the lake correct whether or not Schwab rotates the
+    refresh token on each refresh, which nothing here has measured. If it does, a second
+    refresh with the superseded refresh token would be refused and read as auth death.
+
+    A re-read that fails leaves the session's own token in place and prints one line naming
+    the failure's type, never its message or anything from the file. The request then goes
+    ahead as it did before the re-read existed, so an unreadable file costs at most the
+    duplicate refresh the re-read was there to save, not the cycle.
+
+    The lock also keeps the token writer safe. ``reauth.write_token`` names its temp file by
+    process id, so two threads writing at once would share one temp file. Every write from
+    a refresh happens inside ``ensure_active_token``, and so inside this lock.
+
     It reaches into the session by attribute, so a library upgrade that moves it raises
     ``AttributeError`` from ``from_token`` rather than running capture with the refresh
-    unguarded. Two tests cover what can be covered offline.
-    ``tests/unit/test_token_refresh_lock.py`` drives a real authlib ``OAuth2Client`` through
-    ``httpx.MockTransport``, so an authlib upgrade that renames ``ensure_active_token`` fails
-    there. ``tests/unit/test_schwab_from_token.py`` checks that ``from_token`` installs the
-    lock. Neither can see a ``schwab-py`` upgrade that renames the client's ``session``, since
-    no test builds a real ``schwab-py`` client. That upgrade raises from every ``from_token``
-    caller, the capture daemon included, which exits and is relaunched into the same error.
+    unguarded. ``tests/unit/test_token_refresh_lock.py`` drives a real authlib
+    ``OAuth2Client`` through ``httpx.MockTransport``, so an authlib upgrade that renames
+    ``ensure_active_token`` fails there. ``tests/component/test_token_file_refresh.py``
+    builds real ``schwab-py`` clients through ``client_from_token`` over the same transport,
+    so an upgrade that renames the client's ``session`` or its token metadata fails there.
     """
     ensure_active_token = session.ensure_active_token
-    lock = threading.Lock()
 
     def ensure_active_token_once(token: object = None) -> object:
-        with lock:
+        with _TOKEN_REFRESH_LOCK:
+            if adopt_stored is not None and session.token.is_expired(leeway=session.leeway):
+                try:
+                    adopt_stored()
+                except Exception as exc:  # noqa: BLE001 - the session's own token still works
+                    print(
+                        "schwab: token file re-read failed, refreshing from the client's own "
+                        f"token: {type(exc).__name__}",
+                        file=sys.stderr,
+                    )
             return ensure_active_token(session.token)
 
     session.ensure_active_token = ensure_active_token_once
+
+
+def _read_token_file(token_path: Path) -> object:
+    """The token file's contents, parsed. ``schwab-py``'s own file loader, spelled here."""
+    return json.loads(token_path.read_bytes())
+
+
+def _adopt_stored_token(client: object, read_token: Callable[[], object]) -> None:
+    """Replace a client's token with the one stored in the token file.
+
+    The file holds ``schwab-py``'s envelope: the token itself and ``creation_timestamp``,
+    the refresh token's mint time. Both are adopted. The session takes the token, which is
+    what the next request is sent with. The client's ``token_metadata`` takes both, because
+    ``schwab-py`` writes its ``creation_timestamp`` back into the file on the next refresh.
+    Adopting the token alone would let a client built before a mid-week re-login write the
+    old mint time over the new one. ``token_mint_time`` reads the same field, so it keeps
+    matching the token the client actually runs on.
+
+    Everything is checked before anything is assigned, so a file of the wrong shape raises
+    and leaves the client exactly as it was.
+    """
+    stored = read_token()
+    if not isinstance(stored, Mapping):
+        raise ValueError(f"token file holds {type(stored).__name__}, not an object")
+    token = stored.get("token")
+    created = stored.get("creation_timestamp")
+    if not isinstance(token, Mapping) or created is None:
+        raise ValueError("token file has no token object or no creation_timestamp")
+    client.session.token = dict(token)
+    client.token_metadata.token = client.session.token
+    client.token_metadata.creation_timestamp = created
+
+
+def client_from_token(token_path: str | Path, *, api_key: str, app_secret: str) -> object:
+    """Build a real ``schwab-py`` client from a token file, with its refreshes made safe.
+
+    This is the one place ``schwab-py`` is imported, and it is imported lazily. So
+    ``import lake.schwab`` and the whole unit suite run without the library installed.
+
+    Two things differ from ``schwab-py``'s own ``client_from_token_file``.
+
+    1. **The token is written atomically.** ``schwab-py``'s writer opens the file with
+       ``open(token_path, 'w')`` and then writes into it, so the file is empty between the
+       two and a reader in that moment meets a truncated token. That reader can be another
+       cycle's client, onboarding, the close+5 fill or the Sunday canary, each in its own
+       process. ``client_from_access_functions`` takes a ``token_write_func``, and this
+       passes the re-auth ritual's ``TokenWriter``: a temp file, an fsync, mode 0600, then
+       one ``os.replace``. A reader meets the old token or the new one, never part of
+       either. The mode is set before the rename because the daemon's umask is 022, so a
+       plainly created file would publish the credential readable by every account.
+    2. **One refresh at a time in the process, and a waiting client adopts the file's
+       token.** ``serialize_token_refresh`` carries the reasoning.
+
+    The loader is the same file read ``client_from_token_file`` does, so the client is built
+    from exactly what it built from before.
+
+    ``enforce_enums=False`` lets ``get_quotes`` pass the field groups as plain strings
+    rather than ``schwab-py`` ``Fields`` enum members, keeping this layer enum-agnostic.
+    """
+    from schwab.auth import client_from_access_functions  # lazy: real dep, live only
+
+    path = Path(token_path)
+
+    def read_token() -> object:
+        return _read_token_file(path)
+
+    client = client_from_access_functions(
+        api_key, app_secret, read_token, TokenWriter(path), enforce_enums=False
+    )
+    serialize_token_refresh(client.session, lambda: _adopt_stored_token(client, read_token))
+    return client
 
 
 class SchwabVendor:
@@ -609,11 +719,11 @@ class SchwabVendor:
     ) -> SchwabVendor:
         """Build the real vendor from a token file.
 
-        This is the one place ``schwab-py`` is imported, and it is imported lazily.
-        So ``import lake.schwab`` and the whole unit suite run without the library
-        installed. In tests this factory is reached only from the by-hand live check that
-        records cassettes from a real Schwab call. It never runs in continuous
-        integration, because it needs a real token and real credentials.
+        ``client_from_token`` builds the client, and its docstring says what it adds to
+        ``schwab-py``'s own: an atomic token write, and one refresh at a time across every
+        client in the process. The only live callers are the daemon and the by-hand tools,
+        since a real call needs a real token and real credentials. The suite drives it
+        against ``httpx.MockTransport`` and a temporary token file.
 
         ``api_key`` and ``app_secret`` are secrets. They are passed in by the caller,
         never read from or written to the repo.
@@ -622,14 +732,7 @@ class SchwabVendor:
         The three callers that fetch a chain pass theirs: the capture cycle, the close+5
         fill and onboarding. Every other caller leaves it ``None`` and records nothing.
         """
-        from schwab.auth import client_from_token_file  # lazy: real dep, live only
-
-        # enforce_enums=False lets get_quotes pass the field groups as plain strings
-        # rather than schwab-py Fields enum members, keeping this layer enum-agnostic.
-        client = client_from_token_file(str(token_path), api_key, app_secret, enforce_enums=False)
-        # The capture cycle shares this client across a pool of threads, so an expired token
-        # must be refreshed once rather than once per request in flight.
-        serialize_token_refresh(client.session)
+        client = client_from_token(token_path, api_key=api_key, app_secret=app_secret)
         if clock is not None:
             attach_timing(client, clock)
         return cls(client)

@@ -321,8 +321,9 @@ def temp_write_path(target: Path | str, pid: int) -> Path:
     """The temp file an atomic write to ``target`` writes into first.
 
     It sits beside the target, so the rename that finishes the write stays on one
-    filesystem. ``pid`` is the writing process's id. Two writers therefore never share
-    a temp file, and a leftover names the process that died holding it.
+    filesystem. ``pid`` is the writing process's id. Two processes therefore never share
+    a temp file, and a leftover names the process that died holding it. Two threads in one
+    process would share it, so a writer used from several threads serialises its writes.
     """
     target = Path(target)
     return target.with_name(f"{target.name}{TEMP_MARKER}{pid}")
