@@ -1304,11 +1304,13 @@ def run_loop_from_config(
             try:
                 guard_on_skipped(slots)
             finally:
-                # In a ``finally`` because the marker re-raises ``TickersError`` and a
-                # caller's own hook runs inside it. Before the deferral the guard had
-                # already run by the time either could raise, so a raise must not cost
-                # the run now. The guard then finds 16:00 unrecorded and marks it, and the
-                # successor's startup marking counts that row.
+                # In a ``finally`` because the marker's pass can raise and a caller's own
+                # hook runs inside it. Before the deferral the guard had already run by the
+                # time either could raise, so a raise there must not cost the run now. The
+                # guard then finds 16:00 unrecorded and marks it, and the successor's
+                # startup marking counts that row. The alarm's roster read wraps outside
+                # this hook, so a roster that will not load still exits before the guard
+                # runs, and a successor started the same day runs it from ``on_start``.
                 waiting, guard_waiting = guard_waiting, None
                 if waiting is not None:
                     dispatch.check(waiting)

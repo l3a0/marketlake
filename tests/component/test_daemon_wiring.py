@@ -925,6 +925,52 @@ def test_a_stall_into_the_next_days_evening_leaves_one_row_at_that_days_close(tm
     assert row["error_class"] == gap.SLOT_OVERRUN
 
 
+def test_a_startup_that_outlives_close_plus_five_still_runs_the_guard_after_the_markers(
+    tmp_path,
+):
+    """The guard's previous slot is the one ``run_loop`` seeded, not the first tick's.
+
+    The daemon starts at 15:59:30 and its startup pass runs until 16:25:10, a lid closed
+    during startup. The first tick then reports 16:00 to 16:15 to ``on_skipped``. A wrapper
+    that began tracking only at that tick would see no skipped slots, run the guard
+    first, and put its 16:00 marker in the way of the overrun markers.
+    """
+    rig = _rig(tmp_path)
+    _in_scope_all_day(rig)
+    _record(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", et(2026, 9, 2, 15, 58))
+    clock = ManualClock(start=et(2026, 9, 2, 15, 59, 30))
+    hooks = daemon.DaemonHooks(on_start=lambda slot: clock.set(et(2026, 9, 2, 16, 25, 10)))
+    _run(rig, clock, ticks=1, cycle_runner=_no_cycle, hooks=hooks)
+
+    owed = [et(2026, 9, 2, 16, 0) + TICK * minute for minute in range(16)]
+    found = Counter(
+        (datetime.fromisoformat(row["snap_ts"]), row["error_class"])
+        for row in _rows(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", DAY)
+        if datetime.fromisoformat(row["snap_ts"]) >= owed[0]
+    )
+    assert found == Counter((slot, gap.SLOT_OVERRUN) for slot in owed)
+    assert _guard_found(rig.lake_root) == [["XYZ"]]
+
+
+def test_a_wake_past_close_plus_five_that_skipped_no_capture_slot_runs_the_guard_that_tick(
+    tmp_path,
+):
+    """Nothing waits when no marker is owed, so the one tick the daemon is awake serves.
+
+    The lid closes after the 16:15 cycle and opens at 16:25. No capture slot lies in
+    between, so ``on_skipped`` never fires, and a guard waiting for it would not run at
+    all if the machine slept again after that one tick.
+    """
+    rig = _rig(tmp_path)
+    _in_scope_all_day(rig)
+    clock = ManualClock(start=et(2026, 9, 2, 16, 14, 30))
+    stall = _Stalls(rig.lake_root, clock, 9 * 60 + 30, at=et(2026, 9, 2, 16, 15))
+    _run(rig, clock, ticks=2, cycle_runner=stall)
+
+    files = sorted(report.close_guard_dir(rig.lake_root, DAY).glob("*.json"))
+    assert [json.loads(path.read_text())["at"][:16] for path in files] == ["2026-09-02T16:25"]
+
+
 def test_a_raise_in_the_waking_ticks_skipped_hook_does_not_cost_the_guard_its_run(tmp_path):
     """The deferred run sits in a ``finally``, so a raise inside ``on_skipped`` still runs it.
 
