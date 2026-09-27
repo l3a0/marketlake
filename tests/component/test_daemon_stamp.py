@@ -196,7 +196,6 @@ def test_a_capture_minute_is_left_to_the_cycle_s_own_stamp(tmp_path):
     def record_cycle(
         *, slot: datetime, close_tag: str | None, session_phase: str | None
     ) -> CycleResult:
-        slot = et(2026, 8, 31, 12, 1)
         ran.append(slot)
         return CycleResult(slot, ())
 

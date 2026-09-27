@@ -232,10 +232,8 @@ def _sleep_until(clock: Clock, top: datetime) -> None:
     short of its top. It did twice on 2026-09-11. A loop that read its slot there took the
     minute it had already served, and at a session boundary that loses the open minute or
     moves a close tag onto the wrong minute (marketlake #572). So a clock still short of
-    the top sleeps the remainder. A sleep that overshoots returns as it is.
-
-    The remainder has no bound. A wall clock stepped backward makes the loop wait until it
-    reaches the top again, rather than run a cycle for a minute it already captured.
+    the top sleeps the remainder. A sleep that overshoots returns as it is. The remainder
+    has no bound, so a wall clock stepped backward waits until it reaches the top again.
     """
     now = clock.now()
     while now < top:
@@ -261,10 +259,16 @@ def run_loop(
     ``on_start`` fires once, before the first tick. Then each iteration:
 
     1. Sleep through ``clock.sleep`` until the next minute top, computed from
-       ``clock.now``, and sleep again while the clock still reads short of it.
-    2. Read ``session_clock.phase()`` and the snap slot, then hand the slot to
-       ``on_tick``. That fires every minute, session or not, because the power
-       assertion the control plane holds is owed on holidays too.
+       ``clock.now``, and sleep again while the clock still reads short of it. The top is
+       never earlier than the minute after the previous tick's slot, so a wall clock
+       stepped backward, during the sleep or during a tick, makes the loop wait rather
+       than serve a minute it already served.
+    2. Read the snap slot once and take its phase with ``phase_at``, then hand the slot
+       to ``on_tick``. One read, because two reads can fall on either side of a minute
+       top when a long sleep lands just before one, and the loop would then decide
+       capture on one minute and serve another. ``on_tick`` fires every minute, session
+       or not, because the power assertion the control plane holds is owed on holidays
+       too.
     3. Hand any capture slots missed since the previous tick, across days if the loop
        slept that long, to ``on_skipped``, then remember this tick's slot. This is the
        loop's only state across ticks.
@@ -285,12 +289,12 @@ def run_loop(
     # in between belong to neither producer. Seeding here hands them to ``on_skipped``,
     # which is true to what happened: the daemon was alive and busy. Seeding also costs
     # nothing when the pass is quick, because adjacent slots yield no missed minutes.
-    last_slot: datetime | None = session_clock.snap_slot()
+    last_slot = session_clock.snap_slot()
     hooks.on_start()
     while should_continue():
-        _sleep_until(clock, next_minute_top(clock.now()))
-        phase = session_clock.phase()
+        _sleep_until(clock, max(next_minute_top(clock.now()), last_slot + TICK))
         slot = session_clock.snap_slot()
+        phase = session_clock.phase_at(slot)
         hooks.on_tick(slot)
         skipped = missed_slots(session_clock, last_slot, slot)
         if skipped:
@@ -1507,9 +1511,9 @@ __all__ = [
     "DaemonHooks",
     "build_parser",
     "main",
+    "next_minute_top",
     "run_loop",
     "run_loop_from_config",
-    "next_minute_top",
     "skipped_slots",
 ]
 

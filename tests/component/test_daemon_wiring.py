@@ -341,7 +341,6 @@ class _Overrunning:
     def __call__(
         self, *, slot: datetime, close_tag: str | None, session_phase: str | None
     ) -> CycleResult:
-        slot = self._clock.now().replace(second=0, microsecond=0)
         self.slots.append(slot)
         if len(self.slots) == 1:
             self._clock.advance(self._seconds)
@@ -753,7 +752,8 @@ def test_the_production_runner_files_the_cycle_under_the_loops_slot(tmp_path, mo
     passing.
 
     The clock here reads Eastern time, so a cycle that kept the loop's Eastern slot as it
-    came would spell ``snap_ts`` with ``-04:00``. Every captured row is stored in UTC, and
+    came would spell ``snap_ts`` with ``-04:00``. Every row a loop cycle writes is stored in
+    UTC, and
     the text is what a row carries, so the text is asserted rather than the instant.
     """
     rig = _rig(tmp_path, roster=WITH_OPTIONS)
@@ -927,7 +927,6 @@ def test_a_broken_roster_off_the_capture_window_is_fatal_too(tmp_path):
     def stall_across_the_close(
         *, slot: datetime, close_tag: str | None, session_phase: str | None
     ) -> CycleResult:
-        slot = clock.now().replace(second=0, microsecond=0)
         rig.tickers.write_text(UNLOADABLE)
         clock.advance(ACROSS_THE_CLOSE)
         return CycleResult(snap_ts=slot, segments=())
@@ -1000,7 +999,6 @@ class _FailingCycles:
                 self._rig.lake_root,
                 guards={"watchdog_page_minutes": self._new_page_minutes},
             )
-        slot = self._clock.now().replace(second=0, microsecond=0)
         return CycleResult(
             snap_ts=slot, segments=(_segment(journal.ROW_KIND_GAP, self._rig.lake_root),)
         )
@@ -1053,7 +1051,6 @@ class _RateLimited:
     def __call__(
         self, *, slot: datetime, close_tag: str | None, session_phase: str | None
     ) -> CycleResult:
-        slot = self._clock.now().replace(second=0, microsecond=0)
         segment = SegmentOutcome(
             surface=journal.QUOTES_SURFACE,
             ticker="XYZ",
@@ -1095,7 +1092,6 @@ class _WholeDaemonFailure:
     def __call__(
         self, *, slot: datetime, close_tag: str | None, session_phase: str | None
     ) -> CycleResult:
-        slot = self._clock.now().replace(second=0, microsecond=0)
         segments = tuple(
             SegmentOutcome(
                 surface=surface,
@@ -1149,7 +1145,6 @@ class _DeadSampler:
     def __call__(
         self, *, slot: datetime, close_tag: str | None, session_phase: str | None
     ) -> CycleResult:
-        slot = self._clock.now().replace(second=0, microsecond=0)
         segments = tuple(
             SegmentOutcome(
                 surface=journal.QUOTES_SURFACE,
@@ -1201,7 +1196,6 @@ class _SplitSampler:
     def __call__(
         self, *, slot: datetime, close_tag: str | None, session_phase: str | None
     ) -> CycleResult:
-        slot = self._clock.now().replace(second=0, microsecond=0)
         segments = tuple(
             SegmentOutcome(
                 surface=journal.QUOTES_SURFACE,
@@ -2104,7 +2098,6 @@ class _Drifting:
     ) -> CycleResult:
         self.cycles += 1
         routed = ("open_interest",) if self.cycles in self._drifting else ()
-        slot = self._clock.now().replace(second=0, microsecond=0)
         segment = _segment(
             journal.ROW_KIND_DATA, self._rig.lake_root, journal.CHAINS_SURFACE, "XYZ", routed
         )

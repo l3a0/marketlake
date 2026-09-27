@@ -1418,7 +1418,7 @@ class _CaptureCycle:
         # clock here can land past a minute top the loop read short of, and the rows then
         # file under a minute whose close tag and phase were decided for another
         # (marketlake #572). The loop's slot is Eastern, and ``snap_ts`` is stored as text,
-        # so it is converted to UTC, the spelling every captured row already carries.
+        # so it is converted to UTC, the spelling every loop cycle's rows already carry.
         #
         # One instant still anchors the writer session. The segment stamp derives from the
         # cycle's own start, so two cycles never share a segment name. A caller outside the
@@ -2035,10 +2035,11 @@ def journal_snapshot(
     the same primitives end to end, so the result is indistinguishable in shape from a
     segment ``run_cycle`` writes:
 
-    1. Derive the coordinates from ``cycle_start`` the way a cycle does: ``snap_ts`` is
-       that instant floored to the minute, ``day`` is that slot's date, and ``start_ts``
-       is the writer-session stamp. The caller stamps ``cycle_start``, ``fetch_ts``, and
-       ``fetch_end_ts`` from the injected clock around its own fetch.
+    1. Derive the coordinates from ``cycle_start`` the way a cycle outside the loop does:
+       ``snap_ts`` is that instant floored to the minute unless ``slot`` names it, ``day``
+       is that slot's date, and ``start_ts`` is the writer-session stamp. The caller
+       stamps ``cycle_start``, ``fetch_ts``, and ``fetch_end_ts`` from the injected clock
+       around its own fetch.
     2. Build the surface's data batch with the D4 journal row builders.
     3. Read the schema-drift signature off that batch with ``journal.routed_columns`` and
        put it on the returned outcome's ``routed_columns``. The cycle's own writer does
