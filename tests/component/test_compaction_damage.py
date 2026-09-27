@@ -232,14 +232,16 @@ def test_a_flipped_byte_refuses_the_ticker_day_and_keeps_every_segment(lake_root
 
     result, events = _run(lake_root, publisher=publisher)
 
+    # The other ticker-day on the same date sealed, and the damaged one did not. Without
+    # the check, SPY seals here too, with 8 rows or with a changed value.
+    assert [(item.ticker, item.rows) for item in result.sealed] == [("QQQ", 10)]
+    assert not any(path.exists() for path in qqq)
     # Nothing of the damaged ticker-day was sealed or deleted.
     assert {path: path.read_bytes() for path in spy} == before
     assert not _partition(lake_root, "SPY").exists()
     spy_partition = _rel(lake_root, _partition(lake_root, "SPY"))
     assert spy_partition not in latest_entries(lake_root)
-    # The other ticker-day on the same date sealed, and the run went on to the end.
-    assert [(item.ticker, item.rows) for item in result.sealed] == [("QQQ", 10)]
-    assert not any(path.exists() for path in qqq)
+    # The run went on to the end.
     assert events == ["backup", "ping"]
     assert result.backed_up and result.pinged
     # The refusal says which segment, with the digest it closed with and the one it has now.
