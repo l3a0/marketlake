@@ -8,7 +8,11 @@ what keeps a later rejoin's time away out of scope rather than marked as gaps.
 
 Closing the span comes before the roster change on purpose. Capture only records inside an
 open span, so once the span is closed the ticker is not captured again even if a crash
-leaves it in the roster. The bad state is off or removed with the span still open, and what
+leaves it in the roster. The daemon still names that ticker on stderr as enabled and outside
+every span, and when it was the last enabled ticker the capture dead-man goes unfed and
+pages every session until this command is re-run. The files cannot tell that state from an
+onboard that stopped after writing its roster entry, which owes every minute, so both page
+(marketlake #554). The bad state is off or removed with the span still open, and what
 keeps it away depends on what is being kept away.
 
 Ordering keeps a *crash* from reaching it, because the roster change is last. That is the

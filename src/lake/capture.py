@@ -645,12 +645,19 @@ class CycleResult:
     write. That is a different shape from a non-empty roster where every fetch failed,
     which still writes gap segments. The dead-man feed tells the two apart, because a
     fully retired daemon is alive and idle, not broken.
+
+    ``out_of_span`` names the enabled tickers the capture spans left out of this cycle, in
+    roster order. It is what keeps the flag honest. A roster the spans emptied is also a
+    cycle with nothing to fetch, but its tickers are still enabled, so it owes the minutes
+    it did not capture and the flag stays false (marketlake #554). The daemon prints a line
+    when the set changes, since nothing else names a ticker that is enabled and skipped.
     """
 
     snap_ts: datetime
     segments: tuple[SegmentOutcome, ...]
     errors: tuple[SegmentError, ...] = ()
     nothing_to_capture: bool = False
+    out_of_span: tuple[str, ...] = ()
 
     @property
     def partitions(self) -> tuple[str, ...]:
@@ -1378,6 +1385,9 @@ class _CaptureCycle:
 
     ``requests`` collects one record per vendor request the cycle made, chains and quotes,
     for the timing file the cycle appends to last of all.
+
+    ``out_of_span`` is the enabled tickers the caller left out of ``roster`` because no
+    capture span covers them. The cycle fetches nothing for them and only reports them.
     """
 
     clock: Clock
@@ -1389,6 +1399,7 @@ class _CaptureCycle:
     plan: ChainPlan
     close_tag: str | None = None
     session_phase: str | None = None
+    out_of_span: tuple[str, ...] = ()
     snap_ts: datetime = field(init=False)
     day: date = field(init=False)
     start_ts: str = field(init=False)
@@ -1501,8 +1512,11 @@ class _CaptureCycle:
         The sampler is one shared failure unit. A failed batch plans a gap for every
         ticker. A success is split per ticker, each ticker planned on its own.
 
-        An empty roster, every ticker retired, skips the request outright. Nothing is
-        owed, so nothing is fetched, and no cycle wastes a batched call on zero symbols.
+        An empty roster skips the request outright, so no cycle wastes a batched call on
+        zero symbols. The roster here is the one the spans already clamped, so it is empty
+        when every ticker retired and also when the spans left out every enabled ticker.
+        Neither has a symbol to ask for. The second still owes its minutes, and the result's
+        ``out_of_span`` is what says so.
         """
         symbols = self.roster.symbols
         if not symbols:
@@ -1748,7 +1762,8 @@ class _CaptureCycle:
             snap_ts=self.snap_ts,
             segments=tuple(outcomes),
             errors=tuple(errors),
-            nothing_to_capture=not self.roster,
+            nothing_to_capture=not self.roster and not self.out_of_span,
+            out_of_span=self.out_of_span,
         )
 
     def _stamp(self) -> None:
@@ -1783,6 +1798,7 @@ def run_cycle(
     plan: ChainPlan | None = None,
     close_tag: str | None = None,
     session_phase: str | None = None,
+    out_of_span: tuple[str, ...] = (),
 ) -> CycleResult:
     """Run one capture cycle. The primitive the daemon calls once a minute.
 
@@ -1799,6 +1815,12 @@ def run_cycle(
     them per minute from the session clock and its close-tag hook. The cycle stamps both on
     every row it writes, on both surfaces, gap rows and absence markers included, so a
     tagged cycle tags consistently. A caller outside the loop leaves both null.
+
+    ``out_of_span`` is the enabled tickers the caller dropped from ``roster`` because no
+    capture span covers them. The cycle fetches nothing for them. It carries them onto the
+    result, and while any are named the result does not report ``nothing_to_capture``,
+    because those tickers still owe their minutes (marketlake #554). A caller whose roster
+    is already exactly what it owes, as every test's is, leaves it empty.
 
     The steps, in order:
 
@@ -1829,6 +1851,7 @@ def run_cycle(
         plan=plan if plan is not None else load_chain_plan(),
         close_tag=close_tag,
         session_phase=session_phase,
+        out_of_span=out_of_span,
     )
     return cycle.run()
 
@@ -1855,11 +1878,18 @@ def run_cycle_from_config(
     so importing this module and running the offline suite need neither the library nor a
     real token. A test drives ``run_cycle`` directly with fakes instead. ``close_tag`` and
     ``session_phase`` pass straight through to ``run_cycle``.
+
+    This is the one place that holds both the enabled roster and the live one, so it is
+    where the enabled tickers the spans left out are named. They ride to the result as
+    ``out_of_span``, and that is what stops a roster the spans emptied from reading as one
+    whose every ticker retired (marketlake #554).
     """
     config = load_config(config_path)
     roster = load_tickers(tickers_path)
     resolved_clock = clock if clock is not None else SystemClock()
     live_roster = _live_roster(roster, config.lake_root, resolved_clock.now())
+    live = set(live_roster.symbols)
+    out_of_span = tuple(entry.ticker for entry in roster.enabled if entry.ticker not in live)
     vendor = SchwabVendor.from_token(
         token_path if token_path is not None else DEFAULT_TOKEN_PATH,
         api_key=config.schwab_api_key.reveal(),
@@ -1877,6 +1907,7 @@ def run_cycle_from_config(
             plan=load_chain_plan(),
             close_tag=close_tag,
             session_phase=session_phase,
+            out_of_span=out_of_span,
         )
     finally:
         _close_vendor(vendor)
@@ -1900,7 +1931,9 @@ def _live_roster(roster: Roster, lake_root: Path | str, now: datetime) -> Roster
     Retiring closes a ticker's capture span before it turns off the roster entry, so a
     crash between the two writes leaves a stale enabled entry with a closed span. Filtering
     on the span too, not only on ``enabled``, means that stale entry is never captured, so
-    no row is ever recorded outside a span.
+    no row is ever recorded outside a span. The caller names every entry this drops as
+    ``out_of_span`` on the cycle's result, because the same state is left by an onboard that
+    stopped after writing its roster entry, and that one owes every minute (marketlake #554).
 
     A missing master or spans file widens rather than narrows: every enabled entry is
     captured, the same as before capture spans existed. A missing reference file must

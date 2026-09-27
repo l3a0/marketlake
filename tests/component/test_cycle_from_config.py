@@ -471,6 +471,69 @@ def test_a_ticker_with_a_closed_span_is_not_captured_even_if_still_enabled(tmp_p
     tickers_captured = {seg.ticker for seg in result.segments}
     assert tickers_captured == {"SPY"}
     assert "XYZ" not in vendor.quotes[0]
+    # Still enabled, so it is named rather than dropped in silence (marketlake #554).
+    assert result.out_of_span == ("XYZ",)
+    assert result.nothing_to_capture is False
+
+
+def _one_ticker_lake(rig: _Rig) -> None:
+    """A master and spans file for SPY alone, its one span closed before ``FIRST_MINUTE``.
+
+    Both are valid files the commands themselves would write. A directory or a foreign
+    parquet would read differently once marketlake #551 lands, so none is used here.
+    """
+    from lake.capture_spans import CaptureSpans, spans_path
+    from lake.security_master import SecurityMaster, master_path
+
+    master = SecurityMaster()
+    spy = master.register(
+        kind="equity", capture_start=et(2026, 9, 1, 9, 30), valid_from=DAY, ticker="SPY"
+    )
+    master.write(master_path(rig.lake_root))
+    spans = CaptureSpans()
+    spans.open_span(spy, et(2026, 9, 1, 9, 30), True)
+    spans.close_span(spy, et(2026, 9, 2, 9, 45))
+    spans.write(spans_path(rig.lake_root))
+
+
+def test_a_roster_the_spans_emptied_is_not_read_as_every_ticker_retired(tmp_path, monkeypatch):
+    """Enabled tickers the spans left out still owe their minutes (marketlake #554).
+
+    This is the state a retire leaves when it stops between closing the span and turning
+    the entry off, and the state an onboard leaves when it stops after writing its roster
+    entry. The files cannot tell the two apart, and the second owes every minute. So the
+    cycle fetches nothing, as before, but it must not report ``nothing_to_capture``,
+    because the daemon feeds the dead-man on that flag and a fed dead-man never pages.
+    """
+    rig = _rig(tmp_path, SPY_ONLY)
+    _one_ticker_lake(rig)
+    vendor = _Vendor()
+    _wire(monkeypatch, rig, lambda path: vendor)
+
+    result = _cycle(rig, ManualClock(start=FIRST_MINUTE))
+
+    assert result.segments == ()
+    assert vendor.chains == [] and vendor.quotes == []
+    assert result.out_of_span == ("SPY",)
+    assert result.nothing_to_capture is False
+
+
+def test_a_roster_whose_every_ticker_retired_reports_nothing_to_capture(tmp_path, monkeypatch):
+    """The same lake with the retire finished: the entry off, nothing owed, the daemon idle.
+
+    This is the one empty cycle that may feed the dead-man, and the other half of the
+    test above. Without it a flag that was never true would pass that one.
+    """
+    rig = _rig(tmp_path, "SPY: {options: true, chain_cadence: 1m, enabled: false}\n")
+    _one_ticker_lake(rig)
+    vendor = _Vendor()
+    _wire(monkeypatch, rig, lambda path: vendor)
+
+    result = _cycle(rig, ManualClock(start=FIRST_MINUTE))
+
+    assert result.segments == ()
+    assert result.out_of_span == ()
+    assert result.nothing_to_capture is True
 
 
 def test_a_ticker_disabled_in_place_is_not_captured(tmp_path, monkeypatch):
@@ -500,6 +563,7 @@ def test_with_no_master_or_spans_file_every_enabled_ticker_is_captured(tmp_path,
 
     tickers_captured = {seg.ticker for seg in result.segments}
     assert tickers_captured == {"SPY", "QQQ"}
+    assert result.out_of_span == ()
 
 
 def test_a_drifted_spans_file_widens_rather_than_crashing_the_cycle(tmp_path, monkeypatch):

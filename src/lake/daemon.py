@@ -98,7 +98,7 @@ from pathlib import Path
 from typing import Protocol
 
 from lake.alert import REFUSED, Message, NtfyTransport, Publisher, Transport
-from lake.calendar import Calendar, ExchangeCalendar
+from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar
 from lake.capture import (
     CycleResult,
     FillResult,
@@ -299,6 +299,62 @@ def _report(report: MarkingReport, pass_name: str) -> None:
     if report.problems:
         parts.append(f"problems={'; '.join(report.problems)}")
     print(" ".join(parts), file=sys.stderr)
+
+
+class _OutOfSpanLine:
+    """Say which enabled tickers the capture spans left out, when that changes.
+
+    A cycle names them in ``CycleResult.out_of_span``. Nothing fetches for them, and when
+    they are every enabled ticker the dead-man goes unfed, so healthchecks pages with a
+    body that names no cause (marketlake #554). This line is where the cause is read.
+
+    Three rules place it.
+
+    1. **It prints on a change, and once a session.** A line a cycle would be about 400 a
+       session for one standing state. But the dead-man pages again every morning while
+       the state stands, so the line also prints at the first cycle of each session date
+       that still has tickers left out, the rollover the watchdog keys its counters on.
+    2. **It lives here, not in the cycle.** The previous set is state that outlives a
+       cycle, and ``run_cycle_from_config`` rebuilds everything every minute. ``on_cycle``
+       sees the cycles in slot order, so a change is a change once.
+    3. **It never raises.** ``run_loop`` wraps no hook, so a ``print`` that raises on a
+       full log volume would end the daemon. A line that cannot be written is dropped.
+
+    It prescribes no repair. The files cannot tell a retire that stopped midway, which
+    owes nothing, from an onboard or a rejoin that stopped midway, or a spans file that
+    no longer matches the lake, which owe every minute. Re-running either command is the
+    wrong repair for one of them.
+    """
+
+    def __init__(self) -> None:
+        self._last: tuple[str, ...] = ()
+        self._day: date | None = None
+
+    def observe(self, slot: datetime, out_of_span: tuple[str, ...]) -> None:
+        day = slot.astimezone(MARKET_TZ).date()
+        changed = out_of_span != self._last
+        new_session = bool(out_of_span) and day != self._day
+        self._last = out_of_span
+        if not changed and not new_session:
+            return
+        self._day = day
+        try:
+            print(self._line(slot, out_of_span), file=sys.stderr)
+        except Exception:  # noqa: BLE001 - a lost line must never end the daemon
+            pass
+
+    @staticmethod
+    def _line(slot: datetime, out_of_span: tuple[str, ...]) -> str:
+        if not out_of_span:
+            return (
+                f"capture: {slot.isoformat()}: every enabled ticker is inside a capture span again"
+            )
+        return (
+            f"capture: {slot.isoformat()}: {len(out_of_span)} enabled ticker(s) outside every "
+            f"capture span, so not captured: {', '.join(out_of_span)}. A retire, onboard or "
+            "rejoin that stopped midway leaves this, and so does a spans file that no longer "
+            "matches the lake"
+        )
 
 
 def _master_reader(lake_root: Path | str, clock: Clock) -> Callable[[], SecurityMaster | None]:
@@ -1286,17 +1342,23 @@ def run_loop_from_config(
                 now=now,
             )
 
+    out_of_span_line = _OutOfSpanLine()
+
     def on_cycle(slot: datetime, result: CycleResult) -> None:
         raise_pages(watchdog.observe(result), slot)
         # A cycle that landed real data is the strongest evidence of life. A cycle over
-        # an empty roster is different: every ticker retired, so there was nothing to
-        # fetch, and that is the daemon idle by design rather than broken. Both feed the
-        # check. A non-empty roster where every fetch failed writes gap segments and
-        # neither condition holds, so it stays unfed, which is what lets the dead-man
-        # ping go silent for capture that is truly stuck.
+        # an empty enabled roster is different: every ticker retired, so there was
+        # nothing to fetch, and that is the daemon idle by design rather than broken.
+        # Both feed the check. A non-empty roster where every fetch failed writes gap
+        # segments and neither condition holds, so it stays unfed, which is what lets
+        # the dead-man ping go silent for capture that is truly stuck. So does a roster
+        # the capture spans emptied while its tickers are still enabled: nothing was
+        # fetched, but those tickers owe their minutes, so the cycle does not report
+        # ``nothing_to_capture`` and the line below names them (marketlake #554).
         landed_data = any(seg.row_kind == ROW_KIND_DATA for seg in result.segments)
         if landed_data or result.nothing_to_capture:
             deadman.captured(slot)
+        out_of_span_line.observe(slot, result.out_of_span)
         # The vendor's payload changing shape, read off the batches this cycle just built.
         # It pages once when a column starts drifting rather than once a minute for as
         # long as it does, because a cycle a minute against a forty-a-day cap would spend

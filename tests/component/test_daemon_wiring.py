@@ -1201,6 +1201,80 @@ def test_an_empty_roster_still_runs_the_loop_and_reports(tmp_path):
     assert rig.transport.sent == []
 
 
+def _xyz_span_closed(rig: _Rig) -> None:
+    """A master and spans file naming XYZ, its one span closed before the session.
+
+    Valid files, the kind ``retire`` and ``onboard`` write. A directory or a foreign parquet
+    would stop narrowing once marketlake #551 lands, so neither is used.
+    """
+    master = SecurityMaster()
+    xyz = master.register(
+        kind="equity", capture_start=et(2026, 9, 1, 9, 30), valid_from=DAY, ticker="XYZ"
+    )
+    master.write(master_path(rig.lake_root))
+    spans = CaptureSpans()
+    spans.open_span(xyz, et(2026, 9, 1, 9, 30), False)
+    spans.close_span(xyz, et(2026, 9, 1, 16, 0))
+    spans.write(spans_path(rig.lake_root))
+
+
+def _capture_lines(err: str) -> list[str]:
+    return [line for line in err.splitlines() if line.startswith("capture: ")]
+
+
+def test_a_roster_the_spans_emptied_leaves_the_dead_man_unfed_and_says_why(
+    tmp_path, monkeypatch, capsys
+):
+    """An enabled ticker outside every span owes its minutes, so nothing may say it is fine.
+
+    Through the real cycle runner. XYZ is enabled, and the spans leave it out, the state a
+    retire or an onboard leaves when it stops midway (marketlake #554). No request goes
+    out, no segment is written, and the watchdog is charged nothing, so the dead-man's
+    silence is the only thing that pages. Before this fix the cycle reported
+    ``nothing_to_capture`` and fed it every minute, so nothing paged at all.
+
+    The line is what names the cause, since healthchecks' page does not. It prints once,
+    not once a minute.
+    """
+    rig = _rig(tmp_path)
+    _xyz_span_closed(rig)
+    vendor = _PlanVendor()
+    monkeypatch.setattr(capture, "SchwabVendor", _stub_schwab(vendor))
+    seen: list[CycleResult] = []
+
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=3, hooks=daemon.DaemonHooks(on_cycle=lambda s, r: seen.append(r)))
+
+    assert len(seen) == 3
+    assert all(r.segments == () and r.out_of_span == ("XYZ",) for r in seen)
+    assert rig.pinger.urls == []
+    (line,) = _capture_lines(capsys.readouterr().err)
+    assert line.startswith("capture: 2026-09-02T10:00:00-04:00: 1 enabled ticker(s)")
+    assert line.endswith(
+        "not captured: XYZ. A retire, onboard or rejoin that stopped midway "
+        "leaves this, and so does a spans file that no longer matches the lake"
+    )
+
+
+def test_a_roster_whose_every_ticker_retired_still_feeds_the_dead_man(
+    tmp_path, monkeypatch, capsys
+):
+    """The same lake with the retire finished is idle by design, and says nothing.
+
+    The other half of the test above, through the same runner. Without it, a dead-man
+    that was never fed on an empty cycle would pass that test too.
+    """
+    rig = _rig(tmp_path, roster="XYZ: {options: false, enabled: false}\n")
+    _xyz_span_closed(rig)
+    monkeypatch.setattr(capture, "SchwabVendor", _stub_schwab(_PlanVendor()))
+
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=3)
+
+    assert rig.pinger.urls == [CAPTURE_URL] * 3
+    assert _capture_lines(capsys.readouterr().err) == []
+
+
 # -- 10. the tick hook reaches the close+15 compaction ---------------------------------
 
 
