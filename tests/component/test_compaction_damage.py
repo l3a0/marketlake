@@ -587,6 +587,20 @@ def _deny(path: Path) -> None:
         path.open("rb")
 
 
+def _run_into(lake_root: Path, events: list[str]) -> CompactionResult:
+    """``_run``, recording the backup and the ping into a list the caller keeps if it raises."""
+    return compact(
+        lake_root,
+        clock=ManualClock(_et(16, 30)),
+        calendar=_calendar(),
+        backup=FakeBackup(events),
+        backup_target=TARGET,
+        pinger=FakePinger(events),
+        ping_url=URL,
+        plan_path=lake_root.parent / "chain_plan.json",
+    )
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 file")
 def test_an_unmanifested_segment_that_cannot_be_opened_stops_the_run(lake_root):
     """An access failure is not damage and not a tear, so it ends the run (marketlake #591).
@@ -603,18 +617,39 @@ def test_an_unmanifested_segment_that_cannot_be_opened_stops_the_run(lake_root):
     events: list[str] = []
     try:
         with pytest.raises(PermissionError):
-            compact(
-                lake_root,
-                clock=ManualClock(_et(16, 30)),
-                calendar=_calendar(),
-                backup=FakeBackup(events),
-                backup_target=TARGET,
-                pinger=FakePinger(events),
-                ping_url=URL,
-                plan_path=lake_root.parent / "chain_plan.json",
-            )
+            _run_into(lake_root, events)
     finally:
         locked.chmod(0o644)
+
+    assert {path: path.read_bytes() for path in spy} == before
+    assert not _partition(lake_root, "SPY").exists()
+    assert latest_entries(lake_root) == {}
+    assert events == []
+
+
+def _dangling(path: Path) -> None:
+    path.symlink_to(path.with_name("gone.arrows"))
+
+
+def _directory(path: Path) -> None:
+    path.mkdir()
+
+
+@pytest.mark.parametrize("make", [_dangling, _directory], ids=["missing", "not-a-file"])
+def test_a_segment_name_with_no_file_behind_it_stops_the_run(lake_root, make):
+    """The other two access failures, a file gone after the listing and a directory named
+    like a segment. Neither holds rows, but a read that folded them into no rows sealed the
+    day and unlinked the real segments before it met them again at the unlink. It sorts
+    after every real segment, so the real ones are read first."""
+    spy = _unmanifested(lake_root)
+    before = {path: path.read_bytes() for path in spy}
+    odd = journal.segment_path(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "zz", PID)
+    make(odd)
+    assert sorted(odd.parent.glob("*.arrows"))[-1] == odd
+    events: list[str] = []
+
+    with pytest.raises(OSError):
+        _run_into(lake_root, events)
 
     assert {path: path.read_bytes() for path in spy} == before
     assert not _partition(lake_root, "SPY").exists()

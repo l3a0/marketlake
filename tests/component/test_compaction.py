@@ -497,9 +497,10 @@ def test_a_segment_torn_before_its_first_batch_reads_as_no_rows(lake_root):
 def test_an_empty_segment_reads_as_no_rows(lake_root):
     # A crash between the create and the first write leaves a file of zero bytes. It holds
     # no cycle, so it merges as zero rows beside a whole segment and is unlinked with it.
-    # An empty file fails at the open, and compaction stopped catching an access failure
-    # there (marketlake #591). So this is the case a catch narrowed to the wrong class
-    # would turn into a failed run every night.
+    # An empty file fails as its stream opens, which reads as ``ArrowInvalid``, while the
+    # file's own open is where an access failure raises, which compaction stopped catching
+    # (marketlake #591). So this is the case a catch narrowed to the wrong class would turn
+    # into a failed run every night.
     whole = _segment(
         lake_root, "chains", "SPY", DAY, _chains(3, snap_ts=_snap(DAY, 0)), start_ts="a"
     )
