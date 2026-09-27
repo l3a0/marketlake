@@ -1491,8 +1491,14 @@ def test_the_line_carries_the_fetch_end_and_one_line_of_message(lake_root, monke
 
 
 class _Unprintable(Exception):
+    """An exception whose message itself raises, as the class ``refusal`` names."""
+
+    def __init__(self, refusal: type[Exception]) -> None:
+        super().__init__()
+        self.refusal = refusal
+
     def __str__(self) -> str:
-        raise RuntimeError("no message")
+        raise self.refusal("no message")
 
 
 class _RefusingStream:
@@ -1503,14 +1509,16 @@ class _RefusingStream:
         raise OSError(28, "No space left on device")
 
 
-@pytest.mark.parametrize("where", ["message", "stderr"])
+@pytest.mark.parametrize("where", ["message-runtime", "message-value", "stderr"])
 def test_the_line_never_costs_the_minute(lake_root, monkeypatch, where):
     # The line exists to report a fallback that keeps the minute, so it must not be what
     # loses it. Building it calls the exception's ``__str__``, and printing it writes to a
     # launchd log that can sit on a full volume.
     _prior_cycle(lake_root)
-    if where == "message":
-        monkeypatch.setattr(journal, "latest_expirations", _raising(_Unprintable()))
+    if where == "message-runtime":
+        monkeypatch.setattr(journal, "latest_expirations", _raising(_Unprintable(RuntimeError)))
+    elif where == "message-value":
+        monkeypatch.setattr(journal, "latest_expirations", _raising(_Unprintable(ValueError)))
     else:
         monkeypatch.setattr(journal, "latest_expirations", _raising(SystemError("damaged")))
         monkeypatch.setattr("sys.stderr", _RefusingStream())
@@ -1518,6 +1526,18 @@ def test_the_line_never_costs_the_minute(lake_root, monkeypatch, where):
     result = _run(_near_fails(), lake_root, _FAILING_NEAR, pid=4243)
 
     _assert_one_per_window_marker(_chain_rows(result))
+
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt(), SystemExit(1)], ids=["interrupt", "exit"])
+def test_an_interrupt_during_the_read_still_stops_the_process(lake_root, monkeypatch, exc):
+    # The fallback answers a read that failed, not a process being told to stop. An
+    # interrupt or an exit derives from ``BaseException`` rather than ``Exception``, so it
+    # passes through the containment and the loop, as it did before.
+    _prior_cycle(lake_root)
+    monkeypatch.setattr(journal, "latest_expirations", _raising(exc))
+
+    with pytest.raises(type(exc)):
+        _run(_near_fails(), lake_root, _FAILING_NEAR, pid=4243)
 
 
 def test_a_close_fill_whose_prior_read_raises_still_lands(lake_root, monkeypatch):
