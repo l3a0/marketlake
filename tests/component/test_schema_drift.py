@@ -83,6 +83,7 @@ def _segment(surface: str, ticker: str, *routed: str) -> SegmentOutcome:
         rows=1,
         error_class=None,
         fetched_at=None,
+        data_rows=1,
         routed_columns=routed,
     )
 
