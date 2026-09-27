@@ -3424,20 +3424,30 @@ def test_each_walk_names_its_held_findings_in_the_files_order(root: Path):
             (
                 "bars",
                 PieceOutcome(
-                    held=2,
-                    subjects=("SPY 2026-09-17 bar_close", "QQQ 2026-09-18 bar_close"),
+                    held=3,
+                    subjects=(
+                        "SPY 2026-09-17 bar_close",
+                        "QQQ 2026-09-18 bar_close",
+                        "IWM 2026-09-16 bar_close",
+                    ),
                 ),
             ),
         ),
     )
     entry = service_over(root).run_query("history", {})["reports"][0]
-    assert entry["disagreements"] == 3
+    # Three names in one walk, so a cap on how many pass through cannot go unnoticed. One
+    # name per held finding is what lets the panel say which ones the count counts.
+    assert entry["disagreements"] == 4
     assert entry["pieces"] == {
         "dividends": {"refusal": None, "subjects": ["KO 2026-09-15 amount"]},
         "splits": {"refusal": None, "subjects": []},
         "bars": {
             "refusal": None,
-            "subjects": ["SPY 2026-09-17 bar_close", "QQQ 2026-09-18 bar_close"],
+            "subjects": [
+                "SPY 2026-09-17 bar_close",
+                "QQQ 2026-09-18 bar_close",
+                "IWM 2026-09-16 bar_close",
+            ],
         },
     }
 
