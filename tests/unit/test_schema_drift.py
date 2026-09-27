@@ -15,8 +15,9 @@ What they cover is the state machine, which is where the settled rules live. The
    twice.
 4. One column drifting across many tickers is one report carrying them all, because a
    vendor retype reaches every ticker on the same cycle.
-5. Only data segments are evidence. A cycle that gapped a surface says nothing about the
-   vendor's payload and must leave that surface's state where it stood.
+5. Only data rows are evidence. A cycle that gapped a surface says nothing about the
+   vendor's payload and must leave that surface's state where it stood, and so does a data
+   segment holding no data row, such as a chain that answered with no contract.
 
 ``observe_partial`` is the second way in, for the close+5 fill, which writes one ticker's
 segment from outside the loop. Four rules cover its state machine.
@@ -261,6 +262,37 @@ def test_a_drifting_ticker_that_gaps_does_not_re_arm_while_the_surface_stays_hea
     assert len(observer.observe(_cycle(*drifting))) == 1
     assert observer.observe(_cycle(*gapped)) == ()
     assert observer.observe(_cycle(*drifting)) == ()
+
+
+def test_a_drifting_ticker_whose_chain_holds_no_contract_does_not_re_arm():
+    """A data segment with no data row is the same non-evidence as a gap.
+
+    One window answering 200 with empty maps while another fails lands a data segment
+    whose only row is the failed window's marker. Read by its kind, it cleared the column,
+    and AAPL's next retyped row paged a second time for one vendor fact (marketlake #326).
+    """
+    observer = SchemaDriftObserver()
+    drifting = (_segment(ticker="AAPL", routed=("open_interest",)), _segment(ticker="MSFT"))
+    empty = (_segment(ticker="AAPL", rows=1, data_rows=0), _segment(ticker="MSFT"))
+
+    assert len(observer.observe(_cycle(*drifting))) == 1
+    assert observer.observe(_cycle(*empty)) == ()
+    assert observer.observe(_cycle(*drifting)) == ()
+
+
+def test_a_drifting_ticker_whose_partial_chain_landed_clean_rows_clears_the_column():
+    """The other side: one data row that did not drift is the evidence the rule asks for.
+
+    A chain that lost one window and landed the rest holds real contracts beside the
+    marker, so it speaks about the payload, and the column clears.
+    """
+    observer = SchemaDriftObserver()
+    observer.observe(_cycle(_segment(ticker="AAPL", routed=("open_interest",))))
+
+    assert observer.observe(_cycle(_segment(ticker="AAPL", rows=3, data_rows=2))) == ()
+    assert observer.observe(_cycle(_segment(ticker="AAPL", routed=("open_interest",)))) == (
+        ColumnDrift(CHAINS_SURFACE, "open_interest", ("AAPL",)),
+    )
 
 
 def test_a_flapping_ticker_pages_once_for_one_unchanging_vendor_fact():

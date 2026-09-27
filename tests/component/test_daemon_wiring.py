@@ -583,6 +583,36 @@ def test_one_live_surface_beside_a_dead_one_still_arms_the_dead_man(data_first, 
     assert rig.pinger.urls == [CAPTURE_URL]
 
 
+@pytest.mark.parametrize(("data_rows", "pings"), [(0, 0), (2, 1)])
+def test_a_chain_holding_no_contract_beside_a_failed_quote_leaves_the_dead_man_silent(
+    data_rows, pings, tmp_path
+):
+    """A minute that landed no data row is not evidence of capture, whatever its kind.
+
+    Quotes are captured for every roster ticker, so the feed reaches this only in a
+    minute the batched quotes request failed as well. A chain beside it that answered 200
+    with no contract lands a data segment holding only the failed window's marker, and
+    read by its kind it fed the check for a daemon that captured nothing (marketlake
+    #326). A chain that lost one window and landed the rest holds real contracts, so it
+    still feeds the check, which is the other side of the boundary.
+    """
+    rig = _rig(tmp_path, WITH_OPTIONS + EQUITY_ONLY)
+    chain = _segment(
+        journal.ROW_KIND_DATA,
+        tmp_path,
+        journal.CHAINS_SURFACE,
+        "SPY",
+        rows=data_rows + 1,
+        data_rows=data_rows,
+    )
+    quote = _segment(journal.ROW_KIND_GAP, tmp_path, journal.QUOTES_SURFACE, "XYZ")
+    result = CycleResult(et(2026, 9, 2, 11, 59), (chain, quote))
+    clock = ManualClock(start=et(2026, 9, 2, 11, 58, 30))
+    _run(rig, clock, ticks=1, cycle_runner=lambda *, slot, close_tag, session_phase: result)
+
+    assert rig.pinger.urls == [CAPTURE_URL] * pings
+
+
 def test_a_cycle_that_journalled_nothing_leaves_the_dead_man_silent(tmp_path):
     """A cycle that wrote no segment at all captured nothing, and must not say it did.
 
