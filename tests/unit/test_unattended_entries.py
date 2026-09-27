@@ -82,6 +82,9 @@ def test_the_entry_reaches_main_through_its_guard(job, monkeypatch, capsys):
         signal.signal(signal.SIGALRM, previous)
 
     assert exited.value.code == 2
-    err = capsys.readouterr().err
-    assert err.count("\n") == 1
-    assert err.startswith(f"{stderr_label(module, args)}: config file not found:")
+    # The whole line, path included. A guard that handed ``main`` a ``--config`` of its
+    # own would exit 2 with the right label too, and under launchd it would refuse the
+    # real config on every relaunch.
+    label = stderr_label(module, args)
+    expected = f"{label}: config file not found: {config.DEFAULT_CONFIG_PATH}\n"
+    assert capsys.readouterr().err == expected
