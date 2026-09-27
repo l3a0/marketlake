@@ -1081,6 +1081,86 @@ def test_the_close_plus_five_tick_hands_on_the_option_close_cycle_before_its_hoo
     ]
 
 
+def test_a_cycle_still_running_at_the_option_close_does_not_hold_the_close(calendar):
+    # The 16:14 cycle is still running at 16:15. Only a tick at or past close+5 waits for
+    # the cycles in flight, so the option close still fires at its own top. A wait that
+    # began at the option close instead would start 16:15 only once 16:14 finished.
+    release = threading.Event()
+
+    def on_tick(slot: datetime) -> None:
+        if slot == et(REGULAR, 16, 16):
+            release.set()
+
+    runner, _ = _held_run(
+        calendar,
+        et(REGULAR, 16, 13, 30),
+        _until(et(REGULAR, 16, 17)),
+        hold={et(REGULAR, 16, 14): release},
+        on_tick=on_tick,
+    )
+
+    fired = [et(REGULAR, 16, 14), et(REGULAR, 16, 15)]
+    assert runner.slots == fired
+    assert runner.floors == fired
+
+
+def test_a_cycle_that_raises_past_exception_still_ends_the_loop(calendar):
+    # ``lake.capture`` lets ``SystemExit`` and ``KeyboardInterrupt`` through on purpose. A
+    # thread that dropped one would leave its future unsettled forever, the queue would
+    # grow a cycle a minute, and the next wait for every cycle would never return. So the
+    # cycle's thread keeps any ``BaseException`` and the loop raises it. The loop runs on
+    # a thread of its own here, so a regression fails the test rather than hanging it.
+    class _Out(BaseException):
+        pass
+
+    def cycle(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        raise _Out
+
+    clock = ManualClock(start=et(REGULAR, 9, 59, 30).astimezone(UTC), grace=HELD_GRACE_SECONDS)
+    end = et(REGULAR, 10, 5).astimezone(UTC)
+    raised: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            daemon.run_loop(
+                SessionClock(clock, calendar),
+                cycle,
+                clock=clock,
+                should_continue=lambda: clock.now() < end,
+            )
+        except BaseException as exc:  # noqa: BLE001 - the case is what escapes
+            raised.append(exc)
+
+    loop = threading.Thread(target=run, daemon=True)
+    loop.start()
+    loop.join(HOLD_TIMEOUT_SECONDS)
+
+    assert not loop.is_alive(), "the loop never ended"
+    assert [type(exc) for exc in raised] == [_Out]
+
+
+def test_a_cycle_runs_on_a_thread_the_interpreter_waits_for_at_exit(calendar):
+    # A hook that raises ends the loop without waiting for the cycles in flight. A
+    # non-daemon thread is what lets such a cycle finish its writes before the process
+    # exits, rather than being cut off with a segment half written.
+    daemon_flags: list[bool] = []
+
+    def cycle(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        daemon_flags.append(threading.current_thread().daemon)
+        return CycleResult(snap_ts=slot.astimezone(UTC), segments=())
+
+    clock = ManualClock(start=et(REGULAR, 9, 59, 30).astimezone(UTC))
+    end = et(REGULAR, 10, 1).astimezone(UTC)
+    daemon.run_loop(
+        SessionClock(clock, calendar),
+        cycle,
+        clock=clock,
+        should_continue=lambda: clock.now() < end,
+    )
+
+    assert daemon_flags == [False, False]
+
+
 def test_leaving_the_loop_hands_on_the_cycles_still_in_flight(calendar):
     release = threading.Event()
     ticks: list[bool] = []
