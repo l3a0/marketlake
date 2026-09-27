@@ -13,13 +13,17 @@ thread pool. These tests cover what that pool must and must not do:
    the representative error class and the contract order match a sequential fetch.
 5. A task that raises costs its own window and nothing else, and a quote request that
    raises gaps every quoted ticker, as in the sequential cycle.
-6. Segments are still written in roster order, chains before quotes.
+6. The result still lists the segments in roster order, chains before quotes.
+7. Each unit, a chain or the quote batch, lands as soon as its own requests are done
+   (marketlake #563). A slow window holds back its own chain and nothing else, while the
+   manifest entries still wait for the cycle's end.
 
 The cap-of-1 path is the sequential cycle, and the rest of the suite covers it.
 """
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from datetime import UTC, date, datetime, timedelta
@@ -31,7 +35,9 @@ from lake import capture, journal
 from lake.chain_plan import ChainPlan
 from lake.clock import SystemClock
 from lake.config import GuardConstants
+from lake.manifest import LedgerNotUtf8, manifest_path, read_manifest
 from lake.tickers import Roster
+from lake.timing import timing_path
 from lake.vendor import VendorError, VendorResponse
 from tests.support.clock import ManualClock
 
@@ -513,12 +519,12 @@ def test_a_quote_request_answered_with_an_error_status_gaps_every_quoted_ticker(
         ]
 
 
-# -- 6. write order ----------------------------------------------------------------------
+# -- 6. result order ---------------------------------------------------------------------
 
 
-def test_segments_are_written_in_roster_order_chains_before_quotes(lake_root):
-    # QQQ's windows answer first, and the order the segments are written in is still the
-    # sequential cycle's.
+def test_segments_are_listed_in_roster_order_chains_before_quotes(lake_root):
+    # QQQ's windows answer first, and the order the result lists the segments in is still
+    # the sequential cycle's.
     vendor = _ThreadedVendor(delay={("SPY", _d(0)): 0.2, ("SPY", _d(10)): 0.2})
     result = _run(vendor, lake_root)
 
@@ -527,4 +533,146 @@ def test_segments_are_written_in_roster_order_chains_before_quotes(lake_root):
         (CHAINS, "QQQ"),
         (QUOTES, "SPY"),
         (QUOTES, "QQQ"),
+    ]
+
+
+# -- 7. each unit lands as soon as its own requests are done -----------------------------
+
+
+class _HeldVendor(_ThreadedVendor):
+    """A vendor whose SPY first window waits on ``release`` before it answers."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.release = threading.Event()
+
+    def get_chain(self, symbol, *, from_date=None, to_date=None, strike_count=None):
+        if (symbol, from_date) == ("SPY", _d(0)):
+            assert self.release.wait(10), "the test never released SPY's first window"
+        return super().get_chain(symbol, from_date=from_date, to_date=to_date)
+
+
+def _segments(lake_root: Path, surface: str, ticker: str) -> list[Path]:
+    return sorted(lake_root.glob(f"journal/date=*/surface={surface}/ticker={ticker}/*.arrows"))
+
+
+def _durable(path: Path) -> bool:
+    """Whether a segment reads back its one batch, which the writer makes durable at close.
+
+    The cycle writes one batch per segment, so any complete batch is the whole of it.
+    """
+    try:
+        return journal.read_segment(path).num_rows > 0
+    except Exception:  # noqa: BLE001 - a segment still being written reads as not yet durable
+        return False
+
+
+def _wait_until(condition, *, seconds: float = 5.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.01)
+    return condition()
+
+
+def _landed(lake_root: Path) -> bool:
+    return all(
+        any(_durable(path) for path in _segments(lake_root, surface, ticker))
+        for surface, ticker in ((CHAINS, "QQQ"), (QUOTES, "SPY"), (QUOTES, "QQQ"))
+    )
+
+
+def _run_in_background(vendor, lake_root: Path, **kwargs):
+    outcome: dict[str, object] = {}
+
+    def target() -> None:
+        try:
+            outcome["result"] = _run(vendor, lake_root, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 - handed back to the test thread
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=target)
+    thread.start()
+    return thread, outcome
+
+
+def test_a_held_window_holds_back_its_own_chain_and_nothing_else(lake_root):
+    # SPY's first window waits on an event. While it waits, QQQ's chain and both quote
+    # segments are already durable, SPY's chain has no segment yet, and the manifest holds
+    # nothing, because every entry waits for the cycle's end. Once the event is set, SPY's
+    # chain lands and every entry is appended, in the order the old cycle listed them.
+    vendor = _HeldVendor()
+    thread, outcome = _run_in_background(vendor, lake_root)
+    try:
+        assert _wait_until(lambda: _landed(lake_root))
+        assert _segments(lake_root, CHAINS, "SPY") == []
+        assert read_manifest(lake_root) == []
+    finally:
+        vendor.release.set()
+        thread.join(10)
+
+    result = outcome["result"]
+    order = [(CHAINS, "SPY"), (CHAINS, "QQQ"), (QUOTES, "SPY"), (QUOTES, "QQQ")]
+    assert result.errors == ()
+    assert [(s.surface, s.ticker) for s in result.segments] == order
+    assert [entry["partition"] for entry in read_manifest(lake_root)] == list(result.partitions)
+    assert all(_durable(seg.path) for seg in result.segments)
+
+
+def test_a_refused_manifest_raises_only_after_every_unit_has_landed(lake_root):
+    # The manifest refuses every read, so the cycle's append raises. SPY's chain is the last
+    # unit to finish, and it is durable before the append raises, as are the units that
+    # landed while it was still in flight.
+    ledger = manifest_path(lake_root)
+    ledger.write_bytes(b'{"partition": "\xff"}\n')
+    vendor = _ThreadedVendor(delay={("SPY", _d(0)): 0.3})
+
+    with pytest.raises(LedgerNotUtf8):
+        _run(vendor, lake_root)
+
+    for surface, ticker in ((CHAINS, "SPY"), (CHAINS, "QQQ"), (QUOTES, "SPY"), (QUOTES, "QQQ")):
+        assert [_durable(path) for path in _segments(lake_root, surface, ticker)] == [True]
+
+
+def test_a_unit_whose_write_raises_costs_its_own_segment_and_the_others_land(
+    lake_root, monkeypatch
+):
+    # QQQ's chain and SPY's quote segment cannot be opened. Each is recorded as its own
+    # error, in plan order although QQQ's chain finishes first, and the other two land with
+    # manifest entries.
+    real = journal.SegmentWriter.open
+
+    def refuse(root, surface, ticker, *args, **kwargs):
+        if (surface, ticker) in ((CHAINS, "QQQ"), (QUOTES, "SPY")):
+            raise PermissionError("the disk refused this segment")
+        return real(root, surface, ticker, *args, **kwargs)
+
+    monkeypatch.setattr(journal.SegmentWriter, "open", refuse)
+    vendor = _ThreadedVendor(delay={("SPY", _d(0)): 0.2})
+    result = _run(vendor, lake_root)
+
+    assert result.errors == (
+        capture.SegmentError(CHAINS, "QQQ", "permission_error"),
+        capture.SegmentError(QUOTES, "SPY", "permission_error"),
+    )
+    assert [(s.surface, s.ticker) for s in result.segments] == [(CHAINS, "SPY"), (QUOTES, "QQQ")]
+    assert [entry["partition"] for entry in read_manifest(lake_root)] == list(result.partitions)
+
+
+def test_the_timing_lines_keep_plan_order_whatever_order_the_units_finished(lake_root):
+    # SPY's chain finishes last, after QQQ's and after the quotes, and its three window
+    # lines still come first, in plan order, then QQQ's, then the one quote line.
+    vendor = _ThreadedVendor(delay={("SPY", _d(0)): 0.2, ("SPY", _d(10)): 0.2})
+    _run(vendor, lake_root)
+
+    lines = [json.loads(line) for line in timing_path(lake_root, SESSION).read_text().splitlines()]
+    assert [(line["surface"], line["ticker"], line["window_start"]) for line in lines] == [
+        (CHAINS, "SPY", _d(0).isoformat()),
+        (CHAINS, "SPY", _d(10).isoformat()),
+        (CHAINS, "SPY", _d(31).isoformat()),
+        (CHAINS, "QQQ", _d(0).isoformat()),
+        (CHAINS, "QQQ", _d(10).isoformat()),
+        (CHAINS, "QQQ", _d(31).isoformat()),
+        (QUOTES, None, None),
     ]

@@ -61,7 +61,7 @@ import os
 import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -415,8 +415,10 @@ def _prior_expirations(lake_root: Path | str, ticker: str, at: datetime) -> list
     """The prior durable batch's expirations, or ``None`` when that read raised. Never raises.
 
     Marketlake #548. This read runs only when a window has failed, which is when the vendor
-    is already failing, and it runs before any segment of the cycle is written. A raise from
-    it used to leave the cycle, write nothing for any surface, and end the daemon, since
+    is already failing, and it runs before the cycle's manifest append. Since marketlake #563
+    other units of the same cycle may already be durable when it runs, but the read finds
+    segments through the manifest, so it never sees one from its own cycle. A raise from it
+    used to leave the cycle, write nothing for any surface, and end the daemon, since
     ``run_loop`` calls the cycle with no guard. What it raises is not a short list: a manifest
     that refuses, a manifest line that is not an object, and a damaged segment's
     ``ArrowNotImplementedError`` or ``SystemError`` all reach here. So every ``Exception`` is
@@ -652,7 +654,7 @@ class CycleResult:
 
     @property
     def partitions(self) -> tuple[str, ...]:
-        """Every segment's manifest key, in write order."""
+        """Every segment's manifest key, in plan order: chains in roster order, then quotes."""
         return tuple(seg.partition for seg in self.segments)
 
     def segment(self, surface: str, ticker: str) -> SegmentOutcome:
@@ -1023,6 +1025,9 @@ def _fetch_concurrently(
     tickers: Sequence[str],
     windows: tuple[tuple[date, date | None], ...],
     symbols: Sequence[str],
+    *,
+    on_chain: Callable[[str, list[_WindowOutcome], datetime, datetime], None] | None = None,
+    on_quotes: Callable[[_QuoteFetch], None] | None = None,
 ) -> _Fetched:
     """Fire every chain window and the quote request through one bounded pool.
 
@@ -1052,6 +1057,15 @@ def _fetch_concurrently(
        it is when the unit's last response landed, whatever else was still being submitted.
        Reading the clock from a pool thread is safe, since ``now`` changes nothing, and no
        pool thread ever sleeps on it or advances it.
+    4. **A unit is handed over as soon as its own tasks are done** (marketlake #563). A unit
+       is one ticker's chain, every window of it, or the one quote request. Once the whole
+       volley is submitted, this thread waits for the first task to finish among those still
+       pending, and when that task was a unit's last it calls ``on_chain`` or ``on_quotes``
+       with the unit's result at once, while the rest are still in flight. So a caller that
+       writes in those callbacks lands a fast unit without waiting on the slowest, and it
+       writes on this thread, never on a pool thread. Collection starts only after the last
+       submission, so a write can never stretch the stagger. The price is that a unit that
+       finishes inside the volley is handed over at most one volley's staggers late.
 
     Below the cap some tasks wait in the pool's queue, so a unit's ``fetch_ts`` is when its
     first request was submitted, which can precede when it was sent. At the default cap of 20
@@ -1068,8 +1082,10 @@ def _fetch_concurrently(
     stagger = guards.capture_stagger_ms / 1000
     started: dict[object, datetime] = {}
     chain_futures: dict[str, list[Future]] = {ticker: [] for ticker in tickers}
-    quote_future: Future | None = None
     submitted: list[Future] = []
+    unit_of: dict[Future, object] = {}
+    chains: dict[str, tuple[list[_WindowOutcome], datetime, datetime]] = {}
+    quotes: _QuoteFetch | None = None
     with ThreadPoolExecutor(
         max_workers=min(guards.capture_max_concurrency, tasks),
         thread_name_prefix="capture-fetch",
@@ -1081,36 +1097,48 @@ def _fetch_concurrently(
             started.setdefault(unit, clock.now())
             future = pool.submit(_timed, clock, fn, *args)
             submitted.append(future)
+            unit_of[future] = unit
             return future
 
         if symbols:
-            quote_future = submit(_QUOTES_UNIT, vendor.get_quotes, tuple(symbols))
+            submit(_QUOTES_UNIT, vendor.get_quotes, tuple(symbols))
         for from_date, to_date in windows:
             for ticker in tickers:
                 chain_futures[ticker].append(
                     submit(ticker, _run_window, clock, vendor, guards, ticker, from_date, to_date)
                 )
-        wait(submitted)
 
-    chains = {}
-    for ticker in tickers:
-        results = [_task_result(future) for future in chain_futures[ticker]]
-        chains[ticker] = (
-            [_window_outcome(r, w) for r, w in zip(results, windows, strict=True)],
-            started[ticker],
-            max(r.finished_at for r in results),
-        )
-    quotes = None
-    if quote_future is not None:
-        result = _task_result(quote_future)
-        quotes = _QuoteFetch(
-            result.value,
-            result.error,
-            started[_QUOTES_UNIT],
-            result.finished_at,
-            result.started_at,
-        )
-    return _Fetched(chains, quotes)
+        left = {ticker: len(windows) for ticker in tickers}
+        pending = set(submitted)
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                unit = unit_of[future]
+                if unit is _QUOTES_UNIT:
+                    result = _task_result(future)
+                    quotes = _QuoteFetch(
+                        result.value,
+                        result.error,
+                        started[_QUOTES_UNIT],
+                        result.finished_at,
+                        result.started_at,
+                    )
+                    if on_quotes is not None:
+                        on_quotes(quotes)
+                    continue
+                left[unit] -= 1
+                if left[unit]:
+                    continue
+                results = [_task_result(f) for f in chain_futures[unit]]
+                chains[unit] = (
+                    [_window_outcome(r, w) for r, w in zip(results, windows, strict=True)],
+                    started[unit],
+                    max(r.finished_at for r in results),
+                )
+                if on_chain is not None:
+                    on_chain(unit, *chains[unit])
+
+    return _Fetched({ticker: chains[ticker] for ticker in tickers}, quotes)
 
 
 @dataclass(frozen=True)
@@ -1619,43 +1647,73 @@ class _CaptureCycle:
     # -- the cycle -----------------------------------------------------------
 
     def run(self) -> CycleResult:
-        plans: list[tuple[str, str, _Plan]] = []
         # Chains: one per options ticker, each planned on its own for skip-not-block.
         # Quotes: one shared batched request, then a segment per roster ticker. How they
         # are fetched follows the concurrency cap (marketlake #532). At a cap of 1 the
         # chains are fetched one at a time in roster order and the quotes after them,
-        # exactly the cycle that ran before #532. Above it every request goes through one
-        # bounded pool at once, and ``_fetch_concurrently`` carries the rules. Either way
-        # the segments are planned and written here in the same order, chains in roster
-        # order and then quotes, and only this thread writes.
+        # exactly the cycle that ran before #532, and every segment is written once all
+        # of them are planned. Above it every request goes through one bounded pool at
+        # once, and each unit, a chain or the quote batch, is planned and written as soon
+        # as its own requests are done (marketlake #563), so the slowest chain holds back
+        # nothing but itself. ``_fetch_concurrently`` carries the rules. Either way only
+        # this thread plans and writes.
+        #
+        # Every written segment is durable before the manifest is touched. A write failure
+        # after planning is recorded and the cycle keeps going, never crashing. Each landed
+        # segment is filed under its place in plan order, chains in roster order and then
+        # quotes, so the manifest, the result, and the timing file keep that order whatever
+        # order the units finished in.
         option_tickers = [entry.ticker for entry in self.roster if entry.options]
+        landed: list[tuple[int, SegmentOutcome | SegmentError]] = []
+
+        def land(rank: int, surface: str, ticker: str, plan: _Plan) -> None:
+            try:
+                landed.append((rank, self._write(surface, ticker, plan)))
+            except Exception as exc:
+                landed.append((rank, SegmentError(surface, ticker, _error_class(exc))))
+
         if self.guards.capture_max_concurrency == 1:
-            for ticker in option_tickers:
-                plans.append((CHAINS, ticker, self._plan_chain(ticker)))
-            quote_plans = self._plan_quotes()
+            plans = [(CHAINS, ticker, self._plan_chain(ticker)) for ticker in option_tickers]
+            plans.extend((QUOTES, ticker, plan) for ticker, plan in self._plan_quotes())
+            for rank, (surface, ticker, plan) in enumerate(plans):
+                land(rank, surface, ticker, plan)
         else:
             windows = tuple(self.plan.windows_for(self.day))
-            fetched = _fetch_concurrently(
-                self.clock, self.vendor, self.guards, option_tickers, windows, self.roster.symbols
-            )
-            for ticker in option_tickers:
-                chain = _assemble_chain(ticker, windows, *fetched.chains[ticker], self.lake_root)
-                plans.append((CHAINS, ticker, self._plan_fetched_chain(ticker, chain)))
-            quote_plans = (
-                self._plan_quote_fetch(fetched.quotes) if fetched.quotes is not None else []
-            )
-        for ticker, plan in quote_plans:
-            plans.append((QUOTES, ticker, plan))
+            rank_of = {ticker: rank for rank, ticker in enumerate(option_tickers)}
 
-        # Write every segment durably before touching the manifest. A write failure
-        # after planning is recorded and the cycle keeps going, never crashing.
-        outcomes: list[SegmentOutcome] = []
-        errors: list[SegmentError] = []
-        for surface, ticker, plan in plans:
-            try:
-                outcomes.append(self._write(surface, ticker, plan))
-            except Exception as exc:
-                errors.append(SegmentError(surface, ticker, _error_class(exc)))
+            def land_chain(
+                ticker: str,
+                outcomes: list[_WindowOutcome],
+                fetch_ts: datetime,
+                fetch_end_ts: datetime,
+            ) -> None:
+                chain = _assemble_chain(
+                    ticker, windows, outcomes, fetch_ts, fetch_end_ts, self.lake_root
+                )
+                land(rank_of[ticker], CHAINS, ticker, self._plan_fetched_chain(ticker, chain))
+
+            def land_quotes(fetched: _QuoteFetch) -> None:
+                for offset, (ticker, plan) in enumerate(self._plan_quote_fetch(fetched)):
+                    land(len(option_tickers) + offset, QUOTES, ticker, plan)
+
+            _fetch_concurrently(
+                self.clock,
+                self.vendor,
+                self.guards,
+                option_tickers,
+                windows,
+                self.roster.symbols,
+                on_chain=land_chain,
+                on_quotes=land_quotes,
+            )
+            # The request records were collected as each unit was planned. A stable sort
+            # puts them back in plan order and keeps each unit's own calls in call order.
+            self.requests.sort(
+                key=lambda record: (record.surface != CHAINS, rank_of.get(record.ticker, 0))
+            )
+        landed.sort(key=lambda item: item[0])
+        outcomes = [item for _, item in landed if isinstance(item, SegmentOutcome)]
+        errors = [item for _, item in landed if isinstance(item, SegmentError)]
 
         # Now the segments are durable, append one manifest entry per segment, keyed by
         # the segment path, under the lake-root lock. This is the slice-1 segment-keyed
