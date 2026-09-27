@@ -7,6 +7,8 @@ over, so the rules are driven here directly.
 
 from __future__ import annotations
 
+from datetime import UTC
+
 from lake import daemon
 from tests.support.calendar import et
 
@@ -65,10 +67,14 @@ def test_a_set_standing_into_the_next_session_prints_again_once(capsys):
 
 
 def test_the_session_date_is_the_market_date_not_the_utc_one(capsys):
-    """20:30 ET on 09-02 is 00:30 UTC on 09-03, and it is still the same session date."""
+    """20:30 ET on 09-02 is 00:30 UTC on 09-03, and it is still the same session date.
+
+    The slots go in as UTC, the way a clock may hand them over, so a date read without
+    converting to the market's zone lands on 09-03 and prints a second line.
+    """
     line = daemon._OutOfSpanLine()
-    line.observe(et(2026, 9, 2, 16, 0), ("XYZ",))
-    line.observe(et(2026, 9, 2, 20, 30), ("XYZ",))
+    line.observe(et(2026, 9, 2, 16, 0).astimezone(UTC), ("XYZ",))
+    line.observe(et(2026, 9, 2, 20, 30).astimezone(UTC), ("XYZ",))
     assert len(_lines(capsys)) == 1
 
 
