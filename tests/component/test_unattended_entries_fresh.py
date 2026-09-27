@@ -6,8 +6,9 @@ starts from an empty interpreter. Under ``-m`` the entry runs as ``__main__`` ra
 as ``lake.daemon``, so a helper that imports ``lake.daemon`` back loads a second copy of it
 partway through the cycle, and that copy fails on a name the helper has not defined yet.
 The suite only sees that failure if some test imports the helper before the entry. A
-helper extracted from the daemon and reached only through it passes every in-process test
-and stops capture: under ``KeepAlive`` the daemon exits 1 on every relaunch.
+helper extracted from the daemon and reached only through it passes the full suite, the
+in-process entry test included, and stops capture: under ``KeepAlive`` the daemon exits 1
+on every relaunch.
 
 So each job here runs as a real child, the way launchd runs it: the job's own argv,
 environment and working directory. The working directory matters under ``-m``, because

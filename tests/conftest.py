@@ -54,12 +54,13 @@ from tests.support.config_defaults import modules_building_a_default
 # is how ``_child`` in ``tests/component/test_config_dir_override.py`` asks what a
 # process with no override resolves, and how the four render tests sandbox a rendered
 # script. And the rendered ``reauth.sh`` unsets the variable before it calls the tool, so
-# anything it runs is outside this by design. One explicit-``env=`` child does reach real
-# code at a default path: ``tests/component/test_unattended_entries_fresh.py`` starts each
-# launchd entry with its job's own environment, which carries no config-directory
-# variable, so ``main`` resolves its default config under ``HOME``. That test arranges its
-# own redirect by pointing ``HOME`` at a throwaway directory. Any other child that
-# reaches a default path has to do the same.
+# anything it runs is outside this by design. One test's explicit-``env=`` children do
+# reach real code at a default path: ``tests/component/test_unattended_entries_fresh.py``
+# starts each launchd entry with its job's own environment, which carries no
+# config-directory variable, so ``DEFAULT_CONFIG_PATH`` is bound under ``HOME`` when the
+# child imports ``lake.config``. That test arranges its own redirect by pointing ``HOME``
+# at a throwaway directory. Any other child that reaches a default path has to do the
+# same.
 #
 # The export sits above the rest of this file's imports because every default in the
 # package is built from ``config_dir`` when its module is imported. Exporting the
