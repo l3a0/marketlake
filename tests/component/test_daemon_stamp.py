@@ -41,7 +41,7 @@ class Broken:
         raise OSError("no network")
 
 
-def _no_cycle(*, close_tag: str | None, session_phase: str | None) -> CycleResult:
+def _no_cycle(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:
     """A cycle runner for minutes the loop must never capture in."""
     raise AssertionError("no cycle should run in these minutes")
 
@@ -193,7 +193,9 @@ def test_a_capture_minute_is_left_to_the_cycle_s_own_stamp(tmp_path):
         counted[0] += 1
         return counted[0] <= 1
 
-    def record_cycle(*, close_tag: str | None, session_phase: str | None) -> CycleResult:
+    def record_cycle(
+        *, slot: datetime, close_tag: str | None, session_phase: str | None
+    ) -> CycleResult:
         slot = et(2026, 8, 31, 12, 1)
         ran.append(slot)
         return CycleResult(slot, ())
@@ -279,7 +281,9 @@ def test_a_capture_minute_stamps_the_pid_too(tmp_path):
         counted[0] += 1
         return counted[0] <= 1
 
-    def record_cycle(*, close_tag: str | None, session_phase: str | None) -> CycleResult:
+    def record_cycle(
+        *, slot: datetime, close_tag: str | None, session_phase: str | None
+    ) -> CycleResult:
         return CycleResult(et(2026, 8, 31, 12, 1), ())
 
     daemon.run_loop_from_config(

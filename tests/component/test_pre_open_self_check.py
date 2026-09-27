@@ -65,7 +65,7 @@ def _run_daemon(tmp_path: Path, start: datetime, pid: int) -> Path:
         counted[0] += 1
         return counted[0] <= 1
 
-    def no_cycle(*, close_tag, session_phase) -> CycleResult:
+    def no_cycle(*, slot, close_tag, session_phase) -> CycleResult:
         raise AssertionError("no cycle here")
 
     daemon.run_loop_from_config(

@@ -97,10 +97,13 @@ def calendar() -> FakeCalendar:
 class _RecordingRunner:
     """A fake cycle runner.
 
-    It records each call as ``(slot, close_tag, session_phase)``, with the slot read off
-    the clock the way the real cycle floors it, and returns a canned empty result. An
-    optional ``duration`` maps a slot to the seconds the cycle takes. The runner advances
-    the clock by that much across the call, modelling a cycle that takes real time.
+    It records each call as ``(slot, close_tag, session_phase)``, with the slot the loop
+    handed it, and returns a canned empty result whose ``snap_ts`` is that slot in UTC, the
+    way the real cycle files it. Beside each call it records ``floors``, its own clock
+    read floored to the minute, which is the minute a cycle reading the clock for itself
+    would have filed under. An optional ``duration`` maps a slot to the seconds the cycle
+    takes. The runner advances the clock by that much across the call, modelling a cycle
+    that takes real time.
     """
 
     def __init__(
@@ -109,13 +112,16 @@ class _RecordingRunner:
         self._clock = clock
         self._duration = duration if duration is not None else _instant
         self.calls: list[tuple[datetime, str | None, str | None]] = []
+        self.floors: list[datetime] = []
         self.results: list[CycleResult] = []
 
-    def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult:
-        snap = self._clock.now().replace(second=0, microsecond=0).astimezone(ET)
-        self._clock.advance(self._duration(snap))
-        result = CycleResult(snap_ts=snap.astimezone(UTC), segments=())
-        self.calls.append((snap, close_tag, session_phase))
+    def __call__(
+        self, *, slot: datetime, close_tag: str | None, session_phase: str | None
+    ) -> CycleResult:
+        self.floors.append(self._clock.now().replace(second=0, microsecond=0).astimezone(ET))
+        self._clock.advance(self._duration(slot))
+        result = CycleResult(snap_ts=slot.astimezone(UTC), segments=())
+        self.calls.append((slot, close_tag, session_phase))
         self.results.append(result)
         return result
 
@@ -259,8 +265,130 @@ def test_a_slow_cycle_skips_the_overrun_minute_and_realigns(calendar):
         (datetime(2026, 8, 24, 13, 30, 59, 999999, tzinfo=UTC), 0.000001),
     ],
 )
-def test_seconds_to_next_minute(now: datetime, expected: float):
-    assert daemon.seconds_to_next_minute(now) == pytest.approx(expected)
+def test_next_minute_top(now: datetime, expected: float):
+    top = daemon.next_minute_top(now)
+    assert top == datetime(2026, 8, 24, 13, 31, tzinfo=UTC)
+    assert (top - now).total_seconds() == pytest.approx(expected)
+
+
+class _ShortWakeClock(ManualClock):
+    """A manual clock whose one sleep across ``short_of`` wakes 5 ms before it.
+
+    ``SystemClock.sleep`` counts elapsed time on the monotonic timer while ``now`` reads
+    the wall clock, and on 2026-09-11 two sleeps ended just before their minute top
+    (marketlake #572). This models one such sleep. Every other sleep lands where asked.
+    """
+
+    def __init__(self, start: datetime, short_of: datetime | None) -> None:
+        super().__init__(start)
+        self._short_of = short_of
+
+    def sleep(self, seconds: float) -> None:
+        now = self.now()
+        end = now + timedelta(seconds=seconds)
+        if self._short_of is not None and now < self._short_of <= end:
+            end = self._short_of - timedelta(milliseconds=5)
+            self._short_of = None
+        self.advance((end - now).total_seconds())
+
+
+def _early_wake_run(
+    calendar: FakeCalendar, start: datetime, end: datetime, short_of: datetime | None
+) -> tuple[_RecordingRunner, list[list[datetime]]]:
+    """Run the loop with the real close tags, hooks that take 30 ms, and one early wake.
+
+    Returns the runner and every report handed to ``on_skipped``. ``short_of=None`` is the
+    same run with no early wake. The 30 ms stands for the hooks' real cost, which is what
+    carried the 2026-09-11 cycles' own clock reads past the top the loop read short of.
+    """
+    clock = _ShortWakeClock(start.astimezone(UTC), short_of)
+    session_clock = SessionClock(clock, calendar)
+    runner = _RecordingRunner(clock)
+    skipped: list[list[datetime]] = []
+    hooks = daemon.DaemonHooks(
+        on_tick=lambda slot: clock.advance(0.030),
+        close_tag_for=session_clock.close_tag_at,
+        on_skipped=lambda slots: skipped.append(list(slots)),
+    )
+    end_utc = end.astimezone(UTC)
+    daemon.run_loop(
+        session_clock,
+        runner,
+        clock=clock,
+        hooks=hooks,
+        should_continue=lambda: clock.now() < end_utc,
+    )
+    return runner, skipped
+
+
+@pytest.mark.parametrize(
+    "hour,minute",
+    [(9, 30), (16, 0), (16, 1), (16, 15), (16, 16)],
+    ids=["open", "equity-close", "after-equity-close", "option-close", "after-option-close"],
+)
+def test_a_wake_just_short_of_a_boundary_top_changes_no_cycle(calendar, hour, minute):
+    # Before the fix, each boundary lost something different: the open minute outright,
+    # a close tag, or a close tag moved onto the minute after. So every one is compared
+    # with the same run left undisturbed rather than with a hand-written list.
+    boundary = et(REGULAR, hour, minute)
+    start = boundary - timedelta(minutes=2, seconds=30)
+    end = boundary + timedelta(minutes=3)
+
+    clean, clean_skips = _early_wake_run(calendar, start, end, None)
+    early, early_skips = _early_wake_run(calendar, start, end, boundary)
+
+    assert clean.calls, "the window around the boundary ran no cycle"
+    assert early.calls == clean.calls
+    assert early_skips == clean_skips == []
+    # Each cycle's own clock read agrees with the slot it was handed.
+    assert early.floors == early.slots
+
+
+@pytest.mark.parametrize(
+    "hour,minute,tag,phase",
+    [(16, 0, "spot_close", None), (16, 15, "option_close", POST_EQUITY_CLOSE)],
+)
+def test_a_wake_just_short_of_a_close_keeps_the_close_tag_on_its_minute(
+    calendar, hour, minute, tag, phase
+):
+    close = et(REGULAR, hour, minute)
+    runner, skipped = _early_wake_run(
+        calendar, close - timedelta(minutes=2, seconds=30), close + timedelta(minutes=2), close
+    )
+
+    assert [call for call in runner.calls if call[1] == tag] == [(close, tag, phase)]
+    assert skipped == []
+
+
+def test_hooks_that_run_past_the_next_top_still_hand_the_cycle_its_own_slot(calendar):
+    # The 16:00 tick's hooks take 61 seconds. The cycle still runs for 16:00 with its
+    # close tag, although a clock read of its own would land in 16:01. The minute the
+    # hooks ran through had no cycle, and it is the one reported skipped.
+    clock = ManualClock(start=et(REGULAR, 15, 58, 30).astimezone(UTC))
+    session_clock = SessionClock(clock, calendar)
+    runner = _RecordingRunner(clock)
+    skipped: list[list[datetime]] = []
+
+    def slow_close_tick(slot: datetime) -> None:
+        if slot == et(REGULAR, 16, 0):
+            clock.advance(61)
+
+    hooks = daemon.DaemonHooks(
+        on_tick=slow_close_tick,
+        close_tag_for=session_clock.close_tag_at,
+        on_skipped=lambda slots: skipped.append(list(slots)),
+    )
+    end = et(REGULAR, 16, 3).astimezone(UTC)
+    daemon.run_loop(
+        session_clock, runner, clock=clock, hooks=hooks, should_continue=lambda: clock.now() < end
+    )
+
+    assert runner.calls[:2] == [
+        (et(REGULAR, 15, 59), None, None),
+        (et(REGULAR, 16, 0), "spot_close", None),
+    ]
+    assert runner.floors[1] == et(REGULAR, 16, 1)
+    assert skipped == [[et(REGULAR, 16, 1)]]
 
 
 # -- 3. the hooks -----------------------------------------------------------------

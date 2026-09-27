@@ -10,14 +10,15 @@ own. Outside the capture window it idles and keeps ticking.
 Each minute the loop does three things, in order.
 
 1. **Align to the minute top.** It sleeps through the injected clock until the next
-   whole minute. The wait is computed from the clock's own ``now``, never from the wall
-   clock, so a test with a manual clock steps the loop deterministically and a sleep
-   costs no real time.
+   whole minute, and sleeps again if it wakes short of it. The wait is computed from the
+   clock's own ``now``, never from the wall clock, so a test with a manual clock steps the
+   loop deterministically and a sleep costs no real time.
 2. **Consult the session clock.** ``SessionClock.phase`` says where the current minute
    sits in the session. The capture window is the open through the option close. Off it
    the loop idles.
-3. **Run one cycle** through the injected cycle runner, stamped with the two provenance
-   tags the loop owns, then hand the result to the observer hook.
+3. **Run one cycle** through the injected cycle runner, for the minute the loop read and
+   stamped with the two provenance tags the loop owns, then hand the result to the
+   observer hook.
 
 Five hooks let the loop-coupled deliverables plug in without touching the loop. Each
 has a no-op default, so the loop ships standalone.
@@ -154,13 +155,18 @@ CompactionRunner = Callable[[Sequence[str]], object]
 
 
 class CycleRunner(Protocol):
-    """Runs one capture cycle, stamped with the loop's two provenance tags.
+    """Runs one capture cycle for the loop's slot, stamped with its two provenance tags.
 
-    Both tags are passed by keyword. In production this is a closure over
-    ``run_cycle_from_config``. A test injects a fake that records the call.
+    All three are passed by keyword. ``slot`` is the minute the loop decided, and the
+    cycle files every row under it rather than reading the clock for a minute of its own.
+    Two reads can straddle a minute top, and then the rows land under one minute while
+    the tags were chosen for another (marketlake #572). In production this is a closure
+    over ``run_cycle_from_config``. A test injects a fake that records the call.
     """
 
-    def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult: ...
+    def __call__(
+        self, *, slot: datetime, close_tag: str | None, session_phase: str | None
+    ) -> CycleResult: ...
 
 
 # -- the five hooks ----------------------------------------------------------
@@ -207,16 +213,34 @@ class DaemonHooks:
 # -- the loop ------------------------------------------------------------------
 
 
-def seconds_to_next_minute(now: datetime) -> float:
-    """Seconds from ``now`` to the next minute top. Always positive.
+def next_minute_top(now: datetime) -> datetime:
+    """The next minute top after ``now``. Always later than ``now``.
 
     Flooring ``now`` to the minute and adding one minute gives the next top. An instant
     already on a top waits a full minute, so the loop never fires twice for one slot.
     Zeroing the seconds and microseconds is flooring, the one time-of-day construction
     the calendar-seam scanner allows outside the calendar module.
     """
-    top = now.replace(second=0, microsecond=0) + TICK
-    return (top - now).total_seconds()
+    return now.replace(second=0, microsecond=0) + TICK
+
+
+def _sleep_until(clock: Clock, top: datetime) -> None:
+    """Sleep through ``clock`` until it reads ``top`` or later. Never return short of it.
+
+    ``SystemClock.sleep`` counts elapsed time on the monotonic timer, while ``now`` reads
+    the wall clock, so a sleep computed from the wall clock can end a few milliseconds
+    short of its top. It did twice on 2026-09-11. A loop that read its slot there took the
+    minute it had already served, and at a session boundary that loses the open minute or
+    moves a close tag onto the wrong minute (marketlake #572). So a clock still short of
+    the top sleeps the remainder. A sleep that overshoots returns as it is.
+
+    The remainder has no bound. A wall clock stepped backward makes the loop wait until it
+    reaches the top again, rather than run a cycle for a minute it already captured.
+    """
+    now = clock.now()
+    while now < top:
+        clock.sleep((top - now).total_seconds())
+        now = clock.now()
 
 
 def _forever() -> bool:
@@ -237,7 +261,7 @@ def run_loop(
     ``on_start`` fires once, before the first tick. Then each iteration:
 
     1. Sleep through ``clock.sleep`` until the next minute top, computed from
-       ``clock.now``.
+       ``clock.now``, and sleep again while the clock still reads short of it.
     2. Read ``session_clock.phase()`` and the snap slot, then hand the slot to
        ``on_tick``. That fires every minute, session or not, because the power
        assertion the control plane holds is owed on holidays too.
@@ -246,8 +270,9 @@ def run_loop(
        loop's only state across ticks.
     4. Off the capture window, idle: nothing else runs this tick.
     5. On a capture slot, ask ``close_tag_for`` for the minute's tag, derive
-       ``session_phase`` from the phase, run one cycle with both, and hand the result to
-       ``on_cycle``.
+       ``session_phase`` from the phase, run one cycle for the slot with both, and hand
+       the result to ``on_cycle``. The cycle files under this slot rather than a minute
+       of its own, so a hook that runs past the next top cannot move its rows.
 
     ``should_continue`` is checked at the top of each iteration. It defaults to forever.
     A test binds it to a manual clock to bound a simulated session.
@@ -263,7 +288,7 @@ def run_loop(
     last_slot: datetime | None = session_clock.snap_slot()
     hooks.on_start()
     while should_continue():
-        clock.sleep(seconds_to_next_minute(clock.now()))
+        _sleep_until(clock, next_minute_top(clock.now()))
         phase = session_clock.phase()
         slot = session_clock.snap_slot()
         hooks.on_tick(slot)
@@ -275,7 +300,7 @@ def run_loop(
             continue
         close_tag = hooks.close_tag_for(slot)
         session_phase = phase.value if phase is SessionPhase.POST_EQUITY_CLOSE else None
-        result = cycle_runner(close_tag=close_tag, session_phase=session_phase)
+        result = cycle_runner(slot=slot, close_tag=close_tag, session_phase=session_phase)
         hooks.on_cycle(slot, result)
 
 
@@ -1413,12 +1438,15 @@ def run_loop_from_config(
 
     hooks = replace(hooks, on_cycle=on_cycle, on_skipped=on_skipped, on_tick=on_tick)
 
-    def run_a_cycle(*, close_tag: str | None, session_phase: str | None) -> CycleResult:
+    def run_a_cycle(
+        *, slot: datetime, close_tag: str | None, session_phase: str | None
+    ) -> CycleResult:
         return run_cycle_from_config(
             clock=clock,
             config_path=config_path,
             tickers_path=tickers_path,
             token_path=token_path,
+            slot=slot,
             close_tag=close_tag,
             session_phase=session_phase,
         )
@@ -1481,7 +1509,7 @@ __all__ = [
     "main",
     "run_loop",
     "run_loop_from_config",
-    "seconds_to_next_minute",
+    "next_minute_top",
     "skipped_slots",
 ]
 
