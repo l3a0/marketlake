@@ -60,11 +60,12 @@ def stderr_label(module: str, args: list[str]) -> str:
     return module.removeprefix("lake.")
 
 
-# ``runpy`` warns that the module was already imported, which it always is here. Only
-# that warning is silenced, so one the entry raises itself still shows.
-@pytest.mark.filterwarnings("ignore:.*found in sys.modules after import:RuntimeWarning")
-@pytest.mark.parametrize("job", JOBS, ids=[job.label for job in JOBS])
-def test_the_entry_reaches_main_through_its_guard(job, monkeypatch, capsys):
+class EntryCrashed(Exception):
+    """A failure planted inside ``main``, standing in for any bug past the config load."""
+
+
+def run_entry(job, monkeypatch) -> None:
+    """Run one job's module as ``__main__`` with its own arguments, under a deadline."""
     python, flag, module, *args = job.program_arguments
     assert flag == "-m", f"{job.label} does not start a module: {job.program_arguments}"
 
@@ -81,16 +82,44 @@ def test_the_entry_reaches_main_through_its_guard(job, monkeypatch, capsys):
     previous = signal.signal(signal.SIGALRM, too_slow)
     signal.alarm(DEADLINE_SECONDS)
     try:
-        with pytest.raises(SystemExit) as exited:
-            runpy.run_module(module, run_name="__main__")
+        runpy.run_module(module, run_name="__main__")
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous)
+
+
+# ``runpy`` warns that the module was already imported, which it always is here. Only
+# that warning is silenced, so one the entry raises itself still shows.
+RUNPY_WARNING = "ignore:.*found in sys.modules after import:RuntimeWarning"
+
+
+@pytest.mark.filterwarnings(RUNPY_WARNING)
+@pytest.mark.parametrize("job", JOBS, ids=[job.label for job in JOBS])
+def test_the_entry_reaches_main_through_its_guard(job, monkeypatch, capsys):
+    with pytest.raises(SystemExit) as exited:
+        run_entry(job, monkeypatch)
 
     assert exited.value.code == 2
     # The whole line, path included. A guard that handed ``main`` a ``--config`` of its
     # own would exit 2 with the right label too, and under launchd it would refuse the
     # real config on every relaunch.
+    _, _, module, *args = job.program_arguments
     label = stderr_label(module, args)
     expected = f"{label}: config file not found: {config.DEFAULT_CONFIG_PATH}\n"
     assert capsys.readouterr().err == expected
+
+
+@pytest.mark.filterwarnings(RUNPY_WARNING)
+@pytest.mark.parametrize("job", JOBS, ids=[job.label for job in JOBS])
+def test_a_crash_in_main_escapes_the_guard(job, monkeypatch):
+    # The case above only ever sees ``SystemExit``, so a guard that swallowed every other
+    # exception would pass it. Under launchd that turns a crash into a silent exit 0, and
+    # the traceback the operator reads in the job's error log never gets written. Every
+    # entry calls ``load_config`` first, and the ``runpy`` copy looks it up afresh, so a
+    # failure planted there is a failure inside ``main``.
+    def crash(*args, **kwargs):
+        raise EntryCrashed(job.label)
+
+    monkeypatch.setattr(config, "load_config", crash)
+    with pytest.raises(EntryCrashed):
+        run_entry(job, monkeypatch)
