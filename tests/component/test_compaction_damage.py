@@ -36,7 +36,7 @@ These cover the check's contract:
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, time
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 
 import pyarrow as pa
@@ -282,6 +282,10 @@ def test_a_flipped_byte_refuses_the_ticker_day_and_keeps_every_segment(lake_root
     assert _rel(lake_root, damaged) in page.body
     # One finding, in its own tree and not in the drift tree.
     (finding,) = _findings(lake_root)
+    assert finding["day"] == DAY.isoformat()
+    assert finding["surface"] == journal.CHAINS_SURFACE
+    assert finding["ticker"] == "SPY"
+    assert finding["segments"] == [_rel(lake_root, path) for path in spy]
     assert finding["partition"] == spy_partition
     assert finding["damaged"] == [
         {
@@ -323,6 +327,102 @@ def test_every_damaged_segment_is_named_not_only_the_first(lake_root):
     ]
 
 
+def test_a_marker_sorting_before_the_damage_does_not_end_the_check(lake_root):
+    # A gap marker has no manifest entry and takes its name from the minute it covers, so
+    # in a real day it sorts among the capture segments rather than after them. The check
+    # has to step past it and go on hashing the segments behind it.
+    spy = _captured(lake_root, "SPY")
+    with journal.SegmentWriter.open(
+        lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "0", PID
+    ) as writer:
+        writer.write_cycle(
+            journal.gap_batch(
+                journal.CHAINS_SURFACE,
+                ticker="SPY",
+                snap_ts=_et(9, 30),
+                error_class="http_500",
+                close_tag=None,
+                session_phase=None,
+            )
+        )
+    _flip(spy[2], DROPS_THE_SEGMENT)
+
+    result, _ = _run(lake_root)
+
+    (refused,) = result.refused
+    assert [item.segment for item in refused.damaged] == [_rel(lake_root, spy[2])]
+    assert result.sealed == ()
+
+
+def test_a_segment_that_cannot_be_read_for_its_hash_stops_the_run(lake_root, monkeypatch):
+    # An access failure is not damage, and the seal's own read would swallow it as a torn
+    # tail and unlink the segment. So the hash read lets it out, the run stops before any
+    # write, and the missed ping pages. A rsync over the same file would fail as well.
+    spy = _captured(lake_root, "SPY")
+    real = compact_module.sha256_file
+    locked = spy[2]
+
+    def refuse(path):
+        if Path(path) == locked:
+            raise PermissionError(f"permission denied: {path}")
+        return real(path)
+
+    monkeypatch.setattr(compact_module, "sha256_file", refuse)
+
+    with pytest.raises(PermissionError):
+        _run(lake_root)
+
+    assert all(path.exists() for path in spy)
+    assert not _partition(lake_root, "SPY").exists()
+
+
+def test_a_day_swept_late_files_under_the_day_the_segments_belong_to(lake_root):
+    # A missed night leaves the day for the next run. The finding is about the ticker-day,
+    # so it lands under that day's directory and says that day, and its stamp is Eastern
+    # whatever zone the run's clock reports in, as the production clock reports UTC.
+    spy = _captured(lake_root, "SPY")
+    _flip(spy[2], DROPS_THE_SEGMENT)
+    late = datetime(2026, 8, 25, 20, 30, tzinfo=UTC)
+    calendar = FakeCalendar(
+        {
+            DAY: SessionTimes(open=_et(9, 30), close=_et(16, 0)),
+            date(2026, 8, 25): SessionTimes(
+                open=datetime(2026, 8, 25, 9, 30, tzinfo=MARKET_TZ),
+                close=datetime(2026, 8, 25, 16, 0, tzinfo=MARKET_TZ),
+            ),
+        }
+    )
+
+    result = compact(
+        lake_root,
+        clock=ManualClock(late),
+        calendar=calendar,
+        backup=FakeBackup([]),
+        backup_target=TARGET,
+        plan_path=lake_root.parent / "chain_plan.json",
+    )
+
+    assert len(result.refused) == 1
+    (finding,) = _findings(lake_root)
+    assert finding["day"] == DAY.isoformat()
+    assert finding["at"] == "2026-08-25T16:30:00-04:00"
+    assert not (lake_root / "reports" / "damaged_segments" / "date=2026-08-25").exists()
+
+
+def test_an_unsent_damage_page_names_itself_on_stderr(lake_root, capsys):
+    class Broken:
+        def send(self, message):
+            raise ConnectionError("ntfy unreachable")
+
+    spy = _captured(lake_root, "SPY")
+    _flip(spy[2], DROPS_THE_SEGMENT)
+    publisher = Publisher(lake_root=lake_root, transport=Broken(), secrets=(PING_KEY, NTFY_TOPIC))
+
+    _run(lake_root, publisher=publisher)
+
+    assert "compaction: damaged-segment page not sent: post_failed" in capsys.readouterr().err
+
+
 # -- 3. one refused list, with a reason --------------------------------------
 
 
@@ -347,9 +447,10 @@ def test_the_summary_words_damage_as_damage(lake_root):
 
     assert "refused=1" in lines[0]
     (line,) = [line for line in lines if line.startswith("  refused")]
-    assert "damaged, sha256 no longer matches" in line
-    assert spy[2].name in line
-    assert "types disagree" not in line
+    assert line == (
+        "  refused  chains/ticker=SPY/date=2026-08-24.parquet segments=5 kept, "
+        f"damaged, sha256 no longer matches: {spy[2].name}"
+    )
     assert result.changed
 
 
@@ -540,6 +641,31 @@ def test_the_page_stays_under_the_body_limit_however_wide_the_damage():
     assert "600 segment(s)" in body
     assert f"and {600 - PAGE_SEGMENT_CAP} more" in body
     assert f"and {30 - PAGE_SEGMENT_CAP} more" in body
+
+
+def test_the_page_counts_and_names_only_the_damaged_segments():
+    # A ticker-day of seven segments with five damaged. The page counts five, names the
+    # cap's worth of them and no more, and never names an intact one.
+    whole = _damage(DAY, 7)
+    found = [
+        SegmentDamage(
+            surface=whole.surface,
+            ticker=whole.ticker,
+            day=whole.day,
+            partition=whole.partition,
+            segments=whole.segments,
+            damaged=whole.damaged[2:],
+        )
+    ]
+
+    body = compact_module._damage_body(found)
+
+    assert "1 ticker-day(s)" in body
+    assert "5 segment(s)" in body
+    assert sum(item.segment in body for item in whole.damaged) == PAGE_SEGMENT_CAP
+    assert not any(item.segment in body for item in whole.damaged[:2])
+    assert f"and {5 - PAGE_SEGMENT_CAP} more" in body
+    assert "reports/damaged_segments/" in body
 
 
 def test_the_page_names_every_segment_up_to_the_cap():
