@@ -193,7 +193,12 @@ def test_from_token_adopts_the_files_token_once_its_own_has_expired(tmp_path, mo
     vendor = SchwabVendor.from_token(token, api_key="api-key", app_secret="app-secret")
     session = factory.clients[-1].session
     token.write_text(
-        json.dumps({"creation_timestamp": MINT_AFTER, "token": {"access_token": "on-disk"}})
+        json.dumps(
+            {
+                "creation_timestamp": MINT_AFTER,
+                "token": {"access_token": "on-disk", "refresh_token": "r", "expires_at": 1},
+            }
+        )
     )
 
     session.ensure_active_token()
@@ -201,7 +206,7 @@ def test_from_token_adopts_the_files_token_once_its_own_has_expired(tmp_path, mo
 
     session.token.expired = True
     session.ensure_active_token()
-    assert session.checked[-1] == {"access_token": "on-disk"}
+    assert session.checked[-1]["access_token"] == "on-disk"
     assert vendor.token_mint_time() == datetime.fromtimestamp(MINT_AFTER, tz=UTC)
 
 

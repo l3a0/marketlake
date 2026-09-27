@@ -427,7 +427,10 @@ def _auth_failures_named() -> Iterator[None]:
 # every cycle, and once cycles overlap (marketlake #534) two clients can find the token
 # expired at the same moment. A lock per client would let both refresh and both rewrite
 # ``token.json``. This one lets one refresh, and the other re-reads the file the first wrote.
-_TOKEN_REFRESH_LOCK = threading.Lock()
+# It is reentrant so that a session wrapped twice waits on nothing but itself. A plain lock
+# would leave the outer wrapper holding it while the inner one waits, and that hangs every
+# client in the process.
+_TOKEN_REFRESH_LOCK = threading.RLock()
 
 
 def serialize_token_refresh(
@@ -463,6 +466,11 @@ def serialize_token_refresh(
     refresh token on disk. That keeps the lake correct whether or not Schwab rotates the
     refresh token on each refresh, which nothing here has measured. If it does, a second
     refresh with the superseded refresh token would be refused and read as auth death.
+
+    One case stays open under rotation, and it predates the re-read. A refresh whose file
+    write fails leaves the new token in that client's memory and the old one on disk. The
+    client's own request raises the write's error. If Schwab rotates, every client that
+    later adopts the file refreshes with a refresh token Schwab has already superseded.
 
     A re-read that fails leaves the session's own token in place and prints one line naming
     the failure's type, never its message or anything from the file. The request then goes
@@ -504,6 +512,11 @@ def _read_token_file(token_path: Path) -> object:
     return json.loads(token_path.read_bytes())
 
 
+# The two fields a stored token must carry to replace a client's own. Without either, the
+# adopted token could not be sent or could not be refreshed.
+_STORED_TOKEN_KEYS = ("access_token", "refresh_token")
+
+
 def _adopt_stored_token(client: object, read_token: Callable[[], object]) -> None:
     """Replace a client's token with the one stored in the token file.
 
@@ -515,9 +528,13 @@ def _adopt_stored_token(client: object, read_token: Callable[[], object]) -> Non
     old mint time over the new one. ``token_mint_time`` reads the same field, so it keeps
     matching the token the client actually runs on.
 
-    Everything is checked before anything is assigned, so a file of the wrong shape raises
-    and leaves the client exactly as it was.
+    Everything is checked before anything is assigned, so a file that cannot stand in for
+    the client's own token raises and leaves the client exactly as it was. That covers a
+    token with no access token or refresh token to send, and one with no whole-second
+    ``expires_at``, which authlib's ``is_expired`` cannot judge and would call live.
+    ``schwab-py`` writes all three on every login and every refresh, so a real file passes.
     """
+    metadata = client.token_metadata
     stored = read_token()
     if not isinstance(stored, Mapping):
         raise ValueError(f"token file holds {type(stored).__name__}, not an object")
@@ -525,9 +542,13 @@ def _adopt_stored_token(client: object, read_token: Callable[[], object]) -> Non
     created = stored.get("creation_timestamp")
     if not isinstance(token, Mapping) or created is None:
         raise ValueError("token file has no token object or no creation_timestamp")
+    if not all(token.get(key) for key in _STORED_TOKEN_KEYS) or not isinstance(
+        token.get("expires_at"), int
+    ):
+        raise ValueError("token file's token lacks an access token, refresh token or expiry")
     client.session.token = dict(token)
-    client.token_metadata.token = client.session.token
-    client.token_metadata.creation_timestamp = created
+    metadata.token = client.session.token
+    metadata.creation_timestamp = created
 
 
 def client_from_token(token_path: str | Path, *, api_key: str, app_secret: str) -> object:

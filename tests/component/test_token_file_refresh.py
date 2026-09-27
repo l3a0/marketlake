@@ -216,6 +216,25 @@ def test_the_probe_writes_its_refresh_atomically_too(tmp_path, monkeypatch):
     assert token.stat().st_mode & 0o777 == 0o600
 
 
+def test_a_session_wrapped_twice_still_refreshes(tmp_path, monkeypatch):
+    # A second install nests one wrapper inside the other, both taking the process lock. A
+    # plain lock would hang the request, and every client in the process behind it.
+    token = tmp_path / "token.json"
+    _write(token, access="stale", refresh="refresh-0", expires_in=-10)
+    _serve(monkeypatch, _Server(rotate=False))
+    client = lake.schwab.client_from_token(token, api_key="app-key", app_secret="app-secret")
+    lake.schwab.serialize_token_refresh(client.session)
+
+    sent: list[str] = []
+    request = threading.Thread(
+        target=lambda: sent.append(SchwabVendor(client).get_quotes(["SPY"]).body["authorization"]),
+        daemon=True,
+    )
+    request.start()
+    request.join(timeout=5)
+    assert sent == ["Bearer fresh-1"]
+
+
 def test_a_live_token_is_neither_reread_nor_refreshed(tmp_path, monkeypatch):
     token = tmp_path / "token.json"
     _write(token, access="live", refresh="refresh-0", expires_in=1800)
@@ -259,6 +278,17 @@ def test_a_relogin_since_the_build_keeps_its_mint_time_through_a_refresh(tmp_pat
     assert vendor.token_mint_time() == datetime.fromtimestamp(MINT_AFTER, tz=UTC)
 
 
+def _on_disk(*without: str) -> dict:
+    """A token on disk that would be adopted, less the fields named, and far from expiry."""
+    token = {
+        "access_token": "on-disk",
+        "refresh_token": "on-disk-refresh",
+        "token_type": "Bearer",
+        "expires_at": int(time.time()) + 1800,
+    }
+    return {k: v for k, v in token.items() if k not in without}
+
+
 @pytest.mark.parametrize(
     ("contents", "failure"),
     [
@@ -266,9 +296,29 @@ def test_a_relogin_since_the_build_keeps_its_mint_time_through_a_refresh(tmp_pat
         ("{", "JSONDecodeError"),
         ("[]", "ValueError"),
         (json.dumps({"creation_timestamp": MINT}), "ValueError"),
-        (json.dumps({"token": {"access_token": "on-disk"}}), "ValueError"),
+        (json.dumps({"token": _on_disk()}), "ValueError"),
+        (json.dumps({"creation_timestamp": MINT, "token": _on_disk("access_token")}), "ValueError"),
+        (
+            json.dumps({"creation_timestamp": MINT, "token": _on_disk("refresh_token")}),
+            "ValueError",
+        ),
+        (json.dumps({"creation_timestamp": MINT, "token": _on_disk("expires_at")}), "ValueError"),
+        (
+            json.dumps({"creation_timestamp": MINT, "token": {**_on_disk(), "expires_at": "9"}}),
+            "ValueError",
+        ),
     ],
-    ids=["missing", "not-json", "not-an-object", "no-token", "no-mint-time"],
+    ids=[
+        "missing",
+        "not-json",
+        "not-an-object",
+        "no-token",
+        "no-mint-time",
+        "no-access-token",
+        "no-refresh-token",
+        "no-expiry",
+        "expiry-not-a-whole-second",
+    ],
 )
 def test_a_failed_reread_refreshes_from_the_clients_own_token(
     tmp_path, monkeypatch, capsys, contents, failure
@@ -289,5 +339,6 @@ def test_a_failed_reread_refreshes_from_the_clients_own_token(
     err = capsys.readouterr().err
     assert f"token file re-read failed, refreshing from the client's own token: {failure}\n" in err
     assert "on-disk" not in err and "refresh-0" not in err
+    assert "expires_at" not in err
     # The refresh rewrote the file whole, so the next build reads a good token.
     assert _stored(token)["token"]["access_token"] == "fresh-1"
