@@ -21,6 +21,8 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from lake import capture, daemon, journal
 from lake.calendar import MARKET_TZ
 from lake.cassette import load_cassette
@@ -131,6 +133,35 @@ def test_run_cycle_files_every_row_under_the_slot_it_is_handed_in_utc(cassette_v
     assert {row["snap_ts"] for _, _, row in _all_rows(result)} == {"2026-08-24T20:00:00+00:00"}
     for segment in result.segments:
         assert "20260824T200100030000" in segment.path.name, segment.path
+
+
+@pytest.mark.parametrize(
+    "slot,clock_at,day",
+    [
+        # The hooks ran past UTC midnight. The rows still belong to the slot's day.
+        (et(16, 0), datetime(2026, 8, 25, 0, 0, 30, tzinfo=UTC), "2026-08-24"),
+        # A direct caller's evening slot is past UTC midnight. The day is the UTC date of
+        # snap_ts, the rule every cycle's partition follows, not the slot's Eastern date.
+        (et(20, 30), datetime(2026, 8, 25, 0, 31, tzinfo=UTC), "2026-08-25"),
+    ],
+    ids=["clock-past-utc-midnight", "evening-eastern-slot"],
+)
+def test_run_cycle_files_its_segments_under_the_utc_date_of_the_slot(
+    cassette_vendor, lake_root, slot, clock_at, day
+):
+    result = capture.run_cycle(
+        ManualClock(start=clock_at),
+        cassette_vendor,
+        _both_options(),
+        lake_root,
+        pid=4242,
+        plan=_ONE_WINDOW,
+        slot=slot,
+    )
+
+    assert result.segments
+    for segment in result.segments:
+        assert f"date={day}" in str(segment.path), segment.path
 
 
 def test_run_cycle_without_a_slot_floors_its_own_clock_read(cassette_vendor, lake_root):
