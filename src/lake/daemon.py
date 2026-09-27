@@ -301,6 +301,34 @@ def _report(report: MarkingReport, pass_name: str) -> None:
     print(" ".join(parts), file=sys.stderr)
 
 
+# How many of the tickers the spans leave out the page names before it counts the rest.
+# The body has a byte budget, and a spans file restored from an old backup can leave out
+# most of the roster at once.
+_OUT_OF_SPAN_NAMED = 4
+
+
+def _out_of_span_body(page: Page) -> str:
+    """What the out-of-span page says: how many, for how long, and which.
+
+    It names up to ``_OUT_OF_SPAN_NAMED`` tickers and counts the rest. Unlike the folds
+    that fire only when a whole set failed, this set is part of the roster, so the names
+    say which part. Like the ``capture:`` line it names the possible causes and prescribes
+    no repair, because re-running ``retire`` or ``onboard`` is the wrong repair for some of
+    them. It carries no class, since nothing was attempted for these tickers, and no
+    dead-man follow-on, since the tickers still captured keep the dead-man fed.
+    """
+    names = ", ".join(page.tickers[:_OUT_OF_SPAN_NAMED])
+    rest = len(page.tickers) - _OUT_OF_SPAN_NAMED
+    if rest > 0:
+        names = f"{names} and {rest} more"
+    return (
+        f"{len(page.tickers)} enabled ticker(s) outside every capture span for "
+        f"{page.minutes} session minutes, so not captured: {names}. A retire, onboard or "
+        "rejoin that stopped midway leaves this, and so does a spans file that no longer "
+        "matches the lake"
+    )
+
+
 class _OutOfSpanLine:
     """Say which enabled tickers the capture spans left out, when that changes.
 
@@ -1316,6 +1344,13 @@ def run_loop_from_config(
 
     def raise_pages(pages: list[Page], now: datetime) -> None:
         for page in pages:
+            if page.tickers:
+                # The tickers the spans leave out, which have no surface and no class.
+                publisher.publish(
+                    Message(event="capture_down", title=page.title, body=_out_of_span_body(page)),
+                    now=now,
+                )
+                continue
             # The title says what went quiet. The class says why, and without it a rate
             # limit that starves one ticker reads as that ticker being dead. A page with
             # no class says nothing rather than guessing: a slept-through slot attempted
@@ -1391,7 +1426,10 @@ def run_loop_from_config(
         # Only the enabled entries are charged. A ticker disabled in place still names
         # an entry here, but its capture span is already closed, so charging it would
         # page for a surface nothing owes any more, the same reasoning gap-marking's
-        # roster read applies.
+        # roster read applies. An enabled entry the spans leave out is charged too, and
+        # the next cycle, which never touches it, drops the charge again (marketlake
+        # #570). Reading the spans here as well would cost two reference reads a stall
+        # to keep that one entry out of the overrun page's surface count.
         watched = [
             Surface(surface, entry.ticker)
             for entry in load_tickers(tickers_path).enabled

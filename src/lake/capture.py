@@ -652,8 +652,9 @@ class CycleResult:
     roster order. It is what keeps the flag honest. A roster the spans emptied is also a
     cycle with nothing to fetch, but its tickers are still enabled, so it owes the minutes
     it did not capture and the flag stays false (marketlake #554). The daemon prints a line
-    when the set changes and once a session while it stands, since nothing else names a
-    ticker that is enabled and skipped.
+    when the set changes and once a session while it stands, and the watchdog pages once a
+    ticker has been left out for its threshold, unless every enabled ticker is, which is
+    the dead-man's to page (marketlake #570).
     """
 
     snap_ts: datetime

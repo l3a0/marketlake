@@ -261,8 +261,9 @@ def test_a_span_opened_during_the_run_survives_and_stays_in_capture_scope(
 
     An instrument onboarded in the window keeps its master row and loses its span, so
     ``capture._live_roster`` resolves it and finds nothing in scope. The ticker is enabled,
-    registered, and captured by nothing, and neither the watchdog nor gap marking can see it,
-    because both read that state as a retirement.
+    registered, and captured by nothing. Gap marking cannot see it, because it reads that
+    state as a retirement. The cycle names it as out of span, which the daemon prints and
+    the watchdog pages once it passes the threshold (marketlake #554, #570).
     """
     from lake.capture import _live_roster
 

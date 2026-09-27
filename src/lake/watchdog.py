@@ -34,6 +34,18 @@ charged. That page leaves the per-surface budget alone, where the sampler collap
 spends it. A stall is evidence about the loop rather than about any surface's health,
 so a surface that is genuinely dead still pages on its own account on the first cycle
 after the loop resumes.
+
+A ticker the capture spans leave out is counted on its own. The cycle names it in
+``CycleResult.out_of_span`` and fetches nothing for it, so none of its surfaces is ever
+touched and no surface counter can see it. Each ticker gets a count of consecutive cycles
+spent out of span instead, and the threshold pages once, with one page naming every
+ticker left out, rather than one page per surface. It is held while every enabled ticker
+is left out, because the dead-man already pages that case (marketlake #554, #570).
+
+A surface that leaves the cycle takes its counter with it. A counter frozen where it
+stood would climb again under a stall, which charges the whole enabled roster, and would
+page on the first failure after the ticker came back, claiming three minutes after an
+hour away.
 """
 
 from __future__ import annotations
@@ -70,6 +82,9 @@ _WHOLE_DAEMON_CAUSES = {
 # ``slot_overrun``, so operator and journal name the minute the same way.
 _OVERRUN_TITLE = "Capture down: loop overran"
 
+# What enabled tickers the capture spans leave out page under, one page for all of them.
+_OUT_OF_SPAN_TITLE = "Capture down: tickers outside every capture span"
+
 
 @dataclass(frozen=True)
 class Surface:
@@ -95,6 +110,11 @@ class Page:
     rather than only what. It is ``None`` where there is nothing to name: a slot the loop
     slept through attempted no request, a failure can be recorded without a class, and a
     collapsed sampler page whose tickers disagreed has no single class to pick.
+
+    ``tickers`` is set only on the out-of-span page, and names every enabled ticker the
+    spans leave out, in roster order. The cycle knows those tickers and not which surfaces
+    they owe, so that page leaves ``surfaces`` empty. It names no class either, because
+    nothing was attempted for them.
     """
 
     title: str
@@ -102,6 +122,7 @@ class Page:
     surfaces: tuple[Surface, ...]
     sampler_collapse: bool = False
     cause: str | None = None
+    tickers: tuple[str, ...] = ()
 
 
 class Watchdog:
@@ -129,6 +150,12 @@ class Watchdog:
         # flag, kept apart from ``_paged`` so a stall never spends a surface's budget.
         # A durable data cycle proves the loop is running again and re-arms it.
         self._paged_overrun = False
+        # Consecutive observed cycles each enabled ticker has spent outside every capture
+        # span, and which of them have paged. Kept per ticker, because the cycle names
+        # tickers there and not their surfaces, and apart from ``_paged``, because a clamp
+        # says nothing about any surface's health.
+        self._out_of_span: dict[str, int] = {}
+        self._paged_out_of_span: set[str] = set()
 
     def _threshold(self) -> int:
         """The page threshold as it stands now.
@@ -149,6 +176,12 @@ class Watchdog:
         Every surface the cycle wrote a data row for resets. Every surface it wrote only
         a gap for fails, and so does every surface it could not journal at all, because
         an unwritten segment is the same absence as a failed one from the counter's side.
+        A surface it did not touch at all has left the cycle and loses its counter, per
+        :meth:`_drop_departed`.
+
+        The tickers the spans left out are counted apart, and their page rides beside
+        whatever else this minute owes, a cause page included, because a clamp and a dead
+        token have different repairs.
         """
         produced: set[Surface] = set()
         touched: set[Surface] = set()
@@ -160,6 +193,7 @@ class Watchdog:
         for error in result.errors:
             touched.add(Surface(error.surface, error.ticker))
         self._roll(result.snap_ts)
+        self._drop_departed(touched, result.out_of_span)
         failed = touched - produced
         for key in produced:
             self._reset(key)
@@ -176,10 +210,11 @@ class Watchdog:
             classes[Surface(error.surface, error.ticker)] = error.error_class
         self._release_retired(touched)
         threshold = self._threshold()
+        out_of_span = self._out_of_span_pages(result, threshold)
         cause = self._whole_daemon(result, failed, touched, threshold)
         if cause is not None:
-            return cause
-        return self._pages(failed, touched, threshold=threshold, classes=classes)
+            return cause + out_of_span
+        return self._pages(failed, touched, threshold=threshold, classes=classes) + out_of_span
 
     def missed(self, surfaces: Iterable[Surface], slots: Sequence[datetime]) -> list[Page]:
         """Charge a run of slept-through slots, and page the overrun once.
@@ -317,6 +352,8 @@ class Watchdog:
             self._paged.clear()
             self._paged_causes.clear()
             self._paged_overrun = False
+            self._out_of_span.clear()
+            self._paged_out_of_span.clear()
 
     def _reset(self, key: Surface) -> None:
         self._counts[key] = 0
@@ -344,6 +381,81 @@ class Watchdog:
             if not held:
                 del self._paged_causes[title]
 
+    def _drop_departed(self, touched: set[Surface], out_of_span: tuple[str, ...]) -> None:
+        """Forget the counter and the paged flag of every surface that left the cycle.
+
+        A live ticker touches every surface it owes on every cycle: capture plans quotes
+        for each live ticker and a chain for each live options ticker, and a write that
+        fails is recorded as an error, which counts as touched. So on a cycle that touched
+        anything, an untouched surface belongs to a ticker the cycle no longer captures,
+        whether it was retired, turned equity-only, or left out by the capture spans.
+
+        Frozen instead, its counter did harm twice (marketlake #570). The skipped-slot
+        hook charges the whole enabled roster, so every stall added to it and nothing ever
+        reset it, until a one-minute stall paged the loop as overrun for three. And a
+        ticker that came back failing paged on its first gap, reading three minutes after
+        an hour away, which is the one transient failure the threshold exists to absorb.
+
+        A cycle that touched nothing is the full case, every enabled ticker left out, and
+        says nothing about any surface. There the tickers it names as out of span are
+        dropped and nothing else. ``_release_retired`` is this rule's twin for causes.
+
+        The price is a second page. A surface that paged, left the cycle, and came back
+        still failing pages again at the threshold, where a frozen flag kept it silent.
+        """
+        if touched:
+            gone = {key for key in self._counts.keys() | self._paged if key not in touched}
+        else:
+            names = set(out_of_span)
+            gone = {key for key in self._counts.keys() | self._paged if key.ticker in names}
+        for key in gone:
+            self._counts.pop(key, None)
+            self._paged.discard(key)
+
+    def _out_of_span_pages(self, result: CycleResult, threshold: int) -> list[Page]:
+        """Count the tickers the spans left out, and page the ones that newly tripped.
+
+        A ticker's count rises on each cycle that names it and is dropped on the first
+        that does not, which re-arms its page. Two commands pass through this state in
+        ordinary use: a rejoin writes its roster entry before its span, and a retire
+        closes the span before it changes the roster. A cycle can land in either window
+        for one minute, so the page waits for the threshold like every other.
+
+        One page covers every ticker tripping in the same cycle and names the whole
+        standing set, so a clamp that widens later pages again for the new ticker. Its
+        minutes are the longest any named ticker has been out.
+
+        A cycle with no segment and no error captured nothing, so its live roster was
+        empty and every enabled ticker is left out. The dead-man pages that case and no
+        other page is added (marketlake #554). The counts still rise there, so the first
+        cycle that captures anything pages at once for a ticker already past the threshold.
+        """
+        named = result.out_of_span
+        for ticker in list(self._out_of_span):
+            if ticker not in named:
+                del self._out_of_span[ticker]
+                self._paged_out_of_span.discard(ticker)
+        for ticker in named:
+            self._out_of_span[ticker] = self._out_of_span.get(ticker, 0) + 1
+        if not result.segments and not result.errors:
+            return []
+        tripped = [
+            ticker
+            for ticker in named
+            if self._out_of_span[ticker] >= threshold and ticker not in self._paged_out_of_span
+        ]
+        if not tripped:
+            return []
+        self._paged_out_of_span.update(tripped)
+        return [
+            Page(
+                title=_OUT_OF_SPAN_TITLE,
+                minutes=max(self._out_of_span[ticker] for ticker in named),
+                surfaces=(),
+                tickers=tuple(named),
+            )
+        ]
+
     def _release_retired(self, touched: set[Surface]) -> None:
         """Stop covering a surface the roster has dropped.
 
@@ -353,7 +465,8 @@ class Watchdog:
         title would page nobody for the rest of the session.
 
         A cycle that touched nothing at all is an empty roster rather than a retired
-        one. It is evidence about no surface, so it releases none.
+        one. It is evidence about no surface, so it releases none. ``_drop_departed`` makes
+        the same judgement for the counters.
         """
         if not self._paged_causes or not touched:
             return

@@ -234,12 +234,13 @@ def test_a_stall_and_a_failing_cycle_count_toward_the_same_page():
 @pytest.mark.parametrize("kind", ["data", "gap"])
 def test_a_surface_the_cycle_never_touched_is_not_counted(kind):
     # A ticker dropped from the roster mid-session stops being watched rather than
-    # paging forever for a surface nobody is capturing.
+    # paging forever for a surface nobody is capturing. Its counter goes with it, so it
+    # does not come back at the count it left with (marketlake #570).
     watchdog = Watchdog()
     watchdog.observe(_cycle(_seg("chains", "SPY", "gap")))
     for _ in range(4):
         watchdog.observe(_cycle(_seg("chains", "QQQ", kind)))
-    assert watchdog.count("chains", "SPY") == 1
+    assert watchdog.count("chains", "SPY") == 0
 
 
 def test_two_dead_quotes_tickers_beside_a_live_one_is_not_a_sampler_collapse():
@@ -1258,3 +1259,206 @@ def test_an_unwritten_segment_failing_another_cause_s_way_is_released():
         "Capture down: SPY chains",
     ]
     assert raised[1].cause == "vendor_auth_error"
+
+
+# -- tickers the capture spans leave out (marketlake #570) ----------------------------
+
+
+def _clamped(*segments: SegmentOutcome, out: tuple[str, ...], at: datetime, errors=()):
+    return CycleResult(at, segments, errors, out_of_span=out)
+
+
+def test_a_ticker_the_spans_leave_out_pages_once_at_the_threshold():
+    """SPY is captured and QQQ is enabled and outside every span, so it owes minutes.
+
+    Nothing touches QQQ's surfaces and the dead-man is fed by SPY, so this page is the
+    only thing that reports it.
+    """
+    watchdog = Watchdog()
+    raised = [
+        watchdog.observe(_clamped(_seg("quotes", "SPY", "data"), out=("QQQ",), at=_at(m)))
+        for m in range(4)
+    ]
+    assert raised[0] == raised[1] == raised[3] == []
+    (page,) = raised[2]
+    assert page.title == "Capture down: tickers outside every capture span"
+    assert page.tickers == ("QQQ",)
+    assert page.minutes == 3
+    assert page.surfaces == ()
+    assert page.cause is None
+
+
+def test_a_ticker_out_of_span_for_less_than_the_threshold_pages_nothing():
+    # A rejoin writes its roster entry before its span, and a retire closes the span
+    # before it changes the roster, so a cycle can see one ticker out for a minute.
+    watchdog = Watchdog()
+    raised = []
+    for m in range(2):
+        raised += watchdog.observe(_clamped(_seg("quotes", "SPY", "data"), out=("QQQ",), at=_at(m)))
+    for m in range(2, 6):
+        raised += watchdog.observe(_clamped(_seg("quotes", "SPY", "data"), out=(), at=_at(m)))
+    raised += watchdog.observe(_clamped(_seg("quotes", "SPY", "data"), out=("QQQ",), at=_at(6)))
+    assert raised == []
+
+
+def test_a_ticker_back_in_span_re_arms_its_page():
+    watchdog = Watchdog()
+    outs = [("QQQ",)] * 3 + [()] + [("QQQ",)] * 3
+    raised = [
+        watchdog.observe(_clamped(_seg("quotes", "SPY", "data"), out=out, at=_at(m)))
+        for m, out in enumerate(outs)
+    ]
+    assert [len(pages) for pages in raised] == [0, 0, 1, 0, 0, 0, 1]
+    assert raised[6][0].minutes == 3
+
+
+def test_a_clamp_standing_overnight_pages_again_the_next_session():
+    watchdog = Watchdog()
+    raised = []
+    for day in (2, 3):
+        for m in range(3):
+            raised += watchdog.observe(
+                _clamped(_seg("quotes", "SPY", "data"), out=("QQQ",), at=_at(m, day=day))
+            )
+    assert [page.minutes for page in raised] == [3, 3]
+
+
+def test_every_enabled_ticker_left_out_pages_nothing_until_a_cycle_captures():
+    """The full case is the dead-man's to page, and no second page is added.
+
+    The count still rises, so the first cycle that captures anything pages at once for a
+    ticker that has been out past the threshold.
+    """
+    watchdog = Watchdog()
+    raised = []
+    for m in range(4):
+        raised += watchdog.observe(_clamped(out=("SPY", "QQQ"), at=_at(m)))
+    assert raised == []
+    (page,) = watchdog.observe(_clamped(_seg("quotes", "SPY", "data"), out=("QQQ",), at=_at(4)))
+    assert page.tickers == ("QQQ",)
+    assert page.minutes == 5
+
+
+def test_a_cycle_whose_every_write_failed_is_not_the_full_case():
+    # A segment that could not be written still proves a live ticker was attempted.
+    watchdog = Watchdog()
+    raised = []
+    for m in range(3):
+        raised += watchdog.observe(
+            _clamped(out=("QQQ",), at=_at(m), errors=(SegmentError("quotes", "SPY", "OSError"),))
+        )
+    assert [page.tickers for page in raised if page.tickers] == [("QQQ",)]
+
+
+def test_a_cause_page_and_the_out_of_span_page_are_both_sent():
+    # A dead token and a clamp have different repairs, so neither holds the other back.
+    watchdog = Watchdog()
+    raised = []
+    for m in range(3):
+        raised += watchdog.observe(
+            _clamped(
+                _fail("chains", "SPY", "http_401"),
+                _fail("quotes", "SPY", "http_401"),
+                out=("QQQ",),
+                at=_at(m),
+            )
+        )
+    assert [page.title for page in raised] == [
+        "Capture down: token dead",
+        "Capture down: tickers outside every capture span",
+    ]
+
+
+def test_a_ticker_joining_the_set_later_pages_again_naming_every_ticker_out():
+    watchdog = Watchdog()
+    outs = [("QQQ",)] * 3 + [("QQQ", "IWM")] * 3
+    raised = []
+    for m, out in enumerate(outs):
+        raised += watchdog.observe(_clamped(_seg("quotes", "SPY", "data"), out=out, at=_at(m)))
+    assert [page.tickers for page in raised] == [("QQQ",), ("QQQ", "IWM")]
+    assert raised[1].minutes == 6
+
+
+def test_the_out_of_span_page_reads_the_threshold_live():
+    threshold = [5]
+    watchdog = Watchdog(page_minutes=lambda: threshold[0])
+    raised = []
+    for m in range(3):
+        raised += watchdog.observe(_clamped(_seg("quotes", "SPY", "data"), out=("QQQ",), at=_at(m)))
+    assert raised == []
+    threshold[0] = 3
+    (page,) = watchdog.observe(_clamped(_seg("quotes", "SPY", "data"), out=("QQQ",), at=_at(3)))
+    assert page.tickers == ("QQQ",)
+
+
+# -- a surface that leaves the cycle takes its counter with it (marketlake #570) ------
+
+
+def test_a_clamped_ticker_charged_by_two_stalls_does_not_page_a_short_one():
+    """The skipped-slot hook charges every enabled entry, the clamped one included.
+
+    Frozen, QQQ's counter kept each stall's charge, so a one-minute stall took it to three
+    and paged the loop as overrun for three minutes.
+    """
+    watched = [Surface("quotes", "SPY"), Surface("quotes", "QQQ")]
+    watchdog = Watchdog()
+    watchdog.observe(_clamped(_seg("quotes", "SPY", "data"), out=("QQQ",), at=_at(0)))
+    assert watchdog.missed(watched, [_at(1), _at(2)]) == []
+    watchdog.observe(_clamped(_seg("quotes", "SPY", "data"), out=("QQQ",), at=_at(3)))
+    assert watchdog.count("quotes", "QQQ") == 0
+    assert watchdog.missed(watched, [_at(4)]) == []
+
+
+def test_a_ticker_back_from_a_clamp_does_not_page_on_its_first_gap():
+    """QQQ gapped twice, sat out of span for an hour, and gapped once on its return.
+
+    Frozen at two, that one gap paged it as three minutes down.
+    """
+    watchdog = Watchdog()
+    raised = []
+    for m in range(2):
+        raised += watchdog.observe(
+            _clamped(_seg("quotes", "SPY", "data"), _seg("quotes", "QQQ", "gap"), out=(), at=_at(m))
+        )
+    for m in range(2, 50):
+        raised += watchdog.observe(_clamped(_seg("quotes", "SPY", "data"), out=("QQQ",), at=_at(m)))
+    raised += watchdog.observe(
+        _clamped(_seg("quotes", "SPY", "data"), _seg("quotes", "QQQ", "gap"), out=(), at=_at(50))
+    )
+    assert [page for page in raised if not page.tickers] == []
+    assert watchdog.count("quotes", "QQQ") == 1
+
+
+def test_a_surface_that_paged_and_left_pages_again_when_it_returns_failing():
+    # The named price of the drop: a second page after the ticker's time away.
+    watchdog = Watchdog()
+    titles = []
+    for m in range(3):
+        titles += [
+            p.title
+            for p in watchdog.observe(
+                _cycle(_seg("quotes", "SPY", "data"), _seg("quotes", "QQQ", "gap"), at=_at(m))
+            )
+        ]
+    titles += [p.title for p in watchdog.observe(_cycle(_seg("quotes", "SPY", "data"), at=_at(3)))]
+    for m in range(4, 7):
+        titles += [
+            p.title
+            for p in watchdog.observe(
+                _cycle(_seg("quotes", "SPY", "data"), _seg("quotes", "QQQ", "gap"), at=_at(m))
+            )
+        ]
+    assert titles == ["Capture down: QQQ quotes", "Capture down: QQQ quotes"]
+
+
+def test_the_full_case_drops_only_the_tickers_it_names():
+    # A cycle that touched nothing is evidence about no surface, except that the tickers
+    # it names are no longer captured.
+    watchdog = Watchdog()
+    for m in range(2):
+        watchdog.observe(
+            _cycle(_seg("chains", "SPY", "gap"), _seg("quotes", "QQQ", "gap"), at=_at(m))
+        )
+    watchdog.observe(_clamped(out=("QQQ",), at=_at(2)))
+    assert watchdog.count("quotes", "QQQ") == 0
+    assert watchdog.count("chains", "SPY") == 2
