@@ -71,3 +71,22 @@ class ManualClock:
         if when.tzinfo is None:
             raise ValueError("ManualClock time must be timezone-aware")
         self._now = when
+
+
+class CostlyClock(ManualClock):
+    """A manual clock where every ``now`` read costs ``cost`` seconds.
+
+    A plain ``ManualClock`` stands still between two reads, so a test on it cannot tell
+    one read from two taken back to back. Here each read moves the clock on, so a clock
+    started a few reads short of a minute top lets two back-to-back reads fall on either
+    side of it, through the real code path and with no advance placed by hand.
+    """
+
+    def __init__(self, start: datetime, cost: float = 0.000001) -> None:
+        super().__init__(start)
+        self._cost = cost
+
+    def now(self) -> datetime:
+        instant = super().now()
+        self.advance(self._cost)
+        return instant

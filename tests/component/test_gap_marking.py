@@ -155,7 +155,9 @@ def test_a_partially_captured_date_is_marked_from_its_last_row_to_its_option_clo
         surfaces=("chains", "quotes"),
         through=et(2026, 9, 1, 11, 0),
     )
-    report = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((SPY,))).on_start()
+    report = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((SPY,))).on_start(
+        et(2026, 9, 2, 10, 0)
+    )
 
     tuesday = [s for s in report.spans if s.day == date(2026, 9, 1) and s.surface == "quotes"]
     assert len(tuesday) == 1
@@ -169,7 +171,9 @@ def test_a_partially_captured_date_is_marked_from_its_last_row_to_its_option_clo
 def test_a_fully_dark_date_is_marked_for_its_whole_session(tmp_path):
     # Monday fully captured on both surfaces is the floor. Tuesday is fully dark.
     _capture(tmp_path, "SPY", date(2026, 8, 31), surfaces=("chains", "quotes"))
-    report = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((SPY,))).on_start()
+    report = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((SPY,))).on_start(
+        et(2026, 9, 2, 10, 0)
+    )
 
     tuesday_dark = [s for s in report.spans if s.day == date(2026, 9, 1)]
     assert [s.slots for s in tuesday_dark] == [FULL_SESSION_SLOTS] * 2
@@ -183,7 +187,7 @@ def test_a_holiday_inside_the_dark_stretch_is_marked_not_at_all(tmp_path):
         roster=Roster((EQUITY_ONLY,)),
         holidays=(date(2026, 9, 2),),
     )
-    days = {span.day for span in marker.on_start().spans}
+    days = {span.day for span in marker.on_start(et(2026, 9, 4, 10, 0)).spans}
     assert date(2026, 9, 2) not in days
     assert {date(2026, 9, 1), date(2026, 9, 3), date(2026, 9, 4)} <= days
 
@@ -204,7 +208,9 @@ def test_a_dark_day_with_only_a_late_row_is_still_marked_back_to_its_open(tmp_pa
     _capture(tmp_path, "XYZ", date(2026, 8, 31))
     # Tuesday's only row is a late one, the shape that fooled the old anchor.
     _record(tmp_path, "quotes", "XYZ", et(2026, 9, 1, 16, 0))
-    report = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((EQUITY_ONLY,))).on_start()
+    report = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((EQUITY_ONLY,))).on_start(
+        et(2026, 9, 2, 10, 0)
+    )
 
     tuesday = [s for s in report.spans if s.day == date(2026, 9, 1) and s.surface == "quotes"]
     assert len(tuesday) == 1
@@ -227,7 +233,9 @@ def test_the_walk_stops_at_the_first_fully_captured_prior_day(tmp_path):
     """
     # Tuesday fully captured is the floor. Monday below it is dark but must be left alone.
     _capture(tmp_path, "XYZ", date(2026, 9, 1))
-    report = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((EQUITY_ONLY,))).on_start()
+    report = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((EQUITY_ONLY,))).on_start(
+        et(2026, 9, 2, 10, 0)
+    )
 
     assert not report.truncated, "a healthy restart reported a truncation"
     marked_days = {span.day for span in report.spans}
@@ -236,13 +244,15 @@ def test_the_walk_stops_at_the_first_fully_captured_prior_day(tmp_path):
     assert marked_days <= {date(2026, 9, 2)}
 
 
-# -- rule 7: today's markers stop at the first live slot -----------------------------
+# -- rule 7: today's markers stop at the minute the daemon started in ----------------
 
 
-def test_todays_markers_stop_at_the_first_slot_the_loop_will_capture(tmp_path):
+def test_todays_markers_stop_at_the_minute_the_daemon_started_in(tmp_path):
     # Tuesday fully captured is the floor. Today is dark up to the start minute.
     _capture(tmp_path, "XYZ", date(2026, 9, 1))
-    report = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((EQUITY_ONLY,))).on_start()
+    report = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((EQUITY_ONLY,))).on_start(
+        et(2026, 9, 2, 10, 0)
+    )
 
     today = [s for s in report.spans if s.day == date(2026, 9, 2)]
     # 09:30 through 10:00 inclusive. The daemon's own start minute is marked, because
@@ -256,7 +266,9 @@ def test_a_post_close_restart_clips_todays_markers_at_the_option_close(tmp_path)
     # Monday fully captured is the floor. Today captured to 11:00, then dark, post-close.
     _capture(tmp_path, "XYZ", date(2026, 9, 1))
     _capture(tmp_path, "XYZ", date(2026, 9, 2), through=et(2026, 9, 2, 11, 0))
-    report = _marker(tmp_path, et(2026, 9, 2, 23, 30), roster=Roster((EQUITY_ONLY,))).on_start()
+    report = _marker(tmp_path, et(2026, 9, 2, 23, 30), roster=Roster((EQUITY_ONLY,))).on_start(
+        et(2026, 9, 2, 23, 30)
+    )
 
     today = [s for s in report.spans if s.day == date(2026, 9, 2)]
     assert [s.slots for s in today] == [315]
@@ -273,9 +285,9 @@ def test_a_second_restart_the_same_minute_marks_nothing(tmp_path):
     first = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((EQUITY_ONLY,)), pid=1)
     second = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((EQUITY_ONLY,)), pid=2)
 
-    assert first.on_start().rows > 0
+    assert first.on_start(et(2026, 9, 2, 10, 0)).rows > 0
     # The anchor counts marker rows, so the first pass's own markers move it forward.
-    assert second.on_start().rows == 0
+    assert second.on_start(et(2026, 9, 2, 10, 0)).rows == 0
 
 
 def test_repeated_restarts_never_mark_one_minute_twice(tmp_path):
@@ -283,7 +295,7 @@ def test_repeated_restarts_never_mark_one_minute_twice(tmp_path):
     for minute, pid in ((0, 1), (0, 2), (30, 3), (45, 4)):
         _marker(
             tmp_path, et(2026, 9, 2, 10, minute), roster=Roster((EQUITY_ONLY,)), pid=pid
-        ).on_start()
+        ).on_start(et(2026, 9, 2, 10, minute))
 
     for day in (date(2026, 9, 1), date(2026, 9, 2)):
         marked = _slots(tmp_path, "quotes", "XYZ", day)
@@ -302,7 +314,9 @@ def test_a_sealed_date_is_skipped_and_named(tmp_path, monkeypatch):
     monkeypatch.setattr(manifest, "latest_entries", lambda root: {sealed_key: {"row_count": 1}})
     monkeypatch.setattr(gap, "latest_entries", lambda root: {sealed_key: {"row_count": 1}})
 
-    report = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((EQUITY_ONLY,))).on_start()
+    report = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((EQUITY_ONLY,))).on_start(
+        et(2026, 9, 2, 10, 0)
+    )
     assert sealed_key in report.sealed
     assert date(2026, 9, 1) not in {span.day for span in report.spans}
 
@@ -323,7 +337,9 @@ def test_the_walk_continues_past_a_sealed_date_to_mark_a_dark_day_below_it(tmp_p
     monkeypatch.setattr(manifest, "latest_entries", lambda root: {sealed_key: {"row_count": 1}})
     monkeypatch.setattr(gap, "latest_entries", lambda root: {sealed_key: {"row_count": 1}})
 
-    report = _marker(tmp_path, et(2026, 9, 3, 10, 0), roster=Roster((EQUITY_ONLY,))).on_start()
+    report = _marker(tmp_path, et(2026, 9, 3, 10, 0), roster=Roster((EQUITY_ONLY,))).on_start(
+        et(2026, 9, 3, 10, 0)
+    )
 
     assert sealed_key in report.sealed
     tuesday = [s for s in report.spans if s.day == date(2026, 9, 1) and s.surface == "quotes"]
@@ -338,7 +354,9 @@ def test_the_walk_continues_past_a_sealed_date_to_mark_a_dark_day_below_it(tmp_p
 def test_a_marker_row_holds_no_market_data_and_names_its_reason(tmp_path):
     _capture(tmp_path, "XYZ", date(2026, 9, 1))  # Tuesday full is the floor the walk stops at
     _record(tmp_path, "quotes", "XYZ", et(2026, 9, 2, 9, 59))
-    _marker(tmp_path, et(2026, 9, 2, 10, 5), roster=Roster((EQUITY_ONLY,))).on_start()
+    _marker(tmp_path, et(2026, 9, 2, 10, 5), roster=Roster((EQUITY_ONLY,))).on_start(
+        et(2026, 9, 2, 10, 5)
+    )
 
     directory = journal.segment_dir(tmp_path, "quotes", "XYZ", date(2026, 9, 2))
     rows = [
@@ -359,7 +377,9 @@ def test_a_marker_row_holds_no_market_data_and_names_its_reason(tmp_path):
 
 def test_a_post_equity_close_marker_carries_the_phase_a_captured_row_would_have(tmp_path):
     _record(tmp_path, "quotes", "XYZ", et(2026, 9, 2, 15, 59))
-    _marker(tmp_path, et(2026, 9, 2, 23, 0), roster=Roster((EQUITY_ONLY,))).on_start()
+    _marker(tmp_path, et(2026, 9, 2, 23, 0), roster=Roster((EQUITY_ONLY,))).on_start(
+        et(2026, 9, 2, 23, 0)
+    )
 
     rows = {
         r["snap_ts"]: r["session_phase"]
@@ -379,7 +399,9 @@ def test_a_marker_never_carries_a_close_tag(tmp_path):
     # dark day therefore has no option-close-tagged cycle, and a snap=None load fails
     # loudly rather than resolving to a row that stands for a close nobody observed.
     _record(tmp_path, "quotes", "XYZ", et(2026, 9, 1, 11, 0))
-    _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((EQUITY_ONLY,))).on_start()
+    _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((EQUITY_ONLY,))).on_start(
+        et(2026, 9, 2, 10, 0)
+    )
 
     for p in sorted(
         journal.segment_dir(tmp_path, "quotes", "XYZ", date(2026, 9, 1)).glob("*.arrows")
@@ -393,14 +415,18 @@ def test_a_marker_never_carries_a_close_tag(tmp_path):
 
 def test_an_equity_only_ticker_is_marked_on_quotes_alone(tmp_path):
     _record(tmp_path, "quotes", "XYZ", et(2026, 9, 1, 11, 0))
-    report = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((EQUITY_ONLY,))).on_start()
+    report = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((EQUITY_ONLY,))).on_start(
+        et(2026, 9, 2, 10, 0)
+    )
     assert {span.surface for span in report.spans} == {"quotes"}
 
 
 def test_an_options_ticker_is_marked_on_both_surfaces(tmp_path):
     _record(tmp_path, "quotes", "SPY", et(2026, 9, 1, 11, 0))
     _record(tmp_path, "chains", "SPY", et(2026, 9, 1, 11, 0))
-    report = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((SPY,))).on_start()
+    report = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((SPY,))).on_start(
+        et(2026, 9, 2, 10, 0)
+    )
     assert {span.surface for span in report.spans} == {"chains", "quotes"}
 
 
@@ -432,7 +458,7 @@ def test_a_slot_the_live_loop_slept_through_is_not_called_daemon_dead(tmp_path):
 def test_both_producers_write_through_the_same_writer(tmp_path):
     _record(tmp_path, "quotes", "XYZ", et(2026, 9, 2, 9, 59))
     marker = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((EQUITY_ONLY,)))
-    marker.on_start()
+    marker.on_start(et(2026, 9, 2, 10, 0))
     after = marker.on_skipped([et(2026, 9, 2, 10, 1)])
     # The startup pass stopped at 10:00, so the skipped slot does not collide with it.
     assert after.rows == 1
@@ -454,7 +480,7 @@ def test_a_ticker_with_no_capture_span_is_out_of_scope_and_not_marked(tmp_path):
         session_clock=SessionClock(clock=clock, calendar=weekday_sessions(WEEK)),
         pid=7,
     )
-    report = marker.on_start()
+    report = marker.on_start(et(2026, 9, 2, 10, 0))
     assert report.spans == ()
     assert not list(tmp_path.rglob("*.arrows"))
 
@@ -468,7 +494,7 @@ def test_a_marking_pass_with_no_missed_minutes_opens_no_segment(tmp_path):
         et(2026, 9, 2, 10, 0),
         roster=Roster((EQUITY_ONLY,)),
         scope_start=et(2026, 9, 2, 9, 30),
-    ).on_start()
+    ).on_start(et(2026, 9, 2, 10, 0))
     assert report.spans == ()
     assert (
         len(list(journal.segment_dir(tmp_path, "quotes", "XYZ", date(2026, 9, 2)).glob("*.arrows")))
@@ -497,7 +523,7 @@ def test_a_walk_that_reaches_the_cap_is_reported_rather_than_silent(tmp_path, mo
         spans=lambda: spans,
         pid=7,
     )
-    report = marker.on_start()
+    report = marker.on_start(et(2026, 9, 2, 10, 0))
     assert report.truncated == ("quotes/XYZ",)
 
 
@@ -522,7 +548,7 @@ def test_a_master_that_raises_leaves_the_walk_marking_nothing_not_crashing(tmp_p
     # The daemon runs under KeepAlive and run_loop does not guard on_start, so a raise
     # here would be a crash loop. The reader swallows the master's error and returns no
     # scope, so the walk marks nothing this pass and the next readable restart retries.
-    report = marker.on_start()
+    report = marker.on_start(et(2026, 9, 2, 10, 0))
     assert report.rows == 0
 
 
@@ -617,7 +643,7 @@ def test_the_startup_pass_reads_the_roster_too(tmp_path):
     )
     # LATE joins after the marker was built but before the pass runs.
     live[0] = both
-    marked = {span.ticker for span in marker.on_start().spans}
+    marked = {span.ticker for span in marker.on_start(et(2026, 9, 2, 10, 0)).spans}
     assert marked == {"XYZ", "LATE"}
 
 
@@ -742,6 +768,92 @@ def test_the_daemon_wires_gap_marking_into_the_startup_hook(tmp_path, monkeypatc
     assert marked[-1].startswith("2026-09-01T16:15")
 
 
+def test_the_daemon_hands_the_loops_start_minute_through_to_the_marker(tmp_path, capsys):
+    """The production wrappers pass the loop's seeded slot on rather than reading again.
+
+    In production the close+5 guard's startup check reads the clock between the loop's
+    seed and the marker's pass, so a wrapper that took a fresh slot there would reopen
+    the double claim. Every read on this clock costs a whole minute, so any second read
+    names a later minute than the seed, however many reads the entry makes. A marker
+    bounded by such a read marks a minute the loop's first tick then hands to
+    ``on_skipped`` too, as a second row or as a ``FileExistsError`` on stderr. A marker
+    bounded short of the handed slot leaves the start minute in no row at all.
+    """
+    from datetime import timedelta
+
+    from lake import daemon
+    from lake.capture import CycleResult
+    from lake.capture_spans import spans_path
+    from lake.security_master import master_path
+    from tests.support.clock import CostlyClock
+    from tests.support.config import write_config
+
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("XYZ: {options: false}\n")
+    master, spans = _spans_for(Roster((EQUITY_ONLY,)))
+    master.write(master_path(lake_root))
+    spans.write(spans_path(lake_root))
+    _capture(lake_root, "XYZ", date(2026, 9, 1))  # Tuesday full is the floor
+
+    clock = CostlyClock(et(2026, 9, 2, 10, 0, 30), cost=60)
+    ticks = [0]
+    captured: list[datetime] = []
+
+    def cycle(*, slot: datetime, close_tag: str | None, session_phase: str | None):
+        captured.append(slot)
+        return CycleResult(snap_ts=slot, segments=())
+
+    def twice() -> bool:
+        ticks[0] += 1
+        return ticks[0] <= 2
+
+    daemon.run_loop_from_config(
+        config_path=str(config),
+        tickers_path=str(tickers),
+        clock=clock,
+        calendar=weekday_sessions(WEEK),
+        assertion_runner=lambda args: None,
+        transport=FakeTransport(),
+        pinger=FakePinger(),
+        compaction_runner=lambda args: None,
+        cycle_runner=cycle,
+        should_continue=twice,
+    )
+
+    marked = collections.Counter(_gap_snaps(lake_root, "quotes", "XYZ", date(2026, 9, 2)))
+    assert marked, "the daemon marked nothing, so no handoff was exercised"
+    assert {snap for snap, count in marked.items() if count > 1} == set()
+    assert "problems=" not in capsys.readouterr().err
+    covered = sorted({datetime.fromisoformat(snap) for snap in marked} | set(captured))
+    holes = [
+        (covered[i] + timedelta(minutes=1)).isoformat()
+        for i in range(len(covered) - 1)
+        if covered[i + 1] - covered[i] != timedelta(minutes=1)
+    ]
+    assert holes == [], f"minutes in no row at all: {holes}"
+    assert covered[0] == et(2026, 9, 2, 9, 30)
+
+
+@pytest.mark.parametrize("clock_at", [(10, 0), (10, 10)], ids=["behind", "ahead"])
+def test_the_startup_pass_is_bounded_by_the_slot_it_is_handed_not_its_clock(clock_at, tmp_path):
+    """The handed slot is the bound, whichever side of it the marker's own clock reads.
+
+    ``run_loop`` hands over the minute it seeded. A marker that also consulted its clock,
+    through a ``min`` or ``max`` or a plain read, would agree on every test where the two
+    match and mark the wrong minutes when they do not, as after a wall clock step.
+    """
+    _capture(tmp_path, "XYZ", date(2026, 9, 1))  # Tuesday full is the floor
+    marker = _marker(tmp_path, et(2026, 9, 2, *clock_at), roster=Roster((EQUITY_ONLY,)))
+    marker.on_start(et(2026, 9, 2, 10, 5))
+    marked = sorted(_gap_snaps(tmp_path, "quotes", "XYZ", date(2026, 9, 2)))
+    assert marked[0] == et(2026, 9, 2, 9, 30).isoformat()
+    assert marked[-1] == et(2026, 9, 2, 10, 5).isoformat()
+    assert len(marked) == 36
+
+
 def test_a_marking_pass_that_hits_a_problem_says_so_on_stderr(tmp_path, capsys):
     from lake import daemon
     from lake.gap import MarkingReport
@@ -766,7 +878,9 @@ def test_a_day_whose_record_cannot_be_read_is_refused_rather_than_over_marked(tm
     )
     corrupt.write_bytes(b"not arrow at all")
 
-    report = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((EQUITY_ONLY,))).on_start()
+    report = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((EQUITY_ONLY,))).on_start(
+        et(2026, 9, 2, 10, 0)
+    )
     # A full session of daemon_dead markers over a day that really was captured would
     # be worse than marking nothing.
     assert report.rows == 0
@@ -790,7 +904,7 @@ def test_the_walk_back_cap_counts_sessions_not_calendar_days(tmp_path, monkeypat
         spans=lambda: spans,
         pid=7,
     )
-    report = marker.on_start()
+    report = marker.on_start(et(2026, 9, 8, 10, 0))
     days = sorted({span.day for span in report.spans})
     assert len(days) == 6, days
     assert days[0] == date(2026, 9, 1)
@@ -809,10 +923,11 @@ def test_no_minute_falls_between_the_startup_pass_and_the_first_cycle(
 ):
     """The union of marked and captured minutes is contiguous, whatever the pass costs.
 
-    Startup marking bounds itself at the minute it began. A pass that outlives that
-    minute pushes the loop's first tick past the bound, and the minutes in between
-    belong to neither producer unless the loop is seeded. That is the one-minute hole
-    gap marking exists to close, reopened by gap marking itself.
+    Startup marking bounds itself at the minute the daemon started in, which the loop
+    hands it. A pass that outlives that minute pushes the loop's first tick past the
+    bound, and the minutes in between belong to neither producer unless the loop is
+    seeded. That is the one-minute hole gap marking exists to close, reopened by gap
+    marking itself.
     """
     from datetime import timedelta
 
@@ -832,8 +947,8 @@ def test_no_minute_falls_between_the_startup_pass_and_the_first_cycle(
         pid=11,
     )
 
-    def slow_start() -> None:
-        marker.on_start()
+    def slow_start(slot: datetime) -> None:
+        marker.on_start(slot)
         clock.advance(seconds=pass_seconds)
 
     captured: list[datetime] = []
@@ -866,6 +981,115 @@ def test_no_minute_falls_between_the_startup_pass_and_the_first_cycle(
     ]
     assert holes == [], f"minutes in no row at all: {holes}"
     assert covered[-1] == captured[-1]
+
+
+def _straddled_restart(
+    root: Path, reads_short: int
+) -> tuple[dict[str, list[str]], list[str], list[str]]:
+    """Restart the daemon a few clock reads short of 10:01, with a real marker on both hooks.
+
+    Every clock read costs 1 us, so the loop's seed read falls inside 10:00. One read
+    short puts the very next read past the top, which is the straddle. Two and three
+    reads short leave room for reads added before the handoff later. Nothing moves the
+    clock by hand. Returns every row on the
+    day by minute with its ``error_class``, the minutes the loop ran a cycle for, and the
+    problems either marking pass reported.
+    """
+    from datetime import timedelta
+
+    from lake import daemon
+    from tests.support.clock import CostlyClock
+
+    master, spans = _spans_for(Roster((EQUITY_ONLY,)))
+    clock = CostlyClock(et(2026, 9, 2, 10, 1) - timedelta(microseconds=reads_short))
+    session_clock = SessionClock(clock=clock, calendar=weekday_sessions(WEEK))
+    marker = gap.GapMarker(
+        lake_root=root,
+        roster=lambda: Roster((EQUITY_ONLY,)),
+        session_clock=session_clock,
+        master=lambda: master,
+        spans=lambda: spans,
+        pid=11,
+    )
+    reports: list[gap.MarkingReport] = []
+    captured: list[str] = []
+    ticks = [0]
+
+    def twice() -> bool:
+        ticks[0] += 1
+        return ticks[0] <= 2
+
+    daemon.run_loop(
+        session_clock,
+        lambda **kwargs: None,
+        clock=clock,
+        hooks=daemon.DaemonHooks(
+            on_start=lambda slot: reports.append(marker.on_start(slot)),
+            on_skipped=lambda slots: reports.append(marker.on_skipped(slots)),
+            on_cycle=lambda slot, result: captured.append(slot.isoformat()),
+        ),
+        should_continue=twice,
+    )
+
+    rows: dict[str, list[str]] = collections.defaultdict(list)
+    directory = journal.segment_dir(root, "quotes", "XYZ", date(2026, 9, 2))
+    for path in sorted(directory.glob("*.arrows")):
+        for row in journal.read_segment(path).to_pylist():
+            rows[row["snap_ts"]].append(row["error_class"])
+    problems = [problem for report in reports for problem in report.problems]
+    return rows, captured, problems
+
+
+@pytest.mark.parametrize("reads_short", [1, 2, 3])
+def test_a_restart_across_a_minute_top_marks_no_minute_twice(reads_short, tmp_path):
+    """Startup marking and the loop's skipped-slot marking never both claim one minute.
+
+    The loop seeds its previous slot from one read and hands that minute to startup
+    marking. If the marker read the clock for its own bound, a read past 10:01 would mark
+    10:01 ``daemon_dead`` while the first tick hands 10:01 to ``on_skipped`` as
+    ``slot_overrun``. Two rows for one minute double-count it in every per-slot read.
+    """
+    from datetime import timedelta
+
+    _capture(tmp_path, "XYZ", date(2026, 9, 1))  # Tuesday full is the floor
+    _record(tmp_path, "quotes", "XYZ", et(2026, 9, 2, 9, 59))
+    rows, captured, problems = _straddled_restart(tmp_path, reads_short)
+
+    doubled = {snap: kinds for snap, kinds in rows.items() if len(kinds) > 1}
+    assert doubled == {}, f"minutes holding two rows: {doubled}"
+    assert not set(rows) & set(captured), "a captured minute was marked too"
+    assert problems == []
+    covered = sorted(datetime.fromisoformat(snap) for snap in [*rows, *captured])
+    holes = [
+        (covered[i] + timedelta(minutes=1)).isoformat()
+        for i in range(len(covered) - 1)
+        if covered[i + 1] - covered[i] != timedelta(minutes=1)
+    ]
+    assert holes == [], f"minutes in no row at all: {holes}"
+    assert covered[0] == et(2026, 9, 2, 9, 30)
+
+
+@pytest.mark.parametrize("reads_short", [1, 2, 3])
+def test_a_restart_across_a_minute_top_writes_the_first_owed_minute_once(reads_short, tmp_path):
+    """The two passes never stamp one segment name, so the skipped pass reports nothing.
+
+    The dead incarnation captured through 10:00. A marker reading 10:01 for its own bound
+    would owe only 10:01, and both passes would stamp their segment ``10:01`` under one
+    pid. The skipped pass's write would then fail ``O_EXCL`` and report
+    ``FileExistsError`` as a problem, leaving 10:01 marked with the wrong reason.
+    """
+    _capture(tmp_path, "XYZ", date(2026, 9, 1))  # Tuesday full is the floor
+    _capture(tmp_path, "XYZ", date(2026, 9, 2), through=et(2026, 9, 2, 10, 0))
+    rows, captured, problems = _straddled_restart(tmp_path, reads_short)
+
+    assert problems == []
+    first_owed = et(2026, 9, 2, 10, 1).isoformat()
+    owners = rows.get(first_owed, []) + [first_owed] * captured.count(first_owed)
+    assert len(owners) == 1, f"10:01 is held by {owners}"
+    if reads_short == 1:
+        # The seed read is the last one inside 10:00, so the first tick is 10:02 and 10:01
+        # is the loop's to mark. The daemon was alive then, so the reason is an overrun.
+        assert rows[first_owed] == [gap.SLOT_OVERRUN]
 
 
 def _overrun_after_a_roster_change(tmp_path: Path, *, before: str, after: str) -> tuple[Path, int]:
@@ -1086,7 +1310,7 @@ def test_a_manifest_line_naming_no_partition_is_recorded_rather_than_raised(tmp_
     (tmp_path / "manifest.jsonl").write_text('{"source": "compaction", "rows": 406}\n')
     marker = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=_roster_of("XYZ"))
 
-    report = marker.on_start()
+    report = marker.on_start(et(2026, 9, 2, 10, 0))
 
     assert len(report.problems) == 1, report.problems
     assert report.problems[0].startswith("marking pass: ManifestError"), report.problems
@@ -1105,7 +1329,7 @@ def test_a_manifest_partition_that_cannot_be_a_key_is_recorded_rather_than_raise
     (tmp_path / "manifest.jsonl").write_text('{"partition": [], "rows": 406}\n')
     marker = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=_roster_of("XYZ"))
 
-    report = marker.on_start()
+    report = marker.on_start(et(2026, 9, 2, 10, 0))
 
     assert len(report.problems) == 1, report.problems
     assert report.problems[0].startswith("marking pass: ManifestError"), report.problems
@@ -1125,7 +1349,7 @@ def test_a_drifted_segment_is_recorded_rather_than_raised(tmp_path):
     _drifted_segment(tmp_path, "quotes", "XYZ", date(2026, 9, 2))
     marker = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=_roster_of("XYZ"))
 
-    report = marker.on_start()
+    report = marker.on_start(et(2026, 9, 2, 10, 0))
 
     # The pair is refused and named, which is what the reader's ``unreadable`` channel is
     # for. Marking the day would write a full session of holes over a record that may
@@ -1170,7 +1394,9 @@ def test_a_shadow_appended_day_is_refused_rather_than_over_marked(tmp_path):
     with path.open("ab") as handle:
         handle.write(b"shadow bytes past the end of stream")
 
-    report = _marker(tmp_path, et(2026, 9, 2, 12, 0), roster=_roster_of("XYZ")).on_start()
+    report = _marker(tmp_path, et(2026, 9, 2, 12, 0), roster=_roster_of("XYZ")).on_start(
+        et(2026, 9, 2, 12, 0)
+    )
 
     assert report.problems == ("quotes/XYZ 2026-09-02: 1 unreadable (1 shadow_append)",), (
         report.problems
@@ -1194,7 +1420,9 @@ def test_a_day_whose_segment_vanishes_under_the_read_is_refused_too(tmp_path, mo
 
     monkeypatch.setattr(journal, "read_segment", vanishing_read)
 
-    report = _marker(tmp_path, et(2026, 9, 2, 12, 0), roster=_roster_of("XYZ")).on_start()
+    report = _marker(tmp_path, et(2026, 9, 2, 12, 0), roster=_roster_of("XYZ")).on_start(
+        et(2026, 9, 2, 12, 0)
+    )
 
     assert report.problems == ("quotes/XYZ 2026-09-02: 1 unreadable (1 vanished)",), report.problems
     assert report.rows == 0, "the walk marked a day compaction had just sealed"
@@ -1222,7 +1450,9 @@ def test_a_day_whose_stamps_will_not_decode_is_refused_too(tmp_path):
     with pa.ipc.new_stream(path, schema) as writer:
         writer.write_batch(pa.record_batch([stamps], schema=schema))
 
-    report = _marker(tmp_path, et(2026, 9, 2, 12, 0), roster=_roster_of("XYZ")).on_start()
+    report = _marker(tmp_path, et(2026, 9, 2, 12, 0), roster=_roster_of("XYZ")).on_start(
+        et(2026, 9, 2, 12, 0)
+    )
 
     assert report.problems == ("quotes/XYZ 2026-09-02: 1 unreadable (1 unparseable)",), (
         report.problems
@@ -1255,7 +1485,7 @@ def test_a_roster_that_will_not_load_is_still_fatal(tmp_path):
     )
 
     with pytest.raises(TickersError):
-        marker.on_start()
+        marker.on_start(et(2026, 9, 2, 10, 0))
 
 
 def test_one_pairs_failure_does_not_cost_the_rest_of_the_roster_their_markers(tmp_path):
@@ -1277,7 +1507,7 @@ def test_one_pairs_failure_does_not_cost_the_rest_of_the_roster_their_markers(tm
     marker = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=roster)
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(journal, "recorded_slots", boom)
-        report = marker.on_start()
+        report = marker.on_start(et(2026, 9, 2, 10, 0))
 
     assert len(report.problems) == 1, report.problems
     assert report.problems[0].startswith("quotes/BOOM: RuntimeError"), report.problems
