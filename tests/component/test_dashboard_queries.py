@@ -2282,10 +2282,11 @@ def test_one_unusable_span_costs_the_whole_ticker_its_clamp(root: Path):
     # A partial clamp is the one way this reading can come back narrower than the truth,
     # so a ticker with any unusable span gets no clamp rather than the spans that
     # survived. Instrument 1 captured Monday 09:30 to 09:34, which covers the fixture's
-    # 09:32 gap marker, and its span is closed. Instrument 2 is still open, so its
-    # ``span_end`` is null and a drifted ``span_end`` column leaves it usable while
-    # dropping instrument 1's. Keeping only the survivor would put 09:32 out of scope and
-    # erase a real gap marker.
+    # 09:32 gap marker, and its span is closed. Instrument 1's ``span_start`` is null,
+    # which every pinned field allows, so its span is dropped while instrument 2's
+    # survives. A retyped ``span_end`` used to do the same, before the read refused a
+    # retyped file (marketlake #551). Keeping only the survivor would put 09:32 out of
+    # scope and erase a real gap marker.
     SecurityMaster(
         [
             Mapping(
@@ -2316,9 +2317,15 @@ def test_one_unusable_span_costs_the_whole_ticker_its_clamp(root: Path):
             CaptureSpan(2, et(MONDAY, 9, 36).astimezone(UTC), None, False),
         ]
     ).to_table()
+    starts = table.column("span_start").to_pylist()
+    table = table.set_column(
+        table.schema.get_field_index("span_start"),
+        "span_start",
+        pa.array([None, *starts[1:]], pa.timestamp("us", tz="UTC")),
+    )
     path = spans_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(_retype(table, {"span_end": pa.timestamp("us")}), path)
+    pq.write_table(table, path)
 
     chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
         "strips"
@@ -2476,9 +2483,10 @@ def test_a_non_ticker_mapping_of_the_same_spelling_stays_out_of_the_union(root: 
 def test_the_broad_guard_still_serves_a_panel_when_the_clamp_raises(root: Path, monkeypatch):
     # ``_capture_spans`` catches everything on purpose, and its comment says not to
     # narrow it back to a list of error types. Both file reads inside it have their own
-    # narrow guards, so nothing a reference file can hold reaches the broad one any
-    # more. This drives it directly, because a backstop no test reaches is a backstop
-    # nothing would notice the loss of.
+    # guards, and the reads refuse a column at the wrong type, but a null the pinned
+    # types allow can still raise from a comparison further in. This drives the guard
+    # directly, because a backstop no test reaches is a backstop nothing would notice the
+    # loss of.
     write_master(root, "SPY", et(MONDAY, 9, 36))
 
     def boom(span):

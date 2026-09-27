@@ -5,7 +5,8 @@ Marketlake #551 and #396. ``SecurityMaster.read``, ``CaptureSpans.read`` and
 read as an empty spans set, so the daemon captured nothing and said nothing. A parquet in some
 other schema raised a bare ``KeyError`` out of the capture cycle, which ends the daemon. The
 rule now is that every damaged file raises the module's unreadable class, a file from newer
-code raises its unsupported class, and only an access failure comes through as ``OSError``.
+code raises its unsupported class, and ``OSError`` comes through unfolded. That last is an
+absent or refused file, or corruption pyarrow itself reports as ``OSError``.
 
 Every test here runs against all three readers rather than against the shared helper alone. A
 test on the helper would still pass if one reader stopped calling it.
@@ -275,6 +276,27 @@ def test_a_torn_file_is_unreadable(reader, target, keep):
 
 
 # -- a file from newer code ------------------------------------------------------------------
+
+
+def test_a_null_version_is_unreadable_rather_than_newer(reader, target):
+    """Every pinned field is nullable, and a null version is damage, not newer code."""
+    _write(_table(reader.columns, schema_version=pa.array([None], pa.int32())), target)
+
+    with pytest.raises(reader.unreadable, match="null schema_version"):
+        reader.read(target)
+
+
+def test_a_reason_the_file_supplies_stays_on_one_line(reader, target):
+    """A column type can carry a field name the file chose, and it must not forge a line."""
+    forged = pa.array(
+        [{"a\nreference: forged": 1}], pa.struct([("a\nreference: forged", pa.int64())])
+    )
+    _write(_table(reader.columns, **{reader.other: forged}), target)
+
+    with pytest.raises(reader.unreadable) as caught:
+        reader.read(target)
+    assert "reference: forged" in str(caught.value)
+    assert "\n" not in str(caught.value)
 
 
 def test_a_newer_version_is_unsupported(reader, target):

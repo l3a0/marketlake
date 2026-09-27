@@ -129,14 +129,15 @@ class UnsupportedSchemaVersion(SecurityMasterError):
 class MasterUnreadable(SecurityMasterError):
     """Raised when something is at the master's path and it is not a master this code can read.
 
-    That is every damaged file, not only a torn one. A torn write leaves fewer bytes than a
-    whole master, and ``pyarrow`` refuses it with ``ArrowInvalid``, whose class tree is
-    ``ArrowInvalid -> ValueError``, not a ``SecurityMasterError``. A directory reads as an
-    empty table, a readable parquet in some other schema used to raise a bare ``KeyError``
-    from the build, and a bit flip can raise ``ArrowNotImplementedError`` or
-    ``OverflowError``. A caller guarding the master's own errors alone would let each of
-    them escape or read as a master holding nothing, so ``read`` folds them all into this
-    class, through ``reference_table.read_reference_table`` (marketlake #396, #551).
+    That is every damaged file pyarrow does not report as ``OSError``, not only a torn one.
+    A torn write leaves fewer bytes than a whole master, and ``pyarrow`` refuses it with
+    ``ArrowInvalid``, whose class tree is ``ArrowInvalid -> ValueError``, not a
+    ``SecurityMasterError``. A directory reads as an empty table, a readable parquet in some
+    other schema used to raise a bare ``KeyError`` from the build, and a bit flip can raise
+    ``ArrowNotImplementedError`` or ``OverflowError``. A caller guarding the master's own
+    errors alone would let each of them escape or read as a master holding nothing, so
+    ``read`` folds them all into this class, through
+    ``reference_table.read_reference_table`` (marketlake #396, #551).
 
     ``reason`` says which shape it was, and the message carries it, because the daemon's
     line prints the message and a directory is not "not readable parquet". Two unreadable
@@ -519,7 +520,8 @@ class SecurityMaster:
     def read(cls, path: Path | str) -> SecurityMaster:
         """Read a master from a parquet file at ``path``.
 
-        Every damaged file raises ``MasterUnreadable``, so a caller guarding
+        Every damaged file raises ``MasterUnreadable``, except corruption pyarrow reports as
+        ``OSError``, so a caller guarding
         ``SecurityMasterError`` catches it rather than a stray ``ValueError`` or
         ``KeyError``. That covers a torn file, a directory, a parquet in some other schema
         and a column of the wrong type. A master from newer code raises

@@ -131,14 +131,14 @@ class UnsupportedLedgerSchemaVersion(SchemaVersionsError):
 class LedgerUnreadable(SchemaVersionsError):
     """Raised when something is at the ledger's path and it is not a ledger this code can read.
 
-    That is every damaged file, not only a torn one. A torn write leaves fewer bytes than a
-    whole file, and ``pyarrow`` refuses it with ``ArrowInvalid``, whose class tree is
-    ``ArrowInvalid -> ValueError``, not a ``SchemaVersionsError``. A directory reads as an
-    empty table, which used to answer "not recorded" and send the operator to a repair that
-    dies at ``os.replace`` (marketlake #551). A parquet in some other schema used to raise a
-    bare ``KeyError``. ``read`` folds them all into this class, through
-    ``reference_table.read_reference_table``, so a caller guarding this module's own errors
-    catches every one.
+    That is every damaged file pyarrow does not report as ``OSError``, not only a torn one.
+    A torn write leaves fewer bytes than a whole file, and ``pyarrow`` refuses it with
+    ``ArrowInvalid``, whose class tree is ``ArrowInvalid -> ValueError``, not a
+    ``SchemaVersionsError``. A directory reads as an empty table, which used to answer "not
+    recorded" and send the operator to a repair that dies at ``os.replace`` (marketlake
+    #551). A parquet in some other schema used to raise a bare ``KeyError``. ``read`` folds
+    them all into this class, through ``reference_table.read_reference_table``, so a caller
+    guarding this module's own errors catches every one.
 
     ``reason`` says which shape it was, and the message carries it, because the ledger
     check's page puts the message in its detail. An absent file raises ``OSError`` instead,
@@ -324,7 +324,8 @@ class SchemaVersionLedger:
     def read(cls, path: Path | str) -> SchemaVersionLedger:
         """Read a ledger from parquet at ``path``.
 
-        Every damaged file raises ``LedgerUnreadable``, so a caller guarding
+        Every damaged file raises ``LedgerUnreadable``, except corruption pyarrow reports as
+        ``OSError``, so a caller guarding
         ``SchemaVersionsError`` catches it. That covers a torn file, a directory, a parquet
         in some other schema and a column of the wrong type. A file from newer code raises
         ``UnsupportedLedgerSchemaVersion``. An absent file raises ``OSError`` instead, and

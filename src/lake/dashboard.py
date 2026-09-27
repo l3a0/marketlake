@@ -888,10 +888,11 @@ def _read_capture_spans(
     truth, which is why it is refused outright. The surviving instrument's spans get
     applied to days they never owned, so a minute reads out of scope when the missing
     span is what would have shown it was owed. Measured: a recycled ticker whose closed
-    span is dropped by a drifted ``span_end`` while its open one survives turned two
+    span is dropped while its open one survives turned two
     recorded ``daemon_dead`` gap rows into out-of-scope minutes and took the day out of
-    the History panel's denominator. An instrument registered with no span row reaches
-    the same state by a different route.
+    the History panel's denominator. The drop was a retyped ``span_end`` then. The read
+    refuses a retyped file now (marketlake #551), so a null ``span_start`` is the route that
+    remains. An instrument registered with no span row reaches the same state by another.
 
     Order is not relied on anywhere. ``CaptureSpans.spans_of`` returns insertion order
     and the union concatenates per instrument, so the tuple's order is an accident of two

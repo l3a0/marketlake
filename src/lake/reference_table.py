@@ -65,7 +65,9 @@ def read_reference_table[T](
        stops here with any number of rows, including none. The type is checked here, and
        only as far as "an integer", so a foreign ``schema_version`` of strings is not
        reported as a newer table while a newer file of some other integer width still is.
-    4. **Check the version**, and raise ``unsupported`` on a mismatch. It runs before the
+    4. **Check the version**, and raise ``unsupported`` on a mismatch. A null version is
+       damage rather than newer code, since every pinned field is nullable and no writer
+       leaves it empty, so it is unreadable. The check runs before the
        check on the other columns because that class means a file from newer code, which
        is a different answer from a damaged one, and a newer version may add or change
        columns.
@@ -86,7 +88,13 @@ def read_reference_table[T](
     ``OSError`` stays out of the fold. pyarrow reports most corruption as a bare ``OSError``,
     262 of 400 byte flips in a real ledger, and the ledger check splits ``PermissionError``
     off it on purpose (marketlake #536). Callers already guard ``OSError`` beside the
-    module's own class.
+    module's own class. So "every damaged file" in this module's callers means every one
+    pyarrow does not report as ``OSError``: those still arrive as ``OSError``, as damage,
+    alongside the absent and refused files.
+
+    A reason can quote the file, through a column type or a chained message, so its
+    whitespace is collapsed. A file must not be able to put a newline, and so a forged
+    second line, into a log line or a page's detail that prints the message.
     """
     mode = os.stat(path).st_mode
     if not stat.S_ISREG(mode):
@@ -98,6 +106,8 @@ def read_reference_table[T](
         if index < 0 or not pa.types.is_integer(table.schema.field(index).type):
             raise unreadable(path, f"is not the pinned schema, it has no integer {VERSION_COLUMN}")
         for found in table.column(VERSION_COLUMN).unique().to_pylist():
+            if found is None:
+                raise unreadable(path, f"has a null {VERSION_COLUMN}")
             if found != version:
                 raise unsupported(found)
         for name in schema.names:
@@ -106,7 +116,13 @@ def read_reference_table[T](
     except (OSError, base):
         raise
     except Exception as exc:
-        raise unreadable(path, f"is not readable parquet, {type(exc).__name__}: {exc}") from exc
+        reason = _one_line(f"is not readable parquet, {type(exc).__name__}: {exc}")
+        raise unreadable(path, reason) from exc
+
+
+def _one_line(text: str) -> str:
+    """``text`` with every run of whitespace collapsed to one space, per ``read``'s docstring."""
+    return " ".join(text.split())
 
 
 def _require_column(
@@ -124,5 +140,6 @@ def _require_column(
     actual = found.field(index).type
     if not actual.equals(expected):
         raise unreadable(
-            path, f"is not the pinned schema, its {name} column is {actual}, not {expected}"
+            path,
+            _one_line(f"is not the pinned schema, its {name} column is {actual}, not {expected}"),
         )

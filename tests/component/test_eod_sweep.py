@@ -1158,9 +1158,10 @@ def test_a_walk_refuses_the_whole_os_error_class_and_never_an_ordinary_bug(
 ):
     """The width of what marketlake #435 added, asserted from both sides.
 
-    **Wide enough.** Every reference-file case reaches the tuple as ``PermissionError``, and a
-    corrupt file does not reach it at all, because ``SecurityMaster.read`` and
-    ``CaptureSpans.read`` fold ``ArrowInvalid`` into their own named classes first. So narrowing
+    **Wide enough.** Every reference-file case below reaches the tuple as ``PermissionError``.
+    Most damaged files do not reach it at all, because ``SecurityMaster.read`` and
+    ``CaptureSpans.read`` fold them into their own named classes first, and only corruption
+    pyarrow reports as ``OSError`` comes through as one. So narrowing
     the entry to ``PermissionError`` passes every one of those cases, and the entry says
     ``OSError`` on purpose: ``MasterUnreadable``'s own docstring names an on-disk read error, "such
     as a bad sector, which ``pyarrow`` reports as ``ArrowIOError``", and that is an ``OSError`` and
