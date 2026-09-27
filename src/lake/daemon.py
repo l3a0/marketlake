@@ -122,7 +122,7 @@ from lake.control_plane import (
 )
 from lake.deadman import CAPTURE_SLUG, DeadMan
 from lake.gap import GapMarker, MarkingReport, surfaces_for
-from lake.journal import CHAINS_SURFACE, ROW_KIND_DATA
+from lake.journal import CHAINS_SURFACE
 from lake.metadata import stamp_assertion_pid, stamp_cycle, stamp_ping
 from lake.reference_read import read_or_none
 from lake.report import write_close_guard
@@ -1403,7 +1403,9 @@ def run_loop_from_config(
             # limit that starves one ticker reads as that ticker being dead. A page with
             # no class says nothing rather than guessing: a slept-through slot attempted
             # no request, and a collapsed sampler page whose tickers disagreed has no one
-            # class to name.
+            # class to name. One class is not recorded anywhere: ``contracts_absent``, a
+            # chain that answered with no contract, which the watchdog derives and the
+            # lake never carries (marketlake #326).
             body = f"{page.minutes} session minutes without a durable cycle"
             if page.cause is not None:
                 body = f"{body}, failing with {page.cause}"
@@ -1432,16 +1434,18 @@ def run_loop_from_config(
 
     def on_cycle(slot: datetime, result: CycleResult) -> None:
         raise_pages(watchdog.observe(result), slot)
-        # A cycle that landed real data is the strongest evidence of life. A cycle over
-        # an empty enabled roster is different: every ticker retired, so there was
-        # nothing to fetch, and that is the daemon idle by design rather than broken.
+        # A cycle that landed real data is the strongest evidence of life, and real data
+        # means a data row, so a chain segment carrying only absence markers or nothing
+        # at all does not count (marketlake #326). A cycle over an empty enabled roster
+        # is different: every ticker retired, so there was nothing to fetch, and that is
+        # the daemon idle by design rather than broken.
         # Both feed the check. A non-empty roster where every fetch failed writes gap
         # segments and neither condition holds, so it stays unfed, which is what lets
         # the dead-man ping go silent for capture that is truly stuck. So does a roster
         # the capture spans emptied while its tickers are still enabled: nothing was
         # fetched, but those tickers owe their minutes, so the cycle does not report
         # ``nothing_to_capture`` and the line below names them (marketlake #554).
-        landed_data = any(seg.row_kind == ROW_KIND_DATA for seg in result.segments)
+        landed_data = any(seg.landed_data for seg in result.segments)
         if landed_data or result.nothing_to_capture:
             deadman.captured(slot)
         out_of_span_line.observe(slot, result.out_of_span)

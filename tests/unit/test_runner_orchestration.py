@@ -41,6 +41,7 @@ def _segment(surface: str, ticker: str, row_kind: str) -> SegmentOutcome:
         rows=1,
         error_class=None if row_kind == ROW_KIND_DATA else "http_500",
         fetched_at=_SNAP.isoformat(),
+        data_rows=1 if row_kind == ROW_KIND_DATA else 0,
     )
 
 

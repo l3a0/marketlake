@@ -224,7 +224,9 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
      every window drifted is a whole-chain gap, and the watchdog is what speaks for a ticker
      that stopped producing data. A chain that lost one window lands as data carrying that
      window's absence marker, which resets the watchdog rather than tripping it, so the marker
-     rows are what a reader has.
+     rows are what a reader has. It resets because it still holds contracts. A chain whose
+     every successful window answered with no contract holds none, so it trips the watchdog
+     as `contracts_absent` ([#326](https://github.com/l3a0/marketlake/issues/326)).
      The merge itself reads a whole body into scratch maps and copies them into the
      reassembly maps only on success. So a window given up carries no data rows beside the
      absence marker saying it was never collected, which is the double-record the markers
@@ -269,7 +271,7 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   keeps holding the first time the sync root widens. Both are derived from constants in
   `paths`, because `compact` spelled the temp name twice before and a second spelling
   would put a temp file outside the exclusion with nothing to say so.
-- **D13** watchdog and alerting. One counter per ticker and surface. A durable data cycle resets it, a gap row does not, and three consecutive session minutes page once. Counters start at zero on every restart, never rebuilt from the journal, so a restart never pages for the downtime that preceded it. It observes both D9's cycle-outcome hook and its skipped-slot hook, because the loop runs no cycle for a slot it slept through and those are the minutes the daemon was worst off. Three collapses keep a page storm from replacing a diagnosis:
+- **D13** watchdog and alerting. One counter per ticker and surface. A durable data cycle resets it, and a gap row does not, nor does a data segment holding no data row. Three consecutive session minutes page once. Counters start at zero on every restart, never rebuilt from the journal, so a restart never pages for the downtime that preceded it. It observes both D9's cycle-outcome hook and its skipped-slot hook, because the loop runs no cycle for a slot it slept through and those are the minutes the daemon was worst off. Three collapses keep a page storm from replacing a diagnosis:
   1. Every quotes ticker rides one batched request, so all of them failing together is one page naming the sampler.
   2. A cycle where every surface failed with the same known class pages that cause instead. A dead refresh token gaps chains and quotes for every ticker at once, and the design expects one every seven days.
   3. A slot the loop slept through gaps every watched surface at once, so one overrun that trips the threshold is one page rather than one per surface.
