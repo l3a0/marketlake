@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from lake import capture, close_guard, daemon, journal
+from lake import capture, close_guard, daemon, gap, journal
 from lake.capture import CycleResult
 from lake.capture_spans import CaptureSpans, spans_path
 from lake.manifest import append_manifest, manifest_path, sha256_file
@@ -272,6 +272,92 @@ def test_an_equity_close_that_ran_and_failed_is_already_recorded(tmp_path):
     outcome = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 18)), [("XYZ", False)]).run(DAY)
     assert outcome.unobserved == ()
     assert len(_rows(tmp_path, "quotes", "XYZ", DAY)) == 1
+
+
+def _untagged(root: Path, ticker: str, slot: datetime) -> None:
+    """One untagged gap row, the shape both gap-marking passes write for a missed minute."""
+    batch = journal.gap_rows(
+        journal.QUOTES_SURFACE, ticker=ticker, slots=[slot], error_class=gap.DAEMON_DEAD
+    )
+    stamp = slot.strftime(_STAMP_FORMAT)
+    with journal.SegmentWriter.open(
+        root, journal.QUOTES_SURFACE, ticker, slot.date(), stamp, 1
+    ) as writer:
+        writer.write_cycle(batch)
+
+
+@pytest.mark.parametrize(
+    ("minute", "markers"),
+    [
+        # Gap marking recorded the close minute, so a marker would be its second row.
+        (et(2026, 9, 2, 16, 0), 0),
+        # A row one minute early records a different minute, and the close is still owed.
+        (et(2026, 9, 2, 15, 59), 1),
+    ],
+)
+def test_an_equity_close_gap_marking_recorded_gets_no_second_row(tmp_path, minute, markers):
+    """A restart or a stall across the equity close leaves 16:00 marked, untagged.
+
+    Gap marking writes its rows with no close tag, so the tagged read above finds nothing
+    at 16:00 and cannot tell this minute from one no row records. A marker beside the
+    untagged row would double-count the minute in every per-slot completeness read. Nothing
+    observed the close either way, so the report still names the ticker.
+    """
+    _untagged(tmp_path, "XYZ", minute)
+    outcome = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 20)), [("XYZ", False)]).run(DAY)
+
+    assert outcome.unobserved == ("XYZ",), "the report lost a close nobody observed"
+    assert outcome.problems == ()
+    rows = _rows(tmp_path, journal.QUOTES_SURFACE, "XYZ", DAY)
+    marked = [row for row in rows if row["error_class"] == close_guard.SPOT_CLOSE_UNOBSERVED]
+    assert len(marked) == markers
+    assert len(rows) == 1 + markers
+
+
+def _unreadable_minute(root: Path, ticker: str) -> Path:
+    """A segment the tagged read answers cleanly and the minute read cannot.
+
+    Its one row is untagged, so the tagged read counts nothing and finds nothing wrong.
+    Its ``snap_ts`` is not a time, so the read that asks which minutes are recorded
+    cannot say whether this row is the close. Written by hand, because no writer produces
+    a value like this.
+    """
+    import pyarrow as pa
+
+    directory = LakePaths(root).segment_dir(journal.QUOTES_SURFACE, ticker, DAY)
+    directory.mkdir(parents=True, exist_ok=True)
+    schema = pa.schema(
+        [("snap_ts", pa.string()), ("close_tag", pa.string()), ("row_kind", pa.string())]
+    )
+    path = directory / "20260902T160000000000-1.arrows"
+    with pa.ipc.new_stream(path, schema) as writer:
+        writer.write_batch(
+            pa.record_batch(
+                [
+                    pa.array(["2026-09-02T16:00 or so"]),
+                    pa.array([None], type=pa.string()),
+                    pa.array([journal.ROW_KIND_GAP]),
+                ],
+                schema=schema,
+            )
+        )
+    return path
+
+
+def test_a_minute_the_presence_read_cannot_see_withholds_the_marker(tmp_path):
+    """The file that will not say which minute it holds could be holding the close.
+
+    The same refusal the tagged read makes, reached through the second read. The blast
+    radius still stops at the one ticker, so OK gets the marker it is owed.
+    """
+    path = _unreadable_minute(tmp_path, "BAD")
+
+    guard = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 20)), [("BAD", False), ("OK", False)])
+    outcome = guard.run(DAY)
+
+    assert outcome.problems == ("quotes/BAD: 1 unreadable (1 unparseable)",), outcome.problems
+    assert outcome.unobserved == ("OK",), "the guard claimed a close it could not see"
+    assert _segments(tmp_path, "BAD") == [path], "a marker landed beside an unreadable file"
 
 
 # -- the recoverable half ------------------------------------------------------------

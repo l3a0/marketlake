@@ -489,6 +489,19 @@ def run_loop(
 # -- the production entry ------------------------------------------------------
 
 
+def _skips_an_equity_close(session_clock: SessionClock, skipped: list[datetime]) -> bool:
+    """Whether ``skipped`` includes any session day's equity close.
+
+    Asked once per day the slots touch rather than once per slot, because an overnight
+    stall hands over hundreds of slots and each lookup asks the calendar. Every skipped
+    slot is a capture slot of a session day, so ``bounds`` never refuses one.
+    """
+    missed = set(skipped)
+    return any(
+        session_clock.bounds(day).equity_close in missed for day in {s.date() for s in skipped}
+    )
+
+
 def _report(report: MarkingReport, pass_name: str) -> None:
     """Print what a marking pass did, so a pass that failed is not silent.
 
@@ -964,12 +977,14 @@ def _start_compaction(runner: CompactionRunner, args: Sequence[str]) -> None:
 def _dispatched(name: str, job: Callable[[date], None]) -> Callable[[date], None]:
     """Wrap a session-relative job so its failure costs the job and never the daemon.
 
-    Everything session-relative is dispatched from the tick hook, and ``run_loop`` wraps
-    no hook in a try. So a job that raises exits the process, and under ``KeepAlive`` the
-    successor reaches the same minute, runs the same job against the same lake, and raises
-    again. A deterministic failure at a fixed moment therefore becomes a crash loop with
-    capture dead inside it, which inverts the design's order of precedence: capture is the
-    un-buy-backable thing, and every other job is arranged not to block it.
+    Everything session-relative is dispatched from the tick hook, or for the close+5
+    guard on a tick that wakes from a stall across the equity close, from the skipped-slot
+    hook later in that tick.
+    ``run_loop`` wraps no hook in a try. So a job that raises exits the process, and under
+    ``KeepAlive`` the successor reaches the same minute, runs the same job against the same
+    lake, and raises again. A deterministic failure at a fixed moment therefore becomes a
+    crash loop with capture dead inside it, which inverts the design's order of precedence:
+    capture is the un-buy-backable thing, and every other job is arranged not to block it.
 
     The trade is only right for a job whose own failure is cheap. Both jobs here qualify.
     A close+5 run that could not finish costs markers, and a marker stands for a minute
@@ -1397,6 +1412,19 @@ def run_loop_from_config(
     # load-bearing. On a post-close restart the guard owns the two close minutes, and it
     # must write them before startup marking walks the day, or the day's 16:00 and 16:15
     # would carry a marker from each writer.
+    #
+    # The same order holds for ``on_skipped``. ``run_loop`` calls it after ``on_tick``, so
+    # a guard dispatched from the tick a stall woke on would run before that tick's
+    # overrun markers. A lid closed after 15:55 and opened at 16:25 is that case. The
+    # guard would find 16:00 unrecorded and mark it, and the skipped-slot pass, which
+    # reads no journal rows, would then mark it again. So on a tick whose skipped slots
+    # include an equity close, the dispatch waits for ``on_skipped`` and runs after the
+    # marker's pass, where the guard finds 16:00 recorded and adds nothing.
+    #
+    # Only then. The wait puts the watchdog's page and the marker's lake-root lock in front
+    # of the guard, and the fill checks the clock itself. A stall that skipped only 16:11
+    # to 16:15 and woke at 16:20 would otherwise risk its option-close fill for nothing,
+    # because 16:00 already holds its row and the guard's order cannot matter there.
     guard = _close_guard(
         config_path,
         tickers_path,
@@ -1415,27 +1443,64 @@ def run_loop_from_config(
         )
         guard_on_start = hooks.on_start
         guard_on_tick = hooks.on_tick
+        guard_on_skipped = hooks.on_skipped
+        # The previous tick's slot, seeded from the one ``run_loop`` hands ``on_start``, so
+        # this asks ``missed_slots`` exactly what the loop is about to ask it. And the slot
+        # whose dispatch waits for ``on_skipped``, or ``None`` when none does.
+        guard_last: datetime | None = None
+        guard_waiting: datetime | None = None
 
         def on_start_guarded(slot: datetime) -> None:
+            nonlocal guard_last
+            guard_last = slot
             dispatch.check(clock.now())
             guard_on_start(slot)
 
         def on_tick_guarded(slot: datetime) -> None:
-            dispatch.check(slot)
+            nonlocal guard_last, guard_waiting
+            last, guard_last = guard_last, slot
+            if _skips_an_equity_close(session_clock, missed_slots(session_clock, last, slot)):
+                guard_waiting = slot
+            else:
+                dispatch.check(slot)
             guard_on_tick(slot)
 
-        hooks = replace(hooks, on_start=on_start_guarded, on_tick=on_tick_guarded)
+        def on_skipped_guarded(slots: list[datetime]) -> None:
+            nonlocal guard_waiting
+            try:
+                guard_on_skipped(slots)
+            finally:
+                # In a ``finally`` because the marker's pass can raise and a caller's own
+                # hook runs inside it. Before the deferral the guard had already run by the
+                # time either could raise, so a raise there must not cost the run now. The
+                # guard then finds 16:00 unrecorded and marks it, and the successor's
+                # startup marking counts that row. The alarm's roster read wraps outside
+                # this hook, so a roster that will not load still exits before the guard
+                # runs, and a successor started the same day runs it from ``on_start``.
+                waiting, guard_waiting = guard_waiting, None
+                if waiting is not None:
+                    dispatch.check(waiting)
+
+        hooks = replace(
+            hooks,
+            on_start=on_start_guarded,
+            on_tick=on_tick_guarded,
+            on_skipped=on_skipped_guarded,
+        )
 
     # Close+15 compaction, dispatched one tick after its moment. Sealing a day is the one
     # act here that cannot be taken back, so it runs after every writer that can still
     # add a row to that day, and the one-tick wait is what puts it there.
     #
     # Three writers come before it, and the tick alone does not order all three. Startup
-    # marking runs from ``on_start``, before the first tick. The close+5 guard runs from
-    # the tick hook above, so it is already wrapped inside this one. The third is the
-    # loop's own skipped-slot marking, and it is the one that decides this: ``run_loop``
-    # calls ``on_skipped`` *after* ``on_tick``, so a compaction dispatched from the tick
-    # it woke on would seal the day a minute before those markers were written.
+    # marking runs from ``on_start``, before the first tick. The close+5 guard runs from the
+    # tick hook above, so it is already wrapped inside this one. On a tick that wakes from a
+    # stall across the equity close it runs from ``on_skipped`` instead, later in that same
+    # tick, and the seal still follows it because the check below reads the previous tick's
+    # slot. The third is the loop's own skipped-slot marking, and it is the one that decides
+    # this: ``run_loop`` calls ``on_skipped`` *after* ``on_tick``, so a compaction
+    # dispatched from the tick it woke on would seal the day a minute before those markers
+    # were written.
     #
     # A lid closed at 16:10 and opened at 17:00 is that case, and it is an ordinary
     # laptop day rather than an exotic one. The waking tick owes markers for 16:11
