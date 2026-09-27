@@ -679,11 +679,13 @@ def test_the_daemon_hands_the_guard_a_fill_that_lands_the_close(unset, tmp_path,
     the close, so the guard finds the option close missing and fills it.
 
     The unset shape is the one the installed plist runs, which passes the daemon no path
-    at all. ``MARKETLAKE_CONFIG`` and ``MARKETLAKE_TICKERS`` point the loaders at this
-    test's files, the shape ``control_plane render --config`` installs. The fill is the
-    only place the loop's config and token paths reach ``fill_option_close_from_config``,
-    and a guard that fills is needed to get there, which the daemon wiring file's rig
-    never builds. So a fill handed a mangled path is caught here and nowhere else.
+    at all. ``MARKETLAKE_CONFIG`` points the config loader at this test's config, the
+    shape ``control_plane render --config`` installs. No install sets
+    ``MARKETLAKE_TICKERS``, so it stands in for the default roster path, which a test must
+    not write. ``_close_fill`` is the only site that forwards the loop's config and token
+    paths to ``fill_option_close_from_config``. Reaching it takes a guard that fills, which
+    the daemon wiring file's rig never builds, and this is the only test that reaches a
+    fill with unset paths. So only this test fails when the fill receives a mangled path.
     """
     lake_root = tmp_path / "lake"
     lake_root.mkdir()

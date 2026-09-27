@@ -14,18 +14,25 @@ one, under whatever name the module binds it. The three are ``lake.config.load_c
 ``lake.tickers.load_tickers`` and ``lake.control_plane.read_token_mint``. Each wrapper
 records the path it was handed and the function that called it, so a failure names the
 helper rather than only the file, and then calls the real reader with the same arguments.
-The defining module is wrapped too, so a call spelled ``config.load_config(...)`` is
-recorded as well. ``monkeypatch`` puts every real reader back when the test ends.
+``install`` wraps the defining modules too, so the record also catches a call spelled
+``config.load_config(...)``, and a module first imported during the run binds the wrapper.
+``monkeypatch`` puts every binding it replaced back when the test ends.
+
+What it does not put back is a binding it never made. A module first imported during a
+spied test keeps that test's wrapper afterwards, and the wrapper still calls the real
+reader but records into a list nothing reads any more. So ``install`` wraps a binding
+whose innermost function is a real reader, not only the real reader itself, and
+``assert_no_reader_escaped`` fails on a binding that is a real reader or another spy's
+wrapper. Either one is a read the test cannot see.
 
 The price is named here rather than hidden. A reader held somewhere other than a module
-attribute, such as a default argument or a class attribute, escapes the spy. So does a
-module first imported after ``install`` ran, since it binds the real reader. The second
-case is the one a daemon run can plausibly produce, so ``assert_no_reader_escaped`` looks
-for it and fails. None of the first kind exists in ``src/lake`` today.
+attribute, such as a default argument, a closure or a class attribute, escapes the spy
+and the check alike. None exists in ``src/lake`` today.
 
-The vendor's own token read goes through ``SchwabVendor.from_token``, which every daemon
-test replaces because the real one builds the ``schwab-py`` client. ``vendor_factory``
-builds that replacement and records its path in the same list.
+The vendor's own token read goes through ``SchwabVendor.from_token``. Every daemon test
+that runs the production cycle runner or the close+5 fill replaces it, because the real
+one builds the ``schwab-py`` client. ``vendor_factory`` builds that replacement and
+records its path in the same list.
 """
 
 from __future__ import annotations
@@ -68,6 +75,15 @@ def _caller(depth: int) -> str:
     return f"{frame.f_globals.get('__name__')}.{frame.f_code.co_qualname}"
 
 
+def _innermost(value: object) -> object:
+    """``value`` with every ``functools.wraps`` layer peeled off."""
+    seen: set[int] = set()
+    while hasattr(value, "__wrapped__") and id(value) not in seen:
+        seen.add(id(value))
+        value = value.__wrapped__
+    return value
+
+
 def _lake_modules() -> list[ModuleType]:
     return [
         module
@@ -81,6 +97,7 @@ class PathReads:
 
     def __init__(self) -> None:
         self.reads: list[Read] = []
+        self._wrappers: set[int] = set()
 
     @classmethod
     def install(cls, monkeypatch: pytest.MonkeyPatch) -> PathReads:
@@ -89,9 +106,12 @@ class PathReads:
         wrappers = {id(real): spy._wrap(name, real) for name, real in READERS.items()}
         for module in _lake_modules():
             for attribute, value in list(vars(module).items()):
-                wrapper = wrappers.get(id(value))
+                # The innermost function, so a wrapper an earlier test left behind on a
+                # module it imported is replaced like the real reader it calls.
+                wrapper = wrappers.get(id(_innermost(value)))
                 if wrapper is not None:
                     monkeypatch.setattr(module, attribute, wrapper)
+        spy._wrappers = {id(wrapper) for wrapper in wrappers.values()}
         return spy
 
     def _wrap(self, name: str, real: Callable[..., object]) -> Callable[..., object]:
@@ -132,17 +152,16 @@ class PathReads:
         return {read.caller for read in self.of(*readers)}
 
     def assert_no_reader_escaped(self) -> None:
-        """Fail when a loaded ``lake`` module still binds a real reader.
+        """Fail when a loaded ``lake`` module binds a reader this spy does not record.
 
-        A module first imported after ``install`` binds the real reader, and its reads
-        never reach this record. Call this after the run, when every module the run
-        imported is loaded.
+        That is the real reader, or a wrapper another spy made. Call this after the run,
+        when every module the run imported is loaded.
         """
         real = {id(reader): name for name, reader in READERS.items()}
         escaped = sorted(
-            f"{module.__name__}.{attribute} is the real {real[id(value)]}"
+            f"{module.__name__}.{attribute} reaches {real[id(_innermost(value))]} unrecorded"
             for module in _lake_modules()
             for attribute, value in vars(module).items()
-            if id(value) in real
+            if id(_innermost(value)) in real and id(value) not in self._wrappers
         )
         assert not escaped, f"reads the spy cannot see: {escaped}"
