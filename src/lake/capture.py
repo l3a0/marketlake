@@ -1244,9 +1244,10 @@ _QUOTES_UNIT = object()
 class _QuoteFetch:
     """The one batched quote request's result: a response or the exception it raised.
 
-    ``request_start`` is when the last attempt was sent. In the pool that can follow
-    ``fetch_ts``, the submission, and after a retry it always does. ``None`` means the two
-    coincide.
+    ``request_start`` is when the last attempt was sent, read by ``_Deadline.send`` just
+    after ``fetch_ts`` at a cap of 1 and on the worker in the pool, and after a retry
+    always later. ``None`` means no attempt was sent, or none is left in flight when the
+    bound cut the batch, and then ``fetch_ts`` stands in.
 
     ``earlier`` is the record of an attempt that failed transiently before the one this
     result is from (marketlake #558), so its timing line is written beside the last
