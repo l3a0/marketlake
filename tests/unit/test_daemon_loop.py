@@ -22,7 +22,10 @@ They cover the loop's observable contract:
    caught up. The skipped slot is reported, never a silent hole.
 7. Skip detection reports exactly the missed capture slots: one for a one-slot overrun,
    both in order for a two-slot overrun, only the in-window slots when the overrun
-   crosses the option close, and nothing under normal cadence or on the first tick.
+   crosses the option close, and nothing under normal cadence or on a first tick that
+   follows the start minute. A startup hook that outlives its minute leaves the minutes
+   up to the first tick to skip detection, starting at the minute after the one the
+   daemon started in.
 8. A stall spans days within one incarnation. It reports the first day's tail and the
    last day's head, in order, with weekends and holidays contributing nothing. A wake
    on a Saturday still reports Friday's tail. A night jump reports nothing.
@@ -44,7 +47,7 @@ from lake.runner import UrllibPinger
 from lake.session import CAPTURE_PHASES, SessionClock, SessionPhase
 from lake.tickers import TickersError
 from tests.support.calendar import FakeCalendar, SessionTimes
-from tests.support.clock import ManualClock
+from tests.support.clock import CostlyClock, ManualClock
 from tests.support.config import NTFY_TOPIC, write_config
 from tests.support.pinger import FakePinger
 from tests.support.transport import FakeTransport
@@ -423,7 +426,7 @@ def test_a_clock_stepped_back_during_a_cycle_serves_no_minute_twice(calendar):
     assert runner.slots == _slots(et(REGULAR, 15, 59), et(REGULAR, 16, 4))
 
 
-class _LandingClock(ManualClock):
+class _LandingClock(CostlyClock):
     """A manual clock whose first sleep lands at ``lands_at``, and whose reads cost 1 us.
 
     The landing models a long overshoot, like a machine that slept, waking just before a
@@ -434,11 +437,6 @@ class _LandingClock(ManualClock):
     def __init__(self, start: datetime, lands_at: datetime) -> None:
         super().__init__(start)
         self._lands_at: datetime | None = lands_at
-
-    def now(self) -> datetime:
-        instant = super().now()
-        self.advance(0.000001)
-        return instant
 
     def sleep(self, seconds: float) -> None:
         if self._lands_at is not None:
@@ -495,7 +493,7 @@ def test_a_wake_landing_just_before_a_top_reads_its_phase_from_its_slot(
 def test_on_start_is_called_once_before_any_cycle(calendar):
     events: list[str] = []
     hooks = daemon.DaemonHooks(
-        on_start=lambda: events.append("start"),
+        on_start=lambda slot: events.append("start"),
         on_cycle=lambda slot, result: events.append("cycle"),
     )
     _simulate(calendar, et(REGULAR, 9, 28), et(REGULAR, 9, 33), hooks=hooks)
@@ -504,7 +502,7 @@ def test_on_start_is_called_once_before_any_cycle(calendar):
 
 def test_on_start_fires_even_when_no_cycle_ever_does(calendar):
     events: list[str] = []
-    hooks = daemon.DaemonHooks(on_start=lambda: events.append("start"))
+    hooks = daemon.DaemonHooks(on_start=lambda slot: events.append("start"))
     _simulate(calendar, et(HOLIDAY, 12, 0), et(HOLIDAY, 12, 5), hooks=hooks)
     assert events == ["start"]
 
@@ -547,7 +545,7 @@ def test_on_cycle_receives_every_result_in_order(calendar):
 
 def test_default_hooks_are_no_ops():
     hooks = daemon.DaemonHooks()
-    assert hooks.on_start() is None
+    assert hooks.on_start(et(REGULAR, 9, 29)) is None
     assert hooks.close_tag_for(et(REGULAR, 16, 0)) is None
     result = CycleResult(snap_ts=et(REGULAR, 16, 0), segments=())
     assert hooks.on_cycle(et(REGULAR, 16, 0), result) is None
@@ -598,13 +596,55 @@ def test_normal_cadence_never_calls_on_skipped(calendar):
     assert reports == []
 
 
-def test_the_first_tick_never_calls_on_skipped(calendar):
-    # Started mid-session, mid-minute. The first tick has no previous slot to compare
-    # against. The minutes before it belong to startup gap-marking, not the loop.
+def test_a_quick_starts_first_tick_never_calls_on_skipped(calendar):
+    # Started mid-session, mid-minute. The loop seeds its previous slot with 10:00, the
+    # minute it started in, and hands that minute to startup gap-marking. The first tick
+    # is 10:01, adjacent to the seed, so nothing is missed. Every minute through 10:00
+    # belongs to startup gap-marking, not the loop.
     hooks, reports = _skip_recorder()
     runner, _ = _simulate(calendar, et(REGULAR, 10, 0, 17), et(REGULAR, 10, 3), hooks=hooks)
     assert runner.slots == [et(REGULAR, 10, 1), et(REGULAR, 10, 2), et(REGULAR, 10, 3)]
     assert reports == []
+
+
+@pytest.mark.parametrize("reads_short", [1, 2, 3])
+def test_on_start_is_handed_the_slot_the_loop_seeded_and_the_first_skip_follows_it(
+    calendar, reads_short
+):
+    # Every read costs 1 us, and the clock starts a few reads short of 10:01. The loop's
+    # seed read falls inside 10:00, the minute the daemon started in. A second read taken
+    # for ``on_start`` can fall past the top and hand it 10:01, and startup marking would
+    # then claim 10:01 while the first tick hands it to ``on_skipped`` too. On a clock
+    # that stands still between reads, nothing tells that second read from the first.
+    # One read short puts the very next read past the top. Two and three leave room for
+    # reads added before the handoff later.
+    top = et(REGULAR, 10, 1)
+    clock = CostlyClock((top - timedelta(microseconds=reads_short)).astimezone(UTC))
+    session_clock = SessionClock(clock, calendar)
+    handed: list[datetime] = []
+    reports: list[list[datetime]] = []
+
+    def on_start(slot: datetime) -> None:
+        handed.append(slot)
+        # A startup pass reads the clock as it works. These reads carry it past 10:01, so
+        # the first tick lands on 10:02 and has a minute to report.
+        for _ in range(reads_short):
+            clock.now()
+
+    hooks = daemon.DaemonHooks(
+        on_start=on_start, on_skipped=lambda slots: reports.append(list(slots))
+    )
+    end = et(REGULAR, 10, 2, 30).astimezone(UTC)
+    daemon.run_loop(
+        session_clock,
+        _RecordingRunner(clock),
+        clock=clock,
+        hooks=hooks,
+        should_continue=lambda: clock.now() < end,
+    )
+
+    assert handed == [et(REGULAR, 10, 0)]
+    assert reports == [[handed[0] + daemon.TICK]]
 
 
 def test_a_run_spanning_two_session_dates_does_not_report_the_overnight_minutes(calendar):

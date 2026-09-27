@@ -219,7 +219,9 @@ def missed_slots(
 ) -> list[datetime]:
     """The capture slots missed between the previous tick and this one, in order.
 
-    Nothing is missed before the first tick or between adjacent ticks, and only past
+    Nothing is missed between adjacent slots, or when there is no previous slot at all.
+    The loop never passes ``None``, because it seeds its previous slot with the minute it
+    started in, so its first tick reports whatever a startup hook outlived. Only past
     that short-circuit does the calendar get asked, so the normal-cadence path never
     touches it. A wider span is walked one calendar day at a time, from the previous
     tick's date through this one's. A day the calendar refuses as ``NotASession``, a
