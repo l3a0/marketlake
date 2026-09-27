@@ -19,16 +19,34 @@ def _at(minute: int, day: int = 2) -> datetime:
     return datetime(2026, 9, day, 10, minute, tzinfo=ET)
 
 
-def _seg(surface: str, ticker: str, kind: str) -> SegmentOutcome:
+def _seg(
+    surface: str,
+    ticker: str,
+    kind: str,
+    *,
+    rows: int = 1,
+    data_rows: int | None = None,
+    error_class: str | None = None,
+) -> SegmentOutcome:
+    """One segment outcome. ``data_rows`` defaults to every row on data and none on a gap.
+
+    A data segment holding marker rows and no contract takes ``rows`` above zero with
+    ``data_rows=0``. ``error_class`` defaults to none on data and ``boom`` on a gap.
+    """
+    if data_rows is None:
+        data_rows = rows if kind == "data" else 0
+    if error_class is None and kind != "data":
+        error_class = "boom"
     return SegmentOutcome(
         surface=surface,
         ticker=ticker,
         path=Path("seg.arrows"),
         partition="p",
         row_kind=kind,
-        rows=1,
-        error_class=None if kind == "data" else "boom",
+        rows=rows,
+        error_class=error_class,
         fetched_at=None,
+        data_rows=data_rows,
     )
 
 
@@ -550,6 +568,7 @@ def _fail(surface: str, ticker: str, error_class: str) -> SegmentOutcome:
         rows=1,
         error_class=error_class,
         fetched_at=None,
+        data_rows=0,
     )
 
 
@@ -1097,6 +1116,7 @@ def test_a_page_for_a_failure_with_no_recorded_class_names_none():
                     rows=1,
                     error_class=None,
                     fetched_at=None,
+                    data_rows=0,
                 ),
                 at=_at(minute),
             )

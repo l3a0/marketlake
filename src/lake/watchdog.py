@@ -10,6 +10,9 @@ A counter counts session minutes without a durable data cycle for its own surfac
 ticker. A durable data cycle resets it to zero. Gap rows are journaled and durable, but
 they are not data, so a minute that produced only a gap still increments. That is the
 whole point: a surface that fails every minute is producing rows and producing nothing.
+A durable data cycle is one that landed a data row, so a chain segment carrying only
+absence markers, or nothing at all, increments too, and fails as ``contracts_absent``
+(marketlake #326).
 
 Three consecutive minutes pages, once, on the transition. It stays silent after that
 until a durable cycle resets the counter or the surface leaves the cycle, and re-arms when
@@ -56,7 +59,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 
 from lake.calendar import MARKET_TZ
-from lake.capture import CycleResult
+from lake.capture import CycleResult, SegmentOutcome
 from lake.journal import QUOTES_SURFACE, ROW_KIND_DATA
 
 # What the design pins as the page threshold, in consecutive session minutes without a
@@ -85,6 +88,27 @@ _OVERRUN_TITLE = "Capture down: loop overran"
 
 # What enabled tickers the capture spans leave out page under, one page for all of them.
 _OUT_OF_SPAN_TITLE = "Capture down: tickers outside every capture span"
+
+# The reason a data segment holding no data row fails with. The segment records none of
+# its own, or records the first failed window's class, so the watchdog derives this one
+# and writes it nowhere. It names what is missing, the way ``quote_absent`` does.
+CONTRACTS_ABSENT = "contracts_absent"
+
+
+def _failure_class(segment: SegmentOutcome) -> str | None:
+    """The class a segment that produced nothing is failing with.
+
+    A gap segment's is the one it recorded. A data segment that produced nothing answered
+    and brought no contract, and that answer is the reason, over any class the segment
+    recorded. A chain whose one window answered 200 with empty maps while another window
+    failed records the failed window's class, and taking it would let a 401 on one window
+    fold a surface that authenticated under a dead token. The failed window's own reason
+    is not lost, because its absence-marker rows carry it. Only a chain reaches this, since
+    a quotes data segment is one quote row.
+    """
+    if segment.row_kind == ROW_KIND_DATA:
+        return CONTRACTS_ABSENT
+    return segment.error_class
 
 
 @dataclass(frozen=True)
@@ -143,8 +167,8 @@ class Watchdog:
         self._counts: dict[Surface, int] = {}
         self._day: date | None = None
         # A cause maps to the surfaces its page covers. A surface leaves that set when
-        # it produces data, when it starts failing a way another cause names, or when
-        # the roster drops it. A cause whose set empties is dropped, which re-arms it.
+        # it produces data, when it answers with no contract, or when the roster drops
+        # it, per ``_release``. A cause whose set empties is dropped, which re-arms it.
         self._paged_causes: dict[str, set[Surface]] = {}
         self._paged: set[Surface] = set()
         # Whether an overrun has already paged. It is the stall's own once-on-transition
@@ -177,6 +201,8 @@ class Watchdog:
         Every surface the cycle wrote a data row for resets. Every surface it wrote only
         a gap for fails, and so does every surface it could not journal at all, because
         an unwritten segment is the same absence as a failed one from the counter's side.
+        A data segment holding no data row fails too, as ``contracts_absent``, per
+        :func:`_failure_class`, and leaves every cause that named it, per :meth:`_release`.
         A surface it did not touch at all has left the cycle and loses its counter, per
         :meth:`_drop_departed`.
 
@@ -189,7 +215,7 @@ class Watchdog:
         for segment in result.segments:
             key = Surface(segment.surface, segment.ticker)
             touched.add(key)
-            if segment.row_kind == ROW_KIND_DATA:
+            if segment.landed_data:
                 produced.add(key)
         for error in result.errors:
             touched.add(Surface(error.surface, error.ticker))
@@ -200,11 +226,18 @@ class Watchdog:
             self._reset(key)
         for key in sorted(failed, key=str):
             self._counts[key] = self._counts.get(key, 0) + 1
-        classes: dict[Surface, str | None] = {
-            Surface(segment.surface, segment.ticker): segment.error_class
+        recorded: dict[Surface, str | None] = {
+            Surface(segment.surface, segment.ticker): _failure_class(segment)
             for segment in result.segments
             if Surface(segment.surface, segment.ticker) in failed
         }
+        # A surface that answered and brought nothing is not failing for any cause's
+        # reason, so it leaves every cause that named it, before any cause is asked
+        # whether it is still live this minute.
+        for key, error_class in recorded.items():
+            if error_class == CONTRACTS_ABSENT:
+                self._release(key)
+        classes = dict(recorded)
         # A segment that could not be written carries its own class, and that surface is
         # just as down, so its page names that class the same way.
         for error in result.errors:
@@ -212,7 +245,7 @@ class Watchdog:
         self._release_retired(touched)
         threshold = self._threshold()
         out_of_span = self._out_of_span_pages(result, threshold)
-        cause = self._whole_daemon(result, failed, touched, threshold)
+        cause = self._whole_daemon(recorded, failed, touched, threshold)
         if cause is not None:
             return cause + out_of_span
         return self._pages(failed, touched, threshold=threshold, classes=classes) + out_of_span
@@ -299,7 +332,11 @@ class Watchdog:
         ]
 
     def _whole_daemon(
-        self, result: CycleResult, failed: set[Surface], touched: set[Surface], threshold: int
+        self,
+        recorded: dict[Surface, str | None],
+        failed: set[Surface],
+        touched: set[Surface],
+        threshold: int,
     ) -> list[Page] | None:
         """One page naming the cause, when every surface failed the same way.
 
@@ -320,12 +357,16 @@ class Watchdog:
         ``vendor_auth_error`` once the refresh fails and no request goes out. One session
         carries both, so counting by class would page the same outage a second time under
         the same title when the vendor changed how it said no.
+
+        ``recorded`` is the class each failed segment is failing with, ``contracts_absent``
+        included, so a chain that answered 200 with no contract counts against unanimity.
+        That answer proves the request authenticated and was not rate-limited, so the
+        cycle is not one cause. A surface whose segment could not be written is left out,
+        because a write failure says nothing about what the vendor did.
         """
         if not failed or failed != touched or len(touched) < 2:
             return None
-        classes = {
-            segment.error_class for segment in result.segments if segment.error_class is not None
-        }
+        classes = {error_class for error_class in recorded.values() if error_class is not None}
         if len(classes) != 1:
             return None
         error_class = classes.pop()
@@ -381,9 +422,14 @@ class Watchdog:
         """Take one surface out of the causes covering it, dropping one that empties.
 
         A cause with no surfaces left has nothing to explain, so dropping it re-arms it.
-        Only two things bring a surface here: it produced data, or the roster dropped it.
-        A surface that merely started failing another way is still down, so the cause
-        that named it has not lifted and keeps it.
+        Three things bring a surface here: it produced data, the roster dropped it, or it
+        answered with no contract. That answer proves the request authenticated and was
+        not rate-limited, so no cause can still be what is failing the surface. Kept in the
+        cause instead, it held a token-dead cause live after the token recovered, and the
+        next token death that session paged nothing (marketlake #326). Its counter keeps
+        climbing, because it still produced nothing. A surface that merely started failing
+        another way, a timeout or a 5xx or another cause's class, is still down, so the
+        cause that named it has not lifted and keeps it.
         """
         for title in list(self._paged_causes):
             held = self._paged_causes[title]
@@ -568,6 +614,7 @@ class Watchdog:
 
 
 __all__ = [
+    "CONTRACTS_ABSENT",
     "DEFAULT_PAGE_MINUTES",
     "Page",
     "Surface",

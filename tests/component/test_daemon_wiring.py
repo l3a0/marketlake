@@ -358,6 +358,8 @@ def _segment(
     surface: str = journal.QUOTES_SURFACE,
     ticker: str = "XYZ",
     routed: tuple[str, ...] = (),
+    rows: int = 1,
+    data_rows: int | None = None,
 ) -> SegmentOutcome:
     """One journalled segment of the named kind, the shape a cycle result carries.
 
@@ -370,16 +372,22 @@ def _segment(
 
     ``routed`` is the columns whose vendor field arrived at a type the column refused,
     empty on every ordinary segment, which is what the schema-drift page reads.
+
+    ``data_rows`` defaults to every row on data and none on a gap. A data segment holding
+    marker rows and no contract takes ``rows`` above zero with ``data_rows=0``.
     """
+    if data_rows is None:
+        data_rows = rows if row_kind == journal.ROW_KIND_DATA else 0
     return SegmentOutcome(
         surface=surface,
         ticker=ticker,
         path=root / "segment.arrows",
         partition=f"{surface}/ticker={ticker}/date=2026-09-02/segment.arrows",
         row_kind=row_kind,
-        rows=1,
+        rows=rows,
         error_class=None if row_kind == journal.ROW_KIND_DATA else "boom",
         fetched_at=None,
+        data_rows=data_rows,
         routed_columns=routed,
     )
 
@@ -1060,6 +1068,7 @@ class _RateLimited:
             rows=1,
             error_class="http_429",
             fetched_at=None,
+            data_rows=0,
         )
         return CycleResult(snap_ts=slot, segments=(segment,))
 
@@ -1102,6 +1111,7 @@ class _WholeDaemonFailure:
                 rows=1,
                 error_class="http_401",
                 fetched_at=None,
+                data_rows=0,
             )
             for surface in (journal.QUOTES_SURFACE, "chains")
         )
@@ -1155,6 +1165,7 @@ class _DeadSampler:
                 rows=1,
                 error_class="boom",
                 fetched_at=None,
+                data_rows=0,
             )
             for ticker in self._tickers
         )
@@ -1206,6 +1217,7 @@ class _SplitSampler:
                 rows=1,
                 error_class="boom" if index % 2 else "timeout",
                 fetched_at=None,
+                data_rows=0,
             )
             for index, ticker in enumerate(self._tickers)
         )
@@ -1391,6 +1403,7 @@ def test_the_out_of_span_page_names_four_tickers_and_counts_the_rest(tmp_path, l
         rows=1,
         error_class=None,
         fetched_at=None,
+        data_rows=1,
     )
 
     def runner(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:

@@ -55,17 +55,26 @@ def _segment(
     *,
     routed: tuple[str, ...] = (),
     row_kind: str = ROW_KIND_DATA,
+    rows: int = 1,
+    data_rows: int | None = None,
 ) -> SegmentOutcome:
-    """One segment outcome, the shape a cycle result carries."""
+    """One segment outcome, the shape a cycle result carries.
+
+    ``data_rows`` defaults to every row on data and none on a gap. A data segment holding
+    marker rows and no contract takes ``rows`` above zero with ``data_rows=0``.
+    """
+    if data_rows is None:
+        data_rows = rows if row_kind == ROW_KIND_DATA else 0
     return SegmentOutcome(
         surface=surface,
         ticker=ticker,
         path=Path("segment.arrows"),
         partition=f"{surface}/ticker={ticker}/date=2026-09-14/segment.arrows",
         row_kind=row_kind,
-        rows=1,
+        rows=rows,
         error_class=None if row_kind == ROW_KIND_DATA else "http_429",
         fetched_at=None,
+        data_rows=data_rows,
         routed_columns=routed,
     )
 

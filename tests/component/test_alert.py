@@ -199,6 +199,7 @@ def test_the_daemon_pages_through_the_publisher_when_a_surface_goes_quiet(tmp_pa
                     rows=1,
                     error_class="boom",
                     fetched_at=None,
+                    data_rows=0,
                 ),
             ),
         )

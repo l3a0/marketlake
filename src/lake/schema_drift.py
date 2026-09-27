@@ -62,7 +62,6 @@ from datetime import datetime
 
 from lake.alert import REFUSED, Message, Publisher
 from lake.capture import CycleResult
-from lake.journal import ROW_KIND_DATA
 
 # The event and title on the parser's schema-drift page. ``compact.SCHEMA_DRIFT_EVENT`` is
 # ``compaction_schema_drift`` and ``battery_drift.SCHEMA_DRIFT_EVENT`` is
@@ -152,7 +151,9 @@ class SchemaDriftObserver:
         drifting: dict[str, dict[str, list[str]]] = {}
         for segment in result.segments:
             roster.setdefault(segment.surface, set()).add(segment.ticker)
-            if segment.row_kind != ROW_KIND_DATA:
+            # A data segment holding no data row is no evidence about the payload either,
+            # so it clears nothing, the same as a gap (marketlake #326).
+            if not segment.landed_data:
                 continue
             landed.setdefault(segment.surface, set()).add(segment.ticker)
             for column in segment.routed_columns:
