@@ -427,6 +427,10 @@ class BatteryReport:
     and to ``sweep.SweepOutcome.render``. The finding reaches both through ``report``
     instead.
 
+    ``report_kinds`` gives each ``report`` line its kind, set where the line is composed, and
+    ``report.Nightly`` says what the kinds are for. The sweep pours the pair into its own
+    through ``report.ReportLines.pour``.
+
     ``sessions_owed`` and ``sessions_missing`` are the coverage check's pair, and they are the
     one pair here not scoped by ``day``. :func:`coverage` says why. The denominator is carried
     because the check's correct answer against today's lake is that it found nothing, and a
