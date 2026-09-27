@@ -39,6 +39,7 @@ These cover the check's contract:
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 from datetime import UTC, date, datetime, time
@@ -649,6 +650,37 @@ def test_a_segment_name_with_no_file_behind_it_stops_the_run(lake_root, make):
     events: list[str] = []
 
     with pytest.raises(OSError):
+        _run_into(lake_root, events)
+
+    assert {path: path.read_bytes() for path in spy} == before
+    assert not _partition(lake_root, "SPY").exists()
+    assert latest_entries(lake_root) == {}
+    assert events == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [OSError(errno.EMFILE, "Too many open files"), ValueError("a bug"), TypeError("a bug")],
+    ids=["out-of-descriptors", "value-error", "type-error"],
+)
+def test_only_a_tear_reads_as_no_rows(lake_root, monkeypatch, error):
+    """The read folds ``ArrowInvalid`` into no rows and nothing else. A regular file the
+    system could not open, out of descriptors for one, holds rows, and so might a file a
+    bug in the reader failed on. Folding either would seal the day without them. This runs
+    under root too, which the ``chmod 000`` tests cannot."""
+    spy = _unmanifested(lake_root)
+    before = {path: path.read_bytes() for path in spy}
+    real = journal.read_segment
+
+    def fail_one(path):
+        if Path(path) == spy[2]:
+            raise error
+        return real(path)
+
+    monkeypatch.setattr(journal, "read_segment", fail_one)
+    events: list[str] = []
+
+    with pytest.raises(type(error)):
         _run_into(lake_root, events)
 
     assert {path: path.read_bytes() for path in spy} == before
