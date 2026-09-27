@@ -1269,7 +1269,7 @@ def _fetch_concurrently(
 
     Marketlake #532. A cycle's requests used to run one after another, so its wall time was
     their sum, and on 2026-09-24 three cycles ran past their minute and lost four. Here they
-    run concurrently, at most ``guards.capture_max_concurrency`` at once. Four rules shape
+    run concurrently, at most ``guards.capture_max_concurrency`` at once. Five rules shape
     how.
 
     1. **One flat pool, bounded by the cap.** Every (ticker, window) pair is one task, and
@@ -1312,7 +1312,8 @@ def _fetch_concurrently(
        cut task made gets its line from the shared record ``_Deadline`` keeps. The pool is
        shut without waiting, and its queued tasks are cancelled. The tasks still running
        are handed to ``on_abandoned``, for a caller that must not close what they use
-       until they finish. A ``deadline`` of ``None`` waits for every task, as before.
+       until they finish, and so is every task still running when a raise leaves early. A
+       ``deadline`` of ``None`` waits for every task, as before.
 
     Below the cap some tasks wait in the pool's queue, so a unit's ``fetch_ts`` is when its
     first request was submitted, which can precede when it was sent. At the default cap of 20
@@ -1377,6 +1378,7 @@ def _fetch_concurrently(
         max_workers=min(guards.capture_max_concurrency, tasks),
         thread_name_prefix="capture-fetch",
     )
+    reported = False
     try:
 
         def submit(unit: object, fn: Callable[..., object], *args: object) -> Future:
@@ -1430,6 +1432,7 @@ def _fetch_concurrently(
         for future in [f for f in submitted if f in pending and f.done()]:
             pending.discard(future)
             collect(future)
+        reported = True
         if on_abandoned is not None:
             on_abandoned(tuple(f for f in submitted if f in pending))
         at = bound.at
@@ -1461,9 +1464,23 @@ def _fetch_concurrently(
             hand_over_chain(ticker, outcomes, at)
         return _Fetched({ticker: chains[ticker] for ticker in tickers}, quotes)
     finally:
-        # Never wait on the pool. Leaving a ``with`` block waited 8.95s more in a probe
-        # (marketlake #534), and a task the bound abandoned is still running.
-        pool.shutdown(wait=False, cancel_futures=True)
+        # A raise that leaves before the cut, a write's own bug or an interrupt, still hands
+        # over whatever is running. The pool below is not waited on, so without this a
+        # caller would close the vendor under a request that may be refreshing the token.
+        if not reported and on_abandoned is not None:
+            running = tuple(f for f in submitted if not f.done())
+            if running:
+                on_abandoned(running)
+        # A bounded fetch never waits on the pool. Leaving a ``with`` block waited 8.95s more
+        # in a probe (marketlake #534), and a task the bound abandoned is still running. A
+        # fetch with no bound, the close+5 fill and onboarding, shuts the pool as it always
+        # did, waiting for every task. Its caller closes the vendor in a plain ``finally``
+        # and has no ``on_abandoned`` to defer that close by, so a raise that left early
+        # without waiting would close the client under a request still in flight.
+        if bound.at is None:
+            pool.shutdown(wait=True)
+        else:
+            pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _send_quotes(vendor: Vendor, symbols: tuple[str, ...], deadline: _Deadline) -> VendorResponse:
@@ -1580,11 +1597,13 @@ def _fetch_window(
     since a healthy SPY chain fetch already takes about nine seconds for its five windows and
     113 requests do not fit in sixty. The 120 req/min ceiling goes next, at two option
     tickers. When this was decided, a cycle that overran fired no cycle in the next minute and
-    charged every watched surface, quotes included. Since marketlake #597 the cycle's bound
-    abandons a request still running at its 55s instead, so the overrun is gone. The tree
-    still does not finish inside the bound, so its window is lost either way. So the split
-    traded a narrower loss inside one window for whole minutes on both surfaces, and under the
-    bound it would trade it for nothing, on the one failure no narrower chunk plan fixes anyway.
+    charged every watched surface, quotes included. Since marketlake #597 the cycle stops
+    sending at its bound, and above a concurrency cap of 1 it abandons what is still running
+    there. So the cycle outruns its bound by at most the one call in progress at a cap of 1,
+    and not at all above it. A tree of 113 requests still does not finish inside the bound,
+    so its window is lost either way. So the split traded a narrower loss inside one window for
+    whole minutes on both surfaces, and under the bound it would trade it for nothing, on the
+    one failure no narrower chunk plan fixes anyway.
 
     The register entry this replaces rejected two proposals, stopping the split once both
     halves have failed and bounding drift lower than size, on the grounds that either buys a
@@ -2229,9 +2248,10 @@ def run_cycle(
     A slot also bounds the cycle (marketlake #597). A request not done by
     ``cycle_deadline`` is abandoned under ``request_abandoned``, and the cycle lands what
     it has and returns rather than waiting on it. A caller outside the loop is not bounded.
-    ``on_abandoned`` is handed the requests still running when the cycle returned, before
-    anything that could raise, so the caller can release what they use once they finish.
-    ``run_cycle_from_config`` uses it to close the vendor then rather than at the bound.
+    ``on_abandoned`` is handed the requests still running when the fetch ended, whether the
+    bound cut it or a raise left it early, so the caller can release what they use once
+    they finish. ``run_cycle_from_config`` uses it to close the vendor then rather than at
+    the bound.
 
     The steps, in order:
 

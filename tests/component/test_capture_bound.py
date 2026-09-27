@@ -78,6 +78,7 @@ class _HoldingVendor(_ThreadedVendor):
     def __init__(self, hold=(), *, ranges=None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.release = threading.Event()
+        self.holding = threading.Event()
         self._hold = set(hold)
         self._hold_lock = threading.Lock()
         self._ranges = ranges or {}
@@ -89,6 +90,7 @@ class _HoldingVendor(_ThreadedVendor):
             if key not in self._hold:
                 return
             self._hold.discard(key)
+        self.holding.set()
         assert self.release.wait(30), "the test never released a held call"
 
     def get_chain(self, symbol, *, from_date=None, to_date=None, strike_count=None):
@@ -278,20 +280,30 @@ def test_a_split_window_with_a_held_half_fails_whole_and_keeps_every_line_once(l
     # The first window comes back too big and splits. Its first half answers and its second
     # half is held. At the bound the window fails whole, since the first half's contracts
     # sit in the cut task's own maps. The too-big request and the first half keep the lines
-    # they finished with, and the held half gets the abandon line. Releasing it afterwards,
-    # and letting its task run to the end, writes nothing more.
+    # they finished with, and the held half gets the abandon line.
+    #
+    # The held half is released once the fetch is cut and before the chain is handed over,
+    # and its task runs to the end, filing its finished record in the shared record. The
+    # line still reads as the bound left it, because the cut took a copy, and no second
+    # line is written for it.
     vendor = holding(
         _HoldingVendor({("SPY", _d(2), _d(3))}, ranges={("SPY", _d(0), _d(3)): TOO_BIG})
     )
     clock = ManualClock(start=_utc(SLOT) + timedelta(seconds=1))
     abandoned: list[Future] = []
+
+    def release_after_the_cut(futures: tuple[Future, ...]) -> None:
+        abandoned.extend(futures)
+        vendor.release.set()
+        assert futures_wait(futures, timeout=10).not_done == set()
+
     result = _run(
         vendor,
         lake_root,
         clock,
         roster=_spy_only(),
         plan=_SPLITTABLE,
-        on_abandoned=abandoned.extend,
+        on_abandoned=release_after_the_cut,
     )
 
     rows = _rows(result, CHAINS, "SPY")
@@ -318,12 +330,43 @@ def test_a_split_window_with_a_held_half_fails_whole_and_keeps_every_line_once(l
         (_d(4).isoformat(), None, 200, None, False),
     ]
     assert chain_lines() == expected
-
     assert len(abandoned) == 1
-    vendor.release.set()
-    assert futures_wait(abandoned, timeout=10).not_done == set()
     assert ("SPY", _d(2), _d(3)) in vendor.chain_calls
-    assert chain_lines() == expected
+
+
+class _LateWakeClock(ManualClock):
+    """A manual clock whose wait gives up at the bound just as the held request finishes.
+
+    It stands for a real wait whose timeout fires a moment before the last task finishes, so
+    the task is done by the time the fetch is cut.
+    """
+
+    def __init__(self, start: datetime, release: threading.Event) -> None:
+        super().__init__(start)
+        self._release = release
+
+    def wait(self, futures, until):
+        done = super().wait(futures, until)
+        if not done and until is not None:
+            self._release.set()
+            futures_wait(futures, timeout=10)
+        return done
+
+
+def test_a_task_that_finishes_between_the_last_wait_and_the_cut_is_kept(lake_root, holding):
+    # SPY's first window is still running when the wait gives up at the bound, and done by
+    # the time the fetch is cut. It is collected as it stands, so the chain lands whole.
+    vendor = holding(_HoldingVendor({("SPY", _d(0), _d(9))}))
+    clock = _LateWakeClock(_utc(SLOT) + timedelta(seconds=1), vendor.release)
+    abandoned: list[Future] = []
+    result = _run(vendor, lake_root, clock, on_abandoned=abandoned.extend)
+
+    assert clock.now() == BOUND
+    rows = _rows(result, CHAINS, "SPY")
+    assert _markers(rows) == []
+    assert _expirations(rows) == {_d(0).isoformat(), _d(10).isoformat(), _d(31).isoformat()}
+    assert _line(lake_root, "SPY", _d(0).isoformat())["error_class"] is None
+    assert abandoned == []
 
 
 # -- 4. where the option close's bound falls, and the fill it must not reach -------------
@@ -427,9 +470,46 @@ def test_the_vendor_closes_once_its_abandoned_request_finishes_not_at_the_bound(
     assert (chain.row_kind, chain.error_class) == (GAP, ABANDONED)
     assert vendor.closed == 0
     vendor.release.set()
-    deadline = time.monotonic() + 10
-    while vendor.closed == 0 and time.monotonic() < deadline:
+    _wait_for(lambda: vendor.closed == 1)
+    assert vendor.closed == 1
+
+
+def _wait_for(condition, seconds: float = 10.0) -> None:
+    deadline = time.monotonic() + seconds
+    while not condition() and time.monotonic() < deadline:
         time.sleep(0.01)
+
+
+def test_a_cycle_that_raises_before_its_bound_still_leaves_the_vendor_open(
+    tmp_path, monkeypatch, holding
+):
+    # The quote batch lands first and its planning raises, which leaves the cycle before the
+    # bound with SPY's window still held. The pool is not waited on, so the vendor must stay
+    # open until that request finishes, as it does when the bound cuts it.
+    rig = _rig(tmp_path, SPY_ONLY)
+    vendor = holding(_HoldingVendor({("SPY", FIRST_MINUTE.date(), None)}))
+    _wire(monkeypatch, rig, lambda path: vendor)
+
+    def broken(self, fetched):
+        # Only once SPY's request is in flight, so the raise leaves a request running
+        # rather than one still queued, which the pool's shutdown would cancel unsent.
+        assert vendor.holding.wait(10)
+        raise RuntimeError("planning the quotes broke")
+
+    monkeypatch.setattr(capture._CaptureCycle, "_plan_quote_fetch", broken)
+    with pytest.raises(RuntimeError, match="planning the quotes broke"):
+        capture.run_cycle_from_config(
+            clock=ManualClock(start=_utc(FIRST_MINUTE) + timedelta(seconds=1)),
+            config_path=rig.config,
+            tickers_path=rig.tickers,
+            token_path=rig.token,
+            pid=4242,
+            slot=FIRST_MINUTE,
+        )
+
+    assert vendor.closed == 0
+    vendor.release.set()
+    _wait_for(lambda: vendor.closed == 1)
     assert vendor.closed == 1
 
 
@@ -504,3 +584,44 @@ def test_a_held_request_costs_its_own_minute_and_the_next_cycle_fires_on_time(la
         (et(2026, 8, 24, 10, 1), et(2026, 8, 24, 10, 1)),
     ]
     assert skipped == []
+
+
+class _Interrupted(BaseException):
+    """An interrupt of the test's own, so pytest's own handling is not involved."""
+
+
+class _InterruptingClock(ManualClock):
+    """A manual clock whose wait is interrupted once the held request is in flight."""
+
+    def __init__(self, start: datetime, vendor: _HoldingVendor) -> None:
+        super().__init__(start)
+        self._vendor = vendor
+
+    def wait(self, futures, until):
+        assert self._vendor.holding.wait(10)
+        raise _Interrupted
+
+
+def test_an_interrupted_fetch_with_no_bound_waits_for_its_requests(lake_root, holding):
+    # The close+5 fill's fetch has no bound and no ``on_abandoned``, and its caller closes
+    # the vendor in a plain ``finally``. So an interrupt must not leave the fetch while a
+    # request is still in flight, or the close lands under it. The held request is released
+    # half a second later, and the fetch leaves only after it has answered.
+    vendor = holding(_HoldingVendor({("SPY", _d(10), _d(30))}))
+    releaser = threading.Timer(0.5, vendor.release.set)
+    releaser.start()
+    try:
+        with pytest.raises(_Interrupted):
+            capture.fetch_chain(
+                _InterruptingClock(_utc(SLOT), vendor),
+                vendor,
+                "SPY",
+                day=SESSION,
+                lake_root=lake_root,
+                plan=_THREE_WINDOWS,
+                guards=GuardConstants(),
+                deadline=None,
+            )
+        assert ("SPY", _d(10), _d(30)) in vendor.chain_calls
+    finally:
+        releaser.join()
