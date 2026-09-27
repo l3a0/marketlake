@@ -236,6 +236,40 @@ def test_a_count_that_raises_reads_the_segment_as_production_and_keeps_the_minut
     assert "capture: data-row count failed on chains SPY: RuntimeError: a bug in the count" in err
 
 
+def test_a_count_that_raises_on_a_failed_chain_still_reads_the_gap_as_a_failure(
+    lake_root, monkeypatch
+):
+    """The fallback is the old reading, and the old reading never counted a gap.
+
+    Falling back to production for every segment would reset a chain whose every window
+    failed, whenever the count broke, which is the silent outage this change exists for.
+    """
+
+    def explode(batch):
+        raise RuntimeError("a bug in the count")
+
+    monkeypatch.setattr(journal, "data_rows", explode)
+    failed = VendorResponse(status=500, body={})
+    watchdog = Watchdog()
+    for pid in (1, 2):
+        result = _run(_Vendor(failed, failed), lake_root, pid=pid)
+        watchdog.observe(result)
+
+    chain = result.segment(CHAINS, "SPY")
+    assert (chain.row_kind, chain.data_rows) == (journal.ROW_KIND_GAP, None)
+    assert chain.landed_data is False
+    assert watchdog.count(CHAINS, "SPY") == 2
+
+
+def test_the_page_names_the_class_the_operator_reads():
+    """The class is written nowhere but the page, so its spelling is the contract.
+
+    The design's message table names it, and every other test compares against the
+    constant, which would move with a misspelling.
+    """
+    assert CONTRACTS_ABSENT == "contracts_absent"
+
+
 def _snapshot(lake_root: Path, body: dict, markers=(), pid: int = 1) -> capture.SegmentOutcome:
     return capture.journal_snapshot(
         lake_root,
