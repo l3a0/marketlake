@@ -616,6 +616,8 @@ def test_on_start_is_handed_the_slot_the_loop_seeded_and_the_first_skip_follows_
     # for ``on_start`` can fall past the top and hand it 10:01, and startup marking would
     # then claim 10:01 while the first tick hands it to ``on_skipped`` too. On a clock
     # that stands still between reads, nothing tells that second read from the first.
+    # One read short puts the very next read past the top. Two and three leave room for
+    # reads added before the handoff later.
     top = et(REGULAR, 10, 1)
     clock = CostlyClock((top - timedelta(microseconds=reads_short)).astimezone(UTC))
     session_clock = SessionClock(clock, calendar)

@@ -957,8 +957,10 @@ def _straddled_restart(
 ) -> tuple[dict[str, list[str]], list[str], list[str]]:
     """Restart the daemon a few clock reads short of 10:01, with a real marker on both hooks.
 
-    Every clock read costs 1 us, so the loop's seed read falls inside 10:00 and any later
-    read can fall past the top. Nothing moves the clock by hand. Returns every row on the
+    Every clock read costs 1 us, so the loop's seed read falls inside 10:00. One read
+    short puts the very next read past the top, which is the straddle. Two and three
+    reads short leave room for reads added before the handoff later. Nothing moves the
+    clock by hand. Returns every row on the
     day by minute with its ``error_class``, the minutes the loop ran a cycle for, and the
     problems either marking pass reported.
     """
