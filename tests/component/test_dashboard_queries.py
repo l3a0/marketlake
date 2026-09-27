@@ -3407,7 +3407,73 @@ def test_unfiled_is_summed_off_the_pieces_because_the_file_does_not_carry_it(roo
     assert entry["unfiled"] == 3
     assert entry["disagreements"] == 3
     # A walk that stopped says so, with its exception message already dropped.
-    assert entry["pieces"] == {"dividends": None, "splits": "OSError"}
+    assert entry["pieces"] == {
+        "dividends": {"refusal": None, "subjects": []},
+        "splits": {"refusal": "OSError", "subjects": []},
+    }
+
+
+def test_each_walk_names_its_held_findings_in_the_files_order(root: Path):
+    # ``disagreements 2`` on the live panel gave no way to learn which two, while the file
+    # named them. The names pass through as the file writes them, per walk.
+    _file_nightly(
+        root,
+        MONDAY,
+        pieces=(
+            ("dividends", PieceOutcome(held=1, subjects=("KO 2026-09-15 amount",))),
+            ("splits", PieceOutcome()),
+            (
+                "bars",
+                PieceOutcome(
+                    held=3,
+                    subjects=(
+                        "SPY 2026-09-17 bar_close",
+                        "QQQ 2026-09-18 bar_close",
+                        "IWM 2026-09-16 bar_close",
+                    ),
+                ),
+            ),
+        ),
+    )
+    entry = service_over(root).run_query("history", {})["reports"][0]
+    # Three names in one walk, so a cap on how many pass through cannot go unnoticed. One
+    # name per held finding is what lets the panel say which ones the count counts.
+    assert entry["disagreements"] == 4
+    assert entry["pieces"] == {
+        "dividends": {"refusal": None, "subjects": ["KO 2026-09-15 amount"]},
+        "splits": {"refusal": None, "subjects": []},
+        "bars": {
+            "refusal": None,
+            "subjects": [
+                "SPY 2026-09-17 bar_close",
+                "QQQ 2026-09-18 bar_close",
+                "IWM 2026-09-16 bar_close",
+            ],
+        },
+    }
+
+
+def test_held_names_of_the_wrong_type_give_strings_alone_rather_than_raising(root: Path):
+    directory = root / "reports"
+    directory.mkdir()
+    (directory / f"{MONDAY.isoformat()}-183000000000-11.json").write_text(
+        json.dumps(
+            {
+                "day": MONDAY.isoformat(),
+                "pieces": {
+                    "dividends": {"held": 1},
+                    "splits": {"subjects": "SPY 2026-09-17 split_ratio"},
+                    "bars": {"subjects": ["SPY 2026-09-17 bar_close", 7, None, ["x"]]},
+                },
+            }
+        )
+    )
+    entry = service_over(root).run_query("history", {})["reports"][0]
+    assert entry["pieces"] == {
+        "dividends": {"refusal": None, "subjects": []},
+        "splits": {"refusal": None, "subjects": []},
+        "bars": {"refusal": None, "subjects": ["SPY 2026-09-17 bar_close"]},
+    }
 
 
 def test_the_reports_glob_skips_the_other_producers_subdirectories(root: Path):
@@ -3570,7 +3636,7 @@ def test_a_report_whose_fields_carry_the_wrong_types_renders_rather_than_raising
     )
     entry = service_over(root).run_query("history", {})["reports"][0]
     assert entry["unfiled"] == 0
-    assert entry["pieces"] == {"dividends": None}
+    assert entry["pieces"] == {"dividends": {"refusal": None, "subjects": []}}
     assert entry["problems"] == ["a real line"]
     assert entry["report"] == []
 

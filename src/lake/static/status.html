@@ -898,10 +898,11 @@
       counts.push(counter.label + " " + (value === null || value === undefined ? DASH : value));
     });
     item.appendChild(el("div", counts.join("   "), "muted"));
-    // ``pieces`` is not rendered beside ``problems``. The sweep appends "<walk> did not
-    // run: <refusal>" to its problems for every walk that refused, so a page showing
-    // both prints each refusal twice. The payload keeps the structured form for a
-    // reader that wants the walk rather than the sentence.
+    // ``pieces`` carries each walk's held findings by name, and the panel draws them
+    // under the counts. It carries each walk's refusal too, which is not drawn here. The
+    // sweep appends "<walk> did not run: <refusal>" to its problems for every walk that
+    // refused, so drawing both would print each refusal twice.
+    appendHeld(item, entry.pieces);
     appendLines(item, entry.problems, "alarm");
     // An empty ``problems`` draws no list, which cannot be told from a section that was
     // never drawn. So a run whose ping went out says in words that nothing held it back.
@@ -912,13 +913,35 @@
     if (entry.nothing_withheld === true) {
       var withheld = el("li", "Nothing withheld the ping.", "nothing-withheld");
       withheld.title = "The run's problems list is empty and its ping went out. " +
-        "The counts above and the lines below can still carry findings.";
+        "The counts and held findings above and the lines below can still carry findings.";
       var held = el("ul", null, "lines");
       held.appendChild(withheld);
       item.appendChild(held);
     }
     appendReport(item, entry.report, entry.report_kinds);
     return item;
+  }
+
+  // One line per finding the sweep's gate held, led by its walk, which is what the
+  // ``disagreements`` count above counts. The names are not report lines and the file
+  // gives them no kind, so they take no kind colour and stay out of the key. They render
+  // in the page's plain text colour. "Held" and the title are what tell one apart from a
+  // ``worth knowing`` line, whose colour is plain text a little faded.
+  function appendHeld(item, pieces) {
+    if (!pieces || typeof pieces !== "object") { return; }
+    var list = el("ul", null, "lines");
+    Object.keys(pieces).forEach(function (walk) {
+      var piece = pieces[walk];
+      var subjects = piece && Array.isArray(piece.subjects) ? piece.subjects : [];
+      subjects.forEach(function (subject) {
+        var node = el("li", walk + " held " + subject, "held");
+        node.title = "The sweep's gate kept this finding out of the lake's data. " +
+          "Its detail is under reports/withheld/, by the date it names. " +
+          "The file gives it no kind.";
+        list.appendChild(node);
+      });
+    });
+    if (list.firstChild) { item.appendChild(list); }
   }
 
   // Each report line at the weight its kind gives it. ``report_kinds`` is null for a file
