@@ -90,6 +90,13 @@
   .nightly { margin: .6rem 0 0; padding: 0; list-style: none; }
   .nightly li { border-top: 1px solid var(--rule); padding: .4rem 0; }
   .nightly .lines { margin: .2rem 0 0; padding-left: 1.1rem; }
+  /* A report line's kind, which the sweep sets where it writes the line. ``problems`` stays
+     the loudest thing in an entry, so an action line is the note colour at a lighter weight
+     than an alarm. A healthy line is the quietest and is never hidden: both of its producers
+     print it so a check that ran can be told from one that did not. */
+  .kind-action { color: var(--note); font-weight: 600; }
+  .kind-info { opacity: .8; }
+  .kind-healthy { opacity: .55; }
   .empty { opacity: .7; font-style: italic; }
   .legend { margin: .4rem 0 .6rem; }
   .legend i { display: inline-block; width: 12px; height: 12px; vertical-align: -1px; margin: 0 .3rem 0 .9rem; }
@@ -249,6 +256,20 @@
     {key: "unfiled", label: "unfiled"},
     {key: "pages_lost", label: "pages lost"}
   ];
+
+  // What each report line asks of its reader, which the sweep writes beside the line. The
+  // panel computes none of these. It weights each line by the kind the file carries.
+  var REPORT_KINDS = [
+    {key: "action", label: "needs action",
+     title: "Needs action: a human has something to do about this line."},
+    {key: "info", label: "worth knowing",
+     title: "Worth knowing, nothing to do: a permanent condition, or news that asks for nothing."},
+    {key: "healthy", label: "a check that found nothing",
+     title: "A check saying it ran and found nothing. It is printed so a check that ran " +
+       "can be told from one that did not."}
+  ];
+  var REPORT_KIND_BY_KEY = {};
+  REPORT_KINDS.forEach(function (kind) { REPORT_KIND_BY_KEY[kind.key] = kind; });
 
   // The five segment-health counters, each named for what it is. One integer cannot
   // carry these, so the page never sums them. A shadow append leads and is loud: bytes
@@ -828,12 +849,33 @@
         "empty"));
       return;
     }
+    // The key is drawn only when some file carries kinds. A file from before them
+    // renders every line in the one note colour, and a key would describe nothing on it.
+    var kinded = history.reports.some(function (entry) {
+      return Array.isArray(entry.report_kinds);
+    });
+    if (kinded) {
+      // Not ``muted``: that multiplies into each sample's own opacity and leaves the key
+      // dimmer than the lines it describes.
+      var legend = el("p");
+      legend.appendChild(el("span", "Report lines: ", "muted"));
+      REPORT_KINDS.forEach(function (kind, index) {
+        if (index > 0) { legend.appendChild(document.createTextNode(" · ")); }
+        var sample = el("span", kind.label, "kind-" + kind.key);
+        sample.title = kind.title;
+        legend.appendChild(sample);
+      });
+      legend.appendChild(el("span",
+        ". A report filed before the kinds existed shows its lines in one colour and says so.",
+        "muted"));
+      box.appendChild(legend);
+    }
     var list = el("ul", null, "nightly");
-    history.reports.forEach(function (entry) { list.appendChild(reportItem(entry)); });
+    history.reports.forEach(function (entry) { list.appendChild(reportItem(entry, kinded)); });
     box.appendChild(list);
   }
 
-  function reportItem(entry) {
+  function reportItem(entry, kinded) {
     var item = el("li");
     // The report is the one pre-written thing this page shows, so it leads with the day
     // it is about and the instant it was written. A stale one never reads as now.
@@ -842,6 +884,12 @@
     head.appendChild(el("span", "  filed " + (entry.at === null ? DASH : entry.at), "muted"));
     if (entry.session === false) { head.appendChild(el("span", "  no session", "muted")); }
     if (entry.pinged === false) { head.appendChild(el("span", "  did not ping", "alarm")); }
+    // Beside a key, an older file's one-colour lines would read as all needing action,
+    // which is the misreading the kinds exist to end. Its lines render as they always did,
+    // and the entry says why they carry no kind.
+    if (kinded && !Array.isArray(entry.report_kinds) && entry.report.length > 0) {
+      head.appendChild(el("span", "  lines not classified", "muted"));
+    }
     item.appendChild(head);
     var counts = [];
     NIGHTLY_COUNTS.forEach(function (counter) {
@@ -869,8 +917,24 @@
       held.appendChild(withheld);
       item.appendChild(held);
     }
-    appendLines(item, entry.report, "note");
+    appendReport(item, entry.report, entry.report_kinds);
     return item;
+  }
+
+  // Each report line at the weight its kind gives it. ``report_kinds`` is null for a file
+  // the payload could not pair with its lines, which includes every file written before the
+  // kinds existed, and those render exactly as they always did.
+  function appendReport(item, lines, kinds) {
+    if (!Array.isArray(kinds)) { appendLines(item, lines, "note"); return; }
+    if (!lines || lines.length === 0) { return; }
+    var list = el("ul", null, "lines");
+    lines.forEach(function (line, index) {
+      var kind = REPORT_KIND_BY_KEY[kinds[index]] || REPORT_KIND_BY_KEY.action;
+      var node = el("li", line, "kind-" + kind.key);
+      node.title = kind.title;
+      list.appendChild(node);
+    });
+    item.appendChild(list);
   }
 
   function appendLines(item, lines, className) {

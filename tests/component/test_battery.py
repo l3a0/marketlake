@@ -86,7 +86,9 @@ from lake.manifest import (
     scrub,
     withholding,
 )
+from lake.report import ACTION, INFO
 from tests.support.calendar import weekday_sessions
+from tests.support.report_kinds import kind_of
 
 # The weeks these tests judge in. A regular session opens 09:30 and closes 16:00 Eastern, so
 # the option close lands at 16:15 and every row ``_row`` builds falls inside it.
@@ -568,6 +570,8 @@ def test_the_run_leaves_a_human_sign_off_standing_and_says_so(lake: Path):
     assert report.appended == ()
     assert read_quarantine(lake) == before
     assert any("human precedence stands" in line for line in report.report)
+    # A human decided this partition, so re-observing it asks for nothing (marketlake #530).
+    assert kind_of(report, "human precedence stands") == INFO
 
 
 # -- the ledger read and the lock --------------------------------------------
@@ -1048,6 +1052,7 @@ def test_a_ticker_the_master_does_not_know_is_scope_unknown_rather_than_out_of_s
     assert report.quarantined == 0
     assert report.appended == ()
     assert any("knows no instrument spelled 'QQQ'" in line for line in report.report)
+    assert kind_of(report, "knows no instrument spelled 'QQQ'") == ACTION
 
 
 @pytest.mark.parametrize("missing", ["security_master", "capture_spans"])
@@ -1354,6 +1359,12 @@ def test_a_stamp_that_will_not_parse_reports_the_partition_unreadable(lake: Path
     assert report.unreadable == 1
     assert report.judged == 0
     assert report.appended == ()
+    # Three producers' kinds on one night (marketlake #530). A partition that would not
+    # read wants a human. A surface with no earlier day to compare is a fact that asks for
+    # nothing, and so is a census with sessions missing, which the capture dead-man pages.
+    assert kind_of(report, "will not parse as a zone-aware timestamp") == ACTION
+    assert kind_of(report, "no earlier sealed day to compare") == INFO
+    assert kind_of(report, "owed sessions have no partition") == INFO
     assert any("zone-aware timestamp" in line for line in report.report)
 
 
@@ -1528,6 +1539,7 @@ def test_a_dry_run_writes_no_line_and_sends_no_page(lake: Path):
     assert transport.messages == []
     assert not (lake / "quarantine.jsonl").exists()
     assert any("would write" in line for line in dry.report)
+    assert kind_of(dry, "would write") == ACTION
 
     wet = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants(), publisher=publisher)
     assert wet.quarantined == dry.quarantined
@@ -1760,6 +1772,7 @@ def test_the_report_line_names_every_check_still_withholding(lake: Path):
 
     (line,) = [ln for ln in report.report if "stays quarantined under" in ln]
     assert "'row_count_band'" in line
+    assert kind_of(report, "stays quarantined under") == ACTION
     assert "'strike_grid_completeness'" in line
 
 
@@ -1811,6 +1824,8 @@ def test_a_release_is_counted_and_reported_when_the_last_check_clears(lake: Path
     assert report.released == 1
     assert report.withheld == 0
     assert any("now reads, no check withholds it" in line for line in report.report)
+    # ``judge``'s docstring: a partition rejoining the readable set asks for no action.
+    assert kind_of(report, "now reads, no check withholds it") == INFO
     assert "released:             1" in render(report)
     # The quarantine guard runs before the read, so its silence is the claim. This file's
     # minimal rows carry no close-tagged cycle, which is a later refusal and a different one.
@@ -1836,6 +1851,7 @@ def test_a_dry_run_reports_the_release_the_real_run_would_produce(lake: Path):
     # a dry run, and a release stated in the present tense tells an operator the partition
     # reads while the ledger still refuses it.
     assert any("would now read, no check would withhold it" in line for line in dry.report)
+    assert kind_of(dry, "would now read, no check would withhold it") == INFO
     assert not any("now reads, no check withholds it" in line for line in dry.report)
     assert any("now reads, no check withholds it" in line for line in real.report)
 
@@ -2037,7 +2053,7 @@ def test_the_report_prints_every_count_including_the_zeroes():
     # The fields that are not counts, for the reasons ``tests/component/test_eod_sweep.py``
     # gives where it draws the same line. ``drift_paged`` is there on ``paged``'s own
     # reasoning, which that file states and which holds of the schema-drift page unchanged.
-    not_counts = {"report", "findings", "paged", "drift_paged"}
+    not_counts = {"report", "report_kinds", "findings", "paged", "drift_paged"}
 
     named = {field.name for field in fields(BatteryReport)}
     assert labelled.keys() <= named, f"stale label: {labelled.keys() - named}"
@@ -2729,6 +2745,7 @@ def test_an_instrument_coverage_cannot_name_costs_its_own_answer_and_not_the_run
 
     assert report.scope_unknown == 1
     assert any("has a capture span and no ticker" in line for line in report.report)
+    assert kind_of(report, "has a capture span and no ticker") == ACTION
     assert _answer(report).verdict == QUARANTINED_VERDICT, "SPY is still judged"
     assert len(transport.messages) == 1, "and the delayed feed still pages"
 
@@ -3674,6 +3691,7 @@ def test_a_schema_drift_failure_does_not_cost_the_delayed_feed_page(lake: Path, 
     assert transport.messages[0].title == DELAYED_FEED_TITLE
     assert report.drift_paged == ()
     assert any("schema drift did not run: RuntimeError" in line for line in report.report)
+    assert kind_of(report, "schema drift did not run: RuntimeError") == ACTION
 
 
 def test_a_schema_drift_page_does_not_land_in_the_delayed_feeds_tuple(lake: Path, monkeypatch):

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -644,3 +645,83 @@ def test_a_missing_lake_root_refuses_rather_than_conjuring_one(tmp_path):
     """
     with pytest.raises(FileNotFoundError, match="lake root missing"):
         report.write_nightly(tmp_path / "gone", NIGHT, now=AT, pid=11)
+
+
+# -- the kind of each report line (marketlake #530) ----------------------------
+
+
+def test_the_file_carries_the_kinds_the_producers_set(lake_root):
+    lines = ("bars abandoned: 6 ticker-day(s), 6 NoSpotClose", "battery: nothing drifted")
+    night = replace(NIGHT, report=lines, report_kinds=(report.INFO, report.HEALTHY))
+    report.write_nightly(lake_root, night, now=AT, pid=11)
+
+    (entry,) = _nightly_entries(lake_root)
+    assert entry["report"] == list(lines)
+    assert entry["report_kinds"] == ["info", "healthy"]
+
+
+@pytest.mark.parametrize(
+    "kinds",
+    [
+        (),
+        ("info",),
+        ("info", "healthy", "info"),
+        ("info", "clean"),
+        ("info", ["healthy"]),
+        ("info", {"kind": "healthy"}),
+        ("info", None),
+        ("info", 1),
+        None,
+        "info",
+    ],
+    ids=[
+        "no-kinds",
+        "one-short",
+        "one-long",
+        "an-unknown-value",
+        "a-list-value",
+        "a-mapping-value",
+        "a-null-value",
+        "a-number-value",
+        "kinds-null",
+        "kinds-a-string",
+    ],
+)
+def test_kinds_that_do_not_fit_the_lines_land_every_line_as_action_and_never_raise(
+    lake_root, kinds
+):
+    # ``Nightly`` is built after the ping, so a raise here would cost the report file and the
+    # digest on a night the check already went green. A list that does not fit cannot say
+    # which line lost its kind, so every line reads loud rather than one reading wrong.
+    night = replace(NIGHT, report=("first line", "second line"), report_kinds=kinds)
+    report.write_nightly(lake_root, night, now=AT, pid=11)
+
+    (entry,) = _nightly_entries(lake_root)
+    assert entry["report_kinds"] == ["action", "action"]
+
+
+def test_a_night_with_no_report_lines_writes_an_empty_kind_list(lake_root):
+    report.write_nightly(lake_root, replace(NIGHT, report=(), report_kinds=()), now=AT, pid=11)
+
+    (entry,) = _nightly_entries(lake_root)
+    assert entry["report_kinds"] == []
+
+
+def test_a_pour_keeps_each_records_kinds_on_its_own_lines():
+    # The sweep pours the battery's lines into its own, and the battery the drift report's.
+    # One record whose kinds do not fit costs that record's lines their kinds and no other's.
+    lines = report.ReportLines()
+    lines.add("schema_version: unrecorded", report.ACTION)
+    lines.pour(("drift judged", "coverage all present"), ("healthy", "healthy"))
+    lines.pour(("battery: a", "battery: b"), ("info",))
+    lines.add("bars deferred: 2", report.INFO)
+
+    assert lines.lines == (
+        "schema_version: unrecorded",
+        "drift judged",
+        "coverage all present",
+        "battery: a",
+        "battery: b",
+        "bars deferred: 2",
+    )
+    assert lines.kinds == ("action", "healthy", "healthy", "action", "action", "info")

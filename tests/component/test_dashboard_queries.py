@@ -3315,8 +3315,81 @@ def test_nothing_withheld_is_true_for_a_hand_written_empty_list_beside_pinged_tr
     assert entry["nothing_withheld"] is True
 
 
+def test_the_kinds_the_writer_set_ride_the_payload_beside_their_lines(root: Path):
+    # Writer to file to payload in one test, which is what marketlake #503 says a new
+    # ``Nightly`` field needs, since nothing else fails when one goes missing on the way.
+    _file_nightly(
+        root,
+        MONDAY,
+        report=("bars abandoned: 6 ticker-day(s), 6 NoSpotClose", "battery: nothing drifted"),
+        report_kinds=("info", "healthy"),
+    )
+    entry = service_over(root).run_query("history", {})["reports"][0]
+    assert entry["report"] == [
+        "bars abandoned: 6 ticker-day(s), 6 NoSpotClose",
+        "battery: nothing drifted",
+    ]
+    assert entry["report_kinds"] == ["info", "healthy"]
+
+
+@pytest.mark.parametrize(
+    ("report_lines", "kinds"),
+    [
+        (["a line"], _ABSENT),
+        (["a line", "another"], ["info"]),
+        (["a line"], ["info", "healthy"]),
+        (["a line"], ["clean"]),
+        (["a line"], [["info"]]),
+        (["a line"], [{"kind": "info"}]),
+        (["a line"], [None]),
+        (["a line"], "info"),
+        (["a line", 7], ["info", "info"]),
+        ("a line", ["info"]),
+    ],
+    ids=[
+        "kinds-missing",
+        "kinds-short",
+        "kinds-long",
+        "an-unknown-value",
+        "a-list-value",
+        "a-mapping-value",
+        "a-null-value",
+        "kinds-a-string",
+        "report-holding-a-non-string",
+        "report-not-a-list",
+    ],
+)
+def test_kinds_that_do_not_pair_with_the_raw_report_give_none_and_never_raise(
+    root: Path, report_lines: object, kinds: object
+):
+    # ``None`` renders every line as it rendered before the kinds existed. A report holding a
+    # non-string gives ``None`` too, because ``_lines`` drops it and every kind after it would
+    # land on the wrong line. A list or mapping value would make a membership test raise, and
+    # a raise here is a 500 for the whole History panel.
+    fields: dict[str, object] = {"day": MONDAY.isoformat(), "report": report_lines}
+    if kinds is not _ABSENT:
+        fields["report_kinds"] = kinds
+    directory = root / "reports"
+    directory.mkdir()
+    (directory / f"{MONDAY.isoformat()}-183000000000-11.json").write_text(json.dumps(fields))
+    entry = service_over(root).run_query("history", {})["reports"][0]
+    assert entry["report_kinds"] is None
+
+
+def test_a_file_from_before_the_kinds_renders_as_it_always_did(root: Path):
+    # Every file the live lake held on 2026-09-27 carries ``report`` and no kinds.
+    directory = root / "reports"
+    directory.mkdir()
+    (directory / f"{MONDAY.isoformat()}-183000000000-11.json").write_text(
+        json.dumps({"day": MONDAY.isoformat(), "report": ["battery: nothing drifted"]})
+    )
+    entry = service_over(root).run_query("history", {})["reports"][0]
+    assert entry["report"] == ["battery: nothing drifted"]
+    assert entry["report_kinds"] is None
+
+
 def test_unfiled_is_summed_off_the_pieces_because_the_file_does_not_carry_it(root: Path):
-    # ``Nightly.unfiled`` is a property and ``write_nightly`` writes eleven keys without
+    # ``Nightly.unfiled`` is a property and ``write_nightly`` writes twelve keys without
     # it, so a reader spelling the key would always read nothing at all.
     path = _file_nightly(
         root,
