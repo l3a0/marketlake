@@ -59,6 +59,12 @@ Clarity comes first. Write plain sentences a reader understands on one read. Pre
 
 **List a counted set. Do not inline it.** When a sentence names a count of items, like "four seams" or "three tests," the items follow as a list, not a run-on of sentences. Number the list when the prose states the count. Use a bulleted list for an unordered set with no count.
 
+**Link every issue and pull request number in chat (owner directive, 2026-09-26).** In a chat reply or a message to another session, each number is a Markdown link: `[#534](https://github.com/l3a0/marketlake/issues/534)` for an issue and `[PR #543](https://github.com/l3a0/marketlake/pull/543)` for a pull request. Link every mention, not only the first, including numbers inside lists, tables and summaries. A bare `#NN` in chat is text the owner has to copy into a browser, and a report that links its first number and leaves the next dozen bare fails the same way. The planning report for #534 did exactly that.
+
+The prefix still matters. Issues and pull requests share one number space, and the link path differs, `/issues/NN` against `/pull/NN`, so an issue is `#NN` and a pull request is `PR #NN`.
+
+GitHub surfaces keep the bare form. In an issue body, a comment, a pull request body or a commit message, GitHub links a bare `#NN` on its own, and a closing keyword needs the number right after it.
+
 ## The design doc is review-hardened
 
 The doc survived three adversarial review batteries. That was 89+ agents and 58 verified findings, with zero findings refuted. It also survived the owner's own Socratic passes. Respect two conventions it carries:
