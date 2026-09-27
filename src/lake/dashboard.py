@@ -126,6 +126,7 @@ from lake.paths import (
     LakePaths,
     parse_date_dir,
 )
+from lake.report import kinds_fit
 from lake.runway import GROWTH_WINDOW_DAYS, HEADROOM_WEEKS, assess
 from lake.runway import Usage as RunwayUsage
 from lake.security_master import (
@@ -1889,7 +1890,7 @@ def _nightly_payload(entry: Mapping[str, object]) -> dict[str, object]:
     """One nightly file as the panel renders it, every field taken defensively.
 
     ``unfiled`` is summed off the pieces rather than read: ``Nightly.unfiled`` is a
-    property and ``write_nightly`` puts eleven keys in the file without it.
+    property and ``write_nightly`` puts twelve keys in the file without it.
 
     ``problems`` withheld the run's ping and ``report`` are the report-tier findings,
     which "send no message of their own." The second is why this panel reads these files
@@ -1903,6 +1904,16 @@ def _nightly_payload(entry: Mapping[str, object]) -> dict[str, object]:
     payload's ``problems``. That one is a missing key or a list of non-strings turned
     into ``[]``, so keying on it would reassure about a file nobody could read. It says
     what ``problems`` proves and no more: a run can ping with ``gaps`` above zero.
+
+    ``report_kinds`` is the writer's kind for each ``report`` line, ``action``, ``info`` or
+    ``healthy``, or ``None``. The kinds pass through only when the raw ``report`` is all
+    strings and the raw ``report_kinds`` fits it by ``report.kinds_fit``, one known kind per
+    line. Anything else gives ``None``, which the panel renders exactly as it rendered
+    every line before the kinds existed, and that covers every file written before them.
+    The check runs on the raw lists, because ``_lines`` dropping a non-string first would
+    shift every kind after it onto the wrong line. ``kinds_fit`` tests each value as a
+    string before it tests membership, since a list value would make ``in`` raise, and
+    nothing here may raise.
 
     ``day`` and ``at`` both ride along, because the design pins the nightly report as
     "the one pre-written thing the dashboard shows, and it is dated, so a stale one never
@@ -1935,7 +1946,17 @@ def _nightly_payload(entry: Mapping[str, object]) -> dict[str, object]:
             isinstance(problems, list) and not problems and entry.get("pinged") is True
         ),
         "report": _lines(entry.get("report")),
+        "report_kinds": _report_kinds(entry.get("report"), entry.get("report_kinds")),
     }
+
+
+def _report_kinds(report: object, kinds: object) -> list[str] | None:
+    """The file's kinds when they classify every one of its report lines, and ``None`` if not."""
+    if not isinstance(report, list) or not all(isinstance(line, str) for line in report):
+        return None
+    if not kinds_fit(report, kinds):
+        return None
+    return list(kinds)  # type: ignore[call-overload]
 
 
 def _lines(value: object) -> list[str]:
