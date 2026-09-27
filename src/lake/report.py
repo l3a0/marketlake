@@ -48,6 +48,15 @@ seal unlinks the segments, and it has no reader until D20 renders it. What
 reaches a human in the meantime is compaction's own page, which folds the run's findings
 into one message and sends the reader here for the per-ticker-day detail.
 
+Compaction files a second kind of finding, in a subdirectory of its own. Before it reads a
+ticker-day's segments it checks each one that has a manifest entry against the sha256 that
+entry recorded when the segment closed, and a segment that no longer matches refuses the
+whole ticker-day. That finding is damage rather than drift, and a reader counting drift
+must not pick it up, so it goes under ``reports/damaged_segments/`` and not
+``reports/schema_drift/``. It names the segment and both hashes, and it files on every run
+the damage survives, for the reason a refused merge does: nothing was sealed, so no
+manifest entry makes a later silence readable.
+
 The third producer is the vendor sweep's gates. A check that refuses to land a row holds
 that row out of its ledger, and a fail-closed decision leaving no record reads exactly like
 never having seen the event. So the refusal is filed here. Two callers reach it, the
@@ -63,8 +72,8 @@ it, and the report-tier findings the design says send no message at all. It writ
 run including a holiday no-op, for the close+5 guard's reason, since an absent file cannot be
 told from a run that never happened.
 
-It sits at the root because nothing else does. Four named subdirectories sit under it, so a
-reader globbing ``reports/*.json`` picks up the nightly files and nothing else, and the four
+It sits at the root because nothing else does. Five named subdirectories sit under it, so a
+reader globbing ``reports/*.json`` picks up the nightly files and nothing else, and the five
 counting globs each name their own directory.
 
 A held finding recurs every night, because nothing settles it, and nothing under
@@ -99,6 +108,10 @@ SCHEMA_DRIFT_DIR = "schema_drift"
 # The vendor sweep's gates. Its own subdirectory, per rule 2 above, so a finding a gate
 # refused never counts as a page that failed to send.
 WITHHELD_DIR = "withheld"
+
+# Compaction's check of each manifested segment against the hash taken when it closed. Its
+# own subdirectory, per rule 2 above, so a damaged segment never counts as schema drift.
+DAMAGED_SEGMENTS_DIR = "damaged_segments"
 
 
 @dataclass(frozen=True)
@@ -352,6 +365,107 @@ def write_schema_drift(
     directory.mkdir(parents=True, exist_ok=True)
     stamp = eastern.strftime("%H%M%S%f")
     path = directory / f"{stamp}-{drift.surface}-{drift.ticker}-{pid}.json"
+    with open(path, "x", encoding="utf-8") as handle:
+        json.dump(entry, handle, sort_keys=True)
+        handle.write("\n")
+    return path
+
+
+@dataclass(frozen=True)
+class DamagedSegment:
+    """One segment whose bytes no longer match the sha256 recorded when it closed.
+
+    ``segment`` is the lake-relative path. ``expected`` is the digest the segment's manifest
+    entry carries, which the capture cycle hashed from the file right after closing it.
+    ``actual`` is the digest of the bytes on disk when compaction came to seal them. The
+    two differ, which is the whole finding: a flip anywhere in the file changes the digest,
+    whether it breaks the stream, drops a batch, or rewrites one value.
+
+    Both digests are here because the pair is what an operator repairing the day compares.
+    Only the expected one says what the segment was. The actual one says the copy on disk
+    is not it, and lets a later read tell whether the file changed again since.
+    """
+
+    segment: str
+    expected: str
+    actual: str
+
+
+@dataclass(frozen=True)
+class SegmentDamage:
+    """One ticker-day compaction refused because a segment no longer matched its hash.
+
+    ``partition`` is the Parquet the refusal did not write. ``segments`` names every segment
+    of the ticker-day, all still on disk, because the refusal keeps the whole ticker-day
+    rather than sealing the healthy segments: the next run would find the partition
+    manifested and delete the kept one as debris. ``damaged`` names the ones that failed the
+    check, each with both digests.
+    """
+
+    surface: str
+    ticker: str
+    day: date
+    partition: str
+    segments: tuple[str, ...]
+    damaged: tuple[DamagedSegment, ...]
+
+
+def damaged_segments_dir(lake_root: Path | str, day: date) -> Path:
+    """Where one session day's damaged-segment findings are filed.
+
+    Keyed on the ticker-day the segments belong to, not the instant compaction ran, for the
+    reason ``schema_drift_dir`` gives.
+    """
+    return Path(lake_root) / REPORTS_DIR / DAMAGED_SEGMENTS_DIR / f"{DATE_PREFIX}{day.isoformat()}"
+
+
+def write_damaged_segments(
+    lake_root: Path | str,
+    damage: SegmentDamage,
+    *,
+    now: datetime,
+    pid: int | None = None,
+) -> Path:
+    """File one refused ticker-day's damage, and hand back the path it landed at.
+
+    **It files on every run the damage survives.** The refused ticker-day has no partition
+    and no manifest entry, so a second night's silence would be consistent with a repair,
+    with damage already filed, and with a ticker-day that is gone. That is the refused
+    merge's reason, and the cadence is the same.
+
+    **Raises rather than swallowing**, for the reason ``write_schema_drift`` gives. The
+    caller contains it.
+
+    The name carries the surface, the ticker, the stamp and the pid, the same shape as a
+    drift finding's, because one sweep can refuse several ticker-days microseconds apart.
+    """
+    pid = os.getpid() if pid is None else pid
+    eastern = now.astimezone(MARKET_TZ)
+    entry = {
+        "at": eastern.isoformat(),
+        "day": damage.day.isoformat(),
+        "surface": damage.surface,
+        "ticker": damage.ticker,
+        "partition": damage.partition,
+        "segments": list(damage.segments),
+        "damaged": [
+            {
+                "segment": item.segment,
+                "expected_sha256": item.expected,
+                "actual_sha256": item.actual,
+            }
+            for item in damage.damaged
+        ],
+    }
+    # A report is written inside a lake that exists, or not at all, for the reason
+    # ``write_close_guard`` gives.
+    root = Path(lake_root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"lake root missing: {root}")
+    directory = damaged_segments_dir(root, damage.day)
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = eastern.strftime("%H%M%S%f")
+    path = directory / f"{stamp}-{damage.surface}-{damage.ticker}-{pid}.json"
     with open(path, "x", encoding="utf-8") as handle:
         json.dump(entry, handle, sort_keys=True)
         handle.write("\n")
@@ -730,19 +844,24 @@ __all__ = [
     "CLOSE_GUARD_DIR",
     "DIVIDENDS_PIECE",
     "PIECES",
+    "DAMAGED_SEGMENTS_DIR",
     "SCHEMA_DRIFT_DIR",
     "SPLITS_PIECE",
     "WITHHELD_DIR",
+    "DamagedSegment",
     "Nightly",
     "PieceOutcome",
     "SchemaDrift",
+    "SegmentDamage",
     "Withheld",
     "close_guard_dir",
+    "damaged_segments_dir",
     "redacted",
     "nightly_path",
     "schema_drift_dir",
     "withheld_dir",
     "write_close_guard",
+    "write_damaged_segments",
     "write_nightly",
     "write_schema_drift",
     "write_withheld",

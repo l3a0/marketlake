@@ -434,9 +434,11 @@ def _prior_expirations(lake_root: Path | str, ticker: str, at: datetime) -> list
     when some window answered, and the walk reads newest first, so the next failed window's
     read finds that segment and succeeds while the damaged one sits untouched behind it.
     Measured: a recovery line printed the very next minute with the damage still in place,
-    retracting the only sign of it until marketlake #556 lands. So a second failure is a
-    second event, and a read that works says nothing. A refused manifest ends the cycle at
-    its own manifest append anyway, so it prints one line per relaunch beside the traceback.
+    retracting the only sign of it before close+15. That is when compaction checks each
+    segment against the hash taken when it closed and pages the one that no longer matches
+    (marketlake #556). So a second failure is a second event, and a read that works says
+    nothing. A refused manifest ends the cycle at its own manifest append anyway, so it
+    prints one line per relaunch beside the traceback.
 
     ``at`` is the line's instant, from the caller's injected clock. The line cannot raise,
     because building it calls the exception's own ``__str__``, and a raise there would cost

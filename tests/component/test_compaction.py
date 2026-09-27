@@ -49,6 +49,7 @@ from lake.calendar import MARKET_TZ
 from lake.chain_plan import DEFAULT_CHAIN_PLAN, ChainPlan, load_chain_plan
 from lake.compact import (
     COMPACTION_SLUG,
+    REFUSED_TYPES_DISAGREE,
     CompactionResult,
     CompactionVerifyError,
     PartitionMismatch,
@@ -1657,6 +1658,7 @@ def test_render_names_a_refusal_the_scan_could_not_explain(lake_root):
         partition="chains/ticker=SPY/date=2026-08-24.parquet",
         conflicts=(),
         segments=("journal/date=2026-08-24/surface=chains/ticker=SPY/seg-a-1.arrows",),
+        reason=REFUSED_TYPES_DISAGREE,
     )
     result = CompactionResult(
         sealed=(),
