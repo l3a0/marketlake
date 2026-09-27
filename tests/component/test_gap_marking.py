@@ -776,8 +776,11 @@ def test_the_daemon_hands_the_loops_start_minute_through_to_the_marker(tmp_path,
     the double claim. Every read on this clock costs a whole minute, so any second read
     names a later minute than the seed, however many reads the entry makes. A marker
     bounded by such a read marks a minute the loop's first tick then hands to
-    ``on_skipped`` too, as a second row or as a ``FileExistsError`` on stderr.
+    ``on_skipped`` too, as a second row or as a ``FileExistsError`` on stderr. A marker
+    bounded short of the handed slot leaves the start minute in no row at all.
     """
+    from datetime import timedelta
+
     from lake import daemon
     from lake.capture import CycleResult
     from lake.capture_spans import spans_path
@@ -797,6 +800,11 @@ def test_the_daemon_hands_the_loops_start_minute_through_to_the_marker(tmp_path,
 
     clock = CostlyClock(et(2026, 9, 2, 10, 0, 30), cost=60)
     ticks = [0]
+    captured: list[datetime] = []
+
+    def cycle(*, slot: datetime, close_tag: str | None, session_phase: str | None):
+        captured.append(slot)
+        return CycleResult(snap_ts=slot, segments=())
 
     def twice() -> bool:
         ticks[0] += 1
@@ -811,9 +819,7 @@ def test_the_daemon_hands_the_loops_start_minute_through_to_the_marker(tmp_path,
         transport=FakeTransport(),
         pinger=FakePinger(),
         compaction_runner=lambda args: None,
-        cycle_runner=lambda *, slot, close_tag, session_phase: CycleResult(
-            snap_ts=slot, segments=()
-        ),
+        cycle_runner=cycle,
         should_continue=twice,
     )
 
@@ -821,6 +827,31 @@ def test_the_daemon_hands_the_loops_start_minute_through_to_the_marker(tmp_path,
     assert marked, "the daemon marked nothing, so no handoff was exercised"
     assert {snap for snap, count in marked.items() if count > 1} == set()
     assert "problems=" not in capsys.readouterr().err
+    covered = sorted({datetime.fromisoformat(snap) for snap in marked} | set(captured))
+    holes = [
+        (covered[i] + timedelta(minutes=1)).isoformat()
+        for i in range(len(covered) - 1)
+        if covered[i + 1] - covered[i] != timedelta(minutes=1)
+    ]
+    assert holes == [], f"minutes in no row at all: {holes}"
+    assert covered[0] == et(2026, 9, 2, 9, 30)
+
+
+@pytest.mark.parametrize("clock_at", [(10, 0), (10, 10)], ids=["behind", "ahead"])
+def test_the_startup_pass_is_bounded_by_the_slot_it_is_handed_not_its_clock(clock_at, tmp_path):
+    """The handed slot is the bound, whichever side of it the marker's own clock reads.
+
+    ``run_loop`` hands over the minute it seeded. A marker that also consulted its clock,
+    through a ``min`` or ``max`` or a plain read, would agree on every test where the two
+    match and mark the wrong minutes when they do not, as after a wall clock step.
+    """
+    _capture(tmp_path, "XYZ", date(2026, 9, 1))  # Tuesday full is the floor
+    marker = _marker(tmp_path, et(2026, 9, 2, *clock_at), roster=Roster((EQUITY_ONLY,)))
+    marker.on_start(et(2026, 9, 2, 10, 5))
+    marked = sorted(_gap_snaps(tmp_path, "quotes", "XYZ", date(2026, 9, 2)))
+    assert marked[0] == et(2026, 9, 2, 9, 30).isoformat()
+    assert marked[-1] == et(2026, 9, 2, 10, 5).isoformat()
+    assert len(marked) == 36
 
 
 def test_a_marking_pass_that_hits_a_problem_says_so_on_stderr(tmp_path, capsys):
