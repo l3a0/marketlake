@@ -421,10 +421,12 @@ def _prior_expirations(lake_root: Path | str, ticker: str, at: datetime) -> list
     segments through the manifest, so it never sees one from its own cycle. A raise from it
     used to leave the cycle, write nothing for any surface, and end the daemon, since
     ``run_loop`` calls the cycle with no guard. What it raises is not a short list: a manifest
-    that refuses, a manifest line that is not an object, and a damaged segment's
-    ``ArrowNotImplementedError`` or ``SystemError`` all reach here. So every ``Exception`` is
-    answered the way no prior batch is answered, with one marker per failed window, which
-    still carries that window's class and dates and names no series.
+    that refuses and a manifest line that is not an object both reach here. A damaged
+    segment's ``ArrowNotImplementedError`` or ``SystemError`` used to as well, until the
+    reader folded whatever a damaged stream raises into ``SegmentDamaged`` and walked past
+    the segment (marketlake #552). So every ``Exception`` is answered the way no prior batch
+    is answered, with one marker per failed window, which still carries that window's class
+    and dates and names no series.
 
     The fallback is caught here rather than inside ``journal.latest_expirations``, because
     that reader's ``None`` means nothing in scope names an expiration. The close+5 guard reads

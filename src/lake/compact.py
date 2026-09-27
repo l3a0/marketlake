@@ -44,6 +44,10 @@ The job's rules, each glossed at first use.
    under ``reports/damaged_segments/``, one page per run names it, and the rest of the
    run goes on. A segment with no manifest entry, a gap or close-guard marker or a
    capture whose append a crash lost, has no hash to compare and is read as before.
+   The read is the check for those. When it proves the bytes were damaged, because a
+   batch fails validation or the stream stops inside a file that still ends in its
+   end-of-stream marker, it refuses the ticker-day the same way, and the finding names
+   the read's failure where a recorded digest would be (marketlake #552).
 4. *Drift is reported, and costs one ticker-day at most.* Segments in one ticker-day
    can disagree about columns only when the daemon restarted onto different code
    mid-session, because every production segment takes its schema from
@@ -82,7 +86,9 @@ The job's rules, each glossed at first use.
    compaction's business. This check is a detector and secondary to it.
 5. *A torn tail is dropped, a shadow-append is refused.* A torn tail is a segment cut
    mid-batch by a power loss. Its complete batches are kept and the cut bytes dropped,
-   never an error. A *shadow-append* is bytes after a segment's end-of-stream marker, the
+   never an error. A file that still ends in its end-of-stream marker was not cut, so a
+   stream that stops inside one is damage, which rule 3 refuses, and never a torn tail.
+   A *shadow-append* is bytes after a segment's end-of-stream marker, the
    signature of a second writer appending past a closed stream. Standard readers never
    see those rows, so the job refuses to bless the file and fails the run loudly. That
    holds for a segment with no manifest entry. One with an entry no longer matches the
@@ -335,9 +341,11 @@ class DamagedSegments(Exception):
 
     Every capture segment has a manifest entry whose sha256 the cycle hashed from the file
     right after closing it. ``_seal`` compares each segment that has one before reading any
-    of them, and this names what failed. The sweep catches it the way it catches
-    ``SegmentSchemaConflict`` and for the same reason: nothing in this module repairs it,
-    so ending the run would cost every other ticker-day, the backup, and the ping.
+    of them, and this names what failed. A segment the read proves damaged is refused the
+    same way, which is how one with no entry and so no hash reaches it (marketlake #552).
+    The sweep catches it the way it catches ``SegmentSchemaConflict`` and for the same
+    reason: nothing in this module repairs it, so ending the run would cost every other
+    ticker-day, the backup, and the ping.
 
     Sealing the healthy segments and keeping the damaged one is not an option. The next
     run would find the partition manifested and delete every remaining segment as debris
@@ -358,19 +366,22 @@ class DamagedSegments(Exception):
         segments: tuple[str, ...],
         damaged: tuple[DamagedSegment, ...],
     ) -> None:
-        named = "; ".join(
-            f"{item.segment} (recorded {item.expected}, now {item.actual})" for item in damaged
-        )
-        super().__init__(
-            f"{partition}: {len(damaged)} segment(s) no longer match the sha256 recorded "
-            f"when they closed: {named}"
-        )
+        named = "; ".join(_damage_detail(item) for item in damaged)
+        super().__init__(f"{partition}: {len(damaged)} segment(s) damaged: {named}")
         self.surface = surface
         self.ticker = ticker
         self.day = day
         self.partition = partition
         self.segments = segments
         self.damaged = damaged
+
+
+def _damage_detail(item: DamagedSegment) -> str:
+    """One damaged segment, worded by what proved it damaged."""
+    recorded = "no sha256 recorded" if item.expected is None else f"recorded {item.expected}"
+    if item.error is None:
+        return f"{item.segment} (sha256 no longer matches: {recorded}, now {item.actual})"
+    return f"{item.segment} (failed to read: {item.error}; {recorded}, now {item.actual})"
 
 
 # -- the result types --------------------------------------------------------
@@ -539,10 +550,9 @@ class CompactionResult:
             lines.append(f"  skipped  {item.day} ({item.reason})")
         for item in self.refused:
             if item.reason == REFUSED_SEGMENT_DAMAGED:
-                named = ", ".join(PurePosixPath(bad.segment).name for bad in item.damaged)
                 lines.append(
                     f"  refused  {item.partition} segments={len(item.segments)} kept, "
-                    f"damaged, sha256 no longer matches: {named}"
+                    f"damaged, {_damage_kinds(item.damaged)}"
                 )
                 continue
             named = ", ".join(item.conflicts) if item.conflicts else "no column named"
@@ -664,10 +674,15 @@ def _read_complete(path: Path) -> pa.Table | None:
     all. It reads as no rows rather than an error, the same torn-tail rule applied at the
     front of the file. A shadow-append still raises: bytes after an end-of-stream marker
     are never dropped silently.
+
+    ``journal.SegmentDamaged`` raises too, though it is an ``ArrowInvalid``. It means the
+    bytes were damaged after the segment was written, so reading it as a segment torn
+    before its first batch would seal the ticker-day without its rows and unlink the only
+    copy of them. ``_seal`` refuses the ticker-day instead.
     """
     try:
         return journal.read_segment(path)
-    except ShadowAppendError:
+    except (ShadowAppendError, journal.SegmentDamaged):
         raise
     except (pa.ArrowInvalid, OSError):
         return None
@@ -809,6 +824,23 @@ def _refuse(
         segments=conflict.segments,
         reason=REFUSED_TYPES_DISAGREE,
     )
+
+
+def _damage_kinds(damaged: Sequence[DamagedSegment]) -> str:
+    """The damaged segments' names, grouped by what proved each one damaged.
+
+    Reads ``sha256 no longer matches: a; failed to read: b``, leaving out a group with no
+    member. A segment the read refused may have no recorded digest at all, so naming it
+    under the digest check would say something about it that never happened.
+    """
+    mismatched = [PurePosixPath(bad.segment).name for bad in damaged if bad.error is None]
+    unreadable = [PurePosixPath(bad.segment).name for bad in damaged if bad.error is not None]
+    parts = []
+    if mismatched:
+        parts.append(f"sha256 no longer matches: {', '.join(mismatched)}")
+    if unreadable:
+        parts.append(f"failed to read: {', '.join(unreadable)}")
+    return "; ".join(parts)
 
 
 def _damaged_segments(
@@ -1083,9 +1115,16 @@ def _damage_body(found: Sequence[SegmentDamage]) -> str:
     """
     days = sorted({item.day.isoformat() for item in found})
     segments = sorted(bad.segment for item in found for bad in item.damaged)
+    mismatched = sum(1 for item in found for bad in item.damaged if bad.error is None)
+    unreadable = len(segments) - mismatched
+    counts = []
+    if mismatched:
+        counts.append(f"{mismatched} segment(s) no longer match the sha256 taken when they closed")
+    if unreadable:
+        counts.append(f"{unreadable} segment(s) failed to read as damaged")
     return (
         f"{len(found)} ticker-day(s) over {_capped(days, PAGE_SEGMENT_CAP)} refused: "
-        f"{len(segments)} segment(s) no longer match the sha256 taken when they closed. "
+        f"{' and '.join(counts)}. "
         f"{_capped(segments, PAGE_SEGMENT_CAP)}. Their segments are kept and nothing of "
         f"theirs was sealed or deleted. Findings under {REPORTS_DIR}/{DAMAGED_SEGMENTS_DIR}/."
     )
@@ -1398,11 +1437,38 @@ def _seal(
     tables: list[pa.Table] = []
     expected = 0
     widened: tuple[str, ...] = ()
+    unreadable: list[DamagedSegment] = []
     for path in segments:
-        table = _read_complete(path)
+        try:
+            table = _read_complete(path)
+        except journal.SegmentDamaged as exc:
+            # The read proved what the hash check above could not, for a segment with no
+            # manifest entry: a batch that fails validation, or a stream that stops inside
+            # a finished file. The refusal is the hash check's own, and every other
+            # segment is still read first, so the finding names all of them in one run.
+            seg = path.relative_to(root).as_posix()
+            recorded = entries.get(seg)
+            unreadable.append(
+                DamagedSegment(
+                    segment=seg,
+                    expected=None if recorded is None else str(recorded["sha256"]),
+                    actual=sha256_file(path),
+                    error=str(exc),
+                )
+            )
+            continue
         if table is not None:
             tables.append(table)
             expected += table.num_rows
+    if unreadable:
+        raise DamagedSegments(
+            surface=surface,
+            ticker=ticker,
+            day=day,
+            partition=rel,
+            segments=named_segments,
+            damaged=tuple(unreadable),
+        )
     if tables and allow_retype:
         # A human has authorized the widening for this one ticker-day and is standing
         # behind the claim that the two types are two recordings of the same thing. The

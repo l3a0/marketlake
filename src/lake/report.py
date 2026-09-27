@@ -386,11 +386,20 @@ class DamagedSegment:
     Both digests are here because the pair is what an operator repairing the day compares.
     Only the expected one says what the segment was. The actual one says the copy on disk
     is not it, and lets a later read tell whether the file changed again since.
+
+    A segment can also be refused by its read rather than its digest (marketlake #552). A
+    batch failed validation, or the stream stopped inside a file that still ends in its
+    end-of-stream marker. ``error`` then carries what the read raised, which is the only
+    evidence such a segment has. ``expected`` is ``None`` when the segment has no manifest
+    entry, as gap and close-guard markers never do. ``actual`` is still taken, so a later
+    read can tell whether the file changed again. ``error`` is ``None`` for a digest
+    mismatch.
     """
 
     segment: str
-    expected: str
+    expected: str | None
     actual: str
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -455,6 +464,7 @@ def write_damaged_segments(
                 "segment": item.segment,
                 "expected_sha256": item.expected,
                 "actual_sha256": item.actual,
+                "error": item.error,
             }
             for item in damage.damaged
         ],

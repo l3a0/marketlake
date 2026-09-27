@@ -24,8 +24,10 @@ These cover the check's contract:
    seal a changed value, and a shadow-append.
 3. The refusal joins ``refused`` with its own reason, so the re-tune leaves the day alone and
    the summary words it as damage rather than a type conflict.
-4. Today's behavior for an unmanifested segment, which has no digest to compare and so is
-   still the reader's to judge. The reader-side change that moves this is marketlake #552.
+4. An unmanifested segment has no digest to compare, so the read judges it. A flip the
+   read proves is damage refuses the ticker-day the same way, with the read's failure in
+   place of the recorded digest (marketlake #552). A flip that decodes cleanly with a
+   changed value still seals, because no structural check can see it.
 5. The refusal repeats every night the damage survives, a finding that cannot be written
    still pages, and a run with drift and damage sends both pages under their own titles.
 6. The page stays inside the design's body limit however many segments are damaged.
@@ -91,6 +93,11 @@ DROPS_THE_SEGMENT = 4632
 # No structural check can see it. Only the digest does. The flip is bit 0 of the first
 # character of the first stored stamp, located by content, so "2026" becomes "3026".
 CHANGES_A_VALUE = b"2026-08-24T10:"
+# One gap marker segment, the size the close guard's and the startup walk's markers write,
+# and the last byte of its one batch body. Flipping it breaks the last column's buffers,
+# which only full validation sees, and leaves the end-of-stream marker after it intact.
+MARKER_BYTES = 9088
+MARKER_FLIP = 9079
 
 
 # -- the seams ---------------------------------------------------------------
@@ -292,6 +299,7 @@ def test_a_flipped_byte_refuses_the_ticker_day_and_keeps_every_segment(lake_root
             "segment": _rel(lake_root, damaged),
             "expected_sha256": recorded,
             "actual_sha256": sha256_file(damaged),
+            "error": None,
         }
     ]
     assert not report.schema_drift_dir(lake_root, DAY).exists()
@@ -454,7 +462,7 @@ def test_the_summary_words_damage_as_damage(lake_root):
     assert result.changed
 
 
-# -- 4. an unmanifested segment is still the reader's ------------------------
+# -- 4. an unmanifested segment is the reader's -------------------------------
 
 
 def _unmanifested(lake_root: Path) -> list[Path]:
@@ -464,18 +472,129 @@ def _unmanifested(lake_root: Path) -> list[Path]:
     return spy
 
 
-def test_an_unmanifested_flip_that_drops_the_segment_still_seals_short(lake_root):
-    # Today's behavior, asserted so the reader-side change in marketlake #552 is visible
-    # when it lands. No digest exists to compare, so the check skips the segment and the
-    # reader reads it as a stream torn before its first batch.
+def test_an_unmanifested_flip_the_read_proves_refuses_the_ticker_day(lake_root):
+    """The flip that used to seal the day 2 rows short now refuses it (marketlake #552).
+
+    No digest exists to compare, so the hash check skips the segment. The file still ends
+    in its end-of-stream marker, so the stream that stops inside it is damage rather than a
+    tear, and the read raises into the same refusal the hash check uses. Before, compaction
+    read it as a segment torn before its first batch, sealed 8 of 10 rows, and unlinked it.
+    """
     spy = _unmanifested(lake_root)
-    _flip(spy[2], DROPS_THE_SEGMENT)
+    damaged = spy[2]
+    _flip(damaged, DROPS_THE_SEGMENT)
+    before = {path: path.read_bytes() for path in spy}
+    publisher, transport = _paging(lake_root)
+
+    result, events = _run(lake_root, publisher=publisher)
+
+    assert result.sealed == ()
+    assert {path: path.read_bytes() for path in spy} == before
+    assert not _partition(lake_root, "SPY").exists()
+    assert events == ["backup", "ping"]
+    (refused,) = result.refused
+    assert refused.reason == REFUSED_SEGMENT_DAMAGED
+    assert refused.segments == tuple(_rel(lake_root, path) for path in spy)
+    (item,) = refused.damaged
+    # No entry, so no recorded digest. The read's failure is the evidence instead.
+    assert (item.segment, item.expected, item.actual) == (
+        _rel(lake_root, damaged),
+        None,
+        sha256_file(damaged),
+    )
+    assert item.error is not None and "stopped inside a finished file" in item.error
+    (finding,) = _findings(lake_root)
+    assert finding["damaged"] == [
+        {
+            "segment": _rel(lake_root, damaged),
+            "expected_sha256": None,
+            "actual_sha256": sha256_file(damaged),
+            "error": item.error,
+        }
+    ]
+    # Worded as a failed read, never as a digest that no longer matches, since none was
+    # recorded.
+    (page,) = transport.messages
+    assert page.title == DAMAGED_SEGMENT_TITLE
+    assert "1 segment(s) failed to read as damaged" in page.body
+    assert "no longer match" not in page.body
+    (line,) = [line for line in result.render().splitlines() if line.startswith("  refused")]
+    assert line.endswith(f"segments=5 kept, damaged, failed to read: {damaged.name}")
+
+
+def test_a_damaged_marker_beside_intact_captures_refuses_the_ticker_day(lake_root):
+    """A marker segment carries no entry, and the read is the only check it gets.
+
+    The captures beside it pass their hash check, so the refusal names the marker alone.
+    Sealing past it would drop the marker's gap row and unlink the file, and that row is
+    the only record of why its minute is missing.
+    """
+    spy = _captured(lake_root, "SPY")
+    with journal.SegmentWriter.open(
+        lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "m", PID
+    ) as writer:
+        writer.write_cycle(
+            journal.gap_batch(
+                journal.CHAINS_SURFACE,
+                ticker="SPY",
+                snap_ts=_et(10, 9),
+                error_class="http_500",
+                close_tag=None,
+                session_phase=None,
+            )
+        )
+    marker = writer.path
+    # The file still ends in its end-of-stream marker after the flip, which lands on the
+    # body ahead of it.
+    data = bytearray(marker.read_bytes())
+    assert len(data) == MARKER_BYTES
+    assert data[-8:] == b"\xff\xff\xff\xff\x00\x00\x00\x00"
+    data[MARKER_FLIP] ^= 0x01
+    marker.write_bytes(bytes(data))
 
     result, _ = _run(lake_root)
 
-    assert result.refused == ()
-    assert [item.rows for item in result.sealed] == [4 * ROWS_PER_SEGMENT]
-    assert not any(path.exists() for path in spy)
+    assert result.sealed == ()
+    (refused,) = result.refused
+    assert [item.segment for item in refused.damaged] == [_rel(lake_root, marker)]
+    assert refused.damaged[0].expected is None
+    assert "a batch failed validation" in (refused.damaged[0].error or "")
+    assert all(path.exists() for path in [*spy, marker])
+
+
+def test_a_read_that_refuses_a_segment_its_digest_passed_keeps_the_digest(lake_root, monkeypatch):
+    """The shape a validation false positive would take, reported rather than dropped.
+
+    The bytes are the ones the capture hashed, so the digest check passes, and the read
+    refuses them anyway. That can only mean the check is wrong or the writer wrote bad
+    bytes, and either way the finding has to say the digest matched. It carries the
+    recorded digest beside the one on disk, equal, so an operator reading it sees at once
+    that the disk did not change them.
+    """
+    spy = _captured(lake_root, "SPY")
+    refused_path = spy[1]
+    recorded = latest_entries(lake_root)[_rel(lake_root, refused_path)]["sha256"]
+    real = journal.read_segment
+
+    def refuse_one(path):
+        if Path(path) == refused_path:
+            raise journal.SegmentDamaged(Path(path), "a batch failed validation: refused")
+        return real(path)
+
+    monkeypatch.setattr(journal, "read_segment", refuse_one)
+
+    result, _ = _run(lake_root)
+
+    assert result.sealed == ()
+    (refused,) = result.refused
+    (item,) = refused.damaged
+    assert (item.segment, item.expected, item.actual) == (
+        _rel(lake_root, refused_path),
+        recorded,
+        recorded,
+    )
+    assert item.error is not None and "a batch failed validation" in item.error
+    assert all(path.exists() for path in spy)
 
 
 def test_an_unmanifested_flip_that_changes_a_value_still_seals_it(lake_root):
@@ -677,6 +796,50 @@ def test_the_page_names_every_segment_up_to_the_cap():
     assert "more" not in body
 
 
+def test_the_page_and_the_summary_count_each_kind_of_damage_apart():
+    """A segment refused by its read had no digest compared, so it is not counted as one.
+
+    One ticker-day with a digest mismatch and a segment the read refused. The page counts
+    them under their own words, and the summary names each under its own heading.
+    """
+    base = f"journal/date={DAY.isoformat()}/surface=chains/ticker=SPY"
+    mismatch = DamagedSegment(segment=f"{base}/seg-a.arrows", expected="a" * 64, actual="b" * 64)
+    unread = DamagedSegment(
+        segment=f"{base}/seg-b.arrows", expected=None, actual="c" * 64, error="stopped"
+    )
+    found = [
+        SegmentDamage(
+            surface="chains",
+            ticker="SPY",
+            day=DAY,
+            partition=f"chains/ticker=SPY/date={DAY.isoformat()}.parquet",
+            segments=(mismatch.segment, unread.segment),
+            damaged=(mismatch, unread),
+        )
+    ]
+
+    body = compact_module._damage_body(found)
+    kinds = compact_module._damage_kinds((mismatch, unread))
+    message = str(
+        DamagedSegments(
+            surface="chains",
+            ticker="SPY",
+            day=DAY,
+            partition=found[0].partition,
+            segments=found[0].segments,
+            damaged=(mismatch, unread),
+        )
+    )
+
+    assert (
+        "1 segment(s) no longer match the sha256 taken when they closed "
+        "and 1 segment(s) failed to read as damaged." in body
+    )
+    assert kinds == "sha256 no longer matches: seg-a.arrows; failed to read: seg-b.arrows"
+    assert "seg-a.arrows (sha256 no longer matches: recorded " in message
+    assert "seg-b.arrows (failed to read: stopped; no sha256 recorded, now " in message
+
+
 # -- 7. the human-invoked repair ---------------------------------------------
 
 
@@ -729,6 +892,7 @@ def test_the_writer_files_one_json_per_finding_and_never_overwrites(lake_root):
                 "segment": damage.damaged[0].segment,
                 "expected_sha256": "a" * 64,
                 "actual_sha256": "b" * 64,
+                "error": None,
             }
         ],
     }

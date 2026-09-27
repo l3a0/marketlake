@@ -2173,7 +2173,17 @@ class SegmentWriter:
     It creates the file exclusively, appends one record batch per cycle, and makes
     each cycle durable before returning. A clean close writes the end-of-stream
     marker. The segment is never re-opened for append. Use it as a context manager so
-    the marker always lands.
+    the marker lands after every write that finished.
+
+    The marker never lands after a write that raised. A write can fail partway through a
+    batch and leave the caller running, as a full disk that frees up does. A marker
+    written behind those half-written bytes would make the file look finished, and the
+    reader calls a stop inside a finished file damage rather than a torn tail
+    (marketlake #552). So ``write_cycle`` records that it raised, and ``close`` then
+    closes the file without the marker. The file reads as a torn tail, and its complete
+    batches are kept. This is keyed on the write rather than on the exception
+    ``__exit__`` receives, because a caller that catches the failure inside the ``with``
+    block leaves ``__exit__`` nothing to see.
     """
 
     def __init__(self, path: Path | str, schema: pa.Schema, *, surface: str | None = None) -> None:
@@ -2185,6 +2195,8 @@ class SegmentWriter:
         # per-cycle durability contract holds.
         self.durable_syncs = 0
         self._closed = False
+        # Set when a write raised, which keeps ``close`` from writing the marker.
+        self._write_failed = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # ``O_CREAT | O_EXCL`` makes the create fail loudly if the path already exists.
         # A collision must never truncate durable rows or shadow-append past an EOS.
@@ -2245,11 +2257,17 @@ class SegmentWriter:
         """
         if self._closed:
             raise ValueError("cannot write to a closed segment")
-        if isinstance(batch, pa.Table):
-            self._writer.write_table(batch)
-        else:
-            self._writer.write_batch(batch)
-        self._flush_durable()
+        try:
+            if isinstance(batch, pa.Table):
+                self._writer.write_table(batch)
+            else:
+                self._writer.write_batch(batch)
+            self._flush_durable()
+        except BaseException:
+            # How many of the batch's bytes reached the file is unknown, so the marker
+            # must not follow them. The class docstring says why.
+            self._write_failed = True
+            raise
 
     def _flush_durable(self) -> None:
         self._sink.flush()
@@ -2260,11 +2278,17 @@ class SegmentWriter:
         self.durable_syncs += 1
 
     def close(self) -> None:
-        """Write the end-of-stream marker, make it durable, and close the file."""
+        """Write the end-of-stream marker, make it durable, and close the file.
+
+        After a write that raised, the file is closed without the marker, as the class
+        docstring explains. The Arrow writer is left unclosed, because closing it is what
+        writes the marker, and it writes nothing once the file under it is closed.
+        """
         if self._closed:
             return
-        self._writer.close()  # writes the EOS marker
-        self._flush_durable()
+        if not self._write_failed:
+            self._writer.close()  # writes the EOS marker
+            self._flush_durable()
         self._file.close()
         self._closed = True
 
@@ -2299,22 +2323,99 @@ class ShadowAppendError(Exception):
         )
 
 
-def _complete_batches(reader: pa.ipc.RecordBatchStreamReader) -> tuple[list[pa.RecordBatch], bool]:
-    """Every complete record batch in a stream, and whether it ended at a clean EOS.
+class SegmentDamaged(pa.ArrowInvalid):
+    """Raised when a segment's bytes were damaged after it was written.
+
+    Two things prove it. A batch that fails Arrow's full validation holds bytes no writer
+    produced. A stream that stops early in a file that still ends in its end-of-stream
+    marker was finished and then changed, because a power loss cuts a file before its
+    marker and a failed write leaves the marker off (see ``SegmentWriter``).
+
+    It is an ``ArrowInvalid``, so every reader that already tells a bad file from an
+    absent one catches it unchanged. ``UNUSABLE_SEGMENT`` holds it through ``ValueError``,
+    ``_open_failure_kind`` files it ``corrupt``, and the dashboard counts it. Compaction is
+    the one reader that must tell it from a torn file, because it reads a stream that fails
+    to open as a segment with no durable batch and would drop the rows. It refuses the
+    ticker-day instead (marketlake #552).
+
+    What pyarrow raised is kept as ``__cause__``. That class is not a short list: a damaged
+    stream has raised ``OSError``, ``ArrowInvalid``, ``ArrowNotImplementedError`` and
+    ``SystemError``, and a batch read without validation has crashed the process outright.
+    """
+
+    def __init__(self, path: Path, detail: str) -> None:
+        self.path = path
+        super().__init__(f"{path}: {detail}")
+
+
+# The eight bytes a clean close writes last: a continuation token and a zero length.
+_EOS_MARKER = b"\xff\xff\xff\xff\x00\x00\x00\x00"
+
+
+def _ends_in_eos(source: pa.MemoryMappedFile) -> bool:
+    """Whether the file's last eight bytes are the end-of-stream marker.
+
+    ``read_at`` leaves the stream's position alone, so the read after this starts at the
+    first byte.
+    """
+    size = source.size()
+    marker = len(_EOS_MARKER)
+    return size >= marker and source.read_at(marker, size - marker) == _EOS_MARKER
+
+
+def _complete_batches(
+    path: Path, source: pa.MemoryMappedFile
+) -> tuple[pa.Schema, list[pa.RecordBatch], bool]:
+    """A stream's schema, every complete batch, and whether it ended at a clean EOS.
 
     A torn tail, from a power loss mid-append, stops the read at the last complete batch.
     The incomplete trailing bytes are dropped, never an error. Every durable cycle ends in a
     full flush, so the last complete batch is exactly what the writer believed it had. The
     flag is ``True`` only when the stream reached its end-of-stream marker.
+
+    A stop is a torn tail only when the file does not end in that marker. A power loss cuts
+    the file before the marker lands, and the writer leaves it off after a write that
+    raised, so a file that ends in it was finished whole. A stream that fails inside such a
+    file was damaged in place, and the read raises ``SegmentDamaged`` rather than returning
+    the batches before the failure. Returning them would read a captured minute as an
+    empty segment, which startup gap-marking then marks as missing and nothing notices.
+
+    Every batch is validated in full before it is kept, and a failure raises
+    ``SegmentDamaged`` whatever the file ends in. A damaged batch can decode without error
+    and then raise ``SystemError`` or crash the process when a column is read, and only the
+    full validation catches it. The cheap one left 49 of 51 crashing flips in place.
+
+    Whatever the stream raises is caught, not a list of classes, because each list tried
+    so far has missed a member. On a file that ends in the marker it becomes
+    ``SegmentDamaged``. On one that does not, a failure at the open becomes ``ArrowInvalid``,
+    which compaction reads as a segment torn before its first batch, and a failure after it
+    is the torn tail. The memory map is opened by the caller, outside this, so a missing
+    file still raises ``FileNotFoundError`` and a refused one ``PermissionError``.
     """
+    finished = _ends_in_eos(source)
+    try:
+        reader = pa.ipc.open_stream(source)
+    except Exception as exc:
+        if finished:
+            raise SegmentDamaged(path, f"the stream will not open: {exc!r}") from exc
+        raise pa.ArrowInvalid(f"{path}: the stream will not open: {exc!r}") from exc
     batches: list[pa.RecordBatch] = []
     while True:
         try:
-            batches.append(reader.read_next_batch())
+            batch = reader.read_next_batch()
         except StopIteration:
-            return batches, True
-        except (pa.ArrowInvalid, OSError):
-            return batches, False
+            return reader.schema, batches, True
+        except Exception as exc:
+            if finished:
+                raise SegmentDamaged(
+                    path, f"the stream stopped inside a finished file: {exc!r}"
+                ) from exc
+            return reader.schema, batches, False
+        try:
+            batch.validate(full=True)
+        except Exception as exc:
+            raise SegmentDamaged(path, f"a batch failed validation: {exc!r}") from exc
+        batches.append(batch)
 
 
 def read_segment(path: Path | str) -> pa.Table:
@@ -2326,14 +2427,16 @@ def read_segment(path: Path | str) -> pa.Table:
     2. A torn tail, from a power loss mid-append, reads up to the last complete batch.
        The incomplete trailing bytes are dropped, not an error. Every durable cycle
        ends in a full flush, so the last complete batch is exactly what the writer
-       believed it had.
+       believed it had. A file that still ends in its end-of-stream marker is not torn,
+       so a stream that stops inside one raises ``SegmentDamaged`` instead.
     3. Bytes after the end-of-stream marker are a shadow-append and raise loudly.
+
+    Every batch is fully validated before it is returned, and one that fails raises
+    ``SegmentDamaged``. ``_complete_batches`` carries both rules.
     """
     path = Path(path)
     with pa.memory_map(str(path), "rb") as source:
-        reader = pa.ipc.open_stream(source)
-        schema = reader.schema
-        batches, clean_eos = _complete_batches(reader)
+        schema, batches, clean_eos = _complete_batches(path, source)
         if clean_eos and source.tell() < source.size():
             raise ShadowAppendError(path, source.tell(), source.size())
     return pa.Table.from_batches(batches, schema=schema)
@@ -2342,7 +2445,10 @@ def read_segment(path: Path | str) -> pa.Table:
 # What makes a segment unusable rather than absent, for a reader asking what it holds.
 # Four things go wrong and they all mean one thing to the caller. The file will not open,
 # which is an ``OSError``. The stream is malformed, which pyarrow raises as
-# ``ArrowInvalid``, itself a ``ValueError``. Bytes sit past the end-of-stream marker, which
+# ``ArrowInvalid``, itself a ``ValueError``. That covers damage too: whatever a damaged
+# stream raises, ``ArrowNotImplementedError`` included, reaches here as ``SegmentDamaged``,
+# an ``ArrowInvalid``, and a stream that stops inside a finished file is damage rather than
+# the torn tail it used to read as. Bytes sit past the end-of-stream marker, which
 # is a ``ShadowAppendError``. Or the segment opens cleanly and its schema has drifted, so
 # the column asked of it is gone, a ``KeyError``, or holds a value the parse refuses, a
 # ``TypeError`` or a ``ValueError``.
@@ -2683,7 +2789,8 @@ def latest_expirations(
     ``None`` means nothing in scope names an expiration. That covers no manifest, no chains
     segment for the ticker, none on the named date, none of its segments holding a data
     batch, and every data batch leaving the column null. A manifested segment whose file is
-    gone is skipped, never an error.
+    gone is skipped, never an error, and so is one that cannot be read, a damaged one
+    included, so the walk reaches the next older batch.
     """
     root = Path(lake_root)
     ordered: dict[str, dict] = {}
@@ -2700,7 +2807,7 @@ def latest_expirations(
             continue
         try:
             with pa.memory_map(str(path), "rb") as source:
-                batches, _clean_eos = _complete_batches(pa.ipc.open_stream(source))
+                _schema, batches, _clean_eos = _complete_batches(path, source)
             found = _expirations_of(batches)
         except UNUSABLE_SEGMENT:
             continue

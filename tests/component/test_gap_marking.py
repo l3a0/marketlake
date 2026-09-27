@@ -1205,18 +1205,18 @@ def test_a_day_whose_stamps_will_not_decode_is_refused_too(tmp_path):
 
     ``snap_ts`` is still ``string``, so nothing went missing and nothing was retyped. The
     minutes are in the file all the same, unread, which is the only thing the refusal turns
-    on. Written by hand because no writer makes bytes like these.
+    on. Written by hand because no writer stamps a minute like this.
+
+    The unusable value is a legible string that is not a timestamp. Bytes that are not
+    UTF-8 used to stand in for it, and they no longer reach this stage: full validation
+    refuses them at the read, so they file as ``corrupt`` (marketlake #552).
     """
     import pyarrow as pa
 
     stamp = et(2026, 9, 2, 11, 0).isoformat()
     directory = journal.segment_dir(tmp_path, "quotes", "XYZ", DRIFT_DAY)
     directory.mkdir(parents=True, exist_ok=True)
-    values = stamp.encode() + b"\xff\xfe"
-    offsets = pa.array([0, len(stamp), len(values)], type=pa.int32())
-    stamps = pa.Array.from_buffers(
-        pa.string(), 2, [None, offsets.buffers()[1], pa.py_buffer(values)]
-    )
+    stamps = pa.array([stamp, "the third minute"], type=pa.string())
     schema = pa.schema([("snap_ts", pa.string())])
     path = directory / "20260902T110000000000-1.arrows"
     with pa.ipc.new_stream(path, schema) as writer:
