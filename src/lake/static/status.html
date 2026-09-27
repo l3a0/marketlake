@@ -90,7 +90,6 @@
   .nightly { margin: .6rem 0 0; padding: 0; list-style: none; }
   .nightly li { border-top: 1px solid var(--rule); padding: .4rem 0; }
   .nightly .lines { margin: .2rem 0 0; padding-left: 1.1rem; }
-  .nothing-withheld { color: var(--captured); }
   .empty { opacity: .7; font-style: italic; }
   .legend { margin: .4rem 0 .6rem; }
   .legend i { display: inline-block; width: 12px; height: 12px; vertical-align: -1px; margin: 0 .3rem 0 .9rem; }
@@ -859,7 +858,9 @@
     // An empty ``problems`` draws no list, which cannot be told from a section that was
     // never drawn. So a run whose ping went out says in words that nothing held it back.
     // The flag is the file's own verdict, and it claims no more than that: a run can
-    // ping with gaps above zero, so the line never calls the night clean.
+    // ping with gaps above zero, so the line never calls the night clean. It takes the
+    // page's plain text colour for the same reason. Green is the heatmap's "captured",
+    // and beside "gaps 39" it would say healthy in colour what the words refuse to say.
     if (entry.nothing_withheld === true) {
       var withheld = el("li", "Nothing withheld the ping.", "nothing-withheld");
       withheld.title = "The run's problems list is empty and its ping went out. " +
