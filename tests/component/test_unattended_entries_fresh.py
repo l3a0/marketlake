@@ -81,8 +81,10 @@ def test_the_entry_imports_cleanly_from_a_fresh_interpreter(label, tmp_path):
         timeout=TIMEOUT_SECONDS,
     )
 
-    # One comparison, so a cycle's failure prints the child's traceback rather than only
-    # its exit code. The line matters as well as the code: ``argparse`` exits 2 too.
+    # The child's stderr is the assertion message, so a cycle's failure prints the whole
+    # traceback. pytest's own diff of two tuples stops at the first differing item and
+    # clips the strings, which would show ``1 != 2`` and hide the ``ImportError``. The
+    # line matters as well as the code: ``argparse`` exits 2 too.
     label_printed = stderr_label(module, args)
     expected = f"{label_printed}: config file not found: {config_path}\n"
-    assert (finished.returncode, finished.stderr) == (2, expected)
+    assert (finished.returncode, finished.stderr) == (2, expected), finished.stderr

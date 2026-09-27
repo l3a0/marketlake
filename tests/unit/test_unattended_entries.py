@@ -1,9 +1,11 @@
 """Every entry launchd starts reaches ``main`` through its ``__main__`` guard.
 
 The installed plists start ``lake`` modules with ``python -m``, and a guard that is
-deleted, or that calls ``main`` with the wrong argv, fails nothing else in the suite. The
-daemon is the member that costs the most: under ``KeepAlive`` a daemon whose guard is gone
-imports, exits 0 and is relaunched every ten seconds, and capture never starts.
+deleted, or that calls ``main`` with the wrong argv, fails nothing in the suite outside
+this file and ``tests/component/test_unattended_entries_fresh.py``, which starts the same
+jobs from a fresh interpreter. The daemon is the member that costs the most: under
+``KeepAlive`` a daemon whose guard is gone imports, exits 0 and is relaunched every ten
+seconds, and capture never starts.
 
 The roster is ``control_plane.all_jobs``, the list ``render_all`` writes one plist per job
 from, so a job added there is covered here with no edit. Each entry runs in process under
