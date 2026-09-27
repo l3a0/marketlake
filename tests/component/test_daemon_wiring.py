@@ -360,6 +360,8 @@ def _segment(
     surface: str = journal.QUOTES_SURFACE,
     ticker: str = "XYZ",
     routed: tuple[str, ...] = (),
+    rows: int = 1,
+    data_rows: int | None = None,
 ) -> SegmentOutcome:
     """One journalled segment of the named kind, the shape a cycle result carries.
 
@@ -372,16 +374,22 @@ def _segment(
 
     ``routed`` is the columns whose vendor field arrived at a type the column refused,
     empty on every ordinary segment, which is what the schema-drift page reads.
+
+    ``data_rows`` defaults to every row on data and none on a gap. A data segment holding
+    marker rows and no contract takes ``rows`` above zero with ``data_rows=0``.
     """
+    if data_rows is None:
+        data_rows = rows if row_kind == journal.ROW_KIND_DATA else 0
     return SegmentOutcome(
         surface=surface,
         ticker=ticker,
         path=root / "segment.arrows",
         partition=f"{surface}/ticker={ticker}/date=2026-09-02/segment.arrows",
         row_kind=row_kind,
-        rows=1,
+        rows=rows,
         error_class=None if row_kind == journal.ROW_KIND_DATA else "boom",
         fetched_at=None,
+        data_rows=data_rows,
         routed_columns=routed,
     )
 
@@ -575,6 +583,36 @@ def test_one_live_surface_beside_a_dead_one_still_arms_the_dead_man(data_first, 
     _run(rig, clock, ticks=1, cycle_runner=lambda *, slot, close_tag, session_phase: result)
 
     assert rig.pinger.urls == [CAPTURE_URL]
+
+
+@pytest.mark.parametrize(("data_rows", "pings"), [(0, 0), (2, 1)])
+def test_a_chain_holding_no_contract_beside_a_failed_quote_leaves_the_dead_man_silent(
+    data_rows, pings, tmp_path
+):
+    """A minute that landed no data row is not evidence of capture, whatever its kind.
+
+    Quotes are captured for every roster ticker, so the feed reaches this only in a
+    minute the batched quotes request failed as well. A chain beside it that answered 200
+    with no contract lands a data segment holding only the failed window's marker, and
+    read by its kind it fed the check for a daemon that captured nothing (marketlake
+    #326). A chain that lost one window and landed the rest holds real contracts, so it
+    still feeds the check, which is the other side of the boundary.
+    """
+    rig = _rig(tmp_path, WITH_OPTIONS + EQUITY_ONLY)
+    chain = _segment(
+        journal.ROW_KIND_DATA,
+        tmp_path,
+        journal.CHAINS_SURFACE,
+        "SPY",
+        rows=data_rows + 1,
+        data_rows=data_rows,
+    )
+    quote = _segment(journal.ROW_KIND_GAP, tmp_path, journal.QUOTES_SURFACE, "XYZ")
+    result = CycleResult(et(2026, 9, 2, 11, 59), (chain, quote))
+    clock = ManualClock(start=et(2026, 9, 2, 11, 58, 30))
+    _run(rig, clock, ticks=1, cycle_runner=lambda *, slot, close_tag, session_phase: result)
+
+    assert rig.pinger.urls == [CAPTURE_URL] * pings
 
 
 def test_a_cycle_that_journalled_nothing_leaves_the_dead_man_silent(tmp_path):
@@ -1236,6 +1274,7 @@ class _RateLimited:
             rows=1,
             error_class="http_429",
             fetched_at=None,
+            data_rows=0,
         )
         return CycleResult(snap_ts=slot, segments=(segment,))
 
@@ -1278,6 +1317,7 @@ class _WholeDaemonFailure:
                 rows=1,
                 error_class="http_401",
                 fetched_at=None,
+                data_rows=0,
             )
             for surface in (journal.QUOTES_SURFACE, "chains")
         )
@@ -1331,6 +1371,7 @@ class _DeadSampler:
                 rows=1,
                 error_class="boom",
                 fetched_at=None,
+                data_rows=0,
             )
             for ticker in self._tickers
         )
@@ -1382,6 +1423,7 @@ class _SplitSampler:
                 rows=1,
                 error_class="boom" if index % 2 else "timeout",
                 fetched_at=None,
+                data_rows=0,
             )
             for index, ticker in enumerate(self._tickers)
         )
@@ -1567,6 +1609,7 @@ def test_the_out_of_span_page_names_four_tickers_and_counts_the_rest(tmp_path, l
         rows=1,
         error_class=None,
         fetched_at=None,
+        data_rows=1,
     )
 
     def runner(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:

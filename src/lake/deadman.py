@@ -5,8 +5,9 @@ daemon can report that it died, so that case is left to a check outside the mach
 The daemon pings a healthchecks slug, healthchecks expects the ping, and its absence is
 what pages. A process that is gone cannot suppress it.
 
-The ping is fed by two things. Every durable capture cycle feeds it, because a cycle
-that produced data is the strongest possible evidence the daemon is alive and working.
+The ping is fed by two things. Every capture cycle that landed a data row feeds it,
+because a cycle that produced data is the strongest possible evidence the daemon is alive
+and working.
 And an idle heartbeat feeds it whenever the daemon is awake but has nothing to capture,
 so a holiday or the minutes before the open do not read as death.
 

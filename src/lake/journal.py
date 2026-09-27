@@ -1485,6 +1485,16 @@ def _columns_named(
                     yield column
 
 
+def data_rows(batch: pa.RecordBatch) -> int:
+    """How many rows of a built batch are data rows rather than gap rows.
+
+    A batch's row count cannot say whether it holds any market data, because a chains
+    data batch can carry absence-marker gap rows and no contract at all. Counting each
+    row's own ``row_kind`` can (marketlake #326).
+    """
+    return sum(1 for kind in batch.column("row_kind").to_pylist() if kind == ROW_KIND_DATA)
+
+
 def routed_columns(surface: str, batch: pa.RecordBatch) -> tuple[str, ...]:
     """The surface's own columns whose vendor name sits in a built batch's ``extra``.
 
