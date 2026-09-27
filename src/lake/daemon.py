@@ -23,9 +23,10 @@ Each minute the loop does three things, in order.
 Five hooks let the loop-coupled deliverables plug in without touching the loop. Each
 has a no-op default, so the loop ships standalone.
 
-- ``on_start()`` is called exactly once, before the first tick. Startup gap-marking
-  (D10) plugs in here. Gap-marking writes an explicit marker row for each minute a dead
-  daemon missed, so the gap is recorded rather than silently absent.
+- ``on_start(slot)`` is called exactly once, before the first tick, with the minute the
+  daemon started in. Startup gap-marking (D10) plugs in here. Gap-marking writes an
+  explicit marker row for each minute a dead daemon missed, so the gap is recorded rather
+  than silently absent.
 - ``on_tick(slot)`` is handed every minute the loop sees, session or not. D14's power
   assertion and D13's idle heartbeat plug in here, because each needs a minute the loop is
   awake for rather than a minute it captures on.
@@ -65,13 +66,15 @@ fired a cycle, and it spans days. Within one incarnation the loop reports every 
 slot it slept through, an overrun or a stall, across as many session days as the stall
 covered. A lid closed Monday afternoon and opened Tuesday morning reports Monday's tail
 and Tuesday's head. Non-session days contribute nothing, and a night jump that touches
-no capture slot reports nothing. A restart resets the memory to none, since the first
-tick after ``on_start`` has no previous slot. From there the successor's startup
-gap-marking takes over. So the two writers never overlap: the loop reports what it slept
-through while alive, and startup marking reports what happened while it was dead. That
-one datetime is the loop's only state. The loop keeps neither the expiration set nor the
-chain plan, because the cycle reads the plan fresh from its file and the expiration set
-off the journal on its failure path.
+no capture slot reports nothing. A restart seeds the memory from one read of the minute
+the daemon starts in, and hands that same minute to ``on_start``. Startup gap-marking
+owns every owed minute through it, and the loop owns every minute after it. So the two
+writers never overlap: the loop reports what it slept through while alive, and startup
+marking reports what happened while it was dead. One read rather than two, because a
+second read can fall past a minute top the first did not, and both writers would then
+claim that minute. That one datetime is the loop's only state. The loop keeps neither
+the expiration set nor the chain plan, because the cycle reads the plan fresh from its
+file and the expiration set off the journal on its failure path.
 
 A cycle that raises propagates out of the loop. The production entry reloads config and
 the token per cycle, so a raise there means a broken machine, not a vendor hiccup, and the
@@ -172,7 +175,7 @@ class CycleRunner(Protocol):
 # -- the five hooks ----------------------------------------------------------
 
 
-def _no_start() -> None:
+def _no_start(slot: datetime) -> None:
     """The default startup hook. Nothing runs before the first tick."""
 
 
@@ -199,11 +202,13 @@ class DaemonHooks:
 
     Every field is a callable with a no-op default, so ``DaemonHooks()`` is a complete,
     standalone set. ``slot`` in each signature is the snap slot, the Eastern-time minute
-    the cycle fired for, as ``SessionClock.snap_slot`` reports it. ``slots`` in
-    ``on_skipped`` are the capture slots the loop missed, in order, the same kind of value.
+    the cycle fired for, as ``SessionClock.snap_slot`` reports it. The one exception is
+    ``on_start``, whose ``slot`` is the minute the daemon started in, the same value the
+    loop seeds its previous slot with. ``slots`` in ``on_skipped`` are the capture slots
+    the loop missed, in order, the same kind of value.
     """
 
-    on_start: Callable[[], None] = _no_start
+    on_start: Callable[[datetime], None] = _no_start
     on_tick: Callable[[datetime], None] = _ignore_tick
     close_tag_for: Callable[[datetime], str | None] = _no_close_tag
     on_cycle: Callable[[datetime, CycleResult], None] = _ignore_cycle
@@ -256,7 +261,11 @@ def run_loop(
 ) -> None:
     """Run the market-hours loop until ``should_continue`` says stop.
 
-    ``on_start`` fires once, before the first tick. Then each iteration:
+    Before the first tick, read the snap slot once, remember it as the previous tick's
+    slot, and hand it to ``on_start``, which fires once. One read, for the reason step 2
+    gives for the tick: a second read can fall past a minute top the first did not, and
+    startup marking and ``on_skipped`` would then both claim that minute. Then each
+    iteration:
 
     1. Sleep through ``clock.sleep`` until the next minute top, computed from
        ``clock.now``, and sleep again while the clock still reads short of it. The top is
@@ -284,13 +293,16 @@ def run_loop(
     hooks = hooks if hooks is not None else DaemonHooks()
     # The slot of the previous tick, seeded before ``on_start`` runs so the handoff
     # between startup marking and the loop is exact rather than a matter of timing.
-    # Startup marking bounds itself at this same minute plus one. If the pass then
+    # The seed is handed to ``on_start`` rather than read again there, and startup
+    # marking bounds itself at this same minute plus one. A second read could land a
+    # minute later and mark that minute ``daemon_dead`` while the first tick hands it to
+    # ``on_skipped`` as ``slot_overrun``, two rows for one minute. If the pass then
     # outlives its minute, the first tick lands later than that bound and the minutes
     # in between belong to neither producer. Seeding here hands them to ``on_skipped``,
     # which is true to what happened: the daemon was alive and busy. Seeding also costs
     # nothing when the pass is quick, because adjacent slots yield no missed minutes.
     last_slot = session_clock.snap_slot()
-    hooks.on_start()
+    hooks.on_start(last_slot)
     while should_continue():
         _sleep_until(clock, max(next_minute_top(clock.now()), last_slot + TICK))
         slot = session_clock.snap_slot()
@@ -1200,9 +1212,9 @@ def run_loop_from_config(
         caller_on_start = hooks.on_start
         caller_on_skipped = hooks.on_skipped
 
-        def on_start() -> None:
-            _report(marker.on_start(), "startup")
-            caller_on_start()
+        def on_start(slot: datetime) -> None:
+            _report(marker.on_start(slot), "startup")
+            caller_on_start(slot)
 
         def on_skipped(slots: list[datetime]) -> None:
             _report(marker.on_skipped(slots), "skipped")
@@ -1238,9 +1250,9 @@ def run_loop_from_config(
         guard_on_start = hooks.on_start
         guard_on_tick = hooks.on_tick
 
-        def on_start_guarded() -> None:
+        def on_start_guarded(slot: datetime) -> None:
             dispatch.check(clock.now())
-            guard_on_start()
+            guard_on_start(slot)
 
         def on_tick_guarded(slot: datetime) -> None:
             dispatch.check(slot)

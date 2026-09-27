@@ -12,8 +12,10 @@ Two producers hand slots to one writer.
 2. Skipped-slot marking runs from ``on_skipped`` when a live loop sleeps through a
    capture slot, after an overrun or a stall.
 
-They never overlap, because ``run_loop`` calls ``on_start`` before its first tick and
-carries no previous slot into it. The two differ only in the reason they stamp. A
+They never overlap, because ``run_loop`` reads the minute it starts in once, hands it
+to startup marking, and keeps it as the previous slot its first tick counts from.
+Startup marking owns every owed minute through it, and the loop reports only minutes
+after it. The two differ only in the reason they stamp. A
 startup marker says ``daemon_dead``, which is true: some other incarnation ended. A
 skipped-slot marker says ``slot_overrun``, because the daemon is alive on those minutes
 and recording it as dead would make the marker lie about its own reason.
@@ -200,23 +202,31 @@ class GapMarker:
 
     # -- the two hooks ---------------------------------------------------------
 
-    def on_start(self) -> MarkingReport:
-        """Mark every minute owed before the daemon's first live cycle.
+    def on_start(self, slot: datetime) -> MarkingReport:
+        """Mark every owed minute through ``slot``, the minute the daemon started in.
 
-        The upper bound is the first slot the loop will capture, not the current minute.
-        ``run_loop`` sleeps to the next minute top before its first tick, so the minute
-        the daemon starts in is one no cycle will ever run for. Bounding at the current
-        minute would leave it both uncaptured and unmarked, a one-minute hole on every
-        restart, which is the hole this exists to close.
+        ``run_loop`` hands ``slot`` in. It is the value the loop seeded its previous slot
+        with, so the loop's first ``on_skipped`` starts no earlier than ``slot`` plus one and
+        the two passes meet without overlapping. Reading the clock here instead would be a second
+        read, and one that falls past a minute top the loop's read did not would mark
+        that next minute ``daemon_dead`` while the loop later marks it ``slot_overrun``.
+        It is required rather than defaulted, so no caller can fall back to that read.
+
+        The upper bound is ``slot`` plus one, not ``slot`` itself. ``run_loop`` sleeps to
+        the next minute top before its first tick, so the minute the daemon starts in is
+        one no cycle will ever run for. Bounding short of it would leave it both
+        uncaptured and unmarked, a one-minute hole on every restart, which is the hole
+        this exists to close.
         """
-        first_live_slot = self._session_clock.snap_slot() + TICK
+        # The minute after the one the daemon started in. Markers stop short of it.
+        past_start = slot + TICK
 
         def plan(
             surface: str, ticker: str, recorded: dict[str, dict]
         ) -> tuple[list[datetime], MarkingReport]:
             self._unreadable = []
             missing, truncated, sealed = self._startup_missing(
-                surface, ticker, first_live_slot, recorded
+                surface, ticker, past_start, recorded
             )
             notes = MarkingReport(
                 sealed=tuple(sealed),
@@ -379,9 +389,13 @@ class GapMarker:
         Two marking passes in the same second would otherwise produce the same name, and
         ``SegmentWriter`` opens with ``O_CREAT|O_EXCL``, so the second would fail. A
         startup pass and a skipped-slot pass in the same minute is the ordinary case,
-        not a rare one. Stamping from the span also makes the name say what it covers,
-        and two passes cannot cover the same first minute, because the recorded set counts
-        the previous pass's marker rows, so those minutes are no longer owed.
+        not a rare one. Stamping from the span also makes the name say what it covers.
+        Two passes cannot cover the same first minute. Two startup passes cannot, because
+        the recorded set counts the previous pass's marker rows, so those minutes are no
+        longer owed. A startup pass and a skipped-slot pass cannot either, but for another
+        reason, because the skipped-slot plan never reads the recorded set. ``run_loop``
+        hands both the one minute it started in, startup marking stops at that minute,
+        and the loop hands ``on_skipped`` only minutes after it.
         """
         stamp = slots[0].strftime(SEGMENT_STAMP_FORMAT)
         path = journal.segment_path(self._root, surface, ticker, day, stamp, self._pid)
@@ -409,10 +423,13 @@ class GapMarker:
         self,
         surface: str,
         ticker: str,
-        first_live_slot: datetime,
+        past_start: datetime,
         recorded: dict[str, dict],
     ) -> tuple[list[datetime], bool, list[str]]:
         """The owed-but-unrecorded minutes for one ticker-surface, walking back from today.
+
+        ``past_start`` is the minute after the one the daemon started in. Every owed minute
+        before it is examined, and none from it on, because those are the loop's.
 
         For each session day, the owed minutes are the capture window intersected with the
         ticker's capture spans, and the missing ones are the owed minutes no row records. A
@@ -450,7 +467,7 @@ class GapMarker:
         )
         missing: list[datetime] = []
         sealed: list[str] = []
-        day = first_live_slot.date()
+        day = past_start.date()
         sessions = 0
         calendar_days = 0
         while sessions < MAX_LOOKBACK_SESSIONS and calendar_days < _CALENDAR_DAY_GUARD:
@@ -486,11 +503,11 @@ class GapMarker:
             owed = [
                 slot
                 for slot in session_slots(bounds)
-                if slot < first_live_slot and self._in_scope(surface, spanlist, slot)
+                if slot < past_start and self._in_scope(surface, spanlist, slot)
             ]
             day_missing = [slot for slot in owed if slot not in present.slots]
             missing.extend(day_missing)
-            if not day_missing and day < first_live_slot.date():
+            if not day_missing and day < past_start.date():
                 # A prior day with nothing missing: fully captured, or out of scope.
                 # Everything below it is accounted, so stop. The restart date itself never
                 # stops the walk, because a pre-open or mid-session restart owes little or

@@ -682,7 +682,9 @@ def test_a_daemon_alive_across_close_plus_five_runs_the_guard_that_minute(tmp_pa
     _record(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", et(2026, 9, 2, 16, 15))
     at_start: list[dict] = []
     hooks = daemon.DaemonHooks(
-        on_start=lambda: at_start.extend(_rows(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", DAY))
+        on_start=lambda slot: at_start.extend(
+            _rows(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", DAY)
+        )
     )
     # Close+5 is 16:20. The start sits before it and the second tick lands on it.
     clock = ManualClock(start=et(2026, 9, 2, 16, 18, 30))
