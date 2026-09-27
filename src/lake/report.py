@@ -93,6 +93,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -116,6 +117,77 @@ WITHHELD_DIR = "withheld"
 # Compaction's check of each manifested segment against the hash taken when it closed. Its
 # own subdirectory, per rule 2 above, so a damaged segment never counts as schema drift.
 DAMAGED_SEGMENTS_DIR = "damaged_segments"
+
+# What a report line asks of its reader, named for what the reader does (marketlake #530).
+# ``ACTION``: a human has something to do. ``INFO``: true and worth knowing, with nothing to
+# do, which is a permanent condition or news that asks for nothing. ``HEALTHY``: a check
+# saying it ran and found nothing. The writer sets the kind where it composes the line,
+# because four producers need a value only the writer holds to tell which kind a line is.
+ACTION = "action"
+INFO = "info"
+HEALTHY = "healthy"
+REPORT_KINDS = frozenset({ACTION, INFO, HEALTHY})
+
+
+def kinds_fit(lines: object, kinds: object) -> bool:
+    """Whether ``kinds`` classifies ``lines``: one known kind per line, in a list or tuple.
+
+    **Never raises**, whatever either argument holds. The sweep builds ``Nightly`` after the
+    ping, so a raise there would cost the report file and the digest on a night the check had
+    already gone green, and the dashboard reads the same pair off a file anything may have
+    written. Each value is tested as a string before it is tested for membership, because
+    ``[1] in frozenset(...)`` raises ``TypeError``.
+    """
+    if not isinstance(lines, (list, tuple)) or not isinstance(kinds, (list, tuple)):
+        return False
+    if len(lines) != len(kinds):
+        return False
+    return all(isinstance(kind, str) and kind in REPORT_KINDS for kind in kinds)
+
+
+def classified(lines: Sequence[str], kinds: object) -> tuple[str, ...]:
+    """One kind per line: ``kinds`` when it fits ``lines``, and otherwise ``ACTION`` for every one.
+
+    A line nobody classified reads loud rather than quiet, which is the failure a reader
+    notices. The whole list falls back rather than the missing tail alone, because a list of
+    the wrong length cannot say which line lost its kind, and pairing the rest by position
+    would put a kind on the wrong line.
+    """
+    if kinds_fit(lines, kinds):
+        return tuple(kinds)  # type: ignore[arg-type]
+    return (ACTION,) * len(lines)
+
+
+class ReportLines:
+    """Report lines and their kinds, accumulated together so neither list can outgrow the other.
+
+    Every producer that carries report lines appends through this, including the ``ACTION``
+    ones. One bare ``append`` on a plain list makes the lines outnumber the kinds, and
+    :func:`classified` then turns the whole night to ``ACTION``, not only the line that was
+    missed.
+    """
+
+    def __init__(self) -> None:
+        self._lines: list[str] = []
+        self._kinds: list[str] = []
+
+    def add(self, line: str, kind: str) -> None:
+        """One line and the kind its producer gave it."""
+        self._lines.append(line)
+        self._kinds.append(kind)
+
+    def pour(self, lines: Sequence[str], kinds: object) -> None:
+        """Another record's lines, with its kinds where they fit and ``ACTION`` where not."""
+        self._lines.extend(lines)
+        self._kinds.extend(classified(lines, kinds))
+
+    @property
+    def lines(self) -> tuple[str, ...]:
+        return tuple(self._lines)
+
+    @property
+    def kinds(self) -> tuple[str, ...]:
+        return tuple(self._kinds)
 
 
 @dataclass(frozen=True)
@@ -744,6 +816,12 @@ class Nightly:
     ride this file and send no message of their own. ``SundayOutcome`` carries the same split
     in the same two names, and keeping them one list is what would let a held finding silence
     the check.
+
+    ``report_kinds`` gives each ``report`` line its kind, ``ACTION``, ``INFO`` or ``HEALTHY``,
+    and :func:`write_nightly` reads the pair through :func:`classified`. It sits beside
+    ``report`` rather than inside it, so ``report`` stays a tuple of strings for every reader
+    that takes it as text: the digest, the job's stdout, and a dashboard still running the
+    code from before the kinds existed.
     """
 
     day: date
@@ -755,6 +833,7 @@ class Nightly:
     pieces: tuple[tuple[str, PieceOutcome], ...] = ()
     problems: tuple[str, ...] = ()
     report: tuple[str, ...] = ()
+    report_kinds: tuple[str, ...] = ()
 
     @property
     def disagreements(self) -> int:
@@ -813,6 +892,8 @@ def write_nightly(
         "pieces": {name: outcome.as_entry() for name, outcome in nightly.pieces},
         "problems": [redacted(problem) for problem in nightly.problems],
         "report": [redacted(line) for line in nightly.report],
+        # Always full length, so a reader never has to decide what a short list means.
+        "report_kinds": list(classified(nightly.report, nightly.report_kinds)),
     }
     # `parents=True` from a missing lake root would create the lake itself, which
     # `write_close_guard` and `alert._record` both refuse for the reason given there. A

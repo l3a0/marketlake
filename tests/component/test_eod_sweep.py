@@ -43,6 +43,7 @@ from lake.config import GuardConstants
 from lake.control_plane import EOD_SWEEP_SLUG, SUNDAY_WAKE, pmset_schedule_args
 from lake.manifest import LedgerNotUtf8, append_quarantine
 from lake.paths import CHAINS, QUOTES, REPORTS_DIR, LakePaths
+from lake.report import ACTION, INFO
 from lake.schema_versions import (
     LEDGER_PARTITION,
     LedgerUnreadable,
@@ -63,8 +64,9 @@ from lake.tickers import Roster
 from lake.vendor import DAILY_FREQ, MINUTE_FREQ
 from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
-from tests.support.lake import FixtureLake
+from tests.support.lake import FixtureLake, sample_chains_table
 from tests.support.pinger import FakePinger
+from tests.support.report_kinds import kind_of
 from tests.support.transport import FakeTransport
 from tests.support.vendor import CassetteVendor, bars_candle, bars_interactions
 
@@ -92,7 +94,7 @@ CENSUS_RENAMED = {"cleared": "clean", "appended": "wrote"}
 # Whether the battery's pages belong in the census at all is a fair question, and it is
 # ``paged``'s question as much as this field's. Answering it for one of the two would leave
 # the pair inconsistent, so it is not marketlake #427's to answer.
-CENSUS_NOT_COUNTS = {"report", "findings", "paged", "drift_paged"}
+CENSUS_NOT_COUNTS = {"report", "report_kinds", "findings", "paged", "drift_paged"}
 
 # The week the fixture calendar serves. 2026-09-14 is a Monday, so the sessions run Monday
 # through Friday and the second Monday gives the Friday branch a next week to wake before.
@@ -763,6 +765,9 @@ def test_the_friday_run_sets_the_sunday_one_shot_and_reads_it_back(fixture_lake:
         "battery: calendar coverage, 9 of 10 owed sessions have no partition, "
         "over 5 sessions, 2026-09-14 to 2026-09-18"
     )
+    # A missing session is a standing fact, and the capture dead-man is what pages the day
+    # one goes missing, so the census with misses is ``info`` (marketlake #530).
+    assert outcome.nightly.report_kinds == (report.INFO,)
     assert outcome.nightly.problems == ()
     assert pinger.urls == [PING_URL]
 
@@ -815,6 +820,9 @@ def test_a_sealed_reference_that_offers_no_close_is_reported_by_reason(
 
     (line,) = [entry for entry in outcome.nightly.report if entry.startswith("bars abandoned")]
     assert line == "bars abandoned: 3 ticker-day(s), 2 NoSpotClose, 1 PartitionQuarantined"
+    # One reason a human can act on makes the whole line ``action`` (marketlake #530). The
+    # six outage days alone are ``info``, which the operator's night below drives.
+    assert kind_of(outcome.nightly, "bars abandoned") == ACTION
     assert report.redacted(line) == line, "the reasons were cut off before any reader saw them"
     assert line in outcome.digest.body
     # The run also holds unsettled ticker-days, and none of them is in the line. That silence is
@@ -916,6 +924,8 @@ def test_pmset_drift_rides_the_report_file_rather_than_withholding_the_ping(
     )
 
     assert any("one-shot" in line for line in outcome.nightly.report)
+    # A wake that will not fire wants a human, even riding the report tier (marketlake #530).
+    assert kind_of(outcome.nightly, "one-shot") == ACTION
     assert outcome.nightly.problems == ()
     assert pinger.urls == [PING_URL]
     assert any("one-shot" in line for line in _filed(root)[0]["report"])
@@ -933,6 +943,7 @@ def test_an_unreadable_read_back_is_a_finding_rather_than_a_crash(fixture_lake: 
     )
 
     assert any("read-back unreadable" in line for line in outcome.nightly.report)
+    assert kind_of(outcome.nightly, "read-back unreadable") == ACTION
     assert pinger.urls == [PING_URL]
 
 
@@ -1062,6 +1073,7 @@ def test_the_file_carries_the_counts_and_the_detail_the_digest_dropped(
         "problems",
         "quarantined",
         "report",
+        "report_kinds",
         "session",
     ]
     assert sorted(filed["pieces"]["bars"]) == [
@@ -1624,6 +1636,7 @@ def test_the_unwalked_lines_are_counted_rather_than_listed(fixture_lake: Fixture
     outcome, _, _ = _run(root, roster=roster)
 
     unwalked = [line for line in outcome.nightly.report if line.startswith("bars unwalked")]
+    assert kind_of(outcome.nightly, "bars unwalked") == ACTION
     assert len(unwalked) == 1, f"one line per ticker-day reached the report: {unwalked}"
     assert "ticker-day(s)" in unwalked[0]
     assert "QQQ" in unwalked[0], "the line says nothing about which ticker"
@@ -1965,6 +1978,7 @@ def test_a_summary_count_that_cannot_be_read_keeps_the_record_and_the_digest(
     assert pinger.urls == [PING_URL]
     assert outcome.nightly.gaps is None
     assert any("gap count unreadable" in line for line in outcome.nightly.report)
+    assert kind_of(outcome.nightly, "gap count unreadable") == ACTION
     assert outcome.filed_at is not None, "the record was lost"
     assert any("gap count unreadable" in line for line in _filed(root)[0]["report"])
     assert transport.messages, "the digest was lost"
@@ -2178,6 +2192,7 @@ def test_a_battery_that_raises_costs_the_run_nothing_and_says_so(
     assert pinger.urls == [PING_URL]
     assert outcome.filed_at is not None
     assert any("battery did not run: RuntimeError" in line for line in outcome.nightly.report)
+    assert kind_of(outcome.nightly, "battery did not run") == ACTION
 
 
 def test_a_battery_that_raises_does_not_withhold_the_ping(fixture_lake: FixtureLake, monkeypatch):
@@ -2441,6 +2456,8 @@ def test_a_quarantine_the_battery_wrote_is_reported_and_still_pings(fixture_lake
     assert outcome.nightly.pinged is True
     assert pinger.urls == [PING_URL]
     assert any("battery wrote 1 quarantine line" in line for line in outcome.nightly.report)
+    # How a new quarantine reaches the nightly, so it wants a human (marketlake #530).
+    assert kind_of(outcome.nightly, "battery wrote 1 quarantine line") == ACTION
 
 
 def test_the_quarantine_count_on_the_file_is_this_evenings_not_last_evenings(
@@ -2588,6 +2605,8 @@ def test_the_nightly_reports_a_run_the_request_budget_bounded(fixture_lake: Fixt
 
     (line,) = [entry for entry in outcome.nightly.report if entry.startswith("bars deferred")]
     assert line == "bars deferred: 3 ticker-day(s), 1 request(s) spent"
+    # The run spent what it was allowed and the next evening holds the rest (marketlake #530).
+    assert kind_of(outcome.nightly, "bars deferred") == INFO
     assert report.redacted(line) == line, "the budget was cut off before any reader saw it"
     assert line in outcome.digest.body
     # A bound the run was told to respect is not a failure, so the ping still goes out and the
@@ -2687,6 +2706,7 @@ def test_a_run_whose_version_the_ledger_does_not_know_files_a_line_and_still_pin
 
     (line,) = _version_lines(outcome)
     assert str(journal.SCHEMA_VERSION) in line
+    assert kind_of(outcome.nightly, "schema_version") == ACTION
     assert outcome.nightly.problems == ()
     assert pinger.urls == [PING_URL]
 
@@ -2890,3 +2910,156 @@ def test_a_damaged_manifest_ledger_is_named_and_still_ends_the_run(fixture_lake:
     # And the run filed nothing, which is what marketlake #517 is for.
     reports = sorted((root / REPORTS_DIR).rglob("*")) if (root / REPORTS_DIR).exists() else []
     assert reports == [], "the run filed a record, so #517 has landed and this test is stale"
+
+
+# -- the kind of each report line -------------------------------------------------------
+
+# The live lake's first battery week, 2026-09-08 onward, with Labor Day kept out. The
+# 2026-09-17 nightly this reproduces walked from the span's first session, and one fake week
+# starting on ``MONDAY`` has too few sessions to hold six gated outage days and two data days.
+OUTAGE_WEEK = date(2026, 9, 7)
+LABOR_DAY = OUTAGE_WEEK
+OUTAGE_GATES = (
+    date(2026, 9, 9),
+    date(2026, 9, 10),
+    date(2026, 9, 11),
+    date(2026, 9, 14),
+    date(2026, 9, 15),
+    date(2026, 9, 16),
+)
+
+
+# The columns the battery judges a quotes partition on, beyond what ``_quote_row`` carries.
+# Without them the delayed-feed, entitlement and quote-sanity checks each quarantine the night,
+# and it gains an ``action`` line the operator's night did not have.
+JUDGED_QUOTES_SCHEMA = pa.schema(
+    [
+        *QUOTES_SCHEMA,
+        ("vendor_quote_ts", pa.string()),
+        ("realtime", pa.bool_()),
+        ("bid", pa.float64()),
+        ("mark", pa.float64()),
+        ("ask", pa.float64()),
+    ]
+)
+
+
+def _judged_quote_row(day: date) -> dict:
+    """``_quote_row`` with a realtime vendor stamp and an ordered bid, mark and ask."""
+    row = _quote_row(day)
+    return {
+        **row,
+        "vendor_quote_ts": row["snap_ts"],
+        "realtime": True,
+        "bid": 648.9,
+        "mark": 649.0,
+        "ask": 649.1,
+    }
+
+
+def _judged_quotes_table(rows: list[dict]) -> pa.Table:
+    columns = {name: [row.get(name) for row in rows] for name in JUDGED_QUOTES_SCHEMA.names}
+    return pa.table(columns, schema=JUDGED_QUOTES_SCHEMA)
+
+
+def _operator_night(
+    fixture_lake: FixtureLake,
+    *,
+    close_absent: date | None = None,
+    lost: date | None = None,
+):
+    """A sweep over the lake shape the operator read on 2026-09-17 (marketlake #530).
+
+    Six daily ticker-days are gated against a sealed quotes session holding gap rows and no
+    data row, which is the outage's ``NoSpotClose``. The last two sessions carry data on both
+    surfaces, so schema drift judges the night against the day before and finds nothing, and
+    every owed session has both partitions, so coverage finds nothing missing. That is the
+    night's three lines: one standing fact and two checks that ran clean.
+
+    ``close_absent`` turns one outage day into a data row with no close, which the walk
+    files as ``CloseValueAbsent``. ``lost`` deletes one outage day's sealed quotes file, which
+    it files as ``PartitionAbsent``.
+    """
+    night = date(2026, 9, 18)
+    baseline = date(2026, 9, 17)
+    sessions = [date(2026, 9, 8), *OUTAGE_GATES, baseline, night]
+    for day in sessions:
+        rows = (
+            [_quote_row(day, row_kind=journal.ROW_KIND_GAP)]
+            if day in OUTAGE_GATES and day != close_absent
+            else [_judged_quote_row(day)]
+        )
+        if day == close_absent:
+            rows[0]["close_price"] = None
+        fixture_lake.with_quotes("SPY", day, _judged_quotes_table(rows))
+        fixture_lake.with_chains("SPY", day, sample_chains_table())
+    root = _lake(fixture_lake, quotes={})
+    if lost is not None:
+        (root / QUOTES / "ticker=SPY" / f"date={lost.isoformat()}.parquet").unlink()
+    interactions: list = []
+    for day in (date(2026, 9, 16), baseline):
+        day_open, day_close = _bounds(day)
+        interactions.extend(
+            bars_interactions(
+                "SPY",
+                DAILY_FREQ,
+                [(day_open - DAY_MARGIN, day_close + DAY_MARGIN, [_daily_candle(day)])],
+            )
+        )
+    outcome = sweep.sweep(
+        lake_root=root,
+        clock=ManualClock(datetime.fromisoformat(f"{night.isoformat()}T18:30:00-04:00")),
+        calendar=weekday_sessions(OUTAGE_WEEK, MONDAY, NEXT_MONDAY, holidays=(LABOR_DAY,)),
+        roster=_roster(),
+        vendor_source=_CountingVendorSource(Cassette(interactions=tuple(interactions))),
+        pinger=FakePinger(),
+        ping_url=PING_URL,
+        publisher=Publisher(lake_root=root, transport=FakeTransport(), secrets=("secret-key",)),
+        schedule_reader=lambda: _schedule_text(),
+        schedule_setter=_RecordingSetter(),
+        guards=None,
+    )
+    return root, outcome
+
+
+def test_the_operators_night_files_one_standing_fact_and_two_clean_checks(
+    fixture_lake: FixtureLake,
+):
+    """The acceptance test for marketlake #530: the night the operator could not read.
+
+    It drives the real ``sweep()``, so every hop a kind takes is on the path: the bars walk's
+    own line, the drift report poured into the battery's, the battery's poured into the
+    sweep's, and ``write_nightly``. A bare append or a pour that drops the kinds anywhere
+    on it makes the lists unequal, and the file then reads ``action`` on all three lines.
+    """
+    root, outcome = _operator_night(fixture_lake)
+    assert outcome.nightly.report == (
+        "bars abandoned: 6 ticker-day(s), 6 NoSpotClose",
+        "battery: schema drift judged chains against 2026-09-17, quotes against 2026-09-17, "
+        "nothing drifted",
+        "battery: calendar coverage, 18 owed sessions, all present",
+    )
+    assert outcome.nightly.problems == ()
+    (filed,) = _filed(root)
+    assert filed["report"] == list(outcome.nightly.report)
+    assert filed["report_kinds"] == ["info", "healthy", "healthy"]
+
+
+def test_an_outage_line_with_a_close_value_absent_is_still_a_standing_fact(
+    fixture_lake: FixtureLake,
+):
+    # ``CloseValueAbsent`` is the other reason nothing can change: the sealed partition holds
+    # a data row and no usable close. Both reasons together are still ``info``.
+    _, outcome = _operator_night(fixture_lake, close_absent=OUTAGE_GATES[0])
+    (line,) = [entry for entry in outcome.nightly.report if entry.startswith("bars abandoned")]
+    assert line == "bars abandoned: 6 ticker-day(s), 1 CloseValueAbsent, 5 NoSpotClose"
+    assert kind_of(outcome.nightly, "bars abandoned") == INFO
+
+
+def test_an_outage_line_with_a_lost_partition_asks_for_a_restore(fixture_lake: FixtureLake):
+    # ``PartitionAbsent`` here is a manifested partition gone from disk, which a restore
+    # answers, so one of them makes the line ``action``.
+    _, outcome = _operator_night(fixture_lake, lost=OUTAGE_GATES[0])
+    (line,) = [entry for entry in outcome.nightly.report if entry.startswith("bars abandoned")]
+    assert line == "bars abandoned: 6 ticker-day(s), 5 NoSpotClose, 1 PartitionAbsent"
+    assert kind_of(outcome.nightly, "bars abandoned") == ACTION

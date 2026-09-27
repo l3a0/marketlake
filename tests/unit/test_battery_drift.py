@@ -21,6 +21,8 @@ import pytest
 from lake import battery_drift, journal
 from lake import schema_versions as sv
 from lake.battery import SEALED_SURFACES, SealedPartition
+from lake.report import ACTION, HEALTHY, INFO
+from tests.support.report_kinds import kind_of
 
 DAY = date(2026, 9, 16)
 BEFORE = date(2026, 9, 15)
@@ -131,6 +133,10 @@ def test_a_retype_that_starts_today_pages(tmp_path: Path):
 
     assert _kinds(report) == {(battery_drift.RETYPED, "open_interest")}
     assert report.findings[0].title == "Schema drift: open_interest retyped"
+    # A finding wants a human, and so does the summary that counts it, or the summary would
+    # tell a reader the opposite of the line above it (marketlake #530).
+    assert kind_of(report, report.findings[0].line) == ACTION
+    assert kind_of(report, "1 drifted") == ACTION
 
 
 def test_a_retype_already_running_yesterday_does_not_page(tmp_path: Path):
@@ -246,6 +252,7 @@ def test_no_baseline_day_reports_and_does_not_page(tmp_path: Path):
 
     assert report.findings == ()
     assert any("insufficient_history" in line for line in report.report)
+    assert kind_of(report, "no earlier sealed day to compare") == INFO
 
 
 # -- the rotation guard ------------------------------------------------------
@@ -279,6 +286,7 @@ def test_an_unreadable_ledger_refuses_the_missing_half_and_not_the_retype_half(t
 
     assert _kinds(report) == {(battery_drift.RETYPED, "open_interest")}
     assert any("insufficient_history" in line for line in report.report)
+    assert kind_of(report, "insufficient_history") == INFO
 
 
 def test_a_day_spanning_two_versions_refuses_the_missing_half(tmp_path: Path):
@@ -302,6 +310,7 @@ def test_a_day_spanning_two_versions_refuses_the_missing_half(tmp_path: Path):
 
     assert report.findings == ()
     assert any("span schema_versions 1, 2" in line for line in report.report)
+    assert kind_of(report, "span schema_versions 1, 2") == INFO
 
 
 # -- the page ----------------------------------------------------------------
@@ -407,6 +416,8 @@ def test_a_clean_night_says_it_ran(tmp_path: Path):
 
     assert report.findings == ()
     assert any("nothing drifted" in line for line in report.report)
+    # The check saying it ran, on the night it found nothing (marketlake #530).
+    assert kind_of(report, "nothing drifted") == HEALTHY
 
 
 # -- reading ------------------------------------------------------------------
@@ -427,6 +438,23 @@ def test_an_unreadable_partition_does_not_cost_the_night(tmp_path: Path):
 
     assert _kinds(report) == {(battery_drift.RETYPED, "open_interest")}
     assert any("skipped a partition" in line for line in report.report)
+    assert kind_of(report, "skipped a partition") == ACTION
+
+
+def test_an_unreadable_baseline_partition_is_reported_as_wanting_a_human(tmp_path: Path):
+    """The baseline's own skip line, which no other test drives (marketlake #530)."""
+    _ledger(tmp_path)
+    before = [
+        _seal(tmp_path, "chains", "SPY", BEFORE, _table("chains", BEFORE)),
+        _seal(tmp_path, "chains", "QQQ", BEFORE, _table("chains", BEFORE)),
+    ]
+    today = [_seal(tmp_path, "chains", "SPY", DAY, _table("chains", DAY))]
+    before[1].path.write_bytes(b"not parquet")
+
+    report = _judge(tmp_path, today, before)
+
+    assert kind_of(report, "skipped a baseline partition") == ACTION
+    assert kind_of(report, "nothing drifted") == HEALTHY
 
 
 def test_a_column_with_no_footer_statistics_is_read_rather_than_assumed(tmp_path: Path):
@@ -697,6 +725,7 @@ def test_a_version_the_ledger_records_no_shape_for_refuses_the_missing_half(tmp_
 
     assert report.findings == ()
     assert any("records no shape for schema_version 7" in line for line in report.report)
+    assert kind_of(report, "records no shape for schema_version 7") == INFO
 
 
 def test_an_all_gap_baseline_day_refuses_the_comparison(tmp_path: Path):
@@ -718,3 +747,4 @@ def test_an_all_gap_baseline_day_refuses_the_comparison(tmp_path: Path):
 
     assert report.findings == ()
     assert any("carried no data row" in line for line in report.report)
+    assert kind_of(report, "carried no data row") == INFO
