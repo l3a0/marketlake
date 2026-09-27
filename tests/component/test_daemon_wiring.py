@@ -22,7 +22,9 @@ Fourteen bindings are covered here.
 4. The cycle hook feeds the same dead-man's ``captured`` signal, which arms the check on
    the first durable cycle.
 5. The per-tick hook reaches the close+5 guard's dispatcher, so a daemon alive across
-   close+5 runs the guard on that minute.
+   close+5 runs the guard on that minute. On a tick that wakes from a stall, the dispatch
+   waits for the skipped-slot hook and runs after its markers, so every ordering of the
+   guard and gap marking leaves one row at the equity close.
 6. The cycle runner is the production entry that re-reads the chain plan, so a nightly
    plan rewrite takes effect the next minute.
 7. The skipped-slot hook charges the counters the current roster names. It re-reads the
@@ -620,17 +622,31 @@ def test_a_cycle_that_journalled_nothing_leaves_the_dead_man_silent(tmp_path):
 # -- 5. the per-tick hook reaches the close+5 guard ----------------------------------
 
 
-def test_a_daemon_alive_across_close_plus_five_runs_the_guard_that_minute(tmp_path):
-    """The guard has to fire on the ordinary day, not only after a restart.
+class _FailsTheClose:
+    """A cycle runner whose 16:00 write fails, the one case the guard's tick path marks.
 
-    launchd's calendar intervals are fixed wall clock and cannot express a
-    close-relative moment, so every session-relative job is dispatched from inside the
-    loop. A daemon still running at close+5 is the common case. An unbound tick hook
-    leaves the guard to the startup check alone, so the equity close goes unwitnessed
-    on every day the daemon does not happen to restart after it.
+    Every other minute records a row, standing for a cycle that landed. The 16:00 cycle
+    returns a ``SegmentError`` and no row, the way a live cycle reports a segment it could
+    not journal. Nothing marks that minute later, because the loop was alive and on time,
+    so the guard's marker is the only row 16:00 can get.
     """
-    rig = _rig(tmp_path)
-    # XYZ is in scope for the session, so the guard finds it owes the close.
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+
+    def __call__(
+        self, *, slot: datetime, close_tag: str | None, session_phase: str | None
+    ) -> CycleResult:
+        if slot == et(2026, 9, 2, 16, 0):
+            return CycleResult(
+                slot, (), errors=(SegmentError(journal.QUOTES_SURFACE, "XYZ", "disk_error"),)
+            )
+        _record(self._root, journal.QUOTES_SURFACE, "XYZ", slot)
+        return CycleResult(slot, ())
+
+
+def _in_scope_all_day(rig: _Rig) -> None:
+    """Register XYZ and open its span at the day's open, so the guard owes its close."""
     master = SecurityMaster()
     xyz = master.register(
         kind="equity", capture_start=et(2026, 9, 2, 9, 30), valid_from=DAY, ticker="XYZ"
@@ -639,29 +655,187 @@ def test_a_daemon_alive_across_close_plus_five_runs_the_guard_that_minute(tmp_pa
     spans = CaptureSpans()
     spans.open_span(xyz, et(2026, 9, 2, 9, 30), False)
     spans.write(spans_path(rig.lake_root))
-    # The option close is already recorded, so startup marking has nothing to write for
-    # the day and every later row came from the guard.
-    _record(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", et(2026, 9, 2, 16, 15))
+
+
+def _at_close(root: Path) -> list[dict]:
+    """Every quotes row XYZ holds at 16:00, of every kind and class.
+
+    Compared as instants, because a row's ``snap_ts`` text carries whichever offset its
+    writer was handed.
+    """
+    close = et(2026, 9, 2, 16, 0)
+    return [
+        row
+        for row in _rows(root, journal.QUOTES_SURFACE, "XYZ", DAY)
+        if datetime.fromisoformat(row["snap_ts"]) == close
+    ]
+
+
+# From 15:59:30 the first tick is 16:00 and the twenty-first is 16:20, which is close+5.
+TO_CLOSE_PLUS_FIVE = 21
+
+
+def test_a_daemon_alive_across_close_plus_five_runs_the_guard_that_minute(tmp_path):
+    """The guard has to fire on the ordinary day, not only after a restart.
+
+    launchd's calendar intervals are fixed wall clock and cannot express a
+    close-relative moment, so every session-relative job is dispatched from inside the
+    loop. A daemon still running at close+5 is the common case. An unbound tick hook
+    leaves the guard to the startup check alone, so the equity close goes unwitnessed
+    on every day the daemon does not happen to restart after it.
+
+    The daemon here is alive across 16:00 and its 16:00 write failed, so no row records
+    the close when the guard runs. Startup marking reaches only the minute the daemon
+    started in, and the loop skipped nothing. Every row at 16:00 is counted, whatever its
+    class, so a second row from any writer fails this.
+    """
+    rig = _rig(tmp_path)
+    _in_scope_all_day(rig)
     at_start: list[dict] = []
     hooks = daemon.DaemonHooks(
         on_start=lambda slot: at_start.extend(
             _rows(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", DAY)
         )
     )
-    # Close+5 is 16:20. The start sits before it and the second tick lands on it.
-    clock = ManualClock(start=et(2026, 9, 2, 16, 18, 30))
-    _run(rig, clock, ticks=2, cycle_runner=_no_cycle, hooks=hooks)
+    clock = ManualClock(start=et(2026, 9, 2, 15, 59, 30))
+    _run(
+        rig,
+        clock,
+        ticks=TO_CLOSE_PLUS_FIVE,
+        cycle_runner=_FailsTheClose(rig.lake_root),
+        hooks=hooks,
+    )
 
     unobserved = [row["error_class"] == close_guard.SPOT_CLOSE_UNOBSERVED for row in at_start]
     assert not any(unobserved), "the startup check ran the guard before close+5"
-    marked = [
-        row
-        for row in _rows(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", DAY)
-        if row["error_class"] == close_guard.SPOT_CLOSE_UNOBSERVED
+    (marked,) = _at_close(rig.lake_root)
+    assert marked["error_class"] == close_guard.SPOT_CLOSE_UNOBSERVED
+    assert marked["close_tag"] == SPOT_CLOSE
+    # The guard's run is what wrote it, at close+5 and not before.
+    files = sorted(report.close_guard_dir(rig.lake_root, DAY).glob("*.json"))
+    assert [json.loads(path.read_text())["at"][:16] for path in files] == ["2026-09-02T16:20"]
+
+
+# The five orderings that reach 16:00 with another writer, and the row each leaves there.
+# A second row for one minute double-counts it in every per-slot completeness read, so
+# each asserts one row at the close, counted without filtering by class.
+
+
+def _guard_found(root: Path) -> list[list[str]]:
+    """The ``unobserved`` field of every close+5 report the day's runs filed."""
+    return [
+        json.loads(path.read_text())["unobserved"]
+        for path in sorted(report.close_guard_dir(root, DAY).glob("*.json"))
     ]
-    assert len(marked) == 1
-    assert marked[0]["snap_ts"].startswith("2026-09-02T16:00")
-    assert marked[0]["close_tag"] == SPOT_CLOSE
+
+
+@pytest.mark.parametrize(
+    ("start", "ticks", "at_close", "reports"),
+    [
+        # Dead from 15:58 and relaunched at 16:10. Startup marking records 16:00, and the
+        # guard at 16:20 finds it recorded.
+        pytest.param(
+            et(2026, 9, 2, 16, 10, 30), 10, gap.DAEMON_DEAD, [["XYZ"]], id="restart-at-16:10"
+        ),
+        # Relaunched past close+5. The guard runs from ``on_start``, ahead of startup
+        # marking, and startup marking then counts its row.
+        pytest.param(
+            et(2026, 9, 2, 16, 25, 30),
+            1,
+            close_guard.SPOT_CLOSE_UNOBSERVED,
+            [["XYZ"]],
+            id="restart-at-16:25",
+        ),
+        # Dead across the evening. That day's guard never runs, so startup marking's row
+        # is the one the next morning leaves.
+        pytest.param(et(2026, 9, 3, 9, 29, 30), 1, gap.DAEMON_DEAD, [], id="overnight"),
+    ],
+)
+def test_a_restart_leaves_one_row_at_the_equity_close(tmp_path, start, ticks, at_close, reports):
+    rig = _rig(tmp_path)
+    _in_scope_all_day(rig)
+    _record(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", et(2026, 9, 2, 15, 58))
+    clock = ManualClock(start=start)
+    _run(rig, clock, ticks=ticks, cycle_runner=_FailsTheClose(rig.lake_root))
+
+    (row,) = _at_close(rig.lake_root)
+    assert row["error_class"] == at_close
+    assert _guard_found(rig.lake_root) == reports
+
+
+class _Stalls:
+    """A cycle runner whose 15:55 cycle lands and then sleeps for ``seconds``.
+
+    It stands for a lid closed after the 15:55 cycle. The loop wakes at the next minute
+    top past the stall, and the slots in between reach ``on_skipped`` on that tick.
+    """
+
+    def __init__(self, root: Path, clock: ManualClock, seconds: float) -> None:
+        self._root = root
+        self._clock = clock
+        self._seconds = seconds
+
+    def __call__(
+        self, *, slot: datetime, close_tag: str | None, session_phase: str | None
+    ) -> CycleResult:
+        _record(self._root, journal.QUOTES_SURFACE, "XYZ", slot)
+        if slot == et(2026, 9, 2, 15, 55):
+            self._clock.advance(self._seconds)
+        return CycleResult(slot, ())
+
+
+# Each stall runs from the 15:55 cycle to half a minute before the tick it wakes on.
+STALLS = [
+    # Wakes at 16:10, before close+5. The waking tick marks 16:00, and the guard at 16:20
+    # finds it recorded.
+    pytest.param(14 * 60 + 30, 12, id="stall-to-16:10"),
+    # Wakes at 16:25, past close+5. The guard is owed on the waking tick, and it runs
+    # after that tick's overrun markers rather than before them.
+    pytest.param(29 * 60 + 30, 2, id="stall-to-16:25"),
+    # Wakes in the evening, the same order at a later hour.
+    pytest.param(3 * 3600 + 4 * 60 + 30, 2, id="stall-to-19:00"),
+]
+
+
+@pytest.mark.parametrize(("seconds", "ticks"), STALLS)
+def test_a_stall_across_the_close_leaves_one_row_there(tmp_path, seconds, ticks):
+    rig = _rig(tmp_path)
+    _in_scope_all_day(rig)
+    clock = ManualClock(start=et(2026, 9, 2, 15, 54, 30))
+    _run(rig, clock, ticks=ticks, cycle_runner=_Stalls(rig.lake_root, clock, seconds))
+
+    (row,) = _at_close(rig.lake_root)
+    assert row["error_class"] == gap.SLOT_OVERRUN
+    assert _guard_found(rig.lake_root) == [["XYZ"]]
+
+
+def test_a_raise_in_the_waking_ticks_skipped_hook_does_not_cost_the_guard_its_run(tmp_path):
+    """The deferred run sits in a ``finally``, so a raise inside ``on_skipped`` still runs it.
+
+    Before the deferral the guard had already run by the time the skipped-slot hook could
+    raise. A caller's own hook runs inside the marker's, and the marker re-raises a roster
+    that will not load, so either can raise on the waking tick. The run still raises, and
+    the guard's report is on disk beside it.
+    """
+    rig = _rig(tmp_path)
+    _in_scope_all_day(rig)
+
+    def refuse(slots: list[datetime]) -> None:
+        raise RuntimeError("the caller's skipped-slot hook failed")
+
+    clock = ManualClock(start=et(2026, 9, 2, 15, 54, 30))
+    with pytest.raises(RuntimeError, match="skipped-slot hook failed"):
+        _run(
+            rig,
+            clock,
+            ticks=2,
+            cycle_runner=_Stalls(rig.lake_root, clock, 29 * 60 + 30),
+            hooks=daemon.DaemonHooks(on_skipped=refuse),
+        )
+
+    assert _guard_found(rig.lake_root) == [["XYZ"]], "the raise cost the guard its run"
+    (row,) = _at_close(rig.lake_root)
+    assert row["error_class"] == gap.SLOT_OVERRUN
 
 
 # -- 6. the cycle runner re-reads the chain plan ------------------------------------
@@ -1690,7 +1864,8 @@ def _tagged(root: Path, ticker: str, slot: datetime, *, close_tag: str) -> None:
 
     A tagged gap row is enough to satisfy the guard. It ran and it is recorded, so the
     guard adds nothing, which is what a day with nothing to report looks like. ``_record``
-    above writes an untagged row, and the guard reads a close by its tag.
+    above writes an untagged row, which stops the marker too but still reports the close
+    as unobserved, because nothing under the tag says a cycle ran.
     """
     batch = journal.gap_batch(
         journal.QUOTES_SURFACE,
@@ -1768,32 +1943,33 @@ def test_a_report_that_cannot_be_written_costs_the_file_and_not_the_markers(tmp_
     tick on. The guard's own run is finished by then, so its rows are already down. This
     blocks the directory the day's reports go in with a file of the same name, which is
     the shape a filesystem can actually present.
+
+    The daemon is alive across 16:00 and its 16:00 write failed, so the guard's marker is
+    the one row that minute gets. A daemon started after 16:00 would have startup marking
+    record the close first, and the guard would then rightly write nothing.
     """
     rig = _rig(tmp_path)
-    master = SecurityMaster()
-    xyz = master.register(
-        kind="equity", capture_start=et(2026, 9, 2, 9, 30), valid_from=DAY, ticker="XYZ"
-    )
-    master.write(master_path(rig.lake_root))
-    spans = CaptureSpans()
-    spans.open_span(xyz, et(2026, 9, 2, 9, 30), False)
-    spans.write(spans_path(rig.lake_root))
+    _in_scope_all_day(rig)
     blocked = rig.lake_root / "reports" / "close_guard"
     blocked.parent.mkdir(parents=True)
     blocked.write_text("not a directory\n")
 
     seen: list[str] = []
     hooks = daemon.DaemonHooks(on_tick=lambda slot: seen.append(slot.strftime("%H:%M")))
-    clock = ManualClock(start=et(2026, 9, 2, 16, 18, 30))
-    _run(rig, clock, ticks=3, cycle_runner=_no_cycle, hooks=hooks)
+    clock = ManualClock(start=et(2026, 9, 2, 15, 59, 30))
+    _run(
+        rig,
+        clock,
+        ticks=TO_CLOSE_PLUS_FIVE + 1,
+        cycle_runner=_FailsTheClose(rig.lake_root),
+        hooks=hooks,
+    )
 
-    assert seen == ["16:19", "16:20", "16:21"], "the loop died on the minute the write failed"
-    marked = [
-        row
-        for row in _rows(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", DAY)
-        if row["error_class"] == close_guard.SPOT_CLOSE_UNOBSERVED
-    ]
-    assert len(marked) == 1, "the failed write cost the marker the guard had already made"
+    assert seen[-3:] == ["16:19", "16:20", "16:21"], "the loop died on the minute the write failed"
+    (marked,) = _at_close(rig.lake_root)
+    assert marked["error_class"] == close_guard.SPOT_CLOSE_UNOBSERVED, (
+        "the failed write cost the marker the guard had already made"
+    )
     reported = capsys.readouterr().err
     assert "close+5 2026-09-02:" in reported, "stderr lost the findings too"
     assert "unobserved=XYZ" in reported, "stderr lost the findings too"
