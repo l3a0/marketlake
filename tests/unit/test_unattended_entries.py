@@ -8,9 +8,11 @@ imports, exits 0 and is relaunched every ten seconds, and capture never starts.
 The roster is ``control_plane.all_jobs``, the list ``render_all`` writes one plist per job
 from, so a job added there is covered here with no edit. Each entry runs in process under
 ``runpy`` with the job's own arguments, and stops at the config load, because the suite's
-config directory is an empty throwaway. That exit is the only thing standing between the
-entry and live work, which is why the precondition is asserted first and why a deadline
-turns an entry that runs past it into a failure rather than a hung suite.
+config directory is an empty throwaway. That exit is the first stop between the entry and
+live work. The conftest's network and subprocess guards catch some of what lies past it,
+but not a server bound to a local port or a loop that never calls out. So the precondition
+is asserted first, and a deadline turns an entry that runs past it into a failure rather
+than a hung suite.
 """
 
 from __future__ import annotations
@@ -38,7 +40,9 @@ JOBS = cp.all_jobs(HOST)
 
 # Every current entry exits at the config load in well under a second. The deadline is
 # for one that does not, such as the dashboard given ``--lake-root``, which skips the
-# config and serves forever. The project has no timeout plugin, so nothing else stops it.
+# config and serves forever. The project has no timeout plugin. CI's job-level
+# ``timeout-minutes`` would end the run after fifteen minutes without naming the test,
+# and a local run has nothing to stop it at all.
 DEADLINE_SECONDS = 30
 
 
