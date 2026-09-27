@@ -691,3 +691,24 @@ def test_the_vendor_closes_once_after_the_last_of_several_abandoned_requests(
     finally:
         vendor.release_quotes.set()
         vendor.release_chain.set()
+
+
+@pytest.mark.parametrize("cap", [1, 20])
+def test_a_cycle_outside_the_loop_is_not_bounded(lake_root, cap):
+    # A caller with no slot gets its own start floored as ``snap_ts``. A bound taken from
+    # that would already have passed for a cycle starting at 10:00:58, and every request
+    # would be refused. So it has no bound, and it fetches as it always did.
+    vendor = _HoldingVendor()
+    result = capture.run_cycle(
+        ManualClock(start=_utc(et(2026, 8, 24, 10, 0, 58))),
+        vendor,
+        _both(),
+        lake_root,
+        pid=4242,
+        plan=_THREE_WINDOWS,
+        guards=GuardConstants(capture_max_concurrency=cap),
+    )
+
+    assert len(vendor.chain_calls) == 6
+    assert vendor.quote_calls == 1
+    assert all(seg.error_class is None for seg in result.segments)
