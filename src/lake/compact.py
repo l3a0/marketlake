@@ -44,10 +44,13 @@ The job's rules, each glossed at first use.
    under ``reports/damaged_segments/``, one page per run names it, and the rest of the
    run goes on. A segment with no manifest entry, a gap or close-guard marker or a
    capture whose append a crash lost, has no hash to compare and is read as before.
-   The read is the check for those. When it proves the bytes were damaged, because a
-   batch fails validation or the stream stops inside a file that still ends in its
-   end-of-stream marker, it refuses the ticker-day the same way, and the finding names
-   the read's failure where a recorded digest would be (marketlake #552).
+   The read is the check for those. An access failure on that read, a file denied,
+   missing, or not a regular file, ends the run the way the hash check's read does, and
+   nothing is sealed or unlinked (marketlake #591). When the read proves the bytes were
+   damaged, because a batch fails validation or the stream stops inside a file that still
+   ends in its end-of-stream marker, it refuses the ticker-day the way the hash check
+   does, and the finding names the read's failure where a recorded digest would be
+   (marketlake #552).
 4. *Drift is reported, and costs one ticker-day at most.* Segments in one ticker-day
    can disagree about columns only when the daemon restarted onto different code
    mid-session, because every production segment takes its schema from
@@ -161,7 +164,7 @@ from lake.config import GuardConstants, input_errors_exit, load_config
 # the install renderer reads to name every check the operator has to arm, and re-exported
 # here so every consumer still reads it from the job that pings it.
 from lake.control_plane import COMPACTION_SLUG
-from lake.journal import ROW_KIND_DATA, ShadowAppendError
+from lake.journal import ROW_KIND_DATA
 from lake.lock import lake_lock
 from lake.manifest import (
     append_manifest,
@@ -679,12 +682,21 @@ def _read_complete(path: Path) -> pa.Table | None:
     bytes were damaged after the segment was written, so reading it as a segment torn
     before its first batch would seal the ticker-day without its rows and unlink the only
     copy of them. ``_seal`` refuses the ticker-day instead.
+
+    An ``OSError`` is not caught either. No tear raises one, because ``read_segment`` turns
+    every failure of the stream's own bytes into ``ArrowInvalid`` or a torn tail. What
+    still raises one is the memory map the reader opens first, which fails when the file
+    is denied, missing, or not a regular file, or when the system cannot open it at all,
+    out of file descriptors for one. That is an access failure rather than damage, and it
+    used to read here as no rows, so the ticker-day sealed without the segment and
+    unlinked it (marketlake #591). It ends the run instead, the way the hash
+    check's own read of a manifested segment already does.
     """
     try:
         return journal.read_segment(path)
-    except (ShadowAppendError, journal.SegmentDamaged):
+    except journal.SegmentDamaged:
         raise
-    except (pa.ArrowInvalid, OSError):
+    except pa.ArrowInvalid:
         return None
 
 
@@ -1964,7 +1976,8 @@ def compact(
         chains_by_day: dict[date, list[SealedPartition]] = {}
         # The page goes out in a ``finally``, so no raise anywhere can swallow it. The
         # sweep itself raises on a row-count regression, a failed verify, a partition that
-        # does not match its manifest entry, and any OSError from the write or the unlink.
+        # does not match its manifest entry, and any OSError from a segment's read, the
+        # write, or the unlink.
         # A merge the segments' types refused is one failure it catches instead, and that
         # finding joins ``drifted`` like any other, so this same page carries it. A
         # segment whose bytes were damaged is the other, and its finding joins
