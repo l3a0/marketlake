@@ -139,6 +139,8 @@ CHAIN_CHUNK_FAILED = "chain_chunk_failed"
 # that stopped producing data. A chain that lost one window lands as data carrying that
 # window's absence marker, which resets the watchdog rather than tripping it, so the marker
 # rows are what a reader has. That was true before marketlake #305 and is unchanged by it.
+# It resets because it still holds contracts. A chain whose every successful window answered
+# with no contract holds none, so it trips the watchdog as ``contracts_absent`` (#326).
 CHAIN_SCHEMA_DRIFT = "chain_schema_drift"
 
 # The two chain maps every window response nests contracts under.
@@ -602,6 +604,14 @@ class SegmentOutcome:
     is ``None`` on data. ``rows`` is the batch's row count, the same count recorded in
     the manifest.
 
+    ``data_rows`` is how many of those rows are themselves data rather than gap rows, and
+    it is what says whether the segment produced anything. ``rows`` cannot say it, because
+    a chains data segment can carry absence-marker gap rows and no contract at all: one
+    window answering 200 with empty expiration maps while another fails lands exactly
+    that. Every reader asking whether a surface produced goes through :attr:`landed_data`
+    (marketlake #326). It is ``None`` only when counting raised, and it takes no default,
+    so a writer that forgets it fails loudly rather than claiming production.
+
     ``routed_columns`` names the columns whose vendor field arrived at a type the column
     refused, which is the schema-drift signature ``journal.routed_columns`` reads off the
     batch. It rides the outcome because the batch does not outlive the write, and every
@@ -624,7 +634,20 @@ class SegmentOutcome:
     rows: int
     error_class: str | None
     fetched_at: str | None
+    data_rows: int | None
     routed_columns: tuple[str, ...] = ()
+
+    @property
+    def landed_data(self) -> bool:
+        """Whether this segment holds at least one data row.
+
+        A segment whose count failed is read the way every reader read a segment before
+        the count existed, a data segment counting as production. The other fallback,
+        zero, would page a minute that may have landed every contract.
+        """
+        if self.data_rows is None:
+            return self.row_kind == journal.ROW_KIND_DATA
+        return self.data_rows > 0
 
 
 @dataclass(frozen=True)
@@ -1654,6 +1677,9 @@ class _CaptureCycle:
         costs the finding rather than the capture. The failure is not silent: it reaches
         the launchd log the restart script already sends the operator to, and the segment
         lands with no column named, which reads as the ordinary cycle it otherwise is.
+
+        The data-row count is an alarm's input in the same way, so it runs beside the scan
+        on the same terms. ``_count_data_rows`` says what a count that raised falls back to.
         """
         try:
             routed = journal.routed_columns(surface, plan.batch)
@@ -1664,6 +1690,7 @@ class _CaptureCycle:
                 file=sys.stderr,
             )
             routed = ()
+        data_rows = _count_data_rows(surface, ticker, plan.batch)
         writer = journal.SegmentWriter.open(
             self.lake_root, surface, ticker, self.day, self.start_ts, self.pid
         )
@@ -1679,6 +1706,7 @@ class _CaptureCycle:
             rows=plan.batch.num_rows,
             error_class=plan.error_class,
             fetched_at=plan.fetch_ts.isoformat() if plan.fetch_ts is not None else None,
+            data_rows=data_rows,
             routed_columns=routed,
         )
 
@@ -2105,6 +2133,7 @@ def journal_snapshot(
             file=sys.stderr,
         )
         routed = ()
+    data_rows = _count_data_rows(surface, ticker, batch)
     writer = journal.SegmentWriter.open(lake_root, surface, ticker, day, start_ts, writer_pid)
     with writer:
         writer.write_cycle(batch)
@@ -2131,8 +2160,32 @@ def journal_snapshot(
         # for a segment that does hold a failure would hide it from every caller.
         error_class=absent_markers[0].error_class if absent_markers else None,
         fetched_at=fetched_at,
+        data_rows=data_rows,
         routed_columns=routed,
     )
+
+
+def _count_data_rows(surface: str, ticker: str, batch: object) -> int | None:
+    """How many of a built batch's rows are data rows, or ``None`` when counting raised.
+
+    Both writers call this before the writer opens and on the drift scan's terms, for the
+    scan's reasons. A raise after the write would sit between a durable segment and its
+    manifest entry, and an unguarded raise before it would lose the minute, while the
+    count is only an alarm's input.
+
+    A count that raised returns ``None``, which ``SegmentOutcome.landed_data`` reads the
+    way a segment was read before the count existed, so the failure never pages a minute
+    that may have landed every contract. It prints one line to the launchd log, as the
+    scan does.
+    """
+    try:
+        return journal.data_rows(batch)
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must never cost a minute
+        print(
+            f"capture: data-row count failed on {surface} {ticker}: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return None
 
 
 def _landed_expirations(path: Path) -> list[str]:

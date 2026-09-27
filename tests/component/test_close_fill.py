@@ -1438,6 +1438,7 @@ def _cycle_segment(ticker: str, *routed: str) -> capture.SegmentOutcome:
         rows=1,
         error_class=None,
         fetched_at=None,
+        data_rows=1,
         routed_columns=routed,
     )
 
