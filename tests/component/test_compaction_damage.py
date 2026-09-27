@@ -27,7 +27,9 @@ These cover the check's contract:
 4. An unmanifested segment has no digest to compare, so the read judges it. A flip the
    read proves is damage refuses the ticker-day the same way, with the read's failure in
    place of the recorded digest (marketlake #552). A flip that decodes cleanly with a
-   changed value still seals, because no structural check can see it.
+   changed value still seals, because no structural check can see it. A segment the read
+   cannot open at all is an access failure rather than damage, so it ends the run, and the
+   repair too, with nothing sealed or unlinked (marketlake #591).
 5. The refusal repeats every night the damage survives, a finding that cannot be written
    still pages, and a run with drift and damage sends both pages under their own titles.
 6. The page stays inside the design's body limit however many segments are damaged.
@@ -38,6 +40,7 @@ These cover the check's contract:
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 
@@ -365,9 +368,10 @@ def test_a_marker_sorting_before_the_damage_does_not_end_the_check(lake_root):
 
 
 def test_a_segment_that_cannot_be_read_for_its_hash_stops_the_run(lake_root, monkeypatch):
-    # An access failure is not damage, and the seal's own read would swallow it as a torn
-    # tail and unlink the segment. So the hash read lets it out, the run stops before any
-    # write, and the missed ping pages. A rsync over the same file would fail as well.
+    # An access failure is not damage. So the hash read lets it out, the run stops before
+    # any write, and the missed ping pages. A rsync over the same file would fail as well.
+    # The seal's own read lets it out too, which section 4 covers for a segment with no
+    # manifest entry.
     spy = _captured(lake_root, "SPY")
     real = compact_module.sha256_file
     locked = spy[2]
@@ -569,6 +573,73 @@ def test_an_os_error_at_the_open_refuses_the_ticker_day(lake_root):
     (refused,) = result.refused
     assert [bad.segment for bad in refused.damaged] == [_rel(lake_root, spy[2])]
     assert spy[2].exists()
+
+
+def _deny(path: Path) -> None:
+    """Take every permission off a file, and prove the process can no longer open it.
+
+    Root opens a ``chmod 000`` file anyway, so under root the denial never happens and a
+    test built on it would reach none of the code it names. The skip marks that case, and
+    this check refuses to go on if anything else lets the open through.
+    """
+    path.chmod(0o000)
+    with pytest.raises(PermissionError):
+        path.open("rb")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 file")
+def test_an_unmanifested_segment_that_cannot_be_opened_stops_the_run(lake_root):
+    """An access failure is not damage and not a tear, so it ends the run (marketlake #591).
+
+    The read used to take it as a segment torn before its first batch. The day sealed 8 of
+    its 10 rows, the denied segment was unlinked, and the run backed up and pinged healthy.
+    Now nothing is sealed or unlinked, the backup and the ping are skipped, and the missed
+    ping pages, as a manifested segment's hash read already did.
+    """
+    spy = _unmanifested(lake_root)
+    locked = spy[2]
+    before = {path: path.read_bytes() for path in spy}
+    _deny(locked)
+    events: list[str] = []
+    try:
+        with pytest.raises(PermissionError):
+            compact(
+                lake_root,
+                clock=ManualClock(_et(16, 30)),
+                calendar=_calendar(),
+                backup=FakeBackup(events),
+                backup_target=TARGET,
+                pinger=FakePinger(events),
+                ping_url=URL,
+                plan_path=lake_root.parent / "chain_plan.json",
+            )
+    finally:
+        locked.chmod(0o644)
+
+    assert {path: path.read_bytes() for path in spy} == before
+    assert not _partition(lake_root, "SPY").exists()
+    assert latest_entries(lake_root) == {}
+    assert events == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 file")
+def test_the_repair_stops_on_a_segment_it_cannot_open(lake_root):
+    """The repair seals through the same read, so it lost the segment the same way."""
+    spy = _unmanifested(lake_root)
+    locked = spy[2]
+    before = {path: path.read_bytes() for path in spy}
+    _deny(locked)
+    try:
+        with pytest.raises(PermissionError):
+            recompact_ticker_day(
+                lake_root, journal.CHAINS_SURFACE, "SPY", DAY, clock=ManualClock(_et(17, 0))
+            )
+    finally:
+        locked.chmod(0o644)
+
+    assert {path: path.read_bytes() for path in spy} == before
+    assert not _partition(lake_root, "SPY").exists()
+    assert latest_entries(lake_root) == {}
 
 
 def test_a_damaged_marker_beside_intact_captures_refuses_the_ticker_day(lake_root):

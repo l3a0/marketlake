@@ -9,8 +9,10 @@ They cover the job's contract:
 
 1. A day of segments compacts to one Parquet per surface and ticker, rows equal to the
    sum, a manifest entry carrying the sha, the segments deleted. A second run no-ops.
-2. A torn tail compacts to its complete batches. Bytes after an end-of-stream marker
-   in a segment with no manifest entry fail loudly and seal nothing for that ticker-day.
+2. A torn tail compacts to its complete batches. A segment torn before its first batch,
+   inside its stream header or before its first byte, reads as no rows. Bytes after an
+   end-of-stream marker in a segment with no manifest entry fail loudly and seal nothing
+   for that ticker-day.
 3. An orphaned segment from an older date is swept and sealed.
 4. A ticker-day whose close+5 has not passed is never touched.
 5. A manifested partition is sha-verified, its debris deleted, and never rewritten. A
@@ -490,6 +492,24 @@ def test_a_segment_torn_before_its_first_batch_reads_as_no_rows(lake_root):
 
     assert result.sealed[0].rows == 3
     assert not whole.exists() and not stub.exists()
+
+
+def test_an_empty_segment_reads_as_no_rows(lake_root):
+    # A crash between the create and the first write leaves a file of zero bytes. It holds
+    # no cycle, so it merges as zero rows beside a whole segment and is unlinked with it.
+    # An empty file fails at the open, and compaction stopped catching an access failure
+    # there (marketlake #591). So this is the case a catch narrowed to the wrong class
+    # would turn into a failed run every night.
+    whole = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(3, snap_ts=_snap(DAY, 0)), start_ts="a"
+    )
+    empty = journal.segment_path(lake_root, "chains", "SPY", DAY, "b", PID)
+    empty.write_bytes(b"")
+
+    result, _, _, _ = _run(lake_root)
+
+    assert result.sealed[0].rows == 3
+    assert not whole.exists() and not empty.exists()
 
 
 def test_bytes_after_the_eos_fail_loudly_and_seal_nothing_for_the_ticker_day(lake_root):
