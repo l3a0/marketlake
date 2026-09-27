@@ -518,6 +518,29 @@ def test_a_roster_the_spans_emptied_is_not_read_as_every_ticker_retired(tmp_path
     assert result.nothing_to_capture is False
 
 
+def test_the_tickers_left_out_are_named_in_roster_order(tmp_path, monkeypatch):
+    """The line reads the names in the order the operator wrote them, not sorted."""
+    from lake.capture_spans import CaptureSpans, spans_path
+    from lake.security_master import SecurityMaster, master_path
+
+    rig = _rig(tmp_path, "XYZ: {options: false}\nABC: {options: false}\n")
+    master = SecurityMaster()
+    spans = CaptureSpans()
+    for ticker in ("XYZ", "ABC"):
+        iid = master.register(
+            kind="equity", capture_start=et(2026, 9, 1, 9, 30), valid_from=DAY, ticker=ticker
+        )
+        spans.open_span(iid, et(2026, 9, 1, 9, 30), False)
+        spans.close_span(iid, et(2026, 9, 2, 9, 45))
+    master.write(master_path(rig.lake_root))
+    spans.write(spans_path(rig.lake_root))
+    _wire(monkeypatch, rig, lambda path: _Vendor())
+
+    result = _cycle(rig, ManualClock(start=FIRST_MINUTE))
+
+    assert result.out_of_span == ("XYZ", "ABC")
+
+
 def test_a_roster_whose_every_ticker_retired_reports_nothing_to_capture(tmp_path, monkeypatch):
     """The same lake with the retire finished: the entry off, nothing owed, the daemon idle.
 

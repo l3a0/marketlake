@@ -7,6 +7,7 @@ over, so the rules are driven here directly.
 
 from __future__ import annotations
 
+import io
 from datetime import UTC
 
 from lake import daemon
@@ -39,6 +40,23 @@ def test_a_changed_set_prints_again_and_names_every_ticker(capsys):
     first, second = _lines(capsys)
     assert "not captured: XYZ." in first
     assert "2 enabled ticker(s)" in second and "not captured: ABC, XYZ." in second
+
+
+def test_a_swap_of_the_same_size_prints_again(capsys):
+    line = daemon._OutOfSpanLine()
+    line.observe(et(2026, 9, 2, 10, 0), ("XYZ",))
+    line.observe(et(2026, 9, 2, 10, 1), ("ABC",))
+    _, second = _lines(capsys)
+    assert "not captured: ABC." in second
+
+
+def test_a_set_that_shrinks_without_emptying_prints_again(capsys):
+    """Otherwise the last line keeps naming a ticker that is back in a span."""
+    line = daemon._OutOfSpanLine()
+    line.observe(et(2026, 9, 2, 10, 0), ("ABC", "XYZ"))
+    line.observe(et(2026, 9, 2, 10, 1), ("XYZ",))
+    _, second = _lines(capsys)
+    assert "1 enabled ticker(s)" in second and "not captured: XYZ." in second
 
 
 def test_recovery_prints_once_and_does_not_claim_a_span(capsys):
@@ -92,6 +110,14 @@ def test_a_line_that_cannot_be_written_is_dropped_rather_than_raised(monkeypatch
     line = daemon._OutOfSpanLine()
     line.observe(et(2026, 9, 2, 10, 0), ("XYZ",))
     line.observe(et(2026, 9, 2, 10, 1), ())
+
+
+def test_a_closed_stderr_is_dropped_rather_than_raised(monkeypatch):
+    """A closed stream raises ``ValueError``, not ``OSError``, and must not end the daemon."""
+    closed = io.StringIO()
+    closed.close()
+    monkeypatch.setattr("sys.stderr", closed)
+    daemon._OutOfSpanLine().observe(et(2026, 9, 2, 10, 0), ("XYZ",))
 
 
 def test_a_dropped_line_still_records_the_set(monkeypatch, capsys):

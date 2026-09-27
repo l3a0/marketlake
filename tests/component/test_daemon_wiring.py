@@ -1253,6 +1253,38 @@ def test_a_roster_the_spans_emptied_leaves_the_dead_man_unfed_and_says_why(
     assert "not captured: XYZ." in line
 
 
+def test_the_line_names_a_partial_clamp_and_its_recovery_while_data_lands(
+    tmp_path, monkeypatch, capsys
+):
+    """The line reports every change the loop sees, not only an unfed dead-man.
+
+    SPY lands data every minute, since the master does not name it and a ticker the master
+    cannot resolve is kept. XYZ starts outside every span, and its span reopens after the
+    first cycle. The line names XYZ on the first minute and says so on the second, both
+    in cycles that fed the dead-man. A line gated on an unfed dead-man, or on an empty
+    cycle, would print neither.
+    """
+    rig = _rig(tmp_path, roster="SPY: {options: false}\nXYZ: {options: false}\n")
+    _xyz_span_closed(rig)
+    monkeypatch.setattr(capture, "SchwabVendor", _stub_schwab(_PlanVendor()))
+
+    def reopen_after_first(slot: datetime, result: CycleResult) -> None:
+        spans = CaptureSpans.read(spans_path(rig.lake_root))
+        (xyz,) = spans.instrument_ids()
+        if not spans.has_open_span(xyz):
+            spans.open_span(xyz, et(2026, 9, 2, 10, 0, 30), False)
+            spans.write(spans_path(rig.lake_root))
+
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=3, hooks=daemon.DaemonHooks(on_cycle=reopen_after_first))
+
+    assert rig.pinger.urls == [CAPTURE_URL] * 3
+    named, recovered = _capture_lines(capsys.readouterr().err)
+    assert named.startswith("capture: 2026-09-02T10:00:00-04:00: 1 enabled ticker(s)")
+    assert "not captured: XYZ." in named
+    assert recovered.startswith("capture: 2026-09-02T10:01:00-04:00: ")
+
+
 def test_a_roster_whose_every_ticker_retired_still_feeds_the_dead_man(
     tmp_path, monkeypatch, capsys
 ):
