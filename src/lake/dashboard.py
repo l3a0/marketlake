@@ -1897,6 +1897,13 @@ def _nightly_payload(entry: Mapping[str, object]) -> dict[str, object]:
     closure as the three that ride here, and this panel is their reader. It renders the
     lines the file carries and computes none of them.
 
+    ``nothing_withheld`` is true only when the file's own ``problems`` is an empty list
+    and its ``pinged`` is ``True``, which is what lets the panel say so in words rather
+    than draw nothing (marketlake #530). It is read off the raw entry and never off the
+    payload's ``problems``. That one is a missing key or a list of non-strings turned
+    into ``[]``, so keying on it would reassure about a file nobody could read. It says
+    what ``problems`` proves and no more: a run can ping with ``gaps`` above zero.
+
     ``day`` and ``at`` both ride along, because the design pins the nightly report as
     "the one pre-written thing the dashboard shows, and it is dated, so a stale one never
     reads as now."
@@ -1907,6 +1914,7 @@ def _nightly_payload(entry: Mapping[str, object]) -> dict[str, object]:
     for outcome in pieces.values():
         if isinstance(outcome, Mapping) and isinstance(outcome.get("unfiled"), int):
             unfiled += outcome["unfiled"]
+    problems = entry.get("problems")
     return {
         "day": entry.get("day"),
         "at": entry.get("at"),
@@ -1922,7 +1930,10 @@ def _nightly_payload(entry: Mapping[str, object]) -> dict[str, object]:
             for name, outcome in pieces.items()
             if isinstance(outcome, Mapping)
         },
-        "problems": _lines(entry.get("problems")),
+        "problems": _lines(problems),
+        "nothing_withheld": (
+            isinstance(problems, list) and not problems and entry.get("pinged") is True
+        ),
         "report": _lines(entry.get("report")),
     }
 

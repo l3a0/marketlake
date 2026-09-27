@@ -3200,6 +3200,7 @@ def test_a_report_missing_a_key_renders_it_as_no_number(root: Path):
     for field in ("gaps", "quarantined", "disagreements", "pages_lost", "at", "pinged"):
         assert entry[field] is None
     assert entry["problems"] == []
+    assert entry["nothing_withheld"] is False
     assert entry["report"] == []
 
 
@@ -3222,6 +3223,96 @@ def test_the_report_tier_findings_ride_the_panel(root: Path):
     entry = service_over(root).run_query("history", {})["reports"][0]
     assert entry["report"] == ["pmset repeat drifted"]
     assert entry["problems"] == ["ping failed: OSError"]
+
+
+def test_a_run_nothing_withheld_says_so_even_beside_findings(root: Path):
+    # An empty ``problems`` draws nothing on the panel, which reads the same as a section
+    # that never drew (marketlake #530). The flag gives the panel something to say. It
+    # claims only what ``problems`` proves: the live 2026-09-25 file pinged with gaps 39
+    # and two disagreements, so a night with findings still gets the line.
+    _file_nightly(root, MONDAY, gaps=39, report=("bars abandoned: 6 ticker-day(s)",))
+    entry = service_over(root).run_query("history", {})["reports"][0]
+    assert entry["nothing_withheld"] is True
+    assert entry["problems"] == []
+    assert entry["gaps"] == 39
+
+
+@pytest.mark.parametrize(
+    ("problems", "pinged"),
+    [
+        (("ping failed: OSError",), True),
+        (("ping failed: OSError",), False),
+        ((), False),
+    ],
+    ids=["a-problem-and-pinged", "a-problem-and-not-pinged", "no-problem-and-not-pinged"],
+)
+def test_a_run_the_writer_filed_with_a_problem_or_no_ping_is_not_nothing_withheld(
+    root: Path, problems: tuple[str, ...], pinged: bool
+):
+    _file_nightly(root, MONDAY, problems=problems, pinged=pinged)
+    entry = service_over(root).run_query("history", {})["reports"][0]
+    assert entry["nothing_withheld"] is False
+
+
+_ABSENT = object()
+
+
+@pytest.mark.parametrize(
+    ("problems", "pinged"),
+    [
+        (_ABSENT, True),
+        ("", True),
+        ({}, True),
+        (None, True),
+        ([7, None], True),
+        ([], False),
+        ([], _ABSENT),
+        ([], None),
+        ([], 1),
+        ([], "true"),
+    ],
+    ids=[
+        "problems-missing",
+        "problems-an-empty-string",
+        "problems-an-empty-mapping",
+        "problems-null",
+        "problems-only-non-strings",
+        "pinged-false",
+        "pinged-missing",
+        "pinged-null",
+        "pinged-a-truthy-number",
+        "pinged-a-string",
+    ],
+)
+def test_nothing_withheld_is_true_only_for_an_empty_list_beside_pinged_true(
+    root: Path, problems: object, pinged: object
+):
+    # Each of these reads as an empty ``problems`` once ``_lines`` has had it, and none
+    # of them says the run held nothing back. A missing or unreadable list is a file
+    # nobody can vouch for, and a ping that is not ``True`` is a ping nobody saw go out.
+    fields: dict[str, object] = {"day": MONDAY.isoformat(), "session": True}
+    if problems is not _ABSENT:
+        fields["problems"] = problems
+    if pinged is not _ABSENT:
+        fields["pinged"] = pinged
+    directory = root / "reports"
+    directory.mkdir()
+    (directory / f"{MONDAY.isoformat()}-183000000000-11.json").write_text(json.dumps(fields))
+    entry = service_over(root).run_query("history", {})["reports"][0]
+    assert entry["problems"] == []
+    assert entry["nothing_withheld"] is False
+
+
+def test_nothing_withheld_is_true_for_a_hand_written_empty_list_beside_pinged_true(root: Path):
+    # The other side of the table above, on a file written without the production writer,
+    # so the flag reads the file's keys rather than anything ``Nightly`` guarantees.
+    directory = root / "reports"
+    directory.mkdir()
+    (directory / f"{MONDAY.isoformat()}-183000000000-11.json").write_text(
+        json.dumps({"day": MONDAY.isoformat(), "problems": [], "pinged": True})
+    )
+    entry = service_over(root).run_query("history", {})["reports"][0]
+    assert entry["nothing_withheld"] is True
 
 
 def test_unfiled_is_summed_off_the_pieces_because_the_file_does_not_carry_it(root: Path):
