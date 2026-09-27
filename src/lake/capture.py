@@ -2177,8 +2177,7 @@ def _count_data_rows(surface: str, ticker: str, batch: object) -> int | None:
     scan does.
     """
     try:
-        kinds = batch.column("row_kind").to_pylist()
-        return sum(1 for kind in kinds if kind == journal.ROW_KIND_DATA)
+        return journal.data_rows(batch)
     except Exception as exc:  # noqa: BLE001 - a diagnostic must never cost a minute
         print(
             f"capture: data-row count failed on {surface} {ticker}: {type(exc).__name__}: {exc}",

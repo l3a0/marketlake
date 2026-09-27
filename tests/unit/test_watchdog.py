@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from lake.capture import CycleResult, SegmentError, SegmentOutcome
-from lake.watchdog import Surface, Watchdog
+from lake.watchdog import CONTRACTS_ABSENT, Surface, Watchdog
 
 ET = ZoneInfo("America/New_York")
 SLOT = datetime(2026, 9, 2, 10, 0, tzinfo=ET)
@@ -1530,3 +1530,179 @@ def test_a_ticker_below_the_threshold_when_another_pages_still_pages_itself():
     for m, out in enumerate(outs):
         raised += watchdog.observe(_clamped(_seg("quotes", "SPY", "data"), out=out, at=_at(m)))
     assert [page.tickers for page in raised] == [("QQQ", "IWM"), ("QQQ", "IWM")]
+
+
+# -- a chain that answered and brought no contract (marketlake #326) -----------------
+
+
+def _empty_chain(ticker: str, error_class: str | None = None, *, rows: int = 1) -> SegmentOutcome:
+    """A chains data segment holding no contract.
+
+    ``rows`` defaults to one, the failed window's absence marker, because a fixture with
+    no row at all cannot tell a count of data rows from a count of every row.
+    ``error_class`` is what the segment recorded: none when every window answered empty,
+    and the first failed window's class when one failed beside it.
+    """
+    return _seg("chains", ticker, "data", rows=rows, data_rows=0, error_class=error_class)
+
+
+@pytest.mark.parametrize("rows", [1, 0])
+def test_a_data_segment_holding_no_data_row_fails_and_pages_why(rows):
+    """A segment's kind says what the writer planned, not whether the chain produced.
+
+    One window answering 200 with empty maps while another fails lands a data segment
+    whose only row is the failed window's marker. It used to reset the counter, so a chain
+    producing nothing read as a healthy minute and never paged.
+    """
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(3):
+        raised += watchdog.observe(
+            _cycle(
+                _empty_chain("SPY", "http_429" if rows else None, rows=rows),
+                _seg("quotes", "SPY", "data"),
+                at=_at(minute),
+            )
+        )
+        assert watchdog.count("chains", "SPY") == minute + 1
+    assert [(page.title, page.cause) for page in raised] == [
+        ("Capture down: SPY chains", CONTRACTS_ABSENT)
+    ]
+
+
+def test_a_chain_that_lost_some_windows_and_landed_the_rest_still_resets():
+    """The boundary on the other side, which marketlake #553 owns.
+
+    A partial chain holds real contracts beside its markers, so it produced. This fix
+    changes the reset from a segment's kind to its data rows and moves nothing else.
+    """
+    watchdog = Watchdog()
+    watchdog.observe(_cycle(_seg("chains", "SPY", "gap"), at=_at(0)))
+    watchdog.observe(_cycle(_seg("chains", "SPY", "gap"), at=_at(1)))
+    partial = _seg("chains", "SPY", "data", rows=3, data_rows=2, error_class="http_429")
+    raised = []
+    for minute in range(2, 8):
+        raised += watchdog.observe(_cycle(partial, at=_at(minute)))
+    assert watchdog.count("chains", "SPY") == 0
+    assert raised == []
+
+
+def _roster_401(minute: int) -> CycleResult:
+    return _cycle(
+        _fail("chains", "SPY", "http_401"),
+        _fail("chains", "QQQ", "http_401"),
+        _fail("quotes", "SPY", "http_401"),
+        _fail("quotes", "QQQ", "http_401"),
+        at=_at(minute),
+    )
+
+
+@pytest.mark.parametrize("recorded", [None, "http_401"])
+def test_a_chain_that_answered_empty_breaks_the_unanimity_of_a_dead_token(recorded):
+    """A 200 proves the request authenticated, so the minute is not one dead token.
+
+    Two readings would fold it anyway. A segment naming no class was skipped when the
+    classes were gathered, so the rest agreed. And the mixed shape records its failed
+    window's class, so one 401 on one window made the surface read as a dead token too.
+    Both paged ``Capture down: token dead`` at a daemon authenticating fine. The surface
+    pages what it is failing with instead, and the quotes collapse keeps its class.
+    """
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(3):
+        raised += watchdog.observe(
+            _cycle(
+                _empty_chain("SPY", recorded),
+                _empty_chain("QQQ", recorded),
+                _fail("quotes", "SPY", "http_401"),
+                _fail("quotes", "QQQ", "http_401"),
+                at=_at(minute),
+            )
+        )
+    assert [(page.title, page.cause) for page in raised] == [
+        ("Capture down: quote sampler dead", "http_401"),
+        ("Capture down: QQQ chains", CONTRACTS_ABSENT),
+        ("Capture down: SPY chains", CONTRACTS_ABSENT),
+    ]
+    assert watchdog._paged_causes == {}
+
+
+def test_a_chain_that_answered_empty_leaves_the_cause_so_the_next_death_pages():
+    """A second token death in one session must page, and a held surface silenced it.
+
+    A cause stays live until every surface it named is released, and while it is live no
+    page goes out under its title. A chain answering 200 with no contract produced
+    nothing, so it was never released, and the cause it held outlived the outage. The
+    answer proves the token works, so the surface leaves the cause, and its own page goes
+    out at once because its counter kept climbing under the cause.
+    """
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(3):
+        raised += watchdog.observe(_roster_401(minute))
+    assert [page.title for page in raised] == ["Capture down: token dead"]
+    for minute in range(3, 7):
+        raised += watchdog.observe(
+            _cycle(
+                _empty_chain("SPY"),
+                _seg("chains", "QQQ", "data"),
+                _seg("quotes", "SPY", "data"),
+                _seg("quotes", "QQQ", "data"),
+                at=_at(minute),
+            )
+        )
+    assert watchdog._paged_causes == {}
+    assert watchdog.count("chains", "SPY") == 7
+    for minute in range(7, 10):
+        raised += watchdog.observe(_roster_401(minute))
+    assert [(page.title, page.minutes, page.cause) for page in raised] == [
+        ("Capture down: token dead", 3, "http_401"),
+        ("Capture down: SPY chains", 4, CONTRACTS_ABSENT),
+        ("Capture down: token dead", 10, "http_401"),
+    ]
+
+
+def test_a_chain_that_answered_empty_leaves_only_its_own_surface_in_the_cause():
+    """The release is the surface's own, and the cause keeps the surfaces still down."""
+    watchdog = Watchdog()
+    for minute in range(3):
+        watchdog.observe(_roster_401(minute))
+    watchdog.observe(
+        _cycle(
+            _empty_chain("SPY"),
+            _fail("chains", "QQQ", "http_401"),
+            _fail("quotes", "SPY", "timeout"),
+            _fail("quotes", "QQQ", "http_401"),
+            at=_at(3),
+        )
+    )
+    assert watchdog._paged_causes == {
+        "Capture down: token dead": {
+            Surface("chains", "QQQ"),
+            Surface("quotes", "SPY"),
+            Surface("quotes", "QQQ"),
+        }
+    }
+
+
+def test_a_write_failure_beside_a_dead_token_still_folds_under_it():
+    """A write failure says nothing about the vendor, so it is left out of the unanimity.
+
+    Its class names the page of its own surface. It does not stand beside the vendor's
+    classes when the watchdog asks whether every surface failed the same way, which is
+    the rule the design states for a segment that could not be written.
+    """
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(3):
+        raised += watchdog.observe(
+            _cycle(
+                _fail("chains", "SPY", "http_401"),
+                _fail("quotes", "SPY", "http_401"),
+                errors=(SegmentError("chains", "QQQ", "os_error"),),
+                at=_at(minute),
+            )
+        )
+    assert [(page.title, len(page.surfaces)) for page in raised] == [
+        ("Capture down: token dead", 3)
+    ]
