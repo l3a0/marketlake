@@ -12,9 +12,10 @@ Two producers hand slots to one writer.
 2. Skipped-slot marking runs from ``on_skipped`` when a live loop sleeps through a
    capture slot, after an overrun or a stall.
 
-They never overlap, because ``run_loop`` reads the minute it starts in once and hands
-that one value to both. Startup marking owns every owed minute through it, and the loop
-reports only minutes after it. The two differ only in the reason they stamp. A
+They never overlap, because ``run_loop`` reads the minute it starts in once, hands it
+to startup marking, and keeps it as the previous slot its first tick counts from.
+Startup marking owns every owed minute through it, and the loop reports only minutes
+after it. The two differ only in the reason they stamp. A
 startup marker says ``daemon_dead``, which is true: some other incarnation ended. A
 skipped-slot marker says ``slot_overrun``, because the daemon is alive on those minutes
 and recording it as dead would make the marker lie about its own reason.
@@ -205,8 +206,8 @@ class GapMarker:
         """Mark every owed minute through ``slot``, the minute the daemon started in.
 
         ``run_loop`` hands ``slot`` in. It is the value the loop seeded its previous slot
-        with, so the loop's first ``on_skipped`` starts at ``slot`` plus one and the two
-        passes meet without overlapping. Reading the clock here instead would be a second
+        with, so the loop's first ``on_skipped`` starts no earlier than ``slot`` plus one and
+        the two passes meet without overlapping. Reading the clock here instead would be a second
         read, and one that falls past a minute top the loop's read did not would mark
         that next minute ``daemon_dead`` while the loop later marks it ``slot_overrun``.
         It is required rather than defaulted, so no caller can fall back to that read.

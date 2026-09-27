@@ -626,10 +626,10 @@ def test_on_start_is_handed_the_slot_the_loop_seeded_and_the_first_skip_follows_
 
     def on_start(slot: datetime) -> None:
         handed.append(slot)
-        # A startup pass reads the clock as it works. This one outlives its minute, so the
-        # first tick lands past 10:01 and has a minute to report.
-        while clock.now() < top:
-            pass
+        # A startup pass reads the clock as it works. These reads carry it past 10:01, so
+        # the first tick lands on 10:02 and has a minute to report.
+        for _ in range(reads_short):
+            clock.now()
 
     hooks = daemon.DaemonHooks(
         on_start=on_start, on_skipped=lambda slots: reports.append(list(slots))
