@@ -94,13 +94,14 @@ The job's rules, each glossed at first use.
    the entry and finishes the interrupted cleanup by deleting the debris segments. Any
    mismatch raises to human review. The one repair for a manifested partition is
    ``recompact_ticker_day``, a deliberate, human-invoked rebuild that appends a
-   superseding entry. It repairs nothing for a ticker-day rule 4's merge refused, which
-   is a different failure with no repair yet. The standing
+   superseding entry. On its own it repairs nothing for a ticker-day rule 4's merge
+   refused, which needs its ``allow_retype`` flag, and nothing for one rule 3's check
+   refused, which has no repair yet (marketlake #557). The standing
    invariant holds throughout: no automatic run ever replaces a manifested partition with
    fewer rows than its recorded count.
 7. *Backup, then ping.* After the sweep has finished with every eligible ticker-day, the
-   lake is synced to the backup target. A ticker-day the merge refused does not hold that
-   up, which is the whole point of catching the refusal where rule 4 catches it.
+   lake is synced to the backup target. A ticker-day the sweep refused does not hold that
+   up, which is the whole point of catching the refusals where rules 3 and 4 catch them.
    The health-check ping fires only after the backup succeeds, so the
    one ping attests both. An unmounted target raises before any ping. A holiday or an
    empty journal is a correct no-op and still backs up and pings. The drift page above
@@ -114,12 +115,12 @@ The job's rules, each glossed at first use.
    at its midpoint offset. Two adjacent finite windows both under the min merge. The open
    tail is never split and never merged. A window that failed all day has no measured
    size, so it never moves and no merge crosses it. A day with no windowed data row says
-   nothing about the plan and rewrites nothing. Neither does a day the merge refused a
-   chains ticker-day on, because that ticker's rows are sitting unmerged in a segment and
-   a window with no rows counts zero. Reading its absence as zero would merge its windows
-   into their neighbours, and a wider window is a wider request, which is the body limit
-   this plan exists to stay under. The rebuilt plan is written to ``chain_plan.json``
-   atomically, and only when it changed.
+   nothing about the plan and rewrites nothing. Neither does a day the sweep refused a
+   chains ticker-day on, for either reason, because that ticker's rows are sitting
+   unmerged in a segment and a window with no rows counts zero. Reading its absence as
+   zero would merge its windows into their neighbours, and a wider window is a wider
+   request, which is the body limit this plan exists to stay under. The rebuilt plan is
+   written to ``chain_plan.json`` atomically, and only when it changed.
 
 This module reads no wall clock. ``clock`` and ``calendar`` are injected, and every
 session-relative moment comes from the session clock over them.
@@ -2139,7 +2140,7 @@ def main(
 ) -> int:
     """The ``python -m lake.compact`` entry. Returns a process exit code.
 
-    ``backup``, ``pinger`` and the drift page's ``Publisher`` are built here, not
+    ``backup``, ``pinger`` and the pages' ``Publisher`` are built here, not
     accepted. Each reaches past this process. ``rsync`` shells out to copy the lake, the
     healthchecks GET goes to the network, and the publisher POSTs to ntfy, which reaches
     a phone. A ``main`` that accepted them let a test omit one and reach the real effect,

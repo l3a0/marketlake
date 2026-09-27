@@ -544,9 +544,9 @@ def test_two_drifted_ticker_days_each_file_their_own(lake_root, monkeypatch):
 
 
 def test_the_sweep_finishes_past_a_drifted_ticker_day(lake_root, monkeypatch):
-    # The sweep catches one name out of ``_seal``, the merge a column type conflict
-    # refused, and nothing else. So a raise here would cost the rest of the sweep, the
-    # backup, and the ping.
+    # The sweep catches two names out of ``_seal``, the merge a column type conflict
+    # refused and a segment that no longer matches its hash, and nothing else. So a raise
+    # here would cost the rest of the sweep, the backup, and the ping.
     dropped = _without(CHAINS_SCHEMA, COLUMN)
     _segment(
         lake_root,

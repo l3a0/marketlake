@@ -4,8 +4,10 @@ The design gives report-tier findings no message of their own. They ride the nig
 report, one dated file per vendor-sweep run under ``reports/`` in the lake root, which
 sits inside the backup sync root and outside the manifest. ``lake.sweep`` writes that
 file and D20 renders it, so the reader arrives later than the producers do. Compaction's
-finding is the exception, and the schema policy is what makes it one. A missing or
-retyped known field pages, so compaction pages once per run on top of filing here.
+two findings are the exception. The schema policy makes drift one, since a missing or
+retyped known field pages. A damaged segment is the other, because the minutes it holds
+are lost unless a human repairs the day. So compaction pages once per run for each on top
+of filing here.
 
 The close+5 guard is one of those producers and it has been finding things with nowhere
 to put them. Three of the design's rules for it end in "flags the nightly report", and

@@ -447,6 +447,65 @@ def test_drift_and_damage_in_one_run_send_both_pages(lake_root):
     )
 
 
+def test_a_raise_later_in_the_sweep_cannot_swallow_the_damage_page(lake_root, monkeypatch):
+    # The page goes out from the ``finally`` around the whole sweep, so a raise on a later
+    # step cannot carry the finding out of the run with the phone silent.
+    spy = _captured(lake_root, "SPY")
+    _flip(spy[2], DROPS_THE_SEGMENT)
+    real = compact_module._prune_empty
+
+    def refuse(date_dir):
+        real(date_dir)
+        raise OSError("the journal directory went away")
+
+    monkeypatch.setattr(compact_module, "_prune_empty", refuse)
+    publisher, transport = _paging(lake_root)
+
+    with pytest.raises(OSError, match="went away"):
+        _run(lake_root, publisher=publisher)
+
+    assert [page.title for page in transport.messages] == [DAMAGED_SEGMENT_TITLE]
+
+
+def test_the_damage_page_goes_out_before_the_backup(lake_root):
+    class Unplugged:
+        def sync(self, source, target):
+            raise RuntimeError("backup target not mounted")
+
+    spy = _captured(lake_root, "SPY")
+    _flip(spy[2], DROPS_THE_SEGMENT)
+    publisher, transport = _paging(lake_root)
+
+    with pytest.raises(RuntimeError, match="not mounted"):
+        compact(
+            lake_root,
+            clock=ManualClock(_et(16, 30)),
+            calendar=_calendar(),
+            backup=Unplugged(),
+            backup_target=TARGET,
+            publisher=publisher,
+            plan_path=lake_root.parent / "chain_plan.json",
+        )
+
+    assert [page.title for page in transport.messages] == [DAMAGED_SEGMENT_TITLE]
+
+
+def test_a_drift_page_that_raises_cannot_swallow_the_damage_page(lake_root, monkeypatch):
+    spy = _captured(lake_root, "SPY")
+    _flip(spy[2], DROPS_THE_SEGMENT)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("the drift page broke")
+
+    monkeypatch.setattr(compact_module, "_page_drift", broken)
+    publisher, transport = _paging(lake_root)
+
+    with pytest.raises(RuntimeError, match="drift page broke"):
+        _run(lake_root, publisher=publisher)
+
+    assert [page.title for page in transport.messages] == [DAMAGED_SEGMENT_TITLE]
+
+
 # -- 6. the page's size ------------------------------------------------------
 
 
