@@ -9,8 +9,10 @@ They cover the job's contract:
 
 1. A day of segments compacts to one Parquet per surface and ticker, rows equal to the
    sum, a manifest entry carrying the sha, the segments deleted. A second run no-ops.
-2. A torn tail compacts to its complete batches. Bytes after an end-of-stream marker
-   in a segment with no manifest entry fail loudly and seal nothing for that ticker-day.
+2. A torn tail compacts to its complete batches. A segment torn before its first batch,
+   inside its stream header or before its first byte, reads as no rows. Bytes after an
+   end-of-stream marker in a segment with no manifest entry fail loudly and seal nothing
+   for that ticker-day.
 3. An orphaned segment from an older date is swept and sealed.
 4. A ticker-day whose close+5 has not passed is never touched.
 5. A manifested partition is sha-verified, its debris deleted, and never rewritten. A
@@ -490,6 +492,48 @@ def test_a_segment_torn_before_its_first_batch_reads_as_no_rows(lake_root):
 
     assert result.sealed[0].rows == 3
     assert not whole.exists() and not stub.exists()
+
+
+def test_an_empty_segment_reads_as_no_rows(lake_root):
+    # A crash between the create and the first write leaves a file of zero bytes. It holds
+    # no cycle, so it merges as zero rows beside a whole segment and is unlinked with it.
+    # An empty file fails as its stream opens, which reads as ``ArrowInvalid``, while the
+    # file's own open is where an access failure raises, which compaction stopped catching
+    # (marketlake #591). So this is the case a catch narrowed to the wrong class would turn
+    # into a failed run every night.
+    whole = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(3, snap_ts=_snap(DAY, 0)), start_ts="a"
+    )
+    empty = journal.segment_path(lake_root, "chains", "SPY", DAY, "b", PID)
+    empty.write_bytes(b"")
+
+    result, _, _, _ = _run(lake_root)
+
+    assert result.sealed[0].rows == 3
+    assert not whole.exists() and not empty.exists()
+
+
+def test_a_segment_with_no_marker_that_fails_to_open_as_an_os_error_reads_as_no_rows(lake_root):
+    # Compaction lets every OSError out of its read (marketlake #591), so it relies on the
+    # journal turning the one pyarrow raises about a file's bytes into ``ArrowInvalid``. A
+    # file with no end-of-stream marker cannot be told from a tear, so the rule for a tear
+    # applies: no rows, and the run goes on. A regression in that conversion would stop
+    # the run every night for as long as the file exists.
+    whole = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(3, snap_ts=_snap(DAY, 0)), start_ts="a"
+    )
+    batch = _chains(1, snap_ts=_snap(DAY, 1))
+    cut = bytearray(_stream_bytes([batch, batch])[:-8])
+    cut[0] ^= 0x01  # the continuation token, which pyarrow refuses as an OSError
+    odd = journal.segment_path(lake_root, "chains", "SPY", DAY, "b", PID)
+    odd.write_bytes(bytes(cut))
+    with pa.memory_map(str(odd), "rb") as source, pytest.raises(OSError):
+        pa.ipc.open_stream(source)
+
+    result, _, _, _ = _run(lake_root)
+
+    assert result.sealed[0].rows == 3
+    assert not whole.exists() and not odd.exists()
 
 
 def test_bytes_after_the_eos_fail_loudly_and_seal_nothing_for_the_ticker_day(lake_root):
