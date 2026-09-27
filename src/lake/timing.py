@@ -1,11 +1,12 @@
 """The request timing file: one line per vendor request, so a slow minute can be taken apart.
 
-A capture cycle makes one request per chain window and one for the batched quotes. The
-rows a cycle writes carry one ``fetch_ts`` and one ``fetch_end_ts`` per ticker-minute, so
-a chain whose nine windows took 70 seconds cannot say whether one window was slow or all
-nine were, or whether the time went to Schwab or to the network. On 2026-09-24 three
-cycles ran past their minute and lost four slots, and nothing the lake held could say
-which. Marketlake #531 is that gap, and this file is where its evidence lands.
+A capture cycle makes one request per chain window and one for the batched quotes, plus
+one for each half of a split window and a second attempt at a transient failure
+(marketlake #558). The rows a cycle writes carry one ``fetch_ts`` and one ``fetch_end_ts``
+per ticker-minute, so a chain whose nine windows took 70 seconds cannot say whether one
+window was slow or all nine were, or whether the time went to Schwab or to the network.
+On 2026-09-24 three cycles ran past their minute and lost four slots, and nothing the lake
+held could say which. Marketlake #531 is that gap, and this file is where its evidence lands.
 
 Each line is one JSON object naming one request. It carries the request's own
 coordinates, which are the keys that join it to the rows it produced: ``snap_ts``,

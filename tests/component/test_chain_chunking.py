@@ -15,7 +15,8 @@ They cover the chunker's contract:
 2. Only a genuine size failure, a ``TooBigBody`` 502 or a body flagged
    ``isChainTruncated``, is split at its date midpoint and refetched until it succeeds.
 3. A non-size failure, a non-2xx status or a raised exception, is recorded once with its
-   own error class and never split.
+   own error class and never split. A transient one, such as a 5xx, is sent once more first
+   (#558), and the window still carries one absent-marker.
 4. A window that fails becomes one absent-marker gap row inside a tagged partial snapshot,
    carrying that window's class, while the other windows journal normally.
 5. A chain where every window fails is a whole-chain gap carrying the first failed

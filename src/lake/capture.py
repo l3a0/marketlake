@@ -1470,19 +1470,23 @@ def _fetch_concurrently(
         at = bound.at
         assert at is not None  # only a bound that has passed cuts a fetch
         if symbols and submitted[0] in pending:
-            # The last attempt sent is the one the bound cut. One before it, a first attempt
-            # that failed transiently, keeps the line it finished with.
+            # An attempt that finished keeps the line it finished with. Only a last attempt
+            # still in flight is the request the bound cut. The task can also be cut between
+            # a first attempt that failed and its retry, which the cut then refuses, so every
+            # attempt sent may have finished and no request is in flight.
             sent = calls.get(_QUOTES_UNIT, ())
+            running = sent[-1] if sent and sent[-1].record is None else None
             hand_over_quotes(
                 _QuoteFetch(
                     None,
                     RequestAbandoned(
-                        "the quote request was not done by the cycle's bound", sent=bool(sent)
+                        "the quote request was not done by the cycle's bound",
+                        sent=running is not None,
                     ),
                     started[_QUOTES_UNIT],
                     at,
-                    sent[-1].start if sent else None,
-                    tuple(call.at_the_bound(at) for call in sent[:-1]),
+                    running.start if running is not None else None,
+                    tuple(call.at_the_bound(at) for call in sent if call is not running),
                 )
             )
         for ticker in tickers:
@@ -1732,7 +1736,11 @@ def _fetch_window(
        ``request_abandoned``, since the request that lost the window did go out.
     4. **The retry is still running at the bound**, above a cap of 1. The task is cut and
        the window fails under ``request_abandoned`` like any window the bound cut. The first
-       attempt keeps its own line from the shared record.
+       attempt keeps its own line from the shared record. The same holds when the bound
+       cuts the task after a first attempt failed and before its retry registered, so the
+       cut refuses the retry. The window reads ``request_abandoned`` while its only line
+       carries the first attempt's class. That is the shape marketlake #597 accepted for
+       any task whose request finished a moment before the cut.
 
     The retry's reply takes every branch a first reply takes: a too-big retry splits, one
     that will not merge records ``chain_schema_drift``, and a 2xx lands. A retry is never
@@ -2092,7 +2100,11 @@ class _CaptureCycle:
         response: VendorResponse | None,
         error_class: str | None,
     ) -> None:
-        """Record the one batched quote request. Its stamps are the batch's own."""
+        """Record the batched quote request's last attempt. Its stamps are the batch's own.
+
+        An earlier attempt that failed transiently arrives with its own record in
+        ``_QuoteFetch.earlier`` and is written beside this one.
+        """
         self.requests.append(
             request_record(
                 QUOTES,

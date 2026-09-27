@@ -269,7 +269,8 @@ def test_failing_chain_gaps_only_that_ticker(lake_root):
     assert spy_chain.rows == 1
 
     # QQQ's only window returned a non-2xx status. That is not a size signal, so the window
-    # is recorded once with its http class and never split. It is the only window, so the
+    # is recorded with its http class and never split. A 500 is sent once more first (#558),
+    # and the cassette answers it the same way. It is the only window, so the
     # whole chain gaps carrying that class, http_500, not a blanket chunk-failure.
     qqq_chain = result.segment(CHAINS, "QQQ")
     assert qqq_chain.row_kind == journal.ROW_KIND_GAP

@@ -266,17 +266,23 @@ def test_the_predicate_reads_the_cause_chain_and_stops_at_a_loop():
 
 
 @pytest.mark.parametrize("cap", [1, 20])
-def test_a_window_that_fails_twice_records_the_retrys_class(lake_root, cap):
-    vendor = _ScriptedVendor(
-        {("SPY", _d(0)): [httpx.ReadTimeout("read"), VendorResponse(status=503, body={})]}
-    )
+@pytest.mark.parametrize(
+    ("first", "first_line"),
+    [
+        (httpx.ReadTimeout("read"), (None, "read_timeout")),
+        (VendorResponse(status=503, body={}), (503, "http_503")),
+    ],
+    ids=["timeout then 503", "503 twice"],
+)
+def test_a_window_that_fails_twice_records_the_retrys_class(lake_root, first, first_line, cap):
+    vendor = _ScriptedVendor({("SPY", _d(0)): [first, VendorResponse(status=503, body={})]})
     result = _run(vendor, lake_root, ManualClock(start=START), guards=_cap(cap))
 
     assert vendor.calls[("SPY", _d(0))] == 2
     rows = _rows(result, CHAINS, "SPY")
     assert _markers(rows) == [(_d(0).isoformat(), _d(9).isoformat(), "http_503")]
     assert _window_lines(lake_root, "SPY", _d(0).isoformat()) == [
-        (_d(9).isoformat(), None, "read_timeout"),
+        (_d(9).isoformat(), *first_line),
         (_d(9).isoformat(), 503, "http_503"),
     ]
 
@@ -498,18 +504,67 @@ def test_at_a_cap_of_one_a_quote_failure_past_the_bound_is_not_sent_again(lake_r
 
 
 def test_a_quote_retry_held_past_the_bound_writes_both_lines(lake_root, holding):
-    vendor = holding(_ScriptedVendor({"quotes": [VendorResponse(status=503, body={}), HOLD]}))
-    result = _run(vendor, lake_root, ManualClock(start=START))
+    # The first attempt takes 20s, so the two attempts' starts differ and the retry's line
+    # must carry its own. With no stagger nothing else moves the clock.
+    clock = ManualClock(start=START)
+    first_503 = _Late(clock, VendorResponse(status=503, body={}), by=20)
+    vendor = holding(_ScriptedVendor({"quotes": [first_503, HOLD]}))
+    result = _run(vendor, lake_root, clock, guards=_cap(20, capture_stagger_ms=0))
 
     assert vendor.holding.is_set()
     for ticker in ("SPY", "QQQ"):
         quote = result.segment(QUOTES, ticker)
         assert (quote.row_kind, quote.error_class) == (GAP, ABANDONED)
     first, retry = _quote_lines(lake_root)
+    retry_start = (START + timedelta(seconds=20)).isoformat()
     assert (first["status"], first["error_class"]) == (503, "http_503")
+    assert (first["request_start_ts"], first["request_end_ts"]) == (START.isoformat(), retry_start)
     assert (retry["status"], retry["error_class"]) == (None, ABANDONED)
-    assert retry["request_end_ts"] == _utc(BOUND).isoformat()
-    assert first["request_end_ts"] <= retry["request_start_ts"]
+    assert (retry["request_start_ts"], retry["request_end_ts"]) == (
+        retry_start,
+        _utc(BOUND).isoformat(),
+    )
+
+
+class _CutBeforeTheRetry(capture._Deadline):
+    """A bound that holds the quote retry's registration until the fetch has been cut.
+
+    It stands for the moment between a first attempt filing its record and its retry
+    passing the check, when the coordinating thread reaches the bound and cuts the task.
+    ``on_abandoned`` opens ``gate``, which comes after the cut's snapshot, so the retry is
+    then refused.
+    """
+
+    gate = threading.Event()
+
+    def send(self, unit, surface, **kwargs):
+        if unit is capture._QUOTES_UNIT and self._calls.get(unit):
+            assert self.gate.wait(10), "the fetch was never cut"
+        return super().send(unit, surface, **kwargs)
+
+
+def test_a_quote_cut_between_its_attempts_keeps_the_first_attempts_line(lake_root, monkeypatch):
+    # The 503 finished and filed its record, and the retry never went out. So the only line
+    # is the 503's own, not an abandon line in its place, and no line is added for a retry
+    # that was refused. The batch still gaps under the abandon class, since the bound cut
+    # its task (marketlake #597).
+    _CutBeforeTheRetry.gate = threading.Event()
+    monkeypatch.setattr(capture, "_Deadline", _CutBeforeTheRetry)
+    vendor = _ScriptedVendor({"quotes": [VendorResponse(status=503, body={})]})
+    result = _run(
+        vendor,
+        lake_root,
+        ManualClock(start=START),
+        on_abandoned=lambda futures: _CutBeforeTheRetry.gate.set(),
+    )
+
+    assert vendor.quote_calls == 1
+    for ticker in ("SPY", "QQQ"):
+        quote = result.segment(QUOTES, ticker)
+        assert (quote.row_kind, quote.error_class) == (GAP, ABANDONED)
+    assert [(line["status"], line["error_class"]) for line in _quote_lines(lake_root)] == [
+        (503, "http_503")
+    ]
 
 
 @pytest.mark.parametrize("cap", [1, 20])
