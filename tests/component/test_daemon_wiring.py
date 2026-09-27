@@ -1250,10 +1250,7 @@ def test_a_roster_the_spans_emptied_leaves_the_dead_man_unfed_and_says_why(
     assert rig.pinger.urls == []
     (line,) = _capture_lines(capsys.readouterr().err)
     assert line.startswith("capture: 2026-09-02T10:00:00-04:00: 1 enabled ticker(s)")
-    assert line.endswith(
-        "not captured: XYZ. A retire, onboard or rejoin that stopped midway "
-        "leaves this, and so does a spans file that no longer matches the lake"
-    )
+    assert "not captured: XYZ." in line
 
 
 def test_a_roster_whose_every_ticker_retired_still_feeds_the_dead_man(

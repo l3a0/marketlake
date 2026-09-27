@@ -41,15 +41,15 @@ def test_a_changed_set_prints_again_and_names_every_ticker(capsys):
     assert "2 enabled ticker(s)" in second and "not captured: ABC, XYZ." in second
 
 
-def test_recovery_prints_once(capsys):
+def test_recovery_prints_once_and_does_not_claim_a_span(capsys):
+    """The set also empties when a missing file widens the roster, so the line says less."""
     line = daemon._OutOfSpanLine()
     line.observe(et(2026, 9, 2, 10, 0), ("XYZ",))
     line.observe(et(2026, 9, 2, 10, 1), ())
     line.observe(et(2026, 9, 2, 10, 2), ())
     _, recovered = _lines(capsys)
-    assert recovered == (
-        "capture: 2026-09-02T10:01:00-04:00: every enabled ticker is inside a capture span again"
-    )
+    assert recovered.startswith("capture: 2026-09-02T10:01:00-04:00: ")
+    assert "left out" in recovered and "inside" not in recovered
 
 
 def test_a_set_standing_into_the_next_session_prints_again_once(capsys):

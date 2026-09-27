@@ -346,8 +346,11 @@ class _OutOfSpanLine:
     @staticmethod
     def _line(slot: datetime, out_of_span: tuple[str, ...]) -> str:
         if not out_of_span:
+            # Not "inside a span again". The set also empties when a missing master or
+            # spans file widens the roster, and when the last enabled ticker is retired,
+            # and neither puts a ticker back inside a span.
             return (
-                f"capture: {slot.isoformat()}: every enabled ticker is inside a capture span again"
+                f"capture: {slot.isoformat()}: no enabled ticker is left out by the capture spans"
             )
         return (
             f"capture: {slot.isoformat()}: {len(out_of_span)} enabled ticker(s) outside every "

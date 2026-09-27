@@ -643,8 +643,8 @@ class CycleResult:
     ``segments`` is every durable segment written, data and gap alike. ``errors`` is the
     normally-empty set of tickers that could not be journaled. ``snap_ts`` is the minute
     slot the whole cycle fired for. ``nothing_to_capture`` is true when the cycle ran over
-    an empty roster: every ticker retired, so there was nothing to fetch and no segment to
-    write. That is a different shape from a non-empty roster where every fetch failed,
+    an empty enabled roster: every ticker retired, so there was nothing to fetch and no
+    segment to write. That is a different shape from a non-empty roster where every fetch failed,
     which still writes gap segments. The dead-man feed tells the two apart, because a
     fully retired daemon is alive and idle, not broken.
 
@@ -652,7 +652,8 @@ class CycleResult:
     roster order. It is what keeps the flag honest. A roster the spans emptied is also a
     cycle with nothing to fetch, but its tickers are still enabled, so it owes the minutes
     it did not capture and the flag stays false (marketlake #554). The daemon prints a line
-    when the set changes, since nothing else names a ticker that is enabled and skipped.
+    when the set changes and once a session while it stands, since nothing else names a
+    ticker that is enabled and skipped.
     """
 
     snap_ts: datetime
