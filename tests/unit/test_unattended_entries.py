@@ -60,7 +60,9 @@ def stderr_label(module: str, args: list[str]) -> str:
     return module.removeprefix("lake.")
 
 
-@pytest.mark.filterwarnings("ignore::RuntimeWarning")
+# ``runpy`` warns that the module was already imported, which it always is here. Only
+# that warning is silenced, so one the entry raises itself still shows.
+@pytest.mark.filterwarnings("ignore:.*found in sys.modules after import:RuntimeWarning")
 @pytest.mark.parametrize("job", JOBS, ids=[job.label for job in JOBS])
 def test_the_entry_reaches_main_through_its_guard(job, monkeypatch, capsys):
     python, flag, module, *args = job.program_arguments
