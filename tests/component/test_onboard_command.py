@@ -754,17 +754,18 @@ def test_a_backdated_span_marks_nothing_into_a_sealed_date(lake_root, tmp_path):
         capture_start=_BACKDATED,
     )
 
+    session_clock = SessionClock(
+        clock=ManualClock(start=_MID_SESSION), calendar=weekday_sessions(_WEEK)
+    )
     marker = gap.GapMarker(
         lake_root=lake_root,
         roster=lambda: load_tickers(tickers_path),
-        session_clock=SessionClock(
-            clock=ManualClock(start=_MID_SESSION), calendar=weekday_sessions(_WEEK)
-        ),
+        session_clock=session_clock,
         master=lambda: SecurityMaster.read(master_path(lake_root)),
         spans=lambda: CaptureSpans.read(spans_path(lake_root)),
         pid=4242,
     )
-    report = marker.on_start()
+    report = marker.on_start(session_clock.snap_slot())
 
     assert report.problems == ()
     assert sealed_key in report.sealed

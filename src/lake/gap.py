@@ -12,8 +12,9 @@ Two producers hand slots to one writer.
 2. Skipped-slot marking runs from ``on_skipped`` when a live loop sleeps through a
    capture slot, after an overrun or a stall.
 
-They never overlap, because ``run_loop`` calls ``on_start`` before its first tick and
-carries no previous slot into it. The two differ only in the reason they stamp. A
+They never overlap, because ``run_loop`` reads the minute it starts in once and hands
+that one value to both. Startup marking owns every owed minute through it, and the loop
+reports only minutes after it. The two differ only in the reason they stamp. A
 startup marker says ``daemon_dead``, which is true: some other incarnation ended. A
 skipped-slot marker says ``slot_overrun``, because the daemon is alive on those minutes
 and recording it as dead would make the marker lie about its own reason.
@@ -200,16 +201,23 @@ class GapMarker:
 
     # -- the two hooks ---------------------------------------------------------
 
-    def on_start(self) -> MarkingReport:
-        """Mark every minute owed before the daemon's first live cycle.
+    def on_start(self, slot: datetime) -> MarkingReport:
+        """Mark every owed minute through ``slot``, the minute the daemon started in.
 
-        The upper bound is the first slot the loop will capture, not the current minute.
-        ``run_loop`` sleeps to the next minute top before its first tick, so the minute
-        the daemon starts in is one no cycle will ever run for. Bounding at the current
-        minute would leave it both uncaptured and unmarked, a one-minute hole on every
-        restart, which is the hole this exists to close.
+        ``run_loop`` hands ``slot`` in. It is the value the loop seeded its previous slot
+        with, so the loop's first ``on_skipped`` starts at ``slot`` plus one and the two
+        passes meet without overlapping. Reading the clock here instead would be a second
+        read, and one that falls past a minute top the loop's read did not would mark
+        that next minute ``daemon_dead`` while the loop later marks it ``slot_overrun``.
+        It is required rather than defaulted, so no caller can fall back to that read.
+
+        The upper bound is ``slot`` plus one, not ``slot`` itself. ``run_loop`` sleeps to
+        the next minute top before its first tick, so the minute the daemon starts in is
+        one no cycle will ever run for. Bounding short of it would leave it both
+        uncaptured and unmarked, a one-minute hole on every restart, which is the hole
+        this exists to close.
         """
-        first_live_slot = self._session_clock.snap_slot() + TICK
+        first_live_slot = slot + TICK
 
         def plan(
             surface: str, ticker: str, recorded: dict[str, dict]
@@ -379,9 +387,13 @@ class GapMarker:
         Two marking passes in the same second would otherwise produce the same name, and
         ``SegmentWriter`` opens with ``O_CREAT|O_EXCL``, so the second would fail. A
         startup pass and a skipped-slot pass in the same minute is the ordinary case,
-        not a rare one. Stamping from the span also makes the name say what it covers,
-        and two passes cannot cover the same first minute, because the recorded set counts
-        the previous pass's marker rows, so those minutes are no longer owed.
+        not a rare one. Stamping from the span also makes the name say what it covers.
+        Two passes cannot cover the same first minute. Two startup passes cannot, because
+        the recorded set counts the previous pass's marker rows, so those minutes are no
+        longer owed. A startup pass and a skipped-slot pass cannot either, but for another
+        reason, because the skipped-slot plan never reads the recorded set. ``run_loop``
+        hands both the one minute it started in, startup marking stops at that minute,
+        and the loop hands ``on_skipped`` only minutes after it.
         """
         stamp = slots[0].strftime(SEGMENT_STAMP_FORMAT)
         path = journal.segment_path(self._root, surface, ticker, day, stamp, self._pid)
