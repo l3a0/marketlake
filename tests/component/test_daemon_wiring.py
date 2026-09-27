@@ -1393,10 +1393,8 @@ def test_the_out_of_span_page_names_four_tickers_and_counts_the_rest(tmp_path, l
         fetched_at=None,
     )
 
-    def runner(*, close_tag: str | None, session_phase: str | None) -> CycleResult:
-        return CycleResult(
-            clock.now().replace(second=0, microsecond=0), (landed,), out_of_span=left_out
-        )
+    def runner(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        return CycleResult(slot, (landed,), out_of_span=left_out)
 
     clock = ManualClock(start=et(2026, 9, 2, 11, 58, 30))
     _run(rig, clock, ticks=3, cycle_runner=runner)
