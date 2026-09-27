@@ -1157,8 +1157,9 @@ def test_the_minute_being_captured_is_never_called_missing(fixture_lake: Fixture
 def test_a_slot_stays_pending_through_the_grace_minute_after_its_own(
     fixture_lake: FixtureLake,
 ):
-    # A cycle that overruns its minute is an ordinary slow sample to the loop, not a
-    # failure. Its row lands after the slot's own minute has ended. Judging at that end
+    # A cycle still running into the next minute is an ordinary slow sample, not a
+    # failure, and the loop does not wait for it. Its row lands after the slot's own
+    # minute has ended. Judging at that end
     # would call the slot missing and then flip it to captured on the next refresh, so
     # the grace runs one further minute and the verdict never flaps on a healthy session.
     root = _grace_lake(fixture_lake)

@@ -363,7 +363,7 @@ def test_the_request_bound_default_is_pinned_and_its_edges_are_accepted():
     ],
 )
 def test_a_request_bound_outside_one_to_fifty_nine_seconds_is_refused(raw: str):
-    """At 60 or more an ordinary cycle's bound falls in the next minute, the overrun it ends.
+    """At 60 or more an ordinary cycle's bound falls in the next minute.
 
     At 0 every request is refused before it is sent. ``yes`` parses to ``True``, which a
     bare range check reads as 1, so the type is checked first, as for the fields above.

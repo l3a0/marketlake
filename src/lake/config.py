@@ -363,7 +363,7 @@ class GuardConstants:
                 "capture_request_bound_s must be a whole number from "
                 f"{_MIN_CAPTURE_REQUEST_BOUND_S} to {_MAX_CAPTURE_REQUEST_BOUND_S}, got "
                 f"{bound!r}: it is how many seconds after its minute top a capture cycle "
-                "waits on its requests, and at 60 or more a slow request costs the next minute"
+                "waits on its requests, and at 60 or more it runs into the next minute"
             )
         return merged
 

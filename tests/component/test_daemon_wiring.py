@@ -476,9 +476,6 @@ def test_the_minutes_a_live_stall_slept_through_charge_the_watchdog(tmp_path):
     assert page.body == "3 session minutes without a durable cycle"
 
 
-# -- 3. the per-tick hook feeds the idle heartbeat -----------------------------------
-
-
 class _SleepsWithACycleInFlight(ManualClock):
     """A manual clock whose first sleep from 10:00 on oversleeps by three minutes.
 
@@ -531,6 +528,9 @@ def test_a_cycle_in_flight_across_a_stall_reaches_the_watchdog_before_the_stall(
         "Capture down: XYZ quotes",
     ]
     assert rig.transport.sent[0].body == "3 session minutes without a durable cycle"
+
+
+# -- 3. the per-tick hook feeds the idle heartbeat -----------------------------------
 
 
 def test_an_idle_minute_feeds_the_capture_dead_man(tmp_path):

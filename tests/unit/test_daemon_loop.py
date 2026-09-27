@@ -145,7 +145,9 @@ class _RecordingRunner:
     def __call__(
         self, *, slot: datetime, close_tag: str | None, session_phase: str | None
     ) -> CycleResult:
-        floor = self._clock.now().replace(second=0, microsecond=0).astimezone(ET)
+        # Read through ``ManualClock.now`` itself, so a ``CostlyClock`` does not charge this
+        # read. Its reads move the clock, and a read here would be a cycle moving it.
+        floor = ManualClock.now(self._clock).replace(second=0, microsecond=0).astimezone(ET)
         result = CycleResult(snap_ts=slot.astimezone(UTC), segments=())
         # Recorded before any hold, in the order the loop fired the cycles, since each
         # starts before the loop reaches the next tick.

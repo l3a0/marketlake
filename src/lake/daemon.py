@@ -1648,10 +1648,10 @@ def run_loop_from_config(
             # A folded page says how much it folded, the rule compaction's drift page
             # already follows. Three pages here fold: the sampler page stands for every
             # quotes ticker, the cause page stands for every surface that failed the same
-            # way, and the overrun page stands for every surface a stall charged. Without
+            # way, and the stall page stands for every surface a stall charged. Without
             # the count, one page for two and one page for four hundred read identically.
-            # A page standing for one surface carries none, and on every title but the
-            # overrun's the title itself says which surface that is.
+            # A page standing for one surface carries none, and on every page but the
+            # stall page the title itself says which surface that is.
             #
             # The names are left out because both folds only fire when the whole set
             # failed, so listing them says no more than the count does and costs the

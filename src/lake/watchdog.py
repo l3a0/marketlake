@@ -33,7 +33,7 @@ counters tripping in the same minute means the sampler died rather than N ticker
 dying at once. That sends one page naming the sampler, never one page per ticker.
 
 A stall folds too. A slot the loop slept through gaps every watched surface at the
-same moment, so one overrun that trips the threshold is one fact and sends one page,
+same moment, so one stall that trips the threshold is one fact and sends one page,
 carrying the minutes without a durable cycle it is reporting and how many surfaces it
 charged. That page leaves the per-surface budget alone, where the sampler collapse
 spends it. A stall is evidence about the loop rather than about any surface's health,

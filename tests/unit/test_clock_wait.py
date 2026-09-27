@@ -8,10 +8,13 @@ completion or at an instant, whichever comes first. These cases cover both clock
 2. With nothing done, the manual clock moves forward to the instant through its own
    ``sleep``, and never backwards. The system clock returns empty once the instant passes.
 3. With no instant, each waits for the first completion however long it takes.
+4. The manual clock loses no move when several threads move it at once. The daemon's
+   loop thread and each minute's cycle thread share one clock (marketlake #565).
 """
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from concurrent.futures import Future
@@ -119,3 +122,29 @@ def test_the_system_clock_with_no_instant_waits_for_the_first_completion():
 
     assert clock.wait({future}, None) == {future}
     thread.join()
+
+
+def test_the_manual_clock_loses_no_move_when_threads_move_it_at_once():
+    # ``advance`` reads the time and writes it back. Unlocked, a thread switch between the
+    # two drops the other thread's move. A switch interval of a microsecond makes that
+    # switch land inside the pair on every run measured, 10 of 10 without the lock.
+    clock = ManualClock(start=START)
+    moves = 20_000
+
+    def move() -> None:
+        for _ in range(moves):
+            clock.advance(1)
+
+    threads = [threading.Thread(target=move) for _ in range(4)]
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        sys.setswitchinterval(interval)
+
+    assert clock.now() == START + timedelta(seconds=4 * moves)
+    assert clock.monotonic() == 4 * moves
