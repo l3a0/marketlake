@@ -22,6 +22,7 @@ token here is a made-up string in a temporary file.
 
 from __future__ import annotations
 
+import base64
 import functools
 import json
 import threading
@@ -57,12 +58,14 @@ class _Server:
         self.rotate = rotate
         self.current = "refresh-0"
         self.refreshed_with: list[str] = []
+        self.client_auth: set[str] = set()
         self._lock = threading.Lock()
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/oauth/token":
             sent = parse_qs(request.content.decode())["refresh_token"][0]
             with self._lock:
+                self.client_auth.add(request.headers["authorization"])
                 if self.rotate and sent != self.current:
                     return httpx.Response(400, json={"error": "invalid_grant"})
                 self.refreshed_with.append(sent)
@@ -104,6 +107,10 @@ def _write(path: Path, *, access: str, refresh: str, expires_in: int, mint: int 
     path.chmod(0o644)
 
 
+# How the app key and secret reach the token endpoint: HTTP Basic, in that order.
+_APP_AUTH = "Basic " + base64.b64encode(b"app-key:app-secret").decode()
+
+
 def _stored(path: Path) -> dict:
     return json.loads(path.read_text())
 
@@ -131,15 +138,26 @@ def _fire_together(vendors: list[SchwabVendor]) -> set[str]:
 
 
 @pytest.mark.parametrize("rotate", [False, True], ids=["fixed-refresh", "rotating-refresh"])
-def test_two_clients_refresh_once_and_the_second_adopts_the_first(tmp_path, monkeypatch, rotate):
+@pytest.mark.parametrize(
+    "expires_in",
+    # 100 seconds out is inside the 300-second leeway ``schwab-py`` gives the session, so
+    # authlib refreshes it. The re-read must judge expiry with that same leeway, or the second
+    # client refreshes a token the re-read called live.
+    [-10, 100],
+    ids=["expired", "inside-the-leeway"],
+)
+def test_two_clients_refresh_once_and_the_second_adopts_the_first(
+    tmp_path, monkeypatch, rotate, expires_in
+):
     token = tmp_path / "token.json"
-    _write(token, access="stale", refresh="refresh-0", expires_in=-10)
+    _write(token, access="stale", refresh="refresh-0", expires_in=expires_in)
     server = _Server(rotate=rotate)
     _serve(monkeypatch, server)
     first, second = _vendor(token), _vendor(token)
 
     assert _fire_together([first, second]) == {"Bearer fresh-1"}
     assert server.refreshed_with == ["refresh-0"]
+    assert server.client_auth == {_APP_AUTH}
     stored = _stored(token)
     assert stored["token"]["access_token"] == "fresh-1"
     assert stored["token"]["refresh_token"] == server.current
@@ -177,14 +195,16 @@ def test_a_rotated_refresh_token_is_refused_to_a_client_that_does_not_reread(tmp
 
 def test_a_refresh_publishes_the_file_owner_only(tmp_path, monkeypatch):
     # ``schwab-py``'s writer opens the existing file for writing, which keeps its 0644. The
-    # atomic writer publishes a new file at 0600.
-    token = tmp_path / "token.json"
+    # atomic writer publishes a new file at 0600. The file is not named ``token.json``, so a
+    # writer aimed at the standard name rather than the path it was given fails here.
+    token = tmp_path / "elsewhere.json"
     _write(token, access="stale", refresh="refresh-0", expires_in=-10)
     _serve(monkeypatch, _Server(rotate=False))
 
     assert _sent_with(_vendor(token)) == "Bearer fresh-1"
+    assert _stored(token)["token"]["access_token"] == "fresh-1"
     assert token.stat().st_mode & 0o777 == 0o600
-    assert [p.name for p in tmp_path.iterdir()] == ["token.json"]
+    assert [p.name for p in tmp_path.iterdir()] == ["elsewhere.json"]
 
 
 def test_an_interrupted_refresh_write_leaves_the_old_token_readable(tmp_path, monkeypatch):
@@ -208,10 +228,12 @@ def test_the_probe_writes_its_refresh_atomically_too(tmp_path, monkeypatch):
     # The by-hand probe builds its own client and can run beside the daemon.
     token = tmp_path / "token.json"
     _write(token, access="stale", refresh="refresh-0", expires_in=-10)
-    _serve(monkeypatch, _Server(rotate=False))
+    server = _Server(rotate=False)
+    _serve(monkeypatch, server)
 
     client = probe._client_from_token(token, api_key="app-key", app_secret="app-secret")
     client.session.get("https://api.schwabapi.com/marketdata/v1/quotes")
+    assert server.client_auth == {_APP_AUTH}
     assert _stored(token)["token"]["access_token"] == "fresh-1"
     assert token.stat().st_mode & 0o777 == 0o600
 
@@ -295,6 +317,8 @@ def _on_disk(*without: str) -> dict:
         (None, "FileNotFoundError"),
         ("{", "JSONDecodeError"),
         ("[]", "ValueError"),
+        ("[" * 200_000, "RecursionError"),
+        (json.dumps({"creation_timestamp": MINT, "token": [["access_token", "x"]]}), "ValueError"),
         (json.dumps({"creation_timestamp": MINT}), "ValueError"),
         (json.dumps({"token": _on_disk()}), "ValueError"),
         (json.dumps({"creation_timestamp": MINT, "token": _on_disk("access_token")}), "ValueError"),
@@ -312,6 +336,8 @@ def _on_disk(*without: str) -> dict:
         "missing",
         "not-json",
         "not-an-object",
+        "nested-too-deep",
+        "token-not-an-object",
         "no-token",
         "no-mint-time",
         "no-access-token",

@@ -207,6 +207,7 @@ def test_from_token_adopts_the_files_token_once_its_own_has_expired(tmp_path, mo
     session.token.expired = True
     session.ensure_active_token()
     assert session.checked[-1]["access_token"] == "on-disk"
+    assert factory.clients[-1].token_metadata.token["access_token"] == "on-disk"
     assert vendor.token_mint_time() == datetime.fromtimestamp(MINT_AFTER, tz=UTC)
 
 

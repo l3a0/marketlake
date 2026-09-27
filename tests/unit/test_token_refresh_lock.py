@@ -94,7 +94,7 @@ def test_the_race_is_real_without_the_lock():
     assert len(writes) == server.refreshes
 
 
-def test_an_expired_token_is_refreshed_once_across_threads():
+def test_an_expired_token_is_refreshed_once_across_threads(capsys):
     # One refresh and one token write, and every request goes out with the fresh token. A lock
     # that forwarded the token it was called with, rather than re-reading the session's, would
     # refresh once per thread here: each waiting thread holds the stale token object.
@@ -106,6 +106,23 @@ def test_an_expired_token_is_refreshed_once_across_threads():
     assert server.refreshes == 1
     assert writes == ["fresh-1"]
     assert client.token["access_token"] == "fresh-1"
+    # With no token file to re-read, nothing is attempted, so nothing fails and is reported.
+    assert capsys.readouterr().err == ""
+
+
+def test_an_interrupt_during_the_reread_is_not_swallowed():
+    # The fallback keeps a request going when the file cannot be read. It must not also eat a
+    # Ctrl-C or a shutdown that lands while the file is being read.
+    server, writes = _Server(), []
+    client = _client(server, expires_in=-10, writes=writes)
+
+    def interrupted() -> None:
+        raise KeyboardInterrupt
+
+    serialize_token_refresh(client, interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        client.get("https://api.example.invalid/data")
+    assert server.refreshes == 0
 
 
 def test_a_live_token_is_not_refreshed():
