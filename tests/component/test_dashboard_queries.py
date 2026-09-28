@@ -3162,6 +3162,7 @@ def test_no_reports_directory_renders_an_empty_list(service: DashboardService, r
     assert payload["reports"] == []
     assert payload["reports_unreadable"] == 0
     assert payload["reports_error"] is None
+    assert (payload["reports_older"], payload["held_open"]) == (0, [])
 
 
 def test_the_reports_come_back_newest_first_and_each_carries_its_own_date(root: Path):
@@ -3752,6 +3753,51 @@ def test_a_count_that_moves_is_named_rather_than_called_unchanged(root: Path):
     assert (finding["count"], finding["nights"]) == (2, 3)
 
 
+def test_a_name_new_twice_on_its_first_night_keeps_its_count(root: Path):
+    twice = (("dividends", PieceOutcome(held=2, subjects=("KO 2026-09-15 amount",) * 2)),)
+    _file_nightly(root, date(2026, 9, 17), pieces=(("dividends", PieceOutcome()),))
+    _file_nightly(root, date(2026, 9, 18), pieces=twice)
+    newest = _history(root)["reports"][0]
+    assert [finding["count"] for finding in newest["held_new"]] == [2]
+
+
+def test_findings_come_back_by_walk_then_by_name_whatever_order_the_file_holds(root: Path):
+    # The writer keeps subjects in the order it was handed them, so the grouping sorts.
+    def pieces(*bars: str) -> tuple[tuple[str, PieceOutcome], ...]:
+        return (
+            ("dividends", PieceOutcome(held=1, subjects=("KO 2026-09-15 amount",))),
+            ("bars", PieceOutcome(held=len(bars), subjects=bars)),
+        )
+
+    _file_nightly(root, date(2026, 9, 17), pieces=(("dividends", PieceOutcome()),))
+    _file_nightly(root, date(2026, 9, 18), pieces=pieces(SPY_HELD, QQQ_HELD))
+    _file_nightly(root, date(2026, 9, 21), pieces=pieces())
+    payload = _history(root)
+    nights = _by_day(payload)
+    expected = [f"bars {QQQ_HELD}", f"bars {SPY_HELD}", "dividends KO 2026-09-15 amount"]
+    assert _names(nights["2026-09-18"]["held_new"]) == expected
+    assert _names(nights["2026-09-21"]["held_gone"]) == [f"bars {QQQ_HELD}", f"bars {SPY_HELD}"]
+    assert _names(payload["held_open"]) == ["dividends KO 2026-09-15 amount"]
+
+
+def test_an_empty_refusal_is_still_a_refusal(root: Path):
+    # ``refusal_class`` gives "" for a refusal that begins with ": ", and that walk did
+    # not finish, so it must not close SPY.
+    directory = root / "reports"
+    directory.mkdir()
+    for day, bars in (
+        ("2026-09-17", {"subjects": [SPY_HELD]}),
+        ("2026-09-18", {"subjects": [], "refusal": ""}),
+        ("2026-09-21", {"subjects": [SPY_HELD]}),
+    ):
+        (directory / f"{day}-183000000000-11.json").write_text(
+            json.dumps({"day": day, "pieces": {"bars": bars}})
+        )
+    nights = _by_day(_history(root))
+    assert nights["2026-09-18"]["held_gone"] == []
+    assert nights["2026-09-21"]["held_new"] == []
+
+
 def test_a_name_held_twice_in_one_night_keeps_its_count(root: Path):
     # Two dividend findings for one symbol, day and check give one name twice.
     twice = (("dividends", PieceOutcome(held=2, subjects=("KO 2026-09-15 amount",) * 2)),)
@@ -3968,6 +4014,7 @@ def test_an_unlistable_reports_directory_is_reported_and_never_raised(root: Path
         directory.chmod(0o755)
     assert payload["reports_error"] == "PermissionError"
     assert payload["reports"] == []
+    assert (payload["reports_older"], payload["held_open"]) == (0, [])
     # Everything the directory has nothing to do with is still served.
     assert len(payload["cells"]) == 9
 
