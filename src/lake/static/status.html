@@ -915,10 +915,14 @@
   }
 
   // "on at least" when the run reaches back past what the files read can see, which is a
-  // file past the cap or a night whose walk did not run. "not re-checked" when the walk did
+  // file past the cap or one that would not parse. "not re-checked" when the walk did
   // not finish on the newest night, so the finding is carried from the last night it did.
   function heldOpenText(finding) {
-    var text = finding.walk + " held " + finding.subject + times(finding.count);
+    var text = finding.walk + " held " + finding.subject;
+    if (finding.count > 1) {
+      text += ", " + finding.count + " times on " +
+        (finding.last_seen === null ? DASH : finding.last_seen);
+    }
     var since = finding.first === null ? DASH : finding.first;
     text += finding.earlier
       ? ", on at least " + plural(finding.nights, "night", "nights") + ", since " + since +
@@ -996,8 +1000,8 @@
     "The file gives it no kind.";
 
   // A night's held findings as changes: the ones new that night, the ones held on the first
-  // night their walk finished, the ones a finished walk stopped holding, and one line
-  // counting the rest. The page says "no longer held" and
+  // night their walk finished when older files went unseen, the ones whose count moved, the
+  // ones a finished walk stopped holding, and one line counting the rest. The page says "no longer held" and
   // never "settled", because the file does not say why a finding left.
   function appendHeldChanges(item, entry) {
     var list = el("ul", null, "lines");
@@ -1007,12 +1011,18 @@
       node.title = HELD_TITLE;
       list.appendChild(node);
     });
-    // The first night its walk finished in the reports read, when that is not the earliest.
-    // The nights before did not observe the walk, so the page does not call these new.
+    // The first night its walk finished in the reports read, when older files went unseen.
+    // One of those may have held the finding, so the page does not call it new.
     (entry.held_uncompared || []).forEach(function (finding) {
       var node = el("li", finding.walk + " held " + finding.subject + times(finding.count), "held");
-      node.title = HELD_TITLE + " The reports before this one did not show this walk " +
-        "finishing, so the page cannot say whether the finding is new.";
+      node.title = HELD_TITLE + " A report older than the ones read may have held it " +
+        "already, so the page does not call it new.";
+      list.appendChild(node);
+    });
+    (entry.held_recounted || []).forEach(function (finding) {
+      var node = el("li", finding.walk + " held " + finding.subject + ", now " +
+        finding.count + " times, was " + finding.was, "held");
+      node.title = HELD_TITLE;
       list.appendChild(node);
     });
     (entry.held_gone || []).forEach(function (finding) {
@@ -1053,9 +1063,9 @@
   // the payload could not pair with its lines, which includes every file written before the
   // kinds existed, and those render in the one note colour.
   //
-  // ``report_collapsed`` marks the lines that read exactly as they did in the report before,
-  // and those fold into one count. The payload never marks a healthy line or a line on the
-  // newest or earliest report, so this draws what it is told.
+  // ``report_collapsed`` marks the worth-knowing lines that read exactly as they did in the
+  // report before, and those fold into one count. The payload marks no other kind and no
+  // line on the newest or earliest report, so this draws what it is told.
   function appendReport(item, lines, kinds, collapsed) {
     if (!lines || lines.length === 0) { return; }
     var list = el("ul", null, "lines");
@@ -1069,10 +1079,10 @@
       list.appendChild(node);
     });
     if (folded > 0) {
-      var node = el("li", plural(folded, "line as the night before", "lines as the night before"),
-        "muted");
-      node.title = "These report lines read exactly as they did in the report before this one. " +
-        "The newest report and every health-check line are always drawn in full.";
+      var node = el("li", plural(folded, "worth-knowing line as in the report before",
+        "worth-knowing lines as in the report before"), "muted");
+      node.title = "These worth-knowing lines read exactly as they did in the report before " +
+        "this one. Only worth-knowing lines fold, and the newest report is always drawn in full.";
       list.appendChild(node);
     }
     item.appendChild(list);

@@ -3656,29 +3656,44 @@ def test_a_finding_that_starts_after_the_oldest_file_read_never_says_earlier(roo
     assert (finding["first"], finding["earlier"]) == ("2026-09-06", False)
 
 
-def test_a_first_night_whose_walk_did_not_run_leaves_the_start_unknown(root: Path):
-    # A holiday file carries no walks, so nothing says whether SPY was held on it.
+def test_a_holiday_before_a_findings_first_night_does_not_make_it_earlier(root: Path):
+    # A holiday file carries no walks, so it held nothing, and nothing older was filed.
     _file_nightly(root, date(2026, 9, 17), session=False)
     _file_nightly(root, date(2026, 9, 18), pieces=_bars(SPY_HELD))
     (finding,) = _history(root)["held_open"]
-    assert (finding["first"], finding["earlier"]) == ("2026-09-18", True)
+    assert (finding["first"], finding["earlier"]) == ("2026-09-18", False)
 
 
-def test_a_night_after_nights_that_did_not_observe_the_walk_calls_nothing_new(root: Path):
-    # The 17th's walk refused, so nothing says whether SPY was held then. The 18th lists
-    # it without calling it new, which is what the open section's "or earlier" says too.
+def test_a_refused_first_night_held_nothing_so_the_next_night_is_new(root: Path):
+    # The 17th is the first report filed and its walk refused, so no night before the 18th
+    # held SPY. The per-night list and the open section agree on that.
     _file_nightly(root, date(2026, 9, 17), pieces=_bars(refusal="OSError: denied"))
     _file_nightly(root, date(2026, 9, 18), pieces=_bars(SPY_HELD))
     _file_nightly(root, date(2026, 9, 21), pieces=_bars(SPY_HELD))
     payload = _history(root)
     nights = _by_day(payload)
-    assert nights["2026-09-18"]["held_new"] == []
-    assert _names(nights["2026-09-18"]["held_uncompared"]) == [f"bars {SPY_HELD}"]
-    assert nights["2026-09-21"]["held_uncompared"] == []
-    # The earliest report is drawn in full from its pieces, so it lists nothing here.
-    assert nights["2026-09-17"]["held_uncompared"] == []
+    assert _names(nights["2026-09-18"]["held_new"]) == [f"bars {SPY_HELD}"]
+    assert all(entry["held_uncompared"] == [] for entry in payload["reports"])
     (finding,) = payload["held_open"]
-    assert (finding["first"], finding["earlier"]) == ("2026-09-18", True)
+    assert (finding["first"], finding["earlier"]) == ("2026-09-18", False)
+
+
+def test_a_first_night_after_unseen_older_files_is_not_called_new(root: Path):
+    # Twelve files, so two are past the cap. The first two read refused, so the first night
+    # the walk finished in the window is the 5th, and a file past the cap may have held SPY.
+    first = date(2026, 9, 1)
+    for index in range(12):
+        pieces = _bars(refusal="OSError: denied") if index in (2, 3) else _bars(SPY_HELD)
+        _file_nightly(root, first + timedelta(days=index), pieces=pieces)
+    payload = _history(root)
+    nights = _by_day(payload)
+    assert nights["2026-09-05"]["held_new"] == []
+    assert _names(nights["2026-09-05"]["held_uncompared"]) == [f"bars {SPY_HELD}"]
+    assert nights["2026-09-06"]["held_uncompared"] == []
+    # The earliest report is drawn in full from its pieces, so it lists nothing here.
+    assert nights["2026-09-03"]["held_uncompared"] == []
+    (finding,) = payload["held_open"]
+    assert (finding["first"], finding["earlier"]) == ("2026-09-05", True)
 
 
 def test_an_oldest_file_that_would_not_parse_counts_as_older(root: Path):
@@ -3717,6 +3732,23 @@ def test_two_files_for_one_day_count_as_one_night(root: Path):
     assert (finding["first"], finding["nights"]) == ("2026-09-17", 2)
 
 
+def test_a_count_that_moves_is_named_rather_than_called_unchanged(root: Path):
+    once = (("dividends", PieceOutcome(held=1, subjects=("KO 2026-09-15 amount",))),)
+    twice = (("dividends", PieceOutcome(held=2, subjects=("KO 2026-09-15 amount",) * 2)),)
+    _file_nightly(root, date(2026, 9, 17), pieces=once)
+    _file_nightly(root, date(2026, 9, 18), pieces=once)
+    _file_nightly(root, date(2026, 9, 21), pieces=twice)
+    payload = _history(root)
+    newest = payload["reports"][0]
+    assert newest["held_recounted"] == [
+        {"walk": "dividends", "subject": "KO 2026-09-15 amount", "count": 2, "was": 1}
+    ]
+    assert (newest["held_unchanged"], newest["held_new"]) == (0, [])
+    assert _by_day(payload)["2026-09-18"]["held_unchanged"] == 1
+    (finding,) = payload["held_open"]
+    assert (finding["count"], finding["nights"]) == (2, 3)
+
+
 def test_a_name_held_twice_in_one_night_keeps_its_count(root: Path):
     # Two dividend findings for one symbol, day and check give one name twice.
     twice = (("dividends", PieceOutcome(held=2, subjects=("KO 2026-09-15 amount",) * 2)),)
@@ -3753,7 +3785,16 @@ def test_a_report_line_folds_only_where_it_repeats_the_night_before(root: Path):
     }
 
 
-def test_a_report_line_with_no_kind_folds_like_an_action_line(root: Path):
+def test_an_action_line_never_folds(root: Path):
+    # The same text on two nights is two batches of quarantines, and for two checks this
+    # line is the only sign of one.
+    wrote = "battery wrote 2 quarantine lines"
+    for day in (date(2026, 9, 17), date(2026, 9, 18), date(2026, 9, 21)):
+        _file_nightly(root, day, report=(wrote,), report_kinds=("action",))
+    assert _by_day(_history(root))["2026-09-18"]["report_collapsed"] == [False]
+
+
+def test_a_report_line_with_no_kind_never_folds(root: Path):
     # Tonight's file carries kinds and the ones before it do not, so the tree holds both.
     lines = ["bars abandoned: 6 ticker-day(s), 6 NoSpotClose", "battery: nothing drifted"]
     directory = root / "reports"
@@ -3764,8 +3805,9 @@ def test_a_report_line_with_no_kind_folds_like_an_action_line(root: Path):
         )
     _file_nightly(root, date(2026, 9, 21), report=tuple(lines), report_kinds=("info", "healthy"))
     nights = _by_day(_history(root))
+    # The design reads a line nobody classified as ``action``, and an action line never folds.
     assert nights["2026-09-18"]["report_kinds"] is None
-    assert nights["2026-09-18"]["report_collapsed"] == [True, True]
+    assert nights["2026-09-18"]["report_collapsed"] == [False, False]
 
 
 def test_problems_are_never_folded(root: Path):
@@ -3806,11 +3848,12 @@ def test_the_grouping_never_raises_on_a_day_or_refusal_of_the_wrong_type(root: P
     assert (finding["first"], finding["nights"], finding["last_seen"]) == (None, 2, None)
 
 
-def test_group_nights_changes_a_count_without_opening_or_closing_anything():
+def test_group_nights_names_a_moved_count_without_opening_or_closing_anything():
     grouping = group_nights([("a", {"x": 2}), ("b", {"x": 1}), ("c", {"x": 3})])
     assert grouping.new == [{"x": 2}, {}, {}]
     assert grouping.gone == [[], [], []]
-    assert grouping.unchanged == [0, 1, 3]
+    assert grouping.recounted == [{}, {"x": (2, 1)}, {"x": (1, 3)}]
+    assert grouping.unchanged == [0, 0, 0]
     assert grouping.open["x"].count == 3
     assert grouping.open["x"].nights == 3
     assert grouping.first == 0
