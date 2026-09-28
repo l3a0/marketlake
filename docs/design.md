@@ -123,7 +123,8 @@ lake/
                                                       # today's open capture: one segment per surface, ticker,
                                                       # and writer session, compacted at close+15
   journal/timing/date=D.jsonl                         # one line per request a capture cycle, close+5 fill or onboarding
-                                                      # makes: sent, answered, finished (#531)
+                                                      # makes: sent, answered, finished (#531), and one per capture
+                                                      # cycle: landed, lock waited and held, ended (#537)
   quarantine.jsonl                                    # battery verdicts — append-only, restores with the lake
   reference/security_master.parquet                   # instrument_id <-> ticker/FIGI/OCC symbol, date-ranged
   reference/contracts.parquet                         # instrument_id -> contract terms

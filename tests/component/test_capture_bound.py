@@ -23,7 +23,6 @@ longer. These tests cover what the bound must do:
 
 from __future__ import annotations
 
-import json
 import threading
 import time
 from concurrent.futures import Future
@@ -51,6 +50,7 @@ from tests.component.test_capture_concurrency import (
 from tests.component.test_cycle_from_config import FIRST_MINUTE, SPY_ONLY, _rig, _wire
 from tests.support.calendar import FakeCalendar, SessionTimes, et
 from tests.support.clock import ManualClock
+from tests.support.timing import request_lines
 
 CHAINS = journal.CHAINS_SURFACE
 QUOTES = journal.QUOTES_SURFACE
@@ -160,10 +160,7 @@ def _expirations(rows: list[dict]) -> set[str]:
 
 
 def _lines(lake_root: Path, day=SESSION) -> list[dict]:
-    path = timing_path(lake_root, day)
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text().splitlines()]
+    return request_lines(timing_path(lake_root, day))
 
 
 def _line(lake_root: Path, ticker: str | None, window_start: str | None) -> dict:

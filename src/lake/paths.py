@@ -259,7 +259,7 @@ class LakePaths:
         return self.journal_dir / JOURNAL_METADATA_FILE
 
     def timing_path(self, day: date | str) -> Path:
-        """One day's request timing file, appended one line per vendor request."""
+        """One day's timing file, appended one line per vendor request and one per capture cycle."""
         return self.journal_dir / TIMING_DIR / f"{DATE_PREFIX}{_day_str(day)}{JSONL_SUFFIX}"
 
     def segment_dir(self, surface: str, ticker: str, day: date | str) -> Path:

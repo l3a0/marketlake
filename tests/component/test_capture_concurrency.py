@@ -23,7 +23,6 @@ The cap-of-1 path is the sequential cycle, and the rest of the suite covers it.
 
 from __future__ import annotations
 
-import json
 import threading
 import time
 from datetime import UTC, date, datetime, timedelta
@@ -40,6 +39,7 @@ from lake.tickers import Roster
 from lake.timing import timing_path
 from lake.vendor import VendorError, VendorResponse
 from tests.support.clock import ManualClock
+from tests.support.timing import request_lines
 
 CHAINS = journal.CHAINS_SURFACE
 QUOTES = journal.QUOTES_SURFACE
@@ -671,7 +671,7 @@ def test_the_timing_lines_keep_plan_order_whatever_order_the_units_finished(lake
     vendor = _ThreadedVendor(delay={("SPY", _d(0)): 0.2, ("SPY", _d(10)): 0.2})
     _run(vendor, lake_root)
 
-    lines = [json.loads(line) for line in timing_path(lake_root, SESSION).read_text().splitlines()]
+    lines = request_lines(timing_path(lake_root, SESSION))
     assert [(line["surface"], line["ticker"], line["window_start"]) for line in lines] == [
         (CHAINS, "SPY", _d(0).isoformat()),
         (CHAINS, "SPY", _d(10).isoformat()),

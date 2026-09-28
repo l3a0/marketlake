@@ -83,7 +83,14 @@ from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor, is_transient_failure
 from lake.security_master import ID_TYPE_TICKER, SecurityMaster, SecurityMasterError, master_path
 from lake.session import OPTION_CLOSE, OPTION_CLOSE_GUARD, TICK
 from lake.tickers import Roster, load_tickers
-from lake.timing import RequestRecord, append_requests, failures
+from lake.timing import (
+    CycleRecord,
+    RequestRecord,
+    append_cycle,
+    append_requests,
+    failures,
+    read_load,
+)
 from lake.vendor import Vendor, VendorError, VendorResponse
 
 # The manifest ``source`` for a capture-written segment entry.
@@ -441,6 +448,23 @@ def record_requests(
         found = [f"{type(exc).__name__}: {exc}"]
     if found:
         _say(f"capture: request timing incomplete for {where}: {'; '.join(found)}")
+
+
+def record_cycle(lake_root: Path | str, *, day: date, record: CycleRecord, where: str) -> None:
+    """Append one cycle's line to the timing file, and never raise.
+
+    It runs after the cycle's request lines, so it sits behind everything the minute
+    depends on, and it takes the same bargain ``record_requests`` does (marketlake #537). A
+    write that fails costs the line, and a field that could not be read costs the field.
+    Each prints one stderr line, through the guarded print, because a raise from here
+    would leave the cycle and exit the daemon.
+    """
+    try:
+        append_cycle(lake_root, day=day, record=record)
+    except Exception as exc:  # noqa: BLE001 - timing must never cost a minute
+        _say(f"capture: cycle timing not written for {where}: {type(exc).__name__}: {exc}")
+    if record.failures:
+        _say(f"capture: cycle timing incomplete for {where}: {'; '.join(record.failures)}")
 
 
 def _say(line: str) -> None:
@@ -1913,6 +1937,10 @@ class _CaptureCycle:
     start_ts: str = field(init=False)
     deadline: datetime | None = field(init=False)
     requests: list[RequestRecord] = field(init=False, default_factory=list)
+    started_at: datetime = field(init=False)
+    fetch_end: datetime | None = field(init=False, default=None)
+    load_start: tuple[float, float, float] | None = field(init=False, default=None)
+    timing_failures: list[str] = field(init=False, default_factory=list)
 
     def __post_init__(self) -> None:
         # The snap slot is the loop's, when the loop handed one over. A second read of the
@@ -1937,6 +1965,12 @@ class _CaptureCycle:
             if self.slot is not None
             else None
         )
+        # The cycle line's start (marketlake #537). The load is read here, before the first
+        # request, so ``read_load`` never raises: a failed reading costs its field.
+        self.started_at = cycle_start
+        self.load_start, failure = read_load()
+        if failure is not None:
+            self.timing_failures.append(failure)
 
     # -- planning: the fallible, fail-open half ------------------------------
 
@@ -2228,6 +2262,9 @@ class _CaptureCycle:
         landed: list[tuple[int, SegmentOutcome | SegmentError]] = []
 
         def land(rank: int, surface: str, ticker: str, plan: _Plan) -> None:
+            # The cycle line's ``fetch_end_ts`` is the latest unit's, written or not.
+            if self.fetch_end is None or plan.fetch_end_ts > self.fetch_end:
+                self.fetch_end = plan.fetch_end_ts
             try:
                 landed.append((rank, self._write(surface, ticker, plan)))
             except Exception as exc:
@@ -2274,6 +2311,7 @@ class _CaptureCycle:
             self.requests.sort(
                 key=lambda record: (record.surface != CHAINS, rank_of.get(record.ticker, 0))
             )
+        segments_durable = self.clock.now()
         landed.sort(key=lambda item: item[0])
         outcomes = [item for _, item in landed if isinstance(item, SegmentOutcome)]
         errors = [item for _, item in landed if isinstance(item, SegmentError)]
@@ -2282,7 +2320,10 @@ class _CaptureCycle:
         # the segment path, under the lake-root lock. This is the slice-1 segment-keyed
         # entry. The lock serializes lake-mutating jobs, so the manifest append never
         # races a daily job. Capture stayed outside the lock for the perishable part.
+        # The cycle line brackets the append, so a reader can tell the wait for the lock
+        # from the time spent holding it.
         with lake_lock(self.lake_root):
+            lock_acquired = self.clock.now()
             for outcome in outcomes:
                 record_partition(
                     self.lake_root,
@@ -2291,6 +2332,7 @@ class _CaptureCycle:
                     rows=outcome.rows,
                     fetched_at=outcome.fetched_at,
                 )
+        lock_released = self.clock.now()
 
         # Last, stamp what the rows cannot carry: the token's mint time and the roster.
         self._stamp()
@@ -2303,12 +2345,39 @@ class _CaptureCycle:
             records=self.requests,
             where=f"the {self.snap_ts.isoformat()} cycle",
         )
+        # And last of all the cycle's own line, which says where the time after the fetch
+        # went (marketlake #537). The loop's hooks run later on the loop thread, not here.
+        self._record_cycle(segments_durable, lock_acquired, lock_released)
         return CycleResult(
             snap_ts=self.snap_ts,
             segments=tuple(outcomes),
             errors=tuple(errors),
             nothing_to_capture=not self.roster and not self.out_of_span,
             out_of_span=self.out_of_span,
+        )
+
+    def _record_cycle(
+        self, segments_durable: datetime, lock_acquired: datetime, lock_released: datetime
+    ) -> None:
+        """Append the cycle line, reading its end and its closing load here. Never raises."""
+        load_end, failure = read_load()
+        failures_seen = [*self.timing_failures, *([failure] if failure is not None else [])]
+        record_cycle(
+            self.lake_root,
+            day=self.day,
+            record=CycleRecord(
+                snap_ts=self.snap_ts,
+                cycle_start=self.started_at,
+                fetch_end=self.fetch_end,
+                segments_durable=segments_durable,
+                lock_acquired=lock_acquired,
+                lock_released=lock_released,
+                cycle_end=self.clock.now(),
+                load_start=self.load_start,
+                load_end=load_end,
+                failures=tuple(failures_seen),
+            ),
+            where=f"the {self.snap_ts.isoformat()} cycle",
         )
 
     def _stamp(self) -> None:
@@ -2401,6 +2470,8 @@ def run_cycle(
        lake-root lock.
     5. Stamp the token's mint time and the roster into the journal metadata, so the
        dashboard reads both from the lake rather than from ``~/.config``.
+    6. Append one timing line per request the cycle made, marketlake #531, and then one
+       line for the cycle itself, marketlake #537. Neither can raise.
     """
     cycle = _CaptureCycle(
         clock=clock,
@@ -2930,6 +3001,7 @@ __all__ = [
     "fill_option_close",
     "fill_option_close_from_config",
     "journal_snapshot",
+    "record_cycle",
     "record_requests",
     "request_record",
     "run_cycle",

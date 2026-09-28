@@ -42,6 +42,7 @@ from lake.paths import LakePaths
 from lake.tickers import Roster
 from lake.vendor import RequestTiming, VendorResponse
 from tests.support.clock import ManualClock
+from tests.support.timing import request_lines
 
 CHAINS = journal.CHAINS_SURFACE
 QUOTES = journal.QUOTES_SURFACE
@@ -152,8 +153,7 @@ def _run(vendor: _TimedVendor, clock: ManualClock, lake_root: Path, plan=TWO_WIN
 
 
 def _lines(lake_root: Path, day: date = SESSION) -> list[dict]:
-    path = LakePaths(lake_root).timing_path(day)
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    return request_lines(LakePaths(lake_root).timing_path(day))
 
 
 def _chain_lines(lake_root: Path) -> list[dict]:

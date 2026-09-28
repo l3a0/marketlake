@@ -29,6 +29,7 @@ from lake.watchdog import Watchdog
 from tests.conftest import CASSETTES
 from tests.support.clock import ManualClock
 from tests.support.schwab import FakeResponse, FakeSchwabClient
+from tests.support.timing import request_lines
 
 _RECORDED = load_cassette(CASSETTES / "spy_minimal.json")
 _CHAIN_OK = FakeResponse(200, _RECORDED.find("chains", {"symbol": "SPY"}).body)
@@ -84,7 +85,7 @@ def test_the_timing_file_keeps_an_html_rejection_as_its_own_text(lake_root):
     _cycle(lake_root, chain=FakeResponse(429, content=page), quotes=_QUOTES_OK)
 
     timing = LakePaths(lake_root).timing_path(date(2026, 8, 24))
-    lines = [json.loads(line) for line in timing.read_text(encoding="utf-8").splitlines()]
+    lines = request_lines(timing)
     (chain,) = [line for line in lines if line["surface"] == "chains"]
     assert (chain["status"], chain["error_class"]) == (429, "http_429")
     assert chain["request_subcode"] == "429-005"
