@@ -8,7 +8,7 @@ window was slow or all nine were, or whether the time went to Schwab or to the n
 On 2026-09-24 three cycles ran past their minute and lost four slots, and nothing the lake
 held could say which. Marketlake #531 is that gap, and this file is where its evidence lands.
 
-Most lines name one request. Each is one JSON object carrying the request's own
+Most lines name one request. A request line is one JSON object carrying the request's own
 coordinates, which are the keys that join it to the rows it produced: ``snap_ts``,
 ``surface``, ``ticker``, and the ``window_start`` and ``window_end`` it asked for. It
 carries what capture made of the reply, ``status`` and ``error_class``, and six instants.
@@ -35,18 +35,18 @@ covers a JSON file, and ``kind``, which is ``request`` here.
 
 A capture cycle adds one more line, ``kind`` ``cycle``, after its request lines
 (marketlake #537). The request lines end at the last response, and this one says where the
-rest of the cycle went. It carries the cycle's ``snap_ts`` and seven instants.
+rest of the cycle went. It carries the cycle's ``snap_ts`` and six instants.
 
 1. ``cycle_start_ts`` is when the cycle started, the instant its segment stamp uses.
 2. ``fetch_end_ts`` is the latest ``fetch_end_ts`` among the units the cycle planned, a
-   chain or the quote batch. A unit's spans its retry, and a unit the bound cut ends at
-   the bound. Null when the cycle planned nothing.
+   chain or the quote batch. A unit's spans its retry. On the concurrent path a unit the
+   bound cut ends at the bound. Null when the cycle planned nothing.
 3. ``segments_durable_ts`` is when the last unit had landed. Earlier units land inside
    the fetch, so the tail after the fetch is this less ``fetch_end_ts``.
-4. ``lock_acquired_ts`` and ``lock_released_ts`` bracket the manifest append under the
-   lake-root lock. From durable to acquired is the wait, and from acquired to released
-   the hold.
-5. ``cycle_end_ts`` is read after the metadata stamp and the request lines, just before
+4. ``lock_acquired_ts`` is when the cycle got the lake-root lock for its manifest append.
+   From durable to acquired is the wait, on another process or another cycle.
+5. ``lock_released_ts`` is when it let the lock go. From acquired to released is the hold.
+6. ``cycle_end_ts`` is read after the metadata stamp and the request lines, just before
    this line is appended. The loop's hooks run later, on the loop thread, and are not in it.
 
 ``loadavg_start`` and ``loadavg_end`` are ``os.getloadavg()`` read at the cycle's start
@@ -54,7 +54,9 @@ and end, the 1, 5 and 15 minute averages. Concurrent fetching removed the gap be
 chain's end and the next one's start that used to show the host's CPU at work, and the
 load says whether the host was busy around the cycle, not within any one second. A load
 read that fails is null, and ``cycle_failure`` names it, null when every field was read.
-Both kinds carry the same ``v``, so a reader filters on ``kind``.
+Both kinds carry the same ``v``, so a reader filters on ``kind``. Cycles overlap, so one
+cycle's lines can sit between another's, and a reader groups them by ``snap_ts``, never
+by position.
 
 The file is ``journal/timing/date=YYYY-MM-DD.jsonl`` under the lake root. The journal
 tree is the right home for four reasons that were already true of it.
@@ -275,8 +277,8 @@ __all__ = [
     "RequestRecord",
     "append_cycle",
     "append_requests",
-    "read_load",
     "failures",
+    "read_load",
     "reasons",
     "timing_path",
 ]

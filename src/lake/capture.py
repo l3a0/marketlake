@@ -1918,6 +1918,11 @@ class _CaptureCycle:
     ``snap_ts`` is its own start floored, so a bound taken from it could already have passed
     when the cycle began. It gets ``None`` and waits on its requests as it always did.
     ``on_abandoned`` is handed the requests still running when the bound cut the fetch.
+
+    ``started_at``, ``fetch_end``, ``load_start`` and ``timing_failures`` are what the
+    cycle line needs from before its end (marketlake #537): when the cycle started, the
+    latest unit's ``fetch_end_ts`` so far, the opening load reading, and any field that
+    could not be read.
     """
 
     clock: Clock
@@ -2359,7 +2364,11 @@ class _CaptureCycle:
     def _record_cycle(
         self, segments_durable: datetime, lock_acquired: datetime, lock_released: datetime
     ) -> None:
-        """Append the cycle line, reading its end and its closing load here. Never raises."""
+        """Append the cycle line, reading its closing load and then its end here.
+
+        The load read and the append each cost only themselves when they fail, and
+        neither raises. The clock is read unguarded, as everywhere else in the cycle.
+        """
         load_end, failure = read_load()
         failures_seen = [*self.timing_failures, *([failure] if failure is not None else [])]
         record_cycle(
@@ -3001,7 +3010,6 @@ __all__ = [
     "fill_option_close",
     "fill_option_close_from_config",
     "journal_snapshot",
-    "record_cycle",
     "record_requests",
     "request_record",
     "run_cycle",

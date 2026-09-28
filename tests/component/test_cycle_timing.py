@@ -18,7 +18,7 @@ What they cover:
 1. The instants, in order, on both fetch paths, and one line per cycle after its request
    lines.
 2. ``fetch_end_ts`` is the latest unit's, whether its segment was written or not.
-3. A lock held by another process shows up as the wait.
+3. A lock held by another process, or by another thread of this one, shows up as the wait.
 4. The line never costs a minute: a write that fails, and a load average that cannot be
    read, each cost what they cost and nothing else.
 5. A cycle that raises at its manifest append writes no line of either kind.
@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import wait as futures_wait
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -37,6 +39,7 @@ import pytest
 from lake import capture, journal
 from lake.clock import SystemClock
 from lake.config import GuardConstants
+from lake.lock import lake_lock
 from lake.manifest import manifest_path
 from lake.tickers import Roster
 from lake.timing import timing_path
@@ -50,10 +53,11 @@ from tests.component.test_request_timing import (
     TAIL,
     TWO_WINDOWS,
     _chain_body,
+    _Refusing,
     _TimedVendor,
 )
 from tests.support.clock import ManualClock
-from tests.support.timing import cycle_lines, timing_lines
+from tests.support.timing import cycle_lines, request_lines, timing_lines
 
 CHAINS = journal.CHAINS_SURFACE
 QUOTES = journal.QUOTES_SURFACE
@@ -63,6 +67,8 @@ QUOTES = journal.QUOTES_SURFACE
 _WRITE_S = 0.5
 _APPEND_S = 0.25
 _STAMP_S = 0.125
+_LOAD_S = 0.0625
+_PLAN_S = 0.03125
 
 # The two load readings a test hands the cycle, distinct so a swapped pair shows.
 _LOAD_START = (1.5, 1.25, 1.0)
@@ -99,6 +105,8 @@ def _vendor(clock: ManualClock, *, chain_s: float, quote_s: float) -> _StampingV
 def timed_phases(monkeypatch):
     """Make each segment write, each manifest entry and each load reading take a known time.
 
+    A load reading takes time so a test can tell which side of it an instant was read on.
+
     Returns the clock the phases advance, which the test hands its cycle.
     """
     clock = ManualClock(start=_CLOCK_START)
@@ -116,7 +124,12 @@ def timed_phases(monkeypatch):
 
     monkeypatch.setattr(capture._CaptureCycle, "_write", timed_write)
     monkeypatch.setattr(capture, "record_partition", timed_record)
-    monkeypatch.setattr(capture, "read_load", lambda: (next(loads), None))
+
+    def timed_load():
+        clock.advance(_LOAD_S)
+        return next(loads), None
+
+    monkeypatch.setattr(capture, "read_load", timed_load)
     return clock
 
 
@@ -141,11 +154,23 @@ def _only_cycle_line(lake_root: Path) -> dict:
 # -- 1. the instants, in order ---------------------------------------------------------------
 
 
-def test_one_sequential_cycle_writes_every_instant_it_passed_through(lake_root, timed_phases):
+def test_one_sequential_cycle_writes_every_instant_it_passed_through(
+    lake_root, timed_phases, monkeypatch
+):
     clock = timed_phases
-    # Two chain windows at 3s each, then the quote batch at 1s: the last response lands at
-    # +7s. Two segments, one chain and one quote, are written after it, 0.5s each.
+    # The cycle starts, then reads the load. Two chain windows at 3s each and the quote
+    # batch at 1s follow, so the last response lands 7s after the load. Planning the quotes
+    # takes a little more, and then two segments, one chain and one quote, are written at
+    # 0.5s each.
     vendor = _vendor(clock, chain_s=3.0, quote_s=1.0)
+    plan_quotes = capture._CaptureCycle._plan_quotes
+
+    def timed_plan_quotes(self):
+        plans = plan_quotes(self)
+        clock.advance(_PLAN_S)
+        return plans
+
+    monkeypatch.setattr(capture._CaptureCycle, "_plan_quotes", timed_plan_quotes)
 
     _run(vendor, clock, lake_root)
 
@@ -153,14 +178,19 @@ def test_one_sequential_cycle_writes_every_instant_it_passed_through(lake_root, 
     assert line["v"] == 1
     assert line["kind"] == "cycle"
     assert line["snap_ts"] == _SNAP.isoformat()
+    # Read before the load, so it is the instant the segment stamp uses.
     assert line["cycle_start_ts"] == _at(0)
-    assert line["fetch_end_ts"] == _at(7)
-    assert line["segments_durable_ts"] == _at(8)
+    # The response's own end, so planning after it counts in the tail, not the fetch.
+    fetched = _LOAD_S + 7
+    assert line["fetch_end_ts"] == _at(fetched)
+    durable = fetched + _PLAN_S + 2 * _WRITE_S
+    assert line["segments_durable_ts"] == _at(durable)
     # Nothing else holds the lock, so the wait is nil, and the hold is one entry a segment.
-    assert line["lock_acquired_ts"] == _at(8)
-    assert line["lock_released_ts"] == _at(8.5)
-    # The stamp runs after the append, inside the cycle, and the line's end follows it.
-    assert line["cycle_end_ts"] == _at(8.625)
+    assert line["lock_acquired_ts"] == _at(durable)
+    assert line["lock_released_ts"] == _at(durable + 2 * _APPEND_S)
+    # The stamp runs after the append, inside the cycle, and the closing load after it. The
+    # end is read last.
+    assert line["cycle_end_ts"] == _at(durable + 2 * _APPEND_S + _STAMP_S + _LOAD_S)
     assert line["loadavg_start"] == list(_LOAD_START)
     assert line["loadavg_end"] == list(_LOAD_END)
     assert line["cycle_failure"] is None
@@ -185,14 +215,15 @@ def test_a_concurrent_cycle_writes_its_line_with_the_landing_inside_the_fetch(
     line = _only_cycle_line(lake_root)
     fetch_end = datetime.fromisoformat(line["fetch_end_ts"])
     durable = datetime.fromisoformat(line["segments_durable_ts"])
-    # The first unit to land did so at the start, so the last unit's response came no later
-    # than one write in, and its own write followed it.
-    assert fetch_end <= _CLOCK_START + timedelta(seconds=_WRITE_S)
-    assert durable == _CLOCK_START + timedelta(seconds=2 * _WRITE_S)
+    # The first unit to land did so just after the load, so the last unit's response came
+    # no later than one write in, and its own write followed it.
+    assert fetch_end <= _CLOCK_START + timedelta(seconds=_LOAD_S + _WRITE_S)
+    landed = _LOAD_S + 2 * _WRITE_S
+    assert durable == _CLOCK_START + timedelta(seconds=landed)
     assert durable - fetch_end >= timedelta(seconds=_WRITE_S)
-    assert line["lock_acquired_ts"] == _at(1.0)
-    assert line["lock_released_ts"] == _at(1.5)
-    assert line["cycle_end_ts"] == _at(1.625)
+    assert line["lock_acquired_ts"] == _at(landed)
+    assert line["lock_released_ts"] == _at(landed + 2 * _APPEND_S)
+    assert line["cycle_end_ts"] == _at(landed + 2 * _APPEND_S + _STAMP_S + _LOAD_S)
 
 
 def test_a_cycle_with_nothing_to_fetch_still_writes_its_line(lake_root, timed_phases):
@@ -201,8 +232,8 @@ def test_a_cycle_with_nothing_to_fetch_still_writes_its_line(lake_root, timed_ph
 
     line = _only_cycle_line(lake_root)
     assert line["fetch_end_ts"] is None
-    assert line["segments_durable_ts"] == _at(0)
-    assert line["lock_released_ts"] == _at(0)
+    assert line["segments_durable_ts"] == _at(_LOAD_S)
+    assert line["lock_released_ts"] == _at(_LOAD_S)
 
 
 # -- 2. the latest unit, written or not ------------------------------------------------------
@@ -224,12 +255,57 @@ def test_fetch_end_is_the_latest_units_even_when_its_segment_fails_to_write(
     result = _run(_vendor(clock, chain_s=3.0, quote_s=1.0), clock, lake_root)
 
     assert [(e.surface, e.ticker) for e in result.errors] == [(QUOTES, "SPY")]
-    # The quote batch answered last, at +7s. Its segment never landed, and its response
-    # still ends the fetch.
-    assert _only_cycle_line(lake_root)["fetch_end_ts"] == _at(7)
+    # The quote batch answered last, 7s after the load. Its segment never landed, and its
+    # response still ends the fetch.
+    assert _only_cycle_line(lake_root)["fetch_end_ts"] == _at(_LOAD_S + 7)
 
 
-# -- 3. a lock another process holds ---------------------------------------------------------
+class _LatestFirstClock(SystemClock):
+    """A system clock whose wait hands back every task at once, the latest finisher first.
+
+    ``Clock.wait`` returns a set, so units found done together land in no promised order.
+    This fixes the order that would mislead a line keeping the last unit to land.
+    """
+
+    def wait(self, futures, until):
+        futures_wait(futures)
+        return sorted(futures, key=lambda f: f.result().finished_at, reverse=True)
+
+
+class _SlowQuotesVendor:
+    """Instant chains and a quote batch that takes real time, so the quotes answer last."""
+
+    def get_chain(self, symbol, *, from_date=None, to_date=None, strike_count=None):
+        return VendorResponse(200, _chain_body([(from_date + timedelta(days=4)).isoformat()]))
+
+    def get_quotes(self, symbols):
+        time.sleep(0.3)
+        return VendorResponse(200, _QUOTE_BODY)
+
+    def token_mint_time(self):
+        return datetime(2026, 8, 23, tzinfo=UTC)
+
+
+def test_fetch_end_is_the_latest_units_whatever_order_the_units_land_in(lake_root):
+    # The quote batch answers last and lands first. The chains land after it, and the line
+    # still ends the fetch at the quotes.
+    capture.run_cycle(
+        _LatestFirstClock(),
+        _SlowQuotesVendor(),
+        _ROSTER,
+        lake_root,
+        pid=4242,
+        plan=TWO_WINDOWS,
+        guards=GuardConstants(capture_max_concurrency=20, capture_stagger_ms=0),
+    )
+
+    path = timing_path(lake_root, datetime.now(UTC).date())
+    (quotes,) = [line for line in request_lines(path) if line["surface"] == QUOTES]
+    (line,) = cycle_lines(path)
+    assert line["fetch_end_ts"] >= quotes["request_end_ts"]
+
+
+# -- 3. a lock another holder holds ----------------------------------------------------------
 
 _HOLD_S = 0.6
 
@@ -255,23 +331,47 @@ class _InstantVendor:
         return datetime(2026, 8, 23, tzinfo=UTC)
 
 
-def test_a_lock_another_process_holds_shows_as_the_wait(lake_root):
-    path = manifest_path(lake_root)
+def _hold_in_a_process(lake_root: Path):
+    """Hold the lake-root lock from another process, and return a wait for it to finish."""
     holder = subprocess.Popen(
-        [sys.executable, "-c", _HOLDER, str(path), str(_HOLD_S)],
+        [sys.executable, "-c", _HOLDER, str(manifest_path(lake_root)), str(_HOLD_S)],
         stdout=subprocess.PIPE,
         text=True,
     )
+    assert holder.stdout is not None
+    assert holder.stdout.readline().strip() == "held"
+    return lambda: holder.wait(timeout=10)
+
+
+def _hold_in_a_thread(lake_root: Path):
+    """Hold the lock from another thread of this process, the way an earlier cycle does."""
+    held = threading.Event()
+
+    def hold():
+        with lake_lock(lake_root):
+            held.set()
+            time.sleep(_HOLD_S)
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    assert held.wait(timeout=10)
+    return lambda: thread.join(timeout=10)
+
+
+@pytest.mark.parametrize("hold", [_hold_in_a_process, _hold_in_a_thread], ids=["process", "thread"])
+def test_a_lock_another_holder_holds_shows_as_the_wait(lake_root, hold):
+    # Since cycles run on threads of their own, the likeliest holder is the previous
+    # minute's cycle in this same process. ``lake_lock`` opens its own descriptor each time,
+    # so a thread here waits on it exactly as another process would.
+    finish = hold(lake_root)
     try:
-        assert holder.stdout is not None
-        assert holder.stdout.readline().strip() == "held"
         began = time.monotonic()
         capture.run_cycle(
             SystemClock(), _InstantVendor(), _ROSTER, lake_root, pid=4242, plan=TWO_WINDOWS
         )
         elapsed = time.monotonic() - began
     finally:
-        holder.wait(timeout=10)
+        finish()
 
     line = cycle_lines(timing_path(lake_root, datetime.now(UTC).date()))[-1]
     wait = datetime.fromisoformat(line["lock_acquired_ts"]) - datetime.fromisoformat(
@@ -294,11 +394,13 @@ def test_a_cycle_line_the_file_refuses_costs_the_line_and_says_so(
     lake_root, timed_phases, monkeypatch, capsys
 ):
     clock = timed_phases
+    readings = iter([(None, "load average not read: OSError: first"), (_LOAD_END, None)])
 
     def refuse(*args, **kwargs):
         raise OSError("No space left on device")
 
     monkeypatch.setattr(capture, "append_cycle", refuse)
+    monkeypatch.setattr(capture, "read_load", lambda: next(readings))
 
     result = _run(_vendor(clock, chain_s=3.0, quote_s=1.0), clock, lake_root)
 
@@ -307,9 +409,11 @@ def test_a_cycle_line_the_file_refuses_costs_the_line_and_says_so(
         (QUOTES, journal.ROW_KIND_DATA),
     }
     assert cycle_lines(timing_path(lake_root, SESSION)) == []
+    # Each failure says so once, the refused write and the field it could not read alike.
     err = capsys.readouterr().err
     assert err.count("capture: cycle timing not written for") == 1
     assert "No space left on device" in err
+    assert err.count("capture: cycle timing incomplete for") == 1
 
 
 def test_a_load_average_that_cannot_be_read_costs_its_field_not_the_minute(
@@ -336,6 +440,47 @@ def test_a_load_average_that_cannot_be_read_costs_its_field_not_the_minute(
     assert line["loadavg_end"] == list(_LOAD_END)
     assert line["cycle_failure"] == "load average not read: OSError: load unobtainable"
     assert capsys.readouterr().err.count("capture: cycle timing incomplete for") == 1
+
+
+def test_two_load_readings_that_fail_are_both_named_in_order(
+    lake_root, timed_phases, monkeypatch, capsys
+):
+    clock = timed_phases
+    readings = iter([OSError("first"), OSError("second")])
+
+    def getloadavg():
+        raise next(readings)
+
+    monkeypatch.undo()
+    monkeypatch.setattr("lake.timing.os.getloadavg", getloadavg)
+
+    _run(_vendor(clock, chain_s=3.0, quote_s=1.0), clock, lake_root)
+
+    line = _only_cycle_line(lake_root)
+    assert (line["loadavg_start"], line["loadavg_end"]) == (None, None)
+    named = "load average not read: OSError: first; load average not read: OSError: second"
+    assert line["cycle_failure"] == named
+    err = capsys.readouterr().err
+    assert err.count("capture: cycle timing incomplete for") == 1
+    assert named in err
+
+
+def test_nothing_in_the_cycle_line_can_raise_out_of_a_cycle(lake_root, timed_phases, monkeypatch):
+    # The append raises something that is not an ``OSError``, both load readings fail, and
+    # stderr refuses the report. The cycle still returns with every segment landed.
+    clock = timed_phases
+
+    def broken_append(*args, **kwargs):
+        raise RuntimeError("append broke")
+
+    monkeypatch.setattr(capture, "append_cycle", broken_append)
+    monkeypatch.setattr(capture, "read_load", lambda: (None, "load average not read: x"))
+    monkeypatch.setattr(sys, "stderr", _Refusing())
+
+    result = _run(_vendor(clock, chain_s=3.0, quote_s=1.0), clock, lake_root)
+
+    assert {(s.surface, s.ticker) for s in result.segments} == {(CHAINS, "SPY"), (QUOTES, "SPY")}
+    assert not result.errors
 
 
 # -- 5. a cycle that raises ------------------------------------------------------------------
