@@ -3218,7 +3218,7 @@ def test_an_unreadable_report_is_counted_and_the_others_still_render(root: Path)
 def test_the_report_tier_findings_ride_the_panel(root: Path):
     # ``report`` is why this panel reads these files: the findings that send no message
     # of their own, which the design names as the disk runway, pmset drift and a
-    # suspected unscheduled closure. The panel renders the lines and computes none.
+    # suspected unscheduled closure. The panel renders the lines and writes none of its own.
     _file_nightly(
         root, MONDAY, report=("pmset repeat drifted",), problems=("ping failed: OSError",)
     )
