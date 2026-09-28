@@ -41,7 +41,7 @@ from lake.capture_spans import SPANS_SCHEMA_VERSION, CaptureSpan, CaptureSpans
 from lake.cassette import Cassette
 from lake.config import GuardConstants
 from lake.control_plane import EOD_SWEEP_SLUG, SUNDAY_WAKE, pmset_schedule_args
-from lake.manifest import LedgerNotUtf8, append_quarantine
+from lake.manifest import LedgerNotUtf8, append_quarantine, record_partition
 from lake.paths import CHAINS, QUOTES, REPORTS_DIR, LakePaths
 from lake.report import ACTION, INFO
 from lake.schema_versions import (
@@ -137,6 +137,7 @@ QUOTES_SCHEMA = pa.schema(
         ("ticker", pa.string()),
         ("last", pa.float64()),
         ("close_price", pa.float64()),
+        ("regular_market_last_price", pa.float64()),
         ("row_kind", pa.string()),
         ("error_class", pa.string()),
         ("close_tag", pa.string()),
@@ -146,21 +147,38 @@ QUOTES_SCHEMA = pa.schema(
 )
 
 
-def _quote_row(day: date, *, ticker: str = "SPY", row_kind: str = "data") -> dict:
-    """One quotes row at the session's equity close, carrying the settled close."""
+def _quote_row(
+    day: date, *, ticker: str = "SPY", row_kind: str = "data", close_tag: str = "spot_close"
+) -> dict:
+    """One quotes row at one of the session's two close cycles.
+
+    ``spot_close`` is the 16:00 row the dividend walk reads, and ``option_close`` is the 16:15
+    row whose ``regular_market_last_price`` a daily bar for this session is gated against
+    (marketlake #618). Both carry the captured close, and ``_session_rows`` builds the pair.
+    """
     gap = row_kind == journal.ROW_KIND_GAP
+    minute = "20:15" if close_tag == "option_close" else "20:00"
     return {
-        "snap_ts": f"{day.isoformat()}T20:00:00+00:00",
-        "fetch_ts": f"{day.isoformat()}T20:00:00.300+00:00",
+        "snap_ts": f"{day.isoformat()}T{minute}:00+00:00",
+        "fetch_ts": f"{day.isoformat()}T{minute}:00.300+00:00",
         "ticker": ticker,
         "last": None if gap else 649.0,
         "close_price": None if gap else SETTLED_CLOSE,
+        "regular_market_last_price": None if gap else SETTLED_CLOSE,
         "row_kind": row_kind,
         "error_class": "vendor_auth_error" if gap else None,
-        "close_tag": None if gap else "spot_close",
+        "close_tag": None if gap else close_tag,
         "schema_version": 1,
         "extra": None,
     }
+
+
+def _session_rows(day: date, *, ticker: str = "SPY", row_kind: str = "data") -> list[dict]:
+    """A sealed session's two close rows, 16:00 and 16:15, the way capture writes them."""
+    return [
+        _quote_row(day, ticker=ticker, row_kind=row_kind),
+        _quote_row(day, ticker=ticker, row_kind=row_kind, close_tag="option_close"),
+    ]
 
 
 def _quotes_table(rows: list[dict]) -> pa.Table:
@@ -304,8 +322,9 @@ def _lake(
     tickers: tuple[str, ...] = ("SPY",),
     instrument_ids: tuple[int, ...] = (1,),
     ledger: pa.Table | None = None,
+    judged: tuple[date, ...] = (),
 ) -> Path:
-    """A lake holding the next session's sealed quotes, the ledger, the master and the spans.
+    """A lake holding two sessions' sealed quotes, the ledger, the master and the spans.
 
     The capture spans are here so the battery at step 2.5 judges rather than reporting that it
     could not tell whether capture was running. A fixture without them exercises the wiring
@@ -315,11 +334,25 @@ def _lake(
     ``ledger`` replaces the schema-version ledger. The default records the running version,
     because a production lake has it recorded and marketlake #130 put a check for that on this
     job. A case about that check passes one that does not.
+
+    ``judged`` seals SPY's quotes and chains for each day in the shape the battery judges clean.
+    A daily bar is gated against its own session's 16:15 quote (marketlake #618), so a case that
+    lands or holds tonight's bar needs tonight's session sealed, and a partition the battery
+    quarantines would add lines the case is not about.
     """
     if quotes is None:
-        quotes = {("SPY", FOLLOWING): [_quote_row(FOLLOWING)]}
+        quotes = {("SPY", FOLLOWING): _session_rows(FOLLOWING)}
     for (ticker, day), rows in quotes.items():
         fixture_lake.with_quotes(ticker, day, _quotes_table(rows))
+    for day in judged:
+        fixture_lake.with_quotes(
+            "SPY",
+            day,
+            _judged_quotes_table(
+                [_judged_quote_row(day), _judged_quote_row(day, close_tag="option_close")]
+            ),
+        )
+        fixture_lake.with_chains("SPY", day, sample_chains_table())
     for (ticker, day), table in (chains or {}).items():
         fixture_lake.with_chains(ticker, day, table)
     fixture_lake.with_reference("schema_versions", _ledger_table() if ledger is None else ledger)
@@ -342,6 +375,19 @@ def _spans(instrument_ids: tuple[int, ...] = (1,)) -> CaptureSpans:
             for instrument_id in instrument_ids
         ]
     )
+
+
+def _seal_late(fixture_lake: FixtureLake, root: Path, day: date) -> None:
+    """Seal SPY's quotes for ``day`` after the lake was built, the way compaction does.
+
+    The partition and its manifest entry arrive together, because the manifest entry is what a
+    daily bar's wait reads (marketlake #618). ``FixtureLake.build`` would rewrite the manifest
+    from the fixture's own list and drop what the runs before this appended, so the entry is
+    appended the way a real writer appends it.
+    """
+    fixture_lake.with_quotes("SPY", day, _quotes_table(_session_rows(day)))
+    rel = LakePaths(root).partition_path(QUOTES, "SPY", day).relative_to(root).as_posix()
+    record_partition(root, rel, source="compaction", rows=2, fetched_at=None)
 
 
 def _run(
@@ -474,7 +520,7 @@ def test_a_second_run_lands_nothing_new_and_says_so(fixture_lake: FixtureLake):
     ledger already holds. A run that lands nothing and holds nothing has either done the work
     or found none, and only these numbers tell the two apart.
     """
-    root = _lake(fixture_lake)
+    root = _lake(fixture_lake, judged=(SESSION,))
     first, _, _ = _run(root)
     second, _, _ = _run(root, now=EVENING + timedelta(minutes=1))
 
@@ -661,7 +707,7 @@ def test_a_held_finding_is_the_run_working_and_still_pings(fixture_lake: Fixture
     silence the check. Here the settled close disagrees with the bar's, which the close
     cross-check holds.
     """
-    root = _lake(fixture_lake)
+    root = _lake(fixture_lake, judged=(SESSION,))
     source = _CountingVendorSource(_cassette(close=SETTLED_CLOSE * 1.05))
     outcome, pinger, transport = _run(root, vendor_source=source)
 
@@ -806,20 +852,25 @@ def test_a_sealed_reference_that_offers_no_close_is_reported_by_reason(
     # "6 NoSpotClose", and the count is the only thing separating an outage from one new
     # quarantine. A fixture with one ticker-day per reason never exercises the counting at all:
     # pinning the count to a literal 1 survived mutation against exactly such a fixture.
-    gap = [_quote_row(FOLLOWING, row_kind=journal.ROW_KIND_GAP)]
+    #
+    # A daily bar is gated against its own session's 16:15 row (marketlake #618), so the sessions
+    # that carry the reasons are the bars' own: 2026-09-14 quarantined, and 2026-09-15 and
+    # 2026-09-16 holding gap rows. 2026-09-17 is sealed so the 2026-09-16 bar's wait is over.
+    gap = _session_rows(FOLLOWING, row_kind=journal.ROW_KIND_GAP)
     quotes = {
-        ("SPY", FOLLOWING): [_quote_row(FOLLOWING)],
+        ("SPY", SESSION): _session_rows(SESSION),
+        ("SPY", FOLLOWING): gap,
         ("SPY", date(2026, 9, 16)): gap,
-        ("SPY", date(2026, 9, 17)): gap,
+        ("SPY", date(2026, 9, 17)): _session_rows(date(2026, 9, 17)),
     }
     fixture_lake.with_quarantine(
-        {"partition": f"quotes/ticker=SPY/date={FOLLOWING.isoformat()}.parquet", "verdict": "held"}
+        {"partition": f"quotes/ticker=SPY/date={SESSION.isoformat()}.parquet", "verdict": "held"}
     )
     root = _lake(fixture_lake, quotes=quotes)
     outcome, _, _ = _run(root, now=EVENING + timedelta(days=3))
 
     (line,) = [entry for entry in outcome.nightly.report if entry.startswith("bars abandoned")]
-    assert line == "bars abandoned: 3 ticker-day(s), 2 NoSpotClose, 1 PartitionQuarantined"
+    assert line == "bars abandoned: 3 ticker-day(s), 1 PartitionQuarantined, 2 SnapAbsent"
     # One reason a human can act on makes the whole line ``action`` (marketlake #530). The
     # six outage days alone are ``info``, which the operator's night below drives.
     assert kind_of(outcome.nightly, "bars abandoned") == ACTION
@@ -1007,7 +1058,7 @@ def test_the_digest_carries_counts_and_never_a_list_of_findings(fixture_lake: Fi
     and over it on the night that mattered. The per-finding detail is in the report file and
     under ``reports/withheld/``.
     """
-    root = _lake(fixture_lake)
+    root = _lake(fixture_lake, judged=(SESSION,))
     source = _CountingVendorSource(_cassette(close=SETTLED_CLOSE * 1.05))
     outcome, _, transport = _run(root, vendor_source=source)
 
@@ -1119,7 +1170,16 @@ def test_an_unreadable_reference_file_refuses_its_walks_and_keeps_the_evening(
     message because "an ``OSError`` says the filename it failed on, which is an absolute path on
     the capture machine". The refusal simply never used to arrive.
     """
-    root = _lake(fixture_lake)
+    # Tonight's quotes are sealed so the bar walk reads a quotes partition, which is what reaches
+    # the schema-version ledger. Its chains are not, so the split walk reads none and stays out of
+    # the ledger's refusal.
+    root = _lake(
+        fixture_lake,
+        quotes={
+            ("SPY", SESSION): _session_rows(SESSION),
+            ("SPY", FOLLOWING): _session_rows(FOLLOWING),
+        },
+    )
     target = root / "reference" / reference
     assert target.exists(), "the fixture stopped carrying the file this locks"
     os.chmod(target, 0o000)
@@ -1285,7 +1345,7 @@ def test_a_malformed_ledger_line_refuses_the_two_ledger_walks_and_keeps_the_even
     because landing it is what the containment is for. A tuple that refused all three would pass
     an assertion about the two ledger pieces alone and still cost the night's bars.
     """
-    root = _lake(fixture_lake)
+    root = _lake(fixture_lake, judged=(SESSION,))
     ledger = actions_path(root)
     ledger.parent.mkdir(parents=True, exist_ok=True)
     ledger.write_text(json.dumps({"instrument_id": 1, "ex_date": SESSION.isoformat()}) + "\n")
@@ -1424,7 +1484,7 @@ def test_the_disagreement_count_comes_from_the_run_not_from_tonights_withheld_di
     glob of tonight's directory would read zero while the condition is live. The count is
     taken off the walks instead.
     """
-    root = _lake(fixture_lake)
+    root = _lake(fixture_lake, judged=(SESSION,))
     source = _CountingVendorSource(_cassette(close=SETTLED_CLOSE * 1.05))
     outcome, _, _ = _run(root, vendor_source=source)
 
@@ -1528,7 +1588,7 @@ def test_a_lake_with_no_security_master_ends_each_walk_rather_than_the_run(
     that difference arrive silently, and a reader of the old sentence would have gone to the wrong
     command.
     """
-    fixture_lake.with_quotes("SPY", FOLLOWING, _quotes_table([_quote_row(FOLLOWING)]))
+    fixture_lake.with_quotes("SPY", FOLLOWING, _quotes_table(_session_rows(FOLLOWING)))
     fixture_lake.with_reference("schema_versions", _ledger_table())
     root = fixture_lake.build()
 
@@ -1554,7 +1614,7 @@ def test_the_bars_walk_names_a_missing_master_once_its_spans_are_there(
     ``SecurityMasterError``, so the tuple names their classes rather than the two names above.
     This fixture has the spans and no master, so the walk reaches the condition they cover.
     """
-    fixture_lake.with_quotes("SPY", FOLLOWING, _quotes_table([_quote_row(FOLLOWING)]))
+    fixture_lake.with_quotes("SPY", FOLLOWING, _quotes_table(_session_rows(FOLLOWING)))
     fixture_lake.with_reference("schema_versions", _ledger_table())
     fixture_lake.with_reference("capture_spans", _spans().to_table())
     root = fixture_lake.build()
@@ -1597,7 +1657,7 @@ def test_the_bar_fetch_asks_for_the_session_the_clock_is_in(fixture_lake: Fixtur
     That makes the session an assertion rather than only a precondition, and it is what the
     close guard's selector is choosing.
     """
-    root = _lake(fixture_lake)
+    root = _lake(fixture_lake, judged=(SESSION,))
     outcome, _, _ = _run(root)
     assert dict(outcome.nightly.pieces)["bars"].landed == 1
 
@@ -1690,11 +1750,11 @@ def test_the_walk_reaches_back_further_than_one_session(fixture_lake: FixtureLak
     back are never recovered. Clamping each span's start to two days before the run left the whole
     suite green, which is how that gap was found.
 
-    Here the quotes that unhold 2026-09-14's bar do not seal until three sessions later, which is
+    Here the quotes that end 2026-09-14's wait do not seal until three sessions later, which is
     the shape a repair takes: someone fixes the gap rows days after the outage. The walk has to
     still be asking about that session.
     """
-    root = _lake(fixture_lake, quotes={})
+    root = _lake(fixture_lake, quotes={}, judged=(SESSION,))
     partition = LakePaths(root).bars_partition_path("SPY", DAILY_FREQ, SESSION)
 
     first, _, _ = _run(
@@ -1703,9 +1763,9 @@ def test_the_walk_reaches_back_further_than_one_session(fixture_lake: FixtureLak
     assert dict(first.nightly.pieces)["bars"].landed == 0
     assert not partition.exists()
 
-    # Three sessions pass before anything seals the close of record SESSION is judged against.
+    # Three sessions pass before the session SESSION's bar waits for is sealed.
     late = date(2026, 9, 17)
-    fixture_lake.with_quotes("SPY", FOLLOWING, _quotes_table([_quote_row(FOLLOWING)]))
+    _seal_late(fixture_lake, root, FOLLOWING)
 
     fourth, _, _ = _run(
         root,
@@ -1737,7 +1797,7 @@ def test_a_stale_frequency_on_a_retired_ticker_does_not_withhold_the_ping(
     QQQ is retired with a frequency the seam has no call for. It has a span and a master entry, so
     the plan reaches it, which is what makes the unfiltered roster fail rather than simply skip.
     """
-    root = _lake(fixture_lake, tickers=("SPY", "QQQ"), instrument_ids=(1, 2))
+    root = _lake(fixture_lake, judged=(SESSION,), tickers=("SPY", "QQQ"), instrument_ids=(1, 2))
     roster = Roster.from_mapping(
         {
             "SPY": {"options": True, "bars": [DAILY_FREQ], "enabled": True},
@@ -1758,11 +1818,15 @@ def test_a_stale_frequency_on_a_retired_ticker_does_not_withhold_the_ping(
 def test_a_daily_bar_held_tonight_is_reached_again_tomorrow(fixture_lake: FixtureLake):
     """Marketlake #422. The defect was that nothing ever came back for a held session.
 
-    A daily bar is judged against the calendar-next session's settled close, and at 18:30 on
-    session S that session has not been captured, so every daily bar is held on the night it is
-    fetched. ``fetch_session_bars`` said that settles itself because "the next run lands the bar".
-    It did not. The next run fetched the *next* session, met the same absence for it, and nothing
-    scheduled ever asked about S again. The nightly job therefore landed no daily bar, ever.
+    A daily bar was judged against the calendar-next session's settled close, and at 18:30 on
+    session S that session has not been captured, so every daily bar was held on the night it
+    was fetched. ``fetch_session_bars`` said that settles itself because "the next run lands the
+    bar". It did not. The next run fetched the *next* session, met the same absence for it, and
+    nothing scheduled ever asked about S again. The nightly job therefore landed no daily bar,
+    ever.
+
+    Marketlake #618 moved the comparison onto the session's own 16:15 quote and kept the wait
+    for the next session's seal, so the shape this test covers is unchanged.
 
     **This is the test the old shape could not pass.** Two runs a day apart over one lake. The
     first is the night of ``SESSION`` with no quotes sealed for the session after it, so no bar
@@ -1779,11 +1843,11 @@ def test_a_daily_bar_held_tonight_is_reached_again_tomorrow(fixture_lake: Fixtur
     is what makes the skip safe: a session that is skipped tonight is a session the next run still
     walks.
     """
-    root = _lake(fixture_lake, quotes={})
+    root = _lake(fixture_lake, quotes={}, judged=(SESSION,))
     partition = LakePaths(root).bars_partition_path("SPY", DAILY_FREQ, SESSION)
 
-    # Night one, the night of SESSION. The close cross-check reads the calendar-next session's
-    # settled close, and that session has not been captured yet, so nothing is fetched for it.
+    # Night one, the night of SESSION. The bar waits for the calendar-next session to seal, and
+    # that session has not been captured yet, so nothing is fetched for it.
     first, _, _ = _run(
         root,
         now=EVENING,
@@ -1794,7 +1858,7 @@ def test_a_daily_bar_held_tonight_is_reached_again_tomorrow(fixture_lake: Fixtur
     assert not partition.exists()
 
     # FOLLOWING's quotes seal, which is what its own compaction does the next afternoon.
-    fixture_lake.with_quotes("SPY", FOLLOWING, _quotes_table([_quote_row(FOLLOWING)]))
+    _seal_late(fixture_lake, root, FOLLOWING)
 
     # Night two. Under a single-session fetch this asks only about FOLLOWING and SESSION's
     # partition stays missing forever. It has to reach back.
@@ -1886,7 +1950,7 @@ def test_a_finding_that_could_not_be_filed_reaches_the_count_and_the_exit_code(
     """
     from lake import bars as bars_module
 
-    root = _lake(fixture_lake)
+    root = _lake(fixture_lake, judged=(SESSION,))
     # Patched where it is used rather than where it is defined: ``lake.bars`` binds
     # ``write_withheld`` at import, so patching ``lake.report`` would not reach the walk.
     monkeypatch.setattr(
@@ -1933,7 +1997,7 @@ def test_a_held_findings_subject_names_the_day_its_own_file_is_keyed_on(
     ``withheld_dir`` keys the path on ``observed_on``, so a subject without it sends a
     reader to a pile with no way to pick the file out.
     """
-    root = _lake(fixture_lake)
+    root = _lake(fixture_lake, judged=(SESSION,))
     source = _CountingVendorSource(_cassette(close=SETTLED_CLOSE * 1.05))
     outcome, _, _ = _run(root, vendor_source=source)
 
@@ -2594,7 +2658,7 @@ def test_the_nightly_reports_a_run_the_request_budget_bounded(fixture_lake: Fixt
     # single ticker-day can never defer and so can never produce this line at all.
     later = EVENING + timedelta(days=3)
     walked = _walked(later.date())
-    quotes = {("SPY", day): [_quote_row(day)] for day in (*walked, walked[-1] + timedelta(days=1))}
+    quotes = {("SPY", day): _session_rows(day) for day in (*walked, walked[-1] + timedelta(days=1))}
     root = _lake(fixture_lake, quotes=quotes)
     outcome, pinger, _ = _run(
         root,
@@ -2650,7 +2714,7 @@ def test_the_nightly_reports_a_run_that_deferred_exactly_one_ticker_day(
     """
     later = EVENING + timedelta(days=3)
     walked = _walked(later.date())
-    quotes = {("SPY", day): [_quote_row(day)] for day in (*walked, walked[-1] + timedelta(days=1))}
+    quotes = {("SPY", day): _session_rows(day) for day in (*walked, walked[-1] + timedelta(days=1))}
     root = _lake(fixture_lake, quotes=quotes)
     outcome, pinger, _ = _run(
         root,
@@ -2917,15 +2981,18 @@ def test_a_damaged_manifest_ledger_is_named_and_still_ends_the_run(fixture_lake:
 # The live lake's first battery week, 2026-09-08 onward, with Labor Day kept out. The
 # 2026-09-17 nightly this reproduces walked from the span's first session, and one fake week
 # starting on ``MONDAY`` has too few sessions to hold six gated outage days and two data days.
+#
+# A daily bar is gated against its own session's 16:15 quote (marketlake #618), so the six
+# outage days are the bars' own sessions. Before that they were the six sessions after them.
 OUTAGE_WEEK = date(2026, 9, 7)
 LABOR_DAY = OUTAGE_WEEK
-OUTAGE_GATES = (
+OUTAGE_SESSIONS = (
+    date(2026, 9, 8),
     date(2026, 9, 9),
     date(2026, 9, 10),
     date(2026, 9, 11),
     date(2026, 9, 14),
     date(2026, 9, 15),
-    date(2026, 9, 16),
 )
 
 
@@ -2944,9 +3011,9 @@ JUDGED_QUOTES_SCHEMA = pa.schema(
 )
 
 
-def _judged_quote_row(day: date) -> dict:
+def _judged_quote_row(day: date, *, close_tag: str = "spot_close") -> dict:
     """``_quote_row`` with a realtime vendor stamp and an ordered bid, mark and ask."""
-    row = _quote_row(day)
+    row = _quote_row(day, close_tag=close_tag)
     return {
         **row,
         "vendor_quote_ts": row["snap_ts"],
@@ -2970,8 +3037,8 @@ def _operator_night(
 ):
     """A sweep over the lake shape the operator read on 2026-09-17 (marketlake #530).
 
-    Six daily ticker-days are gated against a sealed quotes session holding gap rows and no
-    data row, which is the outage's ``NoSpotClose``. The last two sessions carry data on both
+    Six daily ticker-days are gated against their own sealed quotes session, which holds gap rows
+    and no data row, which is the outage's ``SnapAbsent``. The last two sessions carry data on both
     surfaces, so schema drift judges the night against the day before and finds nothing, and
     every owed session has both partitions, so coverage finds nothing missing. That is the
     night's three lines: one standing fact and two checks that ran clean.
@@ -2982,15 +3049,15 @@ def _operator_night(
     """
     night = date(2026, 9, 18)
     baseline = date(2026, 9, 17)
-    sessions = [date(2026, 9, 8), *OUTAGE_GATES, baseline, night]
+    sessions = [*OUTAGE_SESSIONS, date(2026, 9, 16), baseline, night]
     for day in sessions:
         rows = (
             [_quote_row(day, row_kind=journal.ROW_KIND_GAP)]
-            if day in OUTAGE_GATES and day != close_absent
-            else [_judged_quote_row(day)]
+            if day in OUTAGE_SESSIONS and day != close_absent
+            else [_judged_quote_row(day), _judged_quote_row(day, close_tag="option_close")]
         )
         if day == close_absent:
-            rows[0]["close_price"] = None
+            rows[1]["regular_market_last_price"] = None
         fixture_lake.with_quotes("SPY", day, _judged_quotes_table(rows))
         fixture_lake.with_chains("SPY", day, sample_chains_table())
     root = _lake(fixture_lake, quotes={})
@@ -3034,7 +3101,7 @@ def test_the_operators_night_files_one_standing_fact_and_two_clean_checks(
     """
     root, outcome = _operator_night(fixture_lake)
     assert outcome.nightly.report == (
-        "bars abandoned: 6 ticker-day(s), 6 NoSpotClose",
+        "bars abandoned: 6 ticker-day(s), 6 SnapAbsent",
         "battery: schema drift judged chains against 2026-09-17, quotes against 2026-09-17, "
         "nothing drifted",
         "battery: calendar coverage, 18 owed sessions, all present",
@@ -3050,16 +3117,16 @@ def test_an_outage_line_with_a_close_value_absent_is_still_a_standing_fact(
 ):
     # ``CloseValueAbsent`` is the other reason nothing can change: the sealed partition holds
     # a data row and no usable close. Both reasons together are still ``info``.
-    _, outcome = _operator_night(fixture_lake, close_absent=OUTAGE_GATES[0])
+    _, outcome = _operator_night(fixture_lake, close_absent=OUTAGE_SESSIONS[0])
     (line,) = [entry for entry in outcome.nightly.report if entry.startswith("bars abandoned")]
-    assert line == "bars abandoned: 6 ticker-day(s), 1 CloseValueAbsent, 5 NoSpotClose"
+    assert line == "bars abandoned: 6 ticker-day(s), 1 CloseValueAbsent, 5 SnapAbsent"
     assert kind_of(outcome.nightly, "bars abandoned") == INFO
 
 
 def test_an_outage_line_with_a_lost_partition_asks_for_a_restore(fixture_lake: FixtureLake):
     # ``PartitionAbsent`` here is a manifested partition gone from disk, which a restore
     # answers, so one of them makes the line ``action``.
-    _, outcome = _operator_night(fixture_lake, lost=OUTAGE_GATES[0])
+    _, outcome = _operator_night(fixture_lake, lost=OUTAGE_SESSIONS[0])
     (line,) = [entry for entry in outcome.nightly.report if entry.startswith("bars abandoned")]
-    assert line == "bars abandoned: 6 ticker-day(s), 5 NoSpotClose, 1 PartitionAbsent"
+    assert line == "bars abandoned: 6 ticker-day(s), 1 PartitionAbsent, 5 SnapAbsent"
     assert kind_of(outcome.nightly, "bars abandoned") == ACTION

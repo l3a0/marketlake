@@ -45,6 +45,7 @@ from lake.bars import (
     CHECK_BAR_SPAN,
     CLOSE_CROSS_TOLERANCE,
     CLOSE_VALUE_ABSENT,
+    FOLLOWING_UNSEALED,
     MINUTE_EXTENDED_HOURS,
     GateSkip,
     UnsupportedBarFreq,
@@ -58,19 +59,20 @@ from lake.paths import LakePaths, temp_write_path
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
 from lake.schwab import SchwabVendor, VendorAuthError
 from lake.security_master import KIND_EQUITY, SecurityMaster, master_path
+from lake.session import SessionClock
 from lake.tickers import Roster
 from lake.vendor import DAILY_FREQ, MINUTE_FREQ, VendorError, bars_params
 from tests.conftest import CASSETTES
-from tests.support.calendar import weekday_sessions
+from tests.support.calendar import FakeCalendar, SessionTimes, weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import write_config
 from tests.support.lake import FixtureLake
 from tests.support.schwab import FakeResponse, FakeSchwabClient
 from tests.support.vendor import CassetteVendor, bars_candle, bars_interactions
 
-# The session the sweep fetches, and the one after it whose sealed quotes carry the settled
-# close the daily bar is judged against. 2026-09-14 is a Monday, so the week is an ordinary
-# one and the calendar-next session is the following day.
+# The session the sweep fetches, and the one after it whose seal the daily bar waits for.
+# 2026-09-14 is a Monday, so the week is an ordinary one and the calendar-next session is the
+# following day. The bar is judged against the session's own 16:15 quote, marketlake #618.
 SESSION = date(2026, 9, 14)
 FOLLOWING = date(2026, 9, 15)
 MONDAY = date(2026, 9, 14)
@@ -88,8 +90,10 @@ OPEN_ET = datetime.fromisoformat("2026-09-14T09:30:00-04:00")
 CLOSE_ET = datetime.fromisoformat("2026-09-14T16:00:00-04:00")
 DAY_MARGIN = timedelta(days=1)
 
-# The close the lake settled for the session, carried on the *next* session's rows. The bar's
-# own close matches it exactly here, so a test that wants a disagreement moves one of the two.
+# The session's close as the lake captured it, ``regular_market_last_price`` on its 16:15
+# ``option_close`` row. The bar's own close matches it exactly here, so a test that wants a
+# disagreement moves one of the two. The name is older than marketlake #618, which moved this
+# figure off the next session's ``close_price``.
 SETTLED_CLOSE = 650.00
 
 RECORDED_AT = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
@@ -99,11 +103,13 @@ RECORDED_AT = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
 # would move with the constant and so could never catch a tolerance widened past what it must
 # refuse, which is the whole point of having one.
 #
-# ``SETTLED_DRIFT`` is the largest drift measured between the two close cycles, QQQ's 1.13
-# basis points on 2026-09-14, and the check has to absorb it. ``PER_EVENT_DIVIDEND`` is the
-# smallest adjustment the check has to catch, QQQ's per-event dividend at 11.47 basis points
-# off the lake's own rows.
-SETTLED_DRIFT = 1.13e-4
+# ``SETTLED_DRIFT`` is the largest move the live lake has shown in a captured close after the
+# print, QQQ's 16:00 row against the vendor's close on 2026-09-21, 2.02 basis points. The 16:15
+# row the gate reads moved 0.0 on all 16 partitions that carry it, so this is the margin kept
+# for a print revised after 16:15 rather than a drift the reference carries, and the check has
+# to absorb it. ``PER_EVENT_DIVIDEND`` is the smallest adjustment the check has to catch, QQQ's
+# per-event dividend at 11.47 basis points off the lake's own rows.
+SETTLED_DRIFT = 2.02e-4
 PER_EVENT_DIVIDEND = 11.47e-4
 
 # The quotes columns the loader needs plus the one the close cross-check reads. A fixture
@@ -115,6 +121,7 @@ QUOTES_SCHEMA = pa.schema(
         ("ticker", pa.string()),
         ("last", pa.float64()),
         ("close_price", pa.float64()),
+        ("regular_market_last_price", pa.float64()),
         ("row_kind", pa.string()),
         ("error_class", pa.string()),
         ("close_tag", pa.string()),
@@ -128,17 +135,26 @@ def _quote_row(
     day: date,
     *,
     ticker: str = "SPY",
-    close_price: float | None = SETTLED_CLOSE,
-    close_tag: str | None = "spot_close",
+    captured: float | None = SETTLED_CLOSE,
+    close_price: float | None = None,
+    close_tag: str | None = "option_close",
+    minute: str = "20:15",
     row_kind: str = "data",
 ) -> dict:
-    """One quotes row at the session's equity close, carrying the settled close."""
+    """One quotes row, by default the session's 16:15 ``option_close`` row the gate reads.
+
+    ``captured`` is its ``regular_market_last_price``, which is what the gate compares against.
+    ``close_price`` is the vendor's previous-close field, which the gate no longer reads, so it
+    is ``None`` unless a test sets it to show that. ``minute`` is the UTC ``HH:MM`` of
+    ``snap_ts``, so ``20:00`` is the 16:00 ``spot_close`` row in September.
+    """
     return {
-        "snap_ts": f"{day.isoformat()}T20:00:00+00:00",
-        "fetch_ts": f"{day.isoformat()}T20:00:00.300+00:00",
+        "snap_ts": f"{day.isoformat()}T{minute}:00+00:00",
+        "fetch_ts": f"{day.isoformat()}T{minute}:00.300+00:00",
         "ticker": ticker,
         "last": 649.0,
         "close_price": close_price,
+        "regular_market_last_price": captured,
         "row_kind": row_kind,
         "error_class": None if row_kind == "data" else "vendor_auth_error",
         "close_tag": close_tag,
@@ -151,9 +167,24 @@ def _gap_row(day: date, ticker: str = "SPY") -> dict:
     """A gap row: a minute the cycle attempted and missed, every vendor column null.
 
     A day of these is what the lake's 2026-09-08 through 2026-09-11 hold from a real auth
-    outage, and it is what makes ``load_quotes`` raise ``NoSpotClose``.
+    outage, and it is what makes the gate's 16:15 read raise ``SnapAbsent``.
     """
-    return _quote_row(day, ticker=ticker, close_price=None, close_tag=None, row_kind="gap")
+    return _quote_row(day, ticker=ticker, captured=None, close_tag=None, row_kind="gap")
+
+
+def _sealed(*tickers: str, session_rows: dict[str, list[dict]] | None = None) -> dict:
+    """Each ticker's session and the session after it, both sealed.
+
+    The session carries the 16:15 row the gate reads, and the following session is only what
+    the bar waits for, so it carries an ordinary row. ``session_rows`` replaces a ticker's
+    session rows, for a test about what the gate reads.
+    """
+    session_rows = session_rows or {}
+    quotes: dict[tuple[str, date], list[dict]] = {}
+    for ticker in tickers:
+        quotes[(ticker, SESSION)] = session_rows.get(ticker, [_quote_row(SESSION, ticker=ticker)])
+        quotes[(ticker, FOLLOWING)] = [_quote_row(FOLLOWING, ticker=ticker)]
+    return quotes
 
 
 def _quotes_table(rows: list[dict]) -> pa.Table:
@@ -215,7 +246,7 @@ def _dense_minute_candles(
     carries real market data from a real account and is what ``lake.record``'s own module
     docstring keeps out of the repo.
 
-    The last candle takes the settled close so the daily cross-check has the same number to
+    The last candle takes the captured close so the daily cross-check has the same number to
     compare against, matching ``_minute_candles``.
     """
     minutes = int((end - start) / timedelta(minutes=1))
@@ -372,14 +403,14 @@ def _lake(
     master: SecurityMaster | None = None,
     bars_partitions: tuple[tuple[str, str, date, pa.Table], ...] = (),
 ) -> Path:
-    """A lake holding the next session's sealed quotes, the ledger, and the master.
+    """A lake holding the two sessions' sealed quotes, the ledger, and the master.
 
-    ``quotes`` defaults to SPY's following session carrying the settled close, which is what
-    the close cross-check reads. ``bars_partitions`` seals bars beside them, for the tests
-    about the manifested skip.
+    ``quotes`` defaults to SPY's session carrying the captured close the close cross-check
+    reads, and the following session sealed beside it. ``bars_partitions`` seals bars beside
+    them, for the tests about the manifested skip.
     """
     if quotes is None:
-        quotes = {("SPY", FOLLOWING): [_quote_row(FOLLOWING)]}
+        quotes = _sealed("SPY")
     for (ticker, day), rows in quotes.items():
         fixture_lake.with_quotes(ticker, day, _quotes_table(rows))
     for ticker, freq, day, table in bars_partitions:
@@ -572,7 +603,7 @@ def test_a_held_bar_files_again_on_the_next_run(fixture_lake: FixtureLake):
 # -- 6 and 7. the no-source rule --------------------------------------------------------
 
 
-def test_a_session_whose_quotes_have_no_spot_close_never_reaches_the_vendor(
+def test_a_session_whose_quotes_have_no_close_row_never_reaches_the_vendor(
     fixture_lake: FixtureLake,
 ):
     """#280 test 6, re-pointed by marketlake #434.
@@ -587,8 +618,9 @@ def test_a_session_whose_quotes_have_no_spot_close_never_reaches_the_vendor(
     never reaches the vendor at all. ``calls`` is what says so, and asserting on ``held`` alone
     would pass just as well with the request still going out, which is the whole defect.
 
-    It lands in ``abandoned`` because the manifest holds the following session's quotes: the
-    lake sealed them and they carry no data row, so nothing this walk can wait for changes that.
+    It lands in ``abandoned`` because the manifest holds the session's own quotes: the lake
+    sealed them and they carry no data row at 16:15, so nothing this walk can wait for changes
+    that. The gate has read the session's own 16:15 row since marketlake #618.
     ``test_the_newest_session_is_unsettled_rather_than_abandoned`` holds the other side, where
     the lake has sealed nothing yet.
 
@@ -597,17 +629,14 @@ def test_a_session_whose_quotes_have_no_spot_close_never_reaches_the_vendor(
     """
     root = _lake(
         fixture_lake,
-        quotes={
-            ("SPY", FOLLOWING): [_gap_row(FOLLOWING)],
-            ("QQQ", FOLLOWING): [_quote_row(FOLLOWING, ticker="QQQ")],
-        },
+        quotes=_sealed("SPY", "QQQ", session_rows={"SPY": [_gap_row(SESSION)]}),
         master=_master(("SPY", "QQQ")),
     )
     vendor = _RecordingVendor(_cassette(tickers=("SPY", "QQQ")))
 
     result = _run(root, vendor, roster=_roster({"SPY": ["1d"], "QQQ": ["1d"]}))
 
-    assert result.abandoned == (GateSkip("SPY", DAILY_FREQ, SESSION, "NoSpotClose"),)
+    assert result.abandoned == (GateSkip("SPY", DAILY_FREQ, SESSION, "SnapAbsent"),)
     assert result.unsettled == ()
     assert result.held == ()
     assert _findings(root) == [], "a skipped ticker-day filed a withheld finding"
@@ -626,23 +655,23 @@ def test_a_session_with_no_sealed_quotes_partition_is_contained_the_same_way(
     """#280 test 7.
 
     Tonight's session has no next partition yet, which this job's first real run meets: the
-    following session has not happened, so compaction has sealed nothing for it. The rule is
-    the same one, written once over ``LoadError``, and this is the half that can settle: tomorrow's
-    seal makes the comparison available. What lands the bar is a run that asks about this session
-    again, and this entry point never does, because it fetches the one session it is given.
+    following session has not happened, so compaction has sealed nothing for it. The bar waits
+    for that seal and reads nothing, which is ``FOLLOWING_UNSEALED``, and this is the half that
+    can settle: tomorrow's seal ends the wait. What lands the bar is a run that asks about this
+    session again, and this entry point never does, because it fetches the one session it is given.
     Marketlake #422 moved the evening run to the span walk for that reason, and
     ``test_a_daily_bar_held_tonight_is_reached_again_tomorrow`` is where the recovery is held.
     """
     root = _lake(
         fixture_lake,
-        quotes={("QQQ", FOLLOWING): [_quote_row(FOLLOWING, ticker="QQQ")]},
+        quotes=_sealed("QQQ"),
         master=_master(("SPY", "QQQ")),
     )
     vendor = _RecordingVendor(_cassette(tickers=("SPY", "QQQ")))
 
     result = _run(root, vendor, roster=_roster({"SPY": ["1d"], "QQQ": ["1d"]}))
 
-    assert result.unsettled == (GateSkip("SPY", DAILY_FREQ, SESSION, "PartitionAbsent"),)
+    assert result.unsettled == (GateSkip("SPY", DAILY_FREQ, SESSION, FOLLOWING_UNSEALED),)
     assert result.abandoned == (), "a session the lake never sealed was called abandoned"
     assert result.held == ()
     assert [call["symbol"] for call in vendor.calls] == ["QQQ"]
@@ -763,10 +792,7 @@ def test_a_vendor_auth_error_stops_the_run_before_a_later_ticker(fixture_lake: F
     """
     root = _lake(
         fixture_lake,
-        quotes={
-            ("SPY", FOLLOWING): [_quote_row(FOLLOWING)],
-            ("QQQ", FOLLOWING): [_quote_row(FOLLOWING, ticker="QQQ")],
-        },
+        quotes=_sealed("SPY", "QQQ"),
         master=_master(("SPY", "QQQ")),
     )
     vendor = _RecordingVendor(
@@ -789,10 +815,7 @@ def test_an_ordinary_vendor_failure_is_contained_to_its_ticker(fixture_lake: Fix
     """
     root = _lake(
         fixture_lake,
-        quotes={
-            ("SPY", FOLLOWING): [_quote_row(FOLLOWING)],
-            ("QQQ", FOLLOWING): [_quote_row(FOLLOWING, ticker="QQQ")],
-        },
+        quotes=_sealed("SPY", "QQQ"),
         master=_master(("SPY", "QQQ")),
     )
     vendor = _RecordingVendor(
@@ -834,10 +857,7 @@ _GATEWAY_PAGE = b"<html><body><h1>Service Unavailable</h1></body></html>"
 def _two_ticker_lake(fixture_lake: FixtureLake) -> Path:
     return _lake(
         fixture_lake,
-        quotes={
-            ("SPY", FOLLOWING): [_quote_row(FOLLOWING)],
-            ("QQQ", FOLLOWING): [_quote_row(FOLLOWING, ticker="QQQ")],
-        },
+        quotes=_sealed("SPY", "QQQ"),
         master=_master(("SPY", "QQQ")),
     )
 
@@ -1799,27 +1819,137 @@ def test_the_recorded_daily_stamps_each_name_their_own_eastern_session():
     )
 
 
-def test_the_close_is_read_off_the_next_session_rather_than_the_session_itself(
+def test_the_close_is_read_off_the_session_itself_rather_than_the_next_one(
     fixture_lake: FixtureLake,
 ):
-    """The session's own ``spot_close`` is the pre-auction book, not the closing print.
+    """Marketlake #618's ex-date case, with the live lake's own SPY 2026-09-17 figures.
 
-    Measured on the live lake, ``regular_market_last_price`` is still moving after 16:00. What
-    the lake holds settled is the next session's ``close_price``, carried on every row of it.
-    So the lake here holds both sessions and they disagree: a check reading the session's own
-    partition would compare against the wrong figure and hold a bar that agrees.
+    This test asserted the opposite until #618. The next session's ``close_price`` is the
+    previous close as the exchange republishes it, and on an ex-dividend date that is the close
+    less the dividend: SPY's 2026-09-18 rows carry 760.711166, which is 762.6 less the 1.88883
+    going ex that day. The vendor's close and the session's own 16:15 quote both read 762.6. A
+    gate reading the next session holds this bar, and one reading the session lands it.
     """
     root = _lake(
         fixture_lake,
         quotes={
-            ("SPY", SESSION): [_quote_row(SESSION, close_price=600.0)],
-            ("SPY", FOLLOWING): [_quote_row(FOLLOWING, close_price=SETTLED_CLOSE)],
+            ("SPY", SESSION): [_quote_row(SESSION, captured=762.6)],
+            ("SPY", FOLLOWING): [_quote_row(FOLLOWING, close_price=760.711166)],
         },
+    )
+
+    result = _run(
+        root, _RecordingVendor(_cassette(daily={"candles": [_daily_candle(close=762.6)]}))
+    )
+
+    assert result.held == (), "the gate compared against the dividend-adjusted previous close"
+    assert len(result.landed) == 1
+
+
+def test_the_close_is_the_regular_last_price_on_the_1615_row(fixture_lake: FixtureLake):
+    """Which row and which column, and each of the two wrong answers disagrees with the bar.
+
+    The 16:00 ``spot_close`` row is still moving: on QQQ 2026-09-14 it and the 16:15 row carry
+    the same print timestamp with prices of 709.26 and 709.18. ``last`` carries extended-hours
+    trades by 16:15, 760.73 against a 760.88 close on SPY 2026-09-14. So here the 16:00 row
+    carries 640.0, every row's ``last`` is the fixture's 649.0, and only the 16:15
+    ``regular_market_last_price`` matches the bar's 650.0. Both wrong readings are more than the
+    tolerance away, so reading either holds the bar.
+    """
+    root = _lake(
+        fixture_lake,
+        quotes=_sealed(
+            "SPY",
+            session_rows={
+                "SPY": [
+                    _quote_row(SESSION, captured=640.0, close_tag="spot_close", minute="20:00"),
+                    _quote_row(SESSION, captured=SETTLED_CLOSE),
+                ]
+            },
+        ),
     )
 
     result = _run(root, _RecordingVendor(_cassette()))
 
-    assert len(result.landed) == 1 and result.held == ()
+    assert result.held == ()
+    assert len(result.landed) == 1
+
+
+def test_a_bar_adjusted_for_a_split_is_held_even_when_the_next_session_agrees(
+    fixture_lake: FixtureLake,
+):
+    """The failure the close cross-check exists to catch, which the old reference let through.
+
+    A vendor that retroactively adjusts its history for a 2-for-1 split serves the pre-split
+    session's close halved. The next session's ``close_price`` is the previous close republished
+    on the split's ex-date, adjusted the same way, so a gate reading it agreed with the adjusted
+    bar and landed it. The session's own 16:15 quote was sealed before any adjustment existed, so
+    it disagrees by half. No split has happened in the live lake, so this is the case the fixture
+    has to supply. Marketlake #618.
+    """
+    root = _lake(
+        fixture_lake,
+        quotes={
+            ("SPY", SESSION): [_quote_row(SESSION, captured=762.6)],
+            ("SPY", FOLLOWING): [_quote_row(FOLLOWING, close_price=381.3)],
+        },
+    )
+    vendor = _RecordingVendor(_cassette(daily={"candles": [_daily_candle(close=381.3)]}))
+
+    result = _run(root, vendor)
+
+    assert result.landed == (), "a split-adjusted bar landed"
+    (held,) = result.held
+    assert held.finding.check == CHECK_BAR_CLOSE
+    assert held.finding.computed == 381.3
+    assert held.finding.against == 762.6
+    assert len(vendor.calls) == 1
+
+
+def test_the_reference_minute_is_the_option_close_the_calendar_names():
+    """The minute the gate reads comes from the session's bounds, so an early close moves it.
+
+    A regular session's option close is 16:15 Eastern, and the day after Thanksgiving closes at
+    13:00, so its option close is 13:15. 2026-11-27 is also in standard time, which is what makes
+    the Eastern conversion visible: the same instant is 18:15 in UTC.
+    """
+    early = date(2026, 11, 27)
+    calendar = FakeCalendar(
+        {
+            SESSION: SessionTimes(OPEN_ET, CLOSE_ET),
+            early: SessionTimes(
+                datetime.fromisoformat("2026-11-27T09:30:00-05:00"),
+                datetime.fromisoformat("2026-11-27T13:00:00-05:00"),
+                early_close=True,
+            ),
+        }
+    )
+    clock = SessionClock(ManualClock(FIRST_NIGHT), calendar)
+
+    assert bars._reference_minute(clock.bounds(SESSION)) == "16:15"
+    assert bars._reference_minute(clock.bounds(early)) == "13:15"
+
+
+def test_a_session_the_lake_never_sealed_waits_even_when_the_next_one_has(
+    fixture_lake: FixtureLake,
+):
+    """Which manifest entry separates waiting from giving up, after marketlake #618.
+
+    The split exists because a manifest entry is the lake's own evidence that it sealed a
+    session, and it has to be asked of the partition the gate reads. That is the session itself
+    now. Here the next session is sealed and the session is not, which is the shape a compaction
+    the machine slept through leaves, and launchd runs the missed job on the next wake. So the bar
+    is ``unsettled`` under the class the read raised, not abandoned. Asking the next session's
+    entry, as the walk did when that was the partition read, calls it a permanent loss.
+    """
+    root = _lake(fixture_lake, quotes={("SPY", FOLLOWING): [_quote_row(FOLLOWING)]})
+    vendor = _RecordingVendor(_cassette())
+
+    result = _run(root, vendor)
+
+    assert result.unsettled == (GateSkip("SPY", DAILY_FREQ, SESSION, "PartitionAbsent"),)
+    assert result.abandoned == ()
+    assert vendor.calls == []
 
 
 def test_a_daily_response_carrying_no_candle_for_the_session_lands_no_row(
@@ -1855,25 +1985,25 @@ def test_a_close_of_record_that_disagrees_is_contained_to_its_ticker(fixture_lak
 
     **This is the one marketlake #434 must not turn into a counted skip, and the assertions say
     both halves.** A disagreement is not an absent close. It says one sealed ticker-day carries
-    two ``close_price`` values, which is this lake's own corruption, and nothing else looks for
-    it: no battery check covers it and ``lake.bars`` is the only module reading the column for
-    consistency. Folded into ``abandoned`` it would have left ``Nightly.disagreements`` reading
-    zero on the night it appeared, since that count sums the pieces' held findings, and the
-    sweep's one abandoned line counts the reasons rather than naming any entry, so a class
-    appearing for the first time moves a census the reader can see.
+    two values at its reference minute, which is this lake's own corruption, and nothing else
+    looks for it: no battery check covers it and ``lake.bars`` is the only module reading the
+    column for consistency. Folded into ``abandoned`` it would have left
+    ``Nightly.disagreements`` reading zero on the night it appeared, since that count sums the
+    pieces' held findings, and the sweep's one abandoned line counts the reasons rather than
+    naming any entry, so a class appearing for the first time moves a census the reader can see.
 
     The request is still saved, which is all #434 asked for. A gate whose reference is ambiguous
     cannot pass either, so the finding is filed without a fetch.
     """
     root = _lake(
         fixture_lake,
-        quotes={
-            ("SPY", FOLLOWING): [
-                _quote_row(FOLLOWING, close_price=650.0),
-                _quote_row(FOLLOWING, close_price=650.01),
-            ],
-            ("QQQ", FOLLOWING): [_quote_row(FOLLOWING, ticker="QQQ")],
-        },
+        quotes=_sealed(
+            "SPY",
+            "QQQ",
+            session_rows={
+                "SPY": [_quote_row(SESSION, captured=650.0), _quote_row(SESSION, captured=650.01)]
+            },
+        ),
         master=_master(("SPY", "QQQ")),
     )
 
@@ -1899,19 +2029,19 @@ def test_a_close_of_record_that_disagrees_is_contained_to_its_ticker(fixture_lak
 def test_a_null_or_nan_close_is_an_absence_rather_than_a_disagreement(fixture_lake: FixtureLake):
     """A null is not a competing answer, and a NaN is not a figure.
 
-    A partition sealed before ``close_price`` carried a value would otherwise read as a
+    A partition sealed before the reference column carried a value would otherwise read as a
     disagreement with the one row that does carry it. A NaN never equals itself, so two rows
     carrying one would read as two answers. Either way the comparison is left with no number
     and the bar is held for a missing input, which is what a missing column already gives.
     """
     root = _lake(
         fixture_lake,
-        quotes={
-            ("SPY", FOLLOWING): [
-                _quote_row(FOLLOWING, close_price=None),
-                _quote_row(FOLLOWING, close_price=SETTLED_CLOSE),
-            ]
-        },
+        quotes=_sealed(
+            "SPY",
+            session_rows={
+                "SPY": [_quote_row(SESSION, captured=None), _quote_row(SESSION, captured=650.0)]
+            },
+        ),
     )
 
     result = _run(root, _RecordingVendor(_cassette()))
@@ -1921,12 +2051,15 @@ def test_a_null_or_nan_close_is_an_absence_rather_than_a_disagreement(fixture_la
 
     nan_root = _lake(
         FixtureLake(root.parent / "nanlake"),
-        quotes={
-            ("SPY", FOLLOWING): [
-                _quote_row(FOLLOWING, close_price=float("nan")),
-                _quote_row(FOLLOWING, close_price=float("nan")),
-            ]
-        },
+        quotes=_sealed(
+            "SPY",
+            session_rows={
+                "SPY": [
+                    _quote_row(SESSION, captured=float("nan")),
+                    _quote_row(SESSION, captured=float("nan")),
+                ]
+            },
+        ),
     )
     nan_vendor = _RecordingVendor(_cassette())
     nan_result = _run(nan_root, nan_vendor)
@@ -1972,10 +2105,7 @@ def test_a_retyped_candle_field_is_contained_to_its_ticker(fixture_lake: Fixture
     """
     root = _lake(
         fixture_lake,
-        quotes={
-            ("SPY", FOLLOWING): [_quote_row(FOLLOWING)],
-            ("QQQ", FOLLOWING): [_quote_row(FOLLOWING, ticker="QQQ")],
-        },
+        quotes=_sealed("SPY", "QQQ"),
         master=_master(("SPY", "QQQ")),
     )
     retyped = dict(_daily_candle(), volume="70000000")
@@ -2574,10 +2704,7 @@ def test_an_ambiguous_symbol_is_contained_and_files_the_instruments_it_found(
         )
     root = _lake(
         fixture_lake,
-        quotes={
-            ("SPY", FOLLOWING): [_quote_row(FOLLOWING)],
-            ("QQQ", FOLLOWING): [_quote_row(FOLLOWING, ticker="QQQ")],
-        },
+        quotes=_sealed("SPY", "QQQ"),
         master=master,
     )
 
@@ -2597,7 +2724,7 @@ def test_an_ambiguous_symbol_is_contained_and_files_the_instruments_it_found(
     assert "QQQ" in [landed.ticker for landed in result.landed]
 
 
-def test_a_quotes_partition_with_no_close_price_column_is_an_absence(fixture_lake: FixtureLake):
+def test_a_quotes_partition_with_no_reference_column_is_an_absence(fixture_lake: FixtureLake):
     """A session sealed before the column existed skips the bar rather than ending the run.
 
     Reading the column anyway raises ``KeyError``, which the walk's catch does not name, so one
@@ -2610,14 +2737,15 @@ def test_a_quotes_partition_with_no_close_price_column_is_an_absence(fixture_lak
         [
             (name, QUOTES_SCHEMA.field(name).type)
             for name in QUOTES_SCHEMA.names
-            if name != "close_price"
+            if name != "regular_market_last_price"
         ]
     )
-    rows = [{k: v for k, v in _quote_row(FOLLOWING).items() if k != "close_price"}]
-    table = pa.table(
-        {name: [row.get(name) for row in rows] for name in schema.names}, schema=schema
-    )
-    fixture_lake.with_quotes("SPY", FOLLOWING, table)
+    for day in (SESSION, FOLLOWING):
+        rows = [{k: v for k, v in _quote_row(day).items() if k != "regular_market_last_price"}]
+        table = pa.table(
+            {name: [row.get(name) for row in rows] for name in schema.names}, schema=schema
+        )
+        fixture_lake.with_quotes("SPY", day, table)
     fixture_lake.with_reference("schema_versions", _ledger_table())
     root = fixture_lake.build()
     _master().write(master_path(root))
@@ -2932,22 +3060,22 @@ def test_a_candle_stamped_exactly_at_the_window_end_is_counted_outside_the_brack
     assert bars.session_of(minute.end.isoformat()) == minute.session
 
 
-def test_a_minute_partition_consults_no_settled_close(fixture_lake: FixtureLake, monkeypatch):
+def test_a_minute_partition_consults_no_captured_close(fixture_lake: FixtureLake, monkeypatch):
     """The close cross-check speaks to ``1d`` alone, and this is what says so.
 
     A single minute has no closing-auction print, so comparing one against the session's
-    settled close would judge it on a figure that does not describe it. Nothing else in the
+    captured close would judge it on a figure that does not describe it. Nothing else in the
     suite would notice the gate running on both frequencies.
     """
     root = _lake(fixture_lake)
     calls: list = []
-    real = bars._settled_close
+    real = bars._captured_close
 
-    def spy(lake_root, ticker, session, following):
+    def spy(lake_root, ticker, session, minute):
         calls.append((ticker, session))
-        return real(lake_root, ticker, session, following)
+        return real(lake_root, ticker, session, minute)
 
-    monkeypatch.setattr(bars, "_settled_close", spy)
+    monkeypatch.setattr(bars, "_captured_close", spy)
 
     result = _run(root, _RecordingVendor(_cassette()), roster=_roster({"SPY": ["1m"]}))
 
@@ -3034,14 +3162,14 @@ def test_the_fetch_stamps_are_the_two_ends_of_the_vendor_call(fixture_lake: Fixt
 
 
 def test_a_session_the_calendar_cannot_follow_holds_the_bar(fixture_lake: FixtureLake):
-    """The last session a calendar knows about has no next partition to be judged against.
+    """The last session a calendar knows about has no next session for its bar to wait for.
 
     A real calendar always has one, so this is the branch nothing reaches in production and
     everything reaches on a fake. It still has to hold rather than land ungated, because
     gate-before-land is the whole shape.
 
     **Marketlake #434's gate precondition deliberately passes this one through.** It needs a
-    following session to read a reference against, so it cannot answer here, and the answer is a
+    following session whose seal the bar waits for, so it cannot answer here, and the answer is a
     guard rather than a fourth outcome: this records the calendar being wrong rather than the
     lake having no data, which is a held finding's job. The request is still spent, on a path
     ``_calendar_next_session`` says a real calendar never produces, and the assertions below say
@@ -3124,10 +3252,7 @@ def test_the_report_renders_a_run_that_both_landed_and_held(fixture_lake: Fixtur
     """
     root = _lake(
         fixture_lake,
-        quotes={
-            ("QQQ", FOLLOWING): [_quote_row(FOLLOWING, ticker="QQQ")],
-            ("XLF", FOLLOWING): [_quote_row(FOLLOWING, ticker="XLF")],
-        },
+        quotes=_sealed("QQQ", "XLF"),
         master=_master(("SPY", "QQQ", "XLF")),
     )
 
@@ -3144,7 +3269,7 @@ def test_the_report_renders_a_run_that_both_landed_and_held(fixture_lake: Fixtur
     assert result.attempted == 2, "a ticker-day skipped at the gate was counted attempted"
     assert "VendorError" in rendered, "a finding with no pair rendered no detail"
     assert "unsettled: 1" in rendered and "abandoned: 0" in rendered
-    assert f"    - SPY 1d {SESSION.isoformat()}: PartitionAbsent" in rendered
+    assert f"    - SPY 1d {SESSION.isoformat()}: {FOLLOWING_UNSEALED}" in rendered
     assert "QQQ 1d" in rendered
     assert "filed at" in rendered
 

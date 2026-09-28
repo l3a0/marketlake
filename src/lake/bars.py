@@ -15,15 +15,17 @@ tonight is re-fetchable tomorrow while a chain snapshot missed at 10:31 is gone.
 Run it with ``python -m lake.bars`` to fetch by hand. ``lake.sweep`` is what schedules it: its
 18:30 weekday job calls :func:`backfill_bars`, walking every session the capture spans still hold
 unlanded rather than the one its clock sits on. Marketlake #422 made that swap, because a daily
-bar is judged against the *next* session's settled close and so cannot pass its own gate on the
-night it is fetched.
+bar is fetched only once the *next* session has sealed, so it is never judged on the night of its
+own session. Marketlake #618 kept that wait and moved what the bar is judged against onto the
+session's own 16:15 quote, which :func:`_captured_close` carries.
 
 What one run does, per ticker and per configured frequency, for one session.
 
 1. Skip the ticker-day whose bars partition the manifest already records. A second run lands
    nothing and says so.
-2. On ``1d``, read the close of record the gate would compare against, and skip the ticker-day
-   that has none rather than spending a request on a gate that cannot pass. Marketlake #434.
+2. On ``1d``, wait for the next session to seal, then read the close the gate would compare
+   against, and skip the ticker-day that has none rather than spending a request on a gate that
+   cannot pass. Marketlake #434.
 3. Fetch the window this module names for that frequency, outside the lake lock.
 4. Build the rows, dropping any candle whose stamp the epoch transform refuses and, on
    ``1d``, any candle belonging to another session.
@@ -153,10 +155,10 @@ from lake.extra_projection import ExtraProjectionError
 from lake.journal import UNFIT_ERRORS, bars_data_batch, bars_rows
 from lake.loader import (
     LoadError,
-    NoSpotClose,
     PartialRead,
     PartitionAbsent,
     PartitionQuarantined,
+    SnapAbsent,
     load_quotes,
 )
 from lake.lock import lake_lock
@@ -244,26 +246,36 @@ MINUTE_EXTENDED_HOURS = False
 # the bar is held out. It is relative, like the sibling's dividend tolerance, and measured
 # from the live lake rather than guessed.
 #
-# The floor is the drift the check has to absorb: the lake's own quotes are still moving after
-# 16:00, by 0.66 basis points on SPY and 1.13 on QQQ between the ``spot_close`` and
-# ``option_close`` cycles on 2026-09-14 and 2026-09-15. That is a lower bound, because capture
-# stops at 16:15 and the closing print can settle later.
-#
 # The ceiling is the smallest adjustment the check has to catch, which is one dividend: the
-# lake's own rows put the per-event figure at 25.13 basis points for SPY and 11.47 for QQQ. So
-# the narrower window is QQQ's, 1.13 to 11.47, and it is ten times wide.
+# lake's own rows put the per-event figure at 25.13 basis points for SPY and 11.47 for QQQ. Five
+# basis points refuses anything above half of the smallest of them.
 #
-# Five basis points sits inside it with room at both ends. It absorbs four times the largest
-# drift measured, which leaves margin for a print that settles later than capture watched, and
-# it refuses anything above half of the smallest per-event dividend.
+# The floor is the drift the reference carries, and marketlake #618 changed which reference that
+# is. The 16:00 ``spot_close`` row is still moving: it differs from the vendor's close by up to
+# 2.02 basis points on the live lake, QQQ on 2026-09-21. The 16:15 ``option_close`` row, which
+# :func:`_captured_close` reads now, equalled the vendor's close to the cent on all 16 daily
+# partitions that carry it. So five basis points is margin for a closing print revised after
+# 16:15, which nothing has shown yet, rather than room for a drift that was measured. Narrowing it
+# is a separate choice with no evidence behind it.
 CLOSE_CROSS_TOLERANCE = 5e-4
 
-# The reason an abandoned ticker-day carries when the close-of-record read produced no number
-# and raised nothing at all. ``_settled_close`` returns ``None`` two ways, on a partition sealed
-# before ``close_price`` existed and on one whose every value in that column is null or NaN, and
-# neither is an exception with a class name to record. The other reasons are class names, so this
-# is spelled like one rather than as a sentence.
+# The reason an abandoned ticker-day carries when the reference read produced no number and
+# raised nothing at all. ``_captured_close`` returns ``None`` two ways, on a partition sealed
+# before ``regular_market_last_price`` existed and on one whose every value in that column at the
+# reference minute is null or NaN, and neither is an exception with a class name to record. The
+# other reasons are class names, so this is spelled like one rather than as a sentence.
 CLOSE_VALUE_ABSENT = "CloseValueAbsent"
+
+# The reason an unsettled ticker-day carries while the next session has not sealed. It is the one
+# gate skip that reads nothing, because the wait is decided off the manifest the walk already
+# holds, so there is no exception to name and it is spelled like one for the reason
+# ``CLOSE_VALUE_ABSENT`` gives. Marketlake #618.
+FOLLOWING_UNSEALED = "FollowingUnsealed"
+
+# The column the gate compares the vendor's close against, on the session's own ``option_close``
+# row. Not ``last``, which carries extended-hours trades by 16:15: 760.73 against a 760.88 close
+# on SPY 2026-09-14. Marketlake #618 carries the measurement.
+REFERENCE_COLUMN = "regular_market_last_price"
 
 # How far past a session the calendar-next search looks. It matches ``oi``'s bound rather
 # than being chosen again: that module and ``control_plane`` already disagree, 30 against 14,
@@ -278,12 +290,13 @@ class BarsError(Exception):
 
 
 class CloseOfRecordDisagrees(BarsError):
-    """The rows of a session's close of record do not agree about ``close_price``.
+    """The rows at a session's reference minute do not agree about the close.
 
-    The close of record is one cycle, which the loader enforces, and it is still more than one
-    row when the partition holds two spellings of that one instant. Those rows have to agree
-    about the close, and a disagreement raises rather than taking the first one, because taking
-    the first lets the file's own row order decide what a bar is judged against, silently.
+    The reference is one cycle, the session's 16:15 ``option_close`` row, and it is still more
+    than one row when the partition holds two spellings of that one instant. Those rows have to
+    agree about ``REFERENCE_COLUMN``, and a disagreement raises rather than taking the first one,
+    because taking the first lets the file's own row order decide what a bar is judged against,
+    silently.
 
     It is a ``BarsError`` rather than a bare ``ValueError`` so the walk can contain it to its
     own ticker-day, which it does around the gate-close read rather than around the fetch, since
@@ -296,7 +309,7 @@ class CloseOfRecordDisagrees(BarsError):
 
     def __init__(self, ticker: str, day: date, values: set[float]) -> None:
         super().__init__(
-            f"the {day.isoformat()} close of record disagrees about close_price for "
+            f"the {day.isoformat()} close of record disagrees about {REFERENCE_COLUMN} for "
             f"{ticker}, among {sorted(str(value) for value in values)}"
         )
         self.ticker = ticker
@@ -463,10 +476,10 @@ class SpanCoverage:
 class CloseCross:
     """What the close cross-check compared, and whether the two agreed.
 
-    ``computed`` is the bar's own close and ``against`` is the close the lake settled for that
-    session out of its own captured quotes. Either is ``None`` when the comparison had no such
-    number, and a check missing an input has not agreed, which is what makes a partial payload
-    a held bar rather than a silent one.
+    ``computed`` is the bar's own close and ``against`` is the session's own close as the lake
+    captured it, the 16:15 quote :func:`_captured_close` reads. Either is ``None`` when the
+    comparison had no such number, and a check missing an input has not agreed, which is what
+    makes a partial payload a held bar rather than a silent one.
     """
 
     agrees: bool
@@ -763,7 +776,7 @@ def check_close_cross(
 
     1. A comparison missing either number has nothing to compare, so it does not agree. That
        is what makes a bar with no readable close a held bar rather than a silent one.
-    2. A settled close of zero has no relative scale, so the two agree only when the bar's own
+    2. A reference close of zero has no relative scale, so the two agree only when the bar's own
        close is zero too. No equity prints a zero close, and a division that returned "agrees"
        for every bar against a zeroed reference is the one failure nobody would notice.
     """
@@ -880,17 +893,18 @@ class BarsReport:
     either done the work already or found nothing to walk, and only this tells the two apart.
     ``ExtractionReport.unchanged`` is the same number one surface over.
 
-    ``unsettled`` and ``abandoned`` are the daily ticker-days the walk did not fetch because
-    their gate had no close of record, and :class:`BackfillReport` carries the same two under
-    the same names. They are on both because :func:`_render_gate_skips` renders both, which is
-    :func:`_render_held`'s argument one field over: the two reports say the same thing about a
-    ticker-day the gate could not reach, and a second copy is how the two drift.
+    ``unsettled`` and ``abandoned`` are the daily ticker-days the walk did not fetch, because
+    their gate could not be judged yet or had no close of record, and :class:`BackfillReport`
+    carries the same two under the same names. They are on both because
+    :func:`_render_gate_skips` renders both, which is :func:`_render_held`'s argument one field
+    over: the two reports say the same thing about a ticker-day the gate could not reach, and a
+    second copy is how the two drift.
     ``sweep._bars_outcome`` reads neither, because a bars-only count has no place beside the
     values all three walks share.
 
     **This command meets ``unsettled`` on every daily run, which is the shape rather than a
-    fault.** It fetches the session the clock is in, and that session's bar is gated against the
-    next session's settled close, which has not been captured yet. So the daily half is skipped
+    fault.** It fetches the session the clock is in, and that session's bar waits for the next
+    session to seal, which has not been captured yet. So the daily half is skipped
     here and lands on the next :func:`backfill_bars` run, which is where marketlake #422 already
     moved the evening job. What changes is that the skip costs no request and files no finding.
 
@@ -1054,38 +1068,59 @@ def _finding(
     )
 
 
-def _settled_close(lake_root: Path, ticker: str, session: date, following: date) -> float | None:
-    """The close the lake settled for ``session``, read out of its own captured quotes.
+def _reference_minute(bounds: SessionBounds) -> str:
+    """The Eastern wall-clock minute of the session's ``option_close`` cycle, as ``HH:MM``.
 
-    **The obvious source is the one the design rules out.** ``load_quotes`` with no snap
-    returns the session's own ``spot_close`` cycle, and that is the pre-auction book rather
-    than the closing print: measured on the live lake, ``regular_market_last_price`` is still
-    moving after 16:00, by 0.66 basis points on SPY and 1.13 on QQQ between the two close
-    cycles. What the lake holds settled is the *next* session's ``close_price``, carried on
-    every row of it: 2026-09-15 reads 709.18 for QQQ, matching 2026-09-14's last reading
-    rather than its ``spot_close`` one, and 760.88 for SPY, matching 2026-09-14's
-    ``spot_close`` exactly. So the drift is per-ticker and sometimes zero, and the settled
-    figure is the one to compare against.
+    It comes from ``SessionBounds`` rather than being spelled, so an early-close session reads
+    13:15 without a second calendar rule here. ``load_quotes`` resolves a ``snap`` against the
+    Eastern date and minute of ``snap_ts``, which is the spelling this produces.
+    """
+    return bounds.option_close.astimezone(MARKET_TZ).strftime("%H:%M")
 
-    ``following`` is the calendar-next session, never the next session that happens to hold
-    data. ``oi.py`` decided that already and refuses to read past a session holding nothing,
-    because the figure it would find settled after some later session's trading and belongs to
-    somebody else. A bar compared against such a close is the same error.
+
+def _captured_close(lake_root: Path, ticker: str, session: date, minute: str) -> float | None:
+    """The session's own close as the lake captured it, the 16:15 quote's last regular trade.
+
+    That is ``REFERENCE_COLUMN`` on the session's ``option_close`` row, read at ``minute``, which
+    the caller takes from :func:`_reference_minute`.
+
+    **This used to read the next session's ``close_price``, and marketlake #618 measured why it
+    cannot.** On an ex-dividend date that field is the previous close less the dividend, the
+    adjusted figure exchanges publish so the day's net change reads correctly. SPY's 2026-09-18
+    rows carry 760.711166, which is 2026-09-17's 762.6 less the 1.88883 dividend going ex that
+    day. So the reference moved by the dividend on exactly the day the check exists to watch: it
+    held both bars before the lake's two ex-dates, and on a split it would have agreed with a
+    retroactively adjusted bar and landed it. That field matched the vendor's close on 16 of 18
+    daily partitions on the live lake and missed exactly those two.
+
+    **The docstring this replaces ruled the session's own quotes out, and its reason was about
+    the 16:00 row alone.** ``load_quotes`` with no snap returns the ``spot_close`` cycle, and that
+    row is still moving: it differs from the vendor's close by up to 2.02 basis points on the
+    live lake, and on QQQ 2026-09-14 it and the 16:15 row carry the same print timestamp,
+    16:00:00.081, with prices of 709.26 and 709.18. The print was revised in place, and only
+    the 16:15 row saw it. The 16:15 row equalled the vendor's close to the cent on all 16 daily
+    partitions that carry it, both ex-date bars included.
+
+    **The read is a minute read rather than the loader's close of record**, because
+    ``load_quotes``' close of record is ``spot_close`` by design and every other reader of it
+    would move if that changed. ``loader._at_close`` reads a close "by tag and never by clock",
+    which is that door's rule for its own close. The minute here is the calendar's, through
+    ``SessionBounds``, rather than a clock reading.
 
     The read goes through the loader, so the quarantine guard and the overflow projection are
     asked rather than skipped by a second path that would then keep skipping them forever.
 
-    A close of record whose rows disagree about ``close_price`` raises rather than taking the
-    first, because taking the first lets the file's own row order decide what the bar is
-    judged against, silently.
+    Rows at the minute that disagree about the column raise rather than taking the first,
+    because taking the first lets the file's own row order decide what the bar is judged
+    against, silently.
 
     **What becomes of each refusal is :func:`_gate_close`'s, and it does not treat them alike.**
     The four that say this session cannot be read become a counted skip. Everything else, a
     disagreement included, is filed as a held finding, because it says the lake's own files
     contradict their writers rather than that a bar has no reference.
     """
-    table = load_quotes(ticker, following, lake_root=lake_root)
-    if "close_price" not in table.column_names:
+    table = load_quotes(ticker, session, snap=minute, lake_root=lake_root)
+    if REFERENCE_COLUMN not in table.column_names:
         # A session sealed before the column existed has no figure to compare against, which
         # is an absence rather than an error. Reading the column anyway would raise
         # ``KeyError``, which the walk's catch does not name, so one old partition would end
@@ -1103,11 +1138,11 @@ def _settled_close(lake_root: Path, ticker: str, session: date, following: date)
     # second number in it.
     values = {
         value
-        for value in table.column("close_price").to_pylist()
+        for value in table.column(REFERENCE_COLUMN).to_pylist()
         if value is not None and value == value
     }
     if len(values) > 1:
-        raise CloseOfRecordDisagrees(ticker, following, values)
+        raise CloseOfRecordDisagrees(ticker, session, values)
     return values.pop() if values else None
 
 
@@ -1121,7 +1156,7 @@ class _GateClose:
     travels to the nightly report file and from there to the dashboard. ``report.redacted``
     draws the same line one module over and ``PieceOutcome.refusal_class`` draws it again.
 
-    The token is enough for the reader it is written for. ``NoSpotClose`` and
+    The token is enough for the reader it is written for. ``SnapAbsent`` and
     ``PartitionQuarantined`` are the two that want different things done about them, and a
     class name is what separates them.
     """
@@ -1130,28 +1165,33 @@ class _GateClose:
     reason: str | None = None
 
 
-def _gate_close(lake_root: Path, ticker: str, session: date, following: date) -> _GateClose:
+def _gate_close(lake_root: Path, ticker: str, session: date, minute: str) -> _GateClose:
     """Whether a daily bar for ``session`` has a close of record to be gated against.
 
     This runs before the request rather than after it, which is the whole of marketlake #434.
-    ``_settled_close`` reads the lake and never the vendor, so the answer to "would this bar
+    ``_captured_close`` reads the lake and never the vendor, so the answer to "would this bar
     pass its gate" is available for the price of one partition read, and a ticker-day whose
     answer is no costs a vendor request and a withheld file on every run until someone repairs
     the quotes. Six ticker-days on the live lake can never be repaired at all, because the
-    2026-09-08 outage left the sessions they are gated against holding gap rows and no data
-    row, and the segments a recompaction would rebuild from hold the same.
+    2026-09-08 outage left their sessions holding a gap row at 16:15 and no data row, and the
+    segments a recompaction would rebuild from hold the same.
 
     **It answers for one class of failure and deliberately not for the other**, which is the
     line marketlake #365 drew over these same exceptions. The four named below say the session
-    cannot be read, which costs one ticker-day, and they are exactly the four
-    ``actions._observation`` contains out of the same ``load_quotes`` call. Everything else out
-    of this read says the lake's own files contradict their writers, which is something a person
-    has to go and look at. Those are not caught here at all, so the caller holds and files them
-    the way it always did. Only the request is saved, because a gate with an ambiguous close
-    cannot pass either.
+    cannot be read, which costs one ticker-day. Everything else out of this read says the lake's
+    own files contradict their writers, which is something a person has to go and look at. Those
+    are not caught here at all, so the caller holds and files them the way it always did. Only
+    the request is saved, because a gate with an ambiguous close cannot pass either.
+
+    **Three of the four are the ones ``actions._observation`` contains, and the fourth differs
+    because the read does.** That walk reads the loader's close of record, whose absence is
+    ``NoSpotClose``. This reads a minute, whose absence is ``SnapAbsent``, since marketlake #618
+    moved the reference onto the 16:15 row. A minute read cannot raise ``NoSpotClose``, and
+    ``SnapMalformed`` stays out because the minute is this module's own spelling rather than an
+    argument a person typed, so a malformed one is this job's bug and not the session's state.
 
     ``CloseOfRecordDisagrees`` is the one that makes the distinction worth drawing. It is not an
-    absent close. It says one sealed ticker-day carries two different ``close_price`` values,
+    absent close. It says one sealed ticker-day carries two different values for one instant,
     and nothing else in this lake looks for that: no battery check covers it, and ``lake.bars``
     is the only module that reads the column for consistency. Folding it in here would have
     turned the lake's own corruption into a line in a count that never returns to zero.
@@ -1164,11 +1204,11 @@ def _gate_close(lake_root: Path, ticker: str, session: date, following: date) ->
 
     So the question asked here is whether a usable number came back, over the refusals that mean
     it could not be read. Whether that answer can still change is the caller's, because it is a
-    question about the clock rather than about the read.
+    question about the manifest rather than about the read.
     """
     try:
-        close = _settled_close(lake_root, ticker, session, following)
-    except (NoSpotClose, PartitionAbsent, PartitionQuarantined, PartialRead) as exc:
+        close = _captured_close(lake_root, ticker, session, minute)
+    except (SnapAbsent, PartitionAbsent, PartitionQuarantined, PartialRead) as exc:
         # The class and nothing else, for the reason :class:`_GateClose` gives.
         return _GateClose(reason=type(exc).__name__)
     if close is None:
@@ -1181,11 +1221,14 @@ def _calendar_next_session(
 ) -> date | None:
     """The first trading session strictly after ``session``.
 
-    Calendar-next, never the next session that happens to hold data, for the reason
-    :func:`_settled_close` gives. ``Calendar`` offers no next-session helper, so this steps
-    forward a day at a time. ``None`` means the search ran past its guard, which a real
-    calendar never does: the longest run of consecutive non-sessions the US market produces is
-    four days.
+    Calendar-next, never the next session that happens to hold data, because it is the session
+    whose seal a daily bar waits for. The wait gives the vendor's candle a full session to take
+    the corrections ``docs/design.md`` schedules the 18:30 sweep around, and a later session
+    holding data would stretch it for no reason. An outage session still seals, as a partition
+    of gap rows, so waiting for it costs nothing. ``Calendar`` offers no next-session helper, so
+    this steps forward a day at a time. ``None`` means the search ran past its guard, which a
+    real calendar never does: the longest run of consecutive non-sessions the US market produces
+    is four days.
 
     This is the third private spelling of one step. ``oi._calendar_next_session`` and
     ``control_plane._first_session_on_or_after`` are the other two. marketlake #334 counts them
@@ -1248,11 +1291,11 @@ def fetch_session_bars(
     request is short, and stalling is better than landing a wrong answer quietly.
 
     **The two causes with no close of record no longer repeat at all**, because marketlake #434
-    stopped them reaching the vendor. A daily bar for the session this was given is gated against
-    the next session's settled close, which at any hour of that session has not been captured, so
-    every daily ticker-day here is reported under ``unsettled`` rather than fetched and held. One
-    whose close of record is sealed and offers none is reported under ``abandoned``. Both
-    cost no request and file no finding, and :class:`BarsReport` carries the argument in full.
+    stopped them reaching the vendor. A daily bar for the session this was given is fetched only
+    once the next session has sealed, which at any hour of that session it has not, so every
+    daily ticker-day here is reported under ``unsettled`` rather than fetched and held. One whose
+    own session is sealed and offers no close is reported under ``abandoned``. Both cost no
+    request and file no finding, and :class:`BarsReport` carries the argument in full.
 
     **Two failures are not contained per ticker-day**, and the catch below is narrow rather
     than broad for exactly that reason. ``VendorAuthError`` is a dead refresh token and is not
@@ -1323,12 +1366,11 @@ def _walk(
     **The session's own instants are computed once per session and only past the manifested
     skip.** A backfill walks many sessions, and each needs its bounds and its calendar-next
     session, which are pure functions of the day. A run whose every ticker-day is already
-    manifested asks the calendar nothing at all. One cache serves both the walked session and
-    the following one, because the gate precondition below needs the second and the window
-    needs the first.
+    manifested asks the calendar nothing at all. The bounds serve both the window and the minute
+    the gate reads, and the following session is what a daily bar waits for.
 
     **A daily ticker-day whose gate has no close of record never reaches the vendor**, which is
-    marketlake #434. :func:`_gate_close` says whether one exists and the clock says whether that
+    marketlake #434. :func:`_gate_close` says whether one exists and the manifest says whether that
     can still change, and the two answers are recorded apart because they mean opposite things
     to a reader. See the skip below for both.
 
@@ -1422,12 +1464,24 @@ def _walk(
             continue
         following = following_session(session)
         window = bar_window(freq, bounds(session))
-        settled: float | None = None
+        reference: float | None = None
         if freq == DAILY_FREQ and following is not None:
+            # **The wait, decided off the manifest and reading nothing.** A daily bar is fetched
+            # only once the calendar-next session has sealed. Marketlake #618 moved what the bar
+            # is judged against onto its own session's 16:15 quote and kept this wait, which now
+            # gives the vendor's candle a full session to take the corrections the 18:30 sweep is
+            # scheduled around. Schwab serves the candle during the session with its close still
+            # moving, and when that close settles is not measured, so each bar lands on the
+            # evening after its session, as it did before.
+            following_key = (
+                paths.quotes_partition_path(ticker, following).relative_to(root).as_posix()
+            )
+            if following_key not in manifested:
+                unsettled.append(GateSkip(ticker, freq, session, FOLLOWING_UNSEALED))
+                continue
             # **The close the gate compares against, read before the request rather than after it.**
-            # A daily
-            # bar is judged against the calendar-next session's settled close, and that close
-            # lives in this lake rather than at the vendor, so a bar that cannot pass its gate
+            # It is the session's own 16:15 quote, which lives in this lake rather than at the
+            # vendor, so a bar that cannot pass its gate
             # is knowable for the price of one partition read. Spending the request anyway
             # costs one vendor call and one withheld file on every run for ever, because a bar
             # that is held is never manifested and so is never skipped. Marketlake #434
@@ -1438,7 +1492,10 @@ def _walk(
             # are written under one lock hold, so an entry is the lake's own evidence that it
             # sealed that session. Sealed and still offering no usable close is a ticker-day
             # nothing this walk can wait for, which is the one an operator has to find. Not
-            # sealed is merely pending, which is the newest session on every healthy run.
+            # sealed is merely pending. The entry asked is the session's own, because that is the
+            # partition the gate reads. Before marketlake #618 it was the following session's,
+            # for the same reason, and keeping that key would call a session whose compaction
+            # was missed, while the next one's ran, a permanent loss.
             #
             # **The schedule is the wrong test and was the first one written here.** Comparing
             # the clock against ``SessionBounds.compaction`` asks when compaction was *due*,
@@ -1450,7 +1507,7 @@ def _walk(
             # run a few lines above.
             #
             # A repair is still possible for some of them and the reason says which: a
-            # quarantined following session clears through ``python -m lake.signoff`` and the
+            # quarantined session clears through ``python -m lake.signoff`` and the
             # verdict here is re-derived on the next run, while a session whose quotes hold gap
             # rows and no data row has nothing any tool can rebuild from. This walk keeps no
             # state either way, so nothing has to be cleared on the bars side.
@@ -1459,7 +1516,7 @@ def _walk(
             # every ticker-day is judged against one moment the way the manifest snapshot above
             # already is.
             try:
-                gate_close = _gate_close(root, ticker, session, following)
+                gate_close = _gate_close(root, ticker, session, _reference_minute(bounds(session)))
             except (
                 LoadError,
                 CloseOfRecordDisagrees,
@@ -1470,10 +1527,10 @@ def _walk(
                 # **What :func:`_gate_close` deliberately does not answer for.** It contains the
                 # four refusals that mean this session cannot be read. What reaches here says
                 # the lake's own files contradict their writers: one sealed ticker-day carrying
-                # two ``close_price`` values, or the three sites ``_load_surface`` raises a bare
-                # ``LoadError`` at. Marketlake #365 put those on the filing side and named this
-                # module as its precedent, and nothing else in the lake looks for them, so a
-                # counted line that never returns to zero would be the only record of a
+                # two values for its reference minute, or the three sites ``_load_surface``
+                # raises a bare ``LoadError`` at. Marketlake #365 put those on the filing side
+                # and named this module as its precedent, and nothing else in the lake looks for
+                # them, so a counted line that never returns to zero would be the only record of a
                 # corruption somebody has to repair.
                 #
                 # **Three families are named here that never had to be named before**, because
@@ -1498,12 +1555,12 @@ def _walk(
                 continue
             if gate_close.reason is not None:
                 entry = GateSkip(ticker, freq, session, gate_close.reason)
-                following_key = (
-                    paths.quotes_partition_path(ticker, following).relative_to(root).as_posix()
+                session_key = (
+                    paths.quotes_partition_path(ticker, session).relative_to(root).as_posix()
                 )
-                (abandoned if following_key in manifested else unsettled).append(entry)
+                (abandoned if session_key in manifested else unsettled).append(entry)
                 continue
-            settled = gate_close.close
+            reference = gate_close.close
         if budget is not None and attempted >= budget:
             # The budget is spent. This ticker-day is not fetched and the loop goes on, so every
             # later skip is still counted and the remainder is a count rather than an inference.
@@ -1521,7 +1578,7 @@ def _walk(
                 ticker=ticker,
                 window=window,
                 following=following,
-                settled=settled,
+                reference=reference,
                 partition=partition,
                 key=key,
                 hold=hold,
@@ -1578,7 +1635,7 @@ def _land(
     ticker: str,
     window: BarWindow,
     following: date | None,
-    settled: float | None,
+    reference: float | None,
     partition: Path,
     key: str,
     hold,
@@ -1589,7 +1646,7 @@ def _land(
     Split out of the walk so the walk reads as the order of its steps rather than as one long
     body, and so the containment above wraps one call rather than a block.
 
-    ``settled`` is the close of record the daily gate compares against, read by the walk before
+    ``reference`` is the close of record the daily gate compares against, read by the walk before
     it spent the request rather than read again here. One read cannot contradict itself, which
     two would be free to do. It is ``None`` on every ``1m`` ticker-day, which runs no close
     cross-check, and on the one daily case the walk passes through unjudged, a session the
@@ -1697,7 +1754,7 @@ def _land(
     if window.freq == DAILY_FREQ:
         if following is None:
             # The one daily ticker-day the gate precondition passes through, because it has no
-            # following session to read a close of record against, so nothing to ask the lake for.
+            # following session whose seal the bar could wait for, so the walk never read one.
             # It stays here and stays a held finding on purpose. It records the calendar being
             # wrong rather than the lake having no data, which is something a person has to go
             # and look at, and ``_calendar_next_session`` says a real calendar never produces
@@ -1713,7 +1770,7 @@ def _land(
                 )
             )
             return
-        cross = check_close_cross(_bar_close(selected), settled)
+        cross = check_close_cross(_bar_close(selected), reference)
         if not cross.agrees:
             hold(
                 _finding(
@@ -2082,10 +2139,11 @@ class BackfillReport:
     4. Its daily half had no close of record to be gated against.
     5. Its request budget was spent before anything landed, which is marketlake #478's.
 
-    ``unsettled`` names a daily ticker-day whose gate has no close of record *yet*, which on a
-    healthy
-    lake is the newest session in range and nothing else: its own bar is judged against the next
-    session's settled close, and that session has not been captured. The next run lands it.
+    ``unsettled`` names a daily ticker-day whose gate cannot be judged *yet*, which on a healthy
+    lake is the newest session in range and nothing else: its bar waits for the next session to
+    seal, and that session has not been captured. The next run lands it. The reason is
+    ``FOLLOWING_UNSEALED`` there, and a class name on the rarer case of a session whose own
+    compaction has not run.
 
     ``deferred`` names a ticker-day the run's request budget stopped it from fetching, which is
     marketlake #478. It is the one entry here that says nothing is wrong: the run did exactly what
@@ -2093,8 +2151,7 @@ class BackfillReport:
     it. It is rendered in full for the by-hand reader and counted to one line by the nightly, and
     it changes no exit code, which stays keyed on findings nothing could write down.
 
-    ``abandoned`` names one whose close of record is settled and holds no usable figure, so
-    nothing
+    ``abandoned`` names one whose own session is sealed and holds no usable close, so nothing
     this walk can wait for will change it. Marketlake #434 measured six of those on the live
     lake, left by the 2026-09-08 outage, and they are the ones an operator has to be able to
     find. Each entry carries the reason as a class-shaped token, because that is what separates
@@ -2192,8 +2249,8 @@ def backfill_bars(
 
     **What the gate cannot judge is skipped rather than fetched, which is marketlake #434.** The
     sessions this recovers are exactly the ones whose quotes hold gap rows and no data row, so
-    ``load_quotes`` raises ``NoSpotClose`` for the session each daily bar is gated against and no
-    later run can change that verdict. Those used to be fetched, held under ``CHECK_BAR_CLOSE``
+    ``load_quotes`` raises ``SnapAbsent`` at the 16:15 minute each daily bar is gated against and
+    no later run can change that verdict. Those used to be fetched, held under ``CHECK_BAR_CLOSE``
     and filed, on every run for ever. The walk now reads that close first and skips them,
     reporting them under ``abandoned``: six ticker-days on the live lake, plus the newest
     session's two under ``unsettled`` every night on a lake with no outage in it.
