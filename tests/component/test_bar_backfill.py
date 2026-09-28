@@ -94,6 +94,8 @@ SESSIONS = (
 TONIGHT = datetime(2026, 9, 16, 22, 0, tzinfo=UTC)
 
 DAY_MARGIN = timedelta(days=1)
+# The session's close as the lake captured it, on its 16:15 row. The name is older than
+# marketlake #618, which moved the gate's reference off the next session's ``close_price``.
 SETTLED_CLOSE = 650.00
 RECORDED_AT = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
 
@@ -307,9 +309,10 @@ def _lake(
 ) -> Path:
     """A lake holding sealed quotes, the ledger, the master and the capture spans.
 
-    ``quotes`` defaults to a settled close on every session in the range and the session after it,
-    which is what lets a daily bar pass the close cross-check on every day the walk reaches. A
-    test about the gate's blind spots names its own.
+    ``quotes`` defaults to a captured 16:15 close on every session in the range, which is what
+    lets a daily bar pass the close cross-check on every day the walk reaches, and on the session
+    after it, whose seal ends the newest session's wait. A test about the gate's blind spots
+    names its own.
     """
     if quotes is None:
         quotes = {("SPY", day): [_quote_row(day)] for day in (*SESSIONS, date(2026, 9, 17))}
@@ -958,7 +961,11 @@ def test_the_bar_before_an_ex_date_lands_and_the_total_view_divides_by_it(
     before, ex_date, earlier = date(2026, 9, 14), date(2026, 9, 15), date(2026, 9, 11)
     quotes = {("SPY", day): [_quote_row(day)] for day in (*SESSIONS, date(2026, 9, 17))}
     quotes[("SPY", before)] = [_quote_row(before, captured=762.6)]
-    quotes[("SPY", ex_date)] = [_quote_row(ex_date, close_price=760.711166)]
+    # Both of the ex-date's close rows carry the adjusted previous close, and the 16:00 one is
+    # the row the gate before #618 read, so a reverted gate makes its comparison and holds.
+    spot = _quote_row(ex_date, close_price=760.711166, close_tag="spot_close")
+    spot["snap_ts"] = f"{ex_date.isoformat()}T20:00:00+00:00"
+    quotes[("SPY", ex_date)] = [spot, _quote_row(ex_date, close_price=760.711166)]
     root = _lake(fixture_lake, quotes=quotes)
     vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,), daily_closes={before: 762.6}))
 

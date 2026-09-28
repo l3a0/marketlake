@@ -16,9 +16,10 @@ What one run does, in the design's own order.
    is the calendar's answer and not the manifest's. Marketlake #431.
 2. The bar walk, ``bars.backfill_bars``. The close cross-check is inside it, and the
    walk covers every session the capture spans still hold unlanded rather than only
-   the one the clock is in, because a daily bar has no close of record to pass that
-   check against on the night of its own session. Marketlake #422, with marketlake
-   #434 turning that night's fetch into a skip.
+   the one the clock is in, because a daily bar waits for the next session to seal before
+   it is fetched, and on the night of its own session that has not happened. Marketlake
+   #422, with marketlake #434 turning that night's fetch into a skip and marketlake #618
+   moving the check onto the session's own 16:15 quote.
 3. The validation battery, ``battery.judge``, which judges the sealed chains and quotes
    partitions and writes a quarantine verdict for what fails. The design places it between the
    bar fetch and the Friday branch, which is where this list puts it.
@@ -1001,9 +1002,10 @@ def sweep(
                 # ``report.redacted``, which is the other half of why it counts classes rather
                 # than naming an entry.
                 #
-                # **``unsettled`` is deliberately not reported here.** It is a ticker-day whose
-                # close of record the lake has not sealed yet, which on a healthy run is the
-                # newest session and nothing else, right every night by construction. A line
+                # **``unsettled`` is deliberately not reported here.** It is a ticker-day that
+                # cannot be judged yet, because the next session has not sealed or its own has
+                # not. On a healthy run that is the newest session and nothing else, waiting for
+                # the next one, right every night by construction. A line
                 # that is loud every evening is one the reader learns to skip, which is the
                 # argument ``dashboard._ping_owed`` already makes in those words. It still
                 # reaches the by-hand run's own output, which is where a reader who wants it

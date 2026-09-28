@@ -126,6 +126,8 @@ def _bounds(session: date) -> tuple[datetime, datetime]:
     )
 
 
+# The session's close as the lake captured it, on its 16:15 row. The name is older than
+# marketlake #618, which moved the gate's reference off the next session's ``close_price``.
 SETTLED_CLOSE = 650.00
 RECORDED_AT = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
 PING_URL = "https://hc-ping.test/key/eod-sweep"
@@ -322,9 +324,9 @@ def _lake(
     tickers: tuple[str, ...] = ("SPY",),
     instrument_ids: tuple[int, ...] = (1,),
     ledger: pa.Table | None = None,
-    judged: tuple[date, ...] = (),
+    judged: tuple[date, ...] | None = None,
 ) -> Path:
-    """A lake holding two sessions' sealed quotes, the ledger, the master and the spans.
+    """A lake holding sealed quotes, the ledger, the master and the spans.
 
     The capture spans are here so the battery at step 2.5 judges rather than reporting that it
     could not tell whether capture was running. A fixture without them exercises the wiring
@@ -335,11 +337,17 @@ def _lake(
     because a production lake has it recorded and marketlake #130 put a check for that on this
     job. A case about that check passes one that does not.
 
+    ``quotes`` defaults to the following session, which is what tonight's daily bar waits for.
+
     ``judged`` seals SPY's quotes and chains for each day in the shape the battery judges clean.
-    A daily bar is gated against its own session's 16:15 quote (marketlake #618), so a case that
-    lands or holds tonight's bar needs tonight's session sealed, and a partition the battery
-    quarantines would add lines the case is not about.
+    A daily bar is gated against its own session's 16:15 quote (marketlake #618), so it defaults
+    to tonight's session whenever ``quotes`` does, and the default lake lands tonight's bar the
+    way a healthy evening does. A partition the battery quarantines would add lines the case is
+    not about, which is why these rows are the judged shape. A case about tonight's session
+    being unsealed passes ``judged=()``.
     """
+    if judged is None:
+        judged = (SESSION,) if quotes is None else ()
     if quotes is None:
         quotes = {("SPY", FOLLOWING): _session_rows(FOLLOWING)}
     for (ticker, day), rows in quotes.items():
@@ -457,6 +465,8 @@ def test_an_ordinary_evening_runs_every_walk_pings_files_and_sends_one_digest(
 
     assert [name for name, _ in outcome.nightly.pieces] == ["dividends", "splits", "bars"]
     assert all(piece.finished for _, piece in outcome.nightly.pieces), outcome.render()
+    # Tonight's daily bar lands: its own session is sealed and so is the one it waits for.
+    assert dict(outcome.nightly.pieces)["bars"].landed == 1
     assert outcome.nightly.problems == ()
     assert pinger.urls == [PING_URL]
     assert outcome.nightly.pinged is True
@@ -566,7 +576,7 @@ def test_the_gap_count_reads_the_sealed_partitions_and_zero_is_not_absence(
 
 def test_an_unsealed_day_says_unsealed_in_the_file_and_in_the_digest(fixture_lake: FixtureLake):
     """``None`` has to survive to both readers, because zero is the answer it is not."""
-    root = _lake(fixture_lake)
+    root = _lake(fixture_lake, judged=())
     outcome, _, transport = _run(root)
 
     assert outcome.nightly.gaps is None
@@ -704,7 +714,7 @@ def test_a_held_finding_is_the_run_working_and_still_pings(fixture_lake: Fixture
 
     A gate refusing to land a row is the sweep doing its job. ``report.py`` says this ping
     "says the run happened whether or not it found anything", so a held finding must not
-    silence the check. Here the settled close disagrees with the bar's, which the close
+    silence the check. Here the captured close disagrees with the bar's, which the close
     cross-check holds.
     """
     root = _lake(fixture_lake, judged=(SESSION,))
@@ -783,7 +793,7 @@ def test_the_friday_run_sets_the_sunday_one_shot_and_reads_it_back(fixture_lake:
     was never set look the same, which is why ``expected_one_shot`` expects it only between
     this run and its own firing.
     """
-    root = _lake(fixture_lake)
+    root = _lake(fixture_lake, judged=())
     setter = _RecordingSetter()
     outcome, pinger, _ = _run(
         root,
@@ -849,7 +859,7 @@ def test_a_sealed_reference_that_offers_no_close_is_reported_by_reason(
     kind of change that would have re-hidden the mutation had the sort not been there.
     """
     # **One reason carries a count above one, on purpose.** The live lake's line is meant to read
-    # "6 NoSpotClose", and the count is the only thing separating an outage from one new
+    # "6 SnapAbsent", and the count is the only thing separating an outage from one new
     # quarantine. A fixture with one ticker-day per reason never exercises the counting at all:
     # pinning the count to a literal 1 survived mutation against exactly such a fixture.
     #
@@ -1090,7 +1100,7 @@ def test_the_publisher_refuses_a_digest_carrying_a_secret(fixture_lake: FixtureL
     refusal reaches a message this module composes rather than only that the publisher can
     refuse one.
     """
-    root = _lake(fixture_lake)
+    root = _lake(fixture_lake, judged=())
     transport = FakeTransport()
     publisher = Publisher(lake_root=root, transport=transport, secrets=("unsealed",))
     outcome, _, _ = _run(root, publisher=publisher, transport=transport)
@@ -1838,10 +1848,10 @@ def test_a_daily_bar_held_tonight_is_reached_again_tomorrow(fixture_lake: Fixtur
 
     **Marketlake #434 changed what night one does about it, not what night two recovers.** That
     night used to fetch the bar, gate it against a close nobody had captured, and hold a finding.
-    The reference is this lake's rather than the vendor's, so the walk reads it first and the
-    ticker-day is left unsettled with the request unspent. The recovery below is unchanged, which
-    is what makes the skip safe: a session that is skipped tonight is a session the next run still
-    walks.
+    Whether the next session has sealed is this lake's answer rather than the vendor's, so the
+    walk asks the manifest first and the ticker-day is left unsettled with the request unspent.
+    The recovery below is unchanged, which is what makes the skip safe: a session that is skipped
+    tonight is a session the next run still walks.
     """
     root = _lake(fixture_lake, quotes={}, judged=(SESSION,))
     partition = LakePaths(root).bars_partition_path("SPY", DAILY_FREQ, SESSION)
@@ -2091,7 +2101,7 @@ def test_the_battery_runs_on_a_session_and_its_counts_reach_the_outcome(
     outcome, the scope resolved, and no line was written. The checks themselves are held in
     ``tests/component/test_battery.py``.
     """
-    root = _lake(fixture_lake)
+    root = _lake(fixture_lake, judged=())
 
     outcome, _, _ = _run(root)
 
@@ -3121,6 +3131,16 @@ def test_an_outage_line_with_a_close_value_absent_is_still_a_standing_fact(
     (line,) = [entry for entry in outcome.nightly.report if entry.startswith("bars abandoned")]
     assert line == "bars abandoned: 6 ticker-day(s), 1 CloseValueAbsent, 5 SnapAbsent"
     assert kind_of(outcome.nightly, "bars abandoned") == INFO
+
+
+def test_only_the_two_absences_nothing_can_repair_read_as_a_standing_fact():
+    """The set that makes the ``bars abandoned`` line ``info``, spelled with literals.
+
+    Each reason outside it wants a person: a restore, a sign-off or a schema change. The outage
+    tests drive two of those, and none drives ``PartialRead``, so widening the set to take it in
+    would pass them all. Marketlake #618 swapped ``NoSpotClose`` for ``SnapAbsent`` here.
+    """
+    assert sweep._PERMANENT_ABANDON_REASONS == {"SnapAbsent", "CloseValueAbsent"}
 
 
 def test_an_outage_line_with_a_lost_partition_asks_for_a_restore(fixture_lake: FixtureLake):

@@ -1819,6 +1819,19 @@ def test_the_recorded_daily_stamps_each_name_their_own_eastern_session():
     )
 
 
+def _next_session_rows(*, close_price: float) -> list[dict]:
+    """FOLLOWING's two close rows, both carrying ``close_price``.
+
+    The 16:00 ``spot_close`` row is the one the gate before marketlake #618 read, so a fixture
+    carrying it lets that gate make its comparison rather than abandoning the day for want of a
+    row. A test that reverts the gate then fails on the comparison its docstring names.
+    """
+    return [
+        _quote_row(FOLLOWING, close_price=close_price, close_tag="spot_close", minute="20:00"),
+        _quote_row(FOLLOWING, close_price=close_price),
+    ]
+
+
 def test_the_close_is_read_off_the_session_itself_rather_than_the_next_one(
     fixture_lake: FixtureLake,
 ):
@@ -1834,7 +1847,7 @@ def test_the_close_is_read_off_the_session_itself_rather_than_the_next_one(
         fixture_lake,
         quotes={
             ("SPY", SESSION): [_quote_row(SESSION, captured=762.6)],
-            ("SPY", FOLLOWING): [_quote_row(FOLLOWING, close_price=760.711166)],
+            ("SPY", FOLLOWING): _next_session_rows(close_price=760.711166),
         },
     )
 
@@ -1891,7 +1904,7 @@ def test_a_bar_adjusted_for_a_split_is_held_even_when_the_next_session_agrees(
         fixture_lake,
         quotes={
             ("SPY", SESSION): [_quote_row(SESSION, captured=762.6)],
-            ("SPY", FOLLOWING): [_quote_row(FOLLOWING, close_price=381.3)],
+            ("SPY", FOLLOWING): _next_session_rows(close_price=381.3),
         },
     )
     vendor = _RecordingVendor(_cassette(daily={"candles": [_daily_candle(close=381.3)]}))
@@ -1904,6 +1917,70 @@ def test_a_bar_adjusted_for_a_split_is_held_even_when_the_next_session_agrees(
     assert held.finding.computed == 381.3
     assert held.finding.against == 762.6
     assert len(vendor.calls) == 1
+
+
+def test_an_unreadable_stamp_at_the_reference_minute_is_filed_rather_than_counted(
+    fixture_lake: FixtureLake,
+):
+    """A 16:15 row whose ``snap_ts`` cannot be read is the lake contradicting its writer.
+
+    The loader answers a minute read over such a partition with ``SnapAbsent`` and names the
+    stamps it could not read. Counted as an absence, the ticker-day would sit in the nightly's
+    ``INFO`` census for ever with the detail thrown away. The tag read before marketlake #618
+    raised a bare ``LoadError`` for the same row and the walk filed it, and this keeps that.
+    """
+    row = _quote_row(SESSION)
+    row["snap_ts"] = f"{SESSION.isoformat()}T20:15:00"
+    root = _lake(fixture_lake, quotes=_sealed("SPY", session_rows={"SPY": [row]}))
+    vendor = _RecordingVendor(_cassette())
+
+    result = _run(root, vendor)
+
+    assert result.abandoned == () and result.unsettled == ()
+    (held,) = result.held
+    assert held.finding.check == CHECK_BAR_CLOSE
+    assert (held.finding.exception or "").startswith("SnapAbsent")
+    assert vendor.calls == []
+
+
+def test_the_walk_reads_the_sessions_own_minute_when_the_next_one_closes_early(
+    fixture_lake: FixtureLake,
+):
+    """The minute comes from the session's bounds, not the following session's.
+
+    A regular session followed by an early close, like the Wednesday before Thanksgiving, has
+    two plausible minutes in reach: its own 16:15 and the next day's 13:15. Only a walk test can
+    tell which one the walk passes, because the unit test of ``_reference_minute`` takes the
+    bounds it is handed. The session here carries 640.0 at 13:15 Eastern and 650.0 at 16:15, and
+    the bar closes at 650.0, so reading the wrong minute holds it.
+    """
+    calendar = FakeCalendar(
+        {
+            SESSION: SessionTimes(OPEN_ET, CLOSE_ET),
+            FOLLOWING: SessionTimes(
+                datetime.fromisoformat("2026-09-15T09:30:00-04:00"),
+                datetime.fromisoformat("2026-09-15T13:00:00-04:00"),
+                early_close=True,
+            ),
+        }
+    )
+    decoy = _quote_row(SESSION, captured=640.0, minute="17:15")
+    root = _lake(
+        fixture_lake,
+        quotes=_sealed("SPY", session_rows={"SPY": [decoy, _quote_row(SESSION)]}),
+    )
+
+    result = fetch_session_bars(
+        lake_root=root,
+        vendor=_RecordingVendor(_cassette()),
+        clock=ManualClock(FIRST_NIGHT),
+        calendar=calendar,
+        roster=_roster({"SPY": ["1d"]}),
+        session=SESSION,
+    )
+
+    assert result.held == (), "the walk read the following session's early-close minute"
+    assert len(result.landed) == 1
 
 
 def test_the_reference_minute_is_the_option_close_the_calendar_names():
@@ -2014,6 +2091,9 @@ def test_a_close_of_record_that_disagrees_is_contained_to_its_ticker(fixture_lak
     assert held.finding.symbol == "SPY"
     assert held.finding.check == CHECK_BAR_CLOSE
     assert "CloseOfRecordDisagrees" in (held.finding.exception or "")
+    # The message names the session whose rows disagree, which is the session read since
+    # marketlake #618 rather than the one after it.
+    assert f"the {SESSION.isoformat()} close of record" in (held.finding.exception or "")
     assert held.filed_at is not None, "the lake's own corruption was not written down"
     assert [f["check"] for f in _findings(root)] == [CHECK_BAR_CLOSE]
     assert result.unsettled == () and result.abandoned == (), (
@@ -3284,7 +3364,7 @@ def test_the_close_cross_check_refuses_a_comparison_missing_either_number():
     assert bars.check_close_cross(None, None).agrees is False
 
 
-def test_the_close_cross_check_handles_a_settled_close_of_zero():
+def test_the_close_cross_check_handles_a_reference_close_of_zero():
     """A zero reference has no relative scale, so the two agree only when both are zero.
 
     A division that returned "agrees" for every bar against a zeroed reference is the one
@@ -3295,12 +3375,20 @@ def test_the_close_cross_check_handles_a_settled_close_of_zero():
 
 
 def test_the_close_cross_tolerance_sits_inside_the_bracket_it_was_measured_from():
-    """The floor is the drift it absorbs and the ceiling is the adjustment it must catch.
+    """The floor is the margin it keeps and the ceiling is the adjustment it must catch.
 
-    The measured window is QQQ's, 1.13 basis points of drift between the two close cycles up
-    to 11.47 basis points for one per-event dividend. A tolerance outside it either files a
-    finding every night on ordinary drift or passes a dividend-sized adjustment silently.
+    The floor is 2.02 basis points, the largest move the live lake has shown in a captured close
+    after the print, which ``SETTLED_DRIFT`` carries. The 16:15 row the gate reads moved 0.0 on
+    every partition that carries it (marketlake #618), so this is margin for a print revised
+    after 16:15. The ceiling is QQQ's 11.47 basis points for one per-event dividend. A tolerance
+    outside the two either files a finding on a revised print or passes a dividend-sized
+    adjustment silently.
     """
     assert SETTLED_DRIFT < CLOSE_CROSS_TOLERANCE < PER_EVENT_DIVIDEND
     assert bars.check_close_cross(650.0 * (1 + SETTLED_DRIFT), 650.0).agrees is True
     assert bars.check_close_cross(650.0 * (1 + PER_EVENT_DIVIDEND), 650.0).agrees is False
+    # The constant's comment says it refuses anything above half the smallest per-event
+    # dividend, which the bracket above does not reach: a tolerance widened to ten basis points
+    # still sits under 11.47. So a move just past half of it is asserted as a disagreement.
+    past_half = PER_EVENT_DIVIDEND / 2 * 1.05
+    assert bars.check_close_cross(650.0 * (1 + past_half), 650.0).agrees is False

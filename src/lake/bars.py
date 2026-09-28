@@ -830,7 +830,7 @@ def _render_held(held: Sequence[HeldFinding]) -> list[str]:
 
 @dataclass(frozen=True)
 class GateSkip:
-    """One daily ticker-day the walk did not fetch, and the reason its gate had no close.
+    """One daily ticker-day the walk did not fetch, and the reason its gate could not judge it.
 
     A record rather than a formatted line, because ``lake.sweep`` counts these by reason and a
     line would make it parse prose this module wrote. Those two spellings agreed only by
@@ -1208,8 +1208,17 @@ def _gate_close(lake_root: Path, ticker: str, session: date, minute: str) -> _Ga
     """
     try:
         close = _captured_close(lake_root, ticker, session, minute)
-    except (SnapAbsent, PartitionAbsent, PartitionQuarantined, PartialRead) as exc:
+    except SnapAbsent as exc:
+        # **An unreadable stamp is a contradiction, not an absence.** ``SnapAbsent`` also fires
+        # when the minute's row carries a ``snap_ts`` the loader cannot read, and its own
+        # docstring says a read "cannot claim the minute is absent while values it could not
+        # read sit beside the answer". So that case is raised to the walk, which files it, the
+        # way the tag read before marketlake #618 raised a bare ``LoadError`` for the same row.
+        if exc.unreadable:
+            raise
         # The class and nothing else, for the reason :class:`_GateClose` gives.
+        return _GateClose(reason=type(exc).__name__)
+    except (PartitionAbsent, PartitionQuarantined, PartialRead) as exc:
         return _GateClose(reason=type(exc).__name__)
     if close is None:
         return _GateClose(reason=CLOSE_VALUE_ABSENT)
@@ -2136,7 +2145,7 @@ class BackfillReport:
     1. The range was empty.
     2. Every ticker-day in it was already manifested.
     3. Every ticker-day in it was held.
-    4. Its daily half had no close of record to be gated against.
+    4. Its daily half could not be judged yet or had no close of record to be gated against.
     5. Its request budget was spent before anything landed, which is marketlake #478's.
 
     ``unsettled`` names a daily ticker-day whose gate cannot be judged *yet*, which on a healthy
@@ -2233,8 +2242,9 @@ def backfill_bars(
     The cost was measured rather than assumed. Against the real calendar the live lake's floor to
     2026-09-16 holds seven sessions and its floor to the 1-min lookback deadline holds twenty-two,
     so a first run over that range would ask for 28 ticker-days and a run at the deadline 88. The
-    gate precondition takes eight off the first of those on the live lake, because those eight
-    are daily ticker-days with no close of record to be compared against.
+    gate precondition takes eight off the first of those on the live lake. Six are daily
+    ticker-days with no close of record to be compared against, and two are the newest
+    session's, waiting for the next session to seal.
 
     **Those figures describe an intact manifest, and that is no longer what bounds the run.**
     Comparing a plan of 88 against the design's 120-a-minute ceiling was the safety argument here,
