@@ -229,6 +229,7 @@ NOT_RETRIED = {
     "401": (VendorResponse(status=401, body={}), "http_401"),
     "403": (VendorResponse(status=403, body={}), "http_403"),
     "499": (VendorResponse(status=499, body={}), "http_499"),
+    "600": (VendorResponse(status=600, body={}), "http_600"),
     "TooBigBody 502": (TOO_BIG, capture.CHAIN_CHUNK_FAILED),
     "auth failure": (VendorAuthError("refresh token expired"), "vendor_auth_error"),
     "body not an object": (VendorBodyError("200 with a list body"), "vendor_body_error"),
@@ -267,23 +268,34 @@ def test_the_predicate_reads_the_cause_chain_and_stops_at_a_loop():
 
 @pytest.mark.parametrize("cap", [1, 20])
 @pytest.mark.parametrize(
-    ("first", "first_line"),
+    ("answers", "lines"),
     [
-        (httpx.ReadTimeout("read"), (None, "read_timeout")),
-        (VendorResponse(status=503, body={}), (503, "http_503")),
+        (
+            [httpx.ReadTimeout("read"), VendorResponse(status=503, body={})],
+            [(None, "read_timeout"), (503, "http_503")],
+        ),
+        (
+            [VendorResponse(status=503, body={}), VendorResponse(status=503, body={})],
+            [(503, "http_503"), (503, "http_503")],
+        ),
+        (
+            [VendorResponse(status=503, body={}), httpx.ReadTimeout("read")],
+            [(503, "http_503"), (None, "read_timeout")],
+        ),
     ],
-    ids=["timeout then 503", "503 twice"],
+    ids=["timeout then 503", "503 twice", "503 then timeout"],
 )
-def test_a_window_that_fails_twice_records_the_retrys_class(lake_root, first, first_line, cap):
-    vendor = _ScriptedVendor({("SPY", _d(0)): [first, VendorResponse(status=503, body={})]})
+def test_a_window_that_fails_twice_records_the_retrys_class(lake_root, answers, lines, cap):
+    # The retry's own failure is what is recorded, whichever kind each attempt was, so a
+    # reply from the first attempt never labels a retry that raised.
+    vendor = _ScriptedVendor({("SPY", _d(0)): answers})
     result = _run(vendor, lake_root, ManualClock(start=START), guards=_cap(cap))
 
     assert vendor.calls[("SPY", _d(0))] == 2
     rows = _rows(result, CHAINS, "SPY")
-    assert _markers(rows) == [(_d(0).isoformat(), _d(9).isoformat(), "http_503")]
+    assert _markers(rows) == [(_d(0).isoformat(), _d(9).isoformat(), lines[-1][1])]
     assert _window_lines(lake_root, "SPY", _d(0).isoformat()) == [
-        (_d(9).isoformat(), *first_line),
-        (_d(9).isoformat(), 503, "http_503"),
+        (_d(9).isoformat(), *line) for line in lines
     ]
 
 
@@ -537,8 +549,10 @@ class _CutBeforeTheRetry(capture._Deadline):
 
     gate = threading.Event()
 
+    unit = capture._QUOTES_UNIT
+
     def send(self, unit, surface, **kwargs):
-        if unit is capture._QUOTES_UNIT and self._calls.get(unit):
+        if unit == self.unit and self._calls.get(unit):
             assert self.gate.wait(10), "the fetch was never cut"
         return super().send(unit, surface, **kwargs)
 
@@ -647,4 +661,27 @@ def test_the_real_vendors_timeout_is_retried_raw_and_wrapped(lake_root, first, e
     assert [(r.status, r.error_class) for r in fetched.requests] == [
         (None, error_class),
         (200, None),
+    ]
+
+
+def test_a_window_cut_between_its_attempts_keeps_the_first_attempts_line(lake_root, monkeypatch):
+    # The chain's twin of the case above. The 503 finished and filed its record before the
+    # retry asked to go out, so its line keeps its own class. The window reads the abandon
+    # class, since the bound cut its task, which is the shape marketlake #597 accepted.
+    _CutBeforeTheRetry.gate = threading.Event()
+    monkeypatch.setattr(_CutBeforeTheRetry, "unit", capture._window_key("SPY", (_d(0), _d(9))))
+    monkeypatch.setattr(capture, "_Deadline", _CutBeforeTheRetry)
+    vendor = _ScriptedVendor({("SPY", _d(0)): [VendorResponse(status=503, body={})]})
+    result = _run(
+        vendor,
+        lake_root,
+        ManualClock(start=START),
+        on_abandoned=lambda futures: _CutBeforeTheRetry.gate.set(),
+    )
+
+    assert vendor.calls[("SPY", _d(0))] == 1
+    rows = _rows(result, CHAINS, "SPY")
+    assert _markers(rows) == [(_d(0).isoformat(), _d(9).isoformat(), ABANDONED)]
+    assert _window_lines(lake_root, "SPY", _d(0).isoformat()) == [
+        (_d(9).isoformat(), 503, "http_503")
     ]
