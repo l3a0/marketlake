@@ -3632,6 +3632,9 @@ def test_a_finding_in_the_oldest_file_read_began_earlier_only_when_something_old
     assert payload["reports_older"] == 0
     (finding,) = payload["held_open"]
     assert (finding["first"], finding["earlier"]) == ("2026-09-17", False)
+    # The earliest report is drawn in full from its pieces, so it carries no changes.
+    earliest = payload["reports"][-1]
+    assert (earliest["held_new"], earliest["held_uncompared"]) == ([], [])
 
 
 def test_a_finding_older_than_the_files_read_says_so(root: Path):
