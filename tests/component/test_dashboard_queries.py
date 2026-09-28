@@ -3780,6 +3780,15 @@ def test_findings_come_back_by_walk_then_by_name_whatever_order_the_file_holds(r
     assert _names(payload["held_open"]) == ["dividends KO 2026-09-15 amount"]
 
 
+def test_findings_a_night_stops_holding_come_back_by_name_not_by_when_they_opened(root: Path):
+    # SPY opened first, so the order the runs were opened in is SPY then QQQ.
+    _file_nightly(root, date(2026, 9, 17), pieces=_bars(SPY_HELD))
+    _file_nightly(root, date(2026, 9, 18), pieces=_bars(QQQ_HELD, SPY_HELD))
+    _file_nightly(root, date(2026, 9, 21), pieces=_bars())
+    newest = _history(root)["reports"][0]
+    assert _names(newest["held_gone"]) == [f"bars {QQQ_HELD}", f"bars {SPY_HELD}"]
+
+
 def test_an_empty_refusal_is_still_a_refusal(root: Path):
     # ``refusal_class`` gives "" for a refusal that begins with ": ", and that walk did
     # not finish, so it must not close SPY.
