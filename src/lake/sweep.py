@@ -986,8 +986,10 @@ def sweep(
                 # That record holds "plain values rather than the walk's own report" shared by
                 # all three walks, and a bars-only number beside ``landed`` and ``held`` is what
                 # its import-direction rule refuses. The line reaches the nightly file, the
-                # digest and the dashboard's History panel, which renders what the file carries
-                # and computes none of it. Every one of those three reads it through
+                # digest and the dashboard's History panel. The panel folds a line whose text
+                # matches the night before's into one count, so a census that reads the same
+                # every night shows once and a count that moves shows as a new line
+                # (marketlake #617). Every one of those three reads it through
                 # ``report.redacted``, which is the other half of why it counts classes rather
                 # than naming an entry.
                 #

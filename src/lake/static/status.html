@@ -189,6 +189,8 @@
     <div id="heat"></div>
     <h3 class="muted">Open quarantines <span id="quarantine-count"></span></h3>
     <div id="quarantines"></div>
+    <h3 class="muted">Open held findings</h3>
+    <div id="held-open"></div>
     <h3 class="muted">Nightly reports <span id="reports-note" class="muted"></span></h3>
     <div id="reports"></div>
   </div>
@@ -871,11 +873,63 @@
       box.appendChild(legend);
     }
     var list = el("ul", null, "nightly");
-    history.reports.forEach(function (entry) { list.appendChild(reportItem(entry, kinded)); });
+    history.reports.forEach(function (entry) {
+      list.appendChild(reportItem(entry, kinded, history.reports_older));
+    });
     box.appendChild(list);
   }
 
-  function reportItem(entry, kinded) {
+  // Each held finding the newest report carries, drawn once, with the first night it was
+  // held and how many nights it has been. A finding the sweep holds again every night
+  // raises its count here rather than adding a line under every night (marketlake #617).
+  // ``_group_reports`` does the grouping, so this draws what the payload says.
+  function renderHeldOpen(history) {
+    var box = byId("held-open");
+    clear(box);
+    if (history.reports.length === 0) { return; }
+    // The grouping is computed across the report files, and the newest of them is still a
+    // dated file, so the section says which one it stands on. A stale one never reads as now.
+    var newest = history.reports[0];
+    var day = newest.day === null ? DASH : newest.day;
+    var head = el("p");
+    head.appendChild(el("span", "As of the " + day + " report"));
+    head.appendChild(el("span", "  filed " + (newest.at === null ? DASH : newest.at), "muted"));
+    box.appendChild(head);
+    // Nothing drawn cannot be told from a section never drawn, so an empty one says so.
+    if (history.held_open.length === 0) {
+      box.appendChild(el("p", "No held findings in the " + day + " report.", "empty"));
+      return;
+    }
+    var list = el("ul", null, "ledger");
+    history.held_open.forEach(function (finding) {
+      var node = el("li", heldOpenText(finding), "held");
+      node.title = HELD_TITLE;
+      list.appendChild(node);
+    });
+    box.appendChild(list);
+  }
+
+  // "on at least" when the run reaches back past what the files read can see, which is a
+  // file past the cap or a night whose walk did not run. "not re-checked" when the walk did
+  // not finish on the newest night, so the finding is carried from the last night it did.
+  function heldOpenText(finding) {
+    var text = finding.walk + " held " + finding.subject + times(finding.count);
+    var since = finding.first === null ? DASH : finding.first;
+    text += finding.earlier
+      ? ", on at least " + plural(finding.nights, "night", "nights") + ", since " + since +
+        " or earlier"
+      : ", on " + plural(finding.nights, "night", "nights") + " since " + since;
+    if (finding.stale) {
+      text += ", not re-checked since " + (finding.last_seen === null ? DASH : finding.last_seen);
+    }
+    return text;
+  }
+
+  // One night can hold the same name twice, and the count keeps the lines adding up to
+  // ``disagreements``.
+  function times(count) { return count > 1 ? ", " + count + " times" : ""; }
+
+  function reportItem(entry, kinded, older) {
     var item = el("li");
     // The report is the one pre-written thing this page shows, so it leads with the day
     // it is about and the instant it was written. A stale one never reads as now.
@@ -890,6 +944,12 @@
     if (kinded && !Array.isArray(entry.report_kinds) && entry.report.length > 0) {
       head.appendChild(el("span", "  lines not classified", "muted"));
     }
+    // The oldest report read has nothing before it to compare against, so it is drawn in
+    // full rather than as changes, and says why.
+    if (entry.earliest === true) {
+      head.appendChild(el("span",
+        older > 0 ? "  earliest report read" : "  first report filed", "muted"));
+    }
     item.appendChild(head);
     var counts = [];
     NIGHTLY_COUNTS.forEach(function (counter) {
@@ -898,11 +958,15 @@
       counts.push(counter.label + " " + (value === null || value === undefined ? DASH : value));
     });
     item.appendChild(el("div", counts.join("   "), "muted"));
-    // ``pieces`` carries each walk's held findings by name, and the panel draws them
-    // under the counts. It carries each walk's refusal too, which is not drawn here. The
-    // sweep appends "<walk> did not run: <refusal>" to its problems for every walk that
-    // refused, so drawing both would print each refusal twice.
-    appendHeld(item, entry.pieces);
+    // Under the counts, what changed in the held findings since the report before. The
+    // earliest report read draws its whole list instead. Each walk's refusal is not drawn
+    // here: the sweep appends "<walk> did not run: <refusal>" to its problems for every walk
+    // that refused, so drawing both would print each refusal twice.
+    if (entry.earliest === true) {
+      appendHeld(item, entry.pieces);
+    } else {
+      appendHeldChanges(item, entry);
+    }
     appendLines(item, entry.problems, "alarm");
     // An empty ``problems`` draws no list, which cannot be told from a section that was
     // never drawn. So a run whose ping went out says in words that nothing held it back.
@@ -918,8 +982,37 @@
       held.appendChild(withheld);
       item.appendChild(held);
     }
-    appendReport(item, entry.report, entry.report_kinds);
+    appendReport(item, entry.report, entry.report_kinds, entry.report_collapsed);
     return item;
+  }
+
+  var HELD_TITLE = "The sweep's gate kept this finding out of the lake's data. " +
+    "Its detail is under reports/withheld/, by the date it names. " +
+    "The file gives it no kind.";
+
+  // A night's held findings as changes: the ones new that night, the ones a finished walk
+  // stopped holding, and one line counting the rest. The page says "no longer held" and
+  // never "settled", because the file does not say why a finding left.
+  function appendHeldChanges(item, entry) {
+    var list = el("ul", null, "lines");
+    (entry.held_new || []).forEach(function (finding) {
+      var node = el("li",
+        finding.walk + " held " + finding.subject + times(finding.count) + ", new", "held");
+      node.title = HELD_TITLE;
+      list.appendChild(node);
+    });
+    (entry.held_gone || []).forEach(function (finding) {
+      var node = el("li", finding.walk + " no longer held " + finding.subject, "held");
+      node.title = "The walk finished this night and did not hold this finding. The file " +
+        "does not say why: a settlement, the bar landing, or the walk skipping or deferring " +
+        "the ticker-day all read the same.";
+      list.appendChild(node);
+    });
+    if (entry.held_unchanged > 0) {
+      list.appendChild(el("li", plural(entry.held_unchanged,
+        "held finding unchanged", "held findings unchanged"), "muted"));
+    }
+    if (list.firstChild) { item.appendChild(list); }
   }
 
   // One line per finding the sweep's gate held, led by its walk, which is what the
@@ -935,9 +1028,7 @@
       var subjects = piece && Array.isArray(piece.subjects) ? piece.subjects : [];
       subjects.forEach(function (subject) {
         var node = el("li", walk + " held " + subject, "held");
-        node.title = "The sweep's gate kept this finding out of the lake's data. " +
-          "Its detail is under reports/withheld/, by the date it names. " +
-          "The file gives it no kind.";
+        node.title = HELD_TITLE;
         list.appendChild(node);
       });
     });
@@ -946,17 +1037,30 @@
 
   // Each report line at the weight its kind gives it. ``report_kinds`` is null for a file
   // the payload could not pair with its lines, which includes every file written before the
-  // kinds existed, and those render exactly as they always did.
-  function appendReport(item, lines, kinds) {
-    if (!Array.isArray(kinds)) { appendLines(item, lines, "note"); return; }
+  // kinds existed, and those render in the one note colour.
+  //
+  // ``report_collapsed`` marks the lines that read exactly as they did in the report before,
+  // and those fold into one count. The payload never marks a healthy line or a line on the
+  // newest or earliest report, so this draws what it is told.
+  function appendReport(item, lines, kinds, collapsed) {
     if (!lines || lines.length === 0) { return; }
     var list = el("ul", null, "lines");
+    var folded = 0;
     lines.forEach(function (line, index) {
+      if (Array.isArray(collapsed) && collapsed[index] === true) { folded += 1; return; }
+      if (!Array.isArray(kinds)) { list.appendChild(el("li", line, "note")); return; }
       var kind = REPORT_KIND_BY_KEY[kinds[index]] || REPORT_KIND_BY_KEY.action;
       var node = el("li", line, "kind-" + kind.key);
       node.title = kind.title;
       list.appendChild(node);
     });
+    if (folded > 0) {
+      var node = el("li", plural(folded, "line as the night before", "lines as the night before"),
+        "muted");
+      node.title = "These report lines read exactly as they did in the report before this one. " +
+        "The newest report and every health-check line are always drawn in full.";
+      list.appendChild(node);
+    }
     item.appendChild(list);
   }
 
@@ -973,6 +1077,7 @@
       plural(history.sessions.length, "session", "sessions");
     renderHeat(history);
     renderQuarantines(history);
+    renderHeldOpen(history);
     renderReports(history);
   }
 
@@ -1195,6 +1300,7 @@
     clear(byId("heat"));
     byId("quarantine-count").textContent = "";
     clear(byId("quarantines"));
+    clear(byId("held-open"));
     byId("reports-note").textContent = "";
     clear(byId("reports"));
     byId("heat").appendChild(el("p",

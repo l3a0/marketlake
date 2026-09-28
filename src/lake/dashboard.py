@@ -99,6 +99,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 import duckdb
@@ -126,7 +127,7 @@ from lake.paths import (
     LakePaths,
     parse_date_dir,
 )
-from lake.report import kinds_fit
+from lake.report import HEALTHY, kinds_fit
 from lake.runway import GROWTH_WINDOW_DAYS, HEADROOM_WEEKS, assess
 from lake.runway import Usage as RunwayUsage
 from lake.security_master import (
@@ -1831,7 +1832,9 @@ def _open_quarantines(root: Path) -> tuple[list[dict[str, object]], str | None]:
     return open_entries, None
 
 
-def _nightly_reports(root: Path, limit: int) -> tuple[list[dict[str, object]], int, str | None]:
+def _nightly_reports(
+    root: Path, limit: int
+) -> tuple[list[dict[str, object]], int, str | None, int]:
     """The last ``limit`` nightly report files, newest first, with what would not read.
 
     Counted off the filesystem rather than queried, which is ``undelivered``'s rule:
@@ -1850,11 +1853,16 @@ def _nightly_reports(root: Path, limit: int) -> tuple[list[dict[str, object]], i
     sets from one writer at two versions, so a reader spelling a key outright would break
     on the older file. An absent count renders as no number rather than zero, which is
     ``Nightly``'s own rule.
+
+    The fourth value counts the files older than the ``limit`` read, which are left
+    unopened. It is what lets the panel say a held finding began before the oldest file
+    it read. With fewer files than ``limit`` on disk, the oldest one read is the first
+    the sweep ever filed, and a finding it holds began there (marketlake #617).
     """
     directory = root / REPORTS_DIR
     if not directory.is_dir():
         # A true zero, which is today's answer: no nightly run has filed anything yet.
-        return [], 0, None
+        return [], 0, None, 0
     try:
         names = sorted(name for name in os.listdir(directory) if name.endswith(".json"))
     except OSError as exc:
@@ -1863,7 +1871,7 @@ def _nightly_reports(root: Path, limit: int) -> tuple[list[dict[str, object]], i
         # so an unreadable ``reports/`` would render as "no report has been filed yet".
         # That is a false zero on the one panel a reader opens to find out what is wrong.
         log.warning("reports directory unlistable: %s", type(exc).__name__)
-        return [], 0, type(exc).__name__
+        return [], 0, type(exc).__name__, 0
     files = [directory / name for name in names[-limit:]]
     reports: list[dict[str, object]] = []
     unreadable = 0
@@ -1884,7 +1892,7 @@ def _nightly_reports(root: Path, limit: int) -> tuple[list[dict[str, object]], i
             unreadable += 1
             continue
         reports.append(_nightly_payload(entry))
-    return reports, unreadable, None
+    return reports, unreadable, None, max(0, len(names) - limit)
 
 
 def _nightly_payload(entry: Mapping[str, object]) -> dict[str, object]:
@@ -1897,7 +1905,9 @@ def _nightly_payload(entry: Mapping[str, object]) -> dict[str, object]:
     which "send no message of their own." The second is why this panel reads these files
     at all: the design names the disk runway, ``pmset`` drift and a suspected unscheduled
     closure as the three that ride here, and this panel is their reader. It renders the
-    lines the file carries and computes none of them.
+    lines the file carries and writes none of its own. How the nights relate to each
+    other is computed across files by :func:`_group_reports`, which reads these payloads
+    and nothing else (marketlake #617).
 
     ``nothing_withheld`` is true only when the file's own ``problems`` is an empty list
     and its ``pinged`` is ``True``, which is what lets the panel say so in words rather
@@ -1976,6 +1986,228 @@ def _lines(value: object) -> list[str]:
     return [item for item in value if isinstance(item, str)]
 
 
+# -- grouping the nights -----------------------------------------------------
+#
+# A held finding is re-held every night nothing settles it, so drawing each night's list
+# in full repeats every finding under every night that held it, and the list grows by one
+# line per finding per night (marketlake #617). The usual shape for this in incident
+# tooling is a condition that is open until it closes, where a repeat raises a count rather
+# than adding a row. So the panel groups the nights it reads. The grouping is computed per
+# request from the report files and kept nowhere, which is the design's "no summary state".
+
+
+@dataclass(frozen=True)
+class NightRun:
+    """One key's unbroken stretch of observed nights, as :func:`group_nights` found it.
+
+    ``start`` and ``end`` index the nights oldest first. ``nights`` counts the distinct
+    nights in the stretch, so two files for one day count once. ``count`` is how many
+    times the latest night in the stretch carried the key. ``from_first`` says the stretch
+    begins on the stream's first observed night, which is where the files read can no
+    longer say when it began.
+    """
+
+    start: int
+    end: int
+    nights: int
+    count: int
+    from_first: bool
+
+
+@dataclass(frozen=True)
+class NightGrouping:
+    """What :func:`group_nights` found, per night and for the keys still open.
+
+    ``new``, ``gone`` and ``unchanged`` are per night, oldest first. A night that did not
+    observe the stream has nothing in any of the three. ``open`` holds each key present on
+    the stream's latest observed night, which is ``last`` and is ``None`` when no night
+    observed the stream at all.
+    """
+
+    new: list[dict[str, int]]
+    gone: list[list[str]]
+    unchanged: list[int]
+    open: dict[str, NightRun]
+    last: int | None
+
+
+def group_nights(nights: Sequence[tuple[object, Mapping[str, int] | None]]) -> NightGrouping:
+    """Group one stream of keys across nights, oldest first, into runs.
+
+    Each night is its identity and then each key's count that night, or ``None`` when the
+    night did not observe the stream. A night that did not observe it neither extends a
+    run nor ends one. A bars walk that refused writes no subjects at all, so reading that
+    absence as "no longer held" would close every open condition on the night the walk
+    failed and reopen each one as new the night after.
+
+    A key present on an observed night that follows an observed night without it starts a
+    new run. So a finding that stops and returns is two runs, each with its own first
+    night. A count that changes between nights changes the run's count and nothing else.
+
+    The identity is what counts distinct nights. Two files for one day are two verdicts and
+    are compared file to file, and the run counts them as one night.
+
+    The streams are held findings, per walk, and report lines, and any later stream with
+    keys and nights can pass through unchanged, such as a walk's skip reasons if the file
+    ever names them (marketlake #459).
+    """
+    new: list[dict[str, int]] = [{} for _ in nights]
+    gone: list[list[str]] = [[] for _ in nights]
+    unchanged = [0 for _ in nights]
+    runs: dict[str, tuple[int, int, set[object], int]] = {}
+    first: int | None = None
+    last: int | None = None
+    for index, (night, seen) in enumerate(nights):
+        if seen is None:
+            continue
+        if first is None:
+            first = index
+        for key in sorted(runs):
+            if key not in seen:
+                gone[index].append(key)
+                del runs[key]
+        for key in sorted(seen):
+            count = seen[key]
+            run = runs.get(key)
+            if run is None:
+                runs[key] = (index, index, {night}, count)
+                new[index][key] = count
+            else:
+                runs[key] = (run[0], index, run[2] | {night}, count)
+                unchanged[index] += count
+        last = index
+    open_runs = {
+        key: NightRun(
+            start=start, end=end, nights=len(days), count=count, from_first=start == first
+        )
+        for key, (start, end, days, count) in runs.items()
+    }
+    return NightGrouping(new=new, gone=gone, unchanged=unchanged, open=open_runs, last=last)
+
+
+def _night_identity(report: Mapping[str, object], index: int) -> object:
+    """The night a report is about: its day, or its own position for a file with none."""
+    day = report.get("day")
+    return day if isinstance(day, str) else ("file", index)
+
+
+def _day(report: Mapping[str, object]) -> str | None:
+    day = report.get("day")
+    return day if isinstance(day, str) else None
+
+
+def _group_reports(reports: list[dict[str, Any]], older: int) -> list[dict[str, object]]:
+    """Add each night's changes to ``reports`` in place, and return the open held findings.
+
+    ``reports`` is newest first, as :func:`_nightly_reports` returns it, and ``older`` is
+    its count of files left unread. Every report gains five keys.
+
+    1. ``earliest`` is true on the oldest report read. With nothing before it to compare
+       against, calling its findings new would be false, so the panel draws it in full.
+    2. ``held_new`` names each held finding whose run starts on this night.
+    3. ``held_gone`` names each one a finished walk stopped holding on this night.
+    4. ``held_unchanged`` counts the rest the night held.
+    5. ``report_collapsed`` says, line by line, whether the panel may fold a report line into
+       "as the night before". A line folds only when the file before it carried the same
+       text, the night is neither the newest nor the earliest read, and its kind is not
+       ``healthy``. The newest night's lines stay whole, because a recurring ``action``
+       line would otherwise show only on the night it first appeared. A ``healthy`` line
+       never folds, because the design says the panel "never hides a ``healthy`` one". A
+       line with no kind folds like an ``action`` line, the design's rule for a line
+       nobody classified.
+
+    A report line matches on its exact text. A line whose number moved is a new line,
+    because a count moving from six to seven is the change ``sweep`` writes the abandoned
+    census to show. ``problems`` are never grouped. They are what withheld that night's
+    ping and each night keeps them whole.
+
+    A walk observes its held findings on a night only when its piece is present with no
+    ``refusal``. A finding stops being held only on a night whose walk finished without it.
+    The panel says "no longer held" there and never "settled", because the file does not say
+    why: a by-hand settlement, a later night's gate letting the bar land, or the walk
+    skipping or deferring the ticker-day all look the same (marketlake #616, #618, #459).
+
+    Nothing here can raise on a file's contents. Every value it reads has already been
+    through :func:`_nightly_payload`, which turns each list into strings and each piece
+    into a mapping, and ``day`` is used only after an ``isinstance`` check.
+    """
+    nights = list(reversed(reports))
+    newest = len(nights) - 1
+    identities = [_night_identity(report, index) for index, report in enumerate(nights)]
+    for report in nights:
+        report["earliest"] = False
+        report["held_new"] = []
+        report["held_gone"] = []
+        report["held_unchanged"] = 0
+    if nights:
+        nights[0]["earliest"] = True
+
+    open_findings: list[dict[str, object]] = []
+    walks = sorted({walk for report in nights for walk in report["pieces"]})
+    for walk in walks:
+        observed: list[tuple[object, Mapping[str, int] | None]] = []
+        for identity, report in zip(identities, nights, strict=True):
+            piece = report["pieces"].get(walk)
+            if piece is None or piece["refusal"] is not None:
+                observed.append((identity, None))
+                continue
+            counts: dict[str, int] = {}
+            for subject in piece["subjects"]:
+                counts[subject] = counts.get(subject, 0) + 1
+            observed.append((identity, counts))
+        grouping = group_nights(observed)
+        for index, report in enumerate(nights):
+            report["held_new"].extend(
+                {"walk": walk, "subject": subject, "count": count}
+                for subject, count in grouping.new[index].items()
+            )
+            report["held_gone"].extend(
+                {"walk": walk, "subject": subject} for subject in grouping.gone[index]
+            )
+            report["held_unchanged"] += grouping.unchanged[index]
+        for subject, run in sorted(grouping.open.items()):
+            open_findings.append(
+                {
+                    "walk": walk,
+                    "subject": subject,
+                    "count": run.count,
+                    "first": _day(nights[run.start]),
+                    "nights": run.nights,
+                    # The files read say when the run began unless it runs back to the
+                    # stream's first observed night and something older went unread: a
+                    # file past the cap, or a night in the window that did not observe it.
+                    "earlier": run.from_first and (older > 0 or run.start > 0),
+                    "last_seen": _day(nights[run.end]),
+                    "stale": run.end != newest,
+                }
+            )
+
+    lines = group_nights(
+        [
+            (identity, _line_counts(report["report"]))
+            for identity, report in zip(identities, nights, strict=True)
+        ]
+    )
+    for index, report in enumerate(nights):
+        text: list[str] = report["report"]
+        kinds = report["report_kinds"]
+        foldable = 0 < index < newest
+        report["report_collapsed"] = [
+            foldable
+            and line not in lines.new[index]
+            and not (isinstance(kinds, list) and kinds[position] == HEALTHY)
+            for position, line in enumerate(text)
+        ]
+    return open_findings
+
+
+def _line_counts(lines: list[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for line in lines:
+        counts[line] = counts.get(line, 0) + 1
+    return counts
+
+
 def query_history(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, object]:
     """The History panel: the completeness window, the quarantines, and the last nights.
 
@@ -1992,6 +2224,10 @@ def query_history(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str
     the ledger, and ``_nightly_reports`` counts the files that would not parse. That is
     the rule ``_capture_spans``, ``_slot_aggregates`` and ``undelivered`` each already
     keep.
+
+    The nightly reports are then grouped across nights by :func:`_group_reports`, which
+    reads only the payloads just built, so it has no file of its own to fail on. Its result
+    is computed per request and kept nowhere.
 
     The scope clamp is read once for the whole window rather than once per day, and
     ``_capture_spans`` takes no date at all, so every day in the window is clamped by
@@ -2028,7 +2264,10 @@ def query_history(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str
                     )
                 )
     quarantines, ledger_unreadable = _open_quarantines(ctx.paths.root)
-    reports, reports_unreadable, reports_error = _nightly_reports(ctx.paths.root, HISTORY_REPORTS)
+    reports, reports_unreadable, reports_error, reports_older = _nightly_reports(
+        ctx.paths.root, HISTORY_REPORTS
+    )
+    held_open = _group_reports(reports, reports_older)
     return {
         "as_of": _iso(ctx.now),
         "window_days": HISTORY_WINDOW_DAYS,
@@ -2044,6 +2283,8 @@ def query_history(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str
         "reports": reports,
         "reports_unreadable": reports_unreadable,
         "reports_error": reports_error,
+        "reports_older": reports_older,
+        "held_open": held_open,
     }
 
 
