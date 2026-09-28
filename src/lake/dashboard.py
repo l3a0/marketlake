@@ -1854,10 +1854,11 @@ def _nightly_reports(
     on the older file. An absent count renders as no number rather than zero, which is
     ``Nightly``'s own rule.
 
-    The fourth value counts the files older than the ``limit`` read, which are left
-    unopened. It is what lets the panel say a held finding began before the oldest file
-    it read. With fewer files than ``limit`` on disk, the oldest one read is the first
-    the sweep ever filed, and a finding it holds began there (marketlake #617).
+    The fourth value counts the files older than the oldest report read: those past
+    ``limit``, which are left unopened, and those inside it that would not parse. It is
+    what lets the panel say a held finding began before the oldest report it read. With
+    no such file, the oldest report read is the first the sweep ever filed, and a finding
+    it holds began there (marketlake #617).
     """
     directory = root / REPORTS_DIR
     if not directory.is_dir():
@@ -1875,6 +1876,9 @@ def _nightly_reports(
     files = [directory / name for name in names[-limit:]]
     reports: list[dict[str, object]] = []
     unreadable = 0
+    # The unreadable count as it stood when the oldest file so far parsed. The files that
+    # failed after it are older than every report read, so they count as unread.
+    unreadable_newer = 0
     for path in reversed(files):
         try:
             if path.stat().st_size > HISTORY_REPORT_MAX_BYTES:
@@ -1892,7 +1896,9 @@ def _nightly_reports(
             unreadable += 1
             continue
         reports.append(_nightly_payload(entry))
-    return reports, unreadable, None, max(0, len(names) - limit)
+        unreadable_newer = unreadable
+    older = max(0, len(names) - limit) + unreadable - unreadable_newer
+    return reports, unreadable, None, older
 
 
 def _nightly_payload(entry: Mapping[str, object]) -> dict[str, object]:
@@ -2020,15 +2026,16 @@ class NightGrouping:
 
     ``new``, ``gone`` and ``unchanged`` are per night, oldest first. A night that did not
     observe the stream has nothing in any of the three. ``open`` holds each key present on
-    the stream's latest observed night, which is ``last`` and is ``None`` when no night
-    observed the stream at all.
+    the stream's latest observed night. ``first`` is the stream's first observed night,
+    or ``None`` when no night observed it. Every key on that night starts a run, and
+    nothing before it can say whether the key is new there.
     """
 
     new: list[dict[str, int]]
     gone: list[list[str]]
     unchanged: list[int]
     open: dict[str, NightRun]
-    last: int | None
+    first: int | None
 
 
 def group_nights(nights: Sequence[tuple[object, Mapping[str, int] | None]]) -> NightGrouping:
@@ -2056,7 +2063,6 @@ def group_nights(nights: Sequence[tuple[object, Mapping[str, int] | None]]) -> N
     unchanged = [0 for _ in nights]
     runs: dict[str, tuple[int, int, set[object], int]] = {}
     first: int | None = None
-    last: int | None = None
     for index, (night, seen) in enumerate(nights):
         if seen is None:
             continue
@@ -2075,14 +2081,13 @@ def group_nights(nights: Sequence[tuple[object, Mapping[str, int] | None]]) -> N
             else:
                 runs[key] = (run[0], index, run[2] | {night}, count)
                 unchanged[index] += count
-        last = index
     open_runs = {
         key: NightRun(
             start=start, end=end, nights=len(days), count=count, from_first=start == first
         )
         for key, (start, end, days, count) in runs.items()
     }
-    return NightGrouping(new=new, gone=gone, unchanged=unchanged, open=open_runs, last=last)
+    return NightGrouping(new=new, gone=gone, unchanged=unchanged, open=open_runs, first=first)
 
 
 def _night_identity(report: Mapping[str, object], index: int) -> object:
@@ -2100,14 +2105,18 @@ def _group_reports(reports: list[dict[str, Any]], older: int) -> list[dict[str, 
     """Add each night's changes to ``reports`` in place, and return the open held findings.
 
     ``reports`` is newest first, as :func:`_nightly_reports` returns it, and ``older`` is
-    its count of files left unread. Every report gains five keys.
+    its count of files older than the oldest report read. Every report gains six keys.
 
     1. ``earliest`` is true on the oldest report read. With nothing before it to compare
        against, calling its findings new would be false, so the panel draws it in full.
-    2. ``held_new`` names each held finding whose run starts on this night.
-    3. ``held_gone`` names each one a finished walk stopped holding on this night.
-    4. ``held_unchanged`` counts the rest the night held.
-    5. ``report_collapsed`` says, line by line, whether the panel may fold a report line into
+    2. ``held_new`` names each held finding whose run starts on this night, after an
+       earlier night on which its walk finished without it.
+    3. ``held_uncompared`` names each finding held on the first night its walk finished in
+       the reports read, when that is not the earliest. The nights before did not observe
+       the walk, so they cannot say whether the finding is new.
+    4. ``held_gone`` names each one a finished walk stopped holding on this night.
+    5. ``held_unchanged`` counts the rest the night held.
+    6. ``report_collapsed`` says, line by line, whether the panel may fold a report line into
        "as the night before". A line folds only when the file before it carried the same
        text, the night is neither the newest nor the earliest read, and its kind is not
        ``healthy``. The newest night's lines stay whole, because a recurring ``action``
@@ -2137,6 +2146,7 @@ def _group_reports(reports: list[dict[str, Any]], older: int) -> list[dict[str, 
     for report in nights:
         report["earliest"] = False
         report["held_new"] = []
+        report["held_uncompared"] = []
         report["held_gone"] = []
         report["held_unchanged"] = 0
     if nights:
@@ -2157,7 +2167,13 @@ def _group_reports(reports: list[dict[str, Any]], older: int) -> list[dict[str, 
             observed.append((identity, counts))
         grouping = group_nights(observed)
         for index, report in enumerate(nights):
-            report["held_new"].extend(
+            # The earliest report is drawn in full from its pieces, so only a later first
+            # night goes to ``held_uncompared``.
+            if index == grouping.first:
+                started = report["held_uncompared"] if index > 0 else []
+            else:
+                started = report["held_new"]
+            started.extend(
                 {"walk": walk, "subject": subject, "count": count}
                 for subject, count in grouping.new[index].items()
             )
@@ -2174,8 +2190,9 @@ def _group_reports(reports: list[dict[str, Any]], older: int) -> list[dict[str, 
                     "first": _day(nights[run.start]),
                     "nights": run.nights,
                     # The files read say when the run began unless it runs back to the
-                    # stream's first observed night and something older went unread: a
-                    # file past the cap, or a night in the window that did not observe it.
+                    # stream's first observed night and something older went unseen: a
+                    # file past the cap or one that would not parse, or a night in the
+                    # window that did not observe the walk.
                     "earlier": run.from_first and (older > 0 or run.start > 0),
                     "last_seen": _day(nights[run.end]),
                     "stale": run.end != newest,

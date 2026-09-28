@@ -3664,6 +3664,47 @@ def test_a_first_night_whose_walk_did_not_run_leaves_the_start_unknown(root: Pat
     assert (finding["first"], finding["earlier"]) == ("2026-09-18", True)
 
 
+def test_a_night_after_nights_that_did_not_observe_the_walk_calls_nothing_new(root: Path):
+    # The 17th's walk refused, so nothing says whether SPY was held then. The 18th lists
+    # it without calling it new, which is what the open section's "or earlier" says too.
+    _file_nightly(root, date(2026, 9, 17), pieces=_bars(refusal="OSError: denied"))
+    _file_nightly(root, date(2026, 9, 18), pieces=_bars(SPY_HELD))
+    _file_nightly(root, date(2026, 9, 21), pieces=_bars(SPY_HELD))
+    payload = _history(root)
+    nights = _by_day(payload)
+    assert nights["2026-09-18"]["held_new"] == []
+    assert _names(nights["2026-09-18"]["held_uncompared"]) == [f"bars {SPY_HELD}"]
+    assert nights["2026-09-21"]["held_uncompared"] == []
+    # The earliest report is drawn in full from its pieces, so it lists nothing here.
+    assert nights["2026-09-17"]["held_uncompared"] == []
+    (finding,) = payload["held_open"]
+    assert (finding["first"], finding["earlier"]) == ("2026-09-18", True)
+
+
+def test_an_oldest_file_that_would_not_parse_counts_as_older(root: Path):
+    # The 17th's file is damaged, so the 18th is not the first report filed and SPY may
+    # have been held before it.
+    for day in (date(2026, 9, 17), date(2026, 9, 18), date(2026, 9, 21)):
+        path = _file_nightly(root, day, pieces=_bars(SPY_HELD))
+        if day == date(2026, 9, 17):
+            path.write_text("{not json")
+    payload = _history(root)
+    assert (payload["reports_unreadable"], payload["reports_older"]) == (1, 1)
+    (finding,) = payload["held_open"]
+    assert (finding["first"], finding["earlier"]) == ("2026-09-18", True)
+
+
+def test_a_middle_file_that_would_not_parse_is_not_older(root: Path):
+    for day in (date(2026, 9, 17), date(2026, 9, 18), date(2026, 9, 21)):
+        path = _file_nightly(root, day, pieces=_bars(SPY_HELD))
+        if day == date(2026, 9, 18):
+            path.write_text("{not json")
+    payload = _history(root)
+    assert (payload["reports_unreadable"], payload["reports_older"]) == (1, 0)
+    (finding,) = payload["held_open"]
+    assert (finding["first"], finding["earlier"]) == ("2026-09-17", False)
+
+
 def test_two_files_for_one_day_count_as_one_night(root: Path):
     day = date(2026, 9, 18)
     _file_nightly(root, date(2026, 9, 17), pieces=_bars(SPY_HELD))
@@ -3772,6 +3813,7 @@ def test_group_nights_changes_a_count_without_opening_or_closing_anything():
     assert grouping.unchanged == [0, 1, 3]
     assert grouping.open["x"].count == 3
     assert grouping.open["x"].nights == 3
+    assert grouping.first == 0
 
 
 def test_the_reports_glob_skips_the_other_producers_subdirectories(root: Path):

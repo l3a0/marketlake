@@ -886,7 +886,12 @@
   function renderHeldOpen(history) {
     var box = byId("held-open");
     clear(box);
-    if (history.reports.length === 0) { return; }
+    // With no report read, the section below says why. This one still says it is empty,
+    // since a heading over nothing cannot be told from a section that failed to draw.
+    if (history.reports.length === 0) {
+      box.appendChild(el("p", "No nightly report to read held findings from.", "empty"));
+      return;
+    }
     // The grouping is computed across the report files, and the newest of them is still a
     // dated file, so the section says which one it stands on. A stale one never reads as now.
     var newest = history.reports[0];
@@ -990,8 +995,9 @@
     "Its detail is under reports/withheld/, by the date it names. " +
     "The file gives it no kind.";
 
-  // A night's held findings as changes: the ones new that night, the ones a finished walk
-  // stopped holding, and one line counting the rest. The page says "no longer held" and
+  // A night's held findings as changes: the ones new that night, the ones held on the first
+  // night their walk finished, the ones a finished walk stopped holding, and one line
+  // counting the rest. The page says "no longer held" and
   // never "settled", because the file does not say why a finding left.
   function appendHeldChanges(item, entry) {
     var list = el("ul", null, "lines");
@@ -999,6 +1005,14 @@
       var node = el("li",
         finding.walk + " held " + finding.subject + times(finding.count) + ", new", "held");
       node.title = HELD_TITLE;
+      list.appendChild(node);
+    });
+    // The first night its walk finished in the reports read, when that is not the earliest.
+    // The nights before did not observe the walk, so the page does not call these new.
+    (entry.held_uncompared || []).forEach(function (finding) {
+      var node = el("li", finding.walk + " held " + finding.subject + times(finding.count), "held");
+      node.title = HELD_TITLE + " The reports before this one did not show this walk " +
+        "finishing, so the page cannot say whether the finding is new.";
       list.appendChild(node);
     });
     (entry.held_gone || []).forEach(function (finding) {
