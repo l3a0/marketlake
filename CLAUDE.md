@@ -21,7 +21,7 @@ Three exceptions come from the design's own reasoning.
 Three measurements produced this rule.
 
 1. Slice 2, the daemon, stood at 43 issues closed and 32 open. Slice 4, the read layer, stood at 0 closed.
-2. The lake held 9,839,816 chain rows captured on 2026-09-14 and no supported way to read any of them. There was no loader in `src/lake` until #241 shipped one.
+2. The lake held 9,839,816 chain rows captured on 2026-09-14 and no supported way to read any of them. There was no loader in `src/lake` until [PR #241](https://github.com/l3a0/marketlake/pull/241) shipped one.
 3. Several rounds of work hardened the `extra` overflow column. That column was non-null on zero of the lake's 9,846,266 sealed rows.
 
 Ranking by severity never runs out of work, because any path with no test behind it can be called a failure waiting to happen. That is how three rounds of hardening reached the capture path while the lake stayed unreadable.
@@ -34,18 +34,20 @@ The price of this is named rather than hidden. Shipping the usable path first le
 
 Two checks have each already caught something.
 
-1. Check the issue's stated blocker against the current code. #242 said pruning a read down to one minute would rest on compaction's incidental row ordering, and concluded the real fix was a change to the writer. Parquet skips only the row groups whose statistics prove they cannot match, so ordering decides how many groups are skipped and never which rows come back. A fixture written in deliberately shuffled order, with overlapping row-group ranges, returned every row a full read returned. The writer was never involved and the work stayed in the reader.
-2. Read what the code already decided in writing. #249 resolves the lake root from config, and `src/lake/loader.py` ended its module docstring by stating that nothing in it read a config file. That sentence was a deliberate decision. A session meeting it mid-change either deletes it quietly or stops to ask. #257 did neither. #249's body had already answered the sentence in advance, so the work arrived knowing what the docstring was protecting and corrected it rather than deleting it.
+1. Check the issue's stated blocker against the current code. [#242](https://github.com/l3a0/marketlake/issues/242) said pruning a read down to one minute would rest on compaction's incidental row ordering, and concluded the real fix was a change to the writer. Parquet skips only the row groups whose statistics prove they cannot match, so ordering decides how many groups are skipped and never which rows come back. A fixture written in deliberately shuffled order, with overlapping row-group ranges, returned every row a full read returned. The writer was never involved and the work stayed in the reader.
+2. Read what the code already decided in writing. [#249](https://github.com/l3a0/marketlake/issues/249) resolves the lake root from config, and `src/lake/loader.py` ended its module docstring by stating that nothing in it read a config file. That sentence was a deliberate decision. A session meeting it mid-change either deletes it quietly or stops to ask. [PR #257](https://github.com/l3a0/marketlake/pull/257) did neither. [#249](https://github.com/l3a0/marketlake/issues/249)'s body had already answered the sentence in advance, so the work arrived knowing what the docstring was protecting and corrected it rather than deleting it.
 
-An audit is a plan too, so it names the commit it was derived against. #249's body first cited that docstring sentence at `src/lake/loader.py:99` and counted 35 call sites in one test file. #251 merged thirty minutes later, moving the sentence to line 170 and the call sites to 49. #201's body already carries the practice that prevents this. It pins its line numbers to a named commit and tells the reader to re-sweep for the class rather than trust the list.
+An audit is a plan too, so it names the commit it was derived against. [#249](https://github.com/l3a0/marketlake/issues/249)'s body first cited that docstring sentence at `src/lake/loader.py:99` and counted 35 call sites in one test file. [PR #251](https://github.com/l3a0/marketlake/pull/251) merged thirty minutes later, moving the sentence to line 170 and the call sites to 49. [#201](https://github.com/l3a0/marketlake/issues/201)'s body already carries the practice that prevents this. It pins its line numbers to a named commit and tells the reader to re-sweep for the class rather than trust the list.
 
-A correction goes on the issue, because a spawned session reads the issue and reads none of the conversation that started it. #242's body carries its own disproof, and #249's body names the sentence it contradicts. An audit that found nothing reports that to whoever asked for it and writes nothing, since an issue padded with empty notes is harder to read, which is what writing to the issue was meant to protect.
+A correction goes on the issue, because a spawned session reads the issue and reads none of the conversation that started it. [#242](https://github.com/l3a0/marketlake/issues/242)'s body carries its own disproof, and [#249](https://github.com/l3a0/marketlake/issues/249)'s body names the sentence it contradicts. An audit that found nothing reports that to whoever asked for it and writes nothing, since an issue padded with empty notes is harder to read, which is what writing to the issue was meant to protect.
 
 Where the audit finds the code contradicting the issue, the issue still decides what the deliverable is, per the tracker directive above. What changes is that the code's stated reason becomes something the issue answers in advance rather than something the work runs into halfway through.
 
 The price is a pass over the files before work starts, paid on issues whose files have moved. The same evidence that sets the trigger bounds it. Two audits found something, and both ran on read-layer issues on the day the loader shipped, while the code they named was still moving. Seventy closed issues before them are not cited.
 
 ## Writing style (owner directive, 2026-08-26)
+
+The owner's global `~/.claude/CLAUDE.md` is the source for these rules. This section repeats them because the repo is public and a reader or an agent may arrive without that file. The price is that the two copies can drift. The global file wins, and this section is what gets corrected.
 
 Clarity comes first. Write plain sentences a reader understands on one read. Prefer short, complete sentences, but never at the cost of clarity. Do not chop an idea into cryptic one-idea fragments. When a short sentence turns hard to parse, write the clear sentence instead, even if it runs a little longer. Explain as you go, like teaching, so the reader follows without backtracking. Avoid em dashes and semicolons. Break a genuinely long sentence into two when that reads better. This applies to every prose surface: this file, the design doc, commit messages, PR bodies, and chat replies. Use plain language. Give the intuition first. Put the precise rule right behind it.
 
@@ -58,6 +60,10 @@ Clarity comes first. Write plain sentences a reader understands on one read. Pre
 **Drop the jargon (owner directive, 2026-09-10).** Given the choice between glossing an in-group term and deleting it, delete it. The test: when a sentence names a concept where it could say what happens, say what happens. "No test covers it" beats "it is unheld." "Nothing fails when the daemon's hook wiring breaks" beats "that wiring is held by nothing." A gloss works once, at first use, while the term keeps reappearing and costs the reader attention every time. Being native to this repo does not save a term. *Unheld* was native here before it was cut, and so was the testing sense of *pin*, as in "a test pins the contract." Cut the whole family in one pass. The first sweep took *hold* and left *pin*, which is the same idiom in the same places, and a review had to catch it. One exemption: the design doc's pinned vocabulary, named under the review-hardened section below, carries exact definitions and is reused on purpose. Keep any word where it is ordinary English, as in "`config.yaml` holds four secrets" or "the daemon holds no expiration state."
 
 **List a counted set. Do not inline it.** When a sentence names a count of items, like "four seams" or "three tests," the items follow as a list, not a run-on of sentences. Number the list when the prose states the count. Use a bulleted list for an unordered set with no count.
+
+**Lead with why it matters, show the reasoning, and name the price.** Establish why something matters before explaining what it is. State the claim, then walk through why. When a choice carries a cost, name it outright, as in "the price for X is Y." When weighing two options, hand over the metric that decides between them instead of gesturing at "tradeoffs."
+
+**Cut what carries nothing.** Throat-clearing, significance-announcing pivots, self-effort asides, hedging, redundancy, decorative modifiers that survive the subtraction test, unsubstantiated superlatives, reversal scaffolding, reassurance tags, and a closing moral that restates the heading. The global file carries the worked examples for each.
 
 **Link every issue and pull request number (owner directive, 2026-09-26).** In a chat reply, a message to another session, or a Markdown file in this repository, each number is a Markdown link: `[#534](https://github.com/l3a0/marketlake/issues/534)` for an issue and `[PR #543](https://github.com/l3a0/marketlake/pull/543)` for a pull request. Link every mention, not only the first, including numbers inside lists, tables and summaries. A bare `#NN` in chat is text the owner has to copy into a browser, and GitHub renders a bare `#NN` in a repository file as plain text too. A report that links its first number and leaves the rest bare fails the same way.
 
@@ -79,7 +85,7 @@ One lesson from the review campaign is worth keeping in view. Reviews armor what
 
 ## Markdown hygiene
 
-Every `.md` file must pass markdownlint. The rules that bite most: use real headings, never a bold line as a heading (MD036). No trailing whitespace (MD009). No stacked blank lines (MD012). End the file with exactly one newline (MD047). Table delimiter rows use single-space padding, so `| --- |` and never `|---|` (MD060). Escape an "approximately" tilde in prose as `\~`. Code fences are exempt. After any edit, sweep:
+Every `.md` file must pass markdownlint. The rules that bite most: use real headings, never a bold line as a heading (MD036). No trailing whitespace (MD009). No stacked blank lines (MD012). End the file with exactly one newline (MD047). Table delimiter rows use single-space padding, so `| --- |` and never `|---|` (MD060). Escape an "approximately" tilde in prose as `\~`, since a bare tilde can render as strikethrough on some surfaces. Code fences are exempt. After any edit, sweep:
 
 ```bash
 rg -n --pcre2 '(?<![\s~\\`<])~' *.md docs/*.md
@@ -87,6 +93,36 @@ rg -n '\|-{1,}\|' *.md docs/*.md
 ```
 
 When a heading changes, verify the Contents anchors still resolve.
+
+## Running things
+
+[README.md](README.md) carries the local commands under its `## Develop` heading, along with how to keep a development run off the real `~/.config/marketlake/` directory.
+
+## Cross-surface consistency
+
+A repo drifts when two surfaces describe the same thing and only one gets updated. The fix is to give each surface exactly one job, so nothing is stated twice.
+
+- **The test suite is the single authority for any number the prose quotes.** Prose states these numbers and never derives them. A document that recomputes a number is a second implementation of the calculation, and the two drift without either one looking wrong. A measurement of the lake on a named date, like the row counts under the ranking directive above, is dated evidence rather than a derived number, and it keeps its date.
+- **The design doc is the single authority for reasoning.** Code comments point at it rather than restating it.
+- **The issue is the single authority for unbuilt scope**, per the tracker directive at the top of this file.
+
+This repo has five prose surfaces, all Markdown.
+
+1. `CLAUDE.md`, this file.
+2. [README.md](README.md).
+3. [docs/design.md](docs/design.md).
+4. [docs/build-plan.md](docs/build-plan.md).
+5. [docs/ducklake-spike.md](docs/ducklake-spike.md).
+
+Three things on them drift against the code.
+
+1. The build plan names each deliverable and links each unbuilt one to its issue, while the design doc carries the reasoning for each built one. A deliverable that ships moves both.
+2. The README's `## Status` and `## Layout` describe the code as it stands, so a change that adds a module or finishes a slice can leave them behind.
+3. A file path, a symbol or a line number cited in prose goes stale when the code moves. A line number goes stale on any edit above it, which is how `src/lake/loader.py:99` became line 170 in the audit history above. Name a symbol rather than a line where the prose can.
+
+Before reporting a code change done, sweep the prose surfaces for what the change could have invalidated, and end the response with a short **Consistency sweep** note listing what was checked, what was updated, and what is still stale. For a pure-internal refactor that moves no line numbers and changes no observable behavior, say "no prose-facing surfaces affected" so it is clear the check was considered rather than forgotten.
+
+A mechanical consequence of an edit is part of that edit, not a separate decision. When a change leaves a generated artifact stale, regenerate it in the same change without asking.
 
 ## Secrets and machine paths
 
@@ -103,6 +139,8 @@ Three things still hold.
 1. `main` requires a pull request. An active repository ruleset enforces it. Owners can bypass that rule, but do not: branch, push, and open a PR, even for a one-line docs change.
 2. A commit carries only what the session actually did. Unrelated edits found on the way past are filed as their own issue, per the closing rule below, and never swept into the branch.
 3. Work outside the session's own deliverable still waits for the owner. That covers this file, `~/.config/marketlake/`, and the configured `lake_root`.
+
+Branch before the first edit, not just before the commit. The moment a task will modify any tracked file, run `git branch --show-current` and branch if it shows `main`. Re-check before every commit, not just the first of a session, because a mid-session squash-merge deletes the branch and leaves the checkout on `main`.
 
 ## Pull requests
 
@@ -127,13 +165,15 @@ So watch the run rather than assume it. `gh pr checks <n> --watch` blocks until 
 
 Three measurements from this repository make the rule sharper than "look for a green tick".
 
-1. **Nothing requires a check to pass.** The `Default` ruleset on `main` carries no `required_status_checks` rule, so a red job blocks no merge. Forty-three pull requests merged from 2026-09-16 onward and none of them had to pass anything. Until #412 closes, the check is advice, which is exactly why reading it is the session's job rather than the gate's.
-2. **A conflicting pull request gets no run at all.** A `pull_request` workflow builds the merge ref, and a branch that conflicts has none, so no run is created. PR #414 showed three green CodeQL entries and no `test` run whatsoever. An absent check reads as a short rollup rather than as a failure, so count what ran instead of scanning for red.
-3. **Green goes stale.** A run is computed against one merge ref, and a later merge to the base replaces it. PR #433's checks read green after the branch had already conflicted underneath them. Re-read the rollup whenever the base has moved.
+1. **Nothing requires a check to pass.** The `Default` ruleset on `main` carries no `required_status_checks` rule, so a red job blocks no merge. Forty-three pull requests merged from 2026-09-16 onward and none of them had to pass anything. Until [#412](https://github.com/l3a0/marketlake/issues/412) closes, the check is advice, which is exactly why reading it is the session's job rather than the gate's.
+2. **A conflicting pull request gets no run at all.** A `pull_request` workflow builds the merge ref, and a branch that conflicts has none, so no run is created. [PR #414](https://github.com/l3a0/marketlake/pull/414) showed three green CodeQL entries and no `test` run whatsoever. An absent check reads as a short rollup rather than as a failure, so count what ran instead of scanning for red.
+3. **Green goes stale.** A run is computed against one merge ref, and a later merge to the base replaces it. [PR #433](https://github.com/l3a0/marketlake/pull/433)'s checks read green after the branch had already conflicted underneath them. Re-read the rollup whenever the base has moved.
+
+**Red goes stale the same way, and costs more.** This behaviour was measured on the sibling `repo-template` rather than here. A failure inherited from the base survives in the rollup after the base has been fixed. [PR #3](https://github.com/l3a0/repo-template/pull/3) there carried a red `test` check from a run computed 25 seconds before the pull request that fixed its base merged. Rebasing made it green, and a monitor reading the older snapshot reported the failure again afterwards. A red check is a claim about one merge ref at one moment, so re-read it before acting, and check whether the pull request has already merged before fixing anything.
 
 Fix the cause rather than the symptom. A lint rule that fails on one file usually fails on its siblings, so sweep for the class. Re-running a job changes nothing the second time unless the failure was the runner rather than the code. Where a failure comes from another branch's merge rather than from this change, say so on the pull request instead of absorbing an unrelated fix into it.
 
-**A filed issue carries its milestone and its labels (owner directive, 2026-09-13).** Filing is not finished when the issue exists. An issue with no milestone appears in no slice view and no view scoped by kind, so only a sweep for nulls finds it, and nothing brings it back on its own. Three arrived that way in a single day, each from a session told to file what it found and nothing further: #143, then #145 and #146. The sessions did exactly what was asked, which is why the rule belongs here rather than in a reminder.
+**A filed issue carries its milestone and its labels (owner directive, 2026-09-13).** Filing is not finished when the issue exists. An issue with no milestone appears in no slice view and no view scoped by kind, so only a sweep for nulls finds it, and nothing brings it back on its own. Three arrived that way in a single day, each from a session told to file what it found and nothing further: [#143](https://github.com/l3a0/marketlake/issues/143), then [#145](https://github.com/l3a0/marketlake/issues/145) and [#146](https://github.com/l3a0/marketlake/issues/146). The sessions did exactly what was asked, which is why the rule belongs here rather than in a reminder.
 
 So a filed issue is finished when it says three things.
 
@@ -145,14 +185,14 @@ No automation supplies the first two. A project's auto-add makes an untriaged is
 
 The same applies to an issue a spawned session is told it may file. The instruction to file carries the instruction to triage, or the work lands where nothing will look for it.
 
-**Close an issue only when nothing is left in it (owner directive, 2026-09-12).** Before a PR closes an issue, move whatever that PR does not do into its own issue. A piece described only inside a body goes when the body closes, and nothing surfaces it again. Two issues have already gone that way, and in both the closing PR's own text named the work it was leaving. #101 was closed by the PR that did half of it. #85 opened with `Closes #77.` and then said a later PR would drop the column, whose remainder survives only because #96 was filed for it afterwards.
+**Close an issue only when nothing is left in it (owner directive, 2026-09-12).** Before a PR closes an issue, move whatever that PR does not do into its own issue. A piece described only inside a body goes when the body closes, and nothing surfaces it again. Two issues have already gone that way, and in both the closing PR's own text named the work it was leaving. [#101](https://github.com/l3a0/marketlake/issues/101) was closed by the PR that did half of it. [PR #85](https://github.com/l3a0/marketlake/pull/85) opened with `Closes #77.` and then said a later PR would drop the column, whose remainder survives only because [#96](https://github.com/l3a0/marketlake/issues/96) was filed for it afterwards.
 
-While a piece is outstanding, a PR writes `Part of #NN` and the closing keyword waits for the PR that leaves nothing. GitHub reads the keyword only when the number follows it immediately, so `Closes #101` closes and `Closes the second half of #101` closes nothing at all. #109 wrote the second form and linked no issue.
+While a piece is outstanding, a PR writes `Part of #NN` and the closing keyword waits for the PR that leaves nothing. GitHub reads the keyword only when the number follows it immediately, so `Closes #101` closes and `Closes the second half of #101` closes nothing at all. [PR #109](https://github.com/l3a0/marketlake/pull/109) wrote the second form and linked no issue. The keyword also has to be plain text, and a code span around it defeats it the same way. Rendered, a code span and plain text differ only in font, so reading the body back does not distinguish them. `gh pr view <n> --json closingIssuesReferences` does, and an empty result on a pull request that means to close something is the signal to fix the body before merging.
 
 An issue whose pieces have all been split has no finishing PR left, so close it by hand and name where each piece went. Do the same when two PRs are open against one issue, because merge order decides which lands last and neither body can know it. The split is the guard that matters here. The keyword discipline only keeps the issue open long enough to make the split.
 
 A split leaves code comments pointing at the parent for work that moved, so repoint those in the PR that splits. A comment naming a closed issue in the past tense records what happened rather than pointing anywhere, and it stays. An unstarted piece goes to an issue, not to the build plan's unowned register. The issue carries that piece's scope and its status together, per the directive at the top of this file. The plan names the issue rather than restating it, so a plan entry cannot go stale the moment work lands.
 
-PR titles use a Conventional Commits prefix. The form is `type(scope): summary`. Types in use: `docs`, `feat`, `fix`, `refactor`, `chore`, `ci`, `perf`. Add a scope in parens when it sharpens the title, like `docs(CLAUDE.md)`. Drop it when none does, like a plain `docs:` for a whole-doc change. The form and the scope rule match the sibling `trading-strategies` repo. Its list carries every type but `refactor`, which this repo uses and that one does not.
+PR titles use a Conventional Commits prefix. The form is `type(scope): summary`. `gh pr list --state merged --json title` reports which prefixes this repo has used, rather than a list here that goes stale on the first unfamiliar one. Add a scope in parens when it sharpens the title, like `docs(CLAUDE.md)`. Drop it when none does, like a plain `docs:` for a whole-doc change. The form and the scope rule match the sibling `trading-strategies` repo. Its list carries every type but `refactor`, which this repo uses and that one does not.
 
 PR bodies use Markdown section headings, not a wall of prose. Lead with `## Why`, then `## What`. Add situational sections after as the change needs them, like `## Scope`, `## Notes`, or `## Evidence`. The body's prose obeys the writing-style rules above. So clear, short sentences and no em dashes, even though the sibling repo allows them. End every body with the footer line: `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
