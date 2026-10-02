@@ -291,7 +291,7 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   4. the 09:35 calendar probe, the says-closed-but-open guard,
   5. the Sunday maintenance job, on its own.
 
-  The 18:30 vendor sweep joined them later, in [#377](https://github.com/l3a0/marketlake/issues/377), which is why the list above stops at five. The count is written as a rule rather than a number because the earlier wording said five after the sweep had made it six.
+  The 18:30 vendor sweep joined them later, in [PR #377](https://github.com/l3a0/marketlake/pull/377), which is why the list above stops at five. The count is written as a rule rather than a number because the earlier wording said five after the sweep had made it six.
 
   `render` also writes an executable `install.sh`, so the privileged half is one command
   the operator runs rather than seventeen lines pasted by hand. The **by-hand paste is
