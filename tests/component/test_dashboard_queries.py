@@ -51,6 +51,7 @@ import pytest
 
 from lake import capture, dashboard, journal
 from lake.alert import Message, Publisher
+from lake.battery import QUARANTINED_VERDICT, build_entry, held_line, wrote_line
 from lake.calendar import MARKET_TZ
 from lake.capture_spans import SPANS_SCHEMA, CaptureSpan, CaptureSpans, spans_path
 from lake.config import GuardConstants
@@ -63,6 +64,7 @@ from lake.dashboard import (
     QueryParameterError,
     group_nights,
 )
+from lake.manifest import CLEAN_VERDICT, append_quarantine
 from lake.metadata import stamp_cycle, stamp_ping
 from lake.paths import DATE_PREFIX, JOURNAL_DIR, SEGMENT_GLOB
 from lake.report import Nightly, PieceOutcome, write_nightly
@@ -3850,6 +3852,123 @@ def test_an_action_line_never_folds(root: Path):
     for day in (date(2026, 9, 17), date(2026, 9, 18), date(2026, 9, 21)):
         _file_nightly(root, day, report=(wrote,), report_kinds=("action",))
     assert _by_day(_history(root))["2026-09-18"]["report_collapsed"] == [False]
+
+
+# -- lines the ledger has settled since (marketlake #626) --------------------
+
+RELEASE_DAY = date(2026, 9, 18)
+SPY_CHAINS = "chains/ticker=SPY/date=2026-09-18.parquet"
+QQQ_CHAINS = "chains/ticker=QQQ/date=2026-09-18.parquet"
+
+
+def _verdict(root: Path, partition: str, verdict: str, at: datetime) -> None:
+    """One ledger line, built and appended by the production code."""
+    append_quarantine(
+        root,
+        build_entry(partition=partition, verdict=verdict, check="row_count_band", observed_at=at),
+    )
+
+
+def _release_night(root: Path) -> datetime:
+    """The 2026-10-02 shape: two partitions quarantined by the run that filed the report.
+
+    The lines come from the battery's own writers, so the panel is tested against the
+    wording the sweep actually files.
+    """
+    filed = et(RELEASE_DAY, 18, 30)
+    _file_nightly(
+        root,
+        RELEASE_DAY,
+        report=(
+            "bars abandoned: 6 ticker-day(s), 6 SnapAbsent",
+            held_line(QQQ_CHAINS, ["realtime_entitlement"], "'row_count_band'"),
+            held_line(SPY_CHAINS, ["realtime_entitlement"], "'row_count_band'"),
+            f"battery: {SPY_CHAINS} now reads, no check withholds it",
+            wrote_line(2),
+        ),
+        report_kinds=("info", "action", "action", "info", "action"),
+    )
+    for partition in (QQQ_CHAINS, SPY_CHAINS):
+        _verdict(root, partition, QUARANTINED_VERDICT, filed)
+    return filed
+
+
+def _released(root: Path) -> list[bool] | None:
+    return _by_day(_history(root))[RELEASE_DAY.isoformat()]["report_released"]
+
+
+def test_a_quarantine_still_open_marks_nothing_released(root: Path):
+    _release_night(root)
+    assert _released(root) == [False, False, False, False, False]
+
+
+def test_a_release_marks_its_line_and_the_census_once_every_partition_reads(root: Path):
+    """What the owner met on 2026-10-03: "Open quarantines (0)" above three lines still drawn
+    as needing action. A line about something else, and one that never needed action, stay as
+    filed, even when the second names a released partition."""
+    filed = _release_night(root)
+    _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed + timedelta(hours=18))
+    assert _released(root) == [False, False, True, False, False]
+
+    _verdict(root, QQQ_CHAINS, CLEAN_VERDICT, filed + timedelta(hours=18))
+    assert _released(root) == [False, True, True, False, True]
+
+
+def test_the_census_is_settled_only_by_the_run_that_filed_it(root: Path):
+    """The census names no partition, so the panel finds them by the run's stamp. A ledger
+    line written at another instant, such as a hand run the next morning, is not what the
+    census counted, and settling it would be a guess."""
+    filed = et(RELEASE_DAY, 18, 30)
+    _file_nightly(root, RELEASE_DAY, report=(wrote_line(1),), report_kinds=("action",))
+    _verdict(root, SPY_CHAINS, QUARANTINED_VERDICT, filed + timedelta(minutes=1))
+    _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed + timedelta(hours=18))
+    assert _released(root) == [False]
+
+
+def test_a_census_of_releases_alone_stays_as_filed(root: Path):
+    """The census counts releases too, which is marketlake #439. A run that wrote only a
+    release withheld nothing, so there is nothing for this to settle."""
+    filed = et(RELEASE_DAY, 18, 30)
+    _file_nightly(root, RELEASE_DAY, report=(wrote_line(1),), report_kinds=("action",))
+    _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed)
+    assert _released(root) == [False]
+
+
+def test_a_partition_withheld_again_is_not_released(root: Path):
+    filed = _release_night(root)
+    _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed + timedelta(hours=18))
+    _verdict(root, SPY_CHAINS, QUARANTINED_VERDICT, filed + timedelta(days=3))
+    assert _released(root) == [False, False, False, False, False]
+
+
+def test_an_unreadable_ledger_marks_nothing_and_draws_every_line_as_filed(root: Path):
+    _release_night(root)
+    with (root / "quarantine.jsonl").open("a", encoding="utf-8") as ledger:
+        ledger.write(json.dumps({"note": "a line that parses and names no partition"}) + "\n")
+    payload = _history(root)
+    assert payload["quarantine_unreadable"] == "ManifestError"
+    assert _by_day(payload)[RELEASE_DAY.isoformat()]["report_released"] is None
+
+
+def test_a_report_without_kinds_marks_nothing(root: Path):
+    """A file from before the kinds draws every line in one colour, so a mark has nothing
+    to change. The writer always files kinds now, so this one is written the old way."""
+    filed = et(RELEASE_DAY, 18, 30)
+    directory = root / "reports"
+    directory.mkdir()
+    (directory / "2026-09-18-183000000000-11.json").write_text(
+        json.dumps(
+            {
+                "day": RELEASE_DAY.isoformat(),
+                "at": filed.isoformat(),
+                "pieces": {},
+                "report": [wrote_line(1)],
+            }
+        )
+    )
+    _verdict(root, SPY_CHAINS, QUARANTINED_VERDICT, filed)
+    _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed + timedelta(hours=18))
+    assert _released(root) is None
 
 
 def test_a_report_line_with_no_kind_never_folds(root: Path):

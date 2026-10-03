@@ -107,13 +107,20 @@ import pyarrow as pa
 
 from lake import journal
 from lake.alert import undelivered
+from lake.battery import PROVENANCE_BATTERY, held_line_partition, is_wrote_line
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
 from lake.capture_spans import CaptureSpan, CaptureSpans, CaptureSpansError, spans_path
 from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants, input_errors_exit, load_config
 from lake.control_plane import assertion_window, sunday_canary_due
 from lake.deadman import in_envelope
-from lake.manifest import VERDICT_FIELD, latest_quarantine_by_check, withholding
+from lake.manifest import (
+    VERDICT_FIELD,
+    is_quarantined,
+    latest_quarantine_by_check,
+    read_quarantine,
+    withholding,
+)
 from lake.metadata import read_metadata
 from lake.paths import (
     CHAINS,
@@ -127,7 +134,7 @@ from lake.paths import (
     LakePaths,
     parse_date_dir,
 )
-from lake.report import INFO, kinds_fit
+from lake.report import ACTION, INFO, kinds_fit
 from lake.runway import GROWTH_WINDOW_DAYS, HEADROOM_WEEKS, assess
 from lake.runway import Usage as RunwayUsage
 from lake.security_master import (
@@ -2243,6 +2250,70 @@ def _group_reports(reports: list[dict[str, Any]], older: int) -> list[dict[str, 
     return open_findings
 
 
+def _mark_released(root: Path, reports: list[dict[str, Any]], withheld: set[str] | None) -> None:
+    """Add ``report_released`` to each report in place: which lines the ledger has since settled.
+
+    A report is the record of its night and is never rewritten, so a line that needed action
+    when it was filed still says so after the action is done. On 2026-10-02 the row-count band
+    quarantined SPY and QQQ, the fix released both, and the panel kept drawing three lines in
+    the needs-action colour under an "Open quarantines (0)" (marketlake #626). This marks
+    the ``action`` lines whose subject the live ledger no longer withholds, and the page draws
+    them as settled. The file is untouched.
+
+    Two lines say a partition was withheld, and each is settled its own way.
+
+    1. ``battery.held_line`` names its partition, which is settled when no check withholds it
+       now. ``withheld`` is the set ``_open_quarantines`` just read.
+    2. ``battery.wrote_line`` names none. The ledger says which partitions it counted, because
+       ``battery.build_entry`` stamps ``observed_at`` in Eastern to match the report's ``at``
+       and the sweep hands both one ``now``. So the run's withholding entries are the battery's
+       entries stamped with the report's ``at``. The line is settled when there is at least one
+       and none of their partitions is withheld now. A run whose writes were all releases has
+       none, and its line stays as filed, which is marketlake #439's to split.
+
+    Nothing is marked when the ledger cannot be read, since ``withheld`` is then ``None`` or
+    the second read fails, and a report without kinds marks nothing, because the page draws
+    its lines in one colour anyway. Both give ``None``, which draws every line as filed. The
+    ledger is read a second time here rather than threading entries out of
+    ``_open_quarantines``: an append landing between the two reads can only add an entry
+    stamped for a report not filed yet, which matches nothing.
+    """
+    written: dict[str, set[str]] | None = None
+    if withheld is not None:
+        try:
+            entries = read_quarantine(root)
+        except Exception:  # noqa: BLE001 - a marking must not cost the panel
+            log.exception("quarantine ledger unreadable, so no report line is marked released")
+        else:
+            written = {}
+            for entry in entries:
+                if not isinstance(entry, dict) or entry.get("provenance") != PROVENANCE_BATTERY:
+                    continue
+                stamp, partition = entry.get("observed_at"), entry.get("partition")
+                if isinstance(stamp, str) and isinstance(partition, str) and is_quarantined(entry):
+                    written.setdefault(stamp, set()).add(partition)
+    for report in reports:
+        kinds = report["report_kinds"]
+        if written is None or withheld is None or not isinstance(kinds, list):
+            report["report_released"] = None
+            continue
+        ran = written.get(report["at"]) if isinstance(report["at"], str) else None
+        report["report_released"] = [
+            kind == ACTION and _settled(line, ran, withheld)
+            for line, kind in zip(report["report"], kinds, strict=True)
+        ]
+
+
+def _settled(line: str, ran: set[str] | None, withheld: set[str]) -> bool:
+    """Whether the live ledger has released what one ``action`` line reported."""
+    partition = held_line_partition(line)
+    if partition is not None:
+        return partition not in withheld
+    if is_wrote_line(line):
+        return bool(ran) and not (ran & withheld)
+    return False
+
+
 def _line_counts(lines: list[str]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for line in lines:
@@ -2310,6 +2381,11 @@ def query_history(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str
         ctx.paths.root, HISTORY_REPORTS
     )
     held_open = _group_reports(reports, reports_older)
+    _mark_released(
+        ctx.paths.root,
+        reports,
+        None if ledger_unreadable else {str(entry["partition"]) for entry in quarantines},
+    )
     return {
         "as_of": _iso(ctx.now),
         "window_days": HISTORY_WINDOW_DAYS,

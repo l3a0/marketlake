@@ -2532,6 +2532,10 @@ def test_a_quarantine_the_battery_wrote_is_reported_and_still_pings(fixture_lake
     assert any("battery wrote 1 quarantine line" in line for line in outcome.nightly.report)
     # How a new quarantine reaches the nightly, so it wants a human (marketlake #530).
     assert kind_of(outcome.nightly, "battery wrote 1 quarantine line") == ACTION
+    # The History panel recognizes this line to settle it (marketlake #626).
+    from lake.battery import is_wrote_line
+
+    assert sum(is_wrote_line(line) for line in outcome.nightly.report) == 1
 
 
 def test_the_quarantine_count_on_the_file_is_this_evenings_not_last_evenings(

@@ -107,7 +107,7 @@ from lake.bars import (
     backfill_bars,
     read_capture_spans,
 )
-from lake.battery import BatteryReport, judge
+from lake.battery import BatteryReport, judge, wrote_line
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
 from lake.capture_spans import CaptureSpansError
 from lake.clock import Clock, SystemClock
@@ -1137,11 +1137,7 @@ def sweep(
         # the two checks that report and never page it is the only sign of one. The count
         # includes releases until marketlake #439 splits it, and the kind cannot say which
         # half a line is.
-        report.add(
-            f"battery wrote {len(battery.appended)} quarantine "
-            f"line{'s' if len(battery.appended) != 1 else ''}",
-            ACTION,
-        )
+        report.add(wrote_line(len(battery.appended)), ACTION)
 
     nightly = Nightly(
         day=day,

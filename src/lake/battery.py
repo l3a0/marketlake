@@ -197,6 +197,7 @@ operator was already told.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from collections.abc import Iterable, Sequence
 from contextlib import contextmanager, nullcontext
@@ -1940,6 +1941,38 @@ def judge_row_count(
     )
 
 
+# -- the report lines a reader matches ---------------------------------------
+#
+# Two nightly report lines say a partition was withheld, and the History panel matches both
+# against the live ledger to mark the ones released since (marketlake #626). Each writer sits
+# beside the reader that parses it, so a change to the wording fails a test rather than
+# leaving the panel to mark nothing.
+
+_HELD_LINE = re.compile(r"battery: (?P<partition>\S+) passes .+ and stays quarantined under .+")
+_WROTE_LINE = re.compile(r"battery wrote \d+ quarantine lines?")
+
+
+def held_line(partition: str, passed: Sequence[str], named: str) -> str:
+    """The line for a partition some checks pass and at least one still withholds."""
+    return f"battery: {partition} passes {', '.join(passed)} and stays quarantined under {named}"
+
+
+def held_line_partition(line: str) -> str | None:
+    """The partition a :func:`held_line` names, or ``None`` for any other line."""
+    matched = _HELD_LINE.fullmatch(line)
+    return matched.group("partition") if matched else None
+
+
+def wrote_line(count: int) -> str:
+    """The sweep's census of the ledger lines one battery run appended."""
+    return f"battery wrote {count} quarantine line{'s' if count != 1 else ''}"
+
+
+def is_wrote_line(line: str) -> bool:
+    """Whether ``line`` is a :func:`wrote_line`."""
+    return _WROTE_LINE.fullmatch(line) is not None
+
+
 # -- the run -----------------------------------------------------------------
 
 
@@ -2139,11 +2172,7 @@ def judge(
                 repr(check) if check is not None else "an unnamed check"
                 for check in outcome.holders
             )
-            report.add(
-                f"battery: {partition.relative} passes {', '.join(passed)} "
-                f"and stays quarantined under {named}",
-                ACTION,
-            )
+            report.add(held_line(partition.relative, passed, named), ACTION)
         if outcome.released:
             released += 1
             # ``INFO``, which is the docstring's reading: a partition rejoining the
@@ -2647,6 +2676,9 @@ __all__ = [
     "judge_entitlement",
     "judge_from_config",
     "judge_quote_order",
+    "held_line",
+    "held_line_partition",
+    "is_wrote_line",
     "judge_row_count",
     "main",
     "median",
@@ -2660,4 +2692,5 @@ __all__ = [
     "split_snapshot_counts",
     "trailing_medians",
     "write_verdict",
+    "wrote_line",
 ]
