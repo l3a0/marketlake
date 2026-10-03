@@ -2567,6 +2567,36 @@ def _battery_returning(report):
         assert lake.battery.judge is not None
 
 
+def test_the_battery_and_the_report_are_stamped_with_one_instant(fixture_lake: FixtureLake):
+    """The History panel finds which partitions a census line counted by matching the battery's
+    ledger stamp to the report's ``at`` (marketlake #626). A sweep handing the two writers
+    different instants leaves every census line unmarked for ever, and nothing else notices."""
+    import json
+
+    from lake.battery import BatteryReport, build_entry
+
+    root = _lake(fixture_lake)
+    handed: list[datetime] = []
+
+    def judging(*args, **kwargs):
+        handed.append(kwargs["now"])
+        return BatteryReport(judged=1, quarantined=1, appended=("chains/x.parquet",))
+
+    original = sweep.judge
+    sweep.judge = judging
+    try:
+        outcome, _, _ = _run(root)
+    finally:
+        sweep.judge = original
+
+    (now,) = handed
+    entry = build_entry(
+        partition="chains/x.parquet", verdict="quarantined", check="row_count_band", observed_at=now
+    )
+    filed = json.loads(outcome.filed_at.read_text(encoding="utf-8"))
+    assert entry["observed_at"] == filed["at"]
+
+
 def test_the_command_hands_the_batterys_threshold_to_the_battery(
     fixture_lake: FixtureLake, capsys, monkeypatch, tmp_path
 ):

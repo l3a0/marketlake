@@ -2260,25 +2260,34 @@ def _mark_released(root: Path, reports: list[dict[str, Any]], withheld: set[str]
     the ``action`` lines whose subject the live ledger no longer withholds, and the page draws
     them as settled. The file is untouched.
 
-    Two lines say a partition was withheld, and each is settled its own way.
+    Two lines can be traced to what they withheld, and the panel settles those two.
 
     1. ``battery.held_line`` names its partition, which is settled when no check withholds it
-       now. ``withheld`` is the set ``_open_quarantines`` just read.
+       now. ``withheld`` is the set ``_open_quarantines`` read.
     2. ``battery.wrote_line`` names none. The ledger says which partitions it counted, because
-       ``battery.build_entry`` stamps ``observed_at`` in Eastern to match the report's ``at``
-       and the sweep hands both one ``now``. So the run's withholding entries are the battery's
-       entries stamped with the report's ``at``. The line is settled when there is at least one
-       and none of their partitions is withheld now. A run whose writes were all releases has
-       none, and its line stays as filed, which is marketlake #439's to split.
+       the sweep hands one ``now`` to the battery, which stamps each entry's ``observed_at``
+       with it, and to ``write_nightly``, which stamps the report's ``at``. So the run's
+       withholding entries are the battery's entries stamped with the report's instant. The
+       stamps are compared as instants rather than as text, so a line spelled in another
+       offset still counts. The census is settled when there is at least one and none of their
+       partitions is withheld now. A run whose writes were all releases has none, and its line
+       stays as filed, which is marketlake #439's to split.
+
+    Other ``action`` lines stay as filed. A ``bars abandoned`` line can carry
+    ``PartitionQuarantined``, which a release also settles, but it counts reasons and names no
+    ticker-day, so nothing here can trace it.
 
     Nothing is marked when the ledger cannot be read, since ``withheld`` is then ``None`` or
     the second read fails, and a report without kinds marks nothing, because the page draws
-    its lines in one colour anyway. Both give ``None``, which draws every line as filed. The
-    ledger is read a second time here rather than threading entries out of
-    ``_open_quarantines``: an append landing between the two reads can only add an entry
-    stamped for a report not filed yet, which matches nothing.
+    its lines in one colour anyway. Both give ``None``, which draws every line as filed.
+
+    **The reports are listed before the ledger is read**, which is what makes reading the
+    ledger twice safe. The sweep appends a run's entries before it files that run's report, so
+    every report listed already has its entries on disk when ``_open_quarantines`` reads.
+    Listed after, a run landing between the two could file a quarantine the ledger read had
+    not seen, and its lines would draw released for one refresh.
     """
-    written: dict[str, set[str]] | None = None
+    written: dict[datetime, set[str]] | None = None
     if withheld is not None:
         try:
             entries = read_quarantine(root)
@@ -2289,19 +2298,31 @@ def _mark_released(root: Path, reports: list[dict[str, Any]], withheld: set[str]
             for entry in entries:
                 if not isinstance(entry, dict) or entry.get("provenance") != PROVENANCE_BATTERY:
                     continue
-                stamp, partition = entry.get("observed_at"), entry.get("partition")
-                if isinstance(stamp, str) and isinstance(partition, str) and is_quarantined(entry):
+                stamp, partition = _instant(entry.get("observed_at")), entry.get("partition")
+                if stamp is not None and isinstance(partition, str) and is_quarantined(entry):
                     written.setdefault(stamp, set()).add(partition)
     for report in reports:
         kinds = report["report_kinds"]
         if written is None or withheld is None or not isinstance(kinds, list):
             report["report_released"] = None
             continue
-        ran = written.get(report["at"]) if isinstance(report["at"], str) else None
+        filed = _instant(report["at"])
+        ran = written.get(filed) if filed is not None else None
         report["report_released"] = [
             kind == ACTION and _settled(line, ran, withheld)
             for line, kind in zip(report["report"], kinds, strict=True)
         ]
+
+
+def _instant(stamp: object) -> datetime | None:
+    """A zone-aware ISO stamp as an instant, or ``None`` for anything else."""
+    if not isinstance(stamp, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 def _settled(line: str, ran: set[str] | None, withheld: set[str]) -> bool:
@@ -2332,9 +2353,10 @@ def query_history(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str
     panel, and a 500 throws away every finding the payload was going to carry, including
     the ones naming what would not read. ``status.html`` keeps this section off the Now
     and Today chain, so a failure here paints this section alone and says so. Each of the
-    three reads is contained at its own boundary and reports its failure as a value: the window read
+    four reads is contained at its own boundary and reports its failure as a value: the window read
     counts an unreadable partition, ``_open_quarantines`` names the class that refused
-    the ledger, and ``_nightly_reports`` counts the files that would not parse. That is
+    the ledger, ``_nightly_reports`` counts the files that would not parse, and
+    ``_mark_released`` reads the ledger again and marks nothing when it refuses. That is
     the rule ``_capture_spans``, ``_slot_aggregates`` and ``undelivered`` each already
     keep.
 
@@ -2376,10 +2398,11 @@ def query_history(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str
                         spans_by_ticker.get(ticker, ()),
                     )
                 )
-    quarantines, ledger_unreadable = _open_quarantines(ctx.paths.root)
+    # Reports first, then the ledger. ``_mark_released`` says why the order matters.
     reports, reports_unreadable, reports_error, reports_older = _nightly_reports(
         ctx.paths.root, HISTORY_REPORTS
     )
+    quarantines, ledger_unreadable = _open_quarantines(ctx.paths.root)
     held_open = _group_reports(reports, reports_older)
     _mark_released(
         ctx.paths.root,

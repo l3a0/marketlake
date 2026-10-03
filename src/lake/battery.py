@@ -1943,10 +1943,10 @@ def judge_row_count(
 
 # -- the report lines a reader matches ---------------------------------------
 #
-# Two nightly report lines say a partition was withheld, and the History panel matches both
-# against the live ledger to mark the ones released since (marketlake #626). Each writer sits
-# beside the reader that parses it, so a change to the wording fails a test rather than
-# leaving the panel to mark nothing.
+# Two nightly report lines can be traced back to the partitions they withheld, and the History
+# panel matches both against the live ledger to mark the ones released since (marketlake #626).
+# Each writer sits beside the reader that parses it, so a change to the wording fails a test
+# rather than leaving the panel to mark nothing.
 
 _HELD_LINE = re.compile(r"battery: (?P<partition>\S+) passes .+ and stays quarantined under .+")
 _WROTE_LINE = re.compile(r"battery wrote \d+ quarantine lines?")

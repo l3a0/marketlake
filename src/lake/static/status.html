@@ -265,7 +265,8 @@
   ];
 
   // What each report line asks of its reader, which the sweep writes beside the line. The
-  // panel computes none of these. It weights each line by the kind the file carries.
+  // panel computes none of these. It weights each line by the kind the file carries, except a
+  // needs-action line the payload marks released since, which draws at the released weight.
   var REPORT_KINDS = [
     {key: "action", label: "needs action",
      title: "Needs action: a human has something to do about this line."},

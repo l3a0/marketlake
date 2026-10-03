@@ -3970,6 +3970,46 @@ def test_the_census_counts_the_battery_entries_and_no_human_one(root: Path):
     assert _released(root) == [False, True, True, False, True]
 
 
+def test_a_stamp_spelled_in_another_offset_is_the_same_run(root: Path):
+    """The census is matched to its run by instant, not by text. A hand-written battery line
+    spelling the same instant in UTC is still the run's, and the partition it withholds keeps
+    the census open."""
+    filed = et(RELEASE_DAY, 18, 30)
+    _file_nightly(root, RELEASE_DAY, report=(wrote_line(2),), report_kinds=("action",))
+    _verdict(root, SPY_CHAINS, QUARANTINED_VERDICT, filed)
+    append_quarantine(
+        root,
+        {
+            "partition": QQQ_CHAINS,
+            "verdict": QUARANTINED_VERDICT,
+            "check": "row_count_band",
+            "provenance": "battery",
+            "observed_at": filed.astimezone(UTC).isoformat(),
+        },
+    )
+    _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed + timedelta(hours=18))
+    assert _released(root) == [False]
+
+
+def test_a_run_landing_mid_request_is_never_drawn_released(root: Path, monkeypatch):
+    """The panel lists the reports before it reads the ledger. A run appends its entries and
+    then files its report, so a run landing between the two reads cannot leave a report listed
+    whose quarantine the ledger read missed, which would draw it released for a refresh."""
+    from lake import dashboard
+
+    listing = dashboard._nightly_reports
+
+    def a_run_lands_first(*args, **kwargs):
+        if not (root / "reports").exists():
+            _release_night(root)
+        return listing(*args, **kwargs)
+
+    monkeypatch.setattr(dashboard, "_nightly_reports", a_run_lands_first)
+    payload = _history(root)
+    assert payload["quarantine_count"] == 2
+    assert _by_day(payload)[RELEASE_DAY.isoformat()]["report_released"] == [False] * 5
+
+
 def test_a_partition_withheld_again_is_not_released(root: Path):
     filed = _release_night(root)
     _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed + timedelta(hours=18))
