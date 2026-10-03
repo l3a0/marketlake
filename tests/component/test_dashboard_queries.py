@@ -51,7 +51,13 @@ import pytest
 
 from lake import capture, dashboard, journal
 from lake.alert import Message, Publisher
-from lake.battery import QUARANTINED_VERDICT, build_entry, held_line, wrote_line
+from lake.battery import (
+    PROVENANCE_HUMAN,
+    QUARANTINED_VERDICT,
+    build_entry,
+    held_line,
+    wrote_line,
+)
 from lake.calendar import MARKET_TZ
 from lake.capture_spans import SPANS_SCHEMA, CaptureSpan, CaptureSpans, spans_path
 from lake.config import GuardConstants
@@ -3932,6 +3938,36 @@ def test_a_census_of_releases_alone_stays_as_filed(root: Path):
     _file_nightly(root, RELEASE_DAY, report=(wrote_line(1),), report_kinds=("action",))
     _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed)
     assert _released(root) == [False]
+
+
+def test_only_a_line_that_needed_action_is_settled(root: Path):
+    """A line the file calls worth knowing asked for nothing, so there is nothing to settle,
+    whatever its text says."""
+    filed = et(RELEASE_DAY, 18, 30)
+    line = held_line(SPY_CHAINS, ["realtime_entitlement"], "'row_count_band'")
+    _file_nightly(root, RELEASE_DAY, report=(line,), report_kinds=("info",))
+    _verdict(root, SPY_CHAINS, QUARANTINED_VERDICT, filed)
+    _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed + timedelta(hours=18))
+    assert _released(root) == [False]
+
+
+def test_the_census_counts_the_battery_entries_and_no_human_one(root: Path):
+    """The census counted what the battery run appended. A human line stamped the same instant
+    was not part of it, so a partition it withholds cannot keep the census open."""
+    filed = _release_night(root)
+    for partition in (QQQ_CHAINS, SPY_CHAINS):
+        _verdict(root, partition, CLEAN_VERDICT, filed + timedelta(hours=18))
+    append_quarantine(
+        root,
+        build_entry(
+            partition="chains/ticker=IWM/date=2026-09-18.parquet",
+            verdict=QUARANTINED_VERDICT,
+            check="row_count_band",
+            observed_at=filed,
+            provenance=PROVENANCE_HUMAN,
+        ),
+    )
+    assert _released(root) == [False, True, True, False, True]
 
 
 def test_a_partition_withheld_again_is_not_released(root: Path):
