@@ -3088,13 +3088,35 @@ def test_only_an_absence_marker_excuses_a_short_snapshot(lake: Path):
         + _windowed(1, rows_each=30, given_up=1, gap_window="2026-10-17")
         + _windowed(2, rows_each=40, given_up=1, gap_window=None)
         + _windowed(3, rows_each=100)
+        + _windowed(4, rows_each=25, given_up=2, gap_window="2027-01-15")
     )
     _write(lake, "chains", "SPY", DAY, rows)
 
     bounds = (CALENDAR.session_open(DAY), CALENDAR.option_close(DAY))
 
-    assert split_snapshot_counts(_partition(lake), bounds) == ((40, 100, 100), (30,))
-    assert session_snapshot_counts(_partition(lake), bounds) == (30, 40, 100, 100)
+    # Two marked snapshots, so leaving out only the first would leave the 25 counted.
+    assert split_snapshot_counts(_partition(lake), bounds) == ((40, 100, 100), (25, 30))
+    assert session_snapshot_counts(_partition(lake), bounds) == (25, 30, 40, 100, 100)
+
+
+def test_a_retyped_row_kind_is_unreadable_rather_than_a_raw_arrow_error(lake: Path):
+    """The marker filter adds Arrow kernels over ``row_kind``, and every kernel a check runs
+    stays inside the partition's containment, for the reason :func:`_contained` gives."""
+    rows = _windowed(0, rows_each=3) + _windowed(1, rows_each=2, given_up=1, gap_window="x")
+    table = _table("chains", rows)
+    table = table.set_column(
+        table.schema.get_field_index("row_kind"),
+        "row_kind",
+        pa.array(list(range(len(rows))), pa.int64()),
+    )
+    path = lake / "chains" / "ticker=SPY" / f"date={DAY.isoformat()}.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pa_pq.write_table(table, path)
+
+    with pytest.raises(PartitionUnreadable):
+        split_snapshot_counts(
+            _partition(lake), (CALENDAR.session_open(DAY), CALENDAR.option_close(DAY))
+        )
 
 
 def test_a_partition_without_the_window_column_still_counts(lake: Path):
