@@ -113,8 +113,9 @@ any work: until a second check existed, no partition could be withheld by two.
 3. :data:`CHECK_QUOTE_SANITY`, ``bid <= mark <= ask`` at a rate within a measured tolerance.
    Crossed quotes are real and :data:`QUOTE_SANITY_TOLERANCE` carries the measurement that says
    so.
-4. :data:`CHECK_ROW_COUNT_BAND`, every session snapshot inside a band of the trailing median,
-   which catches a truncated fetch. It is the options-only one of the four.
+4. :data:`CHECK_ROW_COUNT_BAND`, every session snapshot without an absence marker inside a band
+   of the trailing median, which catches a truncated fetch nothing recorded. It is the
+   options-only one of the four.
 
 **Two classes of partition are out of scope for every check, and the lake holds both today.**
 
@@ -1652,19 +1653,42 @@ def session_snapshot_counts(
     about two percent fewer contracts than the session's own snapshots, and a median built from
     session snapshots is the wrong thing to measure an overnight chain against.
 
-    **A snapshot carrying an absence marker is left out.** A marker is the gap row a windowed
-    fetch writes for each window it gave up, and it is the one gap row with a ``window_start``.
-    The band catches a short fetch nothing else noticed, and a marked snapshot was noticed: its
-    rows say which windows are missing and why. On 2026-10-02 a connection outage left the 12:00
-    ET cycle with 0.30 of QQQ's chain and 0.37 of SPY's, every missing window marked, and judging
-    it withheld both sessions' other 402 minutes (marketlake #623). Across every chains
-    partition at the time, 13 of 12,161 snapshots carried a marker and every unmarked one sat
-    at its partition's median, so the band had only ever fired on losses already recorded.
+    Every snapshot is counted here, marked or not. This is what a trailing session contributes
+    to the median, and :func:`split_snapshot_counts` says why the two sides differ.
+    """
+    unmarked, marked = split_snapshot_counts(partition, bounds)
+    return tuple(sorted(unmarked + marked))
+
+
+def split_snapshot_counts(
+    partition: SealedPartition, bounds: tuple[datetime, datetime] | None
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """The session snapshots' data-row counts, split by whether the snapshot is marked.
+
+    The first tuple holds the snapshots without an absence marker and the second those with
+    one, each sorted. A marker is the gap row a windowed fetch writes for each window it gave
+    up, and it is the one gap row with a ``window_start``.
+
+    **The judged session is measured on its unmarked snapshots alone.** The band catches a short
+    fetch nothing else noticed, and a marked snapshot was noticed: its rows say which windows
+    are missing and why. On 2026-10-02 a connection outage left the 12:00 ET cycle with 0.30 of
+    QQQ's chain and 0.37 of SPY's, every missing window marked, and judging it withheld both
+    sessions' other 402 minutes (marketlake #623). Across every chains partition at the time,
+    13 of 12,161 snapshots carried a marker and every unmarked one sat at its partition's
+    median, so the band had only ever fired on losses already recorded.
+
+    **A trailing session counts every snapshot.** Leaving its marked ones out as well would let
+    a run of sessions whose every cycle gave up one window contribute no median at all. The
+    judged session would then read ``insufficient_history`` and fail open, even on an unmarked
+    snapshot cut short, which is the loss the band exists for. A few marked snapshots barely
+    move a median over some 400.
 
     The price is a snapshot that gave up some windows and came back silently short on another.
-    It is no longer judged, and one count could not have told its two shortfalls apart anyway.
-    The vendor's own ``isChainTruncated`` on a one-shot chain writes no marker, so it stays
-    judged. A partition sealed before the column existed has no marker to find.
+    It is no longer judged. Its data rows carry their window, so a per-window count could tell
+    the two shortfalls apart, and nothing builds one yet: all 13 marked snapshots came back
+    whole on every window they kept (marketlake #625). The vendor's own ``isChainTruncated`` on
+    a one-shot chain writes no marker, so it stays judged. A partition sealed before the column
+    existed has no marker to find.
     """
     import pyarrow as pa
     import pyarrow.compute as pc
@@ -1696,15 +1720,17 @@ def session_snapshot_counts(
             )
             marked = pc.unique(markers[SNAP_TS])
         table = table.filter(pc.equal(table[ROW_KIND_COLUMN], ROW_KIND_DATA))
-        if len(marked):
-            table = table.filter(pc.invert(pc.is_in(table[SNAP_TS], value_set=marked)))
         if table.num_rows == 0:
-            return ()
+            return (), ()
         table = _within(table, partition, bounds)
         if table.num_rows == 0:
-            return ()
+            return (), ()
         counted = table.group_by(SNAP_TS).aggregate([(SNAP_TS, "count")])
-        return tuple(sorted(counted[f"{SNAP_TS}_count"].to_pylist()))
+        is_marked = pc.is_in(counted[SNAP_TS], value_set=marked).to_pylist()
+        sizes = counted[f"{SNAP_TS}_count"].to_pylist()
+        unmarked = tuple(sorted(n for n, hit in zip(sizes, is_marked, strict=True) if not hit))
+        flagged = tuple(sorted(n for n, hit in zip(sizes, is_marked, strict=True) if hit))
+        return unmarked, flagged
 
 
 def median(values: Sequence[float]) -> float:
@@ -1817,20 +1843,29 @@ def judge_row_count(
     counts: Sequence[int],
     trailing: Sequence[float],
     guards: GuardConstants,
+    *,
+    marked: int = 0,
 ) -> Finding:
     """One partition's row-count verdict, from its snapshots and the trailing median.
 
-    Three answers before the band is applied.
+    ``counts`` are the unmarked session snapshots and ``marked`` is how many carried an
+    absence marker and were left out, for the reason :func:`split_snapshot_counts` gives. Every
+    reason names the left-out count, so a session holding three snapshots never reads as
+    though it held two.
+
+    Four answers before the band is applied.
 
     1. No session snapshot at all, which is out of scope. A day of overnight cycles recorded no
        session rather than a bad one, and it is the same answer :func:`judge_entitlement` gives
        the same partition.
-    2. Fewer trailing sessions than ``config.min_trailing_sessions``, which is
+    2. Session snapshots, every one of them marked, which is out of scope too. Nothing is left
+       to judge, and the reason says the loss is recorded rather than that capture never ran.
+    3. Fewer trailing sessions than ``config.min_trailing_sessions``, which is
        ``insufficient_history``. The design says a median-relative check with a thin history
        still runs and tags its rows rather than passing them, and that tag is a finding and
        never a verdict because ``manifest.is_quarantined`` fails closed on anything but
        ``clean``.
-    3. Otherwise the band, ``config.battery_row_count_band`` either side of the trailing median.
+    4. Otherwise the band, ``config.battery_row_count_band`` either side of the trailing median.
 
     **The threshold is one snapshot rather than a rate**, which is what "catches truncated
     fetches" asks for: a truncated fetch is one cycle, and a check tolerating some would not
@@ -1847,6 +1882,14 @@ def judge_row_count(
     ``insufficient_history`` it is how many trailing sessions carried a median against how many
     the check needs, because there is no row count to report.
     """
+    if not counts and marked:
+        return _finding(
+            partition,
+            CHECK_ROW_COUNT_BAND,
+            OUT_OF_SCOPE,
+            f"all {marked} session snapshot{'s' if marked != 1 else ''} carry an absence "
+            "marker, so every shortfall is already recorded and none is left to judge",
+        )
     if not counts:
         return _finding(
             partition,
@@ -1855,6 +1898,11 @@ def judge_row_count(
             "no data row falls inside the session, so the partition carries no snapshot to "
             "measure against the trailing median",
         )
+    left_out = (
+        f", leaving out {marked} snapshot{'s' if marked != 1 else ''} carrying an absence marker"
+        if marked
+        else ""
+    )
     if not trailing or len(trailing) < guards.min_trailing_sessions:
         return _finding(
             partition,
@@ -1877,7 +1925,7 @@ def judge_row_count(
             QUARANTINED_VERDICT,
             f"{len(outside)} of {len(counts)} session snapshots fall outside "
             f"{low:.0f} to {high:.0f} rows, the worst holding {worst} against a trailing "
-            f"median of {against:.0f} over {len(trailing)} sessions",
+            f"median of {against:.0f} over {len(trailing)} sessions{left_out}",
             computed=float(worst),
             against=against,
         )
@@ -1886,7 +1934,7 @@ def judge_row_count(
         CHECK_ROW_COUNT_BAND,
         CLEAN_VERDICT,
         f"all {len(counts)} session snapshots fall inside {low:.0f} to {high:.0f} rows, "
-        f"against a trailing median of {against:.0f} over {len(trailing)} sessions",
+        f"against a trailing median of {against:.0f} over {len(trailing)} sessions{left_out}",
         computed=float(median([float(count) for count in counts])),
         against=against,
     )
@@ -2255,9 +2303,12 @@ def _judge_partition(
             )
         )
         return judged
-    counts = session_snapshot_counts(partition, bounds)
-    if counts:
-        medians[partition.relative] = median(counts)
+    counts, marked = split_snapshot_counts(partition, bounds)
+    if counts or marked:
+        # The memo is what a later partition's trailing window reads, so it holds the median a
+        # trailing session contributes, over every snapshot. Storing the judged side's would
+        # make a session's contribution depend on whether the walk judged it first.
+        medians[partition.relative] = median(counts + marked)
     judged.append(
         judge_row_count(
             partition,
@@ -2271,6 +2322,7 @@ def _judge_partition(
                 memo=medians,
             ),
             guards,
+            marked=len(marked),
         )
     )
     return judged
@@ -2605,6 +2657,7 @@ __all__ = [
     "read_reference",
     "sealed_partitions",
     "session_snapshot_counts",
+    "split_snapshot_counts",
     "trailing_medians",
     "write_verdict",
 ]

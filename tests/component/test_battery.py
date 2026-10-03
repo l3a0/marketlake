@@ -64,6 +64,7 @@ from lake.battery import (
     render,
     sealed_partitions,
     session_snapshot_counts,
+    split_snapshot_counts,
     trailing_medians,
     write_verdict,
 )
@@ -2965,7 +2966,9 @@ def test_a_truncated_snapshot_quarantines_the_partition(lake: Path):
     assert "1 of 3 session snapshots" in finding.reason
 
 
-def _windowed(minute: int, *, rows_each: int, given_up: int = 0, gap_window=None) -> list[dict]:
+def _windowed(
+    minute: int, *, rows_each: int, given_up: int = 0, gap_window=None, day: date = DAY
+) -> list[dict]:
     """One windowed-fetch snapshot: data rows that name their window, and its gap rows.
 
     ``given_up`` absence markers carry a ``window_start``, the way the chunker writes one per
@@ -2982,7 +2985,7 @@ def _windowed(minute: int, *, rows_each: int, given_up: int = 0, gap_window=None
         row = _row(minute, staleness=-1.7, flag=None, surface="chains", kind="gap")
         row["window_start"] = gap_window
         rows.append(row)
-    return _shift(rows, DAY)
+    return _shift(rows, day)
 
 
 def test_a_snapshot_whose_missing_windows_are_marked_absent_is_not_counted(lake: Path):
@@ -3002,6 +3005,79 @@ def test_a_snapshot_whose_missing_windows_are_marked_absent_is_not_counted(lake:
 
     assert finding.verdict == CLEAN_VERDICT
     assert "all 2 session snapshots" in finding.reason
+    assert finding.reason.endswith("leaving out 1 snapshot carrying an absence marker")
+
+
+def test_a_session_whose_every_snapshot_is_marked_says_so(lake: Path):
+    """Nothing is left to judge, and the reason must not claim the session held no data."""
+    _history(lake)
+    rows = _windowed(0, rows_each=30, given_up=1, gap_window="2026-10-17") + _windowed(
+        1, rows_each=90, given_up=1, gap_window="2026-10-17"
+    )
+    _write(lake, "chains", "SPY", DAY, rows)
+    _seed_spans(lake)
+
+    finding = _answer(judge(lake, calendar=CALENDAR, now=NOW), CHECK_ROW_COUNT_BAND, JUDGED)
+
+    assert finding.verdict == OUT_OF_SCOPE
+    assert finding.reason.startswith("all 2 session snapshots carry an absence marker")
+
+
+def test_a_trailing_session_counts_its_marked_snapshots(lake: Path):
+    """A history whose every cycle gave up one window still carries a median. Leaving those
+    snapshots out of the trailing side read as a thin history and passed a snapshot cut short
+    with nothing marked, which is the loss the band exists for."""
+    for day in COVERED_SESSIONS[:-1]:
+        _write(
+            lake,
+            "chains",
+            "SPY",
+            day,
+            [
+                row
+                for minute in range(3)
+                for row in _windowed(
+                    minute, rows_each=90, given_up=1, gap_window="2026-12-18", day=day
+                )
+            ],
+        )
+    rows = _windowed(0, rows_each=90) + _windowed(1, rows_each=50) + _windowed(2, rows_each=90)
+    _write(lake, "chains", "SPY", DAY, rows)
+    _seed_spans(lake)
+
+    finding = _answer(judge(lake, calendar=CALENDAR, now=NOW), CHECK_ROW_COUNT_BAND, JUDGED)
+
+    assert finding.verdict == QUARANTINED_VERDICT
+    assert finding.computed == 50.0
+    assert finding.against == 90.0
+
+
+def test_the_memo_holds_what_a_trailing_session_contributes(lake: Path):
+    """A whole-lake run judges a trailing session before the one it trails and memoizes its
+    median. That median has to be the one a trailing session contributes, over every snapshot,
+    or the verdict depends on whether the run was scoped to one session."""
+    for day in COVERED_SESSIONS[:-1]:
+        _write(
+            lake,
+            "chains",
+            "SPY",
+            day,
+            _windowed(0, rows_each=100, day=day)
+            + _windowed(1, rows_each=60, given_up=1, gap_window="2026-12-18", day=day)
+            + _windowed(2, rows_each=60, given_up=1, gap_window="2026-12-18", day=day),
+        )
+    _write(lake, "chains", "SPY", DAY, _snapshots(DAY, count=3, rows_each=100))
+    _seed_spans(lake)
+
+    scoped = _answer(
+        judge(lake, calendar=CALENDAR, now=NOW, day=DAY, dry_run=True),
+        CHECK_ROW_COUNT_BAND,
+        JUDGED,
+    )
+    whole = _answer(judge(lake, calendar=CALENDAR, now=NOW), CHECK_ROW_COUNT_BAND, JUDGED)
+
+    assert scoped.against == 60.0
+    assert (whole.verdict, whole.against) == (scoped.verdict, scoped.against)
 
 
 def test_only_an_absence_marker_excuses_a_short_snapshot(lake: Path):
@@ -3015,11 +3091,10 @@ def test_only_an_absence_marker_excuses_a_short_snapshot(lake: Path):
     )
     _write(lake, "chains", "SPY", DAY, rows)
 
-    counts = session_snapshot_counts(
-        _partition(lake), (CALENDAR.session_open(DAY), CALENDAR.option_close(DAY))
-    )
+    bounds = (CALENDAR.session_open(DAY), CALENDAR.option_close(DAY))
 
-    assert counts == (40, 100, 100)
+    assert split_snapshot_counts(_partition(lake), bounds) == ((40, 100, 100), (30,))
+    assert session_snapshot_counts(_partition(lake), bounds) == (30, 40, 100, 100)
 
 
 def test_a_partition_without_the_window_column_still_counts(lake: Path):
