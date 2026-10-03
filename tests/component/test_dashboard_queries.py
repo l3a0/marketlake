@@ -4010,6 +4010,78 @@ def test_a_run_landing_mid_request_is_never_drawn_released(root: Path, monkeypat
     assert _by_day(payload)[RELEASE_DAY.isoformat()]["report_released"] == [False] * 5
 
 
+def test_an_action_line_the_ledger_cannot_trace_is_never_settled(root: Path):
+    """Only the two traceable lines are settled. A battery that did not run asked for a
+    human whatever the ledger says now."""
+    filed = et(RELEASE_DAY, 18, 30)
+    held = held_line(SPY_CHAINS, ["realtime_entitlement"], "'row_count_band'")
+    _file_nightly(
+        root,
+        RELEASE_DAY,
+        report=("battery did not run: OSError: disk", held),
+        report_kinds=("action", "action"),
+    )
+    _verdict(root, SPY_CHAINS, QUARANTINED_VERDICT, filed)
+    _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed + timedelta(hours=18))
+    assert _released(root) == [False, True]
+
+
+def test_a_held_line_about_an_earlier_quarantine_is_settled_by_its_release(root: Path):
+    """A held line repeats every night a partition stays withheld, so the run that filed it
+    usually wrote nothing for it. The held line is settled by the partition alone."""
+    filed = et(RELEASE_DAY, 18, 30)
+    held = held_line(SPY_CHAINS, ["realtime_entitlement"], "'row_count_band'")
+    _file_nightly(root, RELEASE_DAY, report=(held,), report_kinds=("action",))
+    _verdict(root, SPY_CHAINS, QUARANTINED_VERDICT, filed - timedelta(days=1))
+    _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed + timedelta(hours=18))
+    assert _released(root) == [True]
+
+
+def test_a_census_of_twelve_is_settled_like_one_of_two(root: Path):
+    """A wide night writes ten or more lines, and a census the parser stops recognizing past
+    nine stays as filed for ever."""
+    filed = et(RELEASE_DAY, 18, 30)
+    _file_nightly(root, RELEASE_DAY, report=(wrote_line(12),), report_kinds=("action",))
+    partitions = [f"chains/ticker=T{index}/date=2026-09-18.parquet" for index in range(12)]
+    for partition in partitions:
+        _verdict(root, partition, QUARANTINED_VERDICT, filed)
+    for partition in partitions:
+        _verdict(root, partition, CLEAN_VERDICT, filed + timedelta(hours=18))
+    assert _released(root) == [True]
+
+
+def test_a_partition_withheld_by_another_check_is_not_released(root: Path):
+    filed = et(RELEASE_DAY, 18, 30)
+    held = held_line(SPY_CHAINS, ["realtime_entitlement"], "'strike_grid_completeness'")
+    _file_nightly(root, RELEASE_DAY, report=(held,), report_kinds=("action",))
+    append_quarantine(
+        root,
+        build_entry(
+            partition=SPY_CHAINS,
+            verdict=QUARANTINED_VERDICT,
+            check="strike_grid_completeness",
+            observed_at=filed,
+        ),
+    )
+    assert _released(root) == [False]
+
+
+def test_a_second_ledger_read_that_fails_costs_the_marks_and_not_the_panel(root: Path, monkeypatch):
+    """The first read succeeded, so the open quarantines are served. The marks need a second
+    read, and when that one fails every line draws as filed."""
+    from lake import dashboard
+
+    _release_night(root)
+
+    def refused(_root):
+        raise OSError("ledger vanished between reads")
+
+    monkeypatch.setattr(dashboard, "read_quarantine", refused)
+    payload = _history(root)
+    assert payload["quarantine_count"] == 2
+    assert _by_day(payload)[RELEASE_DAY.isoformat()]["report_released"] is None
+
+
 def test_a_partition_withheld_again_is_not_released(root: Path):
     filed = _release_night(root)
     _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed + timedelta(hours=18))

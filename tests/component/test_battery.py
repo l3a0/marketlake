@@ -1786,8 +1786,11 @@ def test_the_report_line_names_every_check_still_withholding(lake: Path):
 def test_the_line_parsers_read_only_their_own_lines():
     """Each parser is the History panel's way back from a filed line to what it reported, so
     a line it misreads is a partition the panel calls released when it is not."""
+    assert wrote_line(1) == "battery wrote 1 quarantine line"
+    assert wrote_line(2) == "battery wrote 2 quarantine lines"
     assert is_wrote_line(wrote_line(1))
     assert is_wrote_line(wrote_line(2))
+    assert is_wrote_line(wrote_line(12))
     assert not is_wrote_line(wrote_line(2) + " and more")
     assert (
         held_line_partition(
