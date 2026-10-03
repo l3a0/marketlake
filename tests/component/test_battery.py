@@ -118,6 +118,7 @@ CHAINS_SCHEMA = pa.schema(
         ("suspect", pa.bool_()),
         ("schema_version", pa.int64()),
         ("extra", pa.string()),
+        ("window_start", pa.string()),
     ]
 )
 QUOTES_SCHEMA = pa.schema(
@@ -2962,6 +2963,75 @@ def test_a_truncated_snapshot_quarantines_the_partition(lake: Path):
     assert finding.computed == 50.0
     assert finding.against == 100.0
     assert "1 of 3 session snapshots" in finding.reason
+
+
+def _windowed(minute: int, *, rows_each: int, given_up: int = 0, gap_window=None) -> list[dict]:
+    """One windowed-fetch snapshot: data rows that name their window, and its gap rows.
+
+    ``given_up`` absence markers carry a ``window_start``, the way the chunker writes one per
+    window it gave up. ``gap_window`` sets that column on them, so ``None`` builds a gap row
+    shaped like a whole-cycle failure instead. Real data rows carry a window too, which is what
+    makes the gap-only half of the marker test necessary.
+    """
+    rows = []
+    for _ in range(rows_each):
+        row = _row(minute, staleness=-1.7, flag=False, surface="chains")
+        row["window_start"] = "2026-09-16"
+        rows.append(row)
+    for _ in range(given_up):
+        row = _row(minute, staleness=-1.7, flag=None, surface="chains", kind="gap")
+        row["window_start"] = gap_window
+        rows.append(row)
+    return _shift(rows, DAY)
+
+
+def test_a_snapshot_whose_missing_windows_are_marked_absent_is_not_counted(lake: Path):
+    """Marketlake #623. On 2026-10-02 a connection outage left the 12:00 ET cycle with 0.30 of
+    QQQ's chain, every missing window marked absent, and the band withheld the session's other
+    402 minutes for a loss the lake had already recorded."""
+    _history(lake)
+    rows = (
+        _windowed(0, rows_each=100)
+        + _windowed(1, rows_each=30, given_up=3, gap_window="2026-10-17")
+        + _windowed(2, rows_each=100)
+    )
+    _write(lake, "chains", "SPY", DAY, rows)
+    _seed_spans(lake)
+
+    finding = _answer(judge(lake, calendar=CALENDAR, now=NOW), CHECK_ROW_COUNT_BAND, JUDGED)
+
+    assert finding.verdict == CLEAN_VERDICT
+    assert "all 2 session snapshots" in finding.reason
+
+
+def test_only_an_absence_marker_excuses_a_short_snapshot(lake: Path):
+    """Both halves of the marker: a gap row, and a window on it. A whole-cycle gap row has no
+    window and excuses nothing, and a data row's window is not a marker."""
+    rows = (
+        _windowed(0, rows_each=100)
+        + _windowed(1, rows_each=30, given_up=1, gap_window="2026-10-17")
+        + _windowed(2, rows_each=40, given_up=1, gap_window=None)
+        + _windowed(3, rows_each=100)
+    )
+    _write(lake, "chains", "SPY", DAY, rows)
+
+    counts = session_snapshot_counts(
+        _partition(lake), (CALENDAR.session_open(DAY), CALENDAR.option_close(DAY))
+    )
+
+    assert counts == (40, 100, 100)
+
+
+def test_a_partition_without_the_window_column_still_counts(lake: Path):
+    """Partitions sealed before the windowed fetch carry no ``window_start`` and no marker."""
+    rows = _snapshots(DAY, count=2, rows_each=100) + _snapshots(DAY, count=1, rows_each=50, first=2)
+    _write(lake, "chains", "SPY", DAY, rows, drop="window_start")
+
+    counts = session_snapshot_counts(
+        _partition(lake), (CALENDAR.session_open(DAY), CALENDAR.option_close(DAY))
+    )
+
+    assert counts == (50, 100, 100)
 
 
 def test_a_snapshot_inside_the_band_passes(lake: Path):

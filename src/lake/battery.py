@@ -208,7 +208,7 @@ from lake.alert import REFUSED, Message, Publisher
 from lake.calendar import MARKET_TZ, Calendar, NotASession
 from lake.capture_spans import CaptureSpan, CaptureSpans, CaptureSpansError, spans_path
 from lake.config import GuardConstants
-from lake.journal import ROW_KIND_COLUMN, ROW_KIND_DATA
+from lake.journal import ROW_KIND_COLUMN, ROW_KIND_DATA, ROW_KIND_GAP
 from lake.manifest import (
     CLEAN_VERDICT,
     VERDICT_FIELD,
@@ -306,6 +306,10 @@ ENTITLEMENT_FLAGS: dict[str, tuple[str, bool]] = {
 SNAP_TS = "snap_ts"
 FETCH_TS = "fetch_ts"
 VENDOR_QUOTE_TS = "vendor_quote_ts"
+
+# The column an absence marker names its given-up window in. A whole-cycle gap row leaves it
+# null, so it is what tells the two kinds of gap row apart.
+WINDOW_START = "window_start"
 
 # The three the quote-sanity check orders, in the order the design writes them. Both surfaces
 # carry all three in the pinned capture schema, so the check needs no per-surface mapping the
@@ -1647,7 +1651,22 @@ def session_snapshot_counts(
     own. The 03:25 overnight cycle on each of the lake's 2026-09-16 chain partitions carries
     about two percent fewer contracts than the session's own snapshots, and a median built from
     session snapshots is the wrong thing to measure an overnight chain against.
+
+    **A snapshot carrying an absence marker is left out.** A marker is the gap row a windowed
+    fetch writes for each window it gave up, and it is the one gap row with a ``window_start``.
+    The band catches a short fetch nothing else noticed, and a marked snapshot was noticed: its
+    rows say which windows are missing and why. On 2026-10-02 a connection outage left the 12:00
+    ET cycle with 0.30 of QQQ's chain and 0.37 of SPY's, every missing window marked, and judging
+    it withheld both sessions' other 402 minutes (marketlake #623). Across every chains
+    partition at the time, 13 of 12,161 snapshots carried a marker and every unmarked one sat
+    at its partition's median, so the band had only ever fired on losses already recorded.
+
+    The price is a snapshot that gave up some windows and came back silently short on another.
+    It is no longer judged, and one count could not have told its two shortfalls apart anyway.
+    The vendor's own ``isChainTruncated`` on a one-shot chain writes no marker, so it stays
+    judged. A partition sealed before the column existed has no marker to find.
     """
+    import pyarrow as pa
     import pyarrow.compute as pc
     import pyarrow.parquet as pq
 
@@ -1658,13 +1677,27 @@ def session_snapshot_counts(
     missing = [name for name in (ROW_KIND_COLUMN, SNAP_TS) if name not in available]
     if missing:
         raise PartitionUnreadable(f"{partition.relative}: missing {', '.join(sorted(missing))}")
+    columns = [ROW_KIND_COLUMN, SNAP_TS]
+    if WINDOW_START in available:
+        columns.append(WINDOW_START)
     try:
-        table = pq.read_table(partition.path, columns=[ROW_KIND_COLUMN, SNAP_TS])
+        table = pq.read_table(partition.path, columns=columns)
     except Exception as exc:  # noqa: BLE001 - same reason as above
         raise PartitionUnreadable(f"{partition.relative}: {type(exc).__name__}: {exc}") from exc
 
     with _contained(partition):
+        marked = pa.array([], type=table[SNAP_TS].type)
+        if WINDOW_START in available:
+            markers = table.filter(
+                pc.and_(
+                    pc.equal(table[ROW_KIND_COLUMN], ROW_KIND_GAP),
+                    pc.is_valid(table[WINDOW_START]),
+                )
+            )
+            marked = pc.unique(markers[SNAP_TS])
         table = table.filter(pc.equal(table[ROW_KIND_COLUMN], ROW_KIND_DATA))
+        if len(marked):
+            table = table.filter(pc.invert(pc.is_in(table[SNAP_TS], value_set=marked)))
         if table.num_rows == 0:
             return ()
         table = _within(table, partition, bounds)
