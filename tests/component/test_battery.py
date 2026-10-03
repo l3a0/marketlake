@@ -64,6 +64,7 @@ from lake.battery import (
     render,
     sealed_partitions,
     session_snapshot_counts,
+    split_snapshot_counts,
     trailing_medians,
     write_verdict,
 )
@@ -118,6 +119,7 @@ CHAINS_SCHEMA = pa.schema(
         ("suspect", pa.bool_()),
         ("schema_version", pa.int64()),
         ("extra", pa.string()),
+        ("window_start", pa.string()),
     ]
 )
 QUOTES_SCHEMA = pa.schema(
@@ -2962,6 +2964,171 @@ def test_a_truncated_snapshot_quarantines_the_partition(lake: Path):
     assert finding.computed == 50.0
     assert finding.against == 100.0
     assert "1 of 3 session snapshots" in finding.reason
+
+
+def _windowed(
+    minute: int, *, rows_each: int, given_up: int = 0, gap_window=None, day: date = DAY
+) -> list[dict]:
+    """One windowed-fetch snapshot: data rows that name their window, and its gap rows.
+
+    ``given_up`` absence markers carry a ``window_start``, the way the chunker writes one per
+    window it gave up. ``gap_window`` sets that column on them, so ``None`` builds a gap row
+    shaped like a whole-cycle failure instead. Real data rows carry a window too, which is what
+    makes the gap-only half of the marker test necessary.
+    """
+    rows = []
+    for _ in range(rows_each):
+        row = _row(minute, staleness=-1.7, flag=False, surface="chains")
+        row["window_start"] = "2026-09-16"
+        rows.append(row)
+    for _ in range(given_up):
+        row = _row(minute, staleness=-1.7, flag=None, surface="chains", kind="gap")
+        row["window_start"] = gap_window
+        rows.append(row)
+    return _shift(rows, day)
+
+
+def test_a_snapshot_whose_missing_windows_are_marked_absent_is_not_counted(lake: Path):
+    """Marketlake #623. On 2026-10-02 a connection outage left the 12:00 ET cycle with 0.30 of
+    QQQ's chain, every missing window marked absent, and the band withheld the session's other
+    402 minutes for a loss the lake had already recorded."""
+    _history(lake)
+    rows = (
+        _windowed(0, rows_each=100)
+        + _windowed(1, rows_each=30, given_up=3, gap_window="2026-10-17")
+        + _windowed(2, rows_each=100)
+    )
+    _write(lake, "chains", "SPY", DAY, rows)
+    _seed_spans(lake)
+
+    finding = _answer(judge(lake, calendar=CALENDAR, now=NOW), CHECK_ROW_COUNT_BAND, JUDGED)
+
+    assert finding.verdict == CLEAN_VERDICT
+    assert "all 2 session snapshots" in finding.reason
+    assert finding.reason.endswith("leaving out 1 snapshot carrying an absence marker")
+
+
+def test_a_session_whose_every_snapshot_is_marked_says_so(lake: Path):
+    """Nothing is left to judge, and the reason must not claim the session held no data."""
+    _history(lake)
+    rows = _windowed(0, rows_each=30, given_up=1, gap_window="2026-10-17") + _windowed(
+        1, rows_each=90, given_up=1, gap_window="2026-10-17"
+    )
+    _write(lake, "chains", "SPY", DAY, rows)
+    _seed_spans(lake)
+
+    finding = _answer(judge(lake, calendar=CALENDAR, now=NOW), CHECK_ROW_COUNT_BAND, JUDGED)
+
+    assert finding.verdict == OUT_OF_SCOPE
+    assert finding.reason.startswith("all 2 session snapshots carry an absence marker")
+
+
+def test_a_trailing_session_counts_its_marked_snapshots(lake: Path):
+    """A history whose every cycle gave up one window still carries a median. Leaving those
+    snapshots out of the trailing side read as a thin history and passed a snapshot cut short
+    with nothing marked, which is the loss the band exists for."""
+    for day in COVERED_SESSIONS[:-1]:
+        _write(
+            lake,
+            "chains",
+            "SPY",
+            day,
+            [
+                row
+                for minute in range(3)
+                for row in _windowed(
+                    minute, rows_each=90, given_up=1, gap_window="2026-12-18", day=day
+                )
+            ],
+        )
+    rows = _windowed(0, rows_each=90) + _windowed(1, rows_each=50) + _windowed(2, rows_each=90)
+    _write(lake, "chains", "SPY", DAY, rows)
+    _seed_spans(lake)
+
+    finding = _answer(judge(lake, calendar=CALENDAR, now=NOW), CHECK_ROW_COUNT_BAND, JUDGED)
+
+    assert finding.verdict == QUARANTINED_VERDICT
+    assert finding.computed == 50.0
+    assert finding.against == 90.0
+
+
+def test_the_memo_holds_what_a_trailing_session_contributes(lake: Path):
+    """A whole-lake run judges a trailing session before the one it trails and memoizes its
+    median. That median has to be the one a trailing session contributes, over every snapshot,
+    or the verdict depends on whether the run was scoped to one session."""
+    for day in COVERED_SESSIONS[:-1]:
+        _write(
+            lake,
+            "chains",
+            "SPY",
+            day,
+            _windowed(0, rows_each=100, day=day)
+            + _windowed(1, rows_each=60, given_up=1, gap_window="2026-12-18", day=day)
+            + _windowed(2, rows_each=60, given_up=1, gap_window="2026-12-18", day=day),
+        )
+    _write(lake, "chains", "SPY", DAY, _snapshots(DAY, count=3, rows_each=100))
+    _seed_spans(lake)
+
+    scoped = _answer(
+        judge(lake, calendar=CALENDAR, now=NOW, day=DAY, dry_run=True),
+        CHECK_ROW_COUNT_BAND,
+        JUDGED,
+    )
+    whole = _answer(judge(lake, calendar=CALENDAR, now=NOW), CHECK_ROW_COUNT_BAND, JUDGED)
+
+    assert scoped.against == 60.0
+    assert (whole.verdict, whole.against) == (scoped.verdict, scoped.against)
+
+
+def test_only_an_absence_marker_excuses_a_short_snapshot(lake: Path):
+    """Both halves of the marker: a gap row, and a window on it. A whole-cycle gap row has no
+    window and excuses nothing, and a data row's window is not a marker."""
+    rows = (
+        _windowed(0, rows_each=100)
+        + _windowed(1, rows_each=30, given_up=1, gap_window="2026-10-17")
+        + _windowed(2, rows_each=40, given_up=1, gap_window=None)
+        + _windowed(3, rows_each=100)
+        + _windowed(4, rows_each=25, given_up=2, gap_window="2027-01-15")
+    )
+    _write(lake, "chains", "SPY", DAY, rows)
+
+    bounds = (CALENDAR.session_open(DAY), CALENDAR.option_close(DAY))
+
+    # Two marked snapshots, so leaving out only the first would leave the 25 counted.
+    assert split_snapshot_counts(_partition(lake), bounds) == ((40, 100, 100), (25, 30))
+    assert session_snapshot_counts(_partition(lake), bounds) == (25, 30, 40, 100, 100)
+
+
+def test_a_retyped_row_kind_is_unreadable_rather_than_a_raw_arrow_error(lake: Path):
+    """The marker filter adds Arrow kernels over ``row_kind``, and every kernel a check runs
+    stays inside the partition's containment, for the reason :func:`_contained` gives."""
+    rows = _windowed(0, rows_each=3) + _windowed(1, rows_each=2, given_up=1, gap_window="x")
+    table = _table("chains", rows)
+    table = table.set_column(
+        table.schema.get_field_index("row_kind"),
+        "row_kind",
+        pa.array(list(range(len(rows))), pa.int64()),
+    )
+    path = lake / "chains" / "ticker=SPY" / f"date={DAY.isoformat()}.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pa_pq.write_table(table, path)
+
+    with pytest.raises(PartitionUnreadable):
+        split_snapshot_counts(
+            _partition(lake), (CALENDAR.session_open(DAY), CALENDAR.option_close(DAY))
+        )
+
+
+def test_a_partition_without_the_window_column_still_counts(lake: Path):
+    """Partitions sealed before the windowed fetch carry no ``window_start`` and no marker."""
+    rows = _snapshots(DAY, count=2, rows_each=100) + _snapshots(DAY, count=1, rows_each=50, first=2)
+    _write(lake, "chains", "SPY", DAY, rows, drop="window_start")
+
+    counts = session_snapshot_counts(
+        _partition(lake), (CALENDAR.session_open(DAY), CALENDAR.option_close(DAY))
+    )
+
+    assert counts == (50, 100, 100)
 
 
 def test_a_snapshot_inside_the_band_passes(lake: Path):
