@@ -2275,7 +2275,7 @@ def _mark_released(root: Path, reports: list[dict[str, Any]], withheld: set[str]
 
     Other ``action`` lines stay as filed. A ``bars abandoned`` line can carry
     ``PartitionQuarantined``, which a release also settles, but it counts reasons and names no
-    ticker-day, so nothing here can trace it.
+    ticker-day, so nothing here can trace it (marketlake #628).
 
     Nothing is marked when the ledger cannot be read, since ``withheld`` is then ``None`` or
     the second read fails, and a report without kinds marks nothing, because the page draws
