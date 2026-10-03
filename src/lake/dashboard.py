@@ -107,13 +107,20 @@ import pyarrow as pa
 
 from lake import journal
 from lake.alert import undelivered
+from lake.battery import PROVENANCE_BATTERY, held_line_partition, is_wrote_line
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
 from lake.capture_spans import CaptureSpan, CaptureSpans, CaptureSpansError, spans_path
 from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants, input_errors_exit, load_config
 from lake.control_plane import assertion_window, sunday_canary_due
 from lake.deadman import in_envelope
-from lake.manifest import VERDICT_FIELD, latest_quarantine_by_check, withholding
+from lake.manifest import (
+    VERDICT_FIELD,
+    is_quarantined,
+    latest_quarantine_by_check,
+    read_quarantine,
+    withholding,
+)
 from lake.metadata import read_metadata
 from lake.paths import (
     CHAINS,
@@ -127,7 +134,7 @@ from lake.paths import (
     LakePaths,
     parse_date_dir,
 )
-from lake.report import INFO, kinds_fit
+from lake.report import ACTION, INFO, kinds_fit
 from lake.runway import GROWTH_WINDOW_DAYS, HEADROOM_WEEKS, assess
 from lake.runway import Usage as RunwayUsage
 from lake.security_master import (
@@ -2243,6 +2250,91 @@ def _group_reports(reports: list[dict[str, Any]], older: int) -> list[dict[str, 
     return open_findings
 
 
+def _mark_released(root: Path, reports: list[dict[str, Any]], withheld: set[str] | None) -> None:
+    """Add ``report_released`` to each report in place: which lines the ledger has since settled.
+
+    A report is the record of its night and is never rewritten, so a line that needed action
+    when it was filed still says so after the action is done. On 2026-10-02 the row-count band
+    quarantined SPY and QQQ, the fix released both, and the panel kept drawing three lines in
+    the needs-action colour under an "Open quarantines (0)" (marketlake #626). This marks
+    the ``action`` lines whose subject the live ledger no longer withholds, and the page draws
+    them as settled. The file is untouched.
+
+    Two lines can be traced to what they withheld, and the panel settles those two.
+
+    1. ``battery.held_line`` names its partition, which is settled when no check withholds it
+       now. ``withheld`` is the set ``_open_quarantines`` read.
+    2. ``battery.wrote_line`` names none. The ledger says which partitions it counted, because
+       the sweep hands one ``now`` to the battery, which stamps each entry's ``observed_at``
+       with it, and to ``write_nightly``, which stamps the report's ``at``. So the run's
+       withholding entries are the battery's entries stamped with the report's instant. The
+       stamps are compared as instants rather than as text, so a line spelled in another
+       offset still counts. The census is settled when there is at least one and none of their
+       partitions is withheld now. A run whose writes were all releases has none, and its line
+       stays as filed, which is marketlake #439's to split.
+
+    Other ``action`` lines stay as filed. A ``bars abandoned`` line can carry
+    ``PartitionQuarantined``, which a release also settles, but it counts reasons and names no
+    ticker-day, so nothing here can trace it (marketlake #628).
+
+    Nothing is marked when the ledger cannot be read, since ``withheld`` is then ``None`` or
+    the second read fails, and a report without kinds marks nothing, because the page draws
+    its lines in one colour anyway. Both give ``None``, which draws every line as filed.
+
+    **The reports are listed before the ledger is read**, which is what makes reading the
+    ledger twice safe. The sweep appends a run's entries before it files that run's report, so
+    every report listed already has its entries on disk when ``_open_quarantines`` reads.
+    Listed after, a run landing between the two could file a quarantine the ledger read had
+    not seen, and its lines would draw released for one refresh.
+    """
+    written: dict[datetime, set[str]] | None = None
+    if withheld is not None:
+        try:
+            entries = read_quarantine(root)
+        except Exception:  # noqa: BLE001 - a marking must not cost the panel
+            log.exception("quarantine ledger unreadable, so no report line is marked released")
+        else:
+            written = {}
+            for entry in entries:
+                if not isinstance(entry, dict) or entry.get("provenance") != PROVENANCE_BATTERY:
+                    continue
+                stamp, partition = _instant(entry.get("observed_at")), entry.get("partition")
+                if stamp is not None and isinstance(partition, str) and is_quarantined(entry):
+                    written.setdefault(stamp, set()).add(partition)
+    for report in reports:
+        kinds = report["report_kinds"]
+        if written is None or withheld is None or not isinstance(kinds, list):
+            report["report_released"] = None
+            continue
+        filed = _instant(report["at"])
+        ran = written.get(filed) if filed is not None else None
+        report["report_released"] = [
+            kind == ACTION and _settled(line, ran, withheld)
+            for line, kind in zip(report["report"], kinds, strict=True)
+        ]
+
+
+def _instant(stamp: object) -> datetime | None:
+    """A zone-aware ISO stamp as an instant, or ``None`` for anything else."""
+    if not isinstance(stamp, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _settled(line: str, ran: set[str] | None, withheld: set[str]) -> bool:
+    """Whether the live ledger has released what one ``action`` line reported."""
+    partition = held_line_partition(line)
+    if partition is not None:
+        return partition not in withheld
+    if is_wrote_line(line):
+        return bool(ran) and not (ran & withheld)
+    return False
+
+
 def _line_counts(lines: list[str]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for line in lines:
@@ -2261,9 +2353,10 @@ def query_history(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str
     panel, and a 500 throws away every finding the payload was going to carry, including
     the ones naming what would not read. ``status.html`` keeps this section off the Now
     and Today chain, so a failure here paints this section alone and says so. Each of the
-    three reads is contained at its own boundary and reports its failure as a value: the window read
+    four reads is contained at its own boundary and reports its failure as a value: the window read
     counts an unreadable partition, ``_open_quarantines`` names the class that refused
-    the ledger, and ``_nightly_reports`` counts the files that would not parse. That is
+    the ledger, ``_nightly_reports`` counts the files that would not parse, and
+    ``_mark_released`` reads the ledger again and marks nothing when it refuses. That is
     the rule ``_capture_spans``, ``_slot_aggregates`` and ``undelivered`` each already
     keep.
 
@@ -2305,11 +2398,17 @@ def query_history(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str
                         spans_by_ticker.get(ticker, ()),
                     )
                 )
-    quarantines, ledger_unreadable = _open_quarantines(ctx.paths.root)
+    # Reports first, then the ledger. ``_mark_released`` says why the order matters.
     reports, reports_unreadable, reports_error, reports_older = _nightly_reports(
         ctx.paths.root, HISTORY_REPORTS
     )
+    quarantines, ledger_unreadable = _open_quarantines(ctx.paths.root)
     held_open = _group_reports(reports, reports_older)
+    _mark_released(
+        ctx.paths.root,
+        reports,
+        None if ledger_unreadable else {str(entry["partition"]) for entry in quarantines},
+    )
     return {
         "as_of": _iso(ctx.now),
         "window_days": HISTORY_WINDOW_DAYS,

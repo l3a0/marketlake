@@ -97,6 +97,11 @@
   .kind-action { color: var(--note); font-weight: 600; }
   .kind-info { opacity: .8; }
   .kind-healthy { opacity: .55; }
+  /* An action line the live ledger has since settled. It keeps its text, because the report
+     is the record of its night, and drops to the worth-knowing weight with a strike so it
+     cannot read as something still to do. */
+  .kind-released { opacity: .55; text-decoration: line-through; }
+  .released-tag { opacity: .8; margin-left: .4rem; }
   .empty { opacity: .7; font-style: italic; }
   .legend { margin: .4rem 0 .6rem; }
   .legend i { display: inline-block; width: 12px; height: 12px; vertical-align: -1px; margin: 0 .3rem 0 .9rem; }
@@ -260,7 +265,8 @@
   ];
 
   // What each report line asks of its reader, which the sweep writes beside the line. The
-  // panel computes none of these. It weights each line by the kind the file carries.
+  // panel computes none of these. It weights each line by the kind the file carries, except a
+  // needs-action line the payload marks released since, which draws at the released weight.
   var REPORT_KINDS = [
     {key: "action", label: "needs action",
      title: "Needs action: a human has something to do about this line."},
@@ -270,6 +276,10 @@
      title: "A check saying it ran and found nothing. It is printed so a check that ran " +
        "can be told from one that did not."}
   ];
+  // A needs-action line whose quarantine the live ledger has released since the report was
+  // filed. The payload decides it from the ledger, and the report file is never changed.
+  var RELEASED_TITLE = "Released since: when this report was filed this line needed action, " +
+    "and the quarantine ledger no longer withholds what it reported. The report is unchanged.";
   var REPORT_KIND_BY_KEY = {};
   REPORT_KINDS.forEach(function (kind) { REPORT_KIND_BY_KEY[kind.key] = kind; });
 
@@ -867,6 +877,10 @@
         sample.title = kind.title;
         legend.appendChild(sample);
       });
+      legend.appendChild(document.createTextNode(" · "));
+      var settled = el("span", "released since", "kind-released");
+      settled.title = RELEASED_TITLE;
+      legend.appendChild(settled);
       legend.appendChild(el("span",
         ". A report filed before the kinds existed shows its lines in one colour and says so.",
         "muted"));
@@ -991,7 +1005,8 @@
       held.appendChild(withheld);
       item.appendChild(held);
     }
-    appendReport(item, entry.report, entry.report_kinds, entry.report_collapsed);
+    appendReport(item, entry.report, entry.report_kinds, entry.report_collapsed,
+      entry.report_released);
     return item;
   }
 
@@ -1066,7 +1081,11 @@
   // ``report_collapsed`` marks the worth-knowing lines that read exactly as they did in the
   // report before, and those fold into one count. The payload marks no other kind and no
   // line on the newest or earliest report, so this draws what it is told.
-  function appendReport(item, lines, kinds, collapsed) {
+  //
+  // ``report_released`` marks the needs-action lines the live ledger has settled since, and
+  // those draw struck through with a tag that says so. It is null whenever the ledger could
+  // not be read, which draws every line as filed.
+  function appendReport(item, lines, kinds, collapsed, released) {
     if (!lines || lines.length === 0) { return; }
     var list = el("ul", null, "lines");
     var folded = 0;
@@ -1074,6 +1093,14 @@
       if (Array.isArray(collapsed) && collapsed[index] === true) { folded += 1; return; }
       if (!Array.isArray(kinds)) { list.appendChild(el("li", line, "note")); return; }
       var kind = REPORT_KIND_BY_KEY[kinds[index]] || REPORT_KIND_BY_KEY.action;
+      if (Array.isArray(released) && released[index] === true) {
+        var settled = el("li");
+        settled.appendChild(el("span", line, "kind-released"));
+        settled.appendChild(el("span", "released since", "released-tag"));
+        settled.title = RELEASED_TITLE;
+        list.appendChild(settled);
+        return;
+      }
       var node = el("li", line, "kind-" + kind.key);
       node.title = kind.title;
       list.appendChild(node);

@@ -51,6 +51,13 @@ import pytest
 
 from lake import capture, dashboard, journal
 from lake.alert import Message, Publisher
+from lake.battery import (
+    PROVENANCE_HUMAN,
+    QUARANTINED_VERDICT,
+    build_entry,
+    held_line,
+    wrote_line,
+)
 from lake.calendar import MARKET_TZ
 from lake.capture_spans import SPANS_SCHEMA, CaptureSpan, CaptureSpans, spans_path
 from lake.config import GuardConstants
@@ -63,6 +70,7 @@ from lake.dashboard import (
     QueryParameterError,
     group_nights,
 )
+from lake.manifest import CLEAN_VERDICT, append_quarantine
 from lake.metadata import stamp_cycle, stamp_ping
 from lake.paths import DATE_PREFIX, JOURNAL_DIR, SEGMENT_GLOB
 from lake.report import Nightly, PieceOutcome, write_nightly
@@ -3850,6 +3858,265 @@ def test_an_action_line_never_folds(root: Path):
     for day in (date(2026, 9, 17), date(2026, 9, 18), date(2026, 9, 21)):
         _file_nightly(root, day, report=(wrote,), report_kinds=("action",))
     assert _by_day(_history(root))["2026-09-18"]["report_collapsed"] == [False]
+
+
+# -- lines the ledger has settled since (marketlake #626) --------------------
+
+RELEASE_DAY = date(2026, 9, 18)
+SPY_CHAINS = "chains/ticker=SPY/date=2026-09-18.parquet"
+QQQ_CHAINS = "chains/ticker=QQQ/date=2026-09-18.parquet"
+
+
+def _verdict(root: Path, partition: str, verdict: str, at: datetime) -> None:
+    """One ledger line, built and appended by the production code."""
+    append_quarantine(
+        root,
+        build_entry(partition=partition, verdict=verdict, check="row_count_band", observed_at=at),
+    )
+
+
+def _release_night(root: Path) -> datetime:
+    """The 2026-10-02 shape: two partitions quarantined by the run that filed the report.
+
+    The lines come from the battery's own writers, so the panel is tested against the
+    wording the sweep actually files.
+    """
+    filed = et(RELEASE_DAY, 18, 30)
+    _file_nightly(
+        root,
+        RELEASE_DAY,
+        report=(
+            "bars abandoned: 6 ticker-day(s), 6 SnapAbsent",
+            held_line(QQQ_CHAINS, ["realtime_entitlement"], "'row_count_band'"),
+            held_line(SPY_CHAINS, ["realtime_entitlement"], "'row_count_band'"),
+            f"battery: {SPY_CHAINS} now reads, no check withholds it",
+            wrote_line(2),
+        ),
+        report_kinds=("info", "action", "action", "info", "action"),
+    )
+    for partition in (QQQ_CHAINS, SPY_CHAINS):
+        _verdict(root, partition, QUARANTINED_VERDICT, filed)
+    return filed
+
+
+def _released(root: Path) -> list[bool] | None:
+    return _by_day(_history(root))[RELEASE_DAY.isoformat()]["report_released"]
+
+
+def test_a_quarantine_still_open_marks_nothing_released(root: Path):
+    _release_night(root)
+    assert _released(root) == [False, False, False, False, False]
+
+
+def test_a_release_marks_its_line_and_the_census_once_every_partition_reads(root: Path):
+    """What the owner met on 2026-10-03: "Open quarantines (0)" above three lines still drawn
+    as needing action. A line about something else, and one that never needed action, stay as
+    filed, even when the second names a released partition."""
+    filed = _release_night(root)
+    _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed + timedelta(hours=18))
+    assert _released(root) == [False, False, True, False, False]
+
+    _verdict(root, QQQ_CHAINS, CLEAN_VERDICT, filed + timedelta(hours=18))
+    assert _released(root) == [False, True, True, False, True]
+
+
+def test_the_census_is_settled_only_by_the_run_that_filed_it(root: Path):
+    """The census names no partition, so the panel finds them by the run's stamp. A ledger
+    line written at another instant, such as a hand run the next morning, is not what the
+    census counted, and settling it would be a guess."""
+    filed = et(RELEASE_DAY, 18, 30)
+    _file_nightly(root, RELEASE_DAY, report=(wrote_line(1),), report_kinds=("action",))
+    _verdict(root, SPY_CHAINS, QUARANTINED_VERDICT, filed + timedelta(minutes=1))
+    _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed + timedelta(hours=18))
+    assert _released(root) == [False]
+
+
+def test_a_census_of_releases_alone_stays_as_filed(root: Path):
+    """The census counts releases too, which is marketlake #439. A run that wrote only a
+    release withheld nothing, so there is nothing for this to settle."""
+    filed = et(RELEASE_DAY, 18, 30)
+    _file_nightly(root, RELEASE_DAY, report=(wrote_line(1),), report_kinds=("action",))
+    _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed)
+    assert _released(root) == [False]
+
+
+def test_only_a_line_that_needed_action_is_settled(root: Path):
+    """A line the file calls worth knowing asked for nothing, so there is nothing to settle,
+    whatever its text says."""
+    filed = et(RELEASE_DAY, 18, 30)
+    line = held_line(SPY_CHAINS, ["realtime_entitlement"], "'row_count_band'")
+    _file_nightly(root, RELEASE_DAY, report=(line,), report_kinds=("info",))
+    _verdict(root, SPY_CHAINS, QUARANTINED_VERDICT, filed)
+    _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed + timedelta(hours=18))
+    assert _released(root) == [False]
+
+
+def test_the_census_counts_the_battery_entries_and_no_human_one(root: Path):
+    """The census counted what the battery run appended. A human line stamped the same instant
+    was not part of it, so a partition it withholds cannot keep the census open."""
+    filed = _release_night(root)
+    for partition in (QQQ_CHAINS, SPY_CHAINS):
+        _verdict(root, partition, CLEAN_VERDICT, filed + timedelta(hours=18))
+    append_quarantine(
+        root,
+        build_entry(
+            partition="chains/ticker=IWM/date=2026-09-18.parquet",
+            verdict=QUARANTINED_VERDICT,
+            check="row_count_band",
+            observed_at=filed,
+            provenance=PROVENANCE_HUMAN,
+        ),
+    )
+    assert _released(root) == [False, True, True, False, True]
+
+
+def test_a_stamp_spelled_in_another_offset_is_the_same_run(root: Path):
+    """The census is matched to its run by instant, not by text. A hand-written battery line
+    spelling the same instant in UTC is still the run's, and the partition it withholds keeps
+    the census open."""
+    filed = et(RELEASE_DAY, 18, 30)
+    _file_nightly(root, RELEASE_DAY, report=(wrote_line(2),), report_kinds=("action",))
+    _verdict(root, SPY_CHAINS, QUARANTINED_VERDICT, filed)
+    append_quarantine(
+        root,
+        {
+            "partition": QQQ_CHAINS,
+            "verdict": QUARANTINED_VERDICT,
+            "check": "row_count_band",
+            "provenance": "battery",
+            "observed_at": filed.astimezone(UTC).isoformat(),
+        },
+    )
+    _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed + timedelta(hours=18))
+    assert _released(root) == [False]
+
+
+def test_a_run_landing_mid_request_is_never_drawn_released(root: Path, monkeypatch):
+    """The panel lists the reports before it reads the ledger. A run appends its entries and
+    then files its report, so a run landing between the two reads cannot leave a report listed
+    whose quarantine the ledger read missed, which would draw it released for a refresh."""
+    from lake import dashboard
+
+    listing = dashboard._nightly_reports
+
+    def a_run_lands_first(*args, **kwargs):
+        if not (root / "reports").exists():
+            _release_night(root)
+        return listing(*args, **kwargs)
+
+    monkeypatch.setattr(dashboard, "_nightly_reports", a_run_lands_first)
+    payload = _history(root)
+    assert payload["quarantine_count"] == 2
+    assert _by_day(payload)[RELEASE_DAY.isoformat()]["report_released"] == [False] * 5
+
+
+def test_an_action_line_the_ledger_cannot_trace_is_never_settled(root: Path):
+    """Only the two traceable lines are settled. A battery that did not run asked for a
+    human whatever the ledger says now."""
+    filed = et(RELEASE_DAY, 18, 30)
+    held = held_line(SPY_CHAINS, ["realtime_entitlement"], "'row_count_band'")
+    _file_nightly(
+        root,
+        RELEASE_DAY,
+        report=("battery did not run: OSError: disk", held),
+        report_kinds=("action", "action"),
+    )
+    _verdict(root, SPY_CHAINS, QUARANTINED_VERDICT, filed)
+    _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed + timedelta(hours=18))
+    assert _released(root) == [False, True]
+
+
+def test_a_held_line_about_an_earlier_quarantine_is_settled_by_its_release(root: Path):
+    """A held line repeats every night a partition stays withheld, so the run that filed it
+    usually wrote nothing for it. The held line is settled by the partition alone."""
+    filed = et(RELEASE_DAY, 18, 30)
+    held = held_line(SPY_CHAINS, ["realtime_entitlement"], "'row_count_band'")
+    _file_nightly(root, RELEASE_DAY, report=(held,), report_kinds=("action",))
+    _verdict(root, SPY_CHAINS, QUARANTINED_VERDICT, filed - timedelta(days=1))
+    _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed + timedelta(hours=18))
+    assert _released(root) == [True]
+
+
+def test_a_census_of_twelve_is_settled_like_one_of_two(root: Path):
+    """A wide night writes ten or more lines, and a census the parser stops recognizing past
+    nine stays as filed for ever."""
+    filed = et(RELEASE_DAY, 18, 30)
+    _file_nightly(root, RELEASE_DAY, report=(wrote_line(12),), report_kinds=("action",))
+    partitions = [f"chains/ticker=T{index}/date=2026-09-18.parquet" for index in range(12)]
+    for partition in partitions:
+        _verdict(root, partition, QUARANTINED_VERDICT, filed)
+    for partition in partitions:
+        _verdict(root, partition, CLEAN_VERDICT, filed + timedelta(hours=18))
+    assert _released(root) == [True]
+
+
+def test_a_partition_withheld_by_another_check_is_not_released(root: Path):
+    filed = et(RELEASE_DAY, 18, 30)
+    held = held_line(SPY_CHAINS, ["realtime_entitlement"], "'strike_grid_completeness'")
+    _file_nightly(root, RELEASE_DAY, report=(held,), report_kinds=("action",))
+    append_quarantine(
+        root,
+        build_entry(
+            partition=SPY_CHAINS,
+            verdict=QUARANTINED_VERDICT,
+            check="strike_grid_completeness",
+            observed_at=filed,
+        ),
+    )
+    assert _released(root) == [False]
+
+
+def test_a_second_ledger_read_that_fails_costs_the_marks_and_not_the_panel(root: Path, monkeypatch):
+    """The first read succeeded, so the open quarantines are served. The marks need a second
+    read, and when that one fails every line draws as filed."""
+    from lake import dashboard
+
+    _release_night(root)
+
+    def refused(_root):
+        raise OSError("ledger vanished between reads")
+
+    monkeypatch.setattr(dashboard, "read_quarantine", refused)
+    payload = _history(root)
+    assert payload["quarantine_count"] == 2
+    assert _by_day(payload)[RELEASE_DAY.isoformat()]["report_released"] is None
+
+
+def test_a_partition_withheld_again_is_not_released(root: Path):
+    filed = _release_night(root)
+    _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed + timedelta(hours=18))
+    _verdict(root, SPY_CHAINS, QUARANTINED_VERDICT, filed + timedelta(days=3))
+    assert _released(root) == [False, False, False, False, False]
+
+
+def test_an_unreadable_ledger_marks_nothing_and_draws_every_line_as_filed(root: Path):
+    _release_night(root)
+    with (root / "quarantine.jsonl").open("a", encoding="utf-8") as ledger:
+        ledger.write(json.dumps({"note": "a line that parses and names no partition"}) + "\n")
+    payload = _history(root)
+    assert payload["quarantine_unreadable"] == "ManifestError"
+    assert _by_day(payload)[RELEASE_DAY.isoformat()]["report_released"] is None
+
+
+def test_a_report_without_kinds_marks_nothing(root: Path):
+    """A file from before the kinds draws every line in one colour, so a mark has nothing
+    to change. The writer always files kinds now, so this one is written the old way."""
+    filed = et(RELEASE_DAY, 18, 30)
+    directory = root / "reports"
+    directory.mkdir()
+    (directory / "2026-09-18-183000000000-11.json").write_text(
+        json.dumps(
+            {
+                "day": RELEASE_DAY.isoformat(),
+                "at": filed.isoformat(),
+                "pieces": {},
+                "report": [wrote_line(1)],
+            }
+        )
+    )
+    _verdict(root, SPY_CHAINS, QUARANTINED_VERDICT, filed)
+    _verdict(root, SPY_CHAINS, CLEAN_VERDICT, filed + timedelta(hours=18))
+    assert _released(root) is None
 
 
 def test_a_report_line_with_no_kind_never_folds(root: Path):

@@ -50,8 +50,10 @@ from lake.battery import (
     coverage,
     coverage_line,
     entry_line_count,
+    held_line_partition,
     human_precedence,
     in_scope,
+    is_wrote_line,
     judge,
     judge_entitlement,
     judge_quote_order,
@@ -67,6 +69,7 @@ from lake.battery import (
     split_snapshot_counts,
     trailing_medians,
     write_verdict,
+    wrote_line,
 )
 from lake.capture_spans import CaptureSpan
 from lake.config import GuardConstants
@@ -1776,6 +1779,26 @@ def test_the_report_line_names_every_check_still_withholding(lake: Path):
     assert "'row_count_band'" in line
     assert kind_of(report, "stays quarantined under") == ACTION
     assert "'strike_grid_completeness'" in line
+    # The History panel reads the partition back out of this line (marketlake #626).
+    assert held_line_partition(line) == partition
+
+
+def test_the_line_parsers_read_only_their_own_lines():
+    """Each parser is the History panel's way back from a filed line to what it reported, so
+    a line it misreads is a partition the panel calls released when it is not."""
+    assert wrote_line(1) == "battery wrote 1 quarantine line"
+    assert wrote_line(2) == "battery wrote 2 quarantine lines"
+    assert is_wrote_line(wrote_line(1))
+    assert is_wrote_line(wrote_line(2))
+    assert is_wrote_line(wrote_line(12))
+    assert not is_wrote_line(wrote_line(2) + " and more")
+    assert (
+        held_line_partition(
+            "battery: chains/ticker=SPY/date=2026-09-16.parquet now reads, no check withholds it"
+        )
+        is None
+    )
+    assert held_line_partition(wrote_line(2)) is None
 
 
 def test_a_holder_naming_no_check_reads_as_prose_rather_than_as_none(lake: Path):
