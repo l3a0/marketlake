@@ -182,7 +182,7 @@ Verify by executing, not by reading. Mutate the code and confirm a test fails. A
 
 **Watch the checks and fix what they find (owner directive, 2026-09-17).** A pull request is not handed over until its checks have run and settled. Pushing is not the end of the work, because the branch that passes locally is not the branch CI builds. CI builds the merge of the branch and its base, and the base moves.
 
-So watch the run rather than assume it. `gh pr checks <n> --watch` blocks until every check settles, and `gh pr view <n> --json statusCheckRollup` says what each one concluded. When a check fails, read its log, fix the cause, and push again, in the same session and without waiting to be asked. A red check the owner finds first is work handed over unfinished.
+So watch the run rather than assume it. `gh pr checks <n> --watch` blocks until every check settles, and `gh pr view <n> --json statusCheckRollup` says what each one concluded. A CI run takes minutes, so the watch runs in the background, per "Delegating work to subagents" above, and the main thread acts on its notification. When a check fails, read its log, fix the cause, and push again, in the same session and without waiting to be asked. A red check the owner finds first is work handed over unfinished.
 
 Three measurements from this repository make the rule sharper than "look for a green tick".
 
