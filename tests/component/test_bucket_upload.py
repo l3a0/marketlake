@@ -665,3 +665,46 @@ def test_a_missing_lake_root_refuses(tmp_path):
     with pytest.raises(FirstUploadRefused, match="not a directory"):
         first_upload(tmp_path / "nowhere", TARGET, client=client, clock=_clock(), calendar=CALENDAR)
     assert client.puts() == []
+
+
+# -- the first upload's locked phase -----------------------------------------------
+
+
+def test_the_first_upload_takes_the_lock_for_its_last_phase_only(tmp_path):
+    # Sealed files go up with the lock free, since each PUT carries its digest. The
+    # files with no manifest entry and manifest.jsonl go up under it, so no seal can
+    # land between the last re-read of the manifest and the copy that claims it.
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    held: dict[str, bool] = {}
+    client.on_put = lambda kwargs, data: held.setdefault(kwargs["Key"], _lock_held(lake))
+
+    first_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    assert held[_key("manifest.jsonl")] is True
+    assert held[_key(f"reports/date={DAY.isoformat()}.md")] is True
+    assert held[_key("chains/ticker=SPY/date=2026-08-24.parquet")] is False
+    assert not _lock_held(lake)
+
+
+def test_an_entry_the_manifest_gains_mid_run_goes_up_before_the_manifest(tmp_path):
+    # A seal landing during the unlocked phase adds a manifest entry the first pass never
+    # saw. The uploaded manifest claims it, so the locked phase must upload it first, or
+    # the bucket would claim a file it does not hold.
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    sealed: list[str] = []
+
+    def seal_once(kwargs, data):
+        if not sealed:
+            sealed.append(_seal_another_day(lake))
+
+    client.on_put = seal_once
+
+    first_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    keys = client.put_keys()
+    assert _key(sealed[0]) in keys
+    assert keys.index(_key(sealed[0])) < keys.index(_key("manifest.jsonl"))
+    assert client.body(_key("manifest.jsonl")) == manifest_path(lake).read_bytes()
+    assert client.body(_key(sealed[0])) == (lake / sealed[0]).read_bytes()

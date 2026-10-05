@@ -152,7 +152,9 @@ def test_main_uploads_to_a_bucket_target_and_pings(lake_root, tmp_path, monkeypa
     assert code == 0
     assert client.put_keys()[-1] == "lake/manifest.jsonl"
     assert pinger.urls == [f"https://hc-ping.com/secret-key/{COMPACTION_SLUG}"]
-    assert "secret-bucket-key" not in capsys.readouterr().out
+    captured = capsys.readouterr()
+    for value in ("secret-bucket-key", "AKIDCONFIG"):
+        assert value not in captured.out and value not in captured.err
 
 
 def test_main_refuses_an_empty_bucket_with_one_line_and_no_ping(

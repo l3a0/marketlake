@@ -13,12 +13,14 @@ name and prefix, all three bucket keys, and a region shaped like an AWS region n
 
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 
 import botocore
 import pytest
 
+import lake
 from lake.config import (
     BucketTarget,
     Config,
@@ -193,3 +195,48 @@ def test_the_page_secrets_hold_the_bucket_keys_when_present():
         "AKIDBUCKETKEY",
         "bucket-secret-value",
     )
+
+
+def _publisher_sites() -> list[tuple[str, int, ast.Call]]:
+    """Every ``Publisher(...)`` construction under ``src/lake``, as (file, line, call)."""
+    source = Path(lake.__file__).parent
+    sites = []
+    for path in sorted(source.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name == "Publisher":
+                sites.append((path.name, node.lineno, node))
+    return sites
+
+
+def test_every_publisher_takes_its_secrets_from_page_secrets():
+    # ``page_secrets`` is what adds the bucket's two key values. A construction site that
+    # spelled its own tuple would let a page carry the bucket key to ntfy, and only the
+    # compaction site has a behavioral test of its own.
+    sites = _publisher_sites()
+    files = {name for name, _, _ in sites}
+    for expected in (
+        "alert.py",
+        "compact.py",
+        "control_plane.py",
+        "daemon.py",
+        "probe_calendar.py",
+        "sweep.py",
+    ):
+        assert expected in files
+    assert sum(name == "control_plane.py" for name, _, _ in sites) == 2
+    for name, line, call in sites:
+        secrets = [kw.value for kw in call.keywords if kw.arg == "secrets"]
+        assert len(secrets) == 1, f"{name}:{line} passes no secrets"
+        value = secrets[0]
+        assert (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr == "page_secrets"
+            and isinstance(value.func.value, ast.Name)
+            and value.func.value.id == "config"
+            and not value.args
+        ), f"{name}:{line} builds its own secrets instead of config.page_secrets()"

@@ -162,3 +162,49 @@ def test_a_region_botocore_refuses_is_one_config_line(region):
     assert "InvalidRegionError" in message
     assert "\n" not in message
     assert CONFIG_SECRET not in message and CONFIG_KEY_ID not in message
+
+
+@pytest.fixture
+def hostile_home(tmp_path, monkeypatch):
+    """``~/.aws/config`` and ``~/.aws/credentials`` in the home directory, pointing elsewhere.
+
+    ``hostile_aws`` reaches its files only through ``AWS_CONFIG_FILE`` and
+    ``AWS_SHARED_CREDENTIALS_FILE``, which the build deletes along with every other
+    ``AWS_*`` variable, so it never shows what botocore does with no variable set. That
+    is the default home-directory files, and only pointing both variables at the null
+    device keeps them out.
+    """
+    home = tmp_path / "home"
+    aws = home / ".aws"
+    aws.mkdir(parents=True)
+    (aws / "config").write_text(
+        "[default]\nregion = ap-south-1\nendpoint_url = https://from-home.invalid\n"
+    )
+    (aws / "credentials").write_text(
+        "[default]\naws_access_key_id = AKIDFROMHOME\naws_secret_access_key = from-home\n"
+        "aws_session_token = token-from-home\n"
+        "endpoint_url = https://from-home.invalid\n"
+    )
+    monkeypatch.setenv("HOME", str(home))
+    for key in [key for key in os.environ if key.startswith("AWS_")]:
+        monkeypatch.delenv(key)
+    return home
+
+
+def test_the_client_ignores_the_aws_files_in_the_home_directory(hostile_home):
+    client = client_from_config(_config())
+    sent = _capture(client)
+
+    client.head_object(Bucket="lake-backup", Key="lake/manifest.jsonl")
+
+    assert len(sent) == 1
+    request = sent[0]
+    assert "from-home" not in request.url
+    assert request.url.startswith(f"https://lake-backup.s3.{REGION}.amazonaws.com/")
+    authorization = request.headers["Authorization"].decode()
+    assert f"Credential={CONFIG_KEY_ID}/" in authorization
+    assert "X-Amz-Security-Token" not in request.headers
+    # The home files are there to be found: a plain session with no redirect reads them.
+    import botocore.session
+
+    assert botocore.session.Session().get_scoped_config().get("region") == "ap-south-1"

@@ -69,10 +69,12 @@ def test_it_uploads_the_whole_lake_with_the_manifest_last(tmp_path, monkeypatch,
     files = sorted(p.relative_to(lake).as_posix() for p in lake.rglob("*") if p.is_file())
     assert client.keys() == sorted(f"lake/{rel}" for rel in files)
     assert client.put_keys()[-1] == "lake/manifest.jsonl"
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    out = captured.out
     assert out.startswith("first-upload: uploaded 4 file(s)")
     assert "Mbit/s" in out
-    assert "secret-bucket-key" not in out
+    for value in ("secret-bucket-key", "AKIDCONFIG"):
+        assert value not in out and value not in captured.err
 
 
 def test_a_second_run_compares_every_object_and_sends_nothing(tmp_path, monkeypatch, capsys):
@@ -135,6 +137,8 @@ def _refused(capsys, code_or_exc) -> str:
     lines = captured.err.splitlines()
     assert len(lines) == 1, captured.err
     assert lines[0].startswith("first-upload: ")
+    for value in ("secret-bucket-key", "AKIDCONFIG"):
+        assert value not in captured.err
     return lines[0]
 
 

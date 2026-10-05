@@ -230,6 +230,7 @@ def test_a_failed_connection_is_named_unreachable_and_never_raises(tmp_path):
         ("SignatureDoesNotMatch", 403),
         ("ExpiredToken", 400),
         ("AccountProblem", 403),
+        ("Forbidden", 403),
     ],
 )
 def test_every_credential_code_is_named_refused(tmp_path, code, status):
@@ -249,6 +250,7 @@ def test_every_credential_code_is_named_refused(tmp_path, code, status):
         ("Throttling", 400),
         ("RequestTimeout", 400),
         ("SomethingNew", 502),
+        ("SomeOtherLimit", 429),
     ],
 )
 def test_a_busy_or_failing_service_is_named_unavailable_not_refused(tmp_path, code, status):
@@ -447,10 +449,38 @@ def test_the_sunday_cli_scrubs_the_configured_bucket(tmp_path, capsys, monkeypat
     assert code == 1
     assert built == ["secret-bucket-key"]
     assert pinger.urls == []
-    printed = capsys.readouterr().out
+    captured = capsys.readouterr()
+    printed = captured.out
     assert f"backup file does not match the lake: {PARTITION}" in printed
     assert "s3://lake-backup/lake" in printed
-    assert "secret-bucket-key" not in printed
+    for value in ("secret-bucket-key", "AKIDCONFIG"):
+        assert value not in printed and value not in captured.err
+
+
+def test_the_sunday_publishers_carry_the_bucket_keys(tmp_path, capsys, monkeypatch):
+    # The reminder and the refused-ping page go out through this publisher, and it
+    # refuses any page holding a value it was handed. The bucket's two key values must
+    # be among them, or a page could carry the key to ntfy.
+    lake, client = _uploaded(tmp_path / "lake")
+    monkeypatch.setattr(bucket, "client_from_config", lambda cfg: client)
+    built: list[dict] = []
+    real = cp.Publisher
+
+    def watched(**kwargs):
+        built.append(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(cp, "Publisher", watched)
+
+    _sunday_cli(tmp_path, monkeypatch, lake)
+
+    assert built
+    for kwargs in built:
+        assert "secret-bucket-key" in kwargs["secrets"]
+        assert "AKIDCONFIG" in kwargs["secrets"]
+    captured = capsys.readouterr()
+    for value in ("secret-bucket-key", "AKIDCONFIG"):
+        assert value not in captured.out and value not in captured.err
 
 
 @pytest.mark.parametrize(
@@ -479,7 +509,8 @@ def test_unusable_bucket_settings_are_a_sunday_finding_and_the_job_runs_on(
     assert "Traceback" not in captured.err
     finding = [line for line in captured.out.splitlines() if "cannot be used" in line]
     assert finding and all(named in line for line in finding)
-    assert "secret-bucket-key" not in captured.out
+    for value in ("secret-bucket-key", "AKIDCONFIG"):
+        assert value not in captured.out and value not in captured.err
 
 
 def test_a_client_that_cannot_be_built_is_a_sunday_finding(tmp_path, capsys, monkeypatch):
