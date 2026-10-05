@@ -163,3 +163,29 @@ def test_main_refuses_an_empty_bucket_with_one_line_and_no_ping(
     assert err[0].startswith("compact: ")
     assert bucket.FIRST_UPLOAD_COMMAND in err[0]
     assert pinger.urls == []
+
+
+def test_main_hands_the_bucket_keys_to_the_page_publisher(lake_root, tmp_path, monkeypatch):
+    # A page that carried the bucket's secret key would publish it to ntfy. The
+    # publisher refuses a page holding any value it is handed, so the key must be one.
+    client = _seeded(lake_root)
+    config = _bucket_config(tmp_path, lake_root)
+    built: dict = {}
+    real = compact_module.Publisher
+
+    def watched(**kwargs):
+        built.update(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(bucket, "client_from_config", lambda cfg: client)
+    monkeypatch.setattr(compact_module, "UrllibPinger", lambda: FakePinger())
+    monkeypatch.setattr(compact_module, "Publisher", watched)
+
+    compact_module.main(
+        ["--config", str(config), "--plan", str(tmp_path / "chain_plan.json")],
+        clock=_clock_at(DAY, 16, 30),
+        calendar=_calendar(),
+    )
+
+    assert "secret-bucket-key" in built["secrets"]
+    assert "AKIDCONFIG" in built["secrets"]

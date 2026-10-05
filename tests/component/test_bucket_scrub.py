@@ -353,3 +353,12 @@ def test_the_sunday_cli_scrubs_the_configured_bucket(tmp_path, capsys, monkeypat
     assert f"backup file does not match the lake: {PARTITION}" in printed
     assert "s3://lake-backup/lake" in printed
     assert "secret-bucket-key" not in printed
+
+
+def test_a_whole_object_digest_with_no_checksum_type_still_matches(tmp_path):
+    # S3 has not always returned ChecksumType. A value that decodes to the manifest's 32
+    # digest bytes cannot be a composite, whose "-N" suffix fails the decode, so it
+    # counts. The live check prints the type S3 returns today.
+    lake, client = _uploaded(tmp_path / "lake")
+    client.store(_key(PARTITION), (lake / PARTITION).read_bytes(), checksum_type=None)
+    assert bucket_scrub(lake, TARGET, client).ok
