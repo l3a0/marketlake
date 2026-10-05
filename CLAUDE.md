@@ -2,11 +2,11 @@
 
 Marketlake is a capture-first market data lake. It records full option chains and equity quotes at one-minute cadence from the Schwab Trader API. Status: implementation is underway. Code lives in `src/lake`, with tests under `tests/`.
 
-**The tracker is authoritative for scope (owner directive, 2026-09-13).** An unbuilt deliverable's issue is the source of truth for what it is and what it must do. The design doc at [docs/design.md](docs/design.md) carries the reasoning, the premise, and the considered-and-rejected register, and it links to the issue rather than competing with it. [docs/build-plan.md](docs/build-plan.md) carries the slicing rule, the build order, and each slice's test surface, and its deliverable entries are links. Read an unbuilt deliverable's issue before proposing a change to it. Read the design doc for everything else, which includes every built deliverable and the reasoning behind all of them.
+**The tracker is authoritative for scope (owner directive, 2026-09-13).** An unbuilt deliverable's issue is the source of truth for what it is and what it must do. The design doc at [docs/design.md](docs/design.md) carries the reasoning, the premise, and the considered-and-rejected register, and it links to the issue rather than competing with it. [docs/build-plan.md](docs/build-plan.md) carries the test tiers and the record of the slice build, and its deliverable entries are links. The order of current work lives in the tracker. An MVP, short for minimum viable product, is the next version of the lake someone can use. The open MVP milestone lists the work toward it, and each issue's blocked-by links say what waits on what. Read an unbuilt deliverable's issue before proposing a change to it. Read the design doc for everything else, which includes every built deliverable and the reasoning behind all of them.
 
 The price of this is named rather than hidden: the same substance now exists in an issue and in the doc that reasons about it, so the two can drift. The issue wins. When they disagree, the doc is what gets corrected.
 
-**Rank work by what makes the product usable (owner directive, 2026-09-14).** Capture reliability still ranks first, as the premise in [docs/design.md](docs/design.md) states, and [docs/build-plan.md](docs/build-plan.md) still carries the slice order and the dependencies between slices. This directive decides what to take next from the work those two allow, and what decides it is not severity. Before proposing an order, name what is missing from the shortest path to a product someone can use, and put that first.
+**Rank work by what makes the product usable (owner directive, 2026-09-14).** Capture reliability still ranks first, as the premise in [docs/design.md](docs/design.md) states, and the open MVP milestone holds the work on the path to the next usable product, with each issue's blocked-by links saying what waits on what. This directive decides what to take next from the work those two allow, and what decides it is not severity. Before proposing an order, name what is missing from the shortest path to a product someone can use, and put that first.
 
 Then ship it, use it, and let what breaks set the order after that. Evidence from real use outranks any ranking made in advance, including this one.
 
@@ -116,8 +116,8 @@ This repo has five prose surfaces, all Markdown.
 
 Three things on them drift against the code.
 
-1. The build plan names each deliverable and links each unbuilt one to its issue, while the design doc carries the reasoning for each built one. A deliverable that ships moves both.
-2. The README's `## Status` and `## Layout` describe the code as it stands, so a change that adds a module or finishes a slice can leave them behind.
+1. The open MVP milestone lists the current deliverables, and the build plan records the slice deliverables before them. The design doc carries the reasoning for each built one. A deliverable that ships moves the design doc.
+2. The README's `## Status` and `## Layout` describe the code as it stands, so a change that adds a module or finishes an MVP milestone can leave them behind.
 3. A file path, a symbol or a line number cited in prose goes stale when the code moves. A line number goes stale on any edit above it, which is how `src/lake/loader.py:99` became line 170 in the audit history above. Name a symbol rather than a line where the prose can.
 
 Before reporting a code change done, sweep the prose surfaces for what the change could have invalidated, and end the response with a short **Consistency sweep** note listing what was checked, what was updated, and what is still stale. For a pure-internal refactor that moves no line numbers and changes no observable behavior, say "no prose-facing surfaces affected" so it is clear the check was considered rather than forgotten.
@@ -175,15 +175,26 @@ Three measurements from this repository make the rule sharper than "look for a g
 
 Fix the cause rather than the symptom. A lint rule that fails on one file usually fails on its siblings, so sweep for the class. Re-running a job changes nothing the second time unless the failure was the runner rather than the code. Where a failure comes from another branch's merge rather than from this change, say so on the pull request instead of absorbing an unrelated fix into it.
 
-**A filed issue carries its milestone and its labels (owner directive, 2026-09-13).** Filing is not finished when the issue exists. An issue with no milestone appears in no slice view and no view scoped by kind, so only a sweep for nulls finds it, and nothing brings it back on its own. Three arrived that way in a single day, each from a session told to file what it found and nothing further: [#143](https://github.com/l3a0/marketlake/issues/143), then [#145](https://github.com/l3a0/marketlake/issues/145) and [#146](https://github.com/l3a0/marketlake/issues/146). The sessions did exactly what was asked, which is why the rule belongs here rather than in a reminder.
+**A filed issue is triaged when it is filed (owner directive, 2026-09-13, restated 2026-10-05).** Filing is not finished when the issue exists. An issue nobody triaged appears in no milestone view and no view scoped by kind, and nothing brings it back on its own. Three arrived that way in a single day, each from a session told to file what it found and nothing further: [#143](https://github.com/l3a0/marketlake/issues/143), then [#145](https://github.com/l3a0/marketlake/issues/145) and [#146](https://github.com/l3a0/marketlake/issues/146). The sessions did exactly what was asked, which is why the rule belongs here rather than in a reminder.
+
+**Milestones exist only for MVP deliverables (owner directive, 2026-10-05).** On that date the owner closed the slice milestones and opened one for the next usable product, [MVP 2, capture on a hosted VM](https://github.com/l3a0/marketlake/milestone/5). A milestone now says that an issue is on the path to that product, per the usable-product directive above. It no longer says which part of the build owns the issue.
 
 So a filed issue is finished when it says three things.
 
-1. A milestone says which slice owns it.
+1. Where it stands against the current MVP. Apply these in order and stop at the first match.
+   1. An issue on the current MVP's path carries that MVP's milestone.
+   2. A bug that can lose a captured minute, or a bug in an alarm, carries no milestone and no `deferred` label. Exceptions 1 and 2 of the usable-product directive never defer those.
+   3. Any other issue carries no milestone and the `deferred` label.
 2. A label says what kind of work it is.
 3. A dependency says what it waits on, where it waits on anything.
 
-No automation supplies the first two. A project's auto-add makes an untriaged issue visible and does not triage it, and nothing infers which slice a gap belongs to.
+No automation supplies the first two. A project's auto-add makes an untriaged issue visible and does not triage it, and nothing infers whether a gap is on the MVP's path.
+
+A missing milestone no longer marks an untriaged issue, because every deferred issue and every exempt bug has none. The exempt bugs carry only the `bug` label, so the tracker cannot tell one from a bug nobody triaged. List the open issues that carry neither a milestone nor `deferred`. Each one is either a capture or alarm bug, or work nobody triaged.
+
+```bash
+gh issue list --state open --limit 500 --json number,title,labels,milestone --jq '.[] | select(.milestone == null) | select([.labels[].name] | index("deferred") | not) | "\(.number) \(.title)"'
+```
 
 The same applies to an issue a spawned session is told it may file. The instruction to file carries the instruction to triage, or the work lands where nothing will look for it.
 
@@ -193,7 +204,7 @@ While a piece is outstanding, a PR writes `Part of #NN` and the closing keyword 
 
 An issue whose pieces have all been split has no finishing PR left, so close it by hand and name where each piece went. Do the same when two PRs are open against one issue, because merge order decides which lands last and neither body can know it. The split is the guard that matters here. The keyword discipline only keeps the issue open long enough to make the split.
 
-A split leaves code comments pointing at the parent for work that moved, so repoint those in the PR that splits. A comment naming a closed issue in the past tense records what happened rather than pointing anywhere, and it stays. An unstarted piece goes to an issue, not to the build plan's unowned register. The issue carries that piece's scope and its status together, per the directive at the top of this file. The plan names the issue rather than restating it, so a plan entry cannot go stale the moment work lands.
+A split leaves code comments pointing at the parent for work that moved, so repoint those in the PR that splits. A comment naming a closed issue in the past tense records what happened rather than pointing anywhere, and it stays. An unstarted piece goes to an issue, not to a document. The issue carries that piece's scope and its status together, per the directive at the top of this file, so no copy elsewhere goes stale the moment work lands.
 
 PR titles use a Conventional Commits prefix. The form is `type(scope): summary`. `gh pr list --state merged --json title` reports which prefixes this repo has used, rather than a list here that goes stale on the first unfamiliar one. Add a scope in parens when it sharpens the title, like `docs(CLAUDE.md)`. Drop it when none does, like a plain `docs:` for a whole-doc change. The form and the scope rule match the sibling `trading-strategies` repo. Its fixed list leaves out `refactor` and `test`, which this repo uses and that one does not.
 
