@@ -8,11 +8,11 @@ An unbuilt deliverable's issue is the source of truth for its scope. The design 
 [docs/design.md](docs/design.md) carries the reasoning, the premise, and the
 considered-and-rejected register, and it is the source of truth for everything already built.
 The build plan at [docs/build-plan.md](docs/build-plan.md) records the slice build, deliverables
-D0 through D21, and points at the MVP milestone that orders current work.
+D0 through D21, and points at the MVP milestone that holds current work.
 
 ## Status
 
-The five build slices closed on 2026-10-05. Current work is the
+The slice build closed on 2026-10-05. Current work is the
 [MVP 2](https://github.com/l3a0/marketlake/milestone/5) milestone, capture on a hosted VM.
 
 The first deliverable, D0, is the test harness. It builds the seams the whole suite

@@ -1,6 +1,6 @@
 # Marketlake — build plan
 
-This plan says how each piece is tested, and it records the order the slice build shipped in. It does not restate the design, and it does not carry a deliverable's scope. Each unbuilt deliverable's issue is the source of truth for what that deliverable is, per the directive in `CLAUDE.md`. The design doc at [design.md](design.md) carries the reasoning and the considered-and-rejected register. Read the issue for scope and the design doc for why.
+This plan says how each piece is tested, and it records the order the slice build was planned in. It does not restate the design, and it does not carry a deliverable's scope. Each unbuilt deliverable's issue is the source of truth for what that deliverable is, per the directive in `CLAUDE.md`. The design doc at [design.md](design.md) carries the reasoning and the considered-and-rejected register. Read the issue for scope and the design doc for why.
 
 Status: PLAN, 2026-08-26. The slice build closed on 2026-10-05.
 
