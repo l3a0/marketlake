@@ -98,6 +98,25 @@ When a heading changes, verify the Contents anchors still resolve.
 
 [README.md](README.md) carries the local commands under its `## Develop` heading, along with how to keep a development run off the real `~/.config/marketlake/` directory.
 
+## Delegating work to subagents (owner directive, 2026-10-05)
+
+The owner's global `~/.claude/CLAUDE.md` is the source for this rule, under "Running work". This section repeats it because the repo is public and an agent may arrive without that file. The global file wins, and this section is what gets corrected.
+
+**Run work in background subagents, not on the main thread.** The main thread is the conversation where the owner talks to the session, so it stays free to answer, take a redirect, and report. Any task that takes more than a few tool calls goes to a subagent through the `Agent` tool, which runs in the background by default. That covers an audit pass, a measurement, an investigation, a review lens, and a build step. The main thread writes the prompt, reads the result when its notification arrives, decides what it means, writes to the tracker, and reports.
+
+On 2026-10-05 the session planning [#629](https://github.com/l3a0/marketlake/issues/629) ran nine audit passes, and the investigation that filed [#644](https://github.com/l3a0/marketlake/issues/644), on its main thread, all in a single reply. For most of that reply the owner could only wait, and Claude Code had to prompt the session to say what it was doing.
+
+Four conditions make the delegation safe.
+
+1. **A subagent prompt stands alone.** The subagent reads none of the conversation, so the prompt names the issue, the commit the work is derived against, the facts to verify rather than trust, and what is out of scope.
+2. **A subagent that edits files or mutates code gets `isolation: "worktree"`.** That option runs the subagent in its own git worktree, a separate checkout of the repository, so its edits cannot land in the parent session's files. A prompt asking it to stay out does not stop it.
+3. **Independent work goes out in parallel, in one message.** Work whose next step depends on a result waits for that result's notification. Never poll for it, and never predict what it will say.
+4. **A result is a claim until checked.** The main thread sees a conclusion, not the files behind it. So it verifies what it is about to act on, by executing where it can, before the claim reaches an issue, a pull request, or the owner.
+
+The price of delegating is that verification step. It costs less than a main thread the owner cannot reach.
+
+Keep a task on the main thread only when the main thread's next step depends on that task's answer and nothing else could usefully run meanwhile, or when the task is one lookup in a file already known. Where a whole unit of work gets its own session, it still does. This rule governs the work inside every session, that one included.
+
 ## Cross-surface consistency
 
 A repo drifts when two surfaces describe the same thing and only one gets updated. The fix is to give each surface exactly one job, so nothing is stated twice.
@@ -163,7 +182,7 @@ Verify by executing, not by reading. Mutate the code and confirm a test fails. A
 
 **Watch the checks and fix what they find (owner directive, 2026-09-17).** A pull request is not handed over until its checks have run and settled. Pushing is not the end of the work, because the branch that passes locally is not the branch CI builds. CI builds the merge of the branch and its base, and the base moves.
 
-So watch the run rather than assume it. `gh pr checks <n> --watch` blocks until every check settles, and `gh pr view <n> --json statusCheckRollup` says what each one concluded. When a check fails, read its log, fix the cause, and push again, in the same session and without waiting to be asked. A red check the owner finds first is work handed over unfinished.
+So watch the run rather than assume it. `gh pr checks <n> --watch` blocks until every check settles, and `gh pr view <n> --json statusCheckRollup` says what each one concluded. A CI run takes minutes, so the watch runs in the background, per "Delegating work to subagents" above, and the main thread acts on its notification. When a check fails, read its log, fix the cause, and push again, in the same session and without waiting to be asked. A red check the owner finds first is work handed over unfinished.
 
 Three measurements from this repository make the rule sharper than "look for a green tick".
 
