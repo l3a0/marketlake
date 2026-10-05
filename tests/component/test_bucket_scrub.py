@@ -57,6 +57,7 @@ def _uploaded(root: Path) -> tuple[Path, FakeS3]:
         TARGET,
         client=client,
         clock=ManualClock(datetime(2026, 8, 28, 19, 0, tzinfo=MARKET_TZ)),
+        calendar=CALENDAR,
     )
     return lake, client
 

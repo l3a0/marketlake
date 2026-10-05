@@ -24,6 +24,7 @@ from lake.calendar import MARKET_TZ
 from lake.config import BucketTarget
 from lake.paths import CONFIG_DIR_PARTS, CONFIG_FILE, LakePaths, temp_write_path
 from tests.support.bucket import FakeS3
+from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.lake import FixtureLake, sample_chains_table, sample_quotes_table
 
@@ -100,6 +101,7 @@ def _upload(lake):
         TARGET,
         client=client,
         clock=ManualClock(datetime(2026, 8, 24, 19, 0, tzinfo=MARKET_TZ)),
+        calendar=weekday_sessions(date(2026, 8, 24)),
     )
     return client
 

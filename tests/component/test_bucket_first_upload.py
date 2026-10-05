@@ -20,6 +20,7 @@ from lake.calendar import MARKET_TZ
 from lake.config import BucketTarget
 from lake.manifest import manifest_path
 from tests.support.bucket import FakeS3, unreachable
+from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import write_config
 from tests.support.lake import FixtureLake
@@ -31,6 +32,7 @@ MONDAY_19 = datetime(2026, 8, 31, 19, 0, tzinfo=MARKET_TZ)
 SUNDAY_20 = datetime(2026, 8, 30, 20, 0, tzinfo=MARKET_TZ)
 SUNDAY_1950 = datetime(2026, 8, 30, 19, 50, tzinfo=MARKET_TZ)
 SUNDAY_2330 = datetime(2026, 8, 30, 23, 30, tzinfo=MARKET_TZ)
+CALENDAR = weekday_sessions(date(2026, 8, 24), date(2026, 8, 31))
 
 KEYS = (
     "bucket_access_key_id: AKIDCONFIG\n"
@@ -55,7 +57,7 @@ def _main(config: Path, client: FakeS3 | None, monkeypatch, *, now=MONDAY_19, ta
     argv = ["first-upload", "--config", str(config)]
     if target is not None:
         argv += ["--target", target]
-    return bucket.main(argv, clock=ManualClock(now))
+    return bucket.main(argv, clock=ManualClock(now), calendar=CALENDAR)
 
 
 def test_it_uploads_the_whole_lake_with_the_manifest_last(tmp_path, monkeypatch, capsys):
@@ -103,6 +105,7 @@ def test_it_re_baselines_a_copy_that_is_not_a_prefix(tmp_path, monkeypatch, caps
         BucketTarget("lake-backup", "lake"),
         client=client,
         clock=ManualClock(MONDAY_19),
+        calendar=CALENDAR,
     )
 
 
@@ -145,6 +148,28 @@ def test_it_refuses_inside_the_sunday_scrub_window(tmp_path, monkeypatch, capsys
         _main(config, client, monkeypatch, now=now)
     assert "19:55 to 23:30" in _refused(capsys, exited)
     assert client.calls == []
+
+
+def test_a_run_begun_before_the_sunday_window_stops_when_it_opens(tmp_path, monkeypatch, capsys):
+    # Begun at 19:50, each PUT takes three minutes, so the window opens partway through.
+    # The check runs before every request, so the run stops with one line, and the
+    # bucket is left with no manifest.jsonl for the scrub to find a watermark in.
+    _, config = _setup(tmp_path)
+    clock = ManualClock(SUNDAY_1950)
+    client = FakeS3(on_put=lambda kwargs, data: clock.advance(3 * 60))
+    monkeypatch.setattr(bucket, "client_from_config", lambda cfg: client)
+
+    with pytest.raises(SystemExit) as exited:
+        bucket.main(
+            ["first-upload", "--config", str(config), "--target", TARGET],
+            clock=clock,
+            calendar=CALENDAR,
+        )
+
+    line = _refused(capsys, exited)
+    assert "19:55 to 23:30" in line and "stopped after 2 PUT(s)" in line
+    assert len(client.puts()) == 2
+    assert "lake/manifest.jsonl" not in client.keys()
 
 
 @pytest.mark.parametrize("now", [SUNDAY_1950, SUNDAY_2330])

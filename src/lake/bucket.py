@@ -66,7 +66,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from lake.calendar import MARKET_TZ
+from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
 from lake.config import (
     BUCKET_KEYS,
@@ -98,6 +98,7 @@ from lake.manifest import (
 )
 from lake.paths import MANIFEST_FILE
 from lake.runner import BACKUP_EXCLUSIONS
+from lake.session import SessionClock
 
 # The storage class every PUT sets. Standard-IA bills each version for at least 30 days
 # and each object at no less than 128 KB, which marketlake #630 measured and accepted.
@@ -147,12 +148,33 @@ _ABSENT_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
 # check expects its ping near 17:00, so an upload running past about 25 minutes already
 # makes the ping late, which pages and then recovers when the ping lands. Stopping at
 # 17:00 would page the same way and leave the night's files off the bucket, so the
-# budget runs to the sweep instead. A compaction run by hand during a session gets the
-# same 75 minutes, and capture would wait on the lock for that long, which is a reason
-# not to run one then rather than something this budget can fix.
+# budget runs to the sweep instead.
+#
+# **The session bounds it too.** A compaction run by hand, the catch-up ``compact.main``
+# describes, can start at any hour. One started during a session would hold the lock
+# through the seal and then up to 75 minutes of upload while capture waits to append. So
+# the deadline is the earlier of two times.
+#
+# 1. The start plus ``NIGHTLY_UPLOAD_BUDGET``.
+# 2. The next session's capture start, which is the session open, less
+#    ``IN_FLIGHT_ALLOWANCE`` for the PUT in flight and ``PRE_OPEN_MARGIN`` on top. A
+#    session counts as running until its close+5, the last moment an option-close fill
+#    may still append, so a run started before then reads that session's open, which has
+#    already passed.
+#
+# An upload started inside a session therefore finds its deadline already passed and
+# raises before it sends any request. ``session_bound`` derives the time from the
+# calendar through ``SessionClock``, the helper the daemon decides capture with. The
+# first upload's locked phase takes the same bound, and its unlocked phase needs none.
 SEAL_ALLOWANCE = timedelta(minutes=15)
 IN_FLIGHT_ALLOWANCE = timedelta(minutes=15)
 SWEEP_MARGIN = timedelta(minutes=15)
+PRE_OPEN_MARGIN = timedelta(minutes=15)
+
+# How many days ahead ``session_bound`` looks for the next session. A long weekend with a
+# holiday spans four days without one, so eight is ample, and an upload's 75 minutes
+# could never reach a session further off.
+_SESSION_LOOKAHEAD_DAYS = 8
 
 
 def _clock_offset(moment: WallClockTime) -> timedelta:
@@ -169,6 +191,26 @@ NIGHTLY_UPLOAD_BUDGET = (
 
 # Python's ``date.weekday()`` number for Sunday.
 _PY_SUNDAY = 6
+
+
+def session_bound(now: datetime, *, clock: Clock, calendar: Calendar) -> datetime | None:
+    """The last moment an upload holding the lock may send a request, from the calendar.
+
+    It is the open of the session that ``now`` falls before or inside, less
+    ``IN_FLIGHT_ALLOWANCE`` and ``PRE_OPEN_MARGIN``. A session runs until its close+5
+    here, so a ``now`` inside one gives a time already past. ``None`` means the calendar
+    names no session in the next ``_SESSION_LOOKAHEAD_DAYS`` days.
+    """
+    sessions = SessionClock(clock, calendar)
+    today = now.astimezone(MARKET_TZ).date()
+    for offset in range(_SESSION_LOOKAHEAD_DAYS):
+        day = today + timedelta(days=offset)
+        if not calendar.is_session(day):
+            continue
+        bounds = sessions.bounds(day)
+        if now < bounds.option_close_deadline:
+            return bounds.open - IN_FLIGHT_ALLOWANCE - PRE_OPEN_MARGIN
+    return None
 
 
 # -- refusals -----------------------------------------------------------------
@@ -434,6 +476,26 @@ def connect(config: Config, target: BucketTarget | None = None) -> tuple[BucketT
         raise BucketSettingsInvalid(str(exc)) from None
 
 
+class ClientFromConfig:
+    """An S3 client that ``connect`` builds from the config on its first use.
+
+    Compaction seals the day before it uploads. Building the client when the job starts
+    would let a bad bucket setting stop the seal too. Building it at the first request
+    means the setting fails the backup after the seal, the way an unmounted disk fails
+    the path form. An upload the session deadline stops before any request never builds
+    one at all.
+    """
+
+    def __init__(self, config: Config) -> None:
+        self._config = config
+        self._client: Any = None
+
+    def __getattr__(self, name: str) -> Any:
+        if self._client is None:
+            _, self._client = connect(self._config)
+        return getattr(self._client, name)
+
+
 # -- the exclusion list, with rsync's matching rules ----------------------------
 
 
@@ -619,7 +681,11 @@ class UploadSummary:
 
 
 class _Uploader:
-    """The PUT and the compare-before-PUT, shared by the nightly and the first upload."""
+    """The PUT and the compare-before-PUT, shared by the nightly and the first upload.
+
+    ``guards`` run before every request, and each raises when the upload must stop. The
+    nightly upload's deadline is one, and the first upload's Sunday window is another.
+    """
 
     def __init__(
         self,
@@ -628,27 +694,36 @@ class _Uploader:
         target: BucketTarget,
         root: Path,
         clock: Clock,
-        deadline: datetime | None,
         summary: UploadSummary,
     ) -> None:
         self.client = client
         self.target = target
         self.root = root
         self.clock = clock
-        self.deadline = deadline
         self.summary = summary
+        self.guards: list[Callable[[], None]] = []
 
-    def _check_deadline(self) -> None:
-        if self.deadline is not None and self.clock.now() >= self.deadline:
-            raise UploadDeadline(
-                f"the bucket upload reached its deadline at {self.deadline.isoformat()} "
-                f"after {self.summary.puts} PUT(s), before manifest.jsonl, so the lock is "
-                f"released and the next night carries on: {self.target}"
-            )
+    def check(self) -> None:
+        """Run every guard. Called before every request the upload sends."""
+        for guard in self.guards:
+            guard()
+
+    def deadline(self, deadline: datetime, why: str, then: str) -> Callable[[], None]:
+        """A guard that raises ``UploadDeadline`` once the clock reaches ``deadline``."""
+
+        def guard() -> None:
+            if self.clock.now() >= deadline:
+                raise UploadDeadline(
+                    f"the bucket upload reached its deadline at {deadline.isoformat()}, "
+                    f"{why}, after {self.summary.puts} PUT(s) and before manifest.jsonl, so "
+                    f"the lock is released and {then}: {self.target}"
+                )
+
+        return guard
 
     def put(self, rel: str, data: bytes, checksum: str) -> None:
         """One ``PutObject`` carrying ``checksum``, or a named refusal."""
-        self._check_deadline()
+        self.check()
         try:
             self.client.put_object(
                 Bucket=self.target.bucket,
@@ -679,7 +754,7 @@ class _Uploader:
 
     def holds(self, rel: str, hexdigest: str) -> bool:
         """Whether the bucket already holds ``rel`` with exactly this SHA-256."""
-        self._check_deadline()
+        self.check()
         try:
             head = self.client.head_object(
                 Bucket=self.target.bucket, Key=self.target.key(rel), ChecksumMode="ENABLED"
@@ -755,12 +830,14 @@ def nightly_upload(
     *,
     client: Any,
     clock: Clock,
+    calendar: Calendar,
     budget: timedelta = NIGHTLY_UPLOAD_BUDGET,
 ) -> UploadSummary:
     """Upload what changed since the last night. The caller holds the lake-root lock.
 
-    1. The bucket's manifest copy must be a prefix of the lake's, or this refuses with
-       one line naming the first-upload command and uploads nothing.
+    1. The bucket's manifest copy must be a prefix of the lake's that carries at least
+       one whole entry when the lake has any, or this refuses with one line naming the
+       first-upload command and uploads nothing.
     2. Every manifested file whose latest entry sits past the watermark is pending and
        uploads under the manifest's digest, segments by the segment rule.
     3. Every file with no manifest entry and no exclusion compares by size against one
@@ -769,19 +846,22 @@ def nightly_upload(
        not hold. It goes up only when its length moved.
 
     Nothing is deleted from the bucket and nothing is written under the lake root. The
-    deadline is ``budget`` past the start, checked before every request.
+    deadline is the earlier of ``budget`` past the start and ``session_bound``. It is
+    checked before every request, the first included, so an upload started inside a
+    session sends nothing.
     """
     root = Path(lake_root)
     started = clock.monotonic()
     summary = UploadSummary(target=str(target))
-    uploader = _Uploader(
-        client=client,
-        target=target,
-        root=root,
-        clock=clock,
-        deadline=clock.now() + budget,
-        summary=summary,
-    )
+    uploader = _Uploader(client=client, target=target, root=root, clock=clock, summary=summary)
+    now = clock.now()
+    deadline = now + budget
+    why = f"{budget.total_seconds() / 60:.0f} minutes after it started"
+    bound = session_bound(now, clock=clock, calendar=calendar)
+    if bound is not None and bound < deadline:
+        deadline, why = bound, "ahead of the next session's capture start"
+    uploader.guards.append(uploader.deadline(deadline, why, "the next night carries on"))
+    uploader.check()
     ledger = read_ledger(root)
     copy = read_copy_state(client, target, ledger.raw)
     if not copy.present or not copy.is_prefix:
@@ -795,7 +875,16 @@ def nightly_upload(
             f"{FIRST_UPLOAD_COMMAND} by hand: {target}"
         )
     mark = watermark(ledger.raw, copy.length)
+    if mark == 0 and ledger.entries:
+        # A copy of zero bytes, or one shorter than a whole line, is a prefix of any
+        # manifest, and would start a whole-lake upload inside compaction's lock.
+        raise WatermarkMissing(
+            f"the bucket holds a manifest.jsonl of {copy.length} byte(s) that carries no "
+            f"whole entry, so the nightly upload has no watermark. Run "
+            f"{FIRST_UPLOAD_COMMAND} by hand: {target}"
+        )
 
+    uploader.check()
     listing = list_bucket(client, target)
     pending = [rel for rel, position in ledger.last.items() if position >= mark]
     for rel, hexdigest in manifested_files(root, ledger, pending):
@@ -811,27 +900,22 @@ def nightly_upload(
 class BucketBackup:
     """The ``BackupRunner`` for a bucket target, run inside compaction's lake-root lock.
 
-    The S3 client comes from one of two places. ``client`` is a client in hand, which a
-    test passes as a fake. ``config`` is the loaded config, from which ``sync`` builds
-    the client through ``connect`` when it runs. Building it then rather than when the
-    job starts means a bad bucket setting fails the backup after the seal has run, the
-    way an unmounted disk fails the path form, instead of stopping the seal too.
-    ``clock`` sets the deadline. ``last`` is what the most recent ``sync`` did.
+    ``client`` is an S3 client. ``compact.main`` passes a ``ClientFromConfig``, and a
+    test passes a fake. ``clock`` and ``calendar`` set the deadline. ``last`` is what
+    the most recent ``sync`` did.
     """
 
     def __init__(
         self,
         *,
+        client: Any,
         clock: Clock,
-        client: Any = None,
-        config: Config | None = None,
+        calendar: Calendar,
         budget: timedelta = NIGHTLY_UPLOAD_BUDGET,
     ) -> None:
-        if (client is None) == (config is None):
-            raise TypeError("BucketBackup takes exactly one of client and config")
         self._client = client
-        self._config = config
         self._clock = clock
+        self._calendar = calendar
         self._budget = budget
         self.last: UploadSummary | None = None
 
@@ -839,11 +923,13 @@ class BucketBackup:
         if not isinstance(target, BucketTarget):
             raise TypeError(f"BucketBackup uploads to a bucket target, not {target!r}")
         client = self._client
-        if client is None:
-            assert self._config is not None
-            target, client = connect(self._config, target)
         self.last = nightly_upload(
-            source, target, client=client, clock=self._clock, budget=self._budget
+            source,
+            target,
+            client=client,
+            clock=self._clock,
+            calendar=self._calendar,
+            budget=self._budget,
         )
 
 
@@ -870,6 +956,7 @@ def first_upload(
     *,
     client: Any,
     clock: Clock,
+    calendar: Calendar,
 ) -> UploadSummary:
     """Upload a whole lake, comparing every object rather than trusting a watermark.
 
@@ -879,22 +966,47 @@ def first_upload(
     files with no manifest entry, and ``manifest.jsonl`` itself. So the command blocks
     nothing for most of its run. A bucket whose copy stopped being a prefix is
     re-baselined by the same pass, because the copy is replaced at the end.
+
+    Three guards stop it with one line and leave no ``manifest.jsonl`` uploaded.
+
+    1. The Sunday scrub window, checked before every request rather than only at the
+       start, so a run begun at 19:50 stops when the window opens.
+    2. ``session_bound``, checked before every request of the locked phase, so the lock
+       is never held into a session.
+    3. A lake whose own manifest is empty or absent while the bucket's copy is not. A
+       wrong ``lake_root`` reads that way, and the run would replace the bucket's
+       manifest with an empty one. This is checked before the lock, because taking the
+       lock creates ``manifest.jsonl`` under the root it is handed.
     """
-    if in_sunday_scrub_window(clock.now()):
-        raise FirstUploadRefused(
-            "the first upload refuses to run on Sunday from 19:55 to 23:30, while the Sunday "
-            "job may be scrubbing the bucket. Run it on another evening after the 18:30 sweep"
-        )
     root = Path(lake_root)
     started = clock.monotonic()
     summary = UploadSummary(target=str(target))
-    uploader = _Uploader(
-        client=client, target=target, root=root, clock=clock, deadline=None, summary=summary
-    )
+    uploader = _Uploader(client=client, target=target, root=root, clock=clock, summary=summary)
+
+    def sunday_window() -> None:
+        if in_sunday_scrub_window(clock.now()):
+            raise FirstUploadRefused(
+                "the first upload does not run on Sunday from 19:55 to 23:30, while the "
+                f"Sunday job may be scrubbing the bucket, and stopped after {summary.puts} "
+                "PUT(s) with no manifest.jsonl uploaded. Run it on another evening after "
+                "the 18:30 sweep"
+            )
+
+    uploader.guards.append(sunday_window)
+    uploader.check()
+    if not root.is_dir():
+        raise FirstUploadRefused(f"lake_root {root} is not a directory: {target}")
 
     early = read_ledger(root)
     before = read_copy_state(client, target, early.raw)
+    if not early.raw and before.present and before.length > 0:
+        raise FirstUploadRefused(
+            f"the lake's manifest.jsonl under {root} is empty or absent while the bucket's "
+            f"copy holds {before.length} byte(s), so lake_root may name the wrong "
+            f"directory. Nothing was uploaded: {target}"
+        )
     summary.rebaselined = before.present and not before.is_prefix
+    uploader.check()
     listing = list_bucket(client, target)
     done: dict[str, str] = {}
     for rel, hexdigest in manifested_files(root, early, list(early.latest)):
@@ -902,12 +1014,23 @@ def first_upload(
         done[rel] = hexdigest
 
     with lake_lock(root):
+        bound = session_bound(clock.now(), clock=clock, calendar=calendar)
+        if bound is not None:
+            uploader.guards.append(
+                uploader.deadline(
+                    bound,
+                    "ahead of the next session's capture start",
+                    "the first upload can run again after that session's 18:30 sweep",
+                )
+            )
+        uploader.check()
         ledger = read_ledger(root)
         late = [rel for rel, entry in ledger.latest.items() if done.get(rel) != entry["sha256"]]
         for rel, hexdigest in manifested_files(root, ledger, late):
             uploader.manifested(rel, hexdigest, listed=rel in listing)
         for rel, path in _unmanifested(root, ledger):
             uploader.unmanifested(rel, path, listing.get(rel))
+        uploader.check()
         copy = read_copy_state(client, target, ledger.raw)
         if not (copy.is_prefix and copy.length == len(ledger.raw)):
             uploader.put(MANIFEST_FILE, ledger.raw, b64_sha256(ledger.raw))
@@ -1198,12 +1321,17 @@ def _one_line(exc: BaseException, target: BucketTarget) -> BucketUnreachable | N
     return BucketUnreachable(f"the bucket could not be reached ({detail}): {target}")
 
 
-def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    clock: Clock | None = None,
+    calendar: Calendar | None = None,
+) -> int:
     """The ``python -m lake.bucket`` entry. Returns a process exit code.
 
     The client is built here from the config and never accepted, the same rule every
-    other ``main`` keeps for a seam that reaches past this process. ``clock`` stays
-    injectable, since a clock reaches nowhere.
+    other ``main`` keeps for a seam that reaches past this process. ``clock`` and
+    ``calendar`` stay injectable, since neither reaches past this process.
     """
     args = build_parser().parse_args(argv)
     label = args.command
@@ -1216,7 +1344,13 @@ def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> in
             clock = SystemClock()
         try:
             if args.command == "first-upload":
-                summary = first_upload(config.lake_root, target, client=client, clock=clock)
+                if calendar is None:
+                    from lake.calendar import ExchangeCalendar
+
+                    calendar = ExchangeCalendar()
+                summary = first_upload(
+                    config.lake_root, target, client=client, clock=clock, calendar=calendar
+                )
             else:
                 stamp = clock.now().strftime("%Y%m%dT%H%M%SZ")
                 passed = live_check(client, target, stamp=stamp, out=print)
@@ -1245,6 +1379,7 @@ __all__ = [
     "LIVE_PROBE_BYTES",
     "MAX_PUT_BYTES",
     "NIGHTLY_UPLOAD_BUDGET",
+    "PRE_OPEN_MARGIN",
     "SEAL_ALLOWANCE",
     "STORAGE_CLASS",
     "SWEEP_MARGIN",
@@ -1252,6 +1387,7 @@ __all__ = [
     "BucketRefusal",
     "BucketSettingsInvalid",
     "BucketUnreachable",
+    "ClientFromConfig",
     "ChecksumRefused",
     "CopyState",
     "FirstUploadRefused",
@@ -1277,6 +1413,7 @@ __all__ = [
     "read_copy_state",
     "read_ledger",
     "rsync_excluded",
+    "session_bound",
     "stored_sha256",
     "walk_lake",
     "watermark",

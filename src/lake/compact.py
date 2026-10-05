@@ -2263,17 +2263,21 @@ def main(
         )
         return 0
 
+    calendar = calendar if calendar is not None else ExchangeCalendar()
     if isinstance(config.backup_target, BucketTarget):
-        # The client is built inside the backup step, after the seal, so a bad bucket
-        # setting fails the backup and leaves the seal standing.
-        backup: BackupRunner = bucket.BucketBackup(config=config, clock=clock)
+        # The client is built at the upload's first request, after the seal, so a bad
+        # bucket setting fails the backup and leaves the seal standing. The calendar
+        # bounds the upload's deadline by the next session, for a hand run at any hour.
+        backup: BackupRunner = bucket.BucketBackup(
+            client=bucket.ClientFromConfig(config), clock=clock, calendar=calendar
+        )
     else:
         backup = RsyncBackup()
     try:
         result = compact(
             config.lake_root,
             clock=clock,
-            calendar=calendar if calendar is not None else ExchangeCalendar(),
+            calendar=calendar,
             backup=backup,
             backup_target=config.backup_target,
             pinger=UrllibPinger(),

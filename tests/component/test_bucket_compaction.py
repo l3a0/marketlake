@@ -21,6 +21,8 @@ from lake.config import BucketTarget
 from lake.paths import LakePaths
 from tests.component.test_compaction import (
     DAY,
+    FRIDAY,
+    TUESDAY,
     URL,
     _calendar,
     _chains,
@@ -30,6 +32,7 @@ from tests.component.test_compaction import (
 )
 from tests.support.bucket import FakeS3
 from tests.support.config import write_config
+from tests.support.lake import FixtureLake
 from tests.support.pinger import FakePinger
 
 TARGET = BucketTarget(bucket="lake-backup", prefix="lake")
@@ -41,9 +44,18 @@ KEYS = (
 
 
 def _seeded(lake_root: Path) -> FakeS3:
-    """A bucket the first upload has already seeded from this lake."""
+    """A bucket the first upload seeded the evening before, from a lake holding one day.
+
+    The seeded lake is never empty. A bucket seeded from an empty manifest carries a
+    zero-byte copy, which the nightly upload refuses as no watermark.
+    """
+    FixtureLake(lake_root).with_partition(
+        "chains", "SPY", FRIDAY, _chains(1, snap_ts=_snap(FRIDAY, 0))
+    ).build()
     client = FakeS3()
-    first_upload(lake_root, TARGET, client=client, clock=_clock_at(DAY, 9, 0))
+    first_upload(
+        lake_root, TARGET, client=client, clock=_clock_at(FRIDAY, 19, 0), calendar=_calendar()
+    )
     client.calls.clear()
     return client
 
@@ -55,7 +67,7 @@ def _job(lake_root: Path, client: FakeS3, events: list[str], *, clock=None):
         lake_root,
         clock=clock,
         calendar=_calendar(),
-        backup=BucketBackup(client=client, clock=clock),
+        backup=BucketBackup(client=client, clock=clock, calendar=_calendar()),
         backup_target=TARGET,
         pinger=FakePinger(events),
         ping_url=URL,
@@ -102,7 +114,7 @@ def test_a_deadline_raises_before_the_ping(lake_root):
             lake_root,
             clock=clock,
             calendar=_calendar(),
-            backup=BucketBackup(client=client, clock=clock),
+            backup=BucketBackup(client=client, clock=clock, calendar=_calendar()),
             backup_target=TARGET,
             pinger=FakePinger(events),
             ping_url=URL,
@@ -255,3 +267,20 @@ def test_bad_bucket_settings_fail_the_backup_after_the_seal(
     assert named in err[0]
     assert LakePaths(lake_root).chains_partition_path("SPY", DAY).exists()
     assert pinger.urls == []
+
+
+def test_a_hand_run_during_a_session_seals_and_sends_the_bucket_nothing(lake_root):
+    # The catch-up run compact.main describes, started at 11:00 the next session day.
+    # The seal still runs, since it is local and short. The upload finds the session
+    # open and raises before any request, so the lock goes back to capture and the
+    # missing ping pages.
+    client = _seeded(lake_root)
+    _seal_one(lake_root)
+    events: list[str] = []
+
+    with pytest.raises(UploadDeadline, match="next session's capture start"):
+        _job(lake_root, client, events, clock=_clock_at(TUESDAY, 11, 0))
+
+    assert client.calls == []
+    assert "ping" not in events
+    assert LakePaths(lake_root).chains_partition_path("SPY", DAY).exists()

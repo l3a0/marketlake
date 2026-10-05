@@ -123,7 +123,9 @@ backup_target: s3://example-lake-backup/lake
 ```
 
 The client is built from those three values alone, never from `~/.aws/` or an `AWS_*`
-environment variable.
+environment variable. Loading `config.yaml` never checks them or the bucket's name, so
+a mistyped value fails the backup, the first upload or the Sunday scrub that uses it,
+each with one line naming the key, and never stops capture.
 
 Three commands go with it.
 
@@ -133,8 +135,14 @@ Three commands go with it.
    narrow key cannot delete.
 2. `uv run python -m lake.bucket first-upload --target s3://example-lake-backup/lake`
    uploads the whole lake, comparing every object, and prints its throughput. Run it on
-   an evening after the 18:30 sweep. It refuses on Sunday from 19:55 to 23:30, while the
-   Sunday job may be scrubbing the bucket. The same command re-baselines a bucket whose
+   an evening after the 18:30 sweep. It does not run on Sunday from 19:55 to 23:30,
+   while the Sunday job may be scrubbing the bucket, and a run begun just before 19:55
+   stops when the window opens. Its last step holds the lake-root lock, and that step
+   stops 30 minutes before the next session opens, so start it with the evening ahead of
+   it. It refuses when the lake's own `manifest.jsonl` is empty or missing while the
+   bucket's is not, which is what a wrong `lake_root` looks like. Each stop leaves the
+   bucket's `manifest.jsonl` as it was, and running the command again picks up where it
+   left off. The same command re-baselines a bucket whose
    copy of `manifest.jsonl` stopped being a prefix of the lake's, which the nightly
    upload refuses with a line naming it. `networkQuality -s`, built into macOS, measures
    upload capacity beforehand.
