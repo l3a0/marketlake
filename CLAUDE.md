@@ -98,6 +98,23 @@ When a heading changes, verify the Contents anchors still resolve.
 
 [README.md](README.md) carries the local commands under its `## Develop` heading, along with how to keep a development run off the real `~/.config/marketlake/` directory.
 
+## Delegating work to subagents (owner directive, 2026-10-05)
+
+The owner's global `~/.claude/CLAUDE.md` is the source for this rule, under "Running work". This section repeats it because the repo is public and an agent may arrive without that file. The global file wins, and this section is what gets corrected.
+
+**Run work in background subagents, not on the main thread.** The main conversation is where the owner talks to the session, so it stays free to answer, take a redirect, and report. Any task that takes more than a few tool calls goes to a subagent through the `Agent` tool, which runs in the background by default. That covers an audit pass, a measurement, an investigation, a review lens, and a build step. The main thread writes the prompt, reads the result when its notification arrives, decides what it means, writes to the tracker, and reports.
+
+The rule exists because of one turn. On 2026-10-05 the session planning [#629](https://github.com/l3a0/marketlake/issues/629) ran nine audit passes, and the investigation that filed [#644](https://github.com/l3a0/marketlake/issues/644), on its own thread in one turn. For most of that turn the owner could only wait, and the harness had to prompt the session to say what it was doing.
+
+Four rules make the delegation safe.
+
+1. **A subagent prompt stands alone.** The subagent reads none of the conversation, so the prompt names the issue, the commit the work is derived against, the facts to verify rather than trust, and what is out of scope.
+2. **A subagent that edits files or mutates code gets `isolation: "worktree"`.** A prompt asking it to stay out of the parent's tree is advice, and isolation is enforcement.
+3. **Independent work goes out in parallel, in one message.** Work whose next step depends on a result waits for that result's notification. Never poll for it, and never predict what it will say.
+4. **A result is a claim until checked.** The main thread sees a conclusion, not the files behind it. So it verifies what it is about to act on, by executing where it can, before the claim reaches an issue, a pull request, or the owner. That is the price of the rule, and it is smaller than a main thread the owner cannot reach.
+
+Keep a task on the main thread only when its very next step depends on the answer and nothing else could usefully run meanwhile, or when it is one lookup in a file already known. Each decompose-then-build unit still gets its own session, as the owner directed on 2026-09-17, because a session has a row the owner can open and a subagent dies with its parent. This rule governs the work inside every session, that one included.
+
 ## Cross-surface consistency
 
 A repo drifts when two surfaces describe the same thing and only one gets updated. The fix is to give each surface exactly one job, so nothing is stated twice.
