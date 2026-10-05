@@ -103,27 +103,31 @@ def _vendor(clock: ManualClock, *, chain_s: float, quote_s: float) -> _StampingV
 
 @pytest.fixture
 def timed_phases(monkeypatch):
-    """Make each segment write, each manifest entry and each load reading take a known time.
+    """Make each segment write, the cycle's manifest append and each load reading take a known time.
 
-    A load reading takes time so a test can tell which side of it an instant was read on.
+    The append is one call for the whole cycle (marketlake #573), so it takes ``_APPEND_S``
+    once however many segments it records. An empty batch reads and writes nothing, so it
+    takes no time. A load reading takes time so a test can tell which side of it an instant
+    was read on.
 
     Returns the clock the phases advance, which the test hands its cycle.
     """
     clock = ManualClock(start=_CLOCK_START)
     write = capture._CaptureCycle._write
-    record = capture.record_partition
+    append = capture.append_entries
     loads = iter((_LOAD_START, _LOAD_END))
 
     def timed_write(self, surface, ticker, plan):
         clock.advance(_WRITE_S)
         return write(self, surface, ticker, plan)
 
-    def timed_record(*args, **kwargs):
-        clock.advance(_APPEND_S)
-        return record(*args, **kwargs)
+    def timed_append(lake_root, entries, **kwargs):
+        if entries:
+            clock.advance(_APPEND_S)
+        return append(lake_root, entries, **kwargs)
 
     monkeypatch.setattr(capture._CaptureCycle, "_write", timed_write)
-    monkeypatch.setattr(capture, "record_partition", timed_record)
+    monkeypatch.setattr(capture, "append_entries", timed_append)
 
     def timed_load():
         clock.advance(_LOAD_S)
@@ -185,12 +189,13 @@ def test_one_sequential_cycle_writes_every_instant_it_passed_through(
     assert line["fetch_end_ts"] == _at(fetched)
     durable = fetched + _PLAN_S + 2 * _WRITE_S
     assert line["segments_durable_ts"] == _at(durable)
-    # Nothing else holds the lock, so the wait is nil, and the hold is one entry a segment.
+    # Nothing else holds the lock, so the wait is nil, and the hold is one append for the
+    # two segments (marketlake #573).
     assert line["lock_acquired_ts"] == _at(durable)
-    assert line["lock_released_ts"] == _at(durable + 2 * _APPEND_S)
+    assert line["lock_released_ts"] == _at(durable + _APPEND_S)
     # The stamp runs after the append, inside the cycle, and the closing load after it. The
     # end is read last.
-    assert line["cycle_end_ts"] == _at(durable + 2 * _APPEND_S + _STAMP_S + _LOAD_S)
+    assert line["cycle_end_ts"] == _at(durable + _APPEND_S + _STAMP_S + _LOAD_S)
     assert line["loadavg_start"] == list(_LOAD_START)
     assert line["loadavg_end"] == list(_LOAD_END)
     assert line["cycle_failure"] is None
@@ -222,8 +227,8 @@ def test_a_concurrent_cycle_writes_its_line_with_the_landing_inside_the_fetch(
     assert durable == _CLOCK_START + timedelta(seconds=landed)
     assert durable - fetch_end >= timedelta(seconds=_WRITE_S)
     assert line["lock_acquired_ts"] == _at(landed)
-    assert line["lock_released_ts"] == _at(landed + 2 * _APPEND_S)
-    assert line["cycle_end_ts"] == _at(landed + 2 * _APPEND_S + _STAMP_S + _LOAD_S)
+    assert line["lock_released_ts"] == _at(landed + _APPEND_S)
+    assert line["cycle_end_ts"] == _at(landed + _APPEND_S + _STAMP_S + _LOAD_S)
 
 
 def test_a_cycle_with_nothing_to_fetch_still_writes_its_line(lake_root, timed_phases):
@@ -494,7 +499,7 @@ def test_a_cycle_that_raises_at_its_manifest_append_writes_no_line(
     def refuse(*args, **kwargs):
         raise RuntimeError("manifest refused")
 
-    monkeypatch.setattr(capture, "record_partition", refuse)
+    monkeypatch.setattr(capture, "append_entries", refuse)
 
     with pytest.raises(RuntimeError, match="manifest refused"):
         _run(_vendor(clock, chain_s=3.0, quote_s=1.0), clock, lake_root)

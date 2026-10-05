@@ -46,13 +46,14 @@ production entry ``run_cycle_from_config`` wires the real config, roster, and
 Schwab-backed vendor around the same core, and keeps the ``schwab-py`` construction
 lazy so the offline test suite never touches the network.
 
-The manifest step is the one place this cycle takes the lake-root lock. After every
-segment is durable, the cycle appends one manifest entry per segment, keyed by the
-segment path, under ``lake_lock``. That is the slice-1 segment-keyed entry the manifest
-protocol sanctions. It exists only in this single-process phase. When the daemon lands,
-manifest appends move into the serialized compaction job. Capture writes segments
-outside the lock, because blocking a perishable cycle behind a daily job would drop
-minutes.
+The manifest step is the one place this cycle takes the lake-root lock. Each segment is
+hashed as soon as it closes, outside the lock. After every segment is durable, the cycle
+appends one manifest entry per segment, keyed by the segment path, in a single
+``manifest.append_entries`` call under ``lake_lock``. That call reads the manifest once
+and writes the cycle's lines in one write, so the time the lock is held no longer grows
+with the number of segments (marketlake #573). Capture writes segments outside the lock,
+because blocking a perishable cycle behind a daily job would drop minutes. Whether
+capture should take the lock at all is marketlake #535.
 """
 
 from __future__ import annotations
@@ -76,7 +77,7 @@ from lake.chain_plan import ChainPlan, load_chain_plan
 from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants, load_config
 from lake.lock import lake_lock
-from lake.manifest import record_partition
+from lake.manifest import append_entries, sha256_file
 from lake.metadata import stamp_cycle
 from lake.reference_read import read_or_none
 from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor, is_transient_failure
@@ -2190,12 +2191,22 @@ class _CaptureCycle:
 
     # -- writing: the durable half -------------------------------------------
 
-    def _write(self, surface: str, ticker: str, plan: _Plan) -> SegmentOutcome:
-        """Write one planned batch to a fresh segment and make it durable.
+    def _write(self, surface: str, ticker: str, plan: _Plan) -> tuple[SegmentOutcome, str | None]:
+        """Write one planned batch to a fresh segment, make it durable, and hash it.
 
         The writer creates the segment exclusively, appends the one batch, and closes it
         with the end-of-stream marker. Every write is a full flush, so a returned outcome
         means the segment is on disk.
+
+        The segment is hashed right after it closes, before the cycle waits for the
+        lake-root lock, and the digest is returned beside the outcome for its manifest
+        entry. So the entry records the bytes as they closed. A change to the file while the
+        cycle waited shows at compaction as damage, where a hash taken under the lock would
+        have recorded the changed bytes as the segment (marketlake #573). When the hash
+        raises, whatever it raises, the digest returned is ``None`` and
+        ``manifest.append_entries`` hashes the file under the lock, as every cycle did
+        before. Letting the raise out would report a durable segment as a ``SegmentError``,
+        which says no durable segment exists.
 
         The drift scan runs first, and it cannot cost the segment. Both halves of that are
         deliberate.
@@ -2228,8 +2239,17 @@ class _CaptureCycle:
         )
         with writer:
             writer.write_cycle(plan.batch)
+        try:
+            sha256: str | None = sha256_file(writer.path)
+        except Exception as exc:  # noqa: BLE001 - the segment is durable, so it must land
+            print(
+                f"capture: hash at close failed on {surface} {ticker}, "
+                f"hashing under the lock instead: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            sha256 = None
         partition = writer.path.relative_to(self.lake_root).as_posix()
-        return SegmentOutcome(
+        outcome = SegmentOutcome(
             surface=surface,
             ticker=ticker,
             path=writer.path,
@@ -2241,6 +2261,7 @@ class _CaptureCycle:
             data_rows=data_rows,
             routed_columns=routed,
         )
+        return outcome, sha256
 
     # -- the cycle -----------------------------------------------------------
 
@@ -2264,16 +2285,19 @@ class _CaptureCycle:
         # prior-batch fallback or a failed drift scan, prints in landing order and names
         # its own ticker.
         option_tickers = [entry.ticker for entry in self.roster if entry.options]
-        landed: list[tuple[int, SegmentOutcome | SegmentError]] = []
+        # Each landed unit, with the hash its segment got at close. The hash is ``None``
+        # beside a write failure and beside a hash that failed.
+        landed: list[tuple[int, SegmentOutcome | SegmentError, str | None]] = []
 
         def land(rank: int, surface: str, ticker: str, plan: _Plan) -> None:
             # The cycle line's ``fetch_end_ts`` is the latest unit's, written or not.
             if self.fetch_end is None or plan.fetch_end_ts > self.fetch_end:
                 self.fetch_end = plan.fetch_end_ts
             try:
-                landed.append((rank, self._write(surface, ticker, plan)))
+                outcome, sha256 = self._write(surface, ticker, plan)
+                landed.append((rank, outcome, sha256))
             except Exception as exc:
-                landed.append((rank, SegmentError(surface, ticker, _error_class(exc))))
+                landed.append((rank, SegmentError(surface, ticker, _error_class(exc)), None))
 
         if self.guards.capture_max_concurrency == 1:
             plans = [(CHAINS, ticker, self._plan_chain(ticker)) for ticker in option_tickers]
@@ -2318,25 +2342,30 @@ class _CaptureCycle:
             )
         segments_durable = self.clock.now()
         landed.sort(key=lambda item: item[0])
-        outcomes = [item for _, item in landed if isinstance(item, SegmentOutcome)]
-        errors = [item for _, item in landed if isinstance(item, SegmentError)]
+        outcomes = [item for _, item, _ in landed if isinstance(item, SegmentOutcome)]
+        errors = [item for _, item, _ in landed if isinstance(item, SegmentError)]
+        entries = [
+            {
+                "partition": item.partition,
+                "source": CAPTURE_SOURCE,
+                "sha256": sha256,
+                "rows": item.rows,
+                "fetched_at": item.fetched_at,
+            }
+            for _, item, sha256 in landed
+            if isinstance(item, SegmentOutcome)
+        ]
 
         # Now the segments are durable, append one manifest entry per segment, keyed by
-        # the segment path, under the lake-root lock. This is the slice-1 segment-keyed
-        # entry. The lock serializes lake-mutating jobs, so the manifest append never
-        # races a daily job. Capture stayed outside the lock for the perishable part.
-        # The cycle line brackets the append, so a reader can tell the wait for the lock
-        # from the time spent holding it.
+        # the segment path, under the lake-root lock. One call reads the manifest once and
+        # writes every line in one write (marketlake #573). The lock serializes
+        # lake-mutating jobs, so the manifest append never races a daily job. Capture
+        # stayed outside the lock for the perishable part, and each segment was hashed as
+        # it closed. The cycle line brackets the append, so a reader can tell the wait for
+        # the lock from the time spent holding it.
         with lake_lock(self.lake_root):
             lock_acquired = self.clock.now()
-            for outcome in outcomes:
-                record_partition(
-                    self.lake_root,
-                    outcome.partition,
-                    source=CAPTURE_SOURCE,
-                    rows=outcome.rows,
-                    fetched_at=outcome.fetched_at,
-                )
+            append_entries(self.lake_root, entries)
         lock_released = self.clock.now()
 
         # Last, stamp what the rows cannot carry: the token's mint time and the roster.
@@ -2704,9 +2733,11 @@ def journal_snapshot(
        the call below says what each of those two buys here.
     4. Open a fresh ``SegmentWriter``, write the one cycle, and close it, which lays down
        the end-of-stream marker.
-    5. Append one segment-keyed manifest entry under the lake-root lock, keyed by the
-       segment path, ``source`` defaulting to ``capture``, and ``fetched_at`` the
-       dispatch time, exactly as the loop records a segment.
+    5. Hash the segment as soon as it closes, then append one segment-keyed manifest
+       entry carrying that hash under the lake-root lock, keyed by the segment path,
+       ``source`` defaulting to ``capture``, and ``fetched_at`` the dispatch time, exactly
+       as the loop records a segment. A hash that raises here reaches the caller before
+       the lock is taken. Only the loop's own cycle falls back to hashing under the lock.
 
     Each call is its own writer session. A re-run stamps a different ``start_ts`` and
     ``pid``, so the segment name differs and the ``O_CREAT | O_EXCL`` create never
@@ -2759,15 +2790,21 @@ def journal_snapshot(
     writer = journal.SegmentWriter.open(lake_root, surface, ticker, day, start_ts, writer_pid)
     with writer:
         writer.write_cycle(batch)
+    sha256 = sha256_file(writer.path)
     partition = writer.path.relative_to(lake_root).as_posix()
     fetched_at = fetch_ts.isoformat()
     with lake_lock(lake_root):
-        record_partition(
+        append_entries(
             lake_root,
-            partition,
-            source=source,
-            rows=batch.num_rows,
-            fetched_at=fetched_at,
+            [
+                {
+                    "partition": partition,
+                    "source": source,
+                    "sha256": sha256,
+                    "rows": batch.num_rows,
+                    "fetched_at": fetched_at,
+                }
+            ],
         )
     return SegmentOutcome(
         surface=surface,

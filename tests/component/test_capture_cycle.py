@@ -15,7 +15,9 @@ They cover the cycle's observable contract:
    survive the write and the daemon's schema-drift page is what reads it.
 3. A failing quote batch gaps every ticker's quotes, because the sampler is one shared
    failure unit.
-4. The manifest gains one entry per segment, keyed by the segment path.
+4. The manifest gains one entry per segment, keyed by the segment path. The cycle reads the
+   manifest once and hashes each segment as it closes (marketlake #573). A hash that fails
+   there is taken again under the lock, and a cycle with nothing to record reads nothing.
 5. The journal metadata gains the cycle's token mint time and roster, and a vendor that
    cannot name its mint time costs the stamp rather than the cycle.
 """
@@ -28,11 +30,11 @@ from pathlib import Path
 
 import pytest
 
-from lake import capture, journal
+from lake import capture, journal, manifest
 from lake.cassette import Cassette, Interaction, load_cassette
 from lake.chain_plan import ChainPlan
 from lake.config import GuardConstants
-from lake.manifest import latest_entries, sha256_file
+from lake.manifest import latest_entries, manifest_path, sha256_file
 from lake.metadata import JournalMetadata, read_metadata
 from lake.tickers import Roster
 from lake.vendor import VendorError
@@ -249,6 +251,96 @@ def test_manifest_gains_one_entry_per_segment_keyed_by_the_segment_path(cassette
         assert entry["rows"] == segment.rows
         # The recorded checksum matches the segment on disk.
         assert entry["sha256"] == sha256_file(lake_root / segment.partition)
+
+
+def _cycle(lake_root: Path, *, minute: int = 0) -> capture.CycleResult:
+    """One four-segment cycle, ``minute`` minutes after the clock's start."""
+    return capture.run_cycle(
+        ManualClock(start=_CLOCK_START + timedelta(minutes=minute)),
+        CassetteVendor(load_cassette(CASSETTES / "spy_minimal.json")),
+        _both_options(),
+        lake_root,
+        pid=4242,
+        plan=_ONE_WINDOW,
+    )
+
+
+def test_a_four_segment_cycle_reads_the_manifest_once(lake_root, monkeypatch):
+    # The first cycle leaves four entries for the second one's read to find. The second
+    # reads the manifest once for all four of its segments, not once per segment, which is
+    # what made the time the lock is held grow with the lake (marketlake #573).
+    _cycle(lake_root)
+    real = manifest.latest_entries
+    reads: list[int] = []
+
+    def counted(root):
+        reads.append(1)
+        return real(root)
+
+    monkeypatch.setattr(manifest, "latest_entries", counted)
+
+    result = _cycle(lake_root, minute=1)
+
+    assert len(result.segments) == 4
+    assert len(reads) == 1
+    assert set(result.partitions) <= set(real(lake_root))
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [RuntimeError("a bug in the hash"), PermissionError(1, "Operation not permitted")],
+    ids=["runtime", "permission"],
+)
+def test_a_hash_that_fails_at_close_still_lands_the_entry_hashed_under_the_lock(
+    lake_root, monkeypatch, capsys, exc
+):
+    # The segment is durable when its hash fails, so the cycle must not report it as a write
+    # failure. The entry is still written, with the hash the append takes from the file.
+    def refuse(path):
+        raise exc
+
+    monkeypatch.setattr(capture, "sha256_file", refuse)
+    real = manifest.sha256_file
+    hashed_under_the_lock: list[str] = []
+
+    def counted(path):
+        hashed_under_the_lock.append(Path(path).relative_to(lake_root).as_posix())
+        return real(path)
+
+    monkeypatch.setattr(manifest, "sha256_file", counted)
+
+    result = _cycle(lake_root)
+
+    assert result.errors == ()
+    assert len(result.segments) == 4
+    assert hashed_under_the_lock == list(result.partitions)
+    latest = latest_entries(lake_root)
+    for segment in result.segments:
+        assert latest[segment.partition]["sha256"] == real(segment.path)
+    err = capsys.readouterr().err
+    assert err.count("capture: hash at close failed on ") == 4
+    assert type(exc).__name__ in err
+
+
+def test_a_cycle_with_no_segment_to_record_returns_on_a_damaged_manifest(lake_root, monkeypatch):
+    # Every write fails, so the cycle has nothing to append. It reads nothing either, so a
+    # manifest holding a byte that will not decode does not end it.
+    _cycle(lake_root)
+    ledger = manifest_path(lake_root)
+    raw = ledger.read_bytes()
+    damaged = raw[:10] + b"\xff" + raw[11:]
+    ledger.write_bytes(damaged)
+
+    def refuse(self, surface, ticker, plan):
+        raise OSError("disk refused")
+
+    monkeypatch.setattr(capture._CaptureCycle, "_write", refuse)
+
+    result = _cycle(lake_root, minute=1)
+
+    assert result.segments == ()
+    assert len(result.errors) == 4
+    assert ledger.read_bytes() == damaged
 
 
 # -- 2. a failing chain gaps only that ticker --------------------------------

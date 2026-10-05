@@ -25,6 +25,7 @@ from lake.manifest import (
     ManifestError,
     RowCountRegression,
     TornLedger,
+    append_entries,
     append_line,
     append_manifest,
     append_quarantine,
@@ -197,6 +198,201 @@ def test_append_enforces_the_invariant_by_default(lake_root):
         guard=False,
     )
     assert latest_entries(lake_root)["p"]["rows"] == 1
+
+
+# -- one read and one write per batch (marketlake #573) -----------------------
+
+
+def _spec(partition: str, rows: int, sha256: str | None = "s") -> dict:
+    """One batch item, carrying what ``append_manifest`` takes as keywords."""
+    return {
+        "partition": partition,
+        "source": "capture",
+        "sha256": sha256,
+        "rows": rows,
+        "fetched_at": None,
+    }
+
+
+def _count_calls(monkeypatch, module, name: str) -> list[int]:
+    """Count calls to ``module.name`` while still running the real one."""
+    real = getattr(module, name)
+    calls: list[int] = []
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(module, name, counted)
+    return calls
+
+
+def _damage(lake_root: Path) -> bytes:
+    """Put a byte that will not decode into the manifest, and return the damaged bytes."""
+    append_manifest(lake_root, partition="a", source="capture", sha256="s", rows=1, fetched_at=None)
+    ledger = manifest_path(lake_root)
+    raw = ledger.read_bytes()
+    damaged = raw[:5] + b"\xff" + raw[6:]
+    ledger.write_bytes(damaged)
+    return damaged
+
+
+def test_two_entries_for_one_partition_in_a_batch_are_checked_against_each_other(lake_root):
+    # Nothing on disk names ``p``, so only the batch's own first entry can refuse the second.
+    with pytest.raises(RowCountRegression) as refusal:
+        append_entries(lake_root, [_spec("p", 405), _spec("p", 400)])
+
+    assert (refusal.value.recorded, refusal.value.proposed) == (405, 400)
+    assert [entry["rows"] for entry in read_manifest(lake_root)] == [405]
+
+    append_entries(lake_root, [_spec("q", 400), _spec("q", 405)])
+    assert latest_entries(lake_root)["q"]["rows"] == 405
+
+
+def test_a_refusal_writes_the_lines_before_it_and_none_after(lake_root):
+    append_manifest(
+        lake_root, partition="q", source="capture", sha256="s", rows=10, fetched_at=None
+    )
+
+    with pytest.raises(RowCountRegression):
+        append_entries(lake_root, [_spec("a", 1), _spec("b", 2), _spec("q", 1), _spec("c", 3)])
+
+    assert [entry["partition"] for entry in read_manifest(lake_root)] == ["q", "a", "b"]
+
+
+@pytest.mark.parametrize("refused", [False, True], ids=["all-pass", "refused-midway"])
+def test_a_batch_writes_the_bytes_one_append_manifest_call_per_entry_writes(tmp_path, refused):
+    # Two lakes start from the same untorn manifest. One records the batch in one call and
+    # the other one entry at a time, and the two files end byte for byte equal, including
+    # when an entry partway through is refused.
+    batch = [_spec("a", 1, "s1"), _spec("q", 1 if refused else 20, "s2"), _spec("c", 3, "s3")]
+    batch[0]["fetched_at"] = "2026-08-24T09:31:00-04:00"
+    roots = []
+    for name in ("batch", "calls"):
+        root = tmp_path / name
+        root.mkdir()
+        append_manifest(
+            root, partition="q", source="compaction", sha256="s0", rows=10, fetched_at=None
+        )
+        roots.append(root)
+    batch_root, calls_root = roots
+
+    try:
+        returned = append_entries(batch_root, batch)
+    except RowCountRegression:
+        returned = None
+    one_at_a_time = []
+    try:
+        for item in batch:
+            one_at_a_time.append(append_manifest(calls_root, **item))
+    except RowCountRegression:
+        pass
+
+    assert manifest_path(batch_root).read_bytes() == manifest_path(calls_root).read_bytes()
+    assert len(read_manifest(batch_root)) == (2 if refused else 4)
+    if not refused:
+        assert returned == one_at_a_time
+
+
+def test_a_batch_goes_out_in_one_write(lake_root, monkeypatch):
+    writes = _count_calls(monkeypatch, manifest.os, "write")
+
+    append_entries(lake_root, [_spec("a", 1), _spec("b", 2), _spec("c", 3), _spec("d", 4)])
+
+    assert len(writes) == 1
+    assert [entry["partition"] for entry in read_manifest(lake_root)] == ["a", "b", "c", "d"]
+
+
+def test_a_guarded_batch_reads_the_manifest_once(lake_root, monkeypatch):
+    reads = _count_calls(monkeypatch, manifest, "latest_entries")
+
+    append_entries(lake_root, [_spec("a", 1), _spec("b", 2), _spec("c", 3), _spec("d", 4)])
+
+    assert len(reads) == 1
+
+
+def test_a_batch_with_the_guard_off_reads_nothing(lake_root, monkeypatch):
+    damaged = _damage(lake_root)
+    reads = _count_calls(monkeypatch, manifest, "_read_jsonl")
+
+    append_entries(lake_root, [_spec("b", 2), _spec("c", 3)], guard=False)
+
+    assert reads == []
+    assert manifest_path(lake_root).read_bytes().startswith(damaged)
+
+
+def test_an_empty_batch_returns_before_reading_a_damaged_manifest(lake_root):
+    damaged = _damage(lake_root)
+
+    assert append_entries(lake_root, []) == []
+    assert manifest_path(lake_root).read_bytes() == damaged
+
+
+def test_a_missing_digest_is_hashed_at_its_place_in_the_batch(lake_root):
+    # The second entry is hashed from its file. The third names a file that is not there,
+    # so its hash raises, and the lines before it are written as they would have been.
+    (lake_root / "b.bin").write_bytes(b"marketlake")
+
+    with pytest.raises(FileNotFoundError):
+        append_entries(
+            lake_root,
+            [_spec("a", 1), _spec("b.bin", 2, None), _spec("gone.bin", 3, None), _spec("d", 4)],
+        )
+
+    entries = read_manifest(lake_root)
+    assert [entry["partition"] for entry in entries] == ["a", "b.bin"]
+    assert entries[1]["sha256"] == sha256_file(lake_root / "b.bin")
+
+
+def _short_by(monkeypatch, keep: int) -> None:
+    """Make the next ``os.write`` land only its first ``keep`` bytes and say so."""
+    real = os.write
+
+    def short(fd, data):
+        monkeypatch.setattr(os, "write", real)
+        return real(fd, bytes(data)[:keep])
+
+    monkeypatch.setattr(os, "write", short)
+
+
+def test_a_short_append_line_raises_naming_the_bytes_and_leaves_the_fragment(
+    lake_root, monkeypatch
+):
+    append_manifest(lake_root, partition="a", source="capture", sha256="s", rows=1, fetched_at=None)
+    ledger = manifest_path(lake_root)
+    before = ledger.read_bytes()
+    entry = _spec("b", 2)
+    line = (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8")
+    _short_by(monkeypatch, 10)
+
+    with pytest.raises(OSError, match=f"wrote 10 of {len(line)} bytes"):
+        append_line(ledger, entry)
+
+    # The fragment stays where it landed. Nothing repairs it, so the next entry fuses onto
+    # it the way it fuses onto a crash's torn line.
+    assert ledger.read_bytes() == before + line[:10]
+    after = _spec("c", 3)
+    append_line(ledger, after)
+    assert (
+        ledger.read_bytes()
+        == before + line[:10] + json.dumps(after, sort_keys=True).encode() + b"\n"
+    )
+    assert [entry["partition"] for entry in read_manifest(lake_root)] == ["a"]
+
+
+def test_a_short_batch_write_on_a_line_boundary_raises_rather_than_dropping_entries(
+    lake_root, monkeypatch
+):
+    # The write stops exactly after the first line, so the file reads as whole lines and the
+    # second entry would vanish with nothing torn to show for it. The count says it did.
+    first = (json.dumps(_spec("a", 1), sort_keys=True) + "\n").encode("utf-8")
+    second = (json.dumps(_spec("b", 2), sort_keys=True) + "\n").encode("utf-8")
+    _short_by(monkeypatch, len(first))
+
+    with pytest.raises(OSError, match=f"wrote {len(first)} of {len(first) + len(second)} bytes"):
+        append_entries(lake_root, [_spec("a", 1), _spec("b", 2)])
+
+    assert manifest_path(lake_root).read_bytes() == first
 
 
 # -- the two-way scrub -------------------------------------------------------
