@@ -19,7 +19,7 @@ from lake.bucket import UploadSummary, nightly_upload
 from lake.calendar import MARKET_TZ
 from lake.config import BucketTarget
 from lake.manifest import manifest_path
-from tests.support.bucket import FakeS3, unreachable
+from tests.support.bucket import FakeS3, client_error, unreachable
 from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import write_config
@@ -199,7 +199,30 @@ def test_an_unreachable_bucket_refuses_with_one_line(tmp_path, monkeypatch, caps
     client.fail_with = unreachable()
     with pytest.raises(SystemExit) as exited:
         _main(config, client, monkeypatch)
-    assert "could not be reached (EndpointConnectionError)" in _refused(capsys, exited)
+    line = _refused(capsys, exited)
+    assert "could not be reached or was unavailable (EndpointConnectionError)" in line
+    assert "access key" not in line
+
+
+@pytest.mark.parametrize(
+    ("code", "status", "named"),
+    [
+        ("AccessDenied", 403, "refused the request (AccessDenied), so the access key"),
+        ("SlowDown", 503, "could not be reached or was unavailable (SlowDown)"),
+        ("InternalError", 500, "could not be reached or was unavailable (InternalError)"),
+        ("NoSuchBucket", 404, "answered with an error (NoSuchBucket)"),
+    ],
+)
+def test_each_bucket_failure_gets_its_own_line(tmp_path, monkeypatch, capsys, code, status, named):
+    _, config = _setup(tmp_path)
+    client = FakeS3()
+    client.fail_with = client_error(code, "HeadObject", status)
+    with pytest.raises(SystemExit) as exited:
+        _main(config, client, monkeypatch)
+    line = _refused(capsys, exited)
+    assert named in line
+    if code != "AccessDenied":
+        assert "access key" not in line
 
 
 def test_a_rotted_file_refuses_with_one_line_and_leaves_the_manifest_out(
@@ -210,7 +233,12 @@ def test_a_rotted_file_refuses_with_one_line_and_leaves_the_manifest_out(
     client = FakeS3()
     with pytest.raises(SystemExit) as exited:
         _main(config, client, monkeypatch)
-    assert "no longer match" in _refused(capsys, exited)
+    line = _refused(capsys, exited)
+    assert "no longer match its manifest entry" in line
+    # The benign causes are named beside rot, so a race does not read as decay.
+    for cause in ("Rot", "recompact", "journal segment", "compaction runs by hand"):
+        assert cause in line
+    assert "after it was sealed" not in line
     assert "lake/manifest.jsonl" not in client.keys()
 
 

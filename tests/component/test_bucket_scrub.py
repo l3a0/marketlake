@@ -224,6 +224,81 @@ def test_a_failed_connection_is_named_unreachable_and_never_raises(tmp_path):
     assert "could not be reached" in result.problem
 
 
+@pytest.mark.parametrize(
+    ("code", "status"),
+    [
+        ("SignatureDoesNotMatch", 403),
+        ("ExpiredToken", 400),
+        ("AccountProblem", 403),
+    ],
+)
+def test_every_credential_code_is_named_refused(tmp_path, code, status):
+    lake, client = _uploaded(tmp_path / "lake")
+    client.fail_with = client_error(code, "HeadObject", status)
+    result = bucket_scrub(lake, TARGET, client)
+    assert result.bucket_refused == code
+
+
+@pytest.mark.parametrize(
+    ("code", "status"),
+    [
+        ("SlowDown", 503),
+        ("ServiceUnavailable", 503),
+        ("InternalError", 500),
+        ("TooManyRequests", 429),
+        ("Throttling", 400),
+        ("RequestTimeout", 400),
+        ("SomethingNew", 502),
+    ],
+)
+def test_a_busy_or_failing_service_is_named_unavailable_not_refused(tmp_path, code, status):
+    # A 503 SlowDown is S3 asking for fewer requests, which no new key repairs.
+    lake, client = _uploaded(tmp_path / "lake")
+    client.fail_with = client_error(code, "HeadObject", status)
+    result = bucket_scrub(lake, TARGET, client)
+    assert result.bucket_unreachable == code
+    assert result.bucket_refused is None
+    assert "access key" not in result.problem
+    assert "unavailable" in result.problem
+
+
+def test_any_other_answer_is_named_failed_with_its_code(tmp_path):
+    lake, client = _uploaded(tmp_path / "lake")
+    client.fail_with = client_error("NoSuchBucket", "HeadObject", 404)
+    result = bucket_scrub(lake, TARGET, client)
+    assert result.bucket_failed == "NoSuchBucket"
+    assert result.bucket_refused is None and result.bucket_unreachable is None
+    assert "access key" not in result.problem
+    assert "NoSuchBucket" in result.problem
+
+
+def test_the_versioning_line_survives_a_scrub_that_stops_early(tmp_path):
+    # The bucket answers, so its versioning status is known, even though the scrub
+    # stops at the missing manifest before the forward pass.
+    lake, client = _uploaded(tmp_path / "lake")
+    client.versioning = "Suspended"
+    del client.objects[_key("manifest.jsonl")]
+    result = bucket_scrub(lake, TARGET, client)
+    assert result.manifest_missing
+    assert any(line.startswith("bucket versioning is Suspended") for line in result.notes)
+
+
+class _HeadsFail(FakeS3):
+    """A bucket whose versioning answers and whose object requests then fail."""
+
+    def head_object(self, **kwargs):
+        raise unreachable()
+
+
+def test_the_versioning_line_survives_a_bucket_that_fails_mid_scrub(tmp_path):
+    lake, uploaded = _uploaded(tmp_path / "lake")
+    client = _HeadsFail(versioning="Suspended")
+    client.objects = uploaded.objects
+    result = bucket_scrub(lake, TARGET, client)
+    assert result.bucket_unreachable == "EndpointConnectionError"
+    assert any(line.startswith("bucket versioning is Suspended") for line in result.notes)
+
+
 def test_a_bug_still_raises(tmp_path):
     lake, client = _uploaded(tmp_path / "lake")
     client.fail_with = ZeroDivisionError("a real bug")

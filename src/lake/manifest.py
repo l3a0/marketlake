@@ -1022,14 +1022,17 @@ class BackupScrubResult:
     - ``manifest_diverged_at``: the byte offset where the copy's manifest stops matching
       the lake's. ``None`` when the copy is a clean prefix.
 
-    Three more stop a bucket scrub, and only a bucket scrub sets them. They are named
+    Four more stop a bucket scrub, and only a bucket scrub sets them. They are named
     apart because they send the operator to different repairs.
 
-    - ``bucket_refused``: S3 answered a request with an error, named by its code. A
+    - ``bucket_refused``: S3 turned the credentials away, named by the error code. A
       revoked key or a policy that lost an action is the usual cause, and the repair is
       a new key.
-    - ``bucket_unreachable``: no answer came back, named by the error's type. The usual
-      cause is the network, and the repair is usually nothing.
+    - ``bucket_unreachable``: no usable answer came back, named by the error's type or
+      code. A failed connection, a 5xx, and S3 asking for fewer requests all land here,
+      and the repair is usually nothing.
+    - ``bucket_failed``: S3 answered with some other error, named by its code, such as
+      ``NoSuchBucket``.
     - ``bucket_unusable``: the config's bucket settings could not build a client, so no
       request was sent. The repair is an edit to ``config.yaml``.
 
@@ -1060,6 +1063,7 @@ class BackupScrubResult:
     unreadable: str | None = None
     bucket_refused: str | None = None
     bucket_unreachable: str | None = None
+    bucket_failed: str | None = None
     bucket_unusable: str | None = None
     versioning: str | None = None
 
@@ -1085,7 +1089,15 @@ class BackupScrubResult:
                 f"or policy may need replacing: {self.target}"
             )
         if self.bucket_unreachable is not None:
-            return f"backup bucket could not be reached ({self.bucket_unreachable}): {self.target}"
+            return (
+                f"backup bucket could not be reached or was unavailable "
+                f"({self.bucket_unreachable}): {self.target}"
+            )
+        if self.bucket_failed is not None:
+            return (
+                f"backup bucket answered the scrub with an error ({self.bucket_failed}): "
+                f"{self.target}"
+            )
         if self.manifest_missing:
             return f"backup carries no usable manifest copy: {self.target}"
         if self.manifest_diverged_at is not None:

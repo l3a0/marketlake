@@ -22,8 +22,8 @@ Three jobs live here.
 file's SHA-256 as 64 hex characters. S3 takes a SHA-256 as ``ChecksumSHA256``, the
 base64 of the 32 raw digest bytes, so the uploader converts hex to base64 and the scrub
 converts back. S3 refuses a PUT whose bytes do not hash to the value sent, with the
-error code ``BadDigest``. So a sealed file that changed or rotted after the manifest
-recorded it fails its upload rather than landing. Every PUT is one ``PutObject``. A
+error code ``BadDigest``. So a file whose bytes no longer match its manifest entry fails
+its upload rather than landing. Every PUT is one ``PutObject``. A
 multipart upload stores a checksum of part checksums, marked ``COMPOSITE``, which cannot
 be compared with the manifest, so a file over S3's 5 GiB single-PUT limit fails loudly
 rather than falling back to parts.
@@ -121,6 +121,40 @@ BAD_DIGEST = "BadDigest"
 # What a ``HeadObject`` on a missing key answers. The narrow key holds ``s3:ListBucket``,
 # so S3 answers 404 rather than 403, and a HEAD error carries no body to name a code in.
 _ABSENT_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+
+# The error codes that mean the credentials or their policy were turned away. These and
+# an HTTP 401 or 403 are the only answers named *refused*, whose repair is a new key or a
+# fixed policy. A bare "403" is what a ``HeadObject`` answers, since it has no body.
+_CREDENTIAL_CODES = frozenset(
+    {
+        "401",
+        "403",
+        "AccessDenied",
+        "AccountProblem",
+        "AllAccessDisabled",
+        "ExpiredToken",
+        "InvalidAccessKeyId",
+        "InvalidToken",
+        "SignatureDoesNotMatch",
+        "TokenRefreshRequired",
+    }
+)
+
+# The codes S3 uses to say it is busy or briefly unable to answer. These and any 5xx or
+# 429 are named *unreachable* with a failed connection, because the repair for all of
+# them is usually to wait.
+_UNAVAILABLE_CODES = frozenset(
+    {
+        "InternalError",
+        "RequestTimeout",
+        "RequestLimitExceeded",
+        "ServiceUnavailable",
+        "SlowDown",
+        "Throttling",
+        "ThrottlingException",
+        "TooManyRequests",
+    }
+)
 
 # -- the nightly upload's deadline ---------------------------------------------
 #
@@ -239,7 +273,14 @@ class ObjectTooLarge(BucketRefusal):
 
 
 class ChecksumRefused(BucketRefusal):
-    """S3 refused a PUT because the bytes did not match the manifest's SHA-256."""
+    """S3 refused a PUT because the bytes did not match the manifest's SHA-256.
+
+    Rot is one cause and not the only one. The bytes also change under a ``recompact``
+    that runs while a first upload is going, and a live journal segment grows while a
+    compaction run by hand in a session uploads it, since capture writes segment bytes
+    outside the lock. The message names all three, so the operator does not read a
+    benign race as rot.
+    """
 
 
 class UploadDeadline(BucketRefusal):
@@ -341,19 +382,38 @@ def _is_absent(exc: BaseException) -> bool:
     return _is_client_error(exc) and _error_code(exc) in _ABSENT_CODES
 
 
-def _failure(exc: BaseException) -> tuple[str, str] | None:
-    """Sort a bucket failure into refused or unreachable, or ``None`` for a bug.
+def _status(exc: BaseException) -> int | None:
+    """The HTTP status a ``ClientError`` carries, or ``None``."""
+    response = getattr(exc, "response", None)
+    if not isinstance(response, Mapping):
+        return None
+    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return status if isinstance(status, int) else None
 
-    *Refused* means S3 answered and said no: a ``ClientError``, which is a key that was
-    revoked, a policy that lost an action, or a bucket that is gone. That repair is a new
-    key or a fixed policy. *Unreachable* means no answer came back at all: a failed
-    connection, a timeout, or a socket error. That repair is usually nothing, because the
-    network comes back. The two are named apart for that reason.
+
+def _failure(exc: BaseException) -> tuple[str, str] | None:
+    """Sort a bucket failure into refused, unreachable or failed, or ``None`` for a bug.
+
+    The three names send the operator to three repairs.
+
+    1. *Refused* means S3 turned the credentials away: a revoked key, a bad signature, or
+       a policy that lost an action. The repair is a new key or a fixed policy.
+    2. *Unreachable* means no usable answer came back: a failed connection, a timeout, a
+       5xx, or S3 asking for fewer requests with ``SlowDown`` or a 429. The repair is
+       usually nothing, because the network or the service comes back.
+    3. *Failed* is any other answer S3 gave, such as ``NoSuchBucket``. It names the code
+       and promises no repair, because no single one fits.
     """
     from botocore.exceptions import BotoCoreError, ClientError
 
     if isinstance(exc, ClientError):
-        return "refused", _error_code(exc) or type(exc).__name__
+        code = _error_code(exc) or type(exc).__name__
+        status = _status(exc)
+        if code in _UNAVAILABLE_CODES or status == 429 or (status or 0) >= 500:
+            return "unreachable", code
+        if code in _CREDENTIAL_CODES or status in (401, 403):
+            return "refused", code
+        return "failed", code
     if isinstance(exc, BotoCoreError):
         return "unreachable", type(exc).__name__
     return None
@@ -735,8 +795,11 @@ class _Uploader:
         except Exception as exc:
             if _error_code(exc) == BAD_DIGEST:
                 raise ChecksumRefused(
-                    f"S3 refused {rel}: its bytes no longer match the SHA-256 the lake's "
-                    f"manifest recorded, so the file changed or rotted after it was sealed"
+                    f"S3 refused {rel}: its bytes no longer match its manifest entry's "
+                    "SHA-256. Rot does this, and so do two benign causes: a recompact while a "
+                    "first upload runs, and a live journal segment growing while a "
+                    "compaction runs by hand in a session. Run the job again, and treat a "
+                    "repeat as rot"
                 ) from exc
             raise
         self.summary.puts += 1
@@ -1052,11 +1115,13 @@ def bucket_scrub(lake_root: Path, target: BucketTarget, client: Any) -> BackupSc
        object inside the watermark and compares the stored SHA-256 with the manifest.
     3. The reverse pass lists the bucket for orphans and unaccounted objects, skipping
        ``SCRUB_EXCLUSIONS`` as the path form does.
-    4. A bucket that refuses or cannot be reached is a named finding that withholds the
-       ping and never raises, so the rest of the Sunday job still runs. The two get
-       different names, because one needs a new key and the other needs nothing.
+    4. A bucket that refuses, cannot be reached, or answers with another error is a named
+       finding that withholds the ping and never raises, so the rest of the Sunday job
+       still runs. The three get different names, because each sends the operator to a
+       different repair, as ``_failure`` sets out.
     5. ``GetBucketVersioning`` adds a report line when versioning is anything but
-       enabled. It withholds nothing, and no check on objects could see it otherwise.
+       enabled. It withholds nothing, and no check on objects could see it otherwise. It
+       is read first, so the line is reported even when the scrub stops early.
 
     **This proves less than the path scrub.** ``HeadObject`` returns the checksum S3
     stored at upload, and does not re-hash the bytes at rest. So the scrub proves each
@@ -1070,16 +1135,19 @@ def bucket_scrub(lake_root: Path, target: BucketTarget, client: Any) -> BackupSc
         ledger = read_ledger(root)
     except OSError as exc:
         return BackupScrubResult(target=name, unreadable=f"{type(exc).__name__}: {exc}")
+    versioning = _versioning_note(client, target)
     try:
-        return _bucket_scrub(root, ledger, target, client)
+        return _bucket_scrub(root, ledger, target, client, versioning)
     except Exception as exc:
         failure = _failure(exc)
         if failure is None:
             raise
         kind, detail = failure
         if kind == "refused":
-            return BackupScrubResult(target=name, bucket_refused=detail)
-        return BackupScrubResult(target=name, bucket_unreachable=detail)
+            return BackupScrubResult(target=name, bucket_refused=detail, versioning=versioning)
+        if kind == "unreachable":
+            return BackupScrubResult(target=name, bucket_unreachable=detail, versioning=versioning)
+        return BackupScrubResult(target=name, bucket_failed=detail, versioning=versioning)
 
 
 def _versioning_note(client: Any, target: BucketTarget) -> str | None:
@@ -1100,25 +1168,27 @@ def _versioning_note(client: Any, target: BucketTarget) -> str | None:
 
 
 def _bucket_scrub(
-    root: Path, ledger: Ledger, target: BucketTarget, client: Any
+    root: Path, ledger: Ledger, target: BucketTarget, client: Any, versioning: str | None
 ) -> BackupScrubResult:
     name = str(target)
     copy = read_copy_state(client, target, ledger.raw)
     if not copy.present:
-        return BackupScrubResult(target=name, manifest_missing=True)
+        return BackupScrubResult(target=name, manifest_missing=True, versioning=versioning)
     length = copy.length
     if not copy.is_prefix:
         body = client.get_object(Bucket=target.bucket, Key=target.key(MANIFEST_FILE))["Body"]
         held = body.read()
         if not ledger.raw.startswith(held):
             return BackupScrubResult(
-                target=name, manifest_diverged_at=_first_difference(ledger.raw, held)
+                target=name,
+                manifest_diverged_at=_first_difference(ledger.raw, held),
+                versioning=versioning,
             )
         length = len(held)
 
     mark = watermark(ledger.raw, length)
     if mark == 0 and ledger.entries:
-        return BackupScrubResult(target=name, manifest_missing=True)
+        return BackupScrubResult(target=name, manifest_missing=True, versioning=versioning)
     path = manifest_path(root)
     copied = _latest_by_partition(ledger.entries[:mark], path)
     latest = ledger.latest
@@ -1155,7 +1225,7 @@ def _bucket_scrub(
         unaccounted=tuple(sorted(unaccounted)),
         orphans=tuple(sorted(orphans)),
         pending=tuple(sorted(set(latest) - set(copied))),
-        versioning=_versioning_note(client, target),
+        versioning=versioning,
     )
 
 
@@ -1317,8 +1387,15 @@ def _one_line(exc: BaseException, target: BucketTarget) -> BucketUnreachable | N
         return None
     kind, detail = failure
     if kind == "refused":
-        return BucketUnreachable(f"the bucket refused the request ({detail}): {target}")
-    return BucketUnreachable(f"the bucket could not be reached ({detail}): {target}")
+        return BucketUnreachable(
+            f"the bucket refused the request ({detail}), so the access key or its policy "
+            f"may need replacing: {target}"
+        )
+    if kind == "unreachable":
+        return BucketUnreachable(
+            f"the bucket could not be reached or was unavailable ({detail}): {target}"
+        )
+    return BucketUnreachable(f"the bucket answered with an error ({detail}): {target}")
 
 
 def main(
