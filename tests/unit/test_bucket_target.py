@@ -2,18 +2,31 @@
 
 A filesystem path stays the default and loads exactly as before. An ``s3://`` URL loads
 as a ``BucketTarget``, and the scheme is read before any ``Path`` exists, because
-``Path("s3://bucket/x")`` collapses to ``s3:/bucket/x``, a local directory. The bucket's
-access key, secret key and region are required only when the target is a bucket, and the
-two keys load as ``Secret`` values that join every page's secret list.
+``Path("s3://bucket/x")`` collapses to ``s3:/bucket/x``, a local directory. The two keys
+load as ``Secret`` values that join every page's secret list.
+
+Loading refuses no backup setting. Capture loads the config every minute, so a refusal
+there would stop capture over a value only the backup reads. The strict checks live in
+``require_bucket_settings``, which each bucket job calls when it runs: a valid bucket
+name and prefix, all three bucket keys, and a region shaped like an AWS region name.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import botocore
 import pytest
 
-from lake.config import BucketTarget, Config, ConfigError, Secret, parse_backup_target
+from lake.config import (
+    BucketTarget,
+    Config,
+    ConfigError,
+    Secret,
+    parse_backup_target,
+    require_bucket_settings,
+)
 
 BASE = {
     "lake_root": "/data/lake",
@@ -66,25 +79,88 @@ def test_a_bucket_target_maps_keys_both_ways():
     assert bare.list_prefix == ""
 
 
+MALFORMED = ["s3://", "s3://UPPER", "s3://a", "s3://bad_name", "s3://x..y", "s3://ok-name/../up"]
+
+
+@pytest.mark.parametrize("text", MALFORMED)
+def test_a_malformed_bucket_url_loads_and_is_refused_when_a_job_runs(text):
+    cfg = Config.from_mapping({**BASE, "backup_target": text, **KEYS})
+    assert isinstance(cfg.backup_target, BucketTarget)
+    with pytest.raises(ConfigError, match="bucket|prefix"):
+        require_bucket_settings(cfg)
+
+
+@pytest.mark.parametrize("text", ["s3://lake-backup", "s3://lake-backup/a/b", "s3://a.b-c/x"])
+def test_a_well_formed_bucket_with_its_keys_passes_the_job_checks(text):
+    cfg = Config.from_mapping({**BASE, "backup_target": text, **KEYS})
+    assert require_bucket_settings(cfg) == cfg.backup_target
+
+
 @pytest.mark.parametrize(
-    "text", ["s3://", "s3://UPPER", "s3://a", "s3://bad_name", "s3://x..y", "s3://ok-name/../up"]
+    "text", ["gs://lake-backup", "file:///Volumes/ssd", "S3://lake-backup", "smb://nas/share"]
 )
-def test_a_malformed_bucket_url_is_refused(text):
-    with pytest.raises(ConfigError, match="backup_target"):
-        parse_backup_target(text)
+def test_any_other_scheme_loads_as_a_path_exactly_as_before(text):
+    # Before the bucket form existed every value was ``Path(text).expanduser()``, and a
+    # path the backup cannot reach fails the backup rather than the load.
+    cfg = Config.from_mapping({**BASE, "backup_target": text})
+    assert cfg.backup_target == Path(text).expanduser()
+    assert str(Config.from_mapping({**BASE, "backup_target": "smb://nas/share"}).backup_target) == (
+        "smb:/nas/share"
+    )
 
 
-@pytest.mark.parametrize("text", ["gs://lake-backup", "file:///Volumes/ssd", "S3://lake-backup"])
-def test_any_other_scheme_is_refused_rather_than_read_as_a_path(text):
-    with pytest.raises(ConfigError, match="scheme"):
-        parse_backup_target(text)
+def test_a_path_value_is_not_stripped():
+    # The path form keeps the exact text it always took, surrounding spaces included.
+    assert parse_backup_target(" /Volumes/ssd ") == Path(" /Volumes/ssd ")
 
 
-def test_a_bucket_target_needs_its_three_keys():
+def test_a_bucket_target_loads_without_its_keys_and_a_job_names_all_three():
+    cfg = Config.from_mapping({**BASE, "backup_target": "s3://lake-backup"})
+    assert cfg.backup_target == BucketTarget("lake-backup")
     with pytest.raises(ConfigError) as refused:
-        Config.from_mapping({**BASE, "backup_target": "s3://lake-backup"})
+        require_bucket_settings(cfg)
     for key in KEYS:
         assert key in str(refused.value)
+    assert "\n" not in str(refused.value)
+
+
+def test_the_job_checks_refuse_a_path_target_unless_a_bucket_is_named():
+    cfg = Config.from_mapping({**BASE, **KEYS})
+    with pytest.raises(ConfigError, match="not an s3:// bucket"):
+        require_bucket_settings(cfg)
+    assert require_bucket_settings(cfg, BucketTarget("lake-backup")) == BucketTarget("lake-backup")
+
+
+def _aws_regions() -> list[str]:
+    """Every region botocore's own partition data names, the pseudo-regions aside."""
+    data = json.loads((Path(botocore.__file__).parent / "data" / "partitions.json").read_text())
+    names = {region for partition in data["partitions"] for region in partition["regions"]}
+    return sorted(name for name in names if not name.endswith("-global"))
+
+
+def test_the_partition_data_holds_the_awkward_region_shapes():
+    regions = _aws_regions()
+    for shape in ("us-gov-west-1", "us-isob-east-1", "cn-northwest-1", "eusc-de-east-1"):
+        assert shape in regions
+
+
+@pytest.mark.parametrize("region", _aws_regions())
+def test_every_aws_region_name_passes_the_region_check(region):
+    cfg = Config.from_mapping(
+        {**BASE, "backup_target": "s3://lake-backup", **KEYS, "bucket_region": region}
+    )
+    require_bucket_settings(cfg)
+
+
+@pytest.mark.parametrize(
+    "region", ["us east 2", "us-east-2/", "US-EAST-2", "us-east", "useast2", "us-east-"]
+)
+def test_a_malformed_region_loads_and_is_refused_when_a_job_runs(region):
+    cfg = Config.from_mapping(
+        {**BASE, "backup_target": "s3://lake-backup", **KEYS, "bucket_region": region}
+    )
+    with pytest.raises(ConfigError, match="bucket_region"):
+        require_bucket_settings(cfg)
 
 
 def test_a_bucket_target_with_its_keys_loads_them_as_secrets():

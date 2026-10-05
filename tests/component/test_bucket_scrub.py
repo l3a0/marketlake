@@ -303,36 +303,37 @@ def test_a_bucket_target_without_a_client_is_a_caller_error(tmp_path):
         _sunday(lake, None)
 
 
-def test_the_sunday_cli_scrubs_the_configured_bucket(tmp_path, capsys, monkeypatch):
-    """``control_plane.main`` builds the client from the config and scrubs the bucket.
+_KEYS = (
+    "bucket_access_key_id: AKIDCONFIG\n"
+    "bucket_secret_access_key: secret-bucket-key\n"
+    "bucket_region: us-east-2\n"
+)
 
-    The overwritten object is in the bucket alone, so only a scrub that reached the
-    bucket can name it. A wiring slip that scrubbed a path instead would fail
-    differently.
+
+def _sunday_cli(tmp_path, monkeypatch, lake: Path, *, target=str(TARGET), keys=_KEYS):
+    """Run ``control_plane.main sunday`` over a config naming ``target``.
+
+    Every seam that reaches past the process is replaced. The canary records that it
+    ran, so a test can show the job carried on past a bucket finding.
     """
-    lake, client = _uploaded(tmp_path / "lake")
-    client.store(_key(PARTITION), b"overwritten")
     config = write_config(tmp_path, lake)
     text = config.read_text().replace(
-        f"backup_target: {tmp_path / 'ssd'}", f"backup_target: {TARGET}"
+        f"backup_target: {tmp_path / 'ssd'}", f"backup_target: {target}"
     )
-    config.write_text(
-        text
-        + "bucket_access_key_id: AKIDCONFIG\n"
-        + "bucket_secret_access_key: secret-bucket-key\n"
-        + "bucket_region: us-east-2\n"
-    )
-    built = []
-
-    def fake_client(cfg):
-        built.append(cfg.bucket_secret_access_key.reveal())
-        return client
-
-    monkeypatch.setattr(bucket, "client_from_config", fake_client)
+    config.write_text(text + keys)
     pinger = FakePinger()
+    canaries: list[str] = []
+
+    def canary(**kwargs):
+        def run():
+            canaries.append("ran")
+            return True
+
+        return run
+
     monkeypatch.setattr(cp, "read_pmset_schedule", lambda: "")
     monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
-    monkeypatch.setattr(cp, "token_canary", lambda **kwargs: lambda: True)
+    monkeypatch.setattr(cp, "token_canary", canary)
     monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
     monkeypatch.setattr(cp, "read_exclusions", lambda targets: "")
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
@@ -345,6 +346,27 @@ def test_the_sunday_cli_scrubs_the_configured_bucket(tmp_path, capsys, monkeypat
         clock=ManualClock(start=SUNDAY_20),
         calendar=CALENDAR,
     )
+    return code, pinger, canaries
+
+
+def test_the_sunday_cli_scrubs_the_configured_bucket(tmp_path, capsys, monkeypatch):
+    """``control_plane.main`` builds the client from the config and scrubs the bucket.
+
+    The overwritten object is in the bucket alone, so only a scrub that reached the
+    bucket can name it. A wiring slip that scrubbed a path instead would fail
+    differently.
+    """
+    lake, client = _uploaded(tmp_path / "lake")
+    client.store(_key(PARTITION), b"overwritten")
+    built = []
+
+    def fake_client(cfg):
+        built.append(cfg.bucket_secret_access_key.reveal())
+        return client
+
+    monkeypatch.setattr(bucket, "client_from_config", fake_client)
+
+    code, pinger, _ = _sunday_cli(tmp_path, monkeypatch, lake)
 
     assert code == 1
     assert built == ["secret-bucket-key"]
@@ -353,6 +375,55 @@ def test_the_sunday_cli_scrubs_the_configured_bucket(tmp_path, capsys, monkeypat
     assert f"backup file does not match the lake: {PARTITION}" in printed
     assert "s3://lake-backup/lake" in printed
     assert "secret-bucket-key" not in printed
+
+
+@pytest.mark.parametrize(
+    ("target", "keys", "named"),
+    [
+        (str(TARGET), "", "bucket_access_key_id"),
+        ("s3://Legacy_Bucket/lake", _KEYS, "names no valid bucket"),
+        (str(TARGET), _KEYS.replace("us-east-2", "us east 2"), "bucket_region"),
+    ],
+)
+def test_unusable_bucket_settings_are_a_sunday_finding_and_the_job_runs_on(
+    tmp_path, capsys, monkeypatch, target, keys, named
+):
+    # A traceback here would skip the canary, the coverage assertion and the re-auth
+    # reminder. The settings become the backup's finding instead, which withholds the
+    # ping, and the real client builder is never reached.
+    lake, _ = _uploaded(tmp_path / "lake")
+    monkeypatch.setattr(bucket, "_build_client", lambda cfg: pytest.fail("no client is built"))
+
+    code, pinger, canaries = _sunday_cli(tmp_path, monkeypatch, lake, target=target, keys=keys)
+
+    assert code == 1
+    assert pinger.urls == []
+    assert canaries
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    finding = [line for line in captured.out.splitlines() if "cannot be used" in line]
+    assert finding and all(named in line for line in finding)
+    assert "secret-bucket-key" not in captured.out
+
+
+def test_a_client_that_cannot_be_built_is_a_sunday_finding(tmp_path, capsys, monkeypatch):
+    # The region check runs first, and anything botocore still refuses at build time
+    # lands the same way rather than as a traceback.
+    from botocore.exceptions import InvalidRegionError
+
+    lake, _ = _uploaded(tmp_path / "lake")
+
+    def refuse(cfg):
+        raise InvalidRegionError(region_name="us-east-2")
+
+    monkeypatch.setattr(bucket, "_build_client", refuse)
+
+    code, pinger, canaries = _sunday_cli(tmp_path, monkeypatch, lake)
+
+    assert code == 1
+    assert pinger.urls == [] and canaries
+    printed = capsys.readouterr().out
+    assert "cannot be used" in printed and "InvalidRegionError" in printed
 
 
 def test_a_whole_object_digest_with_no_checksum_type_still_matches(tmp_path):

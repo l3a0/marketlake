@@ -1906,6 +1906,7 @@ def sunday_maintenance(
     assertion_pid: int | None = None,
     stamped_at: datetime | None = None,
     bucket_client: object | None = None,
+    bucket_unusable: str | None = None,
 ) -> SundayOutcome:
     """Scrub both copies, verify the wake alarms, run the canary, assert coverage, ping.
 
@@ -1990,7 +1991,10 @@ def sunday_maintenance(
 
     A bucket target is scrubbed by ``lake.bucket.bucket_scrub`` through ``bucket_client``,
     which a bucket target requires. A bucket that refuses or cannot be reached is a
-    problem the same way an unmounted disk is. That scrub proves less than the path
+    problem the same way an unmounted disk is. ``bucket_unusable`` is the one line
+    ``main`` got when the config's bucket settings could not build a client at all. It
+    takes the client's place and becomes the backup's problem, so the rest of the job
+    still runs and the ping is withheld. That scrub proves less than the path
     scrub, because S3 reports the checksum it stored at upload rather than re-hashing the
     bytes at rest, so rot at rest in a bucket is the provider's durability guarantee plus
     the restore test rather than this job's.
@@ -2011,7 +2015,9 @@ def sunday_maintenance(
             f"orphans={len(result.orphans)}"
         )
 
-    if isinstance(backup_target, BucketTarget):
+    if isinstance(backup_target, BucketTarget) and bucket_unusable is not None:
+        backup = BackupScrubResult(target=str(backup_target), bucket_unusable=bucket_unusable)
+    elif isinstance(backup_target, BucketTarget):
         if bucket_client is None:
             raise ValueError("a bucket backup_target needs a bucket_client to scrub it")
         from lake.bucket import bucket_scrub  # lazy: lake.bucket imports this module
@@ -2181,6 +2187,7 @@ def sunday_run(
     assertion_probe: AssertionProbe | None = None,
     stamp_reader: StampReader | None = None,
     bucket_client: object | None = None,
+    bucket_unusable: str | None = None,
 ) -> list[SundayOutcome]:
     """Run the Sunday job, retrying until it passes or the canary deadline.
 
@@ -2212,15 +2219,16 @@ def sunday_run(
     pushes through. One guard covers the whole evening rather than one attempt, for the
     reason the loop below gives. With no publisher nothing escalates.
 
-    ``bucket_client``, ``daemon_probe`` and ``assertion_probe`` pass straight through to
-    every attempt's ``sunday_maintenance`` call. ``stamp_reader`` is read afresh each
-    attempt, the same reason ``mint_reader`` is: the daemon restamps a new pid when it
-    re-takes a lost ``caffeinate`` mid-evening, and a pid cached once at the start would ask about a
-    child already gone, paging a lapse that had already healed by the next retry. A
-    finding still pages at most once for the whole window rather than once per attempt,
-    using a flag local to this call. The retry loop runs inside one process, so that
-    local flag is the entire state a once-per-window rule needs, unlike the daemon's own
-    once-per-window rule, which has to survive across ticks and so keeps a stamp instead.
+    ``bucket_client``, ``bucket_unusable``, ``daemon_probe`` and ``assertion_probe`` pass
+    straight through to every attempt's ``sunday_maintenance`` call. ``stamp_reader`` is
+    read afresh each attempt, the same reason ``mint_reader`` is: the daemon restamps a
+    new pid when it re-takes a lost ``caffeinate`` mid-evening, and a pid cached once at
+    the start would ask about a child already gone, paging a lapse that had already
+    healed by the next retry. A finding still pages at most once for the whole window
+    rather than once per attempt, using a flag local to this call. The retry loop runs
+    inside one process, so that local flag is the entire state a once-per-window rule
+    needs, unlike the daemon's own once-per-window rule, which has to survive across
+    ticks and so keeps a stamp instead.
     """
     start = clock.now().astimezone(MARKET_TZ)
     in_the_window = start.weekday() == _PY_SUNDAY and SUNDAY_MAINTENANCE.on(start.date()) <= start
@@ -2259,6 +2267,7 @@ def sunday_run(
             assertion_pid=stamp.assertion_pid,
             stamped_at=stamp.stamped_at,
             bucket_client=bucket_client,
+            bucket_unusable=bucket_unusable,
         )
         # One reminder an hour. Later attempts in the same hour owe nothing, so the
         # outcome records only the one that went out.
@@ -3475,17 +3484,23 @@ def main(
             secrets=config.page_secrets(),
         )
         # The bucket client, built from the config's own key values, when the target is
-        # a bucket. A path target needs none.
+        # a bucket. A path target needs none. Settings that cannot build one become the
+        # backup's finding rather than an exit, because the canary, the coverage
+        # assertion and the re-auth reminder below still have to run.
         bucket_client = None
+        bucket_unusable = None
         if isinstance(config.backup_target, BucketTarget):
             from lake import bucket  # lazy: lake.bucket imports this module
 
-            with input_errors_exit("sunday"):
-                bucket_client = bucket.client_from_config(config)
+            try:
+                _, bucket_client = bucket.connect(config)
+            except bucket.BucketSettingsInvalid as exc:
+                bucket_unusable = str(exc)
         outcomes = sunday_run(
             lake_root=config.lake_root,
             backup_target=config.backup_target,
             bucket_client=bucket_client,
+            bucket_unusable=bucket_unusable,
             clock=run_clock,
             calendar=calendar if calendar is not None else _exchange_calendar(),
             schedule_reader=read_pmset_schedule,

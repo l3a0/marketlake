@@ -150,3 +150,15 @@ def test_a_config_without_a_bucket_value_builds_no_client(missing):
     config = _config(backup_target="/Volumes/ssd", **{missing: None})
     with pytest.raises(ConfigError, match=missing):
         client_from_config(config)
+
+
+@pytest.mark.parametrize("region", ["us east 2", "us-east-2/"])
+def test_a_region_botocore_refuses_is_one_config_line(region):
+    # ``require_bucket_settings`` catches these first. This is the second line of
+    # defence for whatever botocore refuses that the shape check lets through.
+    with pytest.raises(ConfigError) as refused:
+        client_from_config(_config(bucket_region=region))
+    message = str(refused.value)
+    assert "InvalidRegionError" in message
+    assert "\n" not in message
+    assert CONFIG_SECRET not in message and CONFIG_KEY_ID not in message

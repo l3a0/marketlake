@@ -2264,40 +2264,37 @@ def main(
         return 0
 
     if isinstance(config.backup_target, BucketTarget):
-        backup: BackupRunner = bucket.BucketBackup(
-            client=bucket.client_from_config(config), clock=clock
-        )
+        # The client is built inside the backup step, after the seal, so a bad bucket
+        # setting fails the backup and leaves the seal standing.
+        backup: BackupRunner = bucket.BucketBackup(config=config, clock=clock)
     else:
         backup = RsyncBackup()
-    # A bucket refusal is one operator line and exit 2, the shape ``input_errors_exit``
-    # gives a bad config. It raises before the ping, so healthchecks still pages.
-    with input_errors_exit("compact", bucket.BucketRefusal):
-        result = _compact_from_config(config, args, clock, calendar, backup)
+    try:
+        result = compact(
+            config.lake_root,
+            clock=clock,
+            calendar=calendar if calendar is not None else ExchangeCalendar(),
+            backup=backup,
+            backup_target=config.backup_target,
+            pinger=UrllibPinger(),
+            ping_url=config.healthchecks_url(COMPACTION_SLUG),
+            publisher=Publisher(
+                lake_root=config.lake_root,
+                transport=NtfyTransport(config.ntfy_topic.reveal()),
+                # The values that must never reach a phone, checked against the page itself.
+                secrets=config.page_secrets(),
+            ),
+            guards=config.guards,
+            plan_path=args.plan if args.plan is not None else DEFAULT_CHAIN_PLAN_PATH,
+        )
+    except bucket.BucketRefusal as exc:
+        # Only the bucket form raises this, so the path form keeps its own behavior for
+        # every other error. A bucket refusal is one operator line and exit 2. It raises
+        # before the ping, so healthchecks still pages.
+        print(f"compact: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
     print(result.render())
     return 0
-
-
-def _compact_from_config(
-    config, args: argparse.Namespace, clock: Clock, calendar: Calendar | None, backup: BackupRunner
-) -> CompactionResult:
-    """The close+15 job wired from the config, with the backup ``main`` built."""
-    return compact(
-        config.lake_root,
-        clock=clock,
-        calendar=calendar if calendar is not None else ExchangeCalendar(),
-        backup=backup,
-        backup_target=config.backup_target,
-        pinger=UrllibPinger(),
-        ping_url=config.healthchecks_url(COMPACTION_SLUG),
-        publisher=Publisher(
-            lake_root=config.lake_root,
-            transport=NtfyTransport(config.ntfy_topic.reveal()),
-            # The values that must never reach a phone, checked against the page itself.
-            secrets=config.page_secrets(),
-        ),
-        guards=config.guards,
-        plan_path=args.plan if args.plan is not None else DEFAULT_CHAIN_PLAN_PATH,
-    )
 
 
 __all__ = [

@@ -15,6 +15,7 @@ import pytest
 from lake import bucket
 from lake import compact as compact_module
 from lake.bucket import BucketBackup, UploadDeadline, WatermarkMissing, first_upload
+from lake.chain_plan import ChainPlanError
 from lake.compact import COMPACTION_SLUG, compact
 from lake.config import BucketTarget
 from lake.paths import LakePaths
@@ -189,3 +190,68 @@ def test_main_hands_the_bucket_keys_to_the_page_publisher(lake_root, tmp_path, m
 
     assert "secret-bucket-key" in built["secrets"]
     assert "AKIDCONFIG" in built["secrets"]
+
+
+# -- which errors main turns into one line ---------------------------------------
+
+
+def _seal_one(lake_root: Path) -> None:
+    _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
+
+
+def test_the_path_form_still_raises_a_chain_plan_error(lake_root, tmp_path, monkeypatch):
+    # The bucket refusal is caught for the bucket form alone. A chain plan error on the
+    # path form stays the traceback and exit 1 it always was, rather than one line and
+    # exit 2. The job itself is replaced, so the error reaches main from inside it.
+    config = write_config(tmp_path, lake_root)
+
+    def bad_plan(*args, **kwargs):
+        raise ChainPlanError("'windows' must be a list")
+
+    monkeypatch.setattr(compact_module, "compact", bad_plan)
+    monkeypatch.setattr(compact_module, "UrllibPinger", lambda: FakePinger())
+
+    with pytest.raises(ChainPlanError):
+        compact_module.main(
+            ["--config", str(config), "--plan", str(tmp_path / "chain_plan.json")],
+            clock=_clock_at(DAY, 16, 30),
+            calendar=_calendar(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("extra", "target", "named"),
+    [
+        ("", str(TARGET), "bucket_secret_access_key"),
+        (KEYS, "s3://Legacy_Bucket/lake", "names no valid bucket"),
+        (KEYS.replace("us-east-2", "us east 2"), str(TARGET), "bucket_region"),
+    ],
+)
+def test_bad_bucket_settings_fail_the_backup_after_the_seal(
+    lake_root, tmp_path, monkeypatch, capsys, extra, target, named
+):
+    # The settings are checked when the backup runs, so the day is sealed first, and the
+    # missing ping is what pages. No client is ever built.
+    _seal_one(lake_root)
+    config = write_config(tmp_path, lake_root)
+    config.write_text(
+        config.read_text().replace(f"backup_target: {tmp_path / 'ssd'}", f"backup_target: {target}")
+        + extra
+    )
+    pinger = FakePinger()
+    monkeypatch.setattr(compact_module, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr(bucket, "_build_client", lambda cfg: pytest.fail("no client is built"))
+
+    with pytest.raises(SystemExit) as exited:
+        compact_module.main(
+            ["--config", str(config), "--plan", str(tmp_path / "chain_plan.json")],
+            clock=_clock_at(DAY, 16, 30),
+            calendar=_calendar(),
+        )
+
+    assert exited.value.code == 2
+    err = capsys.readouterr().err.splitlines()
+    assert len(err) == 1 and err[0].startswith("compact: ")
+    assert named in err[0]
+    assert LakePaths(lake_root).chains_partition_path("SPY", DAY).exists()
+    assert pinger.urls == []

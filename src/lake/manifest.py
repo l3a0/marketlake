@@ -1022,7 +1022,7 @@ class BackupScrubResult:
     - ``manifest_diverged_at``: the byte offset where the copy's manifest stops matching
       the lake's. ``None`` when the copy is a clean prefix.
 
-    Two more stop a bucket scrub, and only a bucket scrub sets them. They are named
+    Three more stop a bucket scrub, and only a bucket scrub sets them. They are named
     apart because they send the operator to different repairs.
 
     - ``bucket_refused``: S3 answered a request with an error, named by its code. A
@@ -1030,6 +1030,8 @@ class BackupScrubResult:
       a new key.
     - ``bucket_unreachable``: no answer came back, named by the error's type. The usual
       cause is the network, and the repair is usually nothing.
+    - ``bucket_unusable``: the config's bucket settings could not build a client, so no
+      request was sent. The repair is an edit to ``config.yaml``.
 
     Two tuples are reported and never withhold the ping, because neither can be lake
     data going missing.
@@ -1058,6 +1060,7 @@ class BackupScrubResult:
     unreadable: str | None = None
     bucket_refused: str | None = None
     bucket_unreachable: str | None = None
+    bucket_unusable: str | None = None
     versioning: str | None = None
 
     @property
@@ -1074,6 +1077,8 @@ class BackupScrubResult:
             return f"backup target not mounted: {self.target}"
         if self.unreadable is not None:
             return f"backup could not be read: {self.unreadable}"
+        if self.bucket_unusable is not None:
+            return f"backup bucket settings in config.yaml cannot be used: {self.bucket_unusable}"
         if self.bucket_refused is not None:
             return (
                 f"backup bucket refused the scrub ({self.bucket_refused}), so its access key "

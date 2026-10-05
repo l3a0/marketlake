@@ -26,9 +26,17 @@ exception never leaks any of them.
 with ``rsync``. A bucket URL, ``s3://<bucket>`` or ``s3://<bucket>/<prefix>``, is
 uploaded to by ``lake.bucket``. The scheme is read before any ``Path`` is built,
 because ``Path("s3://bucket/x")`` collapses the double slash and would name a local
-directory called ``s3:``. The bucket's two key values and its region are required only
+directory called ``s3:``. The bucket's two key values and its region are needed only
 when the target is a bucket. They may sit in the file beside a path target, which is
 how the first upload runs before the target is switched.
+
+**Loading never refuses a backup setting.** Capture loads this file every cycle and the
+daemon loads it at startup, so a refusal here would stop capture over a setting only
+the nightly backup reads, and a lost minute cannot be recovered. A value that does not
+start with ``s3://`` loads as a ``Path`` exactly as it always has, whatever it holds. An
+``s3://`` value loads as a ``BucketTarget`` with no checks, and a missing bucket key
+loads as ``None``. ``require_bucket_settings`` holds the strict checks, and each bucket
+job calls it when it runs, so a bad bucket setting fails only the backup.
 
 One key is optional rather than required: ``schwab_callback_url``, the third static
 app-registration input. Only the weekly re-auth in ``lake.reauth`` reads it, and capture
@@ -88,8 +96,11 @@ BUCKET_KEYS = (BUCKET_KEY_ID_KEY, BUCKET_SECRET_KEY, BUCKET_REGION_KEY)
 # starting and ending with a letter or digit.
 _BUCKET_NAME = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
 
-# Any other ``scheme://`` is refused rather than read as a path, for the collapse above.
-_ANY_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
+# The shape of an AWS region name: a two-to-four letter area, one or more lowercase
+# words, and a number, as in ``us-east-2``, ``us-gov-west-1`` or ``eusc-de-east-1``.
+# ``botocore`` refuses a malformed name only when the client is built, with an error
+# that is not a ``ConfigError``, so the check runs first and names the key instead.
+_REGION = re.compile(r"[a-z]{2,4}(-[a-z]+)+-\d+")
 
 # The required keys. Guard constants are optional and default to the pinned values, and
 # so is ``CALLBACK_KEY``: no capture path reads it, so a config missing it must load
@@ -178,27 +189,65 @@ def parse_backup_target(value: object) -> Path | BucketTarget:
     """Read ``backup_target``: an ``s3://`` URL is a bucket, anything else is a path.
 
     The scheme is checked on the raw text, before any ``Path`` exists, because a
-    ``Path`` collapses ``//`` and would turn the URL into a local directory. Any other
-    scheme is refused rather than read as a path, for the same reason.
+    ``Path`` collapses ``//`` and would turn the URL into a local directory. Nothing
+    here refuses, for the reason the module docstring gives. Any other value becomes a
+    ``Path`` exactly as it did before a bucket was possible, and an ``s3://`` value
+    becomes a ``BucketTarget`` with empty prefix components dropped. A malformed bucket
+    is caught by ``require_bucket_settings`` when a bucket job runs.
     """
-    text = str(value).strip()
+    text = str(value)
     if text.startswith(BUCKET_SCHEME):
         bucket, _, prefix = text[len(BUCKET_SCHEME) :].partition("/")
-        if not _BUCKET_NAME.fullmatch(bucket) or ".." in bucket:
-            raise ConfigError(
-                f"backup_target names no valid bucket: {text!r}. The form is "
-                f"{BUCKET_SCHEME}<bucket> or {BUCKET_SCHEME}<bucket>/<prefix>"
-            )
         parts = [part for part in prefix.split("/") if part]
-        if any(part in (".", "..") for part in parts):
-            raise ConfigError(f"backup_target's prefix may not hold . or ..: {text!r}")
         return BucketTarget(bucket=bucket, prefix="/".join(parts))
-    if _ANY_SCHEME.match(text):
-        raise ConfigError(
-            f"backup_target {text!r} names a scheme other than {BUCKET_SCHEME}. It is either "
-            f"a filesystem path or an {BUCKET_SCHEME} bucket"
-        )
     return Path(text).expanduser()
+
+
+def bucket_target_problems(target: BucketTarget) -> list[str]:
+    """What is wrong with a bucket target's name or prefix, as operator phrases."""
+    problems = []
+    if not _BUCKET_NAME.fullmatch(target.bucket) or ".." in target.bucket:
+        problems.append(
+            f"{target} names no valid bucket. The form is {BUCKET_SCHEME}<bucket> or "
+            f"{BUCKET_SCHEME}<bucket>/<prefix>, with a name of 3 to 63 lowercase letters, "
+            "digits, dots and hyphens"
+        )
+    if any(part in (".", "..") for part in target.prefix.split("/")):
+        problems.append(f"{target} has a prefix holding . or ..")
+    return problems
+
+
+def require_bucket_settings(config: Config, target: BucketTarget | None = None) -> BucketTarget:
+    """The strict checks a bucket job runs before it builds a client, or a ``ConfigError``.
+
+    ``target`` defaults to ``backup_target``, which must then be a bucket. Four things are
+    checked, and every failure is named in one line.
+
+    1. The bucket name is one S3 accepts.
+    2. The prefix holds no ``.`` or ``..`` component.
+    3. ``bucket_access_key_id``, ``bucket_secret_access_key`` and ``bucket_region`` are
+       all present.
+    4. The region has the shape of an AWS region name.
+
+    Loading the config runs none of these, so a bad bucket setting reaches the job that
+    uses it and nothing else. The nightly upload, the Sunday scrub, the first upload and
+    the live check each call this when they start.
+    """
+    if target is None:
+        if not isinstance(config.backup_target, BucketTarget):
+            raise ConfigError(f"backup_target is not an {BUCKET_SCHEME} bucket")
+        target = config.backup_target
+    problems = bucket_target_problems(target)
+    values = (config.bucket_access_key_id, config.bucket_secret_access_key, config.bucket_region)
+    absent = [key for key, value in zip(BUCKET_KEYS, values, strict=True) if value is None]
+    if absent:
+        problems.append(f"the bucket needs config key(s): {absent}")
+    region = config.bucket_region
+    if region is not None and not _REGION.fullmatch(region):
+        problems.append(f"{BUCKET_REGION_KEY} {region!r} is not an AWS region name like us-east-2")
+    if problems:
+        raise ConfigError(". ".join(problems))
+    return target
 
 
 # The largest ``capture_stagger_ms`` the config accepts. The field's comment carries why.
@@ -513,10 +562,6 @@ class Config:
         if missing:
             raise ConfigError(f"config missing required key(s): {missing}")
         backup_target = parse_backup_target(mapping["backup_target"])
-        if isinstance(backup_target, BucketTarget):
-            absent = [key for key in BUCKET_KEYS if _optional_text(mapping.get(key)) is None]
-            if absent:
-                raise ConfigError(f"backup_target is a bucket, so config needs key(s): {absent}")
         key_id = _optional_text(mapping.get(BUCKET_KEY_ID_KEY))
         secret_key = _optional_text(mapping.get(BUCKET_SECRET_KEY))
         return cls(

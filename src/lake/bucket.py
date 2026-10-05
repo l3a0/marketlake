@@ -44,7 +44,10 @@ access key, secret key and region from the config and clears every ``AWS_*`` var
 ``~/.aws/config``, ``~/.aws/credentials`` and ``~/.aws/models`` out of the client's
 reach while it builds. A development run therefore cannot reach a real bucket on
 credentials it happened to find on the machine. ``boto3`` is imported there, lazily, so
-the offline suite never loads it unless a test builds a client.
+the offline suite never loads it unless a test builds a client. Every job reaches the
+client through ``connect``, which first runs the config's strict bucket checks. Loading
+the config runs none of them, because capture loads it every minute and a bad backup
+setting must fail the backup and nothing else.
 """
 
 from __future__ import annotations
@@ -73,6 +76,7 @@ from lake.config import (
     input_errors_exit,
     load_config,
     parse_backup_target,
+    require_bucket_settings,
 )
 from lake.control_plane import (
     COMPACTION_RUN,
@@ -206,6 +210,15 @@ class FirstUploadRefused(BucketRefusal):
 
 class BucketUnreachable(BucketRefusal):
     """The bucket refused a request or could not be reached, as one operator line."""
+
+
+class BucketSettingsInvalid(BucketRefusal, ConfigError):
+    """The config's bucket settings cannot build a client, as one operator line.
+
+    It is a ``ConfigError`` because the repair is an edit to ``config.yaml``, and a
+    ``BucketRefusal`` because it is raised when a bucket job runs rather than when the
+    config loads, so the job that catches a bucket refusal catches this one too.
+    """
 
 
 # -- checksums ----------------------------------------------------------------
@@ -358,6 +371,21 @@ def client_from_config(config: Config) -> Any:
         raise ConfigError(f"the bucket needs config key(s): {absent}")
     assert config.bucket_access_key_id is not None
     assert config.bucket_secret_access_key is not None
+    from botocore.exceptions import BotoCoreError  # lazy: only a bucket job needs it
+
+    try:
+        return _build_client(config)
+    except (BotoCoreError, ValueError) as exc:
+        # ``botocore`` refuses a malformed region with an error that is both of these.
+        # Only the type is named, because a message may quote a value from the config.
+        raise ConfigError(
+            f"the bucket client could not be built from config.yaml ({type(exc).__name__})"
+        ) from None
+
+
+def _build_client(config: Config) -> Any:
+    assert config.bucket_access_key_id is not None
+    assert config.bucket_secret_access_key is not None
     with _aws_environment_cleared():
         import boto3  # lazy: only a bucket job builds a client
         import botocore.loaders
@@ -388,6 +416,22 @@ def client_from_config(config: Config) -> Any:
                 response_checksum_validation="when_required",
             ),
         )
+
+
+def connect(config: Config, target: BucketTarget | None = None) -> tuple[BucketTarget, Any]:
+    """The checked bucket target and a client for it, or ``BucketSettingsInvalid``.
+
+    ``target`` defaults to ``backup_target``. The config's strict bucket checks run
+    first, then the client is built. Either failing is one operator line naming what
+    to fix in ``config.yaml``.
+    """
+    try:
+        checked = require_bucket_settings(config, target)
+        return checked, client_from_config(config)
+    except BucketSettingsInvalid:
+        raise
+    except ConfigError as exc:
+        raise BucketSettingsInvalid(str(exc)) from None
 
 
 # -- the exclusion list, with rsync's matching rules ----------------------------
@@ -767,15 +811,26 @@ def nightly_upload(
 class BucketBackup:
     """The ``BackupRunner`` for a bucket target, run inside compaction's lake-root lock.
 
-    ``client`` is an S3 client, which ``client_from_config`` builds in production and a
-    test replaces with a fake. ``clock`` sets the deadline. ``last`` is what the most
-    recent ``sync`` did.
+    The S3 client comes from one of two places. ``client`` is a client in hand, which a
+    test passes as a fake. ``config`` is the loaded config, from which ``sync`` builds
+    the client through ``connect`` when it runs. Building it then rather than when the
+    job starts means a bad bucket setting fails the backup after the seal has run, the
+    way an unmounted disk fails the path form, instead of stopping the seal too.
+    ``clock`` sets the deadline. ``last`` is what the most recent ``sync`` did.
     """
 
     def __init__(
-        self, *, client: Any, clock: Clock, budget: timedelta = NIGHTLY_UPLOAD_BUDGET
+        self,
+        *,
+        clock: Clock,
+        client: Any = None,
+        config: Config | None = None,
+        budget: timedelta = NIGHTLY_UPLOAD_BUDGET,
     ) -> None:
+        if (client is None) == (config is None):
+            raise TypeError("BucketBackup takes exactly one of client and config")
         self._client = client
+        self._config = config
         self._clock = clock
         self._budget = budget
         self.last: UploadSummary | None = None
@@ -783,8 +838,12 @@ class BucketBackup:
     def sync(self, source: Path, target: Path | BucketTarget) -> None:
         if not isinstance(target, BucketTarget):
             raise TypeError(f"BucketBackup uploads to a bucket target, not {target!r}")
+        client = self._client
+        if client is None:
+            assert self._config is not None
+            target, client = connect(self._config, target)
         self.last = nightly_upload(
-            source, target, client=self._client, clock=self._clock, budget=self._budget
+            source, target, client=client, clock=self._clock, budget=self._budget
         )
 
 
@@ -1150,8 +1209,7 @@ def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> in
     label = args.command
     with input_errors_exit(label, BucketRefusal):
         config = load_config(args.config)
-        target = _target(config, args.target)
-        client = client_from_config(config)
+        target, client = connect(config, _target(config, args.target))
         if clock is None:
             from lake.clock import SystemClock
 
@@ -1192,6 +1250,7 @@ __all__ = [
     "SWEEP_MARGIN",
     "BucketBackup",
     "BucketRefusal",
+    "BucketSettingsInvalid",
     "BucketUnreachable",
     "ChecksumRefused",
     "CopyState",
@@ -1206,6 +1265,7 @@ __all__ = [
     "bucket_scrub",
     "build_parser",
     "client_from_config",
+    "connect",
     "first_upload",
     "hex_to_b64",
     "in_sunday_scrub_window",
