@@ -158,6 +158,7 @@ def test_input_errors_exit_lets_every_other_exception_through():
         ("lake.probe_calendar", ["--config", "MISSING"]),
         ("lake.control_plane", ["sunday", "--config", "MISSING"]),
         ("lake.schema_versions", ["--config", "MISSING"]),
+        ("lake.bucket", ["first-upload", "--config", "MISSING"]),
     ],
 )
 def test_a_missing_config_names_itself_at_every_cli_entry(module, argv, tmp_path, capsys):
@@ -172,11 +173,11 @@ def test_a_missing_config_names_itself_at_every_cli_entry(module, argv, tmp_path
     assert excinfo.value.code == 2
     err = capsys.readouterr().err
     assert err.count("\n") == 1
-    # Two entries print a label that is not their bare module suffix. The control
+    # Three entries print a label that is not their bare module suffix. The control
     # plane names its subcommand, because one module carries four of them and
-    # "control_plane:" would not say which failed. probe_calendar spells its label
-    # with a hyphen.
-    if module == "lake.control_plane":
+    # "control_plane:" would not say which failed. The bucket entry names its
+    # subcommand for the same reason. probe_calendar spells its label with a hyphen.
+    if module in ("lake.control_plane", "lake.bucket"):
         expected = argv[0]
     elif module == "lake.probe_calendar":
         expected = "probe-calendar"

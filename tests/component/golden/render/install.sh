@@ -61,7 +61,7 @@ echo '+ pmset -g sched'
 pmset -g sched
 # 4. Keep the token and the config secrets out of Time Machine. As the owner,
 # never under sudo. The whole directory goes, so an editor that saves by rename
-# cannot drop the exclusion, and the four secrets in config.yaml are covered too.
+# cannot drop the exclusion, and the secrets in config.yaml are covered too.
 echo '+ tmutil addexclusion /Users/someone/.config/marketlake'
 tmutil addexclusion /Users/someone/.config/marketlake
 echo '+ tmutil isexcluded /Users/someone/.config/marketlake'

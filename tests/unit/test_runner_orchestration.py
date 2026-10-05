@@ -279,3 +279,34 @@ def test_main_wires_the_live_seams(tmp_path, monkeypatch, capsys):
     assert isinstance(seen["backup"], RsyncBackup)
     # The ping key never reaches stdout, only the slug.
     assert "secret-key" not in capsys.readouterr().out
+
+
+def test_the_slice_one_runner_refuses_a_bucket_target_with_one_line(tmp_path, capsys, monkeypatch):
+    """Run once a minute, this entry would upload to the bucket once a minute.
+
+    It is not installed on the live machine, so it refuses a bucket target at the config
+    load, before any capture cycle runs, rather than learning to upload.
+    """
+    from tests.support.config import write_config
+
+    config = write_config(tmp_path, tmp_path / "lake")
+    text = config.read_text().replace(
+        f"backup_target: {tmp_path / 'ssd'}", "backup_target: s3://lake-backup/lake"
+    )
+    config.write_text(
+        text
+        + "bucket_access_key_id: AKID\n"
+        + "bucket_secret_access_key: bucket-secret\n"
+        + "bucket_region: us-east-2\n"
+    )
+    monkeypatch.setattr(
+        runner, "run_cycle_from_config", lambda **kwargs: pytest.fail("a cycle ran")
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        runner.main(["run", "--config", str(config)])
+
+    assert exited.value.code == 2
+    err = capsys.readouterr().err.splitlines()
+    assert len(err) == 1
+    assert err[0].startswith("runner: backup_target is a bucket (s3://lake-backup/lake)")

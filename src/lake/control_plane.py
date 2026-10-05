@@ -96,7 +96,7 @@ from typing import Protocol, runtime_checkable
 from lake.alert import REFUSED, Message, NtfyTransport, Publisher
 from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
-from lake.config import CALLBACK_KEY, input_errors_exit, load_config
+from lake.config import CALLBACK_KEY, BucketTarget, input_errors_exit, load_config
 from lake.manifest import BackupScrubResult, ScrubResult, backup_scrub, scrub
 from lake.metadata import JournalMetadata, read_metadata
 from lake.paths import CONFIG_DIR_ENV, TOKEN_FILE, config_dir
@@ -1890,7 +1890,7 @@ class SundayOutcome:
 def sunday_maintenance(
     *,
     lake_root: Path,
-    backup_target: Path,
+    backup_target: Path | BucketTarget,
     now: datetime,
     calendar: Calendar,
     schedule_reader: ScheduleReader,
@@ -1905,6 +1905,7 @@ def sunday_maintenance(
     assertion_probe: AssertionProbe | None = None,
     assertion_pid: int | None = None,
     stamped_at: datetime | None = None,
+    bucket_client: object | None = None,
 ) -> SundayOutcome:
     """Scrub both copies, verify the wake alarms, run the canary, assert coverage, ping.
 
@@ -1983,8 +1984,16 @@ def sunday_maintenance(
     is ``token_canary`` and the production target is the config's ``backup_target``.
 
     An unmounted target is a problem rather than a skip, for the same reason the
-    compaction job refuses to sync to one. The backup scrub is now the only thing that
-    notices the copy rotting, so a week it could not run is a week nothing looked.
+    compaction job refuses to sync to one. For a path target the backup scrub is the only
+    thing that notices the copy rotting, so a week it could not run is a week nothing
+    looked.
+
+    A bucket target is scrubbed by ``lake.bucket.bucket_scrub`` through ``bucket_client``,
+    which a bucket target requires. A bucket that refuses or cannot be reached is a
+    problem the same way an unmounted disk is. That scrub proves less than the path
+    scrub, because S3 reports the checksum it stored at upload rather than re-hashing the
+    bytes at rest, so rot at rest in a bucket is the provider's durability guarantee plus
+    the restore test rather than this job's.
 
     The canary's 30-minute retry until the deadline belongs to ``sunday_run``, not to
     this function. This function decides one attempt.
@@ -2002,7 +2011,14 @@ def sunday_maintenance(
             f"orphans={len(result.orphans)}"
         )
 
-    backup = backup_scrub(root, Path(backup_target))
+    if isinstance(backup_target, BucketTarget):
+        if bucket_client is None:
+            raise ValueError("a bucket backup_target needs a bucket_client to scrub it")
+        from lake.bucket import bucket_scrub  # lazy: lake.bucket imports this module
+
+        backup = bucket_scrub(root, backup_target, bucket_client)
+    else:
+        backup = backup_scrub(root, Path(backup_target))
     if backup.problem is not None:
         problems.append(backup.problem)
 
@@ -2148,7 +2164,7 @@ def _page_sunday_daemon_finding(
 def sunday_run(
     *,
     lake_root: Path,
-    backup_target: Path,
+    backup_target: Path | BucketTarget,
     clock: Clock,
     calendar: Calendar,
     schedule_reader: ScheduleReader,
@@ -2164,6 +2180,7 @@ def sunday_run(
     daemon_probe: DaemonProbe | None = None,
     assertion_probe: AssertionProbe | None = None,
     stamp_reader: StampReader | None = None,
+    bucket_client: object | None = None,
 ) -> list[SundayOutcome]:
     """Run the Sunday job, retrying until it passes or the canary deadline.
 
@@ -2195,10 +2212,10 @@ def sunday_run(
     pushes through. One guard covers the whole evening rather than one attempt, for the
     reason the loop below gives. With no publisher nothing escalates.
 
-    ``daemon_probe`` and ``assertion_probe`` pass straight through to every attempt's
-    ``sunday_maintenance`` call. ``stamp_reader`` is read afresh each attempt, the same
-    reason ``mint_reader`` is: the daemon restamps a new pid when it re-takes a lost
-    ``caffeinate`` mid-evening, and a pid cached once at the start would ask about a
+    ``bucket_client``, ``daemon_probe`` and ``assertion_probe`` pass straight through to
+    every attempt's ``sunday_maintenance`` call. ``stamp_reader`` is read afresh each
+    attempt, the same reason ``mint_reader`` is: the daemon restamps a new pid when it
+    re-takes a lost ``caffeinate`` mid-evening, and a pid cached once at the start would ask about a
     child already gone, paging a lapse that had already healed by the next retry. A
     finding still pages at most once for the whole window rather than once per attempt,
     using a flag local to this call. The retry loop runs inside one process, so that
@@ -2241,6 +2258,7 @@ def sunday_run(
             assertion_probe=assertion_probe,
             assertion_pid=stamp.assertion_pid,
             stamped_at=stamp.stamped_at,
+            bucket_client=bucket_client,
         )
         # One reminder an hour. Later attempts in the same hour owe nothing, so the
         # outcome records only the one that went out.
@@ -2382,7 +2400,8 @@ def tmutil_exclusion_targets(config_dir: str, token_path: str) -> tuple[str, ...
     The whole directory is excluded rather than the token file alone. Three reasons.
 
     1. ``config.yaml`` sits beside the token and holds four secrets of its own: the
-       healthchecks ping key, the ntfy topic, and the two Schwab app credentials.
+       healthchecks ping key, the ntfy topic, and the two Schwab app credentials. A
+       bucket backup target adds two more, the bucket's access key id and secret key.
        Excluding only the token left those on a backup disk without FileVault.
     2. A sticky exclusion is an attribute on the item, so it dies when the item is
        deleted and re-created. ``config.yaml`` is hand-edited and most editors save by
@@ -2555,7 +2574,7 @@ def _first_install_lines(
         "pmset -g sched",
         "# 4. Keep the token and the config secrets out of Time Machine. As the owner,",
         "# never under sudo. The whole directory goes, so an editor that saves by rename",
-        "# cannot drop the exclusion, and the four secrets in config.yaml are covered too.",
+        "# cannot drop the exclusion, and the secrets in config.yaml are covered too.",
         *tmutil_exclusion_commands(default_config_dir(host.home), default_token_path(host.home)),
         "tmutil isexcluded "
         + " ".join(
@@ -3412,12 +3431,12 @@ def main(
             stamped_at=stamp.stamped_at,
             now=_system_clock().now(),
             # A ping healthchecks refuses feeds no check, so nothing goes silent to
-            # report it. The secrets are the two values that must never reach a phone,
+            # report it. The secrets are the values that must never reach a phone,
             # checked against the page itself.
             publisher=Publisher(
                 lake_root=config.lake_root,
                 transport=NtfyTransport(config.ntfy_topic.reveal()),
-                secrets=(config.healthchecks_ping_key.reveal(), config.ntfy_topic.reveal()),
+                secrets=config.page_secrets(),
             ),
         )
         status = "daemon up" if outcome.daemon_up else "daemon down"
@@ -3448,16 +3467,25 @@ def main(
         # The job's own clock, shared by the retry loop and the reminder's timestamp, so
         # a push is stamped with the attempt that raised it.
         run_clock = clock if clock is not None else _system_clock()
-        # The reminder's delivery, and the refused-ping page's. The secrets are the two
+        # The reminder's delivery, and the refused-ping page's. The secrets are the
         # values that must never reach a phone, checked against the message itself.
         publisher = Publisher(
             lake_root=config.lake_root,
             transport=NtfyTransport(config.ntfy_topic.reveal()),
-            secrets=(config.healthchecks_ping_key.reveal(), config.ntfy_topic.reveal()),
+            secrets=config.page_secrets(),
         )
+        # The bucket client, built from the config's own key values, when the target is
+        # a bucket. A path target needs none.
+        bucket_client = None
+        if isinstance(config.backup_target, BucketTarget):
+            from lake import bucket  # lazy: lake.bucket imports this module
+
+            with input_errors_exit("sunday"):
+                bucket_client = bucket.client_from_config(config)
         outcomes = sunday_run(
             lake_root=config.lake_root,
             backup_target=config.backup_target,
+            bucket_client=bucket_client,
             clock=run_clock,
             calendar=calendar if calendar is not None else _exchange_calendar(),
             schedule_reader=read_pmset_schedule,

@@ -1221,7 +1221,7 @@ def sweep_from_config(
             lake_root=config.lake_root,
             transport=NtfyTransport(config.ntfy_topic.reveal()),
             # The values that must never reach a phone, checked against the message itself.
-            secrets=(config.healthchecks_ping_key.reveal(), config.ntfy_topic.reveal()),
+            secrets=config.page_secrets(),
         ),
         schedule_reader=read_pmset_schedule if schedule_reader is None else schedule_reader,
         schedule_setter=set_sunday_wake if schedule_setter is None else schedule_setter,

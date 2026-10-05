@@ -1160,7 +1160,7 @@ def _alarm(
         lake_root=config.lake_root,
         transport=transport,
         # The values that must never reach a phone, checked against the page itself.
-        secrets=(config.healthchecks_ping_key.reveal(), config.ntfy_topic.reveal()),
+        secrets=config.page_secrets(),
     )
     lake_root = config.lake_root
     deadman = DeadMan(

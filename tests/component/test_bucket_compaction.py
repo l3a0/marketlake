@@ -1,0 +1,165 @@
+"""The close+15 compaction with a bucket target.
+
+``BucketBackup`` runs where ``RsyncBackup`` runs, inside compaction's lake-root lock,
+chosen by the form of ``backup_target``. The ping still attests the backup: it fires only
+after the upload, and an upload that refuses or reaches its deadline leaves it unsent so
+healthchecks pages. ``compact.main`` reports a bucket refusal as one line and exit 2.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from lake import bucket
+from lake import compact as compact_module
+from lake.bucket import BucketBackup, UploadDeadline, WatermarkMissing, first_upload
+from lake.compact import COMPACTION_SLUG, compact
+from lake.config import BucketTarget
+from lake.paths import LakePaths
+from tests.component.test_compaction import (
+    DAY,
+    URL,
+    _calendar,
+    _chains,
+    _clock_at,
+    _segment,
+    _snap,
+)
+from tests.support.bucket import FakeS3
+from tests.support.config import write_config
+from tests.support.pinger import FakePinger
+
+TARGET = BucketTarget(bucket="lake-backup", prefix="lake")
+KEYS = (
+    "bucket_access_key_id: AKIDCONFIG\n"
+    "bucket_secret_access_key: secret-bucket-key\n"
+    "bucket_region: us-east-2\n"
+)
+
+
+def _seeded(lake_root: Path) -> FakeS3:
+    """A bucket the first upload has already seeded from this lake."""
+    client = FakeS3()
+    first_upload(lake_root, TARGET, client=client, clock=_clock_at(DAY, 9, 0))
+    client.calls.clear()
+    return client
+
+
+def _job(lake_root: Path, client: FakeS3, events: list[str], *, clock=None):
+    clock = clock if clock is not None else _clock_at(DAY, 16, 30)
+    client.on_put = lambda kwargs, data: events.append(f"put {kwargs['Key']}")
+    return compact(
+        lake_root,
+        clock=clock,
+        calendar=_calendar(),
+        backup=BucketBackup(client=client, clock=clock),
+        backup_target=TARGET,
+        pinger=FakePinger(events),
+        ping_url=URL,
+        plan_path=lake_root.parent / "chain_plan.json",
+    )
+
+
+def test_the_sealed_day_goes_up_and_the_ping_comes_after_the_manifest(lake_root):
+    client = _seeded(lake_root)
+    _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
+    events: list[str] = []
+
+    result = _job(lake_root, client, events)
+
+    partition = LakePaths(lake_root).chains_partition_path("SPY", DAY)
+    rel = partition.relative_to(lake_root).as_posix()
+    assert result.backed_up and result.pinged
+    assert events == [f"put lake/{rel}", "put lake/manifest.jsonl", "ping"]
+
+
+def test_an_empty_bucket_raises_before_the_ping(lake_root):
+    _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
+    events: list[str] = []
+    with pytest.raises(WatermarkMissing):
+        _job(lake_root, FakeS3(), events)
+    assert "ping" not in events
+    # The seal itself stood. The day is single-copy, which the missed ping reports.
+    assert LakePaths(lake_root).chains_partition_path("SPY", DAY).exists()
+
+
+def test_a_deadline_raises_before_the_ping(lake_root):
+    client = _seeded(lake_root)
+    _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
+    events: list[str] = []
+    clock = _clock_at(DAY, 16, 30)
+
+    def slow(kwargs, data):
+        events.append(f"put {kwargs['Key']}")
+        clock.advance(bucket.NIGHTLY_UPLOAD_BUDGET.total_seconds())
+
+    client.on_put = slow
+    with pytest.raises(UploadDeadline):
+        compact(
+            lake_root,
+            clock=clock,
+            calendar=_calendar(),
+            backup=BucketBackup(client=client, clock=clock),
+            backup_target=TARGET,
+            pinger=FakePinger(events),
+            ping_url=URL,
+            plan_path=lake_root.parent / "chain_plan.json",
+        )
+    assert len(events) == 1 and events[0].startswith("put lake/chains/")
+
+
+def _bucket_config(tmp_path: Path, lake_root: Path) -> Path:
+    config = write_config(tmp_path, lake_root)
+    text = config.read_text().replace(
+        f"backup_target: {tmp_path / 'ssd'}", f"backup_target: {TARGET}"
+    )
+    config.write_text(text + KEYS)
+    return config
+
+
+def test_main_uploads_to_a_bucket_target_and_pings(lake_root, tmp_path, monkeypatch, capsys):
+    client = _seeded(lake_root)
+    _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
+    config = _bucket_config(tmp_path, lake_root)
+    pinger = FakePinger()
+    monkeypatch.setattr(bucket, "client_from_config", lambda cfg: client)
+    monkeypatch.setattr(compact_module, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr(
+        compact_module, "RsyncBackup", lambda: pytest.fail("a bucket target never runs rsync")
+    )
+
+    code = compact_module.main(
+        ["--config", str(config), "--plan", str(tmp_path / "chain_plan.json")],
+        clock=_clock_at(DAY, 16, 30),
+        calendar=_calendar(),
+    )
+
+    assert code == 0
+    assert client.put_keys()[-1] == "lake/manifest.jsonl"
+    assert pinger.urls == [f"https://hc-ping.com/secret-key/{COMPACTION_SLUG}"]
+    assert "secret-bucket-key" not in capsys.readouterr().out
+
+
+def test_main_refuses_an_empty_bucket_with_one_line_and_no_ping(
+    lake_root, tmp_path, monkeypatch, capsys
+):
+    config = _bucket_config(tmp_path, lake_root)
+    pinger = FakePinger()
+    monkeypatch.setattr(bucket, "client_from_config", lambda cfg: FakeS3())
+    monkeypatch.setattr(compact_module, "UrllibPinger", lambda: pinger)
+
+    with pytest.raises(SystemExit) as exited:
+        compact_module.main(
+            ["--config", str(config), "--plan", str(tmp_path / "chain_plan.json")],
+            clock=_clock_at(DAY, 16, 30),
+            calendar=_calendar(),
+        )
+
+    assert exited.value.code == 2
+    err = capsys.readouterr().err.splitlines()
+    assert len(err) == 1
+    assert err[0].startswith("compact: ")
+    assert bucket.FIRST_UPLOAD_COMMAND in err[0]
+    assert pinger.urls == []

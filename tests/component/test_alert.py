@@ -368,12 +368,13 @@ Eastern hides a missing conversion: the body would read the same either way.
 
 
 def _no_secret(captured) -> None:
-    """Neither stream carries any of the four secrets `config.yaml` holds.
+    """Neither stream carries any of the four secrets this test's `config.yaml` holds.
 
     One sweep, called from every outcome below, so a new outcome cannot get a weaker
     check than the others. `main` loads the whole config, so all four are live in the
     frame, and the design puts the Schwab pair in the same class as the ping key and the
-    topic. A sweep for two of four passes a command that prints the other two.
+    topic. A sweep for two of four passes a command that prints the other two. The config
+    names a path backup target, so it carries neither of the bucket's two keys.
     """
     for stream in (captured.out, captured.err):
         for secret in (NTFY_TOPIC, PING_KEY, SCHWAB_API_KEY, SCHWAB_APP_SECRET):
