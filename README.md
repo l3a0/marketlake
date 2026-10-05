@@ -7,12 +7,13 @@ taken is gone forever. So capture reliability is the first-order concern.
 An unbuilt deliverable's issue is the source of truth for its scope. The design doc at
 [docs/design.md](docs/design.md) carries the reasoning, the premise, and the
 considered-and-rejected register, and it is the source of truth for everything already built.
-The build plan at [docs/build-plan.md](docs/build-plan.md) sequences the work into
-deliverables D0 through D21 and links each unbuilt one to its issue.
+The build plan at [docs/build-plan.md](docs/build-plan.md) records the slice build, deliverables
+D0 through D21, and points at the MVP milestone that orders current work.
 
 ## Status
 
-Build in progress. This is slice 1, the capture clock.
+The five build slices closed on 2026-10-05. Current work is the
+[MVP 2](https://github.com/l3a0/marketlake/milestone/5) milestone, capture on a hosted VM.
 
 The first deliverable, D0, is the test harness. It builds the seams the whole suite
 leans on. A seam is an injection point where a real dependency is swapped for a fake

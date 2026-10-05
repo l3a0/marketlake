@@ -1,8 +1,16 @@
 # Marketlake — build plan
 
-This plan sequences the build. It says what ships, in what order, and how each piece is tested. It does not restate the design, and it does not carry a deliverable's scope. Each unbuilt deliverable's issue is the source of truth for what that deliverable is, per the directive in `CLAUDE.md`. The design doc at [design.md](design.md) carries the reasoning and the considered-and-rejected register. Read the issue for scope and the design doc for why.
+This plan says how each piece is tested, and it records the order the slice build shipped in. It does not restate the design, and it does not carry a deliverable's scope. Each unbuilt deliverable's issue is the source of truth for what that deliverable is, per the directive in `CLAUDE.md`. The design doc at [design.md](design.md) carries the reasoning and the considered-and-rejected register. Read the issue for scope and the design doc for why.
 
-Status: PLAN, 2026-08-26.
+Status: PLAN, 2026-08-26. The slice build closed on 2026-10-05.
+
+## MVP milestones
+
+On 2026-10-05 deliverables D0 through D21 had shipped, and the owner closed the slice milestones. A milestone now exists only for an MVP deliverable, the next step on the shortest path to a product someone can use. The open one is [MVP 2, capture on a hosted VM](https://github.com/l3a0/marketlake/milestone/5), and its description says when it is done.
+
+The milestone lists the work, and each issue's blocked-by links give the order. This plan restates neither, because a copied list goes stale the first time an issue joins the milestone. The filing rule in `CLAUDE.md` says which issues join a milestone and which carry `deferred`.
+
+The slicing rule and the deliverables D0 through D21 below are the record of the slice build, kept as written. No new entry joins them. The sections from the test tiers onward are not tied to slices, and they stay in force for MVP work.
 
 ## Slicing rule
 
