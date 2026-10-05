@@ -258,7 +258,8 @@ class SlugEscalation:
 # pattern holding no "/" is matched against a path's last component, so it drops that
 # name wherever in the tree it appears. A pattern holding a "/" is matched against the
 # end of the whole path. A trailing "/" narrows the match to directories, and an
-# excluded directory is never descended into.
+# excluded directory is never descended into. A bucket target has no ``rsync`` to apply
+# the list, so ``lake.bucket.rsync_excluded`` applies it with these same rules.
 #
 # The bar for an entry is high. An over-broad pattern drops real data and the sync
 # still exits clean, so the loss surfaces only at a restore. Two entries clear it.

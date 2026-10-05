@@ -55,6 +55,92 @@ Tests sit in one folder per tier, matching the build plan's placement rule.
 - `tests/integration` wires two or more subsystems through real boundaries. It is also
   where a test that needs a second real process lives.
 
+## Back up to a bucket
+
+The backup target is an external SSD by default, copied with `rsync`. It can instead be an
+S3 bucket, which is what a hosted VM needs, since no SSD is attached to one. The design's
+Backup section carries the reasoning, and
+[#639](https://github.com/l3a0/marketlake/issues/639) carries the plan. Switching back is one
+setting: put the path back in `backup_target`.
+
+Four steps set the bucket up. The owner does each by hand in the AWS console or CLI, and
+nothing here names a real account, bucket, or key.
+
+1. Create the bucket with versioning on and Object Lock off.
+2. Add a lifecycle rule that expires noncurrent versions after 30 days under
+   `manifest.jsonl`, `quarantine.jsonl`, `actions/` and `journal/`. Those are the files
+   rewritten every night. Partitions keep every version, because with no Object Lock an
+   overwritten partition's old version is its only good copy.
+3. Create an access key whose policy grants exactly `s3:PutObject`, `s3:GetObject`,
+   `s3:ListBucket` and `s3:GetBucketVersioning`, and nothing that deletes a version or
+   changes the bucket.
+4. Put the key in `config.yaml`, run the first upload, restore once from the bucket
+   ([#640](https://github.com/l3a0/marketlake/issues/640)), and only then change
+   `backup_target`.
+
+The examples below use the placeholder bucket `example-lake-backup` and keep the lake
+under the `lake/` prefix, so the live check's probe objects can sit under `live-check/`
+outside it. A lifecycle rule takes one prefix per filter, so step 2 is four rules.
+
+```json
+{
+  "Rules": [
+    {"ID": "manifest", "Status": "Enabled", "Filter": {"Prefix": "lake/manifest.jsonl"},
+     "NoncurrentVersionExpiration": {"NoncurrentDays": 30}},
+    {"ID": "quarantine", "Status": "Enabled", "Filter": {"Prefix": "lake/quarantine.jsonl"},
+     "NoncurrentVersionExpiration": {"NoncurrentDays": 30}},
+    {"ID": "actions", "Status": "Enabled", "Filter": {"Prefix": "lake/actions/"},
+     "NoncurrentVersionExpiration": {"NoncurrentDays": 30}},
+    {"ID": "journal", "Status": "Enabled", "Filter": {"Prefix": "lake/journal/"},
+     "NoncurrentVersionExpiration": {"NoncurrentDays": 30}}
+  ]
+}
+```
+
+The key's policy for step 3:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect": "Allow", "Action": ["s3:ListBucket", "s3:GetBucketVersioning"],
+     "Resource": "arn:aws:s3:::example-lake-backup"},
+    {"Effect": "Allow", "Action": ["s3:PutObject", "s3:GetObject"],
+     "Resource": "arn:aws:s3:::example-lake-backup/*"}
+  ]
+}
+```
+
+Step 4's keys in `config.yaml`. The three `bucket_` keys may sit beside a path
+`backup_target`, which is how the first upload runs before the switch.
+
+```yaml
+bucket_access_key_id: <access key id>
+bucket_secret_access_key: <secret access key>
+bucket_region: <region, like us-east-2>
+# Last, after the first upload and one restore have both passed:
+backup_target: s3://example-lake-backup/lake
+```
+
+The client is built from those three values alone, never from `~/.aws/` or an `AWS_*`
+environment variable.
+
+Three commands go with it.
+
+1. `uv run python -m lake.bucket live-check --target s3://example-lake-backup/live-check`
+   confirms the four S3 behaviors the design rests on, and is live check 8 in the build
+   plan. It writes three probe objects and names the prefix to delete by hand, since the
+   narrow key cannot delete.
+2. `uv run python -m lake.bucket first-upload --target s3://example-lake-backup/lake`
+   uploads the whole lake, comparing every object, and prints its throughput. Run it on
+   an evening after the 18:30 sweep. It refuses on Sunday from 19:55 to 23:30, while the
+   Sunday job may be scrubbing the bucket. The same command re-baselines a bucket whose
+   copy of `manifest.jsonl` stopped being a prefix of the lake's, which the nightly
+   upload refuses with a line naming it. `networkQuality -s`, built into macOS, measures
+   upload capacity beforehand.
+3. The nightly upload needs no command. Once `backup_target` names the bucket, the
+   close+15 compaction uploads to it in place of `rsync`, and the Sunday job scrubs it.
+
 ## Develop
 
 The toolchain is [uv](https://docs.astral.sh/uv/). Set up the environment, then run
