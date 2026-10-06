@@ -48,8 +48,10 @@ SPY_WITHOUT_OPTIONS = b"SPY: {options: false, bars: [1m, 1d]}\n"
 def _build_lake(root: Path, *, unnamed: bool = False) -> Path:
     """A lake whose master names SPY and QQQ, with SPY's span open and QQQ's closed.
 
-    ``unnamed`` adds a third instrument with an open span and a ticker valid only from
-    2030, so the master cannot name it on ``AT``'s market date.
+    ``unnamed`` adds a third instrument with an open span and a ticker valid from the day
+    after ``AT``'s market date. The master cannot name it on ``AT``, and can on any day
+    since, so a check that read the system clock instead of the injected one would name
+    it and refuse.
     """
     root.mkdir()
     master = SecurityMaster()
@@ -61,7 +63,7 @@ def _build_lake(root: Path, *, unnamed: bool = False) -> Path:
     spans.close_span(qqq, CLOSED)
     if unnamed:
         later = master.register(
-            kind="equity", capture_start=START, valid_from=date(2030, 1, 2), ticker="IWM"
+            kind="equity", capture_start=START, valid_from=date(2026, 9, 22), ticker="IWM"
         )
         spans.open_span(later, START, False)
     master.write(master_path(root))
