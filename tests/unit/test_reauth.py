@@ -441,3 +441,14 @@ def test_the_report_prints_the_callback_and_the_token_path(tmp_path):
     assert CALLBACK in rendered
     assert str(token) in rendered
     assert "token landed:  yes" in rendered
+
+
+def test_the_writer_keeps_the_text_it_wrote_which_is_the_files_bytes(tmp_path):
+    # The token parameter's put sends this text, so it must be exactly what landed.
+    token = tmp_path / "token.json"
+    writer = m.token_writer(token)
+    assert writer.text is None
+    writer(FRESH_TOKEN)
+    assert writer.text == token.read_text()
+    assert json.loads(writer.text) == FRESH_TOKEN
+    assert m.write_token(tmp_path / "other.json", OLD_TOKEN) == json.dumps(OLD_TOKEN)

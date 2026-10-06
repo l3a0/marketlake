@@ -26,7 +26,10 @@ no-default check. A re-added seam fails it in any form, required or defaulted.
 ``reauth.main`` is the same shape. Its seam is the vendor login flow, which opens a
 browser, listens on a local callback port, and talks to Schwab. It builds that itself, so
 a test drives the entry with a fake ``schwab`` package in ``sys.modules`` rather than by
-handing the entry a flow.
+handing the entry a flow. Its second seam is the token parameter's AWS client, which
+``reauth_from_config`` takes as a factory and ``token_store.push`` and ``token_store.pull``
+take as a client and a factory. ``reauth.main`` and ``token_store.main`` build both
+themselves, so a test answers the client through botocore's event hooks instead.
 
 ``probe_calendar.main`` already took none. ``compact.main``, ``control_plane.main`` and
 ``daemon.main`` now build ``rsync``, the ntfy POST, the healthchecks GET, the vendor
@@ -48,7 +51,7 @@ import inspect
 
 import pytest
 
-from lake import bucket, compact, control_plane, daemon, reauth, runner, sweep
+from lake import bucket, compact, control_plane, daemon, reauth, runner, sweep, token_store
 
 # Each row is an entry and a seam it must never default. Requiring the seam means a caller
 # that omits it gets a TypeError, not a live object. The protection follows each seam to
@@ -75,6 +78,9 @@ REQUIRED = [
     (sweep._friday_wake, "schedule_reader"),
     (reauth.reauth, "login_flow"),
     (reauth.reauth_from_config, "login_flow"),
+    (reauth.reauth_from_config, "store_client_factory"),
+    (token_store.push, "client"),
+    (token_store.pull, "client_factory"),
     (bucket.nightly_upload, "client"),
     (bucket.first_upload, "client"),
     (bucket.bucket_scrub, "client"),
@@ -104,6 +110,9 @@ FORBIDDEN = [
     (control_plane.main, "clock_probe"),
     (control_plane.main, "transport"),
     (reauth.main, "login_flow"),
+    (reauth.main, "store_client_factory"),
+    (token_store.main, "client"),
+    (token_store.main, "client_factory"),
     (bucket.main, "client"),
     (compact.main, "client"),
     (control_plane.main, "bucket_client"),

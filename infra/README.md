@@ -654,8 +654,8 @@ decrypted value into the state. So the owner puts each value from the laptop. `m
 `AmazonSSMManagedInstanceCore`, which [#695](https://github.com/l3a0/marketlake/issues/695)
 attaches, lets the instance role read every parameter in the account, which holds no
 other secret. `marketlake-token-writer` can only overwrite the
-token, which the laptop's weekly re-auth does once
-[#636](https://github.com/l3a0/marketlake/issues/636) lands.
+token, which the laptop's weekly re-auth does when its `config.yaml` sets
+`token_store: both` ([#636](https://github.com/l3a0/marketlake/issues/636)).
 
 ### Create the token writer, in order
 
@@ -748,8 +748,9 @@ re-auth puts the real token back.
    ```
 
 4. Run the weekly re-auth, the rendered `reauth.sh`, which creates the parameter again as
-   a Standard `SecureString`. Until [#636](https://github.com/l3a0/marketlake/issues/636)
-   lands, put the token again with the `file://` command above instead.
+   a Standard `SecureString`. While the laptop's `config.yaml` leaves `token_store` absent
+   or `file`, the re-auth puts nothing, so put the token again with the `file://` command
+   above instead.
 5. Delete the deactivated key in the console. A user holds at most two access keys, and a
    deactivated key counts toward the two.
 
