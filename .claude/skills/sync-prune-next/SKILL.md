@@ -242,9 +242,21 @@ old content under a new version, and looks exactly like a good write.
 - **`prs`** has one entry per open pull request, written as
   `{issue, pr, state, review, linked, reviewed, rollup}` and keyed by `issue`.
   An entry keyed `n` drops its card without any error. `linked` comes from the
-  pull request's `closingIssuesReferences`. `reviewed` comes from whether a
-  review comment has been posted on it, because GitHub's review decision cannot
-  tell whether the review ran. `rollup` is a list
+  pull request's `closingIssuesReferences`. A reviewed, green card lands in the
+  owner's queue, so `reviewed` is true only once the review is complete. Any
+  review comment is not enough, because a session can post some lenses' results
+  while another lens still runs. That sent
+  [PR #713](https://github.com/l3a0/marketlake/pull/713) to the owner while its
+  mutation lens was running. A review is complete when the pull request carries
+  a comment or review whose body starts with the line `## Review complete`.
+  Count those with
+  `gh pr view <n> --json comments,reviews --jq '[.comments[].body, .reviews[].body] | map(select(startswith("## Review complete"))) | length'`,
+  and set `reviewed` only when the count is above zero. GitHub's review
+  decision cannot tell whether the review ran, so it does not decide
+  `reviewed`. A session posting review results puts that heading only on the
+  comment that closes the review, after every lens has reported. A partial
+  comment leaves `reviewed` false, and the entry's `review` text says which
+  lens is still running. `rollup` is a list
   of `[name, conclusion]` pairs, where the conclusion is one of `"success"`,
   `"failure"`, `"running"` or `"neutral"`.
 - **`working`** marks a card a session is on right now, as `{n, kind, what}`.
@@ -282,9 +294,10 @@ So a card's milestone comes only from `tracker`, and an issue missing from
   the time of the write.
 - `working` entries are owed a removal by whoever added them, so report a stale
   one rather than deleting another session's entry. A build session keeps its
-  entry until it hands its pull request over, so an entry on a card with an
-  open pull request keeps that card out of the owner's queue whatever its
-  `kind`. Ask whoever added it before calling it stale.
+  entry until it hands its pull request over. Until that session removes the
+  entry, the card stays out of "Waiting on your review" whatever its `kind`,
+  even when its pull request is reviewed and green. Ask whoever added it before
+  calling it stale.
 
 Pass `--limit 1000` to every `gh` list command that feeds the board, because
 `gh` stops at its limit without a warning and its default is 30. A cut list
