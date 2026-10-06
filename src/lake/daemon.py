@@ -175,7 +175,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Protocol
 
-from lake.alert import REFUSED, Message, NtfyTransport, Publisher, Transport
+from lake import outbox
+from lake.alert import REFUSED, Message, Publisher, Transport
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
 from lake.capture import (
     CycleResult,
@@ -200,7 +201,7 @@ from lake.journal import CHAINS_SURFACE
 from lake.metadata import stamp_assertion_pid, stamp_cycle, stamp_ping
 from lake.reference_read import read_or_none
 from lake.report import write_close_guard
-from lake.runner import Pinger, UrllibPinger
+from lake.runner import Pinger
 from lake.schema_drift import SchemaDriftObserver
 from lake.schema_drift import page as page_schema_drift
 from lake.schema_versions import check_running_version
@@ -1358,12 +1359,13 @@ def run_loop_from_config(
     design's chain is the wake alarm, then ``KeepAlive`` starting the daemon, then the
     assertion keeping an open laptop awake, and this is the link that holds it.
 
-    ``transport``, ``pinger`` and ``backup`` are required, and none has a live default.
-    Each one reaches past this process: a real ntfy POST, a real healthchecks GET, and an
-    ``rsync`` of the whole lake. A default would hand every caller the live object without
-    being asked. A test that forgot to pass one used to get exactly that, and a page sent
-    from a test is a page a person receives. ``main`` builds the live three; everything
-    else supplies its own.
+    ``transport``, ``pinger`` and ``compaction_runner`` are required, and none has a live
+    default. Each one reaches past this process: a real ntfy POST, a real healthchecks GET,
+    and a spawned compaction child that goes on to ``rsync`` the whole lake. A default would
+    hand every caller the live object without being asked. A test that forgot to pass one
+    used to get exactly that, and a page sent from a test is a page a person receives.
+    ``main`` passes the pair ``outbox.senders`` returns and the real spawn. Every other
+    caller supplies its own.
 
     ``plan_path`` names the machine-derived chunk plan the close+15 re-tune rewrites. It
     defaults to the same file the capture cycle reads, so the two never disagree about
@@ -1852,9 +1854,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """The ``python -m lake.daemon`` entry. Loops forever, so it returns only when stopped."""
     args = build_parser().parse_args(argv)
-    # The only construction site in this module. The config is read here as well as
-    # inside the loop, because the ntfy topic names the transport and the transport is
-    # wired from out here now.
+    # The senders come from ``outbox``, the only construction site in the package. The
+    # config is read here as well as inside the loop, because the ntfy topic names the
+    # transport and the transport is wired from out here now.
     #
     # The wrapper puts this entry in the same class as every other one that reads an
     # operator file. A missing config or roster is an operator mistake, so it earns one
@@ -1863,12 +1865,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     # repeat every few seconds in the log the operator is told to read.
     with input_errors_exit("daemon"):
         config = load_config(args.config)
+        sends = outbox.senders(config)
         run_loop_from_config(
             config_path=args.config,
             tickers_path=args.tickers,
             token_path=args.token,
-            transport=NtfyTransport(config.ntfy_topic.reveal()),
-            pinger=UrllibPinger(),
+            transport=sends.transport,
+            pinger=sends.pinger,
             compaction_runner=_spawn_compaction,
         )
     return 0

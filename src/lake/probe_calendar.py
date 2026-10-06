@@ -326,12 +326,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--token", help="Path to token.json.")
     args = parser.parse_args(argv)
 
-    from lake.alert import NtfyTransport, Publisher
+    from lake import outbox
+    from lake.alert import Publisher
     from lake.calendar import ExchangeCalendar
     from lake.clock import SystemClock
     from lake.config import input_errors_exit, load_config
     from lake.control_plane import CALENDAR_PROBE_SLUG
-    from lake.runner import UrllibPinger
     from lake.schwab import SchwabVendor
     from lake.tickers import load_tickers
 
@@ -351,14 +351,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         symbols=roster.symbols,
         fetch=vendor.get_quotes,
     )
+    sends = outbox.senders(config)
     return report(
         result,
         publisher=Publisher(
             lake_root=config.lake_root,
-            transport=NtfyTransport(config.ntfy_topic.reveal()),
+            transport=sends.transport,
             secrets=config.page_secrets(),
         ),
-        pinger=UrllibPinger(),
+        pinger=sends.pinger,
         ping_url=config.healthchecks_url(CALENDAR_PROBE_SLUG),
         slug=CALENDAR_PROBE_SLUG,
         now=clock.now(),

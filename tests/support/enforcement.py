@@ -1,7 +1,8 @@
-"""The two enforcement scanners.
+"""The three enforcement scanners.
 
-These back the two tests that stay in continuous integration for the life of the
-project. They keep the clock seam and the calendar seam from being bypassed.
+These back the three tests that stay in continuous integration for the life of the
+project. They keep the clock seam, the calendar seam and the two live senders from
+being bypassed.
 
 1. The clock scanner fails the build on any direct wall-clock call anywhere under
    ``src/lake`` outside the clock module. A direct wall-clock call is a read of the
@@ -16,11 +17,18 @@ project. They keep the clock seam and the calendar seam from being bypassed.
    An integer pair is not one of these. ``WallClockTime(19, 55)`` and
    ``datetime(y, m, d, 16, 15)`` pass unseen, which is what lets the control plane
    pin its wall-clock moments as integers.
+3. The sender scanner fails the build on any reference to ``NtfyTransport`` or
+   ``UrllibPinger`` anywhere under ``src/lake`` outside the outbox module, which is the
+   one place both are built. A reference is a name, an attribute, an imported name or
+   its alias, or a string equal to the class name, which is what ``getattr`` by name
+   needs. It reads references rather than calls, because a scan of calls misses an
+   aliased import, ``functools.partial``, and ``getattr`` by name. The one exemption is
+   each class's own entry in the ``__all__`` of the module that defines it.
 
-Both scanners read the source with the ``ast`` module and resolve names through the
-file's own imports, so aliased imports are caught and false positives stay rare. They
-scan production code only. Tests are where injection happens by design, so a test is
-free to name any time it likes through the fakes.
+All three read the source with the ``ast`` module. The first two resolve names through
+the file's own imports, so aliased imports are caught and false positives stay rare.
+They scan production code only. Tests are where injection happens by design, so a test
+is free to name any time or sender it likes through the fakes.
 """
 
 from __future__ import annotations
@@ -34,6 +42,11 @@ from pathlib import Path
 LAKE_SRC = Path(__file__).resolve().parents[2] / "src" / "lake"
 CLOCK_MODULE = "clock.py"
 CALENDAR_MODULE = "calendar.py"
+OUTBOX_MODULE = "outbox.py"
+
+# The two live senders, each with the module that defines and exports it. A string in
+# that module's ``__all__`` is the export rather than a use, so it alone is exempt.
+SENDER_CLASSES = {"NtfyTransport": "alert.py", "UrllibPinger": "runner.py"}
 
 # Canonical tokens a name can resolve to.
 TIME_MODULE = "time"
@@ -203,14 +216,64 @@ class _SessionTimeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+class _SenderVisitor(ast.NodeVisitor):
+    """Flags every reference to a live sender class, whatever spelling it takes."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.module = Path(path).name
+        self.violations: list[Violation] = []
+
+    def _flag(self, node: ast.AST, name: str, how: str) -> None:
+        self.violations.append(
+            Violation(self.path, node.lineno, node.col_offset, f"sender reference: {name} ({how})")
+        )
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        # The export list in the class's own module names it without using it. Every other
+        # entry in that list, and every entry in any other module's list, is scanned.
+        exporting = any(isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets)
+        if exporting and isinstance(node.value, (ast.List, ast.Tuple)):
+            for element in node.value.elts:
+                if (
+                    isinstance(element, ast.Constant)
+                    and SENDER_CLASSES.get(element.value) == self.module
+                ):
+                    continue
+                self.visit(element)
+            return
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if node.id in SENDER_CLASSES:
+            self._flag(node, node.id, "name")
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr in SENDER_CLASSES:
+            self._flag(node, node.attr, "attribute")
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        for alias in node.names:
+            for name in (alias.name, alias.asname):
+                if name in SENDER_CLASSES:
+                    self._flag(node, name, "import")
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        if isinstance(node.value, str) and node.value in SENDER_CLASSES:
+            self._flag(node, node.value, "string")
+
+
 def scan_source(source: str, kind: str, filename: str = "<source>") -> list[Violation]:
-    """Scan one source string. ``kind`` is ``"clock"`` or ``"session_time"``."""
+    """Scan one source string. ``kind`` is ``"clock"``, ``"session_time"`` or ``"sender"``."""
     tree = ast.parse(source, filename=filename)
     imports = _build_imports(tree)
     if kind == "clock":
         visitor: ast.NodeVisitor = _ClockVisitor(filename, imports)
     elif kind == "session_time":
         visitor = _SessionTimeVisitor(filename, imports)
+    elif kind == "sender":
+        visitor = _SenderVisitor(filename)
     else:
         raise ValueError(f"unknown scan kind {kind!r}")
     visitor.visit(tree)
@@ -237,3 +300,8 @@ def find_session_time_violations(
 ) -> list[Violation]:
     """Every hardcoded session time under ``root`` outside the calendar module."""
     return _scan_tree(root, "session_time", allow if allow is not None else {CALENDAR_MODULE})
+
+
+def find_sender_references(root: Path = LAKE_SRC, allow: set[str] | None = None) -> list[Violation]:
+    """Every reference to a live sender class under ``root`` outside the outbox module."""
+    return _scan_tree(root, "sender", allow if allow is not None else {OUTBOX_MODULE})

@@ -445,9 +445,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> int:
     """The ``python -m lake.alert`` entry. Returns a process exit code.
 
-    The transport is built here, not accepted. It POSTs to ntfy, which reaches a phone,
-    so a ``main`` that accepted one let a test omit it and send for real. A test replaces
-    ``NtfyTransport`` instead, which drives the rest of this wiring unchanged.
+    The transport is never accepted. It POSTs to ntfy, which reaches a phone, so a
+    ``main`` that accepted one let a test omit it and send for real. It comes from
+    ``outbox.senders``, the only construction site in the package, and a test replaces
+    ``NtfyTransport`` on this module, where ``outbox`` looks it up, which drives the rest
+    of this wiring unchanged. ``outbox`` is imported here rather than at the top, because
+    it imports this module.
 
     The topic comes from the same config every other producer reads, never from the
     command line. A topic typed at the prompt would prove a channel nothing else uses,
@@ -457,6 +460,7 @@ def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> in
     """
     args = build_parser().parse_args(argv)
 
+    from lake import outbox
     from lake.config import input_errors_exit, load_config
 
     with input_errors_exit("alert"):
@@ -464,7 +468,7 @@ def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> in
 
     publisher = Publisher(
         lake_root=config.lake_root,
-        transport=NtfyTransport(config.ntfy_topic.reveal()),
+        transport=outbox.senders(config).transport,
         # The values that must never reach a phone, checked against the page itself.
         secrets=config.page_secrets(),
     )

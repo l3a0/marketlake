@@ -504,8 +504,9 @@ def run_once_from_config(
 
     ``pinger`` and ``backup`` are required and have no live defaults. Both reach past
     this process, one to healthchecks and one to the backup target over ``rsync``, and a
-    default would hand them to a caller that never asked. ``main`` builds the live pair.
-    A test drives ``run_once`` directly with fakes instead.
+    default would hand them to a caller that never asked. ``main`` passes the pinger
+    ``outbox.senders`` returns and the ``RsyncBackup`` it builds. A test drives
+    ``run_once`` directly with fakes instead.
 
     A bucket target is refused with one line. This entry is not installed on the live
     machine, and run once a minute it would upload to the bucket once a minute.
@@ -769,13 +770,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
 
     if args.command == "run":
+        # Imported here, because ``outbox`` imports this module.
+        from lake import outbox
+
         with input_errors_exit("runner"):
+            config = load_config(args.config)
             outcome = run_once_from_config(
                 config_path=args.config,
                 tickers_path=args.tickers,
                 token_path=args.token,
-                # The only construction site in this module.
-                pinger=UrllibPinger(),
+                # The pinger comes from ``outbox``, the only construction site in the
+                # package for it. The backup runner is the one built in this module.
+                pinger=outbox.senders(config).pinger,
                 backup=RsyncBackup(),
             )
         # Report by slug and counts only. The ping URL carries the secret ping key and

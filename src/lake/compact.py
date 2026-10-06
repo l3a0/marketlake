@@ -157,8 +157,8 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from lake import bucket, journal
-from lake.alert import REFUSED, Message, NtfyTransport, Publisher
+from lake import bucket, journal, outbox
+from lake.alert import REFUSED, Message, Publisher
 from lake.calendar import Calendar, ExchangeCalendar
 from lake.chain_plan import DEFAULT_CHAIN_PLAN_PATH, ChainPlan, Window, load_chain_plan
 from lake.clock import Clock, SystemClock
@@ -204,7 +204,6 @@ from lake.runner import (
     BackupRunner,
     Pinger,
     RsyncBackup,
-    UrllibPinger,
     escalate_ping_failure,
 )
 from lake.session import SessionClock
@@ -2239,6 +2238,9 @@ def main(
     form of ``backup_target``. A ``main`` that accepted them let a test omit one and
     reach the real effect, so ``main`` builds them and a test drives the ``compact``
     helper directly instead.
+    The pinger and the publisher's transport come from ``outbox.senders``, the only
+    construction site the package has for either, so a test replaces them on
+    ``lake.runner`` and ``lake.alert``.
 
     ``clock`` and ``calendar`` stay injectable. A system clock and an exchange calendar
     never reach past this process, so a test injects them with no live effect.
@@ -2270,6 +2272,7 @@ def main(
         return 0
 
     calendar = calendar if calendar is not None else ExchangeCalendar()
+    sends = outbox.senders(config)
     if isinstance(config.backup_target, BucketTarget):
         # The client is built at the upload's first request, after the seal, so a bad
         # bucket setting fails the backup and leaves the seal standing. The calendar
@@ -2286,11 +2289,11 @@ def main(
             calendar=calendar,
             backup=backup,
             backup_target=config.backup_target,
-            pinger=UrllibPinger(),
+            pinger=sends.pinger,
             ping_url=config.healthchecks_url(COMPACTION_SLUG),
             publisher=Publisher(
                 lake_root=config.lake_root,
-                transport=NtfyTransport(config.ntfy_topic.reveal()),
+                transport=sends.transport,
                 # The values that must never reach a phone, checked against the page itself.
                 secrets=config.page_secrets(),
             ),

@@ -95,7 +95,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from lake.alert import REFUSED, Message, NtfyTransport, Publisher
+from lake import outbox
+from lake.alert import REFUSED, Message, Publisher
 from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
 from lake.config import CALLBACK_KEY, BucketTarget, input_errors_exit, load_config
@@ -107,7 +108,6 @@ from lake.runner import (
     LaunchdJob,
     Pinger,
     SlugEscalation,
-    UrllibPinger,
     calendar_interval,
     escalate_ping_failure,
 )
@@ -3371,6 +3371,8 @@ def main(
     and ``tmutil`` reads all shell out or go to the network. A ``main`` that accepted them
     let a test omit one and reach the real effect. So ``main`` builds them, and a test
     drives the ``self_check`` or ``sunday_run`` helper directly, which requires its seams.
+    The two senders are the exception to "built here". They come from ``outbox.senders``,
+    the only construction site the package has for either, and are still never accepted.
 
     ``clock`` and ``calendar`` stay injectable. Neither reaches past this process, so a
     test injects the wall clock and the trading calendar with no live effect. The ``pmset``
@@ -3432,9 +3434,10 @@ def main(
         # One reading carries the stamp's own instant too, which is what lets a missing
         # pid be told apart from a stamp nothing is writing.
         stamp = read_metadata(config.lake_root)
+        sends = outbox.senders(config)
         outcome = self_check(
             probe=launchctl_probe,
-            pinger=UrllibPinger(),
+            pinger=sends.pinger,
             ping_url=config.healthchecks_url(PRE_OPEN_SLUG),
             label=args.label,
             assertion_probe=pmset_assertions_probe,
@@ -3446,7 +3449,7 @@ def main(
             # checked against the page itself.
             publisher=Publisher(
                 lake_root=config.lake_root,
-                transport=NtfyTransport(config.ntfy_topic.reveal()),
+                transport=sends.transport,
                 secrets=config.page_secrets(),
             ),
         )
@@ -3480,9 +3483,10 @@ def main(
         run_clock = clock if clock is not None else _system_clock()
         # The reminder's delivery, and the refused-ping page's. The secrets are the
         # values that must never reach a phone, checked against the message itself.
+        sends = outbox.senders(config)
         publisher = Publisher(
             lake_root=config.lake_root,
-            transport=NtfyTransport(config.ntfy_topic.reveal()),
+            transport=sends.transport,
             secrets=config.page_secrets(),
         )
         # The bucket client, built from the config's own key values, when the target is
@@ -3506,7 +3510,7 @@ def main(
             clock=run_clock,
             calendar=calendar if calendar is not None else _exchange_calendar(),
             schedule_reader=read_pmset_schedule,
-            pinger=UrllibPinger(),
+            pinger=sends.pinger,
             ping_url=config.healthchecks_url(SUNDAY_SLUG),
             canary=token_canary(
                 token_path=token_path,

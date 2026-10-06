@@ -95,8 +95,9 @@ from datetime import date, datetime
 from functools import partial
 from pathlib import Path
 
+from lake import outbox
 from lake.actions import ActionsError, ExtractionReport, extract_dividends
-from lake.alert import Message, NtfyTransport, Publisher, undelivered
+from lake.alert import Message, Publisher, undelivered
 from lake.bars import (
     CLOSE_VALUE_ABSENT,
     BackfillReport,
@@ -139,7 +140,7 @@ from lake.report import (
     redacted,
     write_nightly,
 )
-from lake.runner import PING_FAILURES, Pinger, UrllibPinger, escalate_ping_failure
+from lake.runner import PING_FAILURES, Pinger, escalate_ping_failure
 from lake.schema_versions import check_running_version
 from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor, VendorAuthError
 from lake.security_master import SecurityMasterError
@@ -1209,17 +1210,18 @@ def sweep_from_config(
             app_secret=config.schwab_app_secret.reveal(),
         )
 
+    sends = outbox.senders(config)
     return sweep(
         lake_root=config.lake_root,
         clock=SystemClock() if clock is None else clock,
         calendar=ExchangeCalendar(),
         roster=load_tickers(tickers_path),
         vendor_source=build_vendor if vendor_source is None else vendor_source,
-        pinger=UrllibPinger(),
+        pinger=sends.pinger,
         ping_url=config.healthchecks_url(EOD_SWEEP_SLUG),
         publisher=Publisher(
             lake_root=config.lake_root,
-            transport=NtfyTransport(config.ntfy_topic.reveal()),
+            transport=sends.transport,
             # The values that must never reach a phone, checked against the message itself.
             secrets=config.page_secrets(),
         ),
