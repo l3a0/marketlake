@@ -630,7 +630,12 @@ Migration later is deliberately cheap. The entire deployment is the daemon, the 
 
 **Considered and rejected: a render default read from `sys.platform`.** `render --init` picks the host to render for and defaults to `launchd`, so the laptop's render keeps its arguments and its golden files. A default read from the platform would switch every existing render test to systemd, because CI runs on `ubuntu-latest`. The probes above read the platform because they run on the host they ask about. The render writes for a host that can differ from the machine rendering.
 
-**On a Linux VM the control plane is ten systemd units**, rendered by `render --init systemd` and installed by `deploy/linux-install.sh` ([#634](https://github.com/l3a0/marketlake/issues/634)). Each job keeps its launchd label as its unit's name, so `com.marketlake.daemon.service` is the daemon, and `systemctl is-active com.marketlake.daemon` resolves it without the suffix. The six jobs are one roster, `control_plane.all_jobs`, which serves both hosts, so a seventh job reaches both renders or neither. Each setting replaces a launchd behaviour or answers a fact about the VM.
+**On a Linux VM the control plane is ten systemd units**, rendered by `render --init systemd` and installed by `deploy/linux-install.sh` ([#634](https://github.com/l3a0/marketlake/issues/634)). Each job keeps its launchd label as its unit's name, so `com.marketlake.daemon.service` is the daemon, and `systemctl is-active com.marketlake.daemon` resolves it without the suffix. The six jobs are one roster, `control_plane.all_jobs`, which serves both hosts, so a seventh job reaches both renders or neither. The ten units are these.
+
+- `com.marketlake.daemon.service` and `com.marketlake.dashboard.service`, the two residents.
+- A `.service` and a `.timer` for each of the four scheduled jobs: `com.marketlake.self-check`, `com.marketlake.calendar-probe`, `com.marketlake.eod-sweep` and `com.marketlake.sunday`.
+
+Each setting replaces a launchd behaviour or answers a fact about the VM.
 
 1. **The residents restart forever.** The daemon and the dashboard are `Type=exec` with `Restart=always` ten seconds apart and no start limit, which is `KeepAlive`. A missing config or roster exits 2, and the daemon must start once the file lands. `Type=exec` makes a start report an interpreter that cannot run, with `ExecMainStatus=203`.
 2. **Every timer names the zone.** `OnCalendar=Mon..Fri 08:30:00 America/New_York` and its siblings, built from the `WallClockTime` integers and `MARKET_TZ`. The VM's clock runs in UTC, so a timer without the zone would fire the Sunday job at 16:00 Eastern and the sweep before the close. `AccuracySec=1s` keeps each on the minute.
