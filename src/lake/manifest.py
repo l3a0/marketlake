@@ -1533,20 +1533,23 @@ class RestoreResult:
         asking for a re-copy.
 
         A bucket target gets its own advice. Its scrub compared the checksum S3 stored at
-        upload, so a mismatch there means the bytes S3 served are not the bytes it
-        accepted. Neither upload replaces an object whose stored checksum matches, so
-        the repair is an earlier version recovered by hand, which ``README.md`` describes.
-        A failed read there is the network or the bucket's key rather than a cable.
+        upload, so a mismatch there is rot at rest: the bytes S3 served are not the bytes
+        it accepted. Neither upload replaces an object whose stored checksum matches, and a
+        sealed partition is written once, so its rotted current version is usually its
+        only version. The repair is to put the lake's own copy of the file back by hand,
+        which ``README.md`` describes. A failed read there is the network or the bucket's
+        key rather than a cable.
         """
         lines = _named("restore read back bytes that do not match the manifest", self.mismatches)
         if self.mismatches and self.bucket:
             lines.append(
                 "restore mismatch: the bucket's stored checksum matched the manifest when the "
                 "scrub asked moments earlier, so the bytes S3 served are not the bytes it "
-                "accepted at upload. Re-run the Sunday job. A repeat means the object's "
-                "current version is damaged, and no upload replaces an object whose stored "
-                "checksum matches, so recover an earlier version by hand as README.md's "
-                "bucket section describes"
+                "accepted at upload. Re-run the Sunday job. A repeat means the object rotted "
+                "at rest, and no upload replaces an object whose stored checksum matches. "
+                "Once the lake scrub passes on the file, put the lake's own copy back with "
+                "aws s3api put-object --checksum-algorithm SHA256, as README.md's bucket "
+                "section describes"
             )
         elif self.mismatches:
             lines.append(

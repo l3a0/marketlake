@@ -161,32 +161,51 @@ either.
    records must match its latest entry, and any other file must match the SHA-256 S3
    stored when it was uploaded. A journal segment whose day the manifest records as
    compacted stays out, so the restored lake holds what the lake it came from holds. The
-   download lands in `<dest>.restoring` beside it and is renamed onto `<dest>` only once
-   every file has verified. A file that fails is named on its own line, `<dest>` is left
-   as it was, and the command exits 1. Running it again resumes in `<dest>.restoring` and
-   downloads only what is not already there and correct. It refuses with exit 2 when
-   `<dest>` is not empty, which keeps it off a live lake, and when the disk beside it is
-   too small. A year-end lake is about 154 GB. `<dest>` cannot be a mount point, since the
-   finished directory is renamed onto it, so restore into a directory inside one. A
-   restore uploads nothing and takes no lock, which is why a shadow host may run it, and
-   it is how a new host's empty `lake_root` is seeded.
+   download lands in a hidden working directory, `<dest>/.marketlake-restoring`, and its
+   files are moved up into `<dest>` only once every file has verified, with
+   `manifest.jsonl` moved last. A file that fails is named on its own line, `<dest>` gets
+   no `manifest.jsonl`, and the command exits 1. Running it again resumes in the working
+   directory and downloads only what is not already there and correct, and a run killed
+   while moving files in finishes the move. It refuses with exit 2 when `<dest>` holds
+   anything but `lost+found` and the working directory, which keeps it off a live lake,
+   when `<dest>` is a symbolic link, and when its filesystem is too small. A year-end lake
+   is about 154 GB. `<dest>` may be a volume's mount point, which is how a new host's
+   empty `lake_root` is seeded. A restore uploads nothing and takes no lock, which is why
+   a shadow host may run it.
 4. The nightly upload needs no command. Once `backup_target` names the bucket, the
    close+15 compaction uploads to it in place of `rsync`, and the Sunday job scrubs it and
    downloads the week's share of it to verify. A `shadow` host does neither.
    Compaction prints the upload's throughput to its log, in the line the first upload
    prints.
 
-The restore brings back current versions only. When it names a file that failed, or a
-file needs to be undone to an earlier state, the older version is recovered by hand in
-the S3 console, because the narrow key holds no `s3:GetObjectVersion`.
+The restore brings back current versions only, so a file that fails it is repaired by
+hand. Which repair fits depends on whether the lake still holds a good copy.
+
+While the lake is alive, the repair is the lake's own copy. The Sunday job's sample reads
+only objects whose stored SHA-256 the scrub matched, so a sample mismatch is rot at rest
+in an object whose stored checksum is right. A sealed partition is written once, so its
+rotted current version is usually its only version, and neither upload replaces an
+object whose stored checksum matches. Once the Sunday lake scrub passes on the file, put
+it back with the bucket's key, as a single PUT carrying its SHA-256:
+
+```bash
+aws s3api put-object --bucket example-lake-backup --key lake/<path> --body <lake_root>/<path> --checksum-algorithm SHA256
+```
+
+When the lake is gone, an earlier version is recovered by hand in the S3 console. That
+works only for a file the manifest records whose later version overwrote a good one,
+such as a nightly file rewritten or a partition recompacted. The narrow key holds no
+`s3:GetObjectVersion`, so this is a console step.
 
 1. Open the bucket, turn on **Show versions**, and go to the file's key under the lake's
    prefix.
 2. Pick the latest version uploaded before the damage, and download it.
-3. Check `shasum -a 256` of the download against the file's latest entry in the
-   restored `manifest.jsonl`, which sits in `<dest>.restoring`.
-4. Put the download at the file's path under `<dest>.restoring` and run the restore
-   again. It finds the right hash there, skips the damaged current version, and finishes.
+3. Check `shasum -a 256` of the download against the file's latest entry in
+   `<dest>/.marketlake-restoring/manifest.jsonl`, which a failed restore leaves there.
+4. Put the download at the file's path under `<dest>/.marketlake-restoring` and run the
+   restore again. It finds the manifest's hash there and does not download the damaged
+   current version. A file the manifest does not record is checked against the current
+   version's stored checksum instead, so an earlier version of one never verifies.
 
 Versioning keeps every version of a partition and 30 days of the files rewritten nightly,
 per the lifecycle rules above.

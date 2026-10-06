@@ -23,6 +23,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 import pytest
+import urllib3
 from botocore.exceptions import IncompleteReadError
 
 from lake import bucket
@@ -588,6 +589,12 @@ def test_a_rotted_object_the_scrub_matched_fails_the_restore_and_withholds(tmp_p
     # The advice names the bucket, never the disk-and-cable advice a path target gets.
     assert any("the bytes S3 served" in line for line in outcome.report)
     assert not any("cable" in line for line in outcome.report)
+    # A sealed partition is written once, so it has no earlier version to recover. The
+    # repair is the lake's own copy, put back with a whole-object SHA-256.
+    assert any(
+        "put the lake's own copy back with aws s3api put-object --checksum-algorithm SHA256" in line
+        for line in outcome.report
+    )
     assert pinger.urls == []
 
 
@@ -630,6 +637,24 @@ def test_a_read_cut_off_mid_body_is_an_os_error(tmp_path):
 
     with pytest.raises(OSError, match="could not be reached or was unavailable"):
         list(reader(QUOTES))
+
+
+def test_an_ssl_failure_mid_body_is_an_os_error(tmp_path):
+    # botocore's StreamingBody wraps a timeout and a dropped connection, and lets the
+    # rest of urllib3's errors through. An SSLError is neither a BotoCoreError nor an
+    # OSError, so unmapped it would escape the Sunday job's OSError catch.
+    _, client = _uploaded(tmp_path / "lake")
+
+    class _Body:
+        def read(self, n: int) -> bytes:
+            raise urllib3.exceptions.SSLError("decryption failed or bad record mac")
+
+        def close(self) -> None:
+            pass
+
+    client.get_object = lambda **kwargs: {"Body": _Body()}
+    with pytest.raises(OSError, match=r"could not be reached or was unavailable \(SSLError\)"):
+        list(bucket.bucket_reader(client, TARGET)(QUOTES))
 
 
 def test_a_bug_in_the_download_is_not_mapped_to_an_os_error(tmp_path):

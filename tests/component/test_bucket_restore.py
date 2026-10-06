@@ -2,26 +2,29 @@
 
 A lake is uploaded with the real ``first_upload`` and ``nightly_upload``, then restored
 into a directory beside it, so each test reads the bucket the upload actually left. The
-cases follow marketlake #640's Done when 1.
+cases follow marketlake #640's Done when 1, and the review of its pull request.
 
 1. A round trip restores every file byte for byte, and leaves out a journal segment
-   whose day the manifest records as compacted.
-2. A file that fails verification, or is missing, names itself and leaves the
-   destination as it was.
-3. A non-empty destination, a disk too small and a bucket that cannot be reached each
-   refuse with one line and exit 2.
-4. A second run after a failure resumes in the working directory.
-5. A torn last manifest line names the file it held rather than failing the run.
-6. A shadow host still restores, since a restore uploads nothing.
+   whose day the manifest records as compacted and the console's folder markers.
+2. A file that fails verification, is missing, or names a path outside the lake names
+   itself and leaves no lake at the destination.
+3. A non-empty destination, a symbolic link, a disk too small, a bucket that cannot be
+   reached and a directory that cannot be written each refuse with one line and exit 2.
+4. A destination holding only ``lost+found``, a fresh volume's mount point, is filled.
+5. A second run after a failure resumes, including a run killed while moving files in.
+6. A torn last manifest line names the file it held rather than failing the run.
+7. A shadow host still restores, since a restore uploads nothing.
 
 Expected bytes and digests are read from the lake on disk or computed with ``hashlib``
-here, never through the code under test.
+here, never through the code under test. The working directory's name is written out
+as a literal for the same reason.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
+import os
 import shutil
 from datetime import date, datetime
 from pathlib import Path
@@ -48,6 +51,7 @@ QUOTES = "quotes/ticker=SPY/date=2026-08-28.parquet"
 REPORT = "reports/date=2026-08-28.md"
 SEGMENT = "journal/date=2026-08-31/surface=chains/ticker=SPY/seg-20260831T133000Z-4242.arrows"
 SEALED = "chains/ticker=SPY/date=2026-08-31.parquet"
+WORK = ".marketlake-restoring"
 # A Friday evening after the sweep, and the Monday evening after the next session.
 FRIDAY_19 = datetime(2026, 8, 28, 19, 0, tzinfo=MARKET_TZ)
 MONDAY_19 = datetime(2026, 8, 31, 19, 0, tzinfo=MARKET_TZ)
@@ -85,6 +89,18 @@ def _files(root: Path) -> dict[str, bytes]:
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
+
+
+def _tops(root: Path) -> set[str]:
+    """The top-level names that hold a file, which is what a restore brings back."""
+    return {rel.split("/")[0] for rel in _files(root)}
+
+
+def _no_lake(dest: Path) -> None:
+    """The destination holds no lake: no ``manifest.jsonl``, nothing but the working directory."""
+    assert not (dest / "manifest.jsonl").exists()
+    if dest.exists():
+        assert set(os.listdir(dest)) <= {WORK}
 
 
 def _uploaded(tmp_path: Path) -> tuple[Path, FakeS3]:
@@ -143,7 +159,7 @@ def test_a_restore_returns_the_lake_byte_for_byte(tmp_path):
     assert not (dest / SEGMENT).exists()
     assert summary.segments_left_out == 1
     assert f"lake/{SEGMENT}" not in _gets(client)
-    assert not (tmp_path / "restored.restoring").exists()
+    assert not (dest / WORK).exists()
     # The report is the one file the manifest does not record, and journal/ and reports/
     # are where the lake keeps those by rule, so nothing is named.
     assert summary.unrecorded == []
@@ -175,6 +191,33 @@ def test_an_empty_destination_directory_is_filled(tmp_path):
     assert _files(dest) == _files(lake)
 
 
+def test_a_fresh_volume_holding_only_lost_and_found_is_filled(tmp_path):
+    # A new host mounts its lake volume at lake_root itself, and a fresh ext4 volume
+    # holds lost+found at its root. The restore must seed exactly that directory.
+    lake, client = _uploaded(tmp_path)
+    dest = tmp_path / "volume"
+    (dest / "lost+found").mkdir(parents=True)
+
+    summary = restore_lake(dest, TARGET, client=client)
+
+    assert summary.restored is True
+    assert _files(dest) == _files(lake)
+    assert set(os.listdir(dest)) == {"lost+found", *_tops(lake)}
+
+
+def test_a_console_folder_marker_is_not_a_file(tmp_path):
+    # The S3 console's "Create folder" writes a zero-byte key ending in "/". It names no
+    # file, so it neither blocks the restore nor becomes a file named journal.
+    lake, client = _uploaded(tmp_path)
+    client.store("lake/journal/", b"")
+
+    summary = restore_lake(tmp_path / "restored", TARGET, client=client)
+
+    assert summary.restored is True
+    assert summary.failures == []
+    assert _files(tmp_path / "restored") == _files(lake)
+
+
 def test_the_command_prints_one_line_and_exits_0(tmp_path, monkeypatch, capsys):
     lake, client = _uploaded(tmp_path)
     config = _config(tmp_path, lake)
@@ -193,7 +236,7 @@ def test_the_command_prints_one_line_and_exits_0(tmp_path, monkeypatch, capsys):
 # -- 2. a file that fails verification -------------------------------------------
 
 
-def test_a_rotted_object_names_itself_and_leaves_the_destination_empty(tmp_path):
+def test_a_rotted_object_names_itself_and_leaves_no_lake(tmp_path):
     lake, client = _uploaded(tmp_path)
     _rot(client, QUOTES, lake)
     dest = tmp_path / "restored"
@@ -203,9 +246,9 @@ def test_a_rotted_object_names_itself_and_leaves_the_destination_empty(tmp_path)
 
     assert summary.restored is False
     assert summary.failures == [(QUOTES, "does not match its SHA-256")]
-    assert list(dest.iterdir()) == []
+    _no_lake(dest)
     # The bad bytes never reach the working directory either.
-    assert not (tmp_path / "restored.restoring" / QUOTES).exists()
+    assert not (dest / WORK / QUOTES).exists()
 
 
 def test_an_unmanifested_object_is_checked_against_the_stored_checksum(tmp_path):
@@ -217,7 +260,7 @@ def test_an_unmanifested_object_is_checked_against_the_stored_checksum(tmp_path)
     summary = restore_lake(tmp_path / "restored", TARGET, client=client)
 
     assert summary.failures == [(REPORT, "does not match its SHA-256")]
-    assert not (tmp_path / "restored").exists()
+    _no_lake(tmp_path / "restored")
 
 
 def test_an_object_with_no_stored_checksum_cannot_be_verified(tmp_path):
@@ -227,10 +270,10 @@ def test_an_object_with_no_stored_checksum_cannot_be_verified(tmp_path):
     summary = restore_lake(tmp_path / "restored", TARGET, client=client)
 
     assert summary.failures == [(REPORT, "has no SHA-256 stored in the bucket to verify")]
-    assert not (tmp_path / "restored").exists()
+    _no_lake(tmp_path / "restored")
 
 
-def test_a_missing_object_names_itself_and_leaves_the_destination_empty(tmp_path):
+def test_a_missing_object_names_itself_and_leaves_no_lake(tmp_path):
     lake, client = _uploaded(tmp_path)
     del client.objects[f"lake/{QUOTES}"]
 
@@ -238,7 +281,7 @@ def test_a_missing_object_names_itself_and_leaves_the_destination_empty(tmp_path
 
     assert summary.restored is False
     assert summary.failures == [(QUOTES, "missing from the bucket")]
-    assert not (tmp_path / "restored").exists()
+    _no_lake(tmp_path / "restored")
 
 
 def test_an_object_gone_between_the_listing_and_its_download_is_missing(tmp_path):
@@ -255,7 +298,36 @@ def test_an_object_gone_between_the_listing_and_its_download_is_missing(tmp_path
     summary = restore_lake(tmp_path / "restored", TARGET, client=client)
 
     assert summary.failures == [(QUOTES, "missing from the bucket")]
-    assert not (tmp_path / "restored").exists()
+    _no_lake(tmp_path / "restored")
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param("lake/../escape.txt", id="climbs-out"),
+        pytest.param("lake//ESCAPE", id="absolute"),
+        pytest.param("lake/chains/./x.parquet", id="dot"),
+        pytest.param("lake/.marketlake-restore", id="marker-name"),
+    ],
+)
+def test_a_key_naming_a_path_outside_the_lake_is_never_written(tmp_path, key):
+    # A person or another tool can write any key into the bucket. The absolute form
+    # names a path under tmp_path, so the test can look for it there.
+    lake, client = _uploaded(tmp_path)
+    key = key.replace("ESCAPE", str(tmp_path / "escape.txt").lstrip("/"))
+    client.store(key, b"evil")
+    before = _files(tmp_path)
+
+    summary = restore_lake(tmp_path / "restored", TARGET, client=client)
+
+    assert summary.restored is False
+    assert [why for _, why in summary.failures] == [
+        "names a path outside the lake, so it was not written"
+    ]
+    assert not (tmp_path / "escape.txt").exists()
+    after = {rel for rel in _files(tmp_path) if not rel.startswith("restored/")}
+    assert after == set(before)
+    _no_lake(tmp_path / "restored")
 
 
 def test_the_command_names_each_failing_file_and_exits_1(tmp_path, monkeypatch, capsys):
@@ -273,7 +345,7 @@ def test_the_command_names_each_failing_file_and_exits_1(tmp_path, monkeypatch, 
     assert lines[1] == f"restore: does not match its SHA-256: {QUOTES}"
     assert lines[2].startswith("restore: 2 file(s) failed, so ")
     assert len(lines) == 3
-    assert not (tmp_path / "restored").exists()
+    _no_lake(tmp_path / "restored")
 
 
 # -- 3. refusals, each one line and exit 2 ----------------------------------------
@@ -314,7 +386,40 @@ def test_a_non_empty_destination_refuses_before_any_request(tmp_path, monkeypatc
     line = _refused(capsys, exc)
     assert "is not empty" in line
     assert client.calls == []
-    assert not (tmp_path / "lake.restoring").exists()
+    assert not (lake / WORK).exists()
+
+
+def test_lost_and_found_beside_other_files_still_refuses(tmp_path, monkeypatch, capsys):
+    lake, client = _uploaded(tmp_path)
+    config = _config(tmp_path, lake)
+    dest = tmp_path / "volume"
+    (dest / "lost+found").mkdir(parents=True)
+    (dest / "notes.txt").write_text("someone's file\n")
+    client.calls.clear()
+
+    with pytest.raises(SystemExit) as exc:
+        _main(config, client, monkeypatch, dest)
+
+    assert "is not empty, it holds notes.txt" in _refused(capsys, exc)
+    assert client.calls == []
+    assert sorted(os.listdir(dest)) == ["lost+found", "notes.txt"]
+
+
+def test_a_symlinked_destination_refuses_before_any_request(tmp_path, monkeypatch, capsys):
+    lake, client = _uploaded(tmp_path)
+    config = _config(tmp_path, lake)
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    client.calls.clear()
+
+    with pytest.raises(SystemExit) as exc:
+        _main(config, client, monkeypatch, link)
+
+    assert "is a symbolic link" in _refused(capsys, exc)
+    assert client.calls == []
+    assert list(real.iterdir()) == []
 
 
 def test_a_disk_too_small_refuses_before_any_data_file(tmp_path, monkeypatch, capsys):
@@ -331,7 +436,21 @@ def test_a_disk_too_small_refuses_before_any_data_file(tmp_path, monkeypatch, ca
     assert "MB free, so nothing was restored" in line
     assert _gets(client) == ["lake/manifest.jsonl"]
     assert not (tmp_path / "restored").exists()
-    assert not (tmp_path / "restored.restoring").exists()
+
+
+def test_free_space_is_measured_on_the_destination_s_own_filesystem(tmp_path):
+    # A mount point sits on its own filesystem, so its parent's free space says nothing.
+    lake, client = _uploaded(tmp_path)
+    dest = tmp_path / "volume"
+    dest.mkdir()
+    asked: list[Path] = []
+
+    def free(path: Path) -> int:
+        asked.append(path)
+        return 10**12
+
+    assert restore_lake(dest, TARGET, client=client, free_space=free).restored is True
+    assert asked == [dest]
 
 
 def test_exactly_enough_free_space_is_enough(tmp_path):
@@ -358,6 +477,23 @@ def test_an_unreachable_bucket_refuses_with_one_line(tmp_path, monkeypatch, caps
     assert "a re-run resumes in the working directory" in line
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes through permission bits")
+def test_a_destination_that_cannot_be_written_refuses_with_one_line(tmp_path, monkeypatch, capsys):
+    lake, client = _uploaded(tmp_path)
+    config = _config(tmp_path, lake)
+    parent = tmp_path / "locked"
+    parent.mkdir()
+    parent.chmod(0o555)
+    try:
+        with pytest.raises(SystemExit) as exc:
+            _main(config, client, monkeypatch, parent / "restored")
+    finally:
+        parent.chmod(0o755)
+
+    line = _refused(capsys, exc)
+    assert "creating " in line and "PermissionError" in line
+
+
 def test_a_bucket_with_no_manifest_refuses(tmp_path, monkeypatch, capsys):
     lake = FixtureLake(tmp_path / "lake").with_chains("SPY", DAY).build()
     config = _config(tmp_path, lake)
@@ -377,10 +513,19 @@ def test_a_manifest_that_does_not_match_its_stored_checksum_refuses(tmp_path):
     assert not (tmp_path / "restored").exists()
 
 
+def test_a_manifest_with_a_composite_checksum_says_none_is_stored(tmp_path):
+    lake, client = _uploaded(tmp_path)
+    raw = (lake / "manifest.jsonl").read_bytes()
+    client.store("lake/manifest.jsonl", raw, checksum=_b64(raw) + "-2", checksum_type="COMPOSITE")
+
+    with pytest.raises(bucket.RestoreRefused, match="stores no full-object SHA-256"):
+        restore_lake(tmp_path / "restored", TARGET, client=client)
+
+
 def test_a_working_directory_no_restore_made_is_refused(tmp_path):
     lake, client = _uploaded(tmp_path)
-    stranger = tmp_path / "restored.restoring"
-    stranger.mkdir()
+    stranger = tmp_path / "restored" / WORK
+    stranger.mkdir(parents=True)
     (stranger / "keep.txt").write_text("someone's file\n")
 
     with pytest.raises(bucket.RestoreRefused, match="no restore made it"):
@@ -416,7 +561,7 @@ def test_a_wrong_file_in_the_working_directory_is_downloaded_again(tmp_path):
     _rot(client, QUOTES, lake)
     dest = tmp_path / "restored"
     assert restore_lake(dest, TARGET, client=client).restored is False
-    damaged = tmp_path / "restored.restoring" / CHAINS
+    damaged = dest / WORK / CHAINS
     damaged.write_bytes(bytes(len(damaged.read_bytes())))
 
     client.store(f"lake/{QUOTES}", good.body, checksum=good.checksum)
@@ -456,7 +601,7 @@ def test_a_run_cut_off_mid_download_resumes_without_its_part_file(tmp_path):
     dest = tmp_path / "restored"
     with pytest.raises(bucket.BucketReadError):
         restore_lake(dest, TARGET, client=client)
-    assert not dest.exists()
+    _no_lake(dest)
 
     client.get_object = real_get
     summary = restore_lake(dest, TARGET, client=client)
@@ -481,7 +626,7 @@ def test_a_resumed_run_drops_a_file_the_bucket_no_longer_wants(tmp_path):
     _rot(client, QUOTES, root)
     dest = tmp_path / "restored"
     assert restore_lake(dest, TARGET, client=client).restored is False
-    assert (tmp_path / "restored.restoring" / SEGMENT).is_file()
+    assert (dest / WORK / SEGMENT).is_file()
 
     client.store(f"lake/{QUOTES}", good.body, checksum=good.checksum)
     (root / SEALED).write_bytes(b"sealed chains for the day")
@@ -493,6 +638,95 @@ def test_a_resumed_run_drops_a_file_the_bucket_no_longer_wants(tmp_path):
 
     assert summary.restored is True
     assert _files(dest) == _files(root)
+
+
+def test_a_run_killed_while_moving_files_in_finishes_on_the_next_run(tmp_path, monkeypatch):
+    # The second rename fails, so one top-level directory is in the destination and the
+    # rest, manifest.jsonl included, are still in the working directory. The next run
+    # finds every file verified and finishes the move without a request.
+    lake, client = _uploaded(tmp_path)
+    dest = tmp_path / "restored"
+    real_rename = os.rename
+    renames: list[str] = []
+
+    def failing_second(src, dst):
+        renames.append(str(src))
+        if len(renames) == 2:
+            raise OSError(28, "No space left on device")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", failing_second)
+    with pytest.raises(bucket.RestoreRefused, match="A re-run finishes the move"):
+        restore_lake(dest, TARGET, client=client)
+    monkeypatch.setattr(os, "rename", real_rename)
+    assert not (dest / "manifest.jsonl").exists()
+    assert (dest / WORK / "manifest.jsonl").is_file()
+    client.calls.clear()
+
+    summary = restore_lake(dest, TARGET, client=client)
+
+    assert summary.restored is True and summary.finished_move is True
+    assert client.calls == []
+    assert _files(dest) == _files(lake)
+    assert not (dest / WORK).exists()
+
+
+def test_manifest_jsonl_is_the_last_entry_moved_in(tmp_path, monkeypatch):
+    lake, client = _uploaded(tmp_path)
+    real_rename = os.rename
+    moved: list[str] = []
+
+    def recording(src, dst):
+        moved.append(Path(dst).name)
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", recording)
+    assert restore_lake(tmp_path / "restored", TARGET, client=client).restored is True
+    assert moved[-1] == "manifest.jsonl"
+    assert set(moved) == _tops(lake)
+
+
+def test_a_run_killed_after_verifying_keeps_its_marker(tmp_path, monkeypatch):
+    # A kill after every file verified and before the move must not leave a working
+    # directory the next run refuses as one no restore made.
+    lake, client = _uploaded(tmp_path)
+    dest = tmp_path / "restored"
+
+    def killed(src, dst):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(os, "rename", killed)
+    with pytest.raises(bucket.RestoreRefused):
+        restore_lake(dest, TARGET, client=client)
+    monkeypatch.undo()
+    assert (dest / WORK / ".marketlake-restore").is_file()
+
+    assert restore_lake(dest, TARGET, client=client).restored is True
+    assert _files(dest) == _files(lake)
+
+
+def test_an_empty_unmarked_working_directory_is_resumable(tmp_path):
+    # A run killed between creating the working directory and writing its marker.
+    lake, client = _uploaded(tmp_path)
+    dest = tmp_path / "restored"
+    (dest / WORK).mkdir(parents=True)
+
+    assert restore_lake(dest, TARGET, client=client).restored is True
+    assert _files(dest) == _files(lake)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads through permission bits")
+def test_an_unreadable_working_file_is_named_as_a_read(tmp_path):
+    lake, client = _uploaded(tmp_path)
+    _rot(client, QUOTES, lake)
+    dest = tmp_path / "restored"
+    assert restore_lake(dest, TARGET, client=client).restored is False
+    (dest / WORK / CHAINS).chmod(0o000)
+    try:
+        with pytest.raises(bucket.RestoreRefused, match=f"reading {CHAINS} in .* failed"):
+            restore_lake(dest, TARGET, client=client)
+    finally:
+        (dest / WORK / CHAINS).chmod(0o644)
 
 
 # -- 5. a torn last manifest line --------------------------------------------------
