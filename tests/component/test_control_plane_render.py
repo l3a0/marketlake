@@ -694,10 +694,12 @@ def test_the_sunday_cli_prints_the_restore_test_s_pass_line(tmp_path, capsys, mo
     """A pass prints its own line, so the log can tell a pass from a test that never ran.
 
     The one partition sits in residue 7, computed by hand, and 2026-08-30 is week 34, so
-    the restore wraps round to it and the line says so.
+    the restore wraps round to it and the line says so. An orphan on the copy gives the run
+    one report line that still pings, so the order of the two kinds of line shows.
     """
     lake, config = _sunday_lake(tmp_path)
     stamp_assertion_pid(lake, pid=_DAEMON_PID)
+    (tmp_path / "ssd" / ".DS_Store").write_bytes(b"finder state")
     pinger = FakePinger()
     monkeypatch.setattr(
         cp,
@@ -726,6 +728,7 @@ def test_the_sunday_cli_prints_the_restore_test_s_pass_line(tmp_path, capsys, mo
     ) in lines
     # The restore line comes after the report lines and before the closing summary.
     restore = next(i for i, line in enumerate(lines) if line.startswith("sunday: restore:"))
+    assert lines[restore - 1] == "sunday: report: backup file the lake never recorded: .DS_Store"
     assert lines[restore + 1].startswith("sunday: attempts=1 pinged=True")
 
 
