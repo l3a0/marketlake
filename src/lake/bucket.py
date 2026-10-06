@@ -1725,10 +1725,8 @@ def restore_lake(
             summary.failures.append((rel, "missing from the bucket"))
             continue
         except OSError as exc:
-            # A timeout or an SSL failure from the client is an ``OSError`` too, and it is
-            # the bucket's failure rather than the disk's, so it is named as one.
-            if _failure(exc) is not None:
-                raise
+            # ``bucket_reader`` turns every bucket failure into ``BucketReadError``, a
+            # timeout included, so an ``OSError`` that reaches here is the local disk's.
             raise RestoreRefused(
                 _local(f"writing {rel} into {work}", exc)
                 + f". Nothing was moved into {dest}, and a re-run resumes in {work}"

@@ -30,10 +30,10 @@ from datetime import date, datetime
 from pathlib import Path
 
 import pytest
-from botocore.exceptions import IncompleteReadError
+from botocore.exceptions import IncompleteReadError, ReadTimeoutError
 
 from lake import bucket
-from lake.bucket import first_upload, nightly_upload, restore_lake
+from lake.bucket import bucket_scrub, first_upload, nightly_upload, restore_lake
 from lake.calendar import MARKET_TZ
 from lake.config import BucketTarget
 from lake.manifest import append_manifest
@@ -655,10 +655,15 @@ def test_a_resumed_run_drops_a_file_the_bucket_no_longer_wants(tmp_path):
     (root / SEGMENT).unlink()
     nightly_upload(root, TARGET, client=client, clock=ManualClock(MONDAY_19), calendar=CALENDAR)
 
+    # A part file from a download whose file has since left the plan.
+    (dest / WORK / (SEGMENT + ".part")).write_bytes(b"half a segment")
+
     summary = restore_lake(dest, TARGET, client=client)
 
     assert summary.restored is True
     assert _files(dest) == _files(root)
+    # The stale segment's directories went with it.
+    assert all(any(path.iterdir()) for path in dest.rglob("*") if path.is_dir())
 
 
 def test_a_run_killed_while_moving_files_in_finishes_on_the_next_run(tmp_path, monkeypatch):
@@ -794,3 +799,231 @@ def test_a_shadow_host_still_restores(tmp_path, monkeypatch, capsys):
     assert bucket.BUCKET_SHADOW not in capsys.readouterr().err
     assert client.puts() == []
     assert _files(tmp_path / "restored") == _files(lake)
+
+
+# -- 7. cases the mutation lens found nothing holding -----------------------------
+
+
+def test_a_segment_compacted_before_the_first_upload_is_not_missing(tmp_path):
+    # The real lake's normal state: the manifest records a segment, compaction sealed
+    # its day and unlinked it, and only then did the first upload run. The segment never
+    # reached the bucket, and the sealed partition stands for it.
+    lake = FixtureLake(tmp_path / "lake").with_chains("SPY", DAY).with_quotes("SPY", DAY)
+    lake.with_journal_segment(
+        "chains", "SPY", SEGMENT_DAY, sample_chains_table(), start_ts="20260831T133000Z", pid=4242
+    )
+    root = lake.build()
+    _record(root, SEGMENT, "capture")
+    (root / SEALED).write_bytes(b"sealed chains for the day")
+    _record(root, SEALED, "compaction")
+    (root / SEGMENT).unlink()
+    client = FakeS3()
+    first_upload(root, TARGET, client=client, clock=ManualClock(FRIDAY_19), calendar=CALENDAR)
+    assert f"lake/{SEGMENT}" not in client.keys()
+
+    summary = restore_lake(tmp_path / "restored", TARGET, client=client)
+
+    assert summary.failures == []
+    assert summary.restored is True
+    assert _files(tmp_path / "restored") == _files(root)
+
+
+def test_a_segment_is_left_out_by_the_manifest_even_when_its_partition_is_missing(tmp_path):
+    # The rule reads the manifest, not the listing. The sealed partition's object is gone,
+    # which is its own failure, and the stale segment still stays out.
+    lake, client = _uploaded(tmp_path)
+    del client.objects[f"lake/{SEALED}"]
+
+    summary = restore_lake(tmp_path / "restored", TARGET, client=client)
+
+    assert summary.failures == [(SEALED, "missing from the bucket")]
+    assert summary.segments_left_out == 1
+
+
+def test_a_manifest_with_no_stored_checksum_refuses(tmp_path):
+    lake, client = _uploaded(tmp_path)
+    client.store("lake/manifest.jsonl", (lake / "manifest.jsonl").read_bytes(), checksum=None)
+
+    with pytest.raises(bucket.RestoreRefused, match="stores no full-object SHA-256"):
+        restore_lake(tmp_path / "restored", TARGET, client=client)
+    assert not (tmp_path / "restored").exists()
+
+
+def test_a_refused_download_partway_is_one_line_and_exit_2(tmp_path, monkeypatch, capsys):
+    lake, client = _uploaded(tmp_path)
+    real_get = client.get_object
+
+    def get_object(**kwargs):
+        if kwargs["Key"] == f"lake/{QUOTES}":
+            raise client_error("AccessDenied", "GetObject", 403)
+        return real_get(**kwargs)
+
+    client.get_object = get_object
+    with pytest.raises(SystemExit) as exc:
+        _main(_config(tmp_path, lake), client, monkeypatch, tmp_path / "restored")
+
+    line = _refused(capsys, exc)
+    assert "the bucket refused the request (AccessDenied)" in line
+    _no_lake(tmp_path / "restored")
+
+
+def test_a_head_timeout_is_named_as_the_bucket_and_not_the_disk(tmp_path, monkeypatch, capsys):
+    # A ReadTimeoutError is an OSError, so it must not read as a failed write.
+    lake, client = _uploaded(tmp_path)
+    real_head = client.head_object
+
+    def head_object(**kwargs):
+        if kwargs["Key"] == f"lake/{REPORT}":
+            raise ReadTimeoutError(endpoint_url="https://s3.us-east-2.amazonaws.com")
+        return real_head(**kwargs)
+
+    client.head_object = head_object
+    with pytest.raises(SystemExit) as exc:
+        _main(_config(tmp_path, lake), client, monkeypatch, tmp_path / "restored")
+
+    line = _refused(capsys, exc)
+    assert "could not be reached" in line
+    assert "writing" not in line
+
+
+def test_an_unmanifested_object_gone_before_its_head_is_missing(tmp_path):
+    lake, client = _uploaded(tmp_path)
+    real_head = client.head_object
+
+    def head_object(**kwargs):
+        if kwargs["Key"] == f"lake/{REPORT}":
+            raise client_error("404", "HeadObject", 404)
+        return real_head(**kwargs)
+
+    client.head_object = head_object
+
+    summary = restore_lake(tmp_path / "restored", TARGET, client=client)
+
+    assert summary.failures == [(REPORT, "missing from the bucket")]
+    _no_lake(tmp_path / "restored")
+
+
+def test_a_failed_first_move_leaves_a_directory_the_next_run_finishes(tmp_path, monkeypatch):
+    lake, client = _uploaded(tmp_path)
+    dest = tmp_path / "restored"
+    real_rename = os.rename
+    renames: list[str] = []
+
+    def failing_first(src, dst):
+        renames.append(str(src))
+        if len(renames) == 1:
+            raise OSError(18, "Invalid cross-device link")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", failing_first)
+    with pytest.raises(bucket.RestoreRefused, match="A re-run finishes the move"):
+        restore_lake(dest, TARGET, client=client)
+    client.calls.clear()
+
+    summary = restore_lake(dest, TARGET, client=client)
+
+    assert summary.restored is True and summary.finished_move is True
+    assert client.calls == []
+    assert _files(dest) == _files(lake)
+
+
+def test_one_byte_short_of_the_space_needed_refuses(tmp_path):
+    lake, client = _uploaded(tmp_path)
+    needed = sum(len(data) for data in _files(lake).values())
+
+    with pytest.raises(bucket.RestoreRefused, match="MB free"):
+        restore_lake(tmp_path / "restored", TARGET, client=client, free_space=lambda p: needed - 1)
+
+
+def test_a_resumed_run_needs_space_only_for_what_is_left(tmp_path):
+    lake, client = _uploaded(tmp_path)
+    good = client.versions(f"lake/{QUOTES}")[-1]
+    _rot(client, QUOTES, lake)
+    dest = tmp_path / "restored"
+    assert restore_lake(dest, TARGET, client=client).restored is False
+    client.store(f"lake/{QUOTES}", good.body, checksum=good.checksum)
+    needed = len((lake / "manifest.jsonl").read_bytes()) + len(good.body)
+
+    summary = restore_lake(dest, TARGET, client=client, free_space=lambda p: needed)
+
+    assert summary.restored is True
+
+
+def test_a_working_file_of_the_wrong_size_gets_no_space_credit(tmp_path):
+    lake, client = _uploaded(tmp_path)
+    good = client.versions(f"lake/{QUOTES}")[-1]
+    _rot(client, QUOTES, lake)
+    dest = tmp_path / "restored"
+    assert restore_lake(dest, TARGET, client=client).restored is False
+    client.store(f"lake/{QUOTES}", good.body, checksum=good.checksum)
+    (dest / WORK / CHAINS).write_bytes(b"x")
+    without_chains = len((lake / "manifest.jsonl").read_bytes()) + len(good.body)
+
+    with pytest.raises(bucket.RestoreRefused, match="MB free"):
+        restore_lake(dest, TARGET, client=client, free_space=lambda p: without_chains)
+
+
+def test_a_destination_that_is_a_file_refuses_before_any_request(tmp_path):
+    lake, client = _uploaded(tmp_path)
+    (tmp_path / "restored").write_text("x")
+    client.calls.clear()
+
+    with pytest.raises(bucket.RestoreRefused, match="is not a directory"):
+        restore_lake(tmp_path / "restored", TARGET, client=client)
+    assert client.calls == []
+
+
+def test_a_working_path_that_is_a_file_refuses_before_any_request(tmp_path):
+    lake, client = _uploaded(tmp_path)
+    (tmp_path / "restored").mkdir()
+    (tmp_path / "restored" / WORK).write_text("x")
+    client.calls.clear()
+
+    with pytest.raises(bucket.RestoreRefused, match="is not a directory"):
+        restore_lake(tmp_path / "restored", TARGET, client=client)
+    assert client.calls == []
+
+
+def test_a_missing_parent_refuses_before_any_request(tmp_path):
+    lake, client = _uploaded(tmp_path)
+    client.calls.clear()
+
+    with pytest.raises(bucket.RestoreRefused, match="does not exist"):
+        restore_lake(tmp_path / "nowhere" / "restored", TARGET, client=client)
+    assert client.calls == []
+    assert not (tmp_path / "nowhere").exists()
+
+
+def test_downloaded_bytes_counts_every_chunk(tmp_path, monkeypatch):
+    lake, client = _uploaded(tmp_path)
+    monkeypatch.setattr(bucket, "_READ_CHUNK", 3)
+
+    summary = restore_lake(tmp_path / "restored", TARGET, client=client)
+
+    planned = sum(len(data) for rel, data in _files(lake).items() if rel != "manifest.jsonl")
+    assert summary.downloaded_bytes == planned
+    assert summary.downloaded == 4
+
+
+def test_a_destination_under_the_home_directory_expands_the_tilde(tmp_path, monkeypatch):
+    lake, client = _uploaded(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    summary = restore_lake("~/restored", TARGET, client=client)
+
+    assert summary.restored is True
+    assert _files(home / "restored") == _files(lake)
+
+
+def test_the_bucket_scrub_matches_the_rest_when_one_object_is_missing(tmp_path):
+    # The restore test samples from what the scrub matched, so one missing object must
+    # not empty the set the week reads from.
+    lake, client = _uploaded(tmp_path)
+    del client.objects[f"lake/{QUOTES}"]
+
+    result = bucket_scrub(lake, TARGET, client)
+
+    assert result.missing == (QUOTES,)
+    assert CHAINS in dict(result.matched)
