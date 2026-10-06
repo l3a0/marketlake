@@ -671,7 +671,8 @@ The pull request that adds the token writer changes the bootstrap too, so it fol
    stays out of code, so no secret reaches the state.
 
 Never create the user by hand. The live apply creates it, and its `CreateUser` fails with
-`EntityAlreadyExists` when the user already exists.
+`EntityAlreadyExists` when the user already exists. A rebuild into a fresh account
+creates the token writer's key after its own live apply, then puts all five values below.
 
 ### Put the values
 
@@ -687,25 +688,29 @@ Each of the four secrets is read from the keyboard into a variable. A value type
 command line lands in shell history. A value kept in a file picks up the editor's
 trailing newline, and the put stores that newline as part of the secret. `read -rs`
 echoes nothing and writes nothing to disk, and `unset` drops the value after the put.
-Each command prints a prompt. Paste the value and press Enter. The prompt comes from
-`printf`, because zsh's `read -p` means a coprocess and leaves the variable empty. The
-variable lives in one command line, because a command run through Claude Code's `!`
-prefix may start a fresh shell.
+The value is piped into the put and read from `file:///dev/stdin`, so it never appears
+in any command's arguments. `ps` shows every argument of a running command, and on macOS
+it shows them across users. `printf '%s'` adds no newline. Passing `--value "$V"` would
+also fail with `expected one argument` for a value that starts with `-`, and would read a
+value that starts with `file://` as a path. Each command prints a prompt. Paste the
+value and press Enter. The prompt comes from `printf`, because zsh's `read -p` means a
+coprocess and leaves the variable empty. The variable lives in one command line, because
+a command run through Claude Code's `!` prefix may start a fresh shell.
 
 ```bash
-printf 'Schwab API key: '; read -rs V && echo && aws ssm put-parameter --name /marketlake/config/schwab-api-key --value "$V" --type SecureString --tier Standard --overwrite --profile marketlake-admin --region us-east-1; unset V
+printf 'Schwab API key: '; read -rs V && echo && printf '%s' "$V" | aws ssm put-parameter --name /marketlake/config/schwab-api-key --value file:///dev/stdin --type SecureString --tier Standard --overwrite --profile marketlake-admin --region us-east-1; unset V
 ```
 
 ```bash
-printf 'Schwab app secret: '; read -rs V && echo && aws ssm put-parameter --name /marketlake/config/schwab-app-secret --value "$V" --type SecureString --tier Standard --overwrite --profile marketlake-admin --region us-east-1; unset V
+printf 'Schwab app secret: '; read -rs V && echo && printf '%s' "$V" | aws ssm put-parameter --name /marketlake/config/schwab-app-secret --value file:///dev/stdin --type SecureString --tier Standard --overwrite --profile marketlake-admin --region us-east-1; unset V
 ```
 
 ```bash
-printf 'Healthchecks ping key: '; read -rs V && echo && aws ssm put-parameter --name /marketlake/config/healthchecks-ping-key --value "$V" --type SecureString --tier Standard --overwrite --profile marketlake-admin --region us-east-1; unset V
+printf 'Healthchecks ping key: '; read -rs V && echo && printf '%s' "$V" | aws ssm put-parameter --name /marketlake/config/healthchecks-ping-key --value file:///dev/stdin --type SecureString --tier Standard --overwrite --profile marketlake-admin --region us-east-1; unset V
 ```
 
 ```bash
-printf 'ntfy topic: '; read -rs V && echo && aws ssm put-parameter --name /marketlake/config/ntfy-topic --value "$V" --type SecureString --tier Standard --overwrite --profile marketlake-admin --region us-east-1; unset V
+printf 'ntfy topic: '; read -rs V && echo && printf '%s' "$V" | aws ssm put-parameter --name /marketlake/config/ntfy-topic --value file:///dev/stdin --type SecureString --tier Standard --overwrite --profile marketlake-admin --region us-east-1; unset V
 ```
 
 The token comes from its file, which `src/lake/reauth.py`'s `write_token` writes with no
@@ -726,20 +731,32 @@ aws ssm describe-parameters --profile marketlake-admin --region us-east-1 --para
 
 ### Recover from a leaked token-writer key
 
-The key can only overwrite the token parameter, so the response is short.
+A put can change more than the value. It can move the parameter to the Advanced tier,
+attach a parameter policy, set an allowed pattern, or store a forged token that the VM's
+pull accepts. So recovery deletes the parameter whatever its listing shows, and a fresh
+re-auth puts the real token back.
 
 1. Deactivate the key for `marketlake-token-writer` in the AWS console.
-2. Run the `describe-parameters` check above.
-3. If the token's tier reads `Advanced`, delete the parameter and put the token again as
-   above.
+2. Create a new access key for the same user, and put it in the laptop's `config.yaml`
+   under [#636](https://github.com/l3a0/marketlake/issues/636)'s `token_store_*` keys.
+3. Delete the parameter.
 
-```bash
-aws ssm delete-parameter --name /marketlake/config/schwab-oauth-token --profile marketlake-admin --region us-east-1
-```
+   ```bash
+   aws ssm delete-parameter --name /marketlake/config/schwab-oauth-token --profile marketlake-admin --region us-east-1
+   ```
 
-A forged token put with a future mint time would still reach the VM and stop capture
-until a login there. The guard against that belongs to
-[#636](https://github.com/l3a0/marketlake/issues/636)'s pull.
+4. Run the weekly re-auth, the rendered `reauth.sh`, which creates the parameter again as
+   a Standard `SecureString`. Until [#636](https://github.com/l3a0/marketlake/issues/636)
+   lands, put the token again with the `file://` command above instead.
+5. Delete the deactivated key in the console. A user holds at most two access keys, and a
+   deactivated key counts toward the two.
+
+Step 4 mints a new token rather than putting the laptop's existing `token.json` again. A
+forged token can carry a later mint time than that file, and the VM's pull never writes
+an older mint over a newer one. The guard against a forged token belongs to
+[#636](https://github.com/l3a0/marketlake/issues/636)'s pull, which refuses a mint time
+more than an hour past its own clock. So if capture has not recovered, re-auth once more
+after that hour.
 
 ## Bootstrap changes already known
 

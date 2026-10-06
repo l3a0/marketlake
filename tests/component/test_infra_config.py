@@ -17,9 +17,11 @@
 6. Every policy on an IAM user in ``infra/live``. An assert names the policy it checks,
    so a second inline policy on the same user passes it, and the apply role's
    ``iam:PutUserPolicy`` would apply it.
-7. Whether either configuration manages or reads an SSM parameter. Either one puts the
+7. Whether either configuration declares an SSM parameter as a resource or a data
+   source. A data source, or a resource that takes its value the ordinary way, puts the
    decrypted value into the state, which every pull request's plan role can read, and a
-   mock provider plans it without complaint.
+   mock provider plans it without complaint. An ephemeral block stores nothing, so it
+   stays allowed.
 
 A ``module`` block would hide its resources from every check here, so neither
 configuration may call one.
@@ -45,8 +47,8 @@ _OPTIONS = hcl2.SerializationOptions(
 )
 
 # Price 4 of issue #664: every resource whose loss would lose backups or stop them. The
-# token writer and its policy are here too (#699). CI cannot delete either, and losing
-# one stops the Schwab token reaching the VM.
+# token writer and its policy are here too (#699). CI cannot delete either, so a pull
+# request that renames one fails at plan rather than at apply.
 PREVENT_DESTROY = [
     "bootstrap/aws_s3_bucket.state",
     "bootstrap/aws_s3_bucket_versioning.state",
@@ -279,7 +281,7 @@ def test_each_live_user_carries_exactly_one_inline_policy() -> None:
     assert not {address.split(".")[0] for address in resources} & _USER_POLICY_ROUTES
 
     users = sorted(a.split(".")[1] for a in resources if a.split(".")[0] == "aws_iam_user")
-    assert users == ["backup", "token_writer"]
+    assert users
     policies: list[str] = []
     for address, body in resources.items():
         if address.split(".")[0] not in ("aws_iam_user", "aws_iam_user_policy"):

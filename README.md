@@ -442,12 +442,13 @@ tofu -chdir=infra/live validate
 tofu -chdir=infra/live test
 ```
 
-Three things those checks cannot see are covered by `uv run pytest` instead.
+Four things those checks cannot see are covered by `uv run pytest` instead.
 
 1. `prevent_destroy` on each resource whose loss would lose backups or the infrastructure's
-   state, or stop the Schwab token reaching the VM.
+   state, and on the token writer and its policy, which CI cannot delete.
 2. The exact set of policies each bootstrap role and each live IAM user carries.
 3. The live backend's state key matching what the apply role may write.
+4. No resource or data source that would store an SSM parameter's value in state.
 
 ### Keep development runs off the real config directory
 
