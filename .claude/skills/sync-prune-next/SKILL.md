@@ -337,9 +337,9 @@ look at the page and confirm every card this round added or moved.
 A page republished from a session's scratch copy has no review and no history.
 Fifty-four versions of the board went out that way, and on 2026-10-06 a bug in
 the column logic of one of them sent an unfinished pull request to the owner's
-queue. So the page's source is
-`.claude/skills/sync-prune-next/board.html`, and a change to it goes through a
-pull request and the same review as any other code, per `CLAUDE.md`.
+queue. So the page's source is `.claude/skills/sync-prune-next/board.html`,
+and a change to it goes through a pull request and the same review as any
+other code, per `CLAUDE.md`.
 
 One rule decides every publish: the bytes published to the board equal
 `main`'s copy of that file. Where the file sits on disk does not matter.
@@ -420,9 +420,9 @@ Then record the publish in `state.page`, as below, and look at the page, per
 
 The `Artifact` tool can refuse a publish because the live page changed after
 the read, and hand back the newer content. Its general advice is to merge the
-session's changes into that content. This page overrides that advice, because `main` is
-its only source, and content handed back by a refusal is a version nobody
-reviewed. So fetch again, read the board again, and publish from `origin/main`
+session's changes into that content. This page overrides that advice, because
+`main` is its only source, and content handed back by a refusal is a version
+nobody reviewed. So fetch again, read the board again, and publish from `origin/main`
 by the steps above.
 
 - Never merge the content the refusal hands back.
@@ -440,11 +440,10 @@ live, and every sync round checks it.
 After a publish, write `state.page` as the full sha of the last commit that
 touched the page's source, which
 `git log -1 --format=%H origin/main -- .claude/skills/sync-prune-next/board.html`
-prints. Write it with an `update` pinned to the document's current version, which the
-round's last read or write names. Its `data` carries `state` exactly as read,
-with only `page` set. Sending the
-whole `state` keeps the write correct whether `update` merges nested fields or
-replaces the `state` object.
+prints. Write it with an `update` pinned to the document's current version,
+which the round's last read or write names. Its `data` carries `state` exactly
+as read, with only `page` set. Sending the whole `state` keeps the write
+correct whether `update` merges nested fields or replaces the `state` object.
 
 ```text
 ArtifactData action="update" url="https://claude.ai/artifact/83eeHmHAA19A6hy8kKGJBw"
