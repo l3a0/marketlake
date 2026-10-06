@@ -308,7 +308,9 @@ def test_any_other_code_says_run_reauth_again_and_never_echoes_the_message():
     assert line.endswith("(ValidationException). Run reauth.sh again")
     assert REFRESH not in line and ACCESS not in line
     # The exception itself carries no token either, so a traceback would not.
-    assert REFRESH not in str(failed.value) and failed.value.__cause__ is None
+    assert REFRESH not in str(failed.value)
+    # Neither link to the AWS error survives, so no traceback can print its message.
+    assert failed.value.__cause__ is None and failed.value.__context__ is None
 
 
 def test_a_client_side_validation_error_is_named_by_type_alone():
@@ -326,7 +328,7 @@ def test_a_client_side_validation_error_is_named_by_type_alone():
     line = token_store.push_failure_line(Path("/t/token.json"), failed.value)
     assert REFRESH not in line and ACCESS not in line
     assert REFRESH not in str(failed.value)
-    assert failed.value.__cause__ is None and failed.value.__suppress_context__
+    assert failed.value.__cause__ is None and failed.value.__context__ is None
 
 
 def test_the_validation_error_really_carries_the_token():
@@ -423,6 +425,39 @@ def test_the_token_client_ignores_the_aws_files_in_the_home_directory(hostile_ho
     import botocore.session
 
     assert botocore.session.Session().get_scoped_config().get("region") == "ap-south-1"
+
+
+def test_building_a_client_leaves_the_callers_settings_unchanged():
+    # botocore rewrites the ``retries`` dict it is handed, so a builder that passed a
+    # module constant straight through would change it on the first build.
+    from lake import bucket
+
+    settings = (token_store._SSM_CLIENT_CONFIG, bucket._S3_CLIENT_CONFIG)
+    expected = [
+        {
+            "connect_timeout": 10,
+            "read_timeout": 30,
+            "retries": {"mode": "standard", "max_attempts": 3},
+        },
+        {
+            "connect_timeout": 10,
+            "read_timeout": 60,
+            "retries": {"mode": "standard", "max_attempts": 3},
+            "request_checksum_calculation": "when_required",
+            "response_checksum_validation": "when_required",
+        },
+    ]
+    for _ in range(2):
+        _put_client()
+        bucket.client_from_config(
+            _config(
+                backup_target="s3://lake-backup/lake",
+                bucket_access_key_id=BUCKET_KEY_ID,
+                bucket_secret_access_key=BUCKET_SECRET,
+                bucket_region=REGION,
+            )
+        )
+        assert [dict(setting) for setting in settings] == expected
 
 
 def test_no_service_model_loads_from_the_home_directory():
@@ -544,10 +579,31 @@ def test_an_unreadable_or_malformed_file_is_written(tmp_path, local):
 def test_a_later_parameter_is_written_over_an_earlier_file(tmp_path):
     token = tmp_path / "token.json"
     token.write_text(json.dumps(_token(minted=MINTED - 604800, access="old-a", refresh="old-r")))
+    before = token.stat().st_ino
     result = _pull(Store(_token()), token)
     assert result.outcome == "wrote"
     assert json.loads(token.read_text()) == _token()
+    # The write lands by renaming a new file over the old one, so the inode changes. A
+    # write in place into the old file keeps it, and a crash part-way through it would
+    # leave a torn token where the live one was.
+    assert token.stat().st_ino != before
     _assert_no_token_in(result)
+
+
+def test_the_pull_writes_through_the_re_auths_atomic_writer(tmp_path, monkeypatch):
+    from lake import reauth
+
+    calls = []
+    real = reauth.write_token
+
+    def spy(path, payload):
+        calls.append(Path(path))
+        return real(path, payload)
+
+    monkeypatch.setattr(reauth, "write_token", spy)
+    token = tmp_path / "token.json"
+    assert _pull(Store(_token()), token).outcome == "wrote"
+    assert calls == [token]
 
 
 def test_an_equal_mint_time_writes_nothing(tmp_path):

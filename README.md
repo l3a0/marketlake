@@ -343,8 +343,8 @@ fixed by running `reauth.sh` again.
 
 The first `both` re-auth comes before the VM's first boot, in this order:
 
-1. The put-only user from [#699](https://github.com/l3a0/marketlake/issues/699) exists, and its access key is in the three `token_store_*` keys
-   in the laptop's `config.yaml`.
+1. The put-only user from [#699](https://github.com/l3a0/marketlake/issues/699) exists,
+   and its access key is in the three `token_store_*` keys in the laptop's `config.yaml`.
 2. The laptop's checkout carries this code. `reauth.sh` runs the checkout's Python, and
    older code ignores `token_store`, writes the file, puts nothing, and exits 0 without a
    word.
@@ -367,10 +367,15 @@ uv run python -m lake.token_store pull [--config <path>] [--token <path>]
 
 It reads the parameter with the instance profile, as the bucket client does, and writes
 `token.json` only when the local file is absent or unreadable, or the parameter was minted
-later. It prints one line and exits 0 when it wrote the file or found it current, 1 when
-the parameter is older, unusable, or minted more than an hour in the future, 3 when the
-instance profile is not serving credentials yet, which is worth retrying, and 2 for a
-mistake in `config.yaml`. The VM's first boot runs it
+later. It prints one line and exits with one of four codes:
+
+1. 0 when it wrote the file or found it current.
+2. 1 when the parameter is older, unusable, or minted more than an hour in the future, or
+   when `token.json` could not be written.
+3. 2 for a mistake in `config.yaml`.
+4. 3 when the instance profile is not serving credentials yet, which is worth retrying.
+
+The VM's first boot runs it
 ([#686](https://github.com/l3a0/marketlake/issues/686)), and
 [#702](https://github.com/l3a0/marketlake/issues/702) runs it after that.
 
@@ -531,9 +536,10 @@ Three things those checks cannot see are covered by `uv run pytest` instead.
 ### Keep development runs off the real config directory
 
 `~/.config/marketlake/` holds the live Schwab token, and several commands default to it.
-`python -m lake.reauth` with no `--token` writes the standard location, which is right
-for the weekly ritual and wrong for anyone exercising the tool. On 2026-09-13 that is how
-a stub reached the production token path and a working token was lost.
+`python -m lake.reauth` and `python -m lake.token_store pull` with no `--token` write the
+standard location, which is right for the weekly ritual and the VM's pull and wrong for
+anyone exercising either tool. On 2026-09-13 that is how a stub reached the production
+token path and a working token was lost.
 
 `MARKETLAKE_CONFIG_DIR` moves the whole directory for one process. Set it and the run
 cannot reach the real token, the real `config.yaml`, or the real roster, whatever it is

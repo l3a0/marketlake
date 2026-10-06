@@ -32,6 +32,7 @@ never loads them unless a test builds a client.
 
 from __future__ import annotations
 
+import copy
 import os
 import threading
 from collections.abc import Iterator, Mapping
@@ -219,6 +220,8 @@ def build_client(
     profile raises ``_MetadataLookupFailed`` here rather than failing at the first
     request. ``client_config`` holds the keyword arguments of ``botocore.config.Config``,
     so a caller states its timeouts and checksum settings without importing botocore.
+    It is deep-copied first, because botocore rewrites the ``retries`` dict it is handed
+    in place, and a caller's module constant would otherwise change on the first build.
 
     ``botocore`` refuses a malformed region with an error that is both a
     ``BotoCoreError`` and a ``ValueError``, and that reaches the caller unchanged.
@@ -262,9 +265,8 @@ def build_client(
         else:
             raise TypeError(f"source must be a KeyPair or INSTANCE_PROFILE, got {type(source)}")
         session = boto3.session.Session(botocore_session=core)
-        return session.client(
-            service, region_name=region, **keys, config=BotoConfig(**client_config)
-        )
+        settings = copy.deepcopy(dict(client_config))
+        return session.client(service, region_name=region, **keys, config=BotoConfig(**settings))
 
 
 __all__ = [

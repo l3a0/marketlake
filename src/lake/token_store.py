@@ -27,7 +27,9 @@ Three pieces live here.
    ``bucket_credentials``, which is the instance profile on the VM, and writes
    ``token.json`` only when the local file is absent, unreadable, or minted earlier
    than the parameter's token. So a re-run writes nothing, and a later local token is
-   never replaced by an older one.
+   never replaced by an older one. It writes nothing at all when the parameter's mint
+   time is more than an hour past the VM's clock, whatever the local file holds, so a
+   forged far-future put cannot outrank every later re-auth.
 
 **No token byte reaches any output.** An AWS ``ClientError`` is reported by its error
 code alone, because a ``ValidationException`` message can echo its input. A
@@ -116,9 +118,10 @@ def mode_of(config: Config) -> tuple[str, str | None]:
     if value in (FILE, BOTH, STORE):
         return value, None
     return UNRECOGNISED, (
-        f"{TOKEN_STORE_KEY} {value!r} is not {FILE!r}, {BOTH!r} or {STORE!r}, so this "
-        "re-auth writes token.json and then puts the token parameter if the "
-        f"{TOKEN_STORE_KEY}_* keys allow it"
+        f"{TOKEN_STORE_KEY} {value!r} is not {FILE!r}, {BOTH!r} or {STORE!r}, so it is "
+        "read as the side that cannot cost a token: a re-auth writes token.json and then "
+        f"puts the token parameter if the {TOKEN_STORE_KEY}_* keys allow it, and the "
+        "scheduled pulls run"
     )
 
 
@@ -201,6 +204,9 @@ def push(*, client: Any, text: str) -> int:
     size = len(text.encode("utf-8"))
     if size > MAX_VALUE_BYTES:
         raise PushFailed(TOO_LARGE, f"the token is {size} bytes, over {MAX_VALUE_BYTES}")
+    # The code is taken inside the handler and raised after it, so the AWS error, whose
+    # message can carry the token, is on neither ``__cause__`` nor ``__context__``.
+    failed: str | None = None
     try:
         response = client.put_parameter(
             Name=PARAMETER_NAME,
@@ -210,9 +216,11 @@ def push(*, client: Any, text: str) -> int:
             Tier="Standard",
         )
     except ClientError as exc:
-        raise PushFailed(_client_error_code(exc)) from None
+        failed = _client_error_code(exc)
     except BotoCoreError as exc:
-        raise PushFailed(type(exc).__name__) from None
+        failed = type(exc).__name__
+    if failed is not None:
+        raise PushFailed(failed)
     return int(response["Version"])
 
 
