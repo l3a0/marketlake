@@ -26,8 +26,10 @@ from pathlib import Path
 CONFIG_NAME = "config.yaml"
 PING_KEY = "secret-key"
 NTFY_TOPIC = "secret-topic"
-# The other two secrets the design names, in the same class as the ping key and the topic.
-# A sweep that checks only the first two passes a command that prints these.
+# The Schwab pair, two more of the secrets the design names, in the same class as the ping
+# key and the topic. A sweep that checks only the first two passes a command that prints
+# these. The bucket's two key values are the last two, and only a test that needs a bucket
+# writes them, so this file holds four.
 SCHWAB_API_KEY = "api-key"
 SCHWAB_APP_SECRET = "app-secret"
 

@@ -462,7 +462,7 @@ CONFIG_DIR_PARTS = (".config", "marketlake")
 # given on the command line.
 #
 # It redirects the directory rather than the token alone, because the token is the
-# file that was lost and not the only one that can be. ``config.yaml`` holds four
+# file that was lost and not the only one that can be. ``config.yaml`` holds four to six
 # secrets and the roster is hand-maintained.
 #
 # Two limits are worth stating. ``config_dir`` reads the environment on every call, but

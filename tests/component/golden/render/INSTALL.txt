@@ -16,7 +16,7 @@ sudo pmset repeat wakeorpoweron MTWRF 08:25:00
 pmset -g sched
 # 4. Keep the token and the config secrets out of Time Machine. As the owner,
 # never under sudo. The whole directory goes, so an editor that saves by rename
-# cannot drop the exclusion, and the four secrets in config.yaml are covered too.
+# cannot drop the exclusion, and the secrets in config.yaml are covered too.
 tmutil addexclusion /Users/someone/.config/marketlake
 tmutil isexcluded /Users/someone/.config/marketlake
 # 5. Load the jobs into the system domain, then confirm the daemon is running.

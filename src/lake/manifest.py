@@ -52,7 +52,8 @@ checks it against this manifest rather than against the copy of the manifest rid
 the backup, because the lake is the authority and a copy that rotted alongside its data
 would pass a check against itself. The copy is read for one thing: its length says how
 far the last sync got, so a partition sealed since then reads as not copied yet rather
-than as loss.
+than as loss. A bucket target is scrubbed by ``lake.bucket.bucket_scrub`` by the same
+rules, and it returns the same ``BackupScrubResult``.
 
 The scrub reads. It never writes. Both scrubs do. Repair is a separate, deliberate,
 human-invoked step under the lake-root lock. This module supplies the primitives that
@@ -1021,6 +1022,20 @@ class BackupScrubResult:
     - ``manifest_diverged_at``: the byte offset where the copy's manifest stops matching
       the lake's. ``None`` when the copy is a clean prefix.
 
+    Four more stop a bucket scrub, and only a bucket scrub sets them. They are named
+    apart because they send the operator to different repairs.
+
+    - ``bucket_refused``: S3 turned the credentials away, named by the error code. A
+      revoked key or a policy that lost an action is the usual cause, and the repair is
+      a new key.
+    - ``bucket_unreachable``: no usable answer came back, named by the error's type or
+      code. A failed connection, a 5xx, and S3 asking for fewer requests all land here,
+      and the repair is usually nothing.
+    - ``bucket_failed``: S3 answered with some other error, named by its code, such as
+      ``NoSuchBucket``.
+    - ``bucket_unusable``: the config's bucket settings could not build a client, so no
+      request was sent. The repair is an edit to ``config.yaml``.
+
     Two tuples are reported and never withhold the ping, because neither can be lake
     data going missing.
 
@@ -1030,6 +1045,10 @@ class BackupScrubResult:
       volume on its own, which is why an orphan rides the report rather than paging.
     - ``pending``: the partitions the lake manifested after the backup's last sync,
       which the backup legitimately does not carry yet.
+
+    ``versioning`` is a bucket's report line when its versioning is anything but
+    enabled. It never withholds the ping. Suspending versioning changes no object, so
+    no other finding could see it.
     """
 
     target: str
@@ -1042,12 +1061,17 @@ class BackupScrubResult:
     manifest_missing: bool = False
     manifest_diverged_at: int | None = None
     unreadable: str | None = None
+    bucket_refused: str | None = None
+    bucket_unreachable: str | None = None
+    bucket_failed: str | None = None
+    bucket_unusable: str | None = None
+    versioning: str | None = None
 
     @property
     def problem(self) -> str | None:
         """The one finding that withholds the ping, or ``None`` when there is none.
 
-        The four stopping conditions are mutually exclusive by construction, because
+        The stopping conditions are mutually exclusive by construction, because
         each returns before the next can be reached, so one line always says the whole
         verdict. ``orphans`` and ``pending`` are deliberately absent. An extra file on
         the copy costs space rather than data, and a copy behind its lake is the normal
@@ -1057,6 +1081,23 @@ class BackupScrubResult:
             return f"backup target not mounted: {self.target}"
         if self.unreadable is not None:
             return f"backup could not be read: {self.unreadable}"
+        if self.bucket_unusable is not None:
+            return f"backup bucket settings in config.yaml cannot be used: {self.bucket_unusable}"
+        if self.bucket_refused is not None:
+            return (
+                f"backup bucket refused the scrub ({self.bucket_refused}), so its access key "
+                f"or policy may need replacing: {self.target}"
+            )
+        if self.bucket_unreachable is not None:
+            return (
+                f"backup bucket could not be reached or was unavailable "
+                f"({self.bucket_unreachable}): {self.target}"
+            )
+        if self.bucket_failed is not None:
+            return (
+                f"backup bucket answered the scrub with an error ({self.bucket_failed}): "
+                f"{self.target}"
+            )
         if self.manifest_missing:
             return f"backup carries no usable manifest copy: {self.target}"
         if self.manifest_diverged_at is not None:
@@ -1086,6 +1127,8 @@ class BackupScrubResult:
         lines += _named("backup file the lake never recorded", self.orphans)
         if self.pending:
             lines.append(f"backup behind the lake by {len(self.pending)} partitions")
+        if self.versioning is not None:
+            lines.append(self.versioning)
         return tuple(lines)
 
     @property

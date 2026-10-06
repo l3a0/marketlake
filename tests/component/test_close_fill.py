@@ -69,7 +69,10 @@ from tests.support.transport import FakeTransport
 
 
 def _publisher(lake_root: Path, transport: FakeTransport | None = None) -> Publisher:
-    """A publisher over a recording transport, holding the config's two secrets."""
+    """A publisher over a recording transport, holding the ping key and the topic.
+
+    Those are the page secrets of a config without bucket keys, which this file's is.
+    """
     return Publisher(
         lake_root=lake_root,
         transport=FakeTransport() if transport is None else transport,

@@ -344,7 +344,7 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
      directory holds the token, `config.yaml`, and `tickers.yaml`, all of which survive
      an uninstall, so the guard over them survives too. Symmetry with the install is the
      wrong principle for a protection over data that outlives the install. Lifting the
-     exclusion would put the token and `config.yaml`'s four secrets on the next hourly
+     exclusion would put the token and `config.yaml`'s four to six secrets on the next hourly
      backup, and a backup that already ran cannot be un-run by re-adding the exclusion.
   3. The Sunday one-shot wake. `pmset schedule cancel` can take a single event, but only
      by naming the exact date and time it was set for. Nothing here knows which Sunday
@@ -534,9 +534,9 @@ Every test sits in one of four tiers. The tier is set by the widest boundary the
 | Unit | One module, every seam faked. Decided from values alone. | 320 tests, under 10 seconds | every save |
 | Component | One subsystem across exactly one real boundary. Real files, real DuckDB, or real processes contending on a lock. Clock and vendor stay fake. | 60 tests, under 60 seconds | every commit |
 | Integration | Two or more subsystems wired through real boundaries. | 14 named tests, two to four minutes | every push |
-| Live | Needs the real vendor, the real OS scheduler, or real elapsed time. Deliberately not in CI. | 7 checks | by hand |
+| Live | Needs the real vendor, the real OS scheduler, real elapsed time, or the real backup bucket. Deliberately not in CI. | 8 checks | by hand |
 
-Two of these tiers get a named roster below. The 14 integration tests and the 7 live checks are each small and hand-picked, so every scenario is pinned by name. Unit and component are not rostered. Their counts are targets, filled per module and per subsystem as the build proceeds.
+Two of these tiers get a named roster below. The 14 integration tests and the 8 live checks are each small and hand-picked, so every scenario is pinned by name. Unit and component are not rostered. Their counts are targets, filled per module and per subsystem as the build proceeds.
 
 ## The placement rule
 
@@ -545,7 +545,7 @@ One rule places every test. Apply it in order and stop at the first match.
 1. Decided from values alone is unit.
 2. Needs a real file, process, or query engine within one subsystem is component.
 3. Needs two or more subsystems talking is integration.
-4. Needs the real vendor, the real OS scheduler, or real wall-clock time to pass is not a test at all. It goes in the live lane.
+4. Needs the real vendor, the real OS scheduler, real wall-clock time, or the real backup bucket to pass is not a test at all. It goes in the live lane.
 
 ## The 14 integration tests
 
@@ -594,7 +594,7 @@ not just the ledger's entry. Test 12 joined the list when
 [#281](https://github.com/l3a0/marketlake/issues/281) shipped the 18:30 job it replays, so
 nothing on the roster is blocked on unbuilt work any more.
 
-## The 7 live checks
+## The 8 live checks
 
 These need the real world. They run by hand, off CI.
 
@@ -605,6 +605,14 @@ These need the real world. They run by hand, off CI.
 5. The DST-weekend one-shot behavior. DST is the daylight-saving-time clock change.
 6. A real restore from the SSD.
 7. The Sunday canary coverage assertion. The Sunday canary is the weekend check that proves capture still works.
+8. The four S3 behaviors the bucket backup rests on, against the owner's real bucket ([#639](https://github.com/l3a0/marketlake/issues/639)). `python -m lake.bucket live-check --target s3://<bucket>/live-check` runs it and prints one PASS or FAIL line per behavior. The target prefix sits outside the lake's, so its probe objects never reach the Sunday scrub.
+
+   1. S3 refuses a PUT whose `ChecksumSHA256` does not match the bytes, with `BadDigest`.
+   2. `HeadObject` in checksum mode returns the stored SHA-256 of a single PUT, typed `FULL_OBJECT`.
+   3. A PUT to an existing key on the versioned bucket creates a new version and keeps the old one. The narrow key holds no `s3:GetObjectVersion`, so the check prints the two version ids and asks for the old version to be confirmed in the console.
+   4. `put_object` of a 9 MiB body, past the 8 MiB point where `upload_file` and `aws s3 cp` switch to parts, sends one request.
+
+   The narrow key cannot delete, so the check ends by naming the probe prefix to delete by hand.
 
 ## When the alert channels get created
 

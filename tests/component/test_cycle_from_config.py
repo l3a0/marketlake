@@ -705,3 +705,36 @@ def test_the_client_is_closed_when_the_cycle_raises(tmp_path, monkeypatch):
         _cycle(rig, ManualClock(start=FIRST_MINUTE))
 
     assert vendor.closed == 1
+
+
+# -- a backup setting never stops capture -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "s3://lake-backup/lake",  # a bucket with none of its three keys
+        "s3://Legacy_Bucket/lake",  # a bucket name S3 refuses
+        "smb://nas/share",  # a scheme that is neither a path nor a bucket
+    ],
+)
+def test_a_bad_backup_setting_still_captures(tmp_path, monkeypatch, target):
+    """Only the nightly backup reads ``backup_target``, and capture loads the same file.
+
+    The entry reloads ``config.yaml`` every cycle, so a load that refused a backup
+    setting would stop capture for the rest of the session, and a minute not captured
+    is gone. The bucket checks run when a bucket job runs, never here.
+    """
+    rig = _rig(tmp_path, SPY_ONLY)
+    text = rig.config.read_text()
+    rig.config.write_text(
+        text.replace(f"backup_target: {tmp_path / 'ssd'}", f"backup_target: {target}")
+    )
+    assert f"backup_target: {target}" in rig.config.read_text()
+    vendor = _Vendor()
+    _wire(monkeypatch, rig, lambda path: vendor)
+
+    result = _cycle(rig, ManualClock(start=FIRST_MINUTE))
+
+    assert result.segment(CHAINS, "SPY").row_kind == journal.ROW_KIND_DATA
+    assert vendor.chains == ["SPY"]

@@ -466,7 +466,7 @@ def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> in
         lake_root=config.lake_root,
         transport=NtfyTransport(config.ntfy_topic.reveal()),
         # The values that must never reach a phone, checked against the page itself.
-        secrets=(config.healthchecks_ping_key.reveal(), config.ntfy_topic.reveal()),
+        secrets=config.page_secrets(),
     )
     reader = SystemClock() if clock is None else clock
     return run_test_push(publisher, now=reader.now())
