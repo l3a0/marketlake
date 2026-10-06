@@ -14,6 +14,9 @@ So each job here runs as a real child, the way its service manager runs it: the 
 argv, environment and working directory. Each runs twice, once as launchd starts it and
 once as systemd does. systemd hands a unit its own fixed ``PATH`` and, from ``User=``,
 ``HOME``, ``USER``, ``LOGNAME`` and ``SHELL``, and then the unit's ``Environment=`` on top.
+The service manager's own environment reaches the unit too, which holds the host's locale
+and whatever ``DefaultEnvironment=`` or ``systemctl set-environment`` added. The child here
+starts without it. An operator's shell export reaches a unit through neither source.
 The suite pins ``is_macos`` to true, and that pin does not reach a child, so on CI's Linux
 runner the child takes the Linux branch. Every entry still exits 2 on the missing config
 before any probe. The working directory matters under ``-m``, because
@@ -81,7 +84,8 @@ def started_environment(host_kind: str, job: cp.Job, home: Path) -> dict[str, st
     """The environment the service manager starts the job with.
 
     launchd hands a job exactly its plist's block. systemd sets its own five first and
-    lays the unit's ``Environment=`` over them.
+    lays the unit's ``Environment=`` over them. The manager's own environment, which the
+    module docstring names, is left out.
     """
     if host_kind == "launchd":
         return dict(job.environment)
