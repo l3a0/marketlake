@@ -2562,9 +2562,10 @@ def run_cycle_from_config(
     The vendor is closed once the cycle's last request is done, not when the cycle returns
     (marketlake #597). The cycle returns at its bound with abandoned requests still running,
     and one of them may be refreshing the token, since the refresh runs inside a request.
-    Closing the client under it discards the response, which for a refresh is the new token,
-    and if Schwab rotates the refresh token on each refresh, which nothing here has
-    measured, the file would keep one Schwab has superseded. Closing sooner would stop
+    Closing the client under it discards the response, which for a refresh is the new token.
+    marketlake #633 measured that a refresh leaves the refresh token unchanged, so today
+    that costs one more refresh. If Schwab ever rotated the refresh token on each refresh,
+    the file would keep one Schwab has superseded. Closing sooner would stop
     nothing sooner either: a probe with httpx 0.28.1 closed a client one second into a
     request, and the request still ran to its 30s read timeout. So the close waits, and an
     abandoned request's sockets close at most that long after the bound.

@@ -3022,7 +3022,8 @@ def tmutil_exclusion_targets(config_dir: str, token_path: str) -> tuple[str, ...
     1. ``config.yaml`` sits beside the token and holds four secrets of its own: the
        healthchecks ping key, the ntfy topic, and the two Schwab app credentials. A
        bucket backup target on the key path adds two more, the bucket's access key id
-       and secret key. Excluding only the token left those on a backup disk without
+       and secret key, and the token store's put key adds two more again, so the file
+       holds four to eight. Excluding only the token left those on a backup disk without
        FileVault.
     2. A sticky exclusion is an attribute on the item, so it dies when the item is
        deleted and re-created. ``config.yaml`` is hand-edited and most editors save by
@@ -3036,7 +3037,8 @@ def tmutil_exclusion_targets(config_dir: str, token_path: str) -> tuple[str, ...
     root and Full Disk Access for it, and this step runs as the owner.
 
     Nothing here is restored from a backup anyway. The design rewrites ``config.yaml``
-    per machine, the token is carried deliberately on migration, and the roster is
+    per machine, the token reaches a new host through the token parameter that
+    ``python -m lake.token_store pull`` reads (marketlake #636), and the roster is
     copied from the repository's ``config/tickers.yaml`` by ``python -m lake.roster
     apply``. Each host's re-tune writes its own ``chain_plan.json``.
     A token pointed outside the directory is excluded on its own, because a brokerage

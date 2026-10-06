@@ -30,7 +30,7 @@ import botocore.utils
 import pytest
 from botocore.awsrequest import AWSResponse
 
-from lake import bucket
+from lake import aws_session, bucket
 from lake.bucket import client_from_config
 from lake.config import Config, ConfigError
 
@@ -295,7 +295,7 @@ def test_a_key_and_no_region_beside_instance_profile_refuse_as_one_line(monkeypa
 def test_the_metadata_address_is_the_one_aws_serves():
     # Every test points the address at a server on loopback, so none of them reaches
     # this value. botocore's own constant is the reference, not one built from it here.
-    assert bucket.METADATA_BASE_URL == botocore.utils.METADATA_BASE_URL
+    assert aws_session.METADATA_BASE_URL == botocore.utils.METADATA_BASE_URL
 
 
 def test_instance_profile_still_needs_the_region(monkeypatch):
@@ -313,7 +313,7 @@ def test_a_metadata_fetcher_that_fails_to_build_leaves_the_proxies_set(monkeypat
     # Schwab canary included, loses them.
     monkeypatch.delenv("http_proxy", raising=False)
     monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
-    monkeypatch.setattr(bucket, "METADATA_BASE_URL", "not a url")
+    monkeypatch.setattr(aws_session, "METADATA_BASE_URL", "not a url")
     with pytest.raises(ConfigError) as refused:
         client_from_config(_profile_config())
     assert os.environ["HTTP_PROXY"] == "http://127.0.0.1:9"

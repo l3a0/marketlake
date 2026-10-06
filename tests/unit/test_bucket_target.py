@@ -311,6 +311,37 @@ def test_the_page_secrets_hold_the_bucket_keys_when_present():
     )
 
 
+# The put-only key the weekly re-auth signs the token parameter's put with, marketlake #636.
+STORE_KEYS = {
+    "token_store_access_key_id": "AKIDTOKENSTOREKEY",
+    "token_store_secret_access_key": "token-store-secret-value",
+    "token_store_region": "us-east-2",
+}
+
+
+def test_the_page_secrets_hold_the_token_store_keys_when_present():
+    # Each pair alone and both together, so a method that added only one pair passes
+    # neither the first nor the last assertion.
+    alone = Config.from_mapping({**BASE, **STORE_KEYS}).page_secrets()
+    assert alone == (
+        "PING-KEY-SECRET",
+        "topic-secret-xyz",
+        "AKIDTOKENSTOREKEY",
+        "token-store-secret-value",
+    )
+    both = Config.from_mapping({**BASE, **KEYS, **STORE_KEYS}).page_secrets()
+    assert both == (
+        "PING-KEY-SECRET",
+        "topic-secret-xyz",
+        "AKIDBUCKETKEY",
+        "bucket-secret-value",
+        "AKIDTOKENSTOREKEY",
+        "token-store-secret-value",
+    )
+    # The region is not a secret, so it never joins them.
+    assert "us-east-2" not in both
+
+
 def _publisher_sites() -> list[tuple[str, int, ast.Call]]:
     """Every ``Publisher(...)`` construction under ``src/lake``, as (file, line, call)."""
     source = Path(lake.__file__).parent

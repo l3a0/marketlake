@@ -55,6 +55,11 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
 - `src/lake/outbox.py` is the one place the ntfy transport and the healthchecks pinger
   are built. Under the config's `role: shadow` it builds recorders instead, which write
   each ping and page to `journal/outbox/` rather than sending it.
+- `src/lake/aws_session.py` is the one place an AWS client is built. It builds the
+  bucket's client and the token parameter's from `config.yaml` alone, never from an
+  `AWS_*` variable or `~/.aws/`.
+- `src/lake/token_store.py` carries the Schwab token to a hosted VM through an SSM
+  parameter: the re-auth's put and the VM's pull.
 - `tests/support` holds the fakes, the fixture-lake builder, the enforcement scanners,
   and the proxy pool that measures a read's peak Arrow memory.
 - `infra/bootstrap` is the OpenTofu configuration CI needs before it can run: the bucket
@@ -293,6 +298,81 @@ TZ=America/New_York journalctl -u com.marketlake.daemon
 The steps that follow the install, and their order, are the hosted VM runbook in
 [#686](https://github.com/l3a0/marketlake/issues/686). The design doc's Deployment section
 carries the reasoning for each unit setting.
+
+## Carry the Schwab token to a hosted VM
+
+The VM has no browser, so it cannot run the weekly Schwab login. The laptop's re-auth puts
+the token into the SSM parameter `/marketlake/config/schwab-oauth-token`, and the VM copies
+it into its own `token.json`. The design's Auth section carries the reasoning, and
+[#636](https://github.com/l3a0/marketlake/issues/636) carries the plan.
+
+One key in each host's `config.yaml` says what the host does with the token:
+
+| `token_store` | `reauth.sh` writes | Used by |
+| --- | --- | --- |
+| absent or `file` | `token.json` | the laptop before the VM exists |
+| `both` | `token.json`, then the parameter | the laptop once the VM exists |
+| `store` | `token.json`, then the parameter | the VM |
+
+Any other value prints one line naming it, writes `token.json`, and puts the parameter
+when the keys below allow it. The put signs with three more keys, which hold the access key
+of the IAM user that may only put this one parameter
+([#699](https://github.com/l3a0/marketlake/issues/699)). They never fall back to the
+`bucket_*` keys, whose user holds no grant to put it:
+
+```yaml
+token_store: both
+token_store_access_key_id: <access key id>
+token_store_secret_access_key: <secret access key>
+token_store_region: <the bucket's region>
+```
+
+Under `both` or `store`, a missing or malformed key stops `reauth.sh` with exit 2 before the
+browser opens. A put that succeeds adds a line to the sign-off block naming the parameter's
+version number:
+
+```text
+  parameter:     /marketlake/config/schwab-oauth-token version <n>
+```
+
+The laptop has no grant to read the parameter, so that line is the only proof at the
+terminal that it changed. Exit 3 means `token.json` was written and the parameter was not.
+Its one line names the token's path and the fix. A refused or unknown key is fixed in the
+`token_store_*` keys, and another login fails the same way until it is. Any other error is
+fixed by running `reauth.sh` again.
+
+The first `both` re-auth comes before the VM's first boot, in this order:
+
+1. The put-only user from [#699](https://github.com/l3a0/marketlake/issues/699) exists, and its access key is in the three `token_store_*` keys
+   in the laptop's `config.yaml`.
+2. The laptop's checkout carries this code. `reauth.sh` runs the checkout's Python, and
+   older code ignores `token_store`, writes the file, puts nothing, and exits 0 without a
+   word.
+3. Set `token_store: both`. Edit `config.yaml` outside a session, because capture reloads
+   it every minute and a broken edit stops capture.
+4. Run `reauth.sh` once, and check that it printed a version number.
+
+To rotate the put-only key:
+
+1. Put the new key in the `token_store_*` keys.
+2. Run `reauth.sh`, and see the version line.
+3. Deactivate the old key.
+
+The VM copies the parameter with one command, run as the account that runs the daemon,
+because a run as root leaves a `token.json` the daemon cannot read:
+
+```bash
+uv run python -m lake.token_store pull [--config <path>] [--token <path>]
+```
+
+It reads the parameter with the instance profile, as the bucket client does, and writes
+`token.json` only when the local file is absent or unreadable, or the parameter was minted
+later. It prints one line and exits 0 when it wrote the file or found it current, 1 when
+the parameter is older, unusable, or minted more than an hour in the future, 3 when the
+instance profile is not serving credentials yet, which is worth retrying, and 2 for a
+mistake in `config.yaml`. The VM's first boot runs it
+([#686](https://github.com/l3a0/marketlake/issues/686)), and
+[#702](https://github.com/l3a0/marketlake/issues/702) runs it after that.
 
 ## Reach the dashboard on a hosted VM
 

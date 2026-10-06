@@ -501,13 +501,16 @@ def serialize_token_refresh(
     file. The file's token is then the one checked, so a refresh another client already
     made is adopted rather than repeated, and a refresh that does happen uses the newest
     refresh token on disk. That keeps the lake correct whether or not Schwab rotates the
-    refresh token on each refresh, which nothing here has measured. If it does, a second
-    refresh with the superseded refresh token would be refused and read as auth death.
+    refresh token on each refresh. marketlake #633 measured it on 2026-10-05: a refresh
+    issued a new access token and left the refresh token unchanged, and a refresh on one
+    host did not revoke the other host's copy. Had Schwab rotated, a second refresh with
+    the superseded refresh token would have been refused and read as auth death, and the
+    adoption is what still guards against Schwab starting to.
 
-    One case stays open under rotation, and it predates the re-read. A refresh whose file
-    write fails leaves the new token in that client's memory and the old one on disk. The
-    client's own request raises the write's error. If Schwab rotates, every client that
-    later adopts the file refreshes with a refresh token Schwab has already superseded.
+    One case would open if Schwab ever rotated, and it predates the re-read. A refresh
+    whose file write fails leaves the new token in that client's memory and the old one
+    on disk. The client's own request raises the write's error. Under rotation, every
+    client that later adopted the file would refresh with a superseded refresh token.
 
     A re-read that fails leaves the session's own token in place and prints one line naming
     the failure's type, never its message or anything from the file. The request then goes

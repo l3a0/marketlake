@@ -9,7 +9,7 @@ so a test points it at a throwaway directory and production points it at the con
 ``lake_root``.
 
 The machine's config directory is the second. Four files sit in
-``~/.config/marketlake/``: the machine-local ``config.yaml``, the rotating
+``~/.config/marketlake/``: the machine-local ``config.yaml``, the Schwab
 ``token.json``, the portable ``tickers.yaml``, and the nightly-written
 ``chain_plan.json``. That directory is the one path no config can name, because it is
 where ``config.yaml`` is found. So it is a code constant, and this is where it is
@@ -474,7 +474,7 @@ CONFIG_DIR_PARTS = (".config", "marketlake")
 # given on the command line.
 #
 # It redirects the directory rather than the token alone, because the token is the
-# file that was lost and not the only one that can be. ``config.yaml`` holds four to six
+# file that was lost and not the only one that can be. ``config.yaml`` holds four to eight
 # secrets and the roster is hand-maintained.
 #
 # Two limits are worth stating. ``config_dir`` reads the environment on every call, but
