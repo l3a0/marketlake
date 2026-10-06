@@ -59,7 +59,9 @@ account, differs in three steps.
    request's branch.
 2. Step 10 drops out, since no pull request needs a plan.
 3. Step 11 replaces the merge with a manual run of `infra.yml` on `main`, which is
-   `gh workflow run infra.yml --repo l3a0/marketlake --ref main`.
+   `gh workflow run infra.yml --repo l3a0/marketlake --ref main`. Its first apply in a
+   fresh account also creates `aws_iam_role_policy_attachment.instance_ssm`, which
+   [#695](https://github.com/l3a0/marketlake/issues/695) added after the recorded run.
 
 ### 1. Install the tools
 
