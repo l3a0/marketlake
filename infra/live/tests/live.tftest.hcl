@@ -91,6 +91,17 @@ run "instance_role_is_trusted_by_ec2_alone" {
     condition     = aws_iam_instance_profile.instance.role == aws_iam_role.instance.name
     error_message = "The instance profile does not carry marketlake-instance."
   }
+
+  # The apply role may attach exactly this ARN, so any other fails the first apply.
+  assert {
+    condition     = aws_iam_role_policy_attachment.instance_ssm.role == aws_iam_role.instance.name
+    error_message = "The SSM policy is not attached to marketlake-instance."
+  }
+
+  assert {
+    condition     = aws_iam_role_policy_attachment.instance_ssm.policy_arn == "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+    error_message = "The attachment is not AWS's AmazonSSMManagedInstanceCore."
+  }
 }
 
 run "empty_names_fail_validation" {

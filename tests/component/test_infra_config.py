@@ -1,6 +1,6 @@
 """Checks on ``infra/`` that ``tofu test`` cannot make, read from the ``.tf`` files.
 
-``tofu test`` sees one configuration's plan, and five things are not in one.
+``tofu test`` sees one configuration's plan, and six things are not in one.
 
 1. ``prevent_destroy``. A test refuses destroy-mode plans, and ``tofu show -json`` omits
    ``lifecycle``, so removing the line leaves every ``tofu test`` run green.
@@ -14,6 +14,10 @@
    at once, and without ``encrypt`` it lands unencrypted.
 5. Whether the IAM names the apply role may write in ``infra/bootstrap`` are the names
    ``infra/live`` declares. Each configuration's tests see only their own side.
+6. Whether every managed policy ``infra/live`` attaches is one the apply role may
+   attach to that role. A plan only reads, so an ARN the apply role's ``iam:PolicyARN``
+   condition refuses passes every pull request check and first fails with an
+   AccessDenied at the apply after the merge.
 
 A ``module`` block would hide its resources from every check here, so neither
 configuration may call one.
@@ -232,3 +236,52 @@ def test_apply_role_grants_name_the_iam_resources_live_declares() -> None:
         ("user", "marketlake-backup"),
     }
     assert declared == granted
+
+
+# The condition operators under which an ``iam:PolicyARN`` value grants that ARN. A
+# negated operator such as ``ArnNotEquals`` grants every other ARN instead.
+_GRANTING_OPERATORS = {"ArnEquals", "StringEquals"}
+
+
+def _listed(value: str | list[str]) -> list[str]:
+    return [value] if isinstance(value, str) else list(value)
+
+
+def test_apply_role_may_attach_every_policy_live_attaches() -> None:
+    """Each attachment needs one Allow statement that grants ``iam:AttachRolePolicy`` on
+    its role's name and names its ARN under a granting operator. Collecting every
+    ``iam:PolicyARN`` in the policy instead would pass a Deny statement, a negated
+    operator and an Allow that grants only ``iam:DetachRolePolicy``."""
+    live = _resources("live")
+    attachments = {
+        address: body
+        for address, body in live.items()
+        if address.split(".")[0] == "aws_iam_role_policy_attachment"
+    }
+    assert attachments, "infra/live attaches no managed policy, so this check reads nothing"
+
+    policy = _jsonencode_argument(_resources("bootstrap")["aws_iam_role_policy.apply"]["policy"])
+    grants: list[tuple[set[str], set[str]]] = []
+    for statement in policy["Statement"]:
+        if statement["Effect"] != "Allow" or "iam:AttachRolePolicy" not in _actions(statement):
+            continue
+        roles = set()
+        for resource in _listed(statement["Resource"]):
+            match = re.fullmatch(r"arn:aws:iam::\$\{local\.account_id\}:role/(.+)", resource)
+            if match:
+                roles.add(match.group(1))
+        arns = set()
+        for operator, keys in statement.get("Condition", {}).items():
+            if operator not in _GRANTING_OPERATORS:
+                continue
+            for key, value in keys.items():
+                if key.lower() == "iam:policyarn":
+                    arns.update(_listed(value))
+        grants.append((roles, arns))
+
+    for address, body in attachments.items():
+        role = live[f"aws_iam_role.{_role_name(body['role'])}"]["name"]
+        arn = body["policy_arn"]
+        assert any(role in roles and arn in arns for roles, arns in grants), (
+            f"infra/live/{address} attaches {arn} to {role}, which the apply role may not"
+        )
