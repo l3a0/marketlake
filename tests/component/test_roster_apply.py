@@ -19,8 +19,16 @@ import yaml
 
 from lake import roster as roster_cli
 from lake.config import ConfigError
+from lake.paths import CONFIG_DIR_ENV
 from lake.roster import REPLACED, UNCHANGED, RosterError, apply
-from lake.tickers import TickersError, apply_roster, roster_from_bytes
+from lake.tickers import (
+    TICKERS_PATH_ENV,
+    TickersError,
+    apply_roster,
+    default_tickers_path,
+    roster_from_bytes,
+    tickers_file_path,
+)
 from tests.support.config import write_config
 
 # A roster formatted the way no ``yaml.safe_dump`` call writes it: a comment, flow
@@ -223,6 +231,75 @@ def test_a_bad_entry_names_standard_input_as_its_source():
     with pytest.raises(TickersError) as excinfo:
         roster_from_bytes(b"SPY: [1m]\n")
     assert str(excinfo.value).endswith(" in tickers file: <stdin>")
+
+
+def test_bad_yaml_names_standard_input_as_its_source():
+    with pytest.raises(TickersError) as excinfo:
+        roster_from_bytes(b"SPY: {options: true, bars: [1m\n")
+    message = str(excinfo.value)
+    assert message.startswith("tickers file is not valid YAML")
+    assert message.endswith(": <stdin>")
+
+
+def test_a_roster_with_no_enabled_ticker_names_standard_input_as_its_source(tmp_path):
+    with pytest.raises(TickersError) as excinfo:
+        apply_roster(b"", check=_accept, path=tmp_path / "tickers.yaml")
+    assert str(excinfo.value).endswith("capture nothing: <stdin>")
+
+
+def test_a_host_roster_that_is_a_directory_is_refused(tmp_path):
+    # Reading a directory raises ``IsADirectoryError``, an ``OSError`` that is not a
+    # permission error, so a handler narrowed to the chmod case lets it escape bare.
+    target = tmp_path / "tickers.yaml"
+    target.mkdir()
+    with pytest.raises(TickersError, match="cannot be read"):
+        apply_roster(HAND_FORMATTED, check=_accept, path=target)
+    assert target.is_dir()
+
+
+def test_an_equal_crlf_roster_is_left_alone(tmp_path):
+    # The host's copy is compared as bytes. Read as text, each CRLF turns into LF, the
+    # copy stops matching the payload, and an unchanged roster is rewritten every apply.
+    payload = (
+        b"SPY: {options: true, chain_cadence: 1m, bars: [1m, 1d]}\r\n"
+        b"QQQ: {options: true, chain_cadence: 1m, bars: [1m, 1d]}\r\n"
+    )
+    target = tmp_path / "tickers.yaml"
+    target.write_bytes(payload)
+    before = target.stat().st_ino
+    assert apply_roster(payload, check=_accept, path=target) is False
+    assert target.stat().st_ino == before
+    assert target.read_bytes() == payload
+
+
+def test_an_explicit_path_wins_over_the_environment(tmp_path, monkeypatch):
+    from_env = tmp_path / "env.yaml"
+    from_arg = tmp_path / "arg.yaml"
+    monkeypatch.setenv(TICKERS_PATH_ENV, str(from_env))
+    assert apply_roster(HAND_FORMATTED, check=_accept, path=from_arg) is True
+    assert from_arg.read_bytes() == HAND_FORMATTED
+    assert not from_env.exists()
+
+
+def test_an_empty_environment_override_falls_back_to_the_default():
+    # An empty value is unset, not a path. Read as a path it is the current directory.
+    assert tickers_file_path(env={TICKERS_PATH_ENV: ""}) == default_tickers_path()
+
+
+def test_apply_creates_every_missing_parent_directory(tmp_path):
+    target = tmp_path / "a" / "b" / "tickers.yaml"
+    assert apply_roster(HAND_FORMATTED, check=_accept, path=target) is True
+    assert target.read_bytes() == HAND_FORMATTED
+
+
+def test_the_default_path_follows_the_config_directory_on_every_call(tmp_path, monkeypatch):
+    # A cached path would resolve once and keep the first directory after a redirect,
+    # which is the failure that overwrote a host's live roster on 2026-10-06.
+    monkeypatch.delenv(TICKERS_PATH_ENV, raising=False)
+    monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path / "a"))
+    assert tickers_file_path() == tmp_path / "a" / "tickers.yaml"
+    monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path / "b"))
+    assert tickers_file_path() == tmp_path / "b" / "tickers.yaml"
 
 
 # -- the command: lake.roster.apply ---------------------------------------------------
@@ -519,3 +596,62 @@ def test_a_redirect_made_after_import_moves_the_roster(tmp_path):
     assert applied.stdout.decode() == f"{REPLACED}\n"
     assert (late_dir / "tickers.yaml").read_bytes() == HAND_FORMATTED
     assert list(early_home.rglob("*")) == []
+
+
+# The child for the one-variable redirects. It imports ``lake.roster`` first, then sets
+# only the variables named after the config path, each as ``NAME=value``, and applies the
+# roster on stdin. The config path is passed explicitly for the reason the child above
+# gives.
+_LATE_SETS = """\
+import os
+import sys
+
+import lake.roster
+
+for pair in sys.argv[2:]:
+    name, value = pair.split("=", 1)
+    os.environ[name] = value
+print(lake.roster.apply(sys.stdin.buffer.read(), config_path=sys.argv[1]))
+"""
+
+
+def _apply_in_child(env: dict[str, str], config: Path, *sets: str):
+    # The caller builds every path from ``tmp_path``. The environment is built here,
+    # never inherited, so neither the real HOME nor the suite's redirect reaches it.
+    return subprocess.run(
+        [sys.executable, "-c", _LATE_SETS, str(config), *sets],
+        input=HAND_FORMATTED,
+        capture_output=True,
+        env={"PATH": "/usr/bin:/bin", **env},
+        check=False,
+    )
+
+
+def test_a_late_redirect_of_home_alone_moves_the_roster(tmp_path):
+    # The 2026-10-06 incident redirected HOME and nothing else. The child starts with no
+    # config-directory override, so the default comes from HOME, and HOME changes after
+    # the import.
+    early_home = tmp_path / "early"
+    late_home = tmp_path / "late"
+    early_home.mkdir()
+    late_dir = late_home / ".config" / "marketlake"
+    config = write_config(late_dir, tmp_path / "lake")
+    applied = _apply_in_child({"HOME": str(early_home)}, config, f"HOME={late_home}")
+    assert applied.returncode == 0, applied.stderr
+    assert applied.stdout.decode() == f"{REPLACED}\n"
+    assert (late_dir / "tickers.yaml").read_bytes() == HAND_FORMATTED
+    assert list(early_home.rglob("*")) == []
+
+
+def test_a_late_config_directory_override_alone_moves_the_roster(tmp_path):
+    # The mirror of the HOME case. HOME stays put and only the override is set after the
+    # import, so a default that read the override once, at import, would land under HOME.
+    home = tmp_path / "home"
+    home.mkdir()
+    late_dir = tmp_path / "late"
+    config = write_config(tmp_path / "cfg", tmp_path / "lake")
+    applied = _apply_in_child({"HOME": str(home)}, config, f"{CONFIG_DIR_ENV}={late_dir}")
+    assert applied.returncode == 0, applied.stderr
+    assert applied.stdout.decode() == f"{REPLACED}\n"
+    assert (late_dir / "tickers.yaml").read_bytes() == HAND_FORMATTED
+    assert list(home.rglob("*")) == []
