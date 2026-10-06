@@ -2577,6 +2577,70 @@ def test_a_retyped_flag_still_fails_a_day_whose_data_rows_follow_a_batch_of_gap_
     assert str(caught.value).startswith(f"{partition.relative}: ")
 
 
+def test_a_batch_of_gap_rows_is_skipped_and_the_batches_after_it_still_count(lake: Path):
+    """Skipping a batch the data-row filter emptied moves on to the next batch rather than
+    ending the read. The first batch holds one data row among three gap rows, so it is not
+    empty and must be counted. The second holds gap rows alone, and the data rows after it
+    must still reach the count and the median."""
+    rows = [_gap_row() for _ in range(3)] + _clean_rows("chains", count=1)
+    rows += [_gap_row() for _ in range(4)] + _clean_rows("chains", count=4)
+    _write(lake, "chains", "SPY", DAY, rows)
+
+    found = read_entitlement(_partition(lake), _session(), batch_size=4)
+
+    assert found == Entitlement(
+        rows=5, flag_present=True, flag_violations=0, median_staleness=-1.7, session_rows=5
+    )
+
+
+def test_a_batch_whose_every_flag_is_wrong_counts_every_row_as_a_violation(lake: Path):
+    """A batch where no row agrees sums to zero agreeing rows, and zero is the count, not a
+    missing answer to be replaced."""
+    rows = _clean_rows("chains", count=4)
+    for row in rows:
+        row["is_delayed"] = True
+    _write(lake, "chains", "SPY", DAY, rows)
+
+    found = read_entitlement(_partition(lake), _session(), batch_size=2)
+
+    assert found.flag_violations == 4
+
+
+def test_an_odd_count_session_median_is_its_middle_row(lake: Path):
+    """The exact median at ``q=0.5``. An odd count has one middle row, and a ``q`` a hair
+    either side of one half would answer the midpoint of it and a neighbour instead."""
+    rows = [
+        _row(minute, staleness=staleness, flag=False, surface="chains")
+        for minute, staleness in enumerate([-1.0, -9.0, -2.0])
+    ]
+    _write(lake, "chains", "SPY", DAY, rows)
+
+    assert read_entitlement(_partition(lake), _session()).median_staleness == -2.0
+
+
+def test_the_nightly_judge_reads_entitlement_in_batches_no_larger_than_measured(
+    lake: Path, monkeypatch
+):
+    """The 89.7 MiB peak on SPY 2026-09-28 was measured at 65,536 rows a batch. The memory test
+    above passes its own small ``batch_size``, so it says nothing about the size the nightly
+    ``judge`` actually reads with. This records that size at the real entry point."""
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains"))
+    _seed_spans(lake)
+    sizes: list = []
+    real = pa_pq.ParquetFile
+
+    class Recording(real):
+        def iter_batches(self, *args, **kwargs):
+            sizes.append(kwargs.get("batch_size"))
+            return super().iter_batches(*args, **kwargs)
+
+    monkeypatch.setattr(pa_pq, "ParquetFile", Recording)
+    judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert sizes, "the entitlement read streamed"
+    assert all(size is not None and size <= 65_536 for size in sizes), sizes
+
+
 # Small enough that a 1,998-row day spans eight batches. Every other fixture in this file fits
 # in one batch at the default size, the largest at 300 rows.
 SMALL_BATCH = 256
