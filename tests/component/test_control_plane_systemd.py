@@ -11,6 +11,7 @@ bash 3.2 on a Mac, so the suite also shows they stay valid there.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -436,6 +437,39 @@ def test_the_banner_names_the_install_root(tmp_path, rendered):
     harness = Harness(tmp_path)
     proc = _install(harness, rendered)
     assert proc.stdout.splitlines()[0] == f"{cp.INSTALL_SCRIPT_FILE}: install root {harness.root}"
+
+
+# Every item of a bash array, in the form an empty array survives under ``set -u``.
+GUARDED_EXPANSION = re.compile(r'\$\{(\w+)\[@\]\+"\$\{\1\[@\]\}"\}')
+
+
+def test_an_empty_list_is_harmless_in_both_scripts(tmp_path, monkeypatch, rendered):
+    """bash 3.2 reads an empty array as unbound under ``set -u``, so each read is guarded.
+
+    The run with no units fails on a Mac's ``/bin/bash`` when a loop is bare. A current
+    bash, as on CI's Linux runner, accepts the bare form, so the text check on the real
+    render is what fails there.
+    """
+    for script in (cp.INSTALL_SCRIPT_FILE, cp.UNINSTALL_SCRIPT_FILE):
+        bare = GUARDED_EXPANSION.sub("", (rendered / script).read_text())
+        assert "[@]" not in bare, script
+
+    monkeypatch.setattr(cp, "systemd_units", lambda host: ())
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    (empty / cp.NEEDRESTART_FILE).write_text(cp.needrestart_dropin())
+    for name, text in (
+        (cp.INSTALL_SCRIPT_FILE, cp.systemd_install_script(_host())),
+        (cp.UNINSTALL_SCRIPT_FILE, cp.systemd_uninstall_script(_host())),
+    ):
+        assert "UNITS=()" in text, name
+        (empty / name).write_text(text)
+        (empty / name).chmod(0o755)
+    harness = Harness(tmp_path)
+    installed = _install(harness, empty)
+    assert installed.returncode == 0, installed.stderr
+    removed = _uninstall(harness, empty)
+    assert removed.returncode == 0, removed.stderr
 
 
 # -- uninstall.sh ----------------------------------------------------------------------

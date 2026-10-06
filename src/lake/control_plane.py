@@ -4030,8 +4030,22 @@ def _systemd_guard_lines(script: str) -> list[str]:
 
 
 def _bash_array(name: str, items: Sequence[str]) -> str:
-    """A bash array assignment. Every item is a unit name, which needs no quoting."""
+    """A bash array assignment. Every item is a unit name, which needs no quoting.
+
+    Read it back with :func:`_bash_each`, which an empty array survives.
+    """
     return f"{name}=({' '.join(items)})"
+
+
+def _bash_each(name: str) -> str:
+    """Every item of a bash array, expanding to nothing when the array is empty.
+
+    bash 3.2 treats an empty array as unbound under ``set -u``, and the test suite runs
+    these scripts on a Mac's bash 3.2. A bare ``"${NAME[@]}"`` would then end the script
+    on an empty list. The guarded form is the one ``deploy/linux-install.sh`` uses for its
+    optional flags.
+    """
+    return f'${{{name}[@]+"${{{name}[@]}}"}}'
 
 
 def systemd_install_script(host: SystemdHost) -> str:
@@ -4089,7 +4103,7 @@ def systemd_install_script(host: SystemdHost) -> str:
         "",
         "rendered() {",
         "  local unit",
-        '  for unit in "${UNITS[@]}"; do',
+        f"  for unit in {_bash_each('UNITS')}; do",
         '    if [[ "$unit" == "$1" ]]; then return 0; fi',
         "  done",
         "  return 1",
@@ -4113,7 +4127,7 @@ def systemd_install_script(host: SystemdHost) -> str:
         "# because a host without needrestart has none.",
         'echo "+ mkdir -p $UNIT_DIR $NEEDRESTART_DIR"',
         'mkdir -p "$UNIT_DIR" "$NEEDRESTART_DIR"',
-        'for unit in "${UNITS[@]}"; do',
+        f"for unit in {_bash_each('UNITS')}; do",
         '  place "$HERE/$unit" "$UNIT_DIR/$unit"',
         "done",
         f'place "$HERE/{NEEDRESTART_FILE}" "$NEEDRESTART_DIR/{NEEDRESTART_INSTALLED}"',
@@ -4142,7 +4156,7 @@ def systemd_install_script(host: SystemdHost) -> str:
         "",
         "# 4. Enable and start the residents and the timers. A unit already running is left",
         "# running, and a timer-run service is started only by its timer.",
-        'for unit in "${ENABLE[@]}"; do',
+        f"for unit in {_bash_each('ENABLE')}; do",
         '  echo "+ systemctl enable --now $unit"',
         '  systemctl enable --now "$unit"',
         "done",
@@ -4150,7 +4164,7 @@ def systemd_install_script(host: SystemdHost) -> str:
         "# 5. Read each resident back. enable --now exits 0 whatever the start did, so this",
         "# is the only place a resident that cannot start shows. It never fails the install.",
         "READBACK=ActiveState,SubState,NRestarts,Result,ExecMainStatus",
-        'for unit in "${RESIDENTS[@]}"; do',
+        f"for unit in {_bash_each('RESIDENTS')}; do",
         '  echo "+ systemctl show --property=$READBACK $unit"',
         '  systemctl show --property="$READBACK" "$unit" | sed "s/^/  /" || true',
         "done",
@@ -4208,7 +4222,7 @@ def systemd_uninstall_script(host: SystemdHost) -> str:
         "",
         "# 1. Disable and stop each unit whose file is present. systemd 255's disable fails",
         "# on a missing unit file, so an absent one is skipped rather than fatal.",
-        'for unit in "${UNITS[@]}"; do',
+        f"for unit in {_bash_each('UNITS')}; do",
         '  if [[ -f "$UNIT_DIR/$unit" ]]; then',
         '    echo "+ systemctl disable --now $unit"',
         '    systemctl disable --now "$unit"',
@@ -4218,13 +4232,13 @@ def systemd_uninstall_script(host: SystemdHost) -> str:
         "done",
         "",
         "# 2. Delete the persistent timers' stamps, so a reinstall does not replay them.",
-        'for stamp in "${STAMPS[@]}"; do',
+        f"for stamp in {_bash_each('STAMPS')}; do",
         '  echo "+ rm -f $STAMP_DIR/$stamp"',
         '  rm -f "$STAMP_DIR/$stamp"',
         "done",
         "",
         "# 3. Remove the units and the drop-in.",
-        'for unit in "${UNITS[@]}"; do',
+        f"for unit in {_bash_each('UNITS')}; do",
         '  echo "+ rm -f $UNIT_DIR/$unit"',
         '  rm -f "$UNIT_DIR/$unit"',
         "done",

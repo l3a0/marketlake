@@ -40,7 +40,7 @@ RESIDENTS=(com.marketlake.daemon.service com.marketlake.dashboard.service)
 
 rendered() {
   local unit
-  for unit in "${UNITS[@]}"; do
+  for unit in ${UNITS[@]+"${UNITS[@]}"}; do
     if [[ "$unit" == "$1" ]]; then return 0; fi
   done
   return 1
@@ -64,7 +64,7 @@ place() {
 # because a host without needrestart has none.
 echo "+ mkdir -p $UNIT_DIR $NEEDRESTART_DIR"
 mkdir -p "$UNIT_DIR" "$NEEDRESTART_DIR"
-for unit in "${UNITS[@]}"; do
+for unit in ${UNITS[@]+"${UNITS[@]}"}; do
   place "$HERE/$unit" "$UNIT_DIR/$unit"
 done
 place "$HERE/needrestart.conf" "$NEEDRESTART_DIR/marketlake.conf"
@@ -93,7 +93,7 @@ systemctl daemon-reload
 
 # 4. Enable and start the residents and the timers. A unit already running is left
 # running, and a timer-run service is started only by its timer.
-for unit in "${ENABLE[@]}"; do
+for unit in ${ENABLE[@]+"${ENABLE[@]}"}; do
   echo "+ systemctl enable --now $unit"
   systemctl enable --now "$unit"
 done
@@ -101,7 +101,7 @@ done
 # 5. Read each resident back. enable --now exits 0 whatever the start did, so this
 # is the only place a resident that cannot start shows. It never fails the install.
 READBACK=ActiveState,SubState,NRestarts,Result,ExecMainStatus
-for unit in "${RESIDENTS[@]}"; do
+for unit in ${RESIDENTS[@]+"${RESIDENTS[@]}"}; do
   echo "+ systemctl show --property=$READBACK $unit"
   systemctl show --property="$READBACK" "$unit" | sed "s/^/  /" || true
 done

@@ -37,7 +37,7 @@ STAMPS=(stamp-com.marketlake.sunday.timer stamp-com.marketlake.eod-sweep.timer)
 
 # 1. Disable and stop each unit whose file is present. systemd 255's disable fails
 # on a missing unit file, so an absent one is skipped rather than fatal.
-for unit in "${UNITS[@]}"; do
+for unit in ${UNITS[@]+"${UNITS[@]}"}; do
   if [[ -f "$UNIT_DIR/$unit" ]]; then
     echo "+ systemctl disable --now $unit"
     systemctl disable --now "$unit"
@@ -47,13 +47,13 @@ for unit in "${UNITS[@]}"; do
 done
 
 # 2. Delete the persistent timers' stamps, so a reinstall does not replay them.
-for stamp in "${STAMPS[@]}"; do
+for stamp in ${STAMPS[@]+"${STAMPS[@]}"}; do
   echo "+ rm -f $STAMP_DIR/$stamp"
   rm -f "$STAMP_DIR/$stamp"
 done
 
 # 3. Remove the units and the drop-in.
-for unit in "${UNITS[@]}"; do
+for unit in ${UNITS[@]+"${UNITS[@]}"}; do
   echo "+ rm -f $UNIT_DIR/$unit"
   rm -f "$UNIT_DIR/$unit"
 done
