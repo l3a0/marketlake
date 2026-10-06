@@ -45,16 +45,19 @@ switching back to a path free.
 
 **The client is built from ``config.yaml`` alone, with one exception.** On the
 instance-profile path its credentials come from the EC2 instance metadata service, and
-``config.yaml`` is what decides that. ``client_from_config`` reads the
-region and ``bucket_credentials`` from the config and clears every ``AWS_*`` variable,
-``~/.aws/config``, ``~/.aws/credentials`` and ``~/.aws/models`` out of the client's
-reach while it builds. Under ``keys``, the default, the access key and secret key come
-from the config too. Under ``instance_profile`` they come from the EC2 instance
-metadata service and from nowhere else, so a VM with an instance profile attached
-carries no long-lived key. A development run therefore cannot reach a real bucket on
-credentials it happened to find on the machine, because the metadata service is asked
-only when ``config.yaml`` says so. ``boto3`` is imported there, lazily, so
-the offline suite never loads it unless a test builds a client. Every job reaches the
+``config.yaml`` is what decides that. The exception has a second user: the token pull in
+``lake.token_store`` follows ``bucket_credentials`` too, so on the VM it reads the token
+parameter with the same instance profile (marketlake #636). ``client_from_config`` reads
+the region and ``bucket_credentials`` from the config, and ``lake.aws_session``, the
+builder both clients share, clears every ``AWS_*`` variable, ``~/.aws/config``,
+``~/.aws/credentials`` and ``~/.aws/models`` out of the client's reach while it builds.
+Under ``keys``, the default, the access key and secret key come from the config too.
+Under ``instance_profile`` they come from the EC2 instance metadata service and from
+nowhere else, so a VM with an instance profile attached carries no long-lived key. A
+development run therefore cannot reach a real bucket on credentials it happened to find
+on the machine, because the metadata service is asked only when ``config.yaml`` says so.
+``boto3`` is imported in the builder, lazily, so the offline suite never loads it unless
+a test builds a client. Every job reaches the
 client through ``connect``, which first runs the config's strict bucket checks. Loading
 the config runs none of them, because capture loads it every minute and a bad backup
 setting must fail the backup and nothing else.
@@ -71,22 +74,20 @@ import json
 import os
 import shutil
 import sys
-import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from lake import outbox
+from lake.aws_session import _MetadataLookupFailed, build_client, source_from_bucket_credentials
 from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
 from lake.config import (
     BUCKET_CREDENTIALS_KEY,
     CREDENTIALS_FROM_INSTANCE_PROFILE,
     CREDENTIALS_FROM_KEYS,
-    UNRECOGNISED_CREDENTIALS,
     BucketTarget,
     Config,
     ConfigError,
@@ -453,108 +454,17 @@ def _failure(exc: BaseException) -> tuple[str, str] | None:
 
 # -- the client ---------------------------------------------------------------
 
-_ENVIRONMENT_LOCK = threading.Lock()
-
-
-@contextmanager
-def _aws_environment_cleared() -> Iterator[None]:
-    """Hide every ``AWS_*`` variable and both ``~/.aws`` files while a client is built.
-
-    ``botocore`` reads its settings from the environment and from ``~/.aws/config`` as
-    well as from what it is handed. An ``AWS_ENDPOINT_URL`` would send requests signed
-    with the bucket's credentials to another host, an ``AWS_PROFILE`` naming no profile
-    would refuse to build the client, and an ``AWS_REGION`` would sign for the wrong
-    region. So for the length of the build the variables are removed, the two files are
-    pointed at the null device, and botocore's own instance-metadata lookup is turned
-    off. Everything is put back afterwards, so the process's environment is the same on
-    the way out.
-
-    This holds on both credential paths. The instance-profile path reaches the metadata
-    service only through :func:`_metadata_resolver`, whose fetcher ignores the
-    environment, so turning the lookup off here does not turn that one off.
-    """
-    with _ENVIRONMENT_LOCK:
-        saved = {key: value for key, value in os.environ.items() if key.startswith("AWS_")}
-        for key in saved:
-            del os.environ[key]
-        os.environ["AWS_CONFIG_FILE"] = os.devnull
-        os.environ["AWS_SHARED_CREDENTIALS_FILE"] = os.devnull
-        os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
-        try:
-            yield
-        finally:
-            for key in [key for key in os.environ if key.startswith("AWS_")]:
-                del os.environ[key]
-            os.environ.update(saved)
-
-
-@contextmanager
-def _proxies_cleared() -> Iterator[None]:
-    """Hide every variable whose lowercased name ends in ``_proxy``, and put them back.
-
-    The metadata fetcher reads the proxy variables once, when it is built, and keeps
-    them, so a proxy set then would carry the metadata lookup and the credentials it
-    returns through that proxy. The match is on the lowercased name because urllib
-    lowercases names, so ``HTTP_PROXY`` takes effect as surely as ``http_proxy``. The
-    ``finally`` matters as much as the removal: a fetcher that fails to build must not
-    take the process's proxies with it, Sunday's Schwab canary included.
-    """
-    saved = {key: value for key, value in os.environ.items() if key.lower().endswith("_proxy")}
-    for key in saved:
-        del os.environ[key]
-    try:
-        yield
-    finally:
-        os.environ.update(saved)
-
-
-# The instance metadata service's address. Tests point it at a server on loopback, since
-# ``_aws_environment_cleared`` removes ``AWS_EC2_METADATA_SERVICE_ENDPOINT`` with every
-# other ``AWS_*`` variable.
-METADATA_BASE_URL = "http://169.254.169.254/"
-
-# How long one metadata request may wait, in seconds, and how many tries each gets. A
-# hung service then fails the build in about 2 seconds, measured on marketlake #663.
-METADATA_TIMEOUT_S = 1
-METADATA_ATTEMPTS = 2
-
-
-def _metadata_resolver() -> Any:
-    """A credential resolver that asks the instance metadata service and nothing else.
-
-    botocore's default chain reads ``BOTO_CONFIG``, ``/etc/boto.cfg`` and ``~/.boto``
-    ahead of the metadata service, so this resolver holds one provider. The fetcher
-    takes ``env={}``, because built inside :func:`_aws_environment_cleared` with its
-    default it would read ``AWS_EC2_METADATA_DISABLED`` and return nothing. It uses
-    IMDSv2 only, the form that needs a session token. Only its construction runs
-    inside :func:`_proxies_cleared`, because the S3 client reads the proxy variables
-    too, and those stay as they are on both credential paths.
-    """
-    from botocore.credentials import CredentialResolver, InstanceMetadataProvider
-    from botocore.utils import InstanceMetadataFetcher
-
-    with _proxies_cleared():
-        fetcher = InstanceMetadataFetcher(
-            timeout=METADATA_TIMEOUT_S,
-            num_attempts=METADATA_ATTEMPTS,
-            base_url=METADATA_BASE_URL,
-            env={},
-            config={"ec2_metadata_v1_disabled": True},
-        )
-    return CredentialResolver(providers=[InstanceMetadataProvider(iam_role_fetcher=fetcher)])
-
-
-class _MetadataLookupFailed(Exception):
-    """The instance-profile lookup found no usable credentials.
-
-    ``detail`` names why without quoting the answer: the type of what the lookup raised,
-    ``none returned`` for a reachable service with no instance profile attached, or
-    ``incomplete credentials`` for an answer missing its key.
-    """
-
-    def __init__(self, detail: str) -> None:
-        super().__init__(detail)
-        self.detail = detail
+# The S3 client's settings. The timeouts bound a stalled socket. They do not bound a slow
+# PUT, which the nightly deadline handles between PUTs.
+_S3_CLIENT_CONFIG: Mapping[str, Any] = {
+    "connect_timeout": 10,
+    "read_timeout": 60,
+    "retries": {"mode": "standard", "max_attempts": 3},
+    # The SHA-256 is supplied on every PUT, which stops botocore adding a CRC32 of its
+    # own and the aws-chunked trailer that carries one.
+    "request_checksum_calculation": "when_required",
+    "response_checksum_validation": "when_required",
+}
 
 
 def _lookup_failed(detail: str) -> ConfigError:
@@ -576,13 +486,10 @@ def client_from_config(config: Config) -> Any:
 
     ``bucket_credentials`` picks the credentials. On the key path the access key and
     secret key are passed explicitly. On the instance-profile path they come from the
-    instance metadata service through :func:`_metadata_resolver`, and are fetched before
-    the client is built, so a host with no instance profile refuses here as one line
-    rather than at the first request. Either way the region decides the endpoint,
-    :func:`_aws_environment_cleared` keeps the environment and ``~/.aws`` out of the
-    build, and the service models load from the installed ``botocore`` only, never from
-    ``~/.aws/models``. The timeouts bound a stalled socket. They do not bound a slow PUT,
-    which the nightly deadline handles between PUTs.
+    instance metadata service, and are fetched before the client is built, so a host
+    with no instance profile refuses here as one line rather than at the first request.
+    Either way the region decides the endpoint, and ``lake.aws_session.build_client``
+    keeps the environment, ``~/.aws`` and ``~/.aws/models`` out of the build.
     """
     problems = bucket_credential_problems(config)
     if problems:
@@ -602,65 +509,18 @@ def client_from_config(config: Config) -> Any:
 
 
 def _build_client(config: Config) -> Any:
-    with _aws_environment_cleared():
-        import boto3  # lazy: only a bucket job builds a client
-        import botocore.loaders
-        import botocore.session
-        from botocore.config import Config as BotoConfig
+    """The S3 client for the config's bucket settings, built by ``lake.aws_session``.
 
-        core = botocore.session.Session()
-        core.register_component(
-            "data_loader",
-            botocore.loaders.Loader(
-                extra_search_paths=[botocore.loaders.Loader.BUILTIN_DATA_PATH],
-                include_default_search_paths=False,
-            ),
-        )
-        if config.bucket_credentials == CREDENTIALS_FROM_INSTANCE_PROFILE:
-            core.register_component("credential_provider", _metadata_resolver())
-            # Fetched before the client is built. The session keeps a credential it
-            # found, so ``session.client`` signs with it without a second lookup.
-            try:
-                credentials = core.get_credentials()
-            except Exception as exc:
-                # An unreachable or token-refusing service raises botocore's own error,
-                # and an answer botocore cannot parse raises a plain TypeError or
-                # ValueError. Each is a failed lookup, so only the type is named.
-                raise _MetadataLookupFailed(type(exc).__name__) from None
-            if credentials is None:
-                raise _MetadataLookupFailed("none returned")
-            frozen = credentials.get_frozen_credentials()
-            if not (frozen.access_key and frozen.secret_key):
-                raise _MetadataLookupFailed("incomplete credentials")
-            keys: dict[str, str] = {}
-        elif config.bucket_credentials == CREDENTIALS_FROM_KEYS:
-            assert config.bucket_access_key_id is not None
-            assert config.bucket_secret_access_key is not None
-            keys = {
-                "aws_access_key_id": config.bucket_access_key_id.reveal(),
-                "aws_secret_access_key": config.bucket_secret_access_key.reveal(),
-            }
-        else:
-            # ``bucket_credential_problems`` refuses any other value first. Each path is
-            # still taken only on its own value, so a value that check let through
-            # refuses here as one line rather than building a key client or failing an
-            # ``assert``.
-            raise ConfigError(UNRECOGNISED_CREDENTIALS)
-        session = boto3.session.Session(botocore_session=core)
-        return session.client(
-            "s3",
-            region_name=config.bucket_region,
-            **keys,
-            config=BotoConfig(
-                connect_timeout=10,
-                read_timeout=60,
-                retries={"mode": "standard", "max_attempts": 3},
-                # The SHA-256 is supplied on every PUT, which stops botocore adding a
-                # CRC32 of its own and the aws-chunked trailer that carries one.
-                request_checksum_calculation="when_required",
-                response_checksum_validation="when_required",
-            ),
-        )
+    ``source_from_bucket_credentials`` picks the credential source and refuses any
+    ``bucket_credentials`` value but the two it names. The S3 checksum settings are this
+    module's own, because only S3 has them.
+    """
+    return build_client(
+        "s3",
+        region=config.bucket_region,
+        source=source_from_bucket_credentials(config),
+        client_config=_S3_CLIENT_CONFIG,
+    )
 
 
 def connect(config: Config, target: BucketTarget | None = None) -> tuple[BucketTarget, Any]:

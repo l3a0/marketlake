@@ -350,7 +350,7 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
      directory holds the token, `config.yaml`, and `tickers.yaml`, all of which survive
      an uninstall, so the guard over them survives too. Symmetry with the install is the
      wrong principle for a protection over data that outlives the install. Lifting the
-     exclusion would put the token and `config.yaml`'s four to six secrets on the next hourly
+     exclusion would put the token and `config.yaml`'s four to eight secrets on the next hourly
      backup, and a backup that already ran cannot be un-run by re-adding the exclusion.
   3. The Sunday one-shot wake. `pmset schedule cancel` can take a single event, but only
      by naming the exact date and time it was set for. Nothing here knows which Sunday

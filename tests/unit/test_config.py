@@ -88,6 +88,18 @@ def test_unknown_guard_key_raises():
         Config.from_mapping({**BASE, "guards": {"nope": 1}})
 
 
+def test_an_unknown_top_level_key_loads():
+    """A key this code does not name is ignored, unlike an unknown guard.
+
+    Capture loads the file every minute, so a config written for newer code, such as one
+    carrying a key a later change adds, must load in older code rather than stop capture.
+    The guard section refuses an unknown name because a typo there silently reverts a
+    recalibration. A top-level key has no default for a typo to revert to.
+    """
+    cfg = Config.from_mapping({**BASE, "a_key_no_code_names": [1, 2]})
+    assert cfg == Config.from_mapping(BASE)
+
+
 def test_non_mapping_guards_raises():
     with pytest.raises(ConfigError):
         Config.from_mapping({**BASE, "guards": [1, 2, 3]})
@@ -121,19 +133,32 @@ def test_healthchecks_url_uses_the_slug_form():
     )
 
 
-def test_all_four_secrets_are_secret_wrapped():
-    cfg = Config.from_mapping(BASE)
+# The four optional secrets: the bucket's key pair and the token store's key pair.
+OPTIONAL_SECRETS = {
+    "bucket_access_key_id": "AKID-BUCKET-SECRET",
+    "bucket_secret_access_key": "BUCKET-SECRET-VALUE",
+    "token_store_access_key_id": "AKID-TOKEN-STORE-SECRET",
+    "token_store_secret_access_key": "TOKEN-STORE-SECRET-VALUE",
+}
+
+
+def test_all_eight_secrets_are_secret_wrapped():
+    cfg = Config.from_mapping({**BASE, **OPTIONAL_SECRETS})
     for value in (
         cfg.healthchecks_ping_key,
         cfg.ntfy_topic,
         cfg.schwab_api_key,
         cfg.schwab_app_secret,
+        cfg.bucket_access_key_id,
+        cfg.bucket_secret_access_key,
+        cfg.token_store_access_key_id,
+        cfg.token_store_secret_access_key,
     ):
-        assert isinstance(value, Secret)
+        assert type(value) is Secret
 
 
 def test_secret_never_leaks_in_any_string_form():
-    cfg = Config.from_mapping(BASE)
+    cfg = Config.from_mapping({**BASE, **OPTIONAL_SECRETS})
     forms = (
         repr(cfg),
         str(cfg),
@@ -147,12 +172,16 @@ def test_secret_never_leaks_in_any_string_form():
         repr(cfg.schwab_app_secret),
         str(cfg.schwab_app_secret),
         f"{cfg.schwab_app_secret}",
+        repr(cfg.token_store_access_key_id),
+        str(cfg.token_store_access_key_id),
+        f"{cfg.token_store_secret_access_key}",
     )
     secret_values = (
         "PING-KEY-SECRET",
         "topic-secret-xyz",
         "SCHWAB-API-KEY-SECRET",
         "SCHWAB-APP-SECRET-VALUE",
+        *OPTIONAL_SECRETS.values(),
     )
     for text in forms:
         for secret_value in secret_values:

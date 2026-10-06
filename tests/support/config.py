@@ -28,8 +28,8 @@ PING_KEY = "secret-key"
 NTFY_TOPIC = "secret-topic"
 # The Schwab pair, two more of the secrets the design names, in the same class as the ping
 # key and the topic. A sweep that checks only the first two passes a command that prints
-# these. The bucket's two key values are the last two, and only a test that needs a bucket
-# writes them, so this file holds four.
+# these. The bucket's two key values and the token store's two are the other four, and
+# only a test that needs them writes them, so this file holds four of the eight.
 SCHWAB_API_KEY = "api-key"
 SCHWAB_APP_SECRET = "app-secret"
 
@@ -42,6 +42,14 @@ def write_config(
     guards: Mapping[str, object] | None = None,
     callback_url: str | None = None,
     role: str | None = None,
+    token_store: str | None = None,
+    token_store_access_key_id: str | None = None,
+    token_store_secret_access_key: str | None = None,
+    token_store_region: str | None = None,
+    bucket_credentials: str | None = None,
+    bucket_access_key_id: str | None = None,
+    bucket_secret_access_key: str | None = None,
+    bucket_region: str | None = None,
 ) -> Path:
     """Write a config naming ``lake_root``, and return its path.
 
@@ -60,6 +68,10 @@ def write_config(
     config without it is a primary, which is what every other test runs as. The text goes
     after ``role:`` exactly as given, so ``""`` writes an empty value that YAML reads as
     null and ``"off"`` writes one that YAML reads as false.
+
+    ``token_store``, the three ``token_store_*`` keys, ``bucket_credentials`` and the
+    three ``bucket_*`` keys are written the same way, each only when given, so a config
+    without them is the ``file`` mode on a path backup that every other test runs as.
     """
     target = tmp_path / "ssd" if backup_target is None else backup_target
     target.mkdir(parents=True, exist_ok=True)
@@ -70,6 +82,19 @@ def write_config(
     )
     callback = "" if callback_url is None else f"schwab_callback_url: {callback_url}\n"
     role_line = "" if role is None else f"role: {role}".rstrip() + "\n"
+    optional = {
+        "token_store": token_store,
+        "token_store_access_key_id": token_store_access_key_id,
+        "token_store_secret_access_key": token_store_secret_access_key,
+        "token_store_region": token_store_region,
+        "bucket_credentials": bucket_credentials,
+        "bucket_access_key_id": bucket_access_key_id,
+        "bucket_secret_access_key": bucket_secret_access_key,
+        "bucket_region": bucket_region,
+    }
+    optional_lines = "".join(
+        f"{key}: {value}".rstrip() + "\n" for key, value in optional.items() if value is not None
+    )
     path = tmp_path / CONFIG_NAME
     path.write_text(
         f"lake_root: {lake_root}\n"
@@ -80,6 +105,7 @@ def write_config(
         f"schwab_app_secret: {SCHWAB_APP_SECRET}\n"
         f"{callback}"
         f"{role_line}"
+        f"{optional_lines}"
         f"{section}"
     )
     return path
