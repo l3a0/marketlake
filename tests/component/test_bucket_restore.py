@@ -682,7 +682,9 @@ def test_a_run_killed_while_moving_files_in_finishes_on_the_next_run(tmp_path, m
         return real_rename(src, dst)
 
     monkeypatch.setattr(os, "rename", failing_second)
-    with pytest.raises(bucket.RestoreRefused, match="A re-run finishes the move"):
+    with pytest.raises(
+        bucket.RestoreRefused, match="run the restore again, which finishes the move"
+    ):
         restore_lake(dest, TARGET, client=client)
     monkeypatch.setattr(os, "rename", real_rename)
     assert not (dest / "manifest.jsonl").exists()
@@ -916,7 +918,9 @@ def test_a_failed_first_move_leaves_a_directory_the_next_run_finishes(tmp_path, 
         return real_rename(src, dst)
 
     monkeypatch.setattr(os, "rename", failing_first)
-    with pytest.raises(bucket.RestoreRefused, match="A re-run finishes the move"):
+    with pytest.raises(
+        bucket.RestoreRefused, match="run the restore again, which finishes the move"
+    ):
         restore_lake(dest, TARGET, client=client)
     client.calls.clear()
 
@@ -1027,3 +1031,155 @@ def test_the_bucket_scrub_matches_the_rest_when_one_object_is_missing(tmp_path):
 
     assert result.missing == (QUOTES,)
     assert CHAINS in dict(result.matched)
+
+
+# -- 8. a finishing run that finds things changed ----------------------------------
+
+
+def _killed_mid_move(tmp_path: Path, monkeypatch) -> tuple[Path, FakeS3, Path]:
+    """A restore killed on its second rename: one entry moved in, the rest still waiting.
+
+    ``KeyboardInterrupt`` stands in for the kill, because nothing catches it, so the
+    run leaves exactly what a real kill leaves.
+    """
+    lake, client = _uploaded(tmp_path)
+    dest = tmp_path / "restored"
+    real_rename = os.rename
+    renames: list[str] = []
+
+    def killed_on_second(src, dst):
+        renames.append(str(src))
+        if len(renames) == 2:
+            raise KeyboardInterrupt
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", killed_on_second)
+    with pytest.raises(KeyboardInterrupt):
+        restore_lake(dest, TARGET, client=client)
+    monkeypatch.setattr(os, "rename", real_rename)
+    assert (dest / WORK / "manifest.jsonl").is_file()
+    return lake, client, dest
+
+
+def test_a_live_manifest_at_the_destination_stops_the_finishing_run(tmp_path, monkeypatch, capsys):
+    # A reboot cut the restore short, and capture started on that root and created its
+    # manifest under the lock. Finishing the move would replace a live lake's ledger.
+    lake, client, dest = _killed_mid_move(tmp_path, monkeypatch)
+    (dest / "manifest.jsonl").write_text('{"live": "entry"}\n')
+    config = _config(tmp_path, lake)
+
+    with pytest.raises(SystemExit) as exc:
+        _main(config, client, monkeypatch, dest)
+
+    line = _refused(capsys, exc)
+    assert "gained a manifest.jsonl" in line and "run the restore again" in line
+    assert (dest / "manifest.jsonl").read_text() == '{"live": "entry"}\n'
+    assert (dest / WORK / "manifest.jsonl").is_file()
+
+
+def test_a_name_already_at_the_destination_stops_the_finishing_run(tmp_path, monkeypatch):
+    # An empty directory would be silently replaced by the rename, and a full one would
+    # fail it halfway. The names compare case-folded, as macOS's filesystem does.
+    lake, client, dest = _killed_mid_move(tmp_path, monkeypatch)
+    (dest / "Quotes").mkdir()
+
+    with pytest.raises(bucket.RestoreRefused, match="holds Quotes, which the restore is about"):
+        restore_lake(dest, TARGET, client=client)
+    assert (dest / "Quotes").is_dir() and list((dest / "Quotes").iterdir()) == []
+    assert not (dest / "manifest.jsonl").exists()
+
+
+def test_a_manifest_created_during_the_download_stops_the_move(tmp_path):
+    # The same guard runs before the first move of a fresh run, since a daemon can start
+    # on the root while the download is still going.
+    lake, client = _uploaded(tmp_path)
+    dest = tmp_path / "restored"
+    real_get = client.get_object
+
+    def get_object(**kwargs):
+        if kwargs["Key"] == f"lake/{QUOTES}":
+            (dest / "manifest.jsonl").write_text('{"live": "entry"}\n')
+        return real_get(**kwargs)
+
+    client.get_object = get_object
+
+    with pytest.raises(bucket.RestoreRefused, match="gained a manifest.jsonl"):
+        restore_lake(dest, TARGET, client=client)
+    assert (dest / "manifest.jsonl").read_text() == '{"live": "entry"}\n'
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        pytest.param("deleted", id="file-deleted"),
+        pytest.param("truncated", id="file-truncated"),
+        pytest.param("manifest", id="manifest-deleted"),
+    ],
+)
+def test_a_working_directory_changed_since_it_verified_moves_nothing(tmp_path, monkeypatch, damage):
+    lake, client, dest = _killed_mid_move(tmp_path, monkeypatch)
+    waiting = dest / WORK / REPORT
+    assert waiting.is_file()
+    if damage == "deleted":
+        waiting.unlink()
+    elif damage == "truncated":
+        waiting.write_bytes(b"")
+    else:
+        (dest / WORK / "manifest.jsonl").unlink()
+    before = sorted(os.listdir(dest))
+
+    with pytest.raises(bucket.RestoreRefused, match="no longer holds .* Delete .* and run"):
+        restore_lake(dest, TARGET, client=client)
+    assert sorted(os.listdir(dest)) == before
+    assert not (dest / "manifest.jsonl").exists()
+
+
+@pytest.mark.parametrize("left", [(), (".marketlake-restore",)], ids=["empty", "marker-only"])
+def test_a_working_directory_left_beside_a_finished_lake_is_named_as_finished(tmp_path, left):
+    # A kill after the last file moved in, while the run removed its own markers.
+    lake, client = _uploaded(tmp_path)
+    dest = tmp_path / "restored"
+    assert restore_lake(dest, TARGET, client=client).restored is True
+    (dest / WORK).mkdir()
+    for name in left:
+        (dest / WORK / name).write_text("a marketlake restore in progress\n")
+
+    with pytest.raises(bucket.RestoreRefused, match="already holds a restored lake"):
+        restore_lake(dest, TARGET, client=client)
+    assert {rel for rel in _files(dest) if not rel.startswith(WORK)} == set(_files(lake))
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param("lake/Manifest.jsonl", id="manifest-in-another-case"),
+        pytest.param("lake/.MARKETLAKE-RESTORE", id="marker-in-another-case"),
+        pytest.param("lake/x\x00y", id="nul-byte"),
+    ],
+)
+def test_a_key_that_would_clobber_the_restore_s_own_files_is_never_written(tmp_path, key):
+    lake, client = _uploaded(tmp_path)
+    client.store(key, b"evil")
+
+    summary = restore_lake(tmp_path / "restored", TARGET, client=client)
+
+    assert summary.failures == [
+        (key.removeprefix("lake/"), "names a path outside the lake, so it was not written")
+    ]
+    _no_lake(tmp_path / "restored")
+
+
+def test_two_keys_that_differ_only_by_case_are_both_named(tmp_path):
+    # On macOS's filesystem one would overwrite the other.
+    lake, client = _uploaded(tmp_path)
+    other = "reports/DATE=2026-08-28.md"
+    client.store(f"lake/{other}", b"another report\n")
+
+    summary = restore_lake(tmp_path / "restored", TARGET, client=client)
+
+    assert summary.restored is False
+    ((rel, why),) = summary.failures
+    named = {rel, why.split(" ")[2]}
+    assert named == {REPORT, other}
+    assert why.endswith("on a filesystem that ignores case")
+    _no_lake(tmp_path / "restored")

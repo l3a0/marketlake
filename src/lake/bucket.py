@@ -61,11 +61,12 @@ import base64
 import binascii
 import fnmatch
 import hashlib
+import json
 import os
 import shutil
 import sys
 import threading
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -1362,8 +1363,14 @@ LOST_AND_FOUND = "lost+found"
 # name only once its bytes have hashed to what they must.
 _PART_SUFFIX = ".part"
 
-# Top-level names a bucket key may not restore to, because the restore itself uses them.
-_RESERVED = frozenset({RESTORE_MARKER, VERIFIED_MARKER, RESTORE_WORK_DIR, LOST_AND_FOUND})
+# Top-level names a bucket key may not restore to, because the restore itself uses them,
+# compared case-folded. macOS's filesystem ignores case, so ``Manifest.jsonl`` there is
+# the same file as ``manifest.jsonl``. The exact ``manifest.jsonl`` is the bucket's own
+# copy and is handled before this check.
+_RESERVED = frozenset(
+    name.casefold()
+    for name in (RESTORE_MARKER, VERIFIED_MARKER, RESTORE_WORK_DIR, LOST_AND_FOUND, MANIFEST_FILE)
+)
 
 
 class RestoreRefused(BucketRefusal):
@@ -1422,13 +1429,14 @@ def _unsafe(rel: str) -> bool:
     The key comes from the bucket, which a person or another tool can write to. An
     absolute path replaces the base it is joined to, and a ``..`` part climbs out of it,
     so either would land a file anywhere the process can write. An empty or ``.`` part
-    names no file of the lake's. A top-level name the restore uses for itself is refused
-    too, so a key cannot overwrite a marker.
+    names no file of the lake's. A NUL byte names no file at all. A top-level name the
+    restore uses for itself is refused too, in any case, so a key cannot overwrite a
+    marker or the manifest on a filesystem that ignores case.
     """
     parts = rel.split("/")
-    if rel.startswith("/") or any(part in ("", ".", "..") for part in parts):
+    if "\x00" in rel or rel.startswith("/") or any(part in ("", ".", "..") for part in parts):
         return True
-    return parts[0] in _RESERVED
+    return parts[0].casefold() in _RESERVED
 
 
 def _inside(work: Path, rel: str) -> bool:
@@ -1468,6 +1476,17 @@ def _destination_state(dest: Path) -> str:
     if work.is_dir() and (work / VERIFIED_MARKER).is_file():
         return "move"
     others = sorted(set(os.listdir(dest)) - {LOST_AND_FOUND, RESTORE_WORK_DIR})
+    if (
+        others
+        and (dest / MANIFEST_FILE).is_file()
+        and work.is_dir()
+        and set(os.listdir(work)) <= {RESTORE_MARKER}
+    ):
+        # A run killed after the last file moved in, while it removed its markers.
+        raise RestoreRefused(
+            f"{dest} already holds a restored lake, and {work} is what that finished "
+            "restore left behind. Remove that directory, since nothing is left to restore"
+        )
     if others:
         raise RestoreRefused(
             f"{dest} is not empty, it holds {others[0]}. A restore writes only into an "
@@ -1553,6 +1572,73 @@ def _prune(work: Path, keep: set[str]) -> None:
             here.rmdir()
 
 
+def _write_verified(work: Path, plan: Iterable[str]) -> None:
+    """Mark the working directory verified, recording each file it must hold and its size.
+
+    The finishing run checks against this list rather than re-hashing, because a year-end
+    lake is about 154 GB. Sizes catch a file removed or truncated between the runs. The
+    manifest is listed too, so a working directory that lost it never moves in a lake
+    with no ledger.
+    """
+    files = {rel: (work / rel).stat().st_size for rel in [*plan, MANIFEST_FILE]}
+    (work / VERIFIED_MARKER).write_text(json.dumps({"files": files}, sort_keys=True) + "\n")
+
+
+def _check_before_move(work: Path, dest: Path) -> None:
+    """Refuse to move anything when the destination or the working directory changed.
+
+    Three changes refuse, each before the first rename.
+
+    1. The destination gained a ``manifest.jsonl`` while the working directory still
+       holds its own. ``lake_lock`` creates one when a daemon starts on that root, so
+       something is using the destination as a lake, and moving in would replace it.
+    2. The destination holds a name the working directory is about to move in, compared
+       case-folded for a filesystem that ignores case. A rename would replace an empty
+       directory of that name and fail on a full one.
+    3. A file the verified marker lists is no longer at its recorded size, either in the
+       working directory or already moved in. Moving the rest would land a lake whose
+       manifest records a file it does not hold.
+    """
+    staged = {name.casefold(): name for name in os.listdir(work)}
+    for marker in (RESTORE_MARKER, VERIFIED_MARKER):
+        staged.pop(marker.casefold(), None)
+    present = {
+        name.casefold(): name
+        for name in os.listdir(dest)
+        if name not in (LOST_AND_FOUND, RESTORE_WORK_DIR)
+    }
+    if MANIFEST_FILE in staged and MANIFEST_FILE in present:
+        raise RestoreRefused(
+            f"{dest} gained a {present[MANIFEST_FILE]} while the verified restore waited in "
+            f"{work}, so something is using it as a lake and nothing was moved. Stop what "
+            f"writes there, remove {dest / present[MANIFEST_FILE]} if it holds nothing worth "
+            "keeping, and run the restore again"
+        )
+    clashes = sorted(present[name] for name in staged.keys() & present.keys())
+    if clashes:
+        raise RestoreRefused(
+            f"{dest} holds {clashes[0]}, which the restore is about to move in from {work}, "
+            "so nothing was moved. Move it aside and run the restore again"
+        )
+    try:
+        files = json.loads((work / VERIFIED_MARKER).read_text())["files"]
+        gaps = [
+            rel
+            for rel, size in sorted(files.items())
+            if not any(
+                (root / rel).is_file() and (root / rel).stat().st_size == size
+                for root in (work, dest)
+            )
+        ]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        gaps = [VERIFIED_MARKER]
+    if gaps:
+        raise RestoreRefused(
+            f"{work} no longer holds {gaps[0]} as it verified, so nothing was moved. Delete "
+            f"{work} and run the restore again"
+        )
+
+
 def _finish(work: Path, dest: Path) -> None:
     """Move every verified entry up into the destination, ``manifest.jsonl`` last.
 
@@ -1561,9 +1647,9 @@ def _finish(work: Path, dest: Path) -> None:
     moves what is left. ``manifest.jsonl`` goes last, so the destination holds a lake
     only once everything it records is in place. The markers go after it.
     """
-    skip = {RESTORE_MARKER, VERIFIED_MARKER, MANIFEST_FILE}
+    skip = {name.casefold() for name in (RESTORE_MARKER, VERIFIED_MARKER, MANIFEST_FILE)}
     for name in sorted(os.listdir(work)):
-        if name not in skip:
+        if name.casefold() not in skip:
             os.rename(work / name, dest / name)
     if (work / MANIFEST_FILE).exists():
         os.rename(work / MANIFEST_FILE, dest / MANIFEST_FILE)
@@ -1573,12 +1659,13 @@ def _finish(work: Path, dest: Path) -> None:
 
 
 def _finish_or_refuse(work: Path, dest: Path) -> None:
+    _check_before_move(work, dest)
     try:
         _finish(work, dest)
     except OSError as exc:
         raise RestoreRefused(
             f"every file verified and {_local(f'moving them from {work} into {dest}', exc)}. "
-            "A re-run finishes the move"
+            "Fix that and run the restore again, which finishes the move"
         ) from None
 
 
@@ -1675,6 +1762,18 @@ def restore_lake(
             summary.segments_left_out += 1
             continue
         plan[rel] = str(latest[rel]["sha256"]) if rel in latest else None
+    by_case: dict[str, list[str]] = {}
+    for rel in plan:
+        by_case.setdefault(rel.casefold(), []).append(rel)
+    for same in by_case.values():
+        for rel in same[1:]:
+            summary.failures.append(
+                (
+                    rel,
+                    f"differs from {same[0]} only by case, so one would overwrite the other "
+                    "on a filesystem that ignores case",
+                )
+            )
     for rel in sorted(latest):
         if rel not in listing and not superseded(rel):
             summary.failures.append((rel, "missing from the bucket"))
@@ -1756,7 +1855,7 @@ def restore_lake(
         return summary
     try:
         _prune(work, {*plan, MANIFEST_FILE})
-        (work / VERIFIED_MARKER).write_text("every file in this directory verified\n")
+        _write_verified(work, plan)
     except OSError as exc:
         raise RestoreRefused(
             _local(f"finishing {work}", exc) + f". Nothing was moved into {dest}"

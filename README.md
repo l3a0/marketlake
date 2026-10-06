@@ -166,9 +166,14 @@ either.
    `manifest.jsonl` moved last. A file that fails is named on its own line, `<dest>` gets
    no `manifest.jsonl`, and the command exits 1. Running it again resumes in the working
    directory and downloads only what is not already there and correct, and a run killed
-   while moving files in finishes the move. It refuses with exit 2 when `<dest>` holds
+   while moving files in finishes the move. Before moving anything it checks that each
+   verified file is still there at its recorded size, and refuses when `<dest>` has
+   gained a `manifest.jsonl` or a name it is about to move in, which is what a daemon
+   started on that root looks like. It refuses with exit 2 when `<dest>` holds
    anything but `lost+found` and the working directory, which keeps it off a live lake,
-   when `<dest>` is a symbolic link, and when its filesystem is too small. A year-end lake
+   when `<dest>` is a symbolic link, and when its filesystem is too small. Two keys that
+   differ only by case are named as failures, because on macOS one would overwrite the
+   other. A year-end lake
    is about 154 GB. `<dest>` may be a volume's mount point, which is how a new host's
    empty `lake_root` is seeded. A restore uploads nothing and takes no lock, which is why
    a shadow host may run it.
