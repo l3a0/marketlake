@@ -611,6 +611,17 @@ def test_the_newest_reviewed_artifact_wins(tmp_path: Path) -> None:
         out.unlink()
 
 
+def test_the_pick_refuses_an_expired_artifact_even_when_its_run_is_known() -> None:
+    # The lookup reads no run for an expired artifact, so only the pure pick shows this.
+    runs = {RUN["id"]: RUN}
+    head, repository_id = HEAD_SHA, int(REPOSITORY_ID)
+    assert classify.pick_artifact([ARTIFACT], runs, head, repository_id) == ARTIFACT
+    expired = _artifact(expired=True)
+    assert classify.pick_artifact([expired], runs, head, repository_id) is None
+    unknown = {key: value for key, value in ARTIFACT.items() if key != "expired"}
+    assert classify.pick_artifact([unknown], runs, head, repository_id) is None
+
+
 def test_an_expired_artifacts_run_is_never_read(tmp_path: Path) -> None:
     api = FakeApi(_routes(artifacts=[_artifact(expired=True)], runs={}))
     _fetch(tmp_path, api)
@@ -703,6 +714,11 @@ def test_fetch_mode_calls_gh_api_and_survives_its_failure(
 
 REFUSED: list[tuple[str, dict[str, Any], set[int]]] = [
     ("a delete", _lifecycle(["delete"], after=None), {2}),
+    (
+        "a keyed delete",
+        _entry(f'{LIFECYCLE}.backup["VALUE-KEY"]', LIFECYCLE, ["delete"], LIFECYCLE_BEFORE, None),
+        {2},
+    ),
     ("a replace, delete first", _lifecycle(["delete", "create"]), {2}),
     ("a replace, create first", _lifecycle(["create", "delete"]), {2}),
     ("a forget", _lifecycle(["forget"], after=None), {2}),
@@ -959,6 +975,7 @@ UPDATE = _plan(_lifecycle(["update"]))
         ),
         (None, "push", "1", "not found", "no reviewed change set was found"),
         (b"[{]", "push", "1", "unreadable", "no reviewed change set was found"),
+        (_json([{"address": "a"}]), "push", "1", "unreadable", "no reviewed change set was found"),
         (MATCH, "push", "2", "found, matched", "a re-run is never approved by the merge"),
         (MATCH, "push", "x", "found, matched", "a re-run is never approved by the merge"),
         (
@@ -974,6 +991,7 @@ UPDATE = _plan(_lifecycle(["update"]))
         "a row reviewed twice and planned once",
         "no reviewed file",
         "an unreadable reviewed file",
+        "a reviewed file of the wrong shape",
         "a re-run",
         "an attempt that does not parse",
         "a workflow_dispatch run",
