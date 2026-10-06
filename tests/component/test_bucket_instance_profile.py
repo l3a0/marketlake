@@ -64,7 +64,9 @@ class _Server:
     ``mode`` decides the answer. ``ok`` hands out ``creds``. ``no_role`` answers the
     token and has no instance profile, so the role listing is a 404. ``refuse_token``
     answers the token request with a 403, which is what a service that requires tokens
-    and turns this caller away does.
+    and turns this caller away does. ``null_body``, ``bad_expiration`` and
+    ``no_key_id`` answer the credentials request with what only a broken or impersonated
+    service would send.
     """
 
     def __init__(self, creds: dict[str, str]) -> None:
@@ -107,7 +109,11 @@ class _Server:
                         **server.creds,
                         "Expiration": expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     }
-                    self._answer(200, json.dumps(body))
+                    if server.mode == "bad_expiration":
+                        body["Expiration"] = "not a time"
+                    elif server.mode == "no_key_id":
+                        body["AccessKeyId"] = None
+                    self._answer(200, "null" if server.mode == "null_body" else json.dumps(body))
                 else:
                     self._answer(404, "")
 
@@ -288,6 +294,11 @@ def test_the_key_path_signs_with_the_config_keys_and_never_asks_the_service(
 LOOKUP_FAILURES = [
     pytest.param("refuse_token", "MetadataRetrievalError", id="token-refused"),
     pytest.param("no_role", "none returned", id="no-instance-profile"),
+    # Only a broken or impersonated service answers these ways. botocore raises a plain
+    # TypeError or ValueError for them, which must still be one line naming both fixes.
+    pytest.param("null_body", "TypeError", id="null-body"),
+    pytest.param("bad_expiration", "ParserError", id="bad-expiration"),
+    pytest.param("no_key_id", "incomplete credentials", id="no-key-id"),
 ]
 
 

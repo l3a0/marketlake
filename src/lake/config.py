@@ -621,8 +621,9 @@ class Config:
     role: str | _Absent = ROLE_ABSENT
     # The ``bucket_credentials`` string as the file held it, or the ``repr`` of any other
     # value, the way ``role`` is stored. An absent key is ``keys``. Only a bucket job
-    # checks it, through ``bucket_credential_problems``.
-    bucket_credentials: str = CREDENTIALS_FROM_KEYS
+    # checks it, through ``bucket_credential_problems``. It stays out of the repr,
+    # because a key named for credentials invites a pasted secret.
+    bucket_credentials: str = field(default=CREDENTIALS_FROM_KEYS, repr=False)
 
     def paths(self) -> LakePaths:
         """The lake path builder rooted at ``lake_root``. The DATA_DIR-to-paths bridge."""

@@ -43,7 +43,9 @@ own matching rules, because the uploader walks the tree itself and ``rsync`` is 
 there to apply them. Nothing is ever written under the lake root, which is what keeps
 switching back to a path free.
 
-**The client is built from ``config.yaml`` alone.** ``client_from_config`` reads the
+**The client is built from ``config.yaml`` alone, with one exception.** On the
+instance-profile path its credentials come from the EC2 instance metadata service, and
+``config.yaml`` is what decides that. ``client_from_config`` reads the
 region and ``bucket_credentials`` from the config and clears every ``AWS_*`` variable,
 ``~/.aws/config``, ``~/.aws/credentials`` and ``~/.aws/models`` out of the client's
 reach while it builds. Under ``keys``, the default, the access key and secret key come
@@ -541,11 +543,17 @@ def _metadata_resolver() -> Any:
     return CredentialResolver(providers=[InstanceMetadataProvider(iam_role_fetcher=fetcher)])
 
 
-class _NoMetadataCredentials(Exception):
-    """The metadata service answered and returned no credentials.
+class _MetadataLookupFailed(Exception):
+    """The instance-profile lookup found no usable credentials.
 
-    That is what a reachable service with no instance profile attached does.
+    ``detail`` names why without quoting the answer: the type of what the lookup raised,
+    ``none returned`` for a reachable service with no instance profile attached, or
+    ``incomplete credentials`` for an answer missing its key.
     """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
 
 
 def _lookup_failed(detail: str) -> ConfigError:
@@ -578,15 +586,12 @@ def client_from_config(config: Config) -> Any:
     problems = bucket_credential_problems(config)
     if problems:
         raise ConfigError(". ".join(problems))
-    from botocore.exceptions import BotoCoreError, MetadataRetrievalError  # lazy
+    from botocore.exceptions import BotoCoreError  # lazy: only a bucket job needs it
 
     try:
         return _build_client(config)
-    except MetadataRetrievalError as exc:
-        # An unreachable or token-refusing metadata service. Only the type is named.
-        raise _lookup_failed(type(exc).__name__) from None
-    except _NoMetadataCredentials:
-        raise _lookup_failed("none returned") from None
+    except _MetadataLookupFailed as exc:
+        raise _lookup_failed(exc.detail) from None
     except (BotoCoreError, ValueError) as exc:
         # ``botocore`` refuses a malformed region with an error that is both of these.
         # Only the type is named, because a message may quote a value from the config.
@@ -614,8 +619,18 @@ def _build_client(config: Config) -> Any:
             core.register_component("credential_provider", _metadata_resolver())
             # Fetched before the client is built. The session keeps a credential it
             # found, so ``session.client`` signs with it without a second lookup.
-            if core.get_credentials() is None:
-                raise _NoMetadataCredentials
+            try:
+                credentials = core.get_credentials()
+            except Exception as exc:
+                # An unreachable or token-refusing service raises botocore's own error,
+                # and an answer botocore cannot parse raises a plain TypeError or
+                # ValueError. Each is a failed lookup, so only the type is named.
+                raise _MetadataLookupFailed(type(exc).__name__) from None
+            if credentials is None:
+                raise _MetadataLookupFailed("none returned")
+            frozen = credentials.get_frozen_credentials()
+            if not (frozen.access_key and frozen.secret_key):
+                raise _MetadataLookupFailed("incomplete credentials")
             keys: dict[str, str] = {}
         else:
             assert config.bucket_access_key_id is not None

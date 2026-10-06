@@ -1,8 +1,8 @@
-"""The S3 client is built from ``config.yaml`` alone.
+"""The S3 client is built from ``config.yaml`` alone on the key path.
 
 The repository is public and a development run happens on a machine that may hold real
-AWS credentials. So ``bucket.client_from_config`` must build its client from the config's
-three bucket values and nothing else: never from an ``AWS_*`` variable, never from
+AWS credentials. So on the key path ``bucket.client_from_config`` must build its client
+from the config's three bucket values and nothing else: never from an ``AWS_*`` variable, never from
 ``~/.aws/config`` or ``~/.aws/credentials``, and never with a service model from
 ``~/.aws/models``. These tests fill all of those with values that point elsewhere, build a
 real ``botocore`` client, and read the request it would send. A ``before-send`` hook
@@ -248,6 +248,12 @@ def test_an_unrecognised_credential_source_refuses_alone_and_never_falls_back(mo
     message = str(refused.value)
     assert message == "bucket_credentials must be keys or instance_profile"
     assert SECRET_SHAPED not in message
+
+
+def test_a_pasted_credential_source_stays_out_of_the_config_repr():
+    config = _config(bucket_credentials=SECRET_SHAPED)
+    assert config.bucket_credentials == SECRET_SHAPED
+    assert SECRET_SHAPED not in repr(config)
 
 
 @pytest.mark.parametrize("present", ["bucket_access_key_id", "bucket_secret_access_key"])
