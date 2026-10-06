@@ -465,8 +465,9 @@ const orlist = xs => joinwith("or", xs);
    Two words pass. "success" is a check that ran and passed, and "skipped" is
    GitHub's SKIPPED, a job whose condition kept it from running. The infra
    workflow's `tofu apply (live)` job is skipped on every pull request by
-   design, because it runs only on main. Read as unsettled, it kept every
-   reviewed, green pull request touching infra/ out of the owner's column.
+   design, because it runs only on main. Syncs had no word for SKIPPED, so
+   they wrote that job as "neutral", which kept every reviewed, green pull
+   request touching infra/ out of the owner's column.
 
    Every other word is unsettled, "neutral" and any word this page does not
    know alike. The fold used to count only the words it knew to be bad and

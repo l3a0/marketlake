@@ -267,14 +267,22 @@ old content under a new version, and looks exactly like a good write.
   running. `rollup` is a list of `[name, conclusion]` pairs, and the
   conclusion is one of five words.
 
-  1. `"success"` is a check that ran and passed.
+  1. `"success"` is a check that ran and passed. Write it for a check run's
+     SUCCESS and a status context's SUCCESS.
   2. `"skipped"` is GitHub's SKIPPED, a job whose condition kept it from
      running. It counts as settled. The infra workflow's `tofu apply (live)`
      job is skipped on every pull request, because it runs only on main.
-  3. `"failure"` is a check that ran and failed.
-  4. `"running"` is a check that has not concluded.
-  5. `"neutral"` is a check that concluded neutral, or anything else that
-     reports neither way, such as cancelled, stale or action required.
+  3. `"failure"` is a check that failed, including one that timed out or
+     could not start. Write it for a check run's FAILURE, TIMED_OUT and
+     STARTUP_FAILURE, and for a status context's FAILURE and ERROR.
+  4. `"running"` is a check that has not concluded. Write it for a check run
+     with no conclusion yet, and for a status context's PENDING and EXPECTED.
+  5. `"neutral"` is a check that concluded without passing or failing. Write
+     it for a check run's NEUTRAL, CANCELLED, STALE and ACTION_REQUIRED.
+
+  Those cover every value of GitHub's `CheckConclusionState` and
+  `StatusState`, so no raw value goes into `rollup` unmapped. A value GitHub
+  adds later goes in as `"neutral"` until this list names it.
 
   The page reads a rollup as green when every entry is `"success"` or
   `"skipped"` and at least one is `"success"`. It reads any word outside
