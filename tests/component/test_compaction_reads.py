@@ -6,25 +6,35 @@ written to count its rows, and the nightly re-tune decoded five columns of every
 partition to profile them. Both reads now go through ``iter_batches``, so a read holds one
 batch at a time however large the day grows.
 
-Two rules have to survive that change, and the first three groups below are about them.
+Three rules have to survive that change, and groups 1, 2 and 4 below are about them.
 
 1. Every page still decodes. The count is the only thing that turns a partition whose
    pages do not decode into a raise before the manifest append. A count taken from the
    footer decodes nothing, so a page that fails to decode is the case that tells the two
    apart.
-2. The re-tune's profile is unchanged. A cycle's rows can straddle two batches, so each
+2. A sealed partition still reads whole. A batched read trusts footer facts that a
+   whole-table read refuses on, so the verify checks the footer against the schema that
+   was written. Without that, a day the loader cannot read would seal and lose its
+   segments.
+3. The re-tune's profile is unchanged. A cycle's rows can straddle two batches, so each
    cycle's count has to be summed across batches before the peak per window is taken.
 
 These cover:
 
-1. A partition with a damaged data page raises at the verify, manifests nothing, and
-   leaves the segments, the backup and the ping alone. A zero-row seal counts zero over
-   zero batches.
-2. The verify's peak Arrow memory stays under a fixed bound on a 400,000-row day, which
-   decoding the whole file at once exceeds by an order of magnitude.
-3. The streamed profile equals the whole-table profile it replaced, on shuffled rows read
-   in small batches, and its peak memory stays under a fixed bound.
-4. The profile's null rules, and a partition without the window columns, which the
+1. A partition with a damaged data page, in any of three columns, raises at the verify,
+   manifests nothing, and leaves the segments, the backup and the ping alone. A zero-row
+   seal counts zero over zero batches, and a partition of several row groups counts
+   every group.
+2. A footer that renames a column, stores a chunk under the wrong physical type, or
+   declares a chunk one value short raises the same way, though every page decodes and
+   the count matches.
+3. The verify's and the re-tune's peak Arrow memory stay under fixed bounds on a
+   400,000-row day, which decoding the whole file at once exceeds by an order of
+   magnitude.
+4. The streamed profile equals the whole-table profile it replaced, on shuffled rows read
+   in small batches, and its peak memory stays under a fixed bound. A first batch with
+   no windowed rows does not end the profile, and every row group is profiled.
+5. The profile's null rules, and a partition without the window columns, which the
    re-tune skips.
 
 The memory tests install a proxy pool, which counts every byte Arrow requests through it.
@@ -54,7 +64,8 @@ import pytest
 from lake import compact, journal
 from lake.calendar import MARKET_TZ
 from lake.chain_plan import DEFAULT_CHAIN_PLAN, Window
-from lake.compact import WindowProfile, _write_partition, window_profile
+from lake.compact import CompactionVerifyError, WindowProfile, _write_partition, window_profile
+from lake.config import GuardConstants
 from lake.journal import CHAINS_SCHEMA, ROW_KIND_DATA
 from lake.manifest import read_manifest
 from lake.paths import LakePaths
@@ -135,8 +146,8 @@ def _reference_profile(table: pa.Table, session_date: date) -> WindowProfile:
 # -- 1. the verify still decodes every page ----------------------------------
 
 
-def _damage_a_data_page(partition: Path) -> tuple[int, int]:
-    """Overwrite the tail of ``occ_symbol``'s data page in place, and return the range.
+def _damage_a_data_page(partition: Path, column: str) -> tuple[int, int]:
+    """Overwrite the tail of ``column``'s data page in place, and return the range.
 
     The range is the last eight bytes of the column chunk, which sit in the data page's
     encoded values, past its header and well before the footer. Filling them with 0xFF
@@ -145,7 +156,7 @@ def _damage_a_data_page(partition: Path) -> tuple[int, int]:
     """
     metadata = pq.read_metadata(partition)
     names = [metadata.schema.column(index).name for index in range(metadata.num_columns)]
-    chunk = metadata.row_group(0).column(names.index("occ_symbol"))
+    chunk = metadata.row_group(0).column(names.index(column))
     start = chunk.dictionary_page_offset or chunk.data_page_offset
     end = start + chunk.total_compressed_size
     damaged = bytearray(partition.read_bytes())
@@ -154,8 +165,10 @@ def _damage_a_data_page(partition: Path) -> tuple[int, int]:
     return chunk.data_page_offset, end
 
 
+# Three columns rather than one, so a verify that decoded only some columns fails here.
+@pytest.mark.parametrize("column", ["occ_symbol", "ticker", "snap_ts"])
 def test_a_partition_whose_data_page_fails_to_decode_raises_and_manifests_nothing(
-    lake_root, monkeypatch
+    lake_root, monkeypatch, column
 ):
     """Rule 3's count is what notices a page that does not decode.
 
@@ -172,7 +185,7 @@ def test_a_partition_whose_data_page_fails_to_decode_raises_and_manifests_nothin
 
     def write_damaged(table: pa.Table, target: Path) -> None:
         _write_partition(table, target)
-        damage.append(_damage_a_data_page(target))
+        damage.append(_damage_a_data_page(target, column))
 
     monkeypatch.setattr("lake.compact._write_partition", write_damaged)
     events: list[str] = []
@@ -216,7 +229,221 @@ def test_a_ticker_day_with_no_rows_seals_and_verifies_as_zero(lake_root):
     assert events
 
 
-# -- 2. the verify holds one batch at a time ---------------------------------
+def test_a_partition_of_several_row_groups_counts_every_group(lake_root, monkeypatch):
+    """The verify counts every row group, not only the first.
+
+    Every other fixture here seals one row group, so a count that read only the first
+    group would pass them all. The writer seam writes five rows in groups of two, which is
+    three groups, and the seal has to count all five to match the segments.
+    """
+    segment = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(5, snap_ts=_snap(DAY, 0)), start_ts="a"
+    )
+    partition = LakePaths(lake_root).chains_partition_path("SPY", DAY)
+
+    def write_in_small_groups(table: pa.Table, target: Path) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(table, target, row_group_size=2)
+
+    monkeypatch.setattr("lake.compact._write_partition", write_in_small_groups)
+
+    result, events, _, _ = _run(lake_root)
+
+    assert pq.read_metadata(partition).num_row_groups == 3
+    assert [item.rows for item in result.sealed] == [5]
+    assert [entry["rows"] for entry in read_manifest(lake_root)] == [5]
+    assert not segment.exists()
+    assert events
+
+
+# -- 2. the verify checks the footer a whole read trusts ---------------------
+
+
+def _footer_range(data: bytes) -> tuple[int, int]:
+    """Where a Parquet file's footer starts and ends, from the length in its last 8 bytes."""
+    end = len(data) - 8
+    return end - int.from_bytes(data[end : end + 4], "little"), end
+
+
+def _edit_footer(path: Path, find: bytes, edit, wanted) -> None:
+    """Rewrite one site in ``path``'s footer, chosen by what the edited footer then says.
+
+    The footer is Thrift's compact encoding, so the bytes for one field can occur in many
+    places. Each occurrence of ``find`` is edited in turn with ``edit``, and the first one
+    whose footer still parses and satisfies ``wanted`` is written back. Searching the
+    sites rather than fixing an offset keeps the fixture right when the footer's layout
+    shifts with the schema.
+    """
+    good = path.read_bytes()
+    start, end = _footer_range(good)
+    site = good.find(find, start, end)
+    while site >= 0:
+        edited = bytearray(good)
+        edit(edited, site)
+        try:
+            metadata = pq.read_metadata(pa.BufferReader(bytes(edited)))
+        except OSError:
+            metadata = None
+        if metadata is not None and wanted(metadata):
+            path.write_bytes(bytes(edited))
+            return
+        site = good.find(find, site + 1, end)
+    raise AssertionError(f"no site in the footer of {path} gives the edit wanted")
+
+
+def _chunk_types_that_disagree(metadata: pq.FileMetaData) -> list[tuple[int, str]]:
+    """Each ``(row group, column)`` whose chunk's physical type is not the schema's."""
+    return [
+        (group, metadata.schema.column(index).name)
+        for group in range(metadata.num_row_groups)
+        for index in range(metadata.num_columns)
+        if metadata.row_group(group).column(index).physical_type
+        != metadata.schema.column(index).physical_type
+    ]
+
+
+def _rename_occ_symbol(target: Path) -> None:
+    """Rename ``occ_symbol`` to ``occ_symbox`` in the footer, in both places it is named.
+
+    A name of the same length keeps every other footer byte where it was, so the footer
+    still parses and every page still decodes under the new name.
+    """
+    data = target.read_bytes()
+    start, end = _footer_range(data)
+    footer = data[start:end]
+    assert footer.count(b"occ_symbol") == 2
+    target.write_bytes(data[:start] + footer.replace(b"occ_symbol", b"occ_symbox") + data[end:])
+
+
+def _store_bid_as_float_in_the_last_group(target: Path) -> None:
+    """Relabel ``bid``'s chunk in the last of three row groups from DOUBLE to FLOAT.
+
+    The compact encoding writes a chunk's type as the field header 0x15 and then the type
+    doubled, so DOUBLE, which is 5, is the byte 0x0A and FLOAT, which is 4, is 0x08. The
+    schema still says DOUBLE, so only the chunk disagrees.
+    """
+
+    def relabel(edited: bytearray, site: int) -> None:
+        edited[site + 1] = 0x08
+
+    _edit_footer(
+        target,
+        b"\x15\x0a",
+        relabel,
+        lambda metadata: _chunk_types_that_disagree(metadata) == [(2, "bid")],
+    )
+
+
+def _declare_bid_one_value_short(target: Path) -> None:
+    """Make the footer declare two values in ``bid``'s chunk for its three rows.
+
+    The compact encoding writes a count as its zigzag varint, so 3 is the byte 6 and 2 is
+    the byte 4. Every other chunk keeps three values and the row group keeps three rows.
+    """
+
+    def decrement(edited: bytearray, site: int) -> None:
+        edited[site] = 4
+
+    def only_bid_is_short(metadata: pq.FileMetaData) -> bool:
+        group = metadata.row_group(0)
+        values = {
+            metadata.schema.column(index).name: group.column(index).num_values
+            for index in range(metadata.num_columns)
+        }
+        return group.num_rows == 3 and values.pop("bid") == 2 and set(values.values()) == {3}
+
+    _edit_footer(target, b"\x06", decrement, only_bid_is_short)
+
+
+# Each footer rewrite, and the row group size the file is written at before it.
+_FOOTER_REWRITES = {
+    "renamed-column": (_rename_occ_symbol, None),
+    "chunk-physical-type": (_store_bid_as_float_in_the_last_group, 1),
+    "chunk-value-count": (_declare_bid_one_value_short, None),
+}
+
+
+@pytest.mark.parametrize(
+    ("case", "said"),
+    [
+        ("renamed-column", "column 5 occ_symbox (string) where occ_symbol (string) was written"),
+        ("chunk-physical-type", "row group 2 stores bid as FLOAT, but the schema says DOUBLE"),
+        ("chunk-value-count", "row group 0 declares 2 values in bid for 3 rows"),
+    ],
+)
+def test_a_footer_that_disagrees_with_the_write_raises_and_manifests_nothing(
+    lake_root, monkeypatch, case, said
+):
+    """The verify refuses a footer that disagrees with what was written.
+
+    Each case rewrites one fact in the footer the seal just wrote, through the same writer
+    seam as the damaged-page test. In every case each page still decodes and the batched
+    count still matches the segments, which the next test shows, so the count alone would
+    seal the file and unlink the segments.
+
+    1. A renamed column reads under the new name, so a reader asking for ``occ_symbol``
+       finds nothing.
+    2. A chunk stored under a physical type the schema does not name is refused by a
+       whole-table read.
+    3. A chunk declaring one value short of its row group is refused by a whole-table
+       read, the loader's included.
+
+    The chunk-type case writes three row groups, because a batched read of a single group
+    refuses that chunk on its own.
+    """
+    rewrite, row_group_size = _FOOTER_REWRITES[case]
+    segment = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(3, snap_ts=_snap(DAY, 0)), start_ts="a"
+    )
+
+    def write_rewritten(table: pa.Table, target: Path) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(table, target, row_group_size=row_group_size)
+        rewrite(target)
+
+    monkeypatch.setattr("lake.compact._write_partition", write_rewritten)
+    events: list[str] = []
+
+    with pytest.raises(CompactionVerifyError) as info:
+        _run(lake_root, backup=FakeBackup(events), pinger=FakePinger(events))
+
+    # The count matched, so the footer check is what refused.
+    assert (info.value.expected, info.value.actual) == (3, 3)
+    assert info.value.disagreement is not None
+    assert said in info.value.disagreement
+    assert str(info.value).endswith(f"re-read 3, but {info.value.disagreement}")
+    assert read_manifest(lake_root) == []
+    assert segment.exists()
+    assert events == []
+
+
+@pytest.mark.parametrize("case", list(_FOOTER_REWRITES))
+def test_each_footer_rewrite_passes_a_batched_count(tmp_path, case):
+    """Each footer rewrite above is one a batched count alone would seal.
+
+    Without this, a rewrite that also broke a page would pass the footer test for the
+    wrong reason, because the count would raise first. A batched read of each rewritten
+    file returns all three rows. A whole-table read refuses the chunk-type and value-count
+    files, and reads the renamed file without ``occ_symbol``.
+    """
+    rewrite, row_group_size = _FOOTER_REWRITES[case]
+    path = tmp_path / "chains.parquet"
+    pq.write_table(_chains(3, snap_ts=_snap(DAY, 0)), path, row_group_size=row_group_size)
+    rewrite(path)
+
+    batches = pq.ParquetFile(path).iter_batches(batch_size=8192, use_threads=False)
+    assert sum(batch.num_rows for batch in batches) == 3
+    if case == "renamed-column":
+        assert "occ_symbol" not in pq.read_table(path, use_threads=False).column_names
+    elif case == "chunk-physical-type":
+        with pytest.raises(OSError, match="ColumnMetaData type does not match"):
+            pq.read_table(path, use_threads=False)
+    else:
+        with pytest.raises(pa.ArrowInvalid, match="named bid expected length 3 but got length 2"):
+            pq.read_table(path, use_threads=False)
+
+
+# -- 3. the verify and the re-tune hold one batch at a time ------------------
 
 
 def test_the_verify_reads_a_large_day_in_bounded_memory(lake_root):
@@ -245,7 +472,40 @@ def test_the_verify_reads_a_large_day_in_bounded_memory(lake_root):
     assert pool.max_memory() < 24_000_000
 
 
-# -- 3. the streamed profile -------------------------------------------------
+def test_the_retune_reads_a_large_day_in_bounded_memory(lake_root):
+    """The re-tune's peak Arrow memory stays far under the size of the decoded columns.
+
+    This measures the call production makes, ``_retune`` with no batch size of its own,
+    on the same 400,000-row day as the verify test above. The day is sealed first, outside
+    the measurement, so only the profile is counted. Its streamed read peaked at about
+    2.7 MB. A batch of 32,768 rows peaked at about 10.4 MB, and one batch holding the
+    whole day at about 91.8 MB, so 6 MB fails both.
+    """
+    counts = {0: 2000, 1: 2000, 2: 2000, 3: 2000, 4: 2000}
+    cycle = _profile_table(DEFAULT_CHAIN_PLAN, DAY, counts, snap_ts=_snap(DAY, 0))
+    segment = _segment(
+        lake_root, "chains", "SPY", DAY, pa.concat_tables([cycle] * 40), start_ts="a"
+    )
+    paths = LakePaths(lake_root)
+    clock = ManualClock(datetime.combine(DAY, time(16, 30), tzinfo=MARKET_TZ))
+    sealed = compact._seal(
+        lake_root, paths, "chains", "SPY", DAY, [segment], clock=clock, guard=False, entries={}
+    )
+
+    with _measured() as pool:
+        retune = compact._retune(
+            lake_root,
+            [sealed],
+            DAY,
+            guards=GuardConstants(),
+            plan_path=lake_root.parent / "chain_plan.json",
+        )
+
+    assert retune.counts == (80_000, 80_000, 80_000, 80_000, 80_000)
+    assert pool.max_memory() < 6_000_000
+
+
+# -- 4. the streamed profile -------------------------------------------------
 
 
 def _windowed_rows(cycles: list[tuple[str, int, dict[int, int]]]) -> list[dict]:
@@ -320,7 +580,49 @@ def test_the_streamed_profile_reads_in_bounded_memory(tmp_path):
     assert pool.max_memory() < 500_000
 
 
-# -- 4. the null rules, and a partition with no windows ----------------------
+def test_a_first_batch_with_no_windowed_rows_does_not_end_the_profile(tmp_path):
+    """A batch with no windowed rows is skipped, and the batches after it still count.
+
+    The first 9,000 rows carry no window, so at 1,000 rows a batch the first nine batches
+    hold nothing to profile. The windowed rows come after them, and a profile that stopped
+    at the first empty batch would return nothing.
+    """
+    windows = _iso_windows(DEFAULT_CHAIN_PLAN, DAY)
+    rows = _chains_rows(9000, snap_ts=_snap(DAY, 0))
+    rows += _chains_rows(1200, snap_ts=_snap(DAY, 0), window=windows[0])
+    rows += _chains_rows(300, snap_ts=_snap(DAY, 0), window=windows[1])
+    rows += _chains_rows(2, snap_ts=_snap(DAY, 0), window=windows[2], row_kind="gap")
+    path = tmp_path / "chains.parquet"
+    pq.write_table(_table(CHAINS_SCHEMA, rows), path)
+
+    profile = window_profile(path, DAY, batch_size=1000)
+
+    assert dict(profile.peaks) == {(0, 9): 1200, (10, 30): 300}
+    assert profile.failed == frozenset({(31, 90)})
+
+
+def test_the_profile_reads_every_row_group(tmp_path):
+    """Rows in later row groups count as much as rows in the first.
+
+    Cycle 0 fills the first of five 100-row groups, and cycle 1, the larger, fills the
+    next three. The gap rows sit in the last group. A profile of the first group alone
+    would report cycle 0's 100 contracts and no failed window.
+    """
+    windows = _iso_windows(DEFAULT_CHAIN_PLAN, DAY)
+    rows = _chains_rows(100, snap_ts=_snap(DAY, 0), window=windows[0])
+    rows += _chains_rows(300, snap_ts=_snap(DAY, 1), window=windows[0])
+    rows += _chains_rows(2, snap_ts=_snap(DAY, 1), window=windows[2], row_kind="gap")
+    path = tmp_path / "chains.parquet"
+    pq.write_table(_table(CHAINS_SCHEMA, rows), path, row_group_size=100)
+
+    profile = window_profile(path, DAY)
+
+    assert pq.read_metadata(path).num_row_groups == 5
+    assert dict(profile.peaks) == {(0, 9): 300}
+    assert profile.failed == frozenset({(31, 90)})
+
+
+# -- 5. the null rules, and a partition with no windows ----------------------
 
 
 def test_the_profile_counts_a_null_row_kind_as_neither_data_nor_gap(tmp_path):

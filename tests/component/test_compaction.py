@@ -1242,8 +1242,9 @@ def test_a_partition_that_re_reads_with_the_wrong_count_raises_and_manifests_not
 
     The seal reads the Parquet it just wrote back once, and that read yields both the row
     count it compares to the sum across the segments and the digest the manifest entry
-    will carry. The comparison is what stands between a Parquet whose pages do not all
-    decode and a manifest entry blessing those bytes as the day's record.
+    will carry. The comparison is what stands between a Parquet that decodes to the wrong
+    count and a manifest entry blessing those bytes as the day's record. A page that fails
+    to decode raises at the decode itself, before the comparison.
 
     Reaching it needs the file on disk to disagree with the table that went into it, and
     no input a test can write produces that, because the merge and the write are both

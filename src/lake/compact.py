@@ -33,10 +33,11 @@ The job's rules, each glossed at first use.
    seals the live day and never unlinks a segment the daemon holds open.
 3. *Verify before manifest, manifest before delete.* Each ticker-day's segments are read
    to their last complete batch, concatenated, and written as one Parquet file. The file
-   is then read back, once, and that one read serves both checks. Its row count is
-   compared to the sum across the segments, and its digest is what the manifest records.
-   Only after that does the manifest entry land, and only after the manifest append are
-   the segments unlinked. A crash at any point re-runs with nothing lost.
+   is then read back, once, and that one read serves every check. Its row count is
+   compared to the sum across the segments, its footer to the schema that was written,
+   and its digest is what the manifest records. Only after that does the manifest entry
+   land, and only after the manifest append are the segments unlinked. A crash at any
+   point re-runs with nothing lost.
 
    That count cannot see a segment whose bytes changed on disk, because the sum it is
    checked against is taken from the same reads. A damaged segment can read as a torn
@@ -282,13 +283,84 @@ class PartitionMismatch(Exception):
 
 
 class CompactionVerifyError(Exception):
-    """Raised when a freshly written partition re-reads with the wrong row count."""
+    """Raised when a freshly written partition fails the seal's read-back.
 
-    def __init__(self, partition: str, expected: int, actual: int) -> None:
-        super().__init__(f"{partition}: wrote {expected} rows, re-read {actual}")
+    Either the file re-reads with the wrong row count, or its footer disagrees with what
+    was written, which ``disagreement`` then names. ``_footer_disagreement`` lists what
+    the footer is checked for.
+    """
+
+    def __init__(
+        self, partition: str, expected: int, actual: int, disagreement: str | None = None
+    ) -> None:
+        message = f"{partition}: wrote {expected} rows, re-read {actual}"
+        super().__init__(message if disagreement is None else f"{message}, but {disagreement}")
         self.partition = partition
         self.expected = expected
         self.actual = actual
+        self.disagreement = disagreement
+
+
+def _schema_difference(found: pa.Schema, written: pa.Schema) -> str:
+    """The first field where the footer's schema differs from the one written.
+
+    A chains schema has dozens of columns, so the message names the one that differs
+    rather than printing both schemas whole.
+    """
+
+    def described(field: pa.Field) -> str:
+        return f"{field.name} ({field.type}{'' if field.nullable else ', not null'})"
+
+    for index in range(min(len(found), len(written))):
+        if not found.field(index).equals(written.field(index)):
+            return (
+                f"the footer names column {index} {described(found.field(index))} "
+                f"where {described(written.field(index))} was written"
+            )
+    if len(found) < len(written):
+        return f"the footer has no column {written.field(len(found)).name}"
+    return f"the footer adds column {found.field(len(written)).name}"
+
+
+def _footer_disagreement(reader: pq.ParquetFile, written: pa.Schema) -> str | None:
+    """Where the re-read file's footer disagrees with what was written, or None.
+
+    A batched read decodes every page, but it trusts three footer facts that can be wrong
+    while every page still decodes and the count still matches.
+
+    1. The schema. Any read returns whatever schema the footer names, so a renamed or
+       retyped column reads without complaint, and a reader asking for the column by its
+       written name finds nothing.
+    2. Each column chunk's physical type. A whole-table read refuses a chunk whose type
+       disagrees with the schema, and a filtered read, which decodes the chunk's
+       statistics by that type, hangs on it.
+    3. Each column chunk's value count. A whole-table read, the loader's included, sizes
+       each column by it, so a count that disagrees with its row group refuses the
+       partition there.
+
+    All three are metadata, so checking them decodes nothing. The chunk's statistics are
+    never read here, because reading them from a chunk with the wrong type aborts the
+    process.
+    """
+    if not reader.schema_arrow.equals(written):
+        return _schema_difference(reader.schema_arrow, written)
+    metadata = reader.metadata
+    for i in range(metadata.num_row_groups):
+        group = metadata.row_group(i)
+        for j in range(group.num_columns):
+            column, leaf = group.column(j), metadata.schema.column(j)
+            if column.physical_type != leaf.physical_type:
+                return (
+                    f"row group {i} stores {column.path_in_schema} as "
+                    f"{column.physical_type}, but the schema says {leaf.physical_type}"
+                )
+            # A leaf with no repetition holds one value per row, null or not.
+            if not leaf.max_repetition_level and column.num_values != group.num_rows:
+                return (
+                    f"row group {i} declares {column.num_values} values in "
+                    f"{column.path_in_schema} for {group.num_rows} rows"
+                )
+    return None
 
 
 class RecompactionRefused(Exception):
@@ -1406,9 +1478,10 @@ def _seal(
     segment is then read before anything is written, so a shadow-append raises with the
     ticker-day untouched, and every segment the read proves damaged raises
     ``DamagedSegments`` the same way, after the rest have been read. The
-    Parquet lands and is read back once. That read yields both the row count, checked
-    against the sum across the segments, and the digest the manifest entry carries. The
-    entry is appended. Only then are the segments unlinked.
+    Parquet lands and is read back once. That read yields the row count, checked against
+    the sum across the segments, the footer, checked against the schema that was written,
+    and the digest the manifest entry carries. The entry is appended. Only then are the
+    segments unlinked.
 
     With ``guard`` on, the no-shrink invariant is checked before the partition file is
     replaced. A refused rebuild must leave the larger partition on disk, untouched,
@@ -1584,19 +1657,21 @@ def _seal(
         guard_row_count(root, rel, expected)
 
     _write_partition(merged, partition)
-    # One read of the sealed file serves both post-write checks. The row count proves
+    # One read of the sealed file serves every post-write check. The row count proves
     # every page decodes, and the digest attests the very bytes the count came from. The
     # count is summed over batches decoded from those same bytes, every column of every
-    # row, so only one batch is ever decoded at a time.
+    # row, so only one batch is ever decoded at a time. A batched read trusts footer facts
+    # that a whole-table read refuses on, so the same reader's footer is checked against
+    # the schema written. Without that, a day the loader cannot read would seal, and its
+    # segments would be deleted.
     written = partition.read_bytes()
-    actual = sum(
-        batch.num_rows
-        for batch in pq.ParquetFile(pa.BufferReader(written)).iter_batches(
-            batch_size=_READ_BATCH_ROWS
-        )
-    )
+    reader = pq.ParquetFile(pa.BufferReader(written))
+    actual = sum(batch.num_rows for batch in reader.iter_batches(batch_size=_READ_BATCH_ROWS))
     if actual != expected:
         raise CompactionVerifyError(rel, expected, actual)
+    disagreement = _footer_disagreement(reader, merged.schema)
+    if disagreement is not None:
+        raise CompactionVerifyError(rel, expected, actual, disagreement)
 
     # ``guard`` is passed on, but not because this append re-checks anything reachable.
     # It arrives with the same row count, against the same manifest, and nothing appends
