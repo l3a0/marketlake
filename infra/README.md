@@ -16,13 +16,17 @@ manages, called its state, and both states sit in one S3 bucket under separate k
    OIDC provider, and two roles that GitHub Actions assumes without a stored AWS key. The
    OIDC provider lets a workflow trade a short-lived token that GitHub signs for temporary
    AWS credentials. The plan role reads, and pull requests may assume it. The apply role
-   writes, and only the `infra` environment on `main` may assume it. CI cannot apply the
-   configuration that creates it, so the owner applies this one from the laptop.
+   writes, and only the `infra` and `infra-auto` environments on `main` may assume it.
+   CI cannot apply the configuration that creates it, so the owner applies this one
+   from the laptop.
 2. `infra/live/` holds the backup bucket, its IAM user `marketlake-backup`, the instance
    role `marketlake-instance` with its read of the config parameters, and the IAM user
    `marketlake-token-writer`, which writes the Schwab token's parameter.
    `.github/workflows/infra.yml` plans it on each pull request from a branch here, and
-   applies it after a merge to `main` once the owner approves the run.
+   applies it after a merge to `main`. A merge whose plan does only what the pull
+   request's plan showed, on the S3 settings `infra/ci/classify.py` allows, applies with
+   no click in the `infra-auto` environment. Any other plan waits in the `infra`
+   environment until the owner approves the run.
 
 The laptop also applies any change the apply role may not make, such as the backup
 bucket's versioning or a role's trust policy. A trust policy says who may assume the
@@ -299,7 +303,7 @@ The apply plans again and prints its own summary line. Type `yes` only if that l
 matches the plan just read. On 2026-10-06 the first apply reported 1 imported, 8 added,
 0 changed and 0 destroyed.
 
-### 8. Create the `infra` environment
+### 8. Create the `infra` and `infra-auto` environments
 
 Only the owner runs this step, and only the owner approves a deployment. An agent session
 never approves, rejects or cancels a deployment, and never edits an environment or its
@@ -365,14 +369,49 @@ was left out or ignored.
 gh api repos/l3a0/marketlake/environments/infra --jq .can_admins_bypass
 ```
 
+Then create `infra-auto`, where the no-click apply job runs. It has no reviewers,
+because the merge of a reviewed pull request is the approval, and
+`infra/ci/classify.py` sends every plan the merge did not review to `infra`. A
+custom branch policy keeps it to `main`.
+
+```bash
+gh api -X PUT repos/l3a0/marketlake/environments/infra-auto --input - <<'EOF'
+{"deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
+EOF
+```
+
+```bash
+gh api -X POST repos/l3a0/marketlake/environments/infra-auto/deployment-branch-policies -f name=main -f type=branch
+```
+
+Read it back. The first command must print `["branch_policy"]`, with no
+`required_reviewers`.
+
+```bash
+gh api repos/l3a0/marketlake/environments/infra-auto --jq '[.protection_rules[].type]'
+```
+
+The second must print `["main"]`.
+
+```bash
+gh api repos/l3a0/marketlake/environments/infra-auto/deployment-branch-policies --jq '[.branch_policies[].name]'
+```
+
+A run before this step finds no `infra-auto`, and GitHub creates it with no branch
+policy. That run's no-click job fails its empty-secret check, so the run falls back to
+the owner's approval in `infra`, and the apply role's `ref` condition refuses any
+branch but `main` whatever the environment says.
+
 ### 9. Set the secrets and the variable
 
 Nothing tracked names the account, the buckets or the user's policy, so the workflow
 reads them from five settings.
 
 1. The secret `AWS_APPLY_ROLE_ARN`, the apply role's ARN, the identifier AWS gives each
-   resource. It sits on the `infra` environment, so the apply job can read it only after
-   the approval.
+   resource. An environment's secrets belong to it alone, so it sits on both
+   environments. On `infra`, the `apply` job can read it only after the owner's
+   approval. On `infra-auto`, the `apply-auto` job reads it at once and applies only a
+   plan that `infra/ci/classify.py` accepts.
 2. The secret `AWS_PLAN_ROLE_ARN`, the plan role's ARN, on the repository.
 3. The secret `TF_STATE_BUCKET`, the state bucket's name, on the repository.
 4. The secret `BACKUP_BUCKET`, the backup bucket's name, on the repository.
@@ -384,6 +423,10 @@ tracked file.
 
 ```bash
 aws iam get-role --role-name marketlake-apply --query Role.Arn --output text --profile marketlake-admin | gh secret set AWS_APPLY_ROLE_ARN --env infra --repo l3a0/marketlake
+```
+
+```bash
+aws iam get-role --role-name marketlake-apply --query Role.Arn --output text --profile marketlake-admin | gh secret set AWS_APPLY_ROLE_ARN --env infra-auto --repo l3a0/marketlake
 ```
 
 ```bash
@@ -415,10 +458,14 @@ The repository's secrets should include the three repository-scoped names.
 gh secret list --repo l3a0/marketlake
 ```
 
-The environment's secrets should include `AWS_APPLY_ROLE_ARN`.
+Each environment's secrets should include `AWS_APPLY_ROLE_ARN`.
 
 ```bash
 gh secret list --env infra --repo l3a0/marketlake
+```
+
+```bash
+gh secret list --env infra-auto --repo l3a0/marketlake
 ```
 
 The repository's variables should include `BACKUP_POLICY_NAME`.
@@ -467,14 +514,18 @@ list it on the pull request's issue.
 
 ### 11. Merge, approve, and confirm nothing is left to change
 
-Merge the pull request. Then the owner approves the `tofu apply (live)` run in the
-Actions tab, outside 09:25 to 16:15 ET, so an apply never runs while the market is open
-and the daemon is capturing.
+Merge the pull request. The `tofu apply with no click (live)` job runs first, and its
+step summary names each of `infra/ci/classify.py`'s four rules and the verdict. A first
+run's plan imports and creates IAM resources, so the classifier refuses it, and the
+`tofu apply (live)` job waits. The owner approves that run in the Actions tab, outside
+09:25 to 16:15 ET, so an apply never runs while the market is open and the daemon is
+capturing.
 
 After the first green apply, two runs confirm that nothing is left to change.
 
-1. A manual run of `infra.yml` on `main` waits for the owner's approval like any other
-   apply, and its apply should find nothing to change.
+1. A manual run of `infra.yml` on `main` should find nothing to change. An empty plan
+   passes every rule, so the no-click job applies it and the `tofu apply (live)` job
+   skips. A plan that changes something would wait for the owner's approval instead.
 2. A laptop plan of `infra/bootstrap/` from `main`'s merge commit, in the same worktree,
    should report no changes.
 
@@ -518,7 +569,7 @@ AWS_PROFILE=marketlake-admin tofu -chdir="$HOME/marketlake-infra-<n>/infra/boots
 A change here means a review fix was pushed after the bootstrap apply, or a stale
 checkout applied the bootstrap.
 
-Then confirm again that the environment is protected.
+Then confirm again that the `infra` environment is protected.
 
 ```bash
 gh api repos/l3a0/marketlake/environments/infra --jq '[.protection_rules[].type]'
@@ -529,8 +580,9 @@ named `infra` runs the same apply, and its run is just as green.
 
 A later merge that touches `infra/` or `infra.yml` while a run waits starts a newer run.
 After its approval, the older run checks `main` again, finds the newer commit, and skips
-itself as stale. The newer run applies everything once the owner approves it. So
-approving waiting runs out of order never applies an older commit last.
+itself as stale. The newer run applies everything, with no click or once the owner
+approves it. So approving waiting runs out of order never applies an older commit last.
+The no-click job runs the same check before it plans.
 
 ### 12. End the session
 
@@ -556,7 +608,11 @@ from the laptop under the admin profile. Three things set this apply apart from 
    before the apply.
 2. It shares the CI apply's state lock, the file beside the state that stops two runs
    writing it at once. That file is `live/terraform.tfstate.tflock`, so whichever of the
-   two starts second fails on the lock.
+   two starts second fails on the lock. The merge's no-click job refuses such a change,
+   because neither the bucket nor its versioning is on `infra/ci/classify.py`'s
+   allowlist and a trust policy is IAM. So the merge's `tofu apply (live)` run waits for
+   approval. Apply from the laptop first, then approve that run, which plans again and
+   finds nothing to change.
 3. It must come from `main`'s head. A checkout that predates a merged change reads the
    same state and plans that change away.
 
@@ -604,8 +660,9 @@ git worktree remove "$HOME/marketlake-infra-main"
 ## Recovery
 
 A change made in the console shows up as a difference in the next plan. Adopt it into
-code or revert it. A manual run of `infra.yml` from `main` reverts it behind the same
-approval, with no code change.
+code or revert it. A manual run of `infra.yml` from `main` reverts it behind the owner's
+approval, with no code change. A manual run has no reviewed change set, so a plan that
+changes anything never applies with no click.
 
 A failed apply keeps the state of what it changed and releases its lock, so the next run
 plans only what is left. When a runner, the GitHub machine that runs the job, dies in the
@@ -627,7 +684,9 @@ AWS_PROFILE=marketlake-admin tofu -chdir="$HOME/marketlake-infra-main/infra/live
 ## Changing the bootstrap
 
 Apply any later change to `infra/bootstrap/*.tf` from the laptop first, as in
-step 7, then approve its live apply. Apply it only from the bootstrap pull
+step 7, before the merge. The merge's live plan then runs like any other. It applies
+with no click when `infra/ci/classify.py` accepts it, and waits for the owner's
+approval otherwise. Apply the bootstrap only from the bootstrap pull
 request's branch at its final head, and only when its plan changes nothing that pull
 request does not change. Every checkout reads the same backend file in
 `~/.config/marketlake/infra/`, so a checkout that predates a merged change plans that
@@ -768,4 +827,7 @@ Two open issues change `infra/bootstrap/`, and each follows the order under
 
 1. [#676](https://github.com/l3a0/marketlake/issues/676) adds a deploy role.
 2. [#704](https://github.com/l3a0/marketlake/issues/704) widens the apply role's trust to
-   a second environment.
+   `infra-auto`. Before the merge, and in this order, the owner applies the bootstrap
+   from the pull request's branch as above, creates `infra-auto` with the commands at
+   the end of step 8, and sets its secret with step 9's `--env infra-auto` command. A
+   merge before all three falls back to the owner's approval in `infra`.

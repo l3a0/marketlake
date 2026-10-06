@@ -1,7 +1,7 @@
 """``infra/ci/apply-is-stale.sh`` against a real git remote, in three cases.
 
-The script runs only after a merge, inside the approved apply job, so its first run
-would otherwise be on ``main``. Each case builds a remote holding ``main``, a clone
+The script runs only after a merge, inside the two apply jobs, so its first run would
+otherwise be on ``main``. Each case builds a remote holding ``main``, a clone
 checked out at an older commit the way ``actions/checkout`` leaves one, and runs the
 script with ``GITHUB_SHA`` naming that older commit.
 

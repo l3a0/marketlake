@@ -43,12 +43,15 @@ run "trust_policies_match_the_oidc_subjects" {
       Condition = {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-          "token.actions.githubusercontent.com:sub" = "repo:l3a0@5200900/marketlake@1346754080:environment:infra"
+          "token.actions.githubusercontent.com:sub" = [
+            "repo:l3a0@5200900/marketlake@1346754080:environment:infra",
+            "repo:l3a0@5200900/marketlake@1346754080:environment:infra-auto",
+          ]
           "token.actions.githubusercontent.com:ref" = "refs/heads/main"
         }
       }
     }]
-    error_message = "The apply role's trust is not exactly the infra environment subject on main with the sts audience."
+    error_message = "The apply role's trust is not exactly the infra and infra-auto environment subjects on main with the sts audience."
   }
 }
 

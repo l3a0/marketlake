@@ -2,8 +2,9 @@
 # Print `stale` when a newer commit on main changes infra/ or the workflow, and `fresh`
 # otherwise. Both exit 0. Anything else exits non-zero and prints nothing on stdout.
 #
-# The apply job runs this after its approval. Approving two waiting runs out of order
-# would otherwise apply the older commit last. A stale run skips, because the newer
+# Both apply jobs run this before they plan. apply-auto runs it at once, and apply
+# runs it after its approval. Approving two waiting runs out of order would otherwise
+# apply the older commit last. A stale run skips, because the newer
 # commit's own run applies its change. A docs-only merge after this commit leaves the
 # run fresh, so no pending apply is skipped.
 #

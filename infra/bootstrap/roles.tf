@@ -97,8 +97,10 @@ resource "aws_iam_role_policy" "plan" {
 
 # -- the apply role -----------------------------------------------------------------
 
-# Trusted only in the `infra` environment, which needs the owner's approval, and only
-# on `main`. The ref check puts a branch check in AWS beside the environment's own.
+# Trusted in two environments, and only on `main`. `infra` needs the owner's approval.
+# `infra-auto` has no reviewers, and its job applies only a plan that
+# infra/ci/classify.py accepts, as docs/design.md's "Infrastructure, defined" says. The
+# ref check puts a branch check in AWS beside each environment's own.
 resource "aws_iam_role" "apply" {
   name = "marketlake-apply"
 
@@ -111,7 +113,10 @@ resource "aws_iam_role" "apply" {
       Condition = {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-          "token.actions.githubusercontent.com:sub" = "${local.github_subject_prefix}:environment:infra"
+          "token.actions.githubusercontent.com:sub" = [
+            "${local.github_subject_prefix}:environment:infra",
+            "${local.github_subject_prefix}:environment:infra-auto",
+          ]
           "token.actions.githubusercontent.com:ref" = "refs/heads/main"
         }
       }

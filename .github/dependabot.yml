@@ -38,8 +38,10 @@ updates:
           - "*"
 
   # The AWS provider in both infra configurations. These pull requests get only
-  # Dependabot secrets, so infra.yml's plan job skips them, and the first plan of a
-  # bump is the one the owner approves after the merge. Nothing bumps OpenTofu itself.
+  # Dependabot secrets, so infra.yml's plan job skips them and uploads no reviewed
+  # change set. The first plan of a bump runs after the merge. An empty one applies
+  # with no click, and one that changes anything waits for the owner's approval.
+  # Nothing bumps OpenTofu itself.
   # TOFU_VERSION in infra.yml pins CI's version by hand, and required_version is only a
   # floor that the laptop's Homebrew release must meet.
   - package-ecosystem: opentofu

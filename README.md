@@ -15,9 +15,12 @@ D0 through D21, and points at the MVP milestone that holds current work.
 The slice build closed on 2026-10-05. Current work is the
 [MVP 2](https://github.com/l3a0/marketlake/milestone/5) milestone, capture on a hosted VM.
 The AWS resources it needs are code under `infra/`, written for
-[OpenTofu](https://opentofu.org/) and applied from CI behind the owner's approval,
-except the bootstrap that CI itself stands on, which the owner applies from the laptop
-([#664](https://github.com/l3a0/marketlake/issues/664)). Today that covers the backup
+[OpenTofu](https://opentofu.org/) and applied from CI, except the bootstrap that CI
+itself stands on, which the owner applies from the laptop
+([#664](https://github.com/l3a0/marketlake/issues/664)). A merge applies with no click
+when its plan matches the reviewed one and changes only allowlisted S3 settings, and
+waits for the owner's approval otherwise
+([#704](https://github.com/l3a0/marketlake/issues/704)). Today that covers the backup
 bucket, its IAM user, the instance role the VM will use, and the IAM user that writes the
 Schwab token to the VM's config parameters.
 
@@ -68,7 +71,7 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   roles. The owner applies it from the laptop.
 - `infra/live` is the configuration CI applies: the backup bucket, its IAM user, the
   instance role, and the IAM user that writes the Schwab token.
-- `infra/ci` holds the two scripts `.github/workflows/infra.yml` runs. Each configuration
+- `infra/ci` holds the three scripts `.github/workflows/infra.yml` runs. Each configuration
   keeps its own OpenTofu tests under `tests/`.
 - `infra/README.md` is the owner's runbook for applying both configurations.
 - `deploy/linux-install.sh` is the one install on a Linux host. It renders the systemd
@@ -502,8 +505,9 @@ steps, and the order matters.
 
 The hosted deployment's AWS resources are code under `infra/`, in two OpenTofu
 configurations. The owner applies `infra/bootstrap/` from the laptop, and
-`.github/workflows/infra.yml` applies `infra/live/` after a merge to `main` once the owner
-approves the run. [infra/README.md](infra/README.md) is the runbook, from the first
+`.github/workflows/infra.yml` applies `infra/live/` after a merge to `main`. The merge is
+the approval for a plan that `infra/ci/classify.py` accepts, and any other plan waits
+until the owner approves the run. [infra/README.md](infra/README.md) is the runbook, from the first
 bootstrap through recovery, and lists the secrets and the variable the workflow reads.
 
 ## Develop

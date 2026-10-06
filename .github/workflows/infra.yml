@@ -10,6 +10,11 @@
 # names to its step summary through infra/ci/plan_summary.py, and never a value.
 # Event values reach a `run:` script only through `env:`, never by interpolation.
 #
+# A merge applies with no click when infra/ci/classify.py accepts the plan, and waits
+# for the owner's approval otherwise. The pull request's plan job uploads its change
+# set, and apply-auto compares the plan on main against it. docs/design.md's
+# "Infrastructure, defined" carries the four rules and why they are enough.
+#
 # Every action is pinned to a commit. Any step in a job with `id-token: write` can mint
 # the job's OIDC token, so a re-pointed tag would get the AWS role.
 name: Infra
@@ -24,7 +29,8 @@ on:
     paths:
       - "infra/**"
       - ".github/workflows/infra.yml"
-  # Reverts console drift without a code change, behind the same approval as a merge.
+  # Reverts console drift without a code change. A dispatch has no reviewed change set,
+  # so a plan that changes anything waits for the owner's approval.
   workflow_dispatch:
 
 permissions:
@@ -40,6 +46,11 @@ env:
   # the laptop's Homebrew release must meet.
   TOFU_VERSION: "1.13.1"
   AWS_REGION: us-east-1
+  # The artifact that carries a pull request's change set is this prefix plus the pull
+  # request's head sha, and its zip holds one member under CHANGE_SET_FILE. The upload
+  # and the lookup both read these two names, and nothing else spells them.
+  CHANGE_SET_ARTIFACT: infra-change-set-
+  CHANGE_SET_FILE: change-set.json
 
 jobs:
   fmt:
@@ -155,11 +166,179 @@ jobs:
           tofu -chdir=infra/live show -json "$RUNNER_TEMP/live.tfplan" \
             | python3 infra/ci/plan_summary.py "Plan of infra/live" >> "$GITHUB_STEP_SUMMARY"
 
-  apply:
-    name: tofu apply (live)
+      # Only the change set goes up. Anyone signed in can download a public repository's
+      # artifacts, and the plan's JSON carries the account id and the bucket names.
+      - name: Write the change set
+        run: |
+          tofu -chdir=infra/live show -json "$RUNNER_TEMP/live.tfplan" \
+            | python3 infra/ci/classify.py change-set --out "$RUNNER_TEMP/$CHANGE_SET_FILE" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # Keyed to the head sha, because on pull_request github.sha is the test merge
+      # commit. overwrite lets a re-run of this job replace its own artifact, and a
+      # missing file fails the step rather than uploading nothing.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.CHANGE_SET_ARTIFACT }}${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/${{ env.CHANGE_SET_FILE }}
+          if-no-files-found: error
+          overwrite: true
+
+  apply-auto:
+    name: tofu apply with no click (live)
     if: >-
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
       && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # No reviewers, deploys from main only, and holds its own copy of the apply role's
+    # ARN. The classifier decides whether the plan applies here.
+    environment: infra-auto
+    # A group of its own, so a refusal waiting in infra-apply never holds a later merge.
+    concurrency:
+      group: infra-apply-auto
+      cancel-in-progress: false
+    # A job-level block replaces the default, so every permission is stated.
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+      pull-requests: read
+    outputs:
+      outcome: ${{ steps.outcome.outputs.outcome }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Refuse an empty secret
+        env:
+          AWS_APPLY_ROLE_ARN: ${{ secrets.AWS_APPLY_ROLE_ARN }}
+          TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+          BACKUP_BUCKET: ${{ secrets.BACKUP_BUCKET }}
+          BACKUP_POLICY_NAME: ${{ vars.BACKUP_POLICY_NAME }}
+        run: |
+          missing=0
+          for name in AWS_APPLY_ROLE_ARN TF_STATE_BUCKET BACKUP_BUCKET BACKUP_POLICY_NAME; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is empty. infra/README.md says where to set it."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Check that no newer commit supersedes this one
+        id: freshness
+        run: |
+          state="$(infra/ci/apply-is-stale.sh)"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          if [ "$state" = stale ]; then
+            echo "Skipped: a newer commit on main changes infra/, and its own run applies it." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        if: steps.freshness.outputs.state == 'fresh'
+        with:
+          role-to-assume: ${{ secrets.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        if: steps.freshness.outputs.state == 'fresh'
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - name: Initialise
+        if: steps.freshness.outputs.state == 'fresh'
+        env:
+          TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+        run: |
+          printf 'bucket = "%s"\n' "$TF_STATE_BUCKET" > "$RUNNER_TEMP/live.tfbackend"
+          tofu -chdir=infra/live init -input=false -lockfile=readonly \
+            -backend-config="$RUNNER_TEMP/live.tfbackend"
+
+      - name: Plan
+        if: steps.freshness.outputs.state == 'fresh'
+        env:
+          TF_VAR_backup_bucket: ${{ secrets.BACKUP_BUCKET }}
+          TF_VAR_backup_policy_name: ${{ vars.BACKUP_POLICY_NAME }}
+        run: |
+          tofu -chdir=infra/live plan -input=false -lock-timeout=5m \
+            -out="$RUNNER_TEMP/live.tfplan" > /dev/null
+
+      - name: Summarise the plan
+        if: steps.freshness.outputs.state == 'fresh'
+        run: |
+          tofu -chdir=infra/live show -json "$RUNNER_TEMP/live.tfplan" \
+            | python3 infra/ci/plan_summary.py "Plan this run may apply with no click" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # Runs on every fresh run, and reports only when the plan is empty. It never fails
+      # the job: a failure writes no file and names its reason in the summary.
+      - name: Find the reviewed change set
+        if: steps.freshness.outputs.state == 'fresh'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 infra/ci/classify.py fetch --name-prefix "$CHANGE_SET_ARTIFACT" \
+            --member "$CHANGE_SET_FILE" --out "$RUNNER_TEMP/reviewed-change-set.json" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # Reads the saved plan that Apply applies, with no plan in between. A state change
+      # in between makes tofu apply refuse the saved plan as stale.
+      - name: Classify the plan
+        id: classify
+        if: steps.freshness.outputs.state == 'fresh'
+        env:
+          TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+        run: |
+          tofu -chdir=infra/live show -json "$RUNNER_TEMP/live.tfplan" \
+            | python3 infra/ci/classify.py decide --reviewed "$RUNNER_TEMP/reviewed-change-set.json" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply
+        id: apply
+        if: steps.freshness.outputs.state == 'fresh' && steps.classify.outputs.verdict == 'apply'
+        run: |
+          tofu -chdir=infra/live apply -input=false -lock-timeout=5m \
+            "$RUNNER_TEMP/live.tfplan" > /dev/null
+
+      # Anything but applied or stale sends the run to the apply job, so an empty
+      # outcome from a failed step reaches the owner too.
+      - name: Report the outcome
+        id: outcome
+        if: always()
+        env:
+          STATE: ${{ steps.freshness.outputs.state }}
+          APPLIED: ${{ steps.apply.outcome }}
+          VERDICT: ${{ steps.classify.outputs.verdict }}
+        run: |
+          if [ "$STATE" = stale ]; then
+            outcome=stale
+          elif [ "$APPLIED" = success ]; then
+            outcome=applied
+          elif [ "$VERDICT" = refuse ]; then
+            outcome=refused
+          else
+            outcome=
+          fi
+          echo "outcome=$outcome" >> "$GITHUB_OUTPUT"
+
+  apply:
+    name: tofu apply (live)
+    needs: apply-auto
+    # Runs unless the run was cancelled or apply-auto applied or skipped as stale. The
+    # condition is a negation, so a failure, a refusal, an empty outcome and a timeout
+    # all reach the owner. !cancelled() is written out because a job-level if without a
+    # status function gets success() added, and the event guard stays because
+    # !cancelled() would otherwise start this job on every pull request.
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && github.ref == 'refs/heads/main'
+      && !cancelled()
+      && !(needs.apply-auto.result == 'success'
+      && (needs.apply-auto.outputs.outcome == 'applied'
+      || needs.apply-auto.outputs.outcome == 'stale'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # Needs the owner's approval, and holds the apply role's ARN.
