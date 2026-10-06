@@ -1398,11 +1398,13 @@ def test_a_refused_manifest_still_stops_the_cycle_at_the_append_after_the_segmen
     # read is contained, so the cycle writes its segments. Then its own manifest append
     # reads the manifest again and raises, which ``manifest._latest_by_partition`` and
     # ``lake.daemon`` decide is correct. This test records both halves, so a change to
-    # either one is seen rather than inherited.
+    # either one is seen rather than inherited. The append reads before it writes, so the
+    # refusal leaves the manifest exactly as it was.
     _prior_cycle(lake_root)
     ledger = manifest_path(lake_root)
     raw = ledger.read_bytes()
-    ledger.write_bytes(raw[:10] + b"\xff" + raw[11:])
+    damaged = raw[:10] + b"\xff" + raw[11:]
+    ledger.write_bytes(damaged)
     before = set(lake_root.rglob("*.arrows"))
 
     with pytest.raises(LedgerNotUtf8):
@@ -1418,6 +1420,7 @@ def test_a_refused_manifest_still_stops_the_cycle_at_the_append_after_the_segmen
     by_surface = {path.parent.parent.name: path for path in landed}
     assert sorted(by_surface) == [f"surface={CHAINS}", f"surface={QUOTES}"]
     _assert_one_per_window_marker(journal.read_segment(by_surface[f"surface={CHAINS}"]).to_pylist())
+    assert ledger.read_bytes() == damaged
 
 
 def test_every_fallback_prints_its_own_line_and_a_working_read_prints_nothing(

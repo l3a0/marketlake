@@ -453,11 +453,12 @@ class Watchdog:
         anything, an untouched surface belongs to a ticker the cycle no longer captures,
         whether it was retired, turned equity-only, or left out by the capture spans.
 
-        Frozen instead, its counter did harm twice (marketlake #570). The skipped-slot
-        hook charges the whole enabled roster, so every stall added to it and nothing ever
-        reset it, until a one-minute stall paged the loop as overrun for three. And a
-        ticker that came back failing paged on its first gap, reading three minutes after
-        an hour away, which is the one transient failure the threshold exists to absorb.
+        Frozen instead, its counter did harm twice (marketlake #570). The missed-slot
+        hook, ``on_missed``, charges the whole enabled roster, so every stall added to it
+        and nothing ever reset it, until a one-minute stall paged the loop as overrun for
+        three. And a ticker that came back failing paged on its first gap, reading three
+        minutes after an hour away, which is the one transient failure the threshold exists
+        to absorb.
 
         A cycle that touched nothing is the full case, every enabled ticker left out, and
         says nothing about any surface. There the tickers it names as out of span are

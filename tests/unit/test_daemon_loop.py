@@ -12,10 +12,11 @@ They cover the loop's observable contract:
 2. A non-session day fires nothing. An early close's last cycle is its 13:15 slot.
 3. Every sleep lands on a minute top, and the loop keeps ticking off the window rather
    than returning.
-4. The five hooks fire as specified: ``on_start`` once before any cycle, ``on_tick`` on
+4. The six hooks fire as specified: ``on_start`` once before any cycle, ``on_tick`` on
    every minute the loop sees, ``close_tag_for`` once per capture slot with its answer
-   passed through, ``on_cycle`` with every result in order, and ``on_skipped`` with the
-   capture slots a stall missed.
+   passed through, ``on_cycle`` with every result in order, ``on_skipped`` with the
+   capture slots a stall missed, and ``on_missed`` with the same slots once the cycles
+   ahead of the stall are handed on.
 5. ``session_phase`` is ``post_equity_close`` on the slots past the equity close and
    through the option close, and null elsewhere.
 6. A slow cycle skips no minute, because each cycle runs on a thread of its own. A stall
@@ -31,9 +32,11 @@ They cover the loop's observable contract:
    last day's head, in order, with weekends and holidays contributing nothing. A wake
    on a Saturday still reports Friday's tail. A night jump reports nothing.
 9. Results reach ``on_cycle`` in slot order, as each cycle finishes rather than at the
-   next tick. A tick with skipped slots, a tick at close+5, and leaving the loop each wait
-   for every cycle in flight first. A cycle that raises ends the loop once every cycle
-   behind it has finished (marketlake #565).
+   next tick. A tick at close+5 and leaving the loop each wait for every cycle in flight
+   first. A tick with skipped slots waits for none of them, so later minutes still start
+   at their tops, and its stall reaches ``on_missed`` behind them (marketlake #644). A
+   cycle that raises ends the loop once every cycle behind it has finished
+   (marketlake #565).
 
 No fake cycle here moves the clock. The loop thread and a cycle's thread would then race
 for it, and a test that passed would pass through a mechanism production no longer has,
@@ -581,6 +584,7 @@ def test_default_hooks_are_no_ops():
     result = CycleResult(snap_ts=et(REGULAR, 16, 0), segments=())
     assert hooks.on_cycle(et(REGULAR, 16, 0), result) is None
     assert hooks.on_skipped([et(REGULAR, 16, 1)]) is None
+    assert hooks.on_missed([et(REGULAR, 16, 1)]) is None
 
 
 # -- 6. skipped slots --------------------------------------------------------------
@@ -841,11 +845,15 @@ def _held_run(
     hold: dict[datetime, threading.Event],
     on_tick: Callable[[datetime], None] = lambda slot: None,
     clock: ManualClock | None = None,
+    log_starts: bool = False,
 ) -> tuple[_RecordingRunner, list[tuple[str, datetime]]]:
     """Run the loop with held cycles, and return the runner and what each hook saw, in order.
 
-    Each entry is ``("tick", slot)``, ``("cycle", slot)`` or ``("skipped", slot)``, so a case
-    can say which hook ran first. ``on_tick`` runs after the tick is logged.
+    Each entry is ``("tick", slot)``, ``("cycle", slot)``, ``("skipped", slot)`` or
+    ``("missed", slot)``, so a case can say which hook ran first. ``on_tick`` runs after
+    the tick is logged. ``log_starts`` adds ``("start", slot)`` as each cycle starts. That
+    entry is logged on the cycle's own thread, so it is ordered against what the loop did
+    before starting the cycle and against nothing after.
     """
     clock = clock or ManualClock(start=start.astimezone(UTC), grace=HELD_GRACE_SECONDS)
     session_clock = SessionClock(clock, calendar)
@@ -856,14 +864,19 @@ def _held_run(
         events.append(("tick", slot))
         on_tick(slot)
 
+    def logged(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        events.append(("start", slot))
+        return runner(slot=slot, close_tag=close_tag, session_phase=session_phase)
+
     hooks = daemon.DaemonHooks(
         on_tick=tick,
         on_cycle=lambda slot, result: events.append(("cycle", slot)),
         on_skipped=lambda slots: events.extend(("skipped", slot) for slot in slots),
+        on_missed=lambda slots: events.extend(("missed", slot) for slot in slots),
     )
     daemon.run_loop(
         session_clock,
-        runner,
+        logged if log_starts else runner,
         clock=clock,
         hooks=hooks,
         should_continue=lambda: should_continue(clock),
@@ -1017,11 +1030,12 @@ def test_a_cycle_that_raises_ends_the_loop_after_the_cycles_behind_it_finish(cal
     assert handed == []
 
 
-def test_a_tick_with_skipped_slots_hands_on_the_cycle_before_the_stall_first(calendar):
+def test_a_stall_reaches_on_missed_after_the_cycle_that_ran_before_it(calendar):
     # The loop stalls right after the 10:00 tick, with that cycle still running, and
-    # wakes at 10:02:30. The 10:03 tick waits for the 10:00 cycle and hands it on before
-    # its own hooks run. Handed on after the skipped minutes, a cycle that landed data
-    # would reset the watchdog counters the stall raised.
+    # wakes at 10:02:30. The 10:03 tick hands the skipped minutes to ``on_skipped`` and
+    # starts its own cycle without waiting for 10:00. The stall reaches ``on_missed`` only
+    # once the 10:00 cycle has been handed on. Handed on after the skipped minutes, a
+    # cycle that landed data would reset the watchdog counters the stall raised.
     release = threading.Event()
     stalled: list[bool] = []
     end = et(REGULAR, 10, 3).astimezone(UTC)
@@ -1039,11 +1053,56 @@ def test_a_tick_with_skipped_slots_hands_on_the_cycle_before_the_stall_first(cal
         et(REGULAR, 9, 59, 30),
         should_continue,
         hold={et(REGULAR, 10, 0): release},
+        log_starts=True,
+    )
+
+    # Each start is logged on its cycle's thread, which the loop starts after the tick's
+    # hooks, so the 10:03 start follows the skipped minutes and nothing else is ordered
+    # against it.
+    assert events.index(("skipped", et(REGULAR, 10, 2))) < events.index(
+        ("start", et(REGULAR, 10, 3))
+    )
+    assert [event for event in events if event[0] != "start"] == [
+        ("tick", et(REGULAR, 10, 0)),
+        ("tick", et(REGULAR, 10, 3)),
+        ("skipped", et(REGULAR, 10, 1)),
+        ("skipped", et(REGULAR, 10, 2)),
+        ("cycle", et(REGULAR, 10, 0)),
+        ("missed", et(REGULAR, 10, 1)),
+        ("missed", et(REGULAR, 10, 2)),
+        ("cycle", et(REGULAR, 10, 3)),
+    ]
+
+
+def test_a_stall_with_nothing_ahead_of_it_reaches_on_missed_before_on_tick(calendar):
+    # The loop stalls right after the 10:00 tick and wakes at 10:02:30, and the 10:00
+    # cycle finishes during the wait, so nothing is in flight at the 10:03 tick. The
+    # stall's entry joins the queue before the tick hands on, so ``on_missed`` runs inside
+    # that tick, ahead of ``on_tick``, as the module docstring promises. The grace is long
+    # so the wait always sees the 10:00 cycle finish. It costs nothing, because the wait
+    # returns as soon as the cycle does.
+    stalled: list[bool] = []
+    end = et(REGULAR, 10, 3).astimezone(UTC)
+
+    def should_continue(clock: ManualClock) -> bool:
+        if not stalled and clock.now() >= et(REGULAR, 10, 0):
+            stalled.append(True)
+            clock.advance(150)
+        return clock.now() < end
+
+    _, events = _held_run(
+        calendar,
+        et(REGULAR, 9, 59, 30),
+        should_continue,
+        hold={},
+        clock=ManualClock(start=et(REGULAR, 9, 59, 30).astimezone(UTC), grace=5.0),
     )
 
     assert events == [
         ("tick", et(REGULAR, 10, 0)),
         ("cycle", et(REGULAR, 10, 0)),
+        ("missed", et(REGULAR, 10, 1)),
+        ("missed", et(REGULAR, 10, 2)),
         ("tick", et(REGULAR, 10, 3)),
         ("skipped", et(REGULAR, 10, 1)),
         ("skipped", et(REGULAR, 10, 2)),
@@ -1051,11 +1110,56 @@ def test_a_tick_with_skipped_slots_hands_on_the_cycle_before_the_stall_first(cal
     ]
 
 
+def test_a_cycle_held_across_a_stall_does_not_hold_the_minutes_after_it(calendar):
+    # The 10:00 cycle stands for one queued on the lake-root lock. It is held until the
+    # 10:05 tick. The loop stalls after the 10:00 tick and wakes at 10:02:30, so the 10:03
+    # tick has two skipped slots. A tick that waited for every cycle in flight would wait
+    # on 10:00 until its hold times out, which is how capture lost twelve minutes on
+    # 2026-10-05 (marketlake #644). The 10:03, 10:04 and 10:05 cycles must start at their
+    # own tops instead.
+    release = threading.Event()
+    stalled: list[bool] = []
+    end = et(REGULAR, 10, 5).astimezone(UTC)
+
+    def on_tick(slot: datetime) -> None:
+        if slot == et(REGULAR, 10, 5):
+            release.set()
+
+    def should_continue(clock: ManualClock) -> bool:
+        if not stalled and clock.now() >= et(REGULAR, 10, 0):
+            stalled.append(True)
+            clock.advance(150)
+        return clock.now() < end
+
+    runner, events = _held_run(
+        calendar,
+        et(REGULAR, 9, 59, 30),
+        should_continue,
+        hold={et(REGULAR, 10, 0): release},
+        on_tick=on_tick,
+    )
+
+    fired = [et(REGULAR, 10, 0), et(REGULAR, 10, 3), et(REGULAR, 10, 4), et(REGULAR, 10, 5)]
+    assert runner.slots == fired
+    assert runner.floors == fired
+    stall = [et(REGULAR, 10, 1), et(REGULAR, 10, 2)]
+    assert [slot for kind, slot in events if kind == "skipped"] == stall
+    assert [slot for kind, slot in events if kind == "missed"] == stall
+    # The stall waited in the queue for the held cycle, then went on ahead of 10:03.
+    assert events.index(("missed", et(REGULAR, 10, 1))) > events.index(
+        ("cycle", et(REGULAR, 10, 0))
+    )
+    assert events.index(("missed", et(REGULAR, 10, 2))) < events.index(
+        ("cycle", et(REGULAR, 10, 3))
+    )
+
+
 def test_the_close_plus_five_tick_hands_on_the_option_close_cycle_before_its_hooks(calendar):
     # The 16:15 cycle is still running at 16:20, the close+5 deadline, where ``on_tick``
     # dispatches the guard. The guard refills an option close only when no data row holds
     # it, so it must run after that cycle has finished. The minutes between are off the
-    # capture window, so this tick has no skipped slot to wait for.
+    # capture window, so this tick has no skipped slot, and the close+5 deadline alone is
+    # what makes it wait.
     release = threading.Event()
     stalled: list[bool] = []
     end = et(REGULAR, 16, 20).astimezone(UTC)

@@ -54,7 +54,9 @@ Two rules keep repeated marking safe, which matters because the daemon runs unde
 1. The present set counts marker rows as well as data rows, so a minute a previous
    restart already marked is not owed a second time.
 2. A date the manifest has already sealed is skipped, so markers never land under a
-   partition whose row count is fixed.
+   partition whose row count is fixed. A skipped-slot pass over today's minutes, run at
+   or before today's option close, reads no manifest, because no scheduled compaction
+   seals a date before its close+5.
 
 A pass with no missed minutes writes nothing, because the write loop runs once per date
 that has slots and an empty span has none.
@@ -64,6 +66,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -163,16 +166,17 @@ class GapMarker:
     """The one writer both hooks hand missed slots to.
 
     Every seam is injected. There is no wall clock here at all: the minutes come from
-    the calendar, and each segment is stamped with the first minute it marks. So a
-    marking pass is decided entirely by the calendar, the roster it reads, and what is
-    already on disk.
+    the calendar, and each segment is stamped with the first minute it marks. So what a
+    marking pass marks is decided entirely by the calendar, the roster it reads, and what
+    is already on disk. The session clock's own reading decides one thing more, whether
+    a skipped-slot pass takes the lake-root lock, and never which minutes it marks.
 
     ``roster`` is a reader, not a roster, because scope changes while the daemon runs.
     Each pass calls it once and marks whatever it returns.
 
     A reader that raises takes the daemon down, and the daemon's reader carries no
-    fallback to stop that. The price is the one the skipped-slot hook already pays for
-    its own read, and it is smaller here: a marker stands for a minute already gone, so
+    fallback to stop that. The price is the one the watchdog's ``on_missed`` hook already pays
+    for its own read, and it is smaller here: a marker stands for a minute already gone, so
     the successor's startup pass walks back and marks whatever this one missed. A stale
     roster marking minutes the file no longer names is what has no later repair.
     """
@@ -250,6 +254,10 @@ class GapMarker:
         was never owed, and marking it would render "40% missing" on a ticker the design
         renders as "onboarded 10:05". A ticker the master cannot place is not clamped,
         which only ever widens the marking, and ``_capture_start`` never raises.
+
+        A pass whose slots all fall on today, run at or before today's option close, takes
+        neither the lake-root lock nor the manifest read. ``_pass`` gives the lock's two
+        reasons, and neither applies to that pass. Every other pass takes both.
         """
 
         def plan(
@@ -260,7 +268,22 @@ class GapMarker:
                 return list(slots), MarkingReport()
             return [slot for slot in slots if is_in_scope(slot, epoch)], MarkingReport()
 
-        return self._pass(SLOT_OVERRUN, plan)
+        return self._pass(SLOT_OVERRUN, plan, locked=not self._before_todays_close(slots))
+
+    def _before_todays_close(self, slots: list[datetime]) -> bool:
+        """Whether every slot falls on today and the clock reads at or before today's close.
+
+        The close is the option close from the session's own bounds, so a half day's
+        earlier close counts. The clock is read once, here, after the slots were decided,
+        so a reading that lands later than the tick's only errs toward taking the lock.
+        """
+        now = self._session_clock.snap_slot()
+        today = now.date()
+        try:
+            option_close = self._session_clock.bounds(today).option_close
+        except NotASession:
+            return False
+        return now <= option_close and all(slot.date() == today for slot in slots)
 
     # -- the pass --------------------------------------------------------------
 
@@ -268,22 +291,37 @@ class GapMarker:
         self,
         error_class: str,
         plan: Callable[[str, str, dict[str, dict]], tuple[list[datetime], MarkingReport]],
+        *,
+        locked: bool = True,
     ) -> MarkingReport:
-        """Run one marking pass over the whole roster under a single lock.
+        """Run one marking pass over the whole roster, under a single lock when ``locked``.
 
         The lock is taken once and the ledger read once, for the pass rather than for
         each ticker. ``on_skipped`` runs on the loop thread, so a lock per surface per
         ticker would put a growing stall in front of the next capture cycle.
 
-        Deciding and writing sit inside the same hold. The recorded set is read there too,
-        so a second incarnation cannot read the same state and mark the same minutes into
-        a differently named segment. Compaction fixes a date's row count when it seals,
-        so a marker landing between the seal check and the write would make that count
-        wrong.
+        A locked pass decides and writes inside the same hold, for two reasons.
 
-        Capture stays outside this lock, because a blocked cycle drops perishable
-        minutes. A marker stands for a minute already gone, so nothing perishes while it
-        waits.
+        1. The recorded set is read there too, so a second incarnation cannot read the
+           same state and mark the same minutes into a differently named segment. Only the
+           startup pass reads that set.
+        2. Compaction fixes a date's row count when it seals, so a marker landing between
+           the seal check and the write would make that count wrong.
+
+        Neither applies to a skipped-slot pass over today's minutes run at or before
+        today's option close, which ``on_skipped`` runs with ``locked`` false. Its plan
+        reads no recorded set, and the scheduled compaction never seals a date before its
+        close+5. The hand-run ``recompact_ticker_day`` has no such check and can seal today
+        mid-session, but capture writes its segments outside the lock and faces the same
+        risk, so the markers add none. That pass also skips the manifest read, since the
+        seal check it feeds cannot find today sealed before close+5.
+
+        The lock is not free to wait on. A capture cycle takes it once, after its
+        segments are durable, for its manifest append. On 2026-10-05 up to 24 cycles at
+        once queued on it, and a pass waiting behind them on the loop thread would hold
+        the next minute's cycle (marketlake #644). A locked pass still waits there, which
+        costs nothing outside the capture window, and on the rare stall that crosses a
+        day it costs the minutes that wait outlasts.
 
         The roster is read once here, for the pass rather than for each ticker, and
         outside the lock because it is not lake state. One read per pass keeps every
@@ -305,8 +343,8 @@ class GapMarker:
             roster = self._roster().enabled
             self._master_now = self._master() if self._master is not None else None
             self._spans_now = self._spans() if self._spans is not None else None
-            with lake_lock(self._root):
-                recorded = latest_entries(self._root)
+            with lake_lock(self._root) if locked else nullcontext():
+                recorded = latest_entries(self._root) if locked else {}
                 for entry in roster:
                     for surface in surfaces_for(entry):
                         try:
@@ -357,8 +395,8 @@ class GapMarker:
             # The one failure that stays fatal, named rather than left to a class list.
             # A roster that will not load means nobody knows what is in scope, and a
             # daemon marking against a roster it could not read would invent gaps for
-            # tickers or miss them entirely. The skipped-slot hook refuses it the same
-            # way. Naming it here is what lets the catch below widen safely.
+            # tickers or miss them entirely. The watchdog's ``on_missed`` hook refuses it the
+            # same way. Naming it here is what lets the catch below widen safely.
             raise
         except Exception as exc:  # noqa: BLE001 - see the crash-loop rule below
             # The lock, the ledger, or a segment read. ``on_start`` is unguarded and the

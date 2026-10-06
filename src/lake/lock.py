@@ -1,9 +1,9 @@
 """The lake-root lock.
 
-Every job that changes the lake takes one lock first. So two jobs never touch the
-lake at the same time. That is the whole rule. Serialization is a *lock, not a
-schedule*. A hand-run compaction and a scheduled one cannot race, because the second
-one to ask simply waits for the first to finish.
+Every job that appends to the manifest or seals a partition takes one lock first. So
+two such jobs never touch the lake at the same time. That is the whole rule.
+Serialization is a *lock, not a schedule*. A hand-run compaction and a scheduled one
+cannot race, because the second one to ask simply waits for the first to finish.
 
 The lock is a blocking advisory ``flock`` on the manifest, ``manifest.jsonl``.
 
@@ -28,9 +28,12 @@ is already on it, and no new file to the lake tree or the backup. The handle is
 opened read-only, so accidental truncation or corruption of the integrity root through
 the lock path is structurally impossible. ``flock`` works fine on a read-only handle.
 
-Capture workers stay deliberately outside this lock. Blocking a capture cycle behind
-compaction would drop perishable minutes. Only the serialized daily jobs and manual
-lake-mutating runs take it.
+Capture fetches and writes its segments outside this lock, because blocking a fetch
+behind compaction would drop perishable minutes. A capture cycle takes the lock once,
+after its segments are durable, for its manifest append. Gap marking takes it too,
+except for a skipped-slot pass over today's minutes run at or before today's option
+close, which ``lake.gap`` explains. The serialized daily jobs and manual lake-mutating
+runs take it.
 """
 
 from __future__ import annotations

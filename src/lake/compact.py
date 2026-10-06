@@ -16,10 +16,14 @@ close+5 is 16:20.
 
 The job's rules, each glossed at first use.
 
-1. *One lock for the whole run.* Every lake-mutating job takes the lake-root ``flock``
-   first, the kernel file lock on ``manifest.jsonl``. So a hand-run compaction and a
-   scheduled one never race, and neither races the backup. Capture workers stay outside
-   the lock by design, so blocking a cycle behind compaction never drops a minute.
+1. *One lock for the whole run.* Every job that appends to the manifest or seals a
+   partition takes the lake-root ``flock`` first, the kernel file lock on
+   ``manifest.jsonl``. So a hand-run compaction and a scheduled one never race, and
+   neither races the backup. A capture cycle fetches and writes its segments outside the
+   lock, so blocking a cycle behind compaction never drops a minute. It takes the lock
+   once, after its segments are durable, for its manifest append. A gap-marking pass over
+   today's minutes run at or before today's option close does not take it, for the reason
+   ``lake.gap`` gives.
 2. *Sweep every date, but only past the guard.* The job walks every date directory under
    ``journal/``, so a segment orphaned by an earlier failed run is recovered. A ticker-day
    is eligible only once its *option-close deadline* has passed. That is close+5, the last
@@ -345,8 +349,9 @@ class DamagedSegments(Exception):
     """Raised when a ticker-day's segment no longer matches its hash or reads as damaged.
 
     Every capture segment has a manifest entry whose sha256 the cycle hashed from the file
-    right after closing it. ``_seal`` compares each segment that has one before reading any
-    of them, and this names what failed. A segment the read proves damaged is refused the
+    right after closing it, or under the lake-root lock when that hash raised. ``_seal``
+    compares each segment that has one before reading any of them, and this names what
+    failed. A segment the read proves damaged is refused the
     same way, which is how one with no entry and so no hash reaches it (marketlake #552).
     The sweep catches it the way it catches ``SegmentSchemaConflict`` and for the same
     reason: nothing in this module repairs it, so ending the run would cost every other
@@ -863,7 +868,8 @@ def _damaged_segments(
     """Every segment whose bytes no longer match the sha256 its manifest entry recorded.
 
     The reference is the digest the capture cycle took from the file right after closing
-    it, read from the entry and never computed here. A digest compaction took from the
+    it, read from the entry and never computed here. When that hash raised, the cycle took
+    the digest under the lake-root lock instead. A digest compaction took from the
     bytes it is about to seal would be a digest of the copy that may already be damaged,
     so it could never disagree with the damage.
 
