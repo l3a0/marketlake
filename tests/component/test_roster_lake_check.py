@@ -25,10 +25,10 @@ import pyarrow.parquet as pq
 import pytest
 
 from lake import roster as roster_cli
-from lake.capture_spans import CaptureSpans, spans_path
+from lake.capture_spans import CaptureSpans, UnsupportedSpansSchemaVersion, spans_path
 from lake.onboard import DEFAULT_BARS, DEFAULT_CHAIN_CADENCE
 from lake.roster import REPLACED, UNCHANGED, RosterError, apply
-from lake.security_master import SecurityMaster, master_path
+from lake.security_master import SecurityMaster, UnsupportedSchemaVersion, master_path
 from lake.tickers import load_tickers, roster_from_bytes, upsert_ticker
 from tests.component.test_reference_read import _Locked
 from tests.support.clock import ManualClock
@@ -37,6 +37,10 @@ from tests.support.config import write_config
 START = datetime(2026, 9, 8, 17, 7, tzinfo=UTC)
 CLOSED = datetime(2026, 9, 15, 20, 0, tzinfo=UTC)
 AT = datetime(2026, 9, 21, 13, 30, tzinfo=UTC)
+# 21:00 in New York on 2026-09-21, which is already 2026-09-22 in UTC.
+EVENING = datetime(2026, 9, 22, 1, 0, tzinfo=UTC)
+# 10:00 in New York on 2026-09-22, when the master names the unnamed lake's IWM.
+NAMED = datetime(2026, 9, 22, 14, 0, tzinfo=UTC)
 
 SPY_ONLY = b"SPY: {options: true, chain_cadence: 1m, bars: [1m, 1d]}\n"
 QQQ_ONLY = b"QQQ: {options: true, chain_cadence: 1m, bars: [1m, 1d]}\n"
@@ -91,9 +95,16 @@ def target(tmp_path: Path) -> Path:
     return tmp_path / "out" / "tickers.yaml"
 
 
-def _apply(payload: bytes, tmp_path: Path, lake: Path, target: Path, role: str | None = None):
+def _apply(
+    payload: bytes,
+    tmp_path: Path,
+    lake: Path,
+    target: Path,
+    role: str | None = None,
+    at: datetime = AT,
+):
     config = write_config(tmp_path / "cfg", lake, role=role)
-    return apply(payload, clock=ManualClock(AT), config_path=config, tickers_path=target)
+    return apply(payload, clock=ManualClock(at), config_path=config, tickers_path=target)
 
 
 def _held(target: Path, payload: bytes) -> None:
@@ -117,6 +128,21 @@ def test_a_roster_omitting_an_open_span_is_refused_on_a_fresh_write(tmp_path, la
     assert "no entry in this roster names it" in message
     # The remedy is a whole entry, so pasting it cannot stop SPY's bars.
     assert "SPY: {options: true, chain_cadence: 1m, bars: [1m, 1d]}" in message
+    assert "\n" not in message
+    assert not target.parent.exists()
+
+
+def test_every_problem_is_named_on_one_line(tmp_path, target):
+    # On NAMED the master names IWM, whose span is open without options. The roster
+    # omits SPY and IWM, so the refusal carries two problems, joined on one line.
+    lake = _build_lake(tmp_path / "lake", unnamed=True)
+    with pytest.raises(RosterError) as excinfo:
+        _apply(QQQ_ONLY, tmp_path, lake, target, at=NAMED)
+    message = str(excinfo.value)
+    assert "SPY has an open capture span" in message
+    assert "IWM has an open capture span" in message
+    assert "with options false" in message
+    assert message.endswith("IWM: {options: false, bars: [1m, 1d]}")
     assert "\n" not in message
     assert not target.parent.exists()
 
@@ -174,6 +200,17 @@ def test_a_disabled_entry_for_an_open_span_names_both_branches(tmp_path, lake, t
     assert not target.parent.exists()
 
 
+def test_a_disabled_line_prints_the_span_flag_not_the_entry_flag(tmp_path, lake, target):
+    # SPY's span is open with options, and its disabled entry says options false.
+    payload = (
+        b"SPY: {options: false, bars: [1m, 1d], enabled: false}\n"
+        b"QQQ: {options: true, chain_cadence: 1m, bars: [1m, 1d]}\n"
+    )
+    with pytest.raises(RosterError, match=r"is open \(options true\)"):
+        _apply(payload, tmp_path, lake, target)
+    assert not target.parent.exists()
+
+
 # -- test 3: an enabled entry that drops the span's options ------------------------------
 
 
@@ -194,6 +231,16 @@ def test_an_entry_with_options_for_a_span_without_options_passes(tmp_path, targe
     lake = _build_lake(tmp_path / "lake", options=False)
     assert _apply(SPY_ONLY, tmp_path, lake, target) == REPLACED
     assert target.read_bytes() == SPY_ONLY
+    captured = capsys.readouterr()
+    assert captured.out == f"roster: lake check passed, 1 open capture span checked in {lake}\n"
+    assert captured.err == ""
+
+
+def test_an_entry_without_options_for_a_span_without_options_passes(tmp_path, target, capsys):
+    # A check refusing every entry without options would refuse this one.
+    lake = _build_lake(tmp_path / "lake", options=False)
+    assert _apply(SPY_WITHOUT_OPTIONS, tmp_path, lake, target) == REPLACED
+    assert target.read_bytes() == SPY_WITHOUT_OPTIONS
     captured = capsys.readouterr()
     assert captured.out == f"roster: lake check passed, 1 open capture span checked in {lake}\n"
     assert captured.err == ""
@@ -274,6 +321,14 @@ def test_a_missing_master_with_an_empty_role_is_refused(tmp_path, lake, target, 
     assert not target.parent.exists()
 
 
+def test_a_role_warning_prints_when_the_check_runs(tmp_path, lake, target, capsys):
+    # Both files are present, so the warning cannot ride on the missing-file branch.
+    assert _apply(SPY_ONLY, tmp_path, lake, target, role="") == REPLACED
+    (warning,) = capsys.readouterr().err.splitlines()
+    assert warning.startswith("roster: role ")
+    assert "is neither 'primary' nor 'shadow'" in warning
+
+
 def test_an_unmounted_lake_root_is_refused(tmp_path, target):
     # An empty mount point, or a lake never restored: nothing under ``lake_root`` at all.
     with pytest.raises(RosterError, match="does not exist"):
@@ -342,6 +397,23 @@ def test_a_bare_oserror_from_a_read_is_refused_on_one_line(
     assert not target.parent.exists()
 
 
+@pytest.mark.parametrize("file", ["master", "spans"])
+def test_an_unsupported_schema_version_is_refused(tmp_path, lake, target, monkeypatch, file):
+    owner = SecurityMaster if file == "master" else CaptureSpans
+    raised = UnsupportedSchemaVersion(99) if file == "master" else UnsupportedSpansSchemaVersion(99)
+    monkeypatch.setattr(owner, "read", _raising_read(raised))
+    with pytest.raises(RosterError, match=r"cannot be read \(Unsupported"):
+        _apply(SPY_ONLY, tmp_path, lake, target, role="shadow")
+    assert not target.parent.exists()
+
+
+def test_an_exception_with_no_message_prints_its_class_alone(tmp_path, lake, target, monkeypatch):
+    monkeypatch.setattr(SecurityMaster, "read", _raising_read(OSError()))
+    with pytest.raises(RosterError, match=r"cannot be read \(OSError\), so"):
+        _apply(SPY_ONLY, tmp_path, lake, target)
+    assert not target.parent.exists()
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 file")
 @pytest.mark.parametrize("role", ROLES)
 def test_a_locked_master_is_refused(tmp_path, lake, target, role):
@@ -387,6 +459,16 @@ def test_a_null_valid_from_while_naming_the_spans_is_refused(tmp_path, lake, tar
     assert not target.parent.exists()
 
 
+def test_any_exception_naming_a_span_is_refused(tmp_path, lake, target, monkeypatch):
+    def symbol_at(self, instrument_id, on, id_type="ticker"):
+        raise ValueError("bad mapping")
+
+    monkeypatch.setattr(SecurityMaster, "symbol_at", symbol_at)
+    with pytest.raises(RosterError, match=r"naming the open capture spans .*\(ValueError: bad"):
+        _apply(SPY_ONLY, tmp_path, lake, target)
+    assert not target.parent.exists()
+
+
 # -- test 6: an open span the master cannot name ----------------------------------------
 
 
@@ -399,6 +481,23 @@ def test_an_open_span_the_master_cannot_name_warns_and_writes(tmp_path, target, 
     assert warning.startswith("roster: instrument 3 has an open capture span in ")
     assert "no ticker in the security master on 2026-09-21" in warning
     assert captured.out == f"roster: lake check passed, 2 open capture spans checked in {lake}\n"
+
+
+def test_the_unnamed_warning_prints_the_span_options_flag(tmp_path, target, capsys):
+    # The unnamed span is open without options, and SPY's with them.
+    lake = _build_lake(tmp_path / "lake", unnamed=True)
+    _apply(SPY_ONLY, tmp_path, lake, target)
+    (warning,) = capsys.readouterr().err.splitlines()
+    assert "(options false) and no ticker" in warning
+
+
+def test_the_naming_date_is_the_market_date_not_the_utc_date(tmp_path, target, capsys):
+    # EVENING is 2026-09-21 in New York and 2026-09-22 in UTC. The master names IWM from
+    # 2026-09-22, so naming on the UTC date would ask for an IWM entry and refuse.
+    lake = _build_lake(tmp_path / "lake", unnamed=True)
+    assert _apply(SPY_ONLY, tmp_path, lake, target, at=EVENING) == REPLACED
+    (warning,) = capsys.readouterr().err.splitlines()
+    assert "no ticker in the security master on 2026-09-21" in warning
 
 
 # -- the command line runs the check ----------------------------------------------------
