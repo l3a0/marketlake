@@ -43,7 +43,7 @@ from lake.paths import (
     parse_segment_rel,
 )
 from lake.schwab import DEFAULT_TOKEN_PATH
-from lake.tickers import DEFAULT_TICKERS_PATH
+from lake.tickers import default_tickers_path
 from tests.support.lake import FixtureLake
 
 ROOT = Path("/lake")
@@ -456,7 +456,7 @@ def test_the_variable_is_spelled_the_way_the_design_doc_names_it():
     ("default", "name"),
     [
         (DEFAULT_CONFIG_PATH, CONFIG_FILE),
-        (DEFAULT_TICKERS_PATH, TICKERS_FILE),
+        (default_tickers_path(), TICKERS_FILE),
         (DEFAULT_TOKEN_PATH, TOKEN_FILE),
         (DEFAULT_CHAIN_PLAN_PATH, CHAIN_PLAN_FILE),
     ],
@@ -468,7 +468,7 @@ def test_every_machine_file_sits_in_the_excluded_directory(default, name):
 
 @pytest.mark.parametrize(
     "default",
-    [DEFAULT_CONFIG_PATH, DEFAULT_TICKERS_PATH, DEFAULT_TOKEN_PATH, DEFAULT_CHAIN_PLAN_PATH],
+    [DEFAULT_CONFIG_PATH, default_tickers_path(), DEFAULT_TOKEN_PATH, DEFAULT_CHAIN_PLAN_PATH],
 )
 def test_every_default_comes_back_resolved(default):
     # One convention. An unexpanded "~" path looks usable and is not, because open()

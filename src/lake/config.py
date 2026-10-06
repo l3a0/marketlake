@@ -88,6 +88,9 @@ from lake.tickers import TickersError
 
 # The machine-local config file. Overridable by argument or this environment variable,
 # so a test points the loader at a throwaway file.
+# The path is fixed when this module is imported, so a process that sets HOME or
+# MARKETLAKE_CONFIG_DIR afterwards still resolves the real directory. marketlake #715
+# resolves it at call time instead.
 DEFAULT_CONFIG_PATH = config_dir() / CONFIG_FILE
 CONFIG_PATH_ENV = "MARKETLAKE_CONFIG"
 

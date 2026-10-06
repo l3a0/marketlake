@@ -64,8 +64,8 @@ from tests.support.config_defaults import modules_building_a_default
 # That test arranges its own redirect by pointing ``HOME`` at a throwaway directory. Any
 # other child that reaches a default path has to do the same.
 #
-# The export sits above the rest of this file's imports because every default in the
-# package is built from ``config_dir`` when its module is imported. Exporting the
+# The export sits above the rest of this file's imports because four defaults in the
+# package are built from ``config_dir`` when their module is imported. Exporting the
 # variable after ``lake.reauth`` had been imported would move nothing a caller uses.
 # ``lake.paths`` is safe to import first, since it only spells the variable's name and
 # builds no default from it. The check below enforces that rather than trusting the
@@ -93,7 +93,7 @@ from tests.support.config_defaults import modules_building_a_default
 # constant at import, so one already in ``sys.modules`` here has bound it against
 # whatever the environment said before this file ran.
 #
-# Read out of ``src/lake`` rather than typed, because a sixth default added there would
+# Read out of ``src/lake`` rather than typed, because a new default added there would
 # otherwise be outside this check with nothing to say so. The scanner imports nothing,
 # which it has to avoid: importing one of these modules is the very act this guards
 # against. ``tests.support.config_defaults`` reaches only ``ast`` and ``pathlib``, so it

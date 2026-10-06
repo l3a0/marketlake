@@ -106,7 +106,7 @@ from lake.schema_versions import check_running_version, ledger_path
 from lake.schwab import DEFAULT_TOKEN_PATH
 from lake.security_master import SecurityMaster, master_path
 from lake.session import SPOT_CLOSE, TICK
-from lake.tickers import DEFAULT_TICKERS_PATH, TICKERS_PATH_ENV, TickersError
+from lake.tickers import TICKERS_PATH_ENV, TickersError, default_tickers_path
 from lake.vendor import VendorResponse
 from tests.support.backup import FakeBackup
 from tests.support.calendar import et, weekday_sessions
@@ -3063,7 +3063,7 @@ def test_the_plists_unset_paths_reach_every_read_unchanged(tmp_path, monkeypatch
     monkeypatch.setenv(TICKERS_PATH_ENV, str(rig.tickers))
     # The loaders find the rig through the variables alone. A file at a default path
     # would be found without them.
-    for default in (DEFAULT_CONFIG_PATH, DEFAULT_TICKERS_PATH, DEFAULT_TOKEN_PATH):
+    for default in (DEFAULT_CONFIG_PATH, default_tickers_path(), DEFAULT_TOKEN_PATH):
         assert not default.exists()
         assert not is_protected(default)
     reads = PathReads.install(monkeypatch)

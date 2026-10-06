@@ -87,3 +87,19 @@ def test_the_tracked_roster_keeps_the_rules():
 )
 def test_the_rules_catch_a_typo(text, problem):
     assert problem in roster_problems(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param(
+            "SPY: {options: true, chain_cadence: 1m, bars: [1m, 1d]}\n"
+            "QQQ: {options: true, chain_cadence: 1m, bars: [1m], enabled: false}\n",
+            id="one-enabled-one-disabled",
+        ),
+        pytest.param("IWM: {options: false, bars: [1d]}\n", id="equity-only-without-cadence"),
+    ],
+)
+def test_the_rules_accept_a_roster_that_keeps_them(text):
+    # One enabled entry is enough, and only an options entry needs a cadence.
+    assert roster_problems(text) == []
