@@ -1,19 +1,20 @@
 """The subprocess guard itself, which nothing else covers.
 
 The guard in ``tests/conftest.py`` is the reason a forgotten seam runs a fake tool
-instead of the real ``rsync``, ``launchctl``, ``pmset``, or ``tmutil``. It is autouse,
-so every test depends on it and no test asserts it. These do.
+instead of the real ``rsync``, ``launchctl``, ``pmset``, ``tmutil``, ``systemctl``, or
+``timedatectl``. It is autouse, so every test depends on it and no test asserts it. These
+do.
 
 Five properties carry the whole guard, and each is covered below.
 
-1. Each of the four guarded programs is refused, whether it is named through
+1. Each of the six guarded programs is refused, whether it is named through
    ``subprocess.run`` or ``subprocess.Popen``.
 2. The failure is not an ``Exception``. The Sunday self-check catches bare
    ``Exception`` around both read-backs on purpose, so a guard derived from it would
    be swallowed and the test would pass.
 3. Every other program still runs for real, which is what lets the four render tests
    in ``tests/component/test_control_plane_render.py`` spawn a rendered script.
-4. The six production seams that forget to fake a guarded program are themselves
+4. The eight production seams that forget to fake a guarded program are themselves
    caught, not just a synthetic call naming the program directly.
 5. A guarded program named behind a prefix wrapper is refused too. ``sudo`` is the one
    this repo uses, and the sixth seam is the only guarded call that writes rather than
@@ -33,12 +34,14 @@ from lake.control_plane import (
     pmset_assertions_probe,
     read_exclusions,
     read_pmset_schedule,
+    systemctl_probe,
+    timedatectl_clock_probe,
 )
 from lake.runner import RsyncBackup
 from lake.sweep import set_sunday_wake
 from tests.conftest import SubprocessAccessInTest, _program_of
 
-GUARDED = ("rsync", "launchctl", "pmset", "tmutil")
+GUARDED = ("rsync", "launchctl", "pmset", "tmutil", "systemctl", "timedatectl")
 
 
 @pytest.mark.parametrize("program", GUARDED)
@@ -61,8 +64,8 @@ def test_a_bytes_argv_is_still_refused():
 
 
 def test_an_unguarded_program_still_runs_for_real():
-    # None of the four render tests name rsync, launchctl, pmset, or tmutil directly,
-    # only a rendered script or bash. Confirms the guard leaves everything else
+    # None of the four render tests name a guarded program directly, only a rendered
+    # script or bash. Confirms the guard leaves everything else
     # untouched, which is what those tests depend on.
     proc = subprocess.run([sys.executable, "-c", "print('hi')"], capture_output=True, text=True)
     assert proc.returncode == 0
@@ -97,7 +100,7 @@ def test_a_test_calling_monkeypatch_undo_does_not_disarm_the_guard(monkeypatch):
         subprocess.run(["tmutil", "isexcluded", "/lake"], capture_output=True)
 
 
-# -- the four production seams, unfaked -----------------------------------------------
+# -- the production seams, unfaked ----------------------------------------------------
 
 
 def test_a_forgotten_launchctl_probe_fake_is_caught():
@@ -125,6 +128,18 @@ def test_a_forgotten_pmset_assertions_fake_is_caught():
 def test_a_forgotten_exclusion_reader_fake_is_caught():
     with pytest.raises(SubprocessAccessInTest):
         read_exclusions(["/lake"])
+
+
+def test_a_forgotten_systemd_probe_fake_is_caught():
+    """The seventh seam. A test that forgets it would read the CI runner's own systemd."""
+    with pytest.raises(SubprocessAccessInTest, match="systemctl"):
+        systemctl_probe("com.marketlake.daemon")
+
+
+def test_a_forgotten_clock_probe_fake_is_caught():
+    """The eighth seam. A test that forgets it would read the CI runner's own clock sync."""
+    with pytest.raises(SubprocessAccessInTest, match="timedatectl"):
+        timedatectl_clock_probe()
 
 
 def test_a_forgotten_rsync_backup_fake_is_caught(tmp_path):

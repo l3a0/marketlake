@@ -1,13 +1,16 @@
-"""The laptop control plane.
+"""The control plane.
 
 The data plane is plain files any host can serve. The control plane is what keeps the
 laptop awake, keeps the two resident processes running, and proves both to the outside
-world. It is macOS-specific by construction and is rewritten per host. This module
-renders it and reasons about it. It executes nothing privileged. No ``sudo``, no
-``pmset`` write, no ``launchctl`` bootstrap, and no ``tmutil`` write runs from here.
-Installing is the operator's step, by hand. Four read-only probes do run, from the
-rendered jobs and from the by-hand live checks: ``launchctl print``, ``pmset -g sched``,
-``pmset -g assertions``, and ``tmutil isexcluded``. None of them needs root.
+world. One codebase serves both hosts and branches on ``is_macos``, which reads
+``sys.platform``. On macOS the probes ask ``launchctl`` and ``pmset``. On Linux they ask
+systemd, no assertion is held and no wake is set, because a VM never sleeps. This module
+renders the macOS half and reasons about both. It executes nothing privileged. No
+``sudo``, no ``pmset`` write, no ``launchctl`` bootstrap, and no ``tmutil`` write runs
+from here. Installing is the operator's step, by hand. Six read-only probes do run, from
+the scheduled jobs and from the by-hand live checks. Four run on macOS: ``launchctl
+print``, ``pmset -g sched``, ``pmset -g assertions``, and ``tmutil isexcluded``. Two run
+on Linux: ``systemctl is-active`` and ``timedatectl show``. None of them needs root.
 
 Terms, glossed at first use.
 
@@ -74,8 +77,9 @@ The alarm check here therefore expects the one-shot only between the Friday swee
 that sets it and its own firing. Before that Friday nothing has set it, so a Monday
 catch-up run reports nothing missing. The weekday repeat alarm is always expected.
 
-Every seam is injected: the clock, the calendar, the daemon probe, the schedule reader,
-the pinger, the canary, the alert transport, and the caffeinate runner. The whole module
+Every seam is injected: the clock, the calendar, the daemon probe, the clock-sync probe,
+the schedule reader, the pinger, the canary, the alert transport, and the caffeinate
+runner. The whole module
 runs offline in a test. Two of those seams reach the outside world when they fall back
 to their production default. The canary quotes one symbol through the vendor, and the
 transport POSTs the re-auth reminder to ntfy. Both are built by the ``sunday`` command
@@ -206,6 +210,23 @@ SELF_CHECK_LABEL = "com.marketlake.self-check"
 CALENDAR_PROBE_LABEL = "com.marketlake.calendar-probe"
 SUNDAY_LABEL = "com.marketlake.sunday"
 EOD_SWEEP_LABEL = "com.marketlake.eod-sweep"
+
+
+def is_macos() -> bool:
+    """Whether this process runs on macOS, which decides which health probes it asks.
+
+    The probes depend on the operating system they run on, so the operating system is the
+    fact to read. On macOS the jobs ask ``launchctl`` and ``pmset``, hold a ``caffeinate``
+    assertion and set the Friday wake. On any other host they ask systemd, hold nothing and
+    set no wake, because a VM never sleeps. The price is that a third host would take the
+    Linux path, which is accepted, since none is planned. ``docs/design.md`` records the
+    three alternatives this replaced and why each was refused.
+
+    ``daemon`` and ``sweep`` call this through the module, as ``control_plane.is_macos()``,
+    so the suite's one patch on this name reaches every caller.
+    """
+    return sys.platform == "darwin"
+
 
 # The healthchecks slugs the two calendar jobs ping. Log the slug, never the URL.
 CALENDAR_PROBE_SLUG = "calendar-probe"
@@ -541,8 +562,8 @@ def all_jobs(host: LaunchdHost) -> tuple[LaunchdJob, ...]:
 
 # -- the pre-open self-check ---------------------------------------------------
 
-# Whether the daemon behind a launchd label is running. The real one shells out to
-# ``launchctl``. A test injects a callable.
+# Whether the daemon behind a label is running. The real one shells out to ``launchctl``
+# on macOS and to ``systemctl`` on Linux. A test injects a callable.
 DaemonProbe = Callable[[str], bool]
 
 
@@ -576,6 +597,74 @@ def launchctl_probe(label: str) -> bool:
         check=False,
     )
     return result.returncode == 0 and parse_launchctl_print(result.stdout)
+
+
+def systemctl_probe(label: str) -> bool:
+    """The Linux probe: ``systemctl is-active --quiet <label>``, read by its exit code.
+
+    systemd appends ``.service`` to a name whose last dot-part is not a unit type, so the
+    daemon's label asks about ``com.marketlake.daemon.service``, the unit the systemd host
+    renders. ``is-active`` exits 0 only for its good states, ``active`` and ``reloading``,
+    and non-zero for a stopped unit, a unit with no file, and a bus it could not reach.
+    Reading the exit code rather than the printed state keeps this right if a later
+    systemd adds a good state. A unit in a ``Restart=`` back-off reads ``activating`` and
+    so answers down, as a throttled launchd job does.
+
+    Nothing is captured. With ``--quiet`` stdout is empty anyway, and on a bus failure
+    stderr is the only text saying why the probe answered down, so it reaches the journal
+    beside the self-check's summary line. A missing ``systemctl`` raises, which
+    ``self_check`` lets propagate, because a missed ping is the alarm.
+    """
+    import subprocess  # lazy: only a real run shells out
+
+    result = subprocess.run(["systemctl", "is-active", "--quiet", label], check=False)
+    return result.returncode == 0
+
+
+# Whether the host's clock is synchronized, as a problem sentence or ``None``. The real
+# one shells out to ``timedatectl`` on Linux. macOS passes none. A test injects a
+# callable.
+ClockProbe = Callable[[], str | None]
+
+# The sentence a clock the time service reports unsynchronized withholds the ping with.
+CLOCK_NOT_SYNCED = "clock not synchronized (NTPSynchronized=no)"
+
+
+def parse_ntp_synchronized(stdout: str, returncode: int) -> str | None:
+    """What ``timedatectl show --property=NTPSynchronized --value`` printed, as an answer.
+
+    ``None`` for ``yes`` at exit 0, ``CLOCK_NOT_SYNCED`` for ``no`` at exit 0, and an
+    ``unreadable`` sentence naming the output and the exit for anything else. In systemd
+    v255 the command prints exactly ``yes`` or ``no`` and exits 0, and when
+    ``systemd-timedated`` cannot be reached it prints nothing and exits 1. This never
+    raises, so an answer nobody expected becomes a sentence rather than a traceback.
+    """
+    answer = stdout.strip()
+    if returncode == 0 and answer == "yes":
+        return None
+    if returncode == 0 and answer == "no":
+        return CLOCK_NOT_SYNCED
+    return f"clock sync unreadable: timedatectl printed {stdout!r}, exit {returncode}"
+
+
+def timedatectl_clock_probe() -> str | None:
+    """The Linux clock probe: whether the time service reports the clock synchronized.
+
+    It reads ``NTPSynchronized``, which in systemd v255 is ``yes`` while the kernel's
+    maximum-error estimate is under 16 seconds. ``docs/design.md`` says what ``no`` means
+    and why the pre-open check asks. Only stdout is captured, so ``timedatectl``'s own
+    complaint reaches the journal beside the summary line. A missing binary raises, which
+    ``self_check`` lets propagate.
+    """
+    import subprocess  # lazy: only a real run shells out
+
+    result = subprocess.run(
+        ["timedatectl", "show", "--property=NTPSynchronized", "--value"],
+        stdout=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    return parse_ntp_synchronized(result.stdout, result.returncode)
 
 
 # Whether one named ``caffeinate`` holds the assertion. The real one shells out to
@@ -763,8 +852,9 @@ def self_check(
     stamped_at: datetime | None = None,
     now: datetime | None = None,
     publisher: Publisher | None = None,
+    clock_probe: ClockProbe | None = None,
 ) -> SelfCheckOutcome:
-    """Verify the daemon is up and holding its assertion, and ping only then.
+    """Verify the daemon is up and the host is fit to capture, and ping only then.
 
     ``publisher`` carries the page a refused ping raises. With none, a refusal is named
     in ``problem`` and pages nobody, which is what lets a test drive this helper without
@@ -772,10 +862,21 @@ def self_check(
     ``now`` escalates nothing, the same answer ``_assertion_owed`` gives above. The
     command line always passes one.
 
-    The ping means awake, daemon up, and the machine held awake. A missed ping means
-    one of those failed, paged a full hour before the bell. So the ping fires only on
-    the success condition. A down daemon exits without pinging. A raising probe
-    propagates, which is also a non-ping.
+    On macOS the ping means awake, daemon up, and the machine held awake. On Linux it
+    means daemon up and clock synchronized, because a VM never sleeps and holds no
+    assertion, so the command line passes ``assertion_probe=None`` there and a
+    ``clock_probe`` instead. A missed ping means one of those failed, paged a full hour
+    before the bell. So the ping fires only on the success condition. A down daemon exits
+    without pinging. A raising probe propagates, which is also a non-ping.
+
+    ``clock_probe`` answers ``None`` for a synchronized clock and a sentence otherwise,
+    and a sentence withholds the ping with that sentence as ``problem``. It runs after the
+    daemon probe and before the assertion question, and outside ``_assertion_owed``,
+    because lost sync is wrong at any hour. A withheld ping on a Saturday hand run pages
+    nobody, since ``pre-open`` expects weekdays only. The price of the order is that a
+    down daemon hides lost sync until the next run, which is accepted because the down
+    daemon pages anyway. With no ``clock_probe`` the clock is not asked about, which is
+    the macOS answer.
 
     The assertion is checked because a daemon that is up is not the same as a machine
     that will stay awake. The design rejected ``pmset disablesleep`` in favour of this
@@ -854,6 +955,10 @@ def self_check(
     up = probe(label)
     if not up:
         return SelfCheckOutcome(daemon_up=False, pinged=False)
+    if clock_probe is not None:
+        clock_problem = clock_probe()
+        if clock_problem is not None:
+            return SelfCheckOutcome(daemon_up=True, pinged=False, problem=clock_problem)
     held: bool | None = None
     if _assertion_owed(now) and assertion_probe is not None:
         if assertion_pid is None:
@@ -1737,7 +1842,16 @@ def sunday_daemon_page(
     """The page a dead daemon or an unheld assertion owes during the Sunday window.
 
     Two shapes, so the operator is sent to the right place instead of guessing between
-    them. A dead daemon names the launchd label, since there is no pid to check against.
+    them. A dead daemon names its label, since there is no pid to check against. On macOS
+    the body says what ``launchctl`` showed. On Linux it says what systemd reported and
+    names ``systemctl status <label>``, which prints the unit's load state, its active
+    state and the daemon's last log lines, so an operator who has to SSH in first gets the
+    reason in one command. The Linux body drops the assertion sentence, because a VM holds
+    none, and only the down shape arises there, since the Linux caller passes no
+    assertion probe.
+
+    ``when`` is ``now`` in Eastern time on both hosts. On a UTC host a bare
+    ``now.isoformat()`` would print Monday's date on a Sunday evening.
     A live daemon holding nothing names the pid it stamped, the same identity
     ``self_check`` matches at ``pmset_assertions_probe``. A missing stamp is the third
     state and reads as the second, the way ``self_check`` already treats it.
@@ -1755,6 +1869,16 @@ def sunday_daemon_page(
     not holding its assertion.
     """
     when = now.astimezone(MARKET_TZ).isoformat()
+    if not daemon_up and not is_macos():
+        return Message(
+            event=SUNDAY_DAEMON_DOWN_EVENT,
+            title=SUNDAY_DAEMON_DOWN_TITLE,
+            body=(
+                f"systemd reports {daemon_label} not active, not installed, or could not be "
+                f"asked, checked {when}. Monday's capture is at risk. Run "
+                f"systemctl status {daemon_label} on the VM."
+            ),
+        )
     if not daemon_up:
         return Message(
             event=SUNDAY_DAEMON_DOWN_EVENT,
@@ -1890,6 +2014,9 @@ class SundayOutcome:
     than in ``report``, because ``report`` carries findings, and ``main`` prints its line
     so the log can tell a pass from a test that never ran.
 
+    ``alarms`` is ``None`` when no schedule reader was passed, which is the Linux host,
+    where no ``pmset`` schedule exists to read back.
+
     ``covered`` is ``None`` when the mint time could not be read. That is a problem,
     never a skip. ``pinged`` is the success condition.
 
@@ -1906,7 +2033,7 @@ class SundayOutcome:
 
     scrub: ScrubResult
     backup: BackupScrubResult | None
-    alarms: AlarmCheck
+    alarms: AlarmCheck | None
     canary_passed: bool
     covered: bool | None
     pinged: bool
@@ -1937,7 +2064,7 @@ def sunday_maintenance(
     backup_target: Path | BucketTarget | None,
     now: datetime,
     calendar: Calendar,
-    schedule_reader: ScheduleReader,
+    schedule_reader: ScheduleReader | None,
     pinger: Pinger,
     ping_url: str,
     canary: CanaryCall,
@@ -1961,13 +2088,16 @@ def sunday_maintenance(
     Alarm drift is checked and named in ``report`` but never withholds the ping. A
     read-back that cannot be run or parsed is named there too, for the same reason:
     the design routes the whole read-back step to the nightly report, and the
-    pre-open self-check already catches a missed wake an hour before the bell.
+    pre-open self-check already catches a missed wake an hour before the bell. With no
+    ``schedule_reader`` the read-back is skipped, adds no report line, and ``alarms`` on
+    the outcome is ``None``. ``schedule_reader`` has no default all the same, so a caller
+    says which. The command line passes ``read_pmset_schedule`` on macOS and ``None`` on
+    Linux, where no wake alarm exists to read back.
 
     The Time Machine exclusion is checked the same way and reported the same way. A
     sticky exclusion is invisible once set and dies quietly if the item it marks is
     replaced, so something has to look. With no ``exclusion_reader`` the check does not
-    run, which costs a report line and never a ping. The command line always passes
-    one.
+    run and adds no report line. The command line passes one on macOS and none on Linux.
 
     The coverage assertion needs the token's mint time. ``mint`` is ``None`` when the
     caller could not read it, and that withholds the ping. A ping that is attempted
@@ -1986,10 +2116,11 @@ def sunday_maintenance(
     coverage stops on the weekend on purpose, and the daemon's own re-take heals a lost
     assertion within a minute, so the one gap left is the daemon being gone entirely,
     which nothing else can notice or page for. They are the same two seams ``self_check``
-    takes, so a caller wires the same ``launchctl_probe`` and ``pmset_assertions_probe``,
-    and ``assertion_pid`` is the pid the daemon last stamped, read the same way. With
-    ``daemon_probe`` left out, this attempt checks neither and ``daemon_page`` is always
-    ``None``.
+    takes, so a caller wires the same probes: ``launchctl_probe`` and
+    ``pmset_assertions_probe`` on macOS, and ``systemctl_probe`` with no assertion probe
+    on Linux, where a VM holds no assertion. ``assertion_pid`` is the pid the daemon last
+    stamped, read the same way. With ``daemon_probe`` left out, this attempt checks
+    neither and ``daemon_page`` is always ``None``.
 
     ``stamped_at`` comes off the same reading as ``assertion_pid`` and decides nothing
     about whether a page is owed. It decides what a page with no pid says, per
@@ -2114,18 +2245,21 @@ def sunday_maintenance(
     # production, and ``pmset -g sched`` lists every owner's events, in shapes the
     # parser does not all know yet. So the catch is deliberately broad. A read-back
     # that cannot be read is a report line naming what failed, never a silent pass and
-    # never a page.
-    try:
-        schedule = parse_pmset_schedule(schedule_reader())
-    except Exception as exc:
-        alarms = AlarmCheck(
-            repeat_ok=False,
-            one_shot_ok=False,
-            problems=(f"pmset read-back unreadable: {type(exc).__name__}: {exc}",),
-        )
-    else:
-        alarms = check_alarms(schedule, one_shot_date=expected_one_shot(now, calendar))
-    report = list(alarms.problems)
+    # never a page. No reader is the Linux host, which has no wake alarm to read back,
+    # so the step is skipped there rather than reported unreadable.
+    alarms: AlarmCheck | None = None
+    if schedule_reader is not None:
+        try:
+            schedule = parse_pmset_schedule(schedule_reader())
+        except Exception as exc:
+            alarms = AlarmCheck(
+                repeat_ok=False,
+                one_shot_ok=False,
+                problems=(f"pmset read-back unreadable: {type(exc).__name__}: {exc}",),
+            )
+        else:
+            alarms = check_alarms(schedule, one_shot_date=expected_one_shot(now, calendar))
+    report = list(alarms.problems) if alarms is not None else []
 
     if backup is None:
         report.append(BACKUP_SCRUB_SKIPPED)
@@ -2262,7 +2396,7 @@ def sunday_run(
     backup_target: Path | BucketTarget | None,
     clock: Clock,
     calendar: Calendar,
-    schedule_reader: ScheduleReader,
+    schedule_reader: ScheduleReader | None,
     pinger: Pinger,
     ping_url: str,
     mint_reader: MintReader,
@@ -3419,7 +3553,10 @@ def _build_parser():
 
     parser = argparse.ArgumentParser(
         prog="python -m lake.control_plane",
-        description="The laptop control plane: plists, pmset, sudoers, and the two jobs.",
+        description=(
+            "The control plane: the launchd plists, pmset and sudoers it renders on macOS, "
+            "and the self-check and Sunday jobs it runs on either host."
+        ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -3434,12 +3571,19 @@ def _build_parser():
     render.add_argument("--config", help="Config path, passed via MARKETLAKE_CONFIG.")
 
     check = sub.add_parser(
-        "self-check", help="Verify the daemon is up and holding its assertion, then ping."
+        "self-check",
+        help=(
+            "Verify the daemon is up and, on macOS, holding its assertion, or on Linux that "
+            "the clock is synchronized, then ping."
+        ),
     )
     check.add_argument("--config", help="Path to config.yaml (defaults to the standard location).")
-    check.add_argument("--label", default=DAEMON_LABEL, help="The daemon's launchd label.")
+    check.add_argument("--label", default=DAEMON_LABEL, help="The daemon's label.")
 
-    sunday = sub.add_parser("sunday", help="Scrub, verify the wake alarms, canary, then ping.")
+    sunday = sub.add_parser(
+        "sunday",
+        help="Scrub, test a restore, verify the wake alarms on macOS, canary, then ping.",
+    )
     sunday.add_argument("--config", help="Path to config.yaml (defaults to the standard location).")
     sunday.add_argument(
         "--token", help="Path to token.json. Defaults to the standard place under HOME."
@@ -3458,10 +3602,11 @@ def main(
 ) -> int:
     """The ``python -m lake.control_plane`` entry. Returns a process exit code.
 
-    Every seam that reaches past this process is built here, not accepted. The
-    healthchecks GET, the ntfy POST, the vendor canary, and the ``launchctl``, ``pmset``
-    and ``tmutil`` reads all shell out or go to the network. A ``main`` that accepted them
-    let a test omit one and reach the real effect. So ``main`` builds them, and a test
+    Every seam that reaches past this process is built here, not accepted. The healthchecks
+    GET, the ntfy POST, the vendor canary, the ``launchctl``, ``pmset`` and ``tmutil`` reads
+    on macOS, and the ``systemctl`` and ``timedatectl`` reads on Linux all shell out or go
+    to the network. ``is_macos`` picks which set the two jobs wire. A ``main`` that accepted
+    them let a test omit one and reach the real effect. So ``main`` builds them, and a test
     drives the ``self_check`` or ``sunday_run`` helper directly, which requires its seams.
     The two senders are the exception to "built here". They come from ``outbox.senders``,
     the only construction site the package has for either, and are still never accepted.
@@ -3530,12 +3675,16 @@ def main(
         stamp = read_metadata(config.lake_root)
         check_clock = _system_clock()
         sends = outbox.senders(config, process="self-check", clock=check_clock)
+        # A Mac asks launchd and whether the daemon's caffeinate holds the machine awake.
+        # A Linux VM never sleeps, so it asks systemd and whether the clock is synchronized.
+        on_macos = is_macos()
         outcome = self_check(
-            probe=launchctl_probe,
+            probe=launchctl_probe if on_macos else systemctl_probe,
             pinger=sends.pinger,
             ping_url=config.healthchecks_url(PRE_OPEN_SLUG),
             label=args.label,
-            assertion_probe=pmset_assertions_probe,
+            assertion_probe=pmset_assertions_probe if on_macos else None,
+            clock_probe=None if on_macos else timedatectl_clock_probe,
             assertion_pid=stamp.assertion_pid,
             stamped_at=stamp.stamped_at,
             now=check_clock.now(),
@@ -3597,6 +3746,9 @@ def main(
                 _, bucket_client = bucket.connect(config)
             except bucket.BucketSettingsInvalid as exc:
                 bucket_unusable = str(exc)
+        # A Linux VM has no pmset schedule to read back and no Time Machine exclusion to
+        # check, and holds no assertion, so each of those seams is ``None`` there.
+        on_macos = is_macos()
         outcomes = sunday_run(
             lake_root=config.lake_root,
             # A shadow host uploads and syncs nothing, so there is no copy to scrub.
@@ -3607,7 +3759,7 @@ def main(
             bucket_unusable=bucket_unusable,
             clock=run_clock,
             calendar=calendar if calendar is not None else _exchange_calendar(),
-            schedule_reader=read_pmset_schedule,
+            schedule_reader=read_pmset_schedule if on_macos else None,
             pinger=sends.pinger,
             ping_url=config.healthchecks_url(SUNDAY_SLUG),
             canary=token_canary(
@@ -3623,15 +3775,15 @@ def main(
             exclusion_targets=tmutil_exclusion_targets(
                 default_config_dir(str(Path.home())), token_path
             ),
-            exclusion_reader=read_exclusions,
+            exclusion_reader=read_exclusions if on_macos else None,
             # The same two seams the self-check wires. The stamp is read through the
             # lake the same way too, because this runs as its own process and the
             # daemon's handle on its child lives in another one, but read afresh each
             # retry rather than once: the daemon restamps a new pid when it re-takes a
             # lost ``caffeinate``, and a pid cached at the first attempt would ask about
             # a child already gone by the next one.
-            daemon_probe=launchctl_probe,
-            assertion_probe=pmset_assertions_probe,
+            daemon_probe=launchctl_probe if on_macos else systemctl_probe,
+            assertion_probe=pmset_assertions_probe if on_macos else None,
             stamp_reader=lambda: read_metadata(config.lake_root),
         )
         for number, outcome in enumerate(outcomes, start=1):
@@ -3674,6 +3826,7 @@ def _exchange_calendar() -> Calendar:
 __all__ = [
     "BACKUP_SCRUB_SKIPPED",
     "CANARY_DEADLINE",
+    "CLOCK_NOT_SYNCED",
     "CAPTURE_SLUG",
     "COMPACTION_SLUG",
     "EOD_SWEEP_LABEL",
@@ -3713,6 +3866,7 @@ __all__ = [
     "AssertionRunner",
     "AssertionWindow",
     "CanaryCall",
+    "ClockProbe",
     "DaemonProbe",
     "ExclusionReader",
     "IdentifiedHandle",
@@ -3740,6 +3894,7 @@ __all__ = [
     "default_config_dir",
     "default_token_path",
     "expected_one_shot",
+    "is_macos",
     "INSTALL_SCRIPT_FILE",
     "REAUTH_SCRIPT_FILE",
     "RESTART_SCRIPT_FILE",
@@ -3754,6 +3909,7 @@ __all__ = [
     "next_sunday_wake",
     "parse_exclusions",
     "parse_launchctl_print",
+    "parse_ntp_synchronized",
     "PMSET_BINARY",
     "parse_pmset_schedule",
     "pmset_schedule_args",
@@ -3774,6 +3930,8 @@ __all__ = [
     "sunday_maintenance",
     "sunday_run",
     "sunday_wake_command",
+    "systemctl_probe",
+    "timedatectl_clock_probe",
     "tmutil_exclusion_commands",
     "tmutil_exclusion_targets",
     "token_canary",

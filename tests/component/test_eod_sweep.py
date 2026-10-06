@@ -1603,6 +1603,98 @@ def test_the_mac_friday_command_sets_the_wake_and_reads_it_back_by_default(
     assert f"sunday one-shot wake missing for {SUNDAY.isoformat()}" in printed
 
 
+class _HostTouched(BaseException):
+    """Raised by a live producer the Linux run must never call.
+
+    A ``BaseException`` because ``_friday_wake`` catches ``Exception`` around both the setter
+    and the reader, so an ordinary error would turn into a report line and the run would
+    still look like it skipped the branch.
+    """
+
+
+def test_the_linux_friday_command_sets_no_wake(
+    fixture_lake: FixtureLake, capsys, monkeypatch, tmp_path, on_linux
+):
+    """A VM never sleeps, so the Friday run sets no wake and never calls ``sudo``."""
+    from tests.support.config import write_config
+
+    root = _lake(fixture_lake)
+    config = write_config(tmp_path, lake_root=root)
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("SPY:\n  options: true\n  bars:\n  - 1d\n")
+
+    def untouchable(*args: object) -> None:
+        raise _HostTouched("the Linux sweep reached a live pmset producer")
+
+    monkeypatch.setattr(sweep, "set_sunday_wake", untouchable)
+    monkeypatch.setattr(sweep, "read_pmset_schedule", untouchable)
+    monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: FakeTransport())
+    monkeypatch.setattr(sweep, "ExchangeCalendar", lambda: weekday_sessions(MONDAY, NEXT_MONDAY))
+
+    code = sweep.main(
+        ["--config", str(config), "--tickers", str(tickers)],
+        clock=ManualClock(FRIDAY_EVENING),
+        vendor_source=_CountingVendorSource(_cassette(session=FRIDAY)),
+    )
+    printed = capsys.readouterr().out
+
+    assert code == 0, printed
+    assert "sunday one-shot wake not set" not in printed
+    assert "pmset" not in printed
+
+
+def test_a_friday_with_no_reader_sets_the_wake_and_reads_nothing_back(fixture_lake: FixtureLake):
+    """``sweep_from_config`` resolves each seam on its own, so a setter can come alone.
+
+    A ``None`` reader treated as a read that failed would add ``pmset read-back unreadable``
+    to the report every Friday.
+    """
+    root = _lake(fixture_lake)
+    setter = _RecordingSetter()
+    outcome = sweep.sweep(
+        lake_root=root,
+        clock=ManualClock(FRIDAY_EVENING),
+        calendar=weekday_sessions(MONDAY, NEXT_MONDAY),
+        roster=_roster(),
+        vendor_source=_CountingVendorSource(_cassette(session=FRIDAY)),
+        pinger=FakePinger(),
+        ping_url=PING_URL,
+        publisher=None,
+        schedule_reader=None,
+        schedule_setter=setter,
+    )
+    assert setter.sundays == [SUNDAY]
+    assert not any("pmset" in line for line in outcome.nightly.report)
+    assert outcome.nightly.problems == ()
+
+
+def test_a_friday_with_no_setter_skips_the_whole_branch(fixture_lake: FixtureLake):
+    """A ``None`` setter is the host with no wake, so even a passed reader is not asked."""
+    root = _lake(fixture_lake)
+    reads: list[str] = []
+
+    def reader() -> str:
+        reads.append("read")
+        return _schedule_text(one_shot=None)
+
+    outcome = sweep.sweep(
+        lake_root=root,
+        clock=ManualClock(FRIDAY_EVENING),
+        calendar=weekday_sessions(MONDAY, NEXT_MONDAY),
+        roster=_roster(),
+        vendor_source=_CountingVendorSource(_cassette(session=FRIDAY)),
+        pinger=FakePinger(),
+        ping_url=PING_URL,
+        publisher=None,
+        schedule_reader=reader,
+        schedule_setter=None,
+    )
+    assert reads == []
+    assert not any("one-shot" in line for line in outcome.nightly.report)
+    assert outcome.nightly.problems == ()
+
+
 def test_a_bad_config_file_reaches_the_operator_as_one_line(tmp_path, capsys):
     """``input_errors_exit``'s shape, which every sibling command already takes."""
     config = tmp_path / "config.yaml"
