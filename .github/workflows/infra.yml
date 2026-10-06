@@ -1,14 +1,17 @@
 # Checks, plans and applies the configurations under infra/.
 #
 # No job here is named `test`, because the ruleset on main requires a check by that
-# name and ci.yml provides it. These checks download a 750 MB provider, so they run
-# only when infra/ or this file changes. README.md's "Apply the infrastructure" section
-# carries the owner's steps and the secrets this workflow reads.
+# name and ci.yml provides it. These checks download a provider of about 750 MB
+# unpacked, so they run only when infra/ or this file changes. README.md's "Apply the
+# infrastructure" section carries the owner's steps and the secrets this workflow reads.
 #
 # A public repository's logs are readable by anyone, so plan and apply send their
 # human output to /dev/null. Each job writes resource addresses, actions and attribute
 # names to its step summary through infra/ci/plan_summary.py, and never a value.
 # Event values reach a `run:` script only through `env:`, never by interpolation.
+#
+# Every action is pinned to a commit. Any step in a job with `id-token: write` can mint
+# the job's OIDC token, so a re-pointed tag would get the AWS role.
 name: Infra
 
 on:
@@ -33,7 +36,8 @@ defaults:
     shell: bash
 
 env:
-  # Moves by hand together with required_version in both configurations.
+  # Pins CI's OpenTofu. required_version in both configurations is only a floor that
+  # the laptop's Homebrew release must meet.
   TOFU_VERSION: "1.13.1"
   AWS_REGION: us-east-1
 
@@ -43,9 +47,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: opentofu/setup-opentofu@v2
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
         with:
           tofu_version: ${{ env.TOFU_VERSION }}
           tofu_wrapper: false
@@ -63,9 +67,9 @@ jobs:
       matrix:
         config: [bootstrap, live]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: opentofu/setup-opentofu@v2
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
         with:
           tofu_version: ${{ env.TOFU_VERSION }}
           tofu_wrapper: false
@@ -100,7 +104,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Refuse an empty secret
         env:
@@ -118,13 +122,13 @@ jobs:
           done
           exit "$missing"
 
-      - uses: aws-actions/configure-aws-credentials@v6
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           mask-aws-account-id: true
 
-      - uses: opentofu/setup-opentofu@v2
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
         with:
           tofu_version: ${{ env.TOFU_VERSION }}
           tofu_wrapper: false
@@ -168,7 +172,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Refuse an empty secret
         env:
@@ -198,14 +202,14 @@ jobs:
               >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - uses: aws-actions/configure-aws-credentials@v6
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         if: steps.freshness.outputs.state == 'fresh'
         with:
           role-to-assume: ${{ secrets.AWS_APPLY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           mask-aws-account-id: true
 
-      - uses: opentofu/setup-opentofu@v2
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
         if: steps.freshness.outputs.state == 'fresh'
         with:
           tofu_version: ${{ env.TOFU_VERSION }}

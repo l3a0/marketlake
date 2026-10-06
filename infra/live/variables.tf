@@ -31,7 +31,8 @@ variable "adopt_existing" {
 
 variable "instance_s3_enabled" {
   # The cutover pull request for #638 flips this default to true, and inverts the test
-  # that asserts it is off. A value passed any other way starts no run.
+  # that asserts it is off. CI passes no value for it, so only this default turns the
+  # policy on in CI.
   description = "Give marketlake-instance the backup bucket's four S3 actions."
   type        = bool
   default     = false

@@ -68,6 +68,29 @@ resource "aws_iam_role_policy" "plan" {
         ]
         Resource = ["*"]
       },
+      {
+        # ReadOnlyAccess grants ssm:Get*, and the VM's config.yaml secrets sit under
+        # this path as SecureString parameters (#699).
+        Sid    = "DenyConfigParameterReads"
+        Effect = "Deny"
+        Action = [
+          "ssm:GetParameter",
+          "ssm:GetParameters",
+          "ssm:GetParameterHistory",
+        ]
+        Resource = [
+          "arn:aws:ssm:us-east-1:${local.account_id}:parameter/marketlake/config",
+          "arn:aws:ssm:us-east-1:${local.account_id}:parameter/marketlake/config/*",
+        ]
+      },
+      {
+        # A recursive read of any ancestor path returns every parameter below it, and a
+        # Deny on the child does not stop it, so no path is readable at all.
+        Sid      = "DenyParameterPathReads"
+        Effect   = "Deny"
+        Action   = ["ssm:GetParametersByPath"]
+        Resource = ["*"]
+      },
     ]
   })
 }
@@ -130,6 +153,29 @@ resource "aws_iam_role_policy" "apply" {
         Resource = ["*"]
       },
       {
+        # ReadOnlyAccess grants ssm:Get*, and the VM's config.yaml secrets sit under
+        # this path as SecureString parameters (#699).
+        Sid    = "DenyConfigParameterReads"
+        Effect = "Deny"
+        Action = [
+          "ssm:GetParameter",
+          "ssm:GetParameters",
+          "ssm:GetParameterHistory",
+        ]
+        Resource = [
+          "arn:aws:ssm:us-east-1:${local.account_id}:parameter/marketlake/config",
+          "arn:aws:ssm:us-east-1:${local.account_id}:parameter/marketlake/config/*",
+        ]
+      },
+      {
+        # A recursive read of any ancestor path returns every parameter below it, and a
+        # Deny on the child does not stop it, so no path is readable at all.
+        Sid      = "DenyParameterPathReads"
+        Effect   = "Deny"
+        Action   = ["ssm:GetParametersByPath"]
+        Resource = ["*"]
+      },
+      {
         # A pull request that destroys a resource can also delete its prevent_destroy.
         Sid      = "DenyBucketDelete"
         Effect   = "Deny"
@@ -155,6 +201,17 @@ resource "aws_iam_role_policy" "apply" {
         Sid      = "DenyVolumeDelete"
         Effect   = "Deny"
         Action   = ["ec2:DeleteVolume"]
+        Resource = ["*"]
+      },
+      {
+        # Either would publish the VM's volume snapshots or images, and no plan needs
+        # them.
+        Sid    = "DenySnapshotAndImageSharing"
+        Effect = "Deny"
+        Action = [
+          "ec2:ModifySnapshotAttribute",
+          "ec2:ModifyImageAttribute",
+        ]
         Resource = ["*"]
       },
       {

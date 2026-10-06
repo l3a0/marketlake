@@ -66,13 +66,20 @@ run "every_deny_is_present" {
         ["ssm:ListCommands", "*"],
         ["ssm:ListCommandInvocations", "*"],
         ["ssm:GetCommandInvocation", "*"],
+        ["ssm:GetParameter", "arn:aws:ssm:us-east-1:000000000000:parameter/marketlake/config"],
+        ["ssm:GetParameter", "arn:aws:ssm:us-east-1:000000000000:parameter/marketlake/config/*"],
+        ["ssm:GetParameters", "arn:aws:ssm:us-east-1:000000000000:parameter/marketlake/config"],
+        ["ssm:GetParameters", "arn:aws:ssm:us-east-1:000000000000:parameter/marketlake/config/*"],
+        ["ssm:GetParameterHistory", "arn:aws:ssm:us-east-1:000000000000:parameter/marketlake/config"],
+        ["ssm:GetParameterHistory", "arn:aws:ssm:us-east-1:000000000000:parameter/marketlake/config/*"],
+        ["ssm:GetParametersByPath", "*"],
         ] : anytrue([
           for s in jsondecode(aws_iam_role_policy.plan.policy).Statement :
           s.Effect == "Deny" && try(s.Condition, null) == null
           && contains(flatten([s.Action]), pair[0]) && contains(flatten([s.Resource]), pair[1])
       ])
     ])
-    error_message = "The plan role is missing a Deny on backup objects, console output or Run Command output."
+    error_message = "The plan role is missing a Deny on backup objects, console output, Run Command output or config parameters."
   }
 
   assert {
@@ -84,12 +91,21 @@ run "every_deny_is_present" {
         ["ssm:ListCommands", "*"],
         ["ssm:ListCommandInvocations", "*"],
         ["ssm:GetCommandInvocation", "*"],
+        ["ssm:GetParameter", "arn:aws:ssm:us-east-1:000000000000:parameter/marketlake/config"],
+        ["ssm:GetParameter", "arn:aws:ssm:us-east-1:000000000000:parameter/marketlake/config/*"],
+        ["ssm:GetParameters", "arn:aws:ssm:us-east-1:000000000000:parameter/marketlake/config"],
+        ["ssm:GetParameters", "arn:aws:ssm:us-east-1:000000000000:parameter/marketlake/config/*"],
+        ["ssm:GetParameterHistory", "arn:aws:ssm:us-east-1:000000000000:parameter/marketlake/config"],
+        ["ssm:GetParameterHistory", "arn:aws:ssm:us-east-1:000000000000:parameter/marketlake/config/*"],
+        ["ssm:GetParametersByPath", "*"],
         ["s3:DeleteBucket", "*"],
         ["iam:CreateAccessKey", "*"],
         ["iam:CreateLoginProfile", "*"],
         ["iam:CreateServiceSpecificCredential", "*"],
         ["iam:UpdateAssumeRolePolicy", "*"],
         ["ec2:DeleteVolume", "*"],
+        ["ec2:ModifySnapshotAttribute", "*"],
+        ["ec2:ModifyImageAttribute", "*"],
         ] : anytrue([
           for s in jsondecode(aws_iam_role_policy.apply.policy).Statement :
           s.Effect == "Deny" && try(s.Condition, null) == null

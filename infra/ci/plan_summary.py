@@ -5,7 +5,8 @@ prints to the job's step summary. A public repository's Actions logs are readabl
 anyone, and a plan carries ARNs and bucket names, so the table holds only three things
 per changed resource:
 
-1. Its address.
+1. Its address, with any ``count`` or ``for_each`` key replaced by ``[…]``, because a
+   key can carry a variable's value.
 2. Its action, marked when the change adopts an existing resource.
 3. The names of its changed top-level attributes, never their values.
 
@@ -21,11 +22,21 @@ Usage: ``tofu show -json plan.tfplan | python3 infra/ci/plan_summary.py [title]`
 from __future__ import annotations
 
 import json
+import re
 import sys
 from collections.abc import Mapping
 from typing import Any, TextIO
 
 _REPLACE = (["delete", "create"], ["create", "delete"])
+
+# An index in brackets: a quoted for_each key, which may hold escaped quotes and a
+# closing bracket, or a bare count index.
+_KEY = re.compile(r'\[(?:"(?:[^"\\]|\\.)*"|[^\]]*)\]')
+
+
+def address_without_keys(address: str) -> str:
+    """The address with every ``count`` or ``for_each`` key replaced by ``[…]``."""
+    return _KEY.sub("[…]", address)
 
 
 def _action(actions: list[str]) -> str:
@@ -78,7 +89,7 @@ def rows(plan: Mapping[str, Any]) -> list[tuple[str, str, str]]:
             names = ""
         else:
             names = ", ".join(changed_attributes(change))
-        out.append((resource["address"], action, names))
+        out.append((address_without_keys(resource["address"]), action, names))
     return out
 
 

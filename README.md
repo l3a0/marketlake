@@ -15,7 +15,8 @@ D0 through D21, and points at the MVP milestone that holds current work.
 The slice build closed on 2026-10-05. Current work is the
 [MVP 2](https://github.com/l3a0/marketlake/milestone/5) milestone, capture on a hosted VM.
 The AWS resources it needs are code under `infra/`, written for
-[OpenTofu](https://opentofu.org/) and applied from CI behind the owner's approval
+[OpenTofu](https://opentofu.org/) and applied from CI behind the owner's approval,
+except the bootstrap that CI itself stands on, which the owner applies from the laptop
 ([#664](https://github.com/l3a0/marketlake/issues/664)). Today that covers the backup
 bucket, its IAM user, and the instance role the VM will use.
 
@@ -84,8 +85,8 @@ The bucket and the IAM user whose key the laptop uses are code in `infra/live/`,
 [Apply the infrastructure](#apply-the-infrastructure) below says how they are applied.
 `infra/live/bucket.tf` holds the versioning, the encryption, the public-access block and
 the four lifecycle rules. Each rule expires noncurrent versions after 30 days under one of
-`manifest.jsonl`, `quarantine.jsonl`, `actions/` and `journal/`, the files rewritten every
-night. Partitions keep every version, because with no Object Lock an overwritten
+`lake/manifest.jsonl`, `lake/quarantine.jsonl`, `lake/actions/` and `lake/journal/`, the
+files rewritten every night. Partitions keep every version, because with no Object Lock an overwritten
 partition's old version is its only good copy. `infra/live/iam.tf` holds the user's policy,
 which grants exactly `s3:PutObject`, `s3:GetObject`, `s3:ListBucket` and
 `s3:GetBucketVersioning`, and nothing that deletes a version or changes the bucket.
@@ -97,9 +98,9 @@ Two steps stay by hand, and nothing here names a real account, bucket, or key.
 2. Put the key in `config.yaml`, run the first upload, restore the whole lake once from
    the bucket with the `restore` command below, and only then change `backup_target`.
 
-The examples below use the placeholder bucket `example-lake-backup` and keep the lake
-under the `lake/` prefix, so the live check's probe objects can sit under `live-check/`
-outside it.
+The lifecycle rules expect the lake under the `lake/` prefix, so `backup_target` ends in
+`/lake`, which keeps the live check's probe objects under `live-check/` outside it. The
+examples below use the placeholder bucket `example-lake-backup`.
 
 Step 2's keys in `config.yaml`. The three `bucket_` keys may sit beside a path
 `backup_target`, which is how the first upload runs before the switch.
@@ -292,8 +293,8 @@ them from five settings in the repository.
 ### Tools and an admin session
 
 The laptop applies the bootstrap and anything the apply role may not change, such as the
-backup bucket's versioning or the instance role's trust. Both need an admin credential,
-and it is kept apart from the default one. A plain `aws login` would write the `default`
+backup bucket's versioning or the instance role's trust. Each needs an admin credential,
+which stays apart from the default one. A plain `aws login` would write the `default`
 profile, and then anything reading the default credential chain, an agent session's
 `tofu apply` included, would act as account admin.
 
@@ -325,6 +326,8 @@ tofu -chdir=infra/bootstrap init -backend-config="$HOME/.config/marketlake/infra
 tofu -chdir=infra/bootstrap plan -var-file="$HOME/.config/marketlake/infra/bootstrap.tfvars"
 tofu -chdir=infra/bootstrap apply -var-file="$HOME/.config/marketlake/infra/bootstrap.tfvars"
 ```
+
+Replace `bootstrap` with `live` in all three commands for the other configuration.
 
 ### Values to read first
 
@@ -360,8 +363,9 @@ environment with no protection rules. So the environment exists before that merg
 4. Add the three repository secrets and the variable. `AWS_PLAN_ROLE_ARN` comes from the
    same command with `marketlake-plan`.
 5. Re-run the pull request's `plan` job. Until steps 2 and 4 are done, that check is red
-   by design. Its
-   summary is the import plan, and it should destroy and replace nothing.
+   by design. Its summary is the import plan, and it should destroy and replace nothing.
+   Any in-place update it shows is either adopted into code or listed on
+   [#664](https://github.com/l3a0/marketlake/issues/664).
 6. Merge, then approve the first apply.
 
 After the first green apply, two plans confirm nothing is left to change: a manual run
@@ -439,7 +443,8 @@ tofu -chdir=infra/live test
 
 Three things those checks cannot see are covered by `uv run pytest` instead.
 
-1. `prevent_destroy` on each resource whose loss would lose backups.
+1. `prevent_destroy` on each resource whose loss would lose backups or the infrastructure's
+   state.
 2. The exact set of policies each bootstrap role carries.
 3. The live backend's state key matching what the apply role may write.
 

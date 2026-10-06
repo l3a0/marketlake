@@ -11,6 +11,9 @@
 3. Whether the live backend's key is the one the apply role may write. A mismatch
    passes every pull request check and fails the first apply after the merge.
 
+A ``module`` block would hide its resources from every check here, so neither
+configuration may call one.
+
 These run in ``ci.yml``'s required ``test`` job, which has no OpenTofu. The parse is
 ``python-hcl2``'s, which keeps a function call such as ``jsonencode({...})`` as text, so
 :func:`_jsonencode_argument` parses the call's argument as HCL on its own.
@@ -114,6 +117,16 @@ def test_resource_carries_prevent_destroy(address: str) -> None:
     assert any(block.get("prevent_destroy") is True for block in lifecycles), (
         f"infra/{address} does not carry prevent_destroy = true"
     )
+
+
+@pytest.mark.parametrize("config", ["bootstrap", "live"])
+def test_configuration_calls_no_module(config: str) -> None:
+    """A module's resources are invisible to :func:`_resources`, so a policy attached
+    inside one would pass every check here."""
+    for path in sorted((INFRA / config).glob("*.tf")):
+        with path.open() as f:
+            parsed = hcl2.load(f, serialization_options=_OPTIONS)
+        assert not parsed.get("module"), f"infra/{config}/{path.name} calls a module"
 
 
 def test_bootstrap_holds_only_known_resource_types() -> None:

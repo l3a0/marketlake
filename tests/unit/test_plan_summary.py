@@ -39,6 +39,7 @@ SECRETS = [
     "VALUE-POLICY",
     "VALUE-DELETED",
     "VALUE-IMPORT-ID",
+    "VALUE-KEY",
 ]
 
 
@@ -85,6 +86,13 @@ PLAN = {
             importing={"id": "VALUE-IMPORT-ID"},
         ),
         _change(
+            'aws_iam_role_policy.keyed["VALUE-KEY"]',
+            ["update"],
+            before={"policy": "VALUE-OLD-RULE"},
+            after={"policy": "VALUE-NEW-RULE"},
+            after_unknown={},
+        ),
+        _change(
             "aws_iam_role.unchanged",
             ["no-op"],
             before={"name": "VALUE-BUCKET-NAME"},
@@ -102,11 +110,12 @@ def _run(plan: dict[str, Any], *argv: str) -> str:
 
 def test_rows_name_address_action_and_changed_attributes() -> None:
     assert plan_summary.rows(PLAN) == [
-        ("aws_iam_role_policy.instance_s3[0]", "create", ""),
+        ("aws_iam_role_policy.instance_s3[…]", "create", ""),
         ("aws_s3_bucket_lifecycle_configuration.backup", "update", "rule"),
         ("aws_iam_role.instance", "replace", "arn, assume_role_policy, unique_id"),
         ("aws_iam_instance_profile.instance", "delete", ""),
         ("aws_s3_bucket.backup", "no-op (import)", ""),
+        ("aws_iam_role_policy.keyed[…]", "update", "policy"),
     ]
 
 
@@ -134,15 +143,32 @@ def test_the_table_is_markdown() -> None:
         "| Address | Action | Changed attributes |",
         "| --- | --- | --- |",
     ]
-    assert lines[4] == "| `aws_iam_role_policy.instance_s3[0]` | create |  |"
+    assert lines[4] == "| `aws_iam_role_policy.instance_s3[…]` | create |  |"
     assert lines[8] == "| `aws_s3_bucket.backup` | no-op (import) |  |"
-    assert len(lines) == 9
+    assert lines[9] == "| `aws_iam_role_policy.keyed[…]` | update | policy |"
+    assert len(lines) == 10
 
 
 @pytest.mark.parametrize("secret", SECRETS)
 def test_no_value_reaches_the_output(secret: str) -> None:
     assert secret in json.dumps(PLAN)
     assert secret not in _run(PLAN)
+
+
+@pytest.mark.parametrize(
+    ("address", "expected"),
+    [
+        ("aws_x.y", "aws_x.y"),
+        ("aws_x.y[0]", "aws_x.y[…]"),
+        ('aws_x.y["VALUE-KEY"]', "aws_x.y[…]"),
+        ('aws_x.y["VALUE-KEY \\"]\\" VALUE-KEY"]', "aws_x.y[…]"),
+        ('module.m["VALUE-KEY"].aws_x.y["VALUE-KEY"]', "module.m[…].aws_x.y[…]"),
+    ],
+)
+def test_a_key_never_reaches_the_address(address: str, expected: str) -> None:
+    assert plan_summary.address_without_keys(address) == expected
+    plan = {"resource_changes": [_change(address, ["create"], before=None, after={})]}
+    assert "VALUE-KEY" not in _run(plan)
 
 
 def test_an_empty_plan_says_so() -> None:
