@@ -897,6 +897,38 @@ def test_the_entry_point_finds_its_checkout_under_an_exported_cdpath(tmp_path):
     assert f"\nWorkingDirectory={checkout}\n" in daemon
 
 
+def _as_owner(checkout: Path, home: Path, *flags: str, swapped: bool) -> list[str]:
+    """Every step one entry-point run should send through ``sudo -u <owner> -H``, in order.
+
+    Each one writes under the owner's home or the checkout, so each runs as the owner, and
+    no other step goes through sudo. ``swapped`` is a run that finds a live render to
+    move aside.
+    """
+    python = checkout / ".venv" / "bin" / "python"
+    state = home / ".local" / "state" / "marketlake"
+    live, new, old = state / "systemd", state / "systemd.new", state / "systemd.old"
+    steps = [
+        f"{home}/.local/bin/uv sync --frozen --no-dev",
+        f"rm -rf {new} {old}",
+        f"mkdir -p {state}",
+        " ".join(
+            [
+                f"{python} -m lake.control_plane render --init systemd --out {new}",
+                f"--python {python} --project-dir {checkout} --home {home} --owner {OWNER}",
+                *flags,
+            ]
+        ),
+        *([f"mv {live} {old}"] if swapped else []),
+        f"mv {new} {live}",
+        f"rm -rf {old}",
+    ]
+    return [f"sudo -u {OWNER} -H {step}" for step in steps]
+
+
+def _sudo_calls(harness: Harness) -> list[str]:
+    return [line for line in harness.calls() if line.startswith("sudo ")]
+
+
 def test_two_runs_swap_the_render_and_carry_the_lake_mount(tmp_path):
     """The real render, twice, with the units installed by the rendered install.sh.
 
@@ -918,12 +950,15 @@ def test_two_runs_swap_the_render_and_carry_the_lake_mount(tmp_path):
     calls = harness.calls()
     # The lock first, then uv by absolute path as the owner, in the checkout.
     assert "flock -w 600 9" in calls
-    uv = home / ".local" / "bin" / "uv"
-    assert f"sudo -u {OWNER} -H {uv} sync --frozen --no-dev" in calls
     assert f"uv sync --frozen --no-dev in {checkout}" in calls
     assert calls.index("flock -w 600 9") < calls.index(f"uv sync --frozen --no-dev in {checkout}")
-    renders = [line for line in calls if " -m lake.control_plane render " in line]
-    assert len(renders) == 1 and renders[0].startswith(f"sudo -u {OWNER} -H "), renders
+    # Every write under the owner's home or the checkout runs as the owner, and only those.
+    assert _sudo_calls(harness) == _as_owner(
+        checkout,
+        home,
+        "--lake-mount /srv/lake --config /srv/ml.yaml",
+        swapped=False,
+    )
     for unit in UNITS:
         if unit.endswith(".service"):
             text = (harness.unit_dir / unit).read_text()
@@ -944,6 +979,9 @@ def test_two_runs_swap_the_render_and_carry_the_lake_mount(tmp_path):
     (live / "stale.txt").write_text("")
     second = harness.run([entry, "--owner", OWNER, "--lake-mount", "/srv/other"])
     assert second.returncode == 0, second.stdout + second.stderr
+    assert _sudo_calls(harness) == _as_owner(
+        checkout, home, "--lake-mount /srv/other", swapped=True
+    )
     assert sorted(path.name for path in state.iterdir()) == ["systemd"]
     assert sorted(path.name for path in live.iterdir()) == sorted(SYSTEMD_EXPECTED_FILES)
     for unit in UNITS:
