@@ -310,8 +310,10 @@ def _host_values() -> dict[str, str]:
     }
 
 
+# ``\x1b`` rather than ``\x1f``: Python's ``\s`` matches ``\x1c`` to ``\x1f``, so only a
+# control character it does not match shows the refused range reaches past ``\x0f``.
 @pytest.mark.parametrize(
-    "character", ["%", "$", "'", '"', "\\", " ", "\t", "\n", "\x01", "\x1f", "\x7f"]
+    "character", ["%", "$", "'", '"', "\\", " ", "\t", "\n", "\x01", "\x1b", "\x7f"]
 )
 @pytest.mark.parametrize("field", FIELDS)
 def test_a_value_systemd_would_expand_or_split_is_refused(field, character):

@@ -100,7 +100,8 @@ def test_the_launchd_group_still_defaults_to_staff(tmp_path):
     assert "<string>staff</string>" in (out / "com.marketlake.daemon.plist").read_text()
 
 
-@pytest.mark.parametrize("character", ["%", "$", "'", '"', "\\", " ", "\t", "\x01", "\x1f"])
+# ``\x1b`` is a control character that ``\s`` does not match, unlike ``\x1c`` to ``\x1f``.
+@pytest.mark.parametrize("character", ["%", "$", "'", '"', "\\", " ", "\t", "\x01", "\x1b"])
 @pytest.mark.parametrize("flag", ["--home", "--lake-mount", "--config"])
 def test_a_character_systemd_would_expand_is_refused_with_one_line(
     flag, character, tmp_path, capsys
