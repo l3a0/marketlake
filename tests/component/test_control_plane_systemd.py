@@ -100,7 +100,7 @@ def test_the_launchd_group_still_defaults_to_staff(tmp_path):
     assert "<string>staff</string>" in (out / "com.marketlake.daemon.plist").read_text()
 
 
-@pytest.mark.parametrize("character", ["%", "$", "'", '"', "\\", " ", "\t", "\x01"])
+@pytest.mark.parametrize("character", ["%", "$", "'", '"', "\\", " ", "\t", "\x01", "\x1f"])
 @pytest.mark.parametrize("flag", ["--home", "--lake-mount", "--config"])
 def test_a_character_systemd_would_expand_is_refused_with_one_line(
     flag, character, tmp_path, capsys
@@ -116,6 +116,19 @@ def test_a_character_systemd_would_expand_is_refused_with_one_line(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err.startswith(f"render: {flag} {value!r} ")
+    assert captured.err.count("\n") == 1
+    assert not out.exists()
+
+
+def test_an_empty_owner_is_refused_with_one_line(tmp_path, capsys):
+    """An empty ``User=`` would leave systemd to run every job as root."""
+    args = list(SYSTEMD_RENDER_ARGS)
+    args[args.index("--owner") + 1] = ""
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *args]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("render: --owner '' is empty ")
     assert captured.err.count("\n") == 1
     assert not out.exists()
 

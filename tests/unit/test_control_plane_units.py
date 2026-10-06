@@ -296,12 +296,11 @@ def test_separate_days_stay_separate():
 # -- the values systemd would expand ---------------------------------------------------
 
 
-@pytest.mark.parametrize("character", ["%", "$", "'", '"', "\\", " ", "\t", "\n", "\x01", "\x7f"])
-@pytest.mark.parametrize(
-    "field", ["python", "owner", "home", "project_dir", "config_path", "lake_mount"]
-)
-def test_a_value_systemd_would_expand_or_split_is_refused(field, character):
-    values = {
+FIELDS = ["python", "owner", "home", "project_dir", "config_path", "lake_mount"]
+
+
+def _host_values() -> dict[str, str]:
+    return {
         "python": "/py",
         "owner": "someone",
         "home": "/h",
@@ -309,8 +308,25 @@ def test_a_value_systemd_would_expand_or_split_is_refused(field, character):
         "config_path": "/c.yaml",
         "lake_mount": "/srv/lake",
     }
+
+
+@pytest.mark.parametrize(
+    "character", ["%", "$", "'", '"', "\\", " ", "\t", "\n", "\x01", "\x1f", "\x7f"]
+)
+@pytest.mark.parametrize("field", FIELDS)
+def test_a_value_systemd_would_expand_or_split_is_refused(field, character):
+    values = _host_values()
     values[field] = f"/a{character}b"
     with pytest.raises(ValueError, match="systemd would expand or split"):
+        cp.SystemdHost(**values)
+
+
+@pytest.mark.parametrize("field", FIELDS)
+def test_an_empty_value_is_refused(field):
+    """An empty ``User=`` reads to systemd as no user at all, so the job would run as root."""
+    values = _host_values()
+    values[field] = ""
+    with pytest.raises(ValueError, match="is empty"):
         cp.SystemdHost(**values)
 
 
