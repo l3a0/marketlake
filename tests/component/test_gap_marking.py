@@ -570,8 +570,18 @@ def test_a_same_day_pass_before_the_option_close_writes_while_the_lock_is_held(t
             lambda marker: marker.on_skipped([et(2026, 9, 1, 16, 15), et(2026, 9, 2, 9, 30)]),
         ),
         (et(2026, 9, 2, 10, 5), lambda marker: marker.on_start(et(2026, 9, 2, 10, 5))),
+        (
+            et(2026, 9, 5, 10, 0),
+            lambda marker: marker.on_skipped([et(2026, 9, 4, 16, 14), et(2026, 9, 4, 16, 15)]),
+        ),
     ],
-    ids=["after-the-option-close", "after-a-half-days-close", "across-two-days", "startup"],
+    ids=[
+        "after-the-option-close",
+        "after-a-half-days-close",
+        "across-two-days",
+        "startup",
+        "on-a-non-session-day",
+    ],
 )
 def test_every_other_pass_still_waits_on_the_lock(tmp_path, at, run):
     """Past today's option close, across two days, or at startup, a pass takes the lock.
@@ -579,7 +589,9 @@ def test_every_other_pass_still_waits_on_the_lock(tmp_path, at, run):
     Past the close the day can be sealed under the pass, and a pass touching yesterday
     meets a day that already was. The startup pass reads the recorded set, which is what
     keeps two incarnations from marking the same minutes. The half day closes at 13:15,
-    so a pass at 13:16 is past its close even though a regular day's has not come.
+    so a pass at 13:16 is past its close even though a regular day's has not come. A
+    clock on Saturday has no option close to be before, and Friday's slots it marks
+    belong to a day that may already be sealed.
     """
     calendar = _half_day_calendar() if at.date() == _HALF_DAY else None
     marker = _marker(tmp_path, at, roster=Roster((EQUITY_ONLY,)), calendar=calendar)
@@ -589,6 +601,29 @@ def test_every_other_pass_still_waits_on_the_lock(tmp_path, at, run):
     assert not finished, "the pass ran while another thread held the lake-root lock"
     assert written == 0
     assert _segments(tmp_path) > 0
+
+
+def test_a_same_day_pass_before_the_option_close_reads_no_manifest(tmp_path, monkeypatch):
+    """The unlocked pass leaves the ledger alone, so a ledger it cannot read costs it nothing.
+
+    Its plan reads no recorded set, and without the lock a ledger read could meet a
+    compaction's append halfway. A ledger read here would turn into a problem on the
+    report and leave the stall's minutes unmarked.
+    """
+    from lake import manifest
+
+    def unreadable(root: Path) -> dict:
+        raise manifest.TornLedger("the same-day pass read the manifest")
+
+    monkeypatch.setattr(gap, "latest_entries", unreadable)
+    slots = [et(2026, 9, 2, 10, 3), et(2026, 9, 2, 10, 4)]
+    marker = _marker(tmp_path, et(2026, 9, 2, 10, 5), roster=Roster((EQUITY_ONLY,)))
+
+    report = marker.on_skipped(slots)
+
+    assert report.problems == ()
+    assert report.rows == len(slots)
+    assert journal.recorded_slots(tmp_path, "quotes", "XYZ", date(2026, 9, 2)).slots == set(slots)
 
 
 # -- nothing owed, nothing written ---------------------------------------------------

@@ -1074,6 +1074,42 @@ def test_a_stall_reaches_on_missed_after_the_cycle_that_ran_before_it(calendar):
     ]
 
 
+def test_a_stall_with_nothing_ahead_of_it_reaches_on_missed_before_on_tick(calendar):
+    # The loop stalls right after the 10:00 tick and wakes at 10:02:30, and the 10:00
+    # cycle finishes during the wait, so nothing is in flight at the 10:03 tick. The
+    # stall's entry joins the queue before the tick hands on, so ``on_missed`` runs inside
+    # that tick, ahead of ``on_tick``, as the module docstring promises. The grace is long
+    # so the wait always sees the 10:00 cycle finish. It costs nothing, because the wait
+    # returns as soon as the cycle does.
+    stalled: list[bool] = []
+    end = et(REGULAR, 10, 3).astimezone(UTC)
+
+    def should_continue(clock: ManualClock) -> bool:
+        if not stalled and clock.now() >= et(REGULAR, 10, 0):
+            stalled.append(True)
+            clock.advance(150)
+        return clock.now() < end
+
+    _, events = _held_run(
+        calendar,
+        et(REGULAR, 9, 59, 30),
+        should_continue,
+        hold={},
+        clock=ManualClock(start=et(REGULAR, 9, 59, 30).astimezone(UTC), grace=5.0),
+    )
+
+    assert events == [
+        ("tick", et(REGULAR, 10, 0)),
+        ("cycle", et(REGULAR, 10, 0)),
+        ("missed", et(REGULAR, 10, 1)),
+        ("missed", et(REGULAR, 10, 2)),
+        ("tick", et(REGULAR, 10, 3)),
+        ("skipped", et(REGULAR, 10, 1)),
+        ("skipped", et(REGULAR, 10, 2)),
+        ("cycle", et(REGULAR, 10, 3)),
+    ]
+
+
 def test_a_cycle_held_across_a_stall_does_not_hold_the_minutes_after_it(calendar):
     # The 10:00 cycle stands for one queued on the lake-root lock. It is held until the
     # 10:05 tick. The loop stalls after the 10:00 tick and wakes at 10:02:30, so the 10:03

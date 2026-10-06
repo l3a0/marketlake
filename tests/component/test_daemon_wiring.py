@@ -478,6 +478,33 @@ def test_the_minutes_a_live_stall_slept_through_charge_the_watchdog(tmp_path):
     assert page.body == "3 session minutes without a durable cycle"
 
 
+def test_a_stall_page_is_dated_at_the_stalls_last_minute(tmp_path):
+    """The stall pages at the newest minute it charged, not the first.
+
+    That instant is the one the counters reached the threshold on, and the publisher
+    files a page it could not send under it. With ntfy unreachable, that record is what
+    is left of the page, and it says when the stall paged.
+    """
+    rig = replace(_rig(tmp_path), transport=_BrokenTransport())
+    _record(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", et(2026, 9, 2, 9, 58))
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(
+        rig,
+        clock,
+        ticks=2,
+        cycle_runner=_quiet,
+        hooks=daemon.DaemonHooks(on_tick=_stall_on_first_tick(clock, 200)),
+    )
+
+    # The stall missed 10:01, 10:02 and 10:03, and the page records the last of them.
+    records = [
+        json.loads(path.read_text())
+        for path in (rig.lake_root / "reports" / "alerts").rglob("*.json")
+    ]
+    stalled = [entry for entry in records if entry.get("title") == "Capture down: loop stalled"]
+    assert [entry["at"] for entry in stalled] == [et(2026, 9, 2, 10, 3).isoformat()]
+
+
 class _SleepsWithACycleInFlight(ManualClock):
     """A manual clock whose first sleep from 10:00 on oversleeps by three minutes.
 
