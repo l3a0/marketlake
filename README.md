@@ -83,7 +83,7 @@ restore. Switching back is one setting: put the path back in `backup_target`. A 
 keeps its `rsync` copy, its scrub and its weekly restore test exactly as before.
 
 The bucket and the IAM user whose key the laptop uses are code in `infra/live/`, and
-[infra/README.md](infra/README.md) says how they are applied.
+[infra/README.md](infra/README.md) says how to apply them.
 `infra/live/bucket.tf` holds the versioning, the encryption, the public-access block and
 the four lifecycle rules. Each rule expires noncurrent versions after 30 days under one of
 `lake/manifest.jsonl`, `lake/quarantine.jsonl`, `lake/actions/` and `lake/journal/`, the
