@@ -2691,7 +2691,9 @@ def tmutil_exclusion_targets(config_dir: str, token_path: str) -> tuple[str, ...
     root and Full Disk Access for it, and this step runs as the owner.
 
     Nothing here is restored from a backup anyway. The design rewrites ``config.yaml``
-    per machine, and the token and the roster are carried deliberately on migration.
+    per machine, the token is carried deliberately on migration, and the roster is
+    copied from the repository's ``config/tickers.yaml`` by ``python -m lake.roster
+    apply``. Each host's re-tune writes its own ``chain_plan.json``.
     A token pointed outside the directory is excluded on its own, because a brokerage
     credential must be excluded wherever it is put.
     """
