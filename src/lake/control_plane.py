@@ -166,6 +166,34 @@ class WallClockTime:
         return {**calendar_interval(self.hour, self.minute), "Weekday": weekday}
 
 
+@dataclass(frozen=True)
+class Schedule:
+    """When a calendar job fires, in terms neither service manager owns.
+
+    ``at`` is the wall-clock moment and ``days`` the weekdays it fires on, numbered the
+    way Python's ``date.weekday()`` numbers them, Monday 0 through Sunday 6. Each host
+    converts it to its own form: ``LaunchdHost.job`` to ``StartCalendarInterval``
+    entries, and ``SystemdHost.job`` to a timer's ``OnCalendar=``. Holding one schedule
+    rather than a launchd dict is what lets ``all_jobs`` serve both hosts, so a job added
+    there reaches both renders or neither.
+
+    ``days`` must already be sorted, distinct and in range, and is refused otherwise.
+    A schedule written out of order is a typo rather than a request, and refusing it
+    keeps one spelling of each schedule in source.
+    """
+
+    at: WallClockTime
+    days: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not self.days:
+            raise ValueError("a schedule needs at least one day")
+        if any(day not in range(7) for day in self.days):
+            raise ValueError(f"schedule days are Python weekdays 0 to 6: {self.days}")
+        if list(self.days) != sorted(set(self.days)):
+            raise ValueError(f"schedule days must be sorted and distinct: {self.days}")
+
+
 # The operational wall-clock times, per the design's deployment section. These are
 # machine-clock moments, not session times. launchd and pmset can only fire on the
 # wall clock, so the design pins them there.
@@ -193,17 +221,19 @@ REMINDER_PRIORITY = 3
 # Schwab's refresh token lives this long. The coverage assertion adds it to the mint.
 TOKEN_LIFETIME = timedelta(days=7)
 
-# launchd's weekday numbering: 0 is Sunday, 1 through 5 are Monday through Friday.
-# Python's ``date.weekday()`` runs Monday=0 through Sunday=6. Both appear below, each
-# named at its use.
-LAUNCHD_WEEKDAYS = (1, 2, 3, 4, 5)
-LAUNCHD_SUNDAY = 0
+# Python's ``date.weekday()`` numbering, Monday=0 through Sunday=6, which ``Schedule``
+# uses. launchd numbers Sunday 0 and Monday 1, and ``LaunchdHost.job`` converts at the
+# one place a launchd number is written.
 _PY_WEEKDAYS = frozenset({0, 1, 2, 3, 4})
 _PY_SATURDAY = 5
 _PY_SUNDAY = 6
+_SCHEDULE_WEEKDAYS = tuple(sorted(_PY_WEEKDAYS))
+_SCHEDULE_SUNDAY = (_PY_SUNDAY,)
 
-# The launchd labels. A label is the job's unique identity to launchd. All six sit in
-# the system domain because they are LaunchDaemons.
+# The job labels. A label is the job's unique identity to launchd, where all six sit in
+# the system domain because they are LaunchDaemons. On a systemd host each label names
+# a unit, ``<label>.service``, plus ``<label>.timer`` for a calendar job, so
+# ``systemctl is-active com.marketlake.daemon`` resolves the daemon's unit on its own.
 LAUNCHD_DOMAIN = "system"
 DAEMON_LABEL = "com.marketlake.daemon"
 DASHBOARD_LABEL = "com.marketlake.dashboard"
@@ -293,7 +323,19 @@ def live_check_slugs() -> tuple[str, ...]:
 # The English words for the small counts the rendered scripts spell out in prose. A count
 # written as a word beside a list read from a roster is exactly how the uninstall came to
 # say four while five went silent, so the word is derived from the list rather than typed.
-_NUMBER_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")
+_NUMBER_WORDS = (
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+)
 
 
 def _spelled(count: int) -> str:
@@ -305,10 +347,11 @@ def _spelled(count: int) -> str:
     take the whole render down, and the third would take down the install text the
     operator pastes from. Either way it is over the spelling of one word.
 
-    The design's own budget is not nine: it puts the per-job check pattern "well inside
-    the free tier's 20-check allowance". A tenth check is a thing this project expects to
-    have one day, and reading "Pause all 10 from healthchecks" is a smaller cost than a
-    renderer that will not run.
+    The words stop at ten, because the systemd render counts ten unit files. The design's
+    check budget is larger: it puts the per-job check pattern "well inside the free tier's
+    20-check allowance". An eleventh check is a thing this project expects to have one
+    day, and reading "Pause all 11 from healthchecks" is a smaller cost than a renderer
+    that will not run.
     """
     if 0 <= count < len(_NUMBER_WORDS):
         return _NUMBER_WORDS[count]
@@ -359,8 +402,40 @@ RESTART_SCRIPT_FILE = "restart.sh"
 # terminal, so pointing launchd at it fails fast rather than hanging on the callback.
 REAUTH_SCRIPT_FILE = "reauth.sh"
 
+# The systemd render's one host file beside the ten units and the three scripts. It is a
+# needrestart drop-in, and ``install.sh`` places it as ``NEEDRESTART_INSTALLED``.
+NEEDRESTART_FILE = "needrestart.conf"
+NEEDRESTART_INSTALLED = "marketlake.conf"
 
-# -- the host description and the plists -------------------------------------
+# Every system path the systemd scripts write, each written under the prefix
+# ``INSTALL_ROOT_ENV`` names. The prefix is empty in production. A test points it at a
+# temporary directory, so it observes each write on a machine without root, and the
+# scripts refuse a non-empty one unless ``INSTALL_TEST_ENV`` is also set to 1, so a value
+# leaked from a caller cannot send a real install somewhere harmless while exiting 0.
+SYSTEMD_UNIT_DIR = "/etc/systemd/system"
+NEEDRESTART_DIR = "/etc/needrestart/conf.d"
+TIMER_STAMP_DIR = "/var/lib/systemd/timers"
+INSTALL_LOCK = "/run/marketlake-install.lock"
+INSTALL_ROOT_ENV = "MARKETLAKE_INSTALL_ROOT"
+INSTALL_TEST_ENV = "MARKETLAKE_INSTALL_TEST"
+
+
+# -- the host descriptions, the plists and the units ----------------------------
+
+
+def _launchd_calendar(schedule: Schedule) -> dict[str, int] | list[dict[str, int]]:
+    """``schedule`` as launchd's ``StartCalendarInterval``, entry for entry.
+
+    launchd numbers Sunday 0 and Monday 1, so Python's day ``d`` is launchd's
+    ``(d + 1) % 7``. The entries are sorted by that launchd number, and a single day is a
+    bare dict rather than a one-element list. Both rules decide the plist's bytes: a
+    one-element list breaks the Sunday golden, and descending days break the weekday
+    ones. ``plistlib`` sorts each entry's keys itself, so their order here does not
+    matter.
+    """
+    numbers = sorted((day + 1) % 7 for day in schedule.days)
+    entries = [schedule.at.launchd_interval(number) for number in numbers]
+    return entries[0] if len(entries) == 1 else entries
 
 
 @dataclass(frozen=True)
@@ -401,20 +476,24 @@ class LaunchdHost:
         label: str,
         module: str,
         *args: str,
-        calendar: dict[str, int] | list[dict[str, int]] | None = None,
+        calendar: Schedule | None = None,
         keep_alive: bool = False,
         run_at_load: bool = False,
+        late_run_ok: bool = False,
     ) -> LaunchdJob:
         """One job of this host running ``python -m <module> <args>``.
 
         ``run_at_load`` defaults off. launchd runs a job once at load when it is on,
         which is right for a resident process and wrong for work that belongs to a
         moment. Each caller states which it is.
+
+        ``late_run_ok`` is ignored. launchd already fires a run missed during sleep for
+        every calendar job, and has no setting to stop it.
         """
         return LaunchdJob(
             label=label,
             program_arguments=(self.python, "-m", module, *args),
-            calendar_interval=calendar,
+            calendar_interval=None if calendar is None else _launchd_calendar(calendar),
             working_directory=self.project_dir,
             standard_out_path=self.log_path(label, "out"),
             standard_error_path=self.log_path(label, "err"),
@@ -426,34 +505,279 @@ class LaunchdHost:
         )
 
 
-def daemon_job(host: LaunchdHost) -> LaunchdJob:
-    """The capture daemon, a permanent resident under ``KeepAlive``.
+# What a resident unit waits between restarts. launchd relaunches a ``KeepAlive`` job
+# about ten seconds apart, and the daemon must start once its missing config lands.
+RESTART_SECONDS = 10
+
+# systemd's own spelling of each Python weekday, Monday first.
+_SYSTEMD_DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def _on_calendar_days(days: Sequence[int]) -> str:
+    """``days`` as ``OnCalendar=``'s weekday field, with each consecutive run a range.
+
+    So the weekdays read ``Mon..Fri`` and Sunday alone reads ``Sun``.
+    """
+    runs: list[list[int]] = []
+    for day in days:
+        if runs and day == runs[-1][-1] + 1:
+            runs[-1].append(day)
+        else:
+            runs.append([day])
+    return ",".join(
+        _SYSTEMD_DAYS[run[0]]
+        if len(run) == 1
+        else f"{_SYSTEMD_DAYS[run[0]]}..{_SYSTEMD_DAYS[run[-1]]}"
+        for run in runs
+    )
+
+
+def on_calendar(schedule: Schedule) -> str:
+    """The ``OnCalendar=`` value for ``schedule``, zone included.
+
+    The time comes from the ``WallClockTime`` integers and the zone from
+    ``MARKET_TZ.key``, so no ``"HH:MM"`` literal and no second spelling of the zone enter
+    source. The zone is not decoration. The VM's clock runs in UTC, so without it the
+    Sunday job would fire at 16:00 Eastern and the sweep before the close. systemd
+    recomputes each elapse in the named zone, so 08:30 stays 08:30 across a clock change.
+    """
+    return f"{_on_calendar_days(schedule.days)} {schedule.at.hms} {MARKET_TZ.key}"
+
+
+_UNIT_HEADER = (
+    "# Written by `python -m lake.control_plane render --init systemd`. Change the renderer,\n"
+    "# not this file: the install entry point renders afresh on every run.\n\n"
+)
+
+
+@dataclass(frozen=True)
+class SystemdUnit:
+    """One job of a systemd host, ready to render as a service and, when timed, a timer.
+
+    ``label``, ``program_arguments``, ``keep_alive``, ``environment`` and
+    ``working_directory`` keep the names ``runner.LaunchdJob`` gives them, because the
+    readers of the shared roster use those five on either host. A resident sets
+    ``keep_alive`` and a calendar job sets ``schedule``, and a unit with neither or both is
+    refused, since it would never start or would start twice over.
+
+    ``late_run_ok`` decides ``Persistent=`` on the timer, which makes systemd fire a run
+    missed while the host was down, folded into one, as soon as the timer starts again.
+    Only a job written to be correct when it runs late may take it.
+
+    ``requires_mounts_for`` is the lake's mount point, when the lake lives on a volume of
+    its own. With it every service waits for that mount and does not start without it, so
+    a daemon started before the volume mounts cannot write the lake to the root disk.
+    """
+
+    label: str
+    program_arguments: tuple[str, ...]
+    schedule: Schedule | None
+    keep_alive: bool
+    late_run_ok: bool
+    environment: dict[str, str]
+    working_directory: str
+    user: str
+    requires_mounts_for: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.schedule is not None) == self.keep_alive:
+            raise ValueError(f"{self.label}: a unit needs exactly one of a schedule or keep_alive")
+
+    @property
+    def service_name(self) -> str:
+        """The service's file and unit name, ``<label>.service``."""
+        return f"{self.label}.service"
+
+    @property
+    def timer_name(self) -> str | None:
+        """The timer's file and unit name, or ``None`` for a resident."""
+        return None if self.schedule is None else f"{self.label}.timer"
+
+    def service(self) -> str:
+        """The ``.service`` unit file.
+
+        Every setting below replaces a launchd behaviour or answers a fact about the
+        host, and ``docs/design.md`` names each one with its reason. In brief:
+
+        1. A resident is ``Type=exec`` with ``Restart=always`` every ten seconds and no
+           start limit, which is ``KeepAlive``. ``Type=exec`` makes a start report an
+           interpreter that cannot run, where ``Type=simple`` would report success.
+        2. A timer's service is ``Type=oneshot`` with no ``[Install]`` section. A oneshot
+           has no start timeout, so the Sunday job's hours of retries survive.
+        3. The daemon alone waits for the network and carries ``OOMPolicy=continue``, so
+           the kernel killing its compaction child does not stop it.
+        4. ``User=`` is the owner and no ``Group=`` is set, so systemd takes the owner's
+           primary group. ``PATH`` is left to systemd's default.
+        """
+        unit = ["[Unit]", f"Description={self.label}"]
+        if self.keep_alive:
+            # systemd 255 reads the start limit from [Unit]. Zero keeps hand restarts from
+            # reaching the default of five starts in ten seconds, after which a resident
+            # stays down until someone logs in.
+            unit.append("StartLimitIntervalSec=0")
+        if self.label == DAEMON_LABEL:
+            unit += ["After=network-online.target", "Wants=network-online.target"]
+        if self.requires_mounts_for is not None:
+            unit.append(f"RequiresMountsFor={self.requires_mounts_for}")
+        service = [
+            "[Service]",
+            f"Type={'exec' if self.keep_alive else 'oneshot'}",
+            f"User={self.user}",
+            f"WorkingDirectory={self.working_directory}",
+            *(f"Environment={key}={value}" for key, value in self.environment.items()),
+            f"ExecStart={' '.join(self.program_arguments)}",
+        ]
+        if self.keep_alive:
+            service += ["Restart=always", f"RestartSec={RESTART_SECONDS}"]
+        if self.label == DAEMON_LABEL:
+            service.append("OOMPolicy=continue")
+        sections = [unit, service]
+        if self.keep_alive:
+            sections.append(["[Install]", "WantedBy=multi-user.target"])
+        return _UNIT_HEADER + "\n".join("\n".join(section) + "\n" for section in sections)
+
+    def timer(self) -> str:
+        """The ``.timer`` unit file. A resident has none, and asking for one is refused."""
+        if self.schedule is None:
+            raise ValueError(f"{self.label} is resident, so it has no timer")
+        timer = [
+            "[Timer]",
+            f"OnCalendar={on_calendar(self.schedule)}",
+            # systemd's default lets a timer fire up to a minute late.
+            "AccuracySec=1s",
+        ]
+        if self.late_run_ok:
+            timer.append("Persistent=true")
+        sections = [
+            ["[Unit]", f"Description={self.label}"],
+            timer,
+            ["[Install]", "WantedBy=timers.target"],
+        ]
+        return _UNIT_HEADER + "\n".join("\n".join(section) + "\n" for section in sections)
+
+
+# Characters the systemd render refuses in any value it writes. systemd expands ``%``
+# as a specifier in every unit setting, and ``$`` in ``ExecStart=`` but not in
+# ``Environment=``, while quotes, backslashes and whitespace split or escape a value, so
+# escaping would mean four grammars that disagree. No path a host build needs holds one.
+_SYSTEMD_REFUSED = re.compile(r"[%$'\"\\\s\x00-\x1f\x7f]")
+
+
+@dataclass(frozen=True)
+class SystemdHost:
+    """The machine values every generated systemd unit carries. All caller-supplied.
+
+    ``python``, ``owner``, ``home`` and ``project_dir`` mean what they mean on
+    ``LaunchdHost``. There is no log directory, since journald keeps each unit's output,
+    and no group, since ``User=`` without ``Group=`` takes the owner's primary group.
+    ``lake_mount`` adds ``RequiresMountsFor=`` to every service.
+
+    A value holding ``%``, ``$``, a quote, a backslash, whitespace or a control character
+    is refused here rather than escaped, for the reason ``_SYSTEMD_REFUSED`` gives.
+    """
+
+    python: str
+    owner: str
+    home: str
+    project_dir: str
+    config_path: str | None = None
+    lake_mount: str | None = None
+
+    def __post_init__(self) -> None:
+        for flag, value in (
+            ("--python", self.python),
+            ("--owner", self.owner),
+            ("--home", self.home),
+            ("--project-dir", self.project_dir),
+            ("--config", self.config_path),
+            ("--lake-mount", self.lake_mount),
+        ):
+            if value is None:
+                continue
+            if not value or _SYSTEMD_REFUSED.search(value):
+                raise ValueError(
+                    f"{flag} {value!r} is empty or holds a character systemd would expand or"
+                    " split on: %, $, a quote, a backslash, whitespace or a control character"
+                )
+
+    def environment(self) -> dict[str, str]:
+        """The ``Environment=`` lines every unit shares.
+
+        ``HOME`` comes from the render, so the daemon's token path and the Sunday job's
+        ``--token`` derive from one value. ``MARKETLAKE_CONFIG_DIR`` is never set, so an
+        operator's override cannot reach a scheduled job.
+        """
+        env = {"HOME": self.home, "PYTHONUNBUFFERED": "1"}
+        if self.config_path is not None:
+            env["MARKETLAKE_CONFIG"] = self.config_path
+        return env
+
+    def job(
+        self,
+        label: str,
+        module: str,
+        *args: str,
+        calendar: Schedule | None = None,
+        keep_alive: bool = False,
+        run_at_load: bool = False,
+        late_run_ok: bool = False,
+    ) -> SystemdUnit:
+        """One unit of this host running ``python -m <module> <args>``.
+
+        ``run_at_load`` is ignored. On launchd it arms the self-check's ``pre-open`` at
+        install, and no systemd unit runs at load: a boot-time run would clear a missed
+        08:30 the way a late run would, so arming waits for the cutover's step.
+        """
+        return SystemdUnit(
+            label=label,
+            program_arguments=(self.python, "-m", module, *args),
+            schedule=calendar,
+            keep_alive=keep_alive,
+            late_run_ok=late_run_ok,
+            environment=self.environment(),
+            working_directory=self.project_dir,
+            user=self.owner,
+            requires_mounts_for=self.lake_mount,
+        )
+
+
+# Either host. Every job function below takes one and hands back that host's job.
+Host = LaunchdHost | SystemdHost
+Job = LaunchdJob | SystemdUnit
+
+
+def daemon_job(host: Host) -> Job:
+    """The capture daemon, a permanent resident restarted whenever it exits.
 
     It runs ``python -m lake.daemon``, the slice-2 loop. It never exits on its own.
-    Outside sessions it idles and heartbeats. So it has no calendar interval at all.
+    Outside sessions it idles and heartbeats. So it has no schedule at all. On launchd
     ``RunAtLoad`` starts it as soon as the plist is bootstrapped and after every boot,
-    which is what makes the 08:25 firmware wake reach a running daemon.
+    which is what makes the 08:25 firmware wake reach a running daemon. On systemd the
+    install's ``enable --now`` and every boot start it.
     """
     return host.job(DAEMON_LABEL, "lake.daemon", keep_alive=True, run_at_load=True)
 
 
-def dashboard_job(host: LaunchdHost) -> LaunchdJob:
-    """The read-only localhost query service, the second resident under ``KeepAlive``.
+def dashboard_job(host: Host) -> Job:
+    """The read-only localhost query service, the second resident.
 
     It starts at load for the same reason the daemon does.
     """
     return host.job(DASHBOARD_LABEL, "lake.dashboard", keep_alive=True, run_at_load=True)
 
 
-def self_check_job(host: LaunchdHost) -> LaunchdJob:
+def self_check_job(host: Host) -> Job:
     """The weekday pre-open self-check, five minutes after the firmware wake.
 
-    ``RunAtLoad`` is deliberately on. A load during the day runs the check once at load,
-    which is harmless: it pings only if the daemon is up, and it asks for the assertion
-    only when a window is open. An install outside every window, on a Saturday or a
-    weekday evening, is the case that would otherwise fail on a healthy machine and
-    withhold the first ping, the one that takes this check out of the never-pinged state
-    where it cannot page at all.
+    ``RunAtLoad`` is deliberately on for launchd. A load during the day runs the check
+    once at load, which is harmless: it pings only if the daemon is up, and it asks for
+    the assertion only when a window is open. An install outside every window, on a
+    Saturday or a weekday evening, is the case that would otherwise fail on a healthy
+    machine and withhold the first ping, the one that takes this check out of the
+    never-pinged state where it cannot page at all. A systemd host ignores it, for the
+    reason ``SystemdHost.job`` gives, and replays no missed run, because a late run would
+    ping ``pre-open`` whenever the daemon is up and so clear the page a missed one
+    exists to raise.
 
     An install *inside* a window does withhold that first ping, and it did before the pid
     was stamped too. The daemon spawns its ``caffeinate`` from the loop's tick hook, so
@@ -467,12 +791,12 @@ def self_check_job(host: LaunchdHost) -> LaunchdJob:
         SELF_CHECK_LABEL,
         "lake.control_plane",
         "self-check",
-        calendar=[PRE_OPEN_SELF_CHECK.launchd_interval(wd) for wd in LAUNCHD_WEEKDAYS],
+        calendar=Schedule(PRE_OPEN_SELF_CHECK, _SCHEDULE_WEEKDAYS),
         run_at_load=True,
     )
 
 
-def calendar_probe_job(host: LaunchdHost) -> LaunchdJob:
+def calendar_probe_job(host: Host) -> Job:
     """The 09:35 says-closed-but-open probe, five minutes after the open.
 
     The calendar is the daemon's only authority on whether a session exists, so a day
@@ -481,16 +805,17 @@ def calendar_probe_job(host: LaunchdHost) -> LaunchdJob:
     agrees with the calendar.
 
     ``RunAtLoad`` is off. A load at any other hour would make one vendor call for a
-    question only 09:35 can answer.
+    question only 09:35 can answer. A systemd host replays no missed run for the same
+    reason: a next-day probe would feed the missed day's check.
     """
     return host.job(
         CALENDAR_PROBE_LABEL,
         "lake.probe_calendar",
-        calendar=[CALENDAR_PROBE.launchd_interval(wd) for wd in LAUNCHD_WEEKDAYS],
+        calendar=Schedule(CALENDAR_PROBE, _SCHEDULE_WEEKDAYS),
     )
 
 
-def sunday_job(host: LaunchdHost) -> LaunchdJob:
+def sunday_job(host: Host) -> Job:
     """The Sunday canary and maintenance job, five minutes after the one-shot wake.
 
     The token path is derived from the host's home, the one place every consumer
@@ -508,6 +833,10 @@ def sunday_job(host: LaunchdHost) -> LaunchdJob:
     costs nothing the design asks for. launchd still fires a missed Sunday occurrence
     on the next wake, which is the backstop the pmset table names, and that coalescing
     has nothing to do with ``RunAtLoad``.
+
+    ``late_run_ok`` is on, so a systemd host replays a Sunday run missed while it was
+    down. ``sunday_run``, ``week_option_close`` and ``restore_week`` already handle a
+    Monday run, which is the case launchd's own catch-up brings.
     """
     return host.job(
         SUNDAY_LABEL,
@@ -515,17 +844,18 @@ def sunday_job(host: LaunchdHost) -> LaunchdJob:
         "sunday",
         "--token",
         default_token_path(host.home),
-        calendar=SUNDAY_MAINTENANCE.launchd_interval(LAUNCHD_SUNDAY),
+        calendar=Schedule(SUNDAY_MAINTENANCE, _SCHEDULE_SUNDAY),
+        late_run_ok=True,
     )
 
 
-def eod_sweep_job(host: LaunchdHost) -> LaunchdJob:
+def eod_sweep_job(host: Host) -> Job:
     """The 18:30 weekday vendor sweep, whose health check is the ``eod-sweep`` slug.
 
     It runs ``python -m lake.sweep``: the corporate-actions walks, the bar fetch, the
-    nightly report file, the ping, and the digest. On a Friday it also sets the Sunday
-    one-shot wake and reads it back, which is why install step 6 no longer asks the
-    operator to do that by hand.
+    nightly report file, the ping, and the digest. On a Friday on the Mac it also sets
+    the Sunday one-shot wake and reads it back, which is why install step 6 no longer
+    asks the operator to do that by hand.
 
     **It carries no arguments**, which is the shape ``daemon_job`` and
     ``calendar_probe_job`` take rather than ``sunday_job``'s. That job passes ``--token``
@@ -540,17 +870,24 @@ def eod_sweep_job(host: LaunchdHost) -> LaunchdJob:
     ``lake.sweep`` refuses for itself by asking the calendar before it walks. launchd still fires a
     missed 18:30 occurrence on the next wake, which is a catch-up this job has to refuse
     rather than welcome, and ``lake.sweep`` refuses it by requiring the session's equity
-    close to have passed before it fetches.
+    close to have passed before it fetches. That same rule is why ``late_run_ok`` is on. A
+    systemd host back up on a weekday evening sweeps that evening, and a replay the next
+    morning fetches nothing and pings nothing, which ``docs/design.md`` names as the price.
     """
     return host.job(
         EOD_SWEEP_LABEL,
         "lake.sweep",
-        calendar=[VENDOR_SWEEP.launchd_interval(wd) for wd in LAUNCHD_WEEKDAYS],
+        calendar=Schedule(VENDOR_SWEEP, _SCHEDULE_WEEKDAYS),
+        late_run_ok=True,
     )
 
 
-def all_jobs(host: LaunchdHost) -> tuple[LaunchdJob, ...]:
-    """Every launchd job the control plane installs, resident processes first."""
+def all_jobs(host: Host) -> tuple[Job, ...]:
+    """Every job the control plane installs on ``host``, resident processes first.
+
+    One roster for both hosts, so a job added here reaches the launchd render and the
+    systemd render together, or neither.
+    """
     return (
         daemon_job(host),
         dashboard_job(host),
@@ -2767,8 +3104,14 @@ class RenderedFile:
     mode: int = 0o644
 
 
-def render_all(host: LaunchdHost) -> tuple[RenderedFile, ...]:
-    """Every plist and setup file, as text, in install order."""
+def render_all(host: Host) -> tuple[RenderedFile, ...]:
+    """Every file the host's install needs, as text, in install order.
+
+    On launchd that is the six plists and the setup files. On systemd it is
+    :func:`render_systemd`'s units, scripts and drop-in.
+    """
+    if isinstance(host, SystemdHost):
+        return render_systemd(host)
     files = [RenderedFile(f"{job.label}.plist", job.render()) for job in all_jobs(host)]
     files.append(RenderedFile(SUDOERS_FILE, sudoers_dropin(host.owner)))
     files.append(RenderedFile(INSTALL_SCRIPT_FILE, install_script(host), mode=0o755))
@@ -3583,6 +3926,520 @@ def install_commands(out_dir: Path, host: LaunchdHost) -> str:
     return "\n".join(lines) + "\n"
 
 
+# -- the systemd render -----------------------------------------------------------------
+#
+# The Linux host's half of the render. Its scripts are their own functions rather than a
+# host parameter on the launchd ones, so the launchd goldens stay byte-identical and
+# neither host's script carries the other's branches. Nothing here runs anything. The
+# tracked entry point ``deploy/linux-install.sh`` renders these files on the host and runs
+# the rendered ``install.sh``, and that is the only install.
+
+
+def systemd_units(host: SystemdHost) -> tuple[SystemdUnit, ...]:
+    """The roster as ``SystemdUnit`` records, so the systemd functions read typed fields."""
+    units = all_jobs(host)
+    typed = tuple(unit for unit in units if isinstance(unit, SystemdUnit))
+    if len(typed) != len(units):
+        raise TypeError("a systemd host built a job that is not a systemd unit")
+    return typed
+
+
+def systemd_unit_files(host: SystemdHost) -> list[str]:
+    """Every unit file name the render writes, each service followed by its timer."""
+    names: list[str] = []
+    for unit in systemd_units(host):
+        names.append(unit.service_name)
+        if unit.timer_name is not None:
+            names.append(unit.timer_name)
+    return names
+
+
+def _enabled_units(host: SystemdHost) -> list[str]:
+    """The units with an ``[Install]`` section: the residents, then every timer.
+
+    Enabling a timer-run service instead would print systemd's long notice about a unit
+    with no installation config into the caller's log, and would do nothing.
+    """
+    units = systemd_units(host)
+    residents = [unit.service_name for unit in units if unit.keep_alive]
+    timers = [unit.timer_name for unit in units if unit.timer_name is not None]
+    return residents + timers
+
+
+def _persistent_stamps(host: SystemdHost) -> list[str]:
+    """The timer stamp file each ``Persistent=true`` timer writes, by name."""
+    return [
+        f"stamp-{unit.timer_name}"
+        for unit in systemd_units(host)
+        if unit.timer_name is not None and unit.late_run_ok
+    ]
+
+
+def needrestart_dropin() -> str:
+    """The needrestart drop-in that keeps Ubuntu's post-apt restarts off the units.
+
+    Ubuntu patches ``needrestart`` to restart every service mapping an old library after
+    any apt run, and the daemon maps the system glibc through uv's Python. So an owner's
+    ``sudo apt upgrade`` at 11:00 Eastern would restart the daemon mid-session. A zero in
+    ``override_rc`` for a unit-name pattern defers those units instead. The price is that
+    a patched glibc reaches the daemon only at its next restart. Setting
+    ``$nrconf{restart}`` would cover this too, and is rejected because it changes how every
+    service on the host restarts.
+    """
+    return (
+        "# Marketlake: keep needrestart from restarting the marketlake units after apt runs.\n"
+        "# A restart would cost the daemon its in-flight cycle mid-session. needrestart lists\n"
+        "# them as deferred instead, and `needrestart -b` names what still maps an old\n"
+        "# library, so a patched glibc reaches them at their next restart.\n"
+        "$nrconf{override_rc}->{qr(^com\\.marketlake\\.)} = 0;\n"
+    )
+
+
+def _systemd_guard_lines(script: str) -> list[str]:
+    """The opening every systemd script shares that writes system paths.
+
+    It refuses unless it runs as root, reading ``id -u`` rather than ``$EUID`` so a test
+    can answer for it. It refuses a leaked install root, and then prints the prefix in use,
+    so a caller reading the log can tell a test run from a real one.
+    """
+    return [
+        'if [[ "$(id -u)" != 0 ]]; then',
+        f'  echo "{script}: run this as root, for example with sudo" >&2',
+        "  exit 2",
+        "fi",
+        f'ROOT="${{{INSTALL_ROOT_ENV}:-}}"',
+        f'if [[ -n "$ROOT" && "${{{INSTALL_TEST_ENV}:-}}" != 1 ]]; then',
+        f'  echo "{script}: {INSTALL_ROOT_ENV} is $ROOT, which only a test may set." >&2',
+        f'  echo "{script}: Unset it, so the units land in the real system paths." >&2',
+        "  exit 2",
+        "fi",
+        f'echo "{script}: install root ${{ROOT:-/}}"',
+        f'UNIT_DIR="$ROOT{SYSTEMD_UNIT_DIR}"',
+        f'NEEDRESTART_DIR="$ROOT{NEEDRESTART_DIR}"',
+        f'STAMP_DIR="$ROOT{TIMER_STAMP_DIR}"',
+    ]
+
+
+def _bash_array(name: str, items: Sequence[str]) -> str:
+    """A bash array assignment. Every item is a unit name, which needs no quoting."""
+    return f"{name}=({' '.join(items)})"
+
+
+def systemd_install_script(host: SystemdHost) -> str:
+    """Place the units and the drop-in, retire stale units, reload, enable, read back.
+
+    It runs as root, from ``deploy/linux-install.sh`` or by hand, and finds the files it
+    installs beside itself. It is safe to run again on a host that already has it.
+
+    1. Each unit and the drop-in is copied through a temporary file and a rename, and
+       only when its content differs from the installed copy. A copy that happens prints
+       ``changed: <file>``, so a caller can tell whether a restart would pick up a new
+       definition.
+    2. A ``com.marketlake.*`` service or timer in the unit directory that the render no
+       longer names is stopped, disabled, has its timer stamp deleted, and is removed.
+       ``systemctl edit`` drop-in directories are left alone.
+    3. ``systemctl daemon-reload``, which restarts nothing.
+    4. ``systemctl enable --now`` on the units with an ``[Install]`` section, which
+       starts only what is not running.
+    5. A read-back of each resident's state. On systemd 255 ``enable --now`` exits 0
+       whatever the start does, so the read-back is the install's only signal. It never
+       fails the install, because a restart loop is expected before the config lands.
+
+    So a re-run never restarts a running process. It does start a unit stopped by hand,
+    as a boot does.
+    """
+    units = systemd_unit_files(host)
+    residents = [unit.service_name for unit in systemd_units(host) if unit.keep_alive]
+    lines = [
+        "#!/bin/bash",
+        "# Marketlake control plane on a systemd host: install or update the units.",
+        "#",
+        "# Written by `python -m lake.control_plane render --init systemd`, which never runs",
+        "# it. deploy/linux-install.sh renders this directory afresh and runs this script,",
+        "# as root, on every install. Running it again by hand is safe:",
+        "#",
+        f"#     sudo ./{INSTALL_SCRIPT_FILE}",
+        "#",
+        "# It copies a unit only when its content changed, and prints `changed: <file>`",
+        "# when it does. It retires any com.marketlake unit the render no longer names,",
+        "# reloads systemd, and enables and starts the residents and the timers. Starting",
+        "# skips what already runs, so a running service keeps its old definition until",
+        f"# its next restart. ./{RESTART_SCRIPT_FILE} is how to give it the new one.",
+        "#",
+        "# It closes by reading back each resident's state. A resident that restarts every",
+        f"# {RESTART_SECONDS} seconds is expected until config.yaml and tickers.yaml land.",
+        "# Every command is echoed before it runs.",
+        "set -euo pipefail",
+        "",
+        *_systemd_guard_lines(INSTALL_SCRIPT_FILE),
+        'HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
+        "",
+        _bash_array("UNITS", units),
+        _bash_array("ENABLE", _enabled_units(host)),
+        _bash_array("RESIDENTS", residents),
+        "",
+        "rendered() {",
+        "  local unit",
+        '  for unit in "${UNITS[@]}"; do',
+        '    if [[ "$unit" == "$1" ]]; then return 0; fi',
+        "  done",
+        "  return 1",
+        "}",
+        "",
+        "# Copy $1 to $2 through a temporary file and a rename, only when the two differ.",
+        "place() {",
+        '  local src="$1" dest="$2" tmp',
+        '  if [[ -f "$dest" ]] && cmp -s "$src" "$dest"; then',
+        "    return 0",
+        "  fi",
+        '  tmp="$(dirname "$dest")/.$(basename "$dest").tmp"',
+        '  echo "+ install -m 644 $src $tmp"',
+        '  install -m 644 "$src" "$tmp"',
+        '  echo "+ mv -f $tmp $dest"',
+        '  mv -f "$tmp" "$dest"',
+        '  echo "changed: $(basename "$dest")"',
+        "}",
+        "",
+        "# 1. Copy the units and the needrestart drop-in. The drop-in's directory is created",
+        "# because a host without needrestart has none.",
+        'echo "+ mkdir -p $UNIT_DIR $NEEDRESTART_DIR"',
+        'mkdir -p "$UNIT_DIR" "$NEEDRESTART_DIR"',
+        'for unit in "${UNITS[@]}"; do',
+        '  place "$HERE/$unit" "$UNIT_DIR/$unit"',
+        "done",
+        f'place "$HERE/{NEEDRESTART_FILE}" "$NEEDRESTART_DIR/{NEEDRESTART_INSTALLED}"',
+        "",
+        "# 2. Retire a com.marketlake unit the render no longer names. A timer's stamp goes",
+        "# with it, or a reinstall of that timer would fire a replay at once.",
+        'for path in "$UNIT_DIR"/com.marketlake.*.service "$UNIT_DIR"/com.marketlake.*.timer; do',
+        '  if [[ ! -f "$path" ]]; then continue; fi',
+        '  unit="${path##*/}"',
+        '  if rendered "$unit"; then continue; fi',
+        '  echo "+ systemctl stop $unit"',
+        '  systemctl stop "$unit"',
+        '  echo "+ systemctl disable $unit"',
+        '  systemctl disable "$unit"',
+        '  if [[ "$unit" == *.timer ]]; then',
+        '    echo "+ rm -f $STAMP_DIR/stamp-$unit"',
+        '    rm -f "$STAMP_DIR/stamp-$unit"',
+        "  fi",
+        '  echo "+ rm -f $path"',
+        '  rm -f "$path"',
+        "done",
+        "",
+        "# 3. Reload, so systemd reads what step 1 and step 2 changed. It restarts nothing.",
+        'echo "+ systemctl daemon-reload"',
+        "systemctl daemon-reload",
+        "",
+        "# 4. Enable and start the residents and the timers. A unit already running is left",
+        "# running, and a timer-run service is started only by its timer.",
+        'for unit in "${ENABLE[@]}"; do',
+        '  echo "+ systemctl enable --now $unit"',
+        '  systemctl enable --now "$unit"',
+        "done",
+        "",
+        "# 5. Read each resident back. enable --now exits 0 whatever the start did, so this",
+        "# is the only place a resident that cannot start shows. It never fails the install.",
+        "READBACK=ActiveState,SubState,NRestarts,Result,ExecMainStatus",
+        'for unit in "${RESIDENTS[@]}"; do',
+        '  echo "+ systemctl show --property=$READBACK $unit"',
+        '  systemctl show --property="$READBACK" "$unit" | sed "s/^/  /" || true',
+        "done",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def systemd_uninstall_script(host: SystemdHost) -> str:
+    """Take the units off a systemd host, the install's steps run backwards.
+
+    It acts on each unit whose file is present, so it converges from a partial install,
+    because systemd 255's ``disable`` fails on a missing unit file. Then it deletes the
+    persistent timers' stamps, removes the ten units and the drop-in, and reloads. The
+    stamps go because a reinstall would otherwise fire both persistent timers at once.
+
+    ``systemctl clean --what=state`` would delete the stamps too, and is rejected: systemd
+    255 refuses it on an active timer, a timer without ``Persistent=`` and a unit whose
+    file is gone, which would abort every re-run under ``set -e``.
+
+    It leaves the lake and the config directory. It warns that the dead-man checks go
+    silent if this host is the primary, since the render cannot know the host's role.
+    """
+    units = systemd_units(host)
+    # Timers first, so none fires a service in the middle of the teardown.
+    ordered = [unit.timer_name for unit in units if unit.timer_name is not None] + [
+        unit.service_name for unit in units
+    ]
+    slugs = live_check_slugs()
+    lines = [
+        "#!/bin/bash",
+        "# Marketlake control plane on a systemd host: take the units back off.",
+        "#",
+        "# Written by `python -m lake.control_plane render --init systemd`, which never runs",
+        "# it. Run it as root:",
+        "#",
+        f"#     sudo ./{UNINSTALL_SCRIPT_FILE}",
+        "#",
+        "# It disables and stops each unit that is installed, deletes the persistent timers'",
+        f"# stamps, removes the {_spelled(len(ordered))} units and the needrestart drop-in,"
+        " and reloads",
+        "# systemd. It acts only on units whose files are present, so it finishes on a",
+        "# partial install too. It leaves the lake and the config directory.",
+        "#",
+        f"# If this host is the primary, {_spelled(len(slugs))} dead-man checks go silent"
+        " when these units stop:",
+        f"# {_listed(slugs)}.",
+        "# Pause them in healthchecks first if the host is meant to stay uninstalled. A",
+        "# shadow host feeds none of them, so uninstalling one silences nothing.",
+        "set -euo pipefail",
+        "",
+        *_systemd_guard_lines(UNINSTALL_SCRIPT_FILE),
+        "",
+        _bash_array("UNITS", ordered),
+        _bash_array("STAMPS", _persistent_stamps(host)),
+        "",
+        "# 1. Disable and stop each unit whose file is present. systemd 255's disable fails",
+        "# on a missing unit file, so an absent one is skipped rather than fatal.",
+        'for unit in "${UNITS[@]}"; do',
+        '  if [[ -f "$UNIT_DIR/$unit" ]]; then',
+        '    echo "+ systemctl disable --now $unit"',
+        '    systemctl disable --now "$unit"',
+        "  else",
+        '    echo "  $unit is not installed, nothing to disable"',
+        "  fi",
+        "done",
+        "",
+        "# 2. Delete the persistent timers' stamps, so a reinstall does not replay them.",
+        'for stamp in "${STAMPS[@]}"; do',
+        '  echo "+ rm -f $STAMP_DIR/$stamp"',
+        '  rm -f "$STAMP_DIR/$stamp"',
+        "done",
+        "",
+        "# 3. Remove the units and the drop-in.",
+        'for unit in "${UNITS[@]}"; do',
+        '  echo "+ rm -f $UNIT_DIR/$unit"',
+        '  rm -f "$UNIT_DIR/$unit"',
+        "done",
+        f'echo "+ rm -f $NEEDRESTART_DIR/{NEEDRESTART_INSTALLED}"',
+        f'rm -f "$NEEDRESTART_DIR/{NEEDRESTART_INSTALLED}"',
+        "",
+        "# 4. Reload, so systemd forgets the units.",
+        'echo "+ systemctl daemon-reload"',
+        "systemctl daemon-reload",
+        'echo "' + f"{UNINSTALL_SCRIPT_FILE}: done. On a primary host the {_spelled(len(slugs))}"
+        " dead-man checks now go silent and page." + '"',
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def systemd_restart_script(host: SystemdHost) -> str:
+    """Restart a resident unit so it picks up new code, with the macOS script's contract.
+
+    The contract is the one ``restart_script`` keeps, where it still applies: the
+    dashboard by default, the daemon only when named, both with ``all``, the branch and
+    dirty-tree warnings, the poll for a new pid and the settle, and the exit codes. It
+    exits 0 on success, 1 when a unit is not loaded or will not stay up, and 2 on usage.
+    A deploy reads those codes.
+
+    It differs in five ways.
+
+    1. It requires root rather than calling ``sudo``, which would prompt, or fail without
+       a terminal, under an unattended caller.
+    2. It runs ``git`` as the checkout's owner. git refuses a checkout another account
+       owns, so under root the warnings would silently vanish.
+    3. It reads ``LoadState``, ``MainPID`` and ``NeedDaemonReload`` from ``systemctl
+       show``, and points at ``journalctl -u <unit>`` rather than a log file.
+    4. Under ``Type=exec`` a ``systemctl restart`` exits nonzero when the interpreter
+       cannot start, and that becomes this script's own "will not stay up" exit rather
+       than a silent ``set -e`` exit. A unit whose file changed since the last reload
+       would restart under its old definition, so ``NeedDaemonReload=yes`` exits 1 with
+       "run the install first".
+    5. A role change reaches the daemon only through ``restart.sh daemon``, since the
+       daemon builds its senders once at start.
+    """
+    units = systemd_units(host)
+    residents = [unit.service_name for unit in units if unit.keep_alive]
+    short = {unit.label.rsplit(".", 1)[-1]: unit.service_name for unit in units if unit.keep_alive}
+    default = DASHBOARD_LABEL.rsplit(".", 1)[-1]
+    if default not in short:
+        raise ValueError(f"{DASHBOARD_LABEL} is not resident, so it cannot be the default")
+    lines = [
+        "#!/bin/bash",
+        "# Marketlake control plane on a systemd host: restart a resident unit so it picks",
+        "# up new code. Written by `python -m lake.control_plane render --init systemd`.",
+        "#",
+        "# Usage, as root:",
+        "#",
+        f"#     sudo ./{RESTART_SCRIPT_FILE}".ljust(35) + f"# {default} only, the default",
+    ]
+    for name in short:
+        lines.append(f"#     sudo ./{RESTART_SCRIPT_FILE} {name}".ljust(35) + f"# {name} only")
+    lines += [
+        f"#     sudo ./{RESTART_SCRIPT_FILE} all".ljust(35) + "# every resident unit",
+        "#",
+        "# Only the residents go stale. Each holds the Python it imported at start, and the",
+        "# venv is an editable install of the checkout, so a new commit reaches a new",
+        "# process only. The timer jobs start fresh on every run.",
+        "#",
+        "# Restarting is not free. The dashboard drops its open connections and the daemon",
+        "# loses its in-flight cycle, so a bare invocation restarts the dashboard alone. A",
+        "# role change in config.yaml reaches the daemon only through the daemon argument,",
+        "# because the daemon builds its senders once at start.",
+        "#",
+        "# It exits 0 when every named unit restarted and stayed up, 1 when a unit is not",
+        "# loaded, needs the install first, or will not stay up, and 2 on usage.",
+        "set -euo pipefail",
+        "",
+        f"PROJECT_DIR={shlex.quote(host.project_dir)}",
+        f"OWNER={shlex.quote(host.owner)}",
+        "SETTLE_SECONDS=3",
+        "",
+        'case "${1:-' + default + '}" in',
+    ]
+    for name, unit in short.items():
+        lines.append(f"  {name}) UNITS=({unit}) ;;")
+    lines += [
+        "  all) UNITS=(" + " ".join(residents) + ") ;;",
+        "  *)",
+        "    echo "
+        + shlex.quote(f"usage: ./{RESTART_SCRIPT_FILE} [" + "|".join([*short, "all"]) + "]")
+        + " >&2",
+        "    exit 2 ;;",
+        "esac",
+        'if [[ "$(id -u)" != 0 ]]; then',
+        f'  echo "{RESTART_SCRIPT_FILE}: run this as root, for example with sudo" >&2',
+        "  exit 2",
+        "fi",
+        "",
+        "prop() {",
+        '  systemctl show --property="$2" --value "$1"',
+        "}",
+        "",
+        "# MainPID reads 0 while no process runs, which this script treats as no pid.",
+        "pid_of() {",
+        "  local pid",
+        '  pid="$(prop "$1" MainPID || true)"',
+        '  if [[ "$pid" == "0" ]]; then pid=""; fi',
+        '  printf "%s" "$pid"',
+        "}",
+        "",
+        "# git refuses a checkout another account owns, so it runs as the owner.",
+        "as_owner() {",
+        '  sudo -u "$OWNER" -H "$@"',
+        "}",
+        "",
+        "# 1. What the restart will pick up. The services import from this tree.",
+        "echo " + shlex.quote("+ working tree at " + host.project_dir),
+        'if as_owner git -C "$PROJECT_DIR" rev-parse --git-dir >/dev/null 2>&1; then',
+        "  # An unborn HEAD makes --git-dir succeed and --abbrev-ref fail, and an",
+        "  # unguarded substitution would end the run here under `set -e`.",
+        '  branch="$(as_owner git -C "$PROJECT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null'
+        ' || true)"',
+        '  : "${branch:=unknown}"',
+        '  echo "  branch: $branch"',
+        '  if [[ -n "$(as_owner git -C "$PROJECT_DIR" status --porcelain || true)" ]]; then',
+        "    echo "
+        + shlex.quote("  WARNING: uncommitted changes, so the restart picks those up too"),
+        "  fi",
+        '  if [[ "$branch" != "main" ]]; then',
+        "    echo " + shlex.quote("  WARNING: not on main, so the restart runs branch code"),
+        "  fi",
+        "else",
+        "  echo " + shlex.quote("  not a git checkout, so no branch to report"),
+        "fi",
+        "",
+        "# 2. Restart each named unit, and prove it came back and stayed.",
+        'for unit in "${UNITS[@]}"; do',
+        '  if [[ "$(prop "$unit" LoadState)" != "loaded" ]]; then',
+        '    echo "  $unit is not loaded. Run the install first." >&2',
+        "    exit 1",
+        "  fi",
+        "  # A unit file changed since the last daemon-reload restarts under its old",
+        "  # definition, so the install, which reloads, has to run first.",
+        '  if [[ "$(prop "$unit" NeedDaemonReload)" == "yes" ]]; then',
+        '    echo "  $unit changed on disk since systemd last read it, so a restart would'
+        ' run the old definition. Run the install first." >&2',
+        "    exit 1",
+        "  fi",
+        '  before="$(pid_of "$unit")"',
+        '  if [[ -z "$before" ]]; then',
+        '    echo "  $unit is loaded but not running, so this starts it"',
+        "  else",
+        '    echo "  $unit is pid $before"',
+        "  fi",
+        '  echo "+ systemctl restart $unit"',
+        '  if ! systemctl restart "$unit"; then',
+        '    echo "  WARNING: $unit will not stay up. systemctl restart failed." >&2',
+        '    echo "  Check journalctl -u $unit" >&2',
+        "    exit 1",
+        "  fi",
+        '  after=""',
+        "  for _ in 1 2 3 4 5; do",
+        '    after="$(pid_of "$unit")"',
+        '    if [[ -n "$after" && "$after" != "$before" ]]; then',
+        "      break",
+        "    fi",
+        "    sleep 1",
+        "  done",
+        '  if [[ -z "$after" ]]; then',
+        '    echo "  WARNING: $unit has no pid after the restart" >&2',
+        '    echo "  Check journalctl -u $unit" >&2',
+        "    exit 1",
+        "  fi",
+        '  if [[ "$after" == "$before" ]]; then',
+        '    echo "  WARNING: $unit is still pid $before, so it did not restart" >&2',
+        "    exit 1",
+        "  fi",
+        "  # A new pid is not yet a working service. A resident that dies on import gets a",
+        "  # fresh pid too, so the new one has to still be there a moment later.",
+        '  sleep "$SETTLE_SECONDS"',
+        '  settled="$(pid_of "$unit")"',
+        '  if [[ "$settled" != "$after" ]]; then',
+        '    echo "  WARNING: $unit will not stay up. pid went $before -> $after ->'
+        ' ${settled:-none}." >&2',
+        '    echo "  Check journalctl -u $unit" >&2',
+        "    exit 1",
+        "  fi",
+        '  echo "  $unit restarted: pid ${before:-none} -> $after, still up after'
+        ' ${SETTLE_SECONDS}s"',
+        "done",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def render_systemd(host: SystemdHost) -> tuple[RenderedFile, ...]:
+    """Every unit, script and host file the systemd install needs, as text."""
+    files: list[RenderedFile] = []
+    for unit in systemd_units(host):
+        files.append(RenderedFile(unit.service_name, unit.service()))
+        if unit.timer_name is not None:
+            files.append(RenderedFile(unit.timer_name, unit.timer()))
+    files.append(RenderedFile(NEEDRESTART_FILE, needrestart_dropin()))
+    files.append(RenderedFile(INSTALL_SCRIPT_FILE, systemd_install_script(host), mode=0o755))
+    files.append(RenderedFile(UNINSTALL_SCRIPT_FILE, systemd_uninstall_script(host), mode=0o755))
+    files.append(RenderedFile(RESTART_SCRIPT_FILE, systemd_restart_script(host), mode=0o755))
+    return tuple(files)
+
+
+def systemd_summary(out: Path, host: SystemdHost) -> str:
+    """What ``render --init systemd`` prints on stdout: a short list of what it wrote.
+
+    The Mac's render prints its by-hand install text. A systemd host installs through
+    ``deploy/linux-install.sh``, which reads this in cloud-init's log or a deploy's
+    output, so it says what landed and where the install script is, and nothing more.
+    """
+    names = [item.name for item in render_systemd(host)]
+    units = systemd_unit_files(host)
+    lines = [
+        f"render: systemd units for {host.owner} in {out}",
+        f"  {_spelled(len(units))} unit files:",
+        *(f"    {name}" for name in units),
+        *(f"  {name}" for name in names if name not in units),
+        f"  next: run {out / INSTALL_SCRIPT_FILE} as root."
+        " deploy/linux-install.sh does that after every render.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 # -- the command-line entry ------------------------------------------------------------
 
 
@@ -3598,15 +4455,33 @@ def _build_parser():
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    render = sub.add_parser("render", help="Dry-run: write every plist and setup file to DIR.")
+    render = sub.add_parser(
+        "render",
+        help=(
+            "Dry-run: write every file one host's install needs to DIR. launchd plists and "
+            "by-hand install text for the Mac, or systemd units and install scripts for Linux."
+        ),
+    )
+    render.add_argument(
+        "--init",
+        choices=("launchd", "systemd"),
+        default="launchd",
+        help="The service manager to render for. Defaults to launchd, the Mac's.",
+    )
     render.add_argument("--out", required=True, help="Output directory. Never a system path.")
     render.add_argument("--python", required=True, help="Path to the Python interpreter.")
     render.add_argument("--owner", required=True, help="The account the jobs run as.")
     render.add_argument("--home", required=True, help="That account's home directory.")
     render.add_argument("--project-dir", required=True, help="WorkingDirectory for the jobs.")
-    render.add_argument("--log-dir", required=True, help="Directory for stdout/stderr logs.")
-    render.add_argument("--group", default="staff", help="GroupName for the jobs.")
+    render.add_argument(
+        "--log-dir", help="launchd only, and required there: directory for stdout/stderr logs."
+    )
+    render.add_argument("--group", help="launchd only: GroupName for the jobs. Defaults to staff.")
     render.add_argument("--config", help="Config path, passed via MARKETLAKE_CONFIG.")
+    render.add_argument(
+        "--lake-mount",
+        help="systemd only: the lake's mount point, which every service waits for.",
+    )
 
     check = sub.add_parser(
         "self-check",
@@ -3630,6 +4505,92 @@ def _build_parser():
     sub.add_parser("pmset", help="Print the two pmset commands for the coming week.")
 
     return parser
+
+
+def _render(args) -> int:
+    """The ``render`` subcommand. Returns a process exit code.
+
+    Every refusal is one ``render:`` line on stderr and exit 2, never a traceback, so an
+    unattended caller reading the log can tell which flag was wrong.
+    """
+    launchd = args.init == "launchd"
+    # Each host takes flags the other has no use for. A flag the chosen host would
+    # silently drop is refused, so a caller never believes a setting landed that did not.
+    misplaced = (
+        [("--lake-mount", args.lake_mount)]
+        if launchd
+        else [("--log-dir", args.log_dir), ("--group", args.group)]
+    )
+    given = [flag for flag, value in misplaced if value is not None]
+    if given:
+        other = "systemd" if launchd else "launchd"
+        print(
+            f"render: {' and '.join(given)} apply only to --init {other}, not --init {args.init}",
+            file=sys.stderr,
+        )
+        return 2
+    if launchd and args.log_dir is None:
+        print("render: --init launchd needs --log-dir", file=sys.stderr)
+        return 2
+    # Every one of these lands in a plist, a unit or a printed install line that runs
+    # from wherever the operator pastes it, so a relative value is never right. An absent
+    # flag is skipped. --out is resolved rather than refused, because a directory to
+    # write into is naturally typed relative.
+    relative = {
+        name: value
+        for name, value in (
+            ("--python", args.python),
+            ("--home", args.home),
+            ("--project-dir", args.project_dir),
+            ("--log-dir", args.log_dir),
+            ("--config", args.config),
+            ("--lake-mount", args.lake_mount),
+        )
+        if value is not None and not Path(value).is_absolute()
+    }
+    if relative:
+        named = ", ".join(f"{name} {value!r}" for name, value in sorted(relative.items()))
+        print(f"render: these must be absolute paths: {named}", file=sys.stderr)
+        return 2
+    # Resolved, so the printed lines name an absolute path and work from any directory,
+    # not only the one the render ran in.
+    out = Path(args.out).resolve()
+    try:
+        host: Host
+        if launchd:
+            host = LaunchdHost(
+                python=args.python,
+                owner=args.owner,
+                home=args.home,
+                project_dir=args.project_dir,
+                log_dir=args.log_dir,
+                group="staff" if args.group is None else args.group,
+                config_path=args.config,
+            )
+        else:
+            host = SystemdHost(
+                python=args.python,
+                owner=args.owner,
+                home=args.home,
+                project_dir=args.project_dir,
+                config_path=args.config,
+                lake_mount=args.lake_mount,
+            )
+        written = write_rendered(render_all(host), out)
+    except ValueError as exc:
+        print(f"render: {exc}", file=sys.stderr)
+        return 2
+    # Progress and errors go to stderr, the install text or the summary to stdout. The
+    # launchd text is meant to be read and pasted, so ``render ... > install.txt`` has
+    # to yield a file of nothing but comments and commands. A ``wrote ...`` line welded
+    # to the top of it is not a command, and a shell fed the file reports it as one.
+    for path in written:
+        print(f"wrote {path}", file=sys.stderr)
+    if isinstance(host, SystemdHost):
+        print(systemd_summary(out, host), end="")
+    else:
+        print(install_commands(out, host), end="")
+    return 0
 
 
 def main(
@@ -3659,49 +4620,7 @@ def main(
     args = _build_parser().parse_args(argv)
 
     if args.command == "render":
-        # Every one of these lands in a plist or in a printed install line that runs
-        # from wherever the operator pastes it, so a relative value is never right.
-        # --out is resolved rather than refused, because a directory to write into is
-        # naturally typed relative.
-        relative = {
-            name: value
-            for name, value in (
-                ("--python", args.python),
-                ("--home", args.home),
-                ("--project-dir", args.project_dir),
-                ("--log-dir", args.log_dir),
-            )
-            if not Path(value).is_absolute()
-        }
-        if relative:
-            named = ", ".join(f"{name} {value!r}" for name, value in sorted(relative.items()))
-            print(f"render: these must be absolute paths: {named}", file=sys.stderr)
-            return 2
-        host = LaunchdHost(
-            python=args.python,
-            owner=args.owner,
-            home=args.home,
-            project_dir=args.project_dir,
-            log_dir=args.log_dir,
-            group=args.group,
-            config_path=args.config,
-        )
-        # Resolved, so the printed install lines name an absolute path and work from
-        # any directory, not only the one the render ran in.
-        out = Path(args.out).resolve()
-        try:
-            written = write_rendered(render_all(host), out)
-        except ValueError as exc:
-            print(f"render: {exc}", file=sys.stderr)
-            return 2
-        # Progress and errors go to stderr, the install text to stdout. The text is
-        # meant to be read and pasted, so ``render ... > install.txt`` has to yield a
-        # file of nothing but comments and commands. A ``wrote ...`` line welded to the
-        # top of it is not a command, and a shell fed the file reports it as one.
-        for path in written:
-            print(f"wrote {path}", file=sys.stderr)
-        print(install_commands(out, host), end="")
-        return 0
+        return _render(args)
 
     if args.command == "self-check":
         with input_errors_exit("self-check"):
@@ -3923,6 +4842,27 @@ __all__ = [
     "SundayOutcome",
     "VendorFactory",
     "WallClockTime",
+    "Schedule",
+    "SystemdHost",
+    "SystemdUnit",
+    "INSTALL_LOCK",
+    "INSTALL_ROOT_ENV",
+    "INSTALL_TEST_ENV",
+    "NEEDRESTART_DIR",
+    "NEEDRESTART_FILE",
+    "NEEDRESTART_INSTALLED",
+    "RESTART_SECONDS",
+    "SYSTEMD_UNIT_DIR",
+    "TIMER_STAMP_DIR",
+    "needrestart_dropin",
+    "on_calendar",
+    "render_systemd",
+    "systemd_install_script",
+    "systemd_restart_script",
+    "systemd_summary",
+    "systemd_uninstall_script",
+    "systemd_unit_files",
+    "systemd_units",
     "all_jobs",
     "assertion_window",
     "caffeinate_args",

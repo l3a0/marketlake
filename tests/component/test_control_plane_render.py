@@ -2292,6 +2292,11 @@ def test_both_staleness_sentences_count_the_calendar_jobs_today(tmp_path, capsys
     assert "The other four jobs exec fresh every fire" in install_text, install_text
 
 
+# A daily schedule for the seventh job the roster tests grow. Every day of the seven, so
+# the job reaches both hosts' renders in the one shape each takes.
+EVERY_DAY_AT_THREE = cp.Schedule(cp.WallClockTime(3, 0), (0, 1, 2, 3, 4, 5, 6))
+
+
 def test_both_staleness_sentences_follow_a_seventh_job_onto_the_machine(tmp_path, monkeypatch):
     """A number that is right today is what the last job addition left behind.
 
@@ -2301,7 +2306,7 @@ def test_both_staleness_sentences_follow_a_seventh_job_onto_the_machine(tmp_path
     test above and fails this one.
     """
     grown = cp.all_jobs(_host()) + (
-        _host().job("com.marketlake.seventh", "lake.nothing", calendar={"Hour": 3, "Minute": 0}),
+        _host().job("com.marketlake.seventh", "lake.nothing", calendar=EVERY_DAY_AT_THREE),
     )
     monkeypatch.setattr(cp, "all_jobs", lambda host: grown)
     assert len([job for job in grown if not job.keep_alive]) == 5
