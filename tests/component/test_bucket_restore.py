@@ -330,6 +330,27 @@ def test_a_key_naming_a_path_outside_the_lake_is_never_written(tmp_path, key):
     _no_lake(tmp_path / "restored")
 
 
+def test_a_symlink_in_the_working_directory_is_never_written_through(tmp_path):
+    # Every key here is lexically safe. A symbolic link planted in a working directory
+    # left from an earlier run would still carry the chains partition out of it, so the
+    # path is checked after links are followed too.
+    lake, client = _uploaded(tmp_path)
+    dest = tmp_path / "restored"
+    work = dest / WORK
+    work.mkdir(parents=True)
+    (work / ".marketlake-restore").write_text("a marketlake restore in progress\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (work / "chains").symlink_to(outside)
+
+    summary = restore_lake(dest, TARGET, client=client)
+
+    assert summary.restored is False
+    assert sorted(rel for rel, _ in summary.failures) == [CHAINS, SEALED]
+    assert list(outside.iterdir()) == []
+    _no_lake(dest)
+
+
 def test_the_command_names_each_failing_file_and_exits_1(tmp_path, monkeypatch, capsys):
     lake, client = _uploaded(tmp_path)
     _rot(client, QUOTES, lake)
