@@ -102,8 +102,9 @@ def role_of(config: Config) -> tuple[str, str | None]:
     """The host's role, and the line to print when the key held neither role.
 
     An absent key is ``primary``. A present key is ``primary`` or ``shadow`` only when it
-    is exactly that string, so a null from an empty ``role:`` and a false from
-    ``role: off`` both fall to ``shadow`` with the line naming what was read.
+    is exactly that string. The loader stores a null from an empty ``role:`` as
+    ``"None"`` and a false from ``role: off`` as ``"False"``, so both fall to ``shadow``
+    with the line naming what was read.
     """
     value = config.role
     if value is ROLE_ABSENT:

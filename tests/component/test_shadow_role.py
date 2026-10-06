@@ -16,7 +16,9 @@ expects, so a recorder that drops a field fails it too.
 
 from __future__ import annotations
 
+import copy
 import json
+import pickle
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -27,7 +29,7 @@ from lake import control_plane as cp
 from lake import probe_calendar as probe_module
 from lake.alert import Message
 from lake.capture import CycleResult, SegmentOutcome
-from lake.config import Config, load_config
+from lake.config import ROLE_ABSENT, Config, load_config
 from lake.control_plane import (
     BACKUP_SCRUB_SKIPPED,
     CALENDAR_PROBE_SLUG,
@@ -119,8 +121,8 @@ def _config(root: Path, *, key: str = PING_KEY, role: object = "shadow") -> Conf
         pytest.param("primary", outbox.PRIMARY, None, id="primary"),
         pytest.param("shadow", outbox.SHADOW, None, id="shadow"),
         pytest.param("shadw", outbox.SHADOW, "'shadw'", id="misspelled"),
-        pytest.param("", outbox.SHADOW, "None", id="empty-is-null"),
-        pytest.param("off", outbox.SHADOW, "False", id="off-is-false"),
+        pytest.param("", outbox.SHADOW, "'None'", id="empty-is-null"),
+        pytest.param("off", outbox.SHADOW, "'False'", id="off-is-false"),
     ],
 )
 def test_the_role_key_reads_as_four_cases(tmp_path, capsys, written, role, named):
@@ -150,8 +152,38 @@ def test_the_loader_keeps_an_empty_role_apart_from_an_absent_one(tmp_path):
     root = tmp_path / "lake"
     absent = load_config(write_config(tmp_path, root))
     empty = load_config(write_config(tmp_path, root, role=""))
-    assert empty.role is None
-    assert absent.role is not None
+    assert empty.role == "None"
+    assert absent.role is ROLE_ABSENT
+
+
+@pytest.mark.parametrize(
+    "duplicate",
+    [
+        pytest.param(copy.copy, id="copy"),
+        pytest.param(copy.deepcopy, id="deepcopy"),
+        pytest.param(lambda config: pickle.loads(pickle.dumps(config)), id="pickle"),
+    ],
+)
+def test_a_copied_config_without_the_key_still_reads_as_primary(tmp_path, capsys, duplicate):
+    """``lake.outbox`` compares the absent marker by identity, so a copy must keep it."""
+    root = tmp_path / "lake"
+    root.mkdir()
+    config = duplicate(load_config(write_config(tmp_path, root)))
+
+    assert outbox.role_of(config) == (outbox.PRIMARY, None)
+    assert capsys.readouterr().err == ""
+
+
+def test_a_list_role_leaves_the_config_hashable_and_reads_as_shadow(tmp_path, capsys):
+    """The loader stores a non-string value's ``repr``, so the frozen config stays hashable."""
+    root = tmp_path / "lake"
+    root.mkdir()
+    config = load_config(write_config(tmp_path, root, role="[shadow]"))
+
+    hash(config)
+    sends = outbox.senders(config, process="probe", clock=ManualClock(SATURDAY))
+    assert sends.role == outbox.SHADOW
+    assert capsys.readouterr().err.startswith("probe: role \"['shadow']\" is neither")
 
 
 # -- 2. no ping key in the file ---------------------------------------------------------
