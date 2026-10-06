@@ -568,7 +568,7 @@ Four of those have no test today. `tests/integration/` holds five files, three o
 roster items, and the rest of the roster is served at the component level, which is fine
 for the ones that need no real process to die partway. Test 4 is the first test in any
 tier to kill a running process, and the child it kills is
-`tests/support/compaction_child.py`. The four split into two kinds.
+`tests/support/compaction_child.py`.
 
 All four are buildable now, and each covers a failure the unit and component suites cannot
 reach:
@@ -598,7 +598,7 @@ Test 14, restore from backup, is served for a path target and waits on
 restore test, from [#631](https://github.com/l3a0/marketlake/issues/631), reads files back
 out of the backup copy and verifies them, and
 `tests/component/test_control_plane_sunday.py` and `tests/component/test_restore_check.py`
-drive it with a reader that serves wrong bytes or fails. The bucket form needs the bucket
+drive it with a reader that returns wrong bytes or fails. The bucket form needs the bucket
 download, which is not built yet.
 
 ## The 8 live checks
