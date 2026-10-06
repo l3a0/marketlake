@@ -2504,8 +2504,9 @@ def tmutil_exclusion_targets(config_dir: str, token_path: str) -> tuple[str, ...
 
     1. ``config.yaml`` sits beside the token and holds four secrets of its own: the
        healthchecks ping key, the ntfy topic, and the two Schwab app credentials. A
-       bucket backup target adds two more, the bucket's access key id and secret key.
-       Excluding only the token left those on a backup disk without FileVault.
+       bucket backup target on the key path adds two more, the bucket's access key id
+       and secret key. Excluding only the token left those on a backup disk without
+       FileVault.
     2. A sticky exclusion is an attribute on the item, so it dies when the item is
        deleted and re-created. ``config.yaml`` is hand-edited and most editors save by
        writing a temporary file and renaming over the original, which replaces the
@@ -3584,7 +3585,7 @@ def main(
             transport=sends.transport,
             secrets=config.page_secrets(),
         )
-        # The bucket client, built from the config's own key values, when the target is
+        # The bucket client, built from the config's bucket settings, when the target is
         # a bucket. A path target needs none. Settings that cannot build one become the
         # backup's finding rather than an exit, because the canary, the coverage
         # assertion and the re-auth reminder below still have to run.

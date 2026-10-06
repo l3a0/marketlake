@@ -335,7 +335,8 @@ def test_a_refused_credential_is_named_refused_and_never_raises(tmp_path, code):
     result = bucket_scrub(lake, TARGET, client)
     assert result.bucket_refused == code
     assert result.bucket_unreachable is None
-    assert "refused" in result.problem and "access key" in result.problem
+    assert "refused" in result.problem
+    assert "the bucket's credentials or their policy" in result.problem
 
 
 def test_a_failed_connection_is_named_unreachable_and_never_raises(tmp_path):
@@ -377,13 +378,13 @@ def test_every_credential_code_is_named_refused(tmp_path, code, status):
     ],
 )
 def test_a_busy_or_failing_service_is_named_unavailable_not_refused(tmp_path, code, status):
-    # A 503 SlowDown is S3 asking for fewer requests, which no new key repairs.
+    # A 503 SlowDown is S3 asking for fewer requests, which no new credentials repair.
     lake, client = _uploaded(tmp_path / "lake")
     client.fail_with = client_error(code, "HeadObject", status)
     result = bucket_scrub(lake, TARGET, client)
     assert result.bucket_unreachable == code
     assert result.bucket_refused is None
-    assert "access key" not in result.problem
+    assert "the bucket's credentials" not in result.problem
     assert "unavailable" in result.problem
 
 
@@ -393,7 +394,7 @@ def test_any_other_answer_is_named_failed_with_its_code(tmp_path):
     result = bucket_scrub(lake, TARGET, client)
     assert result.bucket_failed == "NoSuchBucket"
     assert result.bucket_refused is None and result.bucket_unreachable is None
-    assert "access key" not in result.problem
+    assert "the bucket's credentials" not in result.problem
     assert "NoSuchBucket" in result.problem
 
 

@@ -40,12 +40,17 @@ def test_a_bucket_that_behaves_as_documented_passes_all_four(tmp_path):
     for behavior in ("1", "2", "3", "4"):
         assert any(line.startswith(f"live-check: PASS {behavior} ") for line in lines)
     assert lines[-1].startswith("live-check: delete live-check/live-check-20261005T230000Z/")
+    # The check runs on the VM too, where the credentials come from an instance profile,
+    # so the line names the credentials rather than a key.
+    assert lines[-1].endswith("The bucket's credentials cannot delete")
 
 
-def test_a_key_that_cannot_read_old_versions_is_sent_to_the_console():
+def test_credentials_that_cannot_read_old_versions_are_sent_to_the_console():
     passed, lines = _run(FakeS3(deny_versioned_get=True))
     assert passed
-    assert any("confirm by hand in the console" in line for line in lines)
+    sent = [line for line in lines if "confirm by hand in the console" in line]
+    assert len(sent) == 1
+    assert "The bucket's credentials hold no s3:GetObjectVersion" in sent[0]
 
 
 class _AcceptsAnything(FakeS3):

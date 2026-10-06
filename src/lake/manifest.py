@@ -1125,14 +1125,16 @@ class BackupScrubResult:
 
     - ``bucket_refused``: S3 turned the credentials away, named by the error code. A
       revoked key or a policy that lost an action is the usual cause, and the repair is
-      a new key.
+      new credentials or a fixed policy.
     - ``bucket_unreachable``: no usable answer came back, named by the error's type or
       code. A failed connection, a 5xx, and S3 asking for fewer requests all land here,
       and the repair is usually nothing.
     - ``bucket_failed``: S3 answered with some other error, named by its code, such as
       ``NoSuchBucket``.
     - ``bucket_unusable``: the config's bucket settings could not build a client, so no
-      request was sent. The repair is an edit to ``config.yaml``.
+      request was sent. The detail says where the repair lives: a key in
+      ``config.yaml``, or, when an instance-profile build found no credentials, the
+      instance profile or the ``config.yaml`` setting.
 
     Two tuples are reported and never withhold the ping, because neither can be lake
     data going missing.
@@ -1207,11 +1209,11 @@ class BackupScrubResult:
         if self.unreadable is not None:
             return f"backup could not be read: {self.unreadable}"
         if self.bucket_unusable is not None:
-            return f"backup bucket settings in config.yaml cannot be used: {self.bucket_unusable}"
+            return f"backup bucket settings cannot be used: {self.bucket_unusable}"
         if self.bucket_refused is not None:
             return (
-                f"backup bucket refused the scrub ({self.bucket_refused}), so its access key "
-                f"or policy may need replacing: {self.target}"
+                f"backup bucket refused the scrub ({self.bucket_refused}), so the bucket's "
+                f"credentials or their policy may need replacing: {self.target}"
             )
         if self.bucket_unreachable is not None:
             return (

@@ -67,8 +67,10 @@ Backup section carries the reasoning, and
 [#639](https://github.com/l3a0/marketlake/issues/639) carries the plan. Switching back is one
 setting: put the path back in `backup_target`.
 
-Four steps set the bucket up. The owner does each by hand in the AWS console or CLI, and
-nothing here names a real account, bucket, or key.
+Four steps set the bucket up on the key path, which is how the laptop signs its
+requests. On that path the owner does each by hand in the AWS console or CLI, and nothing
+here names a real account, bucket, or key. A hosted VM takes its credentials from an
+instance profile instead, and the procedure after the steps says what changes for it.
 
 1. Create the bucket with versioning on and Object Lock off.
 2. Add a lifecycle rule that expires noncurrent versions after 30 days under
@@ -115,8 +117,8 @@ The key's policy for step 3:
 }
 ```
 
-Step 4's keys in `config.yaml`. The three `bucket_` keys may sit beside a path
-`backup_target`, which is how the first upload runs before the switch.
+Step 4's keys in `config.yaml`. On the key path the three `bucket_` keys may sit beside a
+path `backup_target`, which is how the first upload runs before the switch.
 
 ```yaml
 bucket_access_key_id: <access key id>
@@ -126,19 +128,53 @@ bucket_region: <region, like us-east-2>
 backup_target: s3://example-lake-backup/lake
 ```
 
-The client is built from those three values alone, never from `~/.aws/` or an `AWS_*`
-environment variable. Loading `config.yaml` never checks them or the bucket's name, so
-a mistyped value fails the backup, the first upload or the Sunday scrub that uses it,
-each with one line naming the key, and never stops capture.
+On the key path the client is built from those three values alone, never from
+`~/.aws/` or an `AWS_*` environment variable. Loading `config.yaml` never checks them,
+`bucket_credentials` or the bucket's name, so a mistyped value fails the backup, the
+first upload or the Sunday scrub that uses it, each with one line naming the key, and
+never stops capture.
 
-Three commands go with it. The first two refuse with exit 2 on a shadow host, which is
+A hosted VM in the bucket's AWS account signs with short-lived credentials from an
+instance profile, an IAM role attached to the instance, so no long-lived key sits on it
+([#663](https://github.com/l3a0/marketlake/issues/663)). Steps 1 and 2 are the same
+bucket. Steps 3 and 4 change as follows.
+
+1. Step 3 becomes code. [#664](https://github.com/l3a0/marketlake/issues/664) describes
+   the instance profile and its IAM role in `infra/`, with the same four actions as the
+   laptop's key, and [#686](https://github.com/l3a0/marketlake/issues/686) has the VM
+   require metadata tokens.
+2. Step 4's key lines become one setting. The VM's `config.yaml`, copied there by hand
+   per [#686](https://github.com/l3a0/marketlake/issues/686), names the source beside
+   the region and holds neither key field.
+
+   ```yaml
+   bucket_credentials: instance_profile
+   bucket_region: <region, like us-east-1>
+   ```
+
+3. The rest of step 4, the first upload, the restore and the `backup_target` change,
+   follows the cutover order on [#638](https://github.com/l3a0/marketlake/issues/638).
+   Run `first-upload` only on the host whose lake the bucket should hold, because it
+   replaces the bucket's `manifest.jsonl`. Run `live-check` in the same order, after the
+   IAM role's policy is turned on.
+
+The client asks the instance metadata service for credentials only when `config.yaml`
+says `bucket_credentials: instance_profile`. It then takes them from that service alone,
+never from `~/.aws/`, an `AWS_*` variable or a boto config file, and it sends the lookup
+through no proxy. An absent
+`bucket_credentials` means `keys`, the laptop's path. A host where the setting finds no
+credentials, such as a VM with no instance profile or a laptop that carries the setting
+by mistake, refuses with one line naming both fixes: attach the instance profile, or set
+`bucket_credentials: keys` in `config.yaml`.
+
+Three commands go with the bucket. The first two refuse with exit 2 on a shadow host, which is
 any host whose config sets `role` to something other than `primary`.
 
 1. `uv run python -m lake.bucket live-check --target s3://example-lake-backup/live-check`
    confirms the four S3 behaviors the design rests on, and is live check 8 in the build
    plan. It writes three probe objects and names the prefix to delete by hand, since the
-   narrow key cannot delete. The narrow key also cannot read an old version, so behavior
-   3's read-back of the first version fails with it, and the check says to confirm in
+   bucket's credentials cannot delete. They also cannot read an old version, so behavior
+   3's read-back of the first version fails with them, and the check says to confirm in
    the console that the probe key shows two versions.
 2. `uv run python -m lake.bucket first-upload --target s3://example-lake-backup/lake`
    uploads the whole lake, comparing every object, and prints its throughput. Run it on

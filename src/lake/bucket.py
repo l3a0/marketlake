@@ -4,7 +4,7 @@
 target runs. The path form, ``rsync`` to a mounted directory, is unchanged and stays the
 default, so switching back is one setting. The design's Backup section carries the
 reasoning for a bucket at all, and marketlake #630 carries the provider choice: S3
-Standard-IA, versioning on, no Object Lock, and a narrow key.
+Standard-IA, versioning on, no Object Lock, and credentials with a narrow policy.
 
 Three jobs live here.
 
@@ -40,10 +40,14 @@ there to apply them. Nothing is ever written under the lake root, which is what 
 switching back to a path free.
 
 **The client is built from ``config.yaml`` alone.** ``client_from_config`` reads the
-access key, secret key and region from the config and clears every ``AWS_*`` variable,
+region and ``bucket_credentials`` from the config and clears every ``AWS_*`` variable,
 ``~/.aws/config``, ``~/.aws/credentials`` and ``~/.aws/models`` out of the client's
-reach while it builds. A development run therefore cannot reach a real bucket on
-credentials it happened to find on the machine. ``boto3`` is imported there, lazily, so
+reach while it builds. Under ``keys``, the default, the access key and secret key come
+from the config too. Under ``instance_profile`` they come from the EC2 instance
+metadata service and from nowhere else, so a VM with an instance profile attached
+carries no long-lived key. A development run therefore cannot reach a real bucket on
+credentials it happened to find on the machine, because the metadata service is asked
+only when ``config.yaml`` says so. ``boto3`` is imported there, lazily, so
 the offline suite never loads it unless a test builds a client. Every job reaches the
 client through ``connect``, which first runs the config's strict bucket checks. Loading
 the config runs none of them, because capture loads it every minute and a bad backup
@@ -71,10 +75,13 @@ from lake import outbox
 from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
 from lake.config import (
-    BUCKET_KEYS,
+    BUCKET_CREDENTIALS_KEY,
+    CREDENTIALS_FROM_INSTANCE_PROFILE,
+    CREDENTIALS_FROM_KEYS,
     BucketTarget,
     Config,
     ConfigError,
+    bucket_credential_problems,
     input_errors_exit,
     load_config,
     parse_backup_target,
@@ -118,7 +125,8 @@ FULL_OBJECT = "FULL_OBJECT"
 FIRST_UPLOAD_COMMAND = "python -m lake.bucket first-upload"
 
 # The refusal on a shadow host. Its lake is compared and then discarded, so it uploads
-# nothing, and a shadow seeded from the primary would write under the primary's keys.
+# nothing, and a shadow seeded from the primary would write under the primary's
+# credentials.
 BUCKET_SHADOW = (
     "this host's role is shadow, so it uploads nothing to a bucket and checks none. "
     "Run this on the primary."
@@ -127,13 +135,15 @@ BUCKET_SHADOW = (
 # The error code S3 answers a PUT whose bytes do not match its ``ChecksumSHA256``.
 BAD_DIGEST = "BadDigest"
 
-# What a ``HeadObject`` on a missing key answers. The narrow key holds ``s3:ListBucket``,
-# so S3 answers 404 rather than 403, and a HEAD error carries no body to name a code in.
+# What a ``HeadObject`` on a missing key answers. The bucket's credentials hold
+# ``s3:ListBucket``, so S3 answers 404 rather than 403, and a HEAD error carries no body
+# to name a code in.
 _ABSENT_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
 
 # The error codes that mean the credentials or their policy were turned away. These and
-# an HTTP 401 or 403 are the only answers named *refused*, whose repair is a new key or a
-# fixed policy. A bare "403" is what a ``HeadObject`` answers, since it has no body.
+# an HTTP 401 or 403 are the only answers named *refused*, whose repair is new
+# credentials or a fixed policy. A bare "403" is what a ``HeadObject`` answers, since it
+# has no body.
 _CREDENTIAL_CODES = frozenset(
     {
         "401",
@@ -307,9 +317,11 @@ class BucketUnreachable(BucketRefusal):
 class BucketSettingsInvalid(BucketRefusal, ConfigError):
     """The config's bucket settings cannot build a client, as one operator line.
 
-    It is a ``ConfigError`` because the repair is an edit to ``config.yaml``, and a
-    ``BucketRefusal`` because it is raised when a bucket job runs rather than when the
-    config loads, so the job that catches a bucket refusal catches this one too.
+    It is a ``ConfigError`` because the repair is a setting: an edit to ``config.yaml``,
+    or on the instance-profile path the instance profile itself, and the line names
+    which. It is a ``BucketRefusal`` because it is raised when a bucket job runs rather
+    than when the config loads, so the job that catches a bucket refusal catches this one
+    too.
     """
 
 
@@ -406,7 +418,7 @@ def _failure(exc: BaseException) -> tuple[str, str] | None:
     The three names send the operator to three repairs.
 
     1. *Refused* means S3 turned the credentials away: a revoked key, a bad signature, or
-       a policy that lost an action. The repair is a new key or a fixed policy.
+       a policy that lost an action. The repair is new credentials or a fixed policy.
     2. *Unreachable* means no usable answer came back: a failed connection, a timeout, a
        5xx, or S3 asking for fewer requests with ``SlowDown`` or a 429. The repair is
        usually nothing, because the network or the service comes back.
@@ -439,11 +451,16 @@ def _aws_environment_cleared() -> Iterator[None]:
 
     ``botocore`` reads its settings from the environment and from ``~/.aws/config`` as
     well as from what it is handed. An ``AWS_ENDPOINT_URL`` would send requests signed
-    with the bucket's key to another host, an ``AWS_PROFILE`` naming no profile would
-    refuse to build the client, and an ``AWS_REGION`` would sign for the wrong region. So
-    for the length of the build the variables are removed, the two files are pointed at
-    the null device, and the instance-metadata lookup is turned off. Everything is put
-    back afterwards, so the process's environment is the same on the way out.
+    with the bucket's credentials to another host, an ``AWS_PROFILE`` naming no profile
+    would refuse to build the client, and an ``AWS_REGION`` would sign for the wrong
+    region. So for the length of the build the variables are removed, the two files are
+    pointed at the null device, and botocore's own instance-metadata lookup is turned
+    off. Everything is put back afterwards, so the process's environment is the same on
+    the way out.
+
+    This holds on both credential paths. The instance-profile path reaches the metadata
+    service only through :func:`_metadata_resolver`, whose fetcher ignores the
+    environment, so turning the lookup off here does not turn that one off.
     """
     with _ENVIRONMENT_LOCK:
         saved = {key: value for key, value in os.environ.items() if key.startswith("AWS_")}
@@ -460,32 +477,108 @@ def _aws_environment_cleared() -> Iterator[None]:
             os.environ.update(saved)
 
 
-def client_from_config(config: Config) -> Any:
-    """An S3 client built from the config's three bucket values and nothing else.
+@contextmanager
+def _proxies_cleared() -> Iterator[None]:
+    """Hide every variable whose lowercased name ends in ``_proxy``, and put them back.
 
-    The access key and secret key are passed explicitly, the region decides the endpoint,
-    and :func:`_aws_environment_cleared` keeps the environment and ``~/.aws`` out of the
-    build. The service models load from the installed ``botocore`` only, never from
+    The metadata fetcher reads the proxy variables once, when it is built, and keeps
+    them, so a proxy set then would carry the metadata lookup and the credentials it
+    returns through that proxy. The match is on the lowercased name because urllib
+    lowercases names, so ``HTTP_PROXY`` takes effect as surely as ``http_proxy``. The
+    ``finally`` matters as much as the removal: a fetcher that fails to build must not
+    take the process's proxies with it, Sunday's Schwab canary included.
+    """
+    saved = {key: value for key, value in os.environ.items() if key.lower().endswith("_proxy")}
+    for key in saved:
+        del os.environ[key]
+    try:
+        yield
+    finally:
+        os.environ.update(saved)
+
+
+# The instance metadata service's address. Tests point it at a server on loopback, since
+# ``_aws_environment_cleared`` removes ``AWS_EC2_METADATA_SERVICE_ENDPOINT`` with every
+# other ``AWS_*`` variable.
+METADATA_BASE_URL = "http://169.254.169.254/"
+
+# How long one metadata request may wait, in seconds, and how many tries each gets. A
+# hung service then fails the build in about 2 seconds, measured on marketlake #663.
+METADATA_TIMEOUT_S = 1
+METADATA_ATTEMPTS = 2
+
+
+def _metadata_resolver() -> Any:
+    """A credential resolver that asks the instance metadata service and nothing else.
+
+    botocore's default chain reads ``BOTO_CONFIG``, ``/etc/boto.cfg`` and ``~/.boto``
+    ahead of the metadata service, so this resolver holds one provider. The fetcher
+    takes ``env={}``, because built inside :func:`_aws_environment_cleared` with its
+    default it would read ``AWS_EC2_METADATA_DISABLED`` and return nothing. It uses
+    IMDSv2 only, the form that needs a session token. Only its construction runs
+    inside :func:`_proxies_cleared`, because the S3 client reads the proxy variables
+    too, and those stay as they are on both credential paths.
+    """
+    from botocore.credentials import CredentialResolver, InstanceMetadataProvider
+    from botocore.utils import InstanceMetadataFetcher
+
+    with _proxies_cleared():
+        fetcher = InstanceMetadataFetcher(
+            timeout=METADATA_TIMEOUT_S,
+            num_attempts=METADATA_ATTEMPTS,
+            base_url=METADATA_BASE_URL,
+            env={},
+            config={"ec2_metadata_v1_disabled": True},
+        )
+    return CredentialResolver(providers=[InstanceMetadataProvider(iam_role_fetcher=fetcher)])
+
+
+class _NoMetadataCredentials(Exception):
+    """The metadata service answered and returned no credentials.
+
+    That is what a reachable service with no instance profile attached does.
+    """
+
+
+def _lookup_failed(detail: str) -> ConfigError:
+    """The refusal for an instance-profile build that found no credentials.
+
+    It names both fixes, because the fix depends on the host. On the VM it is the
+    instance profile, and on a laptop that carries the setting by mistake it is
+    ``config.yaml``.
+    """
+    return ConfigError(
+        f"{BUCKET_CREDENTIALS_KEY} is {CREDENTIALS_FROM_INSTANCE_PROFILE} and no credentials "
+        f"came from the instance metadata service ({detail}). Attach the instance profile, "
+        f"or set {BUCKET_CREDENTIALS_KEY}: {CREDENTIALS_FROM_KEYS} in config.yaml"
+    )
+
+
+def client_from_config(config: Config) -> Any:
+    """An S3 client built from the config's bucket settings and nothing else.
+
+    ``bucket_credentials`` picks the credentials. On the key path the access key and
+    secret key are passed explicitly. On the instance-profile path they come from the
+    instance metadata service through :func:`_metadata_resolver`, and are fetched before
+    the client is built, so a host with no instance profile refuses here as one line
+    rather than at the first request. Either way the region decides the endpoint,
+    :func:`_aws_environment_cleared` keeps the environment and ``~/.aws`` out of the
+    build, and the service models load from the installed ``botocore`` only, never from
     ``~/.aws/models``. The timeouts bound a stalled socket. They do not bound a slow PUT,
     which the nightly deadline handles between PUTs.
     """
-    absent = [
-        key
-        for key, value in zip(
-            BUCKET_KEYS,
-            (config.bucket_access_key_id, config.bucket_secret_access_key, config.bucket_region),
-            strict=True,
-        )
-        if value is None
-    ]
-    if absent:
-        raise ConfigError(f"the bucket needs config key(s): {absent}")
-    assert config.bucket_access_key_id is not None
-    assert config.bucket_secret_access_key is not None
-    from botocore.exceptions import BotoCoreError  # lazy: only a bucket job needs it
+    problems = bucket_credential_problems(config)
+    if problems:
+        raise ConfigError(". ".join(problems))
+    from botocore.exceptions import BotoCoreError, MetadataRetrievalError  # lazy
 
     try:
         return _build_client(config)
+    except MetadataRetrievalError as exc:
+        # An unreachable or token-refusing metadata service. Only the type is named.
+        raise _lookup_failed(type(exc).__name__) from None
+    except _NoMetadataCredentials:
+        raise _lookup_failed("none returned") from None
     except (BotoCoreError, ValueError) as exc:
         # ``botocore`` refuses a malformed region with an error that is both of these.
         # Only the type is named, because a message may quote a value from the config.
@@ -495,8 +588,6 @@ def client_from_config(config: Config) -> Any:
 
 
 def _build_client(config: Config) -> Any:
-    assert config.bucket_access_key_id is not None
-    assert config.bucket_secret_access_key is not None
     with _aws_environment_cleared():
         import boto3  # lazy: only a bucket job builds a client
         import botocore.loaders
@@ -511,12 +602,25 @@ def _build_client(config: Config) -> Any:
                 include_default_search_paths=False,
             ),
         )
+        if config.bucket_credentials == CREDENTIALS_FROM_INSTANCE_PROFILE:
+            core.register_component("credential_provider", _metadata_resolver())
+            # Fetched before the client is built. The session keeps a credential it
+            # found, so ``session.client`` signs with it without a second lookup.
+            if core.get_credentials() is None:
+                raise _NoMetadataCredentials
+            keys: dict[str, str] = {}
+        else:
+            assert config.bucket_access_key_id is not None
+            assert config.bucket_secret_access_key is not None
+            keys = {
+                "aws_access_key_id": config.bucket_access_key_id.reveal(),
+                "aws_secret_access_key": config.bucket_secret_access_key.reveal(),
+            }
         session = boto3.session.Session(botocore_session=core)
         return session.client(
             "s3",
             region_name=config.bucket_region,
-            aws_access_key_id=config.bucket_access_key_id.reveal(),
-            aws_secret_access_key=config.bucket_secret_access_key.reveal(),
+            **keys,
             config=BotoConfig(
                 connect_timeout=10,
                 read_timeout=60,
@@ -534,7 +638,9 @@ def connect(config: Config, target: BucketTarget | None = None) -> tuple[BucketT
 
     ``target`` defaults to ``backup_target``. The config's strict bucket checks run
     first, then the client is built. Either failing is one operator line naming what
-    to fix in ``config.yaml``.
+    to fix: a key in ``config.yaml``, or, when an instance-profile build finds no
+    credentials, both the instance profile and the ``config.yaml`` setting, because
+    which one is wrong depends on the host.
     """
     try:
         checked = require_bucket_settings(config, target)
@@ -1253,8 +1359,8 @@ def live_check(
 
     No fake can prove any of the four, so the owner runs this by hand and the suite never
     does. It writes three objects under ``<target>/live-check-<stamp>/`` and deletes
-    nothing, because the narrow key cannot delete. Each line it prints is one behavior
-    passing or failing.
+    nothing, because the bucket's credentials cannot delete. Each line it prints is one
+    behavior passing or failing.
 
     1. S3 refuses a PUT whose ``ChecksumSHA256`` does not match the bytes.
     2. ``HeadObject`` with checksum mode returns the stored SHA-256 of a single PUT, as a
@@ -1331,15 +1437,15 @@ def live_check(
     except Exception as exc:
         out(
             f"live-check: the old version could not be read back ({_error_code(exc)}). The "
-            "narrow key holds no s3:GetObjectVersion, so confirm by hand in the console that "
-            f"{key} shows two versions"
+            "bucket's credentials hold no s3:GetObjectVersion, so confirm by hand in the "
+            f"console that {key} shows two versions"
         )
     else:
         report(kept == probe, "3 the first version still holds the first PUT's bytes")
 
     out(
         f"live-check: delete {target.key(base)}/ and every version under it in the console. "
-        "The narrow key cannot delete"
+        "The bucket's credentials cannot delete"
     )
     return ok
 
@@ -1397,8 +1503,8 @@ def _one_line(exc: BaseException, target: BucketTarget) -> BucketUnreachable | N
     kind, detail = failure
     if kind == "refused":
         return BucketUnreachable(
-            f"the bucket refused the request ({detail}), so the access key or its policy "
-            f"may need replacing: {target}"
+            f"the bucket refused the request ({detail}), so the bucket's credentials or "
+            f"their policy may need replacing: {target}"
         )
     if kind == "unreachable":
         return BucketUnreachable(
@@ -1420,7 +1526,7 @@ def main(
     ``calendar`` stay injectable, since neither reaches past this process.
 
     Under a ``shadow`` role both commands refuse with exit 2 before a client is built. A
-    shadow seeded from the primary would upload under the primary's keys, and
+    shadow seeded from the primary would upload under the primary's credentials, and
     ``first-upload`` replaces the bucket's ``manifest.jsonl`` outright.
     """
     args = build_parser().parse_args(argv)
