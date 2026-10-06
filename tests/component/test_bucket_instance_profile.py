@@ -72,8 +72,9 @@ class _Server:
     answers the token request with a 403, which is what a service that requires tokens
     and turns this caller away does. ``role_500_once`` answers the first role listing
     with a 500 and every later one as ``ok`` does, and ``role_500`` answers every role
-    listing with a 500. ``null_body``, ``bad_expiration`` and ``no_key_id`` answer the
-    credentials request with what only a broken or impersonated service would send.
+    listing with a 500. ``null_body``, ``bad_expiration``, ``no_key_id`` and
+    ``empty_secret`` answer the credentials request with what only a broken or
+    impersonated service would send.
     """
 
     def __init__(self, creds: dict[str, str]) -> None:
@@ -123,6 +124,8 @@ class _Server:
                         body["Expiration"] = "not a time"
                     elif server.mode == "no_key_id":
                         body["AccessKeyId"] = None
+                    elif server.mode == "empty_secret":
+                        body["SecretAccessKey"] = ""
                     self._answer(200, "null" if server.mode == "null_body" else json.dumps(body))
                 else:
                     self._answer(404, "")
@@ -369,6 +372,7 @@ LOOKUP_FAILURES = [
     pytest.param("null_body", "TypeError", id="null-body"),
     pytest.param("bad_expiration", "ParserError", id="bad-expiration"),
     pytest.param("no_key_id", "incomplete credentials", id="no-key-id"),
+    pytest.param("empty_secret", "incomplete credentials", id="empty-secret"),
 ]
 
 

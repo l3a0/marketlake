@@ -18,7 +18,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -148,6 +148,12 @@ def _base() -> dict:
     }
 
 
+def test_a_yaml_date_is_named_by_its_repr():
+    # YAML reads an unquoted ``2026-01-01`` as a date, which the loader stores as its repr.
+    _, line = token_store.mode_of(Config.from_mapping({**_base(), "token_store": date(2026, 1, 1)}))
+    assert line is not None and "datetime.date(2026, 1, 1)" in line
+
+
 def test_the_mode_stays_in_the_config_repr():
     # It names a mode rather than a credential, so unlike ``bucket_credentials`` it is
     # shown, and the key values beside it are not.
@@ -195,6 +201,12 @@ def test_a_malformed_region_is_named(region):
 
 def test_complete_keys_have_no_problem():
     assert token_store.credential_problems(_config()) == []
+
+
+def test_a_padded_region_is_read_trimmed_and_accepted():
+    config = _config(token_store_region="  us-east-2  ")
+    assert config.token_store_region == "us-east-2"
+    assert token_store.credential_problems(config) == []
 
 
 # -- 2. the put ----------------------------------------------------------------------
@@ -460,6 +472,39 @@ def test_building_a_client_leaves_the_callers_settings_unchanged():
         assert [dict(setting) for setting in settings] == expected
 
 
+def test_the_ssm_client_carries_the_stated_timeouts_and_retries():
+    built = _put_client().meta.config
+    assert built.connect_timeout == 10
+    assert built.read_timeout == 30
+    # botocore counts the first attempt too, so three retries read back as four attempts.
+    assert built.retries == {"mode": "standard", "total_max_attempts": 4}
+
+
+def test_the_s3_client_carries_the_stated_timeouts_retries_and_checksum_settings():
+    from lake import bucket
+
+    config = _config(
+        backup_target="s3://lake-backup/lake",
+        bucket_access_key_id=BUCKET_KEY_ID,
+        bucket_secret_access_key=BUCKET_SECRET,
+        bucket_region=REGION,
+    )
+    built = bucket.client_from_config(config).meta.config
+    assert built.connect_timeout == 10
+    assert built.read_timeout == 60
+    assert built.retries == {"mode": "standard", "total_max_attempts": 4}
+    assert built.request_checksum_calculation == "when_required"
+    assert built.response_checksum_validation == "when_required"
+
+
+def test_the_keys_source_names_a_missing_key():
+    # The bucket checks run first everywhere today, so only a direct call reaches this.
+    config = _config(bucket_access_key_id=BUCKET_KEY_ID)
+    with pytest.raises(ConfigError) as refused:
+        aws_session.source_from_bucket_credentials(config)
+    assert str(refused.value) == "the bucket needs config key(s): ['bucket_secret_access_key']"
+
+
 def test_no_service_model_loads_from_the_home_directory():
     assert not any(".aws" in path for path in _put_client()._loader.search_paths)
 
@@ -559,6 +604,7 @@ def test_an_absent_file_is_written_owner_only(tmp_path):
     assert json.loads(token.read_text()) == _token()
     assert token.stat().st_mode & 0o777 == 0o600
     assert f"minted {MINTED_TEXT}" in result.line
+    assert result.line.endswith("The local file was absent")
     _assert_no_token_in(result)
     # Atomic: no temp file is left beside it.
     assert sorted(path.name for path in tmp_path.iterdir()) == ["token.json"]
@@ -648,6 +694,18 @@ def test_an_older_parameter_writes_nothing(tmp_path):
         pytest.param(_token(minted=str(MINTED + 60)), id="string-mint-time"),
         pytest.param(f"not json {REFRESH}", id="not-json"),
         pytest.param("", id="empty"),
+        # Present but unusable: a later mint, so only the shape check stops the write.
+        pytest.param(_token(minted=MINTED + 60, access=""), id="empty-access"),
+        pytest.param(_token(minted=MINTED + 60, refresh=""), id="empty-refresh"),
+        pytest.param(
+            {
+                "creation_timestamp": MINTED + 60,
+                "token": {"access_token": ACCESS, "refresh_token": 7},
+            },
+            id="int-refresh",
+        ),
+        pytest.param({"creation_timestamp": MINTED + 60, "token": "x"}, id="token-is-a-string"),
+        pytest.param("5", id="payload-is-a-number"),
     ],
 )
 def test_a_malformed_parameter_writes_nothing_over_a_good_file(tmp_path, value):
@@ -666,10 +724,21 @@ def test_a_parameter_without_a_value_writes_nothing_over_an_absent_file(tmp_path
     token = tmp_path / "token.json"
     result = _pull(Store(None), token)
     assert result.outcome == "unreadable"
+    assert "(the parameter is empty)" in result.line
     assert not token.exists()
 
 
-@pytest.mark.parametrize("code", ["ParameterNotFound", "AccessDeniedException"])
+def test_an_empty_parameter_is_named_empty(tmp_path):
+    result = _pull(Store(""), tmp_path / "token.json")
+    assert result.outcome == "unreadable"
+    assert "(the parameter is empty)" in result.line
+
+
+# ``UnrecognizedClientException`` is not in SSM's model, so botocore raises the generic
+# ``ClientError`` for it. Its code must still be the one named, not the class.
+@pytest.mark.parametrize(
+    "code", ["ParameterNotFound", "AccessDeniedException", "UnrecognizedClientException"]
+)
 def test_an_aws_error_is_unreadable_by_its_code_alone(tmp_path, code):
     store = Store(status=400, body=_error(code, f"echo {REFRESH}"))
     result = _pull(store, tmp_path / "token.json")
@@ -734,8 +803,10 @@ def test_the_pull_client_refuses_a_config_problem_by_name(overrides, named):
 
 # -- the future-mint guard -------------------------------------------------------------
 
-# The VM's clock in these tests, pinned so the offsets below are literal.
-NOW = datetime(2026, 10, 6, 22, 0, tzinfo=UTC)
+# The VM's clock in these tests, pinned so the offsets below are literal. It sits years
+# from any date the suite runs on, so a pull that read the real clock fails here whatever
+# the day: a token minted a day before 2030 is in the real clock's far future.
+NOW = datetime(2030, 1, 1, 12, 0, tzinfo=UTC)
 
 
 def _minted_at(offset: timedelta) -> int:
@@ -765,6 +836,27 @@ def test_a_mint_time_two_hours_ahead_writes_nothing_over_a_good_older_file(tmp_p
     assert result.outcome == "unreadable"
     assert json.loads(token.read_text()) == good
     assert token.stat().st_ino == before.st_ino
+
+
+@pytest.mark.parametrize(
+    ("offset", "outcome"),
+    [
+        (timedelta(minutes=59), "wrote"),
+        (timedelta(hours=1), "wrote"),
+        (timedelta(hours=1, seconds=1), "unreadable"),
+        (timedelta(minutes=61), "unreadable"),
+    ],
+)
+def test_the_allowance_is_one_hour_and_inclusive(tmp_path, offset, outcome):
+    result = _pull_at_now(Store(_token(minted=_minted_at(offset))), tmp_path / "token.json")
+    assert result.outcome == outcome
+
+
+def test_a_day_old_parameter_is_written_by_the_injected_clock(tmp_path):
+    token = tmp_path / "token.json"
+    result = _pull_at_now(Store(_token(minted=_minted_at(-timedelta(days=1)))), token)
+    assert result.outcome == "wrote"
+    assert result.line.endswith("The local file was absent")
 
 
 def test_a_mint_time_thirty_minutes_ahead_is_accepted(tmp_path):

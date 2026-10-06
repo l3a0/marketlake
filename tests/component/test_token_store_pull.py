@@ -206,6 +206,24 @@ def test_an_unrecognised_credential_source_exits_two(tmp_path, lake_root, capsys
     assert "bucket_credentials must be keys or instance_profile" in _one_line(capsys)
 
 
+def test_a_write_that_fails_exits_one_with_one_line(
+    tmp_path, lake_root, monkeypatch, capsys, metadata
+):
+    from lake import reauth
+
+    StoreHook(json.dumps(TOKEN)).install(monkeypatch)
+
+    def refuse(path, payload):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(reauth, "write_token", refuse)
+    token = tmp_path / "token.json"
+
+    assert _pull(_vm_config(tmp_path, lake_root), token) == 1
+    assert _one_line(capsys) == f"token_store: {token} could not be written (PermissionError)"
+    assert not token.exists()
+
+
 def test_the_pull_does_not_read_token_store(tmp_path, lake_root, monkeypatch, capsys, metadata):
     # Running it is the decision. The gate belongs to the scheduled calls #702 adds.
     StoreHook(json.dumps(TOKEN)).install(monkeypatch)

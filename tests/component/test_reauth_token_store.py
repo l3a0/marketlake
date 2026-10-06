@@ -298,16 +298,20 @@ def test_the_put_sends_the_written_text_not_a_read_back(tmp_path, lake_root, mon
 def test_with_both_key_sets_the_put_signs_with_the_token_store_key(
     tmp_path, lake_root, monkeypatch
 ):
+    # The two regions differ, so a put that read ``bucket_region`` signs for the wrong one.
     hook = StoreHook().install(monkeypatch)
-    config = _config(tmp_path, lake_root, token_store="both", **PUT_KEYS, **BUCKET_KEYS)
+    bucket = {**BUCKET_KEYS, "bucket_region": "us-west-1"}
+    config = _config(tmp_path, lake_root, token_store="both", **PUT_KEYS, **bucket)
 
     _run(tmp_path, config, monkeypatch)
 
-    authorization = hook.requests[0].headers["Authorization"].decode()
+    request = hook.requests[0]
+    authorization = request.headers["Authorization"].decode()
     credential = authorization.split("Credential=", 1)[1].split("/", 1)[0]
     assert credential == PUT_KEY_ID
     assert BUCKET_KEY_ID not in authorization
-    assert f"/{REGION}/ssm/" in authorization
+    assert "/us-east-2/ssm/" in authorization
+    assert request.url == "https://ssm.us-east-2.amazonaws.com/"
 
 
 def test_a_login_that_writes_nothing_over_a_live_token_puts_nothing(
@@ -387,6 +391,29 @@ def test_another_error_echoing_the_token_says_run_again_and_prints_no_token(
     assert token.exists()
     captured = capsys.readouterr()
     assert captured.err.strip().endswith("(ValidationException). Run reauth.sh again")
+    _assert_no_token_bytes(captured)
+
+
+def test_a_region_botocore_refuses_after_the_login_exits_three(
+    tmp_path, lake_root, monkeypatch, capsys
+):
+    # The name has the shape ``is_region_name`` accepts, so no refusal comes before the
+    # browser. botocore refuses a region label over 63 characters when the client is built.
+    hook = StoreHook().install(monkeypatch)
+    keys = {**PUT_KEYS, "token_store_region": "us-" + "a" * 70 + "-1"}
+    config = _config(tmp_path, lake_root, token_store="both", **keys)
+
+    code, flow, token = _run(tmp_path, config, monkeypatch)
+
+    assert code == 3
+    assert flow.calls
+    assert json.loads(token.read_text()) == STORE_TOKEN
+    assert hook.requests == []
+    captured = capsys.readouterr()
+    lines = captured.err.strip().splitlines()
+    assert len(lines) == 1
+    assert str(token) in lines[0]
+    assert "(InvalidRegionError)" in lines[0]
     _assert_no_token_bytes(captured)
 
 

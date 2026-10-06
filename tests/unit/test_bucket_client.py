@@ -117,6 +117,18 @@ def test_the_client_ignores_the_environment_and_the_aws_files(hostile_aws):
     assert client.meta.region_name == REGION
 
 
+def test_the_client_signs_in_the_bucket_region_beside_a_token_store_region():
+    # The token store's region sits in the same file, so a builder that read it would sign
+    # every backup request for the wrong region.
+    client = client_from_config(_config(token_store_region="eu-west-1"))
+    sent = _capture(client)
+
+    client.head_object(Bucket="lake-backup", Key="lake/manifest.jsonl")
+
+    assert f"/{REGION}/s3/" in sent[0].headers["Authorization"].decode()
+    assert "eu-west-1" not in sent[0].url
+
+
 def test_the_environment_is_put_back_after_the_build(hostile_aws):
     client_from_config(_config())
     for key, value in hostile_aws.items():
