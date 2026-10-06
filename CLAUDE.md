@@ -165,18 +165,24 @@ Branch before the first edit, not just before the commit. The moment a task will
 
 ## Deployment approvals (owner directive, 2026-10-06)
 
-**A session never approves, rejects or cancels a deployment.** This holds in every GitHub environment, including the `infra` environment that gates `tofu apply` for [#664](https://github.com/l3a0/marketlake/issues/664). It also holds by every route a session could take:
+**A session never approves, rejects or cancels a deployment, and never edits or deletes an environment or its protection rules, such as required reviewers and wait timers.** Editing the environment skips the approval entirely. This holds in every GitHub environment, including the `infra` environment that [PR #698](https://github.com/l3a0/marketlake/pull/698) adds, which holds the applies that [#704](https://github.com/l3a0/marketlake/issues/704) does not run on its own. It also holds by every route a session could take:
 
-1. The `gh` CLI, including `gh api`.
+1. The `gh` CLI, including `gh api` and `gh api graphql`.
 2. `curl` or any other HTTP client.
 3. The GitHub web UI, driven through a browser tool.
 4. Any MCP tool.
 
-When a deployment waits on approval, the session tells the owner which run is waiting and stops.
+When a deployment waits on approval, the session tells the owner which run is waiting and leaves it waiting. `gh run view <id>` shows the waiting job without touching the approval.
 
 Sessions act through the owner's GitHub token, so GitHub cannot tell a session's approval from the owner's. The approval is the human check on what a session wrote, and a session that approves its own change removes that check.
 
-A tracked deny rule in [.claude/settings.json](.claude/settings.json) backs the directive up. It refuses any shell command that names `pending_deployments` or `deployment_protection_rule`, the two REST endpoints that approve or reject a waiting deployment. The rule reads command text only, so a browser click, an MCP call, or a path built at runtime gets past it, and the directive is what covers those routes. Cancelling a run stays outside the rule, because a session may need to cancel an ordinary CI run. Cancelling a run that waits on approval still counts as rejecting it.
+A tracked deny rule in [.claude/settings.json](.claude/settings.json) backs the directive up. It refuses a `gh api` or `curl` command that names any of these REST paths or GraphQL mutations:
+
+- `pending_deployments` and `deployment_protection_rule`, the REST paths that approve or reject a waiting deployment.
+- `approveDeployments` and `rejectDeployments`, the GraphQL mutations that do the same.
+- `updateEnvironment` and `deleteEnvironment`, the GraphQL mutations that change an environment's reviewers or remove the environment.
+
+The rule reads command text only. A browser click, an MCP call, a query read from a file (`-F query=@file`), a path built at runtime, or a REST `PUT` or `DELETE` on `environments/<name>` gets past it, and the directive is what covers those routes. The deny rule does not match `gh run cancel`, because sessions cancel ordinary CI runs. The directive still forbids cancelling a run that waits on approval, which counts as rejecting it.
 
 ## Pull requests
 

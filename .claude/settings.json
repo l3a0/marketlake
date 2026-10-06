@@ -1,8 +1,18 @@
 {
   "permissions": {
     "deny": [
-      "Bash(*pending_deployments*)",
-      "Bash(*deployment_protection_rule*)"
+      "Bash(gh api *pending_deployments*)",
+      "Bash(curl *pending_deployments*)",
+      "Bash(gh api *deployment_protection_rule*)",
+      "Bash(curl *deployment_protection_rule*)",
+      "Bash(gh api *approveDeployments*)",
+      "Bash(curl *approveDeployments*)",
+      "Bash(gh api *rejectDeployments*)",
+      "Bash(curl *rejectDeployments*)",
+      "Bash(gh api *updateEnvironment*)",
+      "Bash(curl *updateEnvironment*)",
+      "Bash(gh api *deleteEnvironment*)",
+      "Bash(curl *deleteEnvironment*)"
     ]
   }
 }
