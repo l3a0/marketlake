@@ -175,14 +175,18 @@ def test_live_holds_only_known_resource_types() -> None:
 def test_live_roles_leave_their_policies_to_separate_resources() -> None:
     """``managed_policy_arns`` and ``inline_policy`` on a role manage its policies
     exclusively, so on every apply they detach a managed policy or delete an inline one
-    that they do not list. That would detach the SSM policy from ``marketlake-instance``,
-    and the apply role's ``iam:DetachRolePolicy`` grant on that ARN lets the detach
-    succeed silently."""
+    that they do not list. ``managed_policy_arns`` would detach the SSM policy from
+    ``marketlake-instance``, and the apply role's ``iam:DetachRolePolicy`` grant on that
+    ARN lets the detach succeed silently. ``inline_policy`` would delete the gated
+    ``backup-bucket`` policy once ``instance_s3_enabled`` is on. ``python-hcl2`` files a
+    ``dynamic "inline_policy"`` block under ``dynamic``, so that key is read too."""
     roles = {a: body for a, body in _resources("live").items() if a.startswith("aws_iam_role.")}
     assert roles, "infra/live declares no role, so this check reads nothing"
     for address, body in roles.items():
         assert "managed_policy_arns" not in body, f"infra/live/{address} sets managed_policy_arns"
         assert "inline_policy" not in body, f"infra/live/{address} sets inline_policy"
+        dynamic = [label for block in body.get("dynamic", []) for label in block]
+        assert "inline_policy" not in dynamic, f"infra/live/{address} sets inline_policy"
 
 
 def test_bootstrap_roles_carry_exactly_their_policies() -> None:
