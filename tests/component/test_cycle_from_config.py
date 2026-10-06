@@ -26,7 +26,7 @@ Four claims are covered.
 Two boundaries are worth naming, because the design's claim is wider than this file.
 
 - The design names a third consumer of the roster snapshot, the per-ticker watchdog
-  counters. It reads the roster in the daemon's skipped-slot hook, not in this entry, so
+  counters. It reads the roster in the daemon's missed-slot hook, not in this entry, so
   it is out of this file's reach.
 - The entry reloads one more input, the chain plan. Every case here points it at a
   test-owned path so the date windows are deterministic. No case here fails if that

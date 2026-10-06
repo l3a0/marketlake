@@ -1415,7 +1415,7 @@ def test_the_out_of_span_page_reads_the_threshold_live():
 
 
 def test_a_clamped_ticker_charged_by_two_stalls_does_not_page_a_short_one():
-    """The skipped-slot hook charges every enabled entry, the clamped one included.
+    """The missed-slot hook charges every enabled entry, the clamped one included.
 
     Frozen, QQQ's counter kept each stall's charge, so a one-minute stall took it to three
     and paged the loop as overrun for three minutes.
@@ -1487,7 +1487,7 @@ def test_the_full_case_drops_only_the_tickers_it_names():
 def test_a_stall_inside_an_outage_that_paged_adds_no_page_for_a_clamped_ticker():
     """SPY quotes has paged under its own title, and QQQ is out of span.
 
-    The skipped-slot hook charges both, since it reads no spans. Charged to QQQ's surface,
+    The missed-slot hook charges both, since it reads no spans. Charged to QQQ's surface,
     a three-slot stall found a fresh counter at the threshold and paged the loop as
     overrun, where the same stall without QQQ adds nothing.
     """

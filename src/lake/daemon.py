@@ -23,7 +23,7 @@ Each minute the loop does three things, in order.
    own minute, so a slow request in one minute costs no other minute anything
    (marketlake #565).
 
-Five hooks let the loop-coupled deliverables plug in without touching the loop. Each
+Six hooks let the loop-coupled deliverables plug in without touching the loop. Each
 has a no-op default, so the loop ships standalone.
 
 - ``on_start(slot)`` is called exactly once, before the first tick, with the minute the
@@ -42,8 +42,12 @@ has a no-op default, so the loop ships standalone.
   schema-drift observer, which reads the columns the parser refused off the same result
   and pages when a vendor retype starts.
 - ``on_skipped(slots)`` is handed the capture slots the loop missed, in order, when the
-  loop thread itself woke late. The same gap-marking writer plugs in here, so a slot the
-  loop slept through is recorded rather than left a hole.
+  loop thread itself woke late, inside the tick that found them. The same gap-marking
+  writer plugs in here, so a slot the loop slept through is recorded rather than left a
+  hole.
+- ``on_missed(slots)`` is handed the same slots again, once every cycle that started
+  before the stall has reached ``on_cycle``. The watchdog charges a stall here, because
+  it counts minutes in slot order. Added by marketlake #644.
 
 Two provenance tags ride every row of a cycle. The loop is the first piece that consults
 the session clock per minute, so it is the piece that stamps them.
@@ -91,8 +95,8 @@ successor's startup marking records like any other minute a dead daemon missed. 
 keeps neither the expiration set nor the chain plan, because the cycle reads the plan
 fresh from its file and the expiration set off the journal on its failure path.
 
-Results reach ``on_cycle`` in slot order, because three readers on the loop thread count
-minutes in order.
+Results reach ``on_cycle``, and stalls reach ``on_missed``, in slot order, because three
+readers on the loop thread count minutes in order.
 
 1. The watchdog counts consecutive session minutes and rolls its counters on the session
    date, so a later minute seen first would reset a counter the earlier one should raise.
@@ -102,20 +106,31 @@ minutes in order.
    (marketlake #570).
 
 So the loop hands on only from the front of the queue, and a later cycle that finished
-first waits for the earlier one. Two kinds of tick wait for every cycle in flight, and
-hand each on, before any hook runs.
+first waits for the earlier one. A stall joins the same queue. A tick with skipped slots
+puts an entry holding them behind the cycles already in flight, and that entry goes to
+``on_missed`` when it reaches the front. So the cycle that ran before a stall reaches the
+watchdog ahead of the stall's minutes. Handed on after them, a cycle that landed data
+resets the counters the stall raised, and the next failing minute pages nothing.
 
-1. A tick with skipped slots to report. The cycle that ran before a stall must reach the
-   watchdog ahead of the stall's minutes. Handed on after them, a cycle that landed data
-   resets the counters the stall raised, and the next failing minute pages nothing.
-2. A tick at or past its day's close+5 deadline, the moment the close+5 guard is
-   dispatched at. The guard refills an option close only when no data row holds it, so a
-   guard that ran ahead of a 16:15 cycle still writing would fetch a second close.
+The tick itself waits for none of those cycles, so the minute's cycle still starts at its
+top. A cycle past its bound can still be waiting on the lake-root lock for its manifest
+append. On 2026-10-05 a tick that waited for every cycle in flight sat behind cycles
+queued on that lock from 13:26 to 13:36 ET and started no cycle meanwhile (marketlake
+#644).
+``on_missed`` runs inside the tick, before ``on_tick``, when nothing ahead of the stall is
+still in flight. Otherwise it runs later, while the loop waits for a minute top, after
+the minute's cycle has started.
 
-Both waits are short. Every cycle in flight at such a tick is already past its bound, so
-what remains is its writes. Inside a tick ``on_tick`` still runs before ``on_skipped``, and
-both run before the minute's cycle starts. The close+15 compaction's one-tick wait relies
-on that order.
+One kind of tick does wait for every cycle in flight, and hands each on, before any hook
+runs: a tick at or past its day's close+5 deadline, the moment the close+5 guard is
+dispatched at. The guard refills an option close only when no data row holds it, so a
+guard that ran ahead of a 16:15 cycle still writing would fetch a second close. No capture
+slot starts at or after close+5, so this wait never delays a capture start. It is not
+always short. A 16:15 cycle queued on the lake-root lock holds it, and the guard behind
+it, past the guard's own deadline, and the guard then refuses its fill (marketlake #650).
+
+Inside a tick ``on_tick`` still runs before ``on_skipped``, and both run before the
+minute's cycle starts. The close+15 compaction's one-tick wait relies on that order.
 
 A cycle that raises propagates out of the loop once it reaches the front of the queue. The
 loop first waits for every other cycle in flight and hands none of them on, so their rows
@@ -224,7 +239,7 @@ class CycleRunner(Protocol):
     ) -> CycleResult: ...
 
 
-# -- the five hooks ----------------------------------------------------------
+# -- the six hooks -----------------------------------------------------------
 
 
 def _no_start(slot: datetime) -> None:
@@ -244,20 +259,26 @@ def _ignore_skipped(slots: list[datetime]) -> None:
     """The default skipped-slot hook. Bare hooks record nothing, so the slots stay holes."""
 
 
+def _ignore_missed(slots: list[datetime]) -> None:
+    """The default missed-slot hook. Bare hooks charge no counter for a stall."""
+
+
 def _ignore_tick(slot: datetime) -> None:
     """The default tick observer. It fires every minute, session or not."""
 
 
 @dataclass(frozen=True)
 class DaemonHooks:
-    """The five seams the loop-coupled deliverables plug into.
+    """The six seams the loop-coupled deliverables plug into.
 
     Every field is a callable with a no-op default, so ``DaemonHooks()`` is a complete,
     standalone set. ``slot`` in each signature is the snap slot, the Eastern-time minute
     the cycle fired for, as ``SessionClock.snap_slot`` reports it. The one exception is
     ``on_start``, whose ``slot`` is the minute the daemon started in, the same value the
     loop seeds its previous slot with. ``slots`` in ``on_skipped`` are the capture slots
-    the loop missed, in order, the same kind of value.
+    the loop missed, in order, the same kind of value. ``on_missed`` is handed the same
+    slots once the cycles that started before the stall have reached ``on_cycle``, so the
+    watchdog, which rides it, sees every minute in slot order.
     """
 
     on_start: Callable[[datetime], None] = _no_start
@@ -265,6 +286,7 @@ class DaemonHooks:
     close_tag_for: Callable[[datetime], str | None] = _no_close_tag
     on_cycle: Callable[[datetime, CycleResult], None] = _ignore_cycle
     on_skipped: Callable[[list[datetime]], None] = _ignore_skipped
+    on_missed: Callable[[list[datetime]], None] = _ignore_missed
 
 
 # -- the loop ------------------------------------------------------------------
@@ -281,8 +303,29 @@ def next_minute_top(now: datetime) -> datetime:
     return now.replace(second=0, microsecond=0) + TICK
 
 
-# The cycles still in flight, oldest first, each with the slot it was fired for.
-_InFlight = deque[tuple[datetime, "Future[CycleResult]"]]
+@dataclass(frozen=True)
+class _Missed:
+    """A stall's place in the queue: the capture slots one tick found missed, in order."""
+
+    slots: tuple[datetime, ...]
+
+
+# The cycles still in flight, oldest first, each with the slot it was fired for, and
+# between them the stalls waiting for the cycles ahead of them to be handed on.
+_InFlight = deque[tuple[datetime, "Future[CycleResult | _Missed]"]]
+
+
+def _missed_entry(slots: list[datetime]) -> Future[_Missed]:
+    """An entry already settled with ``slots``, for the back of the queue.
+
+    Settled, so a stall never holds up the hand-on. It goes to ``on_missed`` as soon as
+    every cycle ahead of it has gone to ``on_cycle``, and the waits that look at the
+    front of the queue return at once for it.
+    """
+    future: Future[_Missed] = Future()
+    future.set_running_or_notify_cancel()
+    future.set_result(_Missed(tuple(slots)))
+    return future
 
 
 def _start_cycle(
@@ -297,8 +340,11 @@ def _start_cycle(
     A thread per cycle rather than a place in a shared executor. An executor with a cap
     would queue a minute's cycle behind cycles still finishing their writes, which is the
     wait this module exists not to have. The bound on each request keeps the count small
-    without a cap: about two cycles overlap, and a third only while a tail runs long, such
-    as a manifest append waiting on another process's lake lock.
+    on an ordinary day, about two at once. It does not bound a cycle's tail. Each cycle
+    takes the lake-root lock for its manifest append. On 2026-10-05 the holds grew under
+    load, later cycles queued behind them, and 33 cycles were in flight at the peak
+    (marketlake #644). Nothing pauses new cycles while such a queue drains, and each
+    queued cycle keeps its vendor's sockets until it returns (marketlake #651).
 
     The thread is not a daemon thread, so an exit waits for the cycle's writes rather than
     cutting them off. Anything the cycle raises is kept on the future and raised again on
@@ -319,7 +365,7 @@ def _start_cycle(
     return future
 
 
-def _settle(clock: Clock, future: Future[CycleResult]) -> None:
+def _settle(clock: Clock, future: Future[CycleResult | _Missed]) -> None:
     """Wait for ``future`` to finish, however long that takes."""
     while not future.done():
         clock.wait([future], None)
@@ -328,16 +374,17 @@ def _settle(clock: Clock, future: Future[CycleResult]) -> None:
 def _hand_on(
     in_flight: _InFlight,
     clock: Clock,
-    on_cycle: Callable[[datetime, CycleResult], None],
+    hooks: DaemonHooks,
     *,
     drain: bool,
 ) -> None:
-    """Hand ``on_cycle`` every finished cycle at the front of the queue, oldest first.
+    """Hand on every finished entry at the front of the queue, oldest first.
 
-    A cycle still running at the front stops the hand-on, because a later cycle cannot go
-    before it. With ``drain`` the loop waits for it instead, and so waits for every cycle
-    in flight. A cycle that raised, once it reaches the front, waits for every other cycle
-    in flight, hands none of them on, and raises.
+    A cycle goes to ``on_cycle``, and a stall's missed slots go to ``on_missed``. A cycle
+    still running at the front stops the hand-on, because a later entry cannot go before
+    it. With ``drain`` the loop waits for it instead, and so waits for every cycle in
+    flight. A cycle that raised, once it reaches the front, waits for every other cycle in
+    flight, hands none of them on, and raises.
     """
     while in_flight:
         slot, future = in_flight[0]
@@ -351,16 +398,20 @@ def _hand_on(
                 _settle(clock, other)
             raise exc
         in_flight.popleft()
-        on_cycle(slot, future.result())
+        result = future.result()
+        if isinstance(result, _Missed):
+            hooks.on_missed(list(result.slots))
+        else:
+            hooks.on_cycle(slot, result)
 
 
 def _wait_for_top(
     clock: Clock,
     top: datetime,
     in_flight: _InFlight,
-    on_cycle: Callable[[datetime, CycleResult], None],
+    hooks: DaemonHooks,
 ) -> None:
-    """Wait through ``clock`` until it reads ``top`` or later, handing on cycles as they finish.
+    """Wait through ``clock`` until it reads ``top`` or later, handing on entries as they finish.
 
     It waits on the front of the queue alone. A later cycle cannot be handed on before the
     front, and a wait on a set that holds a finished cycle returns at once, so waiting on
@@ -376,7 +427,7 @@ def _wait_for_top(
     no bound, so a wall clock stepped backward waits until it reaches the top again.
     """
     while True:
-        _hand_on(in_flight, clock, on_cycle, drain=False)
+        _hand_on(in_flight, clock, hooks, drain=False)
         now = clock.now()
         if now >= top:
             return
@@ -421,17 +472,21 @@ def run_loop(
 
     1. Wait through the clock until the next minute top, computed from ``clock.now``, and
        wait again while the clock still reads short of it. While waiting, hand each cycle
-       in flight to ``on_cycle`` as it finishes, oldest first. The top is never earlier
+       in flight to ``on_cycle`` as it finishes, oldest first, and each stall queued
+       behind them to ``on_missed``. The top is never earlier
        than the minute after the previous tick's slot, so a wall clock stepped backward,
        during the wait or during a tick, makes the loop wait rather than serve a minute it
        already served.
     2. Read the snap slot once and take its phase with ``phase_at``. One read, because two
        reads can fall on either side of a minute top when a long wait lands just before
        one, and the loop would then decide capture on one minute and serve another.
-    3. Hand on every finished cycle at the front of the queue.
-    4. When the tick has capture slots missed since the previous tick to report, across
-       days if the loop slept that long, or when the slot is at or past its day's close+5
-       deadline, wait for every cycle in flight and hand each on.
+    3. When the tick has capture slots missed since the previous tick to report, across
+       days if the loop slept that long, put an entry holding them at the back of the
+       queue. Then hand on every finished entry at the front of the queue. The tick does
+       not wait for a cycle still running, so the stall reaches ``on_missed`` after the
+       cycles ahead of it, whenever they finish.
+    4. When the slot is at or past its day's close+5 deadline, wait for every cycle in
+       flight and hand each on.
     5. Hand the slot to ``on_tick``. It fires every minute, session or not, because the
        power assertion the control plane holds is owed on holidays too.
     6. Hand the missed slots to ``on_skipped``, still after ``on_tick``, then remember this
@@ -464,14 +519,16 @@ def run_loop(
     last_slot = session_clock.snap_slot()
     hooks.on_start(last_slot)
     while should_continue():
-        _wait_for_top(
-            clock, max(next_minute_top(clock.now()), last_slot + TICK), in_flight, hooks.on_cycle
-        )
+        _wait_for_top(clock, max(next_minute_top(clock.now()), last_slot + TICK), in_flight, hooks)
         slot = session_clock.snap_slot()
         phase = session_clock.phase_at(slot)
         skipped = missed_slots(session_clock, last_slot, slot)
-        drain = bool(in_flight) and (bool(skipped) or _at_or_past_close_guard(session_clock, slot))
-        _hand_on(in_flight, clock, hooks.on_cycle, drain=drain)
+        if skipped:
+            # Behind the cycles already in flight, so the watchdog sees each of them before
+            # the stall, and the tick waits for none of them (marketlake #644).
+            in_flight.append((skipped[0], _missed_entry(skipped)))
+        drain = bool(in_flight) and _at_or_past_close_guard(session_clock, slot)
+        _hand_on(in_flight, clock, hooks, drain=drain)
         hooks.on_tick(slot)
         if skipped:
             hooks.on_skipped(skipped)
@@ -488,7 +545,7 @@ def run_loop(
                 ),
             )
         )
-    _hand_on(in_flight, clock, hooks.on_cycle, drain=True)
+    _hand_on(in_flight, clock, hooks, drain=True)
 
 
 # -- the production entry ------------------------------------------------------
@@ -701,7 +758,7 @@ def _gap_marker(
     The marker gets a reader rather than the roster loaded here, so a pass marks the
     tickers in scope when it runs rather than the ones configured at daemon start. The
     load above still happens, because it decides whether marking is wired at all. The
-    reader carries no fallback, for the reason the skipped-slot hook's own read carries
+    reader carries no fallback, for the reason the watchdog's ``on_missed`` read carries
     none: a stale roster marking minutes the file no longer names is the failure the
     re-read exists to prevent.
     """
@@ -1062,9 +1119,9 @@ def _idle_stamp(
             # wrapped in a try, so anything escaping here exits the process, and
             # KeepAlive relaunches straight into the same tick. The stamp is
             # informational, so losing a minute of it is the correct price and the
-            # docstring above promises exactly that. The skipped-slot hook makes the
-            # opposite call on the same file, deliberately: a roster it cannot read
-            # would have it charge the wrong counters, so there it is fatal.
+            # docstring above promises exactly that. The watchdog's ``on_missed`` hook
+            # makes the opposite call on the same file, deliberately: a roster it cannot
+            # read would have it charge the wrong counters, so there it is fatal.
             return
         try:
             # Only the enabled entries, matching what a live cycle would actually cover.
@@ -1178,7 +1235,7 @@ def _alarm(
     # ``watchdog_page_minutes`` mid-session sees it on the next cycle, not the next
     # restart. That matches the chain chunker's split-depth bound, which the cycle already
     # reads off the config every minute. The price is a config read on the alerting path,
-    # the same one the skipped-slot hook pays for the roster.
+    # the same one the watchdog's ``on_missed`` hook pays for the roster.
     #
     # The drift observer is built here rather than at its one call site, beside the two
     # other observers that carry state between cycles. It needs nothing from the config,
@@ -1287,7 +1344,7 @@ def run_loop_from_config(
     the cycle. Nothing below holds a roster for the daemon's life. The gap marker and the
     close guard each take a reader and call it when a pass or a run starts, and both also
     read the security master there, because onboarding writes both files while the daemon
-    runs. The watchdog's skipped-slot hook reads the roster file on every call. None of
+    runs. The watchdog's ``on_missed`` hook reads the roster file on every call. None of
     the three has a fallback, so a read that fails is fatal to the daemon.
 
     The caffeinate power assertion is held here rather than left to a caller. The
@@ -1426,10 +1483,11 @@ def run_loop_from_config(
     # include an equity close, the dispatch waits for ``on_skipped`` and runs after the
     # marker's pass, where the guard finds 16:00 recorded and adds nothing.
     #
-    # Only then. The wait puts the watchdog's page and the marker's lake-root lock in front
-    # of the guard, and the fill checks the clock itself. A stall that skipped only 16:11
-    # to 16:15 and woke at 16:20 would otherwise risk its option-close fill for nothing,
-    # because 16:00 already holds its row and the guard's order cannot matter there.
+    # Only then. The wait puts the marker's pass, which past the option close waits on the
+    # lake-root lock, in front of the guard, and the fill checks the clock itself. A stall
+    # that skipped only 16:11 to 16:15 and woke at 16:20 would otherwise risk its
+    # option-close fill for nothing, because 16:00 already holds its row and the guard's
+    # order cannot matter there.
     guard = _close_guard(
         config_path,
         tickers_path,
@@ -1479,9 +1537,12 @@ def run_loop_from_config(
                 # hook runs inside it. Before the deferral the guard had already run by the
                 # time either could raise, so a raise there must not cost the run now. The
                 # guard then finds 16:00 unrecorded and marks it, and the successor's
-                # startup marking counts that row. The alarm's roster read wraps outside
-                # this hook, so a roster that will not load still exits before the guard
-                # runs, and a successor started the same day runs it from ``on_start``.
+                # startup marking counts that row. The alarm's roster read no longer wraps
+                # this hook. It rides ``on_missed``, which can run before this tick's hooks
+                # or after them, so a roster that will not load can end the daemon before
+                # the guard runs or after it. The guard reads no roster, so it runs the
+                # same either way, and when the exit comes first a successor started the
+                # same day runs it from ``on_start``.
                 waiting, guard_waiting = guard_waiting, None
                 if waiting is not None:
                     dispatch.check(waiting)
@@ -1560,12 +1621,15 @@ def run_loop_from_config(
 
     hooks = replace(hooks, close_tag_for=session_clock.close_tag_at)
 
-    # The watchdog rides the cycle observer and the skipped-slot hook, because the loop
+    # The watchdog rides the cycle observer and the missed-slot hook, because the loop
     # runs no cycle for a slot it slept through and those are the minutes the daemon was
-    # worst off. The dead-man rides the same two plus every tick, so an idle weekday
-    # keeps feeding the check that pages on silence.
+    # worst off. It charges a stall from ``on_missed`` rather than ``on_skipped``, so the
+    # stall reaches it behind every cycle that started before it while the tick waits for
+    # none of them (marketlake #644). The dead-man rides the cycle observer and every
+    # tick, so an idle weekday keeps feeding the check that pages on silence. Each wrapper
+    # below calls the hook it replaces, so a hook the caller passed still runs.
     alarm_on_cycle = hooks.on_cycle
-    alarm_on_skipped = hooks.on_skipped
+    alarm_on_missed = hooks.on_missed
     alarm_on_tick = hooks.on_tick
 
     def report_lost_assertion(now: datetime) -> None:
@@ -1692,19 +1756,20 @@ def run_loop_from_config(
         page_schema_drift(publisher, schema_drift.observe(result), now=slot)
         alarm_on_cycle(slot, result)
 
-    def on_skipped(slots: list[datetime]) -> None:
+    def on_missed(slots: list[datetime]) -> None:
         # The roster is re-read here rather than closed over. The cycle runner re-reads
         # it every cycle, and the design has the watchdog counters read that same
         # snapshot. So a ticker onboarded mid-session starts being charged with no
         # restart, and one retired mid-session stops.
         # A read that fails takes the daemon down, and nothing here softens that. The
-        # price is real and worth naming. On a capture slot it costs nothing, because
-        # the cycle runner reads the same file later on the same tick and raises on it
-        # too. Off the capture window it costs the rest of the daemon's life: the loop
-        # runs no cycle there, so a fallback would have carried it to the next capture
-        # minute, which across a Friday close is the whole weekend. A stall spanning a
-        # close reaches exactly that tick, since the waking tick reports the window's
-        # tail and then continues past the phase check.
+        # price is real and worth naming. On a capture slot it costs little, because the
+        # waking minute's cycle reads the same file and raises on it too. This hook runs
+        # once the cycles ahead of the stall are handed on, so its read can come before
+        # that cycle's or after it. Off the capture window it costs the rest of the
+        # daemon's life: the loop runs no cycle there, so a fallback would have carried
+        # it to the next capture minute, which across a Friday close is the whole
+        # weekend. A stall spanning a close reaches exactly that case, since the waking
+        # tick queues the window's tail and starts no cycle.
         # The price is the one the design already pays on either side of this hook.
         # ``_alarm`` refuses to build on a roster that will not load, and the cycle
         # runner raises on one every minute of the session. What a fallback bought back
@@ -1724,7 +1789,7 @@ def run_loop_from_config(
             for surface in surfaces_for(entry)
         ]
         raise_pages(watchdog.missed(watched, slots), slots[-1])
-        alarm_on_skipped(slots)
+        alarm_on_missed(slots)
 
     def on_tick(slot: datetime) -> None:
         deadman.idle(slot)
@@ -1737,7 +1802,7 @@ def run_loop_from_config(
         # minute the machine can spend asleep.
         report_lost_assertion(slot)
 
-    hooks = replace(hooks, on_cycle=on_cycle, on_skipped=on_skipped, on_tick=on_tick)
+    hooks = replace(hooks, on_cycle=on_cycle, on_missed=on_missed, on_tick=on_tick)
 
     def run_a_cycle(
         *, slot: datetime, close_tag: str | None, session_phase: str | None

@@ -74,6 +74,11 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   The per-tick hook was added after this entry was written, for D14's power assertion and
   D13's idle heartbeat. Both need a minute the loop is awake for rather than a minute it
   captures on, which is why neither could ride the cycle-outcome hook.
+
+  A missed-slot hook came later still, from [#644](https://github.com/l3a0/marketlake/issues/644), and makes six. It is handed
+  the skipped-slot hook's slots again once every cycle that started before the stall has
+  reached the cycle-outcome observer. The watchdog charges a stall there, so a tick with
+  skipped slots no longer waits for the cycles in flight before starting its own.
 - **D10** startup gap-marking. Gap-marking writes an explicit marker for a missed minute, so a gap is recorded rather than silently absent. One `GapMarker` serves both of D9's hooks, so a restart and a live stall leave the same kind of record. They differ only in the reason they stamp: `daemon_dead` for the minutes another incarnation never reached, `slot_overrun` for the ones a living loop slept through. The anchor counts marker rows as well as data rows, so a daemon restarted repeatedly under `KeepAlive` never marks a minute twice. Four things it builds that nothing had:
   1. `journal.last_recorded_slot`, the newest recorded minute for a surface, ticker, and day. `latest_expirations` could not answer this: it returns expiration dates, it is chains-only, and it filters to data rows.
   2. `journal.gap_rows`, one batch covering many missed minutes. A dark session is 406 slots, and `gap_batch` builds one row per call.
@@ -166,8 +171,9 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
      covered, by `test_the_daemon_answers_the_close_tag_hook_from_the_calendar`,
   2. the caller's `on_start` and `on_skipped` pass-throughs in the gap-marker layer, which
      is [#113](https://github.com/l3a0/marketlake/issues/113),
-  3. the watchdog instance the skipped-slot hook charges, which no test ties to the one the
-     cycle observer feeds, which is [#114](https://github.com/l3a0/marketlake/issues/114).
+  3. the watchdog instance the missed-slot hook charges, which no test ties to the one the
+     cycle observer feeds, which is [#114](https://github.com/l3a0/marketlake/issues/114). That charge rode the skipped-slot hook
+     until [#644](https://github.com/l3a0/marketlake/issues/644) moved it.
 - **D11** close tags and the close+5 guard. Close+5 is the five-minute window after the option close, the last moment an option-close fetch may land. It plugs into D9's close-tag hook, and it builds the session-relative dispatcher the design calls for. Everything session-relative runs from inside the daemon, because launchd's calendar intervals are fixed wall-clock and cannot express a close-relative time. `SessionDispatch` fires one job once per session day at a moment the calendar decides, including on a daemon that starts after that moment has passed. The close+15 compaction dispatch binds to the same seam, one tick later than its own moment, for the reason the entry above gives. Two rules are worth stating where both writers can see them:
   1. The guard's fill triggers on missing marks, not a missing cycle. A chain that failed at the option close leaves a tagged gap row holding nothing a reader can price against, and a close+5 refetch is exactly what rescues it.
   2. On a post-close restart the guard runs before startup gap-marking, so the two close minutes it owns are already recorded when D10's marker walks the day. When gap marking runs first, after a restart or a stall that ends between the equity close and close+5, the guard finds 16:00 recorded and adds no row. On a tick that wakes past close+5 from a stall across the equity close, the wiring runs the guard from `on_skipped`, after that tick's overrun markers, so that case is the previous one again.
@@ -285,7 +291,7 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
   keeps holding the first time the sync root widens. Both are derived from constants in
   `paths`, because `compact` spelled the temp name twice before and a second spelling
   would put a temp file outside the exclusion with nothing to say so.
-- **D13** watchdog and alerting. One counter per ticker and surface. A durable data cycle resets it, and a gap row does not, nor does a data segment holding no data row. Three consecutive session minutes page once. Counters start at zero on every restart, never rebuilt from the journal, so a restart never pages for the downtime that preceded it. It observes both D9's cycle-outcome hook and its skipped-slot hook, because the loop runs no cycle for a slot it slept through and those are the minutes the daemon was worst off. Three collapses keep a page storm from replacing a diagnosis:
+- **D13** watchdog and alerting. One counter per ticker and surface. A durable data cycle resets it, and a gap row does not, nor does a data segment holding no data row. Three consecutive session minutes page once. Counters start at zero on every restart, never rebuilt from the journal, so a restart never pages for the downtime that preceded it. It observes both D9's cycle-outcome hook and its missed-slot hook, because the loop runs no cycle for a slot it slept through and those are the minutes the daemon was worst off. It observed the skipped-slot hook until [#644](https://github.com/l3a0/marketlake/issues/644) moved the charge, so a stall reaches the watchdog behind the cycles that started before it without the loop waiting for them. Three collapses keep a page storm from replacing a diagnosis:
   1. Every quotes ticker rides one batched request, so all of them failing together is one page naming the sampler.
   2. A cycle where every surface failed with the same known class pages that cause instead. A dead refresh token gaps chains and quotes for every ticker at once, and the design expects one every seven days.
   3. A slot the loop slept through gaps every watched surface at once, so one stall that trips the threshold is one page rather than one per surface.

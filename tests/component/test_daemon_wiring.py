@@ -1,6 +1,6 @@
 """The daemon's production hook bindings, over real files.
 
-``run_loop`` owns the loop and ``DaemonHooks`` owns the five seams it fires. Every
+``run_loop`` owns the loop and ``DaemonHooks`` owns the six seams it fires. Every
 observer that plugs into a seam is covered on its own elsewhere. What these cover is the
 wiring ``run_loop_from_config`` builds between the two, which is the wiring the launchd
 job runs. A binding can be deleted with every isolated test still green, so each case
@@ -18,7 +18,9 @@ Fifteen bindings are covered here.
 
 1. The skipped-slot hook reaches the gap marker, so a live stall records the minutes it
    slept through.
-2. The skipped-slot hook reaches the watchdog, so those same minutes charge its counters.
+2. The missed-slot hook reaches the watchdog, so those same minutes charge its counters
+   once the cycles that ran before the stall have, and a caller's own missed-slot hook
+   still runs.
 3. The per-tick hook feeds the capture dead-man's idle heartbeat.
 4. The cycle hook feeds the same dead-man's ``captured`` signal, which arms the check on
    the first durable cycle.
@@ -28,7 +30,7 @@ Fifteen bindings are covered here.
    every ordering of the guard and gap marking leaves one row at the equity close.
 6. The cycle runner is the production entry that re-reads the chain plan, so a nightly
    plan rewrite takes effect the next minute.
-7. The skipped-slot hook charges the counters the current roster names. It re-reads the
+7. The missed-slot hook charges the counters the current roster names. It re-reads the
    file rather than closing over the startup roster, so a ticker retired mid-session
    stops paging without a restart and one onboarded mid-session starts. A file the roster
    loader refuses is fatal rather than fallen back on, and every way that file can fail
@@ -443,14 +445,14 @@ def test_a_live_stall_reaches_the_gap_marker(tmp_path):
     assert stalled == ["2026-09-02T10:01", "2026-09-02T10:02"]
 
 
-# -- 2. the skipped-slot hook reaches the watchdog -----------------------------------
+# -- 2. the missed-slot hook reaches the watchdog ------------------------------------
 
 
 def test_the_minutes_a_live_stall_slept_through_charge_the_watchdog(tmp_path):
     """The minutes the daemon was worst off have to be the ones its counters see.
 
     The loop runs no cycle for a slot it slept through, so the cycle observer never
-    sees those minutes. An unbound skipped-slot hook leaves a daemon that stalled for
+    sees those minutes. An unbound missed-slot hook leaves a daemon that stalled for
     an hour looking healthy, because its counters only ever saw the cycles that ran.
     """
     rig = _rig(tmp_path)
@@ -528,6 +530,32 @@ def test_a_cycle_in_flight_across_a_stall_reaches_the_watchdog_before_the_stall(
         "Capture down: XYZ quotes",
     ]
     assert rig.transport.sent[0].body == "3 session minutes without a durable cycle"
+
+
+def test_a_callers_missed_slot_hook_still_runs_beside_the_watchdog(tmp_path):
+    """The watchdog's wrapper calls the missed-slot hook it replaced.
+
+    ``run_loop_from_config`` binds its own ``on_missed`` and keeps the caller's to call
+    after it, the way it keeps every other hook it wraps (marketlake #113). A wrapper that
+    dropped the call would leave the watchdog paging while the caller's hook never hears
+    of a stall.
+    """
+    rig = _rig(tmp_path)
+    _record(rig.lake_root, journal.QUOTES_SURFACE, "XYZ", et(2026, 9, 2, 9, 58))
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    missed: list[list[datetime]] = []
+    _run(
+        rig,
+        clock,
+        ticks=2,
+        cycle_runner=_quiet,
+        hooks=daemon.DaemonHooks(
+            on_tick=_stall_on_first_tick(clock, 150),
+            on_missed=lambda slots: missed.append(list(slots)),
+        ),
+    )
+
+    assert missed == [[et(2026, 9, 2, 10, 1), et(2026, 9, 2, 10, 2)]]
 
 
 # -- 3. the per-tick hook feeds the idle heartbeat -----------------------------------
@@ -1238,7 +1266,7 @@ def test_the_production_runner_files_the_cycle_under_the_loops_slot(tmp_path, mo
     assert {row["close_tag"] for row in rows} == {"spot_close"}
 
 
-# -- 7. the skipped-slot hook charges what the roster names --------------------------
+# -- 7. the missed-slot hook charges what the roster names ---------------------------
 
 
 def _rewrite_after_first_cycle(
@@ -1248,7 +1276,7 @@ def _rewrite_after_first_cycle(
 
     The rewrite stands for a person editing ``tickers.yaml`` while the daemon runs. The
     first cycle is the session up to that edit. The stall is what hands the fresh file to
-    the skipped-slot hook, on the tick the loop next wakes on.
+    the missed-slot hook, on the tick the loop next wakes on.
     """
     cycles: list[datetime] = []
 
@@ -1274,7 +1302,7 @@ def _run_across_an_edit(rig: _Rig, roster: str) -> None:
     """Run one cycle, rewrite the roster to ``roster``, and stall across three slots.
 
     The 10:00 tick stalls 200 seconds, so the loop next wakes at 10:04 and hands 10:01,
-    10:02, and 10:03 to the skipped-slot hook. Three slept-through slots is the design's
+    10:02, and 10:03 to the missed-slot hook. Three slept-through slots is the design's
     page threshold. So the stretch raises one page, and that page counts the surfaces
     the hook charged. The cycles produce no segment of their own, so nothing but the
     missed minutes charges a counter.
@@ -1295,7 +1323,7 @@ def test_a_ticker_retired_mid_session_stops_charging_the_watchdog(tmp_path):
 
     The design has the daemon re-read ``tickers.yaml`` every capture cycle, and it names
     the per-ticker watchdog counters among the consumers reading that same snapshot.
-    Closing the skipped-slot hook over the startup roster breaks the rule in the one
+    Closing the missed-slot hook over the startup roster breaks the rule in the one
     place the cycle runner cannot cover, because the loop runs no cycle for a slot it
     slept through. A retired ticker would then page from a surface nobody is capturing,
     and only a restart would stop it.
@@ -1358,8 +1386,8 @@ def test_a_roster_that_will_not_load_takes_the_daemon_down(tmp_path, roster):
 def test_a_broken_roster_off_the_capture_window_is_fatal_too(tmp_path):
     """The one tick the deleted fallback used to carry, kept so the cost stays visible.
 
-    `run_loop` hands missed slots to the skipped-slot hook and only then checks the
-    phase, so a tick off the capture window fires the hook and runs no cycle. That is
+    `run_loop` queues missed slots for the missed-slot hook whatever the phase, so a
+    tick off the capture window fires the hook and runs no cycle. That is
     the only tick where this hook's read is the roster's only read of the minute, and it
     is reachable: a stall spanning the option close wakes past it with the window's tail
     still to report.
@@ -2996,8 +3024,8 @@ def test_the_plists_unset_paths_reach_every_read_unchanged(tmp_path, monkeypatch
     production reads the roster at its default path. The variable stands in for that path
     here, because a test must not write there. The cycle runner is the production one,
     over a stub vendor. The run starts at 15:58:30 and lasts 35 ticks. The 16:00 tick
-    stalls into 16:02:30, so the skipped-slot hook reads the roster, and the run crosses
-    close+5 at 16:20 and close+15's dispatch at 16:31.
+    stalls into 16:02:30, so the watchdog's missed-slot hook reads the roster, and the run
+    crosses close+5 at 16:20 and close+15's dispatch at 16:31.
     """
     rig = _rig(tmp_path, roster=WITH_OPTIONS)
     monkeypatch.setenv(CONFIG_PATH_ENV, str(rig.config))
@@ -3066,7 +3094,7 @@ def test_the_plists_unset_paths_reach_every_read_unchanged(tmp_path, monkeypatch
             "_gap_marker",
             "_gap_marker.<locals>.<lambda>",
             "_idle_stamp.<locals>.stamp",
-            "run_loop_from_config.<locals>.on_skipped",
+            "run_loop_from_config.<locals>.on_missed",
         },
         "read_token_mint": {"_idle_stamp.<locals>.stamp"},
     }
