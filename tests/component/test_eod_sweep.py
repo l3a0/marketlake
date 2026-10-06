@@ -1644,6 +1644,42 @@ def test_the_linux_friday_command_sets_no_wake(
     assert "pmset" not in printed
 
 
+def test_on_linux_a_setter_passed_alone_gets_no_live_reader(
+    fixture_lake: FixtureLake, capsys, monkeypatch, tmp_path, on_linux
+):
+    """``sweep_from_config`` resolves the reader on its own, not beside the setter.
+
+    A setter alone opens the Friday branch, so a reader resolved to the live one there would
+    run the real ``pmset -g sched`` on a host that has none.
+    """
+    from tests.support.config import write_config
+
+    root = _lake(fixture_lake)
+    config = write_config(tmp_path, lake_root=root)
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("SPY:\n  options: true\n  bars:\n  - 1d\n")
+
+    def untouchable(*args: object) -> None:
+        raise _HostTouched("the Linux sweep reached the live pmset reader")
+
+    monkeypatch.setattr(sweep, "read_pmset_schedule", untouchable)
+    monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: FakeTransport())
+    monkeypatch.setattr(sweep, "ExchangeCalendar", lambda: weekday_sessions(MONDAY, NEXT_MONDAY))
+
+    setter = _RecordingSetter()
+    sweep.main(
+        ["--config", str(config), "--tickers", str(tickers)],
+        clock=ManualClock(FRIDAY_EVENING),
+        vendor_source=_CountingVendorSource(_cassette(session=FRIDAY)),
+        schedule_setter=setter,
+    )
+    printed = capsys.readouterr().out
+
+    assert setter.sundays == [SUNDAY]
+    assert "pmset" not in printed
+
+
 def test_a_friday_with_no_reader_sets_the_wake_and_reads_nothing_back(fixture_lake: FixtureLake):
     """``sweep_from_config`` resolves each seam on its own, so a setter can come alone.
 
