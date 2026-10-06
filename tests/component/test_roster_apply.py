@@ -132,6 +132,27 @@ def test_a_check_refusing_an_equal_roster_still_refuses(tmp_path):
     assert target.read_bytes() == HAND_FORMATTED
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b"", id="empty-document"),
+        pytest.param(
+            b"SPY: {options: true, chain_cadence: 1m, bars: [1m], enabled: false}\n"
+            b"QQQ: {options: false, bars: [1d], enabled: false}\n",
+            id="all-disabled",
+        ),
+    ],
+)
+def test_the_no_enabled_refusal_runs_before_the_check(tmp_path, payload):
+    # The check refuses too, with an error that is not a TickersError. If the check ran
+    # first, its refusal is what the operator would see instead of the one naming the
+    # empty roster.
+    target = tmp_path / "tickers.yaml"
+    with pytest.raises(TickersError, match="no enabled ticker"):
+        apply_roster(payload, check=_refuse, path=target)
+    assert _listing(tmp_path) == []
+
+
 def test_a_failed_rename_leaves_the_file_and_no_temp_file(tmp_path, monkeypatch):
     target = tmp_path / "tickers.yaml"
     target.write_bytes(PREVIOUS)
