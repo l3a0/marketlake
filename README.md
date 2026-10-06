@@ -159,6 +159,59 @@ any host whose config sets `role` to something other than `primary`.
    Compaction prints the upload's throughput to its log, in the line the first upload
    prints.
 
+## Reach the dashboard on a hosted VM
+
+The dashboard binds the loopback address and serves only requests whose `Host` names
+`localhost` or `127.0.0.1`, so on a VM it is unreachable from anywhere but the VM itself.
+An SSH local forward reaches it from the laptop without opening another port. It rides
+the SSH port the VM already allows from the owner's address. The design's dashboard
+section carries the reasoning, and
+[#637](https://github.com/l3a0/marketlake/issues/637) carries the plan.
+
+Nothing is installed on the VM for this. The dashboard runs there under the systemd unit
+from [#634](https://github.com/l3a0/marketlake/issues/634), which the install script sets
+up, and the forward needs only that and the SSH port. On the laptop, open the forward and
+leave it running:
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -L 127.0.0.1:8766:127.0.0.1:8765 <vm>
+```
+
+Then browse to `http://127.0.0.1:8766/`. Four choices in the command matter.
+
+1. **The laptop side is `127.0.0.1:8766`.** The laptop's own dashboard holds
+   `127.0.0.1:8765`. Given a bare port, ssh listens on every loopback address it can and
+   counts the forward as working if any one of them binds. A forward on a bare 8765 would
+   still take `::1`, and `http://localhost:8765/` would then show the VM's page at the
+   address of the laptop's. Naming one address makes a collision total, and
+   `ExitOnForwardFailure=yes` turns it into an exit rather than a warning.
+2. **The VM side names `127.0.0.1` rather than `localhost`.** The dashboard listens on
+   IPv4 only, and a `localhost` that resolves to `::1` first would be refused there.
+3. **`ServerAliveInterval=15`** makes ssh notice a network that vanished, after three
+   unanswered checks, about 45 seconds, and close the forward. Without it a dead forward
+   can sit open for hours. The page marks itself stale only when its requests fail, so a
+   forward that neither answers nor closes leaves the last data on screen unmarked
+   ([#678](https://github.com/l3a0/marketlake/issues/678)).
+4. **`-N`** runs no remote command, so the session exists only to carry the forward.
+
+The same forward as an entry in `~/.ssh/config`, with `marketlake-vm` as a placeholder
+host name:
+
+```text
+Host marketlake-vm
+    HostName <vm address>
+    User <vm user>
+    LocalForward 127.0.0.1:8766 127.0.0.1:8765
+    ExitOnForwardFailure yes
+    ServerAliveInterval 15
+```
+
+`ssh -N marketlake-vm` then opens it.
+
+When the dashboard is not running on the VM, ssh prints `connect failed: Connection
+refused` for each request, and the page says the query service is unreachable and that
+nothing on it is live.
+
 ## Develop
 
 The toolchain is [uv](https://docs.astral.sh/uv/). Set up the environment, then run
