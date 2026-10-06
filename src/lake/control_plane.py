@@ -4535,8 +4535,9 @@ def _render(args) -> int:
     given = [flag for flag, value in misplaced if value is not None]
     if given:
         other = "systemd" if launchd else "launchd"
+        verb = "applies" if len(given) == 1 else "apply"
         print(
-            f"render: {' and '.join(given)} apply only to --init {other}, not --init {args.init}",
+            f"render: {' and '.join(given)} {verb} only to --init {other}, not --init {args.init}",
             file=sys.stderr,
         )
         return 2

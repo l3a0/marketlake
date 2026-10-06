@@ -54,18 +54,28 @@ def _render(out: Path, *extra: str) -> None:
         ),
         (
             [*RENDER_ARGS, "--lake-mount", "/srv/lake"],
-            "render: --lake-mount apply only to --init systemd, not --init launchd\n",
+            "render: --lake-mount applies only to --init systemd, not --init launchd\n",
         ),
         (
             [*SYSTEMD_RENDER_ARGS, "--log-dir", "/var/log/x"],
-            "render: --log-dir apply only to --init launchd, not --init systemd\n",
+            "render: --log-dir applies only to --init launchd, not --init systemd\n",
         ),
         (
             [*SYSTEMD_RENDER_ARGS, "--group", "wheel"],
-            "render: --group apply only to --init launchd, not --init systemd\n",
+            "render: --group applies only to --init launchd, not --init systemd\n",
+        ),
+        (
+            [*SYSTEMD_RENDER_ARGS, "--log-dir", "/var/log/x", "--group", "wheel"],
+            "render: --log-dir and --group apply only to --init launchd, not --init systemd\n",
         ),
     ],
-    ids=["launchd without --log-dir", "launchd with --lake-mount", "--log-dir", "--group"],
+    ids=[
+        "launchd without --log-dir",
+        "launchd with --lake-mount",
+        "--log-dir",
+        "--group",
+        "both",
+    ],
 )
 def test_a_flag_the_host_has_no_use_for_is_refused(args, message, tmp_path, capsys):
     """One ``render:`` line and exit 2, never a traceback, and nothing written."""
