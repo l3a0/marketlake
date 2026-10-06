@@ -26,12 +26,13 @@ one in a test. There are four seams and one builder.
 4. The lake root as a temporary directory, so a test writes to a throwaway lake.
 5. A fixture-lake builder, which assembles a known lake on disk for a test to read.
 
-Two enforcement tests then stay in continuous integration for the life of the
+Three enforcement tests then stay in continuous integration for the life of the
 project.
 
 1. One fails the build on any direct clock call outside the clock module.
-2. The other fails the build on any hardcoded session time outside the calendar
-   module.
+2. One fails the build on any hardcoded session time outside the calendar module.
+3. One fails the build on any reference to the ntfy transport or the healthchecks
+   pinger outside the outbox module.
 
 ## Layout
 
@@ -43,12 +44,15 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   code that names session times.
 - `src/lake/vendor.py` and `src/lake/cassette.py` define the vendor interface and the
   cassette format.
+- `src/lake/outbox.py` is the one place the ntfy transport and the healthchecks pinger
+  are built. Under the config's `role: shadow` it builds recorders instead, which write
+  each ping and page to `journal/outbox/` rather than sending it.
 - `tests/support` holds the fakes, the fixture-lake builder, and the enforcement
   scanners.
 
 Tests sit in one folder per tier, matching the build plan's placement rule.
 
-- `tests/unit` is decided from values alone with every seam faked. It holds the two
+- `tests/unit` is decided from values alone with every seam faked. It holds the three
   enforcement guards.
 - `tests/component` crosses exactly one real boundary: the real filesystem, or the
   real dependency behind a seam.
@@ -127,7 +131,8 @@ environment variable. Loading `config.yaml` never checks them or the bucket's na
 a mistyped value fails the backup, the first upload or the Sunday scrub that uses it,
 each with one line naming the key, and never stops capture.
 
-Three commands go with it.
+Three commands go with it. The first two refuse with exit 2 on a shadow host, which is
+any host whose config sets `role` to something other than `primary`.
 
 1. `uv run python -m lake.bucket live-check --target s3://example-lake-backup/live-check`
    confirms the four S3 behaviors the design rests on, and is live check 8 in the build
@@ -150,6 +155,7 @@ Three commands go with it.
    upload capacity beforehand.
 3. The nightly upload needs no command. Once `backup_target` names the bucket, the
    close+15 compaction uploads to it in place of `rsync`, and the Sunday job scrubs it.
+   A `shadow` host does neither.
    Compaction prints the upload's throughput to its log, in the line the first upload
    prints.
 

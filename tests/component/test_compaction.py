@@ -1152,10 +1152,11 @@ def test_main_runs_the_job_from_config_with_injected_seams(
     events: list[str] = []
     backup = FakeBackup(events)
     pinger = FakePinger(events)
-    # main builds rsync and the healthchecks pinger itself. A fake reaches them by
-    # replacing the producer main names, not by a seam this entry no longer accepts.
+    # main builds rsync itself and takes the healthchecks pinger from the outbox. A fake
+    # reaches each by replacing the class where it is looked up, not by a seam this entry
+    # no longer accepts.
     monkeypatch.setattr("lake.compact.RsyncBackup", lambda: backup)
-    monkeypatch.setattr("lake.compact.UrllibPinger", lambda: pinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
 
     code = main(
         ["--config", str(config), "--plan", str(plan_path)],

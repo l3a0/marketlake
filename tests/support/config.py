@@ -41,6 +41,7 @@ def write_config(
     backup_target: Path | None = None,
     guards: Mapping[str, object] | None = None,
     callback_url: str | None = None,
+    role: str | None = None,
 ) -> Path:
     """Write a config naming ``lake_root``, and return its path.
 
@@ -54,6 +55,11 @@ def write_config(
     is the point rather than an omission. No capture path reads the key, so the config
     every daemon test runs on is one without it, and requiring the key would turn all of
     them red. Only the re-auth needs it, so only its tests ask for it.
+
+    ``role`` writes the host-role key, and is left out by default for the same reason: a
+    config without it is a primary, which is what every other test runs as. The text goes
+    after ``role:`` exactly as given, so ``""`` writes an empty value that YAML reads as
+    null and ``"off"`` writes one that YAML reads as false.
     """
     target = tmp_path / "ssd" if backup_target is None else backup_target
     target.mkdir(parents=True, exist_ok=True)
@@ -63,6 +69,7 @@ def write_config(
         else "guards:\n" + "".join(f"  {key}: {value}\n" for key, value in guards.items())
     )
     callback = "" if callback_url is None else f"schwab_callback_url: {callback_url}\n"
+    role_line = "" if role is None else f"role: {role}".rstrip() + "\n"
     path = tmp_path / CONFIG_NAME
     path.write_text(
         f"lake_root: {lake_root}\n"
@@ -72,6 +79,7 @@ def write_config(
         f"schwab_api_key: {SCHWAB_API_KEY}\n"
         f"schwab_app_secret: {SCHWAB_APP_SECRET}\n"
         f"{callback}"
+        f"{role_line}"
         f"{section}"
     )
     return path

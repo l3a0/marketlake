@@ -150,7 +150,7 @@ def test_main_uploads_to_a_bucket_target_and_pings(lake_root, tmp_path, monkeypa
     config = _bucket_config(tmp_path, lake_root)
     pinger = FakePinger()
     monkeypatch.setattr(bucket, "client_from_config", lambda cfg: client)
-    monkeypatch.setattr(compact_module, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
     monkeypatch.setattr(
         compact_module, "RsyncBackup", lambda: pytest.fail("a bucket target never runs rsync")
     )
@@ -181,7 +181,7 @@ def test_main_refuses_an_empty_bucket_with_one_line_and_no_ping(
     config = _bucket_config(tmp_path, lake_root)
     pinger = FakePinger()
     monkeypatch.setattr(bucket, "client_from_config", lambda cfg: FakeS3())
-    monkeypatch.setattr(compact_module, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
 
     with pytest.raises(SystemExit) as exited:
         compact_module.main(
@@ -211,7 +211,7 @@ def test_main_hands_the_bucket_keys_to_the_page_publisher(lake_root, tmp_path, m
         return real(**kwargs)
 
     monkeypatch.setattr(bucket, "client_from_config", lambda cfg: client)
-    monkeypatch.setattr(compact_module, "UrllibPinger", lambda: FakePinger())
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: FakePinger())
     monkeypatch.setattr(compact_module, "Publisher", watched)
 
     compact_module.main(
@@ -241,7 +241,7 @@ def test_the_path_form_still_raises_a_chain_plan_error(lake_root, tmp_path, monk
         raise ChainPlanError("'windows' must be a list")
 
     monkeypatch.setattr(compact_module, "compact", bad_plan)
-    monkeypatch.setattr(compact_module, "UrllibPinger", lambda: FakePinger())
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: FakePinger())
 
     with pytest.raises(ChainPlanError):
         compact_module.main(
@@ -271,7 +271,7 @@ def test_bad_bucket_settings_fail_the_backup_after_the_seal(
         + extra
     )
     pinger = FakePinger()
-    monkeypatch.setattr(compact_module, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
     monkeypatch.setattr(bucket, "_build_client", lambda cfg: pytest.fail("no client is built"))
 
     with pytest.raises(SystemExit) as exited:

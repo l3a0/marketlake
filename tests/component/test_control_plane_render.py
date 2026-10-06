@@ -497,11 +497,12 @@ def test_self_check_cli_pings_the_pre_open_slug_when_the_daemon_is_up(
 ):
     config = write_config(tmp_path, tmp_path / "lake")
     pinger = FakePinger()
-    # main builds the probe and the pinger itself, so a fake reaches them by replacing
-    # the producer main names, not by a seam this entry no longer accepts.
+    # main builds the probe itself and takes the pinger from the outbox, so a fake reaches
+    # each by replacing the producer where it is looked up, not by a seam this entry no
+    # longer accepts.
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
-    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
     # Saturday, so no assertion is owed and this stays about the slug. Without a fixed
     # clock the answer would depend on the hour the suite ran, because a lake with no
     # stamped pid fails the check inside a weekday window.
@@ -525,7 +526,7 @@ def test_self_check_cli_names_a_failed_ping_and_still_reports(tmp_path, capsys, 
 
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
-    monkeypatch.setattr(cp, "UrllibPinger", Boom)
+    monkeypatch.setattr("lake.runner.UrllibPinger", Boom)
     # Saturday, for the reason the test above names: nothing owed, so the ping is what
     # this measures.
     monkeypatch.setattr(cp, "_system_clock", lambda: ManualClock(start=et(2026, 9, 5, 12, 0)))
@@ -544,7 +545,7 @@ def test_self_check_cli_exits_non_zero_without_pinging_when_down(tmp_path, monke
     # Faked even though the daemon probe returns first, so a reordering cannot reach the
     # real tool. The guard would catch it, but as a refusal rather than as the finding.
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
-    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
     code = cp.main(["self-check", "--config", str(config)])
     assert code == 1
     assert pinger.urls == []
@@ -625,9 +626,9 @@ def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys, monke
         "read_pmset_schedule",
         lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
     )
-    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
-    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: pushes)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: pushes)
     monkeypatch.setattr(cp, "read_exclusions", _excluded)
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
@@ -667,9 +668,9 @@ def test_the_sunday_cli_scrubs_the_configured_backup_target(tmp_path, capsys, mo
         "read_pmset_schedule",
         lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
     )
-    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
-    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: _Pushes())
     monkeypatch.setattr(cp, "read_exclusions", _excluded)
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
@@ -702,9 +703,9 @@ def test_sunday_cli_withholds_the_ping_for_a_stale_token(tmp_path, capsys, monke
         "read_pmset_schedule",
         lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
     )
-    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
-    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: _Pushes())
     monkeypatch.setattr(cp, "read_exclusions", _excluded)
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
@@ -735,9 +736,9 @@ def test_sunday_cli_reads_the_mint_time_from_the_token_file(tmp_path, capsys, mo
         "read_pmset_schedule",
         lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
     )
-    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
-    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: _Pushes())
     monkeypatch.setattr(cp, "read_exclusions", _excluded)
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
@@ -768,9 +769,9 @@ def test_sunday_cli_checks_the_time_machine_exclusion(tmp_path, capsys, monkeypa
         "read_pmset_schedule",
         lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
     )
-    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
-    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: _Pushes())
     monkeypatch.setattr(cp, "read_exclusions", reader)
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
@@ -799,9 +800,9 @@ def test_sunday_cli_reports_problems_and_exits_non_zero(tmp_path, capsys, monkey
     lake, config = _sunday_lake(tmp_path)
     pinger = FakePinger()
     monkeypatch.setattr(cp, "read_pmset_schedule", lambda: "")
-    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: lambda: False)
-    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: _Pushes())
     monkeypatch.setattr(cp, "read_exclusions", _excluded)
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
@@ -835,9 +836,9 @@ def test_the_sunday_cli_asks_about_the_daemon(tmp_path, capsys, monkeypatch):
         "read_pmset_schedule",
         lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
     )
-    monkeypatch.setattr(cp, "UrllibPinger", FakePinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
-    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: pushes)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: pushes)
     monkeypatch.setattr(cp, "read_exclusions", _excluded)
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: False)
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
@@ -866,9 +867,9 @@ def test_the_sunday_cli_reads_the_pid_from_the_journal_stamp(tmp_path, monkeypat
         "read_pmset_schedule",
         lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
     )
-    monkeypatch.setattr(cp, "UrllibPinger", FakePinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
-    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: _Pushes())
     monkeypatch.setattr(cp, "read_exclusions", _excluded)
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: asked.append(pid) or True)
@@ -900,9 +901,9 @@ def test_the_sunday_cli_reads_the_stamp_instant_as_well_as_the_pid(tmp_path, mon
     )
     pushes = _Pushes()
     monkeypatch.setattr(cp, "read_pmset_schedule", lambda: REPEAT_ONLY)
-    monkeypatch.setattr(cp, "UrllibPinger", FakePinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
-    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: pushes)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: pushes)
     monkeypatch.setattr(cp, "read_exclusions", _excluded)
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
@@ -944,8 +945,8 @@ def test_the_sunday_cli_builds_a_real_canary_rather_than_passing_through(tmp_pat
     monkeypatch.setattr(cp, "token_canary", fake_token_canary)
     pinger = FakePinger()
     monkeypatch.setattr(cp, "read_pmset_schedule", lambda: REPEAT_ONLY)
-    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
-    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: _Pushes())
     monkeypatch.setattr(cp, "read_exclusions", _excluded)
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
@@ -970,9 +971,9 @@ def test_the_sunday_cli_pushes_the_reminder_to_the_phone(tmp_path, monkeypatch):
     stamp_assertion_pid(lake, pid=_DAEMON_PID)
     pushes = _Pushes()
     monkeypatch.setattr(cp, "read_pmset_schedule", lambda: REPEAT_ONLY)
-    monkeypatch.setattr(cp, "UrllibPinger", FakePinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
-    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: pushes)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: pushes)
     monkeypatch.setattr(cp, "read_exclusions", _excluded)
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
@@ -1005,9 +1006,9 @@ def test_a_reminder_that_cannot_be_pushed_is_written_down_and_the_evening_carrie
     # record to the three this test counts.
     stamp_assertion_pid(lake, pid=_DAEMON_PID)
     monkeypatch.setattr(cp, "read_pmset_schedule", lambda: REPEAT_ONLY)
-    monkeypatch.setattr(cp, "UrllibPinger", FakePinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
     monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
-    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _BrokenTransport())
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: _BrokenTransport())
     monkeypatch.setattr(cp, "read_exclusions", _excluded)
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
@@ -2843,7 +2844,7 @@ def test_the_self_check_cli_asks_about_the_assertion(tmp_path, capsys, monkeypat
     stamp_assertion_pid(lake_root, pid=_DAEMON_PID)
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: False)
-    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
     monkeypatch.setattr(cp, "_system_clock", lambda: ManualClock(start=et(2026, 9, 2, 8, 30)))
 
     code = cp.main(["self-check", "--config", str(config)])
@@ -2867,7 +2868,7 @@ def test_the_self_check_cli_reads_the_pid_from_the_journal_stamp(tmp_path, monke
     stamp_assertion_pid(lake_root, pid=7331)
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: asked.append(pid) or True)
-    monkeypatch.setattr(cp, "UrllibPinger", FakePinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
     monkeypatch.setattr(cp, "_system_clock", lambda: ManualClock(start=et(2026, 9, 2, 8, 30)))
 
     assert cp.main(["self-check", "--config", str(config)]) == 0
@@ -2882,7 +2883,7 @@ def test_the_self_check_cli_fails_a_lake_with_no_stamped_pid(tmp_path, capsys, m
     pinger = FakePinger()
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
-    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
     monkeypatch.setattr(cp, "_system_clock", lambda: ManualClock(start=et(2026, 9, 2, 8, 30)))
 
     code = cp.main(["self-check", "--config", str(config)])
@@ -2920,7 +2921,7 @@ def test_the_self_check_cli_reads_the_stamp_instant_as_well_as_the_pid(
     )
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
-    monkeypatch.setattr(cp, "UrllibPinger", FakePinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
     monkeypatch.setattr(cp, "_system_clock", lambda: ManualClock(start=now))
 
     reads: list[Path] = []

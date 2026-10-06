@@ -1197,7 +1197,7 @@ def test_main_builds_the_publisher_that_pages(lake_root, monkeypatch, tmp_path):
             sealed=(), verified=(), skipped=(), retune=None, backed_up=True, pinged=True
         )
 
-    monkeypatch.setattr(compact_module, "NtfyTransport", fake_transport)
+    monkeypatch.setattr("lake.alert.NtfyTransport", fake_transport)
     monkeypatch.setattr(compact_module, "compact", fake_compact)
     config = write_config(tmp_path, lake_root)
 

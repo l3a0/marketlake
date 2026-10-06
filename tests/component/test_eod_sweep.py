@@ -1547,8 +1547,8 @@ def test_the_command_runs_the_sweep_and_reports_what_it_did(
     tickers.write_text("SPY:\n  options: true\n  bars:\n  - 1d\n")
 
     setter = _RecordingSetter()
-    monkeypatch.setattr(sweep, "UrllibPinger", FakePinger)
-    monkeypatch.setattr(sweep, "NtfyTransport", lambda topic: FakeTransport())
+    monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: FakeTransport())
     monkeypatch.setattr(sweep, "ExchangeCalendar", lambda: weekday_sessions(MONDAY, NEXT_MONDAY))
 
     code = sweep.main(
@@ -2622,8 +2622,8 @@ def test_the_command_hands_the_batterys_threshold_to_the_battery(
         return real(*args, **kwargs)
 
     monkeypatch.setattr(sweep, "judge", recording)
-    monkeypatch.setattr(sweep, "UrllibPinger", FakePinger)
-    monkeypatch.setattr(sweep, "NtfyTransport", lambda topic: FakeTransport())
+    monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: FakeTransport())
     monkeypatch.setattr(sweep, "ExchangeCalendar", lambda: weekday_sessions(MONDAY, NEXT_MONDAY))
 
     sweep.main(

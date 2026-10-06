@@ -58,6 +58,7 @@ import binascii
 import fnmatch
 import hashlib
 import os
+import sys
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -66,6 +67,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from lake import outbox
 from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
 from lake.config import (
@@ -114,6 +116,13 @@ FULL_OBJECT = "FULL_OBJECT"
 
 # The command that seeds or re-baselines a bucket, named by every refusal that needs it.
 FIRST_UPLOAD_COMMAND = "python -m lake.bucket first-upload"
+
+# The refusal on a shadow host. Its lake is compared and then discarded, so it uploads
+# nothing, and a shadow seeded from the primary would write under the primary's keys.
+BUCKET_SHADOW = (
+    "this host's role is shadow, so it uploads nothing to a bucket and checks none. "
+    "Run this on the primary."
+)
 
 # The error code S3 answers a PUT whose bytes do not match its ``ChecksumSHA256``.
 BAD_DIGEST = "BadDigest"
@@ -1409,11 +1418,21 @@ def main(
     The client is built here from the config and never accepted, the same rule every
     other ``main`` keeps for a seam that reaches past this process. ``clock`` and
     ``calendar`` stay injectable, since neither reaches past this process.
+
+    Under a ``shadow`` role both commands refuse with exit 2 before a client is built. A
+    shadow seeded from the primary would upload under the primary's keys, and
+    ``first-upload`` replaces the bucket's ``manifest.jsonl`` outright.
     """
     args = build_parser().parse_args(argv)
     label = args.command
     with input_errors_exit(label, BucketRefusal):
         config = load_config(args.config)
+        role, warning = outbox.role_of(config)
+        if warning is not None:
+            print(f"{label}: {warning}", file=sys.stderr)
+        if role != outbox.PRIMARY:
+            print(f"{label}: {BUCKET_SHADOW}", file=sys.stderr)
+            return 2
         target, client = connect(config, _target(config, args.target))
         if clock is None:
             from lake.clock import SystemClock
@@ -1450,6 +1469,7 @@ def main(
 
 __all__ = [
     "BAD_DIGEST",
+    "BUCKET_SHADOW",
     "FIRST_UPLOAD_COMMAND",
     "FULL_OBJECT",
     "IN_FLIGHT_ALLOWANCE",

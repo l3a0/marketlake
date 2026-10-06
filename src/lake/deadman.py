@@ -71,7 +71,8 @@ class DeadMan:
     The recorder is injected on the same terms. healthchecks knows when the last ping
     landed, and the Now panel is meant to show it too. The panel reads the lake, so a
     landed ping is written down there. Only a landed one, because the panel's line says
-    the check is being fed and a ping that never left the laptop is not feeding it.
+    the check is being fed and a ping that never left the laptop is not feeding it. On a
+    ``shadow`` host a recorded ping is stamped too, because the ping call returned.
 
     The publisher is the one failure that must not be swallowed. A ping healthchecks
     refuses feeds no check, so this check never arms and the whole-daemon guarantee sits
