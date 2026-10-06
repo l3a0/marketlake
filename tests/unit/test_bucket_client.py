@@ -14,7 +14,8 @@ no CRC32 of botocore's own, with no aws-chunked body that would carry one.
 ``bucket_credentials`` picks the credential path, marketlake #663. The refusals that need
 no metadata service are here: an unrecognised value, a key beside ``instance_profile``, a
 missing region, and a metadata fetcher that fails to build, which must leave the
-process's proxy variables as it found them. The tests that talk to a metadata service
+process's proxy variables as it found them. So is the metadata service's real address,
+which no test can reach. The tests that talk to a metadata service
 cross a real HTTP boundary, so they live in
 ``tests/component/test_bucket_instance_profile.py``.
 """
@@ -25,6 +26,7 @@ import base64
 import hashlib
 import os
 
+import botocore.utils
 import pytest
 from botocore.awsrequest import AWSResponse
 
@@ -238,7 +240,10 @@ def _profile_config(**overrides) -> Config:
     return _config(**values)
 
 
-@pytest.mark.parametrize("value", [None, "", "Instance_Profile", "key", 1, SECRET_SHAPED])
+UNRECOGNISED = [None, "", "Instance_Profile", " instance_profile ", "key", 1, SECRET_SHAPED]
+
+
+@pytest.mark.parametrize("value", UNRECOGNISED)
 def test_an_unrecognised_credential_source_refuses_alone_and_never_falls_back(monkeypatch, value):
     # The config holds valid keys, so a build that fell back to ``keys`` would succeed.
     # Reaching the builder at all fails the test.
@@ -248,6 +253,16 @@ def test_an_unrecognised_credential_source_refuses_alone_and_never_falls_back(mo
     message = str(refused.value)
     assert message == "bucket_credentials must be keys or instance_profile"
     assert SECRET_SHAPED not in message
+
+
+@pytest.mark.parametrize("value", UNRECOGNISED)
+def test_the_builder_takes_neither_path_on_an_unrecognised_source(value):
+    # The check above runs first. Should it ever let a value through, the builder still
+    # takes each path only on its own value. The config holds valid keys, so a builder
+    # that sent every other value down the key path would build a client here.
+    with pytest.raises(ConfigError) as refused:
+        bucket._build_client(_config(bucket_credentials=value))
+    assert str(refused.value) == "bucket_credentials must be keys or instance_profile"
 
 
 def test_a_pasted_credential_source_stays_out_of_the_config_repr():
@@ -262,9 +277,25 @@ def test_either_key_beside_instance_profile_refuses_naming_it(monkeypatch, prese
     _no_build(monkeypatch)
     with pytest.raises(ConfigError) as refused:
         client_from_config(_profile_config(**{present: "a-value"}))
-    message = str(refused.value)
-    assert present in message and "instance_profile" in message
-    assert "a-value" not in message and "\n" not in message
+    assert str(refused.value) == (
+        f"bucket_credentials is instance_profile, so the config must not hold ['{present}']"
+    )
+
+
+def test_a_key_and_no_region_beside_instance_profile_refuse_as_one_line(monkeypatch):
+    _no_build(monkeypatch)
+    with pytest.raises(ConfigError) as refused:
+        client_from_config(_profile_config(bucket_access_key_id="a-value", bucket_region=None))
+    assert str(refused.value) == (
+        "bucket_credentials is instance_profile, so the config must not hold "
+        "['bucket_access_key_id']. the bucket needs config key(s): ['bucket_region']"
+    )
+
+
+def test_the_metadata_address_is_the_one_aws_serves():
+    # Every test points the address at a server on loopback, so none of them reaches
+    # this value. botocore's own constant is the reference, not one built from it here.
+    assert bucket.METADATA_BASE_URL == botocore.utils.METADATA_BASE_URL
 
 
 def test_instance_profile_still_needs_the_region(monkeypatch):

@@ -13,7 +13,10 @@ address. A ``before-send`` hook answers in place of S3, so no request reaches AW
 What they cover:
 
 1. The profile path signs with the metadata credentials and its session token, and
-   ignores ``BOTO_CONFIG``, ``~/.boto``, the environment's keys and a proxy variable.
+   ignores ``BOTO_CONFIG``, ``~/.boto``, the environment's keys, endpoint and region,
+   a proxy variable, and any service model under ``~/.aws/models``. A failed role
+   listing is asked again once and no more, and a service that never answers refuses
+   within the metadata timeout.
 2. The key path is unchanged and never asks the metadata service.
 3. Both forms of a failed lookup refuse at build as one line naming both fixes: a
    service that refuses the token, which raises ``MetadataRetrievalError``, and a
@@ -26,7 +29,9 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import threading
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,6 +48,7 @@ from tests.component.test_bucket_scrub import _sunday_cli, _uploaded
 REGION = "us-east-2"
 ROLE_NAME = "marketlake-bucket"
 TOKEN = "imds-session-token"
+ROLE_LISTING = "/latest/meta-data/iam/security-credentials/"
 
 
 def _answers(prefix: str) -> dict[str, str]:
@@ -64,9 +70,10 @@ class _Server:
     ``mode`` decides the answer. ``ok`` hands out ``creds``. ``no_role`` answers the
     token and has no instance profile, so the role listing is a 404. ``refuse_token``
     answers the token request with a 403, which is what a service that requires tokens
-    and turns this caller away does. ``null_body``, ``bad_expiration`` and
-    ``no_key_id`` answer the credentials request with what only a broken or impersonated
-    service would send.
+    and turns this caller away does. ``role_500_once`` answers the first role listing
+    with a 500 and every later one as ``ok`` does, and ``role_500`` answers every role
+    listing with a 500. ``null_body``, ``bad_expiration`` and ``no_key_id`` answer the
+    credentials request with what only a broken or impersonated service would send.
     """
 
     def __init__(self, creds: dict[str, str]) -> None:
@@ -96,12 +103,15 @@ class _Server:
                 server.requests.append(("GET", self.path, dict(self.headers)))
                 if self.headers.get("x-aws-ec2-metadata-token") != TOKEN:
                     self._answer(401, "")
-                elif self.path.endswith("/latest/meta-data/iam/security-credentials/"):
+                elif self.path.endswith(ROLE_LISTING):
+                    first = _role_listings(server) == 1
                     if server.mode == "no_role":
                         self._answer(404, "")
+                    elif server.mode == "role_500" or (server.mode == "role_500_once" and first):
+                        self._answer(500, "")
                     else:
                         self._answer(200, ROLE_NAME)
-                elif self.path.endswith(f"/latest/meta-data/iam/security-credentials/{ROLE_NAME}"):
+                elif self.path.endswith(f"{ROLE_LISTING}{ROLE_NAME}"):
                     expires = datetime.now(UTC) + timedelta(hours=6)
                     body = {
                         "Code": "Success",
@@ -132,6 +142,13 @@ class _Server:
     def __exit__(self, *exc: object) -> None:
         self.httpd.shutdown()
         self.httpd.server_close()
+
+
+def _role_listings(server: _Server) -> int:
+    """How many role-listing GETs have reached the server so far."""
+    return sum(
+        1 for method, path, _ in server.requests if method == "GET" and path.endswith(ROLE_LISTING)
+    )
 
 
 @pytest.fixture
@@ -255,6 +272,59 @@ def test_the_profile_path_signs_with_the_metadata_credentials(metadata, proxy, h
     assert proxy.requests == []
 
 
+def test_the_profile_path_ignores_an_endpoint_and_a_region_in_the_environment(
+    metadata, hostile, monkeypatch
+):
+    # The profile path builds inside the same cleanup as the key path, so an endpoint
+    # variable cannot send the metadata credentials to another host.
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://from-env.invalid")
+    monkeypatch.setenv("AWS_ENDPOINT_URL_S3", "https://from-env-s3.invalid")
+    monkeypatch.setenv("AWS_REGION", "eu-west-1")
+    request = _head(client_from_config(_config()))
+
+    assert request.url.startswith(f"https://lake-backup.s3.{REGION}.amazonaws.com/")
+    assert f"/{REGION}/s3/" in request.headers["Authorization"].decode()
+
+
+def test_no_service_model_loads_from_the_home_directory_on_the_profile_path(metadata, hostile):
+    client = client_from_config(_config())
+    assert not any(".aws" in path for path in client._loader.search_paths)
+
+
+def test_one_failed_role_listing_is_asked_again(metadata, hostile):
+    metadata.mode = "role_500_once"
+    request = _head(client_from_config(_config()))
+    assert f"Credential={METADATA['AccessKeyId']}/" in request.headers["Authorization"].decode()
+    assert _role_listings(metadata) == 2
+
+
+def test_a_role_listing_that_always_fails_is_asked_twice_and_no_more(metadata, hostile):
+    metadata.mode = "role_500"
+    with pytest.raises(ConfigError) as refused:
+        client_from_config(_config())
+    _assert_both_fixes(str(refused.value), "none returned")
+    # A literal rather than ``bucket.METADATA_ATTEMPTS``, so a changed constant cannot
+    # move the expectation with it.
+    assert _role_listings(metadata) == 2
+
+
+def test_a_service_that_never_answers_refuses_within_the_timeout(monkeypatch):
+    # The socket listens, so a connection opens, and nothing ever answers on it. The
+    # token request times out and the build refuses in about one second, while a
+    # five-second timeout would take at least five.
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        port = listener.getsockname()[1]
+        monkeypatch.setattr(bucket, "METADATA_BASE_URL", f"http://127.0.0.1:{port}/")
+        started = time.monotonic()
+        with pytest.raises(ConfigError) as refused:
+            client_from_config(_config())
+        elapsed = time.monotonic() - started
+    _assert_both_fixes(str(refused.value), "MetadataRetrievalError")
+    assert elapsed < 3
+
+
 def test_the_build_leaves_the_environment_as_it_found_it(metadata, hostile):
     client_from_config(_config())
     for key, value in hostile.items():
@@ -315,6 +385,17 @@ def test_a_failed_lookup_refuses_at_build_naming_both_fixes(metadata, hostile, m
     with pytest.raises(ConfigError) as refused:
         client_from_config(_config())
     _assert_both_fixes(str(refused.value), detail)
+
+
+def test_the_lookup_failure_line_in_full(metadata, hostile):
+    metadata.mode = "no_role"
+    with pytest.raises(ConfigError) as refused:
+        client_from_config(_config())
+    assert str(refused.value) == (
+        "bucket_credentials is instance_profile and no credentials came from the instance "
+        "metadata service (none returned). Attach the instance profile, or set "
+        "bucket_credentials: keys in config.yaml"
+    )
 
 
 def test_an_unreachable_service_refuses_the_same_way(monkeypatch):

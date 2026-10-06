@@ -117,6 +117,13 @@ BUCKET_CREDENTIALS_KEY = "bucket_credentials"
 CREDENTIALS_FROM_KEYS = "keys"
 CREDENTIALS_FROM_INSTANCE_PROFILE = "instance_profile"
 
+# The refusal for any other ``bucket_credentials`` value. It never quotes the value, for
+# the reason ``bucket_credential_problems`` gives, and ``lake.bucket`` raises it too.
+UNRECOGNISED_CREDENTIALS = (
+    f"{BUCKET_CREDENTIALS_KEY} must be {CREDENTIALS_FROM_KEYS} or "
+    f"{CREDENTIALS_FROM_INSTANCE_PROFILE}"
+)
+
 # What S3 allows in a bucket name: 3 to 63 lowercase letters, digits, dots and hyphens,
 # starting and ending with a letter or digit.
 _BUCKET_NAME = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
@@ -285,10 +292,7 @@ def bucket_credential_problems(config: Config) -> list[str]:
     """
     source = config.bucket_credentials
     if source not in (CREDENTIALS_FROM_KEYS, CREDENTIALS_FROM_INSTANCE_PROFILE):
-        return [
-            f"{BUCKET_CREDENTIALS_KEY} must be {CREDENTIALS_FROM_KEYS} or "
-            f"{CREDENTIALS_FROM_INSTANCE_PROFILE}"
-        ]
+        return [UNRECOGNISED_CREDENTIALS]
     problems = []
     key_id, secret_key = config.bucket_access_key_id, config.bucket_secret_access_key
     if source == CREDENTIALS_FROM_INSTANCE_PROFILE:

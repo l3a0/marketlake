@@ -234,9 +234,28 @@ def test_instance_profile_with_a_region_and_no_keys_passes_the_job_checks():
 def test_a_key_beside_instance_profile_is_refused_naming_it(present):
     with pytest.raises(ConfigError) as refused:
         require_bucket_settings(_profile(**{present: KEYS[present]}))
-    message = str(refused.value)
-    assert present in message and "instance_profile" in message
-    assert KEYS[present] not in message and "\n" not in message
+    assert str(refused.value) == (
+        f"bucket_credentials is instance_profile, so the config must not hold ['{present}']"
+    )
+
+
+def test_a_key_and_no_region_beside_instance_profile_are_refused_as_one_line():
+    with pytest.raises(ConfigError) as refused:
+        require_bucket_settings(
+            _profile(bucket_access_key_id=KEYS["bucket_access_key_id"], bucket_region=None)
+        )
+    assert str(refused.value) == (
+        "bucket_credentials is instance_profile, so the config must not hold "
+        "['bucket_access_key_id']. the bucket needs config key(s): ['bucket_region']"
+    )
+
+
+def test_instance_profile_with_a_malformed_region_is_refused():
+    with pytest.raises(ConfigError) as refused:
+        require_bucket_settings(_profile(bucket_region="useast2"))
+    assert str(refused.value) == (
+        "bucket_region 'useast2' is not an AWS region name like us-east-2"
+    )
 
 
 def test_instance_profile_without_a_region_is_refused_naming_only_the_region():
@@ -246,7 +265,9 @@ def test_instance_profile_without_a_region_is_refused_naming_only_the_region():
     assert "bucket_region" in message and "bucket_access_key_id" not in message
 
 
-@pytest.mark.parametrize("value", [None, "instance-profile", "AKIDPASTEDHERE"])
+@pytest.mark.parametrize(
+    "value", [None, "instance-profile", " instance_profile ", "AKIDPASTEDHERE"]
+)
 def test_an_unrecognised_credential_source_is_refused_alone(value):
     # No key is present, and the refusal still lists none of them, because the value
     # it cannot read is the only thing to fix. The value itself is never quoted.

@@ -86,6 +86,7 @@ from lake.config import (
     BUCKET_CREDENTIALS_KEY,
     CREDENTIALS_FROM_INSTANCE_PROFILE,
     CREDENTIALS_FROM_KEYS,
+    UNRECOGNISED_CREDENTIALS,
     BucketTarget,
     Config,
     ConfigError,
@@ -632,13 +633,19 @@ def _build_client(config: Config) -> Any:
             if not (frozen.access_key and frozen.secret_key):
                 raise _MetadataLookupFailed("incomplete credentials")
             keys: dict[str, str] = {}
-        else:
+        elif config.bucket_credentials == CREDENTIALS_FROM_KEYS:
             assert config.bucket_access_key_id is not None
             assert config.bucket_secret_access_key is not None
             keys = {
                 "aws_access_key_id": config.bucket_access_key_id.reveal(),
                 "aws_secret_access_key": config.bucket_secret_access_key.reveal(),
             }
+        else:
+            # ``bucket_credential_problems`` refuses any other value first. Each path is
+            # still taken only on its own value, so a value that check let through
+            # refuses here as one line rather than building a key client or failing an
+            # ``assert``.
+            raise ConfigError(UNRECOGNISED_CREDENTIALS)
         session = boto3.session.Session(botocore_session=core)
         return session.client(
             "s3",

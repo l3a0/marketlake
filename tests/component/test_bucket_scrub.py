@@ -31,7 +31,7 @@ from lake import control_plane as cp
 from lake.bucket import bucket_scrub, first_upload
 from lake.calendar import MARKET_TZ
 from lake.config import BucketTarget
-from lake.manifest import append_manifest, manifest_path, sha256_file
+from lake.manifest import BackupScrubResult, append_manifest, manifest_path, sha256_file
 from tests.support.bucket import FakeS3, client_error, unreachable
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
@@ -337,8 +337,15 @@ def test_a_refused_credential_is_named_refused_and_never_raises(tmp_path, code):
     result = bucket_scrub(lake, TARGET, client)
     assert result.bucket_refused == code
     assert result.bucket_unreachable is None
-    assert "refused" in result.problem
-    assert "the bucket's credentials or their policy" in result.problem
+    assert result.problem == (
+        f"backup bucket refused the scrub ({code}), so the bucket's credentials or their "
+        "policy may need replacing: s3://lake-backup/lake"
+    )
+
+
+def test_unusable_settings_are_named_in_full():
+    result = BackupScrubResult(target=str(TARGET), bucket_unusable="bucket_region is not set")
+    assert result.problem == "backup bucket settings cannot be used: bucket_region is not set"
 
 
 def test_a_failed_connection_is_named_unreachable_and_never_raises(tmp_path):
