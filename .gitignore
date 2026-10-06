@@ -14,3 +14,12 @@ dist/
 
 # Editors / OS
 .DS_Store
+
+# OpenTofu. State, plans, variables and backend files never enter the repository.
+# Each configuration commits its .terraform.lock.hcl.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+*.tfbackend

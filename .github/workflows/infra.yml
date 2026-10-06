@@ -1,0 +1,246 @@
+# Checks, plans and applies the configurations under infra/.
+#
+# No job here is named `test`, because the ruleset on main requires a check by that
+# name and ci.yml provides it. These checks download a provider of about 750 MB
+# unpacked, so they run only when infra/ or this file changes. README.md's "Apply the
+# infrastructure" section carries the owner's steps and the secrets this workflow reads.
+#
+# A public repository's logs are readable by anyone, so plan and apply send their
+# human output to /dev/null. Each job writes resource addresses, actions and attribute
+# names to its step summary through infra/ci/plan_summary.py, and never a value.
+# Event values reach a `run:` script only through `env:`, never by interpolation.
+#
+# Every action is pinned to a commit. Any step in a job with `id-token: write` can mint
+# the job's OIDC token, so a re-pointed tag would get the AWS role.
+name: Infra
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - ".github/workflows/infra.yml"
+  pull_request:
+    paths:
+      - "infra/**"
+      - ".github/workflows/infra.yml"
+  # Reverts console drift without a code change, behind the same approval as a merge.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # An explicit bash adds pipefail, so a failed `tofu show` fails its pipe.
+    shell: bash
+
+env:
+  # Pins CI's OpenTofu. required_version in both configurations is only a floor that
+  # the laptop's Homebrew release must meet.
+  TOFU_VERSION: "1.13.1"
+  AWS_REGION: us-east-1
+
+jobs:
+  fmt:
+    name: tofu fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      # Without -recursive, misformatted files in tests/ and subdirectories pass.
+      - name: Check formatting
+        run: tofu fmt -check -recursive infra/
+
+  validate:
+    name: tofu validate and test (${{ matrix.config }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [bootstrap, live]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - name: Initialise without a backend
+        run: tofu -chdir="infra/$CONFIG" init -input=false -backend=false -lockfile=readonly
+        env:
+          CONFIG: ${{ matrix.config }}
+
+      - name: Validate
+        run: tofu -chdir="infra/$CONFIG" validate
+        env:
+          CONFIG: ${{ matrix.config }}
+
+      # Runs against a mock provider, with no AWS credentials.
+      - name: Test
+        run: tofu -chdir="infra/$CONFIG" test
+        env:
+          CONFIG: ${{ matrix.config }}
+
+  plan:
+    name: tofu plan (live)
+    # Forks get no OIDC token, and Dependabot's runs get none of the repository's
+    # secrets, so both skip rather than fail the empty-secret check.
+    if: >-
+      github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Refuse an empty secret
+        env:
+          AWS_PLAN_ROLE_ARN: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+          BACKUP_BUCKET: ${{ secrets.BACKUP_BUCKET }}
+          BACKUP_POLICY_NAME: ${{ vars.BACKUP_POLICY_NAME }}
+        run: |
+          missing=0
+          for name in AWS_PLAN_ROLE_ARN TF_STATE_BUCKET BACKUP_BUCKET BACKUP_POLICY_NAME; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is empty. README.md's infrastructure runbook says where to set it."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - name: Initialise
+        env:
+          TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+        run: |
+          printf 'bucket = "%s"\n' "$TF_STATE_BUCKET" > "$RUNNER_TEMP/live.tfbackend"
+          tofu -chdir=infra/live init -input=false -lockfile=readonly \
+            -backend-config="$RUNNER_TEMP/live.tfbackend"
+
+      # The plan role cannot write the lock file, so this plan takes no lock.
+      - name: Plan
+        env:
+          TF_VAR_backup_bucket: ${{ secrets.BACKUP_BUCKET }}
+          TF_VAR_backup_policy_name: ${{ vars.BACKUP_POLICY_NAME }}
+        run: |
+          tofu -chdir=infra/live plan -input=false -lock=false \
+            -out="$RUNNER_TEMP/live.tfplan" > /dev/null
+
+      - name: Summarise the plan
+        run: |
+          tofu -chdir=infra/live show -json "$RUNNER_TEMP/live.tfplan" \
+            | python3 infra/ci/plan_summary.py "Plan of infra/live" >> "$GITHUB_STEP_SUMMARY"
+
+  apply:
+    name: tofu apply (live)
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Needs the owner's approval, and holds the apply role's ARN.
+    environment: infra
+    # One apply at a time. An apply cancelled halfway leaves its lock behind.
+    concurrency:
+      group: infra-apply
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Refuse an empty secret
+        env:
+          AWS_APPLY_ROLE_ARN: ${{ secrets.AWS_APPLY_ROLE_ARN }}
+          TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+          BACKUP_BUCKET: ${{ secrets.BACKUP_BUCKET }}
+          BACKUP_POLICY_NAME: ${{ vars.BACKUP_POLICY_NAME }}
+        run: |
+          missing=0
+          for name in AWS_APPLY_ROLE_ARN TF_STATE_BUCKET BACKUP_BUCKET BACKUP_POLICY_NAME; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is empty. README.md's infrastructure runbook says where to set it."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      # The assignment fails the step when the script exits non-zero, which a bare
+      # command substitution inside echo would not.
+      - name: Check that no newer commit supersedes this one
+        id: freshness
+        run: |
+          state="$(infra/ci/apply-is-stale.sh)"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          if [ "$state" = stale ]; then
+            echo "Skipped: a newer commit on main changes infra/, and its own run applies it." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        if: steps.freshness.outputs.state == 'fresh'
+        with:
+          role-to-assume: ${{ secrets.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        if: steps.freshness.outputs.state == 'fresh'
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - name: Initialise
+        if: steps.freshness.outputs.state == 'fresh'
+        env:
+          TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+        run: |
+          printf 'bucket = "%s"\n' "$TF_STATE_BUCKET" > "$RUNNER_TEMP/live.tfbackend"
+          tofu -chdir=infra/live init -input=false -lockfile=readonly \
+            -backend-config="$RUNNER_TEMP/live.tfbackend"
+
+      - name: Plan
+        if: steps.freshness.outputs.state == 'fresh'
+        env:
+          TF_VAR_backup_bucket: ${{ secrets.BACKUP_BUCKET }}
+          TF_VAR_backup_policy_name: ${{ vars.BACKUP_POLICY_NAME }}
+        run: |
+          tofu -chdir=infra/live plan -input=false -lock-timeout=5m \
+            -out="$RUNNER_TEMP/live.tfplan" > /dev/null
+
+      - name: Summarise the plan
+        if: steps.freshness.outputs.state == 'fresh'
+        run: |
+          tofu -chdir=infra/live show -json "$RUNNER_TEMP/live.tfplan" \
+            | python3 infra/ci/plan_summary.py "Plan this run applies to infra/live" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply
+        if: steps.freshness.outputs.state == 'fresh'
+        run: |
+          tofu -chdir=infra/live apply -input=false -lock-timeout=5m \
+            "$RUNNER_TEMP/live.tfplan" > /dev/null
