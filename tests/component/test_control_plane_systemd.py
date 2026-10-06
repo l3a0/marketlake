@@ -804,8 +804,10 @@ def test_two_runs_swap_the_render_and_carry_the_lake_mount(tmp_path):
     assert banners[0] == f"linux-install: install root {harness.root}"
     assert banners[-1] == "linux-install: done"
 
-    # A killed run's leftovers, and a file the render no longer names.
+    # A killed run's leftovers, one holding a file its render had written, and a file
+    # the render no longer names.
     (state / "systemd.new").mkdir()
+    (state / "systemd.new" / "half-written.service").write_text("")
     (state / "systemd.old").mkdir()
     (live / "stale.txt").write_text("")
     second = harness.run([entry, "--owner", OWNER, "--lake-mount", "/srv/other"])
