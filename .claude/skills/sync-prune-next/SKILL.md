@@ -242,9 +242,27 @@ old content under a new version, and looks exactly like a good write.
 - **`prs`** has one entry per open pull request, written as
   `{issue, pr, state, review, linked, reviewed, rollup}` and keyed by `issue`.
   An entry keyed `n` drops its card without any error. `linked` comes from the
-  pull request's `closingIssuesReferences`. `reviewed` comes from whether a
-  review comment has been posted on it, because GitHub's review decision cannot
-  tell whether the review ran. `rollup` is a list
+  pull request's `closingIssuesReferences`. A reviewed, green card lands in the
+  owner's queue, so `reviewed` is true only once the review is complete. Any
+  review comment is not enough, because a session can post some lenses' results
+  while another lens still runs. That sent
+  [PR #713](https://github.com/l3a0/marketlake/pull/713) to the owner while its
+  mutation lens was running. A review is complete when the pull request carries
+  a comment or review whose whole first line is `## Review complete`, posted
+  after the head commit's `committedDate`. A heading that only starts with
+  those words, like `## Review completeness check`, does not count. Neither
+  does a marker from an earlier round, because the commits pushed since then
+  are code that review never saw. Count the markers with
+  `gh pr view <n> --json comments,reviews,commits --jq '.commits[-1].committedDate as $head | [.comments[] | select(.createdAt > $head) | .body] + [.reviews[] | select(.submittedAt > $head) | .body] | map(select(test("\\A## Review complete\\r?(\\n|\\z)"))) | length'`,
+  and set `reviewed` only when the count is above zero. A pull request whose
+  final review was posted before this rule carries no marker, so it reads
+  `reviewed: false` until a session posts one, and the sync reports it rather
+  than guessing whether its review finished. GitHub's review
+  decision cannot tell whether the review ran, so it does not decide
+  `reviewed`. A session posting review results puts that heading only on the
+  comment that closes the review, after every lens has reported. A partial
+  comment leaves `reviewed` false, and the entry's `review` text says which
+  lens is still running. `rollup` is a list
   of `[name, conclusion]` pairs, where the conclusion is one of `"success"`,
   `"failure"`, `"running"` or `"neutral"`.
 - **`working`** marks a card a session is on right now, as `{n, kind, what}`.
@@ -282,9 +300,12 @@ So a card's milestone comes only from `tracker`, and an issue missing from
   the time of the write.
 - `working` entries are owed a removal by whoever added them, so report a stale
   one rather than deleting another session's entry. A build session keeps its
-  entry until it hands its pull request over, so an entry on a card with an
-  open pull request keeps that card out of the owner's queue whatever its
-  `kind`. Ask whoever added it before calling it stale.
+  entry until it hands its pull request over. Until that session removes it, a
+  `working` entry of `kind: "build"` keeps the card out of "Waiting on your
+  review", even when its pull request is reviewed and green. An entry of any
+  other `kind` does not hold the card, because a planning loop on leftover
+  scope should not hide a finished pull request. Ask whoever added an entry
+  before calling it stale.
 
 Pass `--limit 1000` to every `gh` list command that feeds the board, because
 `gh` stops at its limit without a warning and its default is 30. A cut list
@@ -325,7 +346,7 @@ Collect candidates from three places, and give the evidence for each one.
 1. **The owner's queue.** Nothing moves until the owner answers, so these come
    first.
    - Pull requests that are reviewed, green at the current head, and carry no
-     `working` entry on their card.
+     `working` entry of `kind: "build"` on their card.
    - `planned` entries with `ready` of `decide`.
    - Questions a session handed back.
 2. **Plans ready to build with no builder.** These are `planned` entries with
