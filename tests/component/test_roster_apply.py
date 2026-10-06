@@ -70,18 +70,30 @@ def test_a_roster_is_written_byte_for_byte(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "payload",
+    ("payload", "named"),
     [
-        pytest.param(b"SPY: {options: true, bars: [1m\n", id="bad-yaml"),
-        pytest.param(b"- SPY\n- QQQ\n", id="not-a-mapping"),
-        pytest.param(b"SPY: {options: true, bars: [1m, 1d]}  # caf\xe9\n", id="not-utf8"),
+        pytest.param(b"SPY: {options: true, bars: [1m\n", "not valid YAML", id="bad-yaml"),
+        pytest.param(b"- SPY\n- QQQ\n", "not a mapping", id="not-a-mapping"),
+        pytest.param(
+            b"SPY: {options: true, bars: [1m, 1d]}  # caf\xe9\n", "not UTF-8", id="not-utf8"
+        ),
     ],
 )
-def test_a_payload_that_is_not_a_roster_writes_nothing(tmp_path, payload):
+def test_a_payload_that_is_not_a_roster_writes_nothing(tmp_path, payload, named):
     target = tmp_path / "tickers.yaml"
-    with pytest.raises(TickersError):
+    with pytest.raises(TickersError, match=named):
         apply_roster(payload, check=_accept, path=target)
     assert _listing(tmp_path) == []
+
+
+def test_the_check_sees_the_disabled_entries_too(tmp_path):
+    payload = (
+        b"SPY: {options: true, chain_cadence: 1m, bars: [1m, 1d]}\n"
+        b"QQQ: {options: false, bars: [1d], enabled: false}\n"
+    )
+    seen = []
+    apply_roster(payload, check=lambda r: seen.append(r.symbols), path=tmp_path / "tickers.yaml")
+    assert seen == [("SPY", "QQQ")]
 
 
 def test_a_differing_roster_replaces_the_file(tmp_path):
