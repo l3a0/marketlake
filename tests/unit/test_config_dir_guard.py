@@ -463,12 +463,14 @@ def test_a_forgotten_token_writer_is_caught():
 def test_a_forgotten_roster_upsert_is_caught():
     """The token is not the only file in there that can be lost.
 
-    The roster is hand-maintained and has three writers that resolve into the same
-    directory by default. Only ``upsert_ticker`` is driven here. ``set_enabled`` and
-    ``remove_ticker`` both raise ``TickersError`` when the file is absent, before they
-    reach a write, so neither can be aimed at a name that does not exist and the
-    docstring's safety rule forbids aiming them at the real roster. All three write
-    through ``tickers._write_atomically``, which this drives.
+    The host's roster is copied from the tracked ``config/tickers.yaml`` and has four
+    writers that resolve into the same directory by default: ``upsert_ticker``,
+    ``set_enabled``, ``remove_ticker`` and ``apply_roster``. Only ``upsert_ticker`` is
+    driven here. ``set_enabled`` and ``remove_ticker`` both raise ``TickersError`` when the
+    file is absent, before they reach a write, so neither can be aimed at a name that does
+    not exist and the docstring's safety rule forbids aiming them at the real roster.
+    ``apply_roster`` is not driven either. All four write through
+    ``tickers._write_atomically``, which this drives.
     """
     with pytest.raises(ConfigWriteInTest):
         upsert_ticker("SPY", options=True, chain_cadence="1m", path=PROBE)

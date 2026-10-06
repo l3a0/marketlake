@@ -68,6 +68,8 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
 - `deploy/linux-install.sh` is the one install on a Linux host. It renders the systemd
   units from the checkout and installs them, and the host's first boot and every deploy
   call it.
+- `config/tickers.yaml` is the capture roster. A change to it is a reviewed pull request,
+  and `python -m lake.roster apply` copies it onto a host.
 
 Tests sit in one folder per tier, matching the build plan's placement rule.
 
@@ -351,6 +353,51 @@ open shows a banner saying the query service is unreachable, and clears it on it
 the first refresh after the dashboard is back. Opened while the dashboard is down, the
 page never loads, since the dashboard serves it, and the browser shows its own connection
 error until a reload after the dashboard is back.
+
+## Change the roster
+
+The roster says which tickers to capture. The repository tracks it as
+`config/tickers.yaml`, so a change to it is a reviewed pull request. Every process on a
+host still reads `~/.config/marketlake/tickers.yaml`, and
+`python -m lake.roster apply` copies the tracked file there. It refuses a roster that
+does not parse, one with no enabled ticker, a host with no `config.yaml`, and a run as
+root. It replaces the host's file when the bytes differ, leaves it alone when they match,
+and prints which. It never restarts the daemon, which reads the new roster on its next
+cycle. On the VM, the boot render
+([#686](https://github.com/l3a0/marketlake/issues/686)) and the post-close deploy
+([#676](https://github.com/l3a0/marketlake/issues/676)) will run it once they are built.
+
+On the laptop, run it from the main checkout after a `git pull`. Call the checkout's own
+venv interpreter, the way the rendered `reauth.sh` does. `uv run` would sync the venv
+the live daemon imports from before running anything.
+
+```bash
+git pull
+.venv/bin/python -m lake.roster apply < config/tickers.yaml
+```
+
+Before the pull request that first adds `config/tickers.yaml` merges, check that it
+matches the laptop's roster byte for byte, so the running daemon sees no change. `cmp`
+prints nothing when the two files are equal.
+
+```bash
+cmp ~/.config/marketlake/tickers.yaml config/tickers.yaml
+```
+
+`lake.onboard` and `lake.retire` still write the host's copy, so a roster change is two
+steps, and the order matters.
+
+1. **To onboard,** merge the roster pull request after the close, then run
+   `lake.onboard` the same evening. Capture keeps an enabled ticker the security master
+   cannot resolve yet, so a forgotten onboard loses no minute.
+2. **To retire,** run `lake.retire` after the close, then merge the roster pull request
+   before 09:30 ET. Never merge the retire pull request before `lake.retire` has run.
+   `apply` does not yet check the roster against the lake, so it copies an early merge
+   onto the host, and the ticker silently stops being captured with no page. The check
+   that would refuse that copy arrives with
+   [#692](https://github.com/l3a0/marketlake/issues/692). The other mistake is loud. Run
+   first and left unmerged, the next apply puts the entry back, and the daemon pages
+   during the session that an enabled ticker sits outside every span.
 
 ## Apply the infrastructure
 

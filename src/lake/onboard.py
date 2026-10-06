@@ -32,9 +32,11 @@ The slice-1 steps, in order.
    stamps it around the whole windowed fetch, so the journaled round trip covers every
    window. The quote branch stamps its own pair around its one call. Both read the
    injected clock.
-3. *Write the roster entry.* The command writes the ``tickers.yaml`` entry itself. The
-   roster lives in ``~/.config/marketlake/``, outside the repo, so no machine path or
-   secret ever lands in a tracked file.
+3. *Write the roster entry.* The command writes the entry into this host's
+   ``tickers.yaml`` in ``~/.config/marketlake/``. The reviewed roster is the repository's
+   ``config/tickers.yaml``, which ``python -m lake.roster apply`` copies onto each host,
+   so the entry is merged there first and this run follows the same evening. The roster
+   holds no machine path and no secret, so tracking it commits neither.
 4. *Persist the master and journal the snapshot.* The master is written under the
    lake-root lock and given a manifest entry, so the integrity scrub stays clean in both
    directions. Then, once the ticker is trusted, the same snapshot fetched for
