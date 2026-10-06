@@ -86,7 +86,10 @@ def test_a_second_run_compares_every_object_and_sends_nothing(tmp_path, monkeypa
     assert _main(config, client, monkeypatch) == 0
 
     assert client.puts() == []
-    assert "uploaded 0 file(s)" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "uploaded 0 file(s)" in out
+    # A copy that was already whole was not replaced, so the run does not say it was.
+    assert "replaced" not in out
 
 
 def test_it_re_baselines_a_copy_that_is_not_a_prefix(tmp_path, monkeypatch, capsys):

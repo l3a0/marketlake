@@ -92,10 +92,31 @@ def test_a_malformed_bucket_url_loads_and_is_refused_when_a_job_runs(text):
         require_bucket_settings(cfg)
 
 
-@pytest.mark.parametrize("text", ["s3://lake-backup", "s3://lake-backup/a/b", "s3://a.b-c/x"])
+@pytest.mark.parametrize("text", ["s3://ab", "s3://" + "a" * 64, "s3://lake-backup/./x"])
+def test_a_name_past_either_length_bound_or_a_dot_prefix_part_is_refused(text):
+    cfg = Config.from_mapping({**BASE, "backup_target": text, **KEYS})
+    with pytest.raises(ConfigError, match="bucket|prefix"):
+        require_bucket_settings(cfg)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["s3://lake-backup", "s3://lake-backup/a/b", "s3://a.b-c/x", "s3://abc", "s3://" + "a" * 63],
+)
 def test_a_well_formed_bucket_with_its_keys_passes_the_job_checks(text):
     cfg = Config.from_mapping({**BASE, "backup_target": text, **KEYS})
     assert require_bucket_settings(cfg) == cfg.backup_target
+
+
+@pytest.mark.parametrize("key", list(KEYS))
+def test_a_bucket_key_left_blank_is_refused_naming_it(key):
+    # A key written as blank spaces names nothing. It loads as absent, so the job refuses
+    # with the key named in one line rather than signing requests with a blank value.
+    cfg = Config.from_mapping({**BASE, "backup_target": "s3://lake-backup", **KEYS, key: "   "})
+    with pytest.raises(ConfigError) as refused:
+        require_bucket_settings(cfg)
+    message = str(refused.value)
+    assert key in message and "\n" not in message
 
 
 @pytest.mark.parametrize(

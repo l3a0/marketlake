@@ -323,6 +323,53 @@ def test_an_unmanifested_file_goes_up_again_when_its_size_moves(tmp_path):
     assert client.put_keys() == [_key("journal/metadata.json")]
 
 
+def test_an_unmanifested_file_that_shrank_goes_up_again(tmp_path):
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    (lake / "journal" / "metadata.json").write_text("{}\n")
+    nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+    assert client.put_keys() == [_key("journal/metadata.json")]
+    assert client.body(_key("journal/metadata.json")) == b"{}\n"
+
+
+def test_a_new_empty_file_goes_up(tmp_path):
+    # Its size is zero and the listing names no such key, which is not the same as a key
+    # of zero bytes.
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    (lake / "reports" / "empty.md").write_bytes(b"")
+    nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+    assert client.put_keys() == [_key("reports/empty.md")]
+
+
+def test_a_partition_recompacted_after_it_went_up_goes_up_again(tmp_path):
+    # A recompact rewrites a sealed partition and appends a second manifest entry for the
+    # same path. That entry sits past the watermark, so the new bytes must go up, even
+    # though the path's first entry sits inside it.
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    rel = _seal_another_day(lake)
+    nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+    pq.write_table(sample_quotes_table(), lake / rel, compression="gzip")
+    append_manifest(
+        lake,
+        partition=rel,
+        source="compaction",
+        sha256=sha256_file(lake / rel),
+        rows=1,
+        fetched_at=None,
+    )
+    client.calls.clear()
+
+    nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    assert client.put_keys() == [_key(rel), _key("manifest.jsonl")]
+    assert client.body(_key(rel)) == (lake / rel).read_bytes()
+
+
 def test_nothing_is_ever_deleted(tmp_path):
     lake = _lake(tmp_path / "lake")
     client = FakeS3()
@@ -708,3 +755,96 @@ def test_an_entry_the_manifest_gains_mid_run_goes_up_before_the_manifest(tmp_pat
     assert keys.index(_key(sealed[0])) < keys.index(_key("manifest.jsonl"))
     assert client.body(_key("manifest.jsonl")) == manifest_path(lake).read_bytes()
     assert client.body(_key(sealed[0])) == (lake / sealed[0]).read_bytes()
+
+
+def test_a_partition_recompacted_mid_run_goes_up_with_its_new_bytes(tmp_path):
+    # A recompact during the unlocked phase rewrites a partition the first pass already
+    # sent, and appends a second entry for the same path. The uploaded manifest names the
+    # new digest, so the locked phase must send the new bytes too.
+    lake = _lake(tmp_path / "lake")
+    rel = "chains/ticker=SPY/date=2026-08-24.parquet"
+    client = FakeS3()
+    rewritten: list[bytes] = []
+
+    def recompact_once(kwargs, data):
+        if kwargs["Key"] == _key(rel) and not rewritten:
+            pq.write_table(sample_chains_table(), lake / rel, compression="gzip")
+            rewritten.append((lake / rel).read_bytes())
+            append_manifest(
+                lake,
+                partition=rel,
+                source="compaction",
+                sha256=sha256_file(lake / rel),
+                rows=1,
+                fetched_at=None,
+            )
+
+    client.on_put = recompact_once
+
+    first_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    assert client.put_keys().count(_key(rel)) == 2
+    assert client.body(_key(rel)) == rewritten[0]
+    assert client.body(_key("manifest.jsonl")) == manifest_path(lake).read_bytes()
+
+
+def test_a_first_upload_over_a_copy_that_is_behind_replaces_it(tmp_path):
+    # The bucket's copy is a prefix, only a shorter one. It still has to be replaced, or
+    # the bucket would hold the new partition with no entry in its copy claiming it.
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    rel = _seal_another_day(lake)
+
+    summary = first_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    assert client.put_keys() == [_key(rel), _key("manifest.jsonl")]
+    assert client.body(_key("manifest.jsonl")) == manifest_path(lake).read_bytes()
+    assert summary.rebaselined is False
+
+
+# -- what the summary counts --------------------------------------------------------
+
+
+def test_the_nightly_summary_counts_what_it_sent_skipped_and_took(tmp_path):
+    # One new partition goes up. A second is already in the bucket under its digest, and
+    # the lake's two unmanifested files, the report and journal/metadata.json, are there
+    # at their size. Each PUT takes two seconds on the clock.
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    sent = _seal_another_day(lake)
+    held = _seal_another_day(lake, day=NEXT_WEEK)
+    client.store(_key(held), (lake / held).read_bytes())
+    clock = _clock()
+    client.on_put = lambda kwargs, data: clock.advance(2)
+
+    summary = nightly_upload(lake, TARGET, client=client, clock=clock, calendar=CALENDAR)
+
+    assert summary.uploaded == [sent, "manifest.jsonl"]
+    assert summary.puts == 2
+    assert summary.put_bytes == (lake / sent).stat().st_size + manifest_path(lake).stat().st_size
+    assert summary.skipped == 3
+    assert summary.seconds == 4.0
+
+
+def test_the_first_upload_summary_counts_every_file_and_its_time(tmp_path):
+    lake = _lake(tmp_path / "lake")
+    files = [p for p in lake.rglob("*") if p.is_file()]
+    client = FakeS3()
+    clock = _clock()
+    client.on_put = lambda kwargs, data: clock.advance(2)
+
+    first = first_upload(lake, TARGET, client=client, clock=clock, calendar=CALENDAR)
+
+    assert first.puts == len(files)
+    assert first.put_bytes == sum(p.stat().st_size for p in files)
+    assert first.seconds == 2.0 * len(files)
+
+    again = first_upload(lake, TARGET, client=client, clock=clock, calendar=CALENDAR)
+
+    # Every file but manifest.jsonl is compared and skipped. The copy of manifest.jsonl
+    # is already whole, so it is neither sent nor counted.
+    assert again.puts == 0 and again.put_bytes == 0
+    assert again.skipped == len(files) - 1
+    assert again.seconds == 0.0

@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 from datetime import date, datetime
 from pathlib import Path
 
@@ -33,7 +34,7 @@ from tests.support.bucket import FakeS3, client_error, unreachable
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import write_config
-from tests.support.lake import FixtureLake
+from tests.support.lake import FixtureLake, sample_chains_table
 from tests.support.pinger import FakePinger
 
 DAY = date(2026, 8, 28)
@@ -49,9 +50,7 @@ def _key(rel: str) -> str:
     return TARGET.key(rel)
 
 
-def _uploaded(root: Path) -> tuple[Path, FakeS3]:
-    lake = FixtureLake(root).with_chains("SPY", DAY).with_quotes("SPY", DAY).build()
-    client = FakeS3()
+def _seed(lake: Path, client: FakeS3) -> None:
     first_upload(
         lake,
         TARGET,
@@ -59,6 +58,12 @@ def _uploaded(root: Path) -> tuple[Path, FakeS3]:
         clock=ManualClock(datetime(2026, 8, 28, 19, 0, tzinfo=MARKET_TZ)),
         calendar=CALENDAR,
     )
+
+
+def _uploaded(root: Path) -> tuple[Path, FakeS3]:
+    lake = FixtureLake(root).with_chains("SPY", DAY).with_quotes("SPY", DAY).build()
+    client = FakeS3()
+    _seed(lake, client)
     return lake, client
 
 
@@ -106,6 +111,43 @@ def test_a_copy_behind_the_lake_reads_as_pending_not_loss(tmp_path):
     assert result.pending == ("chains/ticker=QQQ/date=2026-08-28.parquet",)
 
 
+@pytest.mark.parametrize("length", [0, 5])
+def test_a_copy_carrying_no_whole_entry_is_a_missing_manifest(tmp_path, length):
+    # Zero bytes, or a stub shorter than one line, is a prefix of any manifest with a
+    # watermark of 0. Read as a copy, every object in the bucket would sit past it, so
+    # the scrub names the copy missing instead.
+    lake, client = _uploaded(tmp_path / "lake")
+    client.store(_key("manifest.jsonl"), manifest_path(lake).read_bytes()[:length])
+    result = bucket_scrub(lake, TARGET, client)
+    assert result.manifest_missing
+    assert result.unaccounted == () and result.missing == ()
+    assert not result.ok
+
+
+def test_a_copy_stored_without_a_checksum_is_downloaded_and_found_whole(tmp_path):
+    # No stored SHA-256 proves no prefix, so the scrub downloads the copy. Bytes equal to
+    # the lake's manifest have not diverged.
+    lake, client = _uploaded(tmp_path / "lake")
+    client.store(_key("manifest.jsonl"), manifest_path(lake).read_bytes(), checksum=None)
+    result = bucket_scrub(lake, TARGET, client)
+    assert result.manifest_diverged_at is None
+    assert result.ok
+    assert "get_object" in [name for name, _ in client.calls]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a file with no permission bits")
+def test_an_unreadable_lake_manifest_is_a_finding_and_never_raises(tmp_path):
+    lake, client = _uploaded(tmp_path / "lake")
+    path = manifest_path(lake)
+    path.chmod(0)
+    try:
+        result = bucket_scrub(lake, TARGET, client)
+    finally:
+        path.chmod(0o644)
+    assert result.unreadable is not None and result.unreadable.startswith("PermissionError")
+    assert not result.ok
+
+
 # -- 2. the forward pass ---------------------------------------------------------
 
 
@@ -149,6 +191,87 @@ def test_a_deleted_object_is_missing(tmp_path):
     del client.objects[_key(PARTITION)]
     result = bucket_scrub(lake, TARGET, client)
     assert result.missing == (PARTITION,)
+    assert not result.ok
+
+
+class _NoSuchKeyHeads(FakeS3):
+    """A bucket whose ``HeadObject`` on a missing key answers ``NoSuchKey`` rather than 404."""
+
+    def head_object(self, **kwargs):
+        if not self.objects.get(kwargs["Key"]):
+            self.calls.append(("head_object", dict(kwargs)))
+            raise client_error("NoSuchKey", "HeadObject", 404)
+        return super().head_object(**kwargs)
+
+
+def test_a_missing_object_answered_as_no_such_key_is_missing(tmp_path):
+    lake, uploaded = _uploaded(tmp_path / "lake")
+    client = _NoSuchKeyHeads()
+    client.objects = uploaded.objects
+    del client.objects[_key(PARTITION)]
+    result = bucket_scrub(lake, TARGET, client)
+    assert result.missing == (PARTITION,)
+    assert result.bucket_failed is None
+
+
+SEGMENT_DAY = date(2026, 8, 31)
+
+
+def _record(lake: Path, rel: str, source: str) -> str:
+    append_manifest(
+        lake, partition=rel, source=source, sha256=sha256_file(lake / rel), rows=1, fetched_at=None
+    )
+    return rel
+
+
+def _manifest_segment(lake: Path) -> str:
+    """Write a chains journal segment for ``SEGMENT_DAY`` and record it as capture does."""
+    fixture = FixtureLake(lake)
+    path = fixture.segment_path("chains", "SPY", SEGMENT_DAY, "20260831T133000Z", 4242)
+    fixture.with_journal_segment(
+        "chains", "SPY", SEGMENT_DAY, sample_chains_table(), start_ts="20260831T133000Z", pid=4242
+    )
+    return _record(lake, path.relative_to(lake).as_posix(), "capture")
+
+
+def _seal_segment_day(lake: Path) -> str:
+    """Seal ``SEGMENT_DAY``'s chains partition and record it as compaction does."""
+    rel = f"chains/ticker=SPY/date={SEGMENT_DAY.isoformat()}.parquet"
+    (lake / rel).write_bytes(b"sealed chains")
+    return _record(lake, rel, "compaction")
+
+
+def test_a_segment_whose_partition_is_in_the_copy_is_not_looked_for(tmp_path):
+    # Compaction sealed the day and unlinked the segment, so neither the disk nor the
+    # bucket holds it. The partition carries the day, so nothing is missing.
+    lake = FixtureLake(tmp_path / "lake").with_chains("SPY", DAY).build()
+    segment = _manifest_segment(lake)
+    _seal_segment_day(lake)
+    (lake / segment).unlink()
+    client = FakeS3()
+    _seed(lake, client)
+
+    result = bucket_scrub(lake, TARGET, client)
+
+    assert _key(segment) not in client.keys()
+    assert result.missing == ()
+    assert result.ok
+
+
+def test_a_segment_whose_partition_is_only_pending_is_still_looked_for(tmp_path):
+    # The copy carries the segment and not yet the partition sealed from it, so the
+    # segment is the bucket's only copy of that day and must be there.
+    lake = FixtureLake(tmp_path / "lake").with_chains("SPY", DAY).build()
+    segment = _manifest_segment(lake)
+    client = FakeS3()
+    _seed(lake, client)
+    partition = _seal_segment_day(lake)
+    del client.objects[_key(segment)]
+
+    result = bucket_scrub(lake, TARGET, client)
+
+    assert result.pending == (partition,)
+    assert result.missing == (segment,)
     assert not result.ok
 
 
@@ -301,6 +424,26 @@ def test_the_versioning_line_survives_a_bucket_that_fails_mid_scrub(tmp_path):
     assert any(line.startswith("bucket versioning is Suspended") for line in result.notes)
 
 
+class _VersioningRefused(FakeS3):
+    """A key that may do everything but read the bucket's versioning status."""
+
+    def get_bucket_versioning(self, **kwargs):
+        self.calls.append(("get_bucket_versioning", dict(kwargs)))
+        raise client_error("AccessDenied", "GetBucketVersioning", 403)
+
+
+def test_a_refused_versioning_read_is_a_report_line_and_nothing_else(tmp_path):
+    # Every object request answers, so the bucket is fine. The one refusal is the
+    # versioning read, which withholds nothing and is not the bucket refusing the key.
+    lake, uploaded = _uploaded(tmp_path / "lake")
+    client = _VersioningRefused()
+    client.objects = uploaded.objects
+    result = bucket_scrub(lake, TARGET, client)
+    assert result.ok, result.problem
+    assert result.bucket_refused is None
+    assert result.notes == ("bucket versioning unreadable (AccessDenied): s3://lake-backup/lake",)
+
+
 def test_a_bug_still_raises(tmp_path):
     lake, client = _uploaded(tmp_path / "lake")
     client.fail_with = ZeroDivisionError("a real bug")
@@ -318,6 +461,15 @@ def test_versioning_that_is_not_enabled_is_a_report_line_that_withholds_nothing(
     result = bucket_scrub(lake, TARGET, client)
     assert result.ok
     assert any(line.startswith("bucket versioning is") for line in result.notes)
+
+
+def test_versioning_never_enabled_says_so(tmp_path):
+    lake, client = _uploaded(tmp_path / "lake")
+    client.versioning = None
+    assert bucket_scrub(lake, TARGET, client).notes == (
+        "bucket versioning is never enabled, so an overwrite or a delete keeps no old "
+        "version: s3://lake-backup/lake",
+    )
 
 
 # -- the Sunday job --------------------------------------------------------------
