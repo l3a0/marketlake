@@ -1412,6 +1412,20 @@ def test_render_puts_progress_on_stderr_so_stdout_is_pasteable(tmp_path, capsys)
         assert f"wrote {out / name}" in captured.err
 
 
+def test_the_systemd_render_puts_progress_on_stderr_too(tmp_path, capsys):
+    # The systemd render's stdout is a summary that the install entry point's caller
+    # reads in cloud-init's log or the deploy's output. A ``wrote ...`` line among it
+    # would double every file the summary already lists.
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *SYSTEMD_RENDER_ARGS]) == 0
+    captured = capsys.readouterr()
+
+    assert "wrote " not in captured.out
+    assert captured.out.strip(), "stdout carried no summary"
+    for name in SYSTEMD_EXPECTED_FILES:
+        assert f"wrote {out / name}" in captured.err
+
+
 def test_render_reports_a_bad_path_on_stderr_and_prints_no_install_text(capsys):
     # The failure path shares the defect. A caller redirecting stdout to a file used to
     # get the reason written into the file rather than onto the terminal, so the screen
@@ -1498,10 +1512,10 @@ def test_the_reauth_script_says_it_cannot_run_unattended(tmp_path):
 def test_nothing_rendered_bakes_in_a_secret_url(host, tmp_path, capsys):
     """The renderer reads no config, so no callback and no secret can reach a file.
 
-    ``render_all`` takes a ``LaunchdHost`` and nothing else, so it cannot know the
-    registered callback or the healthchecks ping key. Every rendering names a config key
-    or a check slug and leaves the value to the tool, which is what keeps a rendered
-    directory safe to paste into a bug report.
+    ``render_all`` takes a host, a ``LaunchdHost`` or a ``SystemdHost``, and nothing else,
+    so it cannot know the registered callback or the healthchecks ping key. Every
+    rendering names a config key or a check slug and leaves the value to the tool, which
+    is what keeps a rendered directory safe to paste into a bug report.
 
     The sweep covers every rendered file and the install text rather than the re-auth
     script alone. The arming step names a healthchecks row, and a ping URL written
