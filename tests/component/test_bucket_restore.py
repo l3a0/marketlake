@@ -1183,3 +1183,24 @@ def test_two_keys_that_differ_only_by_case_are_both_named(tmp_path):
     assert named == {REPORT, other}
     assert why.endswith("on a filesystem that ignores case")
     _no_lake(tmp_path / "restored")
+
+
+def test_a_waiting_name_in_another_case_still_clashes(tmp_path, monkeypatch):
+    # Both sides fold case. An unmanifested object under an upper-case directory waits in
+    # the working directory, and the destination gained the lower-case name.
+    lake, client = _uploaded(tmp_path)
+    client.store("lake/Zeta/notes.md", b"notes\n")
+    dest = tmp_path / "restored"
+    real_rename = os.rename
+
+    def killed(src, dst):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(os, "rename", killed)
+    with pytest.raises(KeyboardInterrupt):
+        restore_lake(dest, TARGET, client=client)
+    monkeypatch.setattr(os, "rename", real_rename)
+    (dest / "zeta").mkdir()
+
+    with pytest.raises(bucket.RestoreRefused, match="holds zeta, which the restore is about"):
+        restore_lake(dest, TARGET, client=client)
