@@ -460,15 +460,35 @@ const orlist = xs => joinwith("or", xs);
 /* A rollup is folded to the worst thing in it, because a board reader deciding
    whether a branch is ready needs the blocker rather than the tally. An entry
    still running and an empty rollup each read as themselves rather than as a
-   pass, so nothing unfinished is drawn as green. */
+   pass, so nothing unfinished is drawn as green.
+
+   Two words pass. "success" is a check that ran and passed, and "skipped" is
+   GitHub's SKIPPED, a job whose condition kept it from running. The infra
+   workflow's `tofu apply (live)` job is skipped on every pull request by
+   design, because it runs only on main. Read as unsettled, it kept every
+   reviewed, green pull request touching infra/ out of the owner's column.
+
+   Every other word is unsettled, "neutral" and any word this page does not
+   know alike. The fold used to count only the words it knew to be bad and
+   called the rest green, so a sync that wrote a typo such as "sucess" drew a
+   pass. Now a word has to be known good to pass, and an unknown one reads as
+   "reported neither way" until someone teaches the page what it means.
+
+   A rollup of nothing but skipped checks is not green either. Every check
+   standing aside means nothing built the branch, which is the same reason an
+   empty rollup does not pass. This repo's `test` job has no condition and
+   runs on every pull request, so the case has not been seen, and when it
+   comes it reads as unbuilt rather than as passing. */
 function checkword(rollup) {
-  const c = k => (rollup || []).filter(([, s]) => s === k).length;
   if (!rollup || !rollup.length) return ["none", "no checks reported"];
-  const bad = c("failure"), run = c("running"), neu = c("neutral");
+  const c = k => rollup.filter(([, s]) => s === k).length;
+  const bad = c("failure"), run = c("running"), ok = c("success"), skip = c("skipped");
+  const neu = rollup.length - bad - run - ok - skip;
   if (bad) return ["bad", plu(bad, "check") + " failing" +
     (run ? ", " + plu(run, "check") + " still running" : "")];
   if (run) return ["run", plu(run, "check") + " still running"];
   if (neu) return ["none", plu(neu, "check") + " reported neither way"];
+  if (!ok) return ["none", plu(skip, "check") + " skipped and none ran"];
   return ["ok", "checks green"];
 }
 
@@ -1179,11 +1199,13 @@ function buildOrder() {
    and the card read "2 checks still running" under a heading saying the next
    move was theirs, which invites a merge of a branch that can still go red.
 
-   `checkword` returns "ok" only when every entry succeeded, so three states all
-   stay on this side: a check still running, a check that failed, and no checks
-   reported at all. The last is not an oversight. A conflicting pull request gets
+   `checkword` returns "ok" only when every entry succeeded or was skipped and
+   at least one succeeded. So four states all stay on this side: a check still
+   running, a check that failed, a check that reported neither way, and nothing
+   built at all. The last is not an oversight. A conflicting pull request gets
    no run created, which `CLAUDE.md` records as its own failure mode, and a
-   branch nothing built is not one to hand over either. */
+   branch nothing built is not one to hand over either. A rollup where every
+   check was skipped counts as nothing built. */
 const handedOver = p => p.reviewed && checkword(p.rollup)[0] === "ok";
 /* marketlake: a build session that still holds its card has not handed the
    pull request over, whatever the review flag and the checks say. The sync
