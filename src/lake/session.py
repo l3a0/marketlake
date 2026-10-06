@@ -6,7 +6,8 @@ boundaries. So a test sets the clock and declares the calendar, then this module
 reports the phase, the current minute slot, and the session's key moments, all
 decided from those two inputs alone.
 
-Why it exists. launchd schedules on fixed wall-clock times. It cannot express a
+Why it exists. The host's scheduler, launchd on the Mac or a systemd timer on Linux,
+fires only at fixed wall-clock times. It cannot express a
 time like "fifteen minutes after this session's option close." The design pins
 every intraday time as session-relative, derived per day from the calendar. This
 module is the internal dispatcher that does the deriving. It covers the four
@@ -274,9 +275,10 @@ class SessionDispatch:
     """Fires one callback once per session day, at a moment the calendar decides.
 
     The design dispatches everything session-relative from inside the daemon, because
-    ``StartCalendarInterval`` is fixed wall-clock and cannot express a close-relative
-    time. An early close moves the option close, and with it every moment derived from
-    it, which a launchd job could not follow.
+    launchd's ``StartCalendarInterval`` and systemd's ``OnCalendar=`` are both fixed
+    wall-clock times and cannot express a close-relative time. An early close moves the
+    option close, and with it every moment derived from it, which a scheduled job could
+    not follow.
 
     The moment is named by a function of the day's bounds rather than by a time, so a
     caller says "close plus five" and the calendar says when that is. The callback runs

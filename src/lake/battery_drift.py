@@ -68,8 +68,10 @@ every re-run. What that costs is a second sweep in one night paging again:
 and its own docstring says the cap is "held in memory, so it resets when the date turns
 and also when the process does". The design accepts that price for nightly jobs rather
 than asking for a guard, at ``docs/design.md``'s "the run that would clear a drift is the
-run that finds it again". launchd cannot cause it: ``com.marketlake.eod-sweep`` carries
-``StartCalendarInterval`` on weekdays 1 to 5 at 18:30 with ``RunAtLoad`` false.
+run that finds it again". The schedule does not cause it. ``com.marketlake.eod-sweep``
+fires once at 18:30 on weekdays, under launchd's ``StartCalendarInterval`` with
+``RunAtLoad`` false and under a systemd timer whose ``Persistent=true`` folds missed fires
+into one run.
 
 **A day with no readable baseline reports and does not page.** With no baseline there is no
 way to separate a field that stopped arriving from one that never arrived, which is the

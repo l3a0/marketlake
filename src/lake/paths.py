@@ -508,7 +508,7 @@ def config_dir(
     """The config directory: an explicit ``home``, then the env var, then this user's home.
 
     A running process omits ``home`` and gets its own. The control plane's renderer
-    passes one, because it builds a plist for another account, and an explicit ``home``
+    passes one, because it builds a plist or a unit for another account, and an explicit ``home``
     wins over the override so a render stays a render whatever the environment says.
 
     ``MARKETLAKE_CONFIG_DIR`` names the directory itself rather than a home, the way

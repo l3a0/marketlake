@@ -8,6 +8,10 @@ one, on the Mac, and systemd on a Linux VM. Under launchd's ``KeepAlive`` or sys
 exited at the close would relaunch-loop all night. This loop therefore never exits on its
 own. Outside the capture window it idles and keeps ticking.
 
+The service manager also keeps what the daemon prints, which this module calls the daemon's
+log: two files launchd writes on the Mac, one for stdout and one for stderr, and the unit's
+journal on Linux, read with ``journalctl -u``. Each host's restart script names it.
+
 Each minute the loop does three things, in order.
 
 1. **Align to the minute top.** It waits through the injected clock until the next
@@ -147,9 +151,9 @@ that the process exits up to one bound plus one transport timeout after the rais
 that delay would come anyway, since the interpreter joins a cycle's pool threads at exit.
 The production entry reloads config and the token per cycle, so a raise there means a
 broken machine, not a vendor hiccup, and the loop has no channel of its own to report it.
-The process exits non-zero, launchd logs it and relaunches, and the successor's startup
-gap-marking records the minutes lost. A vendor failure never reaches here: the cycle
-resolves it into gap rows and returns normally.
+The process exits non-zero, the service manager logs it and relaunches it, and the
+successor's startup gap-marking records the minutes lost. A vendor failure never reaches
+here: the cycle resolves it into gap rows and returns normally.
 
 Leaving the loop through ``should_continue`` waits for every cycle in flight and hands each
 on. The daemon never leaves that way, and every test of the loop does.
@@ -577,7 +581,7 @@ def _skips_an_equity_close(session_clock: SessionClock, skipped: list[datetime])
 def _report(report: MarkingReport, pass_name: str) -> None:
     """Print what a marking pass did, so a pass that failed is not silent.
 
-    launchd captures the daemon's stderr to its own log, which is the only place a
+    The daemon's log, which the service manager captures from stderr, is the only place a
     startup pass can be seen from. A pass that marked the right thing, one that marked
     nothing because a segment could not be read, and one that stopped at the walk-back
     cap all look identical on disk. Only the quiet case stays quiet: a pass with rows
@@ -792,7 +796,7 @@ def _report_guard(outcome: CloseGuardOutcome) -> None:
     """Print what the guard found, so a close nobody observed is not silent.
 
     Three of the design's rules for this guard end in "flags the nightly report", and
-    no report exists yet. launchd captures the daemon's stderr, which is one of the two
+    no report exists yet. The daemon's log, its captured stderr, is one of the two
     places these land until one does. The other is the file ``_guard_reporter`` writes,
     and the two differ on purpose: stderr keeps an exception's own message and the file
     keeps its class. A day where both closes landed prints nothing here and still writes
@@ -996,8 +1000,8 @@ def compaction_command(config_path: str | Path | None) -> list[str]:
     """The argv that runs the close+15 job in its own process.
 
     ``sys.executable`` rather than a bare ``python``, so the child runs the same
-    interpreter the daemon does. The daemon is started by launchd from the venv, and a
-    bare name would resolve against whatever ``PATH`` launchd happens to hand it.
+    interpreter the daemon does. The service manager starts the daemon from the venv, and a
+    bare name would resolve against whatever ``PATH`` the manager happens to hand it.
 
     The config path is forwarded when the daemon was given one, and omitted otherwise so
     the child falls back to the same standard location the daemon did. Nothing else is
@@ -1036,8 +1040,9 @@ def _start_compaction(runner: CompactionRunner, args: Sequence[str]) -> None:
     Nothing is waited on, so a failing run is not reported from here. It cannot be: the
     child outlives this call by design. The child pings the ``compaction`` check itself,
     after its backup, or with no backup on a ``shadow`` host, so a run that died sends
-    nothing and healthchecks pages on the silence. Its own stderr lands in the launchd log
-    beside the daemon's.
+    nothing and healthchecks pages on the silence. The spawn passes no streams, so the
+    child writes to the daemon's own stdout and stderr, and its lines land in the daemon's
+    log.
 
     A spawn that never started is the one failure this call can still see, and it is
     caught by ``_dispatched`` rather than here. The two spellings named the same event,
@@ -1067,7 +1072,7 @@ def _dispatched(name: str, job: Callable[[date], None]) -> Callable[[date], None
     dead-man ride them, so swallowing a failure there would silence the very thing that
     reports trouble, while a crash loop is at least loud through the missed dead-man ping.
 
-    Reporting is one line on stderr, which launchd captures beside the daemon's own log.
+    Reporting is one line on stderr, which lands in the daemon's log.
     The close+5 guard's findings already go there through ``_report_guard``, so a run that
     failed outright lands beside the runs that merely had something to say.
 
@@ -1440,7 +1445,7 @@ def run_loop_from_config(
         config_path, tickers_path, session_clock, transport, pinger
     )
     # Marketlake #130, and it sits here for two reasons. The publisher above is the one
-    # surface a 01:32 restart reaches, since the daemon's stdout goes to a launchd log nobody
+    # surface a 01:32 restart reaches, since the daemon's stdout goes to a log nobody
     # reads at that hour. And it runs before any hook is wired, so the report leaves before
     # startup gap-marking takes the lake-root lock.
     _report_schema_version(config_path, publisher, clock.now())
@@ -1486,8 +1491,9 @@ def run_loop_from_config(
 
         hooks = replace(hooks, on_start=on_start, on_skipped=on_skipped)
 
-    # Every session-relative job is dispatched from in here, because launchd's calendar
-    # intervals are fixed wall-clock and cannot express a close-relative time. The
+    # Every session-relative job is dispatched from in here, because the host's scheduler,
+    # launchd's calendar intervals or systemd's timers, fires only at fixed wall-clock
+    # times and cannot express a close-relative time. The
     # close+5 guard is the first of them, and the close+15 compaction below is the
     # second.
     #
@@ -1692,7 +1698,7 @@ def run_loop_from_config(
         detail = f"{type(exc).__name__}: {exc}"
         # On stderr as well as on the phone, the bargain ``_dispatched`` already makes.
         # After this the holder retries every minute in silence, so without this line a
-        # permanent failure leaves the launchd log, the one the restart script tells the
+        # permanent failure leaves the daemon's log, the one the restart script tells the
         # operator to read, with nothing in it.
         print(f"assertion: {now.isoformat()}: {detail}", file=sys.stderr)
         delivery = publisher.publish(
@@ -1903,8 +1909,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     # The wrapper puts this entry in the same class as every other one that reads an
     # operator file. A missing config or roster is an operator mistake, so it earns one
     # named line and exit 2 rather than a traceback. That matters more here than
-    # elsewhere: launchd restarts the daemon under ``KeepAlive``, so a traceback would
-    # repeat every few seconds in the log the operator is told to read.
+    # elsewhere: the service manager restarts the daemon, under launchd's ``KeepAlive`` or
+    # systemd's ``Restart=always``, so a traceback would repeat every few seconds in the
+    # log the operator is told to read.
     with input_errors_exit("daemon"):
         config = load_config(args.config)
         sends = outbox.senders(config, process="daemon", clock=SystemClock())

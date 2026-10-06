@@ -2219,7 +2219,7 @@ class _CaptureCycle:
         It is guarded because the segment is a minute and the scan is a page's input. A
         minute cannot be bought back and a page can be sent again, so a scan that raised
         costs the finding rather than the capture. The failure is not silent: it reaches
-        the launchd log the restart script already sends the operator to, and the segment
+        the daemon's log the restart script already sends the operator to, and the segment
         lands with no column named, which reads as the ordinary cycle it otherwise is.
 
         The data-row count is an alarm's input in the same way, so it runs beside the scan
@@ -2835,7 +2835,7 @@ def _count_data_rows(surface: str, ticker: str, batch: object) -> int | None:
 
     A count that raised returns ``None``, which ``SegmentOutcome.landed_data`` reads the
     way a segment was read before the count existed, so the failure never pages a minute
-    that may have landed every contract. It prints one line to the launchd log, as the
+    that may have landed every contract. It prints one line to the daemon's log, as the
     scan does.
     """
     try:

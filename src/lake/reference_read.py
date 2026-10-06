@@ -31,9 +31,10 @@ twice. It gets no lock for the same reason: all it decides is whether a line pri
 
 **The line never raises.** All three readers promise not to, and ``_live_roster`` is why:
 ``run_loop`` calls the cycle with no guard, so an exception there ends the daemon, and under
-``KeepAlive`` the relaunch fails the same way on its first cycle. The daemon's plist sets
-``PYTHONUNBUFFERED``, so a write to a full log volume raises at the ``print``. A line that
-cannot be written is dropped.
+``KeepAlive`` or ``Restart=always`` the relaunch fails the same way on its first cycle. The
+daemon's plist and its unit both set ``PYTHONUNBUFFERED``, so a write that fails, as one to a
+full log volume does on the Mac, raises at the ``print``. A line that cannot be written is
+dropped.
 
 **Each line carries its instant**, from the caller's injected clock, because without one a
 reader of the log cannot tell a denial that lasted five seconds from one that lasted five days.
