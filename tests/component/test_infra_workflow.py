@@ -83,8 +83,9 @@ def test_plan_and_apply_send_their_output_to_dev_null() -> None:
     for name in ("plan", "apply"):
         calls = [call for call in _tofu_calls(jobs[name]) if call[0] in ("plan", "apply")]
         found[name] = sorted(subcommand for subcommand, _ in calls)
+        # A bare `>` or `1>`, since `2> /dev/null` hides only the errors.
         for _, command in calls:
-            assert re.search(r">\s*/dev/null$", command), command
+            assert re.search(r"(?:^|\s)1?>\s*/dev/null$", command), command
     assert found == {"plan": ["plan"], "apply": ["apply", "plan"]}
 
 
