@@ -131,7 +131,8 @@ environment variable. Loading `config.yaml` never checks them or the bucket's na
 a mistyped value fails the backup, the first upload or the Sunday scrub that uses it,
 each with one line naming the key, and never stops capture.
 
-Three commands go with it.
+Three commands go with it. The first two refuse with exit 2 on a shadow host, which is
+any host whose config sets `role` to something other than `primary`.
 
 1. `uv run python -m lake.bucket live-check --target s3://example-lake-backup/live-check`
    confirms the four S3 behaviors the design rests on, and is live check 8 in the build
@@ -154,6 +155,7 @@ Three commands go with it.
    upload capacity beforehand.
 3. The nightly upload needs no command. Once `backup_target` names the bucket, the
    close+15 compaction uploads to it in place of `rsync`, and the Sunday job scrubs it.
+   A `shadow` host does neither.
    Compaction prints the upload's throughput to its log, in the line the first upload
    prints.
 

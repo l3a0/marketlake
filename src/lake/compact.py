@@ -117,9 +117,11 @@ The job's rules, each glossed at first use.
    lake is synced to the backup target. A ticker-day the sweep refused does not hold that
    up, which is the whole point of catching the refusals where rules 3 and 4 catch them.
    The health-check ping fires only after the backup succeeds, so the
-   one ping attests both. An unmounted target raises before any ping, and so does a
+   one ping attests both, except on a ``shadow`` host, which runs no backup and whose
+   ping attests only the seal. An unmounted target raises before any ping, and so does a
    bucket upload that refuses or reaches its deadline. A holiday or an
-   empty journal is a correct no-op and still backs up and pings. The drift page above
+   empty journal is a correct no-op and still backs up and pings, or on a ``shadow``
+   host only pings. The drift page above
    goes out ahead of both, from a ``finally`` around the sweep, because an unmounted
    target or a failed seal must not be able to swallow it. The damaged-segment page goes
    out from the same ``finally``, for the same reason.
@@ -1968,8 +1970,8 @@ def compact(
 
     ``publisher`` carries the schema-drift page, the damaged-segment page and the
     refused-ping page, and it follows
-    ``pinger`` exactly. Both reach past this process, so ``main`` builds them and never
-    accepts them, and a test drives
+    ``pinger`` exactly. Both reach past this process, so ``main`` gets them from
+    ``outbox`` and never accepts them, and a test drives
     this helper with a fake instead. It is optional for the same reason ``pinger`` is: a
     caller with nowhere to page skips it, and the default is ``None`` rather than a live
     object, so omitting it can never reach a real phone. What a run without one loses is
@@ -2247,17 +2249,17 @@ def main(
 ) -> int:
     """The ``python -m lake.compact`` entry. Returns a process exit code.
 
-    ``backup``, ``pinger`` and the pages' ``Publisher`` are built here, not
-    accepted. Each reaches past this process. ``rsync`` shells out to copy the lake, or
+    ``backup``, ``pinger`` and the pages' ``Publisher`` are not accepted. The backup is
+    built here, and the pinger and the publisher's transport come from ``outbox``. Each
+    reaches past this process. ``rsync`` shells out to copy the lake, or
     the bucket client uploads it, the healthchecks GET goes to the network, and the
     publisher POSTs to ntfy, which reaches a phone. Which backup is built follows the
     form of ``backup_target``. A ``main`` that accepted them let a test omit one and
-    reach the real effect, so ``main`` builds them and a test drives the ``compact``
+    reach the real effect, so ``main`` supplies them and a test drives the ``compact``
     helper directly instead.
-    The pinger and the publisher's transport come from ``outbox.senders``, the only
-    construction site the package has for either, so a test replaces them on
-    ``lake.runner`` and ``lake.alert``. Under a ``shadow`` role they record rather than
-    send, and no backup runner is built at all.
+    ``outbox.senders`` is the only construction site the package has for either, so a
+    test replaces them on ``lake.runner`` and ``lake.alert``. Under a ``shadow`` role they
+    record rather than send, and no backup runner is built at all.
 
     ``clock`` and ``calendar`` stay injectable. A system clock and an exchange calendar
     never reach past this process, so a test injects them with no live effect.

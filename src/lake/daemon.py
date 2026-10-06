@@ -157,7 +157,8 @@ The launchd plist that runs the daemon is deliberately not here. It is D14's.
 
 Nothing is pinged or backed up per minute, unlike the slice-1 runner. The two session-
 relative jobs the loop dispatches own both. The close+15 compaction seals the day, syncs
-the lake to the backup target, and pings the ``compaction`` check, once a day. The
+the lake to the backup target except on a ``shadow`` host, and pings the ``compaction``
+check, once a day. The
 dead-man ping is the per-minute exception, and it reports that the daemon is running
 rather than that anything landed.
 """
@@ -1033,8 +1034,9 @@ def _start_compaction(runner: CompactionRunner, args: Sequence[str]) -> None:
 
     Nothing is waited on, so a failing run is not reported from here. It cannot be: the
     child outlives this call by design. The child pings the ``compaction`` check itself,
-    after its backup, so a run that died sends nothing and healthchecks pages on the
-    silence. Its own stderr lands in the launchd log beside the daemon's.
+    after its backup, or with no backup on a ``shadow`` host, so a run that died sends
+    nothing and healthchecks pages on the silence. Its own stderr lands in the launchd log
+    beside the daemon's.
 
     A spawn that never started is the one failure this call can still see, and it is
     caught by ``_dispatched`` rather than here. The two spellings named the same event,
@@ -1208,7 +1210,8 @@ def _alarm(
 
     Both seams are handed in. Neither is defaulted here, because a default reaching a
     public endpoint is one a caller gets without asking, and the caller that most needs
-    to be asked is a test. ``main`` is the only caller in this module that builds them.
+    to be asked is a test. ``main`` is the only caller in this module that gets them from
+    ``outbox``.
 
     A config or roster that will not load raises. Standing the alarm down instead was
     the older behaviour, and it hid the failure twice over: the daemon ran on with no
