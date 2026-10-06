@@ -186,7 +186,8 @@ Then browse to `http://127.0.0.1:8766/`. Four choices in the command matter.
    address of the laptop's. Naming one address makes a collision total, and
    `ExitOnForwardFailure=yes` turns it into an exit rather than a warning.
 2. **The VM side names `127.0.0.1` rather than `localhost`.** The dashboard listens on
-   IPv4 only, and a `localhost` that resolves to `::1` first would be refused there.
+   IPv4 only. sshd would fall back to `127.0.0.1` after a refused `::1`, but naming the
+   address spares that attempt and any dependence on the VM's `/etc/hosts`.
 3. **`ServerAliveInterval=15`** makes ssh notice a network that vanished, after three
    unanswered checks, about 45 seconds, and close the forward. Without it a dead forward
    can sit open for hours. The page marks itself stale only when its requests fail, so a
@@ -208,9 +209,10 @@ Host marketlake-vm
 
 `ssh -N marketlake-vm` then opens it.
 
-When the dashboard is not running on the VM, ssh prints `connect failed: Connection
-refused` for each request, and the page says the query service is unreachable and that
-nothing on it is live.
+When the dashboard is not running on the VM, ssh prints
+`channel N: open failed: connect failed: Connection refused` once for each connection
+the page opens, and the page shows a banner saying the query service is unreachable. The
+page clears the banner on its own at the first refresh after the dashboard is back.
 
 ## Develop
 
