@@ -65,6 +65,9 @@ from lake.paths import TOKEN_FILE, config_dir, temp_write_path
 # The standard location of the Schwab token, per the design's Configuration section. The
 # same home-relative default ``lake.schwab`` reads from, spelled through ``lake.paths``
 # so this module needs nothing from the vendor layer.
+# The path is fixed when this module is imported, so a process that sets HOME or
+# MARKETLAKE_CONFIG_DIR afterwards still resolves the real directory. marketlake #715
+# resolves it at call time instead.
 DEFAULT_TOKEN_PATH = config_dir() / TOKEN_FILE
 
 # The token is a full brokerage credential, so it is written owner-read-write and nothing

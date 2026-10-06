@@ -34,10 +34,21 @@ import yaml
 
 from lake.paths import TICKERS_FILE, config_dir, temp_write_path
 
-# The portable roster file. Overridable by argument or this environment variable, so a
-# test points the loader at a throwaway file.
-DEFAULT_TICKERS_PATH = config_dir() / TICKERS_FILE
+# Overrides the roster's default path, so a test points the loader at a throwaway file.
 TICKERS_PATH_ENV = "MARKETLAKE_TICKERS"
+
+
+def default_tickers_path() -> Path:
+    """The roster's default path, resolved through ``paths.config_dir`` on every call.
+
+    A module constant would be fixed when this module is imported. A process that
+    imported ``lake`` and only then pointed ``HOME`` or ``MARKETLAKE_CONFIG_DIR`` at a
+    throwaway kept the real directory, and on 2026-10-06 a probe doing exactly that
+    overwrote a host's live roster. Resolved here, the environment at the moment of the
+    read or the write decides. The other config-directory defaults still bind at import,
+    and marketlake #715 converts them.
+    """
+    return config_dir() / TICKERS_FILE
 
 
 class TickersError(Exception):
@@ -291,7 +302,7 @@ def upsert_ticker(
 STDIN_SOURCE = "<stdin>"
 
 
-def roster_from_bytes(payload: bytes, *, source: str = STDIN_SOURCE) -> Roster:
+def roster_from_bytes(payload: bytes) -> Roster:
     """The roster ``payload`` holds, or a ``TickersError`` saying why it is not one.
 
     The bytes must decode as UTF-8 and parse to a mapping the loader accepts, which is
@@ -302,12 +313,12 @@ def roster_from_bytes(payload: bytes, *, source: str = STDIN_SOURCE) -> Roster:
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError:
-        raise TickersError(f"tickers file is not UTF-8 text: {source}") from None
-    parsed = _parse(text, source)
+        raise TickersError(f"tickers file is not UTF-8 text: {STDIN_SOURCE}") from None
+    parsed = _parse(text, STDIN_SOURCE)
     mapping = {} if parsed is None else parsed
     if not isinstance(mapping, Mapping):
-        raise TickersError(f"tickers file is not a mapping: {source}")
-    return _roster_from(mapping, source)
+        raise TickersError(f"tickers file is not a mapping: {STDIN_SOURCE}")
+    return _roster_from(mapping, STDIN_SOURCE)
 
 
 def apply_roster(
@@ -315,8 +326,6 @@ def apply_roster(
     *,
     check: Callable[[Roster], None],
     path: str | Path | None = None,
-    env: Mapping[str, str] | None = None,
-    source: str = STDIN_SOURCE,
 ) -> bool:
     """Copy a reviewed roster's bytes onto this host, and return whether it replaced one.
 
@@ -346,13 +355,13 @@ def apply_roster(
     whole new one. Nothing is started or restarted, since the next cycle reads the new
     roster. The path precedence matches ``load_tickers``.
     """
-    roster = roster_from_bytes(payload, source=source)
+    roster = roster_from_bytes(payload)
     if not roster.enabled:
         raise TickersError(
-            f"tickers file names no enabled ticker, so a host would capture nothing: {source}"
+            f"tickers file names no enabled ticker, so a host would capture nothing: {STDIN_SOURCE}"
         )
     check(roster)
-    resolved = _resolve_path(path, env)
+    resolved = _resolve_path(path, None)
     try:
         current: bytes | None = resolved.read_bytes()
     except FileNotFoundError:
@@ -495,7 +504,7 @@ def _resolve_path(path: str | Path | None, env: Mapping[str, str] | None) -> Pat
 
     An argument and an environment override are whatever a person typed, so both may
     carry a ``~`` and both are expanded. The default comes from ``lake.paths`` already
-    resolved.
+    resolved, at the moment this runs.
     """
     if path is not None:
         return Path(path).expanduser()
@@ -503,4 +512,4 @@ def _resolve_path(path: str | Path | None, env: Mapping[str, str] | None) -> Pat
     override = env.get(TICKERS_PATH_ENV)
     if override:
         return Path(override).expanduser()
-    return DEFAULT_TICKERS_PATH
+    return default_tickers_path()

@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from lake.config import Config, input_errors_exit, load_config
@@ -63,28 +63,28 @@ def apply(
     check: Callable[[Roster, Config], None] | None = None,
     config_path: str | Path | None = None,
     tickers_path: str | Path | None = None,
-    env: Mapping[str, str] | None = None,
-    geteuid: Callable[[], int] = os.geteuid,
+    geteuid: Callable[[], int] | None = None,
 ) -> str:
     """Apply ``payload`` as this host's roster, and return ``REPLACED`` or ``UNCHANGED``.
 
     The steps and their order are the module docstring's. ``geteuid`` is injected so a
-    test can ask the root question without being root. ``check`` refuses by raising.
-    Paths resolve the way the daemon's do unless a test passes them.
+    test can ask the root question without being root. It defaults to ``os.geteuid``,
+    looked up at call time, so a test driving ``main`` can replace that instead.
+    ``check`` refuses by raising. Paths resolve the way the daemon's do unless a test
+    passes them.
     """
-    if geteuid() == 0:
+    if (geteuid or os.geteuid)() == 0:
         raise RosterError(
             "refusing to run as root, because a root-owned roster cannot be rewritten "
             "by onboard or retire; run it as the owner"
         )
     roster_from_bytes(payload)
-    config = load_config(config_path, env=env)
+    config = load_config(config_path)
     lake_check = _accept_every_roster if check is None else check
     replaced = apply_roster(
         payload,
         check=lambda roster: lake_check(roster, config),
         path=tickers_path,
-        env=env,
     )
     return REPLACED if replaced else UNCHANGED
 

@@ -1,13 +1,15 @@
 """Which module-level constants in ``src/lake`` are built from ``paths.config_dir``.
 
-Five constants name a file in the machine's config directory, and every one of them is
+Four constants name a file in the machine's config directory, and every one of them is
 bound when its module is imported. That is what makes ``MARKETLAKE_CONFIG_DIR`` work at
 all, and it is also what makes the list of them load-bearing in three places: the suite's
 redirect checks that none of these modules was imported too early, one test asks a child
-where each one resolved, and another asks the same of the pytest process.
+where each one resolved, and another asks the same of the pytest process. The roster's
+default is a function resolved on each call, so it is not on the list, and marketlake
+#715 converts these four the same way.
 
 All three used to type the list out. Nothing bound those spellings to the source, so a
-sixth constant added to ``src/lake`` would have been outside every one of them with
+new constant added to ``src/lake`` would have been outside every one of them with
 nothing to say so. Verified before this existed: adding a sixth default to a probe module
 and running all three left the suite green.
 
@@ -31,7 +33,7 @@ Three limits are named rather than hidden.
    any attribute call spelled ``....config_dir(...)``. A module that reached the function
    through some further indirection, such as looking it up in a dict, would be missed.
    Nothing in this repo does that, and ``test_the_scanner_finds_what_is_there_today``
-   fails if the five known ones stop being found.
+   fails if the known ones stop being found.
 3. Every name a tuple assignment binds is reported when any part of the value calls
    ``config_dir``, so ``A, B = config_dir() / X, something_else()`` names ``B`` as well.
    That over-reports rather than under-reports, which is the safe direction here, and

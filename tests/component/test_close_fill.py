@@ -57,7 +57,7 @@ from lake.schema_drift import SCHEMA_DRIFT_EVENT, SchemaDriftObserver
 from lake.schwab import DEFAULT_TOKEN_PATH
 from lake.security_master import SecurityMaster, master_path
 from lake.session import OPTION_CLOSE, SessionClock
-from lake.tickers import DEFAULT_TICKERS_PATH, TICKERS_PATH_ENV, Roster
+from lake.tickers import TICKERS_PATH_ENV, Roster, default_tickers_path
 from lake.vendor import VendorResponse
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
@@ -714,7 +714,7 @@ def test_the_daemon_hands_the_guard_a_fill_that_lands_the_close(unset, tmp_path,
         monkeypatch.setenv(TICKERS_PATH_ENV, str(tickers))
         # The loaders find this test's files through the variables alone. A file at a
         # default path would be found without them.
-        for default in (DEFAULT_CONFIG_PATH, DEFAULT_TICKERS_PATH, DEFAULT_TOKEN_PATH):
+        for default in (DEFAULT_CONFIG_PATH, default_tickers_path(), DEFAULT_TOKEN_PATH):
             assert not default.exists()
             assert not is_protected(default)
     given = (None, None, None) if unset else (str(config), str(tickers), str(token))

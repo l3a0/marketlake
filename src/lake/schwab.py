@@ -67,6 +67,9 @@ from lake.vendor import RequestTiming, VendorError, VendorResponse, require_utc_
 # The standard location of the Schwab token, per the design's Configuration section.
 # It sits outside the repo and outside the backup-synced lake tree. This is a home-
 # relative default the live recorder falls back to, never a committed machine path.
+# The path is fixed when this module is imported, so a process that sets HOME or
+# MARKETLAKE_CONFIG_DIR afterwards still resolves the real directory. marketlake #715
+# resolves it at call time instead.
 DEFAULT_TOKEN_PATH = config_dir() / TOKEN_FILE
 
 # The field groups pinned on every batched quote request. ``all`` returns every block

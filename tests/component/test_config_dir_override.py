@@ -10,11 +10,13 @@ So the answer for a development run is an override that moves the whole director
 export ``MARKETLAKE_CONFIG_DIR`` and the process cannot reach the real files at all,
 whatever it is given on the command line.
 
-Every default in this package is built from ``paths.config_dir`` at import. That is what
-makes one variable enough and it is also the reason these tests spawn a child process.
-Setting the variable inside a running process moves nothing, because the constants are
-already bound. Only a process that started with it set is the real thing, so that is
-what these run, and each drives production code rather than a stand-in for it.
+Every default in this package is built from ``paths.config_dir``, and four of them at
+import. That is what makes one variable enough and it is also the reason these tests
+spawn a child process. Setting the variable inside a running process moves nothing for
+those four, because the constants are already bound. The roster's default resolves on
+each call, and marketlake #715 converts the other four. Only a process that started with
+the variable set is the real thing for those, so that is what these run, and each drives
+production code rather than a stand-in for it.
 
 The child's own writes land under the test's ``tmp_path``. The parent's guard does not
 reach a child, which the guard says about itself, so nothing here relies on it. The
@@ -44,7 +46,7 @@ ROOT = Path(__file__).resolve().parents[2]
 # Every module-level default built from the config directory, read out of ``src/lake``
 # rather than typed here. All of them move together or the override is not worth having,
 # since a redirected token beside a live config is a half-redirected process, and a
-# sixth one added to the package has to join them without anyone remembering to come
+# new one added to the package has to join them without anyone remembering to come
 # back and edit this file.
 DEFAULT_PAIRS = defaults_built_from_config_dir()
 

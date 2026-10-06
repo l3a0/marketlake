@@ -64,7 +64,7 @@ THROWAWAY = Path(_THROWAWAY_CONFIG_DIR)
 REAL_CONFIG_DIR = Path.home().joinpath(*CONFIG_DIR_PARTS)
 
 # The same defaults ``_DEFAULTS`` asks a child about, read in this process instead. Both
-# come from one scan of ``src/lake``, so a sixth default added to the package joins both
+# come from one scan of ``src/lake``, so a new default added to the package joins both
 # without anyone editing either file, which is what the two hand-written lists here used
 # to get wrong.
 PARENT_DEFAULTS = {

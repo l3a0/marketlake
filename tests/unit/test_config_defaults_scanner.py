@@ -3,14 +3,13 @@
 Three things use that list. The suite's redirect checks that none of those modules was
 imported before it ran, one test asks a child where each default resolved, and another
 asks the same of the pytest process. All three used to type it out, and nothing bound
-those spellings to the source, so a sixth default added to the package would have been
+those spellings to the source, so a new default added to the package would have been
 outside every one of them with nothing to say so.
 
 These cover both halves of the fix. The scanner finds what is in the real tree today,
-which is what keeps it honest against the package it reads. And it finds a sixth one in a
-synthetic tree, which is the half the real tree cannot show, because the real tree has
-exactly five and adding a sixth to it just to watch a test go red is not something a test
-should do.
+which is what keeps it honest against the package it reads. And it finds a new one in a
+synthetic tree, which is the half the real tree cannot show, because adding a default to
+the real tree just to watch a test go red is not something a test should do.
 
 The synthetic trees are written under ``tmp_path`` and never imported. That is the whole
 point of scanning rather than importing: importing one of these modules is what binds its
@@ -37,7 +36,6 @@ KNOWN_TODAY = (
     ("lake.config", "DEFAULT_CONFIG_PATH"),
     ("lake.reauth", "DEFAULT_TOKEN_PATH"),
     ("lake.schwab", "DEFAULT_TOKEN_PATH"),
-    ("lake.tickers", "DEFAULT_TICKERS_PATH"),
 )
 
 
@@ -59,15 +57,14 @@ def test_the_scanner_finds_what_is_there_today():
 
 
 def test_the_modules_view_deduplicates_and_sorts():
-    # reauth and schwab both spell DEFAULT_TOKEN_PATH, so the pair list has five entries
-    # over five modules and the module view has to keep them apart by module rather than
+    # reauth and schwab both spell DEFAULT_TOKEN_PATH, so the pair list has four entries
+    # over four modules and the module view has to keep them apart by module rather than
     # by constant name.
     assert modules_building_a_default() == (
         "lake.chain_plan",
         "lake.config",
         "lake.reauth",
         "lake.schwab",
-        "lake.tickers",
     )
 
 
@@ -81,10 +78,10 @@ def test_the_scanner_reads_the_package_the_other_scanner_reads():
     assert LAKE_SRC.is_dir()
 
 
-# -- a sixth default, which is the case the real tree cannot show --------------------------
+# -- a new default, which is the case the real tree cannot show ----------------------------
 
 
-def test_a_sixth_default_is_found(tmp_path):
+def test_a_new_default_is_found(tmp_path):
     """The failure the hand-written lists had. A new default has to join on its own.
 
     Verified against the old code by adding a probe module to ``src/lake`` and running
@@ -98,14 +95,14 @@ def test_a_sixth_default_is_found(tmp_path):
                 "from lake.paths import TOKEN_FILE, config_dir\n"
                 "DEFAULT_TOKEN_PATH = config_dir() / TOKEN_FILE\n"
             ),
-            "probe_sixth.py": (
+            "probe_new.py": (
                 "from lake.paths import config_dir\n"
                 "DEFAULT_PROBE_PATH = config_dir() / 'probe.json'\n"
             ),
         },
     )
     assert defaults_built_from_config_dir(root) == (
-        ("lake.probe_sixth", "DEFAULT_PROBE_PATH"),
+        ("lake.probe_new", "DEFAULT_PROBE_PATH"),
         ("lake.reauth", "DEFAULT_TOKEN_PATH"),
     )
 
@@ -116,7 +113,7 @@ def test_a_sixth_default_is_found(tmp_path):
 @pytest.mark.parametrize(
     ("source", "found"),
     [
-        # The plain form, which is what all five real ones use.
+        # The plain form, which is what every real one uses.
         ("from lake.paths import config_dir\nD = config_dir() / 'x'\n", True),
         # Aliased on import. Resolved through the file's own imports.
         ("from lake.paths import config_dir as cd\nD = cd() / 'x'\n", True),
@@ -207,7 +204,7 @@ def test_a_tuple_assignment_names_everything_it_binds(tmp_path):
 def test_a_default_built_inside_a_function_is_not_one(tmp_path):
     """Only a module-level assignment binds at import, which is the shape this is about.
 
-    ``lake.tickers`` has a function returning ``DEFAULT_TICKERS_PATH`` and
+    ``lake.tickers`` resolves its default inside ``default_tickers_path`` and
     ``lake.control_plane`` calls ``config_dir(home)`` for another account's home. Neither
     is a constant bound at import, and sweeping them in would have the redirect's check
     refuse imports that bind nothing.
