@@ -109,6 +109,7 @@ from lake.manifest import (
     backup_scrub,
     path_reader,
     restore_check,
+    restore_picks,
     scrub,
 )
 from lake.metadata import JournalMetadata, read_metadata
@@ -1881,12 +1882,11 @@ class SundayOutcome:
     lake, neither of which can be lake data going missing. How far behind reads by eye
     from the partition count, and one run carries no history of the last one. The
     restore test's own findings ride it the same way, each file it read back wrong and
-    the repair for it. So does the line saying the restore test is not built for a
-    bucket target yet.
+    the repair for it.
 
     ``restore`` is the restore test's result. It is ``None`` when the test did not run,
-    because the backup scrub stopped before the end of its walk, because the target is a
-    bucket, or because a shadow host skipped the backup scrub. A pass rides here rather
+    because the backup scrub stopped before the end of its walk, or because a shadow host
+    skipped the backup scrub. A pass rides here rather
     than in ``report``, because ``report`` carries findings, and ``main`` prints its line
     so the log can tell a pass from a test that never ran.
 
@@ -1952,6 +1952,7 @@ def sunday_maintenance(
     bucket_client: object | None = None,
     bucket_unusable: str | None = None,
     backup_reader: BackupReader | None = None,
+    saved_restore: RestoreResult | None = None,
 ) -> SundayOutcome:
     """Scrub both copies, test a restore, verify the alarms, run the canary, assert coverage, ping.
 
@@ -2052,9 +2053,14 @@ def sunday_maintenance(
     backup scrub's own rule, and the files it names ride ``report``. A scrub that stopped
     early, such as on an unmounted target or a manifest copy it could not trust, already
     named the target, so the test does not run and adds no second line. When
-    ``backup_reader`` is ``None`` the test reads ``backup_target`` from disk, so the
-    default reads real bytes. A bucket target gets no restore yet, only a report line
-    saying so, which withholds nothing.
+    ``backup_reader`` is ``None`` the test reads ``backup_target`` itself, from disk for
+    a path and by ``lake.bucket.bucket_reader`` through ``bucket_client`` for a bucket,
+    so the default reads real bytes.
+
+    ``saved_restore`` is a pass ``sunday_run`` kept from an earlier attempt that evening,
+    and only a bucket target ever gets one. It is handed back, marked reused, when the
+    week and the files the test would read are both unchanged, so a retried attempt does
+    not download the same files again. Anything else reads afresh.
 
     A ``backup_target`` of ``None`` is the one skip, and only the shadow role passes it.
     A shadow host syncs no backup, so a scrub there would find no manifest, count that as
@@ -2094,18 +2100,35 @@ def sunday_maintenance(
     if backup is not None and backup.problem is not None:
         problems.append(backup.problem)
 
-    # A bucket target has no restore yet. Its download is marketlake #640. ``Path`` raises
-    # ``TypeError`` on a ``BucketTarget`` before ``restore_check`` and its ``OSError``
-    # catch are ever reached, so the bucket case has to branch off here. The owner's
-    # switch to the bucket already waits on #640, so the gap is a report line and
-    # withholds nothing.
+    # A bucket target reads through a download rather than a path. ``Path`` raises
+    # ``TypeError`` on a ``BucketTarget``, so the two forms branch here. A bucket that
+    # stopped the scrub early, ``bucket_unusable`` included, leaves ``walked`` false, so
+    # ``bucket_client`` is always built by the time the bucket branch runs.
     restore: RestoreResult | None = None
-    restore_unbuilt: str | None = None
-    if backup is not None and backup.walked and isinstance(backup_target, BucketTarget):
-        restore_unbuilt = f"restore test not built for a bucket target yet: {backup_target} (#640)"
-    elif backup is not None and backup.walked:
-        reader = backup_reader if backup_reader is not None else path_reader(Path(backup_target))
-        restore = restore_check(backup_target, backup.matched, restore_week(now), reader)
+    if backup is not None and backup.walked:
+        week = restore_week(now)
+        if isinstance(backup_target, BucketTarget):
+            picks = restore_picks(backup.matched, week)
+            if (
+                saved_restore is not None
+                and saved_restore.week == week
+                and saved_restore.picks == picks
+            ):
+                restore = replace(saved_restore, reused=True, candidates=len(backup.matched))
+            else:
+                from lake.bucket import bucket_reader  # lazy: lake.bucket imports this module
+
+                reader = (
+                    backup_reader
+                    if backup_reader is not None
+                    else bucket_reader(bucket_client, backup_target)
+                )
+                restore = restore_check(backup_target, backup.matched, week, reader, bucket=True)
+        else:
+            reader = (
+                backup_reader if backup_reader is not None else path_reader(Path(backup_target))
+            )
+            restore = restore_check(backup_target, backup.matched, week, reader)
         if restore.problem is not None:
             problems.append(restore.problem)
 
@@ -2133,8 +2156,6 @@ def sunday_maintenance(
         report.extend(backup.notes)
     if restore is not None:
         report.extend(restore.notes)
-    if restore_unbuilt is not None:
-        report.append(restore_unbuilt)
 
     if exclusion_reader is not None and exclusion_targets:
         try:
@@ -2320,8 +2341,14 @@ def sunday_run(
     needs, unlike the daemon's own once-per-window rule, which has to survive across
     ticks and so keeps a stamp instead.
 
-    ``backup_reader`` passes straight through too, and every attempt runs the restore
-    test afresh. Nothing carries a pass from one attempt to the next.
+    ``backup_reader`` passes straight through too. A path target runs the restore test
+    afresh on every attempt, because its read costs at most a 52nd of what the scrub
+    re-hashes. A bucket target's read is a download, so a pass is kept in a local here
+    and handed to the next attempt, which reuses it while the week and the files it
+    would read are unchanged and says so in the pass line. Only a pass in which every
+    sampled file matched is kept, because the retry exists to re-check an integrity
+    failure, so a failing restore is read again on every attempt. Nothing is written
+    under the lake root, and the kept pass dies with this process.
     """
     start = clock.now().astimezone(MARKET_TZ)
     in_the_window = start.weekday() == _PY_SUNDAY and SUNDAY_MAINTENANCE.on(start.date()) <= start
@@ -2337,6 +2364,8 @@ def sunday_run(
     # the first page goes, so a failure that persists across every half-hour retry is
     # heard once rather than up to seven times.
     daemon_paged = False
+    # A bucket target's restore pass, kept for the attempts after it. See the docstring.
+    saved_restore: RestoreResult | None = None
     while True:
         attempt_now = clock.now()
         # One reading per attempt, so the pid and the instant the page reasons about
@@ -2362,7 +2391,16 @@ def sunday_run(
             bucket_client=bucket_client,
             bucket_unusable=bucket_unusable,
             backup_reader=backup_reader,
+            saved_restore=saved_restore,
         )
+        restored = outcome.restore
+        if (
+            isinstance(backup_target, BucketTarget)
+            and restored is not None
+            and restored.ok
+            and restored.restored
+        ):
+            saved_restore = restored
         # One reminder an hour. Later attempts in the same hour owe nothing, so the
         # outcome records only the one that went out.
         hour = attempt_now.astimezone(MARKET_TZ).hour
