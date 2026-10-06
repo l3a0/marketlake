@@ -222,8 +222,8 @@ owner at `~/.local/bin/uv`, and none of the files the jobs read. It is safe to r
 and it restarts nothing that is running.
 
 It renders the units afresh on every run into `<owner home>/.local/state/marketlake/systemd/`,
-beside `install.sh`, `restart.sh` and `uninstall.sh`. A running service keeps its old code
-and its old unit until it restarts:
+beside `install.sh`, `restart.sh` and `uninstall.sh`. A running service keeps its old unit
+until it restarts:
 
 ```bash
 sudo ~/.local/state/marketlake/systemd/restart.sh          # the dashboard only
@@ -234,6 +234,12 @@ sudo ~/.local/state/marketlake/systemd/restart.sh all      # both
 A bare `restart.sh` restarts the dashboard alone, because restarting the daemon costs its
 in-flight cycle. A role change in `config.yaml` reaches the daemon only through
 `restart.sh daemon`.
+
+New code does not wait for a restart. `lake` is an editable install, so once the checkout
+moves or the install runs, the timer jobs, the compaction the daemon starts at close+15,
+and any module the running daemon imports for the first time all run the new code. A
+deploy therefore waits for the session's close before it updates the checkout or installs,
+not only before it restarts ([#676](https://github.com/l3a0/marketlake/issues/676)).
 
 Each unit logs to journald. The VM's clock runs in UTC, so read a unit's lines in Eastern
 time:
