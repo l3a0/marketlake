@@ -5,8 +5,9 @@ This is the job that runs them every weekday evening, the file that records what
 message that says it in one screen, and the two alarms that were already written expecting it
 to exist.
 
-Run it with ``python -m lake.sweep``. launchd runs it at 18:30 Monday through Friday, under
-``control_plane.eod_sweep_job``, and its health check is the ``eod-sweep`` slug.
+Run it with ``python -m lake.sweep``. The host's scheduler runs it at 18:30 Monday through
+Friday: launchd on macOS, under ``control_plane.eod_sweep_job``, and systemd on Linux. Its
+health check is the ``eod-sweep`` slug.
 
 What one run does, in the design's own order.
 
@@ -23,7 +24,8 @@ What one run does, in the design's own order.
 3. The validation battery, ``battery.judge``, which judges the sealed chains and quotes
    partitions and writes a quarantine verdict for what fails. The design places it between the
    bar fetch and the Friday branch, which is where this list puts it.
-4. The Friday branch, which sets the Sunday one-shot wake and reads it back.
+4. The Friday branch, which sets the Sunday one-shot wake and reads it back. It runs on macOS
+   only. A Linux VM never sleeps, so it sets no wake and never calls ``sudo``.
 5. The ping.
 6. The dated report file under ``reports/``.
 7. The digest, at priority 2.
@@ -81,8 +83,12 @@ naming: a holiday never builds the vendor, so it never reads the token.
 **Every seam is injected and only ``main`` builds one.** That is ``control_plane.main``'s rule
 and its reason, which is that a ``main`` accepting them lets a test omit one and reach the real
 effect. So :func:`sweep` requires seven and defaults none: the clock, the calendar, the vendor
-source, the pinger, the publisher, the schedule reader and the schedule setter. The whole
-module runs offline in a test, with no network and no shelling out.
+source, the pinger, the publisher, the schedule reader and the schedule setter. Required
+means a caller must say, not that the answer cannot be ``None``. The schedule setter and
+reader may each be ``None`` on a host with no wake to set or read back, which is Linux, and
+``sweep_from_config`` picks that from ``control_plane.is_macos``. A ``None`` setter skips
+the Friday branch, and a ``None`` reader skips only its read-back. The whole module runs
+offline in a test, with no network and no shelling out.
 """
 
 from __future__ import annotations
@@ -95,7 +101,7 @@ from datetime import date, datetime
 from functools import partial
 from pathlib import Path
 
-from lake import outbox
+from lake import control_plane, outbox
 from lake.actions import ActionsError, ExtractionReport, extract_dividends
 from lake.alert import Message, Publisher, undelivered
 from lake.bars import (
@@ -716,7 +722,7 @@ def _friday_wake(
     now: datetime,
     calendar: Calendar,
     schedule_setter: ScheduleSetter,
-    schedule_reader: ScheduleReader,
+    schedule_reader: ScheduleReader | None,
 ) -> tuple[list[str], ReportLines]:
     """Set the Sunday one-shot and read it back. Returns the problems and the report lines.
 
@@ -732,6 +738,11 @@ def _friday_wake(
     ``expected_one_shot`` is what makes the read-back meaningful. It expects the one-shot only
     between the Friday sweep that sets it and its own firing, so the check is asking about the
     wake this run just set rather than about one that fired days ago.
+
+    A ``None`` reader skips the read-back and adds no report line, the way the Sunday job
+    skips its own. ``sweep_from_config`` resolves the setter and the reader one at a time,
+    so a caller passing only a setter would otherwise add ``pmset read-back unreadable`` to
+    every Friday's report.
     """
     problems: list[str] = []
     report = ReportLines()
@@ -761,6 +772,9 @@ def _friday_wake(
         )
         return problems, report
 
+    if schedule_reader is None:
+        return problems, report
+
     try:
         schedule = parse_pmset_schedule(schedule_reader())
     except Exception as exc:  # noqa: BLE001 - an unreadable read-back is a finding, not a crash
@@ -787,15 +801,17 @@ def sweep(
     pinger: Pinger,
     ping_url: str,
     publisher: Publisher | None,
-    schedule_reader: ScheduleReader,
-    schedule_setter: ScheduleSetter,
+    schedule_reader: ScheduleReader | None,
+    schedule_setter: ScheduleSetter | None,
     guards: GuardConstants | None = None,
 ) -> SweepOutcome:
     """Run one evening sweep. Every seam is required, and the module docstring says why.
 
     ``publisher`` alone may be ``None``, which sends no digest and escalates no refused ping.
     That is what lets a test drive the run without a page reaching anywhere, and it is the
-    same allowance ``escalate_ping_failure`` already makes.
+    same allowance ``escalate_ping_failure`` already makes. ``schedule_setter`` and
+    ``schedule_reader`` may be ``None`` on a host with no wake, and the module docstring
+    says what each skips.
 
     The order below is the design's, and two placements in it were decided rather than
     inherited. The ping comes before the report file, because ``pinged`` is part of what the
@@ -1100,7 +1116,8 @@ def sweep(
         else:
             report.pour(battery.report, battery.report_kinds)
 
-    if day.weekday() == _PY_FRIDAY:
+    # A host with no wake to set, which is Linux, passes no setter and skips the branch.
+    if schedule_setter is not None and day.weekday() == _PY_FRIDAY:
         wake_problems, wake_report = _friday_wake(
             now=now,
             calendar=calendar,
@@ -1198,6 +1215,10 @@ def sweep_from_config(
     The vendor arrives as a thunk rather than as a built object, which is what keeps a holiday
     run from reading the token at all. ``from_token`` imports ``schwab-py`` lazily, so the
     offline suite loads this module without the library installed.
+
+    A ``None`` schedule setter or reader resolves to the live one on macOS and stays ``None``
+    on Linux, each on its own, because a VM never sleeps and has no wake to set or read
+    back. On Linux the sweep then never calls ``sudo``, so the VM needs no sudoers rule.
     """
     from lake.config import load_config
 
@@ -1212,6 +1233,9 @@ def sweep_from_config(
 
     run_clock = SystemClock() if clock is None else clock
     sends = outbox.senders(config, process="sweep", clock=run_clock)
+    on_macos = control_plane.is_macos()
+    default_reader = read_pmset_schedule if on_macos else None
+    default_setter = set_sunday_wake if on_macos else None
     return sweep(
         lake_root=config.lake_root,
         clock=run_clock,
@@ -1226,8 +1250,8 @@ def sweep_from_config(
             # The values that must never reach a phone, checked against the message itself.
             secrets=config.page_secrets(),
         ),
-        schedule_reader=read_pmset_schedule if schedule_reader is None else schedule_reader,
-        schedule_setter=set_sunday_wake if schedule_setter is None else schedule_setter,
+        schedule_reader=schedule_reader if schedule_reader is not None else default_reader,
+        schedule_setter=schedule_setter if schedule_setter is not None else default_setter,
         guards=config.guards,
     )
 
@@ -1239,8 +1263,8 @@ def _build_parser():
         prog="python -m lake.sweep",
         description=(
             "The evening vendor sweep: poll corporate actions, fetch the session's bars, "
-            "set the Sunday wake on a Friday, ping, file the nightly report and send its "
-            "digest. It fetches the session the clock is in."
+            "set the Sunday wake on a Friday on macOS, ping, file the nightly report and "
+            "send its digest. It fetches the session the clock is in."
         ),
     )
     parser.add_argument("--config", help="Path to config.yaml (defaults to the standard location).")

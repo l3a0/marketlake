@@ -46,6 +46,7 @@ stall is a hook, a clock sleep, or ``_simulate``'s ``stall``, all on the loop th
 
 from __future__ import annotations
 
+import subprocess
 import threading
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
@@ -57,6 +58,7 @@ from lake.alert import NtfyTransport
 from lake.calendar import MARKET_TZ
 from lake.capture import CycleResult
 from lake.config import CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH, ConfigError
+from lake.control_plane import assertion_window, caffeinate_args
 from lake.runner import UrllibPinger
 from lake.session import CAPTURE_PHASES, SessionClock, SessionPhase
 from lake.tickers import TickersError
@@ -1381,6 +1383,7 @@ def test_main_passes_the_paths_to_the_config_entry(tmp_path, monkeypatch):
         "transport",
         "pinger",
         "compaction_runner",
+        "assertion_runner",
     }
     assert seen["config_path"] == str(config)
     assert seen["tickers_path"] is None
@@ -1399,6 +1402,34 @@ def test_main_passes_the_paths_to_the_config_entry(tmp_path, monkeypatch):
     # alone passes a `main` that ignored --config and read the machine's own config,
     # which is the very asymmetry this PR exists to remove.
     assert seen["transport"]._topic == NTFY_TOPIC
+    # The suite runs as macOS, where the holder keeps its default spawn of a real
+    # ``caffeinate``. Compared equal to ``None`` rather than dropped from the call, so a
+    # Mac handed the Linux no-op runner fails here.
+    assert seen["assertion_runner"] is None
+
+
+def test_main_on_linux_passes_a_runner_that_spawns_nothing(tmp_path, monkeypatch, on_linux):
+    """A VM never sleeps, so the daemon holds no assertion there.
+
+    The runner is called the way the holder calls it, with ``Popen`` replaced by a
+    recorder. ``caffeinate`` is not a guarded program, so a runner that reached the real
+    spawn would start one on the laptop running the suite.
+    """
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(daemon, "run_loop_from_config", lambda **kwargs: seen.update(kwargs))
+    assert daemon.main(["--config", str(config)]) == 0
+
+    runner = seen["assertion_runner"]
+    assert runner is not None
+    spawned: list[object] = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: spawned.append(args))
+    window = assertion_window(date(2026, 9, 14))
+    args = caffeinate_args(window, window.start)
+    assert runner(args) is None
+    assert spawned == []
 
 
 # -- the power assertion ----------------------------------------------------------

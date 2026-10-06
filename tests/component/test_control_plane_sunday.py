@@ -120,6 +120,35 @@ def test_before_the_wake_a_missing_one_shot_rides_the_report(fixture_lake):
     assert present.pinged is True and pinger.urls == [URL]
 
 
+def test_with_no_readers_the_read_backs_are_skipped_without_a_line(fixture_lake):
+    """The Linux host passes neither reader, because it has no wake and no Time Machine.
+
+    Before the wake both alarms are expected, so a ``None`` reader treated as a read that
+    failed or found nothing would add a line here. A skip adds none and leaves ``alarms``
+    ``None``, which says the question was not asked.
+    """
+    root = _clean_lake(fixture_lake)
+    pinger = FakePinger()
+    outcome = cp.sunday_maintenance(
+        lake_root=root,
+        backup_target=_backup_of(root),
+        now=SUNDAY_19,
+        calendar=CALENDAR,
+        schedule_reader=None,
+        pinger=pinger,
+        ping_url=URL,
+        mint=FRESH_MINT,
+        canary=_passing_canary,
+        exclusion_targets=("/config", "/config/token.json"),
+        exclusion_reader=None,
+    )
+    assert outcome.alarms is None
+    assert not any("pmset" in line or "read-back" in line for line in outcome.report)
+    assert outcome.report == ()
+    assert outcome.problems == ()
+    assert outcome.pinged is True and pinger.urls == [URL]
+
+
 def test_a_scrub_failure_alone_owes_no_reminder(fixture_lake):
     # The reminder keys on the canary and the coverage assertion, never on whether
     # the run pinged. A corrupted partition withholds the ping and owes no reminder,
