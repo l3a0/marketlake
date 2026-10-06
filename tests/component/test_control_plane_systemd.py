@@ -192,7 +192,12 @@ def test_the_summary_counts_the_units_it_wrote(tmp_path, capsys):
     printed = capsys.readouterr().out
     assert f"  {len(UNITS)} unit files:" not in printed
     assert "  ten unit files:" in printed
-    assert str(out.resolve() / cp.INSTALL_SCRIPT_FILE) in printed
+    # The next step is the entry point, which holds the install lock, never a hand run
+    # of the rendered install.sh, which would skip it.
+    (next_line,) = [line for line in printed.splitlines() if line.startswith("  next: ")]
+    assert next_line.startswith("  next: run deploy/linux-install.sh as root."), next_line
+    assert cp.INSTALL_LOCK in next_line, next_line
+    assert str(out.resolve() / cp.INSTALL_SCRIPT_FILE) not in printed
 
 
 def test_a_seventh_job_reaches_both_renders(tmp_path, monkeypatch, capsys):

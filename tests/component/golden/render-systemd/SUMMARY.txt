@@ -14,4 +14,4 @@ render: systemd units for someone in <OUT>
   install.sh
   uninstall.sh
   restart.sh
-  next: run <OUT>/install.sh as root. deploy/linux-install.sh does that after every render.
+  next: run deploy/linux-install.sh as root. It renders afresh and runs install.sh while holding /run/marketlake-install.lock.

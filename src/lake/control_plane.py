@@ -4450,7 +4450,9 @@ def systemd_summary(out: Path, host: SystemdHost) -> str:
 
     The Mac's render prints its by-hand install text. A systemd host installs through
     ``deploy/linux-install.sh``, which reads this in cloud-init's log or a deploy's
-    output, so it says what landed and where the install script is, and nothing more.
+    output, so it says what landed and that the entry point installs it, and nothing
+    more. It names the entry point rather than the rendered ``install.sh``, because the
+    entry point holds the install lock around its run and a hand run would skip it.
     """
     names = [item.name for item in render_systemd(host)]
     units = systemd_unit_files(host)
@@ -4459,8 +4461,8 @@ def systemd_summary(out: Path, host: SystemdHost) -> str:
         f"  {_spelled(len(units))} unit files:",
         *(f"    {name}" for name in units),
         *(f"  {name}" for name in names if name not in units),
-        f"  next: run {out / INSTALL_SCRIPT_FILE} as root."
-        " deploy/linux-install.sh does that after every render.",
+        "  next: run deploy/linux-install.sh as root. It renders afresh and runs"
+        f" {INSTALL_SCRIPT_FILE} while holding {INSTALL_LOCK}.",
     ]
     return "\n".join(lines) + "\n"
 
