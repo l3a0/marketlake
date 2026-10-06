@@ -1,7 +1,7 @@
 # What CI applies: the backup bucket, its IAM user, and the instance role. The apply
-# role in infra/bootstrap/roles.tf grants writes on exactly these. The README's "Apply
-# the infrastructure" section carries the runbook, and docs/design.md's
-# "Infrastructure, defined" carries the reasoning.
+# role in infra/bootstrap/roles.tf grants writes on exactly these. infra/README.md
+# carries the runbook, and docs/design.md's "Infrastructure, defined" carries the
+# reasoning.
 
 terraform {
   required_version = "~> 1.13"
