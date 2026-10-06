@@ -24,7 +24,8 @@ process, and ``crash`` hands out a fresh pid on every read. ``RESTART_DELAY`` is
 ``MainPID`` reads after a restart answer 0 before the new pid shows.
 
 Fakes also stand in for ``id``, ``getent``, ``sudo -u`` and ``flock``, the last two of
-which macOS lacks, and for ``git`` and ``sleep``. Each logs its argv to ``$LOG``.
+which macOS lacks, and for ``git`` and ``sleep``. Each logs its argv to ``$LOG``. The
+fake ``getent`` answers the owner's uid, 1000, as well as the name, as glibc's does.
 """
 
 from __future__ import annotations
@@ -210,9 +211,10 @@ done
 exec "$@"
 """
 
+# glibc's getent passwd resolves a uid as well as a name, so this answers both.
 FAKE_GETENT = """#!/bin/bash
 printf 'getent %s\\n' "$*" >> "$LOG"
-if [[ "$1" == "passwd" && "$2" == "$FAKE_OWNER" ]]; then
+if [[ "$1" == "passwd" && ( "$2" == "$FAKE_OWNER" || "$2" == 1000 ) ]]; then
   echo "$FAKE_OWNER:x:1000:1000:Some One:$FAKE_HOME:/bin/bash"
   exit 0
 fi

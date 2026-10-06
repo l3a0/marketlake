@@ -9,9 +9,10 @@
 # installs. It is safe to run again on a host that already has it, and it renders the
 # units afresh from this checkout every time it runs. In order, it:
 #
-#   1. refuses unless it runs as root, --owner names an account, and --lake-mount is
-#      given. The flag is required because every run re-renders, so a run that left it
-#      out would strip the units' wait for the lake's volume;
+#   1. refuses unless it runs as root, --owner names an account by its name rather
+#      than its uid, and --lake-mount is given. The flag is required because every run
+#      re-renders, so a run that left it out would strip the units' wait for the lake's
+#      volume;
 #   2. takes /run/marketlake-install.lock, waiting up to 600 seconds, and holds it to
 #      the end, so two runs cannot interleave and leave the older commit installed;
 #   3. as the owner, runs uv sync in this checkout;
@@ -80,6 +81,11 @@ if [[ -z "$LAKE_MOUNT" ]]; then
 fi
 if ! ENTRY="$(getent passwd "$OWNER")"; then
   refuse "--owner $OWNER names no account on this host"
+fi
+# getent resolves a uid as well as a name, while sudo -u reads a bare number as a name.
+# So a uid would pass here and fail later, at the first step run as the owner.
+if [[ "${ENTRY%%:*}" != "$OWNER" ]]; then
+  refuse "--owner $OWNER is the uid of ${ENTRY%%:*}. Give the account name"
 fi
 OWNER_HOME="$(printf '%s\n' "$ENTRY" | cut -d: -f6)"
 if [[ -z "$OWNER_HOME" ]]; then

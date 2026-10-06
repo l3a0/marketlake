@@ -720,6 +720,11 @@ def test_the_entry_point_is_tracked_executable():
             "linux-install: --owner nobody-here names no account on this host\n",
         ),
         (
+            ["--owner", "1000", "--lake-mount", "/srv/lake"],
+            {},
+            f"linux-install: --owner 1000 is the uid of {OWNER}. Give the account name\n",
+        ),
+        (
             ["--owner", OWNER, "--lake-mount", "/srv/lake", "--bogus"],
             {},
             "linux-install: unknown argument --bogus. Usage: linux-install.sh --owner"
@@ -746,6 +751,7 @@ def test_the_entry_point_is_tracked_executable():
         "no owner",
         "no lake mount",
         "no such account",
+        "a uid for the owner",
         "unknown flag",
         "flag without value",
         "leaked install root",
