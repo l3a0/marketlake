@@ -259,10 +259,10 @@ old content under a new version, and looks exactly like a good write.
   `reviewed: false` until a session posts one, and the sync reports it rather
   than guessing whether its review finished. GitHub's review
   decision cannot tell whether the review ran, so it does not decide
-  `reviewed`. A session posting review results puts that heading only on the
-  comment that closes the review, after every lens has reported. A partial
-  comment leaves `reviewed` false, and the entry's `review` text says which
-  lens is still running. `rollup` is a list
+  `reviewed`. The rule for writing the heading lives in `CLAUDE.md`, under
+  "Pull requests", where review sessions read it. A partial comment leaves
+  `reviewed` false, and the entry's `review` text says which lens is still
+  running. `rollup` is a list
   of `[name, conclusion]` pairs, where the conclusion is one of `"success"`,
   `"failure"`, `"running"` or `"neutral"`.
 - **`working`** marks a card a session is on right now, as `{n, kind, what}`.
