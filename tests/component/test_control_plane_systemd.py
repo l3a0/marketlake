@@ -439,6 +439,26 @@ def test_the_install_reads_back_a_resident_that_cannot_start_and_still_succeeds(
         assert proc.stdout.count(f"  {prop}=") == len(RESIDENTS), prop
 
 
+def test_a_read_back_that_fails_never_fails_the_install(tmp_path, rendered):
+    """The units are already placed and started by then, so a failed read is no reason
+    to exit nonzero, and the next resident is still read."""
+    failing, other = RESIDENTS
+    harness = Harness(tmp_path)
+    proc = _install(harness, rendered, FAIL_SHOW=failing)
+    assert proc.returncode == 0, proc.stderr
+    assert "Failed to get properties" in proc.stderr
+    lines = proc.stdout.splitlines()
+    shows = [line for line in lines if line.startswith("+ systemctl show")]
+    assert [line.rsplit(" ", 1)[-1] for line in shows] == [failing, other], shows
+    # The other resident's read-back follows its own echo, every property once.
+    after = lines[lines.index(shows[-1]) + 1 :]
+    for prop in ("ActiveState", "SubState", "NRestarts", "Result", "ExecMainStatus"):
+        assert [line for line in lines if line.startswith(f"  {prop}=")] == [
+            line for line in after if line.startswith(f"  {prop}=")
+        ], prop
+        assert sum(line.startswith(f"  {prop}=") for line in after) == 1, prop
+
+
 def test_the_install_echoes_each_command_before_running_it(tmp_path, rendered):
     harness = Harness(tmp_path)
     proc = _install(harness, rendered)

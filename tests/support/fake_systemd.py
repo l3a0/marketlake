@@ -21,7 +21,8 @@ a test too.
 ``FAIL_START`` names units whose interpreter cannot start. ``RESTART_MODE`` picks what a
 restart does: ``new`` brings a new pid, ``same`` leaves the pid alone, ``never`` leaves no
 process, and ``crash`` hands out a fresh pid on every read. ``RESTART_DELAY`` is how many
-``MainPID`` reads after a restart answer 0 before the new pid shows.
+``MainPID`` reads after a restart answer 0 before the new pid shows. ``FAIL_SHOW`` names
+units whose ``show`` exits 1, as a D-Bus timeout makes it.
 
 Fakes also stand in for ``id``, ``getent``, ``sudo -u`` and ``flock``, the last two of
 which macOS lacks, and for ``git`` and ``sleep``. Each logs its argv to ``$LOG``. The
@@ -169,6 +170,11 @@ case "$cmd" in
     printf '%s' "${RESTART_DELAY:-0}" > "$STATE/pending/$1"
     exit 0 ;;
   show)
+    for arg in "$@"; do
+      case " ${FAIL_SHOW:-} " in
+        *" $arg "*) echo "Failed to get properties: Connection timed out" >&2; exit 1 ;;
+      esac
+    done
     value=0
     props=""
     unit=""
