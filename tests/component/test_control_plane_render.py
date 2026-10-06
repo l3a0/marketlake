@@ -188,7 +188,8 @@ def test_the_rendered_rules_cover_the_commands_the_module_composes(tmp_path):
 
 def test_rendered_tmutil_line_excludes_the_whole_config_directory(tmp_path, capsys):
     # The directory, not the token file alone. config.yaml sits beside the token and
-    # holds four secrets of its own, and a sticky exclusion on a hand-edited file dies
+    # holds four secrets of its own, six with a bucket's access key, and a sticky
+    # exclusion on a hand-edited file dies
     # the first time an editor saves by writing a temp file and renaming over it.
     out = tmp_path / "out"
     cp.main(["render", "--out", str(out), *RENDER_ARGS])

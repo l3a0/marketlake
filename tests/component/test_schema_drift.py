@@ -3,8 +3,9 @@
 The observer's state machine is covered on its own in
 ``tests/unit/test_schema_drift.py``. What these cover is the page it feeds: what reaches
 the phone, what reaches stderr, and what a publisher that refused or could not send leaves
-behind. The publisher is the real one over a recording transport, holding the two secrets
-the production ``main`` passes, and it writes its record to a throwaway lake. So the tier
+behind. The publisher is the real one over a recording transport, holding the ping key and
+the topic, which the production ``main`` passes for a config without bucket keys, and it
+writes its record to a throwaway lake. So the tier
 is component: the producer over real files, with the network still fake.
 
 Eight things are covered.
@@ -57,10 +58,11 @@ def lake_root(tmp_path: Path) -> Path:
 
 
 def _paging(lake_root: Path, transport=None) -> tuple[Publisher, FakeTransport]:
-    """A publisher over a recording transport, holding the config's two secrets.
+    """A publisher over a recording transport, holding the ping key and the topic.
 
-    The secrets are what the real ``main`` passes, so a page composed here is refused on
-    exactly the terms a page composed in production would be.
+    The secrets are what the real ``main`` passes for a config without bucket keys, so a
+    page composed here is refused on exactly the terms a page composed in production
+    would be.
     """
     transport = FakeTransport() if transport is None else transport
     publisher = Publisher(lake_root=lake_root, transport=transport, secrets=(PING_KEY, NTFY_TOPIC))

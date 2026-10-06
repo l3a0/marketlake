@@ -188,7 +188,7 @@ def _parse(text: str, resolved: Path) -> object:
 
     The line number is named because it is the one thing an operator needs and this file
     holds no secrets. ``lake.config`` suppresses the same detail for ``config.yaml``,
-    which holds four. Nothing else from the parse error reaches the message, so no line
+    which holds four to six. Nothing else from the parse error reaches the message, so no line
     of the file itself is printed. ``from None`` suppresses the original in a traceback
     too. It stays reachable as ``__context__``, which is where a debugger should find it
     and where nothing that prints an operator error looks.
