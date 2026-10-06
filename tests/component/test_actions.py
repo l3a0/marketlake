@@ -418,10 +418,10 @@ def test_the_manifest_entry_is_written_while_the_lock_is_still_held(lake_root, m
 
 
 def test_the_entry_and_its_manifest_line_are_written_under_the_lake_lock(lake_root):
-    # Every lake-mutating job takes the one lake-root flock first. A writer that skipped it
-    # would land both lines while this test holds the lock, which is what the assertions
-    # inside the ``with`` block catch. Holding them together is what keeps a weekend write
-    # from leaving the Sunday scrub facing a sha nothing has caught up to.
+    # Every job that appends to the manifest takes the one lake-root flock first. A writer
+    # that skipped it would land both lines while this test holds the lock, which is what
+    # the assertions inside the ``with`` block catch. Holding them together is what keeps a
+    # weekend write from leaving the Sunday scrub facing a sha nothing has caught up to.
     failures: list[BaseException] = []
     done = threading.Event()
 

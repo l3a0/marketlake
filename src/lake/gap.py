@@ -175,8 +175,8 @@ class GapMarker:
     Each pass calls it once and marks whatever it returns.
 
     A reader that raises takes the daemon down, and the daemon's reader carries no
-    fallback to stop that. The price is the one the skipped-slot hook already pays for
-    its own read, and it is smaller here: a marker stands for a minute already gone, so
+    fallback to stop that. The price is the one the watchdog's ``on_missed`` hook already pays
+    for its own read, and it is smaller here: a marker stands for a minute already gone, so
     the successor's startup pass walks back and marks whatever this one missed. A stale
     roster marking minutes the file no longer names is what has no later repair.
     """
@@ -395,8 +395,8 @@ class GapMarker:
             # The one failure that stays fatal, named rather than left to a class list.
             # A roster that will not load means nobody knows what is in scope, and a
             # daemon marking against a roster it could not read would invent gaps for
-            # tickers or miss them entirely. The skipped-slot hook refuses it the same
-            # way. Naming it here is what lets the catch below widen safely.
+            # tickers or miss them entirely. The watchdog's ``on_missed`` hook refuses it the
+            # same way. Naming it here is what lets the catch below widen safely.
             raise
         except Exception as exc:  # noqa: BLE001 - see the crash-loop rule below
             # The lock, the ledger, or a segment read. ``on_start`` is unguarded and the

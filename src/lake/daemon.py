@@ -117,9 +117,16 @@ top. A cycle past its bound can still be waiting on the lake-root lock for its m
 append. On 2026-10-05 a tick that waited for every cycle in flight sat behind cycles
 queued on that lock from 13:26 to 13:36 ET and started no cycle meanwhile (marketlake
 #644).
-``on_missed`` runs inside the tick, before ``on_tick``, when nothing ahead of the stall is
-still in flight. Otherwise it runs later, while the loop waits for a minute top, after
-the minute's cycle has started.
+
+``on_missed`` runs on the loop thread as soon as the stall's entry reaches the front of
+the queue, wherever the loop hands on. That is one of four places.
+
+1. Inside the tick that found the stall, before ``on_tick``, when nothing ahead of the
+   stall is still in flight, or when the tick is at or past close+5 and waits for every
+   cycle, as the next paragraph says.
+2. While the loop waits for a later minute top, after the minute's cycle has started.
+3. Inside a later tick, before that tick's ``on_tick``.
+4. In the wait for every cycle in flight when the loop leaves.
 
 One kind of tick does wait for every cycle in flight, and hands each on, before any hook
 runs: a tick at or past its day's close+5 deadline, the moment the close+5 guard is

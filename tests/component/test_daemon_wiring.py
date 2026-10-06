@@ -925,7 +925,9 @@ class _Stalls:
 
     With ``held``, the cycle at ``at`` is still running when the loop wakes. It is
     released half a second after the stall, so a clock with a short wait grace reaches the
-    waking tick first, and that tick has to wait for the cycle before its hooks run.
+    waking tick first. A waking tick at or past the day's close+5 deadline waits for that
+    cycle before its hooks run. One before the deadline waits for none, and the cycle is
+    handed on once it finishes.
     """
 
     def __init__(
@@ -1000,7 +1002,8 @@ def test_a_stall_across_the_close_leaves_one_row_there(tmp_path, seconds, ticks)
             et(2026, 9, 2, 15, 54, 30), et(2026, 9, 2, 15, 55), 29 * 60 + 30, False, id="crossed"
         ),
         # The stall skipped 16:11 to 16:15 only. 16:00 already holds its row, so waiting
-        # would only put the page and the lake-root lock in front of the option-close fill.
+        # would only put the marker's pass, which past the option close waits on the
+        # lake-root lock, in front of the option-close fill.
         pytest.param(
             et(2026, 9, 2, 16, 9, 30), et(2026, 9, 2, 16, 10), 9 * 60 + 30, True, id="after-16:00"
         ),
@@ -1012,9 +1015,9 @@ def test_the_guard_waits_for_the_markers_only_when_the_stall_skipped_the_close(
     """The wait is as wide as its reason, a stall that skipped the equity close.
 
     ``in-flight`` runs the same stall with the stalled minute's cycle still running on its
-    own thread when the loop wakes. The waking tick has skipped slots, so it hands that
-    cycle on before ``on_tick``, and the guard's deferral still runs after the markers
-    (marketlake #565).
+    own thread when the loop wakes. Each case wakes at or past the day's close+5 deadline,
+    16:25 and 16:20, so the waking tick waits for that cycle and hands it on before
+    ``on_tick``, and the guard's deferral still runs after the markers (marketlake #565).
     """
     rig = _rig(tmp_path)
     _in_scope_all_day(rig)
@@ -1276,7 +1279,8 @@ def _rewrite_after_first_cycle(
 
     The rewrite stands for a person editing ``tickers.yaml`` while the daemon runs. The
     first cycle is the session up to that edit. The stall is what hands the fresh file to
-    the missed-slot hook, on the tick the loop next wakes on.
+    the missed-slot hook, once the loop next wakes and the cycle ahead of the stall is
+    handed on.
     """
     cycles: list[datetime] = []
 

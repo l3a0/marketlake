@@ -294,9 +294,9 @@ def test_a_second_run_writes_nothing_at_all(lake_root):
 
 
 def test_the_ledger_and_its_entry_are_written_under_the_lake_lock(lake_root):
-    # Every lake-mutating job takes the one lake-root flock first. A writer that skipped it
-    # would land its file while this test holds the lock, which is what the assertions
-    # inside the ``with`` block catch.
+    # Every job that appends to the manifest takes the one lake-root flock first. A writer
+    # that skipped it would land its file while this test holds the lock, which is what the
+    # assertions inside the ``with`` block catch.
     target = ledger_path(lake_root)
     failures: list[BaseException] = []
     done = threading.Event()

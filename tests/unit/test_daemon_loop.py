@@ -1122,7 +1122,8 @@ def test_the_close_plus_five_tick_hands_on_the_option_close_cycle_before_its_hoo
     # The 16:15 cycle is still running at 16:20, the close+5 deadline, where ``on_tick``
     # dispatches the guard. The guard refills an option close only when no data row holds
     # it, so it must run after that cycle has finished. The minutes between are off the
-    # capture window, so this tick has no skipped slot to wait for.
+    # capture window, so this tick has no skipped slot, and the close+5 deadline alone is
+    # what makes it wait.
     release = threading.Event()
     stalled: list[bool] = []
     end = et(REGULAR, 16, 20).astimezone(UTC)
