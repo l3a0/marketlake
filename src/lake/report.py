@@ -452,7 +452,8 @@ class DamagedSegment:
     """One segment compaction refused: its digest moved, or its read proved it damaged.
 
     ``segment`` is the lake-relative path. ``expected`` is the digest the segment's manifest
-    entry carries, which the capture cycle hashed from the file right after closing it.
+    entry carries, which the capture cycle hashed from the file right after closing it, or
+    under the lake-root lock when that hash raised.
     ``actual`` is the digest of the bytes on disk when compaction came to seal them. For a
     digest refusal the two differ, which is the whole finding: a flip anywhere in the file
     changes the digest, whether it breaks the stream, drops a batch, or rewrites one value.

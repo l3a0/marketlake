@@ -913,8 +913,9 @@ def record_partition(
     ``partition`` is the lake-relative path of a file that already exists under
     ``lake_root``. Its sha256 is read from disk, so the entry always matches the bytes on
     disk at record time. Compaction hashes the bytes it wrote and calls
-    ``append_manifest``, and a capture cycle records its segments through
-    :func:`append_entries`. Every other writer of a manifest entry comes through here.
+    ``append_manifest``. A capture cycle records its segments through
+    :func:`append_entries`, and so does ``capture.journal_snapshot`` for the close+5 fill and
+    an onboarding snapshot. Every other writer of a manifest entry comes through here.
     """
     sha256 = sha256_file(Path(lake_root) / partition)
     return append_manifest(

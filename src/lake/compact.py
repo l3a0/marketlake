@@ -343,8 +343,9 @@ class DamagedSegments(Exception):
     """Raised when a ticker-day's segment no longer matches its hash or reads as damaged.
 
     Every capture segment has a manifest entry whose sha256 the cycle hashed from the file
-    right after closing it. ``_seal`` compares each segment that has one before reading any
-    of them, and this names what failed. A segment the read proves damaged is refused the
+    right after closing it, or under the lake-root lock when that hash raised. ``_seal``
+    compares each segment that has one before reading any of them, and this names what
+    failed. A segment the read proves damaged is refused the
     same way, which is how one with no entry and so no hash reaches it (marketlake #552).
     The sweep catches it the way it catches ``SegmentSchemaConflict`` and for the same
     reason: nothing in this module repairs it, so ending the run would cost every other
@@ -861,7 +862,8 @@ def _damaged_segments(
     """Every segment whose bytes no longer match the sha256 its manifest entry recorded.
 
     The reference is the digest the capture cycle took from the file right after closing
-    it, read from the entry and never computed here. A digest compaction took from the
+    it, read from the entry and never computed here. When that hash raised, the cycle took
+    the digest under the lake-root lock instead. A digest compaction took from the
     bytes it is about to seal would be a digest of the copy that may already be damaged,
     so it could never disagree with the damage.
 

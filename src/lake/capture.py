@@ -47,13 +47,14 @@ Schwab-backed vendor around the same core, and keeps the ``schwab-py`` construct
 lazy so the offline test suite never touches the network.
 
 The manifest step is the one place this cycle takes the lake-root lock. Each segment is
-hashed as soon as it closes, outside the lock. After every segment is durable, the cycle
-appends one manifest entry per segment, keyed by the segment path, in a single
+hashed as soon as it closes, outside the lock. When that hash raises, the segment is
+hashed under the lock instead. After every segment is durable, the cycle appends one
+manifest entry per segment, keyed by the segment path, in a single
 ``manifest.append_entries`` call under ``lake_lock``. That call reads the manifest once
-and writes the cycle's lines in one write, so the time the lock is held no longer grows
-with the number of segments (marketlake #573). Capture writes segments outside the lock,
-because blocking a perishable cycle behind a daily job would drop minutes. Whether
-capture should take the lock at all is marketlake #535.
+and writes the cycle's lines in one write, where the cycle used to read the manifest once
+per segment and write each line on its own (marketlake #573). Capture writes segments
+outside the lock, because blocking a perishable cycle behind a daily job would drop
+minutes. Whether capture should take the lock at all is marketlake #535.
 """
 
 from __future__ import annotations
@@ -2203,7 +2204,7 @@ class _CaptureCycle:
         entry. So the entry records the bytes as they closed. A change to the file while the
         cycle waited shows at compaction as damage, where a hash taken under the lock would
         have recorded the changed bytes as the segment (marketlake #573). When the hash
-        raises, whatever it raises, the digest returned is ``None`` and
+        raises an ``Exception``, the digest returned is ``None`` and
         ``manifest.append_entries`` hashes the file under the lock, as every cycle did
         before. Letting the raise out would report a durable segment as a ``SegmentError``,
         which says no durable segment exists.
