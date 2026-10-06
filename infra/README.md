@@ -59,7 +59,9 @@ account, differs in three steps.
    request's branch.
 2. Step 10 drops out, since no pull request needs a plan.
 3. Step 11 replaces the merge with a manual run of `infra.yml` on `main`, which is
-   `gh workflow run infra.yml --repo l3a0/marketlake --ref main`.
+   `gh workflow run infra.yml --repo l3a0/marketlake --ref main`. Its first apply in a
+   fresh account also creates `aws_iam_role_policy_attachment.instance_ssm`, which
+   [#695](https://github.com/l3a0/marketlake/issues/695) added after the recorded run.
 
 ### 1. Install the tools
 
@@ -443,15 +445,12 @@ gh run rerun "<run-id>" --failed --repo l3a0/marketlake
 The plan appears only in the run page's job summary, never in the log. The repository is
 public, so the job sends OpenTofu's output to `/dev/null` and writes only addresses,
 actions and attribute names to the summary. On the first run the summary should show
-these actions. The run on 2026-10-06 showed all of them except the attachment of AWS's
-managed SSM policy, which [#695](https://github.com/l3a0/marketlake/issues/695) added
-after it.
+these actions, as it did on 2026-10-06.
 
 | Address | Action |
 | --- | --- |
 | `aws_iam_instance_profile.instance` | create |
 | `aws_iam_role.instance` | create |
-| `aws_iam_role_policy_attachment.instance_ssm` | create |
 | `aws_iam_user.backup` | no-op (import) |
 | `aws_iam_user_policy.backup` | no-op (import) |
 | `aws_s3_bucket.backup` | no-op (import) |
@@ -461,9 +460,9 @@ after it.
 | `aws_s3_bucket_versioning.backup` | no-op (import) |
 
 The bucket, its four settings, the user and its policy import with no change. The
-instance role, its profile and its SSM attachment are the only creates, and nothing is
-destroyed or replaced. Before the merge, adopt any in-place update the summary shows into
-code, or list it on the pull request's issue.
+instance role and its profile are the only creates, and nothing is destroyed or
+replaced. Before the merge, adopt any in-place update the summary shows into code, or
+list it on the pull request's issue.
 
 ### 11. Merge, approve, and confirm nothing is left to change
 
