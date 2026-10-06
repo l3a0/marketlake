@@ -611,6 +611,9 @@ def test_the_sunday_twin_with_a_bucket_target_skips_the_whole_backup_step(
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
     # A stamped pid keeps the daemon-liveness page out, so the ping is the one line.
     stamp_assertion_pid(lake_root, pid=4242)
+    # A shadow builds no bucket client at all. With these settings a client could not be
+    # built anyway, and the skip discards the result, so only the call itself shows it.
+    monkeypatch.setattr(bucket, "connect", lambda *args: pytest.fail("a shadow built a client"))
 
     code = cp.main(
         ["sunday", "--config", str(config), "--token", str(token)],
