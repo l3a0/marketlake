@@ -29,9 +29,12 @@ git worktree list
 The log shows what merged since the last round, which is what moves the board.
 
 `--prune` drops a remote-tracking ref only when its branch was deleted on
-GitHub, and this repo does not delete a branch when its pull request merges. So
-remote branches pile up. Deleting them is the owner's call, and this skill
-leaves them alone.
+GitHub. This repo deletes a branch when its pull request merges, so a merged
+branch's remote ref goes at this step. That also means check 3 below rarely
+finds a merged commit on a remote branch, and the merged pull request's
+`headRefOid` is what proves it safe. A branch whose pull request closed
+unmerged stays on GitHub. Deleting it is the owner's call, and this skill
+leaves it alone.
 
 Fast-forward the main checkout only when it is clean and on `main`, since a
 session may be using it. `git -C` keeps the shell where it is, which matters
