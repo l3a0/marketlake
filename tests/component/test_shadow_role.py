@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from lake import alert, bucket, compact, daemon, outbox, runner, sweep
+from lake import alert, bucket, compact, daemon, outbox, runner, runway, sweep
 from lake import control_plane as cp
 from lake import probe_calendar as probe_module
 from lake.alert import Message
@@ -148,6 +148,22 @@ def test_the_role_key_reads_as_four_cases(tmp_path, capsys, written, role, named
         assert err.startswith(f"probe: role {named} is neither")
 
 
+@pytest.mark.parametrize("written", ["Primary", "PRIMARY", "Shadow"])
+def test_a_role_in_another_case_is_neither_role(tmp_path, capsys, written):
+    """Only the exact lowercase strings name a role. The loader stores the text as read."""
+    root = tmp_path / "lake"
+    root.mkdir()
+    config = load_config(write_config(tmp_path, root, role=written))
+
+    sends = outbox.senders(config, process="probe", clock=ManualClock(SATURDAY))
+
+    assert sends.role == "shadow"
+    assert isinstance(sends.pinger, outbox.RecordingPinger)
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert err.startswith(f"probe: role '{written}' is neither 'primary' nor 'shadow'")
+
+
 def test_the_loader_keeps_an_empty_role_apart_from_an_absent_one(tmp_path):
     root = tmp_path / "lake"
     absent = load_config(write_config(tmp_path, root))
@@ -226,6 +242,46 @@ def test_a_recorded_page_keeps_no_body(lake_root):
     assert b"body text" not in LakePaths(lake_root).outbox_path(SATURDAY.date()).read_bytes()
 
 
+def test_a_recorded_line_carries_format_version_one(lake_root):
+    pinger = outbox.senders(_config(lake_root), process="sweep", clock=ManualClock(SATURDAY)).pinger
+
+    pinger.ping(_config(lake_root).healthchecks_url(EOD_SWEEP_SLUG))
+
+    (line,) = _outbox(lake_root, SATURDAY.date())
+    assert line["v"] == 1
+
+
+def test_the_outbox_file_sits_at_the_documented_path(lake_root):
+    """The path is a literal here, because a test that builds it through ``outbox_path``
+    moves with any change to ``outbox_path``."""
+    late = et(2026, 9, 6, 21, 0)
+    pinger = outbox.senders(_config(lake_root), process="sunday", clock=ManualClock(late)).pinger
+
+    pinger.ping(_config(lake_root).healthchecks_url(SUNDAY_SLUG))
+
+    written = sorted(
+        p.relative_to(lake_root).as_posix() for p in lake_root.rglob("*") if p.is_file()
+    )
+    assert written == ["journal/outbox/date=2026-09-06.jsonl"]
+
+
+def test_a_lake_holding_only_outbox_lines_reads_no_day_as_unsealed(lake_root):
+    """``runway.walk`` reads a ``date=`` directory under ``journal/`` as a capture day's
+    segments. A day it marks unsealed stays that way, since compaction never removes the
+    outbox file."""
+    late = et(2026, 9, 6, 21, 0)
+    sends = outbox.senders(_config(lake_root), process="sunday", clock=ManualClock(late))
+
+    sends.pinger.ping(_config(lake_root).healthchecks_url(SUNDAY_SLUG))
+    sends.transport.send(Message(event="capture_down", title="Capture down", body="b"))
+
+    usage = runway.walk(lake_root)
+    # The walk reached the file, so the empty set below is a reading rather than a miss.
+    assert usage.files == 1
+    assert usage.refused == 0
+    assert usage.unsealed == frozenset()
+
+
 # -- 3. the Eastern date ----------------------------------------------------------------
 
 
@@ -239,6 +295,18 @@ def test_a_line_after_eight_in_the_evening_lands_in_that_eastern_days_file(lake_
 
     assert _outbox(lake_root, date(2026, 9, 6)) == [_ping(late, "sunday", SUNDAY_SLUG)]
     assert not LakePaths(lake_root).outbox_path(date(2026, 9, 7)).exists()
+
+
+def test_a_utc_instant_after_eight_in_the_evening_lands_in_that_eastern_days_file(lake_root):
+    # The same evening as above, handed over as a UTC instant. 03:30 UTC on 7 September is
+    # 23:30 EDT on 6 September, so the file is the 6th's.
+    late = datetime(2026, 9, 7, 3, 30, tzinfo=UTC)
+    pinger = outbox.senders(_config(lake_root), process="sunday", clock=ManualClock(late)).pinger
+
+    pinger.ping(_config(lake_root).healthchecks_url(SUNDAY_SLUG))
+
+    assert (lake_root / "journal/outbox/date=2026-09-06.jsonl").is_file()
+    assert not (lake_root / "journal/outbox/date=2026-09-07.jsonl").exists()
 
 
 # -- 4. a missing lake root -------------------------------------------------------------
@@ -277,6 +345,20 @@ def test_a_recorder_raises_only_oserror(lake_root):
         sends.transport.send(Message(event="e", title="t", body="b", priority="high"))  # type: ignore[arg-type]
     assert type(sent.value) is OSError
     assert isinstance(sent.value.__cause__, ValueError)
+
+
+class _InterruptedClock(ManualClock):
+    def now(self) -> datetime:
+        raise KeyboardInterrupt
+
+
+def test_a_recorder_lets_a_keyboard_interrupt_through(lake_root):
+    """Only an ``Exception`` becomes an ``OSError``. Ctrl-C must still stop the process."""
+    sends = outbox.senders(_config(lake_root), process="sweep", clock=_InterruptedClock(SATURDAY))
+    with pytest.raises(KeyboardInterrupt):
+        sends.pinger.ping(_config(lake_root).healthchecks_url(EOD_SWEEP_SLUG))
+    with pytest.raises(KeyboardInterrupt):
+        sends.transport.send(Message(event="e", title="t", body="b"))
 
 
 # -- 6 and 8. the seven mains, with no sender patched -----------------------------------
@@ -498,6 +580,23 @@ def test_the_runner_twin_records_its_ping_and_skips_the_backup(tmp_path, monkeyp
     assert "pinged=True backed_up=False" in out
 
 
+def test_a_primary_runner_with_a_failed_cycle_prints_no_skip_line(tmp_path, monkeypatch, capsys):
+    """A failed cycle backs nothing up on any host, so ``backed_up=False`` is not a skip."""
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
+    empty = CycleResult(snap_ts=datetime(2026, 9, 2, 20, 0, tzinfo=UTC), segments=())
+    monkeypatch.setattr(runner, "run_cycle_from_config", lambda **kwargs: empty)
+
+    assert runner.main(["run", "--config", str(config)]) == 1
+
+    out = capsys.readouterr().out
+    assert "slice-1 run: no durable data" in out
+    assert "backup skipped" not in out
+    assert "role is shadow" not in out
+    assert not (lake_root / "journal").exists()
+
+
 # -- 7. the skip is visible -------------------------------------------------------------
 
 
@@ -699,3 +798,20 @@ def test_the_bucket_commands_refuse_on_a_shadow_host(tmp_path, monkeypatch, caps
     assert code == 2
     assert capsys.readouterr().err == f"{argv[0]}: {bucket.BUCKET_SHADOW}\n"
     assert not (lake_root / "journal").exists()
+
+
+def test_a_bucket_command_names_an_unrecognised_role_before_refusing(tmp_path, monkeypatch, capsys):
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root, role="shadw")
+    monkeypatch.setattr(bucket, "connect", lambda *args: pytest.fail("a shadow built a client"))
+
+    code = bucket.main(["first-upload", "--config", str(config)], clock=ManualClock(SATURDAY))
+
+    assert code == 2
+    warning, refusal = capsys.readouterr().err.splitlines()
+    assert warning.startswith("first-upload: role 'shadw' is neither 'primary' nor 'shadow'")
+    assert refusal == (
+        "first-upload: this host's role is shadow, so it uploads nothing to a bucket and "
+        "checks none. Run this on the primary."
+    )
