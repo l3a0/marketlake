@@ -144,9 +144,11 @@ bucket. Steps 3 and 4 change as follows.
    the instance profile and its IAM role in `infra/`, with the same four actions as the
    laptop's key, and [#686](https://github.com/l3a0/marketlake/issues/686) has the VM
    require metadata tokens.
-2. Step 4's key lines become one setting. The VM's `config.yaml`, copied there by hand
-   per [#686](https://github.com/l3a0/marketlake/issues/686), names the source beside
-   the region and holds neither key field.
+2. Step 4's key lines become one setting. The VM's `config.yaml` is written at deploy
+   time, by [#686](https://github.com/l3a0/marketlake/issues/686)'s cloud-init and
+   [#676](https://github.com/l3a0/marketlake/issues/676)'s deploy, from the parameters
+   [#699](https://github.com/l3a0/marketlake/issues/699) keeps in SSM Parameter Store.
+   It names the source beside the region and holds neither key field.
 
    ```yaml
    bucket_credentials: instance_profile
