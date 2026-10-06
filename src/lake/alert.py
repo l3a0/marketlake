@@ -7,7 +7,9 @@ rather than in the callers, so a producer decides only that something is wrong.
 The publisher is total. ``publish`` never raises and never lets a caller forget to
 handle a failure, because a watchdog that crashes while reporting a dead surface is
 worse than one that stays quiet. Every message that does not reach the phone is written
-down first, under ``reports/``, one write-once file each.
+down first, under ``reports/``, one write-once file each. On a host whose ``role`` is
+``shadow`` no message reaches the phone by design, and ``lake.outbox`` records each one
+under ``journal/outbox/`` as it is handed to the transport.
 
 That sink is a directory of dated files rather than a ledger, and the difference is not
 cosmetic. The scrub's reverse pass treats an unexpected file at the lake root as an
@@ -312,6 +314,12 @@ def undelivered(lake_root: Path | str, day: date) -> int:
 TEST_PUSH_EVENT = "test_push"
 TEST_PUSH_TITLE = "Test push"
 
+# The refusal on a shadow host, where a page is recorded rather than sent.
+TEST_PUSH_SHADOW = (
+    "test-push: NOT sent. This host's role is shadow, so a page would be recorded under "
+    "journal/outbox/ rather than reach ntfy. Run the test push on the primary."
+)
+
 
 def _test_push_body(now: datetime) -> str:
     """What the one test message says.
@@ -445,30 +453,43 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> int:
     """The ``python -m lake.alert`` entry. Returns a process exit code.
 
-    The transport is built here, not accepted. It POSTs to ntfy, which reaches a phone,
-    so a ``main`` that accepted one let a test omit it and send for real. A test replaces
-    ``NtfyTransport`` instead, which drives the rest of this wiring unchanged.
+    The transport is never accepted. It POSTs to ntfy, which reaches a phone, so a
+    ``main`` that accepted one let a test omit it and send for real. It comes from
+    ``outbox.senders``, the only construction site in the package, and a test replaces
+    ``NtfyTransport`` on this module, where ``outbox`` looks it up, which drives the rest
+    of this wiring unchanged. ``outbox`` is imported here rather than at the top, because
+    it imports this module.
 
     The topic comes from the same config every other producer reads, never from the
     command line. A topic typed at the prompt would prove a channel nothing else uses,
     and the channel worth proving is the one the daemon will page on.
 
     ``clock`` stays injectable. A wall clock never reaches past this process.
+
+    Under a ``shadow`` role this refuses with exit 2 and sends nothing. The transport there
+    records rather than POSTs, so ``run_test_push`` would see the page as sent, print that
+    ntfy accepted it, and return 0, which is the false report this command exists to
+    prevent.
     """
     args = build_parser().parse_args(argv)
 
+    from lake import outbox
     from lake.config import input_errors_exit, load_config
 
     with input_errors_exit("alert"):
         config = load_config(args.config)
 
+    reader = SystemClock() if clock is None else clock
+    sends = outbox.senders(config, process="alert", clock=reader)
+    if sends.role != outbox.PRIMARY:
+        print(TEST_PUSH_SHADOW, file=sys.stderr)
+        return 2
     publisher = Publisher(
         lake_root=config.lake_root,
-        transport=NtfyTransport(config.ntfy_topic.reveal()),
+        transport=sends.transport,
         # The values that must never reach a phone, checked against the page itself.
         secrets=config.page_secrets(),
     )
-    reader = SystemClock() if clock is None else clock
     return run_test_push(publisher, now=reader.now())
 
 
@@ -479,6 +500,7 @@ __all__ = [
     "POST_FAILED",
     "REFUSED",
     "TEST_PUSH_EVENT",
+    "TEST_PUSH_SHADOW",
     "TEST_PUSH_TITLE",
     "Delivery",
     "PAGE_TAG",

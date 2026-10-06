@@ -1385,9 +1385,11 @@ def test_main_passes_the_paths_to_the_config_entry(tmp_path, monkeypatch):
     assert seen["config_path"] == str(config)
     assert seen["tickers_path"] is None
     assert seen["token_path"] == "/tok.json"
-    # ``daemon.main`` is the only caller in its module that builds the live three. If any
-    # stops being the real thing, some entry has started defaulting a seam again, which
-    # is how the suite came to feed the owner's live capture check.
+    # ``daemon.main`` is the only caller in its module that supplies the live three, the
+    # two senders from ``outbox`` and the real spawn. This config has no ``role`` key, so
+    # it is a primary and the senders are live. If any stops being the real thing, some
+    # entry has started defaulting a seam again, or an absent key has started reading as
+    # ``shadow``. ``tests/component/test_shadow_role.py`` holds the shadow twin.
     assert isinstance(seen["transport"], NtfyTransport)
     assert isinstance(seen["pinger"], UrllibPinger)
     # The live runner is the one that actually spawns a child process.

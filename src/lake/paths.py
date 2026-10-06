@@ -134,6 +134,14 @@ JOURNAL_METADATA_FILE = "metadata.json"
 # same reason: compaction prunes a sealed day's directories, and these files outlive the
 # seal. A day's file is ``timing/date=YYYY-MM-DD.jsonl``.
 TIMING_DIR = "timing"
+
+# The outbox files, one per Eastern day, written by ``lake.outbox`` on a host whose role is
+# ``shadow``. Each line is a ping or a page that was recorded rather than sent. The
+# directory sits beside the timing files for the same reason they sit where they do, and
+# the file is flat for a second one: a ``date=`` directory under ``journal/`` reads as a
+# capture day to ``runway.walk``, which would mark that day unsealed for good. A day's
+# file is ``outbox/date=YYYY-MM-DD.jsonl``.
+OUTBOX_DIR = "outbox"
 JSONL_SUFFIX = ".jsonl"
 
 # The key prefix on a partition-date directory or filename, as in ``date=2026-01-05``.
@@ -261,6 +269,10 @@ class LakePaths:
     def timing_path(self, day: date | str) -> Path:
         """One day's timing file, appended one line per vendor request and one per capture cycle."""
         return self.journal_dir / TIMING_DIR / f"{DATE_PREFIX}{_day_str(day)}{JSONL_SUFFIX}"
+
+    def outbox_path(self, day: date | str) -> Path:
+        """One Eastern day's outbox file, appended one line per recorded ping or page."""
+        return self.journal_dir / OUTBOX_DIR / f"{DATE_PREFIX}{_day_str(day)}{JSONL_SUFFIX}"
 
     def segment_dir(self, surface: str, ticker: str, day: date | str) -> Path:
         """The directory holding one surface, ticker, and day's journal segments.
@@ -528,6 +540,7 @@ __all__ = [
     "JOURNAL_METADATA_FILE",
     "JSONL_SUFFIX",
     "MANIFEST_FILE",
+    "OUTBOX_DIR",
     "PARQUET_SUFFIX",
     "QUARANTINE_FILE",
     "QUOTES",

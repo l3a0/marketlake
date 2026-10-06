@@ -46,6 +46,14 @@ registered callback is a loopback URL rather than a credential, and the re-auth 
 it so the operator can check it against the Schwab app registration, which a redacting
 wrapper would make impossible.
 
+A second key is optional too: ``role``, which says whether this host is the ``primary``
+or a ``shadow``. The loader refuses nothing. It stores a string as read and any other
+value as its ``repr``, and ``lake.outbox`` decides what the value means when a ``main``
+asks it for senders. A
+refusal here would land inside the capture cycle, which loads this file every minute, so
+a typo made mid-session would stop capture until someone fixed the file. The daemon reads
+the role only at start, so a check every minute would protect nothing.
+
 A *guard constant* is a tunable threshold the failure machinery reads, like the
 watchdog's page-after count or the suspect-snapshot ratio. The defaults here are the
 values the design pins. Slice 1 measures the real distributions and recalibrates them.
@@ -59,6 +67,7 @@ import sys
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
+from enum import Enum
 from pathlib import Path
 
 import yaml
@@ -102,9 +111,35 @@ _BUCKET_NAME = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
 # that is not a ``ConfigError``, so the check runs first and names the key instead.
 _REGION = re.compile(r"[a-z]{2,4}(-[a-z]+)+-\d+")
 
+# The host-role key, spelled once. ``lake.outbox`` names it in the line it prints for a
+# value it does not recognise.
+ROLE_KEY = "role"
+
+
+class _Absent(Enum):
+    """The type of ``ROLE_ABSENT``.
+
+    An ``Enum`` member, because ``lake.outbox`` compares it by identity, and a member
+    survives ``copy.deepcopy`` and a pickle round trip as the same object. A plain
+    ``object()`` comes back as a new one, and a copied config without the key then
+    reads as ``shadow``.
+    """
+
+    ROLE_ABSENT = "ROLE_ABSENT"
+
+    def __repr__(self) -> str:
+        return "ROLE_ABSENT"
+
+
+# What ``Config.role`` holds when the file has no ``role`` key at all. A key written with
+# no value parses to ``None``, and that has to stay distinguishable from no key, because
+# an absent key means ``primary`` and an empty one does not.
+ROLE_ABSENT = _Absent.ROLE_ABSENT
+
 # The required keys. Guard constants are optional and default to the pinned values, and
 # so is ``CALLBACK_KEY``: no capture path reads it, so a config missing it must load
-# rather than take the daemon down for a key the daemon has no use for.
+# rather than take the daemon down for a key the daemon has no use for. ``ROLE_KEY`` is
+# optional as well, and an absent one means the host is the primary.
 _REQUIRED_KEYS = (
     "lake_root",
     "backup_target",
@@ -522,6 +557,10 @@ class Config:
     bucket_access_key_id: Secret | None = None
     bucket_secret_access_key: Secret | None = None
     bucket_region: str | None = None
+    # The ``role`` string as the file held it, the ``repr`` of any other value, or
+    # ``ROLE_ABSENT``. Never the value itself, because a list would make this frozen
+    # config unhashable. ``lake.outbox`` names what it read when it is neither role.
+    role: str | _Absent = ROLE_ABSENT
 
     def paths(self) -> LakePaths:
         """The lake path builder rooted at ``lake_root``. The DATA_DIR-to-paths bridge."""
@@ -556,7 +595,8 @@ class Config:
         missing required key raises ``ConfigError`` naming the key. Paths carrying a
         leading ``~`` are expanded to the home directory. ``schwab_callback_url`` is not
         a required key, so a mapping without it yields ``None`` there and every other
-        value as usual.
+        value as usual. ``role`` is stored as read when it is a string and as its
+        ``repr`` otherwise, and a mapping without it yields ``ROLE_ABSENT``.
         """
         missing = [key for key in _REQUIRED_KEYS if mapping.get(key) is None]
         if missing:
@@ -576,7 +616,17 @@ class Config:
             bucket_access_key_id=None if key_id is None else Secret(key_id),
             bucket_secret_access_key=None if secret_key is None else Secret(secret_key),
             bucket_region=_optional_text(mapping.get(BUCKET_REGION_KEY)),
+            role=_role_text(mapping[ROLE_KEY]) if ROLE_KEY in mapping else ROLE_ABSENT,
         )
+
+
+def _role_text(value: object) -> str:
+    """A present ``role`` value as a string: itself when it is one, its ``repr`` if not.
+
+    So an empty ``role:`` stores ``"None"`` and ``role: off`` stores ``"False"``, and
+    ``lake.outbox`` still names what the file held.
+    """
+    return value if isinstance(value, str) else repr(value)
 
 
 def _optional_text(value: object) -> str | None:

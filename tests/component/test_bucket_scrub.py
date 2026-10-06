@@ -583,9 +583,9 @@ def _sunday_cli(tmp_path, monkeypatch, lake: Path, *, target=str(TARGET), keys=_
         return run
 
     monkeypatch.setattr(cp, "read_pmset_schedule", lambda: "")
-    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
     monkeypatch.setattr(cp, "token_canary", canary)
-    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: _Pushes())
     monkeypatch.setattr(cp, "read_exclusions", lambda targets: "")
     monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)

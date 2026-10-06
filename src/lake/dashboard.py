@@ -1242,9 +1242,10 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
        replace the token in use. ``sunday_canary_due`` owns that moment, because the
        control plane owns the ritual. It goes negative once the ritual is overdue, which
        is the honest reading of a token past its Sunday.
-    4. ``dead_man_last_ping``, the instant the dead-man ping last landed, written by the
-       daemon's own feed, with ``dead_man_age_minutes`` beside it. Three more fields let
-       the panel judge that age rather than leaving the reader to subtract it by eye.
+    4. ``dead_man_last_ping``, the instant the dead-man ping last landed, or on a
+       ``shadow`` host was last recorded, written by the daemon's own feed, with
+       ``dead_man_age_minutes`` beside it. Three more fields let the panel judge that
+       age rather than leaving the reader to subtract it by eye.
        ``dead_man_starved`` is the verdict, per ``_dead_man_starved``, and it is what the
        page alarms on. ``dead_man_expected`` says whether a ping is owed this minute, per
        ``_ping_owed``, and the page says so in words rather than colouring by it.
@@ -1263,7 +1264,8 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
        capture.
     5. ``pages_failed_to_send``, today's count of pages that never reached the phone,
        counted from the files the publisher writes under ``reports/``. The day is the
-       Eastern one, the same key the publisher files them under.
+       Eastern one, the same key the publisher files them under. A page a ``shadow``
+       host recorded instead of sending is not counted here.
     6. ``capture_owed_through``, the last minute a capture cycle was owed, per
        ``_capture_owed_through``. Inside the capture window that is ``now``. Outside it
        that is the last option close that has passed, so a healthy evening reads clean

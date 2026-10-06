@@ -117,9 +117,11 @@ The job's rules, each glossed at first use.
    lake is synced to the backup target. A ticker-day the sweep refused does not hold that
    up, which is the whole point of catching the refusals where rules 3 and 4 catch them.
    The health-check ping fires only after the backup succeeds, so the
-   one ping attests both. An unmounted target raises before any ping, and so does a
+   one ping attests both, except on a ``shadow`` host, which runs no backup and whose
+   ping attests only the seal. An unmounted target raises before any ping, and so does a
    bucket upload that refuses or reaches its deadline. A holiday or an
-   empty journal is a correct no-op and still backs up and pings. The drift page above
+   empty journal is a correct no-op and still backs up and pings, or on a ``shadow``
+   host only pings. The drift page above
    goes out ahead of both, from a ``finally`` around the sweep, because an unmounted
    target or a failed seal must not be able to swallow it. The damaged-segment page goes
    out from the same ``finally``, for the same reason.
@@ -157,8 +159,8 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from lake import bucket, journal
-from lake.alert import REFUSED, Message, NtfyTransport, Publisher
+from lake import bucket, journal, outbox
+from lake.alert import REFUSED, Message, Publisher
 from lake.calendar import Calendar, ExchangeCalendar
 from lake.chain_plan import DEFAULT_CHAIN_PLAN_PATH, ChainPlan, Window, load_chain_plan
 from lake.clock import Clock, SystemClock
@@ -200,11 +202,11 @@ from lake.report import (
     write_schema_drift,
 )
 from lake.runner import (
+    BACKUP_SKIPPED,
     PING_FAILURES,
     BackupRunner,
     Pinger,
     RsyncBackup,
-    UrllibPinger,
     escalate_ping_failure,
 )
 from lake.session import SessionClock
@@ -506,9 +508,10 @@ class CompactionResult:
     which the merge cannot reconcile, or because a segment's bytes were damaged.
     ``retune`` is the window re-tune verdict, or ``None`` when no chains partition of an
     eligible day was available to profile. ``backed_up`` and ``pinged`` record the two
-    post-seal steps. ``problem`` names a ping that failed, which leaves ``pinged`` false.
-    The seal and the backup already happened, so the run's report is worth more than the
-    lost ping.
+    post-seal steps. ``backed_up`` is false only on a shadow host, which runs no backup,
+    and ``render`` then says the backup was skipped. ``problem`` names a ping that failed,
+    which leaves ``pinged`` false. The seal and the backup already happened, so the run's
+    report is worth more than the lost ping.
     """
 
     sealed: tuple[SealedPartition, ...]
@@ -550,6 +553,10 @@ class CompactionResult:
         ]
         if self.problem is not None:
             lines.append(f"  {self.problem}")
+        if not self.backed_up:
+            # A run that returns has either synced or been handed no runner, and only the
+            # shadow role hands it none.
+            lines.append(f"  {BACKUP_SKIPPED}")
         for item in self.sealed:
             lines.append(f"  sealed   {item.partition} rows={item.rows} from {len(item.segments)}")
         for item in self.verified:
@@ -1926,7 +1933,7 @@ def compact(
     *,
     clock: Clock,
     calendar: Calendar,
-    backup: BackupRunner,
+    backup: BackupRunner | None,
     backup_target: Path | str | BucketTarget,
     pinger: Pinger | None = None,
     ping_url: str | None = None,
@@ -1955,10 +1962,16 @@ def compact(
     ``pinger`` is optional so a caller without a health check, like a test, can skip
     it. When given, ``ping_url`` is required.
 
+    ``backup`` is required and has no default, so a caller cannot skip the backup by
+    forgetting it. ``None`` is the shadow role's answer, passed on purpose by ``main``. The
+    run then syncs nothing, leaves ``backed_up`` false, and the result says the backup was
+    skipped. A runner that did nothing would not do, because ``backed_up`` turns true
+    after any sync that returns, and the result would claim a copy that was never made.
+
     ``publisher`` carries the schema-drift page, the damaged-segment page and the
     refused-ping page, and it follows
-    ``pinger`` exactly. Both reach past this process, so ``main`` builds them and never
-    accepts them, and a test drives
+    ``pinger`` exactly. Both reach past this process, so ``main`` gets them from
+    ``outbox`` and never accepts them, and a test drives
     this helper with a fake instead. It is optional for the same reason ``pinger`` is: a
     caller with nowhere to page skips it, and the default is ``None`` rather than a live
     object, so omitting it can never reach a real phone. What a run without one loses is
@@ -2082,9 +2095,13 @@ def compact(
 
         # Backup first. A raised backup propagates before the ping, so a single-copy
         # window pages through the missed ping rather than being reported as healthy.
-        target = backup_target if isinstance(backup_target, BucketTarget) else Path(backup_target)
-        backup.sync(root, target)
-        backed_up = True
+        backed_up = False
+        if backup is not None:
+            target = (
+                backup_target if isinstance(backup_target, BucketTarget) else Path(backup_target)
+            )
+            backup.sync(root, target)
+            backed_up = True
         pinged = False
         if pinger is not None:
             try:
@@ -2232,13 +2249,17 @@ def main(
 ) -> int:
     """The ``python -m lake.compact`` entry. Returns a process exit code.
 
-    ``backup``, ``pinger`` and the pages' ``Publisher`` are built here, not
-    accepted. Each reaches past this process. ``rsync`` shells out to copy the lake, or
+    ``backup``, ``pinger`` and the pages' ``Publisher`` are not accepted. The backup is
+    built here, and the pinger and the publisher's transport come from ``outbox``. Each
+    reaches past this process. ``rsync`` shells out to copy the lake, or
     the bucket client uploads it, the healthchecks GET goes to the network, and the
     publisher POSTs to ntfy, which reaches a phone. Which backup is built follows the
     form of ``backup_target``. A ``main`` that accepted them let a test omit one and
-    reach the real effect, so ``main`` builds them and a test drives the ``compact``
+    reach the real effect, so ``main`` supplies them and a test drives the ``compact``
     helper directly instead.
+    ``outbox.senders`` is the only construction site the package has for either, so a
+    test replaces them on ``lake.runner`` and ``lake.alert``. Under a ``shadow`` role they
+    record rather than send, and no backup runner is built at all.
 
     ``clock`` and ``calendar`` stay injectable. A system clock and an exchange calendar
     never reach past this process, so a test injects them with no live effect.
@@ -2270,11 +2291,18 @@ def main(
         return 0
 
     calendar = calendar if calendar is not None else ExchangeCalendar()
-    if isinstance(config.backup_target, BucketTarget):
+    sends = outbox.senders(config, process="compact", clock=clock)
+    backup: BackupRunner | None
+    if sends.role != outbox.PRIMARY:
+        # A shadow host backs nothing up, whichever form the target takes. Its lake is
+        # compared and then discarded, and a shadow seeded from the primary would
+        # upload over the primary's copy.
+        backup = None
+    elif isinstance(config.backup_target, BucketTarget):
         # The client is built at the upload's first request, after the seal, so a bad
         # bucket setting fails the backup and leaves the seal standing. The calendar
         # bounds the upload's deadline by the next session, for a hand run at any hour.
-        backup: BackupRunner = bucket.BucketBackup(
+        backup = bucket.BucketBackup(
             client=bucket.ClientFromConfig(config), clock=clock, calendar=calendar
         )
     else:
@@ -2286,11 +2314,11 @@ def main(
             calendar=calendar,
             backup=backup,
             backup_target=config.backup_target,
-            pinger=UrllibPinger(),
+            pinger=sends.pinger,
             ping_url=config.healthchecks_url(COMPACTION_SLUG),
             publisher=Publisher(
                 lake_root=config.lake_root,
-                transport=NtfyTransport(config.ntfy_topic.reveal()),
+                transport=sends.transport,
                 # The values that must never reach a phone, checked against the page itself.
                 secrets=config.page_secrets(),
             ),

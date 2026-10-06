@@ -157,7 +157,8 @@ The launchd plist that runs the daemon is deliberately not here. It is D14's.
 
 Nothing is pinged or backed up per minute, unlike the slice-1 runner. The two session-
 relative jobs the loop dispatches own both. The close+15 compaction seals the day, syncs
-the lake to the backup target, and pings the ``compaction`` check, once a day. The
+the lake to the backup target except on a ``shadow`` host, and pings the ``compaction``
+check, once a day. The
 dead-man ping is the per-minute exception, and it reports that the daemon is running
 rather than that anything landed.
 """
@@ -175,7 +176,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Protocol
 
-from lake.alert import REFUSED, Message, NtfyTransport, Publisher, Transport
+from lake import outbox
+from lake.alert import REFUSED, Message, Publisher, Transport
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
 from lake.capture import (
     CycleResult,
@@ -200,7 +202,7 @@ from lake.journal import CHAINS_SURFACE
 from lake.metadata import stamp_assertion_pid, stamp_cycle, stamp_ping
 from lake.reference_read import read_or_none
 from lake.report import write_close_guard
-from lake.runner import Pinger, UrllibPinger
+from lake.runner import Pinger
 from lake.schema_drift import SchemaDriftObserver
 from lake.schema_drift import page as page_schema_drift
 from lake.schema_versions import check_running_version
@@ -1032,8 +1034,9 @@ def _start_compaction(runner: CompactionRunner, args: Sequence[str]) -> None:
 
     Nothing is waited on, so a failing run is not reported from here. It cannot be: the
     child outlives this call by design. The child pings the ``compaction`` check itself,
-    after its backup, so a run that died sends nothing and healthchecks pages on the
-    silence. Its own stderr lands in the launchd log beside the daemon's.
+    after its backup, or with no backup on a ``shadow`` host, so a run that died sends
+    nothing and healthchecks pages on the silence. Its own stderr lands in the launchd log
+    beside the daemon's.
 
     A spawn that never started is the one failure this call can still see, and it is
     caught by ``_dispatched`` rather than here. The two spellings named the same event,
@@ -1207,7 +1210,8 @@ def _alarm(
 
     Both seams are handed in. Neither is defaulted here, because a default reaching a
     public endpoint is one a caller gets without asking, and the caller that most needs
-    to be asked is a test. ``main`` is the only caller in this module that builds them.
+    to be asked is a test. ``main`` is the only caller in this module that gets them from
+    ``outbox``.
 
     A config or roster that will not load raises. Standing the alarm down instead was
     the older behaviour, and it hid the failure twice over: the daemon ran on with no
@@ -1358,12 +1362,14 @@ def run_loop_from_config(
     design's chain is the wake alarm, then ``KeepAlive`` starting the daemon, then the
     assertion keeping an open laptop awake, and this is the link that holds it.
 
-    ``transport``, ``pinger`` and ``backup`` are required, and none has a live default.
-    Each one reaches past this process: a real ntfy POST, a real healthchecks GET, and an
-    ``rsync`` of the whole lake. A default would hand every caller the live object without
-    being asked. A test that forgot to pass one used to get exactly that, and a page sent
-    from a test is a page a person receives. ``main`` builds the live three; everything
-    else supplies its own.
+    ``transport``, ``pinger`` and ``compaction_runner`` are required, and none has a live
+    default. Each one reaches past this process: a real ntfy POST, a real healthchecks GET,
+    and a spawned compaction child that goes on to ``rsync`` the whole lake. A default would
+    hand every caller the live object without being asked. A test that forgot to pass one
+    used to get exactly that, and a page sent from a test is a page a person receives.
+    ``main`` passes the pair ``outbox.senders`` returns and the real spawn. Every other
+    caller supplies its own. Under a ``shadow`` role that pair records each ping and page
+    under ``journal/outbox/`` rather than sending it, and nothing in this loop can tell.
 
     ``plan_path`` names the machine-derived chunk plan the close+15 re-tune rewrites. It
     defaults to the same file the capture cycle reads, so the two never disagree about
@@ -1852,9 +1858,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """The ``python -m lake.daemon`` entry. Loops forever, so it returns only when stopped."""
     args = build_parser().parse_args(argv)
-    # The only construction site in this module. The config is read here as well as
-    # inside the loop, because the ntfy topic names the transport and the transport is
-    # wired from out here now.
+    # The senders come from ``outbox``, the only construction site in the package. The
+    # config is read here as well as inside the loop, because the ntfy topic names the
+    # transport and the transport is wired from out here now. They are built once, so a
+    # change of ``role`` reaches the daemon only through a restart.
+    #
+    # The role is printed at every start, under both roles. ``role=primary`` is the line
+    # that gives a misspelled key away, because ``Config.from_mapping`` ignores an unknown
+    # key and ``rol: shadow`` loads as a primary. That costs one line per restart, against
+    # ``_report``'s rule that an ordinary restart adds no noise.
     #
     # The wrapper puts this entry in the same class as every other one that reads an
     # operator file. A missing config or roster is an operator mistake, so it earns one
@@ -1863,12 +1875,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     # repeat every few seconds in the log the operator is told to read.
     with input_errors_exit("daemon"):
         config = load_config(args.config)
+        sends = outbox.senders(config, process="daemon", clock=SystemClock())
+        print(f"daemon: role={sends.role}", file=sys.stderr)
         run_loop_from_config(
             config_path=args.config,
             tickers_path=args.tickers,
             token_path=args.token,
-            transport=NtfyTransport(config.ntfy_topic.reveal()),
-            pinger=UrllibPinger(),
+            transport=sends.transport,
+            pinger=sends.pinger,
             compaction_runner=_spawn_compaction,
         )
     return 0
