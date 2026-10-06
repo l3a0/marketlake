@@ -1846,6 +1846,11 @@ def reauth_reminder(
     )
 
 
+# The report line for a Sunday run that skipped the backup scrub. Only a shadow host
+# skips it, because it syncs no backup for the scrub to read.
+BACKUP_SCRUB_SKIPPED = "backup scrub skipped: this host's role is shadow, so no backup exists"
+
+
 @dataclass(frozen=True)
 class SundayOutcome:
     """What one Sunday maintenance run found and did.
@@ -1869,6 +1874,9 @@ class SundayOutcome:
     ``covered`` is ``None`` when the mint time could not be read. That is a problem,
     never a skip. ``pinged`` is the success condition.
 
+    ``backup`` is ``None`` when the backup scrub was skipped, which only a shadow host
+    does, and ``report`` then carries ``BACKUP_SCRUB_SKIPPED``.
+
     ``daemon_page`` is the page this attempt found owed for a dead daemon or an unheld
     assertion, or ``None`` when nothing was checked or the daemon was healthy. Its text
     is also named in ``report``, matching every other report-tier finding, but it does
@@ -1878,7 +1886,7 @@ class SundayOutcome:
     """
 
     scrub: ScrubResult
-    backup: BackupScrubResult
+    backup: BackupScrubResult | None
     alarms: AlarmCheck
     canary_passed: bool
     covered: bool | None
@@ -1892,7 +1900,7 @@ class SundayOutcome:
 def sunday_maintenance(
     *,
     lake_root: Path,
-    backup_target: Path | BucketTarget,
+    backup_target: Path | BucketTarget | None,
     now: datetime,
     calendar: Calendar,
     schedule_reader: ScheduleReader,
@@ -2001,6 +2009,11 @@ def sunday_maintenance(
     bytes at rest, so rot at rest in a bucket is the provider's durability guarantee plus
     the restore test rather than this job's.
 
+    A ``backup_target`` of ``None`` is the one skip, and only the shadow role passes it.
+    A shadow host syncs no backup, so a scrub there would find no manifest, count that as
+    a problem, withhold the ``sunday`` ping and retry until the canary deadline. The skip
+    is a report line instead, and ``backup`` on the outcome is ``None``.
+
     The canary's 30-minute retry until the deadline belongs to ``sunday_run``, not to
     this function. This function decides one attempt.
     """
@@ -2017,7 +2030,11 @@ def sunday_maintenance(
             f"orphans={len(result.orphans)}"
         )
 
-    if isinstance(backup_target, BucketTarget) and bucket_unusable is not None:
+    # ``None`` is the shadow role's skip, and it skips every form of the backup step.
+    backup: BackupScrubResult | None = None
+    if backup_target is None:
+        backup = None
+    elif isinstance(backup_target, BucketTarget) and bucket_unusable is not None:
         backup = BackupScrubResult(target=str(backup_target), bucket_unusable=bucket_unusable)
     elif isinstance(backup_target, BucketTarget):
         if bucket_client is None:
@@ -2027,7 +2044,7 @@ def sunday_maintenance(
         backup = bucket_scrub(root, backup_target, bucket_client)
     else:
         backup = backup_scrub(root, Path(backup_target))
-    if backup.problem is not None:
+    if backup is not None and backup.problem is not None:
         problems.append(backup.problem)
 
     # The design routes this whole step to the nightly report, so nothing it can raise
@@ -2048,7 +2065,10 @@ def sunday_maintenance(
         alarms = check_alarms(schedule, one_shot_date=expected_one_shot(now, calendar))
     report = list(alarms.problems)
 
-    report.extend(backup.notes)
+    if backup is None:
+        report.append(BACKUP_SCRUB_SKIPPED)
+    else:
+        report.extend(backup.notes)
 
     if exclusion_reader is not None and exclusion_targets:
         try:
@@ -2172,7 +2192,7 @@ def _page_sunday_daemon_finding(
 def sunday_run(
     *,
     lake_root: Path,
-    backup_target: Path | BucketTarget,
+    backup_target: Path | BucketTarget | None,
     clock: Clock,
     calendar: Calendar,
     schedule_reader: ScheduleReader,
@@ -3373,6 +3393,8 @@ def main(
     drives the ``self_check`` or ``sunday_run`` helper directly, which requires its seams.
     The two senders are the exception to "built here". They come from ``outbox.senders``,
     the only construction site the package has for either, and are still never accepted.
+    Under a ``shadow`` role they record rather than send, and the Sunday job skips the
+    backup scrub, because a shadow host syncs no backup for it to read.
 
     ``clock`` and ``calendar`` stay injectable. Neither reaches past this process, so a
     test injects the wall clock and the trading calendar with no live effect. The ``pmset``
@@ -3434,7 +3456,8 @@ def main(
         # One reading carries the stamp's own instant too, which is what lets a missing
         # pid be told apart from a stamp nothing is writing.
         stamp = read_metadata(config.lake_root)
-        sends = outbox.senders(config)
+        check_clock = _system_clock()
+        sends = outbox.senders(config, process="self-check", clock=check_clock)
         outcome = self_check(
             probe=launchctl_probe,
             pinger=sends.pinger,
@@ -3443,7 +3466,7 @@ def main(
             assertion_probe=pmset_assertions_probe,
             assertion_pid=stamp.assertion_pid,
             stamped_at=stamp.stamped_at,
-            now=_system_clock().now(),
+            now=check_clock.now(),
             # A ping healthchecks refuses feeds no check, so nothing goes silent to
             # report it. The secrets are the values that must never reach a phone,
             # checked against the page itself.
@@ -3483,7 +3506,7 @@ def main(
         run_clock = clock if clock is not None else _system_clock()
         # The reminder's delivery, and the refused-ping page's. The secrets are the
         # values that must never reach a phone, checked against the message itself.
-        sends = outbox.senders(config)
+        sends = outbox.senders(config, process="sunday", clock=run_clock)
         publisher = Publisher(
             lake_root=config.lake_root,
             transport=sends.transport,
@@ -3495,7 +3518,7 @@ def main(
         # assertion and the re-auth reminder below still have to run.
         bucket_client = None
         bucket_unusable = None
-        if isinstance(config.backup_target, BucketTarget):
+        if sends.role == outbox.PRIMARY and isinstance(config.backup_target, BucketTarget):
             from lake import bucket  # lazy: lake.bucket imports this module
 
             try:
@@ -3504,7 +3527,10 @@ def main(
                 bucket_unusable = str(exc)
         outcomes = sunday_run(
             lake_root=config.lake_root,
-            backup_target=config.backup_target,
+            # A shadow host uploads and syncs nothing, so there is no copy to scrub.
+            # ``None`` skips the whole backup step with a report line rather than a
+            # problem, and no bucket client is built for it.
+            backup_target=config.backup_target if sends.role == outbox.PRIMARY else None,
             bucket_client=bucket_client,
             bucket_unusable=bucket_unusable,
             clock=run_clock,
@@ -3572,6 +3598,7 @@ def _exchange_calendar() -> Calendar:
 
 
 __all__ = [
+    "BACKUP_SCRUB_SKIPPED",
     "CANARY_DEADLINE",
     "CAPTURE_SLUG",
     "COMPACTION_SLUG",

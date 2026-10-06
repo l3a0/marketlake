@@ -1365,7 +1365,8 @@ def run_loop_from_config(
     hand every caller the live object without being asked. A test that forgot to pass one
     used to get exactly that, and a page sent from a test is a page a person receives.
     ``main`` passes the pair ``outbox.senders`` returns and the real spawn. Every other
-    caller supplies its own.
+    caller supplies its own. Under a ``shadow`` role that pair records each ping and page
+    under ``journal/outbox/`` rather than sending it, and nothing in this loop can tell.
 
     ``plan_path`` names the machine-derived chunk plan the close+15 re-tune rewrites. It
     defaults to the same file the capture cycle reads, so the two never disagree about
@@ -1856,7 +1857,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     # The senders come from ``outbox``, the only construction site in the package. The
     # config is read here as well as inside the loop, because the ntfy topic names the
-    # transport and the transport is wired from out here now.
+    # transport and the transport is wired from out here now. They are built once, so a
+    # change of ``role`` reaches the daemon only through a restart.
+    #
+    # The role is printed at every start, under both roles. ``role=primary`` is the line
+    # that gives a misspelled key away, because ``Config.from_mapping`` ignores an unknown
+    # key and ``rol: shadow`` loads as a primary. That costs one line per restart, against
+    # ``_report``'s rule that an ordinary restart adds no noise.
     #
     # The wrapper puts this entry in the same class as every other one that reads an
     # operator file. A missing config or roster is an operator mistake, so it earns one
@@ -1865,7 +1872,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     # repeat every few seconds in the log the operator is told to read.
     with input_errors_exit("daemon"):
         config = load_config(args.config)
-        sends = outbox.senders(config)
+        sends = outbox.senders(config, process="daemon", clock=SystemClock())
+        print(f"daemon: role={sends.role}", file=sys.stderr)
         run_loop_from_config(
             config_path=args.config,
             tickers_path=args.tickers,

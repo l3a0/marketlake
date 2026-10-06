@@ -7,7 +7,9 @@ rather than in the callers, so a producer decides only that something is wrong.
 The publisher is total. ``publish`` never raises and never lets a caller forget to
 handle a failure, because a watchdog that crashes while reporting a dead surface is
 worse than one that stays quiet. Every message that does not reach the phone is written
-down first, under ``reports/``, one write-once file each.
+down first, under ``reports/``, one write-once file each. On a host whose ``role`` is
+``shadow`` no message reaches the phone by design, and ``lake.outbox`` records each one
+under ``journal/outbox/`` as it is handed to the transport.
 
 That sink is a directory of dated files rather than a ledger, and the difference is not
 cosmetic. The scrub's reverse pass treats an unexpected file at the lake root as an
@@ -312,6 +314,12 @@ def undelivered(lake_root: Path | str, day: date) -> int:
 TEST_PUSH_EVENT = "test_push"
 TEST_PUSH_TITLE = "Test push"
 
+# The refusal on a shadow host, where a page is recorded rather than sent.
+TEST_PUSH_SHADOW = (
+    "test-push: NOT sent. This host's role is shadow, so a page would be recorded under "
+    "journal/outbox/ rather than reach ntfy. Run the test push on the primary."
+)
+
 
 def _test_push_body(now: datetime) -> str:
     """What the one test message says.
@@ -457,6 +465,11 @@ def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> in
     and the channel worth proving is the one the daemon will page on.
 
     ``clock`` stays injectable. A wall clock never reaches past this process.
+
+    Under a ``shadow`` role this refuses with exit 2 and sends nothing. The transport there
+    records rather than POSTs, so ``run_test_push`` would see the page as sent, print that
+    ntfy accepted it, and return 0, which is the false report this command exists to
+    prevent.
     """
     args = build_parser().parse_args(argv)
 
@@ -466,13 +479,17 @@ def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> in
     with input_errors_exit("alert"):
         config = load_config(args.config)
 
+    reader = SystemClock() if clock is None else clock
+    sends = outbox.senders(config, process="alert", clock=reader)
+    if sends.role != outbox.PRIMARY:
+        print(TEST_PUSH_SHADOW, file=sys.stderr)
+        return 2
     publisher = Publisher(
         lake_root=config.lake_root,
-        transport=outbox.senders(config).transport,
+        transport=sends.transport,
         # The values that must never reach a phone, checked against the page itself.
         secrets=config.page_secrets(),
     )
-    reader = SystemClock() if clock is None else clock
     return run_test_push(publisher, now=reader.now())
 
 
@@ -483,6 +500,7 @@ __all__ = [
     "POST_FAILED",
     "REFUSED",
     "TEST_PUSH_EVENT",
+    "TEST_PUSH_SHADOW",
     "TEST_PUSH_TITLE",
     "Delivery",
     "PAGE_TAG",

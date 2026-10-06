@@ -351,7 +351,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         symbols=roster.symbols,
         fetch=vendor.get_quotes,
     )
-    sends = outbox.senders(config)
+    sends = outbox.senders(config, process="probe-calendar", clock=clock)
     return report(
         result,
         publisher=Publisher(

@@ -1210,10 +1210,11 @@ def sweep_from_config(
             app_secret=config.schwab_app_secret.reveal(),
         )
 
-    sends = outbox.senders(config)
+    run_clock = SystemClock() if clock is None else clock
+    sends = outbox.senders(config, process="sweep", clock=run_clock)
     return sweep(
         lake_root=config.lake_root,
-        clock=SystemClock() if clock is None else clock,
+        clock=run_clock,
         calendar=ExchangeCalendar(),
         roster=load_tickers(tickers_path),
         vendor_source=build_vendor if vendor_source is None else vendor_source,

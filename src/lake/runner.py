@@ -65,6 +65,7 @@ from typing import Protocol, runtime_checkable
 
 from lake.alert import Message, Publisher
 from lake.capture import CycleResult, run_cycle_from_config
+from lake.clock import SystemClock
 from lake.config import BucketTarget, ConfigError, input_errors_exit, load_config
 from lake.journal import ROW_KIND_DATA
 from lake.paths import CONFIG_DIR_PARTS, TEMP_MARKER
@@ -317,6 +318,12 @@ class BackupRunner(Protocol):
         ...
 
 
+# The line a run with no backup runner prints. Only a shadow host runs without one, so
+# the line names the role rather than leaving ``backed_up=False`` to read like a failure.
+# The compaction job prints the same line, so both read it from here.
+BACKUP_SKIPPED = "backup skipped: this host's role is shadow, so nothing was synced"
+
+
 class BackupTargetUnavailable(Exception):
     """Raised when the backup target is not mounted.
 
@@ -416,7 +423,8 @@ class RunOutcome:
     """What one slice-1 run did.
 
     ``succeeded`` is the durable-capture success condition. ``pinged`` and ``backed_up``
-    record whether each success-gated step ran. On a failed cycle both are false.
+    record whether each success-gated step ran. On a failed cycle both are false, and on
+    a shadow host ``backed_up`` is false because no backup runs there.
     ``problem`` names a ping that failed, which leaves ``pinged`` false and the run
     itself successful. The capture is durable either way.
     """
@@ -447,7 +455,7 @@ def run_once(
     *,
     pinger: Pinger,
     ping_url: str,
-    backup: BackupRunner,
+    backup: BackupRunner | None,
     lake_root: Path,
     backup_target: Path,
 ) -> RunOutcome:
@@ -466,6 +474,9 @@ def run_once(
        error surfaces, so the missed ping makes the dead-man catch the single-copy
        window, not just capture-dark. A failed or empty cycle does neither step.
 
+    A ``backup`` of ``None`` is the shadow role's answer. The sync is skipped and
+    ``backed_up`` stays false, so the outcome never claims a copy that was not made.
+
     Every I/O boundary is injected, so this whole function runs offline in a test.
     """
     result = cycle_runner()
@@ -476,8 +487,9 @@ def run_once(
     if succeeded:
         # Backup first. A raised backup propagates before the ping, so a single-copy
         # window pages through the missed ping rather than being reported as healthy.
-        backup.sync(lake_root, backup_target)
-        backed_up = True
+        if backup is not None:
+            backup.sync(lake_root, backup_target)
+            backed_up = True
         try:
             pinger.ping(ping_url)
             pinged = True
@@ -495,7 +507,7 @@ def run_once_from_config(
     token_path: str | Path | None = None,
     slug: str = SLICE1_RUNNER_SLUG,
     pinger: Pinger,
-    backup: BackupRunner,
+    backup: BackupRunner | None,
 ) -> RunOutcome:
     """Run one slice-1 cycle wired from the real config and seams.
 
@@ -505,8 +517,10 @@ def run_once_from_config(
     ``pinger`` and ``backup`` are required and have no live defaults. Both reach past
     this process, one to healthchecks and one to the backup target over ``rsync``, and a
     default would hand them to a caller that never asked. ``main`` passes the pinger
-    ``outbox.senders`` returns and the ``RsyncBackup`` it builds. A test drives
-    ``run_once`` directly with fakes instead.
+    ``outbox.senders`` returns and the ``RsyncBackup`` it builds, or ``None`` for the
+    backup on a shadow host. ``None`` must be passed, never defaulted, so a caller cannot
+    skip the backup by forgetting it. A test drives ``run_once`` directly with fakes
+    instead.
 
     A bucket target is refused with one line. This entry is not installed on the live
     machine, and run once a minute it would upload to the bucket once a minute.
@@ -775,20 +789,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         with input_errors_exit("runner"):
             config = load_config(args.config)
+            sends = outbox.senders(config, process="runner", clock=SystemClock())
             outcome = run_once_from_config(
                 config_path=args.config,
                 tickers_path=args.tickers,
                 token_path=args.token,
                 # The pinger comes from ``outbox``, the only construction site in the
-                # package for it. The backup runner is the one built in this module.
-                pinger=outbox.senders(config).pinger,
-                backup=RsyncBackup(),
+                # package for it. The backup runner is the one built in this module, and
+                # a shadow host gets none, so nothing is synced.
+                pinger=sends.pinger,
+                backup=RsyncBackup() if sends.role == outbox.PRIMARY else None,
             )
         # Report by slug and counts only. The ping URL carries the secret ping key and
         # is never printed.
         status = "captured" if outcome.succeeded else "no durable data"
         if outcome.problem is not None:
             print(f"slice-1 run: {outcome.problem}")
+        if outcome.succeeded and not outcome.backed_up:
+            print(f"slice-1 run: {BACKUP_SKIPPED}")
         print(
             f"slice-1 run: {status} "
             f"segments={len(outcome.result.segments)} "
@@ -816,6 +834,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "BACKUP_EXCLUSIONS",
+    "BACKUP_SKIPPED",
     "DAILY_LABEL",
     "MEASUREMENT_LABEL",
     "PING_REFUSED_EVENT",
