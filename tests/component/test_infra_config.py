@@ -164,6 +164,47 @@ def test_configuration_keeps_parameter_values_out_of_state(config: str) -> None:
             assert not declared & _PARAMETER_VALUE_TYPES, (
                 f"infra/{config}/{path.name} declares a {kind} that stores a parameter's value"
             )
+        # A data block scoped inside a check block is stored in the state too.
+        scoped = {
+            rtype
+            for check in parsed.get("check", [])
+            for body in check.values()
+            for block in body.get("data", [])
+            for rtype in block
+        }
+        assert not scoped & _PARAMETER_VALUE_TYPES, (
+            f"infra/{config}/{path.name} reads a parameter's value in a check block"
+        )
+
+
+@pytest.mark.parametrize("config", ["bootstrap", "live"])
+def test_configuration_is_only_tf_files(config: str) -> None:
+    """tofu also loads ``*.tf.json``, ``*.tofu`` and ``*.tofu.json``, and a ``.tofu``
+    file replaces the ``.tf`` file of the same name. Every check here reads ``*.tf``."""
+    others = [
+        p.name
+        for pattern in ("*.tf.json", "*.tofu", "*.tofu.json")
+        for p in (INFRA / config).glob(pattern)
+    ]
+    assert others == []
+
+
+def test_live_role_carries_exactly_its_inline_policies() -> None:
+    """The role-side twin of the one-policy-per-user check. The apply role's
+    ``iam:PutRolePolicy`` would apply any third inline policy on marketlake-instance."""
+    policies = sorted(
+        (_role_name(body["role"]), address.split(".")[1])
+        for address, body in _resources("live").items()
+        if address.split(".")[0] == "aws_iam_role_policy"
+    )
+    assert policies == [("instance", "instance_config_read"), ("instance", "instance_s3")]
+
+
+def test_token_writer_user_sets_only_its_name() -> None:
+    """A path, tags or a permissions boundary changes what the apply role's grant on
+    ``user/marketlake-token-writer`` must allow, and the first apply is refused."""
+    body = _resources("live")["aws_iam_user.token_writer"]
+    assert set(body) <= {"name", "lifecycle"}
 
 
 def test_bootstrap_holds_only_known_resource_types() -> None:

@@ -411,3 +411,26 @@ run "a_bucket_name_with_a_space_fails_validation" {
 
   expect_failures = [var.state_bucket, var.backup_bucket]
 }
+
+# A Deny naming a hard-coded account id is a Deny on nobody's parameters.
+run "config_denies_follow_the_callers_account" {
+  command = plan
+
+  override_data {
+    target = data.aws_caller_identity.current
+    values = {
+      account_id = "111111111111"
+    }
+  }
+
+  assert {
+    condition = alltrue([
+      for p in [aws_iam_role_policy.plan.policy, aws_iam_role_policy.apply.policy] :
+      [for s in jsondecode(p).Statement : s.Resource if try(s.Sid, "") == "DenyConfigParameterReads"] == [[
+        "arn:aws:ssm:us-east-1:111111111111:parameter/marketlake/config",
+        "arn:aws:ssm:us-east-1:111111111111:parameter/marketlake/config/*",
+      ]]
+    ])
+    error_message = "A config-parameter Deny does not name the caller's account."
+  }
+}
