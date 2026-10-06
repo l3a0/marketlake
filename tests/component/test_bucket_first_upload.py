@@ -208,13 +208,17 @@ def test_an_unreachable_bucket_refuses_with_one_line(tmp_path, monkeypatch, caps
         _main(config, client, monkeypatch)
     line = _refused(capsys, exited)
     assert "could not be reached or was unavailable (EndpointConnectionError)" in line
-    assert "access key" not in line
+    assert "the bucket's credentials" not in line
 
 
 @pytest.mark.parametrize(
     ("code", "status", "named"),
     [
-        ("AccessDenied", 403, "refused the request (AccessDenied), so the access key"),
+        (
+            "AccessDenied",
+            403,
+            "refused the request (AccessDenied), so the bucket's credentials or their policy",
+        ),
         ("SlowDown", 503, "could not be reached or was unavailable (SlowDown)"),
         ("InternalError", 500, "could not be reached or was unavailable (InternalError)"),
         ("NoSuchBucket", 404, "answered with an error (NoSuchBucket)"),
@@ -229,7 +233,7 @@ def test_each_bucket_failure_gets_its_own_line(tmp_path, monkeypatch, capsys, co
     line = _refused(capsys, exited)
     assert named in line
     if code != "AccessDenied":
-        assert "access key" not in line
+        assert "the bucket's credentials" not in line
 
 
 def test_a_rotted_file_refuses_with_one_line_and_leaves_the_manifest_out(

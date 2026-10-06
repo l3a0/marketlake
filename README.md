@@ -64,6 +64,7 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   instance role.
 - `infra/ci` holds the two scripts `.github/workflows/infra.yml` runs. Each configuration
   keeps its own OpenTofu tests under `tests/`.
+- `infra/README.md` is the owner's runbook for applying both configurations.
 - `deploy/linux-install.sh` is the one install on a Linux host. It renders the systemd
   units from the checkout and installs them, and the host's first boot and every deploy
   call it.
@@ -88,7 +89,7 @@ restore. Switching back is one setting: put the path back in `backup_target`. A 
 keeps its `rsync` copy, its scrub and its weekly restore test exactly as before.
 
 The bucket and the IAM user whose key the laptop uses are code in `infra/live/`, and
-[Apply the infrastructure](#apply-the-infrastructure) below says how they are applied.
+[infra/README.md](infra/README.md) says how to apply them.
 `infra/live/bucket.tf` holds the versioning, the encryption, the public-access block and
 the four lifecycle rules. Each rule expires noncurrent versions after 30 days under one of
 `lake/manifest.jsonl`, `lake/quarantine.jsonl`, `lake/actions/` and `lake/journal/`, the
@@ -97,7 +98,9 @@ partition's old version is its only good copy. `infra/live/iam.tf` holds the use
 which grants exactly `s3:PutObject`, `s3:GetObject`, `s3:ListBucket` and
 `s3:GetBucketVersioning`, and nothing that deletes a version or changes the bucket.
 
-Two steps stay by hand, and nothing here names a real account, bucket, or key.
+Two steps stay by hand on the key path, which is how the laptop signs its requests, and
+nothing here names a real account, bucket, or key. A hosted VM takes its credentials from
+an instance profile instead, and the procedure after the steps says what changes for it.
 
 1. Create an access key for the user `marketlake-backup` in the AWS console. The key stays
    out of code, so no secret reaches the infrastructure's state.
@@ -108,8 +111,8 @@ The lifecycle rules expect the lake under the `lake/` prefix, so `backup_target`
 `/lake`, which keeps the live check's probe objects under `live-check/` outside it. The
 examples below use the placeholder bucket `example-lake-backup`.
 
-Step 2's keys in `config.yaml`. The three `bucket_` keys may sit beside a path
-`backup_target`, which is how the first upload runs before the switch.
+Step 2's keys in `config.yaml`. On the key path the three `bucket_` keys may sit beside a
+path `backup_target`, which is how the first upload runs before the switch.
 
 ```yaml
 bucket_access_key_id: <access key id>
@@ -119,20 +122,57 @@ bucket_region: <region, like us-east-2>
 backup_target: s3://example-lake-backup/lake
 ```
 
-The client is built from those three values alone, never from `~/.aws/` or an `AWS_*`
-environment variable. Loading `config.yaml` never checks them or the bucket's name, so
-a mistyped value fails the backup, the first upload or the Sunday scrub that uses it,
-each with one line naming the key, and never stops capture.
+On the key path the client is built from those three values alone, never from
+`~/.aws/` or an `AWS_*` environment variable. Loading `config.yaml` never checks them,
+`bucket_credentials` or the bucket's name, so a mistyped value fails the backup, the
+first upload or the Sunday scrub that uses it, each with one line naming the key, and
+never stops capture.
 
-Four commands go with it. The first two refuse with exit 2 on a shadow host, which is
+A hosted VM in the bucket's AWS account signs with short-lived credentials from an
+instance profile, an IAM role attached to the instance, so no long-lived key sits on it
+([#663](https://github.com/l3a0/marketlake/issues/663)). The bucket is the same, and the
+two steps change as follows.
+
+1. Step 1 has no key to create. `infra/live/iam.tf` describes the IAM role and instance
+   profile `marketlake-instance`, whose S3 policy carries the same four actions as the
+   laptop's key and stays off until the cutover turns it on, and
+   [#686](https://github.com/l3a0/marketlake/issues/686) has the VM require metadata
+   tokens.
+2. Step 2's key lines become one setting. The VM's `config.yaml` is written at deploy
+   time, by [#686](https://github.com/l3a0/marketlake/issues/686)'s cloud-init and
+   [#676](https://github.com/l3a0/marketlake/issues/676)'s deploy, from the parameters
+   [#699](https://github.com/l3a0/marketlake/issues/699) keeps in SSM Parameter Store.
+   It names the source beside the region and holds neither key field.
+
+   ```yaml
+   bucket_credentials: instance_profile
+   bucket_region: <region, like us-east-1>
+   ```
+
+3. The rest of step 2, the first upload, the restore and the `backup_target` change,
+   follows the cutover order on [#638](https://github.com/l3a0/marketlake/issues/638).
+   Run `first-upload` only on the host whose lake the bucket should hold, because it
+   replaces the bucket's `manifest.jsonl`. Run `live-check` in the same order, after the
+   IAM role's policy is turned on.
+
+The client asks the instance metadata service for credentials only when `config.yaml`
+says `bucket_credentials: instance_profile`. It then takes them from that service alone,
+never from `~/.aws/`, an `AWS_*` variable or a boto config file, and it sends the lookup
+through no proxy. An absent
+`bucket_credentials` means `keys`, the laptop's path. A host where the setting finds no
+credentials, such as a VM with no instance profile or a laptop that carries the setting
+by mistake, refuses with one line naming both fixes: attach the instance profile, or set
+`bucket_credentials: keys` in `config.yaml`.
+
+Four commands go with the bucket. The first two refuse with exit 2 on a shadow host, which is
 any host whose config sets `role` to something other than `primary`. The restore runs on
 either.
 
 1. `uv run python -m lake.bucket live-check --target s3://example-lake-backup/live-check`
    confirms the four S3 behaviors the design rests on, and is live check 8 in the build
    plan. It writes three probe objects and names the prefix to delete by hand, since the
-   narrow key cannot delete. The narrow key also cannot read an old version, so behavior
-   3's read-back of the first version fails with it, and the check says to confirm in
+   bucket's credentials cannot delete. They also cannot read an old version, so behavior
+   3's read-back of the first version fails with them, and the check says to confirm in
    the console that the probe key shows two versions.
 2. `uv run python -m lake.bucket first-upload --target s3://example-lake-backup/lake`
    uploads the whole lake, comparing every object, and prints its throughput. Run it on
@@ -183,7 +223,7 @@ only objects whose stored SHA-256 the scrub matched, so a sample mismatch is rot
 in an object whose stored checksum is right. A sealed partition is written once, so its
 rotted current version is usually its only version, and neither upload replaces an
 object whose stored checksum matches. Once the Sunday lake scrub passes on the file, put
-it back with the bucket's key, as a single PUT carrying its SHA-256:
+it back with the bucket's credentials, as a single PUT carrying its SHA-256:
 
 ```bash
 aws s3api put-object --bucket example-lake-backup --key lake/<path> --body <lake_root>/<path> --checksum-algorithm SHA256
@@ -191,8 +231,8 @@ aws s3api put-object --bucket example-lake-backup --key lake/<path> --body <lake
 
 When the lake is gone, an earlier version is recovered by hand in the S3 console. That
 works only for a file the manifest records whose later version overwrote a good one,
-such as a nightly file rewritten or a partition recompacted. The narrow key holds no
-`s3:GetObjectVersion`, so this is a console step.
+such as a nightly file rewritten or a partition recompacted. The bucket's credentials hold
+no `s3:GetObjectVersion`, so this is a console step.
 
 1. Open the bucket, turn on **Show versions**, and go to the file's key under the lake's
    prefix.
@@ -314,149 +354,11 @@ error until a reload after the dashboard is back.
 
 ## Apply the infrastructure
 
-The hosted deployment gets rebuilt at a cutover, after a VM dies, at a resize, and in a
-disaster restore. With its AWS resources in code, each rebuild is one reviewed apply
-instead of a walk through the console. The design's Deployment section carries the
-reasoning, and [#664](https://github.com/l3a0/marketlake/issues/664) carries the plan.
-
-The code is two OpenTofu configurations, each with its state in one S3 bucket under its
-own key.
-
-1. `infra/bootstrap/` holds what CI needs before it can run: the state bucket, GitHub's
-   OIDC provider, and two roles that GitHub Actions assumes without a stored AWS key. The
-   plan role reads and is trusted on pull requests. The apply role writes, and is trusted
-   only in the `infra` environment on `main`. CI cannot apply the configuration that
-   creates it, so the owner applies this one from the laptop.
-2. `infra/live/` holds the backup bucket, its IAM user, and the instance role. CI applies
-   it. `.github/workflows/infra.yml` plans it on each pull request from a branch here,
-   and applies it after a merge to `main` once the owner approves the run.
-
-Nothing tracked names the account, the buckets, or the user's policy. The workflow reads
-them from five settings in the repository.
-
-1. The secret `AWS_PLAN_ROLE_ARN`, the plan role's ARN.
-2. The secret `TF_STATE_BUCKET`, the state bucket's name.
-3. The secret `BACKUP_BUCKET`, the backup bucket's name.
-4. The variable `BACKUP_POLICY_NAME`, the name of `marketlake-backup`'s inline policy.
-5. The secret `AWS_APPLY_ROLE_ARN` on the `infra` environment, the apply role's ARN. The
-   apply job reads it only after the approval.
-
-### Tools and an admin session
-
-The laptop applies the bootstrap and anything the apply role may not change, such as the
-backup bucket's versioning or the instance role's trust. Each needs an admin credential,
-which stays apart from the default one. A plain `aws login` would write the `default`
-profile, and then anything reading the default credential chain, an agent session's
-`tofu apply` included, would act as account admin.
-
-```bash
-brew install awscli opentofu   # aws login needs AWS CLI 2.32.0 or later
-aws login --profile marketlake-admin
-export AWS_PROFILE=marketlake-admin
-# ... the commands below ...
-aws logout --profile marketlake-admin
-```
-
-CloudShell does not work for this. Its 1 GB home cannot hold the AWS provider.
-
-The laptop keeps each configuration's inputs in `~/.config/marketlake/infra/`, outside
-every checkout, because a fresh worktree has no ignored files. Four files sit there, with
-placeholders in place of the real values.
-
-1. `bootstrap.tfbackend` holds `bucket = "<state-bucket>"`.
-2. `bootstrap.tfvars` holds `state_bucket = "<state-bucket>"`,
-   `backup_bucket = "<backup-bucket>"` and `adopt_github_oidc_provider = false`.
-3. `live.tfbackend` holds `bucket = "<state-bucket>"`.
-4. `live.tfvars` holds `backup_bucket = "<backup-bucket>"` and
-   `backup_policy_name = "<policy-name>"`.
-
-A configuration is then planned and applied from the checkout's root like this:
-
-```bash
-tofu -chdir=infra/bootstrap init -backend-config="$HOME/.config/marketlake/infra/bootstrap.tfbackend"
-tofu -chdir=infra/bootstrap plan -var-file="$HOME/.config/marketlake/infra/bootstrap.tfvars"
-tofu -chdir=infra/bootstrap apply -var-file="$HOME/.config/marketlake/infra/bootstrap.tfvars"
-```
-
-Replace `bootstrap` with `live` in all three commands for the other configuration.
-
-### Values to read first
-
-Three values are recorded nowhere, so the owner reads them from AWS before the first run.
-
-1. The user's inline policy name, from
-   `aws iam list-user-policies --user-name marketlake-backup`. It goes in `live.tfvars`
-   and in the `BACKUP_POLICY_NAME` variable. The import needs it, so there is no safe
-   guess.
-2. The lifecycle rule ids and filter shape, from
-   `aws s3api get-bucket-lifecycle-configuration --bucket <backup-bucket>`. The code uses
-   the ids `manifest`, `quarantine`, `actions` and `journal`, each with a `Filter.Prefix`.
-   A different id shows in the first plan as an in-place update.
-3. Whether a GitHub OIDC provider exists, from `aws iam list-open-id-connect-providers`.
-   An account holds one per issuer. When the list shows
-   `token.actions.githubusercontent.com`, set `adopt_github_oidc_provider = true` in
-   `bootstrap.tfvars`, so the bootstrap adopts it rather than failing to create a second.
-
-### The first run, in order
-
-The merge that adds `infra.yml` runs its apply job at once, and GitHub creates a missing
-environment with no protection rules. So the environment exists before that merge.
-
-1. Create the state bucket with
-   `aws s3api create-bucket --bucket <state-bucket> --region us-east-1`. In `us-east-1` the
-   command takes no `--create-bucket-configuration`. The bootstrap adopts the bucket and
-   turns its versioning on.
-2. Apply `infra/bootstrap/` from the pull request's branch, under the admin session.
-3. Create the `infra` environment in the repository's settings, with the owner as required
-   reviewer, `prevent_self_review` off, and deployments from `main` only. Then add its
-   secret, `AWS_APPLY_ROLE_ARN`, from
-   `aws iam get-role --role-name marketlake-apply --query Role.Arn --output text`.
-4. Add the three repository secrets and the variable. `AWS_PLAN_ROLE_ARN` comes from the
-   same command with `marketlake-plan`.
-5. Re-run the pull request's `plan` job. Until steps 2 and 4 are done, that check is red
-   by design. Its summary is the import plan, and it should destroy and replace nothing.
-   Any in-place update it shows is either adopted into code or listed on
-   [#664](https://github.com/l3a0/marketlake/issues/664).
-6. Merge, then approve the first apply.
-
-After the first green apply, two plans confirm nothing is left to change: a manual run
-of `infra.yml` from the Actions tab, whose apply finds nothing, and a laptop plan of
-`infra/bootstrap/` from the merge commit. Then check the environment's protection.
-
-```bash
-gh api repos/l3a0/marketlake/environments/infra --jq '[.protection_rules[].type]'
-```
-
-It must list `required_reviewers` and `branch_policy`, because an unprotected environment
-named `infra` runs the same apply just as green.
-
-From then on, a change that touches both configurations, such as one that widens the
-apply role, gets its bootstrap applied first and its live apply approved second.
-
-### Which checkout applies the bootstrap
-
-Every checkout reads the same backend file in `~/.config/marketlake/infra/`, so applying
-`infra/bootstrap/` from a checkout that predates a merged change plans that change away,
-and OpenTofu gives no warning. So:
-
-- Apply the bootstrap only from its pull request's branch at its final head, after
-  `git fetch`, and only when its plan changes nothing that pull request does not change.
-- Treat a plan that destroys anything as coming from a stale checkout until shown
-  otherwise.
-- After every merge that touches `infra/bootstrap/`, plan it from `main`'s merge commit,
-  and expect no changes. That plan is what shows a review fix pushed after the pre-merge
-  apply, or a stale apply that dropped a Deny from the plan role.
-
-### Drift and recovery
-
-A change made in the console shows up as a difference in the next plan, to be adopted
-into code or reverted. A manual run of `infra.yml` from `main` reverts it behind the same
-approval, with no code change.
-
-A failed apply keeps the state of what it changed and releases its lock. A runner killed
-mid-apply leaves its lock file behind. Clear it from an admin session with
-`tofu -chdir=infra/live force-unlock <lock id>`, where the id is the one the next run's
-error prints.
+The hosted deployment's AWS resources are code under `infra/`, in two OpenTofu
+configurations. The owner applies `infra/bootstrap/` from the laptop, and
+`.github/workflows/infra.yml` applies `infra/live/` after a merge to `main` once the owner
+approves the run. [infra/README.md](infra/README.md) is the runbook, from the first
+bootstrap through recovery, and lists the secrets and the variable the workflow reads.
 
 ## Develop
 

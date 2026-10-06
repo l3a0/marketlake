@@ -2,8 +2,8 @@
 #
 # No job here is named `test`, because the ruleset on main requires a check by that
 # name and ci.yml provides it. These checks download a provider of about 750 MB
-# unpacked, so they run only when infra/ or this file changes. README.md's "Apply the
-# infrastructure" section carries the owner's steps and the secrets this workflow reads.
+# unpacked, so they run only when infra/ or this file changes. infra/README.md carries
+# the owner's steps and the secrets this workflow reads.
 #
 # A public repository's logs are readable by anyone, so plan and apply send their
 # human output to /dev/null. Each job writes resource addresses, actions and attribute
@@ -116,7 +116,7 @@ jobs:
           missing=0
           for name in AWS_PLAN_ROLE_ARN TF_STATE_BUCKET BACKUP_BUCKET BACKUP_POLICY_NAME; do
             if [ -z "${!name}" ]; then
-              echo "::error::$name is empty. README.md's infrastructure runbook says where to set it."
+              echo "::error::$name is empty. infra/README.md says where to set it."
               missing=1
             fi
           done
@@ -184,7 +184,7 @@ jobs:
           missing=0
           for name in AWS_APPLY_ROLE_ARN TF_STATE_BUCKET BACKUP_BUCKET BACKUP_POLICY_NAME; do
             if [ -z "${!name}" ]; then
-              echo "::error::$name is empty. README.md's infrastructure runbook says where to set it."
+              echo "::error::$name is empty. infra/README.md says where to set it."
               missing=1
             fi
           done

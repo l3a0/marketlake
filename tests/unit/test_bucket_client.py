@@ -1,8 +1,8 @@
-"""The S3 client is built from ``config.yaml`` alone.
+"""The S3 client is built from ``config.yaml`` alone on the key path.
 
 The repository is public and a development run happens on a machine that may hold real
-AWS credentials. So ``bucket.client_from_config`` must build its client from the config's
-three bucket values and nothing else: never from an ``AWS_*`` variable, never from
+AWS credentials. So on the key path ``bucket.client_from_config`` must build its client
+from the config's three bucket values and nothing else: never from an ``AWS_*`` variable, never from
 ``~/.aws/config`` or ``~/.aws/credentials``, and never with a service model from
 ``~/.aws/models``. These tests fill all of those with values that point elsewhere, build a
 real ``botocore`` client, and read the request it would send. A ``before-send`` hook
@@ -10,6 +10,14 @@ answers in place of S3, so no socket opens and the network guard stays quiet.
 
 The same capture shows the shape of a PUT: one request carrying the supplied SHA-256 and
 no CRC32 of botocore's own, with no aws-chunked body that would carry one.
+
+``bucket_credentials`` picks the credential path, marketlake #663. The refusals that need
+no metadata service are here: an unrecognised value, a key beside ``instance_profile``, a
+missing region, and a metadata fetcher that fails to build, which must leave the
+process's proxy variables as it found them. So is the metadata service's real address,
+which no test can reach. The tests that talk to a metadata service
+cross a real HTTP boundary, so they live in
+``tests/component/test_bucket_instance_profile.py``.
 """
 
 from __future__ import annotations
@@ -18,9 +26,11 @@ import base64
 import hashlib
 import os
 
+import botocore.utils
 import pytest
 from botocore.awsrequest import AWSResponse
 
+from lake import bucket
 from lake.bucket import client_from_config
 from lake.config import Config, ConfigError
 
@@ -208,3 +218,108 @@ def test_the_client_ignores_the_aws_files_in_the_home_directory(hostile_home):
     import botocore.session
 
     assert botocore.session.Session().get_scoped_config().get("region") == "ap-south-1"
+
+
+# -- the credential source, marketlake #663 -------------------------------------------
+
+# The shape of an AWS secret access key, pasted where the source belongs.
+SECRET_SHAPED = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+
+def _no_build(monkeypatch) -> None:
+    monkeypatch.setattr(bucket, "_build_client", lambda cfg: pytest.fail("no client is built"))
+
+
+def _profile_config(**overrides) -> Config:
+    values = {
+        "bucket_credentials": "instance_profile",
+        "bucket_access_key_id": None,
+        "bucket_secret_access_key": None,
+        **overrides,
+    }
+    return _config(**values)
+
+
+UNRECOGNISED = [None, "", "Instance_Profile", " instance_profile ", "key", 1, SECRET_SHAPED]
+
+
+@pytest.mark.parametrize("value", UNRECOGNISED)
+def test_an_unrecognised_credential_source_refuses_alone_and_never_falls_back(monkeypatch, value):
+    # The config holds valid keys, so a build that fell back to ``keys`` would succeed.
+    # Reaching the builder at all fails the test.
+    _no_build(monkeypatch)
+    with pytest.raises(ConfigError) as refused:
+        client_from_config(_config(bucket_credentials=value))
+    message = str(refused.value)
+    assert message == "bucket_credentials must be keys or instance_profile"
+    assert SECRET_SHAPED not in message
+
+
+@pytest.mark.parametrize("value", UNRECOGNISED)
+def test_the_builder_takes_neither_path_on_an_unrecognised_source(value):
+    # The check above runs first. Should it ever let a value through, the builder still
+    # takes each path only on its own value. The config holds valid keys, so a builder
+    # that sent every other value down the key path would build a client here.
+    with pytest.raises(ConfigError) as refused:
+        bucket._build_client(_config(bucket_credentials=value))
+    assert str(refused.value) == "bucket_credentials must be keys or instance_profile"
+
+
+def test_a_pasted_credential_source_stays_out_of_the_config_repr():
+    config = _config(bucket_credentials=SECRET_SHAPED)
+    assert config.bucket_credentials == SECRET_SHAPED
+    assert SECRET_SHAPED not in repr(config)
+
+
+@pytest.mark.parametrize("present", ["bucket_access_key_id", "bucket_secret_access_key"])
+def test_either_key_beside_instance_profile_refuses_naming_it(monkeypatch, present):
+    # Each key field alone, so a check that refused only when both were present fails.
+    _no_build(monkeypatch)
+    with pytest.raises(ConfigError) as refused:
+        client_from_config(_profile_config(**{present: "a-value"}))
+    assert str(refused.value) == (
+        f"bucket_credentials is instance_profile, so the config must not hold ['{present}']"
+    )
+
+
+def test_a_key_and_no_region_beside_instance_profile_refuse_as_one_line(monkeypatch):
+    _no_build(monkeypatch)
+    with pytest.raises(ConfigError) as refused:
+        client_from_config(_profile_config(bucket_access_key_id="a-value", bucket_region=None))
+    assert str(refused.value) == (
+        "bucket_credentials is instance_profile, so the config must not hold "
+        "['bucket_access_key_id']. the bucket needs config key(s): ['bucket_region']"
+    )
+
+
+def test_the_metadata_address_is_the_one_aws_serves():
+    # Every test points the address at a server on loopback, so none of them reaches
+    # this value. botocore's own constant is the reference, not one built from it here.
+    assert bucket.METADATA_BASE_URL == botocore.utils.METADATA_BASE_URL
+
+
+def test_instance_profile_still_needs_the_region(monkeypatch):
+    _no_build(monkeypatch)
+    with pytest.raises(ConfigError) as refused:
+        client_from_config(_profile_config(bucket_region=None))
+    message = str(refused.value)
+    assert "bucket_region" in message
+    assert "bucket_access_key_id" not in message and "bucket_secret_access_key" not in message
+
+
+def test_a_metadata_fetcher_that_fails_to_build_leaves_the_proxies_set(monkeypatch):
+    # The proxy variables are removed only while the fetcher is built. A fetcher whose
+    # constructor raises must still put them back, or the rest of the process, Sunday's
+    # Schwab canary included, loses them.
+    monkeypatch.delenv("http_proxy", raising=False)
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setattr(bucket, "METADATA_BASE_URL", "not a url")
+    with pytest.raises(ConfigError) as refused:
+        client_from_config(_profile_config())
+    assert os.environ["HTTP_PROXY"] == "http://127.0.0.1:9"
+    assert "AWS_EC2_METADATA_DISABLED" not in os.environ
+    # A build error that is not the metadata lookup keeps the config.yaml line, and the
+    # line that sends the operator to the instance profile is not given to it.
+    assert str(refused.value) == (
+        "the bucket client could not be built from config.yaml (InvalidIMDSEndpointError)"
+    )
