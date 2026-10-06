@@ -1581,7 +1581,6 @@ def restore_lake(
             ) from None
         if actual != expected:
             _part(path).unlink()
-            path.unlink(missing_ok=True)
             summary.failures.append((rel, "does not match its SHA-256"))
             continue
         os.replace(_part(path), path)

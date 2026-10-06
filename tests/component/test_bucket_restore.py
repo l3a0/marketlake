@@ -409,6 +409,25 @@ def test_a_second_run_resumes_and_downloads_only_what_failed(tmp_path):
     assert _files(dest) == _files(lake)
 
 
+def test_a_wrong_file_in_the_working_directory_is_downloaded_again(tmp_path):
+    # A resumed run trusts a file only when its hash matches, never its name or its size.
+    lake, client = _uploaded(tmp_path)
+    good = client.versions(f"lake/{QUOTES}")[-1]
+    _rot(client, QUOTES, lake)
+    dest = tmp_path / "restored"
+    assert restore_lake(dest, TARGET, client=client).restored is False
+    damaged = tmp_path / "restored.restoring" / CHAINS
+    damaged.write_bytes(bytes(len(damaged.read_bytes())))
+
+    client.store(f"lake/{QUOTES}", good.body, checksum=good.checksum)
+    client.calls.clear()
+    summary = restore_lake(dest, TARGET, client=client)
+
+    assert summary.restored is True
+    assert f"lake/{CHAINS}" in _gets(client)
+    assert _files(dest) == _files(lake)
+
+
 def test_a_run_cut_off_mid_download_resumes_without_its_part_file(tmp_path):
     lake, client = _uploaded(tmp_path)
     real_get = client.get_object

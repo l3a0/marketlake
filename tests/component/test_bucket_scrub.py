@@ -719,6 +719,65 @@ def test_a_failing_restore_is_not_kept_and_the_next_attempt_reads_again(tmp_path
     assert pinger.urls == [URL]
 
 
+def test_a_pass_with_one_file_wrong_is_not_kept(tmp_path):
+    # These two paths share rotation slot 10, so week 34 reads both. At 20:00 one reads
+    # back right and one rotted, so the attempt fails with a file restored. The repair
+    # before 20:30 means only a fresh read of both can pass.
+    aapl = "chains/ticker=AAPL/date=2026-08-28.parquet"
+    qqq = "chains/ticker=QQQ/date=2026-08-28.parquet"
+    lake = FixtureLake(tmp_path / "lake").with_chains("AAPL", DAY).with_chains("QQQ", DAY).build()
+    client = FakeS3()
+    _seed(lake, client)
+    good = _rot(client, qqq, lake)
+    stored = client.versions(_key(qqq))[-1].checksum
+    repaired: list[bool] = []
+
+    def repair() -> bool:
+        if not repaired:
+            client.store(_key(qqq), good, checksum=stored)
+            repaired.append(True)
+        return True
+
+    client.calls.clear()
+    outcomes, pinger = _sunday_run(lake, client, mints=_Mints(FRESH_MINT), canary=repair)
+
+    assert outcomes[0].restore.restored == (aapl,)
+    assert outcomes[0].restore.mismatches == (qqq,)
+    assert len(outcomes) == 2
+    assert outcomes[1].restore.restored == (aapl, qqq)
+    assert outcomes[1].restore.reused is False
+    assert _gets(client, aapl) == 2 and _gets(client, qqq) == 2
+    assert pinger.urls == [URL]
+
+
+def test_the_reader_closes_each_body_it_opens(tmp_path):
+    _, client = _uploaded(tmp_path / "lake")
+    closed: list[bool] = []
+
+    class _Body:
+        def __init__(self, chunks: list[bytes], fail: bool) -> None:
+            self.chunks = chunks
+            self.fail = fail
+
+        def read(self, n: int) -> bytes:
+            if self.chunks:
+                return self.chunks.pop(0)
+            if self.fail:
+                raise IncompleteReadError(actual_bytes=1, expected_bytes=2)
+            return b""
+
+        def close(self) -> None:
+            closed.append(True)
+
+    reader = bucket.bucket_reader(client, TARGET)
+    client.get_object = lambda **kwargs: {"Body": _Body([b"a", b"b"], fail=False)}
+    assert b"".join(reader(QUOTES)) == b"ab"
+    client.get_object = lambda **kwargs: {"Body": _Body([b"a"], fail=True)}
+    with pytest.raises(OSError):
+        list(reader(QUOTES))
+    assert closed == [True, True]
+
+
 def test_a_kept_pass_over_other_files_is_not_reused(tmp_path):
     # At 20:00 the quotes object is overwritten, so the scrub leaves it out and the week
     # reads the chains partition instead. Putting the quotes object back before 20:30
