@@ -612,10 +612,11 @@ The instance role carries the same four S3 actions as the user, behind a variabl
 
 A public repository's Actions logs are readable by anyone, so nothing tracked names the account, and the workflow prints no values. The code builds ARNs from `aws_caller_identity`, the bucket names and role ARNs come from secrets, and the workflow masks the account id. Plan and apply send their human output to `/dev/null`, and `infra/ci/plan_summary.py` writes each changed resource's address, its action and the names of its changed attributes to the step summary. The apply job also runs `infra/ci/apply-is-stale.sh` after its approval, which fetches `main` again and skips the run when a newer commit changed `infra/` or the workflow. Without it, approving two waiting runs out of order would apply the older commit last.
 
-Two kinds of test split the checks.
+Three kinds of test split the checks.
 
-1. `tofu test` asserts the trust policies, the Denies, the forbidden Allows, the instance gate, the bucket name's validation, the four actions and the whole lifecycle rule list against literals.
-2. A pytest reads what `tofu test` cannot see from the `.tf` files with `python-hcl2`, inside the required `test` check. That covers `prevent_destroy`, a second policy attachment, whether the live backend key matches the apply role's grant, and a `module` block, whose resources that read would miss.
+1. `tofu test` asserts against literals. It compares each role's trust policy and its whole inline policy, so a widened resource or one added action fails. It also checks the instance gate, the instance role's trust, the bucket names' validation, the four actions, the backup's versioning, encryption and public access block, the state bucket's versioning and the whole lifecycle rule list.
+2. A pytest reads what `tofu test` cannot see from the `.tf` files with `python-hcl2`, inside the required `test` check. That covers `prevent_destroy`, a second policy attachment, whether the live backend key matches the apply role's grant, the backends' locking and encryption, whether the IAM names the apply role may write are the ones `infra/live/` declares, and a `module` block, whose resources that read would miss.
+3. A pytest in the same check reads `infra.yml`, which none of its own jobs reads. It checks that every apply step after the freshness check runs only on a fresh commit, the apply job's approval and concurrency, that plan and apply send their output to `/dev/null`, that `tofu test` runs on both configurations, the trigger paths, and that `infra/ci/apply-is-stale.sh` is committed executable.
 
 The OpenTofu checks stay in `infra.yml`, because putting them in `ci.yml` would download the AWS provider, about 750 MB unpacked, on every pull request. The prices are under Tradeoffs below.
 

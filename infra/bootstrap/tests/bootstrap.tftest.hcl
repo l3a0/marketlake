@@ -155,12 +155,252 @@ run "no_allow_grants_a_forbidden_action" {
   }
 }
 
+# The presence checks above say why each statement exists. These say that nothing else
+# does, so a widened Resource, a loosened Condition or one added action fails here.
+run "policies_are_exactly_the_reviewed_statements" {
+  command = plan
+
+  assert {
+    condition = jsondecode(aws_iam_role_policy.plan.policy) == {
+      Version = "2012-10-17"
+      Statement = [
+        {
+          Sid      = "DenyBackupObjectReads"
+          Effect   = "Deny"
+          Action   = ["s3:GetObject*"]
+          Resource = ["arn:aws:s3:::example-lake-backup/*"]
+        },
+        {
+          Sid    = "DenyConsoleAndCommandOutput"
+          Effect = "Deny"
+          Action = [
+            "ec2:GetConsoleOutput",
+            "ec2:GetConsoleScreenshot",
+            "ssm:ListCommands",
+            "ssm:ListCommandInvocations",
+            "ssm:GetCommandInvocation",
+          ]
+          Resource = ["*"]
+        },
+        {
+          Sid    = "DenyConfigParameterReads"
+          Effect = "Deny"
+          Action = ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParameterHistory"]
+          Resource = [
+            "arn:aws:ssm:us-east-1:000000000000:parameter/marketlake/config",
+            "arn:aws:ssm:us-east-1:000000000000:parameter/marketlake/config/*",
+          ]
+        },
+        {
+          Sid      = "DenyParameterPathReads"
+          Effect   = "Deny"
+          Action   = ["ssm:GetParametersByPath"]
+          Resource = ["*"]
+        },
+      ]
+    }
+    error_message = "The plan role's inline policy is not exactly the reviewed four Denies."
+  }
+
+  assert {
+    condition = jsondecode(aws_iam_role_policy.apply.policy) == {
+      Version = "2012-10-17"
+      Statement = [
+        {
+          Sid      = "DenyBackupObjectReads"
+          Effect   = "Deny"
+          Action   = ["s3:GetObject*"]
+          Resource = ["arn:aws:s3:::example-lake-backup/*"]
+        },
+        {
+          Sid    = "DenyConsoleAndCommandOutput"
+          Effect = "Deny"
+          Action = [
+            "ec2:GetConsoleOutput",
+            "ec2:GetConsoleScreenshot",
+            "ssm:ListCommands",
+            "ssm:ListCommandInvocations",
+            "ssm:GetCommandInvocation",
+          ]
+          Resource = ["*"]
+        },
+        {
+          Sid    = "DenyConfigParameterReads"
+          Effect = "Deny"
+          Action = ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParameterHistory"]
+          Resource = [
+            "arn:aws:ssm:us-east-1:000000000000:parameter/marketlake/config",
+            "arn:aws:ssm:us-east-1:000000000000:parameter/marketlake/config/*",
+          ]
+        },
+        {
+          Sid      = "DenyParameterPathReads"
+          Effect   = "Deny"
+          Action   = ["ssm:GetParametersByPath"]
+          Resource = ["*"]
+        },
+        {
+          Sid      = "DenyBucketDelete"
+          Effect   = "Deny"
+          Action   = ["s3:DeleteBucket"]
+          Resource = ["*"]
+        },
+        {
+          Sid    = "DenyCredentialsAndTrustEdits"
+          Effect = "Deny"
+          Action = [
+            "iam:CreateAccessKey",
+            "iam:CreateLoginProfile",
+            "iam:CreateServiceSpecificCredential",
+            "iam:UpdateAssumeRolePolicy",
+          ]
+          Resource = ["*"]
+        },
+        {
+          Sid      = "DenyVolumeDelete"
+          Effect   = "Deny"
+          Action   = ["ec2:DeleteVolume"]
+          Resource = ["*"]
+        },
+        {
+          Sid      = "DenySnapshotAndImageSharing"
+          Effect   = "Deny"
+          Action   = ["ec2:ModifySnapshotAttribute", "ec2:ModifyImageAttribute"]
+          Resource = ["*"]
+        },
+        {
+          Sid    = "BackupBucketConfiguration"
+          Effect = "Allow"
+          Action = [
+            "s3:PutLifecycleConfiguration",
+            "s3:PutEncryptionConfiguration",
+            "s3:PutBucketPublicAccessBlock",
+          ]
+          Resource = ["arn:aws:s3:::example-lake-backup"]
+        },
+        {
+          Sid    = "LiveStateWrite"
+          Effect = "Allow"
+          Action = ["s3:PutObject", "s3:DeleteObject"]
+          Resource = [
+            "arn:aws:s3:::example-state/live/terraform.tfstate",
+            "arn:aws:s3:::example-state/live/terraform.tfstate.tflock",
+          ]
+        },
+        {
+          Sid    = "InstanceRoleWrite"
+          Effect = "Allow"
+          Action = [
+            "iam:CreateRole",
+            "iam:DeleteRole",
+            "iam:UpdateRole",
+            "iam:UpdateRoleDescription",
+            "iam:TagRole",
+            "iam:UntagRole",
+            "iam:PutRolePolicy",
+            "iam:DeleteRolePolicy",
+            "iam:PassRole",
+          ]
+          Resource = ["arn:aws:iam::000000000000:role/marketlake-instance"]
+        },
+        {
+          Sid      = "InstanceRoleSsmAttachment"
+          Effect   = "Allow"
+          Action   = ["iam:AttachRolePolicy", "iam:DetachRolePolicy"]
+          Resource = ["arn:aws:iam::000000000000:role/marketlake-instance"]
+          Condition = {
+            ArnEquals = { "iam:PolicyARN" = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" }
+          }
+        },
+        {
+          Sid    = "InstanceProfileWrite"
+          Effect = "Allow"
+          Action = [
+            "iam:CreateInstanceProfile",
+            "iam:DeleteInstanceProfile",
+            "iam:AddRoleToInstanceProfile",
+            "iam:RemoveRoleFromInstanceProfile",
+            "iam:TagInstanceProfile",
+            "iam:UntagInstanceProfile",
+          ]
+          Resource = ["arn:aws:iam::000000000000:instance-profile/marketlake-instance"]
+        },
+        {
+          Sid      = "BackupUserWrite"
+          Effect   = "Allow"
+          Action   = ["iam:PutUserPolicy", "iam:TagUser", "iam:UntagUser"]
+          Resource = ["arn:aws:iam::000000000000:user/marketlake-backup"]
+        },
+        {
+          Sid      = "Ec2InHomeRegion"
+          Effect   = "Allow"
+          Action   = ["ec2:*"]
+          Resource = ["*"]
+          Condition = {
+            StringEquals = { "aws:RequestedRegion" = "us-east-1" }
+          }
+        },
+      ]
+    }
+    error_message = "The apply role's inline policy is not exactly the reviewed Denies and Allows."
+  }
+}
+
+run "state_bucket_and_oidc_provider" {
+  command = plan
+
+  assert {
+    condition     = aws_s3_bucket_versioning.state.versioning_configuration[0].status == "Enabled"
+    error_message = "The state bucket's versioning is not Enabled, so an overwritten state has no older copy."
+  }
+
+  assert {
+    condition     = aws_iam_openid_connect_provider.github.url == "https://token.actions.githubusercontent.com"
+    error_message = "The OIDC provider is not GitHub's, so neither role's trust matches a token."
+  }
+}
+
 run "empty_bucket_names_fail_validation" {
   command = plan
 
   variables {
     state_bucket  = ""
     backup_bucket = ""
+  }
+
+  expect_failures = [var.state_bucket, var.backup_bucket]
+}
+
+# An ARN or a name with a space would match an unanchored pattern, and "ab" is one
+# character short of S3's minimum.
+run "an_arn_is_not_a_bucket_name" {
+  command = plan
+
+  variables {
+    state_bucket  = "arn:aws:s3:::example-state"
+    backup_bucket = "arn:aws:s3:::example-state"
+  }
+
+  expect_failures = [var.state_bucket, var.backup_bucket]
+}
+
+run "a_two_character_bucket_name_fails_validation" {
+  command = plan
+
+  variables {
+    state_bucket  = "ab"
+    backup_bucket = "ab"
+  }
+
+  expect_failures = [var.state_bucket, var.backup_bucket]
+}
+
+run "a_bucket_name_with_a_space_fails_validation" {
+  command = plan
+
+  variables {
+    state_bucket  = "has space"
+    backup_bucket = "has space"
   }
 
   expect_failures = [var.state_bucket, var.backup_bucket]

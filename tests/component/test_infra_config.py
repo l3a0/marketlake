@@ -1,6 +1,6 @@
 """Checks on ``infra/`` that ``tofu test`` cannot make, read from the ``.tf`` files.
 
-``tofu test`` sees a plan, and three things are not in one.
+``tofu test`` sees one configuration's plan, and five things are not in one.
 
 1. ``prevent_destroy``. A test refuses destroy-mode plans, and ``tofu show -json`` omits
    ``lifecycle``, so removing the line leaves every ``tofu test`` run green.
@@ -10,6 +10,10 @@
    unreviewed branch change the account.
 3. Whether the live backend's key is the one the apply role may write. A mismatch
    passes every pull request check and fails the first apply after the merge.
+4. The backend's own settings. Without ``use_lockfile`` two applies can write the state
+   at once, and without ``encrypt`` it lands unencrypted.
+5. Whether the IAM names the apply role may write in ``infra/bootstrap`` are the names
+   ``infra/live`` declares. Each configuration's tests see only their own side.
 
 A ``module`` block would hide its resources from every check here, so neither
 configuration may call one.
@@ -76,14 +80,18 @@ def _resources(config: str) -> dict[str, dict[str, Any]]:
     return found
 
 
-def _backend_key(config: str) -> str:
+def _backend(config: str) -> dict[str, Any]:
     for path in sorted((INFRA / config).glob("*.tf")):
         with path.open() as f:
             parsed = hcl2.load(f, serialization_options=_OPTIONS)
         for block in parsed.get("terraform", []):
             for backend in block.get("backend", []):
-                return backend["s3"]["key"]
+                return backend["s3"]
     raise AssertionError(f"infra/{config} has no s3 backend")
+
+
+def _backend_key(config: str) -> str:
+    return _backend(config)["key"]
 
 
 def _jsonencode_argument(expression: str) -> Any:
@@ -182,3 +190,45 @@ def test_apply_role_writes_exactly_the_live_state_and_its_lock() -> None:
         f"arn:aws:s3:::${{var.state_bucket}}/{live_key}",
         f"arn:aws:s3:::${{var.state_bucket}}/{live_key}.tflock",
     ]
+
+
+@pytest.mark.parametrize("config", ["bootstrap", "live"])
+def test_backend_locks_and_encrypts_the_state(config: str) -> None:
+    backend = _backend(config)
+    assert backend["use_lockfile"] is True
+    assert backend["encrypt"] is True
+
+
+# The ARN kind in an apply-role grant, and the resource type that declares it in live.
+_IAM_KINDS = {
+    "role": "aws_iam_role",
+    "instance-profile": "aws_iam_instance_profile",
+    "user": "aws_iam_user",
+}
+
+
+def test_apply_role_grants_name_the_iam_resources_live_declares() -> None:
+    """A rename on either side passes both configurations' own tests and fails the
+    first apply after the merge, with an AccessDenied on the renamed resource."""
+    policy = _jsonencode_argument(_resources("bootstrap")["aws_iam_role_policy.apply"]["policy"])
+    granted = set()
+    for statement in policy["Statement"]:
+        if statement["Effect"] != "Allow":
+            continue
+        for resource in statement["Resource"]:
+            match = re.fullmatch(r"arn:aws:iam::\$\{local\.account_id\}:([a-z-]+)/(.+)", resource)
+            if match:
+                granted.add((match.group(1), match.group(2)))
+
+    declared = {
+        (kind, body["name"])
+        for kind, rtype in _IAM_KINDS.items()
+        for address, body in _resources("live").items()
+        if address.split(".")[0] == rtype
+    }
+    assert granted == {
+        ("role", "marketlake-instance"),
+        ("instance-profile", "marketlake-instance"),
+        ("user", "marketlake-backup"),
+    }
+    assert declared == granted

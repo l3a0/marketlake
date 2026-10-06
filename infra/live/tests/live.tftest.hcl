@@ -34,6 +34,65 @@ run "instance_s3_policy_is_on_when_enabled" {
   }
 }
 
+run "bucket_protections_are_on" {
+  command = plan
+
+  assert {
+    condition     = aws_s3_bucket_versioning.backup.versioning_configuration[0].status == "Enabled"
+    error_message = "The backup's versioning is not Enabled, so an overwritten partition loses its only good copy."
+  }
+
+  assert {
+    condition = [
+      for rule in aws_s3_bucket_server_side_encryption_configuration.backup.rule :
+      [for d in rule.apply_server_side_encryption_by_default : d.sse_algorithm]
+    ] == [["AES256"]]
+    error_message = "The backup's default encryption is not exactly AES256."
+  }
+
+  assert {
+    condition = [
+      aws_s3_bucket_public_access_block.backup.block_public_acls,
+      aws_s3_bucket_public_access_block.backup.block_public_policy,
+      aws_s3_bucket_public_access_block.backup.ignore_public_acls,
+      aws_s3_bucket_public_access_block.backup.restrict_public_buckets,
+    ] == [true, true, true, true]
+    error_message = "One of the backup's four public access blocks is off."
+  }
+}
+
+run "instance_role_is_trusted_by_ec2_alone" {
+  command = plan
+
+  variables {
+    instance_s3_enabled = true
+  }
+
+  assert {
+    condition = jsondecode(aws_iam_role.instance.assume_role_policy) == {
+      Version = "2012-10-17"
+      Statement = [{
+        Effect    = "Allow"
+        Principal = { Service = "ec2.amazonaws.com" }
+        Action    = "sts:AssumeRole"
+      }]
+    }
+    error_message = "marketlake-instance's trust is not exactly EC2 assuming the role."
+  }
+
+  # The apply role may write only the role named marketlake-instance, so a policy or a
+  # profile pointed anywhere else fails the first apply.
+  assert {
+    condition     = aws_iam_role_policy.instance_s3[0].role == aws_iam_role.instance.name
+    error_message = "The S3 policy is not on marketlake-instance."
+  }
+
+  assert {
+    condition     = aws_iam_instance_profile.instance.role == aws_iam_role.instance.name
+    error_message = "The instance profile does not carry marketlake-instance."
+  }
+}
+
 run "empty_names_fail_validation" {
   command = plan
 
@@ -116,4 +175,38 @@ run "lifecycle_rules_are_exactly_the_four" {
     ])
     error_message = "The backup's lifecycle rules are not exactly the four noncurrent expiries."
   }
+}
+
+# An ARN or a name with a space would match an unanchored pattern, and "ab" is one
+# character short of S3's minimum.
+run "an_arn_fails_validation" {
+  command = plan
+
+  variables {
+    backup_bucket      = "arn:aws:s3:::example-state"
+    backup_policy_name = "arn:aws:s3:::example-state"
+  }
+
+  expect_failures = [var.backup_bucket, var.backup_policy_name]
+}
+
+run "a_two_character_bucket_name_fails_validation" {
+  command = plan
+
+  variables {
+    backup_bucket = "ab"
+  }
+
+  expect_failures = [var.backup_bucket]
+}
+
+run "a_name_with_a_space_fails_validation" {
+  command = plan
+
+  variables {
+    backup_bucket      = "has space"
+    backup_policy_name = "has space"
+  }
+
+  expect_failures = [var.backup_bucket, var.backup_policy_name]
 }

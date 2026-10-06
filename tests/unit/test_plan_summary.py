@@ -174,3 +174,78 @@ def test_a_key_never_reaches_the_address(address: str, expected: str) -> None:
 def test_an_empty_plan_says_so() -> None:
     assert _run({"resource_changes": []}) == "### Plan\n\nNo changes.\n"
     assert _run({"format_version": "1.2"}) == "### Plan\n\nNo changes.\n"
+
+
+def test_a_known_nested_marker_is_not_a_change() -> None:
+    """OpenTofu writes ``false`` for a known leaf and ``{}`` for a known block inside
+    ``after_unknown``, so neither may list an attribute whose value did not change."""
+    plan = {
+        "resource_changes": [
+            _change(
+                "aws_s3_bucket_lifecycle_configuration.backup",
+                ["update"],
+                before={"rule": [{"id": "VALUE-OLD-RULE"}], "bucket": "VALUE-BUCKET-NAME"},
+                after={"rule": [{"id": "VALUE-OLD-RULE"}], "bucket": "VALUE-NEW-RULE"},
+                after_unknown={"rule": [{"id": False, "filter": [{}]}]},
+            )
+        ]
+    }
+    assert plan_summary.rows(plan) == [
+        ("aws_s3_bucket_lifecycle_configuration.backup", "update", "bucket")
+    ]
+
+
+def test_a_nested_unknown_is_a_change_even_when_the_values_match() -> None:
+    plan = {
+        "resource_changes": [
+            _change(
+                "aws_x.in_a_mapping",
+                ["update"],
+                before={"tags": {"k": "VALUE-KEY"}},
+                after={"tags": {"k": "VALUE-KEY"}},
+                after_unknown={"tags": {"k": True}},
+            ),
+            _change(
+                "aws_x.in_a_list",
+                ["update"],
+                before={"rule": ["VALUE-OLD-RULE"]},
+                after={"rule": ["VALUE-OLD-RULE"]},
+                after_unknown={"rule": [True]},
+            ),
+        ]
+    }
+    assert plan_summary.rows(plan) == [
+        ("aws_x.in_a_mapping", "update", "tags"),
+        ("aws_x.in_a_list", "update", "rule"),
+    ]
+
+
+def test_create_before_destroy_is_a_replace() -> None:
+    plan = {
+        "resource_changes": [
+            _change(
+                "aws_iam_role.instance",
+                ["create", "delete"],
+                before={"assume_role_policy": "VALUE-OLD-TRUST"},
+                after={"assume_role_policy": "VALUE-NEW-TRUST"},
+                after_unknown={},
+            )
+        ]
+    }
+    assert plan_summary.rows(plan) == [("aws_iam_role.instance", "replace", "assume_role_policy")]
+
+
+def test_a_pipe_in_a_cell_is_escaped() -> None:
+    """An unescaped ``|`` would split the row into extra columns."""
+    plan = {
+        "resource_changes": [
+            _change(
+                "aws_x.a|b",
+                ["update"],
+                before={"c|d": "VALUE-OLD-RULE"},
+                after={"c|d": "VALUE-NEW-RULE"},
+                after_unknown={},
+            )
+        ]
+    }
+    assert _run(plan).splitlines()[-1] == "| `aws_x.a\\|b` | update | c\\|d |"
