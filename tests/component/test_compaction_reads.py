@@ -37,22 +37,14 @@ These cover:
 5. The profile's null rules, and a partition without the window columns, which the
    re-tune skips.
 
-The memory tests install a proxy pool, which counts every byte Arrow requests through it.
-Three constraints on it were measured on pyarrow 25.0.1 and are kept here.
-
-1. The proxy is installed before the read opens the file, because a proxy installed
-   afterwards counts nothing.
-2. Every proxy stays referenced for the life of the test process, in ``_PROXIES``. Memory a
-   threaded read allocated through a proxy can be freed later from a background thread,
-   and a proxy freed before that crashed the interpreter in a later, unrelated test.
-3. A reference read the test takes itself passes ``use_threads=False`` for the same reason.
+The memory tests measure through ``tests.support.memory.measured``, whose docstring carries
+the rules that keep a proxy pool's count honest. A reference read a test takes itself passes
+``use_threads=False``, which is the one rule the caller keeps.
 """
 
 from __future__ import annotations
 
 import random
-from collections.abc import Iterator
-from contextlib import contextmanager
 from datetime import date, datetime, time
 from pathlib import Path
 
@@ -85,28 +77,12 @@ from tests.component.test_compaction import (
 from tests.support.backup import FakeBackup
 from tests.support.clock import ManualClock
 from tests.support.lake import FixtureLake
+from tests.support.memory import measured
 from tests.support.pinger import FakePinger
-
-# Every proxy pool a test installs, kept alive until the process exits. See the module
-# docstring's second constraint for why a proxy must never be freed.
-_PROXIES: list[pa.MemoryPool] = []
 
 # The profile columns, spelled here rather than read from ``compact`` so the reference
 # read below does not move with the code under test.
 _PROFILE = ["ticker", "snap_ts", "row_kind", "window_start", "window_end"]
-
-
-@contextmanager
-def _measured() -> Iterator[pa.MemoryPool]:
-    """Route every Arrow allocation through a fresh proxy pool, then restore the pool."""
-    original = pa.default_memory_pool()
-    proxy = pa.proxy_memory_pool(original)
-    _PROXIES.append(proxy)
-    pa.set_memory_pool(proxy)
-    try:
-        yield proxy
-    finally:
-        pa.set_memory_pool(original)
 
 
 def _reference_profile(table: pa.Table, session_date: date) -> WindowProfile:
@@ -463,7 +439,7 @@ def test_the_verify_reads_a_large_day_in_bounded_memory(lake_root):
     paths = LakePaths(lake_root)
     clock = ManualClock(datetime.combine(DAY, time(16, 30), tzinfo=MARKET_TZ))
 
-    with _measured() as pool:
+    with measured() as pool:
         sealed = compact._seal(
             lake_root, paths, "chains", "SPY", DAY, [segment], clock=clock, guard=False, entries={}
         )
@@ -492,7 +468,7 @@ def test_the_retune_reads_a_large_day_in_bounded_memory(lake_root):
         lake_root, paths, "chains", "SPY", DAY, [segment], clock=clock, guard=False, entries={}
     )
 
-    with _measured() as pool:
+    with measured() as pool:
         retune = compact._retune(
             lake_root,
             [sealed],
@@ -573,7 +549,7 @@ def test_the_streamed_profile_reads_in_bounded_memory(tmp_path):
     """
     path = _shuffled_day(tmp_path / "chains.parquet")
 
-    with _measured() as pool:
+    with measured() as pool:
         profile = window_profile(path, DAY, batch_size=256)
 
     assert dict(profile.peaks) == _SHUFFLED_PEAKS

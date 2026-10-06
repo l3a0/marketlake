@@ -14,7 +14,7 @@ Every default in this package is built from ``paths.config_dir``, and four of th
 import. That is what makes one variable enough and it is also the reason these tests
 spawn a child process. Setting the variable inside a running process moves nothing for
 those four, because the constants are already bound. The roster's default resolves on
-each call, and marketlake #715 converts the other four. Only a process that started with
+each call, and marketlake #715 will convert the other four. Only a process that started with
 the variable set is the real thing for those, so that is what these run, and each drives
 production code rather than a stand-in for it.
 

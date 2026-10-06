@@ -92,6 +92,7 @@ from lake.manifest import (
 )
 from lake.report import ACTION, INFO
 from tests.support.calendar import weekday_sessions
+from tests.support.memory import measured
 from tests.support.report_kinds import kind_of
 
 # The weeks these tests judge in. A regular session opens 09:30 and closes 16:00 Eastern, so
@@ -2431,6 +2432,458 @@ def test_a_refused_page_keeps_its_body_off_stderr(lake: Path, capsys):
     assert transport.messages == []
     assert secret not in printed
     assert "refused" in printed
+
+
+# -- the entitlement read streams, marketlake #670 ---------------------------
+#
+# The read used to decode a whole ticker-day's stamps at once, 1,295.8 MiB of Arrow memory on
+# SPY 2026-09-28 against a 2 GiB host. It now reads a batch at a time and keeps only the float64
+# seconds of session rows. These tests cover what streaming could change: where an error
+# surfaces, which stamps get parsed, the median over a day of many batches, the memory the read
+# holds, and the damaged files a streamed read would otherwise answer silently.
+
+
+def _session(day: date = DAY) -> tuple[datetime, datetime]:
+    return (CALENDAR.session_open(day), CALENDAR.option_close(day))
+
+
+def test_a_retyped_row_kind_costs_the_entitlement_read_its_partition_and_not_the_run(lake: Path):
+    """The data-row filter is an Arrow kernel like any other, and :func:`_contained` says why
+    every kernel a check runs sits inside the partition's containment. ``judge`` catches only
+    :class:`PartitionUnreadable`, so a raw ``ArrowNotImplementedError`` here ends the battery
+    for the night on the one partition that drifted."""
+    rows = _clean_rows("chains")
+    table = _table("chains", rows)
+    table = table.set_column(
+        table.schema.get_field_index("row_kind"),
+        "row_kind",
+        pa.array(list(range(len(rows))), pa.int64()),
+    )
+    path = lake / "chains" / "ticker=SPY" / f"date={DAY.isoformat()}.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pa_pq.write_table(table, path)
+    partition = _partition(lake)
+
+    with pytest.raises(PartitionUnreadable) as caught:
+        read_entitlement(partition, _session())
+    assert str(caught.value).startswith(f"{partition.relative}: ")
+
+
+def test_a_page_that_fails_to_decode_is_unreadable_and_names_its_partition(lake: Path):
+    """The footer is intact, so the file opens cleanly and the failure comes while the rows are
+    decoded. The existing damaged-file test fails at the open, before any row is read.
+
+    The message has to start with the partition. Each line reaches the report as
+    ``battery: {exc}``, and ``report.redacted`` keeps only the first two ``: ``-separated
+    fields, so the report file and the digest show ``battery: <partition>`` and nothing else.
+    """
+    path = _write(lake, "chains", "SPY", DAY, _clean_rows("chains"))
+    chunk = pa_pq.ParquetFile(path).metadata.row_group(0)
+    column = chunk.column(CHAINS_SCHEMA.get_field_index("fetch_ts"))
+    first_page = column.dictionary_page_offset or column.data_page_offset
+    damaged = bytearray(path.read_bytes())
+    damaged[first_page : first_page + 32] = b"\xff" * 32
+    path.write_bytes(bytes(damaged))
+    assert pa_pq.read_schema(path).names == CHAINS_SCHEMA.names, "the footer still reads"
+    partition = _partition(lake)
+
+    with pytest.raises(PartitionUnreadable) as caught:
+        read_entitlement(partition, _session())
+    assert str(caught.value).startswith(f"{partition.relative}: ")
+
+
+def test_a_bad_stamp_on_a_row_the_filters_drop_is_never_parsed(lake: Path):
+    """Every stamp is parsed after the row filters, so a row the read leaves out cannot fail it.
+
+    The overnight row carries a quote stamp with no zone offset, which the session filter drops
+    before the stamps are cast. The gap row carries a ``snap_ts`` with no zone offset, which the
+    data-row filter drops before the session filter parses it. A read that parsed either stamp
+    first would report a healthy partition unreadable.
+    """
+    rows = _clean_rows("chains", staleness=-1.7)
+    overnight = _off_session_row(0, staleness=1.0)
+    overnight["vendor_quote_ts"] = "2026-09-16T03:25:00.931000"  # no zone offset
+    gap = _gap_row()
+    gap["snap_ts"] = "2026-09-16T13:30:00"  # no zone offset
+    rows += [overnight, gap]
+    _write(lake, "chains", "SPY", DAY, rows)
+
+    found = read_entitlement(_partition(lake), _session())
+
+    assert found == Entitlement(
+        rows=6, flag_present=True, flag_violations=0, median_staleness=-1.7, session_rows=5
+    )
+
+
+def test_a_partition_of_no_rows_reads_as_no_rows(lake: Path):
+    """Compaction seals an empty table when no segment held a row, and that file yields no batch
+    at all. The read still answers no rows, which ``judge`` reports as out of scope, rather than
+    failing on a median over nothing and reporting the partition unreadable."""
+    _write(lake, "chains", "SPY", DAY, [])
+
+    assert read_entitlement(_partition(lake), _session()) == Entitlement(
+        rows=0, flag_present=True, flag_violations=0, median_staleness=None, session_rows=0
+    )
+
+
+# A column each kernel after the data-row filter would refuse, retyped for the whole file:
+# the flag count reads ``is_delayed``, the session filter reads ``snap_ts``, and the stamp
+# parse reads ``fetch_ts``.
+RETYPED = {
+    "is_delayed": pa.array(["false"] * 4, pa.string()),
+    "snap_ts": pa.array([0.0] * 4, pa.float64()),
+    "fetch_ts": pa.array([True] * 4, pa.bool_()),
+}
+
+
+def _retyped(lake: Path, rows: list[dict], column: str) -> None:
+    table = _table("chains", rows)
+    values = RETYPED[column]
+    values = pa.concat_arrays([values] * (len(rows) // len(values)))
+    table = table.set_column(table.schema.get_field_index(column), column, values)
+    path = lake / "chains" / "ticker=SPY" / f"date={DAY.isoformat()}.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pa_pq.write_table(table, path)
+
+
+@pytest.mark.parametrize("column", sorted(RETYPED))
+def test_a_partition_of_gap_rows_reads_as_no_rows_whatever_its_column_types(
+    lake: Path, column: str
+):
+    """A day of gap rows only answers no rows, which ``judge`` reports as out of scope, just as
+    an empty file does. The whole read returned before any kernel ran when the data-row filter
+    left nothing. The streamed read skips a batch the filter emptied for the same reason: Arrow
+    picks a kernel by type even for an empty array, so a drifted column on rows nobody reads
+    would otherwise make the partition unreadable."""
+    _retyped(lake, [_gap_row() for _ in range(4)], column)
+
+    assert read_entitlement(_partition(lake), _session()) == Entitlement(
+        rows=0, flag_present=True, flag_violations=0, median_staleness=None, session_rows=0
+    )
+
+
+def test_a_retyped_flag_still_fails_a_day_whose_data_rows_follow_a_batch_of_gap_rows(
+    lake: Path,
+):
+    """Skipping a batch of gap rows defers the kernels to the next batch rather than dropping
+    them. The data rows that follow carry the same retyped flag, so the flag count refuses it
+    there, as the whole read did."""
+    rows = [_gap_row() for _ in range(4)] + _clean_rows("chains", count=4)
+    _retyped(lake, rows, "is_delayed")
+    partition = _partition(lake)
+
+    with pytest.raises(PartitionUnreadable) as caught:
+        read_entitlement(partition, _session(), batch_size=4)
+    assert str(caught.value).startswith(f"{partition.relative}: ")
+
+
+def test_a_batch_of_gap_rows_is_skipped_and_the_batches_after_it_still_count(lake: Path):
+    """Skipping a batch the data-row filter emptied moves on to the next batch rather than
+    ending the read. The first batch holds one data row among three gap rows, so it is not
+    empty and must be counted. The second holds gap rows alone, and the data rows after it
+    must still reach the count and the median."""
+    rows = [_gap_row() for _ in range(3)] + _clean_rows("chains", count=1)
+    rows += [_gap_row() for _ in range(4)] + _clean_rows("chains", count=4)
+    _write(lake, "chains", "SPY", DAY, rows)
+
+    found = read_entitlement(_partition(lake), _session(), batch_size=4)
+
+    assert found == Entitlement(
+        rows=5, flag_present=True, flag_violations=0, median_staleness=-1.7, session_rows=5
+    )
+
+
+def test_a_batch_whose_every_flag_is_wrong_counts_every_row_as_a_violation(lake: Path):
+    """A batch where no row agrees sums to zero agreeing rows, and zero is the count, not a
+    missing answer to be replaced."""
+    rows = _clean_rows("chains", count=4)
+    for row in rows:
+        row["is_delayed"] = True
+    _write(lake, "chains", "SPY", DAY, rows)
+
+    found = read_entitlement(_partition(lake), _session(), batch_size=2)
+
+    assert found.flag_violations == 4
+
+
+def test_an_odd_count_session_median_is_its_middle_row(lake: Path):
+    """The exact median at ``q=0.5``. An odd count has one middle row, and a ``q`` a hair
+    either side of one half would answer the midpoint of it and a neighbour instead."""
+    rows = [
+        _row(minute, staleness=staleness, flag=False, surface="chains")
+        for minute, staleness in enumerate([-1.0, -9.0, -2.0])
+    ]
+    _write(lake, "chains", "SPY", DAY, rows)
+
+    assert read_entitlement(_partition(lake), _session()).median_staleness == -2.0
+
+
+def test_the_nightly_judge_reads_entitlement_in_batches_no_larger_than_measured(
+    lake: Path, monkeypatch
+):
+    """The 89.7 MiB peak on SPY 2026-09-28 was measured at 65,536 rows a batch. The memory test
+    above passes its own small ``batch_size``, so it says nothing about the size the nightly
+    ``judge`` actually reads with. This records that size at the real entry point."""
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains"))
+    _seed_spans(lake)
+    sizes: list = []
+    real = pa_pq.ParquetFile
+
+    class Recording(real):
+        def iter_batches(self, *args, **kwargs):
+            sizes.append(kwargs.get("batch_size"))
+            return super().iter_batches(*args, **kwargs)
+
+    monkeypatch.setattr(pa_pq, "ParquetFile", Recording)
+    judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert sizes, "the entitlement read streamed"
+    assert all(size is not None and size <= 65_536 for size in sizes), sizes
+
+
+# Small enough that a 1,998-row day spans eight batches. Every other fixture in this file fits
+# in one batch at the default size, the largest at 300 rows.
+SMALL_BATCH = 256
+
+# How far below the whole-table read the streamed peak has to sit. On pyarrow 25.0.1 the long
+# day streamed at 281,408 bytes against 483,712 read whole, a ratio of 0.582, and a read that
+# ignored ``batch_size`` peaked at 877,888, a ratio of 1.815.
+STREAMED_MARGIN = 0.75
+
+
+def _long_day(count: int = 1_998) -> list[dict]:
+    """A day of ``count`` rows whose staleness differs row to row and batch to batch.
+
+    It also carries every kind of row the read has to leave out of the median: gap rows,
+    overnight rows, rows missing a stamp, and rows whose flag reads the wrong way.
+
+    At 1,998 rows the session keeps an even number of stamped rows, so the median is the
+    midpoint of a pair. The microsecond term in the staleness makes that midpoint differ in the
+    last bit between float64 seconds and int64 microseconds divided afterwards, which is what
+    lets an exact comparison tell the two apart.
+    """
+    rows = []
+    for i in range(count):
+        staleness = ((i * 7_919) % 2_003) * 0.013_7 - 9.3 + (i * 131 % 997) * 1e-6
+        if i % 89 == 5:
+            row = _off_session_row(i % 60, staleness=25_817.0 + i)
+        else:
+            row = _row(i % 390, staleness=staleness, flag=False, surface="chains")
+        if i % 97 == 0:
+            row["row_kind"] = "gap"
+        if i % 83 == 7:
+            row["vendor_quote_ts"] = None
+        if i % 71 == 3:
+            row["is_delayed"] = True
+        rows.append(row)
+    return rows
+
+
+def _microseconds(row: dict) -> int:
+    fetched = datetime.fromisoformat(row["fetch_ts"])
+    quoted = datetime.fromisoformat(row["vendor_quote_ts"])
+    return (fetched - quoted) // timedelta(microseconds=1)
+
+
+def _in_session(rows: list[dict], bounds: tuple[datetime, datetime]) -> list[dict]:
+    opened, closed = bounds
+    data = [row for row in rows if row["row_kind"] == "data"]
+    return [r for r in data if opened <= datetime.fromisoformat(r["snap_ts"]) <= closed]
+
+
+def _expected_entitlement(rows: list[dict], bounds: tuple[datetime, datetime]) -> Entitlement:
+    """The answer worked out row by row in Python, sharing no code with the read."""
+    data = [row for row in rows if row["row_kind"] == "data"]
+    session = _in_session(rows, bounds)
+    stamped = [r for r in session if r["vendor_quote_ts"] is not None]
+    return Entitlement(
+        rows=len(data),
+        flag_present=True,
+        flag_violations=sum(1 for r in data if r["is_delayed"] is not False),
+        median_staleness=median([_microseconds(r) / 1e6 for r in stamped]),
+        session_rows=len(session),
+    )
+
+
+def test_a_day_spanning_several_batches_gives_the_median_of_the_whole_day(lake: Path):
+    """The median is taken once over every batch's seconds, never per batch.
+
+    The whole ``Entitlement`` is compared, because a read that counted ``rows`` before the
+    data-row filter leaves the median alone. The median is compared exactly, value and type,
+    against one taken in Python over the fixture's own stamps. A pyarrow upgrade that changed
+    how the quantile treats a chunked array would fail here rather than move a verdict quietly.
+    """
+    rows = _long_day()
+    _write(lake, "chains", "SPY", DAY, rows)
+    bounds = _session()
+    expected = _expected_entitlement(rows, bounds)
+    assert expected.session_rows > 7 * SMALL_BATCH, "the session spans several batches"
+    stamped = [r for r in _in_session(rows, bounds) if r["vendor_quote_ts"] is not None]
+    assert median([_microseconds(r) for r in stamped]) / 1e6 != expected.median_staleness, (
+        "the fixture tells float64 seconds from int64 microseconds divided afterwards"
+    )
+
+    found = read_entitlement(_partition(lake), bounds, batch_size=SMALL_BATCH)
+
+    assert found == expected
+    assert type(found.median_staleness) is float
+
+
+def test_the_read_holds_one_batch_at_a_time_rather_than_the_whole_day(lake: Path):
+    """The 18:30 sweep runs on a 2 GiB host, where SPY's whole-day read peaked at 1,295.8 MiB.
+
+    The reference is the whole-table read of the same five columns, which is what the read did
+    before it streamed, taken without threads so nothing frees through its pool late.
+    """
+    path = _write(lake, "chains", "SPY", DAY, _long_day())
+    columns = ["row_kind", "snap_ts", "fetch_ts", "vendor_quote_ts", "is_delayed"]
+
+    with measured() as pool:
+        pa_pq.read_table(path, columns=columns, use_threads=False)
+    whole = pool.max_memory()
+    with measured() as pool:
+        read_entitlement(_partition(lake), _session(), batch_size=SMALL_BATCH)
+    streamed = pool.max_memory()
+
+    assert streamed < STREAMED_MARGIN * whole, f"{streamed:,} bytes against {whole:,} whole"
+
+
+def test_the_read_neither_pre_buffers_nor_threads(lake: Path, monkeypatch):
+    """Neither flag changes an answer, and neither moves a small fixture's peak, so the test
+    records the arguments themselves.
+
+    ``pre_buffer=True`` raised SPY 2026-09-28's peak by 16.9 to 21.8 MiB, because it reads a
+    row group's column chunks ahead of the batch being decoded. ``use_threads=False`` is the
+    rule the proxy-pool measurement above depends on.
+    """
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains"))
+    seen: dict = {}
+    real = pa_pq.ParquetFile
+
+    class Recording(real):
+        def __init__(self, *args, **kwargs):
+            seen["open"] = kwargs
+            super().__init__(*args, **kwargs)
+
+        def iter_batches(self, *args, **kwargs):
+            seen["iterate"] = kwargs
+            return super().iter_batches(*args, **kwargs)
+
+    monkeypatch.setattr(pa_pq, "ParquetFile", Recording)
+    read_entitlement(_partition(lake))
+
+    assert seen["open"].get("pre_buffer") is False
+    assert seen["iterate"].get("use_threads") is False
+
+
+def _varint(n: int) -> bytes:
+    """``n`` as the Thrift compact protocol writes an i64: zigzag, then a base-128 varint."""
+    z = (n << 1) ^ (n >> 63)
+    out = bytearray()
+    while z > 0x7F:
+        out.append((z & 0x7F) | 0x80)
+        z >>= 7
+    out.append(z)
+    return bytes(out)
+
+
+def _footer_hits(raw: bytes, pattern: bytes) -> list[int]:
+    """Every absolute offset in the footer where ``pattern`` starts, in file order."""
+    length = int.from_bytes(raw[-8:-4], "little")
+    start = len(raw) - 8 - length
+    footer = raw[start:-8]
+    return [start + i for i in range(len(footer)) if footer.startswith(pattern, i)]
+
+
+def _two_groups(lake: Path, rows: list[dict]) -> Path:
+    path = lake / "chains" / "ticker=SPY" / f"date={DAY.isoformat()}.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pa_pq.write_table(_table("chains", rows), path, row_group_size=len(rows) // 2)
+    return path
+
+
+@pytest.mark.parametrize("groups", ["the final group", "every group"])
+def test_a_column_chunk_that_lost_its_metadata_is_unreadable(lake: Path, groups: str):
+    """A flipped byte in the footer can drop a column chunk's ``meta_data``, so the chunk
+    reports no values. ``pq.read_table`` raises ``ArrowInvalid`` on the short column.
+    ``iter_batches`` instead ends the stream when that column runs out on a batch boundary,
+    and raises nothing. Without the row-count check the read answered ``rows=0`` for the
+    every-group case, which ``judge`` reports as out of scope rather than unreadable.
+
+    ``ColumnChunk`` writes ``file_offset`` (field 2) as ``0x26`` then the varint, and the
+    ``meta_data`` struct header (field 3) as ``0x1c``. pyarrow 25.0.1 writes ``file_offset``
+    as 0, so each chunk's header is the last byte of one ``26 00 1c`` in the footer, in
+    row-group order, then column order. The count of headers fails loudly if a pyarrow upgrade
+    changes that, rather than letting the flip land somewhere else.
+    """
+    rows = _clean_rows("chains", count=20)
+    path = _two_groups(lake, rows)
+    raw = bytearray(path.read_bytes())
+    width = len(CHAINS_SCHEMA.names)
+    headers = [hit + 2 for hit in _footer_hits(bytes(raw), b"\x26\x00\x1c")]
+    assert len(headers) == 2 * width, "one meta_data header per column chunk"
+    column = CHAINS_SCHEMA.get_field_index("row_kind")
+    for group in [1] if groups == "the final group" else [0, 1]:
+        raw[headers[group * width + column]] ^= 0xFF
+    path.write_bytes(bytes(raw))
+    with pytest.raises(pa.ArrowInvalid):
+        pa_pq.read_table(path, columns=["row_kind", "snap_ts"])
+    partition = _partition(lake)
+
+    with pytest.raises(PartitionUnreadable) as caught:
+        read_entitlement(partition, batch_size=10)
+    assert str(caught.value).startswith(f"{partition.relative}: ")
+
+
+@pytest.mark.parametrize("count", ["the first group's", "the final group's", "the file's own"])
+def test_a_footer_that_undercounts_its_rows_is_refused(lake: Path, count: str):
+    """A row group's ``num_rows`` is the count ``iter_batches`` reads that group by, while
+    ``pq.read_table`` decodes every value the chunks hold. A footer flip that lowers it by one
+    makes a streamed read drop a row and answer, where the whole read answers every row.
+
+    The check compares the rows decoded with the file's own ``num_rows``. A check against the
+    sum of the row groups' counts reads the same damaged field the stream did, and agrees with
+    it. The third case lowers the file's own count alone. Every row still decodes, and the read
+    refuses the file anyway, because its footer disagrees with its data. That case is what keeps
+    the check from weakening to a shortfall alone.
+    """
+    rows = _clean_rows("chains", count=20)
+    path = _two_groups(lake, rows)
+    raw = bytearray(path.read_bytes())
+    metadata = pa_pq.ParquetFile(path).metadata
+    if count == "the file's own":
+        # FileMetaData's ``num_rows`` (field 3) sits just before the two-entry row-group list.
+        pattern = b"\x16" + _varint(metadata.num_rows) + b"\x19\x2c"
+        (hit,) = _footer_hits(bytes(raw), pattern)
+        old = metadata.num_rows
+    else:
+        group = metadata.row_group(0 if count == "the first group's" else 1)
+        pattern = b"\x16" + _varint(group.total_byte_size) + b"\x16" + _varint(group.num_rows)
+        hits = _footer_hits(bytes(raw), pattern)
+        hit = hits[0] if count == "the first group's" else hits[-1]
+        hit += len(pattern) - len(_varint(group.num_rows)) - 1
+        old = group.num_rows
+    at = hit + 1
+    lowered = _varint(old - 1)
+    assert len(lowered) == len(_varint(old))
+    raw[at : at + len(lowered)] = lowered
+    path.write_bytes(bytes(raw))
+    damaged = pa_pq.ParquetFile(path).metadata
+    counts = (damaged.num_rows, damaged.row_group(0).num_rows, damaged.row_group(1).num_rows)
+    assert (
+        counts
+        == {
+            "the first group's": (20, 9, 10),
+            "the final group's": (20, 10, 9),
+            "the file's own": (19, 10, 10),
+        }[count]
+    )
+    assert pa_pq.read_table(path).num_rows == len(rows), "the whole read still sees every row"
+    partition = _partition(lake)
+
+    with pytest.raises(PartitionUnreadable) as caught:
+        read_entitlement(partition, batch_size=10)
+    assert str(caught.value).startswith(f"{partition.relative}: ")
 
 
 # -- trading-calendar coverage -----------------------------------------------
