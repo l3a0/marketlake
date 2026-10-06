@@ -276,7 +276,12 @@ def test_a_segment_compacted_before_the_copy_is_not_missing_from_it(fixture_lake
     target = mirror_lake(root, root.parent / "ssd")
 
     assert scrub(root).ok
-    assert backup_scrub(root, target).ok
+    result = backup_scrub(root, target)
+    assert result.ok
+    # The superseded segment was never checked, so the restore test is not handed it,
+    # while the compacted partition that replaced it is.
+    assert rel not in dict(result.matched)
+    assert CHAINS in dict(result.matched)
 
 
 def _append(root: Path, partition: str, path: Path) -> None:

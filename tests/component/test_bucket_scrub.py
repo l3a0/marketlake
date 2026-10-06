@@ -527,6 +527,27 @@ def test_the_sunday_job_reports_suspended_versioning_and_still_pings(tmp_path):
     assert any("versioning is Suspended" in line for line in outcome.report)
 
 
+def test_a_bucket_target_reports_the_restore_test_as_not_built_and_still_pings(tmp_path):
+    # The bucket's restore is marketlake #640's. Until it lands the gap is named rather
+    # than silent, and it withholds nothing, since the switch to the bucket waits on it.
+    lake, client = _uploaded(tmp_path / "lake")
+    outcome, pinger = _sunday(lake, client)
+    assert outcome.backup.walked is True and outcome.backup.matched == ()
+    assert outcome.restore is None
+    assert f"restore test not built for a bucket target yet: {TARGET} (#640)" in outcome.report
+    assert outcome.problems == ()
+    assert pinger.urls == [URL]
+
+
+def test_a_bucket_scrub_that_stopped_early_adds_no_restore_line(tmp_path):
+    lake, client = _uploaded(tmp_path / "lake")
+    client.fail_with = unreachable()
+    outcome, _ = _sunday(lake, client)
+    assert outcome.backup.walked is False
+    assert outcome.restore is None
+    assert not any(line.startswith("restore") for line in outcome.report + outcome.problems)
+
+
 def test_a_bucket_target_without_a_client_is_a_caller_error(tmp_path):
     lake, _ = _uploaded(tmp_path / "lake")
     with pytest.raises(ValueError, match="bucket_client"):

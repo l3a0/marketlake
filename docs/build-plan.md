@@ -570,20 +570,19 @@ One rule places every test. Apply it in order and stop at the first match.
 13. Synthetic split replay.
 14. Restore from backup.
 
-Five of those have no test today. `tests/integration/` holds five files, three of them
+Four of those have no test today. `tests/integration/` holds five files, three of them
 roster items, and the rest of the roster is served at the component level, which is fine
 for the ones that need no real process to die partway. Test 4 is the first test in any
 tier to kill a running process, and the child it kills is
-`tests/support/compaction_child.py`. The five split into two kinds.
+`tests/support/compaction_child.py`.
 
-All five are buildable now, and each covers a failure the unit and component suites cannot
+All four are buildable now, and each covers a failure the unit and component suites cannot
 reach:
 
 1. 6, overnight death,
 2. 7, fully dark session,
 3. 12, the nightly sweep chain,
-4. 13, synthetic split replay,
-5. 14, restore from backup.
+4. 13, synthetic split replay.
 
 Test 13 joined that list when [#279](https://github.com/l3a0/marketlake/issues/279) shipped
 the detector it replays against. The fixture builder can express the re-symboling half of one now
@@ -598,7 +597,15 @@ beside them, which is what lets a fixture say *which* contract was re-symboled i
 rather than only that a root changed, so the replay can assert the master's mapping rows and
 not just the ledger's entry. Test 12 joined the list when
 [#281](https://github.com/l3a0/marketlake/issues/281) shipped the 18:30 job it replays, so
-nothing on the roster is blocked on unbuilt work any more.
+nothing on the roster is blocked on unbuilt work except test 14's bucket form.
+
+Test 14, restore from backup, is served for a path target and waits on
+[#640](https://github.com/l3a0/marketlake/issues/640) for a bucket. The Sunday job's weekly
+restore test, from [#631](https://github.com/l3a0/marketlake/issues/631), reads files back
+out of the backup copy and verifies them, and
+`tests/component/test_control_plane_sunday.py` and `tests/component/test_restore_check.py`
+drive it with a reader that returns wrong bytes or fails. The bucket form needs the bucket
+download, which is not built yet.
 
 ## The 8 live checks
 
