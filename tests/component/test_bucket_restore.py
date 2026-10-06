@@ -789,7 +789,7 @@ def test_a_torn_last_manifest_line_names_its_file_and_still_restores(tmp_path, m
 
 
 def test_a_shadow_host_still_restores(tmp_path, monkeypatch, capsys):
-    # The shadow refusal is about uploading under the primary's keys. A restore uploads
+    # The shadow refusal is about uploading under the primary's credentials. A restore uploads
     # nothing and writes only into an empty directory, which is how a new host is seeded.
     lake, client = _uploaded(tmp_path)
     config = _config(tmp_path, lake, role="shadow")

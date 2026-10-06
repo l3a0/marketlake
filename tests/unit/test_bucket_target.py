@@ -186,6 +186,99 @@ def test_a_malformed_region_loads_and_is_refused_when_a_job_runs(region):
         require_bucket_settings(cfg)
 
 
+@pytest.mark.parametrize(
+    ("value", "stored"),
+    [
+        ("keys", "keys"),
+        ("instance_profile", "instance_profile"),
+        (None, "None"),
+        ("", ""),
+        (" instance_profile ", " instance_profile "),
+        (["instance_profile"], "['instance_profile']"),
+        (True, "True"),
+    ],
+)
+def test_any_credential_source_loads_as_read(value, stored):
+    # Capture loads the config every minute, so loading refuses no backup setting. A
+    # blank ``bucket_credentials:`` parses to ``None`` and is stored as "None", which a
+    # bucket job then refuses rather than reading as absent.
+    cfg = Config.from_mapping(
+        {**BASE, "backup_target": "s3://lake-backup", "bucket_credentials": value}
+    )
+    assert cfg.bucket_credentials == stored
+
+
+def test_an_absent_credential_source_is_keys():
+    assert Config.from_mapping(BASE).bucket_credentials == "keys"
+
+
+def _profile(**overrides) -> Config:
+    return Config.from_mapping(
+        {
+            **BASE,
+            "backup_target": "s3://lake-backup",
+            "bucket_credentials": "instance_profile",
+            "bucket_region": "us-east-2",
+            **overrides,
+        }
+    )
+
+
+def test_instance_profile_with_a_region_and_no_keys_passes_the_job_checks():
+    cfg = _profile()
+    assert require_bucket_settings(cfg) == BucketTarget("lake-backup")
+    assert cfg.page_secrets() == ("PING-KEY-SECRET", "topic-secret-xyz")
+
+
+@pytest.mark.parametrize("present", ["bucket_access_key_id", "bucket_secret_access_key"])
+def test_a_key_beside_instance_profile_is_refused_naming_it(present):
+    with pytest.raises(ConfigError) as refused:
+        require_bucket_settings(_profile(**{present: KEYS[present]}))
+    assert str(refused.value) == (
+        f"bucket_credentials is instance_profile, so the config must not hold ['{present}']"
+    )
+
+
+def test_a_key_and_no_region_beside_instance_profile_are_refused_as_one_line():
+    with pytest.raises(ConfigError) as refused:
+        require_bucket_settings(
+            _profile(bucket_access_key_id=KEYS["bucket_access_key_id"], bucket_region=None)
+        )
+    assert str(refused.value) == (
+        "bucket_credentials is instance_profile, so the config must not hold "
+        "['bucket_access_key_id']. the bucket needs config key(s): ['bucket_region']"
+    )
+
+
+def test_instance_profile_with_a_malformed_region_is_refused():
+    with pytest.raises(ConfigError) as refused:
+        require_bucket_settings(_profile(bucket_region="useast2"))
+    assert str(refused.value) == (
+        "bucket_region 'useast2' is not an AWS region name like us-east-2"
+    )
+
+
+def test_instance_profile_without_a_region_is_refused_naming_only_the_region():
+    with pytest.raises(ConfigError) as refused:
+        require_bucket_settings(_profile(bucket_region=None))
+    message = str(refused.value)
+    assert "bucket_region" in message and "bucket_access_key_id" not in message
+
+
+@pytest.mark.parametrize(
+    "value", [None, "instance-profile", " instance_profile ", "AKIDPASTEDHERE"]
+)
+def test_an_unrecognised_credential_source_is_refused_alone(value):
+    # No key is present, and the refusal still lists none of them, because the value
+    # it cannot read is the only thing to fix. The value itself is never quoted.
+    cfg = Config.from_mapping(
+        {**BASE, "backup_target": "s3://lake-backup", "bucket_credentials": value}
+    )
+    with pytest.raises(ConfigError) as refused:
+        require_bucket_settings(cfg)
+    assert str(refused.value) == "bucket_credentials must be keys or instance_profile"
+
+
 def test_a_bucket_target_with_its_keys_loads_them_as_secrets():
     cfg = Config.from_mapping({**BASE, "backup_target": "s3://lake-backup/lake", **KEYS})
     assert cfg.backup_target == BucketTarget("lake-backup", "lake")

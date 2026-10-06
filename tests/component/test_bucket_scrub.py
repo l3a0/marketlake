@@ -31,7 +31,7 @@ from lake import control_plane as cp
 from lake.bucket import bucket_scrub, first_upload
 from lake.calendar import MARKET_TZ
 from lake.config import BucketTarget
-from lake.manifest import append_manifest, manifest_path, sha256_file
+from lake.manifest import BackupScrubResult, append_manifest, manifest_path, sha256_file
 from tests.support.bucket import FakeS3, client_error, unreachable
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
@@ -337,7 +337,15 @@ def test_a_refused_credential_is_named_refused_and_never_raises(tmp_path, code):
     result = bucket_scrub(lake, TARGET, client)
     assert result.bucket_refused == code
     assert result.bucket_unreachable is None
-    assert "refused" in result.problem and "access key" in result.problem
+    assert result.problem == (
+        f"backup bucket refused the scrub ({code}), so the bucket's credentials or their "
+        "policy may need replacing: s3://lake-backup/lake"
+    )
+
+
+def test_unusable_settings_are_named_in_full():
+    result = BackupScrubResult(target=str(TARGET), bucket_unusable="bucket_region is not set")
+    assert result.problem == "backup bucket settings cannot be used: bucket_region is not set"
 
 
 def test_a_failed_connection_is_named_unreachable_and_never_raises(tmp_path):
@@ -379,13 +387,13 @@ def test_every_credential_code_is_named_refused(tmp_path, code, status):
     ],
 )
 def test_a_busy_or_failing_service_is_named_unavailable_not_refused(tmp_path, code, status):
-    # A 503 SlowDown is S3 asking for fewer requests, which no new key repairs.
+    # A 503 SlowDown is S3 asking for fewer requests, which no new credentials repair.
     lake, client = _uploaded(tmp_path / "lake")
     client.fail_with = client_error(code, "HeadObject", status)
     result = bucket_scrub(lake, TARGET, client)
     assert result.bucket_unreachable == code
     assert result.bucket_refused is None
-    assert "access key" not in result.problem
+    assert "the bucket's credentials" not in result.problem
     assert "unavailable" in result.problem
 
 
@@ -395,7 +403,7 @@ def test_any_other_answer_is_named_failed_with_its_code(tmp_path):
     result = bucket_scrub(lake, TARGET, client)
     assert result.bucket_failed == "NoSuchBucket"
     assert result.bucket_refused is None and result.bucket_unreachable is None
-    assert "access key" not in result.problem
+    assert "the bucket's credentials" not in result.problem
     assert "NoSuchBucket" in result.problem
 
 
@@ -610,7 +618,7 @@ def test_a_refused_download_is_a_named_finding_and_never_raises(tmp_path):
     assert outcome.restore.unreadable == (
         f"{QUOTES}: BucketReadError: the bucket refused the read (AccessDenied)"
     )
-    assert any("Check the network and the bucket's access key" in line for line in outcome.report)
+    assert any("Check the network and the bucket's credentials" in line for line in outcome.report)
     # The canary still ran after the failed read.
     assert outcome.canary_passed is True
     assert pinger.urls == []

@@ -15,8 +15,10 @@ key is added. The healthchecks ping key builds the health-ping URLs. The ntfy to
 an unauthenticated channel that anyone holding the name can read and spoof. The Schwab
 API key and app secret are the static app-registration inputs ``schwab-py`` needs to
 build the client and refresh the token. The bucket's access key id and secret access
-key sign every request to the backup bucket, and ``lake.bucket`` builds its client
-from these two values alone. The rotating token itself is not here. It lives at
+key sign every request to the backup bucket on the key path, and ``lake.bucket`` builds
+its client from these two values alone. A host whose ``bucket_credentials`` is
+``instance_profile`` carries neither, because its credentials come from the EC2
+instance metadata service instead. The rotating token itself is not here. It lives at
 ``~/.config/marketlake/token.json`` and is handled elsewhere. Every secret is wrapped
 in ``Secret``, which redacts itself in every log, repr, and traceback. The one caller
 that must use a raw value calls ``reveal``. So a stray ``print(config)`` or a logged
@@ -27,16 +29,23 @@ with ``rsync``. A bucket URL, ``s3://<bucket>`` or ``s3://<bucket>/<prefix>``, i
 uploaded to by ``lake.bucket``. The scheme is read before any ``Path`` is built,
 because ``Path("s3://bucket/x")`` collapses the double slash and would name a local
 directory called ``s3:``. The bucket's two key values and its region are needed only
-when the target is a bucket. They may sit in the file beside a path target, which is
-how the first upload runs before the target is switched.
+when the target is a bucket. On the key path they may sit in the file beside a path
+target, which is how the first upload runs before the target is switched.
+
+``bucket_credentials`` says where the bucket client's credentials come from. ``keys``,
+the default when the key is absent, reads the two key values from this file.
+``instance_profile`` reads them from the EC2 instance metadata service, for a VM with an
+instance profile attached, and then this file must hold neither key value. The value is
+stored as read, the way ``role`` is, and only a bucket job checks it.
 
 **Loading never refuses a backup setting.** Capture loads this file every cycle and the
 daemon loads it at startup, so a refusal here would stop capture over a setting only
 the nightly backup reads, and a lost minute cannot be recovered. A value that does not
 start with ``s3://`` loads as a ``Path`` exactly as it always has, whatever it holds. An
 ``s3://`` value loads as a ``BucketTarget`` with no checks, and a missing bucket key
-loads as ``None``. ``require_bucket_settings`` holds the strict checks, and each bucket
-job calls it when it runs, so a bad bucket setting fails only the backup.
+loads as ``None``, and any ``bucket_credentials`` value loads as read.
+``require_bucket_settings`` holds the strict checks, and each bucket job calls it when
+it runs, so a bad bucket setting fails only the backup.
 
 One key is optional rather than required: ``schwab_callback_url``, the third static
 app-registration input. Only the weekly re-auth in ``lake.reauth`` reads it, and capture
@@ -100,6 +109,20 @@ BUCKET_KEY_ID_KEY = "bucket_access_key_id"
 BUCKET_SECRET_KEY = "bucket_secret_access_key"
 BUCKET_REGION_KEY = "bucket_region"
 BUCKET_KEYS = (BUCKET_KEY_ID_KEY, BUCKET_SECRET_KEY, BUCKET_REGION_KEY)
+
+# Where the bucket client's credentials come from, and the two values that key takes.
+# ``keys`` reads the two key values from this file and is what an absent key means.
+# ``instance_profile`` reads them from the EC2 instance metadata service.
+BUCKET_CREDENTIALS_KEY = "bucket_credentials"
+CREDENTIALS_FROM_KEYS = "keys"
+CREDENTIALS_FROM_INSTANCE_PROFILE = "instance_profile"
+
+# The refusal for any other ``bucket_credentials`` value. It never quotes the value, for
+# the reason ``bucket_credential_problems`` gives, and ``lake.bucket`` raises it too.
+UNRECOGNISED_CREDENTIALS = (
+    f"{BUCKET_CREDENTIALS_KEY} must be {CREDENTIALS_FROM_KEYS} or "
+    f"{CREDENTIALS_FROM_INSTANCE_PROFILE}"
+)
 
 # What S3 allows in a bucket name: 3 to 63 lowercase letters, digits, dots and hyphens,
 # starting and ending with a letter or digit.
@@ -252,6 +275,47 @@ def bucket_target_problems(target: BucketTarget) -> list[str]:
     return problems
 
 
+def bucket_credential_problems(config: Config) -> list[str]:
+    """What is wrong with the config's credential settings, as operator phrases.
+
+    ``bucket_credentials`` decides what must be present.
+
+    1. ``keys`` needs ``bucket_access_key_id``, ``bucket_secret_access_key`` and
+       ``bucket_region``.
+    2. ``instance_profile`` needs ``bucket_region`` and refuses either key value, so one
+       machine cannot hold both by mistake.
+    3. Any other value is refused alone, naming the key and the two values it takes.
+       The value read is never quoted, because a key about credentials invites a pasted
+       secret. It never falls back to ``keys``.
+
+    ``require_bucket_settings`` and ``lake.bucket.client_from_config`` both call this.
+    """
+    source = config.bucket_credentials
+    if source not in (CREDENTIALS_FROM_KEYS, CREDENTIALS_FROM_INSTANCE_PROFILE):
+        return [UNRECOGNISED_CREDENTIALS]
+    problems = []
+    key_id, secret_key = config.bucket_access_key_id, config.bucket_secret_access_key
+    if source == CREDENTIALS_FROM_INSTANCE_PROFILE:
+        if key_id is not None or secret_key is not None:
+            present = [
+                key
+                for key, value in ((BUCKET_KEY_ID_KEY, key_id), (BUCKET_SECRET_KEY, secret_key))
+                if value is not None
+            ]
+            problems.append(
+                f"{BUCKET_CREDENTIALS_KEY} is {CREDENTIALS_FROM_INSTANCE_PROFILE}, so the "
+                f"config must not hold {present}"
+            )
+        needed = ((BUCKET_REGION_KEY, config.bucket_region),)
+    else:
+        values = (key_id, secret_key, config.bucket_region)
+        needed = tuple(zip(BUCKET_KEYS, values, strict=True))
+    absent = [key for key, value in needed if value is None]
+    if absent:
+        problems.append(f"the bucket needs config key(s): {absent}")
+    return problems
+
+
 def require_bucket_settings(config: Config, target: BucketTarget | None = None) -> BucketTarget:
     """The strict checks a bucket job runs before it builds a client, or a ``ConfigError``.
 
@@ -260,8 +324,9 @@ def require_bucket_settings(config: Config, target: BucketTarget | None = None) 
 
     1. The bucket name is one S3 accepts.
     2. The prefix holds no ``.`` or ``..`` component.
-    3. ``bucket_access_key_id``, ``bucket_secret_access_key`` and ``bucket_region`` are
-       all present.
+    3. The credential settings fit ``bucket_credentials``, as
+       :func:`bucket_credential_problems` states: ``bucket_region`` always, the two key
+       values on the key path, and neither of them on the instance-profile path.
     4. The region has the shape of an AWS region name.
 
     Loading the config runs none of these, so a bad bucket setting reaches the job that
@@ -273,10 +338,7 @@ def require_bucket_settings(config: Config, target: BucketTarget | None = None) 
             raise ConfigError(f"backup_target is not an {BUCKET_SCHEME} bucket")
         target = config.backup_target
     problems = bucket_target_problems(target)
-    values = (config.bucket_access_key_id, config.bucket_secret_access_key, config.bucket_region)
-    absent = [key for key, value in zip(BUCKET_KEYS, values, strict=True) if value is None]
-    if absent:
-        problems.append(f"the bucket needs config key(s): {absent}")
+    problems.extend(bucket_credential_problems(config))
     region = config.bucket_region
     if region is not None and not _REGION.fullmatch(region):
         problems.append(f"{BUCKET_REGION_KEY} {region!r} is not an AWS region name like us-east-2")
@@ -561,6 +623,11 @@ class Config:
     # ``ROLE_ABSENT``. Never the value itself, because a list would make this frozen
     # config unhashable. ``lake.outbox`` names what it read when it is neither role.
     role: str | _Absent = ROLE_ABSENT
+    # The ``bucket_credentials`` string as the file held it, or the ``repr`` of any other
+    # value, the way ``role`` is stored. An absent key is ``keys``. Only a bucket job
+    # checks it, through ``bucket_credential_problems``. It stays out of the repr,
+    # because a key named for credentials invites a pasted secret.
+    bucket_credentials: str = field(default=CREDENTIALS_FROM_KEYS, repr=False)
 
     def paths(self) -> LakePaths:
         """The lake path builder rooted at ``lake_root``. The DATA_DIR-to-paths bridge."""
@@ -597,6 +664,8 @@ class Config:
         a required key, so a mapping without it yields ``None`` there and every other
         value as usual. ``role`` is stored as read when it is a string and as its
         ``repr`` otherwise, and a mapping without it yields ``ROLE_ABSENT``.
+        ``bucket_credentials`` is stored the same way, and a mapping without it yields
+        ``keys``.
         """
         missing = [key for key in _REQUIRED_KEYS if mapping.get(key) is None]
         if missing:
@@ -617,6 +686,11 @@ class Config:
             bucket_secret_access_key=None if secret_key is None else Secret(secret_key),
             bucket_region=_optional_text(mapping.get(BUCKET_REGION_KEY)),
             role=_role_text(mapping[ROLE_KEY]) if ROLE_KEY in mapping else ROLE_ABSENT,
+            bucket_credentials=(
+                _role_text(mapping[BUCKET_CREDENTIALS_KEY])
+                if BUCKET_CREDENTIALS_KEY in mapping
+                else CREDENTIALS_FROM_KEYS
+            ),
         )
 
 
@@ -624,7 +698,8 @@ def _role_text(value: object) -> str:
     """A present ``role`` value as a string: itself when it is one, its ``repr`` if not.
 
     So an empty ``role:`` stores ``"None"`` and ``role: off`` stores ``"False"``, and
-    ``lake.outbox`` still names what the file held.
+    ``lake.outbox`` still names what the file held. ``bucket_credentials`` is read the
+    same way, so a blank one stores ``"None"`` and a bucket job refuses it.
     """
     return value if isinstance(value, str) else repr(value)
 

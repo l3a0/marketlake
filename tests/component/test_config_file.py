@@ -34,6 +34,23 @@ def test_load_config_reads_a_file(tmp_path: Path):
     assert cfg.guards.watchdog_page_minutes == 4
 
 
+@pytest.mark.parametrize(
+    ("line", "stored"),
+    [
+        ("bucket_credentials:\n", "None"),
+        ("bucket_credentials: instance_profile\n", "instance_profile"),
+        ("bucket_credentials: nonsense\n", "nonsense"),
+        ("bucket_credentials: [a, b]\n", "['a', 'b']"),
+    ],
+)
+def test_load_config_accepts_any_credential_source(tmp_path: Path, line, stored):
+    # Capture loads this file every cycle, so a bad backup setting must load. Only a
+    # bucket job refuses it, marketlake #663.
+    path = _write(tmp_path / "config.yaml", backup="s3://lake-backup")
+    path.write_text(path.read_text() + line)
+    assert load_config(path).bucket_credentials == stored
+
+
 def test_env_var_points_the_loader_at_a_file(tmp_path: Path):
     cfg_file = _write(tmp_path / "elsewhere.yaml")
     cfg = load_config(env={"MARKETLAKE_CONFIG": str(cfg_file)})

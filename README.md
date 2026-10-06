@@ -92,7 +92,9 @@ partition's old version is its only good copy. `infra/live/iam.tf` holds the use
 which grants exactly `s3:PutObject`, `s3:GetObject`, `s3:ListBucket` and
 `s3:GetBucketVersioning`, and nothing that deletes a version or changes the bucket.
 
-Two steps stay by hand, and nothing here names a real account, bucket, or key.
+Two steps stay by hand on the key path, which is how the laptop signs its requests, and
+nothing here names a real account, bucket, or key. A hosted VM takes its credentials from
+an instance profile instead, and the procedure after the steps says what changes for it.
 
 1. Create an access key for the user `marketlake-backup` in the AWS console. The key stays
    out of code, so no secret reaches the infrastructure's state.
@@ -103,8 +105,8 @@ The lifecycle rules expect the lake under the `lake/` prefix, so `backup_target`
 `/lake`, which keeps the live check's probe objects under `live-check/` outside it. The
 examples below use the placeholder bucket `example-lake-backup`.
 
-Step 2's keys in `config.yaml`. The three `bucket_` keys may sit beside a path
-`backup_target`, which is how the first upload runs before the switch.
+Step 2's keys in `config.yaml`. On the key path the three `bucket_` keys may sit beside a
+path `backup_target`, which is how the first upload runs before the switch.
 
 ```yaml
 bucket_access_key_id: <access key id>
@@ -114,20 +116,57 @@ bucket_region: <region, like us-east-2>
 backup_target: s3://example-lake-backup/lake
 ```
 
-The client is built from those three values alone, never from `~/.aws/` or an `AWS_*`
-environment variable. Loading `config.yaml` never checks them or the bucket's name, so
-a mistyped value fails the backup, the first upload or the Sunday scrub that uses it,
-each with one line naming the key, and never stops capture.
+On the key path the client is built from those three values alone, never from
+`~/.aws/` or an `AWS_*` environment variable. Loading `config.yaml` never checks them,
+`bucket_credentials` or the bucket's name, so a mistyped value fails the backup, the
+first upload or the Sunday scrub that uses it, each with one line naming the key, and
+never stops capture.
 
-Four commands go with it. The first two refuse with exit 2 on a shadow host, which is
+A hosted VM in the bucket's AWS account signs with short-lived credentials from an
+instance profile, an IAM role attached to the instance, so no long-lived key sits on it
+([#663](https://github.com/l3a0/marketlake/issues/663)). The bucket is the same, and the
+two steps change as follows.
+
+1. Step 1 has no key to create. `infra/live/iam.tf` describes the IAM role and instance
+   profile `marketlake-instance`, whose S3 policy carries the same four actions as the
+   laptop's key and stays off until the cutover turns it on, and
+   [#686](https://github.com/l3a0/marketlake/issues/686) has the VM require metadata
+   tokens.
+2. Step 2's key lines become one setting. The VM's `config.yaml` is written at deploy
+   time, by [#686](https://github.com/l3a0/marketlake/issues/686)'s cloud-init and
+   [#676](https://github.com/l3a0/marketlake/issues/676)'s deploy, from the parameters
+   [#699](https://github.com/l3a0/marketlake/issues/699) keeps in SSM Parameter Store.
+   It names the source beside the region and holds neither key field.
+
+   ```yaml
+   bucket_credentials: instance_profile
+   bucket_region: <region, like us-east-1>
+   ```
+
+3. The rest of step 2, the first upload, the restore and the `backup_target` change,
+   follows the cutover order on [#638](https://github.com/l3a0/marketlake/issues/638).
+   Run `first-upload` only on the host whose lake the bucket should hold, because it
+   replaces the bucket's `manifest.jsonl`. Run `live-check` in the same order, after the
+   IAM role's policy is turned on.
+
+The client asks the instance metadata service for credentials only when `config.yaml`
+says `bucket_credentials: instance_profile`. It then takes them from that service alone,
+never from `~/.aws/`, an `AWS_*` variable or a boto config file, and it sends the lookup
+through no proxy. An absent
+`bucket_credentials` means `keys`, the laptop's path. A host where the setting finds no
+credentials, such as a VM with no instance profile or a laptop that carries the setting
+by mistake, refuses with one line naming both fixes: attach the instance profile, or set
+`bucket_credentials: keys` in `config.yaml`.
+
+Four commands go with the bucket. The first two refuse with exit 2 on a shadow host, which is
 any host whose config sets `role` to something other than `primary`. The restore runs on
 either.
 
 1. `uv run python -m lake.bucket live-check --target s3://example-lake-backup/live-check`
    confirms the four S3 behaviors the design rests on, and is live check 8 in the build
    plan. It writes three probe objects and names the prefix to delete by hand, since the
-   narrow key cannot delete. The narrow key also cannot read an old version, so behavior
-   3's read-back of the first version fails with it, and the check says to confirm in
+   bucket's credentials cannot delete. They also cannot read an old version, so behavior
+   3's read-back of the first version fails with them, and the check says to confirm in
    the console that the probe key shows two versions.
 2. `uv run python -m lake.bucket first-upload --target s3://example-lake-backup/lake`
    uploads the whole lake, comparing every object, and prints its throughput. Run it on
@@ -178,7 +217,7 @@ only objects whose stored SHA-256 the scrub matched, so a sample mismatch is rot
 in an object whose stored checksum is right. A sealed partition is written once, so its
 rotted current version is usually its only version, and neither upload replaces an
 object whose stored checksum matches. Once the Sunday lake scrub passes on the file, put
-it back with the bucket's key, as a single PUT carrying its SHA-256:
+it back with the bucket's credentials, as a single PUT carrying its SHA-256:
 
 ```bash
 aws s3api put-object --bucket example-lake-backup --key lake/<path> --body <lake_root>/<path> --checksum-algorithm SHA256
@@ -186,8 +225,8 @@ aws s3api put-object --bucket example-lake-backup --key lake/<path> --body <lake
 
 When the lake is gone, an earlier version is recovered by hand in the S3 console. That
 works only for a file the manifest records whose later version overwrote a good one,
-such as a nightly file rewritten or a partition recompacted. The narrow key holds no
-`s3:GetObjectVersion`, so this is a console step.
+such as a nightly file rewritten or a partition recompacted. The bucket's credentials hold
+no `s3:GetObjectVersion`, so this is a console step.
 
 1. Open the bucket, turn on **Show versions**, and go to the file's key under the lake's
    prefix.
