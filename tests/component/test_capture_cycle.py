@@ -249,8 +249,28 @@ def test_manifest_gains_one_entry_per_segment_keyed_by_the_segment_path(cassette
         entry = latest[segment.partition]
         assert entry["source"] == capture.CAPTURE_SOURCE
         assert entry["rows"] == segment.rows
+        assert segment.fetched_at is not None
+        assert entry["fetched_at"] == segment.fetched_at
         # The recorded checksum matches the segment on disk.
         assert entry["sha256"] == sha256_file(lake_root / segment.partition)
+
+
+def test_a_gap_segment_entry_counts_its_gap_row(lake_root):
+    # QQQ's chain gaps, so its segment holds one row and no data row. The manifest records
+    # the rows in the file, which is what compaction checks the sealed partition against.
+    vendor = CassetteVendor(load_cassette(CASSETTES / "chain_fail.json"))
+    result = capture.run_cycle(
+        ManualClock(start=_CLOCK_START),
+        vendor,
+        _both_options(),
+        lake_root,
+        pid=4242,
+        plan=_ONE_WINDOW,
+    )
+
+    gap = result.segment(CHAINS, "QQQ")
+    assert (gap.rows, gap.data_rows) == (1, 0)
+    assert latest_entries(lake_root)[gap.partition]["rows"] == 1
 
 
 def _cycle(lake_root: Path, *, minute: int = 0) -> capture.CycleResult:

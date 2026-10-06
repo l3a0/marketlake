@@ -69,7 +69,7 @@ from lake.compact import (
     compact,
     recompact_ticker_day,
 )
-from lake.manifest import latest_entries, sha256_file
+from lake.manifest import latest_entries, manifest_path, sha256_file
 from lake.paths import LakePaths
 from lake.report import DamagedSegment, SegmentDamage
 from lake.tickers import Roster
@@ -397,6 +397,20 @@ def test_a_segment_damaged_while_its_writer_waits_for_the_lock_keeps_its_close_t
     assert damaged.exists()
     assert not _partition(lake_root, "SPY").exists()
     assert events == ["backup", "ping"]
+
+
+def test_a_snapshot_whose_hash_at_close_raises_records_no_entry(lake_root, monkeypatch):
+    # A snapshot has no fallback hash under the lock. Its caller reads the raise, so the
+    # entry is not written with a digest taken after the segment could have changed.
+    def refuse(path):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(capture, "sha256_file", refuse)
+
+    with pytest.raises(PermissionError):
+        _captured(lake_root, "SPY", count=1)
+
+    assert not manifest_path(lake_root).exists()
 
 
 def test_every_damaged_segment_is_named_not_only_the_first(lake_root):

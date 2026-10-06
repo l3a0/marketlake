@@ -7,6 +7,7 @@ is passed in.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import threading
@@ -249,6 +250,16 @@ def test_two_entries_for_one_partition_in_a_batch_are_checked_against_each_other
     assert latest_entries(lake_root)["q"]["rows"] == 405
 
 
+def test_a_third_entry_for_one_partition_is_checked_against_the_second(lake_root):
+    # The second entry raises the count, so the third is measured against 405 and refused.
+    # Measured against the first entry's 400, it would pass.
+    with pytest.raises(RowCountRegression) as refusal:
+        append_entries(lake_root, [_spec("p", 400), _spec("p", 405), _spec("p", 401)])
+
+    assert (refusal.value.recorded, refusal.value.proposed) == (405, 401)
+    assert [entry["rows"] for entry in read_manifest(lake_root)] == [400, 405]
+
+
 def test_a_refusal_writes_the_lines_before_it_and_none_after(lake_root):
     append_manifest(
         lake_root, partition="q", source="capture", sha256="s", rows=10, fetched_at=None
@@ -344,6 +355,48 @@ def test_a_missing_digest_is_hashed_at_its_place_in_the_batch(lake_root):
     assert entries[1]["sha256"] == sha256_file(lake_root / "b.bin")
 
 
+def test_a_refusal_at_the_first_entry_creates_no_manifest(lake_root):
+    # No line passed, so nothing is written, and a lake with no manifest still has none.
+    with pytest.raises(FileNotFoundError):
+        append_entries(lake_root, [_spec("gone.bin", 1, None)])
+
+    assert not manifest_path(lake_root).exists()
+
+
+def test_an_append_creates_the_manifest_readable_by_others(lake_root):
+    previous = os.umask(0o022)
+    try:
+        append_entries(lake_root, [_spec("a", 1)])
+    finally:
+        os.umask(previous)
+
+    assert manifest_path(lake_root).stat().st_mode & 0o777 == 0o644
+
+
+def test_a_write_that_raises_still_closes_the_manifest(lake_root, monkeypatch):
+    opened: list[int] = []
+    real_open = os.open
+
+    def recording_open(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def full(fd, data):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "open", recording_open)
+    monkeypatch.setattr(os, "write", full)
+
+    with pytest.raises(OSError, match="No space left on device"):
+        append_entries(lake_root, [_spec("a", 1)])
+
+    (fd,) = opened
+    with pytest.raises(OSError) as closed:
+        os.fstat(fd)
+    assert closed.value.errno == errno.EBADF
+
+
 def _short_by(monkeypatch, keep: int) -> None:
     """Make the next ``os.write`` land only its first ``keep`` bytes and say so."""
     real = os.write
@@ -393,6 +446,18 @@ def test_a_short_batch_write_on_a_line_boundary_raises_rather_than_dropping_entr
         append_entries(lake_root, [_spec("a", 1), _spec("b", 2)])
 
     assert manifest_path(lake_root).read_bytes() == first
+
+
+def test_a_write_short_by_one_byte_raises(lake_root, monkeypatch):
+    # The newline is the byte that did not land, so the line reads whole until the next
+    # append fuses onto it. The count is the only thing that sees it.
+    line = (json.dumps(_spec("a", 1), sort_keys=True) + "\n").encode("utf-8")
+    _short_by(monkeypatch, len(line) - 1)
+
+    with pytest.raises(OSError, match=f"wrote {len(line) - 1} of {len(line)} bytes"):
+        append_entries(lake_root, [_spec("a", 1)])
+
+    assert manifest_path(lake_root).read_bytes() == line[:-1]
 
 
 # -- the two-way scrub -------------------------------------------------------
