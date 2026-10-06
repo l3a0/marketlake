@@ -3,8 +3,11 @@
 A default bound when its module is imported keeps the directory the environment named at
 that moment. On 2026-10-06 a probe that moved ``HOME`` after ``import lake`` overwrote a
 host's live roster through one. ``tests/support/config_defaults.py`` reads the source for
-three things: nothing resolves a config path at import, the resolvers it finds are the
-ones the child-process tests enumerate, and every ``config_dir`` call sits inside one.
+three things.
+
+1. Nothing builds a config path at import.
+2. The resolvers it finds are the ones the child-process tests enumerate.
+3. Every ``config_dir`` call that resolves this process's own directory sits inside one.
 
 These cover both halves. The scanner's answers about the real tree are what keep the
 package honest. Its answers about a synthetic tree are the half the real tree cannot
@@ -132,7 +135,8 @@ def test_a_new_constant_is_found(tmp_path):
         ("from lake.paths import config_dir\nD = config_dir\n", False),
         # A different function that happens to be called.
         ("from lake.paths import temp_write_path\nD = temp_write_path('x', 1)\n", False),
-        # A function whose name only contains the word.
+        # A function whose name only contains the word. It is defined in another module,
+        # so it is not recognised as a wrapper either, one of the scanner's named limits.
         ("from lake.control_plane import default_config_dir\nD = default_config_dir('h')\n", False),
     ],
 )
@@ -225,6 +229,11 @@ def test_a_tuple_assignment_names_everything_it_binds(tmp_path):
 
 
 def test_a_chained_assignment_names_every_target(tmp_path):
+    """``A = B = config_dir() / X`` binds both, so both have to be reported.
+
+    Every real default and every other test here uses a single target, so the loop over
+    targets is never put under load by anything else.
+    """
     root = _package(
         tmp_path / "lake",
         {"probe.py": "from lake.paths import config_dir\nA = B = config_dir() / 'x'\n"},
@@ -233,6 +242,8 @@ def test_a_chained_assignment_names_every_target(tmp_path):
 
 
 def test_two_constants_in_one_module_are_both_found(tmp_path):
+    # Keyed by module, so a dict keyed that way would lose one. Every module that built a
+    # default before marketlake #715 built exactly one, so nothing else would notice.
     root = _package(
         tmp_path / "lake",
         {
@@ -324,7 +335,12 @@ def test_a_package_init_is_named_without_its_stem(tmp_path):
 
 
 def test_a_file_that_never_spells_the_name_is_skipped(tmp_path):
-    """The pre-filter is an optimisation, so it has to be invisible in the result."""
+    """The pre-filter is an optimisation, so it has to be invisible in the result.
+
+    Parsing every file is several times slower than parsing the ones the filter keeps, as
+    ``_parsed`` in ``tests/support/config_defaults.py`` measures. A filter that dropped a
+    file which did build a path would make that saving a bug.
+    """
     root = _package(
         tmp_path / "lake",
         {
@@ -336,6 +352,8 @@ def test_a_file_that_never_spells_the_name_is_skipped(tmp_path):
 
 
 def test_the_scan_is_ordered_and_repeatable(tmp_path):
+    # Sorted output, so the list a reader sees is stable across machines and a diff of
+    # it reads as a diff rather than as a reshuffle.
     root = _package(
         tmp_path / "lake",
         {
@@ -353,6 +371,152 @@ def test_an_empty_tree_scans_to_nothing(tmp_path):
     assert bindings_at_import(root) == ()
     assert resolvers(root) == ()
     assert config_dir_calls_outside_resolvers(root) == ()
+
+
+# -- a wrapper, an alias, a statement header, and Path.home() ----------------------------
+
+# The imports every synthetic module below starts with.
+IMPORTS = (
+    "import contextlib\n"
+    "import pathlib\n"
+    "from pathlib import Path\n"
+    "from lake.paths import config_dir, default_token_path\n"
+)
+
+
+def _scan(tmp_path: Path, source: str) -> Path:
+    """A tree holding the synthetic ``lake.paths`` and one probe module."""
+    return _package(
+        tmp_path / "lake", {"paths.py": PATHS_WITH_A_RESOLVER, "probe.py": IMPORTS + source}
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # A private wrapper around a resolver.
+        "def _wrap():\n    return default_token_path()\nP = _wrap()\n",
+        # A wrapper that takes a required home, called with a fixed one.
+        "def default_cfg_dir(home):\n    return config_dir(home)\nP = default_cfg_dir('/h')\n",
+        # A wrapper of a wrapper, which takes a second round to find.
+        (
+            "def _inner():\n    return config_dir()\n"
+            "def _outer():\n    return _inner() / 'x'\n"
+            "P = _outer()\n"
+        ),
+        # A wrapper around Path.home().
+        "def _home():\n    return Path.home() / '.config'\nP = _home()\n",
+        # A wrapper defined under a top-level block still runs from module level.
+        (
+            "try:\n    def _wrap():\n        return config_dir()\n"
+            "except ImportError:\n    pass\n"
+            "P = _wrap()\n"
+        ),
+    ],
+)
+def test_a_wrapper_called_at_import_is_found(tmp_path, source):
+    """A function that builds a path, called at import, fixes the path there."""
+    assert bindings_at_import(_scan(tmp_path, source)) == (("lake.probe", "P"),)
+
+
+@pytest.mark.parametrize(
+    ("source", "where"),
+    [
+        ("for P in [default_token_path()]:\n    pass\n", "P"),
+        ("async for P in default_token_path():\n    pass\n", "P"),
+        ("if (P := default_token_path()):\n    pass\n", "P"),
+        ("while (P := default_token_path()) is None:\n    pass\n", "P"),
+        ("with contextlib.nullcontext(default_token_path()) as P:\n    pass\n", "P"),
+        ("async with contextlib.nullcontext(default_token_path()) as P:\n    pass\n", "P"),
+        ("match default_token_path():\n    case _:\n        pass\n", "<match>"),
+        ("match 1:\n    case _ if default_token_path():\n        pass\n", "<match>"),
+        ("try:\n    pass\nexcept (default_token_path(),):\n    pass\n", "<try>"),
+        ("try:\n    P = default_token_path()\nexcept* OSError:\n    pass\n", "P"),
+        ("@contextlib.contextmanager\n@print(default_token_path())\ndef f():\n    pass\n", "f()"),
+        ("def f(p: print(default_token_path()) = None):\n    pass\n", "f()"),
+        ("@print(default_token_path())\nclass C:\n    pass\n", "C"),
+        ("class C(dict, metaclass=print(default_token_path())):\n    pass\n", "C"),
+        ("class C:\n    for P in [default_token_path()]:\n        pass\n", "C.P"),
+        ("print([p for p in [default_token_path()]])\n", "<expression>"),
+    ],
+)
+def test_a_statement_header_or_decorator_is_found(tmp_path, source, where):
+    """Each of these is evaluated at import, outside any assignment.
+
+    Every case calls a resolver rather than ``config_dir``, so the closing check, which
+    reads only ``config_dir`` calls, cannot be what finds it.
+    """
+    root = _scan(tmp_path, source)
+    assert bindings_at_import(root) == (("lake.probe", where),)
+    assert config_dir_calls_outside_resolvers(root) == ()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "_cd = config_dir\nP = _cd() / 'a'\n",
+        "_cd: object = config_dir\nP = _cd() / 'a'\n",
+        "from lake import paths\n_cd = paths.config_dir\nP = _cd() / 'a'\n",
+        "_first = config_dir\n_second = _first\nP = _second() / 'a'\n",
+    ],
+)
+def test_a_plain_name_alias_of_config_dir_is_found(tmp_path, source):
+    """An alias calls the same function, so both checks have to see through it."""
+    root = _scan(tmp_path, source)
+    assert bindings_at_import(root) == (("lake.probe", "P"),)
+    assert [module for module, _ in config_dir_calls_outside_resolvers(root)] == ["lake.probe"]
+
+
+def test_a_plain_name_alias_of_a_resolver_is_found(tmp_path):
+    root = _scan(tmp_path, "_where = default_token_path\nP = _where()\n")
+    assert bindings_at_import(root) == (("lake.probe", "P"),)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "TOKEN = Path.home() / '.config' / 'marketlake' / 'token.json'\n",
+        "TOKEN = pathlib.Path.home() / 'token.json'\n",
+        "from pathlib import Path as P\nTOKEN = P.home() / 'token.json'\n",
+        "_home = Path.home\nTOKEN = _home() / 'token.json'\n",
+        "class Holder:\n    TOKEN = Path.home() / 'token.json'\n",
+    ],
+)
+def test_path_home_at_import_is_found(tmp_path, source):
+    """``Path.home()`` is the other way a path under this user's home is built."""
+    found = bindings_at_import(_scan(tmp_path, source))
+    assert [where.rsplit(".", 1)[-1] for _, where in found] == ["TOKEN"], found
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # Inside a function body, which runs when called.
+        "def where():\n    return Path.home() / 'x'\n",
+        # An attribute read, not a call.
+        "class Host:\n    home = '/h'\nH = Host.home\n",
+        # A home method on something that is not a Path.
+        "class Host:\n    def home(self):\n        return '/h'\nH = Host().home()\n",
+        # A wrapper that is defined and never called at import.
+        "def _wrap():\n    return default_token_path()\nW = _wrap\n",
+    ],
+)
+def test_what_builds_nothing_at_import_is_not_found(tmp_path, source):
+    assert bindings_at_import(_scan(tmp_path, source)) == ()
+
+
+def test_the_body_of_a_main_guard_is_not_import(tmp_path):
+    """``if __name__ == "__main__":`` runs only when the module is the program.
+
+    Most modules in ``src/lake`` end with one calling ``main()``, and ``main`` often
+    resolves a default. Its ``else`` branch does run at import, so it is still scanned.
+    """
+    source = (
+        "def main():\n    return default_token_path()\n"
+        "if __name__ == '__main__':\n    P = main()\n"
+        "else:\n    Q = main()\n"
+    )
+    assert bindings_at_import(_scan(tmp_path, source)) == (("lake.probe", "Q"),)
 
 
 # -- the resolver list --------------------------------------------------------------------
@@ -421,12 +585,44 @@ def test_a_resolver_reached_through_an_alias_or_the_module_is_listed(tmp_path):
         "class C:\n    def default_path(self):\n        return config_dir()\n",
         # A default argument of a resolver runs at import, so the body rule does not cover it.
         "def default_path(p=config_dir()):\n    return p\n",
+        # A default_* that takes a required home and ignores it, resolving its own.
+        "def default_y_path(home):\n    return config_dir() / 'y'\n",
+        "def default_y_path(home):\n    return config_dir(None) / 'y'\n",
+        "def default_y_path(home):\n    return config_dir(env={}) / 'y'\n",
+        (
+            "from pathlib import Path\n"
+            "def default_y_path(home):\n    return config_dir(str(Path.home())) / 'y'\n"
+        ),
+        (
+            "from pathlib import Path\n"
+            "def default_y_path(home):\n    return config_dir(home=Path.home()) / 'y'\n"
+        ),
     ],
 )
 def test_a_config_dir_call_outside_a_resolver_is_refused(tmp_path, source):
     root = _package(tmp_path / "lake", {"probe.py": f"from lake.paths import config_dir\n{source}"})
     found = config_dir_calls_outside_resolvers(root)
     assert [module for module, _ in found] == ["lake.probe"], found
+
+
+def test_a_default_requiring_a_home_that_resolves_its_own_is_neither_listed_nor_allowed(tmp_path):
+    """It cannot be called with nothing, so no test that enumerates the list runs it.
+
+    It still resolves the running process's own directory, so the closing check is what
+    has to catch it.
+    """
+    root = _package(
+        tmp_path / "lake",
+        {
+            "probe.py": (
+                "from lake.paths import config_dir\n"
+                "def default_y_path(home):\n"
+                "    return config_dir() / 'y'\n"
+            )
+        },
+    )
+    assert resolvers(root) == ()
+    assert config_dir_calls_outside_resolvers(root) == (("lake.probe", 3),)
 
 
 def test_a_config_dir_call_inside_a_resolver_passes(tmp_path):
@@ -437,6 +633,8 @@ def test_a_config_dir_call_inside_a_resolver_passes(tmp_path):
                 "from lake.paths import config_dir\n"
                 "def default_config_dir(home):\n"
                 "    return config_dir(home)\n"
+                "def default_named_home(*, home):\n"
+                "    return config_dir(home=home)\n"
                 "def default_path():\n"
                 "    def helper():\n"
                 "        return config_dir()\n"

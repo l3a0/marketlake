@@ -455,8 +455,15 @@ def test_the_variable_is_spelled_the_way_the_design_doc_names_it():
 # here, so a new one is checked without anyone remembering to add it.
 RESOLVERS = resolvers()
 
-# The four files the config directory holds, each with exactly one resolver.
-MACHINE_FILES = {CONFIG_FILE, TICKERS_FILE, TOKEN_FILE, CHAIN_PLAN_FILE}
+# Which file each resolver names. The pairing is the claim, so it is typed here. Its key
+# set is checked against the scan above, so a resolver added, removed or renamed in
+# ``src/lake`` fails that check rather than dropping out of the pairing.
+RESOLVER_FILES = {
+    ("lake.chain_plan", "default_chain_plan_path"): CHAIN_PLAN_FILE,
+    ("lake.config", "default_config_path"): CONFIG_FILE,
+    ("lake.paths", "default_token_path"): TOKEN_FILE,
+    ("lake.tickers", "default_tickers_path"): TICKERS_FILE,
+}
 
 
 def _resolve(module: str, name: str) -> Path:
@@ -468,16 +475,23 @@ def test_the_resolver_scan_is_not_empty():
     assert ("lake.paths", "default_token_path") in RESOLVERS
 
 
-@pytest.mark.parametrize(("module", "name"), RESOLVERS)
-def test_every_machine_file_sits_in_the_excluded_directory(module, name):
-    default = _resolve(module, name)
-    assert default.parent == config_dir()
-    assert default.name in MACHINE_FILES
+def test_every_resolver_the_scan_finds_is_paired_with_its_file():
+    assert set(RESOLVERS) == set(RESOLVER_FILES)
 
 
 def test_each_machine_file_has_one_resolver():
-    names = [_resolve(module, name).name for module, name in RESOLVERS]
-    assert sorted(names) == sorted(MACHINE_FILES)
+    # The four files the config directory holds, each named once.
+    files = sorted(RESOLVER_FILES.values())
+    assert files == sorted([CONFIG_FILE, TICKERS_FILE, TOKEN_FILE, CHAIN_PLAN_FILE])
+
+
+@pytest.mark.parametrize(("module", "name"), RESOLVERS)
+def test_every_machine_file_sits_in_the_excluded_directory(module, name):
+    # An exact name, never membership in the set of four. Two resolvers that swapped
+    # their files would each still name one of the four.
+    default = _resolve(module, name)
+    assert default.parent == config_dir()
+    assert default.name == RESOLVER_FILES[(module, name)]
 
 
 @pytest.mark.parametrize(("module", "name"), RESOLVERS)

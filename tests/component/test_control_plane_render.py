@@ -28,7 +28,7 @@ import pytest
 
 from lake import control_plane as cp
 from lake.metadata import stamp_assertion_pid, stamp_cycle
-from lake.paths import TOKEN_FILE, config_dir, default_token_path
+from lake.paths import CONFIG_DIR_ENV, TOKEN_FILE, config_dir, default_token_path
 from lake.tickers import Roster
 from tests.support.backup import WRONG, FakeBackupReader, mirror_lake
 from tests.support.calendar import et, weekday_sessions
@@ -721,6 +721,51 @@ def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys, monke
     assert pushes.sent == []
     printed = capsys.readouterr().out
     assert "secret-key" not in printed
+
+
+def test_the_sunday_cli_without_a_token_reads_the_override_s_token(tmp_path, monkeypatch):
+    """A by-hand ``sunday`` with no ``--token`` uses the token in ``MARKETLAKE_CONFIG_DIR``.
+
+    The canary it feeds builds a real vendor, which can refresh the token it is given. A
+    fallback spelled from ``HOME`` would hand it the live token while the override was
+    exported. ``HOME`` moves to a temporary directory too, so that spelling resolves under
+    it here rather than under the real home, and the two answers differ.
+    """
+    lake, config = _sunday_lake(tmp_path)
+    stamp_assertion_pid(lake, pid=_DAEMON_PID)
+    override = tmp_path / "override"
+    override.mkdir()
+    token = _token(override)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv(CONFIG_DIR_ENV, str(override))
+    canaries = []
+
+    def canary(**kwargs):
+        canaries.append(kwargs["token_path"])
+        return _passing_canary
+
+    monkeypatch.setattr(
+        cp,
+        "read_pmset_schedule",
+        lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
+    )
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: FakePinger())
+    monkeypatch.setattr(cp, "token_canary", canary)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr(cp, "read_exclusions", _excluded)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
+    code = cp.main(
+        ["sunday", "--config", str(config)],
+        clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
+        calendar=weekday_sessions(date(2026, 8, 31)),
+    )
+
+    assert canaries == [str(token)]
+    # The mint is read from the same file, so a run that found the token pings.
+    assert code == 0
 
 
 def test_the_sunday_cli_scrubs_the_configured_backup_target(tmp_path, capsys, monkeypatch):
