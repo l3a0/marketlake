@@ -1565,6 +1565,44 @@ def test_the_command_runs_the_sweep_and_reports_what_it_did(
     assert "hc-ping" not in printed, "the command printed a ping URL"
 
 
+def test_the_mac_friday_command_sets_the_wake_and_reads_it_back_by_default(
+    fixture_lake: FixtureLake, capsys, monkeypatch, tmp_path
+):
+    """The command line with no setter and no reader, which is what launchd runs on a Mac.
+
+    Every other command test passes its own setter, so a default that resolved to nothing
+    would cost the Mac its Friday wake with the suite green. The two live producers are
+    replaced where ``sweep_from_config`` looks them up instead.
+
+    The reader returns the weekday repeat and no one-shot, so the read-back has something to
+    say. A reader that named the date could not tell a read-back from a skipped one, since
+    both would leave the report silent.
+    """
+    from tests.support.config import write_config
+
+    root = _lake(fixture_lake)
+    config = write_config(tmp_path, lake_root=root)
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("SPY:\n  options: true\n  bars:\n  - 1d\n")
+
+    setter = _RecordingSetter()
+    monkeypatch.setattr(sweep, "set_sunday_wake", setter)
+    monkeypatch.setattr(sweep, "read_pmset_schedule", lambda: _schedule_text(one_shot=None))
+    monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: FakeTransport())
+    monkeypatch.setattr(sweep, "ExchangeCalendar", lambda: weekday_sessions(MONDAY, NEXT_MONDAY))
+
+    sweep.main(
+        ["--config", str(config), "--tickers", str(tickers)],
+        clock=ManualClock(FRIDAY_EVENING),
+        vendor_source=_CountingVendorSource(_cassette(session=FRIDAY)),
+    )
+    printed = capsys.readouterr().out
+
+    assert setter.sundays == [SUNDAY]
+    assert f"sunday one-shot wake missing for {SUNDAY.isoformat()}" in printed
+
+
 def test_a_bad_config_file_reaches_the_operator_as_one_line(tmp_path, capsys):
     """``input_errors_exit``'s shape, which every sibling command already takes."""
     config = tmp_path / "config.yaml"

@@ -20,7 +20,7 @@ import shlex
 import subprocess
 import urllib.error
 from collections.abc import Sequence
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1022,6 +1022,31 @@ def test_the_sunday_cli_reads_the_stamp_instant_as_well_as_the_pid(tmp_path, mon
     assert code == 0  # report tier: the ping still fires despite the finding
     assert [m.event for m in pushes.sent] == [cp.SUNDAY_ASSERTION_UNHELD_EVENT]
     assert cp.NO_PID_FRESH_STAMP in pushes.sent[0].body, "the CLI dropped the stamp instant"
+
+
+# -- the Sunday daemon page, per host ------------------------------------------------
+
+# 20:30 on Sunday 2026-08-30 in New York, given as the UTC instant ``SystemClock`` returns.
+# It is already Monday in UTC, so a body that printed a bare ``now.isoformat()`` would name
+# Monday's date on a Sunday evening. The Eastern rendering is what both bodies must carry.
+_SUNDAY_EVENING_UTC = datetime(2026, 8, 31, 0, 30, tzinfo=UTC)
+
+
+def test_the_mac_sunday_daemon_down_page_reads_verbatim():
+    """The macOS body, written before the Linux branch existed, so the branch cannot move it."""
+    page = cp.sunday_daemon_page(
+        daemon_up=False,
+        assertion_pid=None,
+        daemon_label=cp.DAEMON_LABEL,
+        now=_SUNDAY_EVENING_UTC,
+    )
+    assert page.event == cp.SUNDAY_DAEMON_DOWN_EVENT
+    assert page.title == "Capture at risk: Sunday daemon down"
+    assert page.body == (
+        "launchctl shows com.marketlake.daemon is not running, checked "
+        "2026-08-30T20:30:00-04:00. Nothing is holding the Sunday assertion, and Monday's "
+        "capture is at risk."
+    )
 
 
 # -- the two producers the launchd job runs on ---------------------------------------
