@@ -21,7 +21,9 @@ These cover the check's contract:
    byte-identical, another ticker-day on the same date seals, the backup and the ping run,
    one page names the segment, and a finding under ``reports/damaged_segments/`` names both
    digests. That holds for the flip that used to seal the day short, the one that used to
-   seal a changed value, and a shadow-append.
+   seal a changed value, and a shadow-append. It holds too for a segment damaged after it
+   closed and before its writer took the lock, because the digest is taken at close
+   (marketlake #573).
 3. The refusal joins ``refused`` with its own reason, so the re-tune leaves the day alone and
    the summary words it as damage rather than a type conflict.
 4. An unmanifested segment has no digest to compare, so the read judges it. A flip the
@@ -42,6 +44,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 
@@ -54,6 +57,7 @@ from lake import compact as compact_module
 from lake.alert import Publisher
 from lake.calendar import MARKET_TZ
 from lake.cassette import load_cassette
+from lake.chain_plan import ChainPlan
 from lake.compact import (
     DAMAGED_SEGMENT_EVENT,
     DAMAGED_SEGMENT_TITLE,
@@ -65,9 +69,10 @@ from lake.compact import (
     compact,
     recompact_ticker_day,
 )
-from lake.manifest import latest_entries, sha256_file
+from lake.manifest import latest_entries, manifest_path, sha256_file
 from lake.paths import LakePaths
 from lake.report import DamagedSegment, SegmentDamage
+from lake.tickers import Roster
 from tests.conftest import CASSETTES
 from tests.support.backup import FakeBackup
 from tests.support.calendar import FakeCalendar, SessionTimes
@@ -75,6 +80,7 @@ from tests.support.clock import ManualClock
 from tests.support.config import NTFY_TOPIC, PING_KEY
 from tests.support.pinger import FakePinger
 from tests.support.transport import FakeTransport
+from tests.support.vendor import CassetteVendor
 
 DAY = date(2026, 8, 24)
 URL = "https://hc-ping.com/secret-key/compaction"
@@ -325,6 +331,86 @@ def test_a_shadow_append_on_a_manifested_segment_is_refused_rather_than_raised(l
     assert [item.segment for item in refused.damaged] == [_rel(lake_root, spy[4])]
     assert all(path.exists() for path in spy)
     assert events == ["backup", "ping"]
+
+
+def _damage_before_the_lock(monkeypatch, lake_root: Path) -> dict[Path, str]:
+    """Flip a byte in each SPY chains segment after it closes and before its writer locks.
+
+    Returns each damaged segment with the digest it had before the flip, which is the digest
+    it closed with. The flip changes a value and decodes cleanly, so only the digest can see
+    it.
+    """
+    real = capture.lake_lock
+    closed: dict[Path, str] = {}
+
+    @contextmanager
+    def damaging(root):
+        for path in sorted(lake_root.rglob("*.arrows")):
+            if "surface=chains" in path.as_posix() and "ticker=SPY" in path.as_posix():
+                if path not in closed:
+                    closed[path] = sha256_file(path)
+                    data = bytearray(path.read_bytes())
+                    data[data.index(b"2026-08-24")] ^= 0x01
+                    path.write_bytes(bytes(data))
+        with real(root) as held:
+            yield held
+
+    monkeypatch.setattr(capture, "lake_lock", damaging)
+    return closed
+
+
+@pytest.mark.parametrize("writer", ["cycle", "snapshot"])
+def test_a_segment_damaged_while_its_writer_waits_for_the_lock_keeps_its_close_time_hash(
+    lake_root, monkeypatch, writer
+):
+    # The hash is taken when the segment closes, outside the lock (marketlake #573). So a
+    # segment that changes while the cycle waits for the lock is recorded as it closed, and
+    # compaction refuses the ticker-day. Hashed under the lock, the entry would bless the
+    # changed bytes and the day would seal.
+    closed = _damage_before_the_lock(monkeypatch, lake_root)
+    if writer == "cycle":
+        capture.run_cycle(
+            ManualClock(_et(10, 0)),
+            CassetteVendor(_RECORDED),
+            Roster.from_mapping({"SPY": {"options": True, "chain_cadence": "1m"}}),
+            lake_root,
+            pid=PID,
+            plan=ChainPlan(((0, None),)),
+        )
+    else:
+        _captured(lake_root, "SPY", count=1)
+    (damaged,) = closed
+    recorded = latest_entries(lake_root)[_rel(lake_root, damaged)]["sha256"]
+    assert recorded == closed[damaged]
+    assert recorded != sha256_file(damaged)
+
+    result, events = _run(lake_root)
+
+    (refused,) = result.refused
+    assert refused.reason == REFUSED_SEGMENT_DAMAGED
+    assert refused.partition == _rel(lake_root, _partition(lake_root, "SPY"))
+    assert refused.damaged == (
+        DamagedSegment(
+            segment=_rel(lake_root, damaged), expected=recorded, actual=sha256_file(damaged)
+        ),
+    )
+    assert damaged.exists()
+    assert not _partition(lake_root, "SPY").exists()
+    assert events == ["backup", "ping"]
+
+
+def test_a_snapshot_whose_hash_at_close_raises_records_no_entry(lake_root, monkeypatch):
+    # A snapshot has no fallback hash under the lock. Its caller reads the raise, so the
+    # entry is not written with a digest taken after the segment could have changed.
+    def refuse(path):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(capture, "sha256_file", refuse)
+
+    with pytest.raises(PermissionError):
+        _captured(lake_root, "SPY", count=1)
+
+    assert not manifest_path(lake_root).exists()
 
 
 def test_every_damaged_segment_is_named_not_only_the_first(lake_root):

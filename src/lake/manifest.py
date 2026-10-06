@@ -68,7 +68,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -757,15 +757,36 @@ def append_line(path: Path, entry: dict) -> None:
     after it, and repairing one is a human's job under the lock.
 
     This is the line primitive rather than the way to record a partition. A manifest entry
-    goes through ``append_manifest``, which enforces the standing row-count invariant
-    first.
+    goes through :func:`append_entries`, on its own or by way of ``append_manifest``, and
+    that enforces the standing row-count invariant first.
     """
-    line = (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8")
+    _append_once(path, _line(entry))
+
+
+def _line(entry: dict) -> bytes:
+    """One entry as the bytes of one ledger line."""
+    return (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _append_once(path: Path, data: bytes) -> None:
+    """Write ``data`` to the end of ``path`` in one ``O_APPEND`` write, or raise.
+
+    ``os.write`` may write fewer bytes than it was given. Linux documents that for a regular
+    file at disk full. A short write raises ``OSError`` naming how many bytes landed, so a
+    batch whose write stopped on a line boundary cannot drop its later entries unseen.
+
+    It never writes the rest in a second call, because a second write is what
+    ``append_line`` says another writer can interleave with. It never removes what did land
+    either. That fragment fuses with the next append the way a crash's torn line does, and
+    repairing it is a human's job under the lock.
+    """
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     try:
-        os.write(fd, line)
+        written = os.write(fd, data)
     finally:
         os.close(fd)
+    if written != len(data):
+        raise OSError(f"{path}: a short append wrote {written} of {len(data)} bytes")
 
 
 def would_shrink(lake_root: Path, partition: str, rows: int) -> bool:
@@ -797,18 +818,86 @@ def append_manifest(
     ``sha256``, ``rows``, ``fetched_at``. With ``guard`` on, the standing row-count
     invariant is enforced first. A deliberate human recompaction passes ``guard=False``
     to supersede an entry on its own authority.
+
+    This is :func:`append_entries` with a batch of one.
     """
-    if guard:
-        guard_row_count(lake_root, partition, rows)
-    entry = {
-        "partition": partition,
-        "source": source,
-        "sha256": sha256,
-        "rows": rows,
-        "fetched_at": fetched_at,
-    }
-    append_line(manifest_path(lake_root), entry)
+    (entry,) = append_entries(
+        lake_root,
+        [
+            {
+                "partition": partition,
+                "source": source,
+                "sha256": sha256,
+                "rows": rows,
+                "fetched_at": fetched_at,
+            }
+        ],
+        guard=guard,
+    )
     return entry
+
+
+def append_entries(
+    lake_root: Path, entries: Sequence[Mapping[str, object]], *, guard: bool = True
+) -> list[dict]:
+    """Append a batch of manifest entries with one read and one write, and return them.
+
+    Each item carries ``append_manifest``'s five fields: ``partition``, ``source``,
+    ``sha256``, ``rows`` and ``fetched_at``. A ``sha256`` of ``None`` means the file at
+    ``partition`` is hashed here, at that entry's place in the batch, the way
+    :func:`record_partition` hashes it.
+
+    The batch behaves like one ``append_manifest`` call per item, in order, and writes the
+    same bytes. What it saves is the cost a capture cycle pays under the lake-root lock
+    (marketlake #573):
+
+    1. With ``guard`` on, the manifest is read once rather than once per entry. Each entry
+       is checked against that map and then folded into it, so two entries for one
+       partition are checked against each other as two calls would be. With ``guard`` off
+       nothing is read.
+    2. The lines that pass go out in one ``O_APPEND`` write, rather than one open, write and
+       close per entry.
+
+    When entry k is refused, by the row-count guard or by a hash that raises, entries 1 to
+    k-1 are written and then the refusal is raised, which is what the calls one at a time
+    left behind. An empty batch returns before reading, so a cycle with nothing to record
+    never meets a damaged manifest.
+
+    One case differs from the calls one at a time. When the manifest's last line is torn,
+    a second call's read cannot see the entry the first fused onto the fragment, while the
+    map here still holds it. Capture never records one partition twice in a batch, so no
+    verdict it gets changes.
+    """
+    if not entries:
+        return []
+    root = Path(lake_root)
+    latest = latest_entries(root) if guard else {}
+    built: list[dict] = []
+    lines: list[bytes] = []
+    try:
+        for item in entries:
+            partition = item["partition"]
+            sha256 = item["sha256"]
+            if sha256 is None:
+                sha256 = sha256_file(root / partition)
+            entry = {
+                "partition": partition,
+                "source": item["source"],
+                "sha256": sha256,
+                "rows": item["rows"],
+                "fetched_at": item["fetched_at"],
+            }
+            if guard:
+                current = latest.get(partition)
+                if current is not None and entry["rows"] < current["rows"]:
+                    raise RowCountRegression(partition, current["rows"], entry["rows"])
+                latest[partition] = entry
+            built.append(entry)
+            lines.append(_line(entry))
+    finally:
+        if lines:
+            _append_once(manifest_path(root), b"".join(lines))
+    return built
 
 
 def record_partition(
@@ -822,9 +911,12 @@ def record_partition(
 ) -> dict:
     """Checksum a partition file on disk and append its manifest entry.
 
-    This is the compaction path in one call. ``partition`` is the lake-relative path
-    of a file that already exists under ``lake_root``. Its sha256 is read from disk, so
-    the entry always matches the bytes on disk at record time.
+    ``partition`` is the lake-relative path of a file that already exists under
+    ``lake_root``. Its sha256 is read from disk, so the entry always matches the bytes on
+    disk at record time. Compaction hashes the bytes it wrote and calls
+    ``append_manifest``. A capture cycle records its segments through
+    :func:`append_entries`, and so does ``capture.journal_snapshot`` for the close+5 fill and
+    an onboarding snapshot. Every other writer of a manifest entry comes through here.
     """
     sha256 = sha256_file(Path(lake_root) / partition)
     return append_manifest(
