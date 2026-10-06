@@ -26,8 +26,10 @@ import pytest
 
 from lake import roster as roster_cli
 from lake.capture_spans import CaptureSpans, spans_path
+from lake.onboard import DEFAULT_BARS, DEFAULT_CHAIN_CADENCE
 from lake.roster import REPLACED, UNCHANGED, RosterError, apply
 from lake.security_master import SecurityMaster, master_path
+from lake.tickers import load_tickers, roster_from_bytes, upsert_ticker
 from tests.component.test_reference_read import _Locked
 from tests.support.clock import ManualClock
 from tests.support.config import write_config
@@ -45,8 +47,13 @@ SPY_DISABLED = (
 SPY_WITHOUT_OPTIONS = b"SPY: {options: false, bars: [1m, 1d]}\n"
 
 
-def _build_lake(root: Path, *, unnamed: bool = False) -> Path:
+def _build_lake(
+    root: Path, *, unnamed: bool = False, ticker: str = "SPY", options: bool = True
+) -> Path:
     """A lake whose master names SPY and QQQ, with SPY's span open and QQQ's closed.
+
+    ``ticker`` and ``options`` replace SPY's name and its open span's options, for the
+    tests that need another ticker or a span without options.
 
     ``unnamed`` adds a third instrument with an open span and a ticker valid from the day
     after ``AT``'s market date. The master cannot name it on ``AT``, and can on any day
@@ -55,10 +62,12 @@ def _build_lake(root: Path, *, unnamed: bool = False) -> Path:
     """
     root.mkdir()
     master = SecurityMaster()
-    spy = master.register(kind="equity", capture_start=START, valid_from=START.date(), ticker="SPY")
+    spy = master.register(
+        kind="equity", capture_start=START, valid_from=START.date(), ticker=ticker
+    )
     qqq = master.register(kind="equity", capture_start=START, valid_from=START.date(), ticker="QQQ")
     spans = CaptureSpans()
-    spans.open_span(spy, START, True)
+    spans.open_span(spy, START, options)
     spans.open_span(qqq, START, True)
     spans.close_span(qqq, CLOSED)
     if unnamed:
@@ -137,7 +146,7 @@ def test_a_roster_of_the_open_span_alone_passes_and_says_so(tmp_path, lake, targ
     assert _apply(SPY_ONLY, tmp_path, lake, target) == REPLACED
     assert target.read_bytes() == SPY_ONLY
     captured = capsys.readouterr()
-    assert captured.out == f"roster: lake check passed, 1 open capture spans checked in {lake}\n"
+    assert captured.out == f"roster: lake check passed, 1 open capture span checked in {lake}\n"
     assert captured.err == ""
 
 
@@ -176,6 +185,53 @@ def test_an_entry_without_options_for_a_span_with_options_is_refused(tmp_path, l
     assert "with options true" in message
     assert "this roster's entry has options false" in message
     assert "SPY: {options: true, chain_cadence: 1m, bars: [1m, 1d]}" in message
+    assert not target.parent.exists()
+
+
+def test_an_entry_with_options_for_a_span_without_options_passes(tmp_path, target, capsys):
+    # The opposite mismatch only captures more, so it is not refused. A check comparing
+    # the two flags for inequality would refuse it.
+    lake = _build_lake(tmp_path / "lake", options=False)
+    assert _apply(SPY_ONLY, tmp_path, lake, target) == REPLACED
+    assert target.read_bytes() == SPY_ONLY
+    captured = capsys.readouterr()
+    assert captured.out == f"roster: lake check passed, 1 open capture span checked in {lake}\n"
+    assert captured.err == ""
+
+
+# -- the remedy line pastes back as the entry onboard writes ----------------------------
+
+
+REMEDY = "built from onboard's defaults: "
+
+
+# The long ticker is past PyYAML's default width of 80, where a dump would wrap the line.
+@pytest.mark.parametrize("ticker", ["SPY", "ON", "NO", "X" * 60], ids=["SPY", "ON", "NO", "long"])
+@pytest.mark.parametrize("options", [True, False], ids=["options", "no-options"])
+def test_the_remedy_line_reads_back_as_the_entry_onboard_writes(tmp_path, target, ticker, options):
+    # ``ON`` and ``NO`` are booleans in YAML 1.1. Printed bare, the line would read back
+    # as a ticker called ``True`` or ``False``. The roster omits the span's ticker, so
+    # the refusal's only problem is that span, and its remedy ends the message. The line
+    # is pasted under the roster's own entry, the way the refusal says to add it.
+    lake = _build_lake(tmp_path / "lake", ticker=ticker, options=options)
+    with pytest.raises(RosterError) as excinfo:
+        _apply(QQQ_ONLY, tmp_path, lake, target)
+    message = str(excinfo.value)
+    assert "\n" not in message
+    assert message.count(REMEDY) == 1
+    pasted = roster_from_bytes(QQQ_ONLY + message.split(REMEDY)[1].encode() + b"\n")
+    assert pasted.symbols == ("QQQ", ticker)
+    onboarded = tmp_path / "onboarded.yaml"
+    onboarded.write_bytes(QQQ_ONLY)
+    upsert_ticker(
+        ticker,
+        options=options,
+        chain_cadence=DEFAULT_CHAIN_CADENCE,
+        bars=DEFAULT_BARS,
+        path=onboarded,
+    )
+    # ``upsert_ticker`` sorts the file's keys, so the two rosters compare by ticker.
+    assert {e.ticker: e for e in pasted} == {e.ticker: e for e in load_tickers(onboarded)}
     assert not target.parent.exists()
 
 
@@ -252,6 +308,19 @@ def test_a_torn_spans_file_is_refused(tmp_path, lake, target, role):
     spans_path(lake).write_bytes(b"not parquet at all")
     with pytest.raises(RosterError) as excinfo:
         _apply(SPY_ONLY, tmp_path, lake, target, role=role)
+    assert str(excinfo.value).startswith(f"lake check refused: {spans_path(lake)} cannot be read")
+    assert not target.parent.exists()
+
+
+def test_a_torn_spans_file_beside_a_missing_master_on_an_exact_shadow_is_refused(
+    tmp_path, lake, target
+):
+    # Both files are read before either is judged, so the missing master cannot hide the
+    # damaged spans file behind the shadow skip. QQQ_ONLY would be written by a skip.
+    master_path(lake).unlink()
+    spans_path(lake).write_bytes(b"not parquet at all")
+    with pytest.raises(RosterError) as excinfo:
+        _apply(QQQ_ONLY, tmp_path, lake, target, role="shadow")
     assert str(excinfo.value).startswith(f"lake check refused: {spans_path(lake)} cannot be read")
     assert not target.parent.exists()
 
@@ -367,7 +436,7 @@ def test_main_prints_the_pass_line_before_the_outcome(tmp_path, lake, target, mo
     _point_main_at(monkeypatch, tmp_path, lake, target)
     _run_main(monkeypatch, SPY_ONLY)
     assert capsys.readouterr().out == (
-        f"roster: lake check passed, 1 open capture spans checked in {lake}\n"
+        f"roster: lake check passed, 1 open capture span checked in {lake}\n"
         f"roster: {REPLACED} {target}\n"
     )
     assert target.read_bytes() == SPY_ONLY

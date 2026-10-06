@@ -45,6 +45,8 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+import yaml
+
 from lake import outbox
 from lake.calendar import MARKET_TZ
 from lake.capture_spans import CaptureSpans, spans_path
@@ -97,13 +99,20 @@ def _onboard_entry(ticker: str, options: bool) -> str:
 
     It carries ``bars`` on purpose. An entry naming only ``options`` would load with no
     bars, which stops that ticker's bars without a word.
+
+    ``yaml.safe_dump`` writes the line, so a ticker that YAML 1.1 reads as another type
+    comes out quoted. Printed bare, ``ON`` would paste back as the boolean ``True`` and
+    name a ticker called ``True``. The dump is a one-entry flow mapping, and its outer
+    braces are dropped so the line pastes into the roster as one more entry.
     """
-    bars = ", ".join(DEFAULT_BARS)
+    entry: dict[str, object] = {"options": options}
     if options:
-        return (
-            f"{ticker}: {{options: true, chain_cadence: {DEFAULT_CHAIN_CADENCE}, bars: [{bars}]}}"
-        )
-    return f"{ticker}: {{options: false, bars: [{bars}]}}"
+        entry["chain_cadence"] = DEFAULT_CHAIN_CADENCE
+    entry["bars"] = list(DEFAULT_BARS)
+    flow = yaml.safe_dump(
+        {ticker: entry}, default_flow_style=True, sort_keys=False, width=sys.maxsize
+    )
+    return flow.strip()[1:-1]
 
 
 def _flag(options: bool) -> str:
@@ -213,7 +222,9 @@ def check_lake(roster: Roster, config: Config, *, clock: Clock) -> None:
         raise RosterError(
             "lake check refused, and this host's roster is left as it was: " + "; ".join(problems)
         )
-    print(f"roster: lake check passed, {len(open_spans)} open capture spans checked in {root}")
+    count = len(open_spans)
+    noun = "span" if count == 1 else "spans"
+    print(f"roster: lake check passed, {count} open capture {noun} checked in {root}")
 
 
 def apply(
