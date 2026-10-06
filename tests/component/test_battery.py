@@ -2526,6 +2526,57 @@ def test_a_partition_of_no_rows_reads_as_no_rows(lake: Path):
     )
 
 
+# A column each kernel after the data-row filter would refuse, retyped for the whole file:
+# the flag count reads ``is_delayed``, the session filter reads ``snap_ts``, and the stamp
+# parse reads ``fetch_ts``.
+RETYPED = {
+    "is_delayed": pa.array(["false"] * 4, pa.string()),
+    "snap_ts": pa.array([0.0] * 4, pa.float64()),
+    "fetch_ts": pa.array([True] * 4, pa.bool_()),
+}
+
+
+def _retyped(lake: Path, rows: list[dict], column: str) -> None:
+    table = _table("chains", rows)
+    values = RETYPED[column]
+    values = pa.concat_arrays([values] * (len(rows) // len(values)))
+    table = table.set_column(table.schema.get_field_index(column), column, values)
+    path = lake / "chains" / "ticker=SPY" / f"date={DAY.isoformat()}.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pa_pq.write_table(table, path)
+
+
+@pytest.mark.parametrize("column", sorted(RETYPED))
+def test_a_partition_of_gap_rows_reads_as_no_rows_whatever_its_column_types(
+    lake: Path, column: str
+):
+    """A day of gap rows only answers no rows, which ``judge`` reports as out of scope, just as
+    an empty file does. The whole read returned before any kernel ran when the data-row filter
+    left nothing. The streamed read skips a batch the filter emptied for the same reason: Arrow
+    picks a kernel by type even for an empty array, so a drifted column on rows nobody reads
+    would otherwise make the partition unreadable."""
+    _retyped(lake, [_gap_row() for _ in range(4)], column)
+
+    assert read_entitlement(_partition(lake), _session()) == Entitlement(
+        rows=0, flag_present=True, flag_violations=0, median_staleness=None, session_rows=0
+    )
+
+
+def test_a_retyped_flag_still_fails_a_day_whose_data_rows_follow_a_batch_of_gap_rows(
+    lake: Path,
+):
+    """Skipping a batch of gap rows defers the kernels to the next batch rather than dropping
+    them. The data rows that follow carry the same retyped flag, so the flag count refuses it
+    there, as the whole read did."""
+    rows = [_gap_row() for _ in range(4)] + _clean_rows("chains", count=4)
+    _retyped(lake, rows, "is_delayed")
+    partition = _partition(lake)
+
+    with pytest.raises(PartitionUnreadable) as caught:
+        read_entitlement(partition, _session(), batch_size=4)
+    assert str(caught.value).startswith(f"{partition.relative}: ")
+
+
 # Small enough that a 1,998-row day spans eight batches. Every other fixture in this file fits
 # in one batch at the default size, the largest at 300 rows.
 SMALL_BATCH = 256

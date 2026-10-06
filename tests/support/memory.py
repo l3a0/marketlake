@@ -18,8 +18,9 @@ marketlake #660.
 4. Restore the previous pool when the measurement ends, even when the read raises. With the
    restore removed, every later test allocated through the proxy and no test failed.
 
-:func:`measured` keeps the first, second and fourth. The third is the caller's, because only
-the caller knows which read is its reference.
+:func:`measured` enforces the second and fourth. The first and third are the caller's. The
+first holds only when the caller opens the file inside the ``with``, and only the caller knows
+which read is its reference.
 """
 
 from __future__ import annotations

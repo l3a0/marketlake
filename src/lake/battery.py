@@ -1069,7 +1069,7 @@ class Entitlement:
 # How many rows the entitlement read decodes at a time. The read streams rather than decoding
 # the partition whole, because the whole read peaked at 1,295.8 MiB of Arrow memory on SPY
 # 2026-09-28, more than a 2 GiB host has left for it (marketlake #670). A batch's memory grows
-# with this number and not with the file. At 65,536 rows the same day peaked at 90.2 MiB, and
+# with this number and not with the file. At 65,536 rows the same day peaked at 89.7 MiB, and
 # a smaller batch saved about 5.5 MiB, because the final median sets the floor.
 _ENTITLEMENT_BATCH_ROWS = 65_536
 
@@ -1093,10 +1093,16 @@ def read_entitlement(
     whole ticker-day at once peaked at 1,295.8 MiB of Arrow memory on SPY 2026-09-28, 5,397,364
     rows, and the 18:30 sweep runs on a 2 GiB host (marketlake #670). So the read decodes
     ``batch_size`` rows at a time and keeps only the float64 seconds of each batch's session
-    rows. The same day then peaked at 90.2 MiB. Each batch runs the steps the whole read ran,
+    rows. The same day then peaked at 89.7 MiB. Each batch runs the steps the whole read ran,
     in the same order: the data-row filter, the flag count, the session filter, then the stamp
     parse. A stamp is therefore parsed only on a row both filters kept, and a bad stamp on a
     gap row or an overnight row still cannot fail the partition.
+
+    A batch the data-row filter empties goes no further. Arrow picks a kernel by type even for
+    an empty array, so the later steps would refuse a drifted column on gap rows that the
+    whole read, which returned before any kernel ran when no data row remained, never judged.
+    A day of gap rows therefore answers no rows, as an empty file does. The row count above
+    still sees every batch.
 
     The median is taken over the session's rows rather than per snapshot. The design says
     session-median and the tail is why per-row would not do: the maximum on QQQ 2026-09-14 is
@@ -1143,6 +1149,8 @@ def read_entitlement(
         for batch in source.iter_batches(columns=wanted, batch_size=batch_size, use_threads=False):
             decoded += batch.num_rows
             data = batch.filter(pc.equal(batch[ROW_KIND_COLUMN], ROW_KIND_DATA))
+            if data.num_rows == 0:
+                continue
             rows += data.num_rows
             if flag_present:
                 agreeing += pc.sum(pc.equal(data[flag], wanted_value)).as_py() or 0
