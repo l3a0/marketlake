@@ -1170,6 +1170,8 @@ def test_main_runs_the_job_from_config_with_injected_seams(
     # The ping went to the config's check, and the secret key was never printed.
     assert pinger.urls == [f"https://hc-ping.com/secret-key/{COMPACTION_SLUG}"]
     assert "secret-key" not in out
+    # The throughput line belongs to a bucket upload, so the path form prints none.
+    assert "Mbit/s" not in out
     assert backup.calls == [(lake_root, tmp_path / "ssd")]
     assert events == ["backup", "ping"]
     assert not plan_path.exists()

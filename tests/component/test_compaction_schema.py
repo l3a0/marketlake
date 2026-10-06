@@ -129,10 +129,11 @@ def _run(
 
 
 def _paging(lake_root: Path, transport=None) -> tuple[Publisher, FakeTransport]:
-    """A publisher over a recording transport, holding the config's two secrets.
+    """A publisher over a recording transport, holding the ping key and the topic.
 
-    The secrets are what the real ``main`` passes, so a page composed here is refused on
-    exactly the terms a page composed in production would be.
+    The secrets are what the real ``main`` passes for a config without bucket keys, so a
+    page composed here is refused on exactly the terms a page composed in production
+    would be.
     """
     transport = FakeTransport() if transport is None else transport
     publisher = Publisher(lake_root=lake_root, transport=transport, secrets=(PING_KEY, NTFY_TOPIC))

@@ -10,14 +10,33 @@ from it. It is the counterpart to the *portable* ``tickers.yaml`` roster, which 
 what to capture and travels on migration. This module loads the machine-local half.
 The roster lives in ``lake.tickers``.
 
-Four of the values are secrets. The healthchecks ping key builds the health-ping URLs.
-The ntfy topic is an unauthenticated channel that anyone holding the name can read and
-spoof. The Schwab API key and app secret are the static app-registration inputs
-``schwab-py`` needs to build the client and refresh the token. The rotating token
-itself is not here. It lives at ``~/.config/marketlake/token.json`` and is handled
-elsewhere. All four secrets are wrapped in ``Secret``, which redacts itself in every
-log, repr, and traceback. The one caller that must use a raw value calls ``reveal``. So
-a stray ``print(config)`` or a logged exception never leaks any of them.
+Four of the values are always secrets, and two more join them once the bucket's access
+key is added. The healthchecks ping key builds the health-ping URLs. The ntfy topic is
+an unauthenticated channel that anyone holding the name can read and spoof. The Schwab
+API key and app secret are the static app-registration inputs ``schwab-py`` needs to
+build the client and refresh the token. The bucket's access key id and secret access
+key sign every request to the backup bucket, and ``lake.bucket`` builds its client
+from these two values alone. The rotating token itself is not here. It lives at
+``~/.config/marketlake/token.json`` and is handled elsewhere. Every secret is wrapped
+in ``Secret``, which redacts itself in every log, repr, and traceback. The one caller
+that must use a raw value calls ``reveal``. So a stray ``print(config)`` or a logged
+exception never leaks any of them.
+
+``backup_target`` takes two forms. A filesystem path is the default and is copied to
+with ``rsync``. A bucket URL, ``s3://<bucket>`` or ``s3://<bucket>/<prefix>``, is
+uploaded to by ``lake.bucket``. The scheme is read before any ``Path`` is built,
+because ``Path("s3://bucket/x")`` collapses the double slash and would name a local
+directory called ``s3:``. The bucket's two key values and its region are needed only
+when the target is a bucket. They may sit in the file beside a path target, which is
+how the first upload runs before the target is switched.
+
+**Loading never refuses a backup setting.** Capture loads this file every cycle and the
+daemon loads it at startup, so a refusal here would stop capture over a setting only
+the nightly backup reads, and a lost minute cannot be recovered. A value that does not
+start with ``s3://`` loads as a ``Path`` exactly as it always has, whatever it holds. An
+``s3://`` value loads as a ``BucketTarget`` with no checks, and a missing bucket key
+loads as ``None``. ``require_bucket_settings`` holds the strict checks, and each bucket
+job calls it when it runs, so a bad bucket setting fails only the backup.
 
 One key is optional rather than required: ``schwab_callback_url``, the third static
 app-registration input. Only the weekly re-auth in ``lake.reauth`` reads it, and capture
@@ -35,6 +54,7 @@ values the design pins. Slice 1 measures the real distributions and recalibrates
 from __future__ import annotations
 
 import os
+import re
 import sys
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -60,6 +80,27 @@ HEALTHCHECKS_HOST = "hc-ping.com"
 # and the rendered re-auth script names it too, so all three read this rather than
 # repeating the string.
 CALLBACK_KEY = "schwab_callback_url"
+
+# The bucket form of ``backup_target``. Only S3 is accepted: the design relies on S3
+# storing and returning a whole-object SHA-256 for a single PUT, which is what lets the
+# manifest's own digest travel with every upload.
+BUCKET_SCHEME = "s3://"
+
+# The keys the bucket form needs, spelled once so the refusal names them.
+BUCKET_KEY_ID_KEY = "bucket_access_key_id"
+BUCKET_SECRET_KEY = "bucket_secret_access_key"
+BUCKET_REGION_KEY = "bucket_region"
+BUCKET_KEYS = (BUCKET_KEY_ID_KEY, BUCKET_SECRET_KEY, BUCKET_REGION_KEY)
+
+# What S3 allows in a bucket name: 3 to 63 lowercase letters, digits, dots and hyphens,
+# starting and ending with a letter or digit.
+_BUCKET_NAME = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
+
+# The shape of an AWS region name: a two-to-four letter area, one or more lowercase
+# words, and a number, as in ``us-east-2``, ``us-gov-west-1`` or ``eusc-de-east-1``.
+# ``botocore`` refuses a malformed name only when the client is built, with an error
+# that is not a ``ConfigError``, so the check runs first and names the key instead.
+_REGION = re.compile(r"[a-z]{2,4}(-[a-z]+)+-\d+")
 
 # The required keys. Guard constants are optional and default to the pinned values, and
 # so is ``CALLBACK_KEY``: no capture path reads it, so a config missing it must load
@@ -109,6 +150,104 @@ class Secret:
 
     def __hash__(self) -> int:
         return hash(self._value)
+
+
+@dataclass(frozen=True)
+class BucketTarget:
+    """The bucket form of ``backup_target``: a bucket name and a key prefix.
+
+    ``prefix`` is empty or a run of path components with no leading or trailing slash.
+    A lake file at lake-relative path ``rel`` lives at key ``prefix/rel``, or at ``rel``
+    when the prefix is empty. Its ``str`` is the URL, normalised, which is what every
+    finding and report line names.
+    """
+
+    bucket: str
+    prefix: str = ""
+
+    def key(self, rel: str) -> str:
+        """The object key for lake-relative path ``rel``."""
+        return f"{self.prefix}/{rel}" if self.prefix else rel
+
+    def rel(self, key: str) -> str | None:
+        """The lake-relative path for an object key, or ``None`` when it is outside."""
+        if not self.prefix:
+            return key
+        head = f"{self.prefix}/"
+        return key[len(head) :] if key.startswith(head) else None
+
+    @property
+    def list_prefix(self) -> str:
+        """The ``Prefix`` a listing of this target passes."""
+        return f"{self.prefix}/" if self.prefix else ""
+
+    def __str__(self) -> str:
+        return f"{BUCKET_SCHEME}{self.bucket}/{self.prefix}".rstrip("/")
+
+
+def parse_backup_target(value: object) -> Path | BucketTarget:
+    """Read ``backup_target``: an ``s3://`` URL is a bucket, anything else is a path.
+
+    The scheme is checked on the raw text, before any ``Path`` exists, because a
+    ``Path`` collapses ``//`` and would turn the URL into a local directory. Nothing
+    here refuses, for the reason the module docstring gives. Any other value becomes a
+    ``Path`` exactly as it did before a bucket was possible, and an ``s3://`` value
+    becomes a ``BucketTarget`` with empty prefix components dropped. A malformed bucket
+    is caught by ``require_bucket_settings`` when a bucket job runs.
+    """
+    text = str(value)
+    if text.startswith(BUCKET_SCHEME):
+        bucket, _, prefix = text[len(BUCKET_SCHEME) :].partition("/")
+        parts = [part for part in prefix.split("/") if part]
+        return BucketTarget(bucket=bucket, prefix="/".join(parts))
+    return Path(text).expanduser()
+
+
+def bucket_target_problems(target: BucketTarget) -> list[str]:
+    """What is wrong with a bucket target's name or prefix, as operator phrases."""
+    problems = []
+    if not _BUCKET_NAME.fullmatch(target.bucket) or ".." in target.bucket:
+        problems.append(
+            f"{target} names no valid bucket. The form is {BUCKET_SCHEME}<bucket> or "
+            f"{BUCKET_SCHEME}<bucket>/<prefix>, with a name of 3 to 63 lowercase letters, "
+            "digits, dots and hyphens"
+        )
+    if any(part in (".", "..") for part in target.prefix.split("/")):
+        problems.append(f"{target} has a prefix holding . or ..")
+    return problems
+
+
+def require_bucket_settings(config: Config, target: BucketTarget | None = None) -> BucketTarget:
+    """The strict checks a bucket job runs before it builds a client, or a ``ConfigError``.
+
+    ``target`` defaults to ``backup_target``, which must then be a bucket. Four things are
+    checked, and every failure is named in one line.
+
+    1. The bucket name is one S3 accepts.
+    2. The prefix holds no ``.`` or ``..`` component.
+    3. ``bucket_access_key_id``, ``bucket_secret_access_key`` and ``bucket_region`` are
+       all present.
+    4. The region has the shape of an AWS region name.
+
+    Loading the config runs none of these, so a bad bucket setting reaches the job that
+    uses it and nothing else. The nightly upload, the Sunday scrub, the first upload and
+    the live check each call this when they start.
+    """
+    if target is None:
+        if not isinstance(config.backup_target, BucketTarget):
+            raise ConfigError(f"backup_target is not an {BUCKET_SCHEME} bucket")
+        target = config.backup_target
+    problems = bucket_target_problems(target)
+    values = (config.bucket_access_key_id, config.bucket_secret_access_key, config.bucket_region)
+    absent = [key for key, value in zip(BUCKET_KEYS, values, strict=True) if value is None]
+    if absent:
+        problems.append(f"the bucket needs config key(s): {absent}")
+    region = config.bucket_region
+    if region is not None and not _REGION.fullmatch(region):
+        problems.append(f"{BUCKET_REGION_KEY} {region!r} is not an AWS region name like us-east-2")
+    if problems:
+        raise ConfigError(". ".join(problems))
+    return target
 
 
 # The largest ``capture_stagger_ms`` the config accepts. The field's comment carries why.
@@ -373,13 +512,16 @@ class Config:
     """The resolved machine-local configuration."""
 
     lake_root: Path
-    backup_target: Path
+    backup_target: Path | BucketTarget
     healthchecks_ping_key: Secret
     ntfy_topic: Secret
     schwab_api_key: Secret
     schwab_app_secret: Secret
     schwab_callback_url: str | None = None
     guards: GuardConstants = field(default_factory=GuardConstants)
+    bucket_access_key_id: Secret | None = None
+    bucket_secret_access_key: Secret | None = None
+    bucket_region: str | None = None
 
     def paths(self) -> LakePaths:
         """The lake path builder rooted at ``lake_root``. The DATA_DIR-to-paths bridge."""
@@ -392,6 +534,19 @@ class Config:
         slug, never this URL.
         """
         return f"https://{HEALTHCHECKS_HOST}/{self.healthchecks_ping_key.reveal()}/{slug}"
+
+    def page_secrets(self) -> tuple[str, ...]:
+        """The values a page must never carry, for every ``Publisher`` that sends one.
+
+        The healthchecks ping key and the ntfy topic always, and the bucket's two key
+        values when the file holds them. One method rather than a tuple at every
+        construction site, so a secret added here reaches every publisher at once.
+        """
+        values = [self.healthchecks_ping_key.reveal(), self.ntfy_topic.reveal()]
+        for secret in (self.bucket_access_key_id, self.bucket_secret_access_key):
+            if secret is not None:
+                values.append(secret.reveal())
+        return tuple(values)
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object]) -> Config:
@@ -406,15 +561,21 @@ class Config:
         missing = [key for key in _REQUIRED_KEYS if mapping.get(key) is None]
         if missing:
             raise ConfigError(f"config missing required key(s): {missing}")
+        backup_target = parse_backup_target(mapping["backup_target"])
+        key_id = _optional_text(mapping.get(BUCKET_KEY_ID_KEY))
+        secret_key = _optional_text(mapping.get(BUCKET_SECRET_KEY))
         return cls(
             lake_root=Path(str(mapping["lake_root"])).expanduser(),
-            backup_target=Path(str(mapping["backup_target"])).expanduser(),
+            backup_target=backup_target,
             healthchecks_ping_key=Secret(str(mapping["healthchecks_ping_key"])),
             ntfy_topic=Secret(str(mapping["ntfy_topic"])),
             schwab_api_key=Secret(str(mapping["schwab_api_key"])),
             schwab_app_secret=Secret(str(mapping["schwab_app_secret"])),
             schwab_callback_url=_optional_text(mapping.get(CALLBACK_KEY)),
             guards=GuardConstants.from_mapping(mapping.get("guards")),
+            bucket_access_key_id=None if key_id is None else Secret(key_id),
+            bucket_secret_access_key=None if secret_key is None else Secret(secret_key),
+            bucket_region=_optional_text(mapping.get(BUCKET_REGION_KEY)),
         )
 
 
@@ -444,7 +605,7 @@ def load_config(
     passes ``path`` or an ``env`` mapping to point the loader at a throwaway file.
 
     A parse failure names the file and nothing else. PyYAML quotes the offending line
-    back in its message, and four of this file's values are secrets, so a stray quote
+    back in its message, and four to six of this file's values are secrets, so a stray quote
     on the ping-key line would put that key in the error. Jobs run from launchd with
     stdout and stderr going to a log file, so an uncaught traceback writes it to disk.
     ``_parse_yaml`` drops the parse error rather than chaining it, and the ``ConfigError``
@@ -466,7 +627,7 @@ def _parse_yaml(text: str) -> object | None:
     """The parsed YAML, or ``None`` when ``text`` is not YAML at all.
 
     The parse error stays inside this function and is never re-raised. Its message
-    quotes the offending source line, and this file holds four secrets, so letting it
+    quotes the offending source line, and this file holds four to six secrets, so letting it
     out would put one of them wherever the caller's error lands. An empty file and a
     ``null`` document both parse to an empty mapping, so ``None`` means the parse
     failed and nothing else.
@@ -478,7 +639,7 @@ def _parse_yaml(text: str) -> object | None:
 
 
 @contextmanager
-def input_errors_exit(command: str) -> Iterator[None]:
+def input_errors_exit(command: str, *refusals: type[Exception]) -> Iterator[None]:
     """Turn a bad operator input file into one named line and exit 2.
 
     Three machine-local files are the operator's to edit, and all three sit in the
@@ -491,10 +652,14 @@ def input_errors_exit(command: str) -> Iterator[None]:
     It wraps the call rather than the load, because two entries load their files inside
     a library helper. Those helpers keep raising, and only a ``main`` turns an
     exception into an exit code.
+
+    ``refusals`` names further classes an entry refuses with in the same shape. The
+    bucket's first-upload command passes its own refusal, so a refusal that is not about
+    an input file still reaches the operator as one line rather than a traceback.
     """
     try:
         yield
-    except (ChainPlanError, ConfigError, TickersError) as exc:
+    except (ChainPlanError, ConfigError, TickersError, *refusals) as exc:
         print(f"{command}: {exc}", file=sys.stderr)
         raise SystemExit(2) from None
 

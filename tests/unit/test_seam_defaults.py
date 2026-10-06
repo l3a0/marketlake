@@ -41,7 +41,7 @@ import inspect
 
 import pytest
 
-from lake import compact, control_plane, daemon, reauth, runner
+from lake import bucket, compact, control_plane, daemon, reauth, runner
 
 # Each row is an entry and a seam it must never default. Requiring the seam means a caller
 # that omits it gets a TypeError, not a live object. The protection follows each seam to
@@ -63,6 +63,10 @@ REQUIRED = [
     (control_plane.sunday_run, "canary"),
     (reauth.reauth, "login_flow"),
     (reauth.reauth_from_config, "login_flow"),
+    (bucket.nightly_upload, "client"),
+    (bucket.first_upload, "client"),
+    (bucket.bucket_scrub, "client"),
+    (bucket.BucketBackup, "client"),
 ]
 
 # Each row is a ``main`` and a seam it must never accept. A ``main`` builds its live seams
@@ -86,6 +90,9 @@ FORBIDDEN = [
     (control_plane.main, "exclusion_reader"),
     (control_plane.main, "transport"),
     (reauth.main, "login_flow"),
+    (bucket.main, "client"),
+    (compact.main, "client"),
+    (control_plane.main, "bucket_client"),
 ]
 
 

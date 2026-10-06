@@ -5,8 +5,9 @@ surface, ticker, and writer session. A *segment* is that file. Reading a day bac
 dozens of segments is slow and fragile, so once the day is final the segments are merged
 into one Parquet *partition* per surface and ticker, checksummed into the manifest, and
 deleted. That merge is *compaction*. This module is the close+15 job that does it, then
-copies the lake to the backup SSD, then re-sizes the chain chunk plan from what the day
-captured.
+copies the lake to the backup target, then re-sizes the chain chunk plan from what the day
+captured. The backup target is a mounted directory, copied with ``rsync``, or a bucket,
+uploaded to by ``lake.bucket``.
 
 Every ``close+N`` here counts from the *option* close, the capture stop at 16:15 ET on a
 regular day and 13:15 on an early close. It never counts from the 16:00 equity close, even
@@ -112,7 +113,8 @@ The job's rules, each glossed at first use.
    lake is synced to the backup target. A ticker-day the sweep refused does not hold that
    up, which is the whole point of catching the refusals where rules 3 and 4 catch them.
    The health-check ping fires only after the backup succeeds, so the
-   one ping attests both. An unmounted target raises before any ping. A holiday or an
+   one ping attests both. An unmounted target raises before any ping, and so does a
+   bucket upload that refuses or reaches its deadline. A holiday or an
    empty journal is a correct no-op and still backs up and pings. The drift page above
    goes out ahead of both, from a ``finally`` around the sweep, because an unmounted
    target or a failed seal must not be able to swallow it. The damaged-segment page goes
@@ -151,12 +153,12 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from lake import journal
+from lake import bucket, journal
 from lake.alert import REFUSED, Message, NtfyTransport, Publisher
 from lake.calendar import Calendar, ExchangeCalendar
 from lake.chain_plan import DEFAULT_CHAIN_PLAN_PATH, ChainPlan, Window, load_chain_plan
 from lake.clock import Clock, SystemClock
-from lake.config import GuardConstants, input_errors_exit, load_config
+from lake.config import BucketTarget, GuardConstants, input_errors_exit, load_config
 
 # The health-check slug this job pings. It is the compaction-plus-backup check from the
 # design's steady-state set. Log the slug, never the ping URL, which carries the secret
@@ -1921,7 +1923,7 @@ def compact(
     clock: Clock,
     calendar: Calendar,
     backup: BackupRunner,
-    backup_target: Path | str,
+    backup_target: Path | str | BucketTarget,
     pinger: Pinger | None = None,
     ping_url: str | None = None,
     publisher: Publisher | None = None,
@@ -2076,7 +2078,8 @@ def compact(
 
         # Backup first. A raised backup propagates before the ping, so a single-copy
         # window pages through the missed ping rather than being reported as healthy.
-        backup.sync(root, Path(backup_target))
+        target = backup_target if isinstance(backup_target, BucketTarget) else Path(backup_target)
+        backup.sync(root, target)
         backed_up = True
         pinged = False
         if pinger is not None:
@@ -2226,10 +2229,12 @@ def main(
     """The ``python -m lake.compact`` entry. Returns a process exit code.
 
     ``backup``, ``pinger`` and the pages' ``Publisher`` are built here, not
-    accepted. Each reaches past this process. ``rsync`` shells out to copy the lake, the
-    healthchecks GET goes to the network, and the publisher POSTs to ntfy, which reaches
-    a phone. A ``main`` that accepted them let a test omit one and reach the real effect,
-    so ``main`` builds them and a test drives the ``compact`` helper directly instead.
+    accepted. Each reaches past this process. ``rsync`` shells out to copy the lake, or
+    the bucket client uploads it, the healthchecks GET goes to the network, and the
+    publisher POSTs to ntfy, which reaches a phone. Which backup is built follows the
+    form of ``backup_target``. A ``main`` that accepted them let a test omit one and
+    reach the real effect, so ``main`` builds them and a test drives the ``compact``
+    helper directly instead.
 
     ``clock`` and ``calendar`` stay injectable. A system clock and an exchange calendar
     never reach past this process, so a test injects them with no live effect.
@@ -2260,24 +2265,45 @@ def main(
         )
         return 0
 
-    result = compact(
-        config.lake_root,
-        clock=clock,
-        calendar=calendar if calendar is not None else ExchangeCalendar(),
-        backup=RsyncBackup(),
-        backup_target=config.backup_target,
-        pinger=UrllibPinger(),
-        ping_url=config.healthchecks_url(COMPACTION_SLUG),
-        publisher=Publisher(
-            lake_root=config.lake_root,
-            transport=NtfyTransport(config.ntfy_topic.reveal()),
-            # The values that must never reach a phone, checked against the page itself.
-            secrets=(config.healthchecks_ping_key.reveal(), config.ntfy_topic.reveal()),
-        ),
-        guards=config.guards,
-        plan_path=args.plan if args.plan is not None else DEFAULT_CHAIN_PLAN_PATH,
-    )
+    calendar = calendar if calendar is not None else ExchangeCalendar()
+    if isinstance(config.backup_target, BucketTarget):
+        # The client is built at the upload's first request, after the seal, so a bad
+        # bucket setting fails the backup and leaves the seal standing. The calendar
+        # bounds the upload's deadline by the next session, for a hand run at any hour.
+        backup: BackupRunner = bucket.BucketBackup(
+            client=bucket.ClientFromConfig(config), clock=clock, calendar=calendar
+        )
+    else:
+        backup = RsyncBackup()
+    try:
+        result = compact(
+            config.lake_root,
+            clock=clock,
+            calendar=calendar,
+            backup=backup,
+            backup_target=config.backup_target,
+            pinger=UrllibPinger(),
+            ping_url=config.healthchecks_url(COMPACTION_SLUG),
+            publisher=Publisher(
+                lake_root=config.lake_root,
+                transport=NtfyTransport(config.ntfy_topic.reveal()),
+                # The values that must never reach a phone, checked against the page itself.
+                secrets=config.page_secrets(),
+            ),
+            guards=config.guards,
+            plan_path=args.plan if args.plan is not None else DEFAULT_CHAIN_PLAN_PATH,
+        )
+    except bucket.BucketRefusal as exc:
+        # Only the bucket form raises this, so the path form keeps its own behavior for
+        # every other error. A bucket refusal is one operator line and exit 2. It raises
+        # before the ping, so healthchecks still pages.
+        print(f"compact: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
     print(result.render())
+    if isinstance(backup, bucket.BucketBackup) and backup.last is not None:
+        # The nightly throughput, the same line the first upload prints. Under launchd
+        # this lands in compaction's log, which is where the night's rate is read.
+        print(f"compact: {backup.last.render()}")
     return 0
 
 

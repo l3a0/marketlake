@@ -356,7 +356,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         publisher=Publisher(
             lake_root=config.lake_root,
             transport=NtfyTransport(config.ntfy_topic.reveal()),
-            secrets=(config.healthchecks_ping_key.reveal(), config.ntfy_topic.reveal()),
+            secrets=config.page_secrets(),
         ),
         pinger=UrllibPinger(),
         ping_url=config.healthchecks_url(CALENDAR_PROBE_SLUG),

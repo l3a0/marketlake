@@ -713,8 +713,8 @@ def _unreadable_check(version: int, target: Path, exc: BaseException) -> Running
         summary=f"schema_version: {LEDGER_PARTITION} could not be read, {type(exc).__name__}",
         page_body=(
             f"{LEDGER_PARTITION} is present and could not be read "
-            f"({type(exc).__name__}). Every read of the lake refuses, and the next "
-            "backup copies this file over the last good one."
+            f"({type(exc).__name__}). Every read of the lake refuses, and with a path "
+            "target the next backup copies this file over the last good one."
         ),
         detail=f"{target} could not be read: {type(exc).__name__}: {exc}",
         event=UNREADABLE_EVENT,
@@ -725,12 +725,18 @@ def _unreadable_check(version: int, target: Path, exc: BaseException) -> Running
 def _inaccessible_check(version: int, target: Path, exc: BaseException) -> RunningVersionCheck:
     """The verdict for a ledger this process was refused permission to open. It never pages.
 
-    The unreadable verdict pages because a torn ledger gets worse by waiting: the design
-    has the next close+15 backup copy it over the last good one. A refused open does not.
-    The backup runs ``rsync -a`` as the same user, which cannot open the file either, so it
-    leaves the backup's copy alone and exits non-zero. The backup then raises before the
-    compaction ping, the ``compaction`` check goes silent, and that pages. So a refusal that
-    lasts to close+15 already pages, and one that clears first needs no page. Marketlake #536
+    The unreadable verdict pages because a torn ledger gets worse by waiting: with a path
+    target the next close+15 backup copies it over the last good one. A bucket target
+    keeps its good copy, because the upload re-sends a manifested file only under a new
+    manifest entry and S3 refuses bytes that do not match one. A refused open does not
+    get worse. A path backup runs ``rsync -a`` as the same user, which cannot open the
+    file either, so it leaves the backup's copy alone and exits non-zero. The backup then
+    raises before the compaction ping, the ``compaction`` check goes silent, and that
+    pages. So with a path target a refusal that lasts to close+15 already pages, and one
+    that clears first needs no page. A bucket upload opens the file only on a night its
+    manifest entry is new, raising the same way then, and otherwise leaves the bucket's
+    copy alone without reading it, so the nightly report below is what carries a lasting
+    refusal there. Marketlake #536
     is the second kind: a reboot starts the daemon a few seconds before the owner's login
     session exists, and on 2026-09-19 its first read of this file came back ``EPERM`` and
     paged, for a condition that had cleared before anyone could read the page.

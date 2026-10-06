@@ -65,7 +65,7 @@ from typing import Protocol, runtime_checkable
 
 from lake.alert import Message, Publisher
 from lake.capture import CycleResult, run_cycle_from_config
-from lake.config import input_errors_exit, load_config
+from lake.config import BucketTarget, ConfigError, input_errors_exit, load_config
 from lake.journal import ROW_KIND_DATA
 from lake.paths import CONFIG_DIR_PARTS, TEMP_MARKER
 
@@ -258,7 +258,8 @@ class SlugEscalation:
 # pattern holding no "/" is matched against a path's last component, so it drops that
 # name wherever in the tree it appears. A pattern holding a "/" is matched against the
 # end of the whole path. A trailing "/" narrows the match to directories, and an
-# excluded directory is never descended into.
+# excluded directory is never descended into. A bucket target has no ``rsync`` to apply
+# the list, so ``lake.bucket.rsync_excluded`` applies it with these same rules.
 #
 # The bar for an entry is high. An over-broad pattern drops real data and the sync
 # still exits clean, so the loss surfaces only at a restore. Two entries clear it.
@@ -272,7 +273,7 @@ class SlugEscalation:
 #    an orphan on the backup. And a temp holds a whole partition's bytes, so the copy
 #    costs real space and real sync time.
 # 2. The config directory, holding ``token.json`` and ``config.yaml``. The token is a
-#    full brokerage credential and ``config.yaml`` holds four secrets. The design's
+#    full brokerage credential and ``config.yaml`` holds four to six secrets. The design's
 #    rule is that neither may ride onto a backup disk that lacks FileVault. That
 #    directory sits outside the sync root today by construction, so this pattern
 #    matches nothing and costs nothing. It is here so the rule holds by exclusion
@@ -305,10 +306,14 @@ class Pinger(Protocol):
 
 @runtime_checkable
 class BackupRunner(Protocol):
-    """Copies the lake to the backup target. The real one shells out to ``rsync``."""
+    """Copies the lake to the backup target.
 
-    def sync(self, source: Path, target: Path) -> None:
-        """Copy ``source`` into ``target``. Asserts the target is mounted first."""
+    ``RsyncBackup`` shells out to ``rsync`` for a path target, and ``lake.bucket``'s
+    ``BucketBackup`` uploads to a bucket target.
+    """
+
+    def sync(self, source: Path, target: Path | BucketTarget) -> None:
+        """Copy ``source`` into ``target``. Asserts the target is reachable first."""
         ...
 
 
@@ -370,7 +375,9 @@ class RsyncBackup:
 
         subprocess.run(args, check=True)
 
-    def sync(self, source: Path, target: Path) -> None:
+    def sync(self, source: Path, target: Path | BucketTarget) -> None:
+        if isinstance(target, BucketTarget):
+            raise TypeError(f"rsync copies to a path, not to a bucket: {target}")
         source = Path(source)
         target = Path(target)
         if not target.exists() or not target.is_dir():
@@ -499,8 +506,16 @@ def run_once_from_config(
     this process, one to healthchecks and one to the backup target over ``rsync``, and a
     default would hand them to a caller that never asked. ``main`` builds the live pair.
     A test drives ``run_once`` directly with fakes instead.
+
+    A bucket target is refused with one line. This entry is not installed on the live
+    machine, and run once a minute it would upload to the bucket once a minute.
     """
     config = load_config(config_path)
+    if isinstance(config.backup_target, BucketTarget):
+        raise ConfigError(
+            f"backup_target is a bucket ({config.backup_target}), and the slice-1 runner "
+            "copies with rsync only; set a path target to run it"
+        )
     ping_url = config.healthchecks_url(slug)
 
     def cycle_runner() -> CycleResult:

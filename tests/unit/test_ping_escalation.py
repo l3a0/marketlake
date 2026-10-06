@@ -272,8 +272,9 @@ def test_no_refused_ping_page_carries_the_url_or_its_key(slug: str, tmp_path: Pa
     """The page names the slug and the status, and never the URL, which carries the key.
 
     The publisher's own refusal is the sweep, so this drives a real publisher built with
-    the two values that must never reach a phone. A page carrying either is refused
-    rather than sent, so ``sent`` is the whole assertion.
+    the ping key and the topic, the values a config without bucket keys must never let
+    reach a phone. A page carrying either is refused rather than sent, so ``sent`` is
+    the whole assertion.
     """
     lake_root = tmp_path / "lake"
     lake_root.mkdir()
