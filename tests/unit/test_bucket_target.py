@@ -292,7 +292,7 @@ def test_a_bucket_target_with_its_keys_loads_them_as_secrets():
 
 
 def test_the_keys_may_sit_beside_a_path_target():
-    # Setup step 4 puts the key in the file before the target is switched, so the first
+    # Setup step 2 puts the key in the file before the target is switched, so the first
     # upload can run while compaction still copies to the path.
     cfg = Config.from_mapping({**BASE, **KEYS})
     assert cfg.backup_target == Path("/Volumes/ssd/lake")
