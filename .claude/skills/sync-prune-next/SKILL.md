@@ -46,10 +46,12 @@ M=$(git worktree list | head -1 | cut -d' ' -f1)
 ```
 
 In this repo the main checkout is also the code the daemon runs. A deploy is a
-fast-forward there followed by `./restart.sh all`, so a fast-forward on its own
-is half a deploy. A calendar job starts fresh and runs the new code, while a
-resident job keeps the code it imported at start. Say in the report that the
-checkout moved, so the owner knows a restart is owed.
+fast-forward there followed by a restart, so a fast-forward on its own is half a
+deploy. A calendar job starts fresh and runs the new code, while a resident job
+keeps the code it imported at start. The restart runs the restart script that
+`python -m lake.control_plane render --out <dir>` writes. That script needs
+root, so running it is the owner's step and never the round's. Say in the
+report that the checkout moved, so the owner knows a restart is owed.
 
 ## 2. Remove what is finished, and only that
 
@@ -70,7 +72,12 @@ A worktree is removable only when all five of these hold.
    no branch names. The commit is safe when `origin/main` contains it, when a
    remote branch contains it (`git branch -r --contains`), or when it equals
    the `headRefOid` of a merged pull request. Squash merges make the last case
-   common, because the branch's commit never reaches `main`.
+   common, because the branch's commit never reaches `main`. Test that last case
+   by exact comparison against the list of merged heads. A
+   `gh pr list --search <sha>` matches any commit inside a pull request, not
+   only its head, so it does not test what this check states. `60ef88e`
+   matched [PR #646](https://github.com/l3a0/marketlake/pull/646), whose head
+   is `f1ecb4c`.
 4. **It holds no uncommitted changes.** `git status --porcelain` is empty.
    That listing omits ignored files, which `git worktree remove` deletes
    silently. `--ignored` shows them. Caches such as `.venv/` and
@@ -97,32 +104,68 @@ session as stuck, re-run `gh pr list --state open --limit 1000` and read its
 latest events with `list_events`, because a pull request may have opened since
 the worktree was classified.
 
+Check 3's last case needs the heads of the merged pull requests. Fetch them
+once into a file, so both loops below read the same list. A shell variable
+would not reach the second loop, because each Bash tool call starts a new
+shell. Replace `<scratch>` with the scratch directory in this block and the two
+after it.
+
+```bash
+MERGED="<scratch>/merged-heads.txt"
+gh pr list --repo l3a0/marketlake --state merged --limit 1000 --json headRefOid --jq '.[].headRefOid' > "$MERGED"
+wc -l < "$MERGED"
+```
+
+A count of exactly 1000 means `gh` cut the list, so raise the limit and fetch
+again.
+
 This prints what checks 3 to 5 need for every worktree.
 
 ```bash
+MERGED="<scratch>/merged-heads.txt"
 git worktree list --porcelain | sed -n 's/^worktree //p' | while read -r w; do
-  h=$(git -C "$w" rev-parse HEAD)
+  if ! h=$(git -C "$w" rev-parse HEAD 2>/dev/null) || [ "$(git -C "$w" rev-parse --show-toplevel 2>/dev/null)" != "$w" ]; then
+    echo "$w unreadable, skipped"; continue
+  fi
   safe=$( { git merge-base --is-ancestor "$h" origin/main && echo main; } || git branch -r --contains "$h" | head -1 | tr -d ' ')
-  pr=$(gh pr list --state merged --search "$h" --json number --jq '.[0].number // empty')
-  echo "$w head=${h:0:7} branch=$(git -C "$w" branch --show-current) safe=[${safe}${pr:+ merged-pr-$pr}] dirty=$(git -C "$w" status --porcelain | wc -l | tr -d ' ') ignored=$(git -C "$w" status --porcelain --ignored | grep -c '^!!')"
+  grep -qxF "$h" "$MERGED" && safe="$safe merged-pr-head"
+  echo "$w head=${h:0:7} branch=$(git -C "$w" branch --show-current) safe=[${safe}] dirty=$(git -C "$w" status --porcelain | wc -l | tr -d ' ') ignored=$(git -C "$w" status --porcelain --ignored | grep -c '^!!')"
 done
 git worktree list --porcelain | grep -B3 '^locked'
 ```
 
+A worktree printed as unreadable has a directory that is gone or a `.git` file
+that is broken. Its `HEAD` cannot be read, so none of the tests can pass for
+it, and the loop skips it rather than test an empty commit. Report it as kept.
+The `--show-toplevel` comparison catches a quieter case. The worktrees sit
+inside the main checkout, so a worktree directory with no `.git` file at all
+resolves to the main checkout, and without the comparison it reports the main
+checkout's `HEAD` as its own.
+
 A branch checked out in no worktree is removable when check 3 holds for its
 head. Git refuses to delete a branch that a worktree has checked out, which
-protects every branch in use.
+protects every branch in use. This loop runs the same three tests as the one
+above.
 
 ```bash
-git branch --format='%(refname:short)' | grep -v -e '^main$' -e '^(HEAD' | while read -r b; do
-  echo "$b $(git rev-parse --short "$b") ahead=$(git rev-list --count origin/main.."$b") $(git merge-base --is-ancestor "$b" origin/main && echo inmain) pr=[$(gh pr list --state all --head "$b" --json number,state,headRefOid --jq '.[]|"\(.number):\(.state):\(.headRefOid[0:7])"' | tr '\n' ' ')]"
+MERGED="<scratch>/merged-heads.txt"
+git branch --format='%(refname:short)' | grep -v -e '^main$' -e '^(HEAD' -e '^(no branch' | while read -r b; do
+  h=$(git rev-parse "$b")
+  safe=$( { git merge-base --is-ancestor "$h" origin/main && echo main; } || git branch -r --contains "$h" | head -1 | tr -d ' ')
+  grep -qxF "$h" "$MERGED" && safe="$safe merged-pr-head"
+  echo "$b ${h:0:7} ahead=$(git rev-list --count origin/main.."$h") safe=[${safe}]"
 done
 ```
 
-Write `grep -v -e '^main$' -e '^(HEAD'` rather than joining the two patterns
-with `\|`. macOS's `/usr/bin/grep` reads the `$` before `\|` as a literal
-character, so the joined form keeps `main` in the list, and `main` then reads as
-safe to delete.
+When the loop runs from a worktree with no branch checked out, `git branch`
+adds a line for that worktree's `HEAD`. The line usually reads
+`(HEAD detached at <sha>)`. It reads `(no branch)` instead when the `HEAD`
+reflog does not record the detach, and `(no branch, rebasing <branch>)` during
+a rebase. The `^(HEAD` pattern misses both, so the third pattern removes them.
+
+Write one `-e` per pattern rather than joining them with `\|`. macOS's
+`/usr/bin/grep` reads the `$` before `\|` as a literal character, so the joined
+form keeps `main` in the list, and `main` then reads as safe to delete.
 
 Then remove with the commands that refuse to lose work. `git worktree remove`
 without `--force` refuses a worktree holding modified or untracked files, and
@@ -194,24 +237,36 @@ old content under a new version, and looks exactly like a good write.
   `sessions`, `chainRows`, `first` and `last`), `suite.tests`, and `issues`
   (with `open` and `deferred`). The page no longer draws `lake` or `suite`, but
   its `usable()` check refuses a document without them, so keep both.
+  `state.deployed` changes only when the owner's restart lands. A fast-forward
+  of the main checkout leaves it as it was.
 - **`prs`** has one entry per open pull request, written as
   `{issue, pr, state, review, linked, reviewed, rollup}` and keyed by `issue`.
-  An entry keyed `n` drops its card without any error. `rollup` is a list of
-  `[name, conclusion]` pairs, where the conclusion is one of `"success"`,
+  An entry keyed `n` drops its card without any error. `linked` comes from the
+  pull request's `closingIssuesReferences`. `reviewed` comes from whether a
+  review comment has been posted on it, because GitHub's review decision cannot
+  tell whether the review ran. `rollup` is a list
+  of `[name, conclusion]` pairs, where the conclusion is one of `"success"`,
   `"failure"`, `"running"` or `"neutral"`.
 - **`working`** marks a card a session is on right now, as `{n, kind, what}`.
   An entry with `kind: "build"` draws under Building, and any other `kind`
   draws under Being planned.
-- **`planned`** holds the cards whose plan is finished. Each entry carries
-  `passes` and a `ready` of `build` or `decide`.
-- **`next`** is the ranking, with entries carrying `band`, `order`, `ready` and
-  `why`. It leaves out every issue labeled `deferred`.
+- **`planned`** holds the cards whose plan is finished. Each entry is keyed by
+  `n` and carries `passes`, `note`, and a `ready` of `build` or `decide`.
+- **`next`** is the ranking. Each entry is keyed by `issue` and carries `band`,
+  `order`, `ready` and `why`. Its `ready` takes `build`, `decide` or `plan`,
+  and the page ranks them in that order. It leaves out every issue labeled
+  `deferred`.
 - **`untracked`** carries over as read unless the round has reason to change
   it.
 - **`tracker`** is every open issue, read from GitHub's GraphQL API. Its `ms`
-  is written as `"MVP 2"` or `"no milestone"`. An issue with open sub-issues
-  gets `kind: "parent"`. Its `needs` comes from the issue's native `blockedBy`
-  links plus the dependency sections of issue bodies.
+  is written as `"MVP 2"` or `"no milestone"`. Its `kind` is one of `ready`,
+  `deferred` or `parent` in the data so far, and the page also draws
+  `decision` and `data`. An issue with open sub-issues gets `kind: "parent"`.
+  Its `needs` comes from the issue's native `blockedBy` links plus the
+  dependency sections of issue bodies.
+
+A `next` or `planned` entry under the wrong key drops its card in silence, the
+same way a `prs` entry keyed `n` does.
 
 The page filters cards by milestone, with a selector that defaults to "MVP 2".
 So a card's milestone comes only from `tracker`, and an issue missing from
@@ -239,23 +294,31 @@ prints the same way a complete one does.
 
 A `set` that succeeded proves the database took the document. It does not prove
 the page drew it, because the page refuses a document its `usable()` check
-rejects, and a `prs` entry keyed wrong drops its card in silence. So after
-writing, open the page with the `Artifact` tool's `open` action and confirm the
-cards show under the "MVP 2" selector, including every card this round added
-or moved.
+rejects, and an entry keyed wrong drops its card in silence. So after writing,
+look at the page and confirm every card this round added or moved.
+
+1. **Look under both selectors.** Check the cards under "MVP 2", then again
+   under "All". The selector defaults to "MVP 2", and bugs that can lose a
+   captured minute and bugs in an alarm carry no milestone. Their cards often
+   rank first in `next`, and they never draw under the default.
+2. **View the page in a browser.** The `Artifact` tool's `open` action shows
+   the page to the owner and shows the session nothing. Open the page in a
+   browser signed in to claude.ai, through Claude in Chrome, and read a
+   screenshot. Text extraction cannot read the page, because it renders inside
+   a frame.
 
 ## 4. Recommend what to take next
 
-The ranking directive in `CLAUDE.md`, "Rank work by what makes the product
-usable", decides the order, with its three exceptions. The board's `next`
-stores that order, so read `next` rather than re-deriving it.
+`CLAUDE.md`'s ranking directive and its exceptions decide the order. Read them
+there rather than from a copy here. The board's `next` stores that order, so
+read `next` rather than re-deriving it.
 
-Since 2026-10-05 the slices are closed and work is tracked by MVP milestones.
-The current one is
-[MVP 2, capture on a hosted VM](https://github.com/l3a0/marketlake/milestone/5).
-An issue off that path carries no milestone and the `deferred` label. Bugs that
-can lose a captured minute, and bugs in an alarm, are never deferred, so they
-carry neither and stay candidates even without the milestone.
+The open MVP milestone tracks the work
+([MVP 2, capture on a hosted VM](https://github.com/l3a0/marketlake/milestone/5),
+when this was written). An issue off that path carries no milestone and the
+`deferred` label. Bugs that can lose a captured minute, and bugs in an alarm,
+are never deferred, so they carry neither and stay candidates even without the
+milestone. That is why the page check above looks under "All" as well.
 
 Collect candidates from three places, and give the evidence for each one.
 
