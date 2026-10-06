@@ -195,8 +195,12 @@ def test_the_summary_counts_the_units_it_wrote(tmp_path, capsys):
     assert str(out.resolve() / cp.INSTALL_SCRIPT_FILE) in printed
 
 
-def test_a_seventh_job_reaches_both_renders(tmp_path, monkeypatch):
-    """One roster, so a job added to ``all_jobs`` lands in the plists and the units both."""
+def test_a_seventh_job_reaches_both_renders(tmp_path, monkeypatch, capsys):
+    """One roster, so a job added to ``all_jobs`` lands in the plists and the units both.
+
+    The summary counts the grown roster too, which only a roster other than the real
+    one can show: a count spelled as a literal ten reads right on the real roster.
+    """
     original = cp.all_jobs
 
     def grown(host):
@@ -206,7 +210,12 @@ def test_a_seventh_job_reaches_both_renders(tmp_path, monkeypatch):
     monkeypatch.setattr(cp, "all_jobs", grown)
     launchd, systemd = tmp_path / "launchd", tmp_path / "systemd"
     assert cp.main(["render", "--out", str(launchd), *RENDER_ARGS]) == 0
+    capsys.readouterr()
     _render(systemd)
+    summary = capsys.readouterr().out.splitlines()
+    assert "  12 unit files:" in summary, summary
+    for name in ("com.marketlake.seventh.service", "com.marketlake.seventh.timer"):
+        assert f"    {name}" in summary, name
     assert (launchd / "com.marketlake.seventh.plist").exists()
     timer = (systemd / "com.marketlake.seventh.timer").read_text()
     assert "\nOnCalendar=Mon..Sun 03:00:00 America/New_York\n" in timer
