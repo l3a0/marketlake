@@ -16,10 +16,14 @@ close+5 is 16:20.
 
 The job's rules, each glossed at first use.
 
-1. *One lock for the whole run.* Every lake-mutating job takes the lake-root ``flock``
-   first, the kernel file lock on ``manifest.jsonl``. So a hand-run compaction and a
-   scheduled one never race, and neither races the backup. Capture workers stay outside
-   the lock by design, so blocking a cycle behind compaction never drops a minute.
+1. *One lock for the whole run.* Every job that appends to the manifest or seals a
+   partition takes the lake-root ``flock`` first, the kernel file lock on
+   ``manifest.jsonl``. So a hand-run compaction and a scheduled one never race, and
+   neither races the backup. A capture cycle fetches and writes its segments outside the
+   lock, so blocking a cycle behind compaction never drops a minute. It takes the lock
+   once, after its segments are durable, for its manifest append. A gap-marking pass over
+   today's minutes run at or before today's option close does not take it, for the reason
+   ``lake.gap`` gives.
 2. *Sweep every date, but only past the guard.* The job walks every date directory under
    ``journal/``, so a segment orphaned by an earlier failed run is recovered. A ticker-day
    is eligible only once its *option-close deadline* has passed. That is close+5, the last

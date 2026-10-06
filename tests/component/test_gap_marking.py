@@ -9,6 +9,8 @@ from __future__ import annotations
 import collections
 import os
 import re
+import threading
+from collections.abc import Callable
 from datetime import date, datetime
 from pathlib import Path
 
@@ -17,10 +19,11 @@ import pytest
 from lake import gap, journal
 from lake.capture_spans import CaptureSpans
 from lake.config import GuardConstants
+from lake.lock import lake_lock
 from lake.security_master import SecurityMaster
 from lake.session import SessionClock, session_slots
 from lake.tickers import Roster, TickerConfig, TickersError
-from tests.support.calendar import et, weekday_sessions
+from tests.support.calendar import FakeCalendar, SessionTimes, et, weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.pinger import FakePinger
 from tests.support.transport import FakeTransport
@@ -61,8 +64,9 @@ def _marker(
     pid: int = 4242,
     holidays=(),
     scope_start: datetime = _SCOPE_START,
+    calendar: FakeCalendar | None = None,
 ) -> gap.GapMarker:
-    calendar = weekday_sessions(WEEK, holidays=holidays)
+    calendar = calendar or weekday_sessions(WEEK, holidays=holidays)
     clock = ManualClock(start=at)
     master, spans = _spans_for(roster, scope_start)
     return gap.GapMarker(
@@ -464,6 +468,162 @@ def test_both_producers_write_through_the_same_writer(tmp_path):
     assert after.rows == 1
     marked = _slots(tmp_path, "quotes", "XYZ", date(2026, 9, 2))
     assert len(marked) == len(set(marked))
+
+
+# -- which passes wait on the lake-root lock (marketlake #644) ------------------------
+
+# How long a pass is watched while another thread holds the lake-root lock. A pass that
+# skips the lock finishes in milliseconds, and one that takes it never finishes inside
+# the hold, so the length decides only how long a failing run takes.
+_HELD_WATCH_SECONDS = 1.0
+
+# The Friday of the test week, made a half day for the one case that needs it. Its option
+# close is 13:15, an hour and a half before a regular day's.
+_HALF_DAY = date(2026, 9, 4)
+
+
+def _half_day_calendar() -> FakeCalendar:
+    return FakeCalendar(
+        {
+            _HALF_DAY: SessionTimes(
+                open=et(2026, 9, 4, 9, 30), close=et(2026, 9, 4, 13, 0), early_close=True
+            )
+        }
+    )
+
+
+def _segments(root: Path) -> int:
+    return len(list(root.rglob("*.arrows")))
+
+
+def _run_while_the_lock_is_held(root: Path, run: Callable[[], object]) -> tuple[bool, int]:
+    """Run ``run`` on a thread while this thread holds the lake-root lock.
+
+    Returns whether it finished inside the watch, and how many segments the lake held at
+    that moment, both read before the lock is let go. The lock is then released and the
+    thread joined, so a pass that waited finishes too and its failures still surface.
+    """
+    failures: list[BaseException] = []
+
+    def target() -> None:
+        try:
+            run()
+        except BaseException as exc:  # noqa: BLE001 - reported to the test thread below
+            failures.append(exc)
+
+    worker = threading.Thread(target=target, daemon=True)
+    with lake_lock(root):
+        worker.start()
+        worker.join(_HELD_WATCH_SECONDS)
+        finished = not worker.is_alive()
+        written = _segments(root)
+    worker.join(10)
+    assert not worker.is_alive(), "the pass never finished once the lock was free"
+    assert failures == []
+    return finished, written
+
+
+@pytest.mark.parametrize(
+    ("at", "slots"),
+    [
+        (et(2026, 9, 2, 10, 5), [et(2026, 9, 2, 10, 3), et(2026, 9, 2, 10, 4)]),
+        (et(2026, 9, 2, 16, 15, 30), [et(2026, 9, 2, 16, 13), et(2026, 9, 2, 16, 14)]),
+    ],
+    ids=["mid-session", "at-the-option-close"],
+)
+def test_a_same_day_pass_before_the_option_close_writes_while_the_lock_is_held(tmp_path, at, slots):
+    """A stall's markers for today land without waiting on the lake-root lock.
+
+    The pass runs on the loop thread. On 2026-10-05 capture cycles queued on that lock for
+    minutes, and a marker pass waiting behind them would have held the next minute's cycle
+    too (marketlake #644). Neither reason the pass took the lock applies before today's
+    option close: its plan reads no recorded set, and no scheduled compaction seals a day
+    before its close+5. The clock reading 16:15:30 is still the option close's minute.
+    """
+    marker = _marker(tmp_path, at, roster=Roster((EQUITY_ONLY,)))
+    reports: list[gap.MarkingReport] = []
+
+    finished, written = _run_while_the_lock_is_held(
+        tmp_path, lambda: reports.append(marker.on_skipped(slots))
+    )
+
+    assert finished, "the pass waited on the lake-root lock"
+    assert written == 1
+    (report,) = reports
+    assert report.rows == len(slots)
+    assert report.problems == ()
+
+
+@pytest.mark.parametrize(
+    ("at", "run"),
+    [
+        (
+            et(2026, 9, 2, 16, 16),
+            lambda marker: marker.on_skipped([et(2026, 9, 2, 16, 14), et(2026, 9, 2, 16, 15)]),
+        ),
+        (
+            et(2026, 9, 4, 13, 16),
+            lambda marker: marker.on_skipped([et(2026, 9, 4, 13, 14), et(2026, 9, 4, 13, 15)]),
+        ),
+        (
+            et(2026, 9, 2, 9, 31),
+            lambda marker: marker.on_skipped([et(2026, 9, 1, 16, 15), et(2026, 9, 2, 9, 30)]),
+        ),
+        (et(2026, 9, 2, 10, 5), lambda marker: marker.on_start(et(2026, 9, 2, 10, 5))),
+        (
+            et(2026, 9, 5, 10, 0),
+            lambda marker: marker.on_skipped([et(2026, 9, 4, 16, 14), et(2026, 9, 4, 16, 15)]),
+        ),
+    ],
+    ids=[
+        "after-the-option-close",
+        "after-a-half-days-close",
+        "across-two-days",
+        "startup",
+        "on-a-non-session-day",
+    ],
+)
+def test_every_other_pass_still_waits_on_the_lock(tmp_path, at, run):
+    """Past today's option close, across two days, or at startup, a pass takes the lock.
+
+    Past the close the day can be sealed under the pass, and a pass touching yesterday
+    meets a day that already was. The startup pass reads the recorded set, which is what
+    keeps two incarnations from marking the same minutes. The half day closes at 13:15,
+    so a pass at 13:16 is past its close even though a regular day's has not come. A
+    clock on Saturday has no option close to be before, and Friday's slots it marks
+    belong to a day that may already be sealed.
+    """
+    calendar = _half_day_calendar() if at.date() == _HALF_DAY else None
+    marker = _marker(tmp_path, at, roster=Roster((EQUITY_ONLY,)), calendar=calendar)
+
+    finished, written = _run_while_the_lock_is_held(tmp_path, lambda: run(marker))
+
+    assert not finished, "the pass ran while another thread held the lake-root lock"
+    assert written == 0
+    assert _segments(tmp_path) > 0
+
+
+def test_a_same_day_pass_before_the_option_close_reads_no_manifest(tmp_path, monkeypatch):
+    """The unlocked pass leaves the ledger alone, so a ledger it cannot read costs it nothing.
+
+    Its plan reads no recorded set, and without the lock a ledger read could meet a
+    compaction's append halfway. A ledger read here would turn into a problem on the
+    report and leave the stall's minutes unmarked.
+    """
+    from lake import manifest
+
+    def unreadable(root: Path) -> dict:
+        raise manifest.TornLedger("the same-day pass read the manifest")
+
+    monkeypatch.setattr(gap, "latest_entries", unreadable)
+    slots = [et(2026, 9, 2, 10, 3), et(2026, 9, 2, 10, 4)]
+    marker = _marker(tmp_path, et(2026, 9, 2, 10, 5), roster=Roster((EQUITY_ONLY,)))
+
+    report = marker.on_skipped(slots)
+
+    assert report.problems == ()
+    assert report.rows == len(slots)
+    assert journal.recorded_slots(tmp_path, "quotes", "XYZ", date(2026, 9, 2)).slots == set(slots)
 
 
 # -- nothing owed, nothing written ---------------------------------------------------
@@ -1095,8 +1255,8 @@ def test_a_restart_across_a_minute_top_writes_the_first_owed_minute_once(reads_s
 def _overrun_after_a_roster_change(tmp_path: Path, *, before: str, after: str) -> tuple[Path, int]:
     """Run a loop whose first tick rewrites ``tickers.yaml`` and then stalls.
 
-    Returns the lake root and how many surfaces the watchdog charged. Both skipped-slot
-    consumers read the roster, so one run shows what each of them did.
+    Returns the lake root and how many surfaces the watchdog charged. Both consumers of
+    a skipped slot read the roster, so one run shows what each of them did.
 
     The rewrite lands at 10:00 and that tick's hook runs to 10:03, so the next tick
     reports 10:01 through 10:03 as skipped. The stall is on the loop thread rather than in
@@ -1244,8 +1404,9 @@ def test_a_ticker_disabled_in_place_stops_collecting_markers_too(tmp_path):
 def test_the_watchdog_charges_the_roster_as_it_stands_on_a_skipped_slot(tmp_path):
     """The other consumer of the same read, driven the same way.
 
-    Gap marking and the watchdog counters both fire from ``on_skipped``, where no cycle
-    ran to fix a roster snapshot, so both read ``tickers.yaml`` themselves. Deleting
+    Gap marking fires from ``on_skipped`` and the watchdog counters from ``on_missed``,
+    both for slots where no cycle ran to fix a roster snapshot, so both read
+    ``tickers.yaml`` themselves. Deleting
     either read must not leave the suite green. XYZ is retired at 10:00 and must stop
     being charged without a restart. NEW is onboarded at 10:00, is captured from the
     next cycle, and must start. Each run charges one counter per enabled ticker, so a
