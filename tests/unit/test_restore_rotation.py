@@ -41,6 +41,8 @@ def test_a_week_reads_the_files_whose_residue_it_is():
 def test_files_sharing_a_residue_are_read_together_in_path_order():
     # Handed over out of order, so the sort is the code's and not the fixture's.
     assert restore_picks(PAIRS, 51) == ((R51A, "sha-51a"), (R51B, "sha-51b"))
+    # And the shas sort the other way round, so a sort on the sha would get it wrong.
+    assert restore_picks([(R51B, "a"), (R51A, "z")], 51) == ((R51A, "z"), (R51B, "a"))
 
 
 def test_the_week_number_wraps_every_52_weeks():
@@ -61,6 +63,16 @@ def test_the_fallthrough_wraps_past_51_to_0():
     assert restore_picks(pairs, 8) == ((R0, "sha-0"),)
     # And week 52 is residue 0 itself, which is the first wrap of the rotation.
     assert restore_picks(pairs, 52) == ((R0, "sha-0"),)
+
+
+def test_the_fallthrough_can_land_on_residue_51():
+    # Weeks 8 to 50 hold nothing, so week 8 stops at 51 rather than going round to 2.
+    assert restore_picks([(R2, "sha-2"), (R51A, "sha-51a")], 8) == ((R51A, "sha-51a"),)
+
+
+def test_the_fallthrough_reaches_a_file_51_steps_on():
+    # A lone file in residue 0, sought from week 1, is the longest walk there is.
+    assert restore_picks([(R0, "sha-0")], 1) == ((R0, "sha-0"),)
 
 
 def test_no_pairs_gives_no_picks():
