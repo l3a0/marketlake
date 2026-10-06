@@ -479,11 +479,10 @@ def main(
     stdin: TextIO,
     stdout: TextIO,
     *,
-    environ: Mapping[str, str] | None = None,
     api: Api = _gh_api,
 ) -> int:
     args = _parser().parse_args(argv[1:])
-    env = os.environ if environ is None else environ
+    env = os.environ
     if args.mode == "change-set":
         rows = change_set(json.load(stdin))
         data = encode(rows)
