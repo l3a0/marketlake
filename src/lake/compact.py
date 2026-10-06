@@ -217,6 +217,13 @@ COMPACTION_SOURCE = "compaction"
 # The chains columns the re-tune profile reads. Everything else stays on disk.
 _PROFILE_COLUMNS = ("ticker", "snap_ts", "row_kind", "window_start", "window_end")
 
+# How many rows the seal's read-back and the re-tune's profile decode at a time. Both
+# stream the partition rather than decoding it whole, because a whole ticker-day decoded
+# at once needed 4,017.2 MiB for SPY on 2026-09-30, more than a 2 GiB host has
+# (marketlake #660). A batch's memory grows with this number and not with the file, so
+# it bounds both reads however large a day gets.
+_READ_BATCH_ROWS = 8192
+
 # The event and title on compaction's schema-drift page. The design's message table gives
 # schema drift one row and names four producers for it: the parser mid-day, the close+5
 # fill through the same page, the nightly battery, and this one. The other three read what
@@ -1578,9 +1585,16 @@ def _seal(
 
     _write_partition(merged, partition)
     # One read of the sealed file serves both post-write checks. The row count proves
-    # every page decodes, and the digest attests the very bytes the count came from.
+    # every page decodes, and the digest attests the very bytes the count came from. The
+    # count is summed over batches decoded from those same bytes, every column of every
+    # row, so only one batch is ever decoded at a time.
     written = partition.read_bytes()
-    actual = pq.read_table(pa.BufferReader(written)).num_rows
+    actual = sum(
+        batch.num_rows
+        for batch in pq.ParquetFile(pa.BufferReader(written)).iter_batches(
+            batch_size=_READ_BATCH_ROWS
+        )
+    )
     if actual != expected:
         raise CompactionVerifyError(rel, expected, actual)
 
@@ -1692,8 +1706,10 @@ def _offsets(row: Mapping[str, object], session_date: date) -> Window:
     return (start, end)
 
 
-def window_profile(table: pa.Table, session_date: date) -> WindowProfile:
-    """Profile one day's chains rows by plan window.
+def window_profile(
+    partition: Path | str, session_date: date, *, batch_size: int = _READ_BATCH_ROWS
+) -> WindowProfile:
+    """Profile one day's chains partition by plan window.
 
     A cycle is one ``(ticker, snap_ts)``. Its contracts in a window are its data rows
     whose ``window_start`` and ``window_end`` name that window. The peak across cycles
@@ -1701,34 +1717,54 @@ def window_profile(table: pa.Table, session_date: date) -> WindowProfile:
     rows carrying a window are that window's absence markers, so they mark it failed
     for the day rather than counting toward it. The ISO window bounds are turned back
     into day offsets from ``session_date``, the same arithmetic ``ChainPlan.windows_for``
-    runs forward. Rows with no window, from a one-shot whole-chain fetch, a whole-chain
-    gap, or an expiration before the session date, are left out.
+    runs forward.
+
+    The partition at ``partition`` is read ``batch_size`` rows at a time, and only the
+    profile columns, so its memory does not grow with the day (marketlake #660). A cycle
+    can straddle two batches, so each cycle's count in a window is summed across batches,
+    and the peak per window is taken only once every batch has been counted.
+
+    Three rules decide what a row with a null counts as.
+
+    1. A null ``window_start`` leaves the row out. Rows with no window come from a
+       one-shot whole-chain fetch, a whole-chain gap, or an expiration before the
+       session date.
+    2. A null ``window_end`` is the plan's open tail, which counts as its own window.
+    3. A null ``row_kind`` counts as neither a data row nor a gap row.
     """
-    if table.num_rows == 0:
-        return WindowProfile({}, frozenset())
-    windowed = table.filter(pc.is_valid(table.column("window_start")))
-    if windowed.num_rows == 0:
-        return WindowProfile({}, frozenset())
-    kinds = windowed.column("row_kind")
-    data = windowed.filter(pc.equal(kinds, ROW_KIND_DATA))
-    gaps = windowed.filter(pc.not_equal(kinds, ROW_KIND_DATA))
+    keys = ["ticker", "snap_ts", "window_start", "window_end"]
+    per_cycle: dict[tuple[object, ...], int] = {}
+    gap_bounds: set[tuple[object, object]] = set()
+    with pq.ParquetFile(partition) as reader:
+        for batch in reader.iter_batches(columns=list(_PROFILE_COLUMNS), batch_size=batch_size):
+            windowed = batch.filter(pc.is_valid(batch.column("window_start")))
+            if windowed.num_rows == 0:
+                continue
+            kinds = windowed.column("row_kind")
+            # ``equal`` and ``not_equal`` give null on a null ``row_kind``, and ``filter``
+            # drops a null, which is rule 3.
+            data = windowed.filter(pc.equal(kinds, ROW_KIND_DATA))
+            gaps = windowed.filter(pc.not_equal(kinds, ROW_KIND_DATA))
+            if data.num_rows:
+                counted = (
+                    pa.Table.from_batches([data]).group_by(keys).aggregate([([], "count_all")])
+                )
+                for row in counted.to_pylist():
+                    key = tuple(row[name] for name in keys)
+                    per_cycle[key] = per_cycle.get(key, 0) + int(row["count_all"])
+            if gaps.num_rows:
+                distinct = pa.Table.from_batches([gaps]).group_by(keys[2:]).aggregate([])
+                for row in distinct.to_pylist():
+                    gap_bounds.add((row["window_start"], row["window_end"]))
 
     peaks: dict[Window, int] = {}
-    if data.num_rows:
-        per_cycle = data.group_by(["ticker", "snap_ts", "window_start", "window_end"]).aggregate(
-            [([], "count_all")]
-        )
-        by_window = per_cycle.group_by(["window_start", "window_end"]).aggregate(
-            [("count_all", "max")]
-        )
-        for row in by_window.to_pylist():
-            peaks[_offsets(row, session_date)] = int(row["count_all_max"])
-
-    failed: set[Window] = set()
-    if gaps.num_rows:
-        distinct = gaps.group_by(["window_start", "window_end"]).aggregate([])
-        for row in distinct.to_pylist():
-            failed.add(_offsets(row, session_date))
+    for (_, _, start, end), count in per_cycle.items():
+        window = _offsets({"window_start": start, "window_end": end}, session_date)
+        peaks[window] = max(peaks.get(window, 0), count)
+    failed = {
+        _offsets({"window_start": start, "window_end": end}, session_date)
+        for start, end in gap_bounds
+    }
     return WindowProfile(peaks, frozenset(failed))
 
 
@@ -1873,8 +1909,7 @@ def _retune(
             # A partition without the window columns predates the windowed fetch. It
             # carries no profile, so it has nothing to say about the plan.
             continue
-        table = pq.read_table(path, columns=list(_PROFILE_COLUMNS))
-        profile = window_profile(table, day)
+        profile = window_profile(path, day)
         for window, count in profile.peaks.items():
             peaks[window] = max(peaks.get(window, 0), count)
         failed |= profile.failed
