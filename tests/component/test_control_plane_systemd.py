@@ -20,8 +20,7 @@ from pathlib import Path
 import pytest
 
 from lake import control_plane as cp
-from lake.paths import TOKEN_FILE, config_dir
-from lake.schwab import DEFAULT_TOKEN_PATH
+from lake.paths import TOKEN_FILE, config_dir, default_token_path
 from tests.component.test_control_plane_render import (
     EVERY_DAY_AT_THREE,
     RENDER_ARGS,
@@ -149,9 +148,10 @@ def test_the_consumers_name_one_token_file(tmp_path):
     daemon = (out / "com.marketlake.daemon.service").read_text()
     assert "\nEnvironment=HOME=/home/someone\n" in daemon
     assert "--token" not in daemon
-    # schwab spells the shared rule its own way. Binding the two spellings is the daemon
-    # leg, and asserting the renderer's helper against itself would prove nothing.
-    assert str(DEFAULT_TOKEN_PATH) == str(config_dir() / TOKEN_FILE)
+    # The vendor resolves the token through lake.paths.default_token_path. Binding that
+    # to the shared rule is the daemon leg, and asserting the renderer's helper against
+    # itself would prove nothing.
+    assert str(default_token_path()) == str(config_dir() / TOKEN_FILE)
     assert cp.default_token_path("/home/someone") == token
 
 

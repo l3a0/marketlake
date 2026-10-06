@@ -1,43 +1,50 @@
-"""Which module-level constants in ``src/lake`` are built from ``paths.config_dir``.
+"""The config-directory defaults in ``src/lake``: what resolves them, and what must not.
 
-Four constants name a file in the machine's config directory, and every one of them is
-bound when its module is imported. That is what makes ``MARKETLAKE_CONFIG_DIR`` work at
-all, and it is also what makes the list of them load-bearing in three places: the suite's
-redirect checks that none of these modules was imported too early, one test asks a child
-where each one resolved, and another asks the same of the pytest process. The roster's
-default is a function resolved on each call, so it is not on the list, and marketlake
-#715 will convert these four the same way.
+Four files sit in the machine's config directory, and each has a default path. Every one
+of those defaults is a function resolved on each call, so the environment at the moment
+of a read or a write decides where it lands. A module constant would be fixed when its
+module is imported instead. On 2026-10-06 a probe that pointed ``HOME`` at a throwaway
+after ``import lake`` overwrote a host's live roster through exactly such a constant, and
+the token, config and chain-plan defaults were built the same way until marketlake #715
+converted them.
 
-All three used to type the list out. Nothing bound those spellings to the source, so a
-new constant added to ``src/lake`` would have been outside every one of them with
-nothing to say so. Verified before this existed: adding a sixth default to a probe module
-and running all three left the suite green.
+This module reads the source to keep it that way, and it answers three questions.
 
-So the list is read out of the source instead. This scans with the ``ast`` module and
-never imports the code it is reading, which matters because importing one of these
-modules is the very thing that binds its default against whatever the environment said at
-that moment.
+1. ``bindings_at_import`` lists everything in ``src/lake`` that calls ``config_dir`` or
+   a resolver while its module is imported. That covers a module-level assignment, a
+   class body, and a default argument, lambdas included. It should find nothing.
+2. ``resolvers`` lists the resolvers themselves: every module-level ``def default_*``
+   whose body calls ``config_dir`` and whose parameters all have defaults. The tests
+   that ask a child process where each default resolved enumerate this list rather
+   than a typed one, because a typed list already went stale once with nothing to say
+   so.
+3. ``config_dir_calls_outside_resolvers`` lists every call to ``config_dir`` that does
+   not sit inside a module-level function named ``default_*``. It should find nothing
+   too. It is what keeps the second answer complete: a resolver spelled any other way,
+   or an inline ``config_dir() / X`` in a function body, fails here rather than
+   dropping out of the list.
+
+It scans with the ``ast`` module and never imports the code it reads. It scans
+``src/lake`` only. ``tests/support/config_guard.REAL_CONFIG_DIR`` binds ``Path.home()``
+at import on purpose, so a test that moves ``HOME`` cannot move the directory the guard
+protects.
 
 ``tests/support/enforcement.py`` is the neighbouring pattern, scanning the same tree for
-the clock and calendar seams. It differs in what it is for. Those scanners forbid a call.
-This one enumerates a declaration, so a new one is picked up rather than refused.
+the clock and calendar seams.
 
 Three limits are named rather than hidden.
 
-1. Only a name bound when the module is imported counts. That includes an assignment
-   nested under a top-level ``if``, ``try``, ``with``, or loop, since those run at
-   import too. It excludes a function body and a class body, because neither binds a
-   module-level name, and the redirect's check would otherwise refuse imports that bind
-   no default at all.
-2. A call is recognised by name: a bare ``config_dir(...)``, an aliased import of it, or
-   any attribute call spelled ``....config_dir(...)``. A module that reached the function
-   through some further indirection, such as looking it up in a dict, would be missed.
-   Nothing in this repo does that, and ``test_the_scanner_finds_what_is_there_today``
-   fails if the known ones stop being found.
-3. Every name a tuple assignment binds is reported when any part of the value calls
-   ``config_dir``, so ``A, B = config_dir() / X, something_else()`` names ``B`` as well.
-   That over-reports rather than under-reports, which is the safe direction here, and
-   nothing in this repo writes one.
+1. A call is recognised by name: a bare call, an aliased import, or any attribute call
+   spelled ``....config_dir(...)`` or ``....<resolver>(...)``. A module that reached the
+   function through some further indirection, such as looking it up in a dict, would be
+   missed. Nothing in this repo does that.
+2. Only code that runs at import counts for the first answer. A function body runs when
+   it is called, and so does a lambda's body, so neither is reported there. The third
+   answer covers function bodies instead.
+3. A resolver is recognised by its name as well as its body. A function that resolves a
+   config-directory path through another resolver, rather than through ``config_dir``,
+   is not on the second list. ``control_plane.default_token_path`` is one, and it takes a
+   required home anyway.
 """
 
 from __future__ import annotations
@@ -49,62 +56,63 @@ from pathlib import Path
 # spells it, so the two scanners cannot disagree about which tree they scan.
 LAKE_SRC = Path(__file__).resolve().parents[2] / "src" / "lake"
 
-# The function whose call marks a constant as living in the config directory.
+# The function that resolves the config directory.
 CONFIG_DIR_FUNC = "config_dir"
 
+# The prefix every resolver's name carries.
+RESOLVER_PREFIX = "default_"
 
-def _local_names_for_config_dir(tree: ast.Module) -> set[str]:
-    """Every bare name this file could call ``config_dir`` by, aliases included."""
-    names = {CONFIG_DIR_FUNC}
+
+def _module_name(path: Path, root: Path, package: str) -> str:
+    """The dotted import name of ``path`` inside ``package``."""
+    relative = path.relative_to(root)
+    parts = list(relative.parts[:-1])
+    if relative.stem != "__init__":
+        parts.append(relative.stem)
+    return ".".join([package, *parts]) if parts else package
+
+
+def _local_names(tree: ast.Module, recognised: frozenset[str]) -> set[str]:
+    """Every bare name this file could call a recognised function by, aliases included."""
+    names = set(recognised)
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             for alias in node.names:
-                if alias.name == CONFIG_DIR_FUNC and alias.asname:
+                if alias.name in recognised and alias.asname:
                     names.add(alias.asname)
     return names
 
 
-def _calls_config_dir(value: ast.expr, local_names: set[str]) -> bool:
-    """Whether ``value`` calls ``config_dir`` anywhere inside it.
-
-    The whole expression is walked rather than only its outermost call, because every
-    real one is a division: ``config_dir() / TOKEN_FILE``.
-    """
-    for node in ast.walk(value):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if isinstance(func, ast.Name) and func.id in local_names:
-            return True
-        if isinstance(func, ast.Attribute) and func.attr == CONFIG_DIR_FUNC:
-            return True
+def _is_call_to(node: ast.AST, attrs: frozenset[str], local_names: set[str]) -> bool:
+    """Whether ``node`` is a call to one of ``attrs`` by bare name, alias or attribute."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id in local_names
+    if isinstance(func, ast.Attribute):
+        return func.attr in attrs
     return False
 
 
-def _binds_at_import(body: list[ast.stmt]) -> list[ast.stmt]:
-    """Every assignment in ``body`` that runs when the module is imported.
+def _calls_at_import(value: ast.AST, attrs: frozenset[str], local_names: set[str]) -> bool:
+    """Whether evaluating ``value`` calls a recognised function.
 
-    A statement nested under a top-level ``if``, ``try``, ``with``, or loop still runs at
-    import, so an optional default guarded by one is still a default. A function body and
-    a class body are not descended into, because neither binds a module-level name.
+    The whole expression is walked, because every real one is a division:
+    ``config_dir() / TOKEN_FILE``. A lambda's defaults are evaluated with it and its body
+    is not, so only the defaults are walked.
     """
-    found: list[ast.stmt] = []
-    for node in body:
-        if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            found.append(node)
-        elif isinstance(node, ast.If):
-            found.extend(_binds_at_import(node.body))
-            found.extend(_binds_at_import(node.orelse))
-        elif isinstance(node, ast.Try):
-            found.extend(_binds_at_import(node.body))
-            for handler in node.handlers:
-                found.extend(_binds_at_import(handler.body))
-            found.extend(_binds_at_import(node.orelse))
-            found.extend(_binds_at_import(node.finalbody))
-        elif isinstance(node, (ast.With, ast.For, ast.While)):
-            found.extend(_binds_at_import(node.body))
-            found.extend(_binds_at_import(getattr(node, "orelse", [])))
-    return found
+    stack: list[ast.AST] = [value]
+    while stack:
+        node = stack.pop()
+        if _is_call_to(node, attrs, local_names):
+            return True
+        if isinstance(node, ast.Lambda):
+            stack.extend(node.args.defaults)
+            stack.extend(default for default in node.args.kw_defaults if default is not None)
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+    return False
 
 
 def _bound_names(target: ast.expr) -> list[str]:
@@ -118,55 +126,136 @@ def _bound_names(target: ast.expr) -> list[str]:
     return []
 
 
-def _module_name(path: Path, root: Path, package: str) -> str:
-    """The dotted import name of ``path`` inside ``package``."""
-    relative = path.relative_to(root)
-    parts = list(relative.parts[:-1])
-    if relative.stem != "__init__":
-        parts.append(relative.stem)
-    return ".".join([package, *parts]) if parts else package
+def _function_defaults(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.expr]:
+    """The default values a ``def`` evaluates when it is defined."""
+    return [*node.args.defaults, *(d for d in node.args.kw_defaults if d is not None)]
 
 
-def defaults_built_from_config_dir(
-    root: Path = LAKE_SRC, package: str = "lake"
-) -> tuple[tuple[str, str], ...]:
-    """Every ``(module, constant)`` under ``root`` assigned from a ``config_dir`` call.
+def _at_import(
+    body: list[ast.stmt], prefix: str, attrs: frozenset[str], local_names: set[str]
+) -> list[str]:
+    """What in ``body`` calls a recognised function while the module is imported.
 
-    Sorted, so the order is the same on every machine and a diff of the list reads as a
-    diff rather than as a reshuffle. A module defining two such constants contributes two
-    pairs.
+    A statement nested under a top-level ``if``, ``try``, ``with`` or loop still runs at
+    import, and so does a class body and the default arguments of a ``def``. A function
+    body does not, so it is never descended into.
     """
-    found: list[tuple[str, str]] = []
-    for path in sorted(root.rglob("*.py")):
-        source = path.read_text(encoding="utf-8")
-        # Parsing every file costs about 84 ms on this tree, against 20 ms with this
-        # line, and it runs once per process rather than once per suite, children
-        # included. A file that never spells the name cannot call it under any of the
-        # three forms below, so it is skipped before the parser sees it. Seven of the
-        # forty-one files spell it, so most of the tree is never parsed.
-        if CONFIG_DIR_FUNC not in source:
-            continue
-        tree = ast.parse(source, filename=str(path))
-        local_names = _local_names_for_config_dir(tree)
-        module = _module_name(path, root, package)
-        for node in _binds_at_import(tree.body):
+    found: list[str] = []
+    for node in body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            if node.value is None or not _calls_at_import(node.value, attrs, local_names):
+                continue
             if isinstance(node, ast.Assign):
                 names = [name for target in node.targets for name in _bound_names(target)]
-                value: ast.expr | None = node.value
             else:
-                assert isinstance(node, ast.AnnAssign)
                 names = _bound_names(node.target)
-                value = node.value
-            if value is None or not names or not _calls_config_dir(value, local_names):
+            found.extend(f"{prefix}{name}" for name in names or ["<assignment>"])
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if any(_calls_at_import(d, attrs, local_names) for d in _function_defaults(node)):
+                found.append(f"{prefix}{node.name}()")
+        elif isinstance(node, ast.ClassDef):
+            found.extend(_at_import(node.body, f"{prefix}{node.name}.", attrs, local_names))
+        elif isinstance(node, ast.If):
+            found.extend(_at_import(node.body, prefix, attrs, local_names))
+            found.extend(_at_import(node.orelse, prefix, attrs, local_names))
+        elif isinstance(node, ast.Try):
+            found.extend(_at_import(node.body, prefix, attrs, local_names))
+            for handler in node.handlers:
+                found.extend(_at_import(handler.body, prefix, attrs, local_names))
+            found.extend(_at_import(node.orelse, prefix, attrs, local_names))
+            found.extend(_at_import(node.finalbody, prefix, attrs, local_names))
+        elif isinstance(node, (ast.With, ast.For, ast.While)):
+            found.extend(_at_import(node.body, prefix, attrs, local_names))
+            found.extend(_at_import(getattr(node, "orelse", []), prefix, attrs, local_names))
+        elif isinstance(node, ast.Expr) and _calls_at_import(node.value, attrs, local_names):
+            found.append(f"{prefix}<expression>")
+    return found
+
+
+def _parsed(root: Path, package: str, needles: frozenset[str]):
+    """Each ``(module, tree)`` under ``root`` whose source spells one of ``needles``.
+
+    A file that never spells a name cannot call it under any of the recognised forms, so
+    it is skipped before the parser sees it. Most of the tree is never parsed.
+    """
+    for path in sorted(root.rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        if not any(needle in source for needle in needles):
+            continue
+        yield _module_name(path, root, package), ast.parse(source, filename=str(path))
+
+
+def _all_have_defaults(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Whether every parameter of ``node`` can be omitted."""
+    args = node.args
+    positional = [*args.posonlyargs, *args.args]
+    if len(args.defaults) < len(positional):
+        return False
+    return all(default is not None for default in args.kw_defaults)
+
+
+def resolvers(root: Path = LAKE_SRC, package: str = "lake") -> tuple[tuple[str, str], ...]:
+    """Every ``(module, function)`` resolver under ``root``, sorted.
+
+    A resolver is a module-level ``def default_*`` whose body calls ``config_dir`` and
+    whose parameters all have defaults, so it can be called with nothing and resolves
+    the running process's own config directory.
+    """
+    attrs = frozenset({CONFIG_DIR_FUNC})
+    found: list[tuple[str, str]] = []
+    for module, tree in _parsed(root, package, attrs):
+        local_names = _local_names(tree, attrs)
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            found.extend((module, name) for name in names)
+            if not node.name.startswith(RESOLVER_PREFIX) or not _all_have_defaults(node):
+                continue
+            if any(_is_call_to(inner, attrs, local_names) for inner in ast.walk(node)):
+                found.append((module, node.name))
     return tuple(sorted(found))
 
 
-def modules_building_a_default(root: Path = LAKE_SRC, package: str = "lake") -> tuple[str, ...]:
-    """Just the module names, deduplicated and sorted.
+def bindings_at_import(root: Path = LAKE_SRC, package: str = "lake") -> tuple[tuple[str, str], ...]:
+    """Every ``(module, where)`` under ``root`` that resolves a config path at import.
 
-    This is what the suite's redirect checks against ``sys.modules``, where the constant's
-    own name does not matter and only whether the module was imported does.
+    ``where`` names the binding: ``NAME`` for a module-level assignment, ``Class.NAME``
+    for a class attribute, and ``func()`` for a ``def`` whose default argument calls one.
+    A call counts when it reaches ``config_dir`` or any resolver ``resolvers`` finds,
+    since a module-level ``X = default_token_path()`` is fixed at import just the same.
     """
-    return tuple(sorted({module for module, _ in defaults_built_from_config_dir(root, package)}))
+    names = frozenset({CONFIG_DIR_FUNC, *(name for _, name in resolvers(root, package))})
+    found: list[tuple[str, str]] = []
+    for module, tree in _parsed(root, package, names):
+        local_names = _local_names(tree, names)
+        found.extend((module, where) for where in _at_import(tree.body, "", names, local_names))
+    return tuple(sorted(found))
+
+
+def config_dir_calls_outside_resolvers(
+    root: Path = LAKE_SRC, package: str = "lake"
+) -> tuple[tuple[str, int], ...]:
+    """Every ``(module, line)`` calling ``config_dir`` outside a module-level ``default_*``.
+
+    A call is recognised the way ``resolvers`` recognises one, never by a text match,
+    which would also hit ``default_config_dir(host.home)``. A call anywhere inside a
+    module-level ``def default_*``'s body passes, nested helpers included. Every other call
+    fails, whether it sits at module level, in a class, or in another function.
+    """
+    attrs = frozenset({CONFIG_DIR_FUNC})
+    found: list[tuple[str, int]] = []
+    for module, tree in _parsed(root, package, attrs):
+        local_names = _local_names(tree, attrs)
+        allowed: set[int] = set()
+        for node in tree.body:
+            is_def = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            if is_def and node.name.startswith(RESOLVER_PREFIX):
+                # The body only. A default argument runs at import, and
+                # ``bindings_at_import`` is what reports one.
+                for statement in node.body:
+                    allowed.update(id(inner) for inner in ast.walk(statement))
+        for node in ast.walk(tree):
+            if id(node) in allowed or not _is_call_to(node, attrs, local_names):
+                continue
+            assert isinstance(node, ast.Call)
+            found.append((module, node.lineno))
+    return tuple(sorted(found))

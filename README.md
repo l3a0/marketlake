@@ -463,12 +463,9 @@ given on the command line.
 MARKETLAKE_CONFIG_DIR=/tmp/marketlake-dev uv run python -m lake.reauth
 ```
 
-It has to be set before the process starts. Four defaults are built when their module is
-imported: the chain plan, the config, and the two token paths. Until
-[#715](https://github.com/l3a0/marketlake/issues/715) converts them, an export made inside
-a running process moves the roster, which resolves each time it is read, and leaves those
-four on the real directory. Exporting it in the shell being worked in covers that whole
-session.
+It has to be set before the process starts, because setting it part-way through a run
+moves only what is resolved afterwards. Exporting it in the shell being worked in covers
+that whole session.
 
 Do not put it in a shell profile. The weekly re-auth runs in that same shell, so a
 profile export would send the week's token to a throwaway directory while the daemon

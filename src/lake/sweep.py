@@ -135,7 +135,7 @@ from lake.control_plane import (
 )
 from lake.loader import SnapAbsent
 from lake.manifest import ManifestError, is_quarantined, latest_quarantine
-from lake.paths import CHAINS, QUOTES
+from lake.paths import CHAINS, QUOTES, default_token_path
 from lake.report import (
     ACTION,
     BARS_PIECE,
@@ -150,7 +150,7 @@ from lake.report import (
 )
 from lake.runner import PING_FAILURES, Pinger, escalate_ping_failure
 from lake.schema_versions import check_running_version
-from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor, VendorAuthError
+from lake.schwab import SchwabVendor, VendorAuthError
 from lake.security_master import SecurityMasterError
 from lake.splits import SplitReport, detect_splits
 from lake.tickers import Roster, load_tickers
@@ -1211,7 +1211,7 @@ def sweep_from_config(
     vendor_source: VendorSource | None = None,
     schedule_setter: ScheduleSetter | None = None,
     schedule_reader: ScheduleReader | None = None,
-    token_path: str | Path = DEFAULT_TOKEN_PATH,
+    token_path: str | Path | None = None,
 ) -> SweepOutcome:
     """The sweep wired from the real config. This is the entry :func:`main` calls.
 
@@ -1229,7 +1229,7 @@ def sweep_from_config(
 
     def build_vendor() -> Vendor:
         return SchwabVendor.from_token(
-            token_path,
+            default_token_path() if token_path is None else token_path,
             api_key=config.schwab_api_key.reveal(),
             app_secret=config.schwab_app_secret.reveal(),
         )

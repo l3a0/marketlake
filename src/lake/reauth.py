@@ -60,15 +60,7 @@ from pathlib import Path
 from typing import Protocol
 
 from lake.config import CALLBACK_KEY, input_errors_exit, load_config
-from lake.paths import TOKEN_FILE, config_dir, temp_write_path
-
-# The standard location of the Schwab token, per the design's Configuration section. The
-# same home-relative default ``lake.schwab`` reads from, spelled through ``lake.paths``
-# so this module needs nothing from the vendor layer.
-# The path is fixed when this module is imported, so a process that sets HOME or
-# MARKETLAKE_CONFIG_DIR afterwards still resolves the real directory. marketlake #715
-# will resolve it at call time instead.
-DEFAULT_TOKEN_PATH = config_dir() / TOKEN_FILE
+from lake.paths import default_token_path, temp_write_path
 
 # The token is a full brokerage credential, so it is written owner-read-write and nothing
 # else. The design pins ``chmod 600`` on this file. The mode goes on the temp file before
@@ -265,7 +257,7 @@ def reauth_from_config(
         api_key=config.schwab_api_key.reveal(),
         app_secret=config.schwab_app_secret.reveal(),
         callback_url=config.schwab_callback_url,
-        token_path=token_path if token_path is not None else DEFAULT_TOKEN_PATH,
+        token_path=token_path if token_path is not None else default_token_path(),
         login_flow=login_flow,
         stdin_is_tty=stdin_is_tty,
     )
@@ -336,7 +328,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "CALLBACK_KEY",
-    "DEFAULT_TOKEN_PATH",
     "TOKEN_MODE",
     "LoginFlow",
     "ReauthError",

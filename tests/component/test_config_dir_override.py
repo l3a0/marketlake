@@ -10,13 +10,11 @@ So the answer for a development run is an override that moves the whole director
 export ``MARKETLAKE_CONFIG_DIR`` and the process cannot reach the real files at all,
 whatever it is given on the command line.
 
-Every default in this package is built from ``paths.config_dir``, and four of them at
-import. That is what makes one variable enough and it is also the reason these tests
-spawn a child process. Setting the variable inside a running process moves nothing for
-those four, because the constants are already bound. The roster's default resolves on
-each call, and marketlake #715 will convert the other four. Only a process that started with
-the variable set is the real thing for those, so that is what these run, and each drives
-production code rather than a stand-in for it.
+Every default in this package is resolved through ``paths.config_dir`` each time it is
+used. That is what makes one variable enough. These tests spawn a child process because
+a process that started with the variable set is the real thing, which is how an operator
+uses it, and each drives production code rather than a stand-in for it. A variable set
+part-way through a run is covered by ``tests/component/test_late_config_dir_redirect.py``.
 
 The child's own writes land under the test's ``tmp_path``. The parent's guard does not
 reach a child, which the guard says about itself, so nothing here relies on it. The
@@ -35,7 +33,7 @@ from pathlib import Path
 from lake import control_plane as cp
 from lake.paths import CONFIG_DIR_ENV
 from tests.component.test_control_plane_render import RENDER_ARGS
-from tests.support.config_defaults import defaults_built_from_config_dir
+from tests.support.config_defaults import resolvers
 
 # The repo root. One script below imports the ``tests`` package, which needs the root on
 # ``sys.path``, and ``python -c`` supplies only the working directory. Giving the child
@@ -43,22 +41,22 @@ from tests.support.config_defaults import defaults_built_from_config_dir
 # alone.
 ROOT = Path(__file__).resolve().parents[2]
 
-# Every module-level default built from the config directory, read out of ``src/lake``
-# rather than typed here. All of them move together or the override is not worth having,
-# since a redirected token beside a live config is a half-redirected process, and a
-# new one added to the package has to join them without anyone remembering to come
-# back and edit this file.
-DEFAULT_PAIRS = defaults_built_from_config_dir()
+# Every resolver of a config-directory default, read out of ``src/lake`` rather than
+# typed here. All of them move together or the override is not worth having, since a
+# redirected token beside a live config is a half-redirected process, and a new one
+# added to the package has to join them without anyone remembering to come back and
+# edit this file.
+DEFAULT_PAIRS = resolvers()
 
-# ``module.CONSTANT`` for each, which is what the child prints and the tests compare.
+# ``module.function`` for each, which is what the child prints and the tests compare.
 DEFAULT_KEYS = tuple(f"{module}.{name}" for module, name in DEFAULT_PAIRS)
 
 # The floor under every assertion built on the scan. A scan that came back empty would
 # leave each loop below iterating nothing and each set comparison holding two empty sets,
 # so both tests here and both in the redirect module would pass while checking nothing.
-# The token's own default is named rather than a count, because it is the file the whole
+# The token's own resolver is named rather than a count, because it is the file the whole
 # arrangement exists to keep and a count goes stale the day a default is retired.
-TOKEN_DEFAULT = "lake.reauth.DEFAULT_TOKEN_PATH"
+TOKEN_DEFAULT = "lake.paths.default_token_path"
 
 
 def assert_the_scan_found_something() -> None:
@@ -71,10 +69,11 @@ def _defaults_script(pairs: tuple[tuple[str, str], ...]) -> str:
     """A child script printing where each default resolved, keyed by its full name.
 
     ``import_module`` rather than a written-out ``from x import y``, because the list is
-    generated. Either binds the constant the same way, which is the thing under test.
+    generated. Each resolver is called with nothing, the way a caller omitting a path
+    reaches it.
     """
     entries = "\n".join(
-        f"    {f'{module}.{name}'!r}: str(getattr(import_module({module!r}), {name!r})),"
+        f"    {f'{module}.{name}'!r}: str(getattr(import_module({module!r}), {name!r})()),"
         for module, name in pairs
     )
     header = "import json\nfrom importlib import import_module\n"
@@ -133,7 +132,7 @@ def test_without_the_override_every_default_is_the_real_directory(tmp_path):
 def test_the_token_a_redirected_reauth_writes_lands_in_the_throwaway(tmp_path):
     """The incident, reproduced with the fix on, through the real writer.
 
-    This is what happened on 2026-09-13: a token written to ``DEFAULT_TOKEN_PATH`` by a
+    This is what happened on 2026-09-13: a token written to the default token path by a
     by-hand run. ``reauth.write_token`` is the function the login flow's callback lands
     in, driven here at the default it would have used, and with the override exported it
     cannot reach the real file. What the write landed on is read back, because a redirect
@@ -145,17 +144,19 @@ def test_the_token_a_redirected_reauth_writes_lands_in_the_throwaway(tmp_path):
     script = f"""
 import json
 from pathlib import Path
-from lake.reauth import DEFAULT_TOKEN_PATH, write_token
+from lake.paths import default_token_path
+from lake.reauth import write_token
+target = default_token_path()
 # The child checks the redirect before it writes, and this is not belt and braces. A
 # child process has no conftest guard, so with the redirect broken this line is the only
 # thing standing between the write below and the machine's real token. Breaking
 # config_dir on purpose is how this suite is reviewed, and the first such run destroyed
 # a working token from exactly here. Refusing the write leaves the parent's assertion to
 # fail instead, which is the whole point of a mutation run.
-redirected = DEFAULT_TOKEN_PATH.parent == Path({str(throwaway)!r})
+redirected = target.parent == Path({str(throwaway)!r})
 if redirected:
-    write_token(DEFAULT_TOKEN_PATH, {{"creation_timestamp": 1, "token": {{"refresh_token": "x"}}}})
-print(json.dumps({{"written": str(DEFAULT_TOKEN_PATH), "redirected": redirected}}))
+    write_token(target, {{"creation_timestamp": 1, "token": {{"refresh_token": "x"}}}})
+print(json.dumps({{"written": str(target), "redirected": redirected}}))
 """
     result = _child(script, throwaway)
     assert result["redirected"] is True, f"the override did not take: {result['written']}"

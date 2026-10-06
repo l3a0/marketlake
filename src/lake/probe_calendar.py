@@ -31,8 +31,8 @@ from typing import NamedTuple
 from lake import journal
 from lake.alert import Message
 from lake.calendar import MARKET_TZ
+from lake.paths import default_token_path
 from lake.runner import PING_FAILURES, escalate_ping_failure
-from lake.schwab import DEFAULT_TOKEN_PATH
 
 # What the probe reports, per the design's message table. A session the daemon slept
 # through is the loudest thing here, because the samples are gone.
@@ -342,7 +342,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     clock = SystemClock()
     vendor = SchwabVendor.from_token(
-        args.token if args.token is not None else DEFAULT_TOKEN_PATH,
+        args.token if args.token is not None else default_token_path(),
         api_key=config.schwab_api_key.reveal(),
         app_secret=config.schwab_app_secret.reveal(),
     )

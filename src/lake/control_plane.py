@@ -106,7 +106,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from lake import outbox
+from lake import outbox, paths
 from lake.alert import REFUSED, Message, Publisher
 from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
@@ -124,7 +124,7 @@ from lake.manifest import (
     scrub,
 )
 from lake.metadata import JournalMetadata, read_metadata
-from lake.paths import CONFIG_DIR_ENV, TOKEN_FILE, config_dir
+from lake.paths import CONFIG_DIR_ENV, config_dir
 from lake.runner import (
     PING_FAILURES,
     LaunchdJob,
@@ -870,8 +870,8 @@ def eod_sweep_job(host: Host) -> Job:
     because it asserts coverage over the same file the daemon reads and the Time Machine
     exclusion protects, and one derivation for the three is what keeps them from
     splitting. Nothing here needs a second spelling of that path: ``environment`` sets
-    ``HOME``, ``schwab.DEFAULT_TOKEN_PATH`` is bound from it at import, and
-    ``bars`` already defaults to that constant wherever the sweep reaches it.
+    ``HOME``, and the sweep resolves the token from it through
+    ``lake.paths.default_token_path`` each time it builds a vendor.
 
     ``RunAtLoad`` is off, for ``calendar_probe_job``'s reason rather than a new one. A
     load at any other hour would make vendor calls about a session the run is not in, which
@@ -3010,8 +3010,13 @@ def default_config_dir(home: str) -> str:
 
 
 def default_token_path(home: str) -> str:
-    """The token's standard location under ``home``. Machine-derived, never tracked."""
-    return str(config_dir(home) / TOKEN_FILE)
+    """The token's standard location under ``home``. Machine-derived, never tracked.
+
+    ``lake.paths.default_token_path`` builds it, so the renderer and the running vendor
+    spell the location one way. An explicit ``home`` wins over ``MARKETLAKE_CONFIG_DIR``
+    there, so a render stays a render whatever the environment says.
+    """
+    return str(paths.default_token_path(home))
 
 
 def tmutil_exclusion_targets(config_dir: str, token_path: str) -> tuple[str, ...]:
@@ -4530,9 +4535,7 @@ def _build_parser():
         help="Scrub, test a restore, verify the wake alarms on macOS, canary, then ping.",
     )
     sunday.add_argument("--config", help="Path to config.yaml (defaults to the standard location).")
-    sunday.add_argument(
-        "--token", help="Path to token.json. Defaults to the standard place under HOME."
-    )
+    sunday.add_argument("--token", help="Path to token.json (defaults to the standard location).")
 
     sub.add_parser("pmset", help="Print the two pmset commands for the coming week.")
 
@@ -4696,7 +4699,7 @@ def main(
     if args.command == "sunday":
         with input_errors_exit("sunday"):
             config = load_config(args.config)
-        token_path = args.token if args.token is not None else default_token_path(str(Path.home()))
+        token_path = args.token if args.token is not None else str(paths.default_token_path())
 
         def read_mint() -> datetime | None:
             """The token's mint time, read fresh so a retry can see a new re-login.

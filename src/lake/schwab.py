@@ -60,17 +60,9 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from lake.clock import Clock
-from lake.paths import TOKEN_FILE, config_dir
+from lake.paths import default_token_path
 from lake.token_epoch import epoch_second_to_utc
 from lake.vendor import RequestTiming, VendorError, VendorResponse, require_utc_bound
-
-# The standard location of the Schwab token, per the design's Configuration section.
-# It sits outside the repo and outside the backup-synced lake tree. This is a home-
-# relative default the live recorder falls back to, never a committed machine path.
-# The path is fixed when this module is imported, so a process that sets HOME or
-# MARKETLAKE_CONFIG_DIR afterwards still resolves the real directory. marketlake #715
-# will resolve it at call time instead.
-DEFAULT_TOKEN_PATH = config_dir() / TOKEN_FILE
 
 # The field groups pinned on every batched quote request. ``all`` returns every block
 # Schwab offers: quote, fundamental, regular, extended, and reference. Pinning them means
@@ -772,13 +764,16 @@ class SchwabVendor:
     @classmethod
     def from_token(
         cls,
-        token_path: str | Path = DEFAULT_TOKEN_PATH,
+        token_path: str | Path | None = None,
         *,
         api_key: str,
         app_secret: str,
         clock: Clock | None = None,
     ) -> SchwabVendor:
         """Build the real vendor from a token file.
+
+        ``token_path`` defaults to ``lake.paths.default_token_path()``, resolved when this
+        runs rather than when the module was imported.
 
         ``client_from_token`` builds the client, and its docstring says what it adds to
         ``schwab-py``'s own: an atomic token write, and one refresh at a time across every
@@ -793,6 +788,8 @@ class SchwabVendor:
         The three callers that fetch a chain pass theirs: the capture cycle, the close+5
         fill and onboarding. Every other caller leaves it ``None`` and records nothing.
         """
+        if token_path is None:
+            token_path = default_token_path()
         client = client_from_token(token_path, api_key=api_key, app_secret=app_secret)
         if clock is not None:
             attach_timing(client, clock)

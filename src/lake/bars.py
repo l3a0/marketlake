@@ -163,9 +163,9 @@ from lake.loader import (
 )
 from lake.lock import lake_lock
 from lake.manifest import ManifestError, latest_entries, record_partition
-from lake.paths import LakePaths, temp_write_path
+from lake.paths import LakePaths, default_token_path, temp_write_path
 from lake.report import Withheld, write_withheld
-from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor, VendorAuthError
+from lake.schwab import SchwabVendor, VendorAuthError
 from lake.security_master import MasterUnreadable, SecurityMaster, master_path
 from lake.session import SessionBounds, SessionClock
 from lake.tickers import Roster, TickersError, load_tickers
@@ -2316,7 +2316,7 @@ def fetch_session_bars_from_config(
     config_path: str | Path | None = None,
     tickers_path: str | Path | None = None,
     vendor_factory: VendorFactory | None = None,
-    token_path: str | Path = DEFAULT_TOKEN_PATH,
+    token_path: str | Path | None = None,
 ) -> BarsReport:
     """The sweep wired from the real config. This is the entry :func:`main` calls.
 
@@ -2336,7 +2336,7 @@ def fetch_session_bars_from_config(
     config = load_config(config_path)
     factory = SchwabVendor.from_token if vendor_factory is None else vendor_factory
     vendor = factory(
-        token_path,
+        default_token_path() if token_path is None else token_path,
         api_key=config.schwab_api_key.reveal(),
         app_secret=config.schwab_app_secret.reveal(),
     )
@@ -2355,7 +2355,7 @@ def backfill_bars_from_config(
     config_path: str | Path | None = None,
     tickers_path: str | Path | None = None,
     vendor_factory: VendorFactory | None = None,
-    token_path: str | Path = DEFAULT_TOKEN_PATH,
+    token_path: str | Path | None = None,
 ) -> BackfillReport:
     """The backfill wired from the real config, taking the same arguments as its sibling.
 
@@ -2370,7 +2370,7 @@ def backfill_bars_from_config(
     config = load_config(config_path)
     factory = SchwabVendor.from_token if vendor_factory is None else vendor_factory
     vendor = factory(
-        token_path,
+        default_token_path() if token_path is None else token_path,
         api_key=config.schwab_api_key.reveal(),
         app_secret=config.schwab_app_secret.reveal(),
     )

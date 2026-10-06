@@ -571,8 +571,7 @@ def test_a_fresh_process_writes_the_path_the_loader_reads(tmp_path):
 # The child for the late-redirect test. It imports ``lake.roster`` while ``HOME`` still
 # names the first directory, and only then points ``HOME`` and the config-directory
 # override at the second, the order a probe that redirects too late runs in. The config
-# path is passed explicitly, because ``config.DEFAULT_CONFIG_PATH`` still binds at import
-# until marketlake #715, and this test is about where the roster lands.
+# path is left to its default, which resolves at call time like the roster's.
 _LATE_REDIRECT = """\
 import os
 import sys
@@ -583,8 +582,7 @@ import lake.roster
 late_home = Path(sys.argv[1])
 os.environ["HOME"] = str(late_home)
 os.environ["MARKETLAKE_CONFIG_DIR"] = str(late_home / ".config" / "marketlake")
-config = late_home / ".config" / "marketlake" / "config.yaml"
-print(lake.roster.apply(sys.stdin.buffer.read(), config_path=config))
+print(lake.roster.apply(sys.stdin.buffer.read()))
 """
 
 
@@ -612,8 +610,9 @@ def test_a_redirect_made_after_import_moves_the_roster(tmp_path):
 
 # The child for the one-variable redirects. It imports ``lake.roster`` first, then sets
 # only the variables named after the config path, each as ``NAME=value``, and applies the
-# roster on stdin. The config path is passed explicitly for the reason the child above
-# gives.
+# roster on stdin. The config path is passed explicitly, so each test turns on the
+# roster's default alone. ``tests/component/test_late_config_dir_redirect.py`` covers the
+# config's default.
 _LATE_SETS = """\
 import os
 import sys

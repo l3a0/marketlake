@@ -28,8 +28,7 @@ import pytest
 
 from lake import control_plane as cp
 from lake.metadata import stamp_assertion_pid, stamp_cycle
-from lake.paths import TOKEN_FILE, config_dir
-from lake.schwab import DEFAULT_TOKEN_PATH
+from lake.paths import TOKEN_FILE, config_dir, default_token_path
 from lake.tickers import Roster
 from tests.support.backup import WRONG, FakeBackupReader, mirror_lake
 from tests.support.calendar import et, weekday_sessions
@@ -263,17 +262,18 @@ def test_the_three_consumers_name_one_file(tmp_path, capsys):
     sunday = plistlib.loads((out / "com.marketlake.sunday.plist").read_bytes())
     assert sunday["ProgramArguments"][-2:] == ["--token", token]
     # The daemon writes it. It carries no --token, so it resolves the path from the
-    # HOME its plist sets, through schwab's own spelling of the same rule. Binding the
-    # two spellings is the daemon leg of the invariant. Asserting control_plane's
+    # HOME its plist sets, through lake.paths.default_token_path. Binding the two
+    # spellings is the daemon leg of the invariant. Asserting control_plane's
     # helper against itself would pass while the daemon read another file entirely.
     daemon = plistlib.loads((out / "com.marketlake.daemon.plist").read_bytes())
     assert daemon["EnvironmentVariables"]["HOME"] == "/Users/someone"
     assert "--token" not in daemon["ProgramArguments"]
-    # config_dir rather than this process's own home: DEFAULT_TOKEN_PATH honours
-    # MARKETLAKE_CONFIG_DIR, and this leg is about schwab spelling the shared rule.
+    # config_dir rather than this process's own home: default_token_path() honours
+    # MARKETLAKE_CONFIG_DIR, and this leg is about the vendor's resolver spelling the
+    # shared rule.
     # The renderer's leg of the same rule is asserted on the line below and in
     # test_paths.test_the_control_plane_renderer_agrees_with_the_shared_rule.
-    assert str(DEFAULT_TOKEN_PATH) == str(config_dir() / TOKEN_FILE)
+    assert str(default_token_path()) == str(config_dir() / TOKEN_FILE)
     assert cp.default_token_path(daemon["EnvironmentVariables"]["HOME"]) == token
     # The exclusion protects the directory holding it.
     assert "tmutil addexclusion /Users/someone/.config/marketlake" in capsys.readouterr().out

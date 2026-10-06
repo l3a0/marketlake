@@ -881,12 +881,13 @@ def onboard_from_config(
     built-in plan rather than to a file. ``load_chain_plan`` never raises, so a missing,
     unreadable, or invalid file lands on that same built-in default.
     """
-    from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor
+    from lake.paths import default_token_path
+    from lake.schwab import SchwabVendor
 
     config = load_config(config_path)
     resolved_clock = clock if clock is not None else SystemClock()
     vendor = SchwabVendor.from_token(
-        token_path if token_path is not None else DEFAULT_TOKEN_PATH,
+        token_path if token_path is not None else default_token_path(),
         api_key=config.schwab_api_key.reveal(),
         app_secret=config.schwab_app_secret.reveal(),
         clock=resolved_clock,

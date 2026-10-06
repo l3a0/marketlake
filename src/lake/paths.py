@@ -462,8 +462,9 @@ CHAIN_PLAN_FILE = "chain_plan.json"
 CONFIG_DIR_PARTS = (".config", "marketlake")
 
 # The whole config directory, moved somewhere else for one process. Every default path
-# in this package is built from ``config_dir``, so setting this before a process starts
-# points its token, config, roster, and chain plan at a throwaway directory together.
+# in this package is resolved through ``config_dir`` each time it is used, so setting
+# this before a process starts points its token, config, roster, and chain plan at a
+# throwaway directory together.
 #
 # It exists because the live token is a real credential that a by-hand run can destroy.
 # ``python -m lake.reauth`` with no ``--token`` writes the standard location, which is
@@ -476,15 +477,12 @@ CONFIG_DIR_PARTS = (".config", "marketlake")
 # file that was lost and not the only one that can be. ``config.yaml`` holds four to six
 # secrets and the roster is hand-maintained.
 #
-# Two limits are worth stating. ``config_dir`` reads the environment on every call, but
-# four of the defaults built from it are module-level constants bound when their module
-# is imported: the chain plan, the config, and the two token paths. Exporting the
-# variable from inside a running process moves none of those four until marketlake #715
-# resolves them at call time. It does move the roster, because
-# ``tickers.default_tickers_path`` resolves on every read and write, which
-# ``test_a_redirect_made_after_import_moves_the_roster`` shows in a child process. So
-# the variable has to be set before the process starts. And it is an override a person
-# sets, so it does not protect a run that forgets it. The test suite
+# Two limits are worth stating. Every default built from ``config_dir`` resolves each
+# time it is used, from the environment at that moment. A script that exports the
+# variable after import moves every later read and write but nothing already resolved,
+# so a change part-way through a run can split it between two directories. A running
+# daemon's environment never changes. Set it before the process starts. And it is an
+# override a person sets, so it does not protect a run that forgets it. The test suite
 # needs nobody to remember anything, because ``tests/conftest.py`` covers it three ways.
 # A guard there fails any test that writes the real directory. Because that guard is a
 # monkeypatch that reaches no child process, the same file exports this variable at a
@@ -527,6 +525,20 @@ def config_dir(
     return Path.home().joinpath(*CONFIG_DIR_PARTS)
 
 
+def default_token_path(home: str | Path | None = None) -> Path:
+    """The standard location of the Schwab token, per the design's Configuration section.
+
+    It sits outside the repo and outside the backup-synced lake tree, and it is resolved
+    through ``config_dir`` on every call, so the environment at the moment of the read or
+    the write decides. Both ``lake.schwab``, which refreshes the token, and
+    ``lake.reauth``, which writes it, read it here. ``lake.reauth`` must not import the
+    vendor layer, and this module is the one both already import. A ``home`` passes
+    through to ``config_dir``, which is how the control plane's renderer names the token
+    of another account.
+    """
+    return config_dir(home) / TOKEN_FILE
+
+
 __all__ = [
     "ACTIONS",
     "BARS",
@@ -564,6 +576,7 @@ __all__ = [
     "PartitionRef",
     "SegmentRef",
     "config_dir",
+    "default_token_path",
     "parse_date_dir",
     "parse_partition_rel",
     "parse_segment_rel",
