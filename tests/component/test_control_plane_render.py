@@ -20,7 +20,7 @@ import shlex
 import subprocess
 import urllib.error
 from collections.abc import Sequence
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1022,6 +1022,144 @@ def test_the_sunday_cli_reads_the_stamp_instant_as_well_as_the_pid(tmp_path, mon
     assert code == 0  # report tier: the ping still fires despite the finding
     assert [m.event for m in pushes.sent] == [cp.SUNDAY_ASSERTION_UNHELD_EVENT]
     assert cp.NO_PID_FRESH_STAMP in pushes.sent[0].body, "the CLI dropped the stamp instant"
+
+
+# -- the Sunday daemon page, per host ------------------------------------------------
+
+# 20:30 on Sunday 2026-08-30 in New York, given as the UTC instant ``SystemClock`` returns.
+# It is already Monday in UTC, so a body that printed a bare ``now.isoformat()`` would name
+# Monday's date on a Sunday evening. The Eastern rendering is what both bodies must carry.
+_SUNDAY_EVENING_UTC = datetime(2026, 8, 31, 0, 30, tzinfo=UTC)
+
+
+def test_the_mac_sunday_daemon_down_page_reads_verbatim():
+    """The macOS body, written before the Linux branch existed, so the branch cannot move it."""
+    page = cp.sunday_daemon_page(
+        daemon_up=False,
+        assertion_pid=None,
+        daemon_label=cp.DAEMON_LABEL,
+        now=_SUNDAY_EVENING_UTC,
+    )
+    assert page.event == cp.SUNDAY_DAEMON_DOWN_EVENT
+    assert page.title == "Capture at risk: Sunday daemon down"
+    assert page.body == (
+        "launchctl shows com.marketlake.daemon is not running, checked "
+        "2026-08-30T20:30:00-04:00. Nothing is holding the Sunday assertion, and Monday's "
+        "capture is at risk."
+    )
+
+
+def test_the_linux_sunday_daemon_down_page_names_systemd_and_its_command(on_linux):
+    """A VM holds no assertion, so the body drops that sentence and names the command."""
+    page = cp.sunday_daemon_page(
+        daemon_up=False,
+        assertion_pid=None,
+        daemon_label=cp.DAEMON_LABEL,
+        now=_SUNDAY_EVENING_UTC,
+    )
+    assert page.event == cp.SUNDAY_DAEMON_DOWN_EVENT
+    assert page.title == "Capture at risk: Sunday daemon down"
+    assert page.body == (
+        "systemd reports com.marketlake.daemon not active, not installed, or could not be "
+        "asked, checked 2026-08-30T20:30:00-04:00. Monday's capture is at risk. Run "
+        "systemctl status com.marketlake.daemon on the VM."
+    )
+    assert "systemctl status" in page.body
+    assert "launchctl" not in page.body
+    assert "Sunday assertion" not in page.body
+
+
+# -- each job's command line, per host ------------------------------------------------
+
+
+def _record_self_check(monkeypatch) -> dict[str, object]:
+    """Replace ``self_check`` with a recorder, so the test reads what ``main`` wired."""
+    seen: dict[str, object] = {}
+
+    def recording(**kwargs):
+        seen.update(kwargs)
+        return cp.SelfCheckOutcome(daemon_up=True, pinged=True)
+
+    monkeypatch.setattr(cp, "self_check", recording)
+    monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
+    return seen
+
+
+def test_the_mac_self_check_cli_asks_launchd_and_the_assertion(tmp_path, monkeypatch):
+    seen = _record_self_check(monkeypatch)
+    config = write_config(tmp_path, tmp_path / "lake")
+    assert cp.main(["self-check", "--config", str(config)]) == 0
+    assert seen["probe"] is cp.launchctl_probe
+    assert seen["assertion_probe"] is cp.pmset_assertions_probe
+    assert seen["clock_probe"] is None
+    assert seen["label"] == cp.DAEMON_LABEL
+
+
+def test_the_linux_self_check_cli_asks_systemd_and_the_clock(tmp_path, monkeypatch, on_linux):
+    seen = _record_self_check(monkeypatch)
+    config = write_config(tmp_path, tmp_path / "lake")
+    assert cp.main(["self-check", "--config", str(config)]) == 0
+    assert seen["probe"] is cp.systemctl_probe
+    assert seen["assertion_probe"] is None
+    assert seen["clock_probe"] is cp.timedatectl_clock_probe
+    assert seen["label"] == cp.DAEMON_LABEL
+
+
+def _drive_sunday(tmp_path: Path, monkeypatch) -> tuple[int, dict[str, object]]:
+    """Run ``main sunday`` on a healthy lake, recording what reaches ``sunday_run``.
+
+    Every live producer on both hosts is replaced, so whichever branch ``main`` takes
+    reaches a fake. The real ``sunday_run`` still runs, so the exit code is the job's own.
+    """
+    lake, config = _sunday_lake(tmp_path)
+    stamp_assertion_pid(lake, pid=_DAEMON_PID)
+    seen: dict[str, object] = {}
+    real = cp.sunday_run
+
+    def recording(**kwargs):
+        seen.update(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(cp, "sunday_run", recording)
+    monkeypatch.setattr(cp, "read_pmset_schedule", lambda: REPEAT_ONLY)
+    monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
+    monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr(cp, "read_exclusions", _excluded)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
+    monkeypatch.setattr(cp, "systemctl_probe", lambda label: True)
+    code = cp.main(
+        ["sunday", "--config", str(config), "--token", str(_token(tmp_path))],
+        clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
+        calendar=weekday_sessions(date(2026, 8, 31)),
+    )
+    return code, seen
+
+
+def test_the_mac_sunday_cli_reads_the_wake_alarms_back(tmp_path, capsys, monkeypatch):
+    code, seen = _drive_sunday(tmp_path, monkeypatch)
+    assert code == 0
+    # The names ``main`` looks up, each replaced above, so identity says which it wired.
+    assert seen["schedule_reader"] is cp.read_pmset_schedule
+    assert seen["exclusion_reader"] is cp.read_exclusions
+    assert seen["daemon_probe"] is cp.launchctl_probe
+    assert seen["assertion_probe"] is cp.pmset_assertions_probe
+    capsys.readouterr()
+
+
+def test_the_linux_sunday_cli_asks_systemd_and_reads_nothing_back(
+    tmp_path, capsys, monkeypatch, on_linux
+):
+    code, seen = _drive_sunday(tmp_path, monkeypatch)
+    printed = capsys.readouterr().out
+    assert code == 0
+    assert seen["schedule_reader"] is None
+    assert seen["exclusion_reader"] is None
+    assert seen["daemon_probe"] is cp.systemctl_probe
+    assert seen["assertion_probe"] is None
+    assert "pmset" not in printed
+    assert "time machine" not in printed
 
 
 # -- the two producers the launchd job runs on ---------------------------------------

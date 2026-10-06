@@ -176,7 +176,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Protocol
 
-from lake import outbox
+from lake import control_plane, outbox
 from lake.alert import REFUSED, Message, Publisher, Transport
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
 from lake.capture import (
@@ -1174,6 +1174,10 @@ def _assertion_pid_stamp(
     remembered here, so the file is the only thing that decides, and a stamp that goes
     missing underneath the daemon comes back on the next tick.
 
+    On a Linux host the runner spawns nothing and hands back no process, so the pid is
+    always ``None``. On a fresh lake this never writes. A lake restored from the Mac's
+    backup carries the Mac's last pid, and the first tick clears it.
+
     A config that will not load answers ``None`` here, mirroring ``_idle_stamp``'s own
     guard on the same file. Neither guard is reachable from the production entry, because
     ``_alarm`` below re-loads the same config and raises rather than returning. They are
@@ -1360,7 +1364,10 @@ def run_loop_from_config(
 
     The caffeinate power assertion is held here rather than left to a caller. The
     design's chain is the wake alarm, then ``KeepAlive`` starting the daemon, then the
-    assertion keeping an open laptop awake, and this is the link that holds it.
+    assertion keeping an open laptop awake, and this is the link that holds it. On a Linux
+    host ``main`` passes ``_hold_nothing`` as ``assertion_runner``, because a VM never
+    sleeps. The holder then records each window as held, so ``assertion_lost`` never fires,
+    and the pid it stamps is ``None``.
 
     ``transport``, ``pinger`` and ``compaction_runner`` are required, and none has a live
     default. Each one reaches past this process: a real ntfy POST, a real healthchecks GET,
@@ -1663,6 +1670,9 @@ def run_loop_from_config(
 
         Once per window rather than once per minute, because the holder retries every
         minute and a page that repeats six hundred times is a page nobody reads.
+
+        On a Linux host this never pages, because ``_hold_nothing`` never fails and never
+        hands back a child that could die.
         """
         if holder.took_over_dead_child():
             # Reported, not paged. The machine was unheld for at most the minute between
@@ -1855,8 +1865,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _hold_nothing(args: Sequence[str]) -> None:
+    """The assertion runner on a host that never sleeps: it spawns nothing.
+
+    ``AssertionHolder`` treats a runner that hands back no process as one that held, so
+    the window counts as held, ``pending_failure`` stays ``None`` and ``assertion_lost``
+    never pages, and ``child_pid`` answers ``None``, so the pid stamp stays empty.
+
+    The price is a holder that believes it holds something, which no operator sees: the
+    only readers of the pid, the self-check and the Sunday job, stop asking on Linux. An
+    optional holder that skipped the hold, the pid stamp and ``report_lost_assertion``
+    together was considered and refused. It costs three edits instead of this one and
+    changes nothing an operator sees.
+    """
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """The ``python -m lake.daemon`` entry. Loops forever, so it returns only when stopped."""
+    """The ``python -m lake.daemon`` entry. Loops forever, so it returns only when stopped.
+
+    On macOS the loop holds a ``caffeinate`` assertion through the holder's default spawn.
+    On any other host it passes ``_hold_nothing``, because a VM never sleeps and has no
+    ``caffeinate`` to spawn. ``control_plane.is_macos`` decides which.
+    """
     args = build_parser().parse_args(argv)
     # The senders come from ``outbox``, the only construction site in the package. The
     # config is read here as well as inside the loop, because the ntfy topic names the
@@ -1884,6 +1915,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             transport=sends.transport,
             pinger=sends.pinger,
             compaction_runner=_spawn_compaction,
+            assertion_runner=None if control_plane.is_macos() else _hold_nothing,
         )
     return 0
 

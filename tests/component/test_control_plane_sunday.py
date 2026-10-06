@@ -120,6 +120,35 @@ def test_before_the_wake_a_missing_one_shot_rides_the_report(fixture_lake):
     assert present.pinged is True and pinger.urls == [URL]
 
 
+def test_with_no_readers_the_read_backs_are_skipped_without_a_line(fixture_lake):
+    """The Linux host passes neither reader, because it has no wake and no Time Machine.
+
+    Before the wake both alarms are expected, so a ``None`` reader treated as a read that
+    failed or found nothing would add a line here. A skip adds none and leaves ``alarms``
+    ``None``, which says the question was not asked.
+    """
+    root = _clean_lake(fixture_lake)
+    pinger = FakePinger()
+    outcome = cp.sunday_maintenance(
+        lake_root=root,
+        backup_target=_backup_of(root),
+        now=SUNDAY_19,
+        calendar=CALENDAR,
+        schedule_reader=None,
+        pinger=pinger,
+        ping_url=URL,
+        mint=FRESH_MINT,
+        canary=_passing_canary,
+        exclusion_targets=("/config", "/config/token.json"),
+        exclusion_reader=None,
+    )
+    assert outcome.alarms is None
+    assert not any("pmset" in line or "read-back" in line for line in outcome.report)
+    assert outcome.report == ()
+    assert outcome.problems == ()
+    assert outcome.pinged is True and pinger.urls == [URL]
+
+
 def test_a_scrub_failure_alone_owes_no_reminder(fixture_lake):
     # The reminder keys on the canary and the coverage assertion, never on whether
     # the run pinged. A corrupted partition withholds the ping and owes no reminder,
@@ -568,8 +597,8 @@ def test_the_retry_loop_scrubs_the_copy_it_was_handed(fixture_lake):
 
 
 def test_every_attempt_restores_afresh_and_a_failing_restore_retries(fixture_lake):
-    # Nothing carries a pass or a failure from one attempt to the next, so a reader that
-    # fails all evening is asked once per attempt and the evening never pings.
+    # A failure is never carried from one attempt to the next, so a reader that fails
+    # all evening is asked once per attempt and the evening never pings.
     root = _clean_lake(fixture_lake)
     reader = FakeBackupReader(_backup_of(root), every=FAIL)
     outcomes, pinger, _ = _retry_run(
@@ -579,6 +608,21 @@ def test_every_attempt_restores_afresh_and_a_failing_restore_retries(fixture_lak
     assert reader.calls == [QUOTES] * 7
     assert all(o.restore is not None and o.restore.ok is False for o in outcomes)
     assert pinger.urls == []
+
+
+def test_a_path_target_reads_again_on_every_attempt_even_after_a_pass(fixture_lake):
+    # A bucket target keeps a pass between attempts, because its read is a download. A
+    # path target's read costs a 52nd of what the scrub re-hashes, so it keeps nothing:
+    # the 20:30 retry after a stale token reads the file a second time.
+    root = _clean_lake(fixture_lake)
+    reader = FakeBackupReader(_backup_of(root))
+    outcomes, pinger, _ = _retry_run(
+        root, start=SUNDAY_20, mints=_Mints(STALE_MINT, FRESH_MINT), backup_reader=reader
+    )
+    assert len(outcomes) == 2
+    assert reader.calls == [QUOTES, QUOTES]
+    assert all(o.restore.ok and o.restore.reused is False for o in outcomes)
+    assert pinger.urls == [URL]
 
 
 def test_a_healthy_sunday_makes_one_attempt(fixture_lake):

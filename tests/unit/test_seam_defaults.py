@@ -2,12 +2,16 @@
 
 This is the rule, stated once, where a signature change cannot slip past it. A seam is a
 parameter whose production value reaches past this process. A healthchecks GET, an ntfy
-POST, an ``rsync``, a vendor quote, and a ``launchctl``, ``pmset`` or ``tmutil`` read are
-all seams. Two kinds of entry carry them, and each has its own failure to guard.
+POST, an ``rsync``, a vendor quote, a ``launchctl``, ``pmset``, ``tmutil``, ``systemctl``
+or ``timedatectl`` read, a ``caffeinate`` spawn, and a ``sudo pmset`` write are all seams.
+Two kinds of entry carry them, and each has its own failure to guard.
 
 A library helper takes its seams and must never default one. ``run_loop_from_config``,
-``run_once_from_config``, ``_alarm``, ``compact``, ``self_check`` and ``sunday_run`` each
-require the seams they use. A later edit re-adding ``= None`` and the
+``run_once_from_config``, ``_alarm``, ``compact``, ``self_check``, ``sunday_run``,
+``sunday_maintenance``, ``sweep.sweep`` and ``sweep._friday_wake`` each require the seams
+they use. Required means the caller must say, and a schedule reader or setter may be
+``None`` on a host with no wake. What a default would add is a caller that said nothing
+and got the live ``pmset`` read or ``sudo`` write. A later edit re-adding ``= None`` and the
 ``x if x is not None else Live()`` fallback would restore the old bug with every test
 still green. The REQUIRED table is what goes red instead. Two of these entries fed the
 owner's live ``capture`` dead-man six times per suite run before the seams were required.
@@ -26,7 +30,8 @@ handing the entry a flow.
 
 ``probe_calendar.main`` already took none. ``compact.main``, ``control_plane.main`` and
 ``daemon.main`` now build ``rsync``, the ntfy POST, the healthchecks GET, the vendor
-canary, and the ``launchctl``, ``pmset`` and ``tmutil`` reads internally. ``daemon.main``
+canary, the ``launchctl``, ``pmset`` and ``tmutil`` reads, the ``systemctl`` and
+``timedatectl`` reads, and the daemon's assertion runner internally. ``daemon.main``
 joined them with the close+15 compaction: it spawns that job as its own process, so the
 seam is the spawn rather than the ``rsync`` the child goes on to run. ``clock`` and
 ``calendar`` stay injectable on both. A system clock and an exchange calendar never
@@ -43,7 +48,7 @@ import inspect
 
 import pytest
 
-from lake import bucket, compact, control_plane, daemon, reauth, runner
+from lake import bucket, compact, control_plane, daemon, reauth, runner, sweep
 
 # Each row is an entry and a seam it must never default. Requiring the seam means a caller
 # that omits it gets a TypeError, not a live object. The protection follows each seam to
@@ -63,6 +68,11 @@ REQUIRED = [
     (control_plane.sunday_run, "schedule_reader"),
     (control_plane.sunday_run, "pinger"),
     (control_plane.sunday_run, "canary"),
+    (control_plane.sunday_maintenance, "schedule_reader"),
+    (sweep.sweep, "schedule_setter"),
+    (sweep.sweep, "schedule_reader"),
+    (sweep._friday_wake, "schedule_setter"),
+    (sweep._friday_wake, "schedule_reader"),
     (reauth.reauth, "login_flow"),
     (reauth.reauth_from_config, "login_flow"),
     (bucket.nightly_upload, "client"),
@@ -85,11 +95,13 @@ FORBIDDEN = [
     (compact.main, "publisher"),
     (compact.main, "transport"),
     (daemon.main, "compaction_runner"),
+    (daemon.main, "assertion_runner"),
     (control_plane.main, "probe"),
     (control_plane.main, "pinger"),
     (control_plane.main, "schedule_reader"),
     (control_plane.main, "canary"),
     (control_plane.main, "exclusion_reader"),
+    (control_plane.main, "clock_probe"),
     (control_plane.main, "transport"),
     (reauth.main, "login_flow"),
     (bucket.main, "client"),
